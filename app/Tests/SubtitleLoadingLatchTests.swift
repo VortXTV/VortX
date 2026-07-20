@@ -8,7 +8,7 @@
 // the session. On tvOS the panel snapshot additionally never rebuilt on completion, so the row said
 // "Loading…" forever even for loads that finished.
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md),
+// VortX's Apple app has no Xcode unit-test bundle (verification is build plus on-device, per the repo docs),
 // so, exactly like app/Tests/BingeAdvanceIdentityTests.swift, this is a self-contained Swift
 // executable that runs directly with the system toolchain:
 //
