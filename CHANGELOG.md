@@ -761,7 +761,7 @@ The curvy vortex X everywhere, the VortX gold theme by default, and a macOS cust
 
 ## 0.3.5 - 2026-06-15
 
-StremioX is now VortX. This release puts on the new name, a new gold-on-obsidian icon, and an animated VortX intro, and it adds Backup & Restore so your settings can travel with you. It is an in-place update: your library, add-ons, history, and settings stay exactly as they are. A handful of player and Apple TV fixes ride along too, including a smarter best-stream picker.
+This release puts on the new VortX name, a new gold-on-obsidian icon, and an animated VortX intro, and it adds Backup & Restore so your settings can travel with you. It is an in-place update: your library, add-ons, history, and settings stay exactly as they are. A handful of player and Apple TV fixes ride along too, including a smarter best-stream picker.
 
 ### Added
 
@@ -868,7 +868,7 @@ A bug-fix and polish pass on top of 0.3.0, driven by on-device testing across iP
 
 ## 0.3.0 - 2026-06-14
 
-StremioX is now a native app on iPhone, iPad, and Mac alongside Apple TV, all on the same stremio-core engine and libmpv player. This milestone retires the old iPhone and iPad web host. The beta entries below list the iPhone polish that led here; the headline additions and fixes are collected here.
+VortX is now a native app on iPhone, iPad, and Mac alongside Apple TV, all on a native Rust engine and libmpv player. This milestone retires the old iPhone and iPad web host. The beta entries below list the iPhone polish that led here; the headline additions and fixes are collected here.
 
 ### Added
 
@@ -1034,7 +1034,7 @@ A stability and polish pass over the native iPhone, iPad, and Mac apps, fixing t
 
 ## 0.3.0 beta (prerelease) - 2026-06-13
 
-The native iPhone, iPad, and Mac apps reach Apple TV parity, and StremioX expands to desktop and Android. iPhone, iPad, and Mac now run the same stremio-core engine and libmpv player as the Apple TV app, with no web host.
+The native iPhone, iPad, and Mac apps reach Apple TV parity, and VortX expands to desktop and Android. iPhone, iPad, and Mac now run the same native Rust engine and libmpv player as the Apple TV app, with no web host.
 
 ### Added
 

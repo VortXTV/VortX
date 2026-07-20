@@ -15,7 +15,7 @@ It is intended for content the user owns or is otherwise authorized to access.
 
 - VortX does **not** host, store, server-side cache, index, or distribute any media content.
 - VortX **bundles no content and no add-ons.** A fresh install has nothing to play until you sign in and add your own add-ons or sources.
-- VortX is **not affiliated with, endorsed by, or sponsored by** Stremio, Apple, Anthropic, or any third-party add-on, server, or content provider. All names and trademarks belong to their owners.
+- VortX is **not affiliated with, endorsed by, or sponsored by** Stremio, Apple, or any third-party add-on, server, or content provider. All names and trademarks belong to their owners.
 
 ## Third-party add-ons and sources
 
