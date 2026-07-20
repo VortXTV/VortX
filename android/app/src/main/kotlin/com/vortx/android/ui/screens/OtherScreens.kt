@@ -253,6 +253,7 @@ fun SettingsScreen(
     onAddonsClick: () -> Unit,
     onIntegrationsClick: () -> Unit,
     onMediaServersClick: () -> Unit,
+    onLiveTvClick: () -> Unit,
     onPlaybackClick: () -> Unit,
     onSourcesClick: () -> Unit,
     onDownloadsClick: () -> Unit,
@@ -308,6 +309,9 @@ fun SettingsScreen(
         SettingRow(VortXIcons.addon, "Add-ons", "Manage", onClick = onAddonsClick)
         SettingRow(VortXIcons.link, "Integrations", "Trakt, SIMKL", onClick = onIntegrationsClick)
         SettingRow(VortXIcons.mediaServer, "Media servers", "Plex, Jellyfin, Emby", onClick = onMediaServersClick)
+        // Live TV (IPTV): add an M3U playlist or Xtream login; the converter output installs as a normal
+        // add-on so channels flow through the existing catalog pipeline (com.vortx.android.iptv).
+        SettingRow(VortXIcons.playRectangle, "Live TV", "IPTV", onClick = onLiveTvClick)
         SettingRow(VortXIcons.audioOutput, "Playback", playbackValue, onClick = onPlaybackClick)
         SettingRow(VortXIcons.sources, "Sources", sourcesValue, onClick = onSourcesClick)
         // The Downloads summary reads the live index, so the row can never disagree with the screen it opens
