@@ -75,6 +75,7 @@ import com.vortx.android.ui.screens.PlaybackSettingsScreen
 import com.vortx.android.ui.screens.ProfilesScreen
 import com.vortx.android.ui.screens.SearchScreen
 import com.vortx.android.ui.screens.SettingsScreen
+import com.vortx.android.iptv.IPTVSettingsScreen
 import com.vortx.android.ui.screens.SourcesSettingsScreen
 import com.vortx.android.ui.screens.VortXAccountScreen
 import com.vortx.android.sync.VortXSyncManager
@@ -143,6 +144,7 @@ fun StremioXApp(
         var showDownloads by remember { mutableStateOf(false) }
         var showPlayback by remember { mutableStateOf(false) }
         var showSources by remember { mutableStateOf(false) }
+        var showLiveTv by remember { mutableStateOf(false) }
         var showLibraryTransfer by remember { mutableStateOf(false) }
         var showProfiles by remember { mutableStateOf(false) }
         val onItem: (MetaItem) -> Unit = { detail = it }
@@ -457,6 +459,16 @@ fun StremioXApp(
             return@VortXTheme
         }
 
+        if (showLiveTv) {
+            // Settings > Live TV (IPTV): add / remove M3U + Xtream playlists. UNLIKE the self-contained
+            // settings overlays it takes [repo], the same way LibraryTransferScreen does: adding installs the
+            // converter's manifest through the engine's add-on pipeline and removing uninstalls it, while the
+            // playlist record rides the IPTVPlaylists singleton.
+            BackHandler { showLiveTv = false }
+            IPTVSettingsScreen(repo = repo, onBack = { showLiveTv = false })
+            return@VortXTheme
+        }
+
         if (showProfiles) {
             // Settings > Profiles: the "Who's watching?" switcher + create/rename/delete. Self-contained
             // (it drives the ProfileStore singleton directly, whose select() fires the engine reload +
@@ -564,6 +576,7 @@ fun StremioXApp(
                     onAddonsClick = { showAddons = true },
                     onIntegrationsClick = { showIntegrations = true },
                     onMediaServersClick = { showMediaServers = true },
+                    onLiveTvClick = { showLiveTv = true },
                     onDownloadsClick = { showDownloads = true },
                     onPlaybackClick = { showPlayback = true },
                     onSourcesClick = { showSources = true },
