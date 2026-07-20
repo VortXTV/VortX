@@ -2287,17 +2287,27 @@ struct TVPlayerView: View {
         .ignoresSafeArea()
         .transition(.move(edge: .trailing))
         .task(id: showOptions) {
-            // Sources and episodes keep arriving after the panel opens (add-ons
-            // answer at their own pace; direct-resume loads meta in the background).
-            // Refresh the cached rows once a second while those panels are up, but only
-            // when the engine actually emitted something since the last tick: an idle
-            // panel does zero ranking work.
+            // Backstop: rebuild the cached rows of WHATEVER panel is open, ~1 Hz, so no async
+            // completion can leave a stale row. Sources/episodes keep arriving after the panel opens
+            // (add-ons answer at their own pace; direct-resume loads meta in the background), and the
+            // other panels read state that lands asynchronously too (a subtitle download callback
+            // clearing "Loading…", late add-on subtitles, a track list the engine fills in). Call
+            // sites still refresh instantly where they can; this loop is the catch-all for the ones
+            // that cannot, so a missed or wrongly-guarded refresh can never strand a row (the tvOS twin
+            // of iOS PlayerScreen's refreshSoon, which already rebuilds the open panel on its tick).
+            //
+            // Preserves the f874120 perf property (no per-frame recompute): the ranking-heavy
+            // Sources/Episodes panels still rebuild ONLY when the engine emitted something since the
+            // last tick (core.revision), so an idle source list does zero re-ranking; every other panel
+            // rebuilds from cheap in-memory track/subtitle state, which does no ranking work.
             var seenRevision = -1
             while showOptions, !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
-                guard showOptions, panelKind == .sources || panelKind == .episodes else { continue }
-                guard core.revision != seenRevision else { continue }
-                seenRevision = core.revision
+                guard showOptions else { continue }
+                if panelKind == .sources || panelKind == .episodes {
+                    guard core.revision != seenRevision else { continue }
+                    seenRevision = core.revision
+                }
                 panelRows = optionRows
             }
         }
