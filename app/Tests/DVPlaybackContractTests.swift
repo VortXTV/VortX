@@ -1,102 +1,96 @@
-// Source-contract harness for the two Dolby Vision playback fixes. Both live in files with heavy dependencies
-// (Network, the remux stream, RemoteConfig, DiagnosticsLog), so compiling them standalone would need app-wide
-// stubs for no added confidence. This reads the production sources as TEXT and asserts the properties the fixes
-// exist to guarantee, which is the same approach used for the identity caller gate.
+// Executable harness for the two Dolby Vision playback fixes.
 //
 //   xcrun swiftc -o /tmp/dv-playback-contract-test \
+//     app/Sources/Player/DVPlaybackPolicy.swift \
 //     app/Tests/DVPlaybackContractTests.swift && /tmp/dv-playback-contract-test
 //
-// The bar for this file is mutation survival, not a pass count: each assertion below has been verified to turn RED
-// when its fix is reverted. An assertion that cannot fail is decoration, and two of the tests added earlier in this
-// engagement passed for the wrong reason, so the check is: delete the fix, watch this go red, restore.
+// This suite CALLS the production decisions. An earlier version asserted on source text instead, because the code
+// using these decisions lives in files that pull in AVFoundation and UIKit. That version was proven inadequate: a
+// mutant that preserved every asserted string and appended `false` to the guard condition passed the whole suite
+// while the guard could never fire. Substring assertions prove a line exists, not that it runs. The decisions now
+// live in a dependency-free file so the real functions can be executed here.
+//
+// The bar is mutation survival, not a pass count: every assertion below must turn RED when its property is broken,
+// including SEMANTIC breaks that leave the source text intact.
 
 import Foundation
-
-let repoRoot: String = {
-    // Walk up from this file to the directory containing `app/`, so the suite runs from anywhere.
-    var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-    for _ in 0..<6 {
-        if FileManager.default.fileExists(atPath: dir.appendingPathComponent("app").path) { return dir.path }
-        dir = dir.deletingLastPathComponent()
-    }
-    return FileManager.default.currentDirectoryPath
-}()
-
-func source(_ relative: String) -> String {
-    let path = repoRoot + "/" + relative
-    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
-        print("FAIL  could not read \(relative) (looked in \(repoRoot))")
-        exit(1)
-    }
-    return text
-}
 
 var failures = 0
 func check(_ name: String, _ condition: Bool) {
     if condition { print("PASS  \(name)") } else { failures += 1; print("FAIL  \(name)") }
 }
 
-// Comments are stripped before asserting. Every property below was previously "guaranteed" by a comment while the
-// code did something else, so a doc line describing the fix must never be able to satisfy the test for it.
-func codeOnly(_ text: String) -> String {
-    text.split(separator: "\n", omittingEmptySubsequences: false)
-        .map { line -> String in
-            let t = line.trimmingCharacters(in: .whitespaces)
-            return t.hasPrefix("//") ? "" : String(line)
-        }
-        .joined(separator: "\n")
+typealias Req = DVPlaybackPolicy.DisplayRequest
+
+// Compiling several files together means only a `main.swift` may carry top-level expressions, so the run body is a
+// function invoked from `@main`, matching the other standalone suites in this directory.
+@main
+enum DVPlaybackContractTests {
+    static func main() { run() }
 }
 
-// MARK: - DV start position
+func run() {
 
-let hlsServer = codeOnly(source("app/Sources/Player/VortXRemuxHLSServer.swift"))
+// MARK: - DV start position (the ~14s start)
 
-// The playlist carries no EXT-X-ENDLIST until the remux finishes, so a client choosing a start point applies the
-// live-edge rule and begins about three target durations from the end. TARGETDURATION is 5, hence the ~15s start
-// reported from the field. EXT-X-START states the start point explicitly instead.
-check("DV start: the media playlist emits EXT-X-START",
-      hlsServer.contains("#EXT-X-START:"))
-check("DV start: the offset is zero, not a live-edge relative value",
-      hlsServer.contains("TIME-OFFSET=0"))
-check("DV start: PRECISE=YES, so the client does not round back to a preceding segment",
-      hlsServer.range(of: #"#EXT-X-START:TIME-OFFSET=0,\s*PRECISE=YES"#, options: .regularExpression) != nil)
-// A negative offset would reintroduce the defect while still emitting the tag, so the shape is pinned rather
-// than merely the tag's presence.
-check("DV start: no negative TIME-OFFSET anywhere (that is the live-edge behaviour we are removing)",
-      !hlsServer.contains("TIME-OFFSET=-"))
+let header = DVPlaybackPolicy.mediaPlaylistHeader(targetDuration: 5, mapURI: "init.mp4")
 
-// MARK: - Display switch idempotency
-
-let hdr = codeOnly(source("app/Sources/Player/HDRDisplayMode.swift"))
-
-// Assigning preferredDisplayCriteria makes tvOS renegotiate the HDMI link, and a renegotiation is a visible flick.
-// Several paths can request the SAME mode during one start, so without a guard a single start renegotiates
-// repeatedly for no change. Field reports described four to five flickers.
-check("flicker: a last-requested mode is remembered",
-      hdr.contains("lastRequested"))
-check("flicker: an identical request is compared BEFORE the criteria assignment",
+check("start: the header states an explicit start point",
+      header.contains { $0.hasPrefix("#EXT-X-START:") })
+check("start: the offset is exactly zero",
+      header.contains { $0.contains("TIME-OFFSET=0") && !$0.contains("TIME-OFFSET=0.") })
+check("start: PRECISE=YES, so the client does not round back to a preceding segment",
+      header.contains { $0.hasPrefix("#EXT-X-START:") && $0.contains("PRECISE=YES") })
+// A negative offset is the live-edge behaviour being removed. It would still emit the tag, so the VALUE is pinned
+// rather than the tag's presence.
+check("start: no negative TIME-OFFSET (that is the live-edge behaviour we are removing)",
+      !header.contains { $0.contains("TIME-OFFSET=-") })
+// Asserted with a value DIFFERENT from the shipping 5. A mutation battery caught the earlier version: it passed 5
+// and asserted 5, so replacing the interpolation with a hardcoded 5 was invisible. A fixture that happens to equal
+// the value under test cannot detect that the value is ignored.
+check("start: the target duration passed in is the one emitted",
+      DVPlaybackPolicy.mediaPlaylistHeader(targetDuration: 7, mapURI: "i.mp4")
+        .contains("#EXT-X-TARGETDURATION:7"))
+check("start: a second, different target duration is also honoured",
+      DVPlaybackPolicy.mediaPlaylistHeader(targetDuration: 11, mapURI: "i.mp4")
+        .contains("#EXT-X-TARGETDURATION:11"))
+check("start: the map URI is carried through",
+      header.contains(#"#EXT-X-MAP:URI="init.mp4""#))
+// The start tag must precede the segment list, which begins after the header. Emitting it after the segments would
+// leave a client applying the live-edge rule before it ever reads the tag.
+check("start: the start tag comes before the playlist type and map lines",
       {
-          guard let guardIdx = hdr.range(of: "if let last = lastRequested")?.lowerBound,
-                let assignIdx = hdr.range(of: "manager.preferredDisplayCriteria = criteria")?.lowerBound
-          else { return false }
-          return guardIdx < assignIdx
+          guard let s = header.firstIndex(where: { $0.hasPrefix("#EXT-X-START:") }),
+                let m = header.firstIndex(where: { $0.hasPrefix("#EXT-X-MAP:") }) else { return false }
+          return s < m
       }())
-check("flicker: the comparison covers range, rate AND dimensions (not just range)",
-      hdr.contains("last.range == range") && hdr.contains("last.rate == rate")
-      && hdr.contains("last.width == width") && hdr.contains("last.height == height"))
-check("flicker: reset forgets the remembered mode, so the next request re-asserts",
-      hdr.contains("lastRequested = nil"))
-check("flicker: the remembered mode is recorded after a real assignment",
-      hdr.range(of: #"manager\.preferredDisplayCriteria = criteria\s*\n\s*lastRequested = \("#,
-                options: .regularExpression) != nil)
+
+// MARK: - Display switch de-duplication (the flicker)
+
+let dv60 = Req(range: "dolbyVision", rate: 60, width: 3840, height: 2160)
+
+// The property that matters: an identical repeat is redundant, so the caller skips the assignment.
+check("flicker: an identical repeat request is redundant",
+      DVPlaybackPolicy.isRedundantDisplayRequest(last: dv60, next: dv60))
+// The property that keeps it SAFE: nothing that differs may ever be skipped, or a needed switch is lost.
+check("flicker: a different rate is NOT redundant",
+      !DVPlaybackPolicy.isRedundantDisplayRequest(
+        last: dv60, next: Req(range: "dolbyVision", rate: 23.976, width: 3840, height: 2160)))
+check("flicker: a different range is NOT redundant",
+      !DVPlaybackPolicy.isRedundantDisplayRequest(
+        last: dv60, next: Req(range: "hdr10", rate: 60, width: 3840, height: 2160)))
+check("flicker: a different width is NOT redundant",
+      !DVPlaybackPolicy.isRedundantDisplayRequest(
+        last: dv60, next: Req(range: "dolbyVision", rate: 60, width: 1920, height: 2160)))
+check("flicker: a different height is NOT redundant",
+      !DVPlaybackPolicy.isRedundantDisplayRequest(
+        last: dv60, next: Req(range: "dolbyVision", rate: 60, width: 3840, height: 1080)))
+// After a reset the caller clears its memory, and asking for nothing can never make the next ask redundant.
+check("flicker: with no remembered request, nothing is redundant",
+      !DVPlaybackPolicy.isRedundantDisplayRequest(last: nil, next: dv60))
 
 // MARK: - Result
 
 print("")
-if failures == 0 {
-    print("ALL PASS")
-    exit(0)
-} else {
-    print("\(failures) FAILED")
-    exit(1)
+if failures == 0 { print("ALL PASS"); exit(0) } else { print("\(failures) FAILED"); exit(1) }
 }

@@ -210,7 +210,7 @@ enum HDRDisplayMode {
     /// with an unknown rate followed by the real one): those differ, so both still fire. Removing that second
     /// switch means deferring the first, which belongs at the call site, not here.
     @MainActor
-    private static var lastRequested: (range: ContentDynamicRange, rate: Float, width: Int, height: Int)?
+    private static var lastRequested: DVPlaybackPolicy.DisplayRequest?
 
     /// Ask tvOS to switch the display into the mode matching the content.
     @MainActor
@@ -279,13 +279,14 @@ enum HDRDisplayMode {
         // can only ever replace a redundant switch and never a needed one. `rate` is the normalized value
         // (not the raw fps), which is what actually reaches the panel, so two requests that differ only in an
         // unknown-rate default correctly compare equal.
-        if let last = lastRequested,
-           last.range == range, last.rate == rate, last.width == width, last.height == height {
+        let thisRequest = DVPlaybackPolicy.DisplayRequest(
+            range: range.rawValue, rate: rate, width: width, height: height)
+        if DVPlaybackPolicy.isRedundantDisplayRequest(last: lastRequested, next: thisRequest) {
             note("display switch skipped: already asking for \(range.rawValue) @\(rate)fps \(width)x\(height)")
             return
         }
         manager.preferredDisplayCriteria = criteria
-        lastRequested = (range: range, rate: rate, width: width, height: height)
+        lastRequested = thisRequest
         // Close the master-parse race at its earliest point: a switch is now pending but the ModeSwitchStart
         // notification has not necessarily fired yet, so mark unsettled here rather than waiting on Start. The
         // early returns above (no window, SDR reset, Match Dynamic Range OFF, criteria build failure) never

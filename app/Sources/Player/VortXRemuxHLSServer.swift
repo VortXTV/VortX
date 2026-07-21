@@ -456,23 +456,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// (segments, ended, mapURI) always yields byte-identical output, so two requests that share one snapshot
     /// cannot disagree. Playback starts at the beginning; entries are only ever appended (MEDIA-SEQUENCE stays 0).
     private static func buildMediaBody(segments: [VortXMKVRemuxStream.HLSSegment], ended: Bool, mapURI: String) -> Data {
-        var lines = [
-            "#EXTM3U",
-            "#EXT-X-VERSION:7",
-            "#EXT-X-TARGETDURATION:\(VortXMKVRemuxStream.hlsTargetDuration)",
-            "#EXT-X-MEDIA-SEQUENCE:0",
-            // START AT ZERO, EXPLICITLY. Without this tag a client picking a start point in a playlist that
-            // carries no EXT-X-ENDLIST yet applies the live-edge rule and begins roughly three target durations
-            // back from the end. TARGETDURATION is 5, so that is about 15 seconds in, which is exactly the
-            // "Dolby Vision starts ~14 seconds in" reported from the field. The docstring above always claimed
-            // playback starts at the beginning; that was the INTENT and nothing expressed it to the client.
-            // TIME-OFFSET=0 with PRECISE=YES says start at zero and do not round to a preceding segment.
-            // Cheap and reversible: it changes only the chosen start point, not the segment set, so a client
-            // that ignores the tag behaves exactly as before.
-            "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES",
-            "#EXT-X-PLAYLIST-TYPE:EVENT",
-            "#EXT-X-MAP:URI=\"\(mapURI)\"",
-        ]
+        // The header (including the EXT-X-START that fixes the ~14s start) comes from DVPlaybackPolicy, which is
+        // dependency-free precisely so a standalone harness can EXECUTE it. Building the lines inline here made the
+        // property testable only by scanning this file's text, and a substring assertion proves a line exists
+        // rather than that it runs.
+        var lines = DVPlaybackPolicy.mediaPlaylistHeader(
+            targetDuration: VortXMKVRemuxStream.hlsTargetDuration, mapURI: mapURI)
         for seg in segments {
             lines.append(String(format: "#EXTINF:%.3f,", seg.duration))
             lines.append("seg\(seg.index).m4s")
