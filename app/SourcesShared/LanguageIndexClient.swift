@@ -49,7 +49,7 @@ enum LanguageIndexClient {
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
             guard let decoded = try? JSONDecoder().decode(LangResponse.self, from: data) else { return nil }
             let seen = decoded.seenCount ?? 0
-            VXProbe.log("sing", "lang fetch key=\(contentKey) seen=\(seen) audio=\(decoded.audioLangs?.count ?? 0) sub=\(decoded.subLangs?.count ?? 0)")
+            VXProbe.log("sing", "lang fetch key=\(VXProbeRedaction.identityToken(contentKey)) seen=\(seen) audio=\(decoded.audioLangs?.count ?? 0) sub=\(decoded.subLangs?.count ?? 0)")
             guard seen >= RemoteConfig.snapshot.langIndexMinSeen else { return nil }
             return LanguageAvailability(audioLangs: decoded.audioLangs ?? [:],
                                         subLangs: decoded.subLangs ?? [:],
@@ -91,7 +91,7 @@ enum LanguageIndexClient {
         req.setValue("application/json", forHTTPHeaderField: "content-type")
         req.httpBody = data
         VortXEdgeAuth.sign(&req)
-        VXProbe.log("sing", "lang contribute key=\(contentKey) audio=\(audio.joined(separator: ",")) sub=\(subs.joined(separator: ",")) prov=\(provenance)")
+        VXProbe.log("sing", "lang contribute key=\(VXProbeRedaction.identityToken(contentKey)) audio=\(audio.joined(separator: ",")) sub=\(subs.joined(separator: ",")) prov=\(provenance)")
         _ = try? await URLSession.shared.data(for: req)
     }
 

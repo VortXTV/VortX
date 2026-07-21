@@ -1,8 +1,13 @@
 // Standalone authorization and zero-transport harness for the production SubtitlePoolClient.swift.
 //
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors -o /tmp/subtitle-pool-consent-test \
+//     app/SourcesShared/VXProbeRedaction.swift \
 //     app/SourcesShared/SubtitlePoolClient.swift \
 //     app/Tests/SubtitlePoolConsentContractTests.swift && /tmp/subtitle-pool-consent-test
+//
+// VXProbeRedaction is a REQUIRED input: the producer-cleanup wave routed this file's three probe lines
+// through identityToken, so the harness no longer compiles without it. A header command that does not
+// run is not a receipt, which is how this regression reached review unnoticed.
 
 import Foundation
 

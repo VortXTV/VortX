@@ -293,14 +293,111 @@ enum SourceIndexClient {
     // MARK: - Content id (colon form: imdb[:season:episode])
 
     /// The pool `content_id` for a title, in the worker's colon form (`tt0903747` for a movie, `tt…:S:E` for an
-    /// episode). nil when the id is not a real imdb `tt…` id (ad-hoc paste-a-link plays have no shareable id).
+    /// episode). nil when the value carries no canonical title id (ad-hoc paste-a-link plays have no shareable
+    /// id), and nil for a PARTIAL coordinate pair -- see `SourceIndexIdentity.contentKey` for why widening a
+    /// half-resolved episode context to the show-wide key is a data-mixing bug, not a graceful fallback.
+    ///
+    /// Reduction to the TITLE id happens inside the shared resolver, which every caller now goes through:
+    /// series call sites pass `behaviorHints.defaultVideoId`, which is often already "tt...:1:1", and appending
+    /// this episode's :S:E to that produced "tt...:1:1:3:5", failed the canonical regex, and silently removed
+    /// every episode of every such show from the pool (no contribute, no serve).
+    ///
+    /// IMDb ONLY (decision REQ-260721-33). A tmdb value canonicalizes to a title head here but is refused by
+    /// `canonicalContentID` at the end, so it never becomes a key; see that function for why.
+    ///
+    /// SCOPE: this is the LOW-LEVEL entry, for shared code that has already resolved a single title id. View
+    /// and coordinator code must not call it -- those callers state ROLES via `contentID(roles:)` or, for a
+    /// Continue-Watching card, `resumeContentID`. `IdentityCallerGateTests` fails if that is violated.
     static func contentID(imdbId: String?, season: Int? = nil, episode: Int? = nil) -> String? {
-        guard let imdbId,
-              SourceIndexContract.canonicalContentID(imdbId) == imdbId else { return nil }
-        if let season, let episode {
-            return SourceIndexContract.canonicalContentID("\(imdbId):\(season):\(episode)")
+        guard let bounded = SourceIndexIdentity.boundedIdentityInput(imdbId),
+              let titleID = SourceIndexContract.canonicalTitleID(bounded) else {
+            diag(.contentIDSkip, reason: .notATitleID,
+                 counts: [(.rawLen, SourceIndexDiag.identityLength(imdbId))])
+            return nil
         }
-        return imdbId
+        guard let composed = SourceIndexIdentity.contentKey(titleID: titleID, season: season, episode: episode) else {
+            diag(.contentIDSkip, reason: .nonCanonicalEpisodeKey,
+                 counts: [(.hasSeason, season == nil ? 0 : 1), (.hasEpisode, episode == nil ? 0 : 1)])
+            return nil
+        }
+        return composed
+    }
+
+    /// The pool `content_id` for a SCREEN, from its named identity roles.
+    ///
+    /// This is the entry point every view and coordinator uses. It exists so that no screen ever picks which
+    /// of its several ids "is" the title: it declares what each id IS (catalog, default-video, current-video)
+    /// and what the page is (movie / series / live), and the shared resolver applies the one authority rule.
+    /// The previous shape took an ordered array, and the ORDER decided authority, which is how an add-on's
+    /// episode-shaped `defaultVideoId` came to outrank the catalog id of the page the user was on.
+    static func contentID(
+        roles: SourceIndexIdentity.Roles,
+        season: Int? = nil,
+        episode: Int? = nil
+    ) -> String? {
+        contentID(imdbId: SourceIndexIdentity.resolve(roles).titleID, season: season, episode: episode)
+    }
+
+    /// The pool `content_id` for a Continue-Watching DIRECT RESUME, which has no page to arbitrate between its
+    /// two ids: the library item id and the stored last-played video id.
+    ///
+    /// Returns nil when those two disagree on the canonical TITLE HEAD. That is the check that catches the
+    /// worked failure (`item tt1375666` + stored video `tt0903747:1:1` published Game-of-Thrones groups under
+    /// `tt1375666:1:1`); the old guard compared episode NUMBERS, which matched, so it caught nothing.
+    ///
+    /// A nil return means ONLY "contribute nothing to the pool". It is never a playback gate: both resume
+    /// paths continue to resume the user's own stored link on a mismatch, unchanged.
+    static func resumeContentID(
+        itemID: String?,
+        videoID: String?,
+        season: Int? = nil,
+        episode: Int? = nil
+    ) -> String? {
+        guard let key = SourceIndexIdentity.resumeKey(
+            itemID: itemID, videoID: videoID, season: season, episode: episode
+        ) else {
+            diag(.contentIDSkip, reason: .resumeIdentityMismatch,
+                 counts: [(.rawLen, SourceIndexDiag.identityLength(itemID)),
+                          (.contentLen, SourceIndexDiag.identityLength(videoID))])
+            return nil
+        }
+        return key
+    }
+
+    // MARK: - Diagnostics (bounded categories only)
+
+    /// Sink seam for the bounded diagnostics. Production writes to the exportable diag log; the standalone
+    /// contract harness swaps in a capture so it can PROVE that no rejected add-on text and no catalog id ever
+    /// reaches the output, including newline-bearing and very long inputs.
+    nonisolated(unsafe) private static var diagnosticSinkStorage: @Sendable (String) -> Void = {
+        VXProbe.log("sing", $0)
+    }
+    private static let diagnosticSinkLock = NSLock()
+
+    static var diagnosticSink: @Sendable (String) -> Void {
+        get { diagnosticSinkLock.withLock { diagnosticSinkStorage } }
+        set { diagnosticSinkLock.withLock { diagnosticSinkStorage = newValue } }
+    }
+
+    /// The ONLY way this file emits a diagnostic. Every textual part of a line -- the event label, the bail
+    /// reason, the pool outcome, and each count's KEY -- is a case of a closed enum declared in
+    /// SourceIndexIdentity.swift. There is no `String` parameter left, so free text genuinely cannot be
+    /// interpolated in from a call site.
+    ///
+    /// The previous version of this comment claimed exactly that while `event` and the count keys were both
+    /// plain `String`, and a verifier compiled a call that interpolated a raw identifier straight into the
+    /// event label. The claim is now enforced by the type rather than asserted by the comment.
+    ///
+    /// What this does NOT constrain, stated precisely instead of glossed: a count VALUE is an `Int`, so a call
+    /// site can still put a number derived from an identifier on a line. That is why the only identity-derived
+    /// number emitted anywhere here comes from `SourceIndexDiag.identityLength`, which is capped and bucketed.
+    static func diag(
+        _ event: SourceIndexDiag.Event,
+        reason: SourceIndexDiag.Reason? = nil,
+        outcome: SourceIndexDiag.Outcome? = nil,
+        counts: [(SourceIndexDiag.Count, Int)] = []
+    ) {
+        diagnosticSink(SourceIndexDiag.line(event, reason: reason, outcome: outcome, counts: counts))
     }
 
     // MARK: - Descriptor extraction (pure; no user data)
@@ -334,7 +431,23 @@ enum SourceIndexClient {
 
         // A resolved torrent may also carry a personal URL. Only its public infohash crosses this boundary.
         // Non-torrent streams have no accepted v1 descriptor and are a clean no-op.
-        guard let hash = SourceIndexContract.normalizeInfoHash(stream.infoHash) else { return nil }
+        // A DEBRID-mode add-on returns a resolved `url` row with NO `infoHash`; the public 40-hex then lives
+        // only in `sources` as the documented `dht:<40hex>` entry. Without that fallback the entire debrid
+        // population contributes nothing at all. The resolved `url` is DELIBERATELY not scanned: it carries a
+        // personal debrid token, and only add-on-declared public fields may cross this boundary.
+        //
+        // PRECEDENCE IS SEMANTIC, most-authoritative first, and it used to be inverted. The explicit `infoHash`
+        // field IS the identity; `dht:<40hex>` is the one exactly-specified place a debrid row republishes it.
+        // The old order consulted free-form provider text BEFORE the documented `dht:` entry, so add-on-chosen
+        // bytes could override a real DHT hash the same row was carrying. That free-text recovery path is gone
+        // entirely (see the removal note on SourceIndexContract): with no anchored schema to justify it, the
+        // only shapes accepted here are the two that are specified.
+        // EXACT-SCHEMA ONLY. An earlier form of this fallback scanned any isolated 40-hex run, which would have
+        // lifted a PRIVATE TRACKER PASSKEY out of a `tracker:` URL in `sources` and uploaded it as an infohash
+        // (caught in cross-review, REQ-260721-05). `infoHashFromSourceEntry` requires a whole-token match.
+        let declaredHash = SourceIndexContract.normalizeInfoHash(stream.infoHash)
+            ?? stream.sources?.lazy.compactMap({ SourceIndexContract.infoHashFromSourceEntry($0) }).first
+        guard let hash = declaredHash else { return nil }
         let seeders = StreamRanking.seedersForSort(stream)
         return Descriptor(kind: Kind.torrent.rawValue, id: hash, quality: quality,
                           sizeBytes: sizeBytes, seeders: seeders >= 0 ? seeders : nil)
@@ -350,26 +463,71 @@ enum SourceIndexClient {
     /// fire-and-forget from the caller. A started POST has one attempt; any non-2xx or transport failure stops
     /// the current title's remaining batches and extends the shared pacing boundary by one interval.
     static func contribute(contentID: String, descriptors: [Descriptor]) async {
-        guard isEnabled, SourceIndexContract.canonicalContentID(contentID) == contentID else { return }
+        // Every bail below used to be SILENT. A give-to-get pool whose "give" half fails invisibly is why this
+        // shipped dead in the field: a full day of playback produced zero contributions and left no trace.
+        // Each exit now names its reason exactly once, so the next diag log answers "why" without a code read.
+        guard isEnabled else {
+            // The consent VALUE is still not printed. What IS printed is WHICH of the two gates is shut,
+            // because they are not the same kind of fact and one combined reason made them indistinguishable:
+            // the fleet kill switch is server-side config (something WE did to everyone) while consent is user
+            // state. A support reader who cannot tell "we disabled it fleet-wide" from "this user opted out"
+            // cannot answer the only question this line exists for. The by-elimination consequence of the
+            // split is documented on SourceIndexDiag.Reason.gateOff rather than left to be discovered.
+            diag(.contributeSkip, reason: closedGateReason, counts: [(.candidates, descriptors.count)])
+            return
+        }
+        guard SourceIndexContract.canonicalContentID(contentID) == contentID else {
+            diag(.contributeSkip, reason: .nonCanonicalContentID,
+                 counts: [(.contentLen, SourceIndexDiag.identityLength(contentID))])
+            return
+        }
         // Revalidate at the network boundary. Descriptor is intentionally a simple value type, so a caller
         // can construct one without going through descriptors(from:); no such value reaches the encoder unless
         // it is torrent-only and carries an exact normalizable 40-hex infohash.
         let uploadable = uploadableDescriptors(descriptors)
-        guard !uploadable.isEmpty else { return }
+        guard !uploadable.isEmpty else {
+            diag(.contributeSkip, reason: .nothingUploadable, counts: [(.candidates, descriptors.count)])
+            return
+        }
+        diag(.contributeBegin, counts: [(.candidates, descriptors.count), (.uploadable, uploadable.count)])
+        // Read every remote-tunable pacing value ONCE, up front. A config swap partway through this loop would
+        // otherwise slice with one batch size and re-validate the encoder against another (dropping the batch),
+        // or pace prepareLaunch and finishAttempt on two different intervals for the same POST.
+        let perTitleCap = maxDescriptorsPerTitle
+        let chunkSize = batchSize
+        let intervalNanoseconds = interBatchDelayMs * 1_000_000
+        let timeout = requestTimeout
         // Bound the whole title: a pathological title still never sends an unbounded number of batches.
-        let all = Array(uploadable.prefix(maxDescriptorsPerTitle))
+        let all = Array(uploadable.prefix(perTitleCap))
         // batchSize MUST stay <= the worker's MAX_SOURCES_PER_CONTRIBUTE or the whole batch is rejected.
         // Slice into <= batchSize chunks.
-        let batches = uploadBatches(all)
+        let batches = uploadBatches(all, batchSize: chunkSize, perTitleCap: perTitleCap)
 
+        // EVERY exit below now names itself. They were silent, which is the same defect the reasons above
+        // were added to cure one level up: a contribute that stopped after two of five batches, or whose POST
+        // was rejected, left a trace identical to one that completed, so "the pool is not filling" had no
+        // answer in the log.
         for (i, candidates) in batches.enumerated() {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else {
+                diag(.contributeStop, reason: .cancelled, counts: [(.batch, i + 1), (.batches, batches.count)])
+                return
+            }
             guard let reservation = await SourceUploadCoordinator.shared.reserve(
                 contentID: contentID,
                 descriptors: candidates
-            ) else { continue }
-            guard let data = contributionBody(contentID: contentID, descriptors: reservation.descriptors) else {
+            ) else {
+                // Not a failure: every descriptor in this batch is already claimed by this process. Named
+                // anyway, so a whole title contributing nothing on a re-open is legible as dedupe, not loss.
+                diag(.contributeSkip, reason: .alreadyClaimed,
+                     counts: [(.batch, i + 1), (.batches, batches.count), (.descriptors, candidates.count)])
+                continue
+            }
+            guard let data = contributionBody(contentID: contentID,
+                                              descriptors: reservation.descriptors,
+                                              batchSize: chunkSize) else {
                 await SourceUploadCoordinator.shared.release(reservation)
+                diag(.contributeSkip, reason: .bodyEncodingFailed,
+                     counts: [(.batch, i + 1), (.batches, batches.count)])
                 continue
             }
 
@@ -377,29 +535,37 @@ enum SourceIndexClient {
             while committed == nil {
                 guard !Task.isCancelled else {
                     await SourceUploadCoordinator.shared.release(reservation)
+                    diag(.contributeStop, reason: .cancelled,
+                         counts: [(.batch, i + 1), (.batches, batches.count)])
                     return
                 }
                 switch await SourceUploadCoordinator.shared.prepareLaunch(
                     reservation,
                     nowNanoseconds: DispatchTime.now().uptimeNanoseconds,
-                    intervalNanoseconds: interBatchDelayMs * 1_000_000,
+                    intervalNanoseconds: intervalNanoseconds,
                     gate: { SourceIndexClient.isEnabled }
                 ) {
                 case let .wait(delayNanoseconds):
                     do { try await Task<Never, Never>.sleep(nanoseconds: delayNanoseconds) }
                     catch {
                         await SourceUploadCoordinator.shared.release(reservation)
+                        diag(.contributeStop, reason: .cancelled,
+                             counts: [(.batch, i + 1), (.batches, batches.count)])
                         return
                     }
                 case let .launch(descriptors):
                     committed = descriptors
                 case .unavailable:
+                    // The live gate closed while this batch waited for its pacing slot, or the reservation is
+                    // already gone. Distinct from the pre-loop gate check: this one happened MID-TITLE.
+                    diag(.contributeStop, reason: closedGateReason,
+                         counts: [(.batch, i + 1), (.batches, batches.count)])
                     return
                 }
             }
 
             var req = URLRequest(url: baseURL.appendingPathComponent("sources").appendingPathComponent("contribute"),
-                                 timeoutInterval: 8)
+                                 timeoutInterval: timeout)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "content-type")
             req.httpBody = data
@@ -407,17 +573,26 @@ enum SourceIndexClient {
             let request = req
             let chunk = committed ?? []
             guard !chunk.isEmpty else { continue }
-            VXProbe.log("sing", "contribute POST content=\(contentID) batch=\(i + 1)/\(batches.count) descriptors=\(chunk.count)")
+            diag(.contributePost, counts: [(.batch, i + 1), (.batches, batches.count),
+                                           (.descriptors, chunk.count)])
             // Detached from caller cancellation after commit: once the at-most-once claim is held, exactly one
             // network attempt is launched. The response is ignored and never buffered.
             let succeeded = await runCancellationIndependentAttempt {
                 try await sourceIndexTransport.discardResponse(for: request)
             }
+            // The POST OUTCOME. Without this a failed POST and a successful POST left byte-identical traces,
+            // so an endpoint rejecting every contribution read exactly like a healthy one.
+            diag(.contributePostResult, counts: [(.batch, i + 1), (.batches, batches.count),
+                                                 (.succeeded, succeeded ? 1 : 0)])
             guard await SourceUploadCoordinator.shared.finishAttempt(
                 succeeded: succeeded,
                 nowNanoseconds: DispatchTime.now().uptimeNanoseconds,
-                intervalNanoseconds: interBatchDelayMs * 1_000_000
-            ) else { return }
+                intervalNanoseconds: intervalNanoseconds
+            ) else {
+                diag(.contributeStop, reason: .postFailed,
+                     counts: [(.batch, i + 1), (.batches, batches.count)])
+                return
+            }
         }
     }
 
@@ -444,6 +619,12 @@ enum SourceIndexClient {
     /// The actual POST encoder. It applies the same final boundary itself so a future caller cannot bypass
     /// filtering by invoking the encoder directly.
     static func contributionBody(contentID: String, descriptors: [Descriptor]) -> Data? {
+        contributionBody(contentID: contentID, descriptors: descriptors, batchSize: batchSize)
+    }
+
+    /// The encoder against an EXPLICIT batch size, so one POST is sliced and re-validated against the same
+    /// number even if a RemoteConfig swap lands between those two steps.
+    static func contributionBody(contentID: String, descriptors: [Descriptor], batchSize: Int) -> Data? {
         guard SourceIndexContract.canonicalContentID(contentID) == contentID,
               !descriptors.isEmpty,
               descriptors.count <= batchSize else { return nil }
@@ -454,9 +635,16 @@ enum SourceIndexClient {
 
     /// Final upload normalization followed by worker-sized chunks. Exposed to the standalone contract harness.
     static func uploadBatches(_ descriptors: [Descriptor]) -> [[Descriptor]] {
-        let all = Array(uploadableDescriptors(descriptors).prefix(maxDescriptorsPerTitle))
-        return stride(from: 0, to: all.count, by: batchSize).map {
-            Array(all[$0 ..< min($0 + batchSize, all.count)])
+        uploadBatches(descriptors, batchSize: batchSize, perTitleCap: maxDescriptorsPerTitle)
+    }
+
+    /// Chunking against EXPLICIT bounds, for the same reason the encoder takes one: the whole title must be
+    /// sliced with a single consistent pair of values.
+    static func uploadBatches(_ descriptors: [Descriptor], batchSize: Int, perTitleCap: Int) -> [[Descriptor]] {
+        let step = max(1, batchSize)
+        let all = Array(uploadableDescriptors(descriptors).prefix(max(1, perTitleCap)))
+        return stride(from: 0, to: all.count, by: step).map {
+            Array(all[$0 ..< min($0 + step, all.count)])
         }
     }
 
@@ -502,9 +690,12 @@ enum SourceIndexClient {
     /// no-op, and the eventual `hoard` is itself consent + fleet-flag gated. Deduped per exact (content,hash)
     /// by the shared coordinator so torrents arriving in later resume waves remain eligible. `resolveGroups` is called
     /// on the main actor (it reads `CoreBridge`'s published state); nothing here blocks the resume/playback.
+    /// The two poll bounds default to the resolved RemoteConfig values (baked 5000 / 250, identical to the
+    /// literals they replace) because the production call sites pass neither: a cold-network resume whose meta
+    /// settles late is the case this budget exists for, and it has no other backend lever.
     static func hoardResumedGroups(contentID: String,
-                                   maxWaitMs: Int = 5000,
-                                   pollIntervalMs: Int = 250,
+                                   maxWaitMs: Int = RemoteConfig.snapshot.sourceIndexResumeHoardMaxWaitMs,
+                                   pollIntervalMs: Int = RemoteConfig.snapshot.sourceIndexResumeHoardPollIntervalMs,
                                    resolveGroups: @MainActor @Sendable @escaping () -> [CoreStreamSourceGroup]) async {
         guard isEnabled else { return }
         let candidateDescriptors = await resumedDescriptors(
@@ -524,7 +715,15 @@ enum SourceIndexClient {
         pollIntervalMs: Int,
         resolveGroups: @MainActor @Sendable @escaping () -> [CoreStreamSourceGroup]
     ) async -> [Descriptor] {
-        let deadline = max(1, maxWaitMs / max(1, pollIntervalMs))
+        // The attempt count is DERIVED from two independently clamped values, so it gets its own ceiling: each
+        // attempt resolves groups on the MainActor during playback start, and a wide wait over a short interval
+        // would otherwise multiply into far more of that than either value alone looks like it buys. The baked
+        // pair derives 20 attempts, well under the cap, so this changes nothing today.
+        // The CAP, not the resolved count: this function is handed caller-supplied wait/interval values, which
+        // need not be the resolved pair, so the ceiling has to be applied here rather than trusted from a
+        // precomputed number. (Those were one field and disagreed between `.baked` and `validate({})`.)
+        let deadline = min(RemoteConfig.snapshot.sourceIndexResumeHoardAttemptCap,
+                           max(1, maxWaitMs / max(1, pollIntervalMs)))
         return await SourceIndexContract.firstNonEmpty(
             attempts: deadline,
             pollIntervalNanoseconds: UInt64(max(1, pollIntervalMs)) * 1_000_000
@@ -571,18 +770,24 @@ enum SourceIndexClient {
     ) async -> [PooledSource] {
         // Validate before logging or constructing a request. A caller-controlled or user-shaped value must not
         // enter telemetry or a query string even if a future call site bypasses contentID(...).
-        guard let url = serveURL(contentID: contentID) else { return [] }
+        guard let url = serveURL(contentID: contentID) else {
+            diag(.fetchPooledSkip, reason: .malformedServeURL,
+                 counts: [(.contentLen, SourceIndexDiag.identityLength(contentID))])
+            return []
+        }
         // SERVE opt-in gate: toggle on/off + signed-in state + master enable, with the decision logged. Sign-in
         // IS required (owner decision 2026-07-04: keep Singularity results a VortX-user-only benefit; the worker
         // enforces the same login gate and serves an empty list to a tokenless caller). Contribute stays open.
         let initiallyOpen = await gate()
-        VXProbe.log("sing", "fetchPooled GATE contentID=\(contentID) open=\(initiallyOpen ? "yes" : "no") isSignedIn=\(isSignedIn ? "yes" : "no")")
+        // Neither the content id nor the sign-in state is loggable: one is viewing history, the other is
+        // account state. The open/closed decision is carried by which of the two lines below is emitted.
+        diag(.fetchPooledGate)
         guard initiallyOpen else {
-            VXProbe.log("sing", "fetchPooled GATE CLOSED contentID=\(contentID) -> [] (gate off / not signed in)")
+            diag(.fetchPooledGateClosed, reason: .gateClosed)
             return []
         }
 
-        var req = URLRequest(url: url, timeoutInterval: 8)
+        var req = URLRequest(url: url, timeoutInterval: requestTimeout)
         req.httpMethod = "GET"
         req.setValue("application/json", forHTTPHeaderField: "accept")
         VortXEdgeAuth.sign(&req)
@@ -591,27 +796,49 @@ enum SourceIndexClient {
         // signature. Fail-soft: no current token returns empty before transport.
         let currentMoat = await moatProvider()
         guard await gate(), let currentMoat, !currentMoat.isEmpty else {
-            VXProbe.log("sing", "fetchPooled GATE CLOSED contentID=\(contentID) -> [] (gate changed / no current moat)")
+            diag(.fetchPooledGateClosed, reason: .gateChangedOrNoMoat)
             return []
         }
         req.setValue(currentMoat, forHTTPHeaderField: MoatToken.header)
-        VXProbe.log("sing", "fetchPooled GET \(url.absoluteString) contentID=\(contentID) edgeSigned=\(signed ? "yes" : "no") moatToken=present")
+        // The URL is NOT logged: its query string is the content id. Only whether the request got stamped.
+        diag(.fetchPooledGet, counts: [(.edgeSigned, signed ? 1 : 0), (.moatToken, 1)])
 
         do {
-            guard await gate() else { return [] }
+            // Both mid-flight gate checks were SILENT returns. F4 requires every bail path to stay
+            // distinguishable, and these two are not the same event: one means the gate shut before we spent a
+            // request, the other means it shut while the response was already in the air.
+            guard await gate() else {
+                diag(.fetchPooledGateClosed, reason: .gateClosedBeforeTransport)
+                return []
+            }
             let (data, resp) = try await transport(req)
-            guard await gate() else { return [] }
+            guard await gate() else {
+                diag(.fetchPooledGateClosed, reason: .gateClosedAfterTransport)
+                return []
+            }
             guard let http = resp as? HTTPURLResponse, isSuccessfulHTTPStatus(http.statusCode) else {
                 let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
-                VXProbe.log("sing", "fetchPooled HTTP non-2xx contentID=\(contentID) status=\(status) -> []")
+                diag(.fetchPooledHTTP, reason: .httpNon2xx, counts: [(.status, status)])
                 return []
             }
             let decoded = try? JSONDecoder().decode(SourcesResponse.self, from: data)
             let sources = Array((decoded?.sources ?? []).prefix(SourceIndexContract.maxServedSources))
-            VXProbe.log("sing", "fetchPooled HTTP OK contentID=\(contentID) status=\(http.statusCode) corroboratedSources=\(sources.count) reason=\(decoded?.reason ?? "-")")
+            // The worker `reason` is server-authored text and is still never echoed. It is MAPPED, through a
+            // closed client-side enum, onto one of a fixed handful of outcomes.
+            //
+            // Dropping it outright was a regression, and the reason given for dropping it ("the row count
+            // already distinguishes an empty login_required read from a real empty pool") is false: both
+            // bodies decode to zero rows, so both emitted this line byte for byte. SERVE is deliberately
+            // login-gated, so login_required is the most common correct explanation for an empty pool.
+            diag(.fetchPooledHTTPOK,
+                 outcome: SourceIndexDiag.Outcome(worker: decoded?.reason),
+                 counts: [(.status, http.statusCode), (.corroboratedSources, sources.count)])
             return sources
         } catch {
-            VXProbe.log("sing", "fetchPooled HTTP ERROR contentID=\(contentID) error=\(error.localizedDescription) -> []")
+            // `localizedDescription` embeds the failing URL (hence the content id) on URLError, so only the
+            // transport error CODE crosses into the log.
+            diag(.fetchPooledHTTP, reason: .httpError,
+                 counts: [(.code, (error as? URLError)?.errorCode ?? 0)])
             return []
         }
     }
@@ -623,12 +850,18 @@ enum SourceIndexClient {
             guard let kind = src.kind, let id = src.id, !id.isEmpty else { return nil }
             // Name/desc both say "Singularity" so the source ROW is visibly a Singularity source (the group
             // label is discarded by the quality re-grouping, but this per-stream text survives and renders).
+            // MIRROR the worker's serve floor; never exceed it. The worker already applied it before sending
+            // (serveFloorForKind() = 1 for torrents, "a torrent infohash is SELF-VERIFYING, so a lone early
+            // contributor is never stranded"; general floor env-tunable via CORROBORATION_MIN). This client
+            // check previously sat at 2 and discarded exactly the single-witness rows the worker deliberately
+            // served -- in a young pool nearly all of them. It is retained at the worker's own value purely as
+            // defence against a malformed/absent count, so real policy stays backend-tunable with no app release.
             guard kind == Kind.torrent.rawValue,
-                  (src.corroboration ?? 0) >= SourceIndexContract.minimumCorroboration,
+                  (src.corroboration ?? 0) >= SourceIndexContract.minimumServedCorroboration,
                   let hash = SourceIndexContract.canonicalStoredInfoHash(id) else { return nil }
             return make(name: "Other · Singularity", description: "Singularity source", infoHash: hash)
         }
-        VXProbe.log("sing", "streams(from:) reconstruct pooled=\(pooled.count) -> playable=\(built.count) (torrent-only)")
+        diag(.streamsReconstruct, counts: [(.pooled, pooled.count), (.playable, built.count)])
         return built
     }
 
@@ -653,8 +886,20 @@ enum SourceIndexClient {
     /// The master gate for the whole client: consent (give-to-get) AND the fleet feature flag. When off, HOARD
     /// and SERVE are both hard no-ops that never touch the network.
     static var isEnabled: Bool {
-        MoatConsent.contributeAndConsume
-            && RemoteConfig.snapshot.isFeatureOn("sourceIndex", default: RemoteConfigDefaults.featureSourceIndex)
+        MoatConsent.contributeAndConsume && fleetEnabled
+    }
+
+    /// The RemoteConfig fleet kill switch on its own. Split out of `isEnabled` so a closed gate can name WHICH
+    /// half is shut without a call site having to recompute either half.
+    static var fleetEnabled: Bool {
+        RemoteConfig.snapshot.isFeatureOn("sourceIndex", default: RemoteConfigDefaults.featureSourceIndex)
+    }
+
+    /// Which reason a closed master gate reports. The fleet flag is server-side config and is named outright;
+    /// otherwise the user-level gate is what is shut and the neutral spelling is used (the consequence of the
+    /// split is documented on `SourceIndexDiag.Reason.gateOff`).
+    static var closedGateReason: SourceIndexDiag.Reason {
+        fleetEnabled ? .gateOff : .fleetOff
     }
 
     /// The per-user SERVE opt-in (the "Singularity" Settings toggle). Default ON, absent key reads as true
@@ -683,13 +928,20 @@ enum SourceIndexClient {
 
     /// The overall per-title cap on descriptors uploaded. Far above real fan-out (a title with more unique
     /// sources than this drops the tail, which is acceptable). At `batchSize` per POST this is at most 125 POSTs.
-    private static let maxDescriptorsPerTitle = 2000
+    /// RemoteConfig can only lower it (clamp 16...2000, baked 2000), so the fleet can shed the tail on a
+    /// pathological title without a build but can never buy itself more background POSTs.
+    private static var maxDescriptorsPerTitle: Int { RemoteConfig.snapshot.sourceIndexMaxDescriptorsPerTitle }
     /// Descriptors per POST. Sixteen sources produce 49 D1 statements (3 each plus one retention prune), under
-    /// Cloudflare D1's 50-query Free-plan invocation limit. Keep this equal to the worker maximum.
-    static let batchSize = 16
+    /// Cloudflare D1's 50-query Free-plan invocation limit. Keep this equal to the worker maximum: the clamp
+    /// (1...16, baked 16) pins the ceiling there because a larger POST is rejected whole.
+    static var batchSize: Int { RemoteConfig.snapshot.sourceIndexBatchSize }
     /// Delay between sequential batch POST starts. Just over one second keeps each process near 55/minute,
     /// leaving headroom within the worker's 240/minute per-IP limit for several devices behind one NAT.
-    private static let interBatchDelayMs: UInt64 = 1100
+    /// RemoteConfig can only lengthen it (clamp 1100...30000, baked 1100), never crowd the worker faster.
+    private static var interBatchDelayMs: UInt64 { UInt64(RemoteConfig.snapshot.sourceIndexInterBatchDelayMs) }
+    /// Per-request budget for both the contribute POST and the serve GET. Shorten-only from remote
+    /// (clamp 3...8, baked 8) so a slow worker fails fast instead of stacking attempts against itself.
+    private static var requestTimeout: TimeInterval { RemoteConfig.snapshot.sourceIndexRequestTimeout }
 
     /// Source Index has one confidentiality origin. A RemoteConfig value is accepted only when it is an exact
     /// spelling of that HTTPS root; every scheme, host-case, userinfo, port, path, query, or fragment variation
@@ -1136,10 +1388,11 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
                   SourceIndexLifecycleClock.snapshot() == lifecycle,
                   serveGate(),
                   accountGate() else {
-                VXProbe.log("sing", "refresh publish SKIPPED contentID=\(contentID) (stale, cancelled, or gate closed) built=\(built.count)")
+                SourceIndexClient.diag(.refreshPublishSkipped, reason: .staleOrCancelled,
+                                       counts: [(.built, built.count)])
                 return
             }
-            VXProbe.log("sing", "refresh publish contentID=\(contentID) streams=\(built.count) (now merge-ready)")
+            SourceIndexClient.diag(.refreshPublish, counts: [(.streams, built.count)])
             self.streams = built
         }
     }

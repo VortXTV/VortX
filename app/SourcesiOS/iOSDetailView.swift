@@ -220,7 +220,7 @@ struct iOSDetailView: View {
     /// type). Keying off meta.type fixes both directions; the fallback to `type` keeps behavior unchanged until
     /// meta loads (verified cause: 3-agent settle 2026-07-01).
     private var effectiveType: String {
-        if core.metaDetails?.meta?.id == id, let t = core.metaDetails?.meta?.type, !t.isEmpty { return t }
+        if let t = meta?.type, !t.isEmpty { return t }
         return type
     }
 
@@ -593,8 +593,8 @@ struct iOSDetailView: View {
             if effectiveType == "series" {
                 torboxSearch.clearResults(); sourceIndex.clearResults(); mediaServers.clearResults()
                 // A series detail loads meta only; streams load per-episode from iOSEpisodeStreams.
-                if core.metaDetails?.meta?.id != id { core.loadMeta(type: effectiveType, id: id) }
-            } else if core.metaDetails?.meta?.id == id {
+                if meta == nil { core.loadMeta(type: effectiveType, id: id) }
+            } else if meta != nil {
                 loadMovieStreamsIfNeeded()        // meta already resident → dispatch streams now
             } else {
                 core.loadMeta(type: effectiveType, id: id) // load meta FIRST; onChange dispatches streams on arrival
@@ -603,7 +603,7 @@ struct iOSDetailView: View {
                 // sources list populates regardless of the meta race. No-op'd by hasStreams once they land.
                 loadMovieStreamsIfNeeded()
             }
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates(); resolveTrailerIfNeeded(m); resolvePreferredTrailerIfNeeded(m) }
+            if let m = meta { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates(); resolveTrailerIfNeeded(m); resolvePreferredTrailerIfNeeded(m) }
             // These resolve from the tt id alone, so a hub-seeded title whose Cinemeta meta never
             // arrives still gets its cast, synopsis fallback, and a More-Like-This rail (#7/#29).
             loadCredits()
@@ -620,11 +620,11 @@ struct iOSDetailView: View {
         // hub's TMDB guess was wrong, meta.type now corrects it and the stream request re-fires under the type
         // the add-ons actually index the title under. The hasStreams guard keys on the effective streamId, so
         // this cannot loop.
-        .onChange(of: core.metaDetails?.meta?.type) { _ in
+        .onChange(of: meta?.type) { _ in
             if effectiveType != "series" { loadMovieStreamsIfNeeded() }
             else { torboxSearch.clearResults(); sourceIndex.clearResults(); mediaServers.clearResults() }
         }
-        .onChange(of: core.metaDetails?.meta?.id) { _ in
+        .onChange(of: meta?.id) { _ in
             if effectiveType != "series" { loadMovieStreamsIfNeeded() }
             else if let m = meta, let videos = m.videos {
                 // F5: opening a series schedules its next-episode alert (asks permission in context the
@@ -668,18 +668,18 @@ struct iOSDetailView: View {
         // TorBox search-as-a-source: fetch the extra usenet/torrent sources once the meta's imdb id is
         // known (gated on a TorBox key inside `refresh`; de-duped by imdb id). Series episodes fetch in
         // their own episode view.
-        .onChange(of: core.metaDetails?.meta?.id) { _ in
+        .onChange(of: meta?.id) { _ in
             if effectiveType != "series" {
-                torboxSearch.refresh(imdbId: ratingsImdbID)
-                mediaServers.refresh(imdb: ratingsImdbID, title: meta?.name,
+                torboxSearch.refresh(imdbId: titleIdentity.titleID)
+                mediaServers.refresh(imdb: titleIdentity.titleID, title: meta?.name,
                                      publicationTarget: mediaServerTargetID)
                 refreshSourceIndex()
             }
         }
         .onAppear {
             if effectiveType != "series" {
-                torboxSearch.refresh(imdbId: ratingsImdbID)
-                mediaServers.refresh(imdb: ratingsImdbID, title: meta?.name,
+                torboxSearch.refresh(imdbId: titleIdentity.titleID)
+                mediaServers.refresh(imdb: titleIdentity.titleID, title: meta?.name,
                                      publicationTarget: mediaServerTargetID)
                 refreshSourceIndex()
             }
@@ -1328,14 +1328,14 @@ struct iOSDetailView: View {
                    (resp as? HTTPURLResponse)?.statusCode == 200,
                    let decoded = try? JSONDecoder().decode(AddonMetaResponse.self, from: data),
                    let yt = decoded.meta?.trailerYouTubeID, !yt.isEmpty {
-                    await MainActor.run { if core.metaDetails?.meta?.id == m.id { resolvedTrailerID = yt } }
+                    await MainActor.run { if ResidentMeta.fenced(core.metaDetails?.meta, pageID: m.id, id: { $0.id }) != nil { resolvedTrailerID = yt } }
                     return
                 }
             }
             // 2) TMDB /videos (when a TMDB key is set) fills Cinemeta's gaps and covers tmdb: catalog ids
             //    with no IMDb id (the same source Stremio trailer add-ons use).
             if let yt = await TMDBClient.trailerYouTubeID(metaID: m.id, type: m.type), !yt.isEmpty {
-                await MainActor.run { if core.metaDetails?.meta?.id == m.id { resolvedTrailerID = yt } }
+                await MainActor.run { if ResidentMeta.fenced(core.metaDetails?.meta, pageID: m.id, id: { $0.id }) != nil { resolvedTrailerID = yt } }
             }
         }
     }
@@ -1364,7 +1364,7 @@ struct iOSDetailView: View {
             // /clip mp4 for a YouTube embed. Fail-soft: no localized trailer leaves the id nil and the default plays.
             let pick = await TMDBClient.preferredTrailerPick(metaID: m.id, type: m.type, preferredLanguages: languages)
             guard pick.matchedPreferred, let yt = pick.key, !yt.isEmpty else { return }
-            await MainActor.run { if core.metaDetails?.meta?.id == m.id { resolvedPreferredTrailerID = yt } }
+            await MainActor.run { if ResidentMeta.fenced(core.metaDetails?.meta, pageID: m.id, id: { $0.id }) != nil { resolvedPreferredTrailerID = yt } }
         }
     }
 
@@ -2000,7 +2000,7 @@ struct iOSDetailView: View {
     /// the meta is loaded. This is what makes imdb-keyed stream add-ons match (the engine's own guess_stream
     /// uses the same default_video_id; we lost it by moving movies to an explicit streamPath).
     private var movieStreamId: String {
-        if let dv = core.metaDetails?.meta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != id { return dv }
+        if let dv = meta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != id { return dv }
         return id
     }
 
@@ -2017,7 +2017,7 @@ struct iOSDetailView: View {
         // catalog id IF it is itself an imdb tt id (the hub-card case). Non-imdb ids without meta still wait
         // (their stream id only resolves from the meta's defaultVideoId). The hasStreams guard keys on the
         // effective id, so this can't form a re-dispatch loop once the streams arrive.
-        let metaResident = core.metaDetails?.meta?.id == id
+        let metaResident = meta != nil
         guard metaResident || id.hasPrefix("tt") else { return }
         let streamId = movieStreamId
         // Either surface counts as resident: meta-embedded streams (metaStreams, #122) are keyed by the
@@ -2042,6 +2042,24 @@ struct iOSDetailView: View {
     /// "tmdb:movie:123"). Carried alongside `ratingsImdbID` so a title whose tt id has not resolved (or
     /// does not exist) can still be rated, and so the rating stays findable once the tt id does arrive.
     /// Same extraction rule as `ScrobbleCoordinator.numericTMDB`, applied to the catalog id.
+    /// The page's TWO resolved identities for the source paths, from the ONE shared resolver. Deliberately
+    /// separate from `ratingsImdbID`: ratings, credits, and the subtitle fingerprint key on that value and are
+    /// not part of this defect, while the pool and the IMDb-keyed TorBox index need a canonicalized title id
+    /// (and the pool can additionally use a tmdb one). tvOS twin: DetailView.swift `CoreStreamList`.
+    private var identityRoles: SourceIndexIdentity.Roles {
+        SourceIndexIdentity.Roles(
+            catalogID: id,
+            defaultVideoID: meta?.behaviorHints?.defaultVideoId,
+            currentVideoID: nil,
+            kind: SourceIndexIdentity.ContentKind.from(type: effectiveType, liveTypes: LiveTypes.all)
+        )
+    }
+
+    /// The page's resolved IMDb identity. ONE value: pool and TorBox take the same IMDb-only key.
+    private var titleIdentity: SourceIndexIdentity.Resolved {
+        SourceIndexIdentity.resolve(identityRoles)
+    }
+
     private var ratingTMDBID: Int? {
         guard id.lowercased().hasPrefix("tmdb") else { return nil }
         return id.lowercased().split(separator: ":").compactMap { Int($0) }.first
@@ -2131,7 +2149,7 @@ struct iOSDetailView: View {
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
     private var sourceContentID: String? {
-        SourceIndexClient.contentID(imdbId: ratingsImdbID)
+        SourceIndexClient.contentID(roles: identityRoles)
     }
 
     /// Media-server lookup also supports IMDb-less title matching. Its merge fence therefore uses an exact
@@ -3406,8 +3424,7 @@ struct iOSDetailView: View {
     // metaDetails is a single shared @Published on the CoreBridge singleton. Guard on the id so a
     // previous page's still-resident meta (A -> back -> B) can't render A's hero/title under B.
     private var meta: CoreMetaItem? {
-        let m = core.metaDetails?.meta
-        return m?.id == id ? m : nil
+        ResidentMeta.fenced(core.metaDetails?.meta, pageID: id) { $0.id }
     }
 }
 
@@ -3492,10 +3509,25 @@ struct iOSEpisodeStreams: View {
     private var pinContext: SourcePinContext { SourcePinContext(metaId: meta.id, isSeries: true) }
     private var sourcePin: ResolvedPin? { pinStore.effectivePin(pinContext) }
 
-    /// The show's imdb id for the TorBox search index (defaultVideoId when the meta id is tmdb:/kitsu:).
-    private var showImdbID: String? {
-        if let dv = meta.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
-        return meta.id.hasPrefix("tt") ? meta.id : nil
+    /// The show's identity ROLES, stated for the ONE shared resolver (tvOS twin: DetailView.swift
+    /// `CoreStreamList.identityRoles`). Naming the roles is what stops an episode-scoped `defaultVideoId`
+    /// ("tt0903747:1:1") from outranking the catalog id purely because it sat earlier in an array.
+    ///
+    /// The FIELD CASE is preserved (REQ-260721-05): a TMDB/Kitsu-identified series with no defaultVideoId
+    /// (meta.id "tmdb:94997") holds its IMDb identity only on the EPISODE video id ("tt0460649:3:6"), which
+    /// the `.series` kind still admits as the last role, so the IMDb-keyed paths keep a usable key.
+    private var showIdentityRoles: SourceIndexIdentity.Roles {
+        SourceIndexIdentity.Roles(
+            catalogID: meta.id,
+            defaultVideoID: meta.behaviorHints?.defaultVideoId,
+            currentVideoID: shownVideo.id,
+            kind: .series
+        )
+    }
+
+    /// The show's resolved IMDb identity. ONE value: pool and TorBox take the same IMDb-only key.
+    private var showIdentity: SourceIndexIdentity.Resolved {
+        SourceIndexIdentity.resolve(showIdentityRoles)
     }
 
     private var backdropHeight: CGFloat {
@@ -3590,14 +3622,14 @@ struct iOSEpisodeStreams: View {
         // synchronously before starting the replacement request, and SourceListModel independently checks
         // the same content token before merging.
         .onAppear {
-            torboxSearch.refresh(imdbId: showImdbID, season: auxiliarySeason, episode: auxiliaryEpisode)
-            mediaServers.refresh(imdb: showImdbID, season: auxiliarySeason, episode: auxiliaryEpisode,
+            torboxSearch.refresh(imdbId: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode)
+            mediaServers.refresh(imdb: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode,
                                  title: meta.name, publicationTarget: mediaServerEpisodeTargetID)
             refreshSourceIndex()
         }
         .onChange(of: shownVideo.id) { _ in
-            torboxSearch.refresh(imdbId: showImdbID, season: auxiliarySeason, episode: auxiliaryEpisode)
-            mediaServers.refresh(imdb: showImdbID, season: auxiliarySeason, episode: auxiliaryEpisode,
+            torboxSearch.refresh(imdbId: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode)
+            mediaServers.refresh(imdb: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode,
                                  title: meta.name, publicationTarget: mediaServerEpisodeTargetID)
             refreshSourceIndex()
             scheduleSourceRefresh()
@@ -4151,7 +4183,7 @@ struct iOSEpisodeStreams: View {
         return DebridEpisode(season: auxiliarySeason, episode: auxiliaryEpisode)
     }
     private var episodeContentID: String? {
-        SourceIndexClient.contentID(imdbId: showImdbID, season: auxiliarySeason, episode: auxiliaryEpisode)
+        SourceIndexClient.contentID(roles: showIdentityRoles, season: auxiliarySeason, episode: auxiliaryEpisode)
     }
     private var mediaServerEpisodeTargetID: String {
         episodeContentID ?? "meta:\(meta.id)|video:\(shownVideo.id)"

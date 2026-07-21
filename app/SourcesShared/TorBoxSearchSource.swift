@@ -245,10 +245,21 @@ final class TorBoxSearchSource: ObservableObject {
     /// off during a scraper cooldown. Safe to call on every meta change / `.onAppear`. Pass `season`/`episode`
     /// from an episode context so the index scopes usenet/torrent results to that episode (nil = movie level).
     func refresh(imdbId: String?, season: Int? = nil, episode: Int? = nil) {
-        guard let imdbId, imdbId.hasPrefix("tt") else { clearResults(); return }
+        // Re-validate through the SHARED module rather than trusting a `tt` prefix. Callers pass an id that a
+        // screen resolved; the old prefix check also accepted the EPISODE form ("tt0903747:1:1"), so `imdb_id:`
+        // below was keyed on an id no IMDb index can answer and the content id composed "tt0903747:1:1:3:5".
+        // `imdbTitleID` yields a BARE tt id or nothing, which is exactly this path's contract: it is IMDb-keyed,
+        // so a tmdb id here is wrong rather than weak.
+        guard let imdbId = SourceIndexIdentity.imdbTitleID(imdbId) else {
+            clearResults(); return
+        }
         guard DebridKeys.shared.isConfigured(.torBox) else { clearResults(); return }   // gate: no TorBox key -> no-op
         let fetchKey = "\(imdbId)|\(season ?? -1)|\(episode ?? -1)"
-        let contentID = if let season, let episode { "\(imdbId):\(season):\(episode)" } else { imdbId }
+        // Tuple-exact, same rule as the pool key: a PARTIAL coordinate pair is not silently widened to the
+        // show, because that publishes one episode's results under the show-wide token.
+        guard let contentID = SourceIndexIdentity.contentKey(titleID: imdbId, season: season, episode: episode) else {
+            clearResults(); return
+        }
         // New title: publish its cached results (or clear), so the prior title's streams never linger.
         if fetchKey != shownKey {
             shownKey = fetchKey
@@ -264,7 +275,7 @@ final class TorBoxSearchSource: ObservableObject {
         // H9 diagnostic (terminal-run repro): confirm refresh actually fires with a key. Logs the id + whether
         // a non-empty TorBox key is present (never the key itself). If this line never appears, the gate above
         // no-op'd; if it appears but the count line below is 0, the index returned nothing for the id.
-        VXProbe.log("torbox-search", "refresh id=\(imdbId) s=\(season ?? -1) e=\(episode ?? -1) hasKey=\(key.isEmpty ? "no" : "yes")")
+        VXProbe.log("torbox-search", "refresh id=\(VXProbeRedaction.identityToken(imdbId)) s=\(season ?? -1) e=\(episode ?? -1) hasKey=\(key.isEmpty ? "no" : "yes")")
         task = Task { [weak self] in
             let result = await TorBoxSearch.streams(imdbId: imdbId, season: season, episode: episode, apiKey: key)
             guard !Task.isCancelled, let self else { return }
@@ -273,17 +284,17 @@ final class TorBoxSearchSource: ObservableObject {
                 // Over the TorBox scraper allowance. Back off ~15 min before re-probing; do NOT cache the
                 // empty result, so it re-fetches for real once the cooldown lifts.
                 self.cooldownUntil = Date().addingTimeInterval(15 * 60)
-                VXProbe.log("torbox-search", "rate-limited (scraper cooldown) for id=\(imdbId), backing off ~15m")
+                VXProbe.log("torbox-search", "rate-limited (scraper cooldown) for id=\(VXProbeRedaction.identityToken(imdbId)), backing off ~15m")
                 return
             }
             if result.transportError {
                 // The request never completed (offline / network failure). Do NOT cache the empty result and do
                 // NOT set a cooldown, so the next meta change or reopen re-fetches for real once the network is
                 // back. Without this, an offline first open cached an empty list for the whole session.
-                VXProbe.log("torbox-search", "transport error for id=\(imdbId), not caching, will retry")
+                VXProbe.log("torbox-search", "transport error for id=\(VXProbeRedaction.identityToken(imdbId)), not caching, will retry")
                 return
             }
-            VXProbe.log("torbox-search", "fetched \(result.streams.count) stream(s) for id=\(imdbId)")
+            VXProbe.log("torbox-search", "fetched \(result.streams.count) stream(s) for id=\(VXProbeRedaction.identityToken(imdbId))")
             self.cache[fetchKey] = result.streams
             if self.shownKey == fetchKey { self.streams = result.streams }
         }

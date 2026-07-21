@@ -57,9 +57,23 @@ struct DetailView: View {
     /// instead of flat canvas. nil (no art / not computed) keeps today's canvas exactly.
     @State private var dominantTint: Color?
 
+    /// The ONLY read of the engine's shared meta slot in this screen, id-fenced.
+    ///
+    /// THE DEFECT THIS CLOSES: `core.metaDetails` is one published slot on a singleton, and this view rendered
+    /// whatever was resident in it with no `id == self.id` check. Navigating A -> back -> B therefore PAINTED
+    /// title A's hero art, name, synopsis, and cast under title B's route until B's meta landed, and the same
+    /// unfenced value fed the ratings id and the movie stream-request id, so B could also DISPATCH A's default
+    /// video id. The iPhone/iPad screen had the fence; this one did not.
+    ///
+    /// Every resident-meta read below goes through this property. `IdentityCallerGateTests` fails if the raw
+    /// `core.metaDetails?.meta` token reappears anywhere else in this file.
+    private var fencedMeta: CoreMetaItem? {
+        ResidentMeta.fenced(core.metaDetails?.meta, pageID: id) { $0.id }
+    }
+
     var body: some View {
         Group {
-            if let meta = core.metaDetails?.meta {
+            if let meta = fencedMeta {
                 // Live (tv / channel / events) gets its own stripped-down page BEFORE the movie
                 // fallback (today live falls through to moviePage): backdrop + name + a red LIVE
                 // badge + the channel source list, with NO VOD chrome: no trailer chip, no movie
@@ -111,7 +125,7 @@ struct DetailView: View {
             // Series load streams per-episode (CoreEpisodeStreams), so a series detail loads meta only.
             if effectiveType == "series" {
                 core.loadMeta(type: effectiveType, id: id)
-            } else if core.metaDetails?.meta?.id == id {
+            } else if fencedMeta != nil {
                 loadMovieStreamsIfNeeded()
             } else {
                 core.loadMeta(type: effectiveType, id: id)
@@ -123,7 +137,7 @@ struct DetailView: View {
             captureHero()
             loadCredits()
             loadCollection()
-            if let m = core.metaDetails?.meta, m.id == id {
+            if let m = fencedMeta {
                 loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates()
             } else {
                 // Meta not resident (and it may NEVER arrive for a title Cinemeta doesn't know): fill
@@ -142,8 +156,8 @@ struct DetailView: View {
         }
         // Re-dispatch streams under the AUTHORITATIVE meta.type once it arrives (Collections-hub fix): if the
         // hub's TMDB guess was wrong, meta.type corrects it and the request re-fires under the type add-ons use.
-        .onChange(of: core.metaDetails?.meta?.type) { loadMovieStreamsIfNeeded() }
-        .onChange(of: core.metaDetails?.meta?.id) {
+        .onChange(of: fencedMeta?.type) { loadMovieStreamsIfNeeded() }
+        .onChange(of: fencedMeta?.id) {
             captureHero()
             langChips = []; langChipsKey = ""   // new title: reset the language chips before recomputing
             castMembers = []; creditsKey = nil  // new title: reset the cast rail before refetching (H16)
@@ -151,7 +165,7 @@ struct DetailView: View {
             if effectiveType != "series" { loadMovieStreamsIfNeeded() }
             loadCredits()
             loadCollection()
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates() }
+            if let m = fencedMeta { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates() }
             refreshLanguageChips()
         }
         .onChange(of: core.streamLoadProgress().loaded) { _ in
@@ -161,9 +175,32 @@ struct DetailView: View {
 
     /// The IMDb id to fetch MDBList ratings for: prefer the meta's imdb `defaultVideoId` (tt...) when the
     /// catalog id is non-imdb (tmdb:/kitsu:), else the catalog id when it is itself an imdb id.
+    ///
+    /// SCOPE, because this value used to be handed to the source paths as well and that was the residual of
+    /// the inline-resolution defect: MDBList, credits, financials, and the collection rail are all IMDb-keyed
+    /// services, so a tt-only shape is CORRECT here and this reads `defaultVideoId` raw on purpose. It is not
+    /// correct for the pool, which is why the source paths now read `sourceIndexIdentityID` below.
     private var ratingsImdbID: String? {
-        if let dv = core.metaDetails?.meta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
+        if let dv = fencedMeta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
         return id.hasPrefix("tt") ? id : nil
+    }
+
+    /// The identity ROLES this page hands to the SOURCE paths (Singularity pool + the IMDb-keyed TorBox
+    /// index). The page states what each id IS and lets the ONE shared resolver rank them; it does not pick.
+    ///
+    /// The catalog id is `self.id` (what the user opened) and the default-video id comes from the ID-FENCED
+    /// meta, so a still-resident previous title can neither supply an identity nor outrank this page's own.
+    /// Movie and live pages have no episode, so `currentVideoID` is nil here by construction.
+    ///
+    /// WHY IT IS NOT `ratingsImdbID`: that value is tt-only and nil for a TMDB-keyed catalog entry, which used
+    /// to leave a tmdb-opened title contributing nothing at all on tvOS.
+    private var sourceIndexRoles: SourceIndexIdentity.Roles {
+        SourceIndexIdentity.Roles(
+            catalogID: id,
+            defaultVideoID: fencedMeta?.behaviorHints?.defaultVideoId,
+            currentVideoID: nil,
+            kind: SourceIndexIdentity.ContentKind.from(type: effectiveType, liveTypes: LiveTypes.all)
+        )
     }
 
     /// The numeric TMDB id when this page was opened from a TMDB-keyed catalog ("tmdb:123",
@@ -354,7 +391,7 @@ struct DetailView: View {
     /// the meta loads. Matches official Stremio (and the engine's guess_stream), which key movie streams on
     /// default_video_id so imdb add-ons match.
     private var movieStreamId: String {
-        if let dv = core.metaDetails?.meta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != id { return dv }
+        if let dv = fencedMeta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != id { return dv }
         return id
     }
 
@@ -365,7 +402,7 @@ struct DetailView: View {
     /// title worked from an add-on catalog carrying the engine's authoritative type). Keying off meta.type
     /// fixes both directions; falling back to `type` keeps behavior unchanged until meta loads.
     private var effectiveType: String {
-        if core.metaDetails?.meta?.id == id, let t = core.metaDetails?.meta?.type, !t.isEmpty { return t }
+        if let t = fencedMeta?.type, !t.isEmpty { return t }
         return type
     }
 
@@ -380,7 +417,7 @@ struct DetailView: View {
         // the catalog id when it is itself an imdb tt (the hub-card case). Non-imdb ids without meta still
         // wait (their stream id only resolves from the meta). hasStreams keys on the effective id, so no
         // re-dispatch loop forms once the streams arrive.
-        let metaResident = core.metaDetails?.meta?.id == id
+        let metaResident = fencedMeta != nil
         guard metaResident || id.hasPrefix("tt") else { return }
         let streamId = movieStreamId
         // Either surface counts as resident: meta-embedded streams (metaStreams, #122) are keyed by the
@@ -397,7 +434,7 @@ struct DetailView: View {
     /// Identifiable without colliding with real TMDB person ids. Same focus pattern as the other rails.
     private var railCastMembers: [TMDBClient.CastMember] {
         if !castMembers.isEmpty { return castMembers }
-        let names = core.metaDetails?.meta?.cast ?? []
+        let names = fencedMeta?.cast ?? []
         return names.enumerated().map {
             TMDBClient.CastMember(id: -1 - $0.offset, name: $0.element, character: nil, profileURL: nil)
         }
@@ -540,7 +577,7 @@ struct DetailView: View {
     /// Feed the browse pages' hero cache with what this page knows. The engine resolved this meta
     /// through the add-on system, so it works for every id scheme (tt, tmdb:, tvdb:, anything).
     private func captureHero() {
-        guard let m = core.metaDetails?.meta, m.id == id else { return }
+        guard let m = fencedMeta else { return }
         FocusedItemModel.noteMeta(id: m.id, type: type, title: m.name,
                                   backdrop: m.background ?? m.poster,
                                   releaseInfo: m.releaseInfo, imdbRating: m.imdbRating,
@@ -670,7 +707,7 @@ struct DetailView: View {
                                                               type: m.type.isEmpty ? effectiveType : m.type,
                                                               name: m.name, poster: m.poster,
                                                               season: nil, episode: nil),
-                                           imdbId: ratingsImdbID)
+                                           identityRoles: sourceIndexRoles)
                         }
                     }
                     .padding(.horizontal, Theme.Space.screenEdge)
@@ -718,7 +755,7 @@ struct DetailView: View {
     /// The art the tint derives from: the SAME background-else-poster pick the hero backdrop paints. Also
     /// the `.task(id:)` key, so a late meta hydrate (or a repoint to another title) recomputes.
     private var tintArtURL: String? {
-        core.metaDetails?.meta?.background ?? core.metaDetails?.meta?.poster
+        fencedMeta?.background ?? fencedMeta?.poster
     }
 
     /// Canvas with the dominant-color wash ramping in BELOW the hero (clear at the top, so the hero's
@@ -768,7 +805,7 @@ struct DetailView: View {
                                    meta: PlaybackMeta(libraryId: m.id, videoId: m.id, type: type,
                                                       name: m.name, poster: m.poster,
                                                       season: nil, episode: nil),
-                                   imdbId: ratingsImdbID)
+                                   identityRoles: sourceIndexRoles)
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
                 .padding(.bottom, Theme.Space.xl)
@@ -1657,10 +1694,18 @@ struct CoreEpisodeStreams: View {
                                    episodeTargetIsCurrent: { videoID, generation in
                                        videoID == currentVideo.id && generation == episodeTargetGeneration
                                    },
-                                   imdbId: {
-                                       if let dv = meta.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
-                                       return meta.id.hasPrefix("tt") ? meta.id : nil
-                                   }())
+                                   // Roles, not an ordered candidate list: this page states what each id IS
+                                   // and the ONE shared resolver ranks them. The catalog id outranks the
+                                   // add-on's episode-shaped defaultVideoId, and the FIELD CASE survives --
+                                   // a TMDB-identified series with no defaultVideoId ("tmdb:94997") holds its
+                                   // IMDb identity only on the EPISODE video id ("tt0460649:3:6"), which the
+                                   // series kind still admits as the last role.
+                                   identityRoles: SourceIndexIdentity.Roles(
+                                       catalogID: meta.id,
+                                       defaultVideoID: meta.behaviorHints?.defaultVideoId,
+                                       currentVideoID: currentVideo.id,
+                                       kind: .series
+                                   ))
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
                 .padding(.bottom, Theme.Space.xl)
@@ -1782,10 +1827,19 @@ struct CoreStreamList: View {
     var episodeStreamId: String? = nil
     var episodeTargetGeneration = 0
     var episodeTargetIsCurrent: ((String?, Int) -> Bool)? = nil
-    /// The title's imdb id (tt...) for the TorBox search-as-a-source lookup, when known. nil = no search
-    /// contribution (also the no-imdb-id case, e.g. a live channel). The feature is further gated on a
-    /// TorBox key inside `TorBoxSearchSource.refresh`.
-    var imdbId: String? = nil
+    /// The identity ROLES of the title this list belongs to, stated by the page that mounts it. The list
+    /// never derives an identity of its own: it forwards these to the ONE shared resolver, so the pool key,
+    /// the TorBox key, and the publication token are the same identity by construction rather than by three
+    /// call sites agreeing. A live channel typically resolves to nothing, which disables both contributors.
+    var identityRoles = SourceIndexIdentity.Roles(
+        catalogID: nil, defaultVideoID: nil, currentVideoID: nil, kind: .movie
+    )
+
+    /// The title's resolved IMDb identity. ONE value: the pool and the IMDb-keyed TorBox index take the same
+    /// IMDb-only key (decision REQ-260721-33), so there is no second field for a caller to pick wrongly.
+    private var titleIdentity: SourceIndexIdentity.Resolved {
+        SourceIndexIdentity.resolve(identityRoles)
+    }
 
     /// The title's numeric TMDB id when this page came from a TMDB-keyed catalog ("tmdb:123",
     /// "tmdb:movie:123"). Same extraction rule as `DetailView.ratingTMDBID`, applied to the library id, so
@@ -1895,7 +1949,7 @@ struct CoreStreamList: View {
     /// (`state.duration` is milliseconds, like `state.timeOffset`.)
     private var traktDurationSeconds: Double? {
         if let d = core.metaDetails?.libraryItem?.state.duration, d > 0 { return d / 1000.0 }
-        return core.metaDetails?.meta?.runtimeSeconds
+        return ResidentMeta.fenced(core.metaDetails?.meta, pageID: meta?.libraryId ?? "") { $0.id }?.runtimeSeconds
     }
 
     /// A position Trakt holds from ANOTHER device worth offering, or nil. Read-only and advisory: it is NOT
@@ -2214,14 +2268,14 @@ struct CoreStreamList: View {
         .onAppear {
             sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
                             mediaServers: mediaServers, debridCache: debridCache)
-            torboxSearch.refresh(imdbId: imdbId, season: meta?.season, episode: meta?.episode)
-            mediaServers.refresh(imdb: imdbId, season: meta?.season, episode: meta?.episode,
+            torboxSearch.refresh(imdbId: titleIdentity.titleID, season: meta?.season, episode: meta?.episode)
+            mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
                                  title: meta?.name, publicationTarget: mediaServerTargetID)
             refreshSourceIndex()
         }
         .onChange(of: mediaServerTargetID) { _ in
-            torboxSearch.refresh(imdbId: imdbId, season: meta?.season, episode: meta?.episode)
-            mediaServers.refresh(imdb: imdbId, season: meta?.season, episode: meta?.episode,
+            torboxSearch.refresh(imdbId: titleIdentity.titleID, season: meta?.season, episode: meta?.episode)
+            mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
                                  title: meta?.name, publicationTarget: mediaServerTargetID)
             refreshSourceIndex()
             scheduleSourceRefresh()
@@ -2411,12 +2465,12 @@ struct CoreStreamList: View {
     /// The pool `content_id` for this list: the title's imdb id, plus `:S:E` when the `PlaybackMeta` carries
     /// a season + episode (a series episode list). nil when no imdb id is known (e.g. a live channel).
     private var sourceContentID: String? {
-        SourceIndexClient.contentID(imdbId: imdbId, season: meta?.season, episode: meta?.episode)
+        SourceIndexClient.contentID(roles: identityRoles, season: meta?.season, episode: meta?.episode)
     }
 
     private var mediaServerTargetID: String {
         if let sourceContentID { return sourceContentID }
-        let libraryID = meta?.libraryId ?? imdbId ?? "unknown"
+        let libraryID = meta?.libraryId ?? titleIdentity.titleID ?? "unknown"
         let videoID = episodeStreamId ?? meta?.videoId ?? "title"
         return "meta:\(libraryID)|video:\(videoID)"
     }

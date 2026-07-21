@@ -161,6 +161,10 @@ targets:
       # self-contained like the two files above, so include just this one so the web-host target still
       # builds without pulling the rest of SourcesShared.
       - path: SourcesShared/ServerDiagnostics.swift
+      # VXProbe's single write path now scrubs each line through VXProbeRedaction before NSLog and the
+      # file mirror, so this target needs it for the same reason it needs VXProbe itself. Foundation +
+      # CryptoKit only and self-contained, matching the three single-file includes above.
+      - path: SourcesShared/VXProbeRedaction.swift
       - Resources/Assets.xcassets
       - path: Resources/server.js
         buildPhase: resources

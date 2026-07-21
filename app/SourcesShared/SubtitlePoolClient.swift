@@ -246,7 +246,7 @@ enum SubtitlePoolClient {
                                   origin: raw.origin ?? "", score: raw.score ?? 0, url: subURL)
         }
         guard readAuthorizationIsCurrent(authorization) else { return ([], nil) }
-        VXProbe.log("sing", "sub fetchPooled key=\(contentKey) subs=\(subs.count) offsetMs=\(decoded.offset?.offsetMs.map(String.init) ?? "-")")
+        VXProbe.log("sing", "sub fetchPooled key=\(VXProbeRedaction.identityToken(contentKey)) subs=\(subs.count) offsetMs=\(decoded.offset?.offsetMs.map(String.init) ?? "-")")
         return (subs, decoded.offset?.offsetMs)
     }
 
@@ -368,7 +368,7 @@ enum SubtitlePoolClient {
         ]
         if let fingerprint, !fingerprint.isEmpty { body["fingerprint"] = fingerprint }
 
-        VXProbe.log("sing", "sub upload key=\(contentKey) lang=\(lang) origin=\(origin) fmt=\(format) bytes=\(bytes)")
+        VXProbe.log("sing", "sub upload key=\(VXProbeRedaction.identityToken(contentKey)) lang=\(lang) origin=\(origin) fmt=\(format) bytes=\(bytes)")
         await postJSON(path: "subs", body: body, transport: transport)
     }
 
@@ -408,7 +408,7 @@ enum SubtitlePoolClient {
         ]
         if let fingerprint, !fingerprint.isEmpty { body["fingerprint"] = fingerprint }
 
-        VXProbe.log("sing", "sub postOffset key=\(contentKey) lang=\(lang) offsetMs=\(offsetMs)")
+        VXProbe.log("sing", "sub postOffset key=\(VXProbeRedaction.identityToken(contentKey)) lang=\(lang) offsetMs=\(offsetMs)")
         await postJSON(path: "offset", body: body, transport: transport)
     }
 

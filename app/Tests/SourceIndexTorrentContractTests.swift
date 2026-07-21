@@ -4,9 +4,14 @@
 //
 //   xcrun swiftc -o /tmp/source-index-contract-test \
 //     app/SourcesShared/SourceIndexContract.swift \
+//     app/SourcesShared/SourceIndexIdentity.swift \
 //     app/SourcesShared/MoatToken.swift \
 //     app/SourcesShared/SourceIndexClient.swift \
 //     app/Tests/SourceIndexTorrentContractTests.swift && /tmp/source-index-contract-test
+//
+// (Run from the repo root. SourceIndexIdentity.swift is REQUIRED: it holds the shared resolver and the whole
+// diagnostics vocabulary. A previous round shipped a header command that omitted it and therefore did not
+// compile, which is the same class of defect as a comment that overstates what the code does.)
 //
 // This exercises the shipped descriptor, wire encoding, served-row filter, merge, and resume polling logic.
 
@@ -22,6 +27,15 @@ struct Published<Value> {
 
 protocol ObservableObject: AnyObject {}
 
+/// Mirrors the add-on-declared public fields the descriptor path reads. `bingeGroup` and `sources` are
+/// modelled because a DEBRID-mode add-on returns a resolved `url` row with NO `infoHash`, carrying the public
+/// 40-hex only in these fields -- and because `sources` also carries `tracker:` URLs whose private passkeys
+/// must never be mistaken for an infohash (see the negative tests below).
+struct CoreStreamBehaviorHints: Codable, Equatable {
+    var bingeGroup: String?
+    init(bingeGroup: String? = nil) { self.bingeGroup = bingeGroup }
+}
+
 struct CoreStream: Codable, Equatable {
     var name: String?
     var description: String?
@@ -29,6 +43,8 @@ struct CoreStream: Codable, Equatable {
     var url: String?
     var nzbUrl: String?
     var ytId: String?
+    var sources: [String]?
+    var behaviorHints: CoreStreamBehaviorHints?
 
     var isYouTubeTrailer: Bool { url == nil && infoHash == nil && !(ytId ?? "").isEmpty }
 
@@ -38,7 +54,9 @@ struct CoreStream: Codable, Equatable {
         infoHash: String? = nil,
         url: String? = nil,
         nzbUrl: String? = nil,
-        ytId: String? = nil
+        ytId: String? = nil,
+        sources: [String]? = nil,
+        behaviorHints: CoreStreamBehaviorHints? = nil
     ) {
         self.name = name
         self.description = description
@@ -46,6 +64,8 @@ struct CoreStream: Codable, Equatable {
         self.url = url
         self.nzbUrl = nzbUrl
         self.ytId = ytId
+        self.sources = sources
+        self.behaviorHints = behaviorHints
     }
 }
 
@@ -68,9 +88,30 @@ enum MoatConsent {
     nonisolated(unsafe) static var contributeAndConsume = true
 }
 
+/// Mirrors the members of the real `ResolvedConfig` that `SourceIndexClient` reads. Every value here MUST equal the
+/// baked default in `RemoteConfigDefaults`, so this harness exercises the same behaviour the app ships with an absent
+/// remote block. A member added to the real snapshot and not added here does not fail a test: it stops the whole
+/// harness COMPILING, which reads as "no test signal" rather than as a failure. Keep the two in step.
+/// Steerable stand-in for the fleet kill switch. Default `nil` means "no remote value", which is exactly the
+/// baked behaviour (`isFeatureOn` returns the call site's default), so every existing case is unaffected.
+enum RemoteConfigTestState {
+    nonisolated(unsafe) static var fleetOverride: Bool?
+}
+
 struct RemoteConfigSnapshot {
-    func isFeatureOn(_ key: String, default value: Bool) -> Bool { value }
+    func isFeatureOn(_ key: String, default value: Bool) -> Bool { RemoteConfigTestState.fleetOverride ?? value }
     func endpoint(_ key: String) -> URL? { nil }
+
+    var sourceIndexInterBatchDelayMs: Int { 1100 }
+    var sourceIndexBatchSize: Int { 16 }
+    var sourceIndexMaxDescriptorsPerTitle: Int { 2000 }
+    var sourceIndexResumeHoardMaxWaitMs: Int { 5000 }
+    var sourceIndexResumeHoardPollIntervalMs: Int { 250 }
+    /// The CONSTANT cap (60), deliberately not the derived count (20). The two used to be one field, and the
+    /// harness inherited the ambiguity from the app.
+    var sourceIndexResumeHoardAttemptCap: Int { 60 }
+    var sourceIndexResumeHoardAttempts: Int { 20 }
+    var sourceIndexRequestTimeout: TimeInterval { 8 }
 }
 
 enum RemoteConfig {
@@ -126,6 +167,17 @@ final class SequencedGate: @unchecked Sendable {
 }
 
 enum SequenceFetchError: Error { case failed }
+
+/// Capture seam for `SourceIndexClient.diagnosticSink`. The diagnostics land in a log the USER EXPORTS AND
+/// SHARES PUBLICLY, so the suite asserts on the exact bytes that would be written rather than trusting a code
+/// read that no raw identifier is interpolated.
+final class CapturedDiagnostics: @unchecked Sendable {
+    private let lock = NSLock()
+    private var captured: [String] = []
+
+    func append(_ line: String) { lock.withLock { captured.append(line) } }
+    func lines() -> [String] { lock.withLock { captured } }
+}
 
 actor SourceFetchSequence {
     enum Step: Sendable {
@@ -846,8 +898,13 @@ struct SourceIndexTorrentContractTests {
             .init(kind: "usenet", id: privateNZB, quality: "1080p", sizeBytes: 0,
                   seeders: nil, corroboration: 2),
         ])
-        expect(served.count == 1 && served.first?.infoHash == lower,
-               "serve reconstruction requires two witnesses and drops non-torrent or noncanonical rows")
+        // CONTRACT CHANGED 2026-07-21: the client floor now MIRRORS the worker's torrent floor of 1 instead of
+        // re-filtering at 2. The worker serves single-witness torrents deliberately (a self-verifying infohash
+        // never strands a lone early contributor); the old client floor of 2 discarded exactly those rows, which
+        // in a young pool is nearly all of them. So `fourthHash` (corroboration 1) is now SERVED. Rows with 0 or
+        // absent corroboration stay dropped as anomalous, and non-torrent / non-canonical rows stay dropped.
+        expect(served.count == 2 && served.map(\.infoHash) == [lower, fourthHash],
+               "serve reconstruction mirrors the worker floor (>=1), still dropping 0/absent, non-torrent, and noncanonical rows")
         expect(served.first?.url == nil && served.first?.nzbUrl == nil,
                "served torrent has no URL or NZB payload")
         expect(served.first?.name == "Other · Singularity"
@@ -950,8 +1007,10 @@ struct SourceIndexTorrentContractTests {
             served + [CoreStream(name: "direct", url: privateURL), CoreStream(name: "nzb", nzbUrl: privateNZB)],
             into: []
         )
-        expect(merged.count == 1 && merged.first?.streams.count == 1,
-               "merge admits only canonical torrent streams")
+        // Count follows `served`, which is now 2 under the corrected worker-mirrored floor (>=1). The INTENT is
+        // unchanged and still enforced: the appended direct and nzb rows must NOT appear in the merged output.
+        expect(merged.count == 1 && merged.first?.streams.count == 2,
+               "merge admits only canonical torrent streams (direct/nzb rows excluded)")
 
         let rotated = SourceIndexClient.PooledSource(
             kind: "torrent", id: secondHash, quality: "Other", sizeBytes: 0,
@@ -1782,11 +1841,375 @@ struct SourceIndexTorrentContractTests {
                && delayedThirdLaunch.map(\.id) == [thirdHash],
                "delayed sleepers recheck launch slots instead of bursting together")
 
+        // MARK: - Singularity field-failure fixes (2026-07-21). Regressions for the four defects that made the
+        // source pool contribute and serve NOTHING in the field, plus the credential leak caught in cross-review.
+
+        // CAUSE A: series call sites pass behaviorHints.defaultVideoId, which on a series is ALREADY "tt…:S:E".
+        // Appending this episode's :S:E produced "tt…:1:1:3:5", which canonicalContentID rejects -> nil -> the
+        // call site returned silently, killing contribute AND serve for every episode of every such show.
+        expect(SourceIndexContract.canonicalTitleID("tt0903747:1:1") == "tt0903747",
+               "canonicalTitleID reduces an episode-scoped imdb id to its title id")
+        expect(SourceIndexContract.canonicalTitleID("tmdb:1399:2:3") == "tmdb:1399",
+               "canonicalTitleID reduces an episode-scoped tmdb id to its title id")
+        expect(SourceIndexContract.canonicalTitleID("tt0903747") == "tt0903747",
+               "canonicalTitleID passes a bare title id through unchanged")
+        expect(SourceIndexContract.canonicalTitleID(nil) == nil
+               && SourceIndexContract.canonicalTitleID("kitsu:42") == nil
+               && SourceIndexContract.canonicalTitleID("tt0903747:garbage") == nil,
+               "canonicalTitleID refuses nil, non-canonical namespaces, and a non-episode tail")
+        expect(SourceIndexClient.contentID(imdbId: "tt0903747:1:1", season: 3, episode: 5) == "tt0903747:3:5",
+               "THE FIELD BUG: an already-episode-scoped id no longer composes tt…:1:1:3:5, it composes tt…:3:5")
+        expect(SourceIndexClient.contentID(imdbId: "tt0903747", season: 3, episode: 5) == "tt0903747:3:5"
+               && SourceIndexClient.contentID(imdbId: "tt0903747") == "tt0903747",
+               "contentID still composes correctly from a bare title id, and passes a movie id through")
+
+        // CAUSE B + the credential leak (cross-review REQ-260721-05): a debrid row republishes the public 40-hex in
+        // `sources` as `dht:<40hex>`. Recovering it is REQUIRED, but `sources` also carries tracker: URLs whose
+        // PRIVATE PASSKEYS are also 40-hex. An "any 40-hex anywhere" scan would upload a user's tracker
+        // credential into the shared pool. Exact-schema matching is the only safe shape.
+        let realHash = "bbe3eb70b55e5ffc0e4eb30fbf33c2ca92fad49e"
+        let passkey = "0123456789abcdef0123456789abcdef01234567"
+        expect(SourceIndexContract.infoHashFromSourceEntry("dht:" + realHash) == realHash,
+               "infoHashFromSourceEntry accepts the exact documented dht:<40hex> form")
+        expect(SourceIndexContract.infoHashFromSourceEntry("tracker:https://tr.example/\(passkey)/announce") == nil,
+               "SECURITY: a private tracker passkey inside a tracker: URL is NEVER lifted out as an infohash")
+        expect(SourceIndexContract.infoHashFromSourceEntry("tracker:udp://tr.example:1337/announce") == nil
+               && SourceIndexContract.infoHashFromSourceEntry("dht:" + realHash + "extra") == nil
+               && SourceIndexContract.infoHashFromSourceEntry(nil) == nil,
+               "infoHashFromSourceEntry refuses trackers, over-long tails, and nil")
+
+        // End-to-end through the real descriptor path: a DEBRID row (resolved url, NO infoHash) yields a
+        // descriptor from its documented `dht:` entry, while a row whose only 40-hex lives in a tracker URL
+        // must not. `bingeGroup` is unconstrained add-on text and is no longer a recovery source AT ALL, so a
+        // row carrying a 40-hex ONLY there contributes nothing: reintroducing that path would admit an
+        // attacker-chosen, credential-shaped value into the shared pool.
+        let debridRow = CoreStream(name: "1080p", url: "https://real-debrid.example/d/TOKEN/file.mkv",
+                                   sources: ["dht:" + realHash, "tracker:udp://tr.example:1337/announce"])
+        let trackerOnlyRow = CoreStream(name: "1080p", url: "https://real-debrid.example/d/TOKEN/file.mkv",
+                                        sources: ["tracker:https://tr.example/\(passkey)/announce"])
+        let bingeOnlyRow = CoreStream(name: "1080p", url: "https://real-debrid.example/d/TOKEN/file.mkv",
+                                      behaviorHints: CoreStreamBehaviorHints(bingeGroup: "comet|torbox|" + realHash))
+        let bingeOverrideRow = CoreStream(name: "1080p", url: "https://real-debrid.example/d/TOKEN/file.mkv",
+                                          sources: ["dht:" + realHash],
+                                          behaviorHints: CoreStreamBehaviorHints(bingeGroup: "provider|user|" + passkey))
+        func descriptorIDs(_ stream: CoreStream) -> [String] {
+            SourceIndexClient.descriptors(from: [CoreStreamSourceGroup(id: "g", addon: "a", streams: [stream])])
+                .map(\.id)
+        }
+        expect(descriptorIDs(debridRow) == [realHash],
+               "CAUSE B: a debrid row with no infoHash still contributes, recovered from its dht: sources entry")
+        expect(descriptorIDs(trackerOnlyRow).isEmpty,
+               "SECURITY: a row whose only 40-hex is a tracker passkey contributes NOTHING")
+        expect(descriptorIDs(bingeOnlyRow).isEmpty,
+               "SECURITY (F2): a 40-hex living ONLY in add-on-controlled bingeGroup text is never contributed")
+        expect(descriptorIDs(bingeOverrideRow) == [realHash],
+               "SECURITY (F2): a credential-shaped bingeGroup token can no longer override the real dht: hash")
+        expect(descriptorIDs(CoreStream(name: "1080p", infoHash: realHash.uppercased(),
+                                        sources: ["dht:" + passkey])) == [realHash],
+               "PRECEDENCE (F2): the explicit infoHash field outranks a sources entry, most-authoritative first")
+
+        // ---- F1/F3: the ONE shared preferred-title resolver, compiled INTO this suite ----
+        // The old inline copies lived in two view files this harness cannot compile, so reverting them left
+        // every case below green. Everything the views now call is here, so a revert is RED.
+        let episodeScoped = SourceIndexIdentity.preferred(candidates: ["tt0903747:1:1", "tmdb:1399", "tt0903747:3:5"])
+        expect(episodeScoped.indexID == "tt0903747" && episodeScoped.torBoxID == "tt0903747",
+               "F1: an EPISODE-scoped defaultVideoId is canonicalized, not returned unchanged")
+        expect(SourceIndexClient.contentID(imdbId: episodeScoped.torBoxID, season: 3, episode: 5) == "tt0903747:3:5",
+               "F1 end-to-end: the resolved TorBox identity composes tt0903747:3:5, never tt0903747:1:1:3:5")
+
+        // THE REPORTED FIELD CASE: tmdb-identified series, NO defaultVideoId, imdb identity only on the video id.
+        let fieldCase = SourceIndexIdentity.preferred(candidates: [nil, "tmdb:94997", "tt0460649:3:6"])
+        expect(fieldCase.indexID == "tt0460649" && fieldCase.torBoxID == "tt0460649",
+               "F1 field case: an imdb episode video id wins over the earlier tmdb catalog id")
+
+        // An episode-scoped default from a DIFFERENT episode than the one being viewed: the coordinates on the
+        // id are noise and must be discarded, not carried into the key for the episode actually on screen.
+        let otherEpisodeDefault = SourceIndexIdentity.preferred(candidates: ["tt0903747:1:1", "tt0903747", "tt0903747:5:9"])
+        expect(SourceIndexClient.contentID(imdbId: otherEpisodeDefault.indexID, season: 5, episode: 9) == "tt0903747:5:9",
+               "F1: a default video id from a DIFFERENT episode never leaks its own coordinates into the key")
+
+        // A malformed preferred candidate must be SKIPPED so a later good one still wins, and an all-malformed
+        // candidate list must resolve to nothing rather than to a half-parsed value.
+        expect(SourceIndexIdentity.preferred(candidates: ["tt0903747:garbage", "tt0903747"]).indexID == "tt0903747",
+               "F1: a malformed preferred candidate is skipped, and the next canonical candidate wins")
+        expect(SourceIndexIdentity.preferred(candidates: ["kitsu:42", "not-an-id", nil]).indexID == nil,
+               "F1: an all-malformed candidate list resolves to no identity at all")
+        // ---- A1: the 128-byte identity CAP, asserted for the first time ----
+        //
+        // WHAT THE OLD ASSERTION HERE ACTUALLY TESTED. It read
+        //     preferred(candidates: [String(repeating: "t", into: 4096)]).indexID == nil
+        // and was labelled "an unbounded identity input is capped BEFORE parsing and rejected". It tested no
+        // such thing. 4096 "t" characters fail `canonicalTitleID` on their FIRST character, because the anchor
+        // is ^(tt[0-9]{6,10}|tmdb:[0-9]{1,10}) and "ttt" has no digit in position three. The case passed with
+        // `maxIdentityInputBytes` set to Int.max, so it proved only that the regex rejects a non-id. It was a
+        // false-confidence test: green either way, and worse than no test, because it occupied the slot where
+        // the real one belonged.
+        //
+        // The three assertions below fail the moment the cap is removed or moved.
+        expect(SourceIndexIdentity.maxIdentityInputBytes == 128,
+               "A1: the identity input cap is pinned at 128 bytes (real ids are ~20)")
+        expect(SourceIndexIdentity.boundedIdentityInput(String(repeating: "a", into: 128)) != nil,
+               "A1: an input EXACTLY at the cap is accepted, so the bound is not off by one")
+        expect(SourceIndexIdentity.boundedIdentityInput(String(repeating: "a", into: 129)) == nil,
+               "A1: an input ONE BYTE over the cap is rejected before any parsing happens")
+        expect(SourceIndexIdentity.boundedIdentityInput(String(repeating: "a", into: 105_000)) == nil,
+               "A1: a 105 KB add-on-controlled identifier never reaches the parser")
+        // The cap is applied BEFORE measurement too, so an unbounded value cannot inflate the one number the
+        // diagnostics are allowed to print about it.
+        expect(SourceIndexDiag.identityLength(String(repeating: "9", into: 105_000))
+               == SourceIndexDiag.identityLengthOverCap,
+               "A1: an over-cap identity reports the fixed sentinel, never its own 105000-byte length")
+
+        // ---- A2: contentKey's OWN canonicalization guard ----
+        // `contentKey` re-canonicalizes its `titleID` rather than trusting the caller, and nothing asserted it:
+        // replacing that guard with `let title = titleID` left the whole suite green. It is the F1 defect class
+        // one level down -- an episode-scoped id passed straight through -- so it gets its own coverage.
+        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747:1:1", season: nil, episode: nil) == "tt0903747",
+               "A2: contentKey REDUCES an episode-scoped title id to the bare title, it does not pass it through")
+        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747:1:1", season: 3, episode: 5) == "tt0903747:3:5",
+               "A2: contentKey composes from the REDUCED title, never tt0903747:1:1:3:5")
+        expect(SourceIndexIdentity.contentKey(titleID: "tmdb:1399:2:3", season: 4, episode: 6) == "tmdb:1399:4:6",
+               "A2: the same reduction applies in the tmdb namespace")
+        expect(SourceIndexIdentity.contentKey(titleID: "kitsu:42", season: nil, episode: nil) == nil
+               && SourceIndexIdentity.contentKey(titleID: "tt0903747:garbage", season: nil, episode: nil) == nil,
+               "A2: a non-canonical titleID yields NO key, rather than being echoed back as one")
+
+        // MOVIE behaviour: a movie page has no video-id candidate and no coordinates.
+        let movie = SourceIndexIdentity.preferred(candidates: ["tt1375666", "tt1375666"])
+        expect(movie.indexID == "tt1375666" && movie.torBoxID == "tt1375666"
+               && SourceIndexClient.contentID(imdbId: movie.indexID) == "tt1375666",
+               "F1: a movie resolves to a bare title id and keys the pool without coordinates")
+
+        // TMDB-only title: the POOL identity accepts it, the IMDb-keyed TorBox path must NOT.
+        let tmdbOnly = SourceIndexIdentity.preferred(candidates: [nil, "tmdb:1399", "tmdb:1399:2:3"])
+        expect(tmdbOnly.indexID == "tmdb:1399" && tmdbOnly.torBoxID == nil,
+               "F1: a tmdb identity is a valid POOL key but is never handed to the IMDb-keyed TorBox path")
+        expect(SourceIndexClient.contentID(imdbId: tmdbOnly.indexID, season: 2, episode: 3) == "tmdb:1399:2:3",
+               "F1: the tmdb pool identity still composes a canonical episode key")
+
+        // SEASON ZERO is VALID (specials air as S00Exx). Presence, never truthiness.
+        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747", season: 0, episode: 1) == "tt0903747:0:1",
+               "F5: season zero is a VALID coordinate and still composes")
+
+        // F5: PARTIAL coordinate pairs are REJECTED; both-absent is a valid show-wide request.
+        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747", season: 3, episode: nil) == nil
+               && SourceIndexIdentity.contentKey(titleID: "tt0903747", season: nil, episode: 5) == nil,
+               "F5: a PARTIAL coordinate pair is rejected, never widened to the show-wide key")
+        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747", season: nil, episode: nil) == "tt0903747",
+               "F5: both coordinates absent is a valid bare-title request")
+        expect(SourceIndexClient.contentID(imdbId: "tt0903747", season: 3) == nil
+               && SourceIndexClient.contentID(imdbId: "tt0903747", episode: 5) == nil
+               && SourceIndexClient.contentID(imdbId: "tt0903747", season: 0, episode: 1) == "tt0903747:0:1",
+               "F5 through the client: partial pairs bail, season zero composes")
+
+        // ---- F4: bounded, category-only diagnostics ----
+        // The diag log is EXPORTED AND SHARED PUBLICLY by users. Prove that no catalog id and no rejected
+        // add-on text ever reaches it, including newline-forging and unbounded inputs.
+        let captured = CapturedDiagnostics()
+        let previousSink = SourceIndexClient.diagnosticSink
+        SourceIndexClient.diagnosticSink = { captured.append($0) }
+        let secretID = "tt0903747:3:5"
+        let hostileID = "tt0903747\nsing FORGED reason=fake token=SECRET-abc123"
+        let hugeID = String(repeating: "9", into: 5000)
+        _ = SourceIndexClient.contentID(imdbId: hostileID, season: 3, episode: 5)
+        _ = SourceIndexClient.contentID(imdbId: hugeID, season: 3, episode: 5)
+        _ = SourceIndexClient.contentID(imdbId: secretID, season: 3, episode: nil)
+        await SourceIndexClient.contribute(contentID: secretID, descriptors: [])
+        _ = await SourceIndexClient.fetchPooledUsing(
+            contentID: secretID, isSignedIn: false,
+            gate: { false }, moatProvider: { nil }, transport: { _ in throw SequenceFetchError.failed }
+        )
+        _ = SourceIndexClient.streams(from: [])
+        SourceIndexClient.diagnosticSink = previousSink
+        let emitted = captured.lines()
+        expect(!emitted.isEmpty, "F4: the bail paths still emit diagnostics (silence was the original defect)")
+        expect(emitted.allSatisfy { !$0.contains("tt0903747") && !$0.contains("0903747") },
+               "F4: a raw catalog id (which IS viewing history) never reaches the exported diag log")
+        expect(emitted.allSatisfy { !$0.contains("SECRET-abc123") && !$0.contains("FORGED") },
+               "F4: rejected add-on-controlled text never reaches the exported diag log")
+        expect(emitted.allSatisfy { !$0.contains("\n") && $0.utf8.count < 200 },
+               "F4: no emitted line can be newline-forged or grown unbounded by a hostile identifier")
+        expect(emitted.allSatisfy { $0.contains("run=") },
+               "F4: every line carries the random per-process correlation token")
+        expect(!emitted.contains(where: { $0.contains("consent=") || $0.contains("isSignedIn=") }),
+               "F4: account/consent state is never a logged value")
+        // USEFULNESS is half the fix: the reasons must still tell the bail paths apart.
+        let reasons = Set(emitted.compactMap { line -> String? in
+            line.split(separator: " ").first(where: { $0.hasPrefix("reason=") }).map(String.init)
+        })
+        expect(reasons.contains("reason=not-a-title-id")
+               && reasons.contains("reason=non-canonical-episode-key")
+               && reasons.contains("reason=gate-closed"),
+               "F4: every distinct bail path is still individually identifiable by its reason")
+
+        // A1 (continued): the CAP's observable consequence in the exported log. With the cap removed the
+        // 5000-byte hostile id above is regex-parsed in full and its true length lands on the line.
+        expect(emitted.contains(where: { $0.contains("rawLen=\(SourceIndexDiag.identityLengthOverCap)") }),
+               "A1: an over-cap identifier logs the sentinel length, and the capped path is what emitted it")
+        expect(emitted.allSatisfy { line in
+            loggedLengths(in: line).allSatisfy { $0 >= -2 && $0 <= 128 }
+        }, "A1: no length a line can carry exceeds the 128-byte cap, whatever the add-on sent")
+
+        // ---- C3: three identity conditions, three distinguishable values ----
+        // nil / empty / over-cap used to map onto only two values, so "the add-on sent nothing" and "the
+        // add-on sent 105 KB" were the same number in the log. They are different bugs.
+        let lengthValues = [SourceIndexDiag.identityLength(nil),
+                            SourceIndexDiag.identityLength(""),
+                            SourceIndexDiag.identityLength(String(repeating: "9", into: 105_000)),
+                            SourceIndexDiag.identityLength("tt0903747")]
+        expect(Set(lengthValues).count == 4,
+               "C3: nil, empty, over-cap and ordinary identities are FOUR distinguishable logged values")
+        expect(lengthValues[0] == 0 && lengthValues[1] == -1 && lengthValues[2] == -2 && lengthValues[3] == 9,
+               "C3: and each one is the documented sentinel or the real bounded length")
+
+        // ---- C1: the worker outcome survives, through a CLOSED enum ----
+        // Two 200 responses, one login_required and one ok, used to emit the byte-identical line
+        // `fetchPooled HTTP OK status=200 corroboratedSources=0`, because both decode to zero rows. SERVE is
+        // login-gated by owner decision, so login_required is the single most useful answer there is.
+        func fetchLine(reason: String) async -> [String] {
+            let capture = CapturedDiagnostics()
+            let previous = SourceIndexClient.diagnosticSink
+            SourceIndexClient.diagnosticSink = { capture.append($0) }
+            _ = await SourceIndexClient.fetchPooledUsing(
+                contentID: "tt0903747:3:5", isSignedIn: true,
+                gate: { true }, moatProvider: { "moat" },
+                transport: { _ in
+                    (Data(#"{"sources":[],"reason":"\#(reason)"}"#.utf8),
+                     HTTPURLResponse(url: URL(string: "https://sources.vortx.tv/sources")!,
+                                     statusCode: 200, httpVersion: nil, headerFields: nil)!)
+                }
+            )
+            SourceIndexClient.diagnosticSink = previous
+            return capture.lines().filter { $0.contains("fetchPooled HTTP OK") }
+        }
+        let loginLines = await fetchLine(reason: "login_required")
+        let okLines = await fetchLine(reason: "ok")
+        expect(loginLines.count == 1 && okLines.count == 1,
+               "C1: a 200 read emits exactly one HTTP OK line")
+        expect(loginLines != okLines,
+               "C1: a login_required empty read and a genuinely empty pool are NOT byte-identical any more")
+        expect(loginLines.first?.contains("outcome=login-required") == true
+               && okLines.first?.contains("outcome=ok") == true,
+               "C1: each maps onto its own closed-enum outcome")
+        // The value is MAPPED, never echoed: hostile server text cannot reach the log through this field.
+        // The two characters backslash-n, so the JSON body carries a valid \n ESCAPE and the decoded reason
+        // really does contain a newline. A raw newline would be invalid JSON and would prove nothing.
+        let hostileOutcome = await fetchLine(reason: "ok\\nsing FORGED token=SECRET-abc123")
+        expect(hostileOutcome.first?.contains("outcome=other") == true,
+               "C1: an unrecognised worker reason degrades to the closed `other` case")
+        expect(hostileOutcome.allSatisfy { !$0.contains("FORGED") && !$0.contains("SECRET-abc123") && !$0.contains("\n") },
+               "C1: server-authored free text never reaches the exported log, however it is spelled")
+
+        // ---- C2: the fleet kill switch and the user gate are DIFFERENT reasons ----
+        // One `gate-off` covered both, so a support reader could not tell "we disabled it fleet-wide" from
+        // "this user opted out". Only the fleet flag's value is logged.
+        func contributeGateReason(fleet: Bool) async -> [String] {
+            RemoteConfigTestState.fleetOverride = fleet
+            MoatConsent.contributeAndConsume = fleet ? false : true
+            let capture = CapturedDiagnostics()
+            let previous = SourceIndexClient.diagnosticSink
+            SourceIndexClient.diagnosticSink = { capture.append($0) }
+            await SourceIndexClient.contribute(contentID: "tt0903747:3:5", descriptors: [])
+            SourceIndexClient.diagnosticSink = previous
+            RemoteConfigTestState.fleetOverride = nil
+            MoatConsent.contributeAndConsume = true
+            return capture.lines()
+        }
+        let consentClosed = await contributeGateReason(fleet: true)    // fleet ON, consent OFF
+        let fleetClosed = await contributeGateReason(fleet: false)     // fleet OFF
+        expect(consentClosed.contains(where: { $0.contains("reason=gate-off") }),
+               "C2: a fleet-enabled build with consent withdrawn reports the neutral user-gate reason")
+        expect(fleetClosed.contains(where: { $0.contains("reason=fleet-off") }),
+               "C2: the fleet kill switch reports itself by name (server config, not user data)")
+        expect(!fleetClosed.contains(where: { $0.contains("reason=gate-off") }),
+               "C2: and the two never collapse back onto one reason")
+        expect((consentClosed + fleetClosed).allSatisfy { !$0.contains("consent=") && !$0.contains("=true") && !$0.contains("=false") },
+               "C2: neither line prints a consent VALUE, only which gate is shut")
+
+        // ---- C4: the mid-flight SERVE bails are distinguishable ----
+        // Two silent `return []`s inside the do-block. They are not the same event: one means the gate shut
+        // before a request was spent, the other means it shut with the response already in the air.
+        func midFlightReasons(_ sequence: [Bool]) async -> Set<String> {
+            let capture = CapturedDiagnostics()
+            let previous = SourceIndexClient.diagnosticSink
+            SourceIndexClient.diagnosticSink = { capture.append($0) }
+            let gate = SequencedGate(sequence)
+            _ = await SourceIndexClient.fetchPooledUsing(
+                contentID: "tt0903747:3:5", isSignedIn: true,
+                gate: { gate.value() }, moatProvider: { "moat" },
+                transport: { _ in
+                    (Data(#"{"sources":[]}"#.utf8),
+                     HTTPURLResponse(url: URL(string: "https://sources.vortx.tv/sources")!,
+                                     statusCode: 200, httpVersion: nil, headerFields: nil)!)
+                }
+            )
+            SourceIndexClient.diagnosticSink = previous
+            return Set(capture.lines().compactMap { line -> String? in
+                line.split(separator: " ").first(where: { $0.hasPrefix("reason=") }).map(String.init)
+            })
+        }
+        let beforeTransport = await midFlightReasons([true, true, false, true])
+        let afterTransport = await midFlightReasons([true, true, true, false])
+        expect(beforeTransport.contains("reason=gate-closed-before-transport"),
+               "C4: the gate closing BEFORE transport is no longer a silent return")
+        expect(afterTransport.contains("reason=gate-closed-after-transport"),
+               "C4: the gate closing AFTER transport names itself, and names itself DIFFERENTLY")
+        expect(beforeTransport != afterTransport,
+               "C4: the two mid-flight bails leave different traces")
+
+        // C4 (contribute): a succeeded and a failed POST must not leave identical traces. The network attempt
+        // itself is not exercised offline -- `contribute` reaches URLSession directly -- so what is asserted
+        // here is the line each outcome produces, which is the part that was missing entirely.
+        expect(SourceIndexDiag.line(.contributePostResult, counts: [(.batch, 1), (.succeeded, 1)])
+               != SourceIndexDiag.line(.contributePostResult, counts: [(.batch, 1), (.succeeded, 0)]),
+               "C4: a successful and a failed contribute POST are distinguishable in the log")
+        expect(SourceIndexDiag.line(.contributeStop, reason: .postFailed).contains("reason=post-failed")
+               && SourceIndexDiag.line(.contributeStop, reason: .cancelled).contains("reason=cancelled")
+               && SourceIndexDiag.line(.contributeSkip, reason: .alreadyClaimed).contains("reason=already-claimed"),
+               "C4: every newly-closed contribute exit has its own reason")
+
+        // ---- B: the closed vocabulary itself ----
+        // The claim on `diag` is that no free text can be interpolated. That is now a type property, so what
+        // is checkable at runtime is that the vocabulary is DISTINCT: two events or two reasons sharing a
+        // spelling would reintroduce exactly the blindness the reasons exist to cure.
+        let allEvents: [SourceIndexDiag.Event] = [
+            .contentIDSkip, .contributeSkip, .contributeBegin, .contributePost, .contributePostResult,
+            .contributeStop, .fetchPooledSkip, .fetchPooledGate, .fetchPooledGateClosed, .fetchPooledGet,
+            .fetchPooledHTTP, .fetchPooledHTTPOK, .streamsReconstruct, .refreshPublish, .refreshPublishSkipped,
+        ]
+        expect(Set(allEvents.map(\.rawValue)).count == allEvents.count,
+               "B: every event label is distinct")
+        let allReasons: [SourceIndexDiag.Reason] = [
+            .notATitleID, .nonCanonicalEpisodeKey, .fleetOff, .gateOff, .nonCanonicalContentID,
+            .nothingUploadable, .alreadyClaimed, .bodyEncodingFailed, .cancelled, .postFailed, .gateClosed,
+            .gateChangedOrNoMoat, .gateClosedBeforeTransport, .gateClosedAfterTransport, .httpNon2xx,
+            .httpError, .staleOrCancelled, .malformedServeURL,
+        ]
+        expect(Set(allReasons.map(\.rawValue)).count == allReasons.count,
+               "B: every bail reason is distinct")
+        expect(Set([SourceIndexDiag.Outcome(worker: nil), .init(worker: "ok"), .init(worker: "LOGIN_REQUIRED"),
+                    .init(worker: "something-else")].map(\.rawValue)).count == 4,
+               "B: the worker-outcome mapping is closed AND total: four inputs, four distinct closed cases")
+
         print(failures == 0 ? "\nALL PASS" : "\n\(failures) FAILURE(S)")
         exit(failures == 0 ? 0 : 1)
     }
 }
 
+/// Every `rawLen=` / `contentLen=` value on one emitted line. Used to assert that NO identity-derived number
+/// a diagnostic can carry ever exceeds the input cap, whatever an add-on sent.
+func loggedLengths(in line: String) -> [Int] {
+    line.split(separator: " ").compactMap { token -> Int? in
+        for prefix in ["rawLen=", "contentLen="] where token.hasPrefix(prefix) {
+            return Int(token.dropFirst(prefix.count))
+        }
+        return nil
+    }
+}
+
 private extension String {
     func repeating(_ count: Int) -> String { String(repeating: self, count: count) }
+    /// Disambiguating spelling used by the identity/diagnostic cases, whose `repeating` reads as a method on a
+    /// literal and collides with the extension above at the call site.
+    init(repeating value: String, into count: Int) { self.init(repeating: value, count: count) }
 }

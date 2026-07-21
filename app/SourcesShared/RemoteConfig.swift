@@ -15,8 +15,17 @@ import Foundation
 ///      new fully-formed value; there is no torn state.
 ///
 ///   3. Clamp ONCE, at swap time. `validate(_:)` turns raw decoded JSON into a `ResolvedConfig` whose every
-///      field is already range-clamped and defaults-filled. A bad remote value reverts to the baked default;
-///      it can never brick the app or breach a jetsam ceiling / ranking invariant.
+///      field is already range-clamped and defaults-filled. It can never brick the app or breach a jetsam
+///      ceiling / ranking invariant.
+///
+///      PRECISELY WHAT HAPPENS TO A BAD VALUE, because this used to say "reverts to the baked default" and
+///      that is not what the code does: an ABSENT (null / missing / wrong-typed) field falls back to the baked
+///      default, and an OUT-OF-RANGE field is CLAMPED TO THE NEAREST EDGE of its range. Remote 0 for a knob
+///      whose range is 1100...30000 resolves to 1100, not to the baked value (which here happens to also be
+///      1100). The two readings coincide on the risk side for every knob in the Singularity block only
+///      because each of those ranges deliberately puts the baked value ON the protective edge -- which is why
+///      the wrong description survived review. They do NOT coincide in general, and a future knob whose baked
+///      value sits mid-range would behave nothing like the old sentence claimed.
 ///
 ///   4. DEFAULTS DO NOT CHANGE. A field defaulting to null => baked default. `features.dvRemux` stays
 ///      effectively OFF unless the owner's user toggle (UserDefaults `stremiox.dvRemux`) or a remote value
@@ -75,6 +84,39 @@ enum RemoteConfigDefaults {
     static let subtitleUploadMaxBytes = 1_048_576  // 1 MiB text cap (mirrors the worker's cap)
     static let subtitleOffsetBucketMs = 250        // offset quantization (worker also buckets to 250 ms)
     static let langIndexMinSeen = 1                // min pool `seenCount` before an availability read is trusted
+
+    // Singularity source-pool upload/rate tunables (clamped in validate). Baked == the shipping literals in
+    // SourceIndexClient, so an absent or garbage `sourceIndex` block is behaviorally identical to today.
+    //
+    // ONE RULE governs this whole block: remote config may make Singularity quieter, slower, or smaller without
+    // a build; it may never make it louder, faster, or larger than the value the app shipped with, and it may
+    // never touch a bound whose job is rejecting bad input. Nothing that gates admission or validates a response
+    // is wired here: SourceIndexContract's minimumServedCorroboration, maxServedSources, maxSeeders and
+    // maxSafeSizeBytes stay compile-time constants precisely because a remote value could only weaken them.
+    static let sourceIndexInterBatchDelayMs = 1100        // SourceIndexClient.interBatchDelayMs
+    // Descriptors per POST. PINNED, NOT A REMOTE DIAL. See the note in `validate` for the derivation that
+    // removed it: lowering this raises both the request count and the total D1 work, so as an emergency
+    // control it amplifies the incident it exists to contain.
+    static let sourceIndexBatchSize = 16                  // SourceIndexClient.batchSize == worker MAX_SOURCES_PER_CONTRIBUTE
+    static let sourceIndexMaxDescriptorsPerTitle = 2000   // SourceIndexClient.maxDescriptorsPerTitle
+    static let sourceIndexResumeHoardMaxWaitMs = 5000     // hoardResumedGroups(maxWaitMs:) default
+    static let sourceIndexResumeHoardPollIntervalMs = 250 // hoardResumedGroups(pollIntervalMs:) default
+    // TWO DISTINCT QUANTITIES, kept apart because conflating them broke the baked-equivalence contract.
+    //
+    // The CAP is a constant guard, not a mirror of a shipping literal: the resume poll count is
+    // maxWaitMs / pollIntervalMs, so two individually in-range remote values can multiply into far more
+    // MainActor polling during playback start than either looks like it buys. The cap trims that product.
+    static let sourceIndexResumeHoardAttemptCap = 60
+    // The COUNT is what the app actually polls with the baked pair: 5000 / 250 = 20, well under the cap.
+    //
+    // WHY THE SPLIT. `ResolvedConfig.baked` used to store the CAP (60) in the same field that
+    // `validate({})` fills with the DERIVED COUNT (20), so the all-baked snapshot and the snapshot produced
+    // by an empty remote config disagreed on a value the app reads -- while the whole point of `.baked` is
+    // that the two are byte-for-value identical. They now hold separate fields and agree on both.
+    static let sourceIndexResumeHoardAttempts =
+        min(sourceIndexResumeHoardAttemptCap,
+            max(1, sourceIndexResumeHoardMaxWaitMs / sourceIndexResumeHoardPollIntervalMs))
+    static let sourceIndexRequestTimeoutSecs = 8          // SourceIndexClient POST + GET timeoutInterval
 
     // Community-subtitle feature flags, baked defaults (call sites pass these to isFeatureOn).
     static let featureCommunitySubtitles = true    // pooled-subtitle read + upload master gate
@@ -202,6 +244,19 @@ struct RemoteConfigData: Decodable {
     struct LangIndex: Decodable {
         let minSeen: Int?
     }
+    /// Singularity upload/rate tunables. Every field optional and backward-compatible: a config with no
+    /// `sourceIndex` block decodes fine and every value falls back to its baked default. No admission or
+    /// response-validation bound appears here by design; see `RemoteConfigDefaults` for why.
+    struct SourceIndex: Decodable {
+        let interBatchDelayMs: Int?
+        // `batchSize` DELIBERATELY ABSENT. It was a remote dial and was removed; see validate for the
+        // derivation. A config that still carries the key decodes fine and the key is ignored, which is the
+        // intended migration path (the field is pinned at RemoteConfigDefaults.sourceIndexBatchSize).
+        let maxDescriptorsPerTitle: Int?
+        let resumeHoardMaxWaitMs: Int?
+        let resumeHoardPollIntervalMs: Int?
+        let requestTimeoutSecs: Int?
+    }
     struct Timeouts: Decodable {
         let detailSettleIOSSecs: Int?
         let detailSettleTVSecs: Int?
@@ -218,6 +273,7 @@ struct RemoteConfigData: Decodable {
     let timeouts: Timeouts?
     let subtitle: Subtitle?
     let langIndex: LangIndex?
+    let sourceIndex: SourceIndex?
     let skipProvider: String?
     let schemaVersion: Int?
     let configRevision: String?   // opaque ISO string (e.g. "2026-07-01T00:00:00Z"); NOT an Int. A wrong
@@ -268,6 +324,22 @@ final class ResolvedConfig: @unchecked Sendable {
     let subtitleOffsetBucketMs: Int
     let langIndexMinSeen: Int
 
+    // Singularity upload/rate tunables, clamped one-directionally (see validate for which side is the risk side).
+    let sourceIndexInterBatchDelayMs: Int
+    let sourceIndexBatchSize: Int
+    let sourceIndexMaxDescriptorsPerTitle: Int
+    let sourceIndexResumeHoardMaxWaitMs: Int
+    let sourceIndexResumeHoardPollIntervalMs: Int
+    /// The CONSTANT ceiling on resume poll attempts. Never derived from the two values above; it exists to
+    /// trim their product. Read by the client, which is handed caller-supplied wait/interval values and so
+    /// must apply the cap itself rather than trust a precomputed count.
+    let sourceIndexResumeHoardAttemptCap: Int
+    /// The RESOLVED current attempt count for the default pair: min(cap, maxWaitMs / pollIntervalMs). Baked
+    /// and validate-with-empty-config must agree on this exactly; they disagreed (60 vs 20) while one field
+    /// carried both meanings.
+    let sourceIndexResumeHoardAttempts: Int
+    let sourceIndexRequestTimeoutSecs: Int
+
     // Feature tri-state (nil = baked default; the accessor substitutes the call site's `default:`).
     private let features: [String: Bool]
 
@@ -297,6 +369,14 @@ final class ResolvedConfig: @unchecked Sendable {
          subtitleUploadMaxBytes: Int,
          subtitleOffsetBucketMs: Int,
          langIndexMinSeen: Int,
+         sourceIndexInterBatchDelayMs: Int,
+         sourceIndexBatchSize: Int,
+         sourceIndexMaxDescriptorsPerTitle: Int,
+         sourceIndexResumeHoardMaxWaitMs: Int,
+         sourceIndexResumeHoardPollIntervalMs: Int,
+         sourceIndexResumeHoardAttemptCap: Int,
+         sourceIndexResumeHoardAttempts: Int,
+         sourceIndexRequestTimeoutSecs: Int,
          features: [String: Bool],
          refreshIntervalHours: Int) {
         self.remoteConfigEnabled = remoteConfigEnabled
@@ -322,6 +402,14 @@ final class ResolvedConfig: @unchecked Sendable {
         self.subtitleUploadMaxBytes = subtitleUploadMaxBytes
         self.subtitleOffsetBucketMs = subtitleOffsetBucketMs
         self.langIndexMinSeen = langIndexMinSeen
+        self.sourceIndexInterBatchDelayMs = sourceIndexInterBatchDelayMs
+        self.sourceIndexBatchSize = sourceIndexBatchSize
+        self.sourceIndexMaxDescriptorsPerTitle = sourceIndexMaxDescriptorsPerTitle
+        self.sourceIndexResumeHoardMaxWaitMs = sourceIndexResumeHoardMaxWaitMs
+        self.sourceIndexResumeHoardPollIntervalMs = sourceIndexResumeHoardPollIntervalMs
+        self.sourceIndexResumeHoardAttemptCap = sourceIndexResumeHoardAttemptCap
+        self.sourceIndexResumeHoardAttempts = sourceIndexResumeHoardAttempts
+        self.sourceIndexRequestTimeoutSecs = sourceIndexRequestTimeoutSecs
         self.features = features
         self.refreshIntervalHours = refreshIntervalHours
     }
@@ -353,6 +441,14 @@ final class ResolvedConfig: @unchecked Sendable {
             subtitleUploadMaxBytes: RemoteConfigDefaults.subtitleUploadMaxBytes,
             subtitleOffsetBucketMs: RemoteConfigDefaults.subtitleOffsetBucketMs,
             langIndexMinSeen: RemoteConfigDefaults.langIndexMinSeen,
+            sourceIndexInterBatchDelayMs: RemoteConfigDefaults.sourceIndexInterBatchDelayMs,
+            sourceIndexBatchSize: RemoteConfigDefaults.sourceIndexBatchSize,
+            sourceIndexMaxDescriptorsPerTitle: RemoteConfigDefaults.sourceIndexMaxDescriptorsPerTitle,
+            sourceIndexResumeHoardMaxWaitMs: RemoteConfigDefaults.sourceIndexResumeHoardMaxWaitMs,
+            sourceIndexResumeHoardPollIntervalMs: RemoteConfigDefaults.sourceIndexResumeHoardPollIntervalMs,
+            sourceIndexResumeHoardAttemptCap: RemoteConfigDefaults.sourceIndexResumeHoardAttemptCap,
+            sourceIndexResumeHoardAttempts: RemoteConfigDefaults.sourceIndexResumeHoardAttempts,
+            sourceIndexRequestTimeoutSecs: RemoteConfigDefaults.sourceIndexRequestTimeoutSecs,
             features: [:],
             refreshIntervalHours: RemoteConfigDefaults.refreshIntervalHours)
     }
@@ -405,6 +501,10 @@ final class ResolvedConfig: @unchecked Sendable {
 
     /// Community-subtitle download budget as a `TimeInterval` (seconds); baked 12 s.
     var subtitleDownloadTimeout: TimeInterval { TimeInterval(subtitleDownloadTimeoutMs) / 1000.0 }
+
+    /// Singularity per-request budget as a `TimeInterval` (seconds); baked 8 s. Shared by the contribute POST and
+    /// the serve GET so one dial cannot pace the two verbs apart.
+    var sourceIndexRequestTimeout: TimeInterval { TimeInterval(sourceIndexRequestTimeoutSecs) }
 
     /// Tri-state feature read: remote true/false wins; remote null (absent) => the call site's baked default.
     func isFeatureOn(_ key: String, default fallback: Bool) -> Bool {
@@ -616,6 +716,82 @@ actor RemoteConfig {
         let subOffsetBucket = clamp(data.subtitle?.offsetBucketMs, RemoteConfigDefaults.subtitleOffsetBucketMs, 50, 2000)
         let langMinSeen = clamp(data.langIndex?.minSeen, RemoteConfigDefaults.langIndexMinSeen, 1, 50)
 
+        // --- Singularity upload/rate tunables. Each range is deliberately one-directional: the endpoint on a
+        //     knob's RISK side equals the protective value, so no in-range remote value can push the client past
+        //     a bound it already relies on. The two reviews differed on three of these bounds and the SAFER
+        //     bound is taken below, named at each site.
+        //
+        // Pacing floor between contribute POSTs. Risk side is DOWN: a shorter delay multiplies POSTs per minute
+        // against the worker's 240/minute per-IP budget, which several devices behind one NAT already share. The
+        // safer of the two proposed floors is taken: 1100 (the baked value) rather than 500, making this knob
+        // slow-only. That loses nothing, because the operator need this dial exists for is throttling the fleet
+        // DOWN during a D1 incident; going faster than the shipped cadence was never the point. The 30 s ceiling
+        // bounds that throttle so the batch loop stalls but never halts.
+        let siDelayMs = clamp(data.sourceIndex?.interBatchDelayMs,
+                              RemoteConfigDefaults.sourceIndexInterBatchDelayMs, 1100, 30000)
+        // Descriptors per POST: PINNED at the baked 16, NOT remotely tunable. It was a dial with a 1...16
+        // clamp, and the justification given for keeping it ("16 sources cost 49 D1 statements against the
+        // 50-query invocation limit, so 8 halves that") is wrong about the quantity that matters.
+        //
+        // THE DERIVATION, so the next reader can check this rather than trust it. The worker's documented cost
+        // is `3 * sources + 1` D1 operations per request (three statements per source plus one retention
+        // prune). With the per-title cap at 2000 descriptors:
+        //
+        //     batch 16 -> ceil(2000/16) = 125 POSTs, 125 * (3*16 + 1) = 6125 D1 ops
+        //     batch  8 -> ceil(2000/ 8) = 250 POSTs, 250 * (3* 8 + 1) = 6250 D1 ops
+        //     batch  1 ->      2000      POSTs, 2000 * (3* 1 + 1) = 8000 D1 ops
+        //
+        // Lowering the dial RAISES the request count AND the total work, because the per-request `+1` prune is
+        // paid once per POST no matter how few sources it carries. Only the PER-INVOCATION statement count
+        // falls, and that is not the resource an incident exhausts. So the emergency control amplifies the
+        // incident it exists to contain, which violates this block's own governing rule (remote config may
+        // make Singularity quieter, slower or smaller, never louder, faster or larger).
+        //
+        // The dial that genuinely sheds load is `maxDescriptorsPerTitle` (fewer POSTs and less work, in the
+        // same direction), and the kill switch is the `sourceIndex` feature flag. Both remain.
+        //
+        // 16 is also the worker's MAX_SOURCES_PER_CONTRIBUTE: a POST above it is rejected whole, so the value
+        // has a hard ceiling at exactly the point it is pinned.
+        let siBatchSize = RemoteConfigDefaults.sourceIndexBatchSize
+        // Per-title descriptor cap. DOWN-ONLY: raising it only ever buys more background POSTs, and at 16 per
+        // POST the baked 2000 is already up to 125 of them holding the process-wide pacer. The floor keeps one
+        // full batch, so no remote value can silently zero out contribution by this path; the reviewed kill
+        // switch for that is the `sourceIndex` feature flag, which has a real lifecycle retirement.
+        let siPerTitle = clamp(data.sourceIndex?.maxDescriptorsPerTitle,
+                               RemoteConfigDefaults.sourceIndexMaxDescriptorsPerTitle, 16, 2000)
+        // Resume-hoard poll budget. NAMED EXCEPTION to this block's "never louder than shipping" rule, stated
+        // here rather than left hidden under the universal wording, because it is the only knob in the block
+        // that can raise client work above the shipped value.
+        //
+        // THE EXCEPTION, and its exact bound. Shipping polls 20 attempts over ~5 s (5000 / 250). This ceiling
+        // permits 20000 ms, which at the pinned 250 ms floor is 80 attempts, trimmed by the derived cap below
+        // to 60 attempts over ~15 s. So the worst case a remote value can buy is 3x the shipped attempt count
+        // and 3x the shipped wall time, on a path that is a bounded poll and whose every timeout is a silent
+        // no-op. Nothing here can run unbounded and nothing here weakens an admission or validation bound.
+        //
+        // WHY IT IS WORTH THAT. The Continue Watching resume path plays a stored source WITHOUT opening the
+        // detail view, so when meta settles slower than the budget on a cold network the most common playback
+        // population contributes nothing at all, and there is no other backend lever for it. This is an
+        // AVAILABILITY exception, deliberately taken, not an oversight in the rule.
+        let siResumeWaitMs = clamp(data.sourceIndex?.resumeHoardMaxWaitMs,
+                                   RemoteConfigDefaults.sourceIndexResumeHoardMaxWaitMs, 250, 20000)
+        // Resume-hoard poll interval. Risk side is DOWN: each attempt resolves groups on the MainActor during
+        // playback start, the one place this otherwise cold feature brushes a hot path. Safer floor taken again:
+        // 250 (the baked value) rather than 100, so the interval is lengthen-only.
+        let siResumePollMs = clamp(data.sourceIndex?.resumeHoardPollIntervalMs,
+                                   RemoteConfigDefaults.sourceIndexResumeHoardPollIntervalMs, 250, 2000)
+        // The DERIVED quantity gets its own clamp. Clamping the pair above is not sufficient: 20000 / 250 is 80
+        // in-range attempts, each one MainActor work. With the baked pair this resolves to 20, so the cap is
+        // inert today and only ever trims a remote combination.
+        let siResumeAttempts = min(RemoteConfigDefaults.sourceIndexResumeHoardAttemptCap,
+                                   max(1, siResumeWaitMs / max(1, siResumePollMs)))
+        // Per-request budget, shared by the contribute POST and the serve GET. Availability lever, not a security
+        // one: every timeout path is already a silent no-op. Safer ceiling taken: 8 (the baked value) rather than
+        // 20, making it shorten-only, since a timeout longer than the pacing interval lets attempts stack against
+        // the same worker a slowdown is already straining. The 3 s floor keeps a normal mobile round trip alive.
+        let siTimeoutSecs = clamp(data.sourceIndex?.requestTimeoutSecs,
+                                  RemoteConfigDefaults.sourceIndexRequestTimeoutSecs, 3, 8)
+
         // --- Refresh cadence. ---
         let refreshHours = clamp(data.refreshIntervalHours, RemoteConfigDefaults.refreshIntervalHours, 1, 24)
 
@@ -674,12 +850,23 @@ actor RemoteConfig {
             subtitleUploadMaxBytes: subUploadMax,
             subtitleOffsetBucketMs: subOffsetBucket,
             langIndexMinSeen: langMinSeen,
+            sourceIndexInterBatchDelayMs: siDelayMs,
+            sourceIndexBatchSize: siBatchSize,
+            sourceIndexMaxDescriptorsPerTitle: siPerTitle,
+            sourceIndexResumeHoardMaxWaitMs: siResumeWaitMs,
+            sourceIndexResumeHoardPollIntervalMs: siResumePollMs,
+            sourceIndexResumeHoardAttemptCap: RemoteConfigDefaults.sourceIndexResumeHoardAttemptCap,
+            sourceIndexResumeHoardAttempts: siResumeAttempts,
+            sourceIndexRequestTimeoutSecs: siTimeoutSecs,
             features: features,
             refreshIntervalHours: refreshHours)
     }
 
     /// Clamp an optional Int into [lo, hi], falling back to `fallback` when nil. `fallback` is assumed already
     /// in range (it is a shipping constant).
+    /// ABSENT -> `fallback` (the baked default). PRESENT BUT OUT OF RANGE -> the nearest edge, `lo` or `hi`,
+    /// NOT the fallback. Both behaviours are intended; they are spelled out here because the file's design
+    /// contract used to describe only the first and claim it covered the second.
     private static func clamp(_ value: Int?, _ fallback: Int, _ lo: Int, _ hi: Int) -> Int {
         guard let value else { return fallback }
         return min(hi, max(lo, value))

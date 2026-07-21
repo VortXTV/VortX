@@ -3137,7 +3137,7 @@ struct TVPlayerView: View {
             var secs = await Self.cinemetaRuntimeSeconds(kind: "movie", id: ttId)
             if secs <= 0 { secs = await Self.cinemetaRuntimeSeconds(kind: "series", id: ttId) }
             guard secs > 0 else {
-                VXProbe.log("tp", "provisional key MISS stays (tvOS): no cinemeta runtime for \(ttId)")
+                VXProbe.log("tp", "provisional key MISS stays (tvOS): no cinemeta runtime for \(VXProbeRedaction.identityToken(ttId))")
                 return
             }
             await MainActor.run {

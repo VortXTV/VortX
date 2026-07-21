@@ -674,7 +674,7 @@ struct PlayerScreen: View {
         // Gated (no-op unless probing is on), so it is free in shipping builds. If engine is AVPlayer on a DV
         // source it is the true-DV lane (VideoToolbox); if it is mpv here the DV source tone-maps to HDR10.
         let candidacy = PlayerEngineRouter.dvRemuxCandidacy(url)
-        VXProbe.log("dv", "route file=\(url.lastPathComponent) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(candidacy.candidate) [\(candidacy.reason)] container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)")
+        VXProbe.log("dv", "route file=\(VXProbeRedaction.identityToken(url.lastPathComponent)) ext=\(url.pathExtension) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(candidacy.candidate) [\(candidacy.reason)] container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)")
         return chosen == .avfoundation
     }
     #endif
@@ -916,7 +916,7 @@ struct PlayerScreen: View {
             #endif
             srcProbe("LOAD START host=\(url.host ?? "-") resume=\(resumeSeconds > 5 ? "Y@\(Int(resumeSeconds))s" : "N") explicit=\(startedFromExplicitPick ? "Y" : "N") debridRef=\(recordDebridRef != nil ? "Y(\(recordDebridRef!.service))" : "N") trailer=\(isTrailer ? "Y" : "N") willRouteAV=\(srcProbeRouteAV)")
             // Diagnostic-only: a notable transition (a source begins loading) surfaced in the heartbeat too.
-            VXProbe.event("player", "open \(curTitle.isEmpty ? "-" : curTitle)")
+            VXProbe.event("player", "open title=\(VXProbeRedaction.identityToken(curTitle))")
             scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
             configureCommunityTrickplayProvisional()
             startTrickplayCaptureTimer()   // wall-clock capture backstop (fires on both engines)
@@ -1496,13 +1496,13 @@ struct PlayerScreen: View {
         // self-heal with a one-shot runtime fetch; mpv's real duration (when it does arrive) still
         // re-keys exactly as before. A tmdb-keyed play resolves its tt id FIRST (Cinemeta only speaks
         // imdb), and the resolver caches the mapping for the store's own keying. Fail-soft on every step.
-        VXProbe.log("tp", "provisional key MISS: playing=\(m.libraryId) metaDetails=\(core.metaDetails?.meta?.id ?? "nil") (fetching runtime)")
+        VXProbe.log("tp", "provisional key MISS: playing=\(VXProbeRedaction.identityToken(m.libraryId)) metaDetails=\(VXProbeRedaction.identityToken(core.metaDetails?.meta?.id)) (fetching runtime)")
         Task {
             var ttId = m.libraryId
             if !ttId.hasPrefix("tt") {
                 guard ttId.lowercased().hasPrefix("tmdb"),
                       let tt = await CommunityTrickplay.resolveIMDbID(rawId: m.libraryId, seriesHint: m.season != nil) else {
-                    VXProbe.log("tp", "provisional key MISS stays: unresolvable id \(m.libraryId)")
+                    VXProbe.log("tp", "provisional key MISS stays: unresolvable id \(VXProbeRedaction.identityToken(m.libraryId))")
                     return
                 }
                 ttId = tt
@@ -1510,7 +1510,7 @@ struct PlayerScreen: View {
             var secs = await Self.cinemetaRuntimeSeconds(kind: "movie", id: ttId)
             if secs <= 0 { secs = await Self.cinemetaRuntimeSeconds(kind: "series", id: ttId) }
             guard secs > 0 else {
-                VXProbe.log("tp", "provisional key MISS stays: no cinemeta runtime for \(ttId)")
+                VXProbe.log("tp", "provisional key MISS stays: no cinemeta runtime for \(VXProbeRedaction.identityToken(ttId))")
                 return
             }
             await MainActor.run {

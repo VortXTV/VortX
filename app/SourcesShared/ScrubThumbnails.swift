@@ -113,7 +113,7 @@ final class ScrubThumbnailsStore: ObservableObject {
             // Diagnose an empty server table: log WHY we never key (the remaining culprits are a non-tt,
             // non-tmdb libraryId, e.g. kitsu:/paste-a-link, or a zero duration).
             if enabled, communityKey == nil {
-                VXProbe.log("tp", "community NOT keyed (need a tt-imdb id + duration>0): imdb=\(imdbId ?? "nil") dur=\(Int(duration))")
+                VXProbe.log("tp", "community NOT keyed (need a tt-imdb id + duration>0): imdb=\(VXProbeRedaction.identityToken(imdbId)) dur=\(Int(duration))")
             }
             return
         }
@@ -124,7 +124,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         if communityKey == key { return }
         if communityKey != nil, !isRealDuration { return }   // keep the provisional key until the real one lands
         let rekeying = communityKey != nil
-        VXProbe.log("tp", "community \(rekeying ? "re-keyed" : "keyed"): \(key) (imdb=\(imdbId) real=\(isRealDuration ? "yes" : "no"))")
+        VXProbe.log("tp", "community \(rekeying ? "re-keyed" : "keyed"): \(VXProbeRedaction.identityToken(key)) (imdb=\(VXProbeRedaction.identityToken(imdbId)) real=\(isRealDuration ? "yes" : "no"))")
         communityKey = key
         communityImdb = imdbId
         communitySeason = season
@@ -162,7 +162,7 @@ final class ScrubThumbnailsStore: ObservableObject {
             await MainActor.run {
                 guard let self else { return }
                 guard let tt else {
-                    VXProbe.log("tp", "tmdb->imdb resolve FAILED for \(rawId) (session stays local-only)")
+                    VXProbe.log("tp", "tmdb->imdb resolve FAILED for \(VXProbeRedaction.identityToken(rawId)) (session stays local-only)")
                     return
                 }
                 self.configureCommunity(imdbId: tt, season: season, episode: episode,
@@ -313,7 +313,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         let willUpload = enabled && hasKey && beatsStored && hasNewCoverage && throttleElapsed
             && enoughToBuild && coverageReady && !uploadInFlight && communityImdb != nil
         let sincePushS = lastUploadUptime == 0 ? -1 : Int(now - lastUploadUptime)
-        VXProbe.log("tp", "upload-gate frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) sincePushS=\(sincePushS) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") imdb=\(communityImdb ?? "nil") beatsStored=\(beatsStored ? "true" : "false") hasNewCoverage=\(hasNewCoverage ? "true" : "false") throttleElapsed=\(throttleElapsed ? "true" : "false") enoughToBuild=\(enoughToBuild ? "true" : "false") coverageReady=\(coverageReady ? "true" : "false") inFlight=\(uploadInFlight ? "true" : "false") -> \(willUpload ? "UPLOAD" : "skip")")
+        VXProbe.log("tp", "upload-gate frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) sincePushS=\(sincePushS) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") imdb=\(VXProbeRedaction.identityToken(communityImdb)) beatsStored=\(beatsStored ? "true" : "false") hasNewCoverage=\(hasNewCoverage ? "true" : "false") throttleElapsed=\(throttleElapsed ? "true" : "false") enoughToBuild=\(enoughToBuild ? "true" : "false") coverageReady=\(coverageReady ? "true" : "false") inFlight=\(uploadInFlight ? "true" : "false") -> \(willUpload ? "UPLOAD" : "skip")")
         // NOTE: the old `hasRealDuration` gate here blocked EVERY upload for a debrid direct-HTTP MKV, because
         // hasRealDuration is only set by mpv's `duration` event, which those streams frequently never deliver.
         // That is exactly the content the owner watches, so trickplay uploaded nothing (build 138 regression).
@@ -357,7 +357,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         let frames = sessionFrames
         let season = communitySeason, episode = communityEpisode
         let bucket = communityDurationBucket, height = communitySrcHeight
-        VXProbe.log("tp", "pushUpload FIRING key=\(key) imdb=\(imdb) frames=\(frames.count)")
+        VXProbe.log("tp", "pushUpload FIRING key=\(VXProbeRedaction.identityToken(key)) imdb=\(VXProbeRedaction.identityToken(imdb)) frames=\(frames.count)")
         Task.detached(priority: .utility) { [weak self] in
             let outcome = await CommunityTrickplay.buildAndUpload(
                 key: key, imdbId: imdb, season: season, episode: episode,
@@ -372,7 +372,7 @@ final class ScrubThumbnailsStore: ObservableObject {
             case .rejected(let reason): resultLabel = "rejected(\(reason))"
             case .failed: resultLabel = "failed"
             }
-            VXProbe.log("tp", "upload key=\(key) frames=\(frames.count) -> \(resultLabel)")
+            VXProbe.log("tp", "upload key=\(VXProbeRedaction.identityToken(key)) frames=\(frames.count) -> \(resultLabel)")
             await MainActor.run { self?.uploadInFlight = false }
         }
     }
