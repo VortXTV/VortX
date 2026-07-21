@@ -227,7 +227,13 @@ targets:
         com.apple.developer.kernel.increased-memory-limit: true
     sources:
       - SourcesiOS # touch UI
-      - SourcesShared # shared engine bridge, models, account, ranking, profiles, themes
+      # Tooling hook logs land inside the source tree and XcodeGen otherwise sweeps them in as bundle
+      # resources, which fails the build with "Multiple commands produce .../hook-log.jsonl" because the
+      # same basename appears under several roots. They are generated artifacts, never sources.
+      - path: SourcesShared
+        excludes: [".claude/**"]
+        # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      # shared engine bridge, models, account, ranking, profiles, themes
       - Sources/Player # libmpv player core (shared with tvOS)
       - Sources/NodeServer.swift # embedded streaming server
       - Sources/PlayerScreen.swift # full native touch player (controls, tracks, resume), reused by the native UI
@@ -324,8 +330,15 @@ targets:
     deploymentTarget: "14.0" # MPVKit's macOS slices (Libuavs3d) require macOS 14
     sources:
       - SourcesiOS # the native SwiftUI UI also runs on macOS
-      - SourcesShared # includes MacNodeServer.swift (the child-process node server)
-      - Sources/Player
+      # Tooling hook logs land inside the source tree and XcodeGen otherwise sweeps them in as bundle
+      # resources, which fails the build with "Multiple commands produce .../hook-log.jsonl" because the
+      # same basename appears under several roots. They are generated artifacts, never sources.
+      - path: SourcesShared
+        excludes: [".claude/**"]
+        # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      # includes MacNodeServer.swift (the child-process node server)
+      - path: Sources/Player
+        excludes: [".claude/**"]
       - Sources/PlayerScreen.swift
       - Sources/ShareSheet.swift
       - Sources/ExternalPlayer.swift
@@ -425,8 +438,15 @@ targets:
       - path: SourcesTV
         excludes:
           - TopShelfExtension/**
-      - SourcesShared # OS-agnostic layer: engine bridge, models, account, ranking, themes
-      - Sources/Player
+      # Tooling hook logs land inside the source tree and XcodeGen otherwise sweeps them in as bundle
+      # resources, which fails the build with "Multiple commands produce .../hook-log.jsonl" because the
+      # same basename appears under several roots. They are generated artifacts, never sources.
+      - path: SourcesShared
+        excludes: [".claude/**"]
+        # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      - path: Sources/Player
+        excludes: [".claude/**"]
       - Sources/NodeServer.swift
       - ResourcesTV/Assets.xcassets
       - Resources/Localizable.xcstrings # shared String Catalog (en + translations)
@@ -571,8 +591,15 @@ targets:
       - path: SourcesTV
         excludes:
           - TopShelfExtension/**
-      - SourcesShared # OS-agnostic layer: engine bridge, models, account, ranking, themes
-      - Sources/Player
+      # Tooling hook logs land inside the source tree and XcodeGen otherwise sweeps them in as bundle
+      # resources, which fails the build with "Multiple commands produce .../hook-log.jsonl" because the
+      # same basename appears under several roots. They are generated artifacts, never sources.
+      - path: SourcesShared
+        excludes: [".claude/**"]
+        # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      - path: Sources/Player
+        excludes: [".claude/**"]
       - ResourcesTV/Assets.xcassets
       - Resources/Localizable.xcstrings # shared String Catalog (en + translations)
       # Same full font set as the Full build. Lite briefly dropped the CJK face, but libass's

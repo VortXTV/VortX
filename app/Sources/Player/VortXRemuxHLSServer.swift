@@ -74,9 +74,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// (the caller fails soft to libmpv). The caller must `start()` the returned server to begin remuxing.
     /// `mode` (#147): `.dolbyVision` (the default, the original lane) or `.plain` for a non-DV MKV kept on
     /// AVPlayer for Picture in Picture; the mode flows into classify + signaling (see VortXMKVRemuxStream.Mode).
+    /// `startAtSeconds` (resume): the source second production should BEGIN at, or 0 for the beginning. The
+    /// stream seeks its input there once, before muxing anything, and publishes where it actually landed as
+    /// `timelineOriginSeconds`; the engine maps between that player clock and source seconds. 0 reproduces the
+    /// pre-resume behavior exactly (no seek, no rebase, identical bytes).
     static func make(input: URL, headers: [String: String]?,
-                     mode: VortXMKVRemuxStream.Mode = .dolbyVision) -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
-        let stream = VortXMKVRemuxStream(input: input.absoluteString, headers: headers, indexForHLS: true, mode: mode)
+                     mode: VortXMKVRemuxStream.Mode = .dolbyVision,
+                     startAtSeconds: Double = 0) -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
+        let stream = VortXMKVRemuxStream(input: input.absoluteString, headers: headers, indexForHLS: true, mode: mode,
+                                         startAtSeconds: startAtSeconds)
         let server = VortXRemuxHLSServer(stream: stream)
         guard server.listen() else { return nil }
         var comps = URLComponents()
@@ -102,6 +108,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// The source MKV runtime in seconds (0 until parsed / when unknown). The engine reads it at readyToPlay
     /// to synthesize a finite VOD duration, since the live HLS delivery keeps AVPlayerItem.duration INDEFINITE.
     var sourceDurationSeconds: Double { stream.sourceDurationSeconds }
+
+    /// The source second the produced stream begins at (0 = the beginning, which is every non-resuming mount
+    /// and every mount whose input seek failed). The engine reads it at readyToPlay and holds it for the item,
+    /// converting between the player clock and the source seconds the chrome speaks. See `RemuxResumePolicy`.
+    var timelineOriginSeconds: Double { stream.timelineOriginSeconds }
 
     /// The source MKV chapter markers (start seconds + title). The engine reads these for the Chapters panel /
     /// scrubber ticks on the DV remux lane, since the local HLS delivery carries no chapter metadata (Gap 3).
@@ -258,6 +269,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             if path.hasPrefix("/seg"), path.hasSuffix(".m4s"),
                let index = Int(path.dropFirst(4).dropLast(4)) {
                 serveSegment(connection, index: index)
+            } else if let request = SubtitleRenditionPolicy.parseRequest(path: path) {
+                // The paths this matches are the ones SubtitleRenditionPolicy generates, so generator and
+                // parser are asserted against each other in one executable suite rather than agreeing by eye.
+                switch request {
+                case .playlist(let id):        serveSubtitlePlaylist(connection, renditionID: id)
+                case .segment(let id, let n):  serveSubtitleSegment(connection, renditionID: id, index: n)
+                }
             } else {
                 DiagnosticsLog.log("dv", "hls 404 \(path)")
                 close(connection, status: "404 Not Found")
@@ -342,6 +360,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         _ = waitFor(seconds: 6) { HDRDisplayMode.isSwitchSettled ? true : nil }
         var codecs = sig.videoCodec
         if let audio = sig.audioCodec { codecs += ",\(audio)" }
+        // Embedded TEXT subtitles ride as SEPARATE renditions, never in the mux (the mp4 muxer cannot
+        // stream-copy Matroska text codecs). Both are empty when the feature is off or the source carries no
+        // text subtitle track, and both lanes below then render exactly the bytes they rendered before, which
+        // is what keeps a subtitle-less DV mount on the shape the b170/#143 work settled on.
+        let subtitleRenditions = stream.subtitleSnapshot().renditions
+        let subtitleTags = subtitleRenditions.map { SubtitleRenditionPolicy.mediaTag($0) }
+        let subtitleAttribute = SubtitleRenditionPolicy.streamInfAttribute(renditionCount: subtitleRenditions.count)
         // #147 PLAIN lane: ONE variant, no SUPPLEMENTAL-CODECS, no VIDEO-RANGE (sig built them nil) - the
         // exact range-unlabeled shape the b170 bisect proved always survives AVFoundation's variant filter,
         // so no lifeboat second variant is needed (the lifeboat exists only because the DV variant's explicit
@@ -352,8 +377,10 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             if sig.width > 0, sig.height > 0 { inf += ",RESOLUTION=\(sig.width)x\(sig.height)" }
             inf += ",CODECS=\"\(codecs)\""
             if sig.fps > 0 { inf += String(format: ",FRAME-RATE=%.3f", sig.fps) }   // authoring rule 9.15 (MUST)
-            let body = Data("#EXTM3U\n#EXT-X-VERSION:7\n\(inf)\nmedia.m3u8\n".utf8)
-            DiagnosticsLog.log("dv", "hls resp /master.m3u8 variants=1 (plain) \(body.count)B")
+            inf += subtitleAttribute
+            let head = (["#EXTM3U", "#EXT-X-VERSION:7"] + subtitleTags).joined(separator: "\n")
+            let body = Data("\(head)\n\(inf)\nmedia.m3u8\n".utf8)
+            DiagnosticsLog.log("dv", "hls resp /master.m3u8 variants=1 (plain) subs=\(subtitleRenditions.count) \(body.count)B")
             respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
             return
         }
@@ -389,9 +416,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         if sig.width > 0, sig.height > 0 { fbInf += ",RESOLUTION=\(sig.width)x\(sig.height)" }
         fbInf += ",CODECS=\"\(codecs)\""
         if sig.fps > 0 { fbInf += String(format: ",FRAME-RATE=%.3f", sig.fps) }   // authoring rule 9.15 (MUST)
-        let playlist = "#EXTM3U\n#EXT-X-VERSION:7\n\(dvInf)\nmedia.m3u8\n\(fbInf)\nmedia-hdr.m3u8\n"
+        // BOTH variants reference the group. A rendition group belongs to the variants that can use it, and
+        // the lifeboat is a real playable variant: leaving it out would mean losing subtitles exactly when
+        // AVFoundation latches the lifeboat, which is the case the lifeboat exists for.
+        dvInf += subtitleAttribute
+        fbInf += subtitleAttribute
+        let head = (["#EXTM3U", "#EXT-X-VERSION:7"] + subtitleTags).joined(separator: "\n")
+        let playlist = "\(head)\n\(dvInf)\nmedia.m3u8\n\(fbInf)\nmedia-hdr.m3u8\n"
         let body = Data(playlist.utf8)
-        DiagnosticsLog.log("dv", "hls resp /master.m3u8 variants=2 \(body.count)B")
+        DiagnosticsLog.log("dv", "hls resp /master.m3u8 variants=2 subs=\(subtitleRenditions.count) \(body.count)B")
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
     }
 
@@ -469,6 +502,64 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         if ended { lines.append("#EXT-X-ENDLIST") }
         lines.append("")
         return Data(lines.joined(separator: "\n").utf8)
+    }
+
+    // MARK: - Subtitle renditions
+
+    /// A subtitle rendition's media playlist. Mirrors the VIDEO playlist's segment list exactly (same count,
+    /// same durations), which is what keeps the rendition aligned with the video timeline.
+    ///
+    /// It answers from whatever segments exist rather than holding for the startup gate the video playlist
+    /// holds for: a subtitle rendition is never what AVPlayer computes its startup buffer from, and a held
+    /// subtitle request could only add latency to a start. An unknown rendition 404s, which is safe because
+    /// nothing references it: the master only advertises published renditions.
+    private func serveSubtitlePlaylist(_ connection: NWConnection, renditionID: Int) {
+        let subs = stream.subtitleSnapshot()
+        guard renditionID >= 0, renditionID < subs.renditions.count else {
+            DiagnosticsLog.log("dv", "hls 404 /subs\(renditionID).m3u8 (no such rendition)")
+            close(connection, status: "404 Not Found")
+            return
+        }
+        let snap = stream.hlsSnapshot()
+        let lines = SubtitleRenditionPolicy.mediaPlaylist(renditionID: renditionID,
+                                                          segmentDurations: snap.segments.map(\.duration),
+                                                          ended: snap.ended,
+                                                          targetDuration: VortXMKVRemuxStream.hlsTargetDuration)
+        let body = Data((lines.joined(separator: "\n") + "\n").utf8)
+        DiagnosticsLog.log("dv", "hls resp /subs\(renditionID).m3u8 segs=\(snap.segments.count) ended=\(snap.ended) \(body.count)B")
+        respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
+    }
+
+    /// One WebVTT segment of a rendition: the cues overlapping that video segment's time window.
+    ///
+    /// A segment INSIDE the advertised range always answers 200, even with no cues, because a 404 on an
+    /// advertised segment is an error the player reports rather than a gap it tolerates, and a stretch of film
+    /// with no dialogue is the normal case. Only an index nothing advertised 404s.
+    ///
+    /// The window is computed from the same closed-segment list the video playlist is built from, offset by
+    /// the source-clock instant segment 0 opened, because cues are stored in source seconds.
+    ///
+    /// Why the cues for an advertised segment are already collected: a segment only enters the playlist once
+    /// it is CLOSED, and it closes on the video packet that starts the NEXT segment, so the demuxer has
+    /// necessarily read past the segment's end before anything can request it. Subtitle packets are
+    /// interleaved with the video they caption, so they came out of the same reads.
+    private func serveSubtitleSegment(_ connection: NWConnection, renditionID: Int, index: Int) {
+        let subs = stream.subtitleSnapshot()
+        let snap = stream.hlsSnapshot()
+        guard renditionID >= 0, renditionID < subs.renditions.count,
+              index >= 0, index < snap.segments.count else {
+            DiagnosticsLog.log("dv", "hls 404 /subs\(renditionID)-\(index).vtt")
+            close(connection, status: "404 Not Found")
+            return
+        }
+        var start = subs.originSec
+        for seg in snap.segments where seg.index < index { start += seg.duration }
+        let end = start + snap.segments[index].duration
+        let all = renditionID < subs.cues.count ? subs.cues[renditionID] : []
+        let window = SubtitleRenditionPolicy.cues(all, overlapping: start, end: end)
+        let body = Data(SubtitleRenditionPolicy.webVTTDocument(cues: window).utf8)
+        DiagnosticsLog.log("dv", "hls resp /subs\(renditionID)-\(index).vtt cues=\(window.count) \(body.count)B")
+        respond(connection, body: body, contentType: "text/vtt")
     }
 
     /// The ftyp+moov init segment, retained in memory for the whole session (immune to window eviction).

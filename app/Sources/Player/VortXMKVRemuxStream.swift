@@ -30,16 +30,30 @@ import Libdovi
 ///     Vorbis, PCM variants), that ONE track is TRANSCODED in-flight by `VortXAudioTranscoder` (EAC3-first,
 ///     else AAC with today's bundled FFmpeg) so the DV lane no longer bails to libmpv's HDR10 tone-map over
 ///     audio alone. A source with no decodable AND no transcodable audio still fails fast to libmpv.
-///   - Subtitles: never mapped. The mp4 muxer cannot stream-copy Matroska text/PGS subtitle codecs
-///     (avformat_write_header fails and kills the whole session); the player's add-on/community subtitle
-///     panel covers subtitles on the AVPlayer path.
+///     Behind `multiAudioEnabled` (default off) the stream-copy lane may additionally map AT MOST ONE extra
+///     track, in a different language and the same codec, and only after that track has proven itself inside
+///     a bounded probe (see `probeAlternateFirstPacket`); an unproven alternate is dropped and the session
+///     continues single-track. Transcoding stays single-track. Heterogeneous codecs are out of scope.
+///   - Subtitles: never mapped, in any configuration. The mp4 muxer cannot stream-copy Matroska text/PGS
+///     subtitle codecs (avformat_write_header fails and kills the whole session). Behind
+///     `subtitleRenditionsEnabled` (default off) the source's TEXT subtitle tracks are instead collected off
+///     the demuxed packets and served as SEPARATE `EXT-X-MEDIA:TYPE=SUBTITLES` WebVTT renditions, which
+///     AVPlayer selects natively; the muxed bytes are identical either way. BITMAP subtitles (PGS/VobSub/DVB)
+///     stay out of scope: they are images, and WebVTT is text. See `SubtitleRenditionPolicy`.
 ///
 /// This mirrors `MKVRemuxSession`'s proven file-based remux (open input, map video/audio/subtitle streams,
 /// `avcodec_parameters_copy`, fragmented-mp4 movflags, `av_read_frame` -> `av_interleaved_write_frame`) but
 /// swaps the file sink for `avio_alloc_context` with a write callback appending to the buffer.
 ///
-/// Phase-1 scope: FORWARD-ONLY DELIVERY. The source is read straight through and the produced stream is served
-/// forward-only, so AVPlayer scrubbing past buffered content is a documented TODO. The custom AVIO IS seekable on
+/// FORWARD-ONLY DELIVERY, from a choosable ORIGIN. Production runs in one direction: the source is read straight
+/// through from wherever it starts and the produced stream is served forward-only, so scrubbing past what has
+/// been produced is still clamped rather than served. What IS supported is starting somewhere other than the
+/// beginning: `startAtSeconds` seeks the INPUT exactly once, before any byte is muxed, to the keyframe at or
+/// before that point, and every packet is then rebased so the produced stream still begins at zero. The source
+/// second it actually begins at is published as `timelineOriginSeconds`, and the engine converts between that
+/// player clock and the source seconds the chrome speaks (see `RemuxResumePolicy`). That is what lets a Dolby
+/// Vision title resume. With no origin requested, no seek runs, no rebase runs, and the bytes are unchanged.
+/// The custom AVIO IS seekable on
 /// the WRITE side, but ONLY so the muxer can backpatch box-size placeholders once a box length is known (see
 /// `avioSeek` / `avioWrite`); it never re-reads and never repositions the source. The remux loop runs on one
 /// dedicated background thread; `cancel()` requests a clean stop and the loop tears down in the correct
@@ -111,11 +125,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// write/seek callbacks synchronously on it), so it needs no lock.
     private var avioWriteCursor: Int = 0
 
-    init(input: String, headers: [String: String]?, indexForHLS: Bool = false, mode: Mode = .dolbyVision) {
+    init(input: String, headers: [String: String]?, indexForHLS: Bool = false, mode: Mode = .dolbyVision,
+         startAtSeconds: Double = 0) {
         self.input = input
         self.headers = headers
         self.hlsIndexingEnabled = indexForHLS
         self.mode = mode
+        self.requestedOriginSeconds = Self.resumeEnabled ? max(0, startAtSeconds) : 0
     }
 
     // MARK: - HLS output index (b166; populated only when `hlsIndexingEnabled`)
@@ -179,6 +195,36 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
     /// The source MKV chapter markers (start seconds + title, start-sorted; empty when none). Thread-safe.
     var chapters: [(start: Double, title: String)] { hlsLock.lock(); defer { hlsLock.unlock() }; return _chapters }
+
+    // Embedded TEXT subtitles, served as SEPARATE HLS renditions rather than muxed (the mp4 muxer cannot
+    // stream-copy Matroska text codecs; see SubtitleRenditionPolicy). Published under hlsLock: the renditions
+    // once, right after the source scan, and the cues progressively as packets are demuxed. Read from the
+    // server's serve queue. Empty whenever the feature is off or the source carries no text subtitle track,
+    // which is the state in which the master playlist is byte-identical to before.
+    private var _subtitleRenditions: [SubtitleRenditionPolicy.Rendition] = []
+    private var _subtitleCues: [[SubtitleRenditionPolicy.Cue]] = []
+    /// Source-clock second at which HLS segment 0 opens. Cues are stored in SOURCE seconds, while the segment
+    /// list the server windows them against measures from the first video packet, so this is the offset
+    /// between the two. nil until the first video packet; treated as 0 then, which is what every container
+    /// that starts at zero yields anyway.
+    private var _subtitleTimelineOriginSec: Double?
+    /// Input stream index -> (rendition id, payload format) for the tracks being collected. Remux-thread only
+    /// (built once during the source scan, read by the mux loops), so it needs no lock. Empty means no packet
+    /// is ever examined, which is exactly the state the feature flag being off produces.
+    private var subtitleCollectors: [Int: (renditionID: Int, format: SubtitleRenditionPolicy.TextFormat)] = [:]
+    /// Per-rendition text bytes stored so far, against `maxSubtitleBytesPerRendition`. Remux-thread only.
+    private var subtitleBytesStored: [Int: Int] = [:]
+    /// Renditions that hit a cap, so the log says so once instead of per packet. Remux-thread only.
+    private var subtitleCapLogged: Set<Int> = []
+
+    /// Consistent snapshot of the published subtitle renditions and their cues. Cue arrays are indexed by
+    /// `Rendition.id`, so `cues[r.id]` is always valid for a published rendition.
+    func subtitleSnapshot() -> (renditions: [SubtitleRenditionPolicy.Rendition],
+                                cues: [[SubtitleRenditionPolicy.Cue]],
+                                originSec: Double) {
+        hlsLock.lock(); defer { hlsLock.unlock() }
+        return (_subtitleRenditions, _subtitleCues, _subtitleTimelineOriginSec ?? 0)
+    }
 
     /// Consistent snapshot of the published HLS index for the local server. `initDataHDR` is the lifeboat
     /// variant's DV-stripped init (#143); non-nil exactly when `initData` is.
@@ -257,7 +303,189 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// and the moov is provably uncompletable. movenc attempts the auto-flush every 1s of media
     /// (frag_duration), and the DV pre-scan drain is capped at 240 packets (under ~10s of media even if
     /// all-video), so 12s of pure deferral is conclusive without ever tripping inside the drain.
+    /// The multi-audio probe can append further packets to that same drain, and on a low-bitrate source its
+    /// byte budget could span more than 12s of media. That does not weaken this deadline, because the probe
+    /// only reads to its budget when the alternate NEVER delivers, and an alternate that never delivers is
+    /// never mapped: the drain then feeds the same single audio track as today, whose first packet starts the
+    /// moov long before this deadline. A probe that ends early (the alternate delivered) maps a track that
+    /// has, by construction, a packet waiting in that same drain.
     private static let hlsPreInitMoovDeadlineSecs = 12.0
+
+    // MARK: - Bounded multi-track audio (feature flag)
+
+    /// Feature flag for the bounded second audio track. Default OFF: mapping a second track puts the moov,
+    /// and therefore the whole Dolby Vision / Atmos session, behind an extra track's first packet, so it ships
+    /// dark and is turned on deliberately. An explicit local UserDefaults value always wins (instant rollback
+    /// on a device already in the field), else the RemoteConfig feature acts as the fleet switch.
+    ///
+    /// The flag is the WHOLE boundary: with it off no alternate is considered, no probe reads a single extra
+    /// packet, and no audio metadata or disposition is written, so the produced bytes are exactly today's.
+    static let multiAudioKey = "stremiox.dvRemuxMultiAudio"
+    static var multiAudioEnabled: Bool {
+        if UserDefaults.standard.object(forKey: multiAudioKey) != nil {
+            return UserDefaults.standard.bool(forKey: multiAudioKey)
+        }
+        return RemoteConfig.snapshot.isFeatureOn("dvRemuxMultiAudio", default: false)
+    }
+
+    // MARK: - Resume: producing from a mid-title origin (feature flag)
+
+    /// Feature flag for starting production part-way into the source. An explicit local UserDefaults value
+    /// always wins (instant rollback on a device already in the field), else the RemoteConfig feature acts as
+    /// the fleet switch. Default ON, because the feature is already inert for every session that is not
+    /// resuming: with no resume point requested the origin is 0, which skips the input seek AND the packet
+    /// rebase, so the produced bytes are byte-identical to a mount without this code. The flag exists so a
+    /// source class that seeks badly can be taken off the path without a build.
+    static let resumeKey = "stremiox.dvRemuxResume"
+    static var resumeEnabled: Bool {
+        if UserDefaults.standard.object(forKey: resumeKey) != nil {
+            return UserDefaults.standard.bool(forKey: resumeKey)
+        }
+        return RemoteConfig.snapshot.isFeatureOn("dvRemuxResume", default: true)
+    }
+
+    /// The source second production was ASKED to begin at, or 0 for the beginning. Immutable for the session.
+    private let requestedOriginSeconds: Double
+
+    /// `AVSEEK_FLAG_BACKWARD` (1). Declared here for the same reason as `AV_PKT_FLAG_KEY_CONST` at the foot of
+    /// this file: libav defines it as a macro, which does not reliably reach Swift.
+    private static let avseekFlagBackward: Int32 = 1
+    /// `AV_TIME_BASE` (1000000), the unit `AVFormatContext.duration` and `avformat_seek_file` use.
+    private static let avTimeBase: Int64 = 1_000_000
+    /// `AV_TIME_BASE_Q`, the same unit as a rational, for `av_rescale_q` into a stream's own time base.
+    private static let avTimeBaseQ = AVRational(num: 1, den: 1_000_000)
+
+    /// Whether the input seek actually ran and succeeded. This, not the shift value, is what gates the rebase:
+    /// a successful seek can legitimately land at a source second of zero, and the two states must not be
+    /// confused. Remux-thread only (set before the first read, read on every packet).
+    private var originSeekApplied = false
+
+    /// How much every packet's timestamps are shifted back by, in AV_TIME_BASE units. 0 means no rebase, which
+    /// is the state for every mount that starts at the beginning AND for a mount whose input seek failed.
+    ///
+    /// Why rebase at all: after the input seek the source hands out packets stamped at the origin (half an hour
+    /// in, say). Shifting them back so the produced stream still starts at zero means the muxer, the fragment
+    /// cutter, the segment index, the subtitle cue collector and the playlist all see exactly the stream shape
+    /// they have always seen. The origin becomes ONE published number instead of an offset every one of those
+    /// pieces would have to agree about. Remux-thread only (latched on the first packet, read on every packet),
+    /// so it needs no lock.
+    private var originShiftUsec: Int64 = 0
+    /// Whether `originShiftUsec` has been decided yet. Separate from the value because a legitimate answer is
+    /// zero (a source whose first post-seek packet really is at zero). Remux-thread only.
+    private var originShiftLatched = false
+
+    // The achieved timeline origin in SOURCE seconds: the second the produced stream actually begins at.
+    // Published under hlsLock (written once on the remux thread, read from the player thread), exactly like
+    // _sourceDurationSeconds. 0 for a mount that starts at the beginning, which is every mount that is not
+    // resuming and every mount whose input seek failed. The engine reads it to convert between the player
+    // clock and the source seconds the chrome speaks; see RemuxResumePolicy.
+    private var _timelineOriginSeconds: Double = 0
+
+    /// The source second the produced stream begins at (0 = the beginning). Thread-safe.
+    var timelineOriginSeconds: Double { hlsLock.lock(); defer { hlsLock.unlock() }; return _timelineOriginSeconds }
+
+    /// `AV_DISPOSITION_DEFAULT` (1 << 0). Declared here for the same reason as `AV_PKT_FLAG_KEY_CONST` at the
+    /// foot of this file: the libav header defines it as a macro, which does not reliably reach Swift.
+    private static let avDispositionDefault: Int32 = 1 << 0
+    /// `AV_DISPOSITION_FORCED` (1 << 6), declared for the same reason.
+    private static let avDispositionForced: Int32 = 1 << 6
+
+    // MARK: - Embedded subtitles as a separate HLS rendition (feature flag)
+
+    /// Feature flag for serving the source's TEXT subtitle tracks as `EXT-X-MEDIA:TYPE=SUBTITLES` renditions.
+    /// An explicit local UserDefaults value always wins (instant rollback on a device already in the field),
+    /// else the RemoteConfig feature acts as the fleet switch.
+    ///
+    /// The flag is the WHOLE boundary. With it off no subtitle track is described, no subtitle packet is
+    /// examined, no cue is stored, and the master playlist is byte-identical to before. With it ON, the MUXED
+    /// bytes are still byte-identical: subtitle tracks are never added to the mux map (the mp4 muxer cannot
+    /// stream-copy Matroska text codecs, which is the whole reason for this shape), so nothing here can
+    /// affect the moov, the Dolby Vision signaling, or the delayed-init timing that the DV lane lives on.
+    static let subtitleRenditionsKey = "stremiox.dvRemuxSubtitles"
+    static var subtitleRenditionsEnabled: Bool {
+        if UserDefaults.standard.object(forKey: subtitleRenditionsKey) != nil {
+            return UserDefaults.standard.bool(forKey: subtitleRenditionsKey)
+        }
+        return RemoteConfig.snapshot.isFeatureOn("dvRemuxSubtitles", default: false)
+    }
+
+    /// Per-rendition cue cap. A two-hour film runs to roughly 2000 cues; 20000 is far above any real track and
+    /// still bounds a malformed source that emits a cue per frame. Reached means later cues are dropped, never
+    /// that playback is affected.
+    private static let maxCuesPerRendition = 20_000
+    /// Per-rendition text budget. Cues live in memory for the whole session (a segment can be requested at any
+    /// time), so the budget is what stops a pathological track from growing without limit. 4 MiB of text is
+    /// several times the largest real subtitle track.
+    private static let maxSubtitleBytesPerRendition = 4 * 1024 * 1024
+
+    /// The TEXT subtitle formats that can become WebVTT, mapped from libav codec ids HERE, where the libav
+    /// headers are imported, so `SubtitleRenditionPolicy` stays dependency-free and testable.
+    ///
+    /// BITMAP subtitles (PGS/HDMV, DVD/VobSub, DVB) deliberately return nil: they are images, and turning an
+    /// image into WebVTT would need OCR, which is out of scope. A source whose only subtitles are bitmaps
+    /// therefore advertises no renditions and behaves exactly as it does today, rather than advertising a
+    /// track that would show nothing.
+    private static func textSubtitleFormat(_ codecID: AVCodecID) -> SubtitleRenditionPolicy.TextFormat? {
+        switch codecID {
+        case AV_CODEC_ID_SUBRIP: return .subRip
+        case AV_CODEC_ID_ASS, AV_CODEC_ID_SSA: return .ass
+        case AV_CODEC_ID_MOV_TEXT: return .movText
+        case AV_CODEC_ID_WEBVTT: return .webVTT
+        case AV_CODEC_ID_TEXT: return .plainText
+        default: return nil
+        }
+    }
+
+    /// Bounded probe for the alternate audio track's FIRST real packet, run before any stream is mapped.
+    ///
+    /// Why a probe at all: movenc's delayed moov is written by an auto-flush that defers WHOLE until every
+    /// mapped track has delivered a sample. Map a track that never delivers and no moov is ever written, the
+    /// init segment never publishes, and the session demotes to libmpv, losing Dolby Vision and Atmos. Since a
+    /// mapped track cannot be removed after avformat_write_header, the only sound bound is to prove the track
+    /// before mapping it, which is what this does.
+    ///
+    /// Packets read here are APPENDED to `prebuffered` and drained into the muxer in order by the drain loop,
+    /// so nothing is re-read and the source is never rewound (the debrid HTTP AVIO is not reliably
+    /// byte-seekable). Already-collected packets from the DV pre-scan count, so a well-interleaved source
+    /// usually decides without reading anything extra.
+    ///
+    /// Every termination condition is `MultiAudioPolicy`'s, so the bounds are executably tested rather than
+    /// asserted in a comment. A zero-size packet does NOT count as delivery: an empty packet is exactly the
+    /// malformed alternate this guard exists for, and it would not give movenc a sample either.
+    private func probeAlternateFirstPacket(inCtx: UnsafeMutablePointer<AVFormatContext>,
+                                           alternateIn: Int,
+                                           prebuffered: inout [UnsafeMutablePointer<AVPacket>])
+        -> MultiAudioPolicy.ProbeOutcome {
+        var delivered = prebuffered.contains { Int($0.pointee.stream_index) == alternateIn && $0.pointee.size > 0 }
+        var packetsRead = 0
+        var bytesRead = 0
+        var sourceEnded = false
+        var allocationFailed = false
+        let began = Date()
+        while true {
+            let outcome = MultiAudioPolicy.probeOutcome(delivered: delivered,
+                                                        packetsRead: packetsRead,
+                                                        bytesRead: bytesRead,
+                                                        elapsedSecs: Date().timeIntervalSince(began),
+                                                        sourceEnded: sourceEnded,
+                                                        cancelled: isCancelled,
+                                                        allocationFailed: allocationFailed)
+            guard outcome == .keepProbing else { return outcome }
+            guard let p = av_packet_alloc() else { allocationFailed = true; continue }
+            if av_read_frame(inCtx, p) < 0 {
+                // Any read failure ends the probe. A retry ladder belongs to the mux loop, which owns the
+                // reconnect policy; spending retries here would only delay the start of playback.
+                var pp: UnsafeMutablePointer<AVPacket>? = p
+                av_packet_free(&pp)
+                sourceEnded = true
+                continue
+            }
+            packetsRead += 1
+            bytesRead += max(Int(p.pointee.size), 0)
+            prebuffered.append(p)
+            if Int(p.pointee.stream_index) == alternateIn, p.pointee.size > 0 { delivered = true }
+        }
+    }
 
     /// Start the remux on a dedicated background thread. Idempotent-ish: call once per session.
     ///
@@ -307,6 +535,36 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// open/read/reconnect aborts promptly once cancel() trips `interruptFlag`. Returns nil if libav cannot
     /// allocate. Used for BOTH the cold open and the warm retry: avformat_open_input frees and NULLs the
     /// context on a failed open, so the retry must allocate a fresh one.
+    /// Shift one packet's timestamps back so the produced stream starts at zero even though the source is being
+    /// read from the middle. A no-op unless the input seek ran and succeeded, so a mount that starts at the
+    /// beginning produces byte-identical output.
+    ///
+    /// The FIRST packet handed here defines the origin: the seek lands on a keyframe at or before the request,
+    /// and the packet is the only thing that says where that was. It is latched once and published, so every
+    /// later packet is shifted by the same amount and audio/video sync is preserved exactly.
+    ///
+    /// Called at the top of packet handling in BOTH mux loops, before anything reads a timestamp: the fragment
+    /// cutter, the subtitle cue collector, the transcoder and the muxer all see a stream that begins at zero.
+    /// Packets carrying no timestamp at all are left alone; there is nothing to shift and the muxer already
+    /// handles them. A packet whose timestamp is slightly BEHIND the latched origin (an audio packet
+    /// interleaved just ahead of the first video keyframe) goes negative, which is correct and is what the
+    /// muxer's own non-negative timestamp handling is for; forcing it to zero would break the sync it encodes.
+    private func rebaseFromOrigin(_ pkt: UnsafeMutablePointer<AVPacket>, timeBase: AVRational) {
+        guard originSeekApplied else { return }
+        let ts = pkt.pointee.dts != AV_NOPTS_VALUE_CONST ? pkt.pointee.dts : pkt.pointee.pts
+        if !originShiftLatched {
+            guard ts != AV_NOPTS_VALUE_CONST else { return }   // undecided until a packet carries a timestamp
+            originShiftUsec = av_rescale_q(ts, timeBase, Self.avTimeBaseQ)
+            originShiftLatched = true
+            let originSec = Double(originShiftUsec) / Double(Self.avTimeBase)
+            hlsLock.lock(); _timelineOriginSeconds = originSec; hlsLock.unlock()
+            VXProbe.log("dv", "resume: timeline origin \(String(format: "%.1f", originSec))s (asked \(Int(requestedOriginSeconds))s)")
+        }
+        let shift = av_rescale_q(originShiftUsec, Self.avTimeBaseQ, timeBase)
+        if pkt.pointee.pts != AV_NOPTS_VALUE_CONST { pkt.pointee.pts -= shift }
+        if pkt.pointee.dts != AV_NOPTS_VALUE_CONST { pkt.pointee.dts -= shift }
+    }
+
     private func makeInterruptibleInputContext() -> UnsafeMutablePointer<AVFormatContext>? {
         guard let ctx = avformat_alloc_context() else { return nil }
         ctx.pointee.interrupt_callback.callback = vortxRemuxInterruptCallback
@@ -404,6 +662,40 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // finite duration to synthesize, it also has the chapters. The forward-only HLS delivery carries none.
         readSourceChapters(inCtx)
 
+        // RESUME: seek the INPUT once, here, before a single byte is muxed. Everything downstream then runs
+        // forward exactly as it always has. This is deliberately the ONLY seek in the session: the produce path
+        // owns one demuxer, one muxer and one linear buffer on one thread, so repositioning it mid-flight is a
+        // different design (the note at the foot of RemuxResumePolicy records what that would take).
+        //
+        // Ordering: AFTER find_stream_info (which reads packets and leaves the input positioned wherever it
+        // stopped) and after the duration / chapter reads, which come from the container header and are
+        // unaffected; BEFORE the DV pre-scan, so the packets that scan buffers are the ones the mux loop will
+        // actually write. AVSEEK_FLAG_BACKWARD lands on the keyframe AT OR BEFORE the target, so production
+        // always begins on a decodable frame and the mount starts a little earlier than asked, never later.
+        //
+        // Fail-soft in every direction: an input that cannot seek (the 127.0.0.1 torrent loopback historically
+        // refuses Range) or a seek that errors leaves the origin at 0 and the session plays from the beginning,
+        // which is exactly the behavior before this code existed. It never fails the buffer, so it can never
+        // cost a viewer the libmpv fallback.
+        if requestedOriginSeconds > 0 {
+            let seekable = inCtx.pointee.pb.map { $0.pointee.seekable != 0 } ?? false
+            if !seekable {
+                VXProbe.log("dv", "resume: source is not seekable, starting from the beginning (asked \(Int(requestedOriginSeconds))s)")
+            } else {
+                let target = Int64(requestedOriginSeconds * Double(Self.avTimeBase))
+                // stream_index -1 means the target is in AV_TIME_BASE units rather than a stream's own base.
+                let rc = avformat_seek_file(inCtx, -1, Int64.min, target, target, Self.avseekFlagBackward)
+                if rc < 0 {
+                    VXProbe.log("dv", "resume: input seek to \(Int(requestedOriginSeconds))s failed rc=\(rc), starting from the beginning")
+                } else {
+                    // Where the seek actually landed is not known yet: it is some keyframe at or before the
+                    // target, and only the first packet says which. `rebaseFromOrigin` latches and publishes it.
+                    originSeekApplied = true
+                    VXProbe.log("dv", "resume: input seeked to \(Int(requestedOriginSeconds))s (keyframe at or before)")
+                }
+            }
+        }
+
         // Output context: fragmented MP4, NO file (custom IO).
         var ofmt: UnsafeMutablePointer<AVFormatContext>? = nil
         let ao = avformat_alloc_output_context2(&ofmt, nil, "mp4", nil)
@@ -482,7 +774,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // target language so raising the channel/EAC3 preference can never swap in a same-channel foreign dub).
         // `decodableAudio` = AVPlayer stream-copyable tracks; `transcodableAudio` = FFmpeg-decodable-only tracks
         // that must be transcoded (TrueHD/DTS/... - the b160 lane).
-        var decodableAudio: [(index: Int, channels: Int32, rank: Int, lang: String, atmos: Bool)] = []
+        // `codecID` is carried only so the bounded multi-audio pick can require the alternate to be the SAME
+        // codec as the primary (MultiAudioPolicy.alternate); nothing else reads it.
+        var decodableAudio: [(index: Int, channels: Int32, rank: Int, lang: String, atmos: Bool, codecID: UInt32)] = []
         var transcodableAudio: [(index: Int, channels: Int32, lang: String)] = []
         // The audio track AVPlayer canNOT decode but the bundled FFmpeg CAN (TrueHD/MLP/DTS/Opus/Vorbis/PCM...,
         // a generic decoder check, no allowlist). Used ONLY when the scan finds no stream-copyable track:
@@ -493,6 +787,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // AVPlayer can't decode and which we DROP (never mapped). Single-track sources have exactly one video
         // stream, so this is a no-op for them. `baseVideoIn` also tells the mux loop which packets to convert.
         var baseVideoIn = -1
+        // TEXT subtitle tracks of the source. Collected in the same scan, never added to `mappable`.
+        var subtitleTracks: [SubtitleRenditionPolicy.SourceTrack] = []
         for i in 0..<nb {
             guard let inStream = inCtx.pointee.streams[i], let par = inStream.pointee.codecpar else { continue }
             switch par.pointee.codec_type {
@@ -508,12 +804,22 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 // Additional video streams (a dual-track P7 enhancement layer) are intentionally NOT mapped.
             case AVMEDIA_TYPE_AUDIO:
                 audioSeen.append(Self.codecName(par.pointee.codec_id))
-                // Collect the track; the single best one is mapped after the scan. Only ONE audio track is ever
-                // mapped: a UHD remux can carry 10+ dubs, and mapping several makes the fragmented muxer's
-                // delay_moov wait for a first packet from EVERY audio stream before it can write the moov, but
-                // frag_keyframe cuts the first fragment at the opening video keyframe before the sparse later
-                // tracks deliver one, so the moov write fails ("Cannot write moov before AC3 packets") and the
-                // mux aborts. AVPlayer plays one track anyway.
+                // Collect the track; the single best one is mapped after the scan, plus AT MOST ONE bounded
+                // alternate when the multi-audio flag is on (see `alternateAudioIn` below).
+                //
+                // Why mapping audio tracks freely is dangerous, stated correctly. delay_moov defers the moov to
+                // the first fragment, and movenc's auto-flush (force=0) DEFERS WHOLE until every mapped track
+                // has delivered a sample: mov_flush_fragment returns without writing a byte while any mapped
+                // track is still empty. So a UHD remux that maps its 10+ dubs, one of which is empty, malformed
+                // or merely late, never gets a moov written at all: init starves, the playlist starves, and the
+                // ~12s pre-init deadline demotes the whole session to libmpv, losing Dolby Vision and Atmos to
+                // save a dub. THAT is the hazard.
+                //
+                // A previous version of this comment blamed frag_keyframe cutting the first fragment at the
+                // opening video keyframe. That was refuted against the shipped libavformat: frag_keyframe is
+                // NOT set here and is NOT implicitly added, because upstream movenc only re-adds it when both
+                // frag duration and size triggers are zero, and `frag_duration` is set (see the movflags block
+                // and its return-code check). The mechanism is init starvation, not a keyframe cut.
                 let audioChannels = par.pointee.ch_layout.nb_channels
                 let audioLang = Self.streamLanguage(inStream)
                 if Self.avPlayerDecodableAudio.contains(par.pointee.codec_id.rawValue) {
@@ -523,13 +829,44 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     // track must never shadow the 6ch EAC3-JOC bed).
                     let isAtmosJOC = par.pointee.codec_id == AV_CODEC_ID_EAC3
                         && par.pointee.profile == Self.eac3AtmosProfile
-                    decodableAudio.append((i, audioChannels, Self.audioCopyRank(par.pointee.codec_id), audioLang, isAtmosJOC))
+                    decodableAudio.append((i, audioChannels, Self.audioCopyRank(par.pointee.codec_id), audioLang,
+                                           isAtmosJOC, par.pointee.codec_id.rawValue))
                 } else if avcodec_find_decoder(par.pointee.codec_id) != nil {
                     transcodableAudio.append((i, audioChannels, audioLang))
                 }
+            case AVMEDIA_TYPE_SUBTITLE:
+                // Subtitle streams are STILL never mapped: the mp4 muxer cannot stream-copy Matroska text or
+                // PGS codecs, and write_header failing takes the whole session down. What changes here is
+                // only that a TEXT track is DESCRIBED, so its packets can be turned into a separate WebVTT
+                // rendition further down. A bitmap track yields no format and is skipped entirely.
+                guard Self.subtitleRenditionsEnabled, hlsIndexingEnabled,
+                      let format = Self.textSubtitleFormat(par.pointee.codec_id) else { break }
+                let disposition = inStream.pointee.disposition
+                subtitleTracks.append(SubtitleRenditionPolicy.SourceTrack(
+                    index: i,
+                    format: format,
+                    language: Self.streamLanguage(inStream),
+                    title: Self.streamMetadata(inStream, key: "title"),
+                    isDefault: (disposition & Self.avDispositionDefault) != 0,
+                    isForced: (disposition & Self.avDispositionForced) != 0))
             default:
-                break   // subtitles/data/attachments are never mapped (see the header note)
+                break   // data/attachments are never mapped (see the header note)
             }
+        }
+        // Publish the subtitle renditions now: the master playlist is served as soon as classify finishes, so
+        // the renditions have to exist by then, and they are derived from the STREAM TABLE alone (never from
+        // cues, which only arrive as the film is demuxed). A source with no text subtitle track publishes
+        // nothing and its master playlist is byte-identical to before.
+        if !subtitleTracks.isEmpty {
+            let renditions = SubtitleRenditionPolicy.renditions(from: subtitleTracks)
+            hlsLock.lock()
+            _subtitleRenditions = renditions
+            _subtitleCues = Array(repeating: [], count: renditions.count)
+            hlsLock.unlock()
+            for rendition in renditions {
+                subtitleCollectors[rendition.sourceIndex] = (rendition.id, rendition.format)
+            }
+            DiagnosticsLog.log("dv", "subtitles: \(renditions.count) text rendition(s) from \(subtitleTracks.count) text track(s) [\(renditions.map { "\($0.name)" }.joined(separator: ", "))]; bitmap tracks are out of scope and never advertised")
         }
         // The target language each pick keeps to: the language of the FIRST track of its OWN kind in scan order,
         // which is exactly the track the old first-decodable / first-transcodable code played. Keeping to it
@@ -709,6 +1046,40 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             buffer.fail("no AVPlayer-decodable audio track (source audio: \(audioSeen.joined(separator: ",")))")
             return
         }
+        // BOUNDED SECOND AUDIO TRACK (flagged, default off). At most ONE extra stream-copy track, in a
+        // DIFFERENT language and the SAME codec as the primary. Same-codec is the boundary because the HLS
+        // master advertises a single audio CODECS entry (hlsBuildSignaling); mixing codecs inside one variant
+        // needs a master-playlist redesign that is deliberately not part of this change. Transcoding stays
+        // single-track: the alternate is only ever considered on the stream-copy lane.
+        //
+        // The alternate is NOT mapped on the strength of the stream table alone. movenc's delayed moov waits
+        // for every mapped track to deliver a sample, so an alternate that is empty, malformed or merely late
+        // starves init and demotes the whole session to libmpv, costing Dolby Vision and Atmos to save a dub.
+        // So the alternate must PROVE itself first, inside a bounded probe, and is dropped otherwise. The
+        // drop happens here because here is the only place it CAN happen: once avformat_write_header has run,
+        // the track is in the moov and cannot be taken back out.
+        var alternateAudioIn = -1
+        if Self.multiAudioEnabled, hasDecodableAudio, mappedAudioIn >= 0, !transcodeActive {
+            let tracks = decodableAudio.map {
+                MultiAudioPolicy.AudioTrack(index: $0.index, codecID: $0.codecID,
+                                            channels: Int($0.channels), language: $0.lang)
+            }
+            if let alt = MultiAudioPolicy.alternate(from: tracks, primaryIndex: mappedAudioIn) {
+                switch probeAlternateFirstPacket(inCtx: inCtx, alternateIn: alt.index, prebuffered: &prebuffered) {
+                case .delivered:
+                    alternateAudioIn = alt.index
+                    mappable.insert(alt.index)
+                    DiagnosticsLog.log("dv", "multi-audio: mapping alternate inStream=\(alt.index) lang=\(MultiAudioPolicy.languageKey(alt.language)) \(alt.channels)ch alongside primary inStream=\(mappedAudioIn)")
+                case .drop(let reason):
+                    DiagnosticsLog.log("dv", "multi-audio: alternate inStream=\(alt.index) DROPPED, \(reason.rawValue); continuing single-track so the session keeps Dolby Vision and Atmos")
+                case .keepProbing:
+                    // Unreachable: the probe loop only returns a terminal outcome. Treated as a drop so a
+                    // future change to the policy can never accidentally map an unproven track.
+                    DiagnosticsLog.log("dv", "multi-audio: alternate inStream=\(alt.index) DROPPED, probe returned no decision")
+                }
+            }
+        }
+
         var streamMap = [Int](repeating: -1, count: nb)
         var outIndex: Int32 = 0
         var baseVideoOut = -1        // output index of the base-layer video track (packets to convert)
@@ -840,6 +1211,30 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 default: outStream.pointee.codecpar.pointee.frame_size = 1536   // AC3/EAC3, and a safe non-zero fallback
                 }
             }
+            // Multi-audio lane: carry the SOURCE track's metadata (language, title) and disposition onto the
+            // output audio track, then mark exactly ONE track default. Without this the moov's audio tracks
+            // carry no language at all (avcodec_parameters_copy copies codec parameters, never metadata or
+            // disposition), so a second track would appear in the player's picker as an unlabelled duplicate.
+            // Gated on the flag, not on an alternate actually being mapped, so the flag is the whole boundary:
+            // with it off the produced bytes are what they are today.
+            //
+            // The default flag goes on the track the pick above chose as best, and is CLEARED on everything
+            // else, because a source commonly tags several of its own tracks default and two default audio
+            // tracks is an ambiguity the player resolves arbitrarily. Copy failures are logged and tolerated:
+            // losing a language label is cosmetic, and failing the session over it would cost Dolby Vision.
+            if Self.multiAudioEnabled, outStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
+                let mdRc = av_dict_copy(&outStream.pointee.metadata, inStream.pointee.metadata, 0)
+                if mdRc < 0 {
+                    DiagnosticsLog.log("dv", "multi-audio: metadata copy failed rc=\(mdRc) for inStream=\(i); track ships unlabelled")
+                }
+                var disposition = inStream.pointee.disposition
+                if i == mappedAudioIn {
+                    disposition |= Self.avDispositionDefault
+                } else {
+                    disposition &= ~Self.avDispositionDefault
+                }
+                outStream.pointee.disposition = disposition
+            }
             streamMap[i] = Int(outIndex)
             outIndex += 1
             info.mappedStreams += 1
@@ -857,6 +1252,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // Fragmented MP4 so playback starts before the whole file is muxed, and so it can stream. `faststart`
         // is a no-op for custom-IO (it needs a seekable sink) but harmless; the frag flags are what matter.
         var opts: OpaquePointer? = nil   // AVDictionary*
+        defer { av_dict_free(&opts) }
         // delay_moov is REQUIRED here: with empty_moov the muxer would try to write the moov at write_header,
         // but an AC3 audio track's parameters are only known once the first AC3 packet arrives, so movenc
         // rejects write_header with EINVAL ("Cannot write moov atom before AC3 packets. Set the delay_moov flag
@@ -870,12 +1266,24 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // valid dac3 box. frag_duration (the max-fragment-duration TRIGGER) is REQUIRED, not min_frag_duration
         // (a floor only): movenc re-adds frag_keyframe in mov_write_header when there is no cut trigger, silently
         // restoring the keyframe cut. Verified against libavformat 62.12.101 (the exact lib this app ships).
-        av_dict_set(&opts, "movflags", "empty_moov+default_base_moof+delay_moov", 0)
-        av_dict_set(&opts, "frag_duration", "1000000", 0)   // 1s fragments in microseconds (the cut TRIGGER)
+        let movflagsRc = av_dict_set(&opts, "movflags", "empty_moov+default_base_moof+delay_moov", 0)
+        let fragDurationRc = av_dict_set(&opts, "frag_duration", "1000000", 0)   // 1s fragments in microseconds (the cut TRIGGER)
         // FLAC-in-mp4 is spec'd (and AVPlayer decodes it) but FFmpeg's mov muxer gates it behind strict
         // experimental; without this a FLAC-audio DV MKV would die at avformat_write_header.
-        av_dict_set(&opts, "strict", "experimental", 0)
-        defer { av_dict_free(&opts) }
+        let strictRc = av_dict_set(&opts, "strict", "experimental", 0)
+        // av_dict_set returns <0 on an allocation failure, and the option is then simply ABSENT from the
+        // dictionary: avformat_write_header succeeds and the session degrades SILENTLY. frag_duration is the
+        // one that matters most. With no fragment-duration trigger movenc re-adds frag_keyframe in
+        // mov_write_header, which cuts the first fragment at the opening video keyframe and serialises the
+        // delayed moov before any audio track has a parsed packet, the exact "Cannot write moov atom before
+        // (E)AC3 packets" abort this whole option set exists to avoid. Fail loudly instead: the buffer failure
+        // demotes to libmpv, which plays the source correctly, rather than shipping a session built on options
+        // that were never applied.
+        if movflagsRc < 0 || fragDurationRc < 0 || strictRc < 0 {
+            VXProbe.log("dv", "HDR10 FALLBACK: muxer option not applied (movflags rc=\(movflagsRc) frag_duration rc=\(fragDurationRc) strict rc=\(strictRc))")
+            buffer.fail("muxer options could not be set (movflags \(movflagsRc), frag_duration \(fragDurationRc), strict \(strictRc))")
+            return
+        }
 
         // [dv] one-line dump of exactly what the muxer is about to validate, for EVERY DV lane (it was
         // convertP7-gated once, which left a failing P8 stream-copy with zero visibility into precisely the
@@ -917,9 +1325,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         guard let pkt = av_packet_alloc() else { buffer.fail("av_packet_alloc returned nil"); return }
         defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
 
-        NSLog("[dv-remux-stream] start: %@ %dx%d dvProfile=%d blCompat=%d streams=%d convertP7=%d nalLen=%d",
+        // altAudio is the INPUT index of the bounded second audio track, or -1 when none was mapped (the flag
+        // is off, nothing qualified, or the probe dropped it). It belongs on this line because a session that
+        // stalls at init needs the mapped-track set visible in the same log entry as the stream count.
+        NSLog("[dv-remux-stream] start: %@ %dx%d dvProfile=%d blCompat=%d streams=%d convertP7=%d nalLen=%d altAudio=%d",
               info.videoCodec, info.width, info.height, info.dvProfile, info.dvBLCompatId,
-              info.mappedStreams, convertP7 ? 1 : 0, nalLengthSize)
+              info.mappedStreams, convertP7 ? 1 : 0, nalLengthSize, alternateAudioIn)
 
         // [dv] tally the P7->8.1 RPU conversion outcome across the whole session and emit ONE greppable summary
         // on every exit (trailer, cancel, or an AVPlayer-rejected write that breaks the loop). This is the line
@@ -947,6 +1358,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             let p = prebuffered.removeFirst()
             defer { var pp: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&pp) }
             let inIdx = Int(p.pointee.stream_index)
+            // RESUME: shift this packet back to a zero-based timeline before anything reads its timestamps.
+            // No-op unless the input was seeked to a mid-title origin.
+            if inIdx >= 0, inIdx < nb, let tsStream = inCtx.pointee.streams[inIdx] {
+                rebaseFromOrigin(p, timeBase: tsStream.pointee.time_base)
+            }
+            // Text subtitle packets are consumed into the WebVTT renditions and never reach the muxer (they
+            // are not in `streamMap` either way; this only turns them into cues on the way past).
+            if inIdx >= 0, inIdx < nb, collectSubtitlePacket(inCtx: inCtx, pkt: p, inIdx: inIdx) { continue }
             guard inIdx >= 0, inIdx < nb, streamMap[inIdx] >= 0,
                   let inStream = inCtx.pointee.streams[inIdx],
                   let outStream = outCtx.pointee.streams[streamMap[inIdx]] else { continue }
@@ -1023,6 +1442,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             }
             readRetries = 0   // a successful read resets the streak
             let inIdx = Int(pkt.pointee.stream_index)
+            // RESUME: shift this packet back to a zero-based timeline before anything reads its timestamps.
+            // No-op unless the input was seeked to a mid-title origin.
+            if inIdx >= 0, inIdx < nb, let tsStream = inCtx.pointee.streams[inIdx] {
+                rebaseFromOrigin(pkt, timeBase: tsStream.pointee.time_base)
+            }
+            // Text subtitle packets are consumed into the WebVTT renditions and never reach the muxer.
+            if inIdx >= 0, inIdx < nb, collectSubtitlePacket(inCtx: inCtx, pkt: pkt, inIdx: inIdx) {
+                av_packet_unref(pkt); continue
+            }
             guard inIdx >= 0, inIdx < nb, streamMap[inIdx] >= 0,
                   let inStream = inCtx.pointee.streams[inIdx],
                   let outStream = outCtx.pointee.streams[streamMap[inIdx]] else {
@@ -1555,6 +1983,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         hlsLastVideoSec = sec
         guard let start = hlsSegmentStartSec else {
             hlsSegmentStartSec = sec   // the first base-video packet opens segment 0
+            // Segment 0 starts HERE on the source clock. Subtitle cues are stored in source seconds, and the
+            // segment list they are windowed against measures from this instant, so the server needs the
+            // offset between the two. It is zero for every container that starts at zero, which is nearly all
+            // of them, but a source that does not must not shift its subtitles.
+            hlsLock.lock(); _subtitleTimelineOriginSec = sec; hlsLock.unlock()
             return
         }
         // #134 root cause: NEVER force a fragment flush before the init segment is published. The forced
@@ -1831,10 +2264,69 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         VXProbe.log("dv", "remux source chapters: \(out.count)")
     }
 
+    /// Turn one demuxed subtitle packet into a stored cue. Returns true when the packet belonged to a
+    /// collected subtitle track, so the caller drops it rather than trying to mux it (subtitle streams are
+    /// never in `streamMap`, so this changes nothing about what is written; it only says the packet was
+    /// consumed here).
+    ///
+    /// Every failure is a DROP, never a fault: a packet with no timestamp, an undecodable payload, a track
+    /// past its cue or byte cap. Subtitles are an addition to a Dolby Vision session, so nothing in this path
+    /// may ever be able to end one.
+    private func collectSubtitlePacket(inCtx: UnsafeMutablePointer<AVFormatContext>,
+                                       pkt: UnsafeMutablePointer<AVPacket>, inIdx: Int) -> Bool {
+        guard let collector = subtitleCollectors[inIdx] else { return false }
+        guard let stream = inCtx.pointee.streams[inIdx] else { return true }
+        let timeBase = stream.pointee.time_base
+        guard timeBase.den > 0 else { return true }
+        let scale = Double(timeBase.num) / Double(timeBase.den)
+        let pts = pkt.pointee.pts != AV_NOPTS_VALUE_CONST ? pkt.pointee.pts : pkt.pointee.dts
+        // A negative start is how SubtitleRenditionPolicy is told "no usable timestamp"; AV_NOPTS_VALUE is
+        // Int64.min, so it must not be scaled into a number that happens to look valid.
+        let startSec = pts != AV_NOPTS_VALUE_CONST ? Double(pts) * scale : -1
+        let durationSec = pkt.pointee.duration > 0 ? Double(pkt.pointee.duration) * scale : 0
+        guard let bytes = pkt.pointee.data, pkt.pointee.size > 0 else { return true }
+        let payload = Data(bytes: bytes, count: Int(pkt.pointee.size))
+        guard let cue = SubtitleRenditionPolicy.cue(payload: payload, format: collector.format,
+                                                    startSeconds: startSec, durationSeconds: durationSec)
+        else { return true }
+        let stored = subtitleBytesStored[collector.renditionID] ?? 0
+        guard stored < Self.maxSubtitleBytesPerRendition else {
+            if subtitleCapLogged.insert(collector.renditionID).inserted {
+                DiagnosticsLog.log("dv", "subtitles: rendition \(collector.renditionID) hit its \(Self.maxSubtitleBytesPerRendition)B budget; later cues are dropped (playback unaffected)")
+            }
+            return true
+        }
+        hlsLock.lock()
+        var capped = false
+        if collector.renditionID < _subtitleCues.count {
+            if _subtitleCues[collector.renditionID].count < Self.maxCuesPerRendition {
+                _subtitleCues[collector.renditionID].append(cue)
+            } else {
+                capped = true
+            }
+        }
+        hlsLock.unlock()
+        if capped {
+            if subtitleCapLogged.insert(collector.renditionID).inserted {
+                DiagnosticsLog.log("dv", "subtitles: rendition \(collector.renditionID) hit its \(Self.maxCuesPerRendition)-cue cap; later cues are dropped (playback unaffected)")
+            }
+            return true
+        }
+        subtitleBytesStored[collector.renditionID] = stored + cue.text.utf8.count
+        return true
+    }
+
     private static func streamLanguage(_ stream: UnsafeMutablePointer<AVStream>) -> String {
         guard let entry = av_dict_get(stream.pointee.metadata, "language", nil, 0),
               let value = entry.pointee.value else { return "" }
         return String(cString: value).lowercased()
+    }
+
+    /// One metadata tag of a stream, or "" when absent. Case-preserving: a track TITLE is shown to the user.
+    private static func streamMetadata(_ stream: UnsafeMutablePointer<AVStream>, key: String) -> String {
+        guard let entry = av_dict_get(stream.pointee.metadata, key, nil, 0),
+              let value = entry.pointee.value else { return "" }
+        return String(cString: value)
     }
 
     /// Per-session tally of Profile-7 -> 8.1 RPU conversion outcomes, logged once at mux exit so a DV source
