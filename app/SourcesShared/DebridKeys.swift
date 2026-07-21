@@ -65,7 +65,13 @@ final class DebridKeys: ObservableObject {
     /// the earliest point at which the device's real owner is known.
     private var hasConsideredLegacy = false
 
-    private init() { reload() }
+    /// Loads the CURRENT scope only. It must never adopt legacy state, because the singleton is constructed
+    /// before `VortXSyncManager.restore()` has bound the restored account, so at this moment `owner` is still
+    /// `signedOutOwner`. An earlier version adopted here and did precisely the damage the comment above warns
+    /// about: an upgrading signed-in user's key was filed under the signed-out scope, their account then saw
+    /// nothing, and the credential stayed readable by anyone using the device signed out. Adoption is now the
+    /// sole responsibility of `bind(owner:)`, which is the first point an explicit owner exists.
+    private init() { loadScope() }
 
     /// Point the store at an account (or at `signedOutOwner`). Call on sign-in, sign-out and account switch.
     /// Republishes and rebuilds the resolvers, so a switched-in account never keeps the previous one's keys
@@ -74,30 +80,39 @@ final class DebridKeys: ObservableObject {
         let resolved = newOwner.isEmpty ? Self.signedOutOwner : newOwner
         guard resolved != owner || !hasConsideredLegacy else { return }
         owner = resolved
-        reload()
+        adoptLegacyIfNeeded()
+        loadScope()
         let snapshot = self.snapshot
         Task { await DebridCoordinator.shared.reload(keys: snapshot) }
     }
 
-    /// Load the current owner's keys, adopting the pre-scoping global entries once if this owner has none.
-    private func reload() {
-        var next: [String: String] = [:]
-        let adoptLegacy = !hasConsideredLegacy
+    /// Move the pre-scoping global entries into the CURRENT owner's scope, once per process, and only where
+    /// that owner has no key of its own so an adoption can never overwrite one the account already had. The
+    /// legacy entry is deleted as it is moved, so a second account cannot inherit the same credential.
+    ///
+    /// Called ONLY from `bind(owner:)`. That is the invariant: adoption requires an explicitly bound owner, so
+    /// a credential can never be filed under a scope that merely happens to be the default at construction.
+    private func adoptLegacyIfNeeded() {
+        guard !hasConsideredLegacy else { return }
         hasConsideredLegacy = true
+        for service in DebridService.allCases {
+            let scoped = service.keychainAccount(owner: owner)
+            guard Keychain.string(scoped)?.isEmpty != false,
+                  let legacy = Keychain.string(service.legacyGlobalKeychainAccount), !legacy.isEmpty
+            else { continue }
+            Keychain.set(legacy, for: scoped)
+            Keychain.set(nil, for: service.legacyGlobalKeychainAccount)
+        }
+    }
+
+    /// Read the current owner's keys into memory. Pure load: it adopts nothing and writes nothing, so calling
+    /// it before an owner is bound cannot consume state belonging to an account that has not restored yet.
+    private func loadScope() {
+        var next: [String: String] = [:]
         for service in DebridService.allCases {
             if let k = Keychain.string(service.keychainAccount(owner: owner)), !k.isEmpty {
                 next[service.rawValue] = k
-                continue
             }
-            // Adopt only on the first binding, and only when this owner has no key of its own, so an adoption
-            // can never overwrite a key the account already had. The legacy entry is removed as it is moved, so
-            // a later account cannot adopt the same credential.
-            guard adoptLegacy,
-                  let legacy = Keychain.string(service.legacyGlobalKeychainAccount), !legacy.isEmpty
-            else { continue }
-            Keychain.set(legacy, for: service.keychainAccount(owner: owner))
-            Keychain.set(nil, for: service.legacyGlobalKeychainAccount)
-            next[service.rawValue] = legacy
         }
         keys = next
     }
