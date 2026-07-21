@@ -295,6 +295,10 @@ final class VortXSyncManager: ObservableObject {
               let dk = Data(base64Encoded: p.dataKey) else { return }
         SourceIndexLifecycleScope.shared.sessionWillMutate()
         token = p.token; account = p.account; dataKey = dk; isSignedIn = true
+        // Point the debrid credential store at THIS account before anything can read a key. Restoring a
+        // session is the earliest moment the device's real owner is known, and it is also where the one-time
+        // adoption of the old unscoped entries happens, so an existing user keeps their keys without a re-paste.
+        DebridKeys.shared.bind(owner: p.account.id)
         reloadLastSyncStamp()   // show this account's persisted "last synced" immediately on relaunch
         // A Keychain-restored session (app relaunch / reinstall) sets isSignedIn WITHOUT going through
         // adopt(), so nothing would open the sync channel until the first scenePhase foreground transition.
@@ -313,6 +317,11 @@ final class VortXSyncManager: ObservableObject {
         token = nil; account = nil; dataKey = nil; isSignedIn = false
         lastSyncAt = nil   // the persisted per-account stamp stays (keyed by account id), the live value clears
         Keychain.set(nil, for: kcAccount)
+        // Release the debrid credentials with the session. They are NOT deleted: they stay in this account's
+        // own Keychain scope and return if the same account signs back in. What must not happen is the next
+        // account on this device inheriting them, which is exactly what used to happen when these entries were
+        // global and sign-out left them behind.
+        DebridKeys.shared.bind(owner: DebridKeys.signedOutOwner)
         // The shared add-on ORDER is a global static with no account context, so a switched-in account would
         // otherwise inherit the previous account's order until its own pull lands. Clear it here so the next
         // account starts from the descriptor spine and converges on its own doc.addonOrder. The per-account
@@ -351,6 +360,9 @@ final class VortXSyncManager: ObservableObject {
             username: acct["username"] as? String ?? "",
             twoFactorEnabled: acct["twoFactorEnabled"] as? Bool ?? false)
         self.isSignedIn = true
+        // Rebind debrid credentials to the account that just signed in. Without this a switched-in account
+        // would keep reading the previous owner's keys out of memory even though the Keychain is now scoped.
+        DebridKeys.shared.bind(owner: self.account?.id ?? DebridKeys.signedOutOwner)
         reloadLastSyncStamp()   // a re-sign-in to a known account restores its persisted "last synced"
         persist()
         // A fresh sign-in is a foreground action, so open the real-time channel immediately (if the app
