@@ -1,6 +1,6 @@
 // Production-linked executable for the TorBox half of REQ-260721-50.
 //
-//   xcrun swiftc -warnings-as-errors -o /tmp/torbox-identity-boundary \
+//   xcrun swiftc -D SOURCE_INDEX_IDENTITY_TESTING -warnings-as-errors -o /tmp/torbox-identity-boundary \
 //     app/SourcesShared/SourceIndexContract.swift \
 //     app/SourcesShared/SourceIndexIdentity.swift \
 //     app/SourcesShared/TorBoxSearchSource.swift \
@@ -54,6 +54,16 @@ final class DebridKeys {
     func key(for service: DebridService) -> String { "test-key" }
 }
 
+enum AuxiliarySourcePipeline {
+    struct Call: Sendable {
+        let resolution: SourceIndexIdentity.TargetResolution
+    }
+
+    static func callForTesting(_ resolution: SourceIndexIdentity.TargetResolution) -> Call {
+        Call(resolution: resolution)
+    }
+}
+
 enum VXProbe {
     static func log(_ channel: String, _ message: String) {}
 }
@@ -81,6 +91,24 @@ actor ControlledSearch {
     }
 
     func calls() -> [String] { requested }
+}
+
+actor CancellationProbe {
+    private var started = 0
+    private var cancelled = 0
+
+    func run() async -> TorBoxSearchSource.SearchResult {
+        started += 1
+        do {
+            try await Task.sleep(for: .seconds(60))
+        } catch {
+            cancelled += 1
+        }
+        return (streams: [], rateLimited: false, transportError: false)
+    }
+
+    func startedCount() -> Int { started }
+    func cancelledCount() -> Int { cancelled }
 }
 
 @main
@@ -137,6 +165,39 @@ struct TorBoxIdentityBoundaryTests {
                "REQ-50: a typed mismatch launches zero TorBox transport")
         expect(source.streams.isEmpty && source.publishedContentID == nil,
                "REQ-50: a typed mismatch publishes no TorBox rows")
+
+        let forged = SourceIndexIdentity.uncheckedTargetForTesting(
+            titleID: "tt0903747",
+            contentID: "tt1375666:1:1",
+            season: 1,
+            episode: 1
+        )
+        source.refresh(target: forged)
+        await Task.yield()
+        let forgedCalls = await probe.calls()
+        expect(forgedCalls.isEmpty,
+               "REQ-56: a relationally forged target launches zero TorBox transport")
+        expect(source.streams.isEmpty && source.publishedContentID == nil,
+               "REQ-56: a relationally forged target publishes no TorBox rows")
+
+        let cancellation = CancellationProbe()
+        let cancellingSource = TorBoxSearchSource(
+            fetchStreams: { _, _ in await cancellation.run() },
+            hasKey: { true },
+            keyProvider: { "test-key" }
+        )
+        let cancellableTarget = SourceIndexIdentity.publicationTarget(
+            roles(catalog: "tt0903747", defaultVideo: nil, currentVideo: nil),
+            season: 1,
+            episode: 1
+        )
+        cancellingSource.refresh(target: cancellableTarget)
+        await waitUntil { await cancellation.startedCount() == 1 }
+        cancellingSource.refresh(target: mismatch)
+        await waitUntil { await cancellation.cancelledCount() == 1 }
+        let cancellationCount = await cancellation.cancelledCount()
+        expect(cancellationCount == 1,
+               "REQ-56: clearing on mismatch cancels the retired TorBox request")
 
         let targetA = SourceIndexIdentity.publicationTarget(
             roles(catalog: "tt0903747", defaultVideo: "tt0903747:1:1",

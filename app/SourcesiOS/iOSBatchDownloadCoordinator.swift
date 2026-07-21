@@ -289,8 +289,12 @@ final class BatchDownloadCoordinator: ObservableObject {
         // on a content-id change until its fetch returns).
         torboxSearch.clearResults()
         sourceIndex.clearResults()
-        torboxSearch.refresh(target: target)
-        sourceIndex.refresh(target: target, isSignedIn: VortXSyncManager.shared.isSignedIn)
+        AuxiliarySourcePipeline.refresh(
+            target: target,
+            torBox: torboxSearch,
+            sourceIndex: sourceIndex,
+            isSignedIn: VortXSyncManager.shared.isSignedIn
+        )
         return target
     }
 
@@ -327,12 +331,11 @@ final class BatchDownloadCoordinator: ObservableObject {
             // The manual `displayGroups` composition: TorBox search merged first, the community pool
             // second, THEN the Direct-links-only filter, so a search/pool torrent obeys the same rule
             // as an add-on's. Re-merged every iteration so contributor results landing mid-settle count.
-            groups = iOSDisplayGroups(sourceIndex.merged(
-                into: torboxSearch.merged(
-                    into: core.streamGroups(forStreamId: job.video.id),
-                    for: auxiliaryTarget
-                ),
-                for: auxiliaryTarget
+            groups = iOSDisplayGroups(AuxiliarySourcePipeline.merged(
+                into: core.streamGroups(forStreamId: job.video.id),
+                target: auxiliaryTarget,
+                torBox: torboxSearch,
+                sourceIndex: sourceIndex
             ))
             if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
             let progress = core.streamLoadProgress(forStreamId: job.video.id)

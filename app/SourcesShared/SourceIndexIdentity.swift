@@ -110,6 +110,15 @@ enum SourceIndexIdentity {
         let contentID: String
         let season: Int?
         let episode: Int?
+
+        /// Construction stays in this file so every target originates from the role resolver and tuple-exact
+        /// content-key composer below. Module peers can inspect a target, but cannot forge unrelated fields.
+        fileprivate init(titleID: String, contentID: String, season: Int?, episode: Int?) {
+            self.titleID = titleID
+            self.contentID = contentID
+            self.season = season
+            self.episode = episode
+        }
     }
 
     /// The typed result of resolving a publication target. `mismatch` must remain distinguishable from an
@@ -190,6 +199,34 @@ enum SourceIndexIdentity {
         }
     }
 
+    /// Re-check every relationship inside an already-resolved target at an owner boundary. This is deliberately
+    /// fail-soft: a malformed or forged value behaves exactly like an absent target, with no fetch or publish.
+    static func validatedTarget(_ resolution: TargetResolution) -> PublicationTarget? {
+        guard let target = resolution.target,
+              imdbTitleID(target.titleID) == target.titleID,
+              contentKey(titleID: target.titleID, season: target.season, episode: target.episode)
+                == target.contentID else { return nil }
+        return target
+    }
+
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    /// Test-only adversarial seam. Production cannot construct this shape; boundary suites use it to prove both
+    /// owners still reject a relational mismatch if one is introduced inside the module in a future refactor.
+    static func uncheckedTargetForTesting(
+        titleID: String,
+        contentID: String,
+        season: Int?,
+        episode: Int?
+    ) -> TargetResolution {
+        .target(PublicationTarget(
+            titleID: titleID,
+            contentID: contentID,
+            season: season,
+            episode: episode
+        ))
+    }
+    #endif
+
     /// The pool key for a Continue-Watching DIRECT RESUME, which is the one path with TWO independent ids and
     /// no page to arbitrate between them.
     ///
@@ -232,7 +269,7 @@ enum SourceIndexIdentity {
     ///
     /// EVERY branch returns through `canonicalContentID`, so the IMDb-only key rule holds even for the bare
     /// title case. Returning `title` directly there is what previously let a tmdb head out as a pool key.
-    static func contentKey(titleID: String, season: Int?, episode: Int?) -> String? {
+    fileprivate static func contentKey(titleID: String, season: Int?, episode: Int?) -> String? {
         guard let title = SourceIndexContract.canonicalTitleID(titleID) else { return nil }
         switch (season, episode) {
         case (nil, nil):
@@ -243,6 +280,12 @@ enum SourceIndexIdentity {
             return nil
         }
     }
+
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    static func contentKeyForTesting(titleID: String, season: Int?, episode: Int?) -> String? {
+        contentKey(titleID: titleID, season: season, episode: episode)
+    }
+    #endif
 }
 
 /// Bounded, category-only diagnostics for the source-index client.

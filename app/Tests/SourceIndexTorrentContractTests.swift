@@ -2,11 +2,12 @@
 // bundle, so this compiles the production SourceIndexContract.swift and SourceIndexClient.swift with only the
 // surrounding app dependencies stubbed:
 //
-//   xcrun swiftc -o /tmp/source-index-contract-test \
+//   xcrun swiftc -D SOURCE_INDEX_IDENTITY_TESTING -o /tmp/source-index-contract-test \
 //     app/SourcesShared/SourceIndexContract.swift \
 //     app/SourcesShared/SourceIndexIdentity.swift \
 //     app/SourcesShared/MoatToken.swift \
 //     app/SourcesShared/SourceIndexClient.swift \
+//     app/SourcesShared/TorBoxSearchSource.swift \
 //     app/Tests/SourceIndexTorrentContractTests.swift && /tmp/source-index-contract-test
 //
 // (Run from the repo root. SourceIndexIdentity.swift is REQUIRED: it holds the shared resolver and the whole
@@ -83,6 +84,14 @@ enum StreamRanking {
 
 enum VortXEdgeAuth { static func sign(_ request: inout URLRequest) {} }
 enum VXProbe { static func log(_ channel: String, _ message: String) {} }
+enum VXProbeRedaction { static func identityToken(_ value: String?) -> String { "redacted" } }
+enum DebridService { case torBox }
+@MainActor
+final class DebridKeys {
+    static let shared = DebridKeys()
+    func isConfigured(_ service: DebridService) -> Bool { true }
+    func key(for service: DebridService) -> String { "test-key" }
+}
 enum MoatConsent {
     static let key = "stremiox.moatContribute"
     nonisolated(unsafe) static var contributeAndConsume = true
@@ -265,6 +274,28 @@ actor IndexedReleasableFetch {
         let call = calls
         await withCheckedContinuation { continuations[call] = $0 }
         return results.indices.contains(call - 1) ? results[call - 1] : []
+    }
+
+    func release(_ call: Int) {
+        continuations.removeValue(forKey: call)?.resume()
+    }
+
+    func callCount() -> Int { calls }
+}
+
+actor IndexedTorBoxFetch {
+    private var calls = 0
+    private var continuations: [Int: CheckedContinuation<Void, Never>] = [:]
+    private let results: [[CoreStream]]
+
+    init(results: [[CoreStream]]) { self.results = results }
+
+    func run() async -> TorBoxSearchSource.SearchResult {
+        calls += 1
+        let call = calls
+        await withCheckedContinuation { continuations[call] = $0 }
+        let streams = results.indices.contains(call - 1) ? results[call - 1] : []
+        return (streams: streams, rateLimited: false, transportError: false)
     }
 
     func release(_ call: Int) {
@@ -1059,6 +1090,169 @@ struct SourceIndexTorrentContractTests {
                "REQ-50: a typed mismatch launches zero SourceIndex transport and publishes zero rows")
         expect(mismatchSource.merged(into: ordinaryGroups, for: mismatchTarget).count == ordinaryGroups.count,
                "REQ-50: mismatch leaves the ordinary engine-only groups available")
+
+        let pipelineTorTransport = AttemptProbe()
+        let pipelineSourceTransport = AttemptProbe()
+        let pipelineTorBox = TorBoxSearchSource(
+            fetchStreams: { _, _ in
+                await pipelineTorTransport.record()
+                return (
+                    streams: [CoreStream(name: "torbox", infoHash: secondHash)],
+                    rateLimited: false,
+                    transportError: false
+                )
+            },
+            hasKey: { true },
+            keyProvider: { "test-key" }
+        )
+        let pipelineSourceIndex = SourceIndexServeSource(
+            fetchPooled: { _, _ in
+                await pipelineSourceTransport.record()
+                return [trusted]
+            },
+            serveGate: { true },
+            coalescer: SourceIndexFetchCoalescer()
+        )
+        let episodeZeroTarget = SourceIndexIdentity.publicationTarget(
+            SourceIndexIdentity.Roles(
+                catalogID: "tmdb:94997",
+                defaultVideoID: nil,
+                currentVideoID: "tt0460649:3:0",
+                kind: .series
+            ),
+            season: 3,
+            episode: 0
+        )
+        AuxiliarySourcePipeline.refresh(
+            target: episodeZeroTarget,
+            torBox: pipelineTorBox,
+            sourceIndex: pipelineSourceIndex,
+            isSignedIn: true
+        )
+        for _ in 0..<1_000 {
+            if await pipelineTorTransport.count() == 1,
+               await pipelineSourceTransport.count() == 1,
+               pipelineTorBox.streams.count == 1,
+               pipelineSourceIndex.streams.count == 1 { break }
+            await Task.yield()
+        }
+        let pipelineTorCount = await pipelineTorTransport.count()
+        let pipelineSourceCount = await pipelineSourceTransport.count()
+        expect(pipelineTorCount == 1 && pipelineSourceCount == 1,
+               "REQ-56: the production pipeline sends the exact episode target to both owners")
+        let pipelineMerged = AuxiliarySourcePipeline.merged(
+            into: ordinaryGroups,
+            target: episodeZeroTarget,
+            torBox: pipelineTorBox,
+            sourceIndex: pipelineSourceIndex
+        )
+        expect(pipelineMerged.map(\.id) == ["ordinary", "vortx.torbox.search", SourceIndexClient.groupID],
+               "REQ-56: production merge preserves engine groups and adds both exact-target owners")
+        expect(AuxiliarySourcePipeline.merged(
+            into: ordinaryGroups,
+            target: publicationTarget("tt1375666"),
+            torBox: pipelineTorBox,
+            sourceIndex: pipelineSourceIndex
+        ).map(\.id) == ["ordinary"],
+               "REQ-56: production merge cannot lend episode rows to a different download target")
+
+        let forgedTarget = SourceIndexIdentity.uncheckedTargetForTesting(
+            titleID: "tt0460649",
+            contentID: "tt1375666:3:0",
+            season: 3,
+            episode: 0
+        )
+        AuxiliarySourcePipeline.refresh(
+            target: forgedTarget,
+            torBox: pipelineTorBox,
+            sourceIndex: pipelineSourceIndex,
+            isSignedIn: true
+        )
+        await Task.yield()
+        let forgedTorCount = await pipelineTorTransport.count()
+        let forgedSourceCount = await pipelineSourceTransport.count()
+        expect(forgedTorCount == 1 && forgedSourceCount == 1,
+               "REQ-56: relational forgery launches zero transport in both production owners")
+        expect(pipelineTorBox.streams.isEmpty && pipelineSourceIndex.streams.isEmpty,
+               "REQ-56: relational forgery clears both owners with zero publication")
+        expect(AuxiliarySourcePipeline.merged(
+            into: ordinaryGroups,
+            target: forgedTarget,
+            torBox: pipelineTorBox,
+            sourceIndex: pipelineSourceIndex
+        ).map(\.id) == ["ordinary"],
+               "REQ-56: relational forgery preserves only ordinary engine groups")
+
+        let delayedTorFetch = IndexedTorBoxFetch(results: [
+            [CoreStream(name: "torbox-A", infoHash: thirdHash)],
+            [CoreStream(name: "torbox-B", infoHash: fourthHash)],
+        ])
+        let delayedSourceFetch = IndexedReleasableFetch(results: [
+            [.init(kind: "torrent", id: thirdHash, quality: "720p", sizeBytes: 1,
+                   seeders: 1, corroboration: 2)],
+            [.init(kind: "torrent", id: secondHash, quality: "1080p", sizeBytes: 2,
+                   seeders: 2, corroboration: 2)],
+        ])
+        let delayedTorBox = TorBoxSearchSource(
+            fetchStreams: { _, _ in await delayedTorFetch.run() },
+            hasKey: { true },
+            keyProvider: { "test-key" }
+        )
+        let delayedSourceIndex = SourceIndexServeSource(
+            fetchPooled: { _, _ in await delayedSourceFetch.run() },
+            serveGate: { true },
+            coalescer: SourceIndexFetchCoalescer()
+        )
+        let delayedTargetA = publicationTarget("tt3333333")
+        let delayedTargetB = publicationTarget("tt4444444")
+        AuxiliarySourcePipeline.refresh(
+            target: delayedTargetA,
+            torBox: delayedTorBox,
+            sourceIndex: delayedSourceIndex,
+            isSignedIn: true
+        )
+        for _ in 0..<1_000 {
+            if await delayedTorFetch.callCount() == 1,
+               await delayedSourceFetch.callCount() == 1 { break }
+            await Task.yield()
+        }
+        AuxiliarySourcePipeline.refresh(
+            target: delayedTargetB,
+            torBox: delayedTorBox,
+            sourceIndex: delayedSourceIndex,
+            isSignedIn: true
+        )
+        for _ in 0..<1_000 {
+            if await delayedTorFetch.callCount() == 2,
+               await delayedSourceFetch.callCount() == 2 { break }
+            await Task.yield()
+        }
+        await delayedTorFetch.release(1)
+        await delayedSourceFetch.release(1)
+        for _ in 0..<100 { await Task.yield() }
+        expect(delayedTorBox.streams.isEmpty && delayedSourceIndex.streams.isEmpty,
+               "REQ-56: delayed target A cannot publish through either production-pipeline owner after B")
+        await delayedTorFetch.release(2)
+        await delayedSourceFetch.release(2)
+        for _ in 0..<1_000 {
+            if delayedTorBox.streams.first?.infoHash == fourthHash,
+               delayedSourceIndex.streams.first?.infoHash == secondHash { break }
+            await Task.yield()
+        }
+        expect(AuxiliarySourcePipeline.merged(
+            into: ordinaryGroups,
+            target: delayedTargetA,
+            torBox: delayedTorBox,
+            sourceIndex: delayedSourceIndex
+        ).map(\.id) == ["ordinary"],
+               "REQ-56: delayed target B rows remain unavailable to target A ranking and download")
+        expect(AuxiliarySourcePipeline.merged(
+            into: ordinaryGroups,
+            target: delayedTargetB,
+            torBox: delayedTorBox,
+            sourceIndex: delayedSourceIndex
+        ).map(\.id) == ["ordinary", "vortx.torbox.search", SourceIndexClient.groupID],
+               "REQ-56: target B receives both exact-owner rows for ranking and download")
 
         let rotated = SourceIndexClient.PooledSource(
             kind: "torrent", id: secondHash, quality: "Other", sizeBytes: 0,
@@ -2133,17 +2327,17 @@ struct SourceIndexTorrentContractTests {
         // `contentKey` re-canonicalizes its `titleID` rather than trusting the caller, and nothing asserted it:
         // replacing that guard with `let title = titleID` left the whole suite green. It is the F1 defect class
         // one level down -- an episode-scoped id passed straight through -- so it gets its own coverage.
-        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747:1:1", season: nil, episode: nil) == "tt0903747",
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747:1:1", season: nil, episode: nil) == "tt0903747",
                "A2: contentKey REDUCES an episode-scoped title id to the bare title, it does not pass it through")
-        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747:1:1", season: 3, episode: 5) == "tt0903747:3:5",
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747:1:1", season: 3, episode: 5) == "tt0903747:3:5",
                "A2: contentKey composes from the REDUCED title, never tt0903747:1:1:3:5")
         // INVERTED (REQ-260721-33): the reduction still happens (canonicalTitleID is a reducer, and the
         // resume fence needs tmdb heads), but the reduced value is refused as a KEY at the final gate.
-        expect(SourceIndexIdentity.contentKey(titleID: "tmdb:1399:2:3", season: 4, episode: 6) == nil
-               && SourceIndexIdentity.contentKey(titleID: "tmdb:1399", season: nil, episode: nil) == nil,
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "tmdb:1399:2:3", season: 4, episode: 6) == nil
+               && SourceIndexIdentity.contentKeyForTesting(titleID: "tmdb:1399", season: nil, episode: nil) == nil,
                "A2: a tmdb head is refused as a pool key in BOTH the composed and the bare-title branch")
-        expect(SourceIndexIdentity.contentKey(titleID: "kitsu:42", season: nil, episode: nil) == nil
-               && SourceIndexIdentity.contentKey(titleID: "tt0903747:garbage", season: nil, episode: nil) == nil,
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "kitsu:42", season: nil, episode: nil) == nil
+               && SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747:garbage", season: nil, episode: nil) == nil,
                "A2: a non-canonical titleID yields NO key, rather than being echoed back as one")
 
         // MOVIE behaviour: a movie page has no video-id role and no coordinates.
@@ -2154,14 +2348,14 @@ struct SourceIndexTorrentContractTests {
                "F1: a movie resolves to a bare title id and keys the pool without coordinates")
 
         // SEASON ZERO is VALID (specials air as S00Exx). Presence, never truthiness.
-        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747", season: 0, episode: 1) == "tt0903747:0:1",
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747", season: 0, episode: 1) == "tt0903747:0:1",
                "F5: season zero is a VALID coordinate and still composes")
 
         // F5: PARTIAL coordinate pairs are REJECTED; both-absent is a valid show-wide request.
-        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747", season: 3, episode: nil) == nil
-               && SourceIndexIdentity.contentKey(titleID: "tt0903747", season: nil, episode: 5) == nil,
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747", season: 3, episode: nil) == nil
+               && SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747", season: nil, episode: 5) == nil,
                "F5: a PARTIAL coordinate pair is rejected, never widened to the show-wide key")
-        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747", season: nil, episode: nil) == "tt0903747",
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747", season: nil, episode: nil) == "tt0903747",
                "F5: both coordinates absent is a valid bare-title request")
         expect(SourceIndexClient.contentID(imdbId: "tt0903747", season: 3) == nil
                && SourceIndexClient.contentID(imdbId: "tt0903747", episode: 5) == nil

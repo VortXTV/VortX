@@ -2278,13 +2278,11 @@ struct CoreStreamList: View {
         .onAppear {
             sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
                             mediaServers: mediaServers, debridCache: debridCache)
-            torboxSearch.refresh(target: auxiliaryTarget)
             mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
                                  title: meta?.name, publicationTarget: mediaServerTargetID)
             refreshSourceIndex()
         }
         .onChange(of: mediaServerTargetID) { _ in
-            torboxSearch.refresh(target: auxiliaryTarget)
             mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
                                  title: meta?.name, publicationTarget: mediaServerTargetID)
             refreshSourceIndex()
@@ -2501,17 +2499,30 @@ struct CoreStreamList: View {
     /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
-    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
-        let contentID = sourceContentID
-        let vortxSignedIn = VortXSyncManager.shared.isSignedIn
-        sourceIndex.refresh(target: auxiliaryTarget, isSignedIn: vortxSignedIn)
-        guard let contentID else { return }
+    private func refreshSourceIndex(
+        torboxMerged: [CoreStreamSourceGroup]? = nil,
+        refreshContributors: Bool = true
+    ) {
+        let target = auxiliaryTarget
+        if refreshContributors {
+            AuxiliarySourcePipeline.refresh(
+                target: target,
+                torBox: torboxSearch,
+                sourceIndex: sourceIndex,
+                isSignedIn: VortXSyncManager.shared.isSignedIn
+            )
+        }
+        guard SourceIndexIdentity.validatedTarget(target) != nil else { return }
         // Pool-EXCLUDED hoard set: the caller's torbox-base when it already merged one (avoids a second walk),
         // else self-merge. NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into
         // itself would be wrong.
-        let groups = torboxMerged ?? torboxSearch.merged(into: targetCoreGroups, for: auxiliaryTarget)
+        let groups = torboxMerged ?? AuxiliarySourcePipeline.torBoxMerged(
+            into: targetCoreGroups,
+            target: target,
+            torBox: torboxSearch
+        )
         guard !groups.isEmpty else { return }
-        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
+        Task.detached { await AuxiliarySourcePipeline.hoard(target: target, groups: groups) }
     }
 
     /// Trailing-debounced driver for the add-on load storm: the raw `.onChange` fired per add-on completion,
@@ -2522,12 +2533,21 @@ struct CoreStreamList: View {
         sourceRefreshDebounce = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
             guard !Task.isCancelled else { return }
-            let torboxBase = torboxSearch.merged(into: targetCoreGroups, for: auxiliaryTarget)   // pool-EXCLUDED (hoard set)
+            let target = auxiliaryTarget
+            let torboxBase = AuxiliarySourcePipeline.torBoxMerged(
+                into: targetCoreGroups,
+                target: target,
+                torBox: torboxSearch
+            )   // pool-EXCLUDED (hoard set)
             // Pool-INCLUDED: cache awareness needs raw torrents and TorBox-search NZBs that the Direct-links-only
             // filter would drop, plus Singularity's torrent-only pool sources. Torrents resolve through debrid;
             // TorBox-search NZBs resolve through TorBox. This remains orthogonal to the display filter.
-            debridCache.refresh(from: sourceIndex.merged(into: torboxBase, for: auxiliaryTarget))
-            refreshSourceIndex(torboxMerged: torboxBase)   // reuse the same base; no second merge walk
+            debridCache.refresh(from: AuxiliarySourcePipeline.sourceIndexMerged(
+                into: torboxBase,
+                target: target,
+                sourceIndex: sourceIndex
+            ))
+            refreshSourceIndex(torboxMerged: torboxBase, refreshContributors: false)
         }
     }
 

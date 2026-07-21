@@ -273,10 +273,8 @@ final class TorBoxSearchSource: ObservableObject {
     /// Fetch search results for one resolved publication target. A typed mismatch or absent target clears the
     /// current publication and launches no transport. The title id, coordinates, cache key, and publication
     /// token all come from this value, so none can be re-derived independently by the caller.
-    func refresh(target resolution: SourceIndexIdentity.TargetResolution) {
-        guard let target = resolution.target,
-              SourceIndexIdentity.imdbTitleID(target.titleID) == target.titleID,
-              SourceIndexContract.canonicalContentID(target.contentID) == target.contentID else {
+    func refresh(call: AuxiliarySourcePipeline.Call) {
+        guard let target = SourceIndexIdentity.validatedTarget(call.resolution) else {
             clearResults(); return
         }
         guard hasKey() else { clearResults(); return }
@@ -322,18 +320,23 @@ final class TorBoxSearchSource: ObservableObject {
         }
     }
 
-    /// Empty the PUBLISHED results (and the shown-key, so a later refresh for the same title
-    /// re-publishes from cache instead of being deduped into staying empty) WITHOUT touching the
-    /// session cache, the in-flight bookkeeping, or the scraper-cooldown state - those protect the
-    /// TorBox allowance for the whole session and must survive a clear. For an owner that reuses ONE
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    func refresh(target resolution: SourceIndexIdentity.TargetResolution) {
+        refresh(call: AuxiliarySourcePipeline.callForTesting(resolution))
+    }
+    #endif
+
+    /// Empty the published results, retire the in-flight request, and clear its key. A later refresh for the
+    /// same title can still republish a completed cache entry. The session cache and cooldown survive because
+    /// they protect the TorBox allowance for the whole session. For an owner that reuses ONE
     /// instance across titles (the batch-download coordinator #119, unlike the per-view @StateObjects
     /// that die with their screen): the result pool is PER-TITLE, and a title that cannot query the
     /// index (no imdb id / no key) must see it EMPTY, never a predecessor title's results - `refresh`
-    /// early-returns on those gates without clearing, so the owner clears explicitly. A still-in-flight
-    /// fetch is left running ON PURPOSE: cancelling it would strand `inFlightKey` and drop a 429
-    /// cooldown signal, while letting it finish only fills the session cache (the `shownKey` guard
-    /// already blocks a stale publish).
+    /// early-returns on those gates without clearing, so the owner clears explicitly.
     func clearResults() {
+        task?.cancel()
+        task = nil
+        inFlightKey = nil
         shownKey = nil
         publishedContentID = nil
         if !streams.isEmpty { streams = [] }
@@ -344,12 +347,21 @@ final class TorBoxSearchSource: ObservableObject {
     /// unchanged when there is nothing to add — so a no-key / empty-result path is a pure pass-through.
     func merged(
         into groups: [CoreStreamSourceGroup],
-        for resolution: SourceIndexIdentity.TargetResolution
+        call: AuxiliarySourcePipeline.Call
     ) -> [CoreStreamSourceGroup] {
-        guard let expectedContentID = resolution.target?.contentID,
+        guard let expectedContentID = SourceIndexIdentity.validatedTarget(call.resolution)?.contentID,
               publishedContentID == expectedContentID else { return groups }
         return Self.merge(streams, into: groups)
     }
+
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    func merged(
+        into groups: [CoreStreamSourceGroup],
+        for resolution: SourceIndexIdentity.TargetResolution
+    ) -> [CoreStreamSourceGroup] {
+        merged(into: groups, call: AuxiliarySourcePipeline.callForTesting(resolution))
+    }
+    #endif
 
     /// The pure merge. `nonisolated static` so `SourceListModel`'s off-main assembly can run it over a
     /// snapshotted `streams` array without hopping to the main actor; the instance `merged(into:)`
