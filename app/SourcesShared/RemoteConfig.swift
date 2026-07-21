@@ -563,6 +563,7 @@ actor RemoteConfig {
     private static let bodyETagKey = "vortx.remoteConfig.bodyETag"
     private static let lastFetchKey = "vortx.remoteConfig.lastFetchEpoch"
     private static let masterDisabledKey = "vortx.remoteConfig.masterDisabled"
+    private static let maximumCachedBodyBytes = 1_048_576
     private static let foregroundThrottle: TimeInterval = 30 * 60   // once / 30 min for a foreground refresh
 
     private let defaults: UserDefaults
@@ -573,6 +574,8 @@ actor RemoteConfig {
     /// genuine no-op and a foreground refresh does not need to re-decode.
     private var currentRaw: Data?
     private var periodicStarted = false
+    private var refreshInFlight = false
+    private var refreshPending = false
 
     init(defaults: UserDefaults = .standard,
          cacheDirectory: URL? = nil,
@@ -617,6 +620,25 @@ actor RemoteConfig {
     /// and no durable master disable is set. A latched or incoherent state forces a full body so 304 cannot
     /// preserve a partial commit. 200 applies the ordered durable transitions below. Any error keeps last-good.
     func refresh() async {
+        if refreshInFlight {
+            refreshPending = true
+            return
+        }
+
+        refreshInFlight = true
+        while true {
+            refreshPending = false
+            await performRefresh()
+            if !refreshPending {
+                // No suspension is allowed between this final pending check and clearing the owner flag. An
+                // overlapping caller must either set refreshPending before the check or become the next owner.
+                refreshInFlight = false
+                return
+            }
+        }
+    }
+
+    private func performRefresh() async {
         var req = URLRequest(url: Self.configURL, timeoutInterval: Self.fetchTimeout)
         req.httpMethod = "GET"
         req.setValue("application/json", forHTTPHeaderField: "accept")
@@ -637,11 +659,14 @@ actor RemoteConfig {
                 // changes, so every foreground refresh 304s), the 30-minute throttle never engages, and we
                 // re-hit the network on every scene activation. An unexpected 304 on an unconditional repair
                 // request is not freshness evidence and must not throttle the next repair attempt.
-                guard requestETag != nil else { return }
+                guard let requestETag, coherentRequestETag() == requestETag else { return }
                 defaults.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
                 return
             }
             guard http.statusCode == 200 else { return }                // any other status: keep last-good
+            // Apply the same bound used by bootstrap before decoding or committing any response state. This
+            // must precede the disable latch too: an oversized body is not an authoritative config update.
+            guard Self.isAcceptableCacheBody(data) else { return }
 
             let decoded = try JSONDecoder().decode(RemoteConfigData.self, from: data)
 
@@ -941,26 +966,57 @@ actor RemoteConfig {
 
     private func cacheFile() -> URL? { cacheDirectory()?.appendingPathComponent("config.json") }
 
-    /// Load the cached JSON, or nil when absent / unreadable / not valid JSON (corrupt => treated as absent).
+    /// Load bounded cached JSON, or nil when absent, unreadable, oversized, or not valid JSON.
     private func loadCachedJSON() -> Data? {
-        guard let file = cacheFile(), let data = try? Data(contentsOf: file), !data.isEmpty else { return nil }
+        guard let data = readBoundedCache(), !data.isEmpty else { return nil }
         // A corrupt cache must decode to nothing rather than crash bootstrap.
         guard (try? JSONSerialization.jsonObject(with: data)) != nil else { return nil }
         return data
     }
 
-    /// The validator this actor may send. All four facts must agree: no disable latch, a decoded readable body
-    /// is resident, the validator is non-empty, and the post-body binding names that same validator.
+    /// The validator this actor may send. Durable bytes must still exist, decode, and exactly match the installed
+    /// raw body. The latch must be clear, and the nonempty request and body validators must name the same body.
     private func coherentRequestETag() -> String? {
-        guard !defaults.bool(forKey: Self.masterDisabledKey), currentRaw != nil,
+        guard !defaults.bool(forKey: Self.masterDisabledKey),
               let etag = defaults.string(forKey: Self.etagKey), !etag.isEmpty,
-              defaults.string(forKey: Self.bodyETagKey) == etag else { return nil }
+              let bodyETag = defaults.string(forKey: Self.bodyETagKey), !bodyETag.isEmpty,
+              bodyETag == etag,
+              let currentRaw,
+              let durableRaw = readBoundedCache(), durableRaw == currentRaw,
+              (try? JSONDecoder().decode(RemoteConfigData.self, from: durableRaw)) != nil else { return nil }
         return etag
+    }
+
+    /// Read at most one byte beyond the cache limit, so an oversized or changing file cannot allocate without
+    /// bound. The caller still validates both schema and byte identity before trusting these bytes.
+    private func readBoundedCache() -> Data? {
+        guard let file = cacheFile(), let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+
+        var data = Data()
+        do {
+            while data.count <= Self.maximumCachedBodyBytes {
+                let remaining = Self.maximumCachedBodyBytes + 1 - data.count
+                guard remaining > 0,
+                      let chunk = try handle.read(upToCount: min(64 * 1024, remaining)),
+                      !chunk.isEmpty else { break }
+                data.append(chunk)
+            }
+        } catch {
+            return nil
+        }
+        guard Self.isAcceptableCacheBody(data) else { return nil }
+        return data
+    }
+
+    private static func isAcceptableCacheBody(_ data: Data) -> Bool {
+        !data.isEmpty && data.count <= maximumCachedBodyBytes
     }
 
     /// Atomically persist the raw body, then record which ETag was bound after that successful write. The
     /// request validator itself is deliberately not changed here; each transition commits it last.
     private func persistBody(json: Data, etag: String?) -> Bool {
+        guard Self.isAcceptableCacheBody(json) else { return false }
         guard let file = cacheFile() else { return false }
         do {
             try json.write(to: file, options: .atomic)
