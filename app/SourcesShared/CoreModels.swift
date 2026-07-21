@@ -684,6 +684,11 @@ struct CoreVideo: Decodable, Identifiable {
     let episode: Int?
 
     /// Display helpers used by the player's episode list and Prev/Next buttons.
+    ///
+    /// DISPLAY ONLY. `episode ?? 0` collapses "not resolved yet" and "explicitly episode 0" (specials are
+    /// legitimately numbered E0) into the same value, so this must never enter a fetch, cache, pool, or
+    /// publication identity. Identity paths read the optional `episode` directly and treat absence as absence;
+    /// see `SourceIndexIdentity.contentKey`, which rejects a PARTIAL coordinate pair rather than widening it.
     var episodeNumber: Int { episode ?? 0 }
     var episodeTitle: String {
         if let title, !title.isEmpty { return title }

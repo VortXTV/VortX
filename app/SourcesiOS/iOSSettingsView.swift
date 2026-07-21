@@ -769,16 +769,24 @@ struct iOSSettingsView: View {
         }
     }
 
-    /// The rolling diagnostic log to hand to the share sheet, or nil when the log is empty/missing. Keyed on
-    /// file content, not on VXProbe.enabled, so turning Diagnostic logging off after a capture still lets the
-    /// user save what was recorded (the QR export path serves the same bytes with no toggle gate). Gating on
-    /// the file size the way exportActiveLibrary guards its empty case means it never shares a nonexistent or
+    /// The diagnostic log to hand to the share sheet, or nil when the log is empty/missing. Keyed on file
+    /// content, not on VXProbe.enabled, so turning Diagnostic logging off after a capture still lets the user
+    /// save what was recorded (the QR export path serves the same bytes with no toggle gate). Gating on the
+    /// file size the way exportActiveLibrary guards its empty case means it never shares a nonexistent or
     /// empty file; nil drives the guidance button instead.
+    ///
+    /// It hands over a SANITISED COPY in the temp directory, never the live file. Sharing the live file was
+    /// the third export path that skipped the sanitiser: `Caches/vortx-diag.log` survives app updates, so it
+    /// holds whatever every previous build wrote, and a write-path scrubber does nothing for bytes that are
+    /// already on disk. `VXDiagExport.exportBody()` re-runs the current rules over every retained line and
+    /// folds in the streaming server's section, so this path emits exactly what the QR and macOS paths do.
     private var diagLogExportURL: URL? {
-        let url = VXProbe.logFileURL
-        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+        let live = VXProbe.logFileURL
+        guard let values = try? live.resourceValues(forKeys: [.fileSizeKey]),
               let size = values.fileSize, size > 0 else { return nil }
-        return url
+        let dest = FileManager.default.temporaryDirectory.appendingPathComponent("vortx-diag.log")
+        guard (try? VXDiagExport.exportBody().write(to: dest, options: .atomic)) != nil else { return nil }
+        return dest
     }
 
     /// QR export sheet for the diagnostic log: the phone scans the code, downloads vortx-diag.log over the

@@ -607,7 +607,14 @@ struct CoreContinueWatchingRow: View {
             // debrid/direct resumes (the common case), so those playbacks seeded nothing. Fire-and-forget,
             // deduped per content, gated inside SourceIndexClient (consent + fleet flag). No-op when the library
             // id is not a real imdb id or no groups assemble.
-            if let cid = SourceIndexClient.contentID(imdbId: item.id, season: entry.season, episode: entry.episode) {
+            // IDENTITY FENCE (REQ-260721-38): the key is built from the library item id, but the groups
+            // below are polled by the STORED entry's videoId, and those are two independent ids. The old
+            // guard compared episode NUMBERS, which cannot catch a title mismatch: item tt1375666 with a
+            // stored video tt0903747:1:1 published the latter's groups under tt1375666:1:1. `resumeContentID`
+            // compares canonical TITLE HEADS and returns nil when they disagree, which SKIPS the pool
+            // contribution only. Playback below is untouched: a mismatch never blocks the user's own resume.
+            if let cid = SourceIndexClient.resumeContentID(itemID: item.id, videoID: entry.videoId,
+                                                          season: entry.season, episode: entry.episode) {
                 let streamId = entry.videoId
                 Task.detached {
                     await SourceIndexClient.hoardResumedGroups(contentID: cid) {

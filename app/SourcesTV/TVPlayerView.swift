@@ -732,7 +732,11 @@ struct TVPlayerView: View {
         // exported log gets the route trail once per stream instead of once per body pass (#76 b163 flood).
         // AVPlayer on a DV source is the true-DV lane (VideoToolbox); mpv here means HDR10 tone-map.
         let candidacy = PlayerEngineRouter.dvRemuxCandidacy(url)
-        let routeLine = "route file=\(url.lastPathComponent) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(candidacy.candidate) [\(candidacy.reason)] container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)"
+        // The file name is an identifier in practice (a release name names the title), and this line goes to
+        // BOTH the opt-in probe log and, via DVRouteBreadcrumb, the always-on diagnostics.log. Its iOS twin
+        // in PlayerScreen.routedToAVPlayer already redacts it; this one did not, which is the whole reason
+        // "the sink will catch it" is not a plan.
+        let routeLine = "route file=\(VXProbeRedaction.identityToken(url.lastPathComponent)) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(candidacy.candidate) [\(candidacy.reason)] container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)"
         VXProbe.log("dv", routeLine)
         // ALWAYS-ON breadcrumb: user builds must record the engine choice + DV flag even with probe
         // logging off. Deduped, so the handful of pre-latch evaluations write one line.
@@ -3123,13 +3127,13 @@ struct TVPlayerView: View {
         // iOS self-heal: log the miss, then one-shot the runtime (movie then series) and key
         // provisionally. A tmdb-keyed play resolves its tt id FIRST (Cinemeta only speaks imdb), and the
         // resolver caches the mapping for the store's own keying. mpv's real `duration` still re-keys.
-        VXProbe.log("tp", "provisional key MISS (tvOS): playing=\(m.libraryId) metaDetails=\(core.metaDetails?.meta?.id ?? "nil") (fetching runtime)")
+        VXProbe.log("tp", "provisional key MISS (tvOS): playing=\(VXProbeRedaction.identityToken(m.libraryId)) metaDetails=\(VXProbeRedaction.identityToken(core.metaDetails?.meta?.id)) (fetching runtime)")
         Task {
             var ttId = m.libraryId
             if !ttId.hasPrefix("tt") {
                 guard ttId.lowercased().hasPrefix("tmdb"),
                       let tt = await CommunityTrickplay.resolveIMDbID(rawId: m.libraryId, seriesHint: m.season != nil) else {
-                    VXProbe.log("tp", "provisional key MISS stays (tvOS): unresolvable id \(m.libraryId)")
+                    VXProbe.log("tp", "provisional key MISS stays (tvOS): unresolvable id \(VXProbeRedaction.identityToken(m.libraryId))")
                     return
                 }
                 ttId = tt
@@ -4730,9 +4734,9 @@ struct TVPlayerView: View {
         assert(pending.url == nil || pending.url == curURL,
                "binge-advance commit: published episode's media (\(pending.url?.lastPathComponent ?? "nil")) != loaded media (\(curURL?.lastPathComponent ?? "nil"))")
         if let u = pending.url, u != curURL {
-            DiagnosticsLog.log("binge", "COMMIT MISMATCH: pending url \(u.lastPathComponent) != curURL \(curURL?.lastPathComponent ?? "nil")")
+            DiagnosticsLog.log("binge", "COMMIT MISMATCH: pending url \(VXProbeRedaction.identityToken(u.lastPathComponent)) != curURL \(VXProbeRedaction.identityToken(curURL?.lastPathComponent))")
         }
-        DiagnosticsLog.log("binge", "advance committed at first frame -> \(pending.meta.videoId) (label/selector/store/engine-gate now agree)")
+        DiagnosticsLog.log("binge", "advance committed at first frame -> \(VXProbeRedaction.identityToken(pending.meta.videoId)) (label/selector/store/engine-gate now agree)")
     }
 
     /// FOREGROUND RECONCILE of an interrupted binge advance. Outside an advance the published episode and
@@ -4749,7 +4753,7 @@ struct TVPlayerView: View {
     private func reconcileAdvanceOnForeground() {
         guard let pending = pendingAdvance, pending.issued, !hasStartedPlaying, !loadFailed,
               let u = pending.url else { return }
-        DiagnosticsLog.log("binge", "foreground reconcile: re-issuing interrupted advance load for \(pending.meta.videoId)")
+        DiagnosticsLog.log("binge", "foreground reconcile: re-issuing interrupted advance load for \(VXProbeRedaction.identityToken(pending.meta.videoId))")
         buffering = true
         guard let loadToken = loadIntoPlayer(u, headers: curHeaders, live: curIsLive) else { return }
         pendingAdvance?.loadToken = loadToken

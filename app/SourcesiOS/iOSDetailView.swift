@@ -105,9 +105,12 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge, pin: pin,
                                         debridCachedHashes: cachedHashes) else { return nil }
     let targetSeason = v.season ?? defaultSeason
-    let targetEpisode = v.episodeNumber
-    let episodeHint = targetSeason >= 0 && targetEpisode > 0
-        ? DebridEpisode(season: targetSeason, episode: targetEpisode) : nil
+    // PRESENCE, not truthiness: `episodeNumber` is the DISPLAY helper (`episode ?? 0`), so using it here
+    // made an unresolved episode indistinguishable from an explicit E0 special, and the `> 0` test then
+    // dropped both. Read the optional directly and accept episode ZERO.
+    let targetEpisode = v.episode
+    let episodeHint = targetSeason >= 0 && (targetEpisode ?? -1) >= 0
+        ? DebridEpisode(season: targetSeason, episode: targetEpisode ?? 0) : nil
     let ref: DebridPlaybackRef?
     if best.url == nil, episodeHint == nil {
         ref = nil
@@ -1999,6 +2002,13 @@ struct iOSDetailView: View {
     /// the catalog id is non-imdb (tmdb:/kitsu:), else the catalog id. Falls back to the catalog id before
     /// the meta is loaded. This is what makes imdb-keyed stream add-ons match (the engine's own guess_stream
     /// uses the same default_video_id; we lost it by moving movies to an explicit streamPath).
+    /// ID-FENCED (REQ-260721-30): it reads the meta only when that meta's own id is this page's id. It used
+    /// to read the shared singleton directly, AROUND the residency guard, so title B could dispatch title A's
+    /// still-resident default video id.
+    ///
+    /// It is deliberately NOT the pool identity. The pool key is a canonical title head; a stream request must
+    /// carry the add-on's OWN video id verbatim, coordinates included, or imdb-keyed add-ons stop matching.
+    /// Same title, different required shape: do not "unify" these two by canonicalizing this one.
     private var movieStreamId: String {
         if let dv = meta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != id { return dv }
         return id
@@ -3209,7 +3219,17 @@ struct iOSDetailView: View {
     private func startBatchDownload(_ vids: [CoreVideo]) {
         guard let m = meta, !vids.isEmpty else { return }
         BatchDownloadCoordinator.shared.enqueue(
-            seriesId: m.id, seriesName: m.name, seriesImdbId: ratingsImdbID, fallbackPoster: m.poster,
+            seriesId: m.id, seriesName: m.name,
+            // ROLES, not `ratingsImdbID`. That value is the show's tt-only ratings id: it is nil for a
+            // TMDB/Kitsu-keyed show, and it is a default, not the selected episode. The coordinator applies
+            // each episode's own current-video role as it walks.
+            identityRoles: SourceIndexIdentity.Roles(
+                catalogID: m.id,
+                defaultVideoID: m.behaviorHints?.defaultVideoId,
+                currentVideoID: nil,
+                kind: .series
+            ),
+            fallbackPoster: m.poster,
             episodes: vids, continuity: rememberedQuality, pin: sourcePin,
             cachedHashes: debridCache.cachedHashes)
     }
@@ -3706,8 +3726,9 @@ struct iOSEpisodeStreams: View {
 
     private func debridHint(for target: CoreVideo) -> DebridEpisode? {
         let targetSeason = target.season ?? season
-        let targetEpisode = target.episode ?? target.episodeNumber
-        guard targetSeason >= 0, targetEpisode > 0 else { return nil }
+        // PRESENCE, not truthiness (see the note on `auxiliaryEpisode`): `?? target.episodeNumber` was
+        // `?? 0`, which laundered an unresolved episode into an explicit E0 and then discarded it anyway.
+        guard targetSeason >= 0, let targetEpisode = target.episode, targetEpisode >= 0 else { return nil }
         return DebridEpisode(season: targetSeason, episode: targetEpisode)
     }
 
@@ -4177,10 +4198,25 @@ struct iOSEpisodeStreams: View {
 
     /// The episode's pool `content_id` (show imdb id + `:S:E`), or nil when the show has no imdb id.
     private var auxiliarySeason: Int { shownVideo.season ?? season }
-    private var auxiliaryEpisode: Int { shownVideo.episode ?? shownVideo.episodeNumber }
+
+    /// The episode coordinate, PRESERVING nil.
+    ///
+    /// It used to read `shownVideo.episode ?? shownVideo.episodeNumber`, and `episodeNumber` is itself
+    /// `episode ?? 0` (CoreModels.swift), so the whole expression was `episode ?? 0`: absence was laundered
+    /// into the explicit value ZERO before any consumer saw it. Two things broke. The tuple-exact guard in
+    /// `SourceIndexIdentity.contentKey` became UNREACHABLE from here, because a nil episode arrived as 0 and
+    /// composed a complete-looking `tt...:S:0` key for an episode nobody had resolved yet. And an add-on that
+    /// legitimately numbers a special E0 became indistinguishable from "not known yet".
+    ///
+    /// `episodeNumber` remains the DISPLAY helper it is named for (labels like "S1E4"); it must never enter a
+    /// fetch, cache, pool, or publication identity, and nothing on this identity path reads it now.
+    private var auxiliaryEpisode: Int? { shownVideo.episode }
+
     private var episodeDebridHint: DebridEpisode? {
-        guard auxiliarySeason >= 0, auxiliaryEpisode > 0 else { return nil }
-        return DebridEpisode(season: auxiliarySeason, episode: auxiliaryEpisode)
+        // Episode ZERO is a valid coordinate (specials), so this tests PRESENCE and non-negativity, never
+        // truthiness. The old `> 0` silently dropped every E0 special from debrid episode matching.
+        guard auxiliarySeason >= 0, let episode = auxiliaryEpisode, episode >= 0 else { return nil }
+        return DebridEpisode(season: auxiliarySeason, episode: episode)
     }
     private var episodeContentID: String? {
         SourceIndexClient.contentID(roles: showIdentityRoles, season: auxiliarySeason, episode: auxiliaryEpisode)
@@ -4254,9 +4290,10 @@ struct iOSEpisodeStreams: View {
         guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
                                             debridCachedHashes: debridCache.cachedHashes) else { return nil }
         let targetSeason = v.season ?? season
-        let targetEpisode = v.episodeNumber
-        let episodeHint = targetSeason >= 0 && targetEpisode > 0
-            ? DebridEpisode(season: targetSeason, episode: targetEpisode) : nil
+        // PRESENCE, not truthiness: the display helper cannot tell absence from an explicit E0.
+        let targetEpisode = v.episode
+        let episodeHint = targetSeason >= 0 && (targetEpisode ?? -1) >= 0
+            ? DebridEpisode(season: targetSeason, episode: targetEpisode ?? 0) : nil
         let ref: DebridPlaybackRef?
         if best.url == nil, episodeHint == nil {
             ref = nil
@@ -4297,9 +4334,10 @@ struct iOSEpisodeStreams: View {
         guard let best = StreamRanking.best(iOSDisplayGroups(groups), continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
                                             debridCachedHashes: debridCache.cachedHashes) else { return }
         let targetSeason = v.season ?? season
-        let targetEpisode = v.episodeNumber
-        let hint = targetSeason >= 0 && targetEpisode > 0
-            ? DebridEpisode(season: targetSeason, episode: targetEpisode) : nil
+        // PRESENCE, not truthiness: the display helper cannot tell absence from an explicit E0.
+        let targetEpisode = v.episode
+        let hint = targetSeason >= 0 && (targetEpisode ?? -1) >= 0
+            ? DebridEpisode(season: targetSeason, episode: targetEpisode ?? 0) : nil
         let ref: DebridPlaybackRef?
         if best.url == nil, hint == nil {
             ref = nil

@@ -390,6 +390,13 @@ struct DetailView: View {
     /// the catalog id is non-imdb (tmdb:/kitsu:), else the catalog id. Falls back to the catalog id before
     /// the meta loads. Matches official Stremio (and the engine's guess_stream), which key movie streams on
     /// default_video_id so imdb add-ons match.
+    /// ID-FENCED (REQ-260721-30): it reads the meta only when that meta's own id is this page's id. It used
+    /// to read the shared singleton directly, AROUND the residency guard, so title B could dispatch title A's
+    /// still-resident default video id.
+    ///
+    /// It is deliberately NOT the pool identity. The pool key is a canonical title head; a stream request must
+    /// carry the add-on's OWN video id verbatim, coordinates included, or imdb-keyed add-ons stop matching.
+    /// Same title, different required shape: do not "unify" these two by canonicalizing this one.
     private var movieStreamId: String {
         if let dv = fencedMeta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != id { return dv }
         return id
@@ -1857,11 +1864,14 @@ struct CoreStreamList: View {
     /// most wanted. It is declared here rather than borrowed from `DetailView` because this is a separate
     /// struct: the identifier is not in scope across the type boundary, however adjacent the two rows look.
     ///
-    /// `imdbId` is already the SHOW-level tt id at EVERY call site (the episode page deliberately passes the
-    /// show's id, not the episode's), which is the exact level ratings are recorded at, so an episode page
-    /// rates its show and matches the title-level intent of the watchlist writes.
+    /// The resolved identity is the SHOW-level title id (the episode page states the show as its catalog role,
+    /// not the episode), which is the exact level ratings are recorded at, so an episode page rates its show
+    /// and matches the title-level intent of the watchlist writes. It is a bare "tt..." or nothing, which is
+    /// also what `TraktRatingChip` needs: the previous property could carry a tmdb value straight into a
+    /// parameter labelled `imdb`.
     @ViewBuilder private var ratingChip: some View {
-        TraktRatingChip(imdb: imdbId, tmdb: ratingTMDBID, isSeries: (meta?.type ?? "") == "series")
+        TraktRatingChip(imdb: titleIdentity.titleID, tmdb: ratingTMDBID,
+                        isSeries: (meta?.type ?? "") == "series")
     }
 
     @EnvironmentObject private var core: CoreBridge

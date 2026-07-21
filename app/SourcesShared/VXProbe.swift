@@ -114,19 +114,21 @@ final class VXProbeFileLog {
     /// is momentarily backed up. Fail-soft: any file error is swallowed so logging never destabilizes the app.
     func record(category: String, message: String) {
         let now = Date()
-        // REDACT FIRST, before NSLog and before the file write, so there is exactly ONE place where a probe
-        // line becomes durable and it is downstream of the scrubber. Doing it here rather than in `write`
-        // covers the NSLog mirror too (a device console log is shared just as casually as the file).
-        //
-        // This is a BACKSTOP, not the fix: the producers that build identifier-bearing strings are corrected
-        // at their own call sites. It is here because the producer set is open -- 19 files call VXProbe -- and
-        // a new one must not be able to reintroduce the class. See VXProbeRedaction for what it does and,
-        // more importantly, what it cannot do.
-        let safe = VXProbeRedaction.scrub(message)
         queue.async { [weak self] in
             guard let self else { return }
-            NSLog("[%@] %@", category, safe)
-            let line = "\(self.formatter.string(from: now)) [\(category)] \(safe)\n"
+            // FORM THE WHOLE LINE THROUGH THE SHARED FORMATTER, then use those same bytes for both sinks, so
+            // there is exactly ONE place where a probe line becomes durable and it is downstream of the
+            // scrubber. NSLog gets the identical text (a device console log is shared just as casually as the
+            // file). Category is scrubbed too, and the cap covers the COMPLETE line rather than the message
+            // alone, so nothing can be appended after the cap to exceed it.
+            //
+            // This is a BACKSTOP, not the fix: the producers that build identifier-bearing strings are
+            // corrected at their own call sites. It is here because the producer set is open, and a new one
+            // must not be able to reintroduce the class. See VXProbeRedaction for what it does and, more
+            // importantly, what it cannot do.
+            let line = VXProbeRedaction.durableLine(timestamp: self.formatter.string(from: now),
+                                                    category: category, message: message)
+            NSLog("%@", String(line.dropLast()))
             guard let data = line.data(using: .utf8) else { return }
             self.write(data)
         }

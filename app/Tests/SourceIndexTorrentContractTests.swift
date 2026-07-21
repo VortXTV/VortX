@@ -686,8 +686,14 @@ struct SourceIndexTorrentContractTests {
                "serve boundary rejects a user-shaped title before request construction")
         expect(SourceIndexClient.serveURL(contentID: "tt1234567:1") == nil,
                "serve boundary rejects an incomplete episodic title")
-        expect(SourceIndexClient.serveURL(contentID: "tmdb:123:1:2")?.absoluteString.contains("kind=torrent") == true,
-               "serve boundary builds only the torrent query for a canonical TMDB episode")
+        // INVERTED (decision REQ-260721-33). This case used to assert that a TMDB episode key built a serve
+        // URL. It now asserts the opposite, because TMDB reuses its numeric ids across the movie and tv
+        // namespaces (`/movie/11` and `/tv/11` are different titles) while `content_id` carries no entity
+        // type, so a tmdb key merges two unrelated titles into one pool bucket in both directions.
+        expect(SourceIndexClient.serveURL(contentID: "tmdb:123:1:2") == nil,
+               "serve boundary REFUSES a tmdb key: pool keys are IMDb-only")
+        expect(SourceIndexClient.serveURL(contentID: "tt1234567:1:2")?.absoluteString.contains("kind=torrent") == true,
+               "serve boundary builds only the torrent query for a canonical IMDb episode")
         let exactOrigin = "https://sources.vortx.tv"
         let hostileOrigins = [
             "http://sources.vortx.tv",
@@ -1908,32 +1914,125 @@ struct SourceIndexTorrentContractTests {
                                         sources: ["dht:" + passkey])) == [realHash],
                "PRECEDENCE (F2): the explicit infoHash field outranks a sources entry, most-authoritative first")
 
-        // ---- F1/F3: the ONE shared preferred-title resolver, compiled INTO this suite ----
+        // ---- F1/F3: the ONE shared role-aware resolver, compiled INTO this suite ----
         // The old inline copies lived in two view files this harness cannot compile, so reverting them left
-        // every case below green. Everything the views now call is here, so a revert is RED.
-        let episodeScoped = SourceIndexIdentity.preferred(candidates: ["tt0903747:1:1", "tmdb:1399", "tt0903747:3:5"])
-        expect(episodeScoped.indexID == "tt0903747" && episodeScoped.torBoxID == "tt0903747",
-               "F1: an EPISODE-scoped defaultVideoId is canonicalized, not returned unchanged")
-        expect(SourceIndexClient.contentID(imdbId: episodeScoped.torBoxID, season: 3, episode: 5) == "tt0903747:3:5",
-               "F1 end-to-end: the resolved TorBox identity composes tt0903747:3:5, never tt0903747:1:1:3:5")
+        // every case below green. Everything the views now call is here, and `IdentityCallerGateTests` reads
+        // the view sources themselves so a view-only revert is red there.
+        //
+        // ROLES, NOT ORDER. The previous signature was `preferred(candidates: [String?])` and the ARRAY ORDER
+        // silently decided authority, wrongly: `preferred(["tt0903747:1:1", "tt1375666"])` returned
+        // `tt0903747`, so an add-on's episode-shaped defaultVideoId outranked the catalog id of the page the
+        // user was on. These cases pin the authority rule to the ROLE instead.
+        func roles(catalog: String?, defaultVideo: String?, currentVideo: String?,
+                   kind: SourceIndexIdentity.ContentKind) -> SourceIndexIdentity.Roles {
+            SourceIndexIdentity.Roles(catalogID: catalog, defaultVideoID: defaultVideo,
+                                      currentVideoID: currentVideo, kind: kind)
+        }
 
-        // THE REPORTED FIELD CASE: tmdb-identified series, NO defaultVideoId, imdb identity only on the video id.
-        let fieldCase = SourceIndexIdentity.preferred(candidates: [nil, "tmdb:94997", "tt0460649:3:6"])
-        expect(fieldCase.indexID == "tt0460649" && fieldCase.torBoxID == "tt0460649",
-               "F1 field case: an imdb episode video id wins over the earlier tmdb catalog id")
+        // THE REVERSED CASE, stated first: a MOVIE whose add-on default is an episode-shaped id from an
+        // entirely different title. The catalog id is what the user opened and must win.
+        expect(SourceIndexIdentity.resolve(
+                   roles(catalog: "tt1375666", defaultVideo: "tt0903747:1:1",
+                         currentVideo: nil, kind: .movie)).titleID == "tt1375666",
+               "F1: a valid bare CATALOG imdb id outranks an episode-derived default on a movie")
+        expect(SourceIndexIdentity.resolve(
+                   roles(catalog: "tt1375666", defaultVideo: "tt0903747:1:1",
+                         currentVideo: "tt0903747:1:1", kind: .live)).titleID == "tt1375666",
+               "F1: the same authority holds for a live page, whose current-video role does not exist")
+        // Conflicting heads on a SERIES resolve to the catalog identity too.
+        expect(SourceIndexIdentity.resolve(
+                   roles(catalog: "tt0903747", defaultVideo: "tt1375666",
+                         currentVideo: "tt2861424:1:1", kind: .series)).titleID == "tt0903747",
+               "F1: on conflicting heads the CATALOG identity wins")
+
+        // An episode-scoped default is canonicalized, never returned unchanged.
+        let episodeScoped = SourceIndexIdentity.resolve(
+            roles(catalog: "tmdb:1399", defaultVideo: "tt0903747:1:1",
+                  currentVideo: "tt0903747:3:5", kind: .series))
+        expect(episodeScoped.titleID == "tt0903747",
+               "F1: an EPISODE-scoped defaultVideoId is canonicalized, not returned unchanged")
+        expect(SourceIndexClient.contentID(imdbId: episodeScoped.titleID, season: 3, episode: 5) == "tt0903747:3:5",
+               "F1 end-to-end: the resolved identity composes tt0903747:3:5, never tt0903747:1:1:3:5")
+
+        // THE PRESERVED FIELD CASE: tmdb-identified series, NO defaultVideoId, imdb identity ONLY on the
+        // episode video id. The current-video role is the only source of an identity here, and it must work.
+        let fieldCase = SourceIndexIdentity.resolve(
+            roles(catalog: "tmdb:94997", defaultVideo: nil, currentVideo: "tt0460649:3:6", kind: .series))
+        expect(fieldCase.titleID == "tt0460649",
+               "F1 field case: an imdb EPISODE video id supplies the identity when no other role carries one")
+        // The same inputs on a MOVIE resolve to nothing: a movie has no episode, so that role is not consulted.
+        expect(SourceIndexIdentity.resolve(
+                   roles(catalog: "tmdb:94997", defaultVideo: nil,
+                         currentVideo: "tt0460649:3:6", kind: .movie)).titleID == nil,
+               "F1: the current-video role is IGNORED for a movie, so kind is load-bearing, not decoration")
 
         // An episode-scoped default from a DIFFERENT episode than the one being viewed: the coordinates on the
         // id are noise and must be discarded, not carried into the key for the episode actually on screen.
-        let otherEpisodeDefault = SourceIndexIdentity.preferred(candidates: ["tt0903747:1:1", "tt0903747", "tt0903747:5:9"])
-        expect(SourceIndexClient.contentID(imdbId: otherEpisodeDefault.indexID, season: 5, episode: 9) == "tt0903747:5:9",
+        let otherEpisodeDefault = SourceIndexIdentity.resolve(
+            roles(catalog: "tt0903747", defaultVideo: "tt0903747:1:1",
+                  currentVideo: "tt0903747:5:9", kind: .series))
+        expect(SourceIndexClient.contentID(imdbId: otherEpisodeDefault.titleID, season: 5, episode: 9) == "tt0903747:5:9",
                "F1: a default video id from a DIFFERENT episode never leaks its own coordinates into the key")
 
-        // A malformed preferred candidate must be SKIPPED so a later good one still wins, and an all-malformed
-        // candidate list must resolve to nothing rather than to a half-parsed value.
-        expect(SourceIndexIdentity.preferred(candidates: ["tt0903747:garbage", "tt0903747"]).indexID == "tt0903747",
-               "F1: a malformed preferred candidate is skipped, and the next canonical candidate wins")
-        expect(SourceIndexIdentity.preferred(candidates: ["kitsu:42", "not-an-id", nil]).indexID == nil,
-               "F1: an all-malformed candidate list resolves to no identity at all")
+        // A malformed role is SKIPPED so a later good one still wins, and an all-malformed set resolves to
+        // nothing rather than to a half-parsed value.
+        expect(SourceIndexIdentity.resolve(
+                   roles(catalog: "tt0903747:garbage", defaultVideo: "tt0903747",
+                         currentVideo: nil, kind: .series)).titleID == "tt0903747",
+               "F1: a malformed role is skipped, and the next canonical role wins")
+        expect(SourceIndexIdentity.resolve(
+                   roles(catalog: "kitsu:42", defaultVideo: "not-an-id",
+                         currentVideo: nil, kind: .series)).titleID == nil,
+               "F1: an all-malformed role set resolves to no identity at all")
+
+        // `selecting` re-points the current-video role and nothing else (the batch coordinator's per-episode
+        // step). Proven by a case where the current-video role is the ONLY identity source.
+        let showLevel = roles(catalog: "tmdb:94997", defaultVideo: nil, currentVideo: nil, kind: .series)
+        expect(SourceIndexIdentity.resolve(showLevel).titleID == nil
+               && SourceIndexIdentity.resolve(showLevel.selecting(currentVideoID: "tt0460649:2:4")).titleID == "tt0460649",
+               "F1 batch: selecting() supplies the per-episode current-video role the coordinator used to omit")
+
+        // ---- REQ-260721-33: pool keys are IMDb ONLY, both platforms, movie / series / live ----
+        // TMDB reuses numeric ids across the movie and tv namespaces and `content_id` carries no entity type,
+        // so `tmdb:11` names two different titles. It may RESOLVE an IMDb id; it never becomes a key.
+        expect(SourceIndexContract.canonicalContentID("tmdb:1399") == nil
+               && SourceIndexContract.canonicalContentID("tmdb:1399:2:3") == nil,
+               "REQ-33: the pool key gate refuses a tmdb key, bare and episode-scoped")
+        expect(SourceIndexIdentity.resolve(
+                   roles(catalog: "tmdb:1399", defaultVideo: nil,
+                         currentVideo: "tmdb:1399:2:3", kind: .series)).titleID == nil,
+               "REQ-33: a tmdb-only title resolves to NO identity, so it contributes nothing rather than a wrong key")
+        expect(SourceIndexClient.contentID(imdbId: "tmdb:1399", season: 2, episode: 3) == nil
+               && SourceIndexClient.contentID(imdbId: "tmdb:1399") == nil,
+               "REQ-33: the client refuses a tmdb key on both the composed and the bare-title branch")
+        expect(SourceIndexIdentity.imdbTitleID("tmdb:1399") == nil
+               && SourceIndexIdentity.imdbTitleID("tt0903747:1:1") == "tt0903747"
+               && SourceIndexIdentity.imdbTitleID("tt0903747") == "tt0903747",
+               "REQ-33: the boundary validator accepts only a BARE imdb title id (TorBox stays bare-IMDb)")
+
+        // ---- REQ-260721-38: the direct-resume identity fence ----
+        // THE WORKED FAILURE: library item tt1375666 with a stored video tt0903747:1:1 published Game of
+        // Thrones' assembled groups under tt1375666:1:1. The old guard compared episode NUMBERS, which
+        // MATCHED, so it caught nothing. Compare canonical TITLE HEADS.
+        expect(SourceIndexIdentity.resumeKey(itemID: "tt1375666", videoID: "tt0903747:1:1",
+                                             season: 1, episode: 1) == nil,
+               "F6: a resume whose item and stored video name DIFFERENT titles contributes NOTHING")
+        expect(SourceIndexClient.resumeContentID(itemID: "tt1375666", videoID: "tt0903747:1:1",
+                                                 season: 1, episode: 1) == nil,
+               "F6: the same refusal through the client entry the resume paths actually call")
+        expect(SourceIndexIdentity.resumeKey(itemID: "tt0903747", videoID: "tt0903747:1:1",
+                                             season: 1, episode: 1) == "tt0903747:1:1",
+               "F6: matching heads still contribute, with the coordinates the resume carries")
+        expect(SourceIndexIdentity.resumeKey(itemID: "tt1375666", videoID: nil,
+                                             season: nil, episode: nil) == "tt1375666",
+               "F6: a movie resume has no stored video id to disagree with, so the item head stands alone")
+        expect(SourceIndexIdentity.resumeKey(itemID: "tt0903747", videoID: "tt0903747:1:1",
+                                             season: 1, episode: nil) == nil,
+               "F6: the tuple-exact rule still applies to a resume, a partial pair is not widened")
+        expect(SourceIndexIdentity.resumeKey(itemID: "tmdb:1399", videoID: "tmdb:1399:1:1",
+                                             season: 1, episode: 1) == nil,
+               "F6: matching TMDB heads still yield no key, because pool keys are IMDb-only")
+
         // ---- A1: the 128-byte identity CAP, asserted for the first time ----
         //
         // WHAT THE OLD ASSERTION HERE ACTUALLY TESTED. It read
@@ -1968,24 +2067,21 @@ struct SourceIndexTorrentContractTests {
                "A2: contentKey REDUCES an episode-scoped title id to the bare title, it does not pass it through")
         expect(SourceIndexIdentity.contentKey(titleID: "tt0903747:1:1", season: 3, episode: 5) == "tt0903747:3:5",
                "A2: contentKey composes from the REDUCED title, never tt0903747:1:1:3:5")
-        expect(SourceIndexIdentity.contentKey(titleID: "tmdb:1399:2:3", season: 4, episode: 6) == "tmdb:1399:4:6",
-               "A2: the same reduction applies in the tmdb namespace")
+        // INVERTED (REQ-260721-33): the reduction still happens (canonicalTitleID is a reducer, and the
+        // resume fence needs tmdb heads), but the reduced value is refused as a KEY at the final gate.
+        expect(SourceIndexIdentity.contentKey(titleID: "tmdb:1399:2:3", season: 4, episode: 6) == nil
+               && SourceIndexIdentity.contentKey(titleID: "tmdb:1399", season: nil, episode: nil) == nil,
+               "A2: a tmdb head is refused as a pool key in BOTH the composed and the bare-title branch")
         expect(SourceIndexIdentity.contentKey(titleID: "kitsu:42", season: nil, episode: nil) == nil
                && SourceIndexIdentity.contentKey(titleID: "tt0903747:garbage", season: nil, episode: nil) == nil,
                "A2: a non-canonical titleID yields NO key, rather than being echoed back as one")
 
-        // MOVIE behaviour: a movie page has no video-id candidate and no coordinates.
-        let movie = SourceIndexIdentity.preferred(candidates: ["tt1375666", "tt1375666"])
-        expect(movie.indexID == "tt1375666" && movie.torBoxID == "tt1375666"
-               && SourceIndexClient.contentID(imdbId: movie.indexID) == "tt1375666",
+        // MOVIE behaviour: a movie page has no video-id role and no coordinates.
+        let movie = SourceIndexIdentity.resolve(
+            roles(catalog: "tt1375666", defaultVideo: "tt1375666", currentVideo: nil, kind: .movie))
+        expect(movie.titleID == "tt1375666"
+               && SourceIndexClient.contentID(imdbId: movie.titleID) == "tt1375666",
                "F1: a movie resolves to a bare title id and keys the pool without coordinates")
-
-        // TMDB-only title: the POOL identity accepts it, the IMDb-keyed TorBox path must NOT.
-        let tmdbOnly = SourceIndexIdentity.preferred(candidates: [nil, "tmdb:1399", "tmdb:1399:2:3"])
-        expect(tmdbOnly.indexID == "tmdb:1399" && tmdbOnly.torBoxID == nil,
-               "F1: a tmdb identity is a valid POOL key but is never handed to the IMDb-keyed TorBox path")
-        expect(SourceIndexClient.contentID(imdbId: tmdbOnly.indexID, season: 2, episode: 3) == "tmdb:1399:2:3",
-               "F1: the tmdb pool identity still composes a canonical episode key")
 
         // SEASON ZERO is VALID (specials air as S00Exx). Presence, never truthiness.
         expect(SourceIndexIdentity.contentKey(titleID: "tt0903747", season: 0, episode: 1) == "tt0903747:0:1",

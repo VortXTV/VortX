@@ -2160,7 +2160,7 @@ final class CoreBridge: ObservableObject {
                         // actually ARRIVED (not just that meta_details re-emitted). On a non-zero arrival
                         // also stamp the heartbeat via note("streams N"). Ready-only pass, no per-item log.
                         let readyStreams = (details?.allStreamGroups ?? []).reduce(0) { $0 + ($1.content?.ready?.count ?? 0) }
-                        VXProbe.log("engine", "metaDetails changed meta=\(details?.meta?.id ?? "nil") streamGroups=\(details?.allStreamGroups.count ?? 0) streams=\(readyStreams)")
+                        VXProbe.log("engine", "metaDetails changed meta=\(VXProbeRedaction.identityToken(details?.meta?.id)) streamGroups=\(details?.allStreamGroups.count ?? 0) streams=\(readyStreams)")
                         if readyStreams > 0 { VXProbeState.shared.note("streams \(readyStreams)") }
                     }
                     DispatchQueue.main.async { [weak self] in

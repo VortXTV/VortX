@@ -169,7 +169,7 @@ enum CommunityTrickplay {
                 let snapshot = tmdb2ttCache
                 tmdb2ttLock.unlock()
                 UserDefaults.standard.set(snapshot, forKey: tmdb2ttDefaultsKey)
-                VXProbe.log("tp", "resolved \(rawId) -> \(tt) (\(media))")
+                VXProbe.log("tp", "resolved \(VXProbeRedaction.identityToken(rawId)) -> \(VXProbeRedaction.identityToken(tt)) (\(media))")
                 return tt
             }
         }
@@ -485,9 +485,13 @@ enum CommunityTrickplay {
             let stored = (obj?["stored"] as? Bool) == true
             // Probe the POST so a failed upload (edge-auth sig rejection, 4xx, worker error) is visible with its
             // reason in the terminal log, not just a silent false. Trim the body to the first 200 chars.
+            //
+            // The URL is logged as endpoint only (host + path). `absoluteString` carried the signed query and
+            // the catalog id in the path components, and the endpoint is the entire triage value here: which
+            // worker route answered, with what status. The body head still passes the sink scrubber.
             let bodyStr = String(data: data, encoding: .utf8) ?? "<non-utf8 \(data.count)B>"
             let bodyHead = String(bodyStr.prefix(200))
-            VXProbe.log("tp", "POST \(url.absoluteString) httpStatus=\(code) ok=\(ok ? "true" : "false") stored=\(stored ? "true" : "false") body=\(bodyHead)")
+            VXProbe.log("tp", "POST \(Self.endpointLabel(url)) httpStatus=\(code) ok=\(ok ? "true" : "false") stored=\(stored ? "true" : "false") body=\(bodyHead)")
             guard code == 200 else { return .failed }
             if stored { return .stored }
             // 200 but not stored: the Worker accepted the request and consciously declined it. Surface its `reason`
@@ -497,9 +501,18 @@ enum CommunityTrickplay {
             return .rejected(reason)
         } catch {
             let errHead = String(String(describing: error).prefix(200))
-            VXProbe.log("tp", "POST \(url.absoluteString) httpStatus=err ok=false stored=false body=\(errHead)")
+            VXProbe.log("tp", "POST \(Self.endpointLabel(url)) httpStatus=err ok=false stored=false body=\(errHead)")
             return .failed
         }
+    }
+
+    /// `scheme://host/path`: the query and fragment are DROPPED at the producer because they carry the
+    /// signed edge auth, and no pattern rule should have to be the thing that notices. The path is kept
+    /// because the route is the triage value ("which worker endpoint answered"); the catalog id inside it is
+    /// an id SHAPE, which is the one case the sink scrubber is genuinely good at. Same spelling as
+    /// `MPVMetalViewController.loadFile` uses for its own play URL.
+    private static func endpointLabel(_ url: URL) -> String {
+        "\(url.scheme ?? "?")://\(url.host ?? "?")\(url.path)"
     }
 }
 

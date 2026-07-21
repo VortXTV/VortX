@@ -74,6 +74,17 @@ enum SourceIndexIdentity {
             self.currentVideoID = currentVideoID
             self.kind = kind
         }
+
+        /// The same title, re-stated for a DIFFERENT selected episode.
+        ///
+        /// It exists for the batch download coordinator, which holds one show-level role set and walks many
+        /// episodes. That coordinator previously passed the show's `ratingsImdbID` for every episode, i.e. a
+        /// default value in place of the selected current-video role, so a show whose IMDb identity lives only
+        /// on its episode ids contributed under the wrong key (or under none).
+        func selecting(currentVideoID: String?) -> Roles {
+            Roles(catalogID: catalogID, defaultVideoID: defaultVideoID,
+                  currentVideoID: currentVideoID, kind: kind)
+        }
     }
 
     /// The resolved identity: ONE bare IMDb title id, or none.

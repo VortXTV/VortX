@@ -62,9 +62,12 @@ final class BatchDownloadCoordinator: ObservableObject {
     struct Job {
         let seriesId: String
         let seriesName: String
-        /// The show's imdb tt id (the meta `defaultVideoId` fallback chain), the key both contributor
-        /// fetchers need. nil when unknown; both fetchers then no-op, same as the manual page.
-        let seriesImdbId: String?
+        /// The show's identity ROLES, exactly as the detail page states them. Not a pre-picked id: this
+        /// coordinator used to carry `ratingsImdbID`, a SHOW-level default value, and hand it to both
+        /// contributor fetchers for every episode. That is the default-video role standing in for the
+        /// selected current-video role, so a show whose IMDb identity lives only on its episode video ids
+        /// contributed under no key at all. The per-episode role is applied in `refreshContributorsIfNeeded`.
+        let identityRoles: SourceIndexIdentity.Roles
         let fallbackPoster: String?
         let video: CoreVideo
         let continuity: String?
@@ -176,7 +179,8 @@ final class BatchDownloadCoordinator: ObservableObject {
     /// skipped with a note; episodes already pending in this batch are deduplicated silently. Calling
     /// again while a batch runs APPENDS to the walk (the per-series totals grow), so "download season
     /// 1" then "download season 2" behaves as one longer queue.
-    func enqueue(seriesId: String, seriesName: String, seriesImdbId: String?, fallbackPoster: String?,
+    func enqueue(seriesId: String, seriesName: String, identityRoles: SourceIndexIdentity.Roles,
+                 fallbackPoster: String?,
                  episodes: [CoreVideo], continuity: String?, pin: ResolvedPin?, cachedHashes: Set<String>) {
         guard !episodes.isEmpty else { return }
         // A fresh batch (nothing running) starts a clean tally and clears the previous summary.
@@ -196,7 +200,7 @@ final class BatchDownloadCoordinator: ObservableObject {
                 continue
             }
             guard !pendingIds.contains(video.id), video.id != currentVideoId else { continue }
-            jobs.append(Job(seriesId: seriesId, seriesName: seriesName, seriesImdbId: seriesImdbId,
+            jobs.append(Job(seriesId: seriesId, seriesName: seriesName, identityRoles: identityRoles,
                             fallbackPoster: fallbackPoster, video: video, continuity: continuity,
                             pin: pin, cachedHashes: cachedHashes))
         }
@@ -273,9 +277,10 @@ final class BatchDownloadCoordinator: ObservableObject {
     private func refreshContributorsIfNeeded(for job: Job) {
         let season = job.video.season
         let episode = job.video.episode
-        let contentID = SourceIndexClient.contentID(
-            imdbId: job.seriesImdbId, season: season, episode: episode
-        )
+        // The episode ACTUALLY being resolved supplies the current-video role, so the key this batch
+        // publishes under is the same key the manual episode page would use.
+        let roles = job.identityRoles.selecting(currentVideoID: job.video.id)
+        let contentID = SourceIndexClient.contentID(roles: roles, season: season, episode: episode)
         let target = contentID ?? "meta:\(job.seriesId)|video:\(job.video.id)"
         guard target != contributorSeriesKey else { return }
         contributorSeriesKey = target
@@ -284,8 +289,14 @@ final class BatchDownloadCoordinator: ObservableObject {
         // on a content-id change until its fetch returns).
         torboxSearch.clearResults()
         sourceIndex.clearResults()
-        guard let season, season >= 0, let episode, episode > 0, contentID != nil else { return }
-        torboxSearch.refresh(imdbId: job.seriesImdbId, season: season, episode: episode)
+        // PRESENCE, not truthiness. `episode > 0` contradicted the accepted tuple contract, in which an
+        // explicit episode ZERO is VALID and distinct from absence (specials air as S00E00), so every E0
+        // special silently lost both contributor pools. The coordinates still have to be COMPLETE: a
+        // half-resolved pair is refused rather than widened to the show, which is what `contentID != nil`
+        // already enforces one level down.
+        guard let season, season >= 0, let episode, episode >= 0, contentID != nil else { return }
+        torboxSearch.refresh(imdbId: SourceIndexIdentity.resolve(roles).titleID,
+                             season: season, episode: episode)
         sourceIndex.refresh(contentID: contentID,
                             isSignedIn: VortXSyncManager.shared.isSignedIn)
     }
@@ -342,9 +353,11 @@ final class BatchDownloadCoordinator: ObservableObject {
         guard let best = StreamRanking.best(groups, continuity: job.continuity, pin: job.pin,
                                             debridCachedHashes: job.cachedHashes) else { return .noSource }
         if Task.isCancelled { return .cancelled }   // don't start a debrid resolve for a stopped batch
+        // PRESENCE, not truthiness: episode ZERO is a valid coordinate (specials), and both coordinates are
+        // already optionals here, so absence is expressed by the flatMap rather than by a sentinel value.
         let ep = job.video.season.flatMap { season in
             job.video.episode.flatMap { episode in
-                season >= 0 && episode > 0 ? DebridEpisode(season: season, episode: episode) : nil
+                season >= 0 && episode >= 0 ? DebridEpisode(season: season, episode: episode) : nil
             }
         }
         let resolved: URL?

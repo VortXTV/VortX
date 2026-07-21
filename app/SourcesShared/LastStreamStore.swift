@@ -99,6 +99,6 @@ enum LastStreamStore {
             detail = " count=\(dict.count) keys=[\(keys)]"
         }
         let pid = profileID.map { String($0.uuidString.prefix(8)) } ?? "nil"
-        DiagnosticsLog.log("cw-resume", "\(outcome) id=\(libraryId) profile=\(pid)\(detail)")
+        DiagnosticsLog.log("cw-resume", "\(outcome) id=\(VXProbeRedaction.identityToken(libraryId)) profile=\(pid)\(detail)")
     }
 }
