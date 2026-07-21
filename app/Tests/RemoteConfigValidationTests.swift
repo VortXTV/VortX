@@ -93,7 +93,6 @@ func fingerprint(_ c: ResolvedConfig) -> [String: String] {
         "sourceIndexResumeHoardMaxWaitMs": "\(c.sourceIndexResumeHoardMaxWaitMs)",
         "sourceIndexResumeHoardPollIntervalMs": "\(c.sourceIndexResumeHoardPollIntervalMs)",
         "sourceIndexResumeHoardAttemptCap": "\(c.sourceIndexResumeHoardAttemptCap)",
-        "sourceIndexResumeHoardAttempts": "\(c.sourceIndexResumeHoardAttempts)",
         "sourceIndexRequestTimeoutSecs": "\(c.sourceIndexRequestTimeoutSecs)",
         "refreshIntervalHours": "\(c.refreshIntervalHours)",
         "featureSourceIndexDefaultTrue": "\(c.isFeatureOn("sourceIndex", default: true))",
@@ -123,9 +122,7 @@ struct RemoteConfigValidationTests {
     static func main() {
         // ---- The baked-equivalence contract, over EVERY readable field ----
         // The whole promise of this service is that deleting it changes nothing. `.baked` and an empty remote
-        // config must therefore be byte-for-value identical. They were not: one field carried both the
-        // constant attempt CAP (60) and the derived attempt COUNT (20), so `.baked` said 60 where
-        // `validate({})` said 20.
+        // config must therefore be byte-for-value identical.
         let bakedFingerprint = fingerprint(ResolvedConfig.baked)
         let emptyFingerprint = fingerprint(resolved("{}"))
         let disagreements = bakedFingerprint.keys.filter { bakedFingerprint[$0] != emptyFingerprint[$0] }.sorted()
@@ -177,29 +174,8 @@ struct RemoteConfigValidationTests {
         let widest = resolved(#"{"sourceIndex":{"resumeHoardMaxWaitMs":20000,"resumeHoardPollIntervalMs":250}}"#)
         expect(widest.sourceIndexResumeHoardMaxWaitMs > ResolvedConfig.baked.sourceIndexResumeHoardMaxWaitMs,
                "EXCEPTION: resumeHoardMaxWaitMs is deliberately allowed ABOVE the shipped value")
-        expect(widest.sourceIndexResumeHoardAttempts == 60,
-               "EXCEPTION BOUND: the widest in-range pair resolves to exactly the 60-attempt cap, not 80")
-        expect(widest.sourceIndexResumeHoardAttempts <= 3 * ResolvedConfig.baked.sourceIndexResumeHoardAttempts,
-               "EXCEPTION BOUND: the worst case is 3x the shipped attempt count, and no more")
-
-        // ---- The DERIVED attempt count ----
-        // Clamping the pair is not sufficient: their quotient is the quantity that reaches the MainActor.
-        expect(resolved("{}").sourceIndexResumeHoardAttempts == 20,
-               "DERIVED: the baked 5000 / 250 pair resolves to 20 attempts")
-        expect(resolved("{}").sourceIndexResumeHoardAttemptCap == 60,
-               "DERIVED: the constant CAP stays 60 and is NOT the derived count")
-        expect(resolved(#"{"sourceIndex":{"resumeHoardMaxWaitMs":250,"resumeHoardPollIntervalMs":2000}}"#)
-                .sourceIndexResumeHoardAttempts == 1,
-               "DERIVED: a wait shorter than one interval still yields at least ONE attempt, never zero")
-        for wait in [250, 1000, 5000, 12000, 20000] {
-            for interval in [250, 500, 1000, 2000] {
-                let c = resolved(#"{"sourceIndex":{"resumeHoardMaxWaitMs":\#(wait),"resumeHoardPollIntervalMs":\#(interval)}}"#)
-                let expected = min(60, max(1, wait / interval))
-                guard c.sourceIndexResumeHoardAttempts != expected else { continue }
-                expect(false, "DERIVED: \(wait)/\(interval) resolves to \(expected) attempts")
-            }
-        }
-        expect(true, "DERIVED: every in-range wait/interval pair resolves to min(60, max(1, wait / interval))")
+        expect(widest.sourceIndexResumeHoardAttemptCap == 60,
+               "EXCEPTION BOUND: the client-facing attempt cap stays pinned at 60")
 
         // ---- F1: batchSize is PINNED, not a dial ----
         // Lowering it raises both the POST count and the total D1 ops (3*sources+1 per request), so as an

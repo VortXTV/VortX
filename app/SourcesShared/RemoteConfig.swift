@@ -8,11 +8,10 @@ import Foundation
 ///      or the remote field being null, is behaviorally identical to today. `RemoteConfigDefaults` holds one
 ///      named constant per wired dial; the accessors read the (already-resolved) value or that default.
 ///
-///   2. Reads are SYNCHRONOUS and LOCK-FREE. Ranking runs per-stream over large lists and the player reads at
-///      init, so a read must never touch the actor or take a lock. `RemoteConfig.snapshot` is a
-///      `nonisolated(unsafe) static var` pointing at an IMMUTABLE `ResolvedConfig` class instance. It is only
-///      ever REPLACED (atomic pointer store) under the actor, never mutated. Readers see either the old or the
-///      new fully-formed value; there is no torn state.
+///   2. Reads are SYNCHRONOUS and take one short, uncontended lock. Ranking runs per-stream over large lists and
+///      the player reads at init, so a read must never hop through the actor. `RemoteConfig.snapshot` returns an
+///      IMMUTABLE `ResolvedConfig` class instance while the same lock protects replacement. Readers see either
+///      the old or the new fully-formed value; there is no torn state or ARC load/store race.
 ///
 ///   3. Clamp ONCE, at swap time. `validate(_:)` turns raw decoded JSON into a `ResolvedConfig` whose every
 ///      field is already range-clamped and defaults-filled. It can never brick the app or breach a jetsam
@@ -32,8 +31,9 @@ import Foundation
 ///      turns it on; the user's EXPLICIT toggle always wins over the remote default (see PlayerEngineRouter).
 ///
 ///   5. FAIL-SOFT everywhere. Any fetch / decode / disk error keeps the last-good snapshot (or baked defaults);
-///      nothing throws out of `bootstrap`/`refresh`. `master.remoteConfigEnabled == false` discards a fetched
-///      config back to baked. A corrupt cache is treated as absent => baked.
+///      nothing throws out of `bootstrap`/`refresh`. `master.remoteConfigEnabled == false` durably latches the
+///      service off and installs baked behavior until a later valid fetched config explicitly re-enables it.
+///      A corrupt cache is treated as absent => baked unless that durable disable latch is set.
 ///
 /// SIGNING: the config GET is signed with the SAME HMAC helper (`VortXEdgeAuth.sign`) every other gated
 /// `*.vortx.tv` worker uses (skip / trickplay / ratings / …). `config.vortx.tv` was added to that helper's
@@ -101,21 +101,10 @@ enum RemoteConfigDefaults {
     static let sourceIndexMaxDescriptorsPerTitle = 2000   // SourceIndexClient.maxDescriptorsPerTitle
     static let sourceIndexResumeHoardMaxWaitMs = 5000     // hoardResumedGroups(maxWaitMs:) default
     static let sourceIndexResumeHoardPollIntervalMs = 250 // hoardResumedGroups(pollIntervalMs:) default
-    // TWO DISTINCT QUANTITIES, kept apart because conflating them broke the baked-equivalence contract.
-    //
     // The CAP is a constant guard, not a mirror of a shipping literal: the resume poll count is
     // maxWaitMs / pollIntervalMs, so two individually in-range remote values can multiply into far more
     // MainActor polling during playback start than either looks like it buys. The cap trims that product.
     static let sourceIndexResumeHoardAttemptCap = 60
-    // The COUNT is what the app actually polls with the baked pair: 5000 / 250 = 20, well under the cap.
-    //
-    // WHY THE SPLIT. `ResolvedConfig.baked` used to store the CAP (60) in the same field that
-    // `validate({})` fills with the DERIVED COUNT (20), so the all-baked snapshot and the snapshot produced
-    // by an empty remote config disagreed on a value the app reads -- while the whole point of `.baked` is
-    // that the two are byte-for-value identical. They now hold separate fields and agree on both.
-    static let sourceIndexResumeHoardAttempts =
-        min(sourceIndexResumeHoardAttemptCap,
-            max(1, sourceIndexResumeHoardMaxWaitMs / sourceIndexResumeHoardPollIntervalMs))
     static let sourceIndexRequestTimeoutSecs = 8          // SourceIndexClient POST + GET timeoutInterval
 
     // Community-subtitle feature flags, baked defaults (call sites pass these to isFeatureOn).
@@ -283,11 +272,11 @@ struct RemoteConfigData: Decodable {
     let refreshIntervalHours: Int?
 }
 
-// MARK: - Resolved, already-clamped, defaults-filled snapshot (immutable; read lock-free on hot paths).
+// MARK: - Resolved, already-clamped, defaults-filled snapshot (immutable; read under a short lock).
 
-/// A `final class` so `RemoteConfig.snapshot` can be swapped as a single atomic pointer store. Every stored
-/// value is ALREADY clamped and defaults-filled by `validate`, so accessors are trivial reads. Never mutated
-/// after construction.
+/// A `final class` so `RemoteConfig.snapshot` can replace one immutable reference while holding its lock. Every
+/// stored value is ALREADY clamped and defaults-filled by `validate`, so accessors are trivial reads. Never
+/// mutated after construction.
 final class ResolvedConfig: @unchecked Sendable {
     // Master gates.
     let remoteConfigEnabled: Bool
@@ -334,10 +323,6 @@ final class ResolvedConfig: @unchecked Sendable {
     /// trim their product. Read by the client, which is handed caller-supplied wait/interval values and so
     /// must apply the cap itself rather than trust a precomputed count.
     let sourceIndexResumeHoardAttemptCap: Int
-    /// The RESOLVED current attempt count for the default pair: min(cap, maxWaitMs / pollIntervalMs). Baked
-    /// and validate-with-empty-config must agree on this exactly; they disagreed (60 vs 20) while one field
-    /// carried both meanings.
-    let sourceIndexResumeHoardAttempts: Int
     let sourceIndexRequestTimeoutSecs: Int
 
     // Feature tri-state (nil = baked default; the accessor substitutes the call site's `default:`).
@@ -375,7 +360,6 @@ final class ResolvedConfig: @unchecked Sendable {
          sourceIndexResumeHoardMaxWaitMs: Int,
          sourceIndexResumeHoardPollIntervalMs: Int,
          sourceIndexResumeHoardAttemptCap: Int,
-         sourceIndexResumeHoardAttempts: Int,
          sourceIndexRequestTimeoutSecs: Int,
          features: [String: Bool],
          refreshIntervalHours: Int) {
@@ -408,17 +392,20 @@ final class ResolvedConfig: @unchecked Sendable {
         self.sourceIndexResumeHoardMaxWaitMs = sourceIndexResumeHoardMaxWaitMs
         self.sourceIndexResumeHoardPollIntervalMs = sourceIndexResumeHoardPollIntervalMs
         self.sourceIndexResumeHoardAttemptCap = sourceIndexResumeHoardAttemptCap
-        self.sourceIndexResumeHoardAttempts = sourceIndexResumeHoardAttempts
         self.sourceIndexRequestTimeoutSecs = sourceIndexRequestTimeoutSecs
         self.features = features
         self.refreshIntervalHours = refreshIntervalHours
     }
 
-    /// The all-baked snapshot: identical to shipping. Built when no cache exists / config is disabled / any
-    /// validation short-circuits.
-    static var baked: ResolvedConfig {
+    /// The all-baked enabled snapshot: identical to shipping when no cached or fetched config exists.
+    static var baked: ResolvedConfig { makeBaked(remoteConfigEnabled: true) }
+
+    /// Baked behavior with the durable remote master-disable state represented explicitly.
+    static var masterDisabled: ResolvedConfig { makeBaked(remoteConfigEnabled: false) }
+
+    private static func makeBaked(remoteConfigEnabled: Bool) -> ResolvedConfig {
         ResolvedConfig(
-            remoteConfigEnabled: true,
+            remoteConfigEnabled: remoteConfigEnabled,
             rankingConfigEnabled: true,
             debridCeilingMiB: RemoteConfigDefaults.debridCeilingMiB,
             reducedCeilingMiB: RemoteConfigDefaults.reducedCeilingMiB,
@@ -447,7 +434,6 @@ final class ResolvedConfig: @unchecked Sendable {
             sourceIndexResumeHoardMaxWaitMs: RemoteConfigDefaults.sourceIndexResumeHoardMaxWaitMs,
             sourceIndexResumeHoardPollIntervalMs: RemoteConfigDefaults.sourceIndexResumeHoardPollIntervalMs,
             sourceIndexResumeHoardAttemptCap: RemoteConfigDefaults.sourceIndexResumeHoardAttemptCap,
-            sourceIndexResumeHoardAttempts: RemoteConfigDefaults.sourceIndexResumeHoardAttempts,
             sourceIndexRequestTimeoutSecs: RemoteConfigDefaults.sourceIndexRequestTimeoutSecs,
             features: [:],
             refreshIntervalHours: RemoteConfigDefaults.refreshIntervalHours)
@@ -573,21 +559,47 @@ actor RemoteConfig {
     private static let fetchTimeout: TimeInterval = 8
     private static let etagKey = "vortx.remoteConfig.etag"
     private static let lastFetchKey = "vortx.remoteConfig.lastFetchEpoch"
+    private static let masterDisabledKey = "vortx.remoteConfig.masterDisabled"
     private static let foregroundThrottle: TimeInterval = 30 * 60   // once / 30 min for a foreground refresh
+
+    private let defaults: UserDefaults
+    private let cacheDirectoryOverride: URL?
+    private let session: URLSession
 
     /// The raw last-good JSON currently installed (nil = none / baked). Kept so `304 Not Modified` is a
     /// genuine no-op and a foreground refresh does not need to re-decode.
     private var currentRaw: Data?
     private var periodicStarted = false
 
+    init(defaults: UserDefaults = .standard,
+         cacheDirectory: URL? = nil,
+         session: URLSession = .shared) {
+        self.defaults = defaults
+        cacheDirectoryOverride = cacheDirectory
+        self.session = session
+    }
+
     // MARK: Bootstrap (call once at launch).
 
     /// (1) Synchronously load the last-good cached JSON from Application Support and build the snapshot (else
     /// all-baked). (2) Kick a background refresh. Never throws.
     func bootstrap() async {
-        if let cached = Self.loadCachedJSON(), let decoded = try? JSONDecoder().decode(RemoteConfigData.self, from: cached) {
+        if defaults.bool(forKey: Self.masterDisabledKey) {
+            // The explicit latch wins over cached bytes. This is deliberately stronger than trusting config.json:
+            // a stale enabled cache must never resurrect remote behavior after an incident disable.
+            currentRaw = nil
+            await installAndAnnounce(.masterDisabled)
+        } else if let cached = loadCachedJSON(),
+                  let decoded = try? JSONDecoder().decode(RemoteConfigData.self, from: cached) {
             currentRaw = cached
-            await installAndAnnounce(Self.validate(decoded))   // clamp once at swap time
+            if decoded.master?.remoteConfigEnabled == false {
+                // Backward/crash recovery: a disabling cache is authoritative even if its UserDefaults latch
+                // was not committed. Restore the latch before exposing the disabled snapshot.
+                defaults.set(true, forKey: Self.masterDisabledKey)
+                await installAndAnnounce(.masterDisabled)
+            } else {
+                await installAndAnnounce(Self.validate(decoded))   // clamp once at swap time
+            }
         } else {
             currentRaw = nil
             await installAndAnnounce(.baked)
@@ -598,14 +610,14 @@ actor RemoteConfig {
 
     // MARK: Refresh.
 
-    /// GET the config with `If-None-Match: <etag>`. 304 => keep. 200 => decode -> validate/clamp -> if
-    /// master.remoteConfigEnabled == false discard to baked, else atomically swap snapshot + persist JSON +
+    /// GET the config with `If-None-Match: <etag>`. 304 => keep. 200 => decode -> validate/clamp -> durably
+    /// latch a master disable with baked behavior, or atomically install a valid re-enable + persist JSON +
     /// ETag. ANY error => keep last-good. Never throws.
     func refresh() async {
         var req = URLRequest(url: Self.configURL, timeoutInterval: Self.fetchTimeout)
         req.httpMethod = "GET"
         req.setValue("application/json", forHTTPHeaderField: "accept")
-        if let etag = UserDefaults.standard.string(forKey: Self.etagKey), !etag.isEmpty {
+        if let etag = defaults.string(forKey: Self.etagKey), !etag.isEmpty {
             req.setValue(etag, forHTTPHeaderField: "If-None-Match")
         }
         // Sign with the shared edge-auth helper (config.vortx.tv is a gated host). No-op without a secret;
@@ -613,32 +625,49 @@ actor RemoteConfig {
         VortXEdgeAuth.sign(&req)
 
         do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await session.data(for: req)
             guard let http = resp as? HTTPURLResponse else { return }   // keep last-good
             if http.statusCode == 304 {
                 // A 304 is a successful "still fresh" fetch, so stamp the fetch time too: otherwise
                 // refreshIfForegroundDue never sees a recent lastFetch in the steady state (the config rarely
                 // changes, so every foreground refresh 304s), the 30-minute throttle never engages, and we
                 // re-hit the network on every scene activation. Keep last-good either way.
-                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
+                defaults.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
                 return
             }
             guard http.statusCode == 200 else { return }                // any other status: keep last-good
 
             let decoded = try JSONDecoder().decode(RemoteConfigData.self, from: data)
 
-            // master.remoteConfigEnabled == false => discard fetched config to baked (kill switch for the
-            // whole system). Do NOT persist a disabling config as last-good, so removing the field restores it.
+            // A valid fetched master disable is last-known safety state, not a process-local fallback. Persist
+            // both its bytes and explicit latch before installing baked behavior so stale enabled cache bytes
+            // cannot revive the fleet on an offline relaunch. Only the valid enabled branch below clears it.
             if decoded.master?.remoteConfigEnabled == false {
-                await installAndAnnounce(.baked)
+                persist(json: data, etag: http.value(forHTTPHeaderField: "Etag"))
+                defaults.set(true, forKey: Self.masterDisabledKey)
+                currentRaw = data
+                defaults.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
+                await installAndAnnounce(.masterDisabled)
+                return
+            }
+
+            if defaults.bool(forKey: Self.masterDisabledKey),
+               decoded.master?.remoteConfigEnabled != true {
+                // Missing and null mean "use the baked default" only before a durable incident latch exists.
+                // Once disabled, omission is not authority to re-enable. Track the current server validator and
+                // successful fetch, but keep both the latch and disabled snapshot until an explicit true arrives.
+                persistETag(http.value(forHTTPHeaderField: "Etag"))
+                defaults.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
+                await installAndAnnounce(.masterDisabled)
                 return
             }
 
             let resolved = Self.validate(decoded)
-            await installAndAnnounce(resolved)       // locked replace; readers see old-or-new, never torn
             currentRaw = data
-            Self.persist(json: data, etag: http.value(forHTTPHeaderField: "Etag"))
-            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
+            persist(json: data, etag: http.value(forHTTPHeaderField: "Etag"))
+            defaults.removeObject(forKey: Self.masterDisabledKey)
+            defaults.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
+            await installAndAnnounce(resolved)       // locked replace; readers see old-or-new, never torn
         } catch {
             // Timeout / offline / decode failure: keep last-good. Never throw.
             return
@@ -648,7 +677,7 @@ actor RemoteConfig {
     /// Foreground refresh, throttled to at most once per 30 minutes. Safe to call on every `.active` scene
     /// phase; it cheaply no-ops when the last fetch is recent.
     func refreshIfForegroundDue() async {
-        let last = UserDefaults.standard.double(forKey: Self.lastFetchKey)
+        let last = defaults.double(forKey: Self.lastFetchKey)
         if last > 0, Date().timeIntervalSince1970 - last < Self.foregroundThrottle { return }
         await refresh()
     }
@@ -670,10 +699,11 @@ actor RemoteConfig {
 
     // MARK: Validation + clamping (the ONE place ranges are enforced).
 
-    /// Turn raw decoded JSON into a fully clamped, defaults-filled `ResolvedConfig`. Every out-of-range or
-    /// non-conforming value falls back to its baked default, so the result is always safe to read on a hot
-    /// path. `master.rankingConfigEnabled == false` short-circuits ranking sections to baked (ranking dials
-    /// are not wired yet, but the gate is honored so a future wiring degrades correctly).
+    /// Turn raw decoded JSON into a fully clamped, defaults-filled `ResolvedConfig`. Missing fields fall back
+    /// to baked defaults, numeric values clamp to their nearest range edge, and invalid endpoints fall back to
+    /// baked URLs, so the result is always safe to read on a hot path. `master.rankingConfigEnabled == false`
+    /// short-circuits ranking sections to baked (ranking dials are not wired yet, but the gate is honored so a
+    /// future wiring degrades correctly).
     static func validate(_ data: RemoteConfigData) -> ResolvedConfig {
         let remoteEnabled = data.master?.remoteConfigEnabled ?? true
         let rankingEnabled = data.master?.rankingConfigEnabled ?? true
@@ -764,10 +794,9 @@ actor RemoteConfig {
         // that can raise client work above the shipped value.
         //
         // THE EXCEPTION, and its exact bound. Shipping polls 20 attempts over ~5 s (5000 / 250). This ceiling
-        // permits 20000 ms, which at the pinned 250 ms floor is 80 attempts, trimmed by the derived cap below
-        // to 60 attempts over ~15 s. So the worst case a remote value can buy is 3x the shipped attempt count
-        // and 3x the shipped wall time, on a path that is a bounded poll and whose every timeout is a silent
-        // no-op. Nothing here can run unbounded and nothing here weakens an admission or validation bound.
+        // permits 20000 ms, which at the pinned 250 ms floor is 80 attempts; the client applies the separate
+        // 60-attempt constant cap at the polling loop, limiting the remote expansion to ~15 s. Nothing here can
+        // run unbounded and nothing here weakens an admission or validation bound.
         //
         // WHY IT IS WORTH THAT. The Continue Watching resume path plays a stored source WITHOUT opening the
         // detail view, so when meta settles slower than the budget on a cold network the most common playback
@@ -780,11 +809,6 @@ actor RemoteConfig {
         // 250 (the baked value) rather than 100, so the interval is lengthen-only.
         let siResumePollMs = clamp(data.sourceIndex?.resumeHoardPollIntervalMs,
                                    RemoteConfigDefaults.sourceIndexResumeHoardPollIntervalMs, 250, 2000)
-        // The DERIVED quantity gets its own clamp. Clamping the pair above is not sufficient: 20000 / 250 is 80
-        // in-range attempts, each one MainActor work. With the baked pair this resolves to 20, so the cap is
-        // inert today and only ever trims a remote combination.
-        let siResumeAttempts = min(RemoteConfigDefaults.sourceIndexResumeHoardAttemptCap,
-                                   max(1, siResumeWaitMs / max(1, siResumePollMs)))
         // Per-request budget, shared by the contribute POST and the serve GET. Availability lever, not a security
         // one: every timeout path is already a silent no-op. Safer ceiling taken: 8 (the baked value) rather than
         // 20, making it shorten-only, since a timeout longer than the pacing interval lets attempts stack against
@@ -856,7 +880,6 @@ actor RemoteConfig {
             sourceIndexResumeHoardMaxWaitMs: siResumeWaitMs,
             sourceIndexResumeHoardPollIntervalMs: siResumePollMs,
             sourceIndexResumeHoardAttemptCap: RemoteConfigDefaults.sourceIndexResumeHoardAttemptCap,
-            sourceIndexResumeHoardAttempts: siResumeAttempts,
             sourceIndexRequestTimeoutSecs: siTimeoutSecs,
             features: features,
             refreshIntervalHours: refreshHours)
@@ -883,19 +906,23 @@ actor RemoteConfig {
         return url
     }
 
-    // MARK: Application Support cache (raw JSON bytes; UserDefaults holds only ETag + lastFetch).
+    // MARK: Application Support cache (raw JSON bytes; UserDefaults holds ETag, lastFetch, and disable latch).
 
-    private static func cacheDirectory() -> URL? {
+    private func cacheDirectory() -> URL? {
+        if let cacheDirectoryOverride {
+            try? FileManager.default.createDirectory(at: cacheDirectoryOverride, withIntermediateDirectories: true)
+            return cacheDirectoryOverride
+        }
         guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
         let dir = base.appendingPathComponent("RemoteConfig", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
 
-    private static func cacheFile() -> URL? { cacheDirectory()?.appendingPathComponent("config.json") }
+    private func cacheFile() -> URL? { cacheDirectory()?.appendingPathComponent("config.json") }
 
     /// Load the cached JSON, or nil when absent / unreadable / not valid JSON (corrupt => treated as absent).
-    private static func loadCachedJSON() -> Data? {
+    private func loadCachedJSON() -> Data? {
         guard let file = cacheFile(), let data = try? Data(contentsOf: file), !data.isEmpty else { return nil }
         // A corrupt cache must decode to nothing rather than crash bootstrap.
         guard (try? JSONSerialization.jsonObject(with: data)) != nil else { return nil }
@@ -904,9 +931,17 @@ actor RemoteConfig {
 
     /// Persist the raw JSON bytes to Application Support and the ETag to UserDefaults. Best-effort; a failed
     /// write just means the next launch re-fetches.
-    private static func persist(json: Data, etag: String?) {
+    private func persist(json: Data, etag: String?) {
         if let file = cacheFile() { try? json.write(to: file, options: .atomic) }
-        if let etag, !etag.isEmpty { UserDefaults.standard.set(etag, forKey: etagKey) }
+        persistETag(etag)
+    }
+
+    private func persistETag(_ etag: String?) {
+        if let etag, !etag.isEmpty {
+            defaults.set(etag, forKey: Self.etagKey)
+        } else {
+            defaults.removeObject(forKey: Self.etagKey)
+        }
     }
 }
 
