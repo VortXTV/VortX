@@ -461,6 +461,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             "#EXT-X-VERSION:7",
             "#EXT-X-TARGETDURATION:\(VortXMKVRemuxStream.hlsTargetDuration)",
             "#EXT-X-MEDIA-SEQUENCE:0",
+            // START AT ZERO, EXPLICITLY. Without this tag a client picking a start point in a playlist that
+            // carries no EXT-X-ENDLIST yet applies the live-edge rule and begins roughly three target durations
+            // back from the end. TARGETDURATION is 5, so that is about 15 seconds in, which is exactly the
+            // "Dolby Vision starts ~14 seconds in" reported from the field. The docstring above always claimed
+            // playback starts at the beginning; that was the INTENT and nothing expressed it to the client.
+            // TIME-OFFSET=0 with PRECISE=YES says start at zero and do not round to a preceding segment.
+            // Cheap and reversible: it changes only the chosen start point, not the segment set, so a client
+            // that ignores the tag behaves exactly as before.
+            "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES",
             "#EXT-X-PLAYLIST-TYPE:EVENT",
             "#EXT-X-MAP:URI=\"\(mapURI)\"",
         ]

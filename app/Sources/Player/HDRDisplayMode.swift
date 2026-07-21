@@ -194,6 +194,24 @@ enum HDRDisplayMode {
         }
     }
 
+    /// The last mode we actually ASKED the panel for, or nil when we are asking for nothing (reset clears it).
+    /// Compared before every assignment so an identical re-request costs nothing.
+    ///
+    /// Why this exists: assigning `preferredDisplayCriteria` makes tvOS renegotiate the HDMI link, and a
+    /// renegotiation is a visible flick. Several paths can ask for the SAME mode during one start (the remux
+    /// server's deferred request once DV signaling is published, and the readyToPlay re-assert once the real
+    /// rate is known), so a start could renegotiate repeatedly for no change at all. Field reports of four to
+    /// five flickers on a single Dolby Vision start are this.
+    ///
+    /// It deliberately compares the REQUEST rather than the panel's state: `AVDisplayCriteria` is not
+    /// equatable and there is no API to read back what the panel actually settled on, so the honest thing to
+    /// track is what we asked for. Any change in range, rate or dimensions still switches; only a genuinely
+    /// identical ask is skipped. Note this does NOT collapse a guess-then-correct pair (a pre-attach request
+    /// with an unknown rate followed by the real one): those differ, so both still fire. Removing that second
+    /// switch means deferring the first, which belongs at the call site, not here.
+    @MainActor
+    private static var lastRequested: (range: ContentDynamicRange, rate: Float, width: Int, height: Int)?
+
     /// Ask tvOS to switch the display into the mode matching the content.
     @MainActor
     static func request(_ range: ContentDynamicRange, fps: Double, width: Int, height: Int, in window: UIWindow?) {
@@ -256,7 +274,18 @@ enum HDRDisplayMode {
             return
         }
         let encoded = (criteria.value(forKey: "videoDynamicRange") as? Int) ?? -999
+        // IDEMPOTENCY: skip an assignment that asks for exactly what we already asked for. Placed AFTER the
+        // criteria build so a build failure is still reported, and after every early return above, so a skip
+        // can only ever replace a redundant switch and never a needed one. `rate` is the normalized value
+        // (not the raw fps), which is what actually reaches the panel, so two requests that differ only in an
+        // unknown-rate default correctly compare equal.
+        if let last = lastRequested,
+           last.range == range, last.rate == rate, last.width == width, last.height == height {
+            note("display switch skipped: already asking for \(range.rawValue) @\(rate)fps \(width)x\(height)")
+            return
+        }
         manager.preferredDisplayCriteria = criteria
+        lastRequested = (range: range, rate: rate, width: width, height: height)
         // Close the master-parse race at its earliest point: a switch is now pending but the ModeSwitchStart
         // notification has not necessarily fired yet, so mark unsettled here rather than waiting on Start. The
         // early returns above (no window, SDR reset, Match Dynamic Range OFF, criteria build failure) never
@@ -392,6 +421,11 @@ enum HDRDisplayMode {
         setSwitchSettled(true)
         guard let window = window ?? fallbackWindow,
               let manager = displayManager(of: window) else { return }
+        // Forget what we were asking for, so the NEXT request re-asserts instead of being skipped as a
+        // duplicate. Cleared only here, past the guards: if we could not reach the manager we did not
+        // actually clear anything, and claiming otherwise would let a later identical request be skipped
+        // while that mode is still in effect.
+        lastRequested = nil
         if manager.preferredDisplayCriteria != nil {
             manager.preferredDisplayCriteria = nil
             note("display criteria cleared, back to default mode")
