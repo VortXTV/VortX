@@ -558,6 +558,9 @@ actor RemoteConfig {
     private static let configURL = URL(string: "https://config.vortx.tv/v1/config.json")!
     private static let fetchTimeout: TimeInterval = 8
     private static let etagKey = "vortx.remoteConfig.etag"
+    /// The ETag known to have been written only after the matching cache body. Existing installs have no
+    /// marker, so their first refresh is unconditional and repairs any pre-fix partial commit.
+    private static let bodyETagKey = "vortx.remoteConfig.bodyETag"
     private static let lastFetchKey = "vortx.remoteConfig.lastFetchEpoch"
     private static let masterDisabledKey = "vortx.remoteConfig.masterDisabled"
     private static let foregroundThrottle: TimeInterval = 30 * 60   // once / 30 min for a foreground refresh
@@ -610,15 +613,16 @@ actor RemoteConfig {
 
     // MARK: Refresh.
 
-    /// GET the config with `If-None-Match: <etag>`. 304 => keep. 200 => decode -> validate/clamp -> durably
-    /// latch a master disable with baked behavior, or atomically install a valid re-enable + persist JSON +
-    /// ETag. ANY error => keep last-good. Never throws.
+    /// GET the config conditionally only when a readable decoded cache, its body binding, and its ETag agree,
+    /// and no durable master disable is set. A latched or incoherent state forces a full body so 304 cannot
+    /// preserve a partial commit. 200 applies the ordered durable transitions below. Any error keeps last-good.
     func refresh() async {
         var req = URLRequest(url: Self.configURL, timeoutInterval: Self.fetchTimeout)
         req.httpMethod = "GET"
         req.setValue("application/json", forHTTPHeaderField: "accept")
-        if let etag = defaults.string(forKey: Self.etagKey), !etag.isEmpty {
-            req.setValue(etag, forHTTPHeaderField: "If-None-Match")
+        let requestETag = coherentRequestETag()
+        if let requestETag {
+            req.setValue(requestETag, forHTTPHeaderField: "If-None-Match")
         }
         // Sign with the shared edge-auth helper (config.vortx.tv is a gated host). No-op without a secret;
         // the worker's observe mode lets an empty-key / unsigned request through, so a fetch never bricks.
@@ -628,10 +632,12 @@ actor RemoteConfig {
             let (data, resp) = try await session.data(for: req)
             guard let http = resp as? HTTPURLResponse else { return }   // keep last-good
             if http.statusCode == 304 {
-                // A 304 is a successful "still fresh" fetch, so stamp the fetch time too: otherwise
+                // A conditional 304 is a successful "still fresh" fetch, so stamp the fetch time too: otherwise
                 // refreshIfForegroundDue never sees a recent lastFetch in the steady state (the config rarely
                 // changes, so every foreground refresh 304s), the 30-minute throttle never engages, and we
-                // re-hit the network on every scene activation. Keep last-good either way.
+                // re-hit the network on every scene activation. An unexpected 304 on an unconditional repair
+                // request is not freshness evidence and must not throttle the next repair attempt.
+                guard requestETag != nil else { return }
                 defaults.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
                 return
             }
@@ -639,14 +645,18 @@ actor RemoteConfig {
 
             let decoded = try JSONDecoder().decode(RemoteConfigData.self, from: data)
 
-            // A valid fetched master disable is last-known safety state, not a process-local fallback. Persist
-            // both its bytes and explicit latch before installing baked behavior so stale enabled cache bytes
-            // cannot revive the fleet on an offline relaunch. Only the valid enabled branch below clears it.
+            let responseETag = http.value(forHTTPHeaderField: "Etag")
+
+            // False is safety-first. Commit the latch before any fallible body write. If persistence fails or
+            // the process dies at any later point, bootstrap still installs disabled behavior and forces a full
+            // repair fetch. The validator is committed only after its matching body and binding are durable.
             if decoded.master?.remoteConfigEnabled == false {
-                persist(json: data, etag: http.value(forHTTPHeaderField: "Etag"))
                 defaults.set(true, forKey: Self.masterDisabledKey)
-                currentRaw = data
-                defaults.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
+                if persistBody(json: data, etag: responseETag) {
+                    currentRaw = data
+                    persistETag(responseETag)
+                    defaults.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
+                }
                 await installAndAnnounce(.masterDisabled)
                 return
             }
@@ -654,18 +664,28 @@ actor RemoteConfig {
             if defaults.bool(forKey: Self.masterDisabledKey),
                decoded.master?.remoteConfigEnabled != true {
                 // Missing and null mean "use the baked default" only before a durable incident latch exists.
-                // Once disabled, omission is not authority to re-enable. Track the current server validator and
-                // successful fetch, but keep both the latch and disabled snapshot until an explicit true arrives.
-                persistETag(http.value(forHTTPHeaderField: "Etag"))
-                defaults.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
+                // Once disabled, omission is not authority to re-enable. Persist its body before advancing the
+                // bound validator, but keep both the latch and disabled snapshot until an explicit true arrives.
+                if persistBody(json: data, etag: responseETag) {
+                    currentRaw = data
+                    persistETag(responseETag)
+                    defaults.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
+                }
                 await installAndAnnounce(.masterDisabled)
                 return
             }
 
             let resolved = Self.validate(decoded)
+            // Enabled installs, including an explicit re-enable, require a durable body first. The binding is
+            // written after the body, then an old disable latch is cleared, then the request validator commits
+            // last. Any crash between those points leaves either a latch or a BV/V mismatch, both of which
+            // force an unconditional repair. A failed body write changes no durable metadata or memory state.
+            guard persistBody(json: data, etag: responseETag) else { return }
             currentRaw = data
-            persist(json: data, etag: http.value(forHTTPHeaderField: "Etag"))
-            defaults.removeObject(forKey: Self.masterDisabledKey)
+            if decoded.master?.remoteConfigEnabled == true {
+                defaults.removeObject(forKey: Self.masterDisabledKey)
+            }
+            persistETag(responseETag)
             defaults.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
             await installAndAnnounce(resolved)       // locked replace; readers see old-or-new, never torn
         } catch {
@@ -906,7 +926,7 @@ actor RemoteConfig {
         return url
     }
 
-    // MARK: Application Support cache (raw JSON bytes; UserDefaults holds ETag, lastFetch, and disable latch).
+    // MARK: Application Support cache (raw JSON; UserDefaults holds body binding, ETag, fetch time, and latch).
 
     private func cacheDirectory() -> URL? {
         if let cacheDirectoryOverride {
@@ -929,11 +949,34 @@ actor RemoteConfig {
         return data
     }
 
-    /// Persist the raw JSON bytes to Application Support and the ETag to UserDefaults. Best-effort; a failed
-    /// write just means the next launch re-fetches.
-    private func persist(json: Data, etag: String?) {
-        if let file = cacheFile() { try? json.write(to: file, options: .atomic) }
-        persistETag(etag)
+    /// The validator this actor may send. All four facts must agree: no disable latch, a decoded readable body
+    /// is resident, the validator is non-empty, and the post-body binding names that same validator.
+    private func coherentRequestETag() -> String? {
+        guard !defaults.bool(forKey: Self.masterDisabledKey), currentRaw != nil,
+              let etag = defaults.string(forKey: Self.etagKey), !etag.isEmpty,
+              defaults.string(forKey: Self.bodyETagKey) == etag else { return nil }
+        return etag
+    }
+
+    /// Atomically persist the raw body, then record which ETag was bound after that successful write. The
+    /// request validator itself is deliberately not changed here; each transition commits it last.
+    private func persistBody(json: Data, etag: String?) -> Bool {
+        guard let file = cacheFile() else { return false }
+        do {
+            try json.write(to: file, options: .atomic)
+        } catch {
+            return false
+        }
+        persistBodyETag(etag)
+        return true
+    }
+
+    private func persistBodyETag(_ etag: String?) {
+        if let etag, !etag.isEmpty {
+            defaults.set(etag, forKey: Self.bodyETagKey)
+        } else {
+            defaults.removeObject(forKey: Self.bodyETagKey)
+        }
     }
 
     private func persistETag(_ etag: String?) {
