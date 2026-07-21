@@ -153,6 +153,78 @@ private func requiring(_ file: SourceFile, _ needle: String, why: String) -> [St
     file.lines(containing: needle).isEmpty ? ["\(file.path) \(why) (missing `\(needle)`)"] : []
 }
 
+private func requiring(_ file: SourceFile, _ needle: String, count: Int, why: String) -> [String] {
+    let actual = file.lines(containing: needle).count
+    return actual == count ? [] : ["\(file.path) \(why) (expected \(count), found \(actual): `\(needle)`)"]
+}
+
+private func replacingOccurrence(_ file: SourceFile, needle: String, occurrence: Int,
+                                 with replacement: String) -> SourceFile? {
+    var lines = file.lines
+    var seen = 0
+    for index in lines.indices where lines[index].contains(needle) {
+        let trimmed = lines[index].trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("//") { continue }
+        if seen == occurrence {
+            lines[index] = lines[index].replacingOccurrences(of: needle, with: replacement)
+            return SourceFile(path: file.path, lines: lines)
+        }
+        seen += 1
+    }
+    return nil
+}
+
+private func targetBoundaryViolations(_ files: [String: SourceFile]) -> [String] {
+    var found: [String] = []
+    if let tv = files["app/SourcesTV/DetailView.swift"] {
+        found += requiring(tv, "SourceIndexIdentity.publicationTarget(", count: 1,
+                           why: "tvOS must derive its one auxiliary target through the forced entry point")
+        found += requiring(tv, "torboxSearch.refresh(target: auxiliaryTarget)", count: 2,
+                           why: "tvOS TorBox refreshes must consume the typed target")
+        found += requiring(tv, "sourceIndex.refresh(target: auxiliaryTarget,", count: 1,
+                           why: "tvOS SourceIndex refresh must consume the same typed target")
+        found += requiring(tv, "for: auxiliaryTarget", count: 3,
+                           why: "tvOS manual merges must validate the exact selected target")
+    }
+    if let ios = files["app/SourcesiOS/iOSDetailView.swift"] {
+        found += requiring(ios, "SourceIndexIdentity.publicationTarget(", count: 2,
+                           why: "iOS movie and episode producers must each use the forced entry point")
+        found += requiring(ios, "torboxSearch.refresh(target: auxiliaryTarget)", count: 2,
+                           why: "iOS movie TorBox refreshes must consume the typed target")
+        found += requiring(ios, "torboxSearch.refresh(target: episodeAuxiliaryTarget)", count: 2,
+                           why: "iOS episode TorBox refreshes must consume the typed target")
+        found += requiring(ios, "sourceIndex.refresh(target: auxiliaryTarget,", count: 1,
+                           why: "iOS movie SourceIndex refresh must consume the same typed target")
+        found += requiring(ios, "sourceIndex.refresh(target: episodeAuxiliaryTarget,", count: 1,
+                           why: "iOS episode SourceIndex refresh must consume the same typed target")
+        found += requiring(ios, "for: auxiliaryTarget", count: 5,
+                           why: "iOS movie merges must validate the exact selected target")
+        found += requiring(ios, "for: episodeAuxiliaryTarget", count: 5,
+                           why: "iOS episode merges must validate the exact selected target")
+    }
+    if let batch = files["app/SourcesiOS/iOSBatchDownloadCoordinator.swift"] {
+        found += requiring(batch, "SourceIndexIdentity.publicationTarget(", count: 1,
+                           why: "batch must derive one target for the selected job")
+        found += requiring(batch, "resolveAndQueue(job, auxiliaryTarget: target)", count: 1,
+                           why: "batch must carry the same target into rank and download assembly")
+        found += requiring(batch, "torboxSearch.refresh(target: target)", count: 1,
+                           why: "batch TorBox refresh must consume the job target")
+        found += requiring(batch, "sourceIndex.refresh(target: target,", count: 1,
+                           why: "batch SourceIndex refresh must consume the job target")
+        found += requiring(batch, "for: auxiliaryTarget", count: 2,
+                           why: "batch merges must validate the exact job target")
+    }
+    for file in files.values {
+        found += violations(file, forbidding: "SourceIndexClient.contentID(roles:",
+                            why: "bypasses the forced typed publication target")
+        found += violations(file, forbidding: "torboxSearch.refresh(imdbId:",
+                            why: "lets a caller give TorBox a separately derived identity")
+        found += violations(file, forbidding: "sourceIndex.refresh(contentID:",
+                            why: "lets a caller give SourceIndex a separately derived identity")
+    }
+    return found
+}
+
 private let rules: [Rule] = [
 
     // R1. Key construction is centralized. A screen states ROLES; it never assembles a pool key from a bare
@@ -164,13 +236,13 @@ private let rules: [Rule] = [
         check: { files in
             files.values.flatMap { file -> [String] in
                 violations(file, forbidding: "SourceIndexClient.contentID(imdbId:",
-                           why: "builds a pool key from a bare id; state ROLES via contentID(roles:)")
+                           why: "builds a pool key from a bare id; state roles via publicationTarget(_:)")
                 + violations(file, forbidding: "SourceIndexContract.canonicalTitleID(",
                              why: "canonicalizes identity independently of the shared resolver")
                 + violations(file, forbidding: "SourceIndexContract.canonicalContentID(",
                              why: "applies the pool key gate independently of the shared resolver")
                 + violations(file, forbidding: "SourceIndexIdentity.contentKey(",
-                             why: "composes a key directly; go through contentID(roles:) or resumeContentID")
+                             why: "composes a key directly; go through publicationTarget(_:) or resumeContentID")
             }
         },
         revertedFixture: [
@@ -283,21 +355,44 @@ private let rules: [Rule] = [
         ]
     ),
 
-    // R6. The batch coordinator. It carried a SHOW-level default value (`ratingsImdbID`) for every episode
-    // instead of the selected current-video role, and it required `episode > 0`, which contradicts the
-    // accepted tuple contract where an explicit episode ZERO is valid and distinct from absence.
+    // R6. REQ-260721-50: every governed producer consumes the ONE typed publication target, and every manual
+    // merge validates the fetched owner's exact target. The check also mutates each REAL entry-point call in
+    // memory and proves the rule turns red, so an unused helper or a substring parked in a comment cannot pass.
     Rule(
-        name: "R6 the batch coordinator uses the per-episode role and accepts episode zero",
-        files: ["app/SourcesiOS/iOSBatchDownloadCoordinator.swift"],
+        name: "R6 every auxiliary producer consumes one typed target and exact merge fence",
+        files: [
+            "app/SourcesTV/DetailView.swift",
+            "app/SourcesiOS/iOSDetailView.swift",
+            "app/SourcesiOS/iOSBatchDownloadCoordinator.swift",
+        ],
         check: { files in
-            files.values.flatMap {
-                requiring($0, "job.identityRoles.selecting(currentVideoID: job.video.id)",
-                          why: "each episode must supply its own current-video role")
-                + violations($0, forbidding: "seriesImdbId",
-                             why: "carries a show-level default value in place of the selected role")
-                + violations($0, forbidding: "episode > 0",
-                             why: "rejects an explicit episode ZERO, which the tuple contract accepts")
+            var found = targetBoundaryViolations(files)
+            if found.isEmpty {
+                let mutations = [
+                    ("app/SourcesTV/DetailView.swift", 0),
+                    ("app/SourcesiOS/iOSDetailView.swift", 0),
+                    ("app/SourcesiOS/iOSDetailView.swift", 1),
+                    ("app/SourcesiOS/iOSBatchDownloadCoordinator.swift", 0),
+                ]
+                for (path, occurrence) in mutations {
+                    guard let file = files[path],
+                          let mutant = replacingOccurrence(
+                              file,
+                              needle: "SourceIndexIdentity.publicationTarget(",
+                              occurrence: occurrence,
+                              with: "SourceIndexIdentity.resolve("
+                          ) else {
+                        found.append("\(path) could not mutate real publication-target call \(occurrence)")
+                        continue
+                    }
+                    var mutated = files
+                    mutated[path] = mutant
+                    if targetBoundaryViolations(mutated).isEmpty {
+                        found.append("\(path) real caller mutation \(occurrence) survived R6")
+                    }
+                }
             }
+            return found
         },
         revertedFixture: [
             "app/SourcesiOS/iOSBatchDownloadCoordinator.swift":
@@ -340,6 +435,10 @@ private let rules: [Rule] = [
             if let identity = files["app/SourcesShared/SourceIndexIdentity.swift"] {
                 found += requiring(identity, "static func resolve(_ roles: Roles)",
                                    why: "the role-aware resolver must exist")
+                found += requiring(identity, "case mismatch",
+                                   why: "conflicting valid heads must remain a typed result")
+                found += requiring(identity, "static func publicationTarget(",
+                                   why: "the forced publication-target entry point must exist")
                 found += requiring(identity, "static func resumeKey(",
                                    why: "the resume identity fence must exist")
                 found += requiring(identity, "enum ResidentMeta",

@@ -34,11 +34,10 @@ enum ResidentMeta {
 /// answer.
 ///
 /// WHY THE INPUTS ARE NAMED ROLES rather than an ordered array: the previous signature was
-/// `preferred(candidates: [String?])`, and the ARRAY ORDER silently encoded authority. It encoded it WRONGLY:
+/// `preferred(candidates: [String?])`, and the ARRAY ORDER silently chose a winner. That was unsafe:
 /// `preferred(["tt0903747:1:1", "tt1375666"])` returned `tt0903747`, so an add-on-controlled episode-shaped
-/// `defaultVideoId` outranked the real catalog id of the page the user was actually on, and the wrong title key
-/// reached both serve and hoard. A role cannot be reordered by accident, and the authority rule below is stated
-/// once instead of being re-implied by each call site's argument order.
+/// `defaultVideoId` could select a different title from the page the user opened. Roles decide which values
+/// apply to each content kind, and disagreement between applicable valid IMDb heads is now an explicit mismatch.
 enum SourceIndexIdentity {
 
     /// What the page is, which decides whether a CURRENT-VIDEO role exists at all.
@@ -59,8 +58,8 @@ enum SourceIndexIdentity {
 
     /// The identity inputs, by ROLE. Every field is add-on- or catalog-controlled text; none is trusted.
     struct Roles: Equatable {
-        /// The id of the page/route/library row the user is actually on. Highest authority: it is the thing
-        /// the user navigated to, and it is the one value not supplied by a stream add-on's free-form hints.
+        /// The id of the page/route/library row the user is actually on. It is compared with every other
+        /// applicable valid IMDb head rather than silently winning a conflict.
         let catalogID: String?
         /// `meta.behaviorHints.defaultVideoId`. Add-on-controlled, frequently episode-shaped on a series.
         let defaultVideoID: String?
@@ -87,15 +86,43 @@ enum SourceIndexIdentity {
         }
     }
 
-    /// The resolved identity: ONE bare IMDb title id, or none.
+    /// The resolved identity: one bare IMDb title id, no usable identity, or a conflict.
     ///
     /// It is one field, not two. It used to carry a separate `indexID` (pool) and `torBoxID` (IMDb search),
     /// because the pool accepted the tmdb namespace and the IMDb-keyed index did not. Decision REQ-260721-33
     /// made pool keys IMDb-only, so the two values are now the same value by construction. Keeping two fields
     /// that can never differ is how a caller eventually picks the wrong one.
-    struct Resolved: Equatable {
-        /// A canonical BARE "tt..." title id (no `:S:E`), or nil when this title has no IMDb identity at all.
-        let titleID: String?
+    enum Resolved: Equatable, Sendable {
+        case title(String)
+        case absent
+        case mismatch
+
+        /// A canonical bare `tt...` title id, or nil when the roles are absent or disagree.
+        var titleID: String? {
+            guard case let .title(value) = self else { return nil }
+            return value
+        }
+    }
+
+    /// One exact target shared by auxiliary transport, publication, merge, rank, and download assembly.
+    struct PublicationTarget: Equatable, Hashable, Sendable {
+        let titleID: String
+        let contentID: String
+        let season: Int?
+        let episode: Int?
+    }
+
+    /// The typed result of resolving a publication target. `mismatch` must remain distinguishable from an
+    /// ordinary title with no IMDb identity so tests can pin the conflicting-head failure contract.
+    enum TargetResolution: Equatable, Sendable {
+        case target(PublicationTarget)
+        case absent
+        case mismatch
+
+        var target: PublicationTarget? {
+            guard case let .target(value) = self else { return nil }
+            return value
+        }
     }
 
     /// Identity inputs are add-on-controlled text. Cap BEFORE any parsing so a megabyte-long "id" cannot be
@@ -104,9 +131,10 @@ enum SourceIndexIdentity {
 
     /// Resolve the title identity from named roles.
     ///
-    /// AUTHORITY ORDER, stated once: catalog, then default-video, then current-video. On CONFLICTING heads the
-    /// catalog identity wins, because it is the title the user opened. `.movie` and `.live` have no episode, so
-    /// `currentVideoID` is ignored entirely for them rather than being ranked last.
+    /// ROLE ORDER is used only to select the representative when every valid IMDb head agrees: catalog, then
+    /// default-video, then current-video. If any two valid heads differ, return `.mismatch`. Choosing a winner
+    /// could attach auxiliary rows for one title to engine rows for another. `.movie` and `.live` have no
+    /// episode, so `currentVideoID` is ignored entirely for them.
     ///
     /// PRESERVED FIELD CASE (do not "simplify" this away): a TMDB- or Kitsu-identified SERIES ("tmdb:94997")
     /// with no `defaultVideoId` carries its IMDb identity ONLY on the episode video id ("tt0460649:3:6"). The
@@ -115,10 +143,10 @@ enum SourceIndexIdentity {
         let ordered: [String?] = roles.kind == .series
             ? [roles.catalogID, roles.defaultVideoID, roles.currentVideoID]
             : [roles.catalogID, roles.defaultVideoID]
-        for candidate in ordered {
-            if let title = imdbTitleID(candidate) { return Resolved(titleID: title) }
-        }
-        return Resolved(titleID: nil)
+        let titles = ordered.compactMap(imdbTitleID)
+        guard let first = titles.first else { return .absent }
+        guard titles.dropFirst().allSatisfy({ $0 == first }) else { return .mismatch }
+        return .title(first)
     }
 
     /// Accept ONE already-resolved value at a module boundary and hand back a bare canonical IMDb title id.
@@ -134,14 +162,32 @@ enum SourceIndexIdentity {
         return title
     }
 
-    /// The pool / TorBox / publication key for a resolved page, in one call.
+    /// The forced auxiliary entry point for a page or batch job.
     ///
-    /// This is the FORCED ENTRY POINT for view and coordinator code: a screen states its roles and its episode
-    /// coordinates and gets a key or nothing. It must not reach past this to `contentKey`, `canonicalTitleID`,
-    /// or `SourceIndexClient.contentID`, and `IdentityCallerGateTests` fails the build's test step if it does.
-    static func poolKey(_ roles: Roles, season: Int? = nil, episode: Int? = nil) -> String? {
-        guard let titleID = resolve(roles).titleID else { return nil }
-        return contentKey(titleID: titleID, season: season, episode: episode)
+    /// A producer states its roles and coordinates once and receives one typed target. Conflicts stay typed,
+    /// while missing identity or invalid coordinates are unavailable. Every governed producer consumes this
+    /// result directly, and merge boundaries compare the target with the owner's fetched publication token.
+    static func publicationTarget(
+        _ roles: Roles,
+        season: Int? = nil,
+        episode: Int? = nil
+    ) -> TargetResolution {
+        switch resolve(roles) {
+        case let .title(titleID):
+            guard let contentID = contentKey(titleID: titleID, season: season, episode: episode) else {
+                return .absent
+            }
+            return .target(PublicationTarget(
+                titleID: titleID,
+                contentID: contentID,
+                season: season,
+                episode: episode
+            ))
+        case .absent:
+            return .absent
+        case .mismatch:
+            return .mismatch
+        }
     }
 
     /// The pool key for a Continue-Watching DIRECT RESUME, which is the one path with TWO independent ids and

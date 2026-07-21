@@ -306,8 +306,9 @@ enum SourceIndexClient {
     /// `canonicalContentID` at the end, so it never becomes a key; see that function for why.
     ///
     /// SCOPE: this is the LOW-LEVEL entry, for shared code that has already resolved a single title id. View
-    /// and coordinator code must not call it -- those callers state ROLES via `contentID(roles:)` or, for a
-    /// Continue-Watching card, `resumeContentID`. `IdentityCallerGateTests` fails if that is violated.
+    /// and coordinator code must not call it -- those callers state roles via
+    /// `SourceIndexIdentity.publicationTarget(_:)` or, for a Continue-Watching card, `resumeContentID`.
+    /// `IdentityCallerGateTests` fails if that is violated.
     static func contentID(imdbId: String?, season: Int? = nil, episode: Int? = nil) -> String? {
         guard let bounded = SourceIndexIdentity.boundedIdentityInput(imdbId),
               let titleID = SourceIndexContract.canonicalTitleID(bounded) else {
@@ -321,21 +322,6 @@ enum SourceIndexClient {
             return nil
         }
         return composed
-    }
-
-    /// The pool `content_id` for a SCREEN, from its named identity roles.
-    ///
-    /// This is the entry point every view and coordinator uses. It exists so that no screen ever picks which
-    /// of its several ids "is" the title: it declares what each id IS (catalog, default-video, current-video)
-    /// and what the page is (movie / series / live), and the shared resolver applies the one authority rule.
-    /// The previous shape took an ordered array, and the ORDER decided authority, which is how an add-on's
-    /// episode-shaped `defaultVideoId` came to outrank the catalog id of the page the user was on.
-    static func contentID(
-        roles: SourceIndexIdentity.Roles,
-        season: Int? = nil,
-        episode: Int? = nil
-    ) -> String? {
-        contentID(imdbId: SourceIndexIdentity.resolve(roles).titleID, season: season, episode: episode)
     }
 
     /// The pool `content_id` for a Continue-Watching DIRECT RESUME, which has no page to arbitrate between its
@@ -1351,16 +1337,16 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         SourceIndexLifecycleScope.shared.register(self)
     }
 
-    /// Fetch pooled sources for `contentID` when SERVE is enabled + the user is signed in (owner decision
+    /// Fetch pooled sources for the resolved target when SERVE is enabled + the user is signed in (owner decision
     /// 2026-07-04: Singularity results are a VortX-user-only benefit). Fail-soft + deduped by content id. Safe
     /// to call on every meta change / `.task` / `.onAppear`.
-    func refresh(contentID requestedContentID: String?, isSignedIn _: Bool) {
+    func refresh(target resolution: SourceIndexIdentity.TargetResolution, isSignedIn _: Bool) {
         guard serveGate(), accountGate() else {
             invalidateLocal(clearIdentity: true)
             return
         }
-        let contentID = requestedContentID.flatMap { candidate in
-            SourceIndexContract.canonicalContentID(candidate) == candidate ? candidate : nil
+        let contentID = resolution.target.flatMap { target in
+            SourceIndexContract.canonicalContentID(target.contentID) == target.contentID ? target.contentID : nil
         }
         let identityChanged = contentID != lastContentID
         if identityChanged {
@@ -1432,8 +1418,13 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     /// one another, so Singularity is not either (that is what made it invisible on titles your add-ons already
     /// cover). We drop only internal duplicates within Singularity's own list, by infoHash. Empty pool (SERVE off
     /// / not signed in / fleet-off / nothing corroborated) is a pure pass-through, so the list is unchanged.
-    func merged(into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        Self.merge(streams, into: groups)
+    func merged(
+        into groups: [CoreStreamSourceGroup],
+        for resolution: SourceIndexIdentity.TargetResolution
+    ) -> [CoreStreamSourceGroup] {
+        guard let expectedContentID = resolution.target?.contentID,
+              lastContentID == expectedContentID else { return groups }
+        return Self.merge(streams, into: groups)
     }
 
     /// The pure merge. `nonisolated static` so `SourceListModel`'s off-main assembly can run it over a

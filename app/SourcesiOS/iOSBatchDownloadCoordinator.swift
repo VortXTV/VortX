@@ -14,9 +14,9 @@ import Combine
 ///     answered first.
 ///  2. The SAME client-side contributors the manual page merges before ranking: the TorBox search
 ///     index (`TorBoxSearchSource`) and the Singularity community pool (`SourceIndexServeSource`),
-///     refreshed ONCE PER SERIES (matching the episode page's show-level refresh) and merged into the
-///     engine groups in the same order (`sourceIndex.merged(into: torboxSearch.merged(into: groups))`)
-///     BEFORE the Direct-links-only filter. Without this merge, a TorBox-primary user's batch would
+///     refreshed once per exact episode target. Both owners are fenced against that target and merged
+///     into the engine groups in the same order before the Direct-links-only filter. Without this merge,
+///     a TorBox-primary user's batch would
 ///     skip every episode a manual tap finds. SERVE only: the HOARD contribution stays on the
 ///     interactive surfaces.
 ///  3. `StreamRanking.best` with the SAME continuity / pin / user-filter inputs the manual path passes,
@@ -248,8 +248,8 @@ final class BatchDownloadCoordinator: ObservableObject {
                 tally?.alreadyDownloaded += 1
                 continue
             }
-            refreshContributorsIfNeeded(for: job)
-            switch await resolveAndQueue(job) {
+            let target = refreshContributorsIfNeeded(for: job)
+            switch await resolveAndQueue(job, auxiliaryTarget: target) {
             case .queued: tally?.queued += 1
             case .noSource: tally?.skipped.append(episodeLabel(job.video))
             case .cancelled: break
@@ -274,38 +274,34 @@ final class BatchDownloadCoordinator: ObservableObject {
     /// published results, leaving the TorBox session cache + scraper-cooldown state and the
     /// Singularity result bank intact (those protect the APIs session-wide, which is why the
     /// instances are cleared rather than recreated).
-    private func refreshContributorsIfNeeded(for job: Job) {
+    private func refreshContributorsIfNeeded(for job: Job) -> SourceIndexIdentity.TargetResolution {
         let season = job.video.season
         let episode = job.video.episode
         // The episode ACTUALLY being resolved supplies the current-video role, so the key this batch
         // publishes under is the same key the manual episode page would use.
         let roles = job.identityRoles.selecting(currentVideoID: job.video.id)
-        let contentID = SourceIndexClient.contentID(roles: roles, season: season, episode: episode)
-        let target = contentID ?? "meta:\(job.seriesId)|video:\(job.video.id)"
-        guard target != contributorSeriesKey else { return }
-        contributorSeriesKey = target
+        let target = SourceIndexIdentity.publicationTarget(roles, season: season, episode: episode)
+        let ownerKey = target.target?.contentID ?? "meta:\(job.seriesId)|video:\(job.video.id)"
+        guard ownerKey != contributorSeriesKey else { return target }
+        contributorSeriesKey = ownerKey
         // Reset FIRST, unconditionally: this also closes the valid-id window where the previous
         // series' streams linger until the new series' own fetch lands (Singularity does not clear
         // on a content-id change until its fetch returns).
         torboxSearch.clearResults()
         sourceIndex.clearResults()
-        // PRESENCE, not truthiness. `episode > 0` contradicted the accepted tuple contract, in which an
-        // explicit episode ZERO is VALID and distinct from absence (specials air as S00E00), so every E0
-        // special silently lost both contributor pools. The coordinates still have to be COMPLETE: a
-        // half-resolved pair is refused rather than widened to the show, which is what `contentID != nil`
-        // already enforces one level down.
-        guard let season, season >= 0, let episode, episode >= 0, contentID != nil else { return }
-        torboxSearch.refresh(imdbId: SourceIndexIdentity.resolve(roles).titleID,
-                             season: season, episode: episode)
-        sourceIndex.refresh(contentID: contentID,
-                            isSignedIn: VortXSyncManager.shared.isSignedIn)
+        torboxSearch.refresh(target: target)
+        sourceIndex.refresh(target: target, isSignedIn: VortXSyncManager.shared.isSignedIn)
+        return target
     }
 
     /// The per-episode pipeline, mirroring the manual episode page step for step (load + settle with
     /// the contributor merge, rank with the user's continuity/pin/filters, cached-debrid resolve,
     /// torrent prime, enqueue). Returns `.noSource` instead of throwing so the walk continues past a
     /// dead episode.
-    private func resolveAndQueue(_ job: Job) async -> Outcome {
+    private func resolveAndQueue(
+        _ job: Job,
+        auxiliaryTarget: SourceIndexIdentity.TargetResolution
+    ) async -> Outcome {
         let core = CoreBridge.shared
         // Point the engine's SINGLE shared meta_details slot at THIS episode's streams. The slot is
         // engine-wide (the open series-detail page and every sibling episode share it), so an episode load
@@ -331,8 +327,13 @@ final class BatchDownloadCoordinator: ObservableObject {
             // The manual `displayGroups` composition: TorBox search merged first, the community pool
             // second, THEN the Direct-links-only filter, so a search/pool torrent obeys the same rule
             // as an add-on's. Re-merged every iteration so contributor results landing mid-settle count.
-            groups = iOSDisplayGroups(
-                sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups(forStreamId: job.video.id))))
+            groups = iOSDisplayGroups(sourceIndex.merged(
+                into: torboxSearch.merged(
+                    into: core.streamGroups(forStreamId: job.video.id),
+                    for: auxiliaryTarget
+                ),
+                for: auxiliaryTarget
+            ))
             if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
             let progress = core.streamLoadProgress(forStreamId: job.video.id)
             // The engine has registered NO loadable for this episode (total == 0) and nothing is resident:

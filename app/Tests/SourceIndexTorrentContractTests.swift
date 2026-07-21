@@ -202,6 +202,18 @@ actor SourceFetchSequence {
     func callCount() -> Int { calls }
 }
 
+private func publicationTarget(_ titleID: String?) -> SourceIndexIdentity.TargetResolution {
+    guard let titleID else { return .absent }
+    return SourceIndexIdentity.publicationTarget(
+        SourceIndexIdentity.Roles(
+            catalogID: titleID,
+            defaultVideoID: nil,
+            currentVideoID: nil,
+            kind: .movie
+        )
+    )
+}
+
 actor ReleasableFetch {
     private var calls = 0
     private var continuation: CheckedContinuation<Void, Never>?
@@ -542,7 +554,7 @@ struct SourceIndexTorrentContractTests {
         )
         scope.register(source)
 
-        source.refresh(contentID: "tt1234567", isSignedIn: true)
+        source.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await fetch.callCount() == 1 { break }
             await Task.yield()
@@ -554,7 +566,7 @@ struct SourceIndexTorrentContractTests {
         }
         let initialPublished = source.streams.first?.infoHash == initial.id
 
-        source.refresh(contentID: "tt7654321", isSignedIn: true)
+        source.refresh(target: publicationTarget("tt7654321"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await fetch.callCount() == 2 { break }
             await Task.yield()
@@ -589,7 +601,7 @@ struct SourceIndexTorrentContractTests {
         }
         let afterReopen = SourceIndexLifecycleClock.snapshot()
         gate.reopen()
-        source.refresh(contentID: "tt7654321", isSignedIn: true)
+        source.refresh(target: publicationTarget("tt7654321"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await fetch.callCount() == 3 { break }
             await Task.yield()
@@ -1018,6 +1030,36 @@ struct SourceIndexTorrentContractTests {
         expect(merged.count == 1 && merged.first?.streams.count == 2,
                "merge admits only canonical torrent streams (direct/nzb rows excluded)")
 
+        let mismatchTransport = AttemptProbe()
+        let mismatchSource = SourceIndexServeSource(
+            fetchPooled: { _, _ in
+                await mismatchTransport.record()
+                return [trusted]
+            },
+            serveGate: { true },
+            coalescer: SourceIndexFetchCoalescer()
+        )
+        let mismatchTarget = SourceIndexIdentity.publicationTarget(
+            SourceIndexIdentity.Roles(
+                catalogID: "tt0903747",
+                defaultVideoID: "tt1375666",
+                currentVideoID: "tt2861424:1:1",
+                kind: .series
+            ),
+            season: 1,
+            episode: 1
+        )
+        mismatchSource.refresh(target: mismatchTarget, isSignedIn: true)
+        await Task.yield()
+        let mismatchTransportCount = await mismatchTransport.count()
+        let ordinaryGroups = [CoreStreamSourceGroup(
+            id: "ordinary", addon: "Ordinary", streams: [CoreStream(name: "ordinary", url: "https://example.test")]
+        )]
+        expect(mismatchTransportCount == 0 && mismatchSource.streams.isEmpty,
+               "REQ-50: a typed mismatch launches zero SourceIndex transport and publishes zero rows")
+        expect(mismatchSource.merged(into: ordinaryGroups, for: mismatchTarget).count == ordinaryGroups.count,
+               "REQ-50: mismatch leaves the ordinary engine-only groups available")
+
         let rotated = SourceIndexClient.PooledSource(
             kind: "torrent", id: secondHash, quality: "Other", sizeBytes: 0,
             seeders: 0, corroboration: 2
@@ -1039,7 +1081,7 @@ struct SourceIndexTorrentContractTests {
             serveGate: { lifecycleGate.value() },
             coalescer: lifecycleCoalescer
         )
-        priorSource?.refresh(contentID: "tt1234567", isSignedIn: true)
+        priorSource?.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if priorSource?.streams.first?.infoHash == lower,
                await lifecycleCoalescer.activeCount() == 0 { break }
@@ -1057,7 +1099,7 @@ struct SourceIndexTorrentContractTests {
             serveGate: { lifecycleGate.value() },
             coalescer: lifecycleCoalescer
         )
-        emptySource.refresh(contentID: "tt1234567", isSignedIn: true)
+        emptySource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         expect(emptySource.streams.isEmpty, "recreated source never warm-paints a prior completed result")
         for _ in 0..<1_000 {
             if await lifecycleSequence.callCount() >= 2,
@@ -1071,7 +1113,7 @@ struct SourceIndexTorrentContractTests {
             serveGate: { lifecycleGate.value() },
             coalescer: lifecycleCoalescer
         )
-        failedSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        failedSource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await lifecycleSequence.callCount() >= 3,
                await lifecycleCoalescer.activeCount() == 0 { break }
@@ -1084,7 +1126,7 @@ struct SourceIndexTorrentContractTests {
             serveGate: { lifecycleGate.value() },
             coalescer: lifecycleCoalescer
         )
-        rotatedSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        rotatedSource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if rotatedSource.streams.first?.infoHash == secondHash,
                await lifecycleCoalescer.activeCount() == 0 { break }
@@ -1093,7 +1135,7 @@ struct SourceIndexTorrentContractTests {
         expect(rotatedSource.streams.map(\.infoHash) == [secondHash],
                "fresh rotation publishes only the new response without prior-row carryover")
         lifecycleGate.close()
-        rotatedSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        rotatedSource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await lifecycleCoalescer.activeCount() == 0 { break }
             await Task.yield()
@@ -1111,12 +1153,12 @@ struct SourceIndexTorrentContractTests {
             serveGate: { true },
             coalescer: identityCoalescer
         )
-        identitySource.refresh(contentID: "tt1234567", isSignedIn: true)
+        identitySource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if identitySource.streams.first?.infoHash == lower { break }
             await Task.yield()
         }
-        identitySource.refresh(contentID: "tt7654321", isSignedIn: true)
+        identitySource.refresh(target: publicationTarget("tt7654321"), isSignedIn: true)
         let accountBBlankedImmediately = identitySource.streams.isEmpty
         for _ in 0..<1_000 {
             if await identitySequence.callCount() == 2,
@@ -1125,12 +1167,12 @@ struct SourceIndexTorrentContractTests {
         }
         expect(accountBBlankedImmediately && identitySource.streams.isEmpty,
                "identity A to B clears A immediately and a failed B fetch stays empty")
-        identitySource.refresh(contentID: "tt1234567", isSignedIn: true)
+        identitySource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if identitySource.streams.first?.infoHash == lower { break }
             await Task.yield()
         }
-        identitySource.refresh(contentID: nil, isSignedIn: true)
+        identitySource.refresh(target: .absent, isSignedIn: true)
         expect(identitySource.streams.isEmpty,
                "identity A to nil clears every previously published row synchronously")
 
@@ -1141,12 +1183,12 @@ struct SourceIndexTorrentContractTests {
             serveGate: { true },
             coalescer: lateIdentityCoalescer
         )
-        lateIdentitySource.refresh(contentID: "tt1234567", isSignedIn: true)
+        lateIdentitySource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await lateIdentityFetch.callCount() == 1 { break }
             await Task.yield()
         }
-        lateIdentitySource.refresh(contentID: "tt7654321", isSignedIn: true)
+        lateIdentitySource.refresh(target: publicationTarget("tt7654321"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await lateIdentityFetch.callCount() == 2 { break }
             await Task.yield()
@@ -1163,6 +1205,12 @@ struct SourceIndexTorrentContractTests {
         }
         expect(lateIdentitySource.streams.map(\.infoHash) == [secondHash],
                "late identity-A completion cannot overwrite identity-B rows")
+        expect(lateIdentitySource.merged(
+                   into: [], for: publicationTarget("tt1234567")).isEmpty,
+               "REQ-50: rows fetched for title B cannot merge into title A")
+        expect(lateIdentitySource.merged(
+                   into: [], for: publicationTarget("tt7654321")).first?.streams.map(\.infoHash) == [secondHash],
+               "REQ-50: rows merge only when the selected target exactly matches their publication target")
 
         let liveAccountGate = LockedGate(true)
         let accountFenceFetch = IndexedReleasableFetch(results: [[trusted]])
@@ -1173,7 +1221,7 @@ struct SourceIndexTorrentContractTests {
             accountGate: { liveAccountGate.value() },
             coalescer: accountFenceCoalescer
         )
-        accountFenceSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        accountFenceSource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await accountFenceFetch.callCount() == 1 { break }
             await Task.yield()
@@ -1222,7 +1270,7 @@ struct SourceIndexTorrentContractTests {
             serveGate: { true },
             coalescer: replacementCoalescer
         )
-        replacedSource?.refresh(contentID: "tt1234567", isSignedIn: true)
+        replacedSource?.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await replacementFetch.callCount() == 1 { break }
             await Task.yield()
@@ -1234,7 +1282,7 @@ struct SourceIndexTorrentContractTests {
             serveGate: { true },
             coalescer: replacementCoalescer
         )
-        replacementSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        replacementSource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<100 { await Task.yield() }
         let replacementCallsBeforeRelease = await replacementFetch.callCount()
         await replacementFetch.release()
@@ -1265,14 +1313,14 @@ struct SourceIndexTorrentContractTests {
             clearMoat: { _, _ in }
         )
         closingScope.register(closingSource)
-        closingSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        closingSource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await closingFetch.counts().calls == 1 { break }
             await Task.yield()
         }
         closingScope.preferencesWillApply(serve: false)
         closingGate.close()
-        closingSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        closingSource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             let counts = await closingFetch.counts()
             if counts.cancellations == 1, await closingCoalescer.activeCount() == 0 { break }
@@ -1320,7 +1368,7 @@ struct SourceIndexTorrentContractTests {
         let beforeServeClose = SourceIndexLifecycleClock.snapshot()
         liminalServeScope.preferencesWillApply(serve: false)
         let afterServeClose = SourceIndexLifecycleClock.snapshot()
-        liminalServeSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        liminalServeSource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await liminalServeFetch.callCount() == 1 { break }
             await Task.yield()
@@ -1329,7 +1377,7 @@ struct SourceIndexTorrentContractTests {
         liminalServeScope.preferencesWillApply(serve: true)
         let afterServeReopen = SourceIndexLifecycleClock.snapshot()
         liminalServeGate.reopen()
-        liminalServeSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        liminalServeSource.refresh(target: publicationTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await liminalServeFetch.callCount() == 2 { break }
             await Task.yield()
@@ -1919,31 +1967,35 @@ struct SourceIndexTorrentContractTests {
         // every case below green. Everything the views now call is here, and `IdentityCallerGateTests` reads
         // the view sources themselves so a view-only revert is red there.
         //
-        // ROLES, NOT ORDER. The previous signature was `preferred(candidates: [String?])` and the ARRAY ORDER
-        // silently decided authority, wrongly: `preferred(["tt0903747:1:1", "tt1375666"])` returned
-        // `tt0903747`, so an add-on's episode-shaped defaultVideoId outranked the catalog id of the page the
-        // user was on. These cases pin the authority rule to the ROLE instead.
+        // ROLES, NOT ORDER. The previous signature was `preferred(candidates: [String?])` and the array order
+        // silently chose a winner: `preferred(["tt0903747:1:1", "tt1375666"])` returned `tt0903747`, even
+        // though the valid catalog head named another title. These cases pin the typed mismatch instead.
         func roles(catalog: String?, defaultVideo: String?, currentVideo: String?,
                    kind: SourceIndexIdentity.ContentKind) -> SourceIndexIdentity.Roles {
             SourceIndexIdentity.Roles(catalogID: catalog, defaultVideoID: defaultVideo,
                                       currentVideoID: currentVideo, kind: kind)
         }
 
-        // THE REVERSED CASE, stated first: a MOVIE whose add-on default is an episode-shaped id from an
-        // entirely different title. The catalog id is what the user opened and must win.
+        // REQ-260721-50: any two VALID IMDb heads that disagree are a typed mismatch. No role is allowed to
+        // choose a winner because the loser may name the file actually selected by an add-on. The ordinary
+        // engine path remains independent; only the auxiliary target becomes unavailable.
         expect(SourceIndexIdentity.resolve(
                    roles(catalog: "tt1375666", defaultVideo: "tt0903747:1:1",
-                         currentVideo: nil, kind: .movie)).titleID == "tt1375666",
-               "F1: a valid bare CATALOG imdb id outranks an episode-derived default on a movie")
+                         currentVideo: nil, kind: .movie)) == .mismatch,
+               "REQ-50: conflicting movie heads return the typed mismatch")
         expect(SourceIndexIdentity.resolve(
                    roles(catalog: "tt1375666", defaultVideo: "tt0903747:1:1",
-                         currentVideo: "tt0903747:1:1", kind: .live)).titleID == "tt1375666",
-               "F1: the same authority holds for a live page, whose current-video role does not exist")
-        // Conflicting heads on a SERIES resolve to the catalog identity too.
-        expect(SourceIndexIdentity.resolve(
-                   roles(catalog: "tt0903747", defaultVideo: "tt1375666",
-                         currentVideo: "tt2861424:1:1", kind: .series)).titleID == "tt0903747",
-               "F1: on conflicting heads the CATALOG identity wins")
+                         currentVideo: "tt0903747:1:1", kind: .live)) == .mismatch,
+               "REQ-50: conflicting live heads return the typed mismatch while ignoring current-video")
+        let conflictingSeriesRoles = roles(
+            catalog: "tt0903747", defaultVideo: "tt1375666",
+            currentVideo: "tt2861424:1:1", kind: .series
+        )
+        expect(SourceIndexIdentity.resolve(conflictingSeriesRoles) == .mismatch,
+               "REQ-50: conflicting series heads return the typed mismatch")
+        expect(SourceIndexIdentity.publicationTarget(
+                   conflictingSeriesRoles, season: 1, episode: 1) == .mismatch,
+               "REQ-50: a conflicting series produces no auxiliary publication target")
 
         // An episode-scoped default is canonicalized, never returned unchanged.
         let episodeScoped = SourceIndexIdentity.resolve(
@@ -1960,6 +2012,16 @@ struct SourceIndexTorrentContractTests {
             roles(catalog: "tmdb:94997", defaultVideo: nil, currentVideo: "tt0460649:3:6", kind: .series))
         expect(fieldCase.titleID == "tt0460649",
                "F1 field case: an imdb EPISODE video id supplies the identity when no other role carries one")
+        let fieldTarget = SourceIndexIdentity.publicationTarget(
+            roles(catalog: "tmdb:94997", defaultVideo: nil,
+                  currentVideo: "tt0460649:3:0", kind: .series),
+            season: 3, episode: 0
+        )
+        expect(fieldTarget.target?.titleID == "tt0460649"
+               && fieldTarget.target?.contentID == "tt0460649:3:0"
+               && fieldTarget.target?.season == 3
+               && fieldTarget.target?.episode == 0,
+               "REQ-50: episode-only IMDb identity remains valid and preserves explicit E0")
         // The same inputs on a MOVIE resolve to nothing: a movie has no episode, so that role is not consulted.
         expect(SourceIndexIdentity.resolve(
                    roles(catalog: "tmdb:94997", defaultVideo: nil,
@@ -1984,6 +2046,14 @@ struct SourceIndexTorrentContractTests {
                    roles(catalog: "kitsu:42", defaultVideo: "not-an-id",
                          currentVideo: nil, kind: .series)).titleID == nil,
                "F1: an all-malformed role set resolves to no identity at all")
+        expect(SourceIndexIdentity.resolve(
+                   roles(catalog: nil, defaultVideo: nil,
+                         currentVideo: nil, kind: .series)) == .absent
+               && SourceIndexIdentity.publicationTarget(
+                   roles(catalog: nil, defaultVideo: nil,
+                         currentVideo: nil, kind: .series),
+                   season: 0, episode: 0) == .absent,
+               "REQ-50: nil identity remains an explicit absent result, including S0E0")
 
         // `selecting` re-points the current-video role and nothing else (the batch coordinator's per-episode
         // step). Proven by a case where the current-video role is the ONLY identity source.

@@ -673,7 +673,7 @@ struct iOSDetailView: View {
         // their own episode view.
         .onChange(of: meta?.id) { _ in
             if effectiveType != "series" {
-                torboxSearch.refresh(imdbId: titleIdentity.titleID)
+                torboxSearch.refresh(target: auxiliaryTarget)
                 mediaServers.refresh(imdb: titleIdentity.titleID, title: meta?.name,
                                      publicationTarget: mediaServerTargetID)
                 refreshSourceIndex()
@@ -681,7 +681,7 @@ struct iOSDetailView: View {
         }
         .onAppear {
             if effectiveType != "series" {
-                torboxSearch.refresh(imdbId: titleIdentity.titleID)
+                torboxSearch.refresh(target: auxiliaryTarget)
                 mediaServers.refresh(imdb: titleIdentity.titleID, title: meta?.name,
                                      publicationTarget: mediaServerTargetID)
                 refreshSourceIndex()
@@ -2158,8 +2158,12 @@ struct iOSDetailView: View {
     /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
+    private var auxiliaryTarget: SourceIndexIdentity.TargetResolution {
+        SourceIndexIdentity.publicationTarget(identityRoles)
+    }
+
     private var sourceContentID: String? {
-        SourceIndexClient.contentID(roles: identityRoles)
+        auxiliaryTarget.target?.contentID
     }
 
     /// Media-server lookup also supports IMDb-less title matching. Its merge fence therefore uses an exact
@@ -2170,13 +2174,13 @@ struct iOSDetailView: View {
 
     private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
         let contentID = sourceContentID
-        sourceIndex.refresh(contentID: contentID, isSignedIn: VortXSyncManager.shared.isSignedIn)
+        sourceIndex.refresh(target: auxiliaryTarget, isSignedIn: VortXSyncManager.shared.isSignedIn)
         guard let contentID else { return }
         // HOARD: report the anonymized descriptors from the UNFILTERED assembled groups (the pool should see
         // torrents even when the user hides them locally). Includes the TorBox search sources. No user data.
         // Pool-EXCLUDED: the caller's torbox-base when it already merged one, else self-merge. NEVER the
         // Singularity-pool-inclusive set: hoarding the pool's own results back into itself would be wrong.
-        let groups = torboxMerged ?? torboxSearch.merged(into: core.streamGroups())
+        let groups = torboxMerged ?? torboxSearch.merged(into: core.streamGroups(), for: auxiliaryTarget)
         guard !groups.isEmpty else { return }
         Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
     }
@@ -2191,8 +2195,8 @@ struct iOSDetailView: View {
         sourceRefreshDebounce = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
             guard !Task.isCancelled else { return }
-            let torboxBase = torboxSearch.merged(into: core.streamGroups())   // pool-EXCLUDED (hoard set)
-            debridCache.refresh(from: sourceIndex.merged(into: torboxBase))   // pool-INCLUDED (debrid set)
+            let torboxBase = torboxSearch.merged(into: core.streamGroups(), for: auxiliaryTarget)   // pool-EXCLUDED (hoard set)
+            debridCache.refresh(from: sourceIndex.merged(into: torboxBase, for: auxiliaryTarget))   // pool-INCLUDED (debrid set)
             refreshSourceIndex(torboxMerged: torboxBase)                      // reuse the same base; no second merge
         }
     }
@@ -2352,7 +2356,10 @@ struct iOSDetailView: View {
         // source-index sources (no-op unless the Singularity toggle is on + signed in), then apply the
         // Direct-links-only filter so a search/community torrent source is filtered on the same rule as an
         // add-on's — keeps the filter contract intact.
-        let withSearch = sourceIndex.merged(into: torboxSearch.merged(into: groups))
+        let withSearch = sourceIndex.merged(
+            into: torboxSearch.merged(into: groups, for: auxiliaryTarget),
+            for: auxiliaryTarget
+        )
         guard PlaybackSettings.directLinksOnly else { return withSearch }
         return withSearch.compactMap { group in
             let streams = group.streams.filter { !$0.isTorrent }
@@ -3529,9 +3536,9 @@ struct iOSEpisodeStreams: View {
     private var pinContext: SourcePinContext { SourcePinContext(metaId: meta.id, isSeries: true) }
     private var sourcePin: ResolvedPin? { pinStore.effectivePin(pinContext) }
 
-    /// The show's identity ROLES, stated for the ONE shared resolver (tvOS twin: DetailView.swift
-    /// `CoreStreamList.identityRoles`). Naming the roles is what stops an episode-scoped `defaultVideoId`
-    /// ("tt0903747:1:1") from outranking the catalog id purely because it sat earlier in an array.
+    /// The show's identity roles, stated for the one shared resolver (tvOS twin: DetailView.swift
+    /// `CoreStreamList.identityRoles`). Naming the roles makes conflicting valid IMDb heads an explicit
+    /// mismatch instead of letting array position choose one.
     ///
     /// The FIELD CASE is preserved (REQ-260721-05): a TMDB/Kitsu-identified series with no defaultVideoId
     /// (meta.id "tmdb:94997") holds its IMDb identity only on the EPISODE video id ("tt0460649:3:6"), which
@@ -3642,13 +3649,13 @@ struct iOSEpisodeStreams: View {
         // synchronously before starting the replacement request, and SourceListModel independently checks
         // the same content token before merging.
         .onAppear {
-            torboxSearch.refresh(imdbId: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode)
+            torboxSearch.refresh(target: episodeAuxiliaryTarget)
             mediaServers.refresh(imdb: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode,
                                  title: meta.name, publicationTarget: mediaServerEpisodeTargetID)
             refreshSourceIndex()
         }
         .onChange(of: shownVideo.id) { _ in
-            torboxSearch.refresh(imdbId: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode)
+            torboxSearch.refresh(target: episodeAuxiliaryTarget)
             mediaServers.refresh(imdb: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode,
                                  title: meta.name, publicationTarget: mediaServerEpisodeTargetID)
             refreshSourceIndex()
@@ -4174,7 +4181,10 @@ struct iOSEpisodeStreams: View {
     /// auto-plays one — the same `displayGroups` filter the tvOS `CoreStreamList` applies. Merges the
     /// TorBox search sources first (no-op with no TorBox key / no results).
     private func displayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        let withSearch = sourceIndex.merged(into: torboxSearch.merged(into: groups))
+        let withSearch = sourceIndex.merged(
+            into: torboxSearch.merged(into: groups, for: episodeAuxiliaryTarget),
+            for: episodeAuxiliaryTarget
+        )
         guard PlaybackSettings.directLinksOnly else { return withSearch }
         return withSearch.compactMap { group in
             let streams = group.streams.filter { !$0.isTorrent }
@@ -4218,8 +4228,15 @@ struct iOSEpisodeStreams: View {
         guard auxiliarySeason >= 0, let episode = auxiliaryEpisode, episode >= 0 else { return nil }
         return DebridEpisode(season: auxiliarySeason, episode: episode)
     }
+    private var episodeAuxiliaryTarget: SourceIndexIdentity.TargetResolution {
+        SourceIndexIdentity.publicationTarget(
+            showIdentityRoles,
+            season: auxiliarySeason,
+            episode: auxiliaryEpisode
+        )
+    }
     private var episodeContentID: String? {
-        SourceIndexClient.contentID(roles: showIdentityRoles, season: auxiliarySeason, episode: auxiliaryEpisode)
+        episodeAuxiliaryTarget.target?.contentID
     }
     private var mediaServerEpisodeTargetID: String {
         episodeContentID ?? "meta:\(meta.id)|video:\(shownVideo.id)"
@@ -4235,11 +4252,14 @@ struct iOSEpisodeStreams: View {
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
     private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
         let contentID = episodeContentID
-        sourceIndex.refresh(contentID: contentID, isSignedIn: VortXSyncManager.shared.isSignedIn)
+        sourceIndex.refresh(target: episodeAuxiliaryTarget, isSignedIn: VortXSyncManager.shared.isSignedIn)
         guard let contentID else { return }
         // Pool-EXCLUDED hoard set: the caller's episode-scoped torbox-base when it merged one, else self-merge.
         // NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into itself is wrong.
-        let groups = torboxMerged ?? torboxSearch.merged(into: core.streamGroups(forStreamId: shownVideo.id))
+        let groups = torboxMerged ?? torboxSearch.merged(
+            into: core.streamGroups(forStreamId: shownVideo.id),
+            for: episodeAuxiliaryTarget
+        )
         guard !groups.isEmpty else { return }
         Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
     }
@@ -4254,8 +4274,14 @@ struct iOSEpisodeStreams: View {
         sourceRefreshDebounce = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
             guard !Task.isCancelled else { return }
-            let torboxBase = torboxSearch.merged(into: core.streamGroups(forStreamId: shownVideo.id))   // pool-EXCLUDED
-            debridCache.refresh(from: sourceIndex.merged(into: torboxBase))   // pool-INCLUDED (debrid set)
+            let torboxBase = torboxSearch.merged(
+                into: core.streamGroups(forStreamId: shownVideo.id),
+                for: episodeAuxiliaryTarget
+            )   // pool-EXCLUDED
+            debridCache.refresh(from: sourceIndex.merged(
+                into: torboxBase,
+                for: episodeAuxiliaryTarget
+            ))   // pool-INCLUDED (debrid set)
             refreshSourceIndex(torboxMerged: torboxBase)                      // reuse the same base; no second merge
         }
     }

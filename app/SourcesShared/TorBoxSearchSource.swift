@@ -209,10 +209,15 @@ enum TorBoxSearch {
 
 /// A per-detail-view `@StateObject` that fetches TorBox search results for the current title and publishes
 /// them as an extra source group to MERGE into the list (mirrors `DebridCacheAwareness`'s shape). Gated on
-/// a TorBox key; no key = no fetch = empty group = the list is unchanged. De-dups by imdb id so a re-render
-/// of the same title does not re-hit the index.
+/// a TorBox key; no key = no fetch = empty group = the list is unchanged. De-dups by exact publication target
+/// so a re-render of the same title or episode does not re-hit the index.
 @MainActor
 final class TorBoxSearchSource: ObservableObject {
+    typealias SearchResult = (streams: [CoreStream], rateLimited: Bool, transportError: Bool)
+    typealias FetchStreams = (SourceIndexIdentity.PublicationTarget, String) async -> SearchResult
+    typealias KeyGate = @MainActor () -> Bool
+    typealias KeyProvider = @MainActor () -> String
+
     /// The extra streams from the search index, ready to merge. Empty until a fetch completes (and always
     /// with no TorBox key). One group so the source list shows a single "TorBox Search" section.
     @Published private(set) var streams: [CoreStream] = [] { didSet { epoch &+= 1 } }
@@ -230,7 +235,7 @@ final class TorBoxSearchSource: ObservableObject {
     /// The fetch key currently in flight, so the paired `.onChange` + `.onAppear` for the same title issue
     /// exactly one network round trip instead of two.
     private var inFlightKey: String?
-    /// Session cache of completed results, keyed by "imdb|season|episode". A hit re-publishes with no network,
+    /// Session cache of completed results, keyed by canonical publication content id. A hit re-publishes with no network,
     /// so browsing back and forth never re-hits the TorBox scraper. Re-hitting on every open is exactly what
     /// exhausts the account's small daily search allowance and trips its ~24h `cooldown_until`.
     private var cache: [String: [CoreStream]] = [:]
@@ -240,30 +245,46 @@ final class TorBoxSearchSource: ObservableObject {
     /// moment the allowance frees, without hammering in between.
     private var cooldownUntil: Date?
     private var task: Task<Void, Never>?
+    private let fetchStreams: FetchStreams
+    private let hasKey: KeyGate
+    private let keyProvider: KeyProvider
 
-    /// Fetch search results for `imdbId` if the user has a TorBox key. Fail-soft, session-cached, and backed
-    /// off during a scraper cooldown. Safe to call on every meta change / `.onAppear`. Pass `season`/`episode`
-    /// from an episode context so the index scopes usenet/torrent results to that episode (nil = movie level).
-    func refresh(imdbId: String?, season: Int? = nil, episode: Int? = nil) {
-        // Re-validate through the SHARED module rather than trusting a `tt` prefix. Callers pass an id that a
-        // screen resolved; the old prefix check also accepted the EPISODE form ("tt0903747:1:1"), so `imdb_id:`
-        // below was keyed on an id no IMDb index can answer and the content id composed "tt0903747:1:1:3:5".
-        // `imdbTitleID` yields a BARE tt id or nothing, which is exactly this path's contract: it is IMDb-keyed,
-        // so a tmdb id here is wrong rather than weak.
-        guard let imdbId = SourceIndexIdentity.imdbTitleID(imdbId) else {
+    init(
+        fetchStreams: @escaping FetchStreams = { target, apiKey in
+            await TorBoxSearch.streams(
+                imdbId: target.titleID,
+                season: target.season,
+                episode: target.episode,
+                apiKey: apiKey
+            )
+        },
+        hasKey: @escaping KeyGate = {
+            DebridKeys.shared.isConfigured(.torBox)
+        },
+        keyProvider: @escaping KeyProvider = {
+            DebridKeys.shared.key(for: .torBox)
+        }
+    ) {
+        self.fetchStreams = fetchStreams
+        self.hasKey = hasKey
+        self.keyProvider = keyProvider
+    }
+
+    /// Fetch search results for one resolved publication target. A typed mismatch or absent target clears the
+    /// current publication and launches no transport. The title id, coordinates, cache key, and publication
+    /// token all come from this value, so none can be re-derived independently by the caller.
+    func refresh(target resolution: SourceIndexIdentity.TargetResolution) {
+        guard let target = resolution.target,
+              SourceIndexIdentity.imdbTitleID(target.titleID) == target.titleID,
+              SourceIndexContract.canonicalContentID(target.contentID) == target.contentID else {
             clearResults(); return
         }
-        guard DebridKeys.shared.isConfigured(.torBox) else { clearResults(); return }   // gate: no TorBox key -> no-op
-        let fetchKey = "\(imdbId)|\(season ?? -1)|\(episode ?? -1)"
-        // Tuple-exact, same rule as the pool key: a PARTIAL coordinate pair is not silently widened to the
-        // show, because that publishes one episode's results under the show-wide token.
-        guard let contentID = SourceIndexIdentity.contentKey(titleID: imdbId, season: season, episode: episode) else {
-            clearResults(); return
-        }
+        guard hasKey() else { clearResults(); return }
+        let fetchKey = target.contentID
         // New title: publish its cached results (or clear), so the prior title's streams never linger.
         if fetchKey != shownKey {
             shownKey = fetchKey
-            publishedContentID = contentID
+            publishedContentID = target.contentID
             streams = cache[fetchKey] ?? []
         }
         if cache[fetchKey] != nil { return }              // cached: already published above, no round trip
@@ -271,30 +292,31 @@ final class TorBoxSearchSource: ObservableObject {
         if let until = cooldownUntil, until > Date() { return }   // in scraper cooldown: don't burn requests
         task?.cancel()
         inFlightKey = fetchKey
-        let key = DebridKeys.shared.key(for: .torBox)
+        let key = keyProvider()
         // H9 diagnostic (terminal-run repro): confirm refresh actually fires with a key. Logs the id + whether
         // a non-empty TorBox key is present (never the key itself). If this line never appears, the gate above
         // no-op'd; if it appears but the count line below is 0, the index returned nothing for the id.
-        VXProbe.log("torbox-search", "refresh id=\(VXProbeRedaction.identityToken(imdbId)) s=\(season ?? -1) e=\(episode ?? -1) hasKey=\(key.isEmpty ? "no" : "yes")")
+        VXProbe.log("torbox-search", "refresh id=\(VXProbeRedaction.identityToken(target.titleID)) s=\(target.season ?? -1) e=\(target.episode ?? -1) hasKey=\(key.isEmpty ? "no" : "yes")")
         task = Task { [weak self] in
-            let result = await TorBoxSearch.streams(imdbId: imdbId, season: season, episode: episode, apiKey: key)
-            guard !Task.isCancelled, let self else { return }
+            guard let self else { return }
+            let result = await self.fetchStreams(target, key)
+            guard !Task.isCancelled else { return }
             self.inFlightKey = nil
             if result.rateLimited {
                 // Over the TorBox scraper allowance. Back off ~15 min before re-probing; do NOT cache the
                 // empty result, so it re-fetches for real once the cooldown lifts.
                 self.cooldownUntil = Date().addingTimeInterval(15 * 60)
-                VXProbe.log("torbox-search", "rate-limited (scraper cooldown) for id=\(VXProbeRedaction.identityToken(imdbId)), backing off ~15m")
+                VXProbe.log("torbox-search", "rate-limited (scraper cooldown) for id=\(VXProbeRedaction.identityToken(target.titleID)), backing off ~15m")
                 return
             }
             if result.transportError {
                 // The request never completed (offline / network failure). Do NOT cache the empty result and do
                 // NOT set a cooldown, so the next meta change or reopen re-fetches for real once the network is
                 // back. Without this, an offline first open cached an empty list for the whole session.
-                VXProbe.log("torbox-search", "transport error for id=\(VXProbeRedaction.identityToken(imdbId)), not caching, will retry")
+                VXProbe.log("torbox-search", "transport error for id=\(VXProbeRedaction.identityToken(target.titleID)), not caching, will retry")
                 return
             }
-            VXProbe.log("torbox-search", "fetched \(result.streams.count) stream(s) for id=\(VXProbeRedaction.identityToken(imdbId))")
+            VXProbe.log("torbox-search", "fetched \(result.streams.count) stream(s) for id=\(VXProbeRedaction.identityToken(target.titleID))")
             self.cache[fetchKey] = result.streams
             if self.shownKey == fetchKey { self.streams = result.streams }
         }
@@ -320,8 +342,13 @@ final class TorBoxSearchSource: ObservableObject {
     /// Merge the fetched search streams into `groups` as one extra group, deduped against the streams
     /// already present (by infoHash for torrents, nzbUrl for usenet, url otherwise). Returns `groups`
     /// unchanged when there is nothing to add — so a no-key / empty-result path is a pure pass-through.
-    func merged(into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        Self.merge(streams, into: groups)
+    func merged(
+        into groups: [CoreStreamSourceGroup],
+        for resolution: SourceIndexIdentity.TargetResolution
+    ) -> [CoreStreamSourceGroup] {
+        guard let expectedContentID = resolution.target?.contentID,
+              publishedContentID == expectedContentID else { return groups }
+        return Self.merge(streams, into: groups)
     }
 
     /// The pure merge. `nonisolated static` so `SourceListModel`'s off-main assembly can run it over a

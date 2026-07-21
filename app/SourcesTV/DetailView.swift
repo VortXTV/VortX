@@ -185,11 +185,11 @@ struct DetailView: View {
         return id.hasPrefix("tt") ? id : nil
     }
 
-    /// The identity ROLES this page hands to the SOURCE paths (Singularity pool + the IMDb-keyed TorBox
-    /// index). The page states what each id IS and lets the ONE shared resolver rank them; it does not pick.
+    /// The identity roles this page hands to the source paths (Singularity pool + the IMDb-keyed TorBox
+    /// index). The page states what each id is and lets the one shared resolver compare valid IMDb heads.
     ///
     /// The catalog id is `self.id` (what the user opened) and the default-video id comes from the ID-FENCED
-    /// meta, so a still-resident previous title can neither supply an identity nor outrank this page's own.
+    /// meta, so a still-resident previous title cannot supply an identity or manufacture a mismatch.
     /// Movie and live pages have no episode, so `currentVideoID` is nil here by construction.
     ///
     /// WHY IT IS NOT `ratingsImdbID`: that value is tt-only and nil for a TMDB-keyed catalog entry, which used
@@ -1701,9 +1701,9 @@ struct CoreEpisodeStreams: View {
                                    episodeTargetIsCurrent: { videoID, generation in
                                        videoID == currentVideo.id && generation == episodeTargetGeneration
                                    },
-                                   // Roles, not an ordered candidate list: this page states what each id IS
-                                   // and the ONE shared resolver ranks them. The catalog id outranks the
-                                   // add-on's episode-shaped defaultVideoId, and the FIELD CASE survives --
+                                   // Roles, not an ordered candidate list: this page states what each id is
+                                   // and the one shared resolver rejects conflicting valid IMDb heads. The
+                                   // field case survives:
                                    // a TMDB-identified series with no defaultVideoId ("tmdb:94997") holds its
                                    // IMDb identity only on the EPISODE video id ("tt0460649:3:6"), which the
                                    // series kind still admits as the last role.
@@ -2278,13 +2278,13 @@ struct CoreStreamList: View {
         .onAppear {
             sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
                             mediaServers: mediaServers, debridCache: debridCache)
-            torboxSearch.refresh(imdbId: titleIdentity.titleID, season: meta?.season, episode: meta?.episode)
+            torboxSearch.refresh(target: auxiliaryTarget)
             mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
                                  title: meta?.name, publicationTarget: mediaServerTargetID)
             refreshSourceIndex()
         }
         .onChange(of: mediaServerTargetID) { _ in
-            torboxSearch.refresh(imdbId: titleIdentity.titleID, season: meta?.season, episode: meta?.episode)
+            torboxSearch.refresh(target: auxiliaryTarget)
             mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
                                  title: meta?.name, publicationTarget: mediaServerTargetID)
             refreshSourceIndex()
@@ -2472,10 +2472,18 @@ struct CoreStreamList: View {
         return try? JSONDecoder().decode(CoreStream.self, from: data)
     }
 
-    /// The pool `content_id` for this list: the title's imdb id, plus `:S:E` when the `PlaybackMeta` carries
-    /// a season + episode (a series episode list). nil when no imdb id is known (e.g. a live channel).
+    /// The one typed auxiliary target for this list. A conflict remains a mismatch and disables only TorBox
+    /// and SourceIndex work; the engine groups below remain available unchanged.
+    private var auxiliaryTarget: SourceIndexIdentity.TargetResolution {
+        SourceIndexIdentity.publicationTarget(
+            identityRoles,
+            season: meta?.season,
+            episode: meta?.episode
+        )
+    }
+
     private var sourceContentID: String? {
-        SourceIndexClient.contentID(roles: identityRoles, season: meta?.season, episode: meta?.episode)
+        auxiliaryTarget.target?.contentID
     }
 
     private var mediaServerTargetID: String {
@@ -2496,12 +2504,12 @@ struct CoreStreamList: View {
     private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
         let contentID = sourceContentID
         let vortxSignedIn = VortXSyncManager.shared.isSignedIn
-        sourceIndex.refresh(contentID: contentID, isSignedIn: vortxSignedIn)
+        sourceIndex.refresh(target: auxiliaryTarget, isSignedIn: vortxSignedIn)
         guard let contentID else { return }
         // Pool-EXCLUDED hoard set: the caller's torbox-base when it already merged one (avoids a second walk),
         // else self-merge. NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into
         // itself would be wrong.
-        let groups = torboxMerged ?? torboxSearch.merged(into: targetCoreGroups)
+        let groups = torboxMerged ?? torboxSearch.merged(into: targetCoreGroups, for: auxiliaryTarget)
         guard !groups.isEmpty else { return }
         Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
     }
@@ -2514,11 +2522,11 @@ struct CoreStreamList: View {
         sourceRefreshDebounce = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
             guard !Task.isCancelled else { return }
-            let torboxBase = torboxSearch.merged(into: targetCoreGroups)   // pool-EXCLUDED (hoard set)
+            let torboxBase = torboxSearch.merged(into: targetCoreGroups, for: auxiliaryTarget)   // pool-EXCLUDED (hoard set)
             // Pool-INCLUDED: cache awareness needs raw torrents and TorBox-search NZBs that the Direct-links-only
             // filter would drop, plus Singularity's torrent-only pool sources. Torrents resolve through debrid;
             // TorBox-search NZBs resolve through TorBox. This remains orthogonal to the display filter.
-            debridCache.refresh(from: sourceIndex.merged(into: torboxBase))
+            debridCache.refresh(from: sourceIndex.merged(into: torboxBase, for: auxiliaryTarget))
             refreshSourceIndex(torboxMerged: torboxBase)   // reuse the same base; no second merge walk
         }
     }
