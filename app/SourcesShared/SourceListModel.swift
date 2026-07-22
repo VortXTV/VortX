@@ -66,7 +66,14 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     struct Context: Equatable {
         var metaId = ""              // for the pin scope + the health-metric log only
         var streamId: String?        // nil = all loaded groups (movie/live); set = one episode's groups (iOS + tvOS episode pages)
-        var auxiliaryContentID: String?   // canonical query token for TorBox Search + Singularity
+        /// The page's WITNESS token for the TorBox + Singularity merges. This is the one identifier the view
+        /// layer still hands over as a raw `String?` (the detail screens derive it from their own resolved
+        /// `TargetResolution` and `setContext`'s callers live outside this file's ownership), and it is INERT
+        /// by construction: the merge itself is opened only by `SourceIndexIdentity.mergeAuthorization`, which
+        /// compares this witness against the SEALED `publishedTarget` each auxiliary source fetched for. A
+        /// witness that matches nothing merges nothing; a matching witness merges exactly the rows the typed
+        /// source legitimately published. It is never formatted into output, a key, a request, or a log line.
+        var auxiliaryContentID: String?
         var mediaServerTargetID: String?  // exact page token, including IMDb-less title/year fallback pages
         var continuity: String?      // remembered quality signature for the best() pick (nil for live)
         var pin: ResolvedPin?        // resolved pinned source, from the view's SourcePinStore lookup
@@ -230,9 +237,16 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
 
         // Immutable snapshot on the main actor; everything below is value types.
         let raw = ctx.streamId.map { core.streamGroups(forStreamId: $0) } ?? core.streamGroups()
-        let target = ctx.auxiliaryContentID
-        let torboxStreams = target != nil && torbox.publishedContentID == target ? torbox.streams : []
-        let singularityStreams = target != nil && singularity.publishedContentID == target ? singularity.streams : []
+        // The TYPED merge gate (REQ: no raw-identifier route on this path). Each auxiliary source publishes
+        // the SEALED target its rows were fetched for; the page witness can only select that typed value via
+        // the identity file's factory. Both authorizations are captured here, in the same main-actor snapshot
+        // that captures the streams they authorize, and the detached merges below cannot run without them.
+        let torboxAuthorization = SourceIndexIdentity.mergeAuthorization(
+            published: torbox.publishedTarget, pageContentID: ctx.auxiliaryContentID)
+        let singularityAuthorization = SourceIndexIdentity.mergeAuthorization(
+            published: singularity.publishedTarget, pageContentID: ctx.auxiliaryContentID)
+        let torboxStreams = torboxAuthorization != nil ? torbox.streams : []
+        let singularityStreams = singularityAuthorization != nil ? singularity.streams : []
         let singularityEpoch = singularity.epoch
         let sourceLifecycle = SourceIndexLifecycleClock.snapshot()
         let includedSingularity = !singularityStreams.isEmpty
@@ -258,9 +272,14 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             // Merge order preserved from the old per-body displayGroups: TorBox search first, then the
             // Singularity pool, then the media-server direct-play groups, then the direct-links filter so a
             // merged torrent obeys the same rule. Final rank order is decided by StreamRanking, not merge order.
+            // The TorBox and Singularity merges REQUIRE the typed authorizations snapshotted above; the
+            // media-server lane still compares its own raw page token (see the remaining-route note on
+            // `Context.mediaServerTargetID`'s witness field and the boundary report).
             assembled = MediaServerSource.merge(mediaServerGroups,
-                          into: SourceIndexServeSource.merge(singularityStreams,
-                                  into: TorBoxSearchSource.merge(torboxStreams, into: assembled)))
+                          into: SourceIndexServeSource.merge(authorizedBy: singularityAuthorization,
+                                  singularityStreams,
+                                  into: TorBoxSearchSource.merge(authorizedBy: torboxAuthorization,
+                                          torboxStreams, into: assembled)))
             if ctx.directLinksOnly {
                 assembled = assembled.compactMap { group in
                     let streams = group.streams.filter { !$0.isTorrent }
@@ -298,7 +317,11 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                 self.publishedIdentity = self.outputIdentity(for: ctx)
                 // HEALTH METRIC: one line per rebuild. More than ~4/sec on a loading title means the
                 // 250 ms coalescer is broken (this used to fire per body eval, thousands of lines).
-                VXProbe.log("sing", "merged rebuild meta=\(ctx.metaId.isEmpty ? "-" : ctx.metaId) groups=\(ranked.count) streams=\(streamCount) torbox=\(torboxStreams.count) singularity=\(singularityStreams.count) gen=\(gen)")
+                // The meta id is a catalog id (viewing history) and this file is on the exportable diag
+                // path, so the PRODUCER-side redaction token is used, never the raw value -- the same
+                // convention as every TorBoxSearchSource line. Lines about one title still correlate
+                // within one exported run, which is all the health metric needs.
+                VXProbe.log("sing", "merged rebuild meta=\(VXProbeRedaction.identityToken(ctx.metaId)) groups=\(ranked.count) streams=\(streamCount) torbox=\(torboxStreams.count) singularity=\(singularityStreams.count) gen=\(gen)")
                 self.publishedGroups = ranked
                 self.publishedBest = rankedBest
                 self.publishedTiers = rankedTiers

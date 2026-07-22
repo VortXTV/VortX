@@ -1310,11 +1310,19 @@ actor SourceIndexFetchCoalescer {
 enum AuxiliarySourcePipeline {
     /// Capability passed to the two owners. Its initializer is file-scoped, so production callers cannot bypass
     /// this pipeline even though the owner implementations live in separate source files.
+    ///
+    /// The resolution is held in a `private` stored property behind a read-only accessor for the same reason
+    /// `SourceIndexIdentity.PublicationTarget` seals its storage: a `fileprivate` init alone does NOT stop a
+    /// same-module extension in another file from directly initializing an internal stored property (SE-0189),
+    /// which would synthesize a Call that never came through this pipeline. With the stored state `private`,
+    /// that extension has nothing visible to initialize and the bypass is a compile error.
     struct Call: Sendable {
-        let resolution: SourceIndexIdentity.TargetResolution
+        private let storedResolution: SourceIndexIdentity.TargetResolution
+
+        var resolution: SourceIndexIdentity.TargetResolution { storedResolution }
 
         fileprivate init(resolution: SourceIndexIdentity.TargetResolution) {
-            self.resolution = resolution
+            storedResolution = resolution
         }
     }
 
@@ -1389,10 +1397,17 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     /// O(1) rebuild signature (a single Int compare instead of hashing the array).
     private(set) var epoch = 0
 
-    private var lastContentID: String?
-    /// Canonical identity for the rows currently owned by this source. The source-list assembler checks it
-    /// before merging so a detached E2 snapshot cannot be reused for E3.
-    var publishedContentID: String? { lastContentID }
+    /// The SEALED identity for the rows currently owned by this source: the exact `PublicationTarget` the
+    /// last fetch was issued for, constructible only by the role resolver. The source-list assembler
+    /// authorizes its merge against this typed value (via `SourceIndexIdentity.mergeAuthorization`) so a
+    /// detached E2 snapshot cannot be reused for E3 and no raw string can stand in for the published
+    /// identity. This replaced the raw `lastContentID: String?` stored token on the published side; the
+    /// wire-facing content-id string below is DERIVED from this value, never stored independently.
+    private var lastTarget: SourceIndexIdentity.PublicationTarget?
+    var publishedTarget: SourceIndexIdentity.PublicationTarget? { lastTarget }
+    /// Derived, read-only string view of the published identity for the existing boundary suites. It cannot
+    /// be set independently of `publishedTarget`, so it can never disagree with the typed value.
+    var publishedContentID: String? { lastTarget?.contentID }
     private var task: Task<Void, Never>?
 
     typealias FetchPooled = @Sendable (String, Bool) async throws -> [SourceIndexClient.PooledSource]
@@ -1431,14 +1446,17 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
             invalidateLocal(clearIdentity: true)
             return
         }
-        let contentID = SourceIndexIdentity.validatedTarget(call.resolution)?.contentID
-        let identityChanged = contentID != lastContentID
+        let target = SourceIndexIdentity.validatedTarget(call.resolution)
+        let identityChanged = target != lastTarget
         if identityChanged {
             invalidateLocal(clearIdentity: false)
-            lastContentID = contentID
+            lastTarget = target
         }
 
-        guard identityChanged, let contentID else { return }
+        guard identityChanged, let target else { return }
+        // The wire-facing string is DERIVED from the sealed target here, at the one point that owns the
+        // network fetch; it is a request key, never a published identity.
+        let contentID = target.contentID
 
         let lifecycle = SourceIndexLifecycleClock.snapshot()
         let generation = refreshGeneration
@@ -1454,7 +1472,7 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
             let built = SourceIndexClient.streams(from: pooled)
             guard !Task.isCancelled, let self,
                   self.refreshGeneration == generation,
-                  self.lastContentID == contentID,
+                  self.lastTarget == target,
                   SourceIndexLifecycleClock.snapshot() == lifecycle,
                   serveGate(),
                   accountGate() else {
@@ -1498,7 +1516,7 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         refreshGeneration &+= 1
         task?.cancel()
         task = nil
-        if clearIdentity { lastContentID = nil }
+        if clearIdentity { lastTarget = nil }
         if !streams.isEmpty { streams = [] }
     }
 
@@ -1512,9 +1530,11 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         into groups: [CoreStreamSourceGroup],
         call: AuxiliarySourcePipeline.Call
     ) -> [CoreStreamSourceGroup] {
-        guard let expectedContentID = SourceIndexIdentity.validatedTarget(call.resolution)?.contentID,
-              lastContentID == expectedContentID else { return groups }
-        return Self.merge(streams, into: groups)
+        let authorization = SourceIndexIdentity.mergeAuthorization(
+            published: lastTarget,
+            pageContentID: SourceIndexIdentity.validatedTarget(call.resolution)?.contentID
+        )
+        return Self.merge(authorizedBy: authorization, streams, into: groups)
     }
 
     #if SOURCE_INDEX_IDENTITY_TESTING
@@ -1534,7 +1554,16 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     /// (thousands of lines, ~150 ms apart, on a loading title) and was the log-flood symptom of the
     /// main-thread source-list storm. The `[sing] merged` health log now lives in
     /// `SourceListModel.rebuild`, once per coalesced rebuild, where its frequency is the metric.
-    nonisolated static func merge(_ extra: [CoreStream], into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+    ///
+    /// AUTHORIZATION-REQUIRED, for the same reason as `TorBoxSearchSource.merge`: the identity-free signature
+    /// let the main merge path open this merge from a raw string comparison. A nil authorization (no published
+    /// target, stale page, forged witness) is a pure pass-through.
+    nonisolated static func merge(
+        authorizedBy authorization: SourceIndexIdentity.MergeAuthorization?,
+        _ extra: [CoreStream],
+        into groups: [CoreStreamSourceGroup]
+    ) -> [CoreStreamSourceGroup] {
+        guard authorization != nil else { return groups }
         guard !extra.isEmpty else { return groups }
         var seen: Set<String> = []
         var own: [CoreStream] = []

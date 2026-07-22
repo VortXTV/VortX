@@ -1052,7 +1052,15 @@ struct SourceIndexTorrentContractTests {
         expect(postResponseResult.isEmpty && postResponseTransportCount == 1,
                "GET gate closing after response prevents decoded rows from escaping")
 
+        // The static merge now REQUIRES a typed authorization (built only by the identity file from a sealed
+        // published target); an authorized call still applies the canonical-torrent-only row filter.
+        let mergeTarget = SourceIndexIdentity.validatedTarget(publicationTarget("tt1234567"))
+        let mergeAuthorization = SourceIndexIdentity.mergeAuthorization(
+            published: mergeTarget, pageContentID: mergeTarget?.contentID)
+        expect(mergeAuthorization != nil,
+               "merge authorization is grantable for a resolver-built published target and matching witness")
         let merged = SourceIndexServeSource.merge(
+            authorizedBy: mergeAuthorization,
             served + [CoreStream(name: "direct", url: privateURL), CoreStream(name: "nzb", nzbUrl: privateNZB)],
             into: []
         )
@@ -1060,6 +1068,13 @@ struct SourceIndexTorrentContractTests {
         // unchanged and still enforced: the appended direct and nzb rows must NOT appear in the merged output.
         expect(merged.count == 1 && merged.first?.streams.count == 2,
                "merge admits only canonical torrent streams (direct/nzb rows excluded)")
+        // A nil authorization (no published target / stale or forged witness) must be a pure pass-through.
+        expect(SourceIndexServeSource.merge(
+            authorizedBy: SourceIndexIdentity.mergeAuthorization(
+                published: mergeTarget, pageContentID: "tt7654321"),
+            served, into: []
+        ).isEmpty,
+               "merge without a matching typed authorization merges nothing")
 
         let mismatchTransport = AttemptProbe()
         let mismatchSource = SourceIndexServeSource(

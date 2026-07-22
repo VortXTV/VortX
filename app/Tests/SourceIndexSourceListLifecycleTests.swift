@@ -1,11 +1,236 @@
-// Standalone lifecycle race harness for the production SourceListModel.swift.
+// Standalone lifecycle + identity-boundary harness for the production SourceListModel.swift merge path.
 //
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors -o /tmp/source-list-lifecycle-test \
+//     app/SourcesShared/SourceIndexContract.swift \
+//     app/SourcesShared/SourceIndexIdentity.swift \
 //     app/SourcesShared/SourceListModel.swift \
 //     app/Tests/SourceIndexSourceListLifecycleTests.swift && /tmp/source-list-lifecycle-test
+//
+// Run from the repo root, or pass the repo root as the single argument (the compile-negative phases below
+// re-invoke swiftc against the production identity sources).
+//
+// THREE phases:
+//
+//   1. FORGE PROOF (compile-negative): the exact same-module-extension fixture that BROKE commit 9a017a1 --
+//      an extension of `SourceIndexIdentity.PublicationTarget` in another file of the module that directly
+//      initializes the stored properties (SE-0189) and prints an identity pair that never passed the role
+//      resolver -- must now FAIL TO COMPILE, in both its pre-fix spelling and its seal-aware spelling.
+//
+//   2. MUTATION PROOF: a guard that cannot be shown to fail is not verified. A COPY of the production
+//      identity file is re-widened two ways (drop `private` from the sealed storage; make the fileprivate
+//      init internal) and the corresponding forge fixture must COMPILE AND RUN again against each widened
+//      copy, printing the forged pair. This pins that the seal, and nothing else, is what stops the forge.
+//
+//   3. LIFECYCLE (production-linked, async): the REAL SourceListModel, driven through the REAL sealed
+//      `SourceIndexIdentity.PublicationTarget` + `mergeAuthorization` gate, must publish matching auxiliary
+//      rows, exclude stale ones synchronously on an identity change, fence detached stale ranks, and clear
+//      on a Source Index lifecycle close. The auxiliary stubs publish TYPED targets built by the real
+//      resolver -- there is no raw-string route left to drive them with.
+//
+// CAPTURED COMPILER OUTPUT (literal, from this machine, so "does not compile" is checkable prose):
+//
+// The PRE-FIX run of fixture (A) against 9a017a1's SourceIndexIdentity.swift compiled with exit 0 and printed:
+//
+//     FORGED pair: titleID=tt0000001 contentID=tt9999999:9:9
+//
+// which is the reviewer's bypass 1 reproduced verbatim: `internal` stored properties behind a `fileprivate`
+// init are NOT a boundary inside one module.
+//
+// The POST-FIX run of fixture (A) (assigning the old stored names) fails with:
+//
+//     main.swift:13:14: error: cannot assign to property: 'titleID' is a get-only property
+//     main.swift:14:14: error: cannot assign to property: 'contentID' is a get-only property
+//     main.swift:15:14: error: cannot assign to property: 'season' is a get-only property
+//     main.swift:16:14: error: cannot assign to property: 'episode' is a get-only property
+//
+// The POST-FIX run of fixture (B) (assigning the sealed storage directly) fails with:
+//
+//     main.swift:6:24: error: 'Storage' is inaccessible due to 'private' protection level
+//     main.swift:6:14: error: 'storage' is inaccessible due to 'private' protection level
+//
+// and the MUTATION run (same fixture (B), `private` dropped from `struct Storage` and `let storage` in a
+// temp copy) compiles with exit 0 and prints `FORGED pair: titleID=tt0000001 contentID=tt9999999:9:9` again.
 
 import Foundation
 import Combine
+
+// MARK: - Compile-negative forge fixtures (phases 1 + 2)
+
+/// Fixture (A): the pre-fix Codex forge, verbatim shape. A same-module extension (any file added to the app
+/// target) that initializes the stored properties directly and prints a forged identity pair.
+private let forgePreFixShape = """
+import Foundation
+
+extension SourceIndexIdentity.PublicationTarget {
+    init(forgedTitleID: String, forgedContentID: String) {
+        self.titleID = forgedTitleID
+        self.contentID = forgedContentID
+        self.season = nil
+        self.episode = nil
+    }
+}
+
+let forged = SourceIndexIdentity.PublicationTarget(
+    forgedTitleID: "tt0000001",
+    forgedContentID: "tt9999999:9:9"
+)
+print("FORGED pair: titleID=\\(forged.titleID) contentID=\\(forged.contentID)")
+"""
+
+/// Fixture (B): the seal-aware spelling of the same forge, targeting the sealed nested storage.
+private let forgeStorageShape = """
+import Foundation
+
+extension SourceIndexIdentity.PublicationTarget {
+    init(forgedTitleID: String, forgedContentID: String) {
+        self.storage = Storage(titleID: forgedTitleID, contentID: forgedContentID, season: nil, episode: nil)
+    }
+}
+
+let forged = SourceIndexIdentity.PublicationTarget(
+    forgedTitleID: "tt0000001",
+    forgedContentID: "tt9999999:9:9"
+)
+print("FORGED pair: titleID=\\(forged.titleID) contentID=\\(forged.contentID)")
+"""
+
+/// Fixture (C): direct construction through the declared init. Rejected while the init stays fileprivate
+/// (the IdentityCallerGateTests ACCESS check pins the sealed direction; this file pins the widened one).
+private let forgeDirectInitShape = """
+import Foundation
+
+let forged = SourceIndexIdentity.PublicationTarget(
+    titleID: "tt0000001", contentID: "tt9999999:9:9", season: nil, episode: nil
+)
+print("FORGED pair: titleID=\\(forged.titleID) contentID=\\(forged.contentID)")
+"""
+
+private struct CompileOutcome {
+    let exitCode: Int32
+    let diagnostics: String
+    let runOutput: String
+}
+
+/// Compile `fixture` (as main.swift, so top-level expressions are legal) together with the production
+/// contract file and `identitySource`, in ONE swiftc invocation -- one invocation is one module, which is
+/// exactly the standing of any file added to the app target. On compile success the produced binary is run
+/// and its output captured.
+private func compileForge(
+    fixture: String,
+    contractPath: String,
+    identitySource: String,
+    label: String
+) -> CompileOutcome {
+    let fm = FileManager.default
+    let dir = fm.temporaryDirectory.appendingPathComponent("vortx-forge-\(label)-\(UUID().uuidString)",
+                                                           isDirectory: true)
+    do {
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        let identityCopy = dir.appendingPathComponent("SourceIndexIdentity.swift")
+        try identitySource.write(to: identityCopy, atomically: true, encoding: .utf8)
+        let fixtureFile = dir.appendingPathComponent("main.swift")
+        try fixture.write(to: fixtureFile, atomically: true, encoding: .utf8)
+        let binary = dir.appendingPathComponent("forge-\(label)")
+
+        let compile = Process()
+        let pipe = Pipe()
+        compile.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        compile.arguments = [
+            "swiftc", "-swift-version", "6",
+            contractPath, identityCopy.path, fixtureFile.path,
+            "-o", binary.path,
+        ]
+        compile.standardOutput = pipe
+        compile.standardError = pipe
+        try compile.run()
+        compile.waitUntilExit()
+        let diagnostics = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+
+        var runOutput = ""
+        if compile.terminationStatus == 0 {
+            let run = Process()
+            let runPipe = Pipe()
+            run.executableURL = binary
+            run.standardOutput = runPipe
+            run.standardError = runPipe
+            try run.run()
+            run.waitUntilExit()
+            runOutput = String(decoding: runPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        }
+        return CompileOutcome(exitCode: compile.terminationStatus, diagnostics: diagnostics, runOutput: runOutput)
+    } catch {
+        return CompileOutcome(exitCode: -1, diagnostics: "harness error: \(error)", runOutput: "")
+    }
+}
+
+/// Phases 1 + 2. Returns human-readable failures; empty means the boundary holds AND is shown able to fail.
+private func forgeProofFailures(repoRoot: String) -> [String] {
+    var failures: [String] = []
+    let contractPath = repoRoot + "/app/SourcesShared/SourceIndexContract.swift"
+    let identityPath = repoRoot + "/app/SourcesShared/SourceIndexIdentity.swift"
+    guard let identitySource = try? String(contentsOfFile: identityPath, encoding: .utf8) else {
+        return ["cannot read \(identityPath); the forge proof covers nothing"]
+    }
+
+    // Phase 1a: the pre-fix forge must be rejected, for the reason the seal predicts.
+    let preFix = compileForge(fixture: forgePreFixShape, contractPath: contractPath,
+                              identitySource: identitySource, label: "prefix-shape")
+    if preFix.exitCode == 0 {
+        failures.append("FORGE: the pre-fix same-module extension forge COMPILED; output: \(preFix.runOutput)")
+    } else if !preFix.diagnostics.contains("cannot assign to property: 'titleID' is a get-only property") {
+        failures.append("FORGE: pre-fix forge failed for an unexpected reason:\n\(preFix.diagnostics)")
+    }
+
+    // Phase 1b: the seal-aware forge must be rejected as INACCESSIBLE private storage.
+    let sealAware = compileForge(fixture: forgeStorageShape, contractPath: contractPath,
+                                 identitySource: identitySource, label: "storage-shape")
+    if sealAware.exitCode == 0 {
+        failures.append("FORGE: the storage-targeting forge COMPILED; output: \(sealAware.runOutput)")
+    } else if !sealAware.diagnostics.contains("'storage' is inaccessible due to 'private' protection level") {
+        failures.append("FORGE: storage forge failed for an unexpected reason:\n\(sealAware.diagnostics)")
+    }
+
+    // Phase 2 preconditions: the exact sealed spellings must exist in the production source, so the widening
+    // below provably bites. A rename that silently defeated the mutation would otherwise pass forever.
+    let sealedStorageDecl = "private struct Storage"
+    let sealedStorageLet = "private let storage: Storage"
+    let sealedInit = "fileprivate init(titleID: String, contentID: String, season: Int?, episode: Int?)"
+    for needle in [sealedStorageDecl, sealedStorageLet, sealedInit] where !identitySource.contains(needle) {
+        failures.append("MUTATION: expected sealed spelling `\(needle)` not found; the widening proof is dead")
+    }
+    guard failures.isEmpty else { return failures }
+
+    // Phase 2a: drop `private` from the sealed storage -> the storage forge must COMPILE AND RUN again.
+    let widenedStorage = identitySource
+        .replacingOccurrences(of: sealedStorageDecl, with: "struct Storage")
+        .replacingOccurrences(of: sealedStorageLet, with: "let storage: Storage")
+    let reopened = compileForge(fixture: forgeStorageShape, contractPath: contractPath,
+                                identitySource: widenedStorage, label: "widened-storage")
+    if reopened.exitCode != 0 {
+        failures.append("MUTATION: re-widened storage did NOT re-open the forge; the proof that the seal is "
+                        + "load-bearing failed:\n\(reopened.diagnostics)")
+    } else if !reopened.runOutput.contains("FORGED pair: titleID=tt0000001") {
+        failures.append("MUTATION: widened forge compiled but did not print the forged pair: \(reopened.runOutput)")
+    }
+
+    // Phase 2b: make the fileprivate init internal again -> direct construction must COMPILE AND RUN again.
+    let widenedInit = identitySource.replacingOccurrences(
+        of: sealedInit,
+        with: "init(titleID: String, contentID: String, season: Int?, episode: Int?)")
+    let reopenedInit = compileForge(fixture: forgeDirectInitShape, contractPath: contractPath,
+                                    identitySource: widenedInit, label: "widened-init")
+    if reopenedInit.exitCode != 0 {
+        failures.append("MUTATION: internal-again init did NOT re-open direct construction:\n"
+                        + reopenedInit.diagnostics)
+    } else if !reopenedInit.runOutput.contains("FORGED pair: titleID=tt0000001") {
+        failures.append("MUTATION: widened-init forge compiled but did not print the forged pair: "
+                        + reopenedInit.runOutput)
+    }
+    return failures
+}
+
+// MARK: - Production-linked lifecycle stubs (phase 3)
 
 struct CoreStream: Equatable, Sendable {
     let id: String
@@ -72,16 +297,20 @@ final class CoreBridge: ObservableObject {
     func streamGroups(forStreamId: String) -> [CoreStreamSourceGroup] { groups }
 }
 
+/// TorBox stub: publishes the REAL sealed `PublicationTarget` type. There is deliberately NO raw-string
+/// identity setter here -- the only way this harness can point the stub at a page is a target built by the
+/// real role resolver, which is the whole point of the boundary under test.
 @MainActor
 final class TorBoxSearchSource: ObservableObject {
     @Published var streams: [CoreStream] = [] { didSet { epoch &+= 1 } }
     var epoch = 0
-    var publishedContentID: String?
+    var publishedTarget: SourceIndexIdentity.PublicationTarget?
 
     nonisolated static func merge(
+        authorizedBy authorization: SourceIndexIdentity.MergeAuthorization?,
         _ streams: [CoreStream], into groups: [CoreStreamSourceGroup]
     ) -> [CoreStreamSourceGroup] {
-        guard !streams.isEmpty else { return groups }
+        guard authorization != nil, !streams.isEmpty else { return groups }
         return groups + [CoreStreamSourceGroup(id: "torbox", addon: "TorBox", streams: streams)]
     }
 }
@@ -91,23 +320,24 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     @Published var streams: [CoreStream] { didSet { epoch &+= 1 } }
     private(set) var epoch = 0
     private var gateOpen = true
-    var publishedContentID: String?
+    var publishedTarget: SourceIndexIdentity.PublicationTarget?
 
-    init(streams: [CoreStream], publishedContentID: String? = nil) {
+    init(streams: [CoreStream], publishedTarget: SourceIndexIdentity.PublicationTarget? = nil) {
         self.streams = streams
-        self.publishedContentID = publishedContentID
+        self.publishedTarget = publishedTarget
     }
 
     nonisolated static func merge(
+        authorizedBy authorization: SourceIndexIdentity.MergeAuthorization?,
         _ streams: [CoreStream], into groups: [CoreStreamSourceGroup]
     ) -> [CoreStreamSourceGroup] {
-        guard !streams.isEmpty else { return groups }
+        guard authorization != nil, !streams.isEmpty else { return groups }
         return groups + [CoreStreamSourceGroup(id: "singularity", addon: "Singularity", streams: streams)]
     }
 
     func sourceIndexLifecycleDidClose(retiredSourceGeneration _: UInt64) {
         gateOpen = false
-        publishedContentID = nil
+        publishedTarget = nil
         streams = []
         epoch &+= 1
     }
@@ -246,10 +476,53 @@ enum VXProbe {
     static func log(_ channel: String, _ message: String) {}
 }
 
+enum VXProbeRedaction {
+    static func identityToken(_ raw: String?) -> String { "redacted" }
+}
+
+// MARK: - Run
+
 @main
 struct SourceIndexSourceListLifecycleTests {
+    /// A resolver-built series episode target. The ONLY identity constructor this harness has.
+    @MainActor
+    static func episodeTarget(_ catalogID: String, season: Int, episode: Int)
+        -> SourceIndexIdentity.PublicationTarget {
+        guard let target = SourceIndexIdentity.publicationTarget(
+            SourceIndexIdentity.Roles(
+                catalogID: catalogID, defaultVideoID: nil, currentVideoID: nil, kind: .series),
+            season: season, episode: episode
+        ).target else { fatalError("fixture target must resolve") }
+        return target
+    }
+
     @MainActor
     static func main() async {
+        let arguments = CommandLine.arguments
+        let repoRoot = arguments.count > 1 ? arguments[1] : FileManager.default.currentDirectoryPath
+
+        // Phases 1 + 2: the forge must not compile, and must be shown to compile again when the seal widens.
+        let forgeFailures = forgeProofFailures(repoRoot: repoRoot)
+        for failure in forgeFailures { print("FAIL  \(failure)") }
+        if forgeFailures.isEmpty {
+            print("PASS  forge: same-module extension forge rejected in both spellings; both re-widenings re-open it")
+        }
+
+        // The authorization factory's contract, pinned directly against resolver-built targets.
+        let e1 = episodeTarget("tt0903747", season: 1, episode: 1)
+        let e2 = episodeTarget("tt0903747", season: 1, episode: 2)
+        let authorizationContract =
+            SourceIndexIdentity.mergeAuthorization(published: e1, pageContentID: e1.contentID) != nil
+            && SourceIndexIdentity.mergeAuthorization(published: e1, pageContentID: e2.contentID) == nil
+            && SourceIndexIdentity.mergeAuthorization(published: nil, pageContentID: e1.contentID) == nil
+            && SourceIndexIdentity.mergeAuthorization(published: e1, pageContentID: nil) == nil
+            && SourceIndexIdentity.mergeAuthorization(published: e1, pageContentID: "") == nil
+        print(authorizationContract
+              ? "PASS  authorization: granted only for a published target whose content id the witness matches"
+              : "FAIL  authorization: factory contract broken")
+
+        // Phase 3: the real SourceListModel over the typed merge gate.
+        let e3 = episodeTarget("tt0903747", season: 1, episode: 3)
         let ordinary = CoreStream(id: "ordinary", infoHash: nil, isTorrent: false)
         let pooled = CoreStream(id: "pooled", infoHash: String(repeating: "a", count: 40), isTorrent: true)
         let torboxRow = CoreStream(id: "torbox-row", infoHash: String(repeating: "b", count: 40), isTorrent: true)
@@ -258,11 +531,9 @@ struct SourceIndexSourceListLifecycleTests {
             CoreStreamSourceGroup(id: "ordinary", addon: "Ordinary", streams: [ordinary]),
         ])
         let torbox = TorBoxSearchSource()
-        torbox.publishedContentID = "tt0903747:1:1"
+        torbox.publishedTarget = e1
         torbox.streams = [torboxRow]
-        let singularity = SourceIndexServeSource(
-            streams: [pooled], publishedContentID: "tt0903747:1:1"
-        )
+        let singularity = SourceIndexServeSource(streams: [pooled], publishedTarget: e1)
         let mediaServers = MediaServerSource()
         mediaServers.publishedContentID = "page:tt0903747:1:1"
         mediaServers.groups = [
@@ -270,9 +541,11 @@ struct SourceIndexSourceListLifecycleTests {
         ]
         let debridCache = DebridCacheAwareness()
         let model = SourceListModel()
+        // The witness the views hand over is the resolver target's content id, exactly as the detail screens
+        // derive it (`auxiliaryTarget.target?.contentID`).
         model.setContext(
-            metaId: "tt0903747", streamId: "tt0903747:1:1", continuity: nil, pin: nil,
-            auxiliaryContentID: "tt0903747:1:1", mediaServerTargetID: "page:tt0903747:1:1"
+            metaId: "tt0903747", streamId: e1.contentID, continuity: nil, pin: nil,
+            auxiliaryContentID: e1.contentID, mediaServerTargetID: "page:tt0903747:1:1"
         )
 
         model.bind(
@@ -291,8 +564,8 @@ struct SourceIndexSourceListLifecycleTests {
         }
 
         model.setContext(
-            metaId: "tt0903747", streamId: "tt0903747:1:2", continuity: nil, pin: nil,
-            auxiliaryContentID: "tt0903747:1:2", mediaServerTargetID: "page:tt0903747:1:2"
+            metaId: "tt0903747", streamId: e2.contentID, continuity: nil, pin: nil,
+            auxiliaryContentID: e2.contentID, mediaServerTargetID: "page:tt0903747:1:2"
         )
         let identityClearedSynchronously = model.groups.isEmpty
             && model.best == nil
@@ -302,13 +575,15 @@ struct SourceIndexSourceListLifecycleTests {
             if model.groups.contains(where: { $0.id == "ordinary" }) { break }
             try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
         }
+        // The sources still publish E1's typed target with live rows; the page witness is E2. The typed gate
+        // must refuse the merge -- this is the stale-episode fence, now unpassable by any raw-string route.
         let staleAuxiliaryExcluded = ["torbox", "singularity", "media"].allSatisfy { id in
             !model.groups.contains { $0.id == id }
         }
 
-        torbox.publishedContentID = "tt0903747:1:2"
+        torbox.publishedTarget = e2
         torbox.streams = [torboxRow]
-        singularity.publishedContentID = "tt0903747:1:2"
+        singularity.publishedTarget = e2
         singularity.streams = [pooled]
         mediaServers.publishedContentID = "page:tt0903747:1:2"
         mediaServers.groups = [
@@ -324,8 +599,8 @@ struct SourceIndexSourceListLifecycleTests {
         }
 
         model.setContext(
-            metaId: "tt0903747", streamId: "tt0903747:1:3", continuity: nil, pin: nil,
-            auxiliaryContentID: "tt0903747:1:3", mediaServerTargetID: "page:tt0903747:1:3"
+            metaId: "tt0903747", streamId: e3.contentID, continuity: nil, pin: nil,
+            auxiliaryContentID: e3.contentID, mediaServerTargetID: "page:tt0903747:1:3"
         )
         let nextEpisodeClearedSynchronously = model.groups.isEmpty
             && model.best == nil
@@ -361,13 +636,17 @@ struct SourceIndexSourceListLifecycleTests {
             && model.best?.id == "ordinary"
             && !model.groups.contains(where: { $0.id == "singularity" })
 
-        if initialPublished && identityClearedSynchronously && staleAuxiliaryExcluded
+        let lifecycleHolds = initialPublished && identityClearedSynchronously && staleAuxiliaryExcluded
             && matchingAuxiliaryIncluded && nextEpisodeClearedSynchronously
-            && detachedRankBlocked && clearedSynchronously && staleCompletionFenced {
-            print("PASS  SourceListModel clears identities, excludes stale auxiliary rows, and fences stale ranks")
-            exit(0)
+            && detachedRankBlocked && clearedSynchronously && staleCompletionFenced
+        if lifecycleHolds {
+            print("PASS  SourceListModel clears identities, excludes stale auxiliary rows via the typed gate, and fences stale ranks")
+        } else {
+            print("FAIL  initial=\(initialPublished) identityClear=\(identityClearedSynchronously) auxScope=\(staleAuxiliaryExcluded) auxMatch=\(matchingAuxiliaryIncluded) nextClear=\(nextEpisodeClearedSynchronously) blocked=\(detachedRankBlocked) clear=\(clearedSynchronously) fenced=\(staleCompletionFenced)")
         }
-        print("FAIL  initial=\(initialPublished) identityClear=\(identityClearedSynchronously) auxScope=\(staleAuxiliaryExcluded) auxMatch=\(matchingAuxiliaryIncluded) nextClear=\(nextEpisodeClearedSynchronously) blocked=\(detachedRankBlocked) clear=\(clearedSynchronously) fenced=\(staleCompletionFenced)")
-        exit(1)
+
+        let allPassed = forgeFailures.isEmpty && authorizationContract && lifecycleHolds
+        print(allPassed ? "ALL PASS" : "FAILURES PRESENT")
+        exit(allPassed ? 0 : 1)
     }
 }

@@ -105,20 +105,89 @@ enum SourceIndexIdentity {
     }
 
     /// One exact target shared by auxiliary transport, publication, merge, rank, and download assembly.
+    ///
+    /// SEALED STORAGE, and WHY THIS EXACT SHAPE. The previous form kept the four fields as `internal` stored
+    /// `let`s behind a `fileprivate init`, and asserted in a comment that module peers "cannot forge unrelated
+    /// fields". That was FALSE: under SE-0189 an extension IN THE SAME MODULE (which is every file of the app
+    /// target) may declare its own initializer that initializes the stored properties DIRECTLY, without ever
+    /// touching the fileprivate init. A same-module fixture did exactly that and printed
+    /// `FORGED pair: titleID=tt0000001 contentID=tt9999999:9:9` -- an identity pair that never passed the
+    /// resolver. `internal` is not a boundary inside one module; only visibility of the STORED state is.
+    ///
+    /// The tools that actually hold, and the one chosen:
+    ///   - `private` stored properties are FILE-scoped: visible to this type and its extensions in THIS file
+    ///     only. An extension in any other file cannot assign them, so the SE-0189 direct-initialization route
+    ///     dies at the declaration: there is no visible stored property left to initialize.
+    ///   - The storage is additionally a NESTED `private struct Storage` behind ONE private stored property.
+    ///     A cross-file extension then cannot even NAME the storage type, so the forge is a compile error in
+    ///     both spellings: assigning the old field names hits get-only computed properties, and assigning
+    ///     `self.storage` hits `'storage' is inaccessible due to 'private' protection level`.
+    ///   - The explicit `fileprivate init` also suppresses the synthesized memberwise init, so there is no
+    ///     third construction route to audit.
+    /// The declaring FILE is therefore the entire trusted base for construction, which is exactly the reviewable
+    /// surface the diagnostics closure in this file already relies on. The standalone lifecycle suite compiles
+    /// the forging extension both ways and pins the literal rejection, and re-widens a COPY of this file to
+    /// prove the fixture compiles again the moment `private` is dropped (a guard that cannot be shown to fail
+    /// is not verified).
     struct PublicationTarget: Equatable, Hashable, Sendable {
-        let titleID: String
-        let contentID: String
-        let season: Int?
-        let episode: Int?
+        private struct Storage: Equatable, Hashable, Sendable {
+            let titleID: String
+            let contentID: String
+            let season: Int?
+            let episode: Int?
+        }
+
+        private let storage: Storage
+
+        var titleID: String { storage.titleID }
+        var contentID: String { storage.contentID }
+        var season: Int? { storage.season }
+        var episode: Int? { storage.episode }
 
         /// Construction stays in this file so every target originates from the role resolver and tuple-exact
-        /// content-key composer below. Module peers can inspect a target, but cannot forge unrelated fields.
+        /// content-key composer below. Module peers can inspect a target, but cannot construct or forge one.
         fileprivate init(titleID: String, contentID: String, season: Int?, episode: Int?) {
-            self.titleID = titleID
-            self.contentID = contentID
-            self.season = season
-            self.episode = episode
+            storage = Storage(titleID: titleID, contentID: contentID, season: season, episode: episode)
         }
+    }
+
+    /// A typed, validated permission to merge ONE auxiliary source's published rows into a page's source list.
+    ///
+    /// WHY THIS EXISTS: `SourceListModel` -- the main merge path every detail screen renders from -- used to
+    /// gate the TorBox and Singularity merges on a hand-rolled comparison of two raw `String?` content ids and
+    /// then call the identity-free static merges directly, outside the typed capability entirely. This value is
+    /// the only way to open those merges now. It can only be built here, from a sealed `PublicationTarget` that
+    /// the SOURCE published (itself constructible only from the role resolver), so no raw string can authorize
+    /// a merge and no identifier can enter the merge path unvalidated.
+    struct MergeAuthorization: Equatable, Sendable {
+        private let storedTarget: PublicationTarget
+
+        /// The published target the merge was authorized against, for consumers that need the coordinates.
+        var target: PublicationTarget { storedTarget }
+
+        /// Same sealing rationale as `PublicationTarget.storage`: `private` storage plus a `fileprivate` init
+        /// keeps a same-module extension from synthesizing an authorization for a page the source never
+        /// published (which would re-open the stale-episode merge this fence exists to stop).
+        fileprivate init(target: PublicationTarget) {
+            storedTarget = target
+        }
+    }
+
+    /// The ONLY factory for `MergeAuthorization`. `published` is the sealed target the auxiliary source
+    /// actually fetched and published for; `pageContentID` is the page's witness token. The witness can only
+    /// SELECT: when it is byte-identical to the published target's canonical content id the merge is authorized
+    /// FOR THAT PUBLISHED TARGET, and in every other case (absent, stale, forged, oversized, non-canonical)
+    /// there is no authorization and the merge is a pass-through. The witness string itself is never stored,
+    /// never logged, and never becomes part of any output: the authorization carries the published target only.
+    static func mergeAuthorization(
+        published: PublicationTarget?,
+        pageContentID: String?
+    ) -> MergeAuthorization? {
+        guard let published,
+              validatedTarget(.target(published)) != nil,
+              let pageContentID,
+              published.contentID == pageContentID else { return nil }
+        return MergeAuthorization(target: published)
     }
 
     /// The typed result of resolving a publication target. `mismatch` must remain distinguishable from an

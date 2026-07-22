@@ -224,10 +224,16 @@ final class TorBoxSearchSource: ObservableObject {
     /// Monotonic epoch bumped whenever `streams` is REPLACED. `SourceListModel` folds this into its
     /// O(1) rebuild signature (a single Int compare instead of hashing the array).
     private(set) var epoch = 0
-    /// Canonical title/episode identity for the currently published rows. SourceListModel compares this
-    /// token with the page target before merging, so an owner that is reused across E2 -> E3 can never lend
-    /// E2 search rows to E3 while the replacement request is in flight.
-    private(set) var publishedContentID: String?
+    /// The SEALED identity for the currently published rows: the exact `PublicationTarget` the fetch was
+    /// issued for, constructible only by the role resolver. `SourceListModel` authorizes its merge against
+    /// this typed value (via `SourceIndexIdentity.mergeAuthorization`), so an owner that is reused across
+    /// E2 -> E3 can never lend E2 search rows to E3 while the replacement request is in flight, and no raw
+    /// string can stand in for the published identity. This replaced a raw `publishedContentID: String?`
+    /// stored token, which was the merge path's last identifier that did not carry its own validation.
+    private(set) var publishedTarget: SourceIndexIdentity.PublicationTarget?
+    /// Derived, read-only string view of the published identity for the existing boundary suites. It cannot
+    /// be set independently of `publishedTarget`, so it can never disagree with the typed value.
+    var publishedContentID: String? { publishedTarget?.contentID }
 
     /// The title currently shown (its fetch key). Switching titles resets `streams` so a previous title's
     /// results can never leak onto one we don't (or can't) fetch.
@@ -282,7 +288,7 @@ final class TorBoxSearchSource: ObservableObject {
         // New title: publish its cached results (or clear), so the prior title's streams never linger.
         if fetchKey != shownKey {
             shownKey = fetchKey
-            publishedContentID = target.contentID
+            publishedTarget = target
             streams = cache[fetchKey] ?? []
         }
         if cache[fetchKey] != nil { return }              // cached: already published above, no round trip
@@ -338,7 +344,7 @@ final class TorBoxSearchSource: ObservableObject {
         task = nil
         inFlightKey = nil
         shownKey = nil
-        publishedContentID = nil
+        publishedTarget = nil
         if !streams.isEmpty { streams = [] }
     }
 
@@ -349,9 +355,11 @@ final class TorBoxSearchSource: ObservableObject {
         into groups: [CoreStreamSourceGroup],
         call: AuxiliarySourcePipeline.Call
     ) -> [CoreStreamSourceGroup] {
-        guard let expectedContentID = SourceIndexIdentity.validatedTarget(call.resolution)?.contentID,
-              publishedContentID == expectedContentID else { return groups }
-        return Self.merge(streams, into: groups)
+        let authorization = SourceIndexIdentity.mergeAuthorization(
+            published: publishedTarget,
+            pageContentID: SourceIndexIdentity.validatedTarget(call.resolution)?.contentID
+        )
+        return Self.merge(authorizedBy: authorization, streams, into: groups)
     }
 
     #if SOURCE_INDEX_IDENTITY_TESTING
@@ -366,7 +374,18 @@ final class TorBoxSearchSource: ObservableObject {
     /// The pure merge. `nonisolated static` so `SourceListModel`'s off-main assembly can run it over a
     /// snapshotted `streams` array without hopping to the main actor; the instance `merged(into:)`
     /// wraps it for the existing main-actor call sites. Value types in, value types out, no state.
-    nonisolated static func merge(_ extra: [CoreStream], into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+    ///
+    /// AUTHORIZATION-REQUIRED. The previous signature took only streams and groups, which left the main merge
+    /// path (`SourceListModel`) free to open the merge from a hand-rolled comparison of two raw strings. The
+    /// required `MergeAuthorization` can only be built by `SourceIndexIdentity.mergeAuthorization` from a
+    /// sealed published target, so a caller that has not proven "these rows belong to this page" cannot merge:
+    /// a nil authorization is a pure pass-through.
+    nonisolated static func merge(
+        authorizedBy authorization: SourceIndexIdentity.MergeAuthorization?,
+        _ extra: [CoreStream],
+        into groups: [CoreStreamSourceGroup]
+    ) -> [CoreStreamSourceGroup] {
+        guard authorization != nil else { return groups }
         guard !extra.isEmpty else { return groups }
         var seenHashes: Set<String> = []
         var seenNZB: Set<String> = []
