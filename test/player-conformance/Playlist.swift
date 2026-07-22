@@ -89,7 +89,7 @@ enum Playlist {
     // MARK: - Contract (1) predicate
 
     /// The startup cohort gate: both floors, ANDed, integer comparison. `ended`
-    /// exempts a source that finished remuxing before the cohort could fill — a
+    /// exempts a source that finished remuxing before the cohort could fill - a
     /// 3-second clip can never advertise 15 s, and the server must still start it
     /// (the beta gate's `|| ended`). The exemption is reported separately so it is
     /// never mistaken for a pass on a still-producing stream.

@@ -1,7 +1,7 @@
 import Foundation
 
 // =============================================================================
-// player-conformance — acceptance harness for the player rework.
+// player-conformance - acceptance harness for the player rework.
 //
 // Subcommands:
 //   selftest                         Validate the oracle (cohort boundary cases,

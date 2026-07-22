@@ -6,9 +6,9 @@ import Foundation
 //
 // In an ISO-BMFF fragmented segment the sync status of sample 0 comes from the
 // `moof > traf` boxes, in this precedence:
-//   1. `trun` first-sample-flags   (trun flag 0x000004)  — the movenc path for a
+//   1. `trun` first-sample-flags   (trun flag 0x000004)  - the movenc path for a
 //      cleanly-cut fragment stamps sample 0 here.
-//   2. `trun` per-sample sample-flags (trun flag 0x000400) — first record.
+//   2. `trun` per-sample sample-flags (trun flag 0x000400) - first record.
 //   3. `tfhd` default-sample-flags (tfhd flag 0x000020).
 // A sample is a sync sample when `sample_is_non_sync_sample` (bit 0x00010000 of
 // the 32-bit sample_flags word) is 0. A hard-cut fragment that begins mid-GOP
@@ -21,7 +21,7 @@ import Foundation
 enum FMP4 {
 
     /// nil when sample-0 sync status cannot be determined from the segment alone
-    /// (no flags in trun or tfhd — would require the moov `trex` defaults).
+    /// (no flags in trun or tfhd - would require the moov `trex` defaults).
     static func firstSampleIsSync(_ data: Data) -> Bool? {
         guard let moof = topLevelBox(named: "moof", in: data, from: data.startIndex) else { return nil }
         guard let traf = childBox(named: "traf", inContainer: moof, of: data) else { return nil }

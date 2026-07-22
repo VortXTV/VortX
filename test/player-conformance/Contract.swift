@@ -8,7 +8,7 @@ import Foundation
 // (VortXRemuxHLSServer) against these values; it never asserts on source text.
 //
 // The plain remux lane and the Dolby Vision lane share the two mechanisms the
-// contract governs — the startup gate in `serveMedia` and the playlist builder
+// contract governs - the startup gate in `serveMedia` and the playlist builder
 // `VortXRemuxHLSServer.buildMediaBody` (which delegates the header to the
 // dependency-free `DVPlaybackPolicy.mediaPlaylistHeader`). So every behaviour
 // below is observable with a plain (non-DV) MKV, which is all this machine has.
@@ -35,15 +35,15 @@ enum Contract {
     //     behaviour (e.g. to recognise a hard-cut segment or size the resident
     //     window). They are not themselves the contract. ---
 
-    /// VortXMKVRemuxStream.hlsMaxSegmentSecs — the hard time cut that fires on
+    /// VortXMKVRemuxStream.hlsMaxSegmentSecs - the hard time cut that fires on
     /// ANY frame (not only a keyframe). A non-final segment whose media duration
     /// equals this is a hard cut, which begins the NEXT segment mid-GOP: exactly
     /// the (2) non-IDR-start violation the rework must remove.
     static let hardCutSecs = 4.0
-    /// VortXMKVRemuxStream.hlsMaxSegmentBytes — the 32 MiB hard byte cut, same
+    /// VortXMKVRemuxStream.hlsMaxSegmentBytes - the 32 MiB hard byte cut, same
     /// non-keyframe hazard as the time cut.
     static let hardCutBytes = 32 << 20
-    /// VortXMKVRemuxStream.hlsTargetDuration — EXT-X-TARGETDURATION (>= every
+    /// VortXMKVRemuxStream.hlsTargetDuration - EXT-X-TARGETDURATION (>= every
     /// EXTINF, constant across reloads).
     static let hlsTargetDuration = 5
     /// VortXRemuxBuffer window floor (dvRemuxWindowMiB default) in MiB. The

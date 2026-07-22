@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run-conformance.sh — build + drive the player-rework acceptance harness.
+# run-conformance.sh - build + drive the player-rework acceptance harness.
 #
 # The harness verifies the local HLS server's RUNTIME behaviour against the
 # REQ-260722-09 + REQ-260722-04 contract (7 points). It reads the server's own
-# request log (Caches/diagnostics.log) the way the overnight run did, and — while
-# a plain-remux MKV is playing — fetches playlists + segments over the simulator's
+# request log (Caches/diagnostics.log) the way the overnight run did, and - while
+# a plain-remux MKV is playing - fetches playlists + segments over the simulator's
 # shared loopback. It NEVER asserts on player source text.
 #
 # Modes:
@@ -19,8 +19,8 @@
 #   ./run-conformance.sh app-build        (Re)build VortXTV into /tmp/dd-harness so
 #                                          a fresh trace can be generated.
 #
-# Everything builds under the STABLE derived-data path /tmp/dd-harness — never a
-# random per-run path — so incremental rebuilds are cheap and reproducible.
+# Everything builds under the STABLE derived-data path /tmp/dd-harness - never a
+# random per-run path - so incremental rebuilds are cheap and reproducible.
 # =============================================================================
 set -euo pipefail
 
@@ -87,7 +87,7 @@ case "$MODE" in
       echo "[trace] $LOG"
       "$BIN" trace "$LOG" || true
     else
-      echo "[trace] no container log yet — play a plain MKV, then re-run: ./run-conformance.sh trace"
+      echo "[trace] no container log yet - play a plain MKV, then re-run: ./run-conformance.sh trace"
     fi ;;
   *)
     echo "usage: $0 [selftest|trace [logfile]|live [--spool D]|app-build|all]" >&2; exit 2 ;;

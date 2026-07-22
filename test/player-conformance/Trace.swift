@@ -7,7 +7,7 @@ import Foundation
 // Caches request log (the same channel the overnight run used). Every line is
 // "yyyy-MM-dd HH:mm:ss.SSS [category] message". We slice out ONE plain-remux HLS
 // session and read the contract-observable facts straight from the real lines the
-// running server emitted — this is runtime behaviour, not source text.
+// running server emitted - this is runtime behaviour, not source text.
 //
 // Facts a trace can decide on its own: (1) cohort segment count + approximate
 // startup ms, (3) first video segment id, (4) any advertised-segment 404 plus the
@@ -119,7 +119,7 @@ enum Trace {
     static func findings(_ s: TraceSession) -> [Finding] {
         var out: [Finding] = []
 
-        // (1) Startup cohort — count is authoritative from the trace; startup ms is
+        // (1) Startup cohort - count is authoritative from the trace; startup ms is
         // the sum of the cohort segments' published durations (2-dp log precision,
         // which is ample to decide the 15 000 ms floor). `ended` short clips exempt.
         do {
@@ -143,7 +143,7 @@ enum Trace {
             }
         }
 
-        // (2) IDR-start — not decidable from a trace. Heuristic note only.
+        // (2) IDR-start - not decidable from a trace. Heuristic note only.
         do {
             let hardCut = s.publishedDurations.filter { abs($0.value - Contract.hardCutSecs) < 0.005 }.keys.sorted()
             var ev = ["segment bytes are not in the trace; the IDR check needs the live channel (fMP4 parse)"]
@@ -197,7 +197,7 @@ enum Trace {
             out.append(Finding(point: .noAdvertised404, verdict: verdict, evidence: ev))
         }
 
-        // (5) Spool — filesystem only.
+        // (5) Spool - filesystem only.
         out.append(Finding(point: .spoolBounded, verdict: .indeterminate,
                            evidence: ["spool byte accounting is not in the trace; needs the live/filesystem channel"]))
 
@@ -214,8 +214,8 @@ enum Trace {
         }
 
         // (7) Fail-soft counted. Two observable sub-invariants:
-        //   (a) success path — 0 timeout events on a start that reaches readyToPlay;
-        //   (b) timeout path — EXACTLY ONE event + a 404 (into the demotion) + no ready.
+        //   (a) success path - 0 timeout events on a start that reaches readyToPlay;
+        //   (b) timeout path - EXACTLY ONE event + a 404 (into the demotion) + no ready.
         // A forced-timeout fixture session proves (b); a normal session proves (a) but
         // cannot prove the mechanism exists, so it stays PENDING (run the fixture too).
         do {
@@ -231,7 +231,7 @@ enum Trace {
                 if s.sawAny404 { ev.append("timeout path verified: one event then a 404 into the demotion"); verdict = .green }
                 else { ev.append("one timeout event but no 404 into the demotion"); verdict = .red }
             } else if n == 0 && reachedReady {
-                ev.append("success-path invariant holds (0 events); the counted-timeout path is unproven here — run the forced-timeout fixture")
+                ev.append("success-path invariant holds (0 events); the counted-timeout path is unproven here - run the forced-timeout fixture")
                 verdict = .pending
             } else {
                 verdict = .indeterminate
