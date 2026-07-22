@@ -1430,14 +1430,14 @@ enum AuxiliarySourcePipeline {
         into groups: [CoreStreamSourceGroup],
         snapshot: Snapshot
     ) -> [CoreStreamSourceGroup] {
-        TorBoxSearchSource.merge(snapshot.torBoxStreams, into: groups)
+        TorBoxSearchSource.merge(snapshot: snapshot, into: groups)
     }
 
     static func sourceIndexMerged(
         into groups: [CoreStreamSourceGroup],
         snapshot: Snapshot
     ) -> [CoreStreamSourceGroup] {
-        SourceIndexServeSource.merge(snapshot.sourceIndexStreams, into: groups)
+        SourceIndexServeSource.merge(snapshot: snapshot, into: groups)
     }
 
     static func merged(
@@ -1595,7 +1595,7 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     ) -> [CoreStreamSourceGroup] {
         guard let expectedContentID = SourceIndexIdentity.validatedTarget(call.resolution)?.contentID,
               lastContentID == expectedContentID else { return groups }
-        return Self.merge(streams, into: groups)
+        return Self.mergeStreams(streams, into: groups)
     }
 
     #if SOURCE_INDEX_IDENTITY_TESTING
@@ -1607,15 +1607,27 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     }
     #endif
 
-    /// The pure merge. `nonisolated static` so `SourceListModel`'s off-main assembly can run it over a
-    /// snapshotted `streams` array without hopping to the main actor; the instance `merged(into:)`
-    /// wraps it for the existing main-actor call sites.
+    /// The off-main entry point accepts only the pipeline's sealed snapshot. `fileprivate` is sufficient because
+    /// the pipeline and this owner share a file, and prevents other module peers from invoking even the typed
+    /// SourceIndex-specific merge directly.
+    fileprivate nonisolated static func merge(
+        snapshot: AuxiliarySourcePipeline.Snapshot,
+        into groups: [CoreStreamSourceGroup]
+    ) -> [CoreStreamSourceGroup] {
+        mergeStreams(snapshot.sourceIndexStreams, into: groups)
+    }
+
+    /// Value-only implementation shared with the validated instance path. It stays private so raw stream arrays
+    /// cannot bypass `AuxiliarySourcePipeline.Snapshot` outside this owner.
     ///
     /// DELIBERATELY SILENT: the old per-call `[sing] merged` probe fired on every SwiftUI body eval
     /// (thousands of lines, ~150 ms apart, on a loading title) and was the log-flood symptom of the
     /// main-thread source-list storm. The `[sing] merged` health log now lives in
     /// `SourceListModel.rebuild`, once per coalesced rebuild, where its frequency is the metric.
-    nonisolated static func merge(_ extra: [CoreStream], into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+    private nonisolated static func mergeStreams(
+        _ extra: [CoreStream],
+        into groups: [CoreStreamSourceGroup]
+    ) -> [CoreStreamSourceGroup] {
         guard !extra.isEmpty else { return groups }
         var seen: Set<String> = []
         var own: [CoreStream] = []

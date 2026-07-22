@@ -351,7 +351,7 @@ final class TorBoxSearchSource: ObservableObject {
     ) -> [CoreStreamSourceGroup] {
         guard let expectedContentID = SourceIndexIdentity.validatedTarget(call.resolution)?.contentID,
               publishedContentID == expectedContentID else { return groups }
-        return Self.merge(streams, into: groups)
+        return Self.mergeStreams(streams, into: groups)
     }
 
     #if SOURCE_INDEX_IDENTITY_TESTING
@@ -363,10 +363,21 @@ final class TorBoxSearchSource: ObservableObject {
     }
     #endif
 
-    /// The pure merge. `nonisolated static` so `SourceListModel`'s off-main assembly can run it over a
-    /// snapshotted `streams` array without hopping to the main actor; the instance `merged(into:)`
-    /// wraps it for the existing main-actor call sites. Value types in, value types out, no state.
-    nonisolated static func merge(_ extra: [CoreStream], into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+    /// The off-main entry point accepts only the pipeline's sealed snapshot. A module peer can therefore never
+    /// pair arbitrary TorBox rows with absent or unrelated identity.
+    nonisolated static func merge(
+        snapshot: AuxiliarySourcePipeline.Snapshot,
+        into groups: [CoreStreamSourceGroup]
+    ) -> [CoreStreamSourceGroup] {
+        mergeStreams(snapshot.torBoxStreams, into: groups)
+    }
+
+    /// Value-only implementation shared with the validated instance path. It stays private so raw stream arrays
+    /// cannot bypass `AuxiliarySourcePipeline.Snapshot` outside this owner.
+    private nonisolated static func mergeStreams(
+        _ extra: [CoreStream],
+        into groups: [CoreStreamSourceGroup]
+    ) -> [CoreStreamSourceGroup] {
         guard !extra.isEmpty else { return groups }
         var seenHashes: Set<String> = []
         var seenNZB: Set<String> = []
