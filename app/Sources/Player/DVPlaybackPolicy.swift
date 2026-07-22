@@ -911,6 +911,29 @@ enum VortXHLSBoundaryPolicy {
         return .continueOpen
     }
 
+    /// A pending, already-confirmed cut may defer only the hard-limit failure caused by the next packet lacking
+    /// matching IDR and key-flag evidence. Invalid timing, byte, or limit inputs remain fail-closed.
+    static func mayDeferHardLimitFailure(
+        hasOpenSegment: Bool,
+        incomingIsIDR: Bool,
+        incomingHasKeyFlag: Bool,
+        elapsed: Double,
+        openBytes: Int,
+        targetSeconds: Double = 1,
+        maximumSeconds: Double = 4,
+        maximumBytes: Int = 32 * 1024 * 1024
+    ) -> Bool {
+        guard hasOpenSegment,
+              elapsed.isFinite, elapsed >= 0,
+              openBytes >= 0,
+              targetSeconds.isFinite, targetSeconds > 0,
+              maximumSeconds.isFinite, maximumSeconds >= targetSeconds,
+              maximumBytes > 0 else { return false }
+        let hardLimitReached = elapsed >= maximumSeconds || openBytes >= maximumBytes
+        let hasConfirmedStart = incomingIsIDR && incomingHasKeyFlag
+        return hardLimitReached && !hasConfirmedStart
+    }
+
     static func timestampSeconds(dts: Int64?,
                                  pts: Int64?,
                                  timeBaseNumerator: Int32,
@@ -942,5 +965,107 @@ struct VortXHLSInitPublicationState: Equatable, Sendable {
         guard !initPublished else { return }
         scanTerminated = true
         failureReason = failureReason ?? reason
+    }
+}
+
+/// FIFO ownership for video boundaries that movenc has accepted but the HLS publisher cannot consume yet.
+/// Delayed init and interleaver latency are independent, so a confirmed boundary remains queued until both the
+/// init and a parser-complete media fragment exist. The queue tail is the logical start of the newest open
+/// segment, which lets later confirmed keys retain their own boundary without replacing an older one.
+final class VortXHLSPendingPublicationMachine<Payload> {
+    struct Entry {
+        let segmentID: Int
+        let startSeconds: Double
+        let endSeconds: Double
+        var payload: Payload
+    }
+
+    enum Failure: Equatable, Sendable {
+        case drainFailed
+        case publishFailed
+        case incompleteAfterDrain
+        case incompleteAtEnd
+    }
+
+    enum AdvanceResult: Equatable, Sendable {
+        case settled
+        case waitingForInit
+        case waitingForFragment
+        case failed(Failure)
+    }
+
+    private var storage: [Entry] = []
+
+    var count: Int { storage.count }
+    var hasPendingBoundary: Bool { !storage.isEmpty }
+    var first: Entry? { storage.first }
+    var logicalSegmentStartSeconds: Double? { storage.last?.endSeconds }
+
+    func append(segmentID: Int,
+                startSeconds: Double,
+                endSeconds: Double,
+                payload: Payload) -> Bool {
+        guard segmentID >= 0,
+              startSeconds.isFinite,
+              endSeconds.isFinite,
+              endSeconds > startSeconds else { return false }
+        if let last = storage.last {
+            guard segmentID == last.segmentID + 1,
+                  startSeconds == last.endSeconds else { return false }
+        }
+        storage.append(Entry(
+            segmentID: segmentID,
+            startSeconds: startSeconds,
+            endSeconds: endSeconds,
+            payload: payload))
+        return true
+    }
+
+    func attachPayload(_ payload: Payload, toSegmentID segmentID: Int) -> Bool {
+        guard let index = storage.firstIndex(where: { $0.segmentID == segmentID }) else { return false }
+        storage[index].payload = payload
+        return true
+    }
+
+    func effectiveBoundaryDecision(
+        _ decision: VortXHLSBoundaryPolicy.Decision,
+        deferHardLimitFailure: Bool
+    ) -> VortXHLSBoundaryPolicy.Decision {
+        hasPendingBoundary && deferHardLimitFailure && decision == .failSoft ? .continueOpen : decision
+    }
+
+    /// Runs the complete pending-publication transition against caller-owned side effects. The machine asks for
+    /// at most one post-init interleave drain, never asks before init, and removes an entry only after a concrete
+    /// parser proof has been accepted by the publication closure.
+    func advance<FragmentProof>(
+        initMayPublishMedia: () -> Bool,
+        allowPostInitDrain: Bool = true,
+        incompleteIsTerminal: Bool = false,
+        proveNextFragment: () -> FragmentProof?,
+        performPostInitDrain: () -> Bool,
+        publish: (Entry, FragmentProof) -> Bool) -> AdvanceResult {
+        var performedPostInitDrain = false
+        var publishedAfterPostInitDrain = false
+        while let pending = storage.first {
+            guard initMayPublishMedia() else { return .waitingForInit }
+            if let proof = proveNextFragment() {
+                guard publish(pending, proof) else { return .failed(.publishFailed) }
+                storage.removeFirst()
+                if performedPostInitDrain { publishedAfterPostInitDrain = true }
+                continue
+            }
+            guard allowPostInitDrain else {
+                return incompleteIsTerminal ? .failed(.incompleteAtEnd) : .waitingForFragment
+            }
+            guard !performedPostInitDrain else {
+                // A single drain can complete one queued fragment while a later, already-bounded fragment still
+                // needs another ordinary packet or EOF trailer. Retain that next FIFO head after concrete forward
+                // progress; only a drain that proves nothing is a terminal malformed-output signal.
+                return publishedAfterPostInitDrain ? .waitingForFragment : .failed(.incompleteAfterDrain)
+            }
+            guard performPostInitDrain() else { return .failed(.drainFailed) }
+            performedPostInitDrain = true
+        }
+        return .settled
     }
 }

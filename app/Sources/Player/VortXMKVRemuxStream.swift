@@ -437,6 +437,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var hlsSegmentStartSec: Double?   // first video DTS of the OPEN segment (input timebase seconds)
     private var hlsSegmentStartByte: Int?     // byte offset the open segment starts at (nil until init known)
     private var hlsSegmentStartPacketProven = false
+    private var hlsPendingBoundaries =
+        VortXHLSPendingPublicationMachine<MultiAudioPolicy.AudioResource?>()
     private var hlsVideoTrackID: UInt32?
     private var hlsOutputVideoFormat: VortXFMP4FragmentParser.VideoSampleFormat?
     private var hlsLastVideoSec: Double = 0   // last written video DTS, used by the init-progress watchdog
@@ -1570,20 +1572,33 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 return
             }
         }
-        var finalAudioResource: MultiAudioPolicy.AudioResource?
-        if hlsIndexingEnabled, let start = hlsSegmentStartSec, let finalEnd {
-            hlsLock.lock(); let finalID = _hlsSegments.count; hlsLock.unlock()
-            finalAudioResource = finishAlternateAudio(
-                id: finalID, start: start, end: finalEnd,
-                alignment: &audioAlignment, packets: &heldAudioPackets)
+        // Resolve every boundary whose fragment can be completed before the trailer. If init is still delayed,
+        // retain the FIFO untouched and let the trailer publish the missing bytes before the terminal pass.
+        if hlsIndexingEnabled, hlsInitState.mayPublishMedia {
+            guard hlsPublishPendingBoundaries(outCtx: outCtx) else { return }
         }
         // Flush the muxer trailer (writes the final fragment metadata), then mark the buffer complete.
         av_write_trailer(outCtx)
         if hlsIndexingEnabled, let finalEnd {
-            // Close the final segment (write_trailer flushed the last fragment + the AVIO tail) and mark the
-            // playlist ended so the server can append EXT-X-ENDLIST. `finalEnd` is packet/cadence evidence;
-            // an unproved tail returned above and deliberately leaves the playlist open for fail-soft demotion.
             avio_flush(outCtx.pointee.pb)
+            // Trailer output can be the first complete delayed init plus several queued fragments. Consume those
+            // parser-proven ranges in FIFO order before assigning the final segment ID or audio interval.
+            guard hlsInitState.mayPublishMedia,
+                  hlsPublishPendingBoundaries(
+                      outCtx: outCtx,
+                      allowPostInitDrain: false,
+                      incompleteIsTerminal: true),
+                  !hlsPendingBoundaries.hasPendingBoundary,
+                  let start = hlsSegmentStartSec else {
+                buffer.fail("HLS pending boundaries did not settle before final segment publication")
+                return
+            }
+            hlsLock.lock(); let finalID = _hlsSegments.count; hlsLock.unlock()
+            let finalAudioResource = finishAlternateAudio(
+                id: finalID, start: start, end: finalEnd,
+                alignment: &audioAlignment, packets: &heldAudioPackets)
+            // Close the final segment after pending IDs and starts have advanced. `finalEnd` is packet/cadence
+            // evidence; an unproved tail returned above and deliberately leaves the playlist open.
             guard hlsCloseSegment(
                 endSec: finalEnd, audioResource: finalAudioResource) else { return }
             hlsLock.lock()
@@ -2399,7 +2414,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 format: packetFormat)
         }()
         let hasKeyFlag = pkt.pointee.flags & AV_PKT_FLAG_KEY_CONST != 0
-        guard let start = hlsSegmentStartSec else {
+        guard let publishedStart = hlsSegmentStartSec else {
             guard isIDR, hasKeyFlag else {
                 return HLSVideoStep(
                     seconds: sec,
@@ -2433,7 +2448,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // movenc's all-tracks-have-data guard. hlsHeadDone also flips on hlsAbortInitScan, so a dead
         // scan cannot park this gate forever (that mount is already failing over). Legacy loader
         // delivery is untouched (hlsIndexingEnabled guard).
-        let elapsed = sec - start
+        // A delayed init can leave one or more confirmed key boundaries waiting for byte proof. Their FIFO tail,
+        // not the last published segment start, is the logical start of the packet being classified now. This
+        // keeps T=3 alive when T=6 arrives and prevents either key from replacing the other.
+        let logicalStart = hlsPendingBoundaries.logicalSegmentStartSeconds ?? publishedStart
+        let elapsed = sec - logicalStart
         let openBytes = buffer.producedCount - (hlsSegmentStartByte ?? 0)
         let decision = VortXHLSBoundaryPolicy.decision(
             hasOpenSegment: true,
@@ -2444,7 +2463,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             targetSeconds: Self.hlsTargetSegmentSecs,
             maximumSeconds: Self.hlsMaxSegmentSecs,
             maximumBytes: Self.hlsMaxSegmentBytes)
-        switch decision {
+        let mayDeferHardLimitFailure = VortXHLSBoundaryPolicy.mayDeferHardLimitFailure(
+            hasOpenSegment: true,
+            incomingIsIDR: isIDR,
+            incomingHasKeyFlag: hasKeyFlag,
+            elapsed: elapsed,
+            openBytes: openBytes,
+            targetSeconds: Self.hlsTargetSegmentSecs,
+            maximumSeconds: Self.hlsMaxSegmentSecs,
+            maximumBytes: Self.hlsMaxSegmentBytes)
+        switch hlsPendingBoundaries.effectiveBoundaryDecision(
+            decision,
+            deferHardLimitFailure: mayDeferHardLimitFailure) {
         case .open:
             return HLSVideoStep(seconds: sec, boundary: nil, failure: nil)
         case .continueOpen:
@@ -2457,13 +2487,24 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         case .cut:
             break
         }
-        guard hlsInitState.mayPublishMedia else {
-            return HLSVideoStep(seconds: sec, boundary: nil, failure: nil)
+        hlsLock.lock()
+        let id = _hlsSegments.count + hlsPendingBoundaries.count
+        hlsLock.unlock()
+        let boundary = MultiAudioPolicy.Boundary(
+            id: id, start: logicalStart, duration: sec - logicalStart)
+        guard hlsPendingBoundaries.append(
+            segmentID: id,
+            startSeconds: logicalStart,
+            endSeconds: sec,
+            payload: nil) else {
+            return HLSVideoStep(
+                seconds: sec,
+                boundary: nil,
+                failure: "HLS pending boundary order was not contiguous")
         }
-        hlsLock.lock(); let id = _hlsSegments.count; hlsLock.unlock()
         return HLSVideoStep(
             seconds: sec,
-            boundary: MultiAudioPolicy.Boundary(id: id, start: start, duration: sec - start),
+            boundary: boundary,
             failure: nil)
     }
 
@@ -2471,50 +2512,86 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                                    step: HLSVideoStep,
                                    audioResource: MultiAudioPolicy.AudioResource?) -> Bool {
         guard hlsIndexingEnabled else { return true }
-        guard step.boundary != nil else {
-            // Pre-init only: push bytes movenc has already completed, but never send a nil packet to movenc.
-            if !hlsInitState.mayPublishMedia { avio_flush(outCtx.pointee.pb) }
-            return buffer.status().failure == nil
-        }
-        // The incoming confirmed key packet was already submitted through this same API. Draining its
-        // interleave queue now makes movenc's automatic frag_keyframe completion observable in AVIO without
-        // mixing av_write_frame and av_interleaved_write_frame.
-        let flushRc = av_interleaved_write_frame(outCtx, nil)
-        if flushRc < 0 {
-            // Post-init only (the hlsHeadDone gate above): a failed cut means the interleave drain or the
-            // fragment write died, so the pipeline is wedged; fail so the HLS server 404s and the demotion
-            // runs in ~1s instead of the start watchdog. NOTE (#134): this rc can NOT see a failed DELAYED
-            // MOOV write. movenc's mov_write_packet(s, NULL) discards mov_flush_fragment's error and returns
-            // 1 (libavformat 62.12.101), which is why the pre-init force is gated off above rather than
-            // rc-checked here; the moov-write failure that CAN surface (an unparseable audio bed at movenc's
-            // own force=0 auto-flush) comes back through the av_interleaved_write_frame(pkt) rc in the mux
-            // loops, which already logs + fails the buffer.
-            DiagnosticsLog.log("dv", "hls fragment flush FAILED rc=\(flushRc) preMoov=\(!hlsInitState.initPublished)")
-            buffer.fail("fragment flush failed (\(flushRc))")
+        if let boundary = step.boundary, let audioResource,
+           !hlsPendingBoundaries.attachPayload(audioResource, toSegmentID: boundary.id) {
+            buffer.fail("alternate-audio resource did not match its pending video boundary")
             return false
         }
-        avio_flush(outCtx.pointee.pb)                 // push the AVIO tail so producedCount == the boundary
-        guard hlsCloseSegment(endSec: step.seconds, audioResource: audioResource) else { return false }
-        hlsSegmentStartSec = step.seconds
-        hlsSegmentStartPacketProven = true
-        return true
+        // Push only bytes ordinary packet interleaving has already completed. This is safe before init because
+        // it never sends movenc a nil packet. A pending boundary remains untouched until init is publishable.
+        avio_flush(outCtx.pointee.pb)
+        return hlsPublishPendingBoundaries(outCtx: outCtx)
     }
 
-    /// Publish the open segment as CLOSED (byte range + exact duration). Only closed segments appear in the
-    /// media playlist, so a segment's bytes are always fully produced before AVPlayer can request them.
-    private func hlsCloseSegment(endSec: Double,
-                                 audioResource: MultiAudioPolicy.AudioResource? = nil) -> Bool {
+    /// Consume parser-proven pending boundaries in FIFO order. A nil interleave drain is permitted only after
+    /// init publication. Parser-incomplete bytes never advance either the queue or the public segment frontier.
+    /// Before init they remain pending; after the one permitted drain they fail soft as malformed or terminal.
+    private func hlsPublishPendingBoundaries(
+        outCtx: UnsafeMutablePointer<AVFormatContext>,
+        allowPostInitDrain: Bool = true,
+        incompleteIsTerminal: Bool = false) -> Bool {
+        var failedDrainRC: Int32?
+        let result = hlsPendingBoundaries.advance(
+            initMayPublishMedia: { hlsInitState.mayPublishMedia },
+            allowPostInitDrain: allowPostInitDrain,
+            incompleteIsTerminal: incompleteIsTerminal,
+            proveNextFragment: { hlsParserProvenSegmentEndByte() },
+            performPostInitDrain: {
+                // The state machine invokes this closure only after init publication and only after the parser
+                // reports an incomplete candidate. No production or test caller owns a second drain decision.
+                let flushRc = av_interleaved_write_frame(outCtx, nil)
+                if flushRc < 0 {
+                    failedDrainRC = flushRc
+                    return false
+                }
+                avio_flush(outCtx.pointee.pb)
+                return true
+            },
+            publish: { pending, provenEndByte in
+                hlsLock.lock()
+                let nextPublishedID = _hlsSegments.count
+                hlsLock.unlock()
+                guard pending.segmentID == nextPublishedID,
+                      hlsSegmentStartSec == pending.startSeconds else {
+                    buffer.fail("HLS pending boundary did not match the publication frontier")
+                    return false
+                }
+                guard hlsCloseSegment(
+                    endSec: pending.endSeconds,
+                    audioResource: pending.payload,
+                    parserProvenEndByte: provenEndByte) else { return false }
+                hlsSegmentStartSec = pending.endSeconds
+                hlsSegmentStartPacketProven = true
+                return true
+            })
+        switch result {
+        case .settled, .waitingForInit, .waitingForFragment:
+            return buffer.status().failure == nil
+        case .failed(.drainFailed):
+            let rc = failedDrainRC ?? -1
+            DiagnosticsLog.log("dv", "hls post-init fragment drain FAILED rc=\(rc)")
+            buffer.fail("fragment drain failed (\(rc))")
+        case .failed(.publishFailed):
+            if buffer.status().failure == nil {
+                buffer.fail("HLS pending boundary publication failed")
+            }
+        case .failed(.incompleteAfterDrain):
+            buffer.fail("HLS pending fragment remained incomplete after post-init drain")
+        case .failed(.incompleteAtEnd):
+            buffer.fail("HLS pending fragment remained incomplete at end of stream")
+        }
+        return false
+    }
+
+    /// Non-mutating completeness probe for the open segment's next fMP4 range. A nil result before init or the
+    /// permitted post-init drain means movenc or AVIO has not emitted the complete moof+mdat yet, so publication
+    /// must not call the fail-closed commit path speculatively.
+    private func hlsParserProvenSegmentEndByte() -> Int? {
         guard hlsIndexingEnabled,
               hlsInitState.mayPublishMedia,
-              let hlsSpool,
               let segStartByte = hlsSegmentStartByte,
-              let startSec = hlsSegmentStartSec,
-              hlsSegmentStartPacketProven,
               let videoTrackID = hlsVideoTrackID,
-              let outputVideoFormat = hlsOutputVideoFormat else {
-            buffer.fail("HLS segment start or output video format was not proven")
-            return false
-        }
+              let outputVideoFormat = hlsOutputVideoFormat else { return nil }
         let candidateEnd = buffer.producedCount
         guard candidateEnd > segStartByte,
               let candidate = buffer.snapshotChunk(
@@ -2524,13 +2601,30 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
               VortXVideoIDRClassifier.isIDR(
                   bytes: [UInt8](mediaProof.firstSampleBytes),
                   codec: outputVideoFormat.codec,
-                  format: outputVideoFormat.packetFormat) else {
-            buffer.fail("HLS segment byte range, sync sample, or first-sample IDR could not be proven")
+                  format: outputVideoFormat.packetFormat) else { return nil }
+        let endByte = segStartByte + mediaProof.mediaEnd
+        return endByte > segStartByte && endByte <= candidateEnd ? endByte : nil
+    }
+
+    /// Publish the open segment as CLOSED (byte range + exact duration). Only closed segments appear in the
+    /// media playlist, so a segment's bytes are always fully produced before AVPlayer can request them.
+    private func hlsCloseSegment(endSec: Double,
+                                 audioResource: MultiAudioPolicy.AudioResource? = nil,
+                                 parserProvenEndByte: Int? = nil) -> Bool {
+        guard hlsIndexingEnabled,
+              hlsInitState.mayPublishMedia,
+              let hlsSpool,
+              let segStartByte = hlsSegmentStartByte,
+              let startSec = hlsSegmentStartSec,
+              hlsSegmentStartPacketProven else {
+            buffer.fail("HLS segment start or output video format was not proven")
             return false
         }
-        let endByte = segStartByte + mediaProof.mediaEnd
-        guard endByte > segStartByte, endByte <= candidateEnd else {
-            buffer.fail("HLS parser returned an invalid media byte range")
+        let candidateEnd = buffer.producedCount
+        guard let endByte = parserProvenEndByte ?? hlsParserProvenSegmentEndByte(),
+              endByte > segStartByte,
+              endByte <= candidateEnd else {
+            buffer.fail("HLS segment byte range, sync sample, or first-sample IDR could not be proven")
             return false
         }
         let duration = endSec - startSec
@@ -2623,7 +2717,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let renditionID = _alternateAudioPlan?.alternate.id
             ?? _alternateAudioCandidatePlan?.alternate.id ?? 0
         hlsLock.unlock()
-        guard videoExists, let muxer, let hlsSpool else { return }
+        guard let muxer, let hlsSpool else { return }
+        if !videoExists {
+            // A delayed primary init can keep the matching video boundary in the FIFO after alternate movenc
+            // has completed its late-straddling resource. Retain that exact resource with its boundary instead
+            // of dropping it; the primary publication path stages and registers the pair once video is proven.
+            guard hlsPendingBoundaries.attachPayload(
+                resource, toSegmentID: resource.segmentID) else {
+                markAlternateAudioFailed(.discontinuity)
+                return
+            }
+            return
+        }
         let duration = resource.decodeEnd - resource.decodeStart
         let rendered = VortXHLSSegment(
             id: resource.segmentID,

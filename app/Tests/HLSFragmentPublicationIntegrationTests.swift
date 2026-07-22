@@ -255,6 +255,28 @@ private struct ScenarioResult {
     let closingSamplesAfterKeyWrite: Int?
 }
 
+private struct PendingInitBoundaryResult {
+    let initWasDelayedAtThree: Bool
+    let retainedThreeAfterItsWrite: Bool
+    let queuedThreeAndSixBeforeConsumption: Bool
+    let publicationOrderWasInitFirst: Bool
+    let nonIDRFourAvoidedHardFailure: Bool
+    let nextLogicalSegmentStartedAtThree: Bool
+    let invalidPendingInputStayedFailClosed: Bool
+    let consumedSegmentIDs: [Int]
+    let firstConsumedAudioToken: String?
+    let parserIncompleteCandidateStayedUnpublished: Bool
+    let preInitInterleaveDrainCount: Int
+    let postInitInterleaveDrainCount: Int
+    let consumedCountBeforeFirstPostInitDrain: Int?
+    let pendingCountBeforeFirstPostInitDrain: Int?
+    let producedBytesBeforeFirstPostInitDrain: Int?
+    let producedBytesAfterFirstPostInitDrain: Int?
+    let progressAfterDrainRetainedNextBoundary: Bool
+    let finalPublishedStartSeconds: Double
+    let nextSegmentID: Int
+}
+
 private struct AlternateAudioResult {
     let prematureSampleCount: Int?
     let firstSegmentProof: VortXFMP4FragmentParser.MediaRangeProof
@@ -636,6 +658,387 @@ private func runScenario(_ config: ScenarioConfig,
         closingSamplesAfterKeyWrite: afterKeyProof?.sampleCount)
 }
 
+/// Drives keys at 0/3/6 and a non-IDR at 4 through shipped movenc plus the production pending-boundary queue.
+/// The natural schedule observes init after every ordinary video write. A second, explicitly injected schedule
+/// defers only the harness's observation of already-produced init bytes until key six, forcing both boundaries
+/// into the exact production FIFO. Its first parser observation is also explicitly delayed until the one real
+/// movenc drain, proving that concrete progress retains an incomplete successor rather than hard-failing it.
+private func runPendingInitBoundaryScenario(
+    fixture: Fixture,
+    deferInitObservationUntilSix: Bool
+) throws -> PendingInitBoundaryResult {
+    let name = deferInitObservationUntilSix
+        ? "injected delayed-observation two-boundary FIFO"
+        : "natural delayed-init pending-boundary production state"
+    let sink = RecordingSink()
+    var optionalOutput: UnsafeMutablePointer<AVFormatContext>?
+    guard avformat_alloc_output_context2(&optionalOutput, nil, "mp4", nil) >= 0,
+          let output = optionalOutput else { throw HarnessError.failed("\(name): output allocation failed") }
+    var ioContext: UnsafeMutablePointer<AVIOContext>?
+    defer {
+        output.pointee.pb = nil
+        avformat_free_context(output)
+        if let ioContext {
+            let backing = ioContext.pointee.buffer
+            var optional: UnsafeMutablePointer<AVIOContext>? = ioContext
+            avio_context_free(&optional)
+            if let backing { av_free(backing) }
+        }
+    }
+
+    guard let ioBytes = av_malloc(256 * 1024)?.assumingMemoryBound(to: UInt8.self) else {
+        throw HarnessError.failed("\(name): AVIO allocation failed")
+    }
+    let opaque = Unmanaged.passUnretained(sink).toOpaque()
+    ioContext = avio_alloc_context(
+        ioBytes, 256 * 1024, 1, opaque, nil,
+        { opaque, bytes, size -> Int32 in
+            guard let opaque, let bytes, size > 0 else { return -1 }
+            let sink = Unmanaged<RecordingSink>.fromOpaque(opaque).takeUnretainedValue()
+            return sink.write(bytes, count: Int(size)) ? size : -1
+        },
+        { opaque, offset, whence -> Int64 in
+            guard let opaque else { return -1 }
+            return Unmanaged<RecordingSink>.fromOpaque(opaque).takeUnretainedValue()
+                .seek(offset: offset, whence: whence)
+        })
+    guard let ioContext else {
+        av_free(ioBytes)
+        throw HarnessError.failed("\(name): AVIO context creation failed")
+    }
+    output.pointee.pb = ioContext
+    output.pointee.flags |= avFormatFlagCustomIO
+
+    guard let videoStream = avformat_new_stream(output, nil),
+          avcodec_parameters_copy(videoStream.pointee.codecpar, fixture.videoParameters) >= 0,
+          let audioStream = avformat_new_stream(output, nil),
+          avcodec_parameters_copy(audioStream.pointee.codecpar, fixture.audioParameters) >= 0 else {
+        throw HarnessError.failed("\(name): stream copy failed")
+    }
+    videoStream.pointee.codecpar.pointee.codec_tag = hvc1Tag()
+    videoStream.pointee.time_base = AVRational(num: 1, den: 1_000)
+    audioStream.pointee.codecpar.pointee.codec_tag = 0
+    if audioStream.pointee.codecpar.pointee.frame_size == 0 {
+        audioStream.pointee.codecpar.pointee.frame_size = 1536
+    }
+    audioStream.pointee.time_base = AVRational(num: 1, den: 48_000)
+
+    var options: OpaquePointer?
+    defer { av_dict_free(&options) }
+    guard av_dict_set(&options, "movflags", VortXHLSMovencPolicy.movflags, 0) >= 0,
+          av_dict_set(
+              &options, "min_frag_duration", VortXHLSMovencPolicy.minimumFragmentDurationMicroseconds, 0) >= 0,
+          av_dict_set(&options, "strict", "experimental", 0) >= 0,
+          avformat_write_header(output, &options) >= 0 else {
+        throw HarnessError.failed("\(name): delayed header setup failed")
+    }
+
+    let videoEvents: [MuxEvent] = [
+        MuxEvent(kind: .video, seconds: 0, packet: fixture.idr, keyFlag: true),
+        MuxEvent(kind: .video, seconds: 1, packet: fixture.nonIDR, keyFlag: false),
+        MuxEvent(kind: .video, seconds: 2, packet: fixture.nonIDR, keyFlag: false),
+        MuxEvent(kind: .video, seconds: 3, packet: fixture.idr, keyFlag: true),
+        MuxEvent(kind: .video, seconds: 4, packet: fixture.nonIDR, keyFlag: false),
+        MuxEvent(kind: .video, seconds: 5, packet: fixture.nonIDR, keyFlag: false),
+        MuxEvent(kind: .video, seconds: 6, packet: fixture.idr, keyFlag: true),
+    ]
+    var events = videoEvents
+    var audioSeconds = 0.0
+    while audioSeconds < 6.25 {
+        events.append(MuxEvent(
+            kind: .audio,
+            seconds: audioSeconds,
+            packet: fixture.audio,
+            keyFlag: true))
+        audioSeconds += 0.032
+    }
+    events.sort {
+        if abs($0.seconds - $1.seconds) > 0.000_001 { return $0.seconds < $1.seconds }
+        if $0.kind == $1.kind { return false }
+        return $0.kind == .audio
+    }
+
+    var hasOpenSegment = false
+    var publishedStartSeconds = 0.0
+    var publishedStartByte: Int?
+    var videoTrackID: UInt32?
+    let pending = VortXHLSPendingPublicationMachine<String?>()
+    var consumedSegmentIDs: [Int] = []
+    var firstConsumedAudioToken: String?
+    var initWasDelayedAtThree = false
+    var retainedThreeAfterItsWrite = false
+    var queuedThreeAndSixBeforeConsumption = false
+    var nonIDRFourAvoidedHardFailure = false
+    var nextLogicalSegmentStartedAtThree = false
+    var invalidPendingInputStayedFailClosed = false
+    var parserIncompleteCandidateStayedUnpublished = false
+    var preInitInterleaveDrainCount = 0
+    var postInitInterleaveDrainCount = 0
+    var consumedCountBeforeFirstPostInitDrain: Int?
+    var pendingCountBeforeFirstPostInitDrain: Int?
+    var producedBytesBeforeFirstPostInitDrain: Int?
+    var producedBytesAfterFirstPostInitDrain: Int?
+    var progressAfterDrainRetainedNextBoundary = false
+    var eventOrdinal = 0
+    var initPublicationOrdinal: Int?
+    var segmentPublicationOrdinals: [Int] = []
+    var initObservationPermitted = !deferInitObservationUntilSix
+    var injectedIncompleteProbeUsed = false
+
+    func refreshInitFromOrdinaryOutput() {
+        guard initObservationPermitted, publishedStartByte == nil else { return }
+        let capture = Data(sink.bytes)
+        guard let discoveredInitEnd = initEnd(in: capture),
+              let discoveredTrackID = VortXFMP4FragmentParser.videoTrackID(
+                  inInit: Data(capture.prefix(discoveredInitEnd))) else { return }
+        publishedStartByte = discoveredInitEnd
+        videoTrackID = discoveredTrackID
+        eventOrdinal += 1
+        initPublicationOrdinal = eventOrdinal
+    }
+
+    func advancePending(
+        allowPostInitDrain: Bool = true,
+        incompleteIsTerminal: Bool = false
+    ) -> VortXHLSPendingPublicationMachine<String?>.AdvanceResult {
+        pending.advance(
+            initMayPublishMedia: { publishedStartByte != nil },
+            allowPostInitDrain: allowPostInitDrain,
+            incompleteIsTerminal: incompleteIsTerminal,
+            proveNextFragment: {
+                guard let startByte = publishedStartByte,
+                      let trackID = videoTrackID else { return nil as Int? }
+                if deferInitObservationUntilSix,
+                   !injectedIncompleteProbeUsed,
+                   pending.count == 2 {
+                    injectedIncompleteProbeUsed = true
+                    return nil
+                }
+                let capture = Data(sink.bytes)
+                guard startByte < capture.count else { return nil }
+                let candidate = Data(capture[startByte..<capture.count])
+                guard let proof = VortXFMP4FragmentParser.proveMediaRange(
+                    candidate, trackID: trackID, requireFirstSampleSync: true),
+                      packetIsIDR(proof.firstSampleBytes) else { return nil }
+                if !parserIncompleteCandidateStayedUnpublished, proof.mediaEnd > 1 {
+                    let incomplete = Data(candidate.prefix(proof.mediaEnd).dropLast())
+                    let incompleteMachine = VortXHLSPendingPublicationMachine<String?>()
+                    _ = incompleteMachine.append(
+                        segmentID: 0, startSeconds: 0, endSeconds: 3, payload: nil)
+                    var incompletePublishCalls = 0
+                    var incompleteDrainCalls = 0
+                    let incompleteResult = incompleteMachine.advance(
+                        initMayPublishMedia: { true },
+                        allowPostInitDrain: false,
+                        proveNextFragment: {
+                            VortXFMP4FragmentParser.proveMediaRange(
+                                incomplete,
+                                trackID: trackID,
+                                requireFirstSampleSync: true)?.mediaEnd
+                        },
+                        performPostInitDrain: {
+                            incompleteDrainCalls += 1
+                            return true
+                        },
+                        publish: { _, _ in
+                            incompletePublishCalls += 1
+                            return true
+                        })
+                    parserIncompleteCandidateStayedUnpublished =
+                        incompleteResult == .waitingForFragment
+                        && incompleteMachine.first?.segmentID == 0
+                        && incompletePublishCalls == 0
+                        && incompleteDrainCalls == 0
+                }
+                return startByte + proof.mediaEnd
+            },
+            performPostInitDrain: {
+                if publishedStartByte == nil {
+                    preInitInterleaveDrainCount += 1
+                } else {
+                    if consumedCountBeforeFirstPostInitDrain == nil {
+                        consumedCountBeforeFirstPostInitDrain = consumedSegmentIDs.count
+                        pendingCountBeforeFirstPostInitDrain = pending.count
+                        producedBytesBeforeFirstPostInitDrain = sink.bytes.count
+                    }
+                    postInitInterleaveDrainCount += 1
+                }
+                let rc = av_interleaved_write_frame(output, nil)
+                avio_flush(output.pointee.pb)
+                if producedBytesAfterFirstPostInitDrain == nil {
+                    producedBytesAfterFirstPostInitDrain = sink.bytes.count
+                }
+                refreshInitFromOrdinaryOutput()
+                return rc >= 0
+            },
+            publish: { consumed, provenEndByte in
+                guard initPublicationOrdinal != nil,
+                      provenEndByte > (publishedStartByte ?? Int.max) else { return false }
+                eventOrdinal += 1
+                segmentPublicationOrdinals.append(eventOrdinal)
+                if firstConsumedAudioToken == nil { firstConsumedAudioToken = consumed.payload }
+                consumedSegmentIDs.append(consumed.segmentID)
+                publishedStartSeconds = consumed.endSeconds
+                publishedStartByte = provenEndByte
+                return true
+            })
+    }
+
+    for event in events {
+        let stream = event.kind == .video ? videoStream : audioStream
+        var boundaryToAttach: Int?
+        if event.kind == .video {
+            let logicalStart = pending.logicalSegmentStartSeconds ?? publishedStartSeconds
+            let parsedIDR = packetIsIDR(event.packet.bytes)
+            let openBytes = event.seconds == 4 ? 32 * 1024 * 1024 : 0
+            let rawDecision = VortXHLSBoundaryPolicy.decision(
+                hasOpenSegment: hasOpenSegment,
+                incomingIsIDR: parsedIDR,
+                incomingHasKeyFlag: event.keyFlag,
+                elapsed: hasOpenSegment ? event.seconds - logicalStart : 0,
+                openBytes: openBytes)
+            let mayDeferHardLimitFailure = VortXHLSBoundaryPolicy.mayDeferHardLimitFailure(
+                hasOpenSegment: hasOpenSegment,
+                incomingIsIDR: parsedIDR,
+                incomingHasKeyFlag: event.keyFlag,
+                elapsed: hasOpenSegment ? event.seconds - logicalStart : 0,
+                openBytes: openBytes)
+            switch pending.effectiveBoundaryDecision(
+                rawDecision,
+                deferHardLimitFailure: mayDeferHardLimitFailure) {
+            case .open:
+                hasOpenSegment = true
+                publishedStartSeconds = event.seconds
+            case .continueOpen:
+                if event.seconds == 4 {
+                    nonIDRFourAvoidedHardFailure = true
+                    nextLogicalSegmentStartedAtThree = logicalStart == 3
+                }
+            case .cut:
+                let segmentID = consumedSegmentIDs.count + pending.count
+                guard pending.append(
+                    segmentID: segmentID,
+                    startSeconds: logicalStart,
+                    endSeconds: event.seconds,
+                    payload: nil) else {
+                    throw HarnessError.failed("\(name): pending FIFO rejected boundary \(segmentID)")
+                }
+                boundaryToAttach = segmentID
+                if event.seconds == 6 {
+                    queuedThreeAndSixBeforeConsumption =
+                        consumedSegmentIDs.isEmpty
+                        && pending.count == 2
+                        && pending.first?.endSeconds == 3
+                        && pending.logicalSegmentStartSeconds == 6
+                }
+            case .failSoft:
+                throw HarnessError.failed("\(name): non-IDR hard-failed after a retained boundary")
+            }
+        }
+
+        let packet = try makePacket(
+            template: event.packet,
+            streamIndex: stream.pointee.index,
+            timeBase: stream.pointee.time_base,
+            seconds: event.seconds,
+            durationSeconds: event.kind == .video ? 1 : 0.032,
+            keyFlag: event.keyFlag)
+        let writeResult = av_interleaved_write_frame(output, packet)
+        var optional: UnsafeMutablePointer<AVPacket>? = packet
+        av_packet_free(&optional)
+        guard writeResult >= 0 else {
+            throw HarnessError.failed("\(name): ordinary interleaved write failed (\(writeResult))")
+        }
+        guard event.kind == .video else { continue }
+
+        // The token is an exact payload-ID retention surrogate for the generic production machine. The separate
+        // alternate-audio movenc scenario below proves real AC3 sample completion and trailer behavior.
+        if let boundaryToAttach,
+           !pending.attachPayload("audio-\(boundaryToAttach)", toSegmentID: boundaryToAttach) {
+            throw HarnessError.failed("\(name): late audio did not attach to boundary \(boundaryToAttach)")
+        }
+
+        if deferInitObservationUntilSix, event.seconds >= 6 {
+            initObservationPermitted = true
+        }
+        avio_flush(output.pointee.pb)
+        refreshInitFromOrdinaryOutput()
+        let advanceResult = advancePending()
+        if case .failed(let failure) = advanceResult {
+            throw HarnessError.failed("\(name): production pending machine failed \(failure)")
+        }
+        if deferInitObservationUntilSix, event.seconds == 6 {
+            progressAfterDrainRetainedNextBoundary =
+                advanceResult == .waitingForFragment
+                && consumedSegmentIDs == [0]
+                && pending.first?.segmentID == 1
+        }
+
+        if event.seconds == 3 {
+            initWasDelayedAtThree = publishedStartByte == nil
+            retainedThreeAfterItsWrite = pending.first?.segmentID == 0
+                && pending.first?.endSeconds == 3
+            let invalidDecision = VortXHLSBoundaryPolicy.decision(
+                hasOpenSegment: true,
+                incomingIsIDR: false,
+                incomingHasKeyFlag: false,
+                elapsed: -1,
+                openBytes: -1)
+            let invalidMayDefer = VortXHLSBoundaryPolicy.mayDeferHardLimitFailure(
+                hasOpenSegment: true,
+                incomingIsIDR: false,
+                incomingHasKeyFlag: false,
+                elapsed: -1,
+                openBytes: -1)
+            invalidPendingInputStayedFailClosed =
+                invalidDecision == .failSoft
+                && !invalidMayDefer
+                && pending.effectiveBoundaryDecision(
+                    invalidDecision,
+                    deferHardLimitFailure: invalidMayDefer) == .failSoft
+        }
+    }
+
+    guard av_write_trailer(output) >= 0 else {
+        throw HarnessError.failed("\(name): trailer failed")
+    }
+    avio_flush(output.pointee.pb)
+    refreshInitFromOrdinaryOutput()
+    let terminalAdvance = advancePending(
+        allowPostInitDrain: false,
+        incompleteIsTerminal: true)
+    guard terminalAdvance == .settled else {
+        throw HarnessError.failed("\(name): terminal pending machine did not settle (\(terminalAdvance))")
+    }
+    let publicationOrderWasInitFirst: Bool = {
+        guard let initPublicationOrdinal,
+              !segmentPublicationOrdinals.isEmpty else { return false }
+        return segmentPublicationOrdinals.allSatisfy { $0 > initPublicationOrdinal }
+    }()
+
+    let result = PendingInitBoundaryResult(
+        initWasDelayedAtThree: initWasDelayedAtThree,
+        retainedThreeAfterItsWrite: retainedThreeAfterItsWrite,
+        queuedThreeAndSixBeforeConsumption: queuedThreeAndSixBeforeConsumption,
+        publicationOrderWasInitFirst: publicationOrderWasInitFirst,
+        nonIDRFourAvoidedHardFailure: nonIDRFourAvoidedHardFailure,
+        nextLogicalSegmentStartedAtThree: nextLogicalSegmentStartedAtThree,
+        invalidPendingInputStayedFailClosed: invalidPendingInputStayedFailClosed,
+        consumedSegmentIDs: consumedSegmentIDs,
+        firstConsumedAudioToken: firstConsumedAudioToken,
+        parserIncompleteCandidateStayedUnpublished: parserIncompleteCandidateStayedUnpublished,
+        preInitInterleaveDrainCount: preInitInterleaveDrainCount,
+        postInitInterleaveDrainCount: postInitInterleaveDrainCount,
+        consumedCountBeforeFirstPostInitDrain: consumedCountBeforeFirstPostInitDrain,
+        pendingCountBeforeFirstPostInitDrain: pendingCountBeforeFirstPostInitDrain,
+        producedBytesBeforeFirstPostInitDrain: producedBytesBeforeFirstPostInitDrain,
+        producedBytesAfterFirstPostInitDrain: producedBytesAfterFirstPostInitDrain,
+        progressAfterDrainRetainedNextBoundary: progressAfterDrainRetainedNextBoundary,
+        finalPublishedStartSeconds: publishedStartSeconds,
+        nextSegmentID: consumedSegmentIDs.count)
+    return result
+}
+
 private func timestampLessPublicationAttemptIsRejected(fixture: Fixture) -> Bool {
     let config = ScenarioConfig(
         name: "timestamp-less first video",
@@ -894,6 +1297,55 @@ private enum HLSFragmentPublicationIntegrationTests {
                          } == true)
             checks.check("alternate schedule: nil drain completes a key-buffered closing range",
                          results.dropFirst().contains { !$0.closingRangeCompleteAfterKeyWrite })
+
+            let pendingInit = try runPendingInitBoundaryScenario(
+                fixture: fixture,
+                deferInitObservationUntilSix: false)
+            checks.check("pending-init production state: init remains delayed after key three",
+                         pendingInit.initWasDelayedAtThree)
+            checks.check("mutant drop pending T turns red",
+                         pendingInit.retainedThreeAfterItsWrite
+                             && pendingInit.consumedSegmentIDs.first == 0)
+            checks.check("mutant force pre-init publication turns red",
+                         pendingInit.publicationOrderWasInitFirst)
+            checks.check("mutant allow non-IDR four hard-fail turns red",
+                         pendingInit.nonIDRFourAvoidedHardFailure
+                             && pendingInit.nextLogicalSegmentStartedAtThree)
+            checks.check("mutant blanket pending fail-soft suppression turns red",
+                         pendingInit.invalidPendingInputStayedFailClosed)
+            checks.check("mutant unconditional test-only drain turns red",
+                         pendingInit.preInitInterleaveDrainCount == 0)
+            checks.check("mutant accept parser-incomplete fragment turns red",
+                         pendingInit.parserIncompleteCandidateStayedUnpublished)
+            checks.check("pending-init production state: payload-ID surrogate stays paired with video zero",
+                         pendingInit.firstConsumedAudioToken == "audio-0")
+            checks.check("pending-init production state: final start and next ID remain contiguous",
+                         pendingInit.finalPublishedStartSeconds == 6
+                             && pendingInit.nextSegmentID == 2)
+            print("RECEIPT  pending-init natural state: pre-init drains=\(pendingInit.preInitInterleaveDrainCount) post-init drains=\(pendingInit.postInitInterleaveDrainCount) consumed=\(pendingInit.consumedSegmentIDs) final-start=\(pendingInit.finalPublishedStartSeconds) next-id=\(pendingInit.nextSegmentID)")
+
+            let injectedFIFO = try runPendingInitBoundaryScenario(
+                fixture: fixture,
+                deferInitObservationUntilSix: true)
+            checks.check("injected delayed observation: key three and key six coexist before consumption",
+                         injectedFIFO.queuedThreeAndSixBeforeConsumption)
+            checks.check("injected delayed observation: FIFO consumes both boundaries in exact order",
+                         injectedFIFO.consumedSegmentIDs == [0, 1])
+            checks.check("injected delayed observation/parser latency: one real drain advances and retains next",
+                         injectedFIFO.postInitInterleaveDrainCount == 1
+                             && injectedFIFO.consumedCountBeforeFirstPostInitDrain == 0
+                             && injectedFIFO.pendingCountBeforeFirstPostInitDrain == 2
+                             && (injectedFIFO.producedBytesAfterFirstPostInitDrain ?? 0)
+                                 > (injectedFIFO.producedBytesBeforeFirstPostInitDrain ?? Int.max)
+                             && injectedFIFO.progressAfterDrainRetainedNextBoundary)
+            checks.check("injected delayed observation: init precedes both media publications",
+                         injectedFIFO.publicationOrderWasInitFirst)
+            checks.check("injected delayed observation: no pre-init nil drain occurs",
+                         injectedFIFO.preInitInterleaveDrainCount == 0)
+            checks.check("injected delayed observation: final start and next ID remain contiguous",
+                         injectedFIFO.finalPublishedStartSeconds == 6
+                             && injectedFIFO.nextSegmentID == 2)
+            print("RECEIPT  injected delayed-observation/parser-latency FIFO: pre-init drains=\(injectedFIFO.preInitInterleaveDrainCount) post-init drains=\(injectedFIFO.postInitInterleaveDrainCount) before-first-drain consumed=\(String(describing: injectedFIFO.consumedCountBeforeFirstPostInitDrain)) pending=\(String(describing: injectedFIFO.pendingCountBeforeFirstPostInitDrain)) bytes=\(String(describing: injectedFIFO.producedBytesBeforeFirstPostInitDrain))->\(String(describing: injectedFIFO.producedBytesAfterFirstPostInitDrain)) consumed=\(injectedFIFO.consumedSegmentIDs) final-start=\(injectedFIFO.finalPublishedStartSeconds) next-id=\(injectedFIFO.nextSegmentID)")
 
             if let audioFirst = results.first {
                 checks.check("audio-track-first output: actual first traf is audio",

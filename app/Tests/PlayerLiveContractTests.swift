@@ -1007,6 +1007,18 @@ enum PlayerLiveContractTests {
             stream,
             from: "private func hlsVideoStep(",
             to: "private func hlsApplyVideoStep(")
+        let pendingVideoPublication = sourceSection(
+            stream,
+            from: "private func hlsApplyVideoStep(",
+            to: "private func hlsCloseSegment(")
+        let lateAlternatePublication = sourceSection(
+            stream,
+            from: "private func publishAlternateAudioResource(",
+            to: "private func registerAlternateAudioResource(")
+        let eofPublication = sourceSection(
+            stream,
+            from: "// EOF: drain the transcoder's decoder/FIFO/encoder tail",
+            to: "// MARK: - Custom AVIO write/seek")
         let appURL = testsURL.deletingLastPathComponent()
         let whatsNew = try? String(contentsOf: appURL.appendingPathComponent("SourcesShared/WhatsNew.swift"),
                                    encoding: .utf8)
@@ -1125,6 +1137,50 @@ enum PlayerLiveContractTests {
                   && videoTiming?.contains("let hasKeyFlag = pkt.pointee.flags & AV_PKT_FLAG_KEY_CONST != 0") == true
                   && videoTiming?.contains("incomingHasKeyFlag: hasKeyFlag") == true
                   && videoTiming?.contains("incomingHasKeyFlag: true") == false)
+        check("wiring: delayed-init boundaries use a FIFO tail and cannot overwrite an older key",
+              videoTiming?.contains(
+                  "hlsPendingBoundaries.logicalSegmentStartSeconds ?? publishedStart") == true
+                  && videoTiming?.contains(
+                      "let id = _hlsSegments.count + hlsPendingBoundaries.count") == true
+                  && videoTiming?.contains("hlsPendingBoundaries.append(") == true
+                  && videoTiming?.contains(
+                      "VortXHLSBoundaryPolicy.mayDeferHardLimitFailure(") == true
+                  && videoTiming?.contains(
+                      "deferHardLimitFailure: mayDeferHardLimitFailure") == true
+                  && videoTiming?.contains("guard hlsInitState.mayPublishMedia else") == false)
+        check("wiring: one production machine owns the init gate and permitted nil drain",
+              sourceContainsInOrder(pendingVideoPublication, [
+                  "avio_flush(outCtx.pointee.pb)",
+                  "return hlsPublishPendingBoundaries(outCtx: outCtx)",
+                  "let result = hlsPendingBoundaries.advance(",
+                  "initMayPublishMedia: { hlsInitState.mayPublishMedia }",
+                  "performPostInitDrain:",
+                  "let flushRc = av_interleaved_write_frame(outCtx, nil)",
+              ]))
+        check("wiring: parser-incomplete bytes never advance or publish a pending boundary",
+              sourceContainsInOrder(pendingVideoPublication, [
+                  "proveNextFragment: { hlsParserProvenSegmentEndByte() }",
+                  "publish: { pending, provenEndByte in",
+                  "hlsCloseSegment(",
+              ]))
+        check("wiring: late alternate audio is retained by pending video ID",
+              lateAlternatePublication?.contains("if !videoExists") == true
+                  && lateAlternatePublication?.contains(
+                      "guard hlsPendingBoundaries.attachPayload(") == true
+                  && lateAlternatePublication?.contains(
+                      "resource, toSegmentID: resource.segmentID) else") == true
+                  && lateAlternatePublication?.contains(
+                      "markAlternateAudioFailed(.discontinuity)") == true)
+        check("wiring: EOF settles queued boundaries before assigning the final ID and start",
+              sourceContainsInOrder(eofPublication, [
+                  "av_write_trailer(outCtx)",
+                  "hlsPublishPendingBoundaries(",
+                  "!hlsPendingBoundaries.hasPendingBoundary",
+                  "let start = hlsSegmentStartSec",
+                  "let finalID = _hlsSegments.count",
+                  "finishAlternateAudio(",
+                  "hlsCloseSegment(",
+              ]))
         check("wiring: audio and subtitle resource paths route through their tested parsers",
               server?.contains("MultiAudioPolicy.parseRequest(path: path)") == true
                   && server?.contains("SubtitleRenditionPolicy.parseRequest(path: path)") == true)

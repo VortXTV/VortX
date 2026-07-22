@@ -441,6 +441,171 @@ publishedInit.publish()
 check("init: successful publication independently terminates scanning and opens media publication",
       publishedInit.scanTerminated && publishedInit.initPublished && publishedInit.mayPublishMedia)
 
+let pendingBoundaries = VortXHLSPendingPublicationMachine<String?>()
+check("pending boundary: first both-confirmed key is retained while init is delayed",
+      pendingBoundaries.append(
+          segmentID: 0, startSeconds: 0, endSeconds: 3, payload: nil)
+          && pendingBoundaries.count == 1
+          && pendingBoundaries.first?.segmentID == 0
+          && pendingBoundaries.first?.endSeconds == 3)
+var delayedInitDrainCalls = 0
+var delayedInitPublishCalls = 0
+let delayedInitResult = pendingBoundaries.advance(
+    initMayPublishMedia: { false },
+    proveNextFragment: { 7 },
+    performPostInitDrain: {
+        delayedInitDrainCalls += 1
+        return true
+    },
+    publish: { _, _ in
+        delayedInitPublishCalls += 1
+        return true
+    })
+check("pending boundary: delayed init cannot force publication or an interleave drain",
+      delayedInitResult == .waitingForInit
+          && delayedInitDrainCalls == 0
+          && delayedInitPublishCalls == 0
+          && pendingBoundaries.first?.segmentID == 0)
+let pendingHardLimitDecision = VortXHLSBoundaryPolicy.decision(
+    hasOpenSegment: true,
+    incomingIsIDR: false,
+    incomingHasKeyFlag: false,
+    elapsed: 4,
+    openBytes: 1)
+let pendingMayDeferHardLimit = VortXHLSBoundaryPolicy.mayDeferHardLimitFailure(
+    hasOpenSegment: true,
+    incomingIsIDR: false,
+    incomingHasKeyFlag: false,
+    elapsed: 4,
+    openBytes: 1)
+check("pending boundary: non-IDR hard failure is suppressed while a confirmed cut is unresolved",
+      pendingBoundaries.effectiveBoundaryDecision(
+          pendingHardLimitDecision,
+          deferHardLimitFailure: pendingMayDeferHardLimit) == .continueOpen)
+let invalidPendingDecision = VortXHLSBoundaryPolicy.decision(
+    hasOpenSegment: true,
+    incomingIsIDR: false,
+    incomingHasKeyFlag: false,
+    elapsed: -1,
+    openBytes: -1)
+let invalidPendingMayDefer = VortXHLSBoundaryPolicy.mayDeferHardLimitFailure(
+    hasOpenSegment: true,
+    incomingIsIDR: false,
+    incomingHasKeyFlag: false,
+    elapsed: -1,
+    openBytes: -1)
+check("pending boundary: invalid timing and byte inputs remain fail-closed",
+      invalidPendingDecision == .failSoft
+          && !invalidPendingMayDefer
+          && pendingBoundaries.effectiveBoundaryDecision(
+              invalidPendingDecision,
+              deferHardLimitFailure: invalidPendingMayDefer) == .failSoft)
+check("pending boundary: key six appends behind key three instead of replacing it",
+      pendingBoundaries.append(
+          segmentID: 1, startSeconds: 3, endSeconds: 6, payload: nil)
+          && pendingBoundaries.count == 2
+          && pendingBoundaries.first?.segmentID == 0
+          && pendingBoundaries.logicalSegmentStartSeconds == 6)
+check("pending boundary: late alternate audio stays paired with its exact video ID",
+      pendingBoundaries.attachPayload("audio-0", toSegmentID: 0)
+          && pendingBoundaries.first?.payload == "audio-0")
+check("pending boundary: an unmatched alternate-audio ID is rejected without replacing the FIFO head",
+      !pendingBoundaries.attachPayload("wrong-audio", toSegmentID: 7)
+          && pendingBoundaries.first?.payload == "audio-0")
+var incompletePublishCalls = 0
+var incompleteDrainCalls = 0
+let incompleteResult = pendingBoundaries.advance(
+    initMayPublishMedia: { true },
+    allowPostInitDrain: false,
+    proveNextFragment: { nil as Int? },
+    performPostInitDrain: {
+        incompleteDrainCalls += 1
+        return true
+    },
+    publish: { _, _ in
+        incompletePublishCalls += 1
+        return true
+    })
+check("pending boundary: parser-incomplete media cannot publish or advance the FIFO",
+      incompleteResult == .waitingForFragment
+          && incompletePublishCalls == 0
+          && incompleteDrainCalls == 0
+          && pendingBoundaries.first?.segmentID == 0)
+var firstReadyBoundaryID: Int?
+var firstReadyBoundaryPayload: String?
+var oneProofAvailable = true
+let firstReadyResult = pendingBoundaries.advance(
+    initMayPublishMedia: { true },
+    allowPostInitDrain: false,
+    proveNextFragment: {
+        guard oneProofAvailable else { return nil as Int? }
+        oneProofAvailable = false
+        return 42
+    },
+    performPostInitDrain: { false },
+    publish: { boundary, _ in
+        firstReadyBoundaryID = boundary.segmentID
+        firstReadyBoundaryPayload = boundary.payload
+        return true
+    })
+check("pending boundary: parser proof consumes only the FIFO head",
+      firstReadyResult == .waitingForFragment
+          && firstReadyBoundaryID == 0
+          && firstReadyBoundaryPayload == "audio-0"
+          && pendingBoundaries.count == 1
+          && pendingBoundaries.first?.segmentID == 1)
+
+let noProgressAfterDrain = VortXHLSPendingPublicationMachine<String?>()
+_ = noProgressAfterDrain.append(
+    segmentID: 0, startSeconds: 0, endSeconds: 3, payload: nil)
+var noProgressDrainCalls = 0
+var noProgressPublishCalls = 0
+let noProgressResult = noProgressAfterDrain.advance(
+    initMayPublishMedia: { true },
+    proveNextFragment: { nil as Int? },
+    performPostInitDrain: {
+        noProgressDrainCalls += 1
+        return true
+    },
+    publish: { _, _ in
+        noProgressPublishCalls += 1
+        return true
+    })
+check("pending boundary: a successful drain with no parser proof remains fail-closed",
+      noProgressResult == .failed(.incompleteAfterDrain)
+          && noProgressDrainCalls == 1
+          && noProgressPublishCalls == 0
+          && noProgressAfterDrain.first?.segmentID == 0)
+
+let progressAfterDrain = VortXHLSPendingPublicationMachine<String?>()
+_ = progressAfterDrain.append(
+    segmentID: 0, startSeconds: 0, endSeconds: 3, payload: nil)
+_ = progressAfterDrain.append(
+    segmentID: 1, startSeconds: 3, endSeconds: 6, payload: nil)
+var progressDrainCompleted = false
+var progressProofsRemaining = 1
+var progressPublishedIDs: [Int] = []
+let progressResult = progressAfterDrain.advance(
+    initMayPublishMedia: { true },
+    proveNextFragment: {
+        guard progressDrainCompleted, progressProofsRemaining > 0 else { return nil as Int? }
+        progressProofsRemaining -= 1
+        return 42
+    },
+    performPostInitDrain: {
+        progressDrainCompleted = true
+        return true
+    },
+    publish: { boundary, _ in
+        progressPublishedIDs.append(boundary.segmentID)
+        return true
+    })
+check("pending boundary: drain progress publishes one head and retains an incomplete successor",
+      progressResult == .waitingForFragment
+          && progressPublishedIDs == [0]
+          && progressAfterDrain.count == 1
+          && progressAfterDrain.first?.segmentID == 1)
+
 // MARK: - Flag-off master artifact identity
 
 let plainMasterInput = DVPlaybackPolicy.MasterPlaylistInput(
