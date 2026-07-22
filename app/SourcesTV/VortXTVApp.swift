@@ -81,7 +81,16 @@ struct VortXTVApp: App {
             // `directResume`) lifted into a shared helper. That is a refactor of the app's most
             // bug-historied path and does not belong inside a new feature's diff, so it is left as a
             // deliberate follow-up rather than duplicated out here where the two copies would drift.
-            .onOpenURL { DeepLinkRouter.shared.handle($0) }
+            .onOpenURL { url in
+                // DEBUG-only headless playback hook front door (`vortx://debug-play?url=…`), tried
+                // FIRST so the harness's warm re-trigger never enters the production router. Consumed
+                // entirely inside the hook (accepted or loudly rejected); compiled out of Release,
+                // where the link falls through below and is ignored as "not ours". See DebugPlaybackHook.
+                #if DEBUG
+                if DebugPlaybackHook.handleDeepLink(url, presenter: presenter) { return }
+                #endif
+                DeepLinkRouter.shared.handle(url)
+            }
             .onChange(of: scenePhase) { _, phase in
                 // Distinguishes "the system suspended us" (an unhandled menu press)
                 // from "we crashed" when a device report says the app vanished.
@@ -172,6 +181,13 @@ struct VortXTVApp: App {
                         await VortXSyncManager.shared.snapshotOwnedFromEngine()
                     }
                 }
+                // DEBUG-only headless playback hook (VORTX_DEBUG_PLAY_URL): the player-conformance
+                // harness's cold-start trigger. Validates + pins the AVFoundation engine override,
+                // then issues the playback request through the same presenter seam -tv-playertest
+                // uses below. One-shot, no-op without the env var, compiled out of Release.
+                #if DEBUG
+                DebugPlaybackHook.fireFromEnvironmentIfRequested(presenter: presenter)
+                #endif
                 // DIAGNOSTIC (-tv-playertest): exercise the real root-replacement path without an account.
                 guard ProcessInfo.processInfo.arguments.contains("-tv-playertest") else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
