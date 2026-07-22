@@ -54,7 +54,25 @@
 #   A symlink that is relative, whose every hop stays inside the bundle, and whose chain ends at an
 #   existing in-bundle target is ACCEPTED. That is exactly the framework-internal case, verified
 #   against real shipping macOS bundles (Tailscale/Sparkle, Discord/Electron) whose versioned
-#   frameworks carry genuine relative symlinks, and against a real VortXMac build.
+#   frameworks carry genuine relative symlinks, and against a real VortXTV/VortXMac build.
+#
+# FAIL-CLOSED TRAVERSAL (the whole point of a safety checker)
+#   A checker that certifies a tree it could not fully read is worse than no checker: it grants
+#   false confidence. So enumeration itself must be fail-closed. `find` output alone is not enough,
+#   because `while read; do ...; done < <(find ...)` exposes the WHILE loop's exit status, not
+#   find's; a subtree find could not enter is then silently invisible. Every traversal here runs
+#   find with its output captured to a file and its exit status AND stderr inspected. If any of the
+#   following holds, the audit refuses to certify and exits non-zero:
+#     * find exits non-zero (unreadable subtree via permissions/ACL/ownership, a directory that
+#       vanished mid-walk, ENAMETOOLONG on an over-long path, and similar);
+#     * find wrote anything to stderr (a per-entry error that some builds report without a non-zero
+#       exit);
+#     * the NUL-delimited output is truncated (does not end in a NUL), which is how a producer that
+#       died mid-write shows up.
+#   A symlink LOOP does not threaten this walk: find is invoked without -L/-follow, so it never
+#   descends through symlinks; link cycles are separately bounded by MAX_HOPS in the chain walk.
+#   A link that vanishes between enumeration and inspection is also caught (re-checked per link).
+#   Principle: I inspected EVERY link, or I fail. When in doubt, fail closed.
 #
 # USAGE
 #   audit-bundle-symlinks.sh <path> [<path> ...]
@@ -64,11 +82,20 @@
 #                                               *.app is scanned)
 #       * any other directory                  (scanned as-is, treated as a single bundle root)
 #   Exit 0 if every inspected symlink is safe; non-zero (1) on the first bundle that contains an
-#   unsafe symlink, after listing every offending link and its target.
+#   unsafe symlink OR that could not be fully traversed, after listing the specific failure.
 set -euo pipefail
 
 PROG="$(basename "$0")"
 MAX_HOPS=64   # cycle / excessive-depth guard for the chain walk
+
+# Temp files used for fail-closed traversal capture; always removed at exit.
+AUDIT_TMPFILES=()
+cleanup_tmpfiles() {
+    if [ "${#AUDIT_TMPFILES[@]}" -gt 0 ]; then
+        rm -f "${AUDIT_TMPFILES[@]}" 2>/dev/null || true
+    fi
+}
+trap cleanup_tmpfiles EXIT
 
 die_usage() {
     echo "usage: $PROG <path-to-.app-or-dir> [<path> ...]" >&2
@@ -76,6 +103,34 @@ die_usage() {
 }
 
 [ "$#" -ge 1 ] || die_usage
+
+# Fail-closed directory traversal. Runs `find <find-args> -print0`, capturing NUL-delimited output
+# and stderr. On COMPLETE traversal it sets the global REPLY_LIST to a temp file holding the output
+# and returns 0. On ANY sign of incompleteness it prints the specific failure and returns 1.
+safe_find() { # <label> <find-args...>
+    local label="$1"; shift
+    local out err rc
+    out="$(mktemp)"; err="$(mktemp)"
+    AUDIT_TMPFILES+=("$out" "$err")
+    find "$@" -print0 >"$out" 2>"$err"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "::error::traversal FAILED for '$label' (find exit $rc); refusing to certify an unread tree:" >&2
+        sed 's/^/    /' "$err" >&2
+        return 1
+    fi
+    if [ -s "$err" ]; then
+        echo "::error::traversal for '$label' produced errors; refusing to certify an unread tree:" >&2
+        sed 's/^/    /' "$err" >&2
+        return 1
+    fi
+    if [ -s "$out" ] && [ "$(tail -c1 "$out" | od -An -tx1 | tr -d ' \n')" != "00" ]; then
+        echo "::error::traversal output for '$label' is truncated (missing final NUL); refusing to certify" >&2
+        return 1
+    fi
+    REPLY_LIST="$out"
+    return 0
+}
 
 # Purely LEXICAL normalization of an absolute path: collapse "//", ".", and ".." textually,
 # WITHOUT following any symlink. This is what lets us judge containment hop by hop: we want to know
@@ -121,7 +176,11 @@ check_symlink_chain() {
             return 1
         fi
 
-        tgt="$(readlink "$cur")"
+        if ! tgt="$(readlink "$cur" 2>/dev/null)"; then
+            # The link (or a link mid-chain) vanished or became unreadable during inspection.
+            echo "::error::unsafe symlink (unreadable mid-inspection): '$start' at '$cur'" >&2
+            return 1
+        fi
         case "$tgt" in
             /*) cand="$tgt" ;;                                 # absolute hop
             *)  dir="$(dirname "$cur")"; cand="$dir/$tgt" ;;   # relative to this link's own dir
@@ -151,10 +210,11 @@ check_symlink_chain() {
     done
 }
 
-# Scan a single bundle root. Returns 0 if clean, 1 if any unsafe symlink is found.
+# Scan a single bundle root. Returns 0 if clean, 1 if any unsafe symlink is found OR the tree could
+# not be fully traversed.
 scan_bundle() {
     local bundle="$1"
-    local root inspected=0 bad=0 link raw
+    local root inspected=0 bad=0 link raw listfile
 
     if [ ! -d "$bundle" ]; then
         echo "::error::$PROG: not a directory: $bundle" >&2
@@ -165,11 +225,29 @@ scan_bundle() {
     root="$(realpath "$bundle")"
     echo "auditing bundle: $bundle"
 
-    # -print0 + read -d '' so names with spaces (e.g. "Electron Framework.framework") survive. The
-    # loop runs in THIS shell (process substitution, not a pipe) so the counters persist.
+    # Fail-closed enumeration: if find could not read the whole tree, we do NOT certify.
+    if ! safe_find "$bundle" "$root" -type l; then
+        echo "FAIL: $bundle : could not fully traverse; treated as unsafe" >&2
+        return 1
+    fi
+    listfile="$REPLY_LIST"
+
+    # read -d '' over the captured NUL-delimited file so names with spaces (e.g. "Electron
+    # Framework.framework") survive. Reading from a real file keeps the loop in THIS shell.
     while IFS= read -r -d '' link; do
         inspected=$((inspected + 1))
-        raw="$(readlink "$link")"
+
+        # Vanished-between-enumeration-and-inspection guard.
+        if [ ! -L "$link" ]; then
+            echo "::error::symlink vanished between enumeration and inspection: '$link'" >&2
+            bad=$((bad + 1))
+            continue
+        fi
+        if ! raw="$(readlink "$link" 2>/dev/null)"; then
+            echo "::error::unreadable symlink during inspection: '$link'" >&2
+            bad=$((bad + 1))
+            continue
+        fi
 
         # (1) absolute direct target : always illegal inside a bundle, reported explicitly.
         case "$raw" in
@@ -185,7 +263,7 @@ scan_bundle() {
             bad=$((bad + 1))
             continue
         fi
-    done < <(find "$root" -type l -print0)
+    done < "$listfile"
 
     if [ "$bad" -gt 0 ]; then
         echo "FAIL: $bundle : $bad unsafe symlink(s) of $inspected inspected" >&2
@@ -208,15 +286,22 @@ for arg in "$@"; do
             roots+=("$arg")
             ;;
         *)
-            # A container dir: audit every *.app under it. If there are none, audit the dir itself
-            # so the tool still works on an extracted Payload or an arbitrary staging tree.
+            # A container dir: audit every *.app under it. This discovery is ALSO fail-closed: an
+            # unreadable subtree here could hide an entire .app from the audit, so a traversal
+            # failure aborts rather than silently auditing fewer bundles.
+            if ! safe_find "$arg (nested .app discovery)" "$arg" -type d -name '*.app'; then
+                echo "::error::$PROG: cannot enumerate .app bundles under '$arg'; refusing to proceed" >&2
+                exit 1
+            fi
             found=()
             while IFS= read -r -d '' app; do
                 found+=("$app")
-            done < <(find "$arg" -type d -name '*.app' -print0)
+            done < "$REPLY_LIST"
             if [ "${#found[@]}" -gt 0 ]; then
                 roots+=("${found[@]}")
             else
+                # No nested .app: audit the dir itself so the tool still works on an extracted
+                # Payload or an arbitrary staging tree.
                 roots+=("$arg")
             fi
             ;;
@@ -231,7 +316,7 @@ for root in "${roots[@]}"; do
 done
 
 if [ "$status" -ne 0 ]; then
-    echo "audit-bundle-symlinks: FAILED, one or more bundles contain unsafe symlinks" >&2
+    echo "audit-bundle-symlinks: FAILED, one or more bundles are unsafe or could not be fully traversed" >&2
     exit 1
 fi
 echo "audit-bundle-symlinks: PASSED, ${#roots[@]} bundle(s) clean"
