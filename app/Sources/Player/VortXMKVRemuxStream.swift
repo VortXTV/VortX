@@ -126,7 +126,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         self.headers = headers
         self.hlsIndexingEnabled = indexForHLS
         self.mode = mode
-        self.hlsTarget = VortXHLSTargetPolicy.freeze(indexEvidence: nil)!
+        self.hlsTarget = VortXHLSTargetPolicy.conservativeTarget
         self.requestedOriginSeconds = RemuxResumePolicy.isEnabledByDefault
             ? RemuxResumePolicy.originRequest(resumeSeconds: startAtSeconds)
             : 0

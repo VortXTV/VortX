@@ -964,14 +964,15 @@ struct VortXHLSStartupReadiness: Equatable, Sendable {
 enum VortXHLSTargetPolicy {
     static let minimumSeconds = 5
     static let conservativeSeconds = 12
+    static let conservativeTarget = VortXHLSFrozenTarget(
+        seconds: conservativeSeconds,
+        authority: .conservativeFallback)
 
     static func freeze(indexEvidence: VortXHLSKeyframeIndexEvidence?) -> VortXHLSFrozenTarget? {
         guard let indexEvidence,
               indexEvidence.completeness == .validatedComplete,
               !indexEvidence.adjacentIntervalsSeconds.isEmpty else {
-            return VortXHLSFrozenTarget(
-                seconds: conservativeSeconds,
-                authority: .conservativeFallback)
+            return conservativeTarget
         }
         var maximum = 0.0
         for interval in indexEvidence.adjacentIntervalsSeconds {
@@ -1049,6 +1050,19 @@ struct VortXHLSMountDeadlineState: Equatable, Sendable {
         }
         phase = .ready
         return (true, false)
+    }
+
+    /// Rechecks a successful probe at its completion edge. A probe that began in budget cannot escape after
+    /// the deadline, while a server already in `.ready` keeps accepting later master reloads.
+    mutating func gateSuccessfulProbe<Value>(
+        _ value: Value,
+        completedAt now: TimeInterval,
+        invalidated: Bool
+    ) -> (value: Value?, didExpire: Bool) {
+        guard !invalidated else { return (nil, false) }
+        let budget = remaining(now: now)
+        guard budget.seconds > 0 else { return (nil, budget.didExpire) }
+        return (value, false)
     }
 
     mutating func cancel() {

@@ -435,6 +435,7 @@ let emptyTarget = VortXHLSTargetPolicy.freeze(indexEvidence: .init(
     completeness: .validatedComplete, adjacentIntervalsSeconds: []))
 check("target authority: absent, incomplete and empty evidence freeze conservative twelve",
       targetFallback == .init(seconds: 12, authority: .conservativeFallback)
+          && VortXHLSTargetPolicy.conservativeTarget == targetFallback
           && incompleteTarget == targetFallback
           && emptyTarget == targetFallback)
 check("target authority: validated complete intervals ceil their maximum with a five-second floor",
@@ -468,6 +469,14 @@ check("startup readiness: six segments and three frozen targets are one immutabl
           minimumSegmentCount: 6))
 check("startup readiness: target seven requires exactly 21000 rendered milliseconds",
       targetSevenReadiness?.minimumRenderedDurationMilliseconds == 21_000)
+check("startup readiness: invalid target bounds and segment counts are rejected without a force unwrap",
+      VortXHLSStartupReadiness(
+          frozenTarget: .init(seconds: 4, authority: .validatedCompleteIndex)) == nil
+          && VortXHLSStartupReadiness(
+              frozenTarget: .init(seconds: 13, authority: .conservativeFallback)) == nil
+          && VortXHLSStartupReadiness(
+              frozenTarget: VortXHLSTargetPolicy.conservativeTarget,
+              minimumSegmentCount: 0) == nil)
 
 var sequentialDeadline = VortXHLSMountDeadlineState()
 check("mount deadline: start at monotonic 100 freezes one absolute edge at 130",
@@ -488,6 +497,33 @@ check("mount deadline: exact expiry owns one transition and later polls cannot f
       exactExpiry == (0, true) && repeatedExpiry == (0, false))
 check("mount deadline: ready after expiry is inert",
       expiredDeadline.markReady(now: 131) == (false, false))
+var crossingProbeDeadline = VortXHLSMountDeadlineState()
+_ = crossingProbeDeadline.start(now: 0)
+let crossingProbeHadBudget = crossingProbeDeadline.remaining(now: 29.999).seconds > 0
+let crossingProbeResult = crossingProbeDeadline.gateSuccessfulProbe(
+    "master", completedAt: 30, invalidated: false)
+check("mount deadline: a probe that starts in budget but completes at the edge is rejected once",
+      crossingProbeHadBudget
+          && crossingProbeResult.value == nil
+          && crossingProbeResult.didExpire
+          && crossingProbeDeadline.phase == .timedOut)
+let repeatedCrossingProbe = crossingProbeDeadline.gateSuccessfulProbe(
+    "master", completedAt: 30.001, invalidated: false)
+let crossingProbeTimeoutCount = [crossingProbeResult, repeatedCrossingProbe]
+    .filter { $0.didExpire }.count
+check("mount deadline: a repeated late probe cannot emit a second expiry and readiness stays rejected",
+      repeatedCrossingProbe.value == nil
+          && !repeatedCrossingProbe.didExpire
+          && crossingProbeTimeoutCount == 1
+          && crossingProbeDeadline.markReady(now: 30.002) == (false, false))
+var readyProbeDeadline = VortXHLSMountDeadlineState()
+_ = readyProbeDeadline.start(now: 0)
+_ = readyProbeDeadline.markReady(now: 29.999)
+check("mount deadline: ready state keeps later master probes valid unless the server is invalidated",
+      readyProbeDeadline.gateSuccessfulProbe(
+          "reload", completedAt: 60, invalidated: false).value == "reload"
+          && readyProbeDeadline.gateSuccessfulProbe(
+              "reload", completedAt: 60, invalidated: true).value == nil)
 
 var abortedInit = VortXHLSInitPublicationState()
 abortedInit.abort(reason: "malformed moov")

@@ -110,7 +110,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             indexForHLS: true,
             mode: mode,
             startAtSeconds: startAtSeconds)
-        let server = VortXRemuxHLSServer(stream: stream, onStartupTimeout: onStartupTimeout)
+        guard let server = VortXRemuxHLSServer(
+            stream: stream,
+            onStartupTimeout: onStartupTimeout) else {
+            stream.cancel()
+            stream.listenerDidRetire()
+            return nil
+        }
         guard server.listen() else { server.invalidate(); return nil }
         var comps = URLComponents()
         comps.scheme = "http"
@@ -121,11 +127,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         return (server, url)
     }
 
-    private init(stream: VortXMKVRemuxStream,
-                 onStartupTimeout: @escaping @Sendable (VortXRemuxHLSServer) -> Void) {
+    private init?(stream: VortXMKVRemuxStream,
+                  onStartupTimeout: @escaping @Sendable (VortXRemuxHLSServer) -> Void) {
+        guard let startupReadiness = VortXHLSStartupReadiness(
+            frozenTarget: stream.frozenHLSTarget) else { return nil }
         self.stream = stream
-        self.startupReadiness = VortXHLSStartupReadiness(
-            frozenTarget: stream.frozenHLSTarget)!
+        self.startupReadiness = startupReadiness
         self.onStartupTimeout = onStartupTimeout
     }
 
@@ -403,12 +410,29 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             let now = ProcessInfo.processInfo.systemUptime
             let remaining = remainingMountBudget(now: now)
             guard remaining > 0, !isInvalidated else { return nil }
-            if let value = probe() { return value }
+            if let value = probe() { return gateMountProbe(value) }
             if stream.buffer.status().failure != nil { return nil }
-            if let stageDeadline, now >= stageDeadline { return probe() }
+            if let stageDeadline, now >= stageDeadline {
+                guard let value = probe() else { return nil }
+                return gateMountProbe(value)
+            }
             let stageRemaining = stageDeadline.map { max(0, $0 - now) } ?? .infinity
             Thread.sleep(forTimeInterval: min(0.1, remaining, stageRemaining))
         }
+    }
+
+    private func gateMountProbe<T>(_ value: T) -> T? {
+        let completedAt = ProcessInfo.processInfo.systemUptime
+        let invalidatedBeforeGate = isInvalidated
+        deadlineLock.lock()
+        let result = mountDeadline.gateSuccessfulProbe(
+            value,
+            completedAt: completedAt,
+            invalidated: invalidatedBeforeGate)
+        deadlineLock.unlock()
+        if result.didExpire { handleMountTimeout() }
+        guard let accepted = result.value, !isInvalidated else { return nil }
+        return accepted
     }
 
     private func remainingMountBudget(now: TimeInterval = ProcessInfo.processInfo.systemUptime)

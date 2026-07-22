@@ -1132,7 +1132,13 @@ enum PlayerLiveContractTests {
         check("wiring: one frozen target renders identically across video, audio and subtitle routes",
               server?.components(separatedBy:
                   "targetDuration: startupReadiness.frozenTarget.seconds").count == 4
-                  && stream?.contains("self.hlsTarget = VortXHLSTargetPolicy.freeze(indexEvidence: nil)!") == true)
+                  && stream?.contains(
+                      "self.hlsTarget = VortXHLSTargetPolicy.conservativeTarget") == true
+                  && stream?.contains("freeze(indexEvidence: nil)!") == false
+                  && server?.contains(
+                      "guard let startupReadiness = VortXHLSStartupReadiness(") == true
+                  && server?.contains("stream.cancel()") == true
+                  && server?.contains("stream.listenerDidRetire()") == true)
         check("wiring: post-ready reloads advance only one common contiguous rendition frontier",
               rollingPublication?.contains("greatestCommonContiguousWindow(") == true
                   && rollingPublication?.contains("DVPlaybackPolicy.minimumConformingSuffix(") == true
@@ -1246,6 +1252,12 @@ enum PlayerLiveContractTests {
                   "mountDeadline.markReady(now: now)",
               ])
                   && mountWaits?.contains("remainingMountBudget(now: now)") == true
+                  && mountWaits?.contains(
+                      "if let value = probe() { return gateMountProbe(value) }") == true
+                  && mountWaits?.contains("return gateMountProbe(value)") == true
+                  && mountWaits?.contains("mountDeadline.gateSuccessfulProbe(") == true
+                  && mountWaits?.contains(
+                      "guard let accepted = result.value, !isInvalidated else") == true
                   && mountWaits?.contains("Date().addingTimeInterval") == false
                   && engine?.contains(
                       "if let server = remuxHLSServer, !server.markEngineReady()") == true)
