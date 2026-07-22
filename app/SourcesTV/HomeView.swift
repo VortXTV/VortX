@@ -19,7 +19,6 @@ struct HomeView: View {
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared   // Collections hub (shared singleton): Discover cards + Streaming-service tiles + Genre tiles
     @ObservedObject private var imported = ImportedCatalogs.shared   // user-imported list catalogs, rendered as Home rows
     @ObservedObject private var railPrefs = HomeRailPreferences.shared   // user's Home row order + hidden set (Continue Watching stays pinned first)
-    @State private var showCustomize = false   // presents the Home rows reorder/hide manage screen
     @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
     @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
@@ -118,7 +117,6 @@ struct HomeView: View {
                     .ignoresSafeArea()   // absolute top-left, clear of the hero title below
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
-            .fullScreenCover(isPresented: $showCustomize) { TVHomeRailEditorView() }
         }
     }
 
@@ -323,17 +321,15 @@ struct HomeView: View {
         }
     }
 
-    /// The brand lockup: serif "Vort" + the gold vortex mark as the "X" (the mark follows the theme accent),
-    /// plus a trailing "Customize Home" action that opens the rows manage screen.
+    /// The brand lockup: serif "Vort" + the gold vortex mark as the "X" (the mark follows the theme accent).
+    /// The old trailing "Customize Home" control was removed (INS-260722-02): it lived inside this header,
+    /// which is drawn as a `.topLeading` overlay that `.ignoresSafeArea()`, so it sat outside every
+    /// focusable container and the tvOS focus engine could never route the remote to it (a dead,
+    /// unfocusable affordance). The Home rows editor now lives as a focusable row under
+    /// Settings > Appearance ("Customize Home"), reached through the normal tvOS navigation model.
     private var header: some View {
-        HStack(spacing: 0) {
-            VortXWordmark(fontSize: 42)
-            Spacer()
-            Button { showCustomize = true } label: { Image(systemName: "slider.horizontal.3") }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .accessibilityLabel(Text("Customize Home"))
-        }
-        .padding(.horizontal, Theme.Space.screenEdge)
+        VortXWordmark(fontSize: 42)
+            .padding(.horizontal, Theme.Space.screenEdge)
     }
 }
 
@@ -1049,7 +1045,7 @@ struct LoadingRail: View {
 /// tvOS manage screen to reorder + hide the Home rows. No drag on tvOS, so each row carries Up / Down and a
 /// Show/Hide toggle (the same pattern as `TVReorderServicesView`), each row its own `.focusSection()`. Writes
 /// straight to `HomeRailPreferences`, so the live Home re-lays out on dismiss. Continue Watching is pinned
-/// first and is intentionally not listed. Presented as a full-screen cover; the remote's Menu button (or the
+/// first and is intentionally not listed. Pushed as a focusable Settings destination via NavigationLink (Settings > Appearance > Customize Home) under INS-260722-02; the remote's Menu button (or the
 /// Done chip) closes it.
 struct TVHomeRailEditorView: View {
     @Environment(\.dismiss) private var dismiss
@@ -1087,7 +1083,7 @@ struct TVHomeRailEditorView: View {
             .padding(.vertical, Theme.Space.lg)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .onExitCommand { dismiss() }   // remote Menu button closes the cover
+        .onExitCommand { dismiss() }   // remote Menu button pops back to Settings (INS-260722-02: pushed, not a cover)
     }
 
     private func row(index: Int, rail: HomeRail, count: Int) -> some View {

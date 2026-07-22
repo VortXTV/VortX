@@ -900,6 +900,17 @@ struct SettingsView: View {
                       selection: Binding(get: { showHubDiscover ? "1" : "0" }, set: { showHubDiscover = ($0 == "1") }))
             choiceRow(String(localized: "Refresh collections"), [("daily", "Daily"), ("twiceDaily", "Twice"), ("fourTimesDaily", "4x")],
                       selection: $hubCadence)
+            // Home rows editor (INS-260722-02): the focusable entry point the remote can actually reach.
+            // The old customize control lived as an unfocusable overlay on the Home header; it was removed
+            // and re-homed here. Pushes the SAME TVHomeRailEditorView (which writes straight to
+            // HomeRailPreferences), through this NavigationStack, so reorder/hide edits persist and drive
+            // the Home layout exactly as before.
+            NavigationLink { TVHomeRailEditorView() } label: {
+                Label("Customize Home", systemImage: "slider.horizontal.3")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            Text("Reorder or hide the rows on your Home screen, like Top Picks and collections. Continue Watching always stays pinned at the top.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             NavigationLink { TVReorderServicesView() } label: {
                 Label("Streaming services", systemImage: "rectangle.stack.badge.plus")
             }
@@ -1478,7 +1489,10 @@ private enum SettingsSearchSection: CaseIterable {
                                   "streaming services", "discover & region", "budget & box office", "spoiler",
                                   "blur", "dolby vision", "hdr", "match frame rate", "frame rate", "judder",
                                   "24p", "refresh rate", "text size", "performance",
-                                  "top shelf", "tv home screen", "home screen", "continue watching"]
+                                  "top shelf", "tv home screen", "home screen", "continue watching",
+                                  // INS-260722-02: the re-homed Home rows editor ("Customize Home"),
+                                  // so search reaches it under Appearance.
+                                  "customize home", "home rows", "top picks", "collections", "order", "hide"]
         case .audioSubtitle: return ["audio language", "fallback audio", "subtitle language", "fallback subtitle",
                                      "subtitles", "forced", "match audio to subtitle"]
         case .subtitle: return ["font", "size", "fine size", "color", "background", "subtitle style"]
