@@ -59,6 +59,10 @@ enum AuxiliarySourcePipeline {
         let resolution: SourceIndexIdentity.TargetResolution
     }
 
+    struct Snapshot: Sendable {
+        let torBoxStreams: [CoreStream]
+    }
+
     static func callForTesting(_ resolution: SourceIndexIdentity.TargetResolution) -> Call {
         Call(resolution: resolution)
     }

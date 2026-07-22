@@ -310,6 +310,10 @@ enum VXProbe {
     static func log(_ channel: String, _ message: String) {}
 }
 
+enum VXProbeRedaction {
+    static func identityToken(_ value: String?) -> String { "redacted" }
+}
+
 @main
 struct SourceIndexSourceListLifecycleTests {
     @MainActor

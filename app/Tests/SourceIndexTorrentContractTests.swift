@@ -932,7 +932,7 @@ struct SourceIndexTorrentContractTests {
             kind: "torrent", id: lower, quality: privateURL, sizeBytes: 9_007_199_254_740_991,
             seeders: 1_000_000, corroboration: 2
         )
-        let served = SourceIndexClient.streams(from: [
+        let pooledRows: [SourceIndexClient.PooledSource] = [
             trusted,
             .init(kind: "torrent", id: secondHash, quality: "4K", sizeBytes: 1,
                   seeders: 1, corroboration: nil),
@@ -946,7 +946,8 @@ struct SourceIndexTorrentContractTests {
                   seeders: nil, corroboration: 2),
             .init(kind: "usenet", id: privateNZB, quality: "1080p", sizeBytes: 0,
                   seeders: nil, corroboration: 2),
-        ])
+        ]
+        let served = SourceIndexClient.streams(from: pooledRows)
         // CONTRACT CHANGED 2026-07-21: the client floor now MIRRORS the worker's torrent floor of 1 instead of
         // re-filtering at 2. The worker serves single-witness torrents deliberately (a self-verifying infohash
         // never strands a lone early contributor); the old client floor of 2 discarded exactly those rows, which
@@ -1052,14 +1053,32 @@ struct SourceIndexTorrentContractTests {
         expect(postResponseResult.isEmpty && postResponseTransportCount == 1,
                "GET gate closing after response prevents decoded rows from escaping")
 
-        let merged = SourceIndexServeSource.merge(
-            served + [CoreStream(name: "direct", url: privateURL), CoreStream(name: "nzb", nzbUrl: privateNZB)],
-            into: []
+        let mergeTorBox = TorBoxSearchSource(hasKey: { false }, keyProvider: { "" })
+        let mergeSourceIndex = SourceIndexServeSource(
+            fetchPooled: { _, _ in pooledRows },
+            serveGate: { true },
+            coalescer: SourceIndexFetchCoalescer()
         )
-        // Count follows `served`, which is now 2 under the corrected worker-mirrored floor (>=1). The INTENT is
-        // unchanged and still enforced: the appended direct and nzb rows must NOT appear in the merged output.
+        let mergeReceipt = AuxiliarySourcePipeline.refresh(
+            target: publicationTarget("tt1234567"),
+            torBox: mergeTorBox,
+            sourceIndex: mergeSourceIndex,
+            isSignedIn: true
+        )
+        for _ in 0..<1_000 {
+            if mergeSourceIndex.streams.count == served.count { break }
+            await Task.yield()
+        }
+        let merged = AuxiliarySourcePipeline.merged(
+            into: [],
+            snapshot: AuxiliarySourcePipeline.snapshot(
+                receipt: mergeReceipt,
+                torBox: mergeTorBox,
+                sourceIndex: mergeSourceIndex
+            )
+        )
         expect(merged.count == 1 && merged.first?.streams.count == 2,
-               "merge admits only canonical torrent streams (direct/nzb rows excluded)")
+               "production Snapshot merge admits only canonical torrent streams (direct/nzb rows excluded)")
 
         let mismatchTransport = AttemptProbe()
         let mismatchSource = SourceIndexServeSource(

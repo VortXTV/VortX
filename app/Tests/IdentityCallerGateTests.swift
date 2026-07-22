@@ -22,7 +22,8 @@
 //
 // WHAT IT DOES NOT CLAIM. R1 through R5, R7, and R8 remain narrow source-shape guards; they do not prove the
 // surrounding code is correct. The access check below is compiler-negative and proves a module peer cannot
-// construct `PublicationTarget`, `Call`, or `Snapshot`, nor invoke a raw owner transport. Refresh, merge,
+// construct `PublicationTarget`, `Call`, or `Snapshot`, nor invoke a raw owner transport or raw-array merge.
+// Refresh, merge,
 // stale-result, and mutation behavior live in the production-
 // linked SourceIndex and TorBox executable suites, which invoke the same pipeline as all three real callers.
 // This file also governs the SOURCE-INDEX / TorBox identity path only. Unrelated reads of the shared meta
@@ -381,6 +382,26 @@ private func rawTransportEntryPointsAreRejected(repoRoot: String) -> Bool {
     )
 }
 
+private func rawMergeEntryPointsAreRejected(repoRoot: String) -> Bool {
+    constructionFixtureIsRejected(
+        repoRoot: repoRoot,
+        name: "raw merge entry points",
+        source: """
+        import Foundation
+
+        func attemptIdentityFreeMerge(
+            _ streams: [CoreStream],
+            into groups: [CoreStreamSourceGroup]
+        ) {
+            _ = TorBoxSearchSource.merge(streams, into: groups)
+            _ = SourceIndexServeSource.merge(streams, into: groups)
+        }
+        """,
+        expectedDiagnostics: ["TorBoxSearchSource.merge", "SourceIndexServeSource.merge"],
+        rejectionDiagnostics: ["missing argument label 'snapshot:' in call", "inaccessible"]
+    )
+}
+
 private let rules: [Rule] = [
 
     // R1. Key construction is centralized. A screen states ROLES; it never assembles a pool key from a bare
@@ -563,6 +584,67 @@ private let rules: [Rule] = [
                 + "                  options: .regularExpression) != nil ? raw : nil\n    }\n",
         ]
     ),
+
+    // R9/R10. A module peer may merge auxiliary rows only through a sealed Snapshot. The raw algorithms stay
+    // private to their owners so a caller cannot pair an arbitrary array with unrelated or absent identity.
+    Rule(
+        name: "R9 TorBox exposes only its Snapshot-bound merge",
+        files: ["app/SourcesShared/TorBoxSearchSource.swift"],
+        check: { files in
+            guard let file = files["app/SourcesShared/TorBoxSearchSource.swift"] else {
+                return ["TorBoxSearchSource.swift was not loaded"]
+            }
+            return violations(
+                file,
+                forbidding: "nonisolated static func merge(_ extra: [CoreStream]",
+                why: "raw arrays must not bypass the sealed Snapshot"
+            )
+            + requiring(
+                file,
+                "private nonisolated static func mergeStreams(",
+                why: "the raw TorBox merge algorithm must remain private"
+            )
+            + requiring(
+                file,
+                "snapshot: AuxiliarySourcePipeline.Snapshot",
+                why: "the only cross-file merge entry must require a sealed Snapshot"
+            )
+        },
+        revertedFixture: [
+            "app/SourcesShared/TorBoxSearchSource.swift":
+                "    nonisolated static func merge(_ extra: [CoreStream], into groups: [CoreStreamSourceGroup])"
+                + " -> [CoreStreamSourceGroup] { groups }\n",
+        ]
+    ),
+    Rule(
+        name: "R10 SourceIndex exposes only its Snapshot-bound merge",
+        files: ["app/SourcesShared/SourceIndexClient.swift"],
+        check: { files in
+            guard let file = files["app/SourcesShared/SourceIndexClient.swift"] else {
+                return ["SourceIndexClient.swift was not loaded"]
+            }
+            return violations(
+                file,
+                forbidding: "nonisolated static func merge(_ extra: [CoreStream]",
+                why: "raw arrays must not bypass the sealed Snapshot"
+            )
+            + requiring(
+                file,
+                "private nonisolated static func mergeStreams(",
+                why: "the raw SourceIndex merge algorithm must remain private"
+            )
+            + requiring(
+                file,
+                "snapshot: AuxiliarySourcePipeline.Snapshot",
+                why: "the only file-scoped merge entry must require a sealed Snapshot"
+            )
+        },
+        revertedFixture: [
+            "app/SourcesShared/SourceIndexClient.swift":
+                "    nonisolated static func merge(_ extra: [CoreStream], into groups: [CoreStreamSourceGroup])"
+                + " -> [CoreStreamSourceGroup] { groups }\n",
+        ]
+    ),
 ]
 
 // MARK: - Run
@@ -595,6 +677,10 @@ results.expect(
 results.expect(
     rawTransportEntryPointsAreRejected(repoRoot: repoRoot),
     "ACCESS: same-module peers cannot invoke raw auxiliary transport entry points"
+)
+results.expect(
+    rawMergeEntryPointsAreRejected(repoRoot: repoRoot),
+    "ACCESS: same-module peers cannot invoke identity-free raw-array merge entry points"
 )
 
 // Phase 0: every governed file must be present and readable. A rule whose files vanished covers nothing, and

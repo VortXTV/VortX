@@ -305,7 +305,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                 self.publishedIdentity = self.outputIdentity(for: ctx)
                 // HEALTH METRIC: one line per rebuild. More than ~4/sec on a loading title means the
                 // 250 ms coalescer is broken (this used to fire per body eval, thousands of lines).
-                VXProbe.log("sing", "merged rebuild meta=\(ctx.metaId.isEmpty ? "-" : ctx.metaId) groups=\(ranked.count) streams=\(streamCount) torbox=\(torboxStreams.count) singularity=\(singularityStreams.count) gen=\(gen)")
+                VXProbe.log("sing", "merged rebuild meta=\(VXProbeRedaction.identityToken(ctx.metaId)) groups=\(ranked.count) streams=\(streamCount) torbox=\(torboxStreams.count) singularity=\(singularityStreams.count) gen=\(gen)")
                 self.publishedGroups = ranked
                 self.publishedBest = rankedBest
                 self.publishedTiers = rankedTiers
