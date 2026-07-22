@@ -154,6 +154,59 @@ check("presented: a negative clock cannot report earlier than the origin",
 
 // MARK: - playerSeek (source seconds -> player clock, clamped)
 
+// Regression: AVPlayer's duration is in PLAYER time after an origin remux. Clamping the SOURCE request to
+// that value before subtracting the origin turns a valid 5000s source seek into player second zero. The source
+// duration must win in source space first, then the mapped player target may be bounded in player space.
+check("seek: source duration clamps before origin mapping and player bounds",
+      near(RemuxResumePolicy.playerSeek(
+        sourceSeconds: 5000,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 3600,
+        producedEdgePlayerSeconds: 2000), 1400))
+check("seek: a source target before the resumed origin still maps to player zero",
+      near(RemuxResumePolicy.playerSeek(
+        sourceSeconds: 1200,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 3600,
+        producedEdgePlayerSeconds: 2000), 0))
+check("seek: the authoritative source end is applied before the player-duration end",
+      near(RemuxResumePolicy.playerSeek(
+        sourceSeconds: 9000,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 3600,
+        producedEdgePlayerSeconds: 5000), 3599))
+
+// A remux duration is reported in SOURCE time. Prefer the demuxer's authoritative duration even when
+// AVPlayer returns a finite player duration; if the source duration is unavailable, add the origin to that
+// finite player duration. The same helper must leave every non-remux duration byte-for-byte unchanged.
+check("duration: authoritative remux source duration wins over finite player duration",
+      near(RemuxResumePolicy.reportedDuration(
+        playerDurationSeconds: 3600,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: 7200,
+        isRemuxMounted: true), 7200))
+check("duration: authoritative remux source duration wins over indefinite player duration",
+      near(RemuxResumePolicy.reportedDuration(
+        playerDurationSeconds: Double.nan,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: 7200,
+        isRemuxMounted: true), 7200))
+check("duration: unknown remux source falls back to origin plus finite player duration",
+      near(RemuxResumePolicy.reportedDuration(
+        playerDurationSeconds: 3600,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: nil,
+        isRemuxMounted: true), 7200))
+check("duration: non-remux duration is an exact identity",
+      RemuxResumePolicy.reportedDuration(
+        playerDurationSeconds: 3600,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: 7200,
+        isRemuxMounted: false) == 3600)
+
 // The ordinary case: a scrub inside the produced band converts by subtracting the origin.
 check("seek: a target inside the produced band converts by subtracting the origin",
       near(RemuxResumePolicy.playerSeek(sourceSeconds: 1900, origin: 1830, producedEdgePlayerSeconds: 300), 70))

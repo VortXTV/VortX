@@ -568,20 +568,25 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // resume seek issued right after loadFile, which AVPlayer would otherwise drop).
         guard isReady else { pendingSeek = seconds; return }
         let dur = item?.duration.seconds ?? 0
-        var clamped = (dur.isFinite && dur > 1) ? min(max(seconds, 0), max(dur - 1, 0)) : max(seconds, 0)
         // FORWARD-ONLY REMUX (P2, #76): cap the target at the produced edge at the ONE engine chokepoint, so
         // EVERY seek surface is covered (scrubber, hiddenSeek right-nudge, the fwd transport button, Lock Screen
         // / Control Center seek, chapter jumps, skip-pill / auto-skip) instead of each chrome clamping on its
         // own. A seek past the produced bytes lands in content that does not exist yet, no frame arrives, and
-        // the start / stall watchdog demotes the whole true-DV session to libmpv (losing DV + Atmos). Backward
-        // The chrome speaks SOURCE seconds while a resumed mount's player clock begins at zero. Convert by the
-        // achieved origin here, clamp content before it to player second zero, and retain the existing produced
-        // edge clamp. Non-remux items use an origin of zero, making the conversion an identity.
+        // the start / stall watchdog demotes the whole true-DV session to libmpv (losing DV + Atmos). The chrome
+        // speaks SOURCE seconds while a resumed mount's player clock begins at zero. Clamp in source space
+        // against the demuxer's source duration, map through the achieved origin, then clamp in player space
+        // against AVPlayer's duration and the produced edge. Non-remux items keep the original expression.
+        let clamped: Double
         if isRemuxMounted {
+            let sourceDuration = remuxHLSServer?.sourceDurationSeconds ?? remuxLoader?.sourceDurationSeconds
             clamped = RemuxResumePolicy.playerSeek(
-                sourceSeconds: clamped,
+                sourceSeconds: seconds,
                 origin: remuxTimelineOrigin,
+                authoritativeSourceDurationSeconds: sourceDuration,
+                playerDurationSeconds: dur,
                 producedEdgePlayerSeconds: producedEdgeSeconds)
+        } else {
+            clamped = (dur.isFinite && dur > 1) ? min(max(seconds, 0), max(dur - 1, 0)) : max(seconds, 0)
         }
         player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
         let reported = RemuxResumePolicy.presented(
@@ -1207,21 +1212,28 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             let dur = item.duration.seconds
             var seekable = dur.isFinite && dur > 0   // an indefinite duration is a live stream
             var emittedDuration = dur
-            // DV-REMUX KNOWN DURATION: a remux mount serves a mid-production fMP4 sliding playlist with no
-            // EXT-X-ENDLIST, so AVPlayerItem.duration reads INDEFINITE at readyToPlay for the whole session
-            // even though the source MKV runtime is known. Left uncorrected the chrome treats the entire DV
-            // play as a live stream: it never arms the launch resume floor, and disables its periodic/exit
-            // saves, reportSeek, scrubber range, skip clamps and mark-watched. Synthesize the demuxer-reported
-            // runtime instead so the session behaves as the VOD it is (progress persists, the playhead scrubs
-            // within the buffered edge per the forward-only clamp). Non-remux items keep AVPlayer's own value
-            // byte for byte; the libmpv path never reaches here. Forward-only pre-start seeks are still dropped
-            // below via the isRemuxMounted guard, so a synthesized seekable=true cannot resume into dead bytes.
-            if !seekable, isRemuxMounted {
-                let known = remuxHLSServer?.sourceDurationSeconds ?? remuxLoader?.sourceDurationSeconds ?? 0
-                if known > 0 {
-                    emittedDuration = known
-                    seekable = true
-                    DiagnosticsLog.log("dv", "synthesized remux duration \(Int(known))s (item.duration indefinite)")
+            // DV-REMUX SOURCE DURATION: AVPlayer's duration is measured from player second zero, while every
+            // chrome clock is in source seconds. Prefer the demuxer's authoritative source duration whether
+            // AVPlayer reports finite or indefinite. If the demuxer cannot provide one and AVPlayer is finite,
+            // add the achieved origin to recover a source-timeline duration. Non-remux values remain untouched.
+            if isRemuxMounted {
+                let authoritativeDuration = remuxHLSServer?.sourceDurationSeconds
+                    ?? remuxLoader?.sourceDurationSeconds
+                emittedDuration = RemuxResumePolicy.reportedDuration(
+                    playerDurationSeconds: dur,
+                    origin: remuxTimelineOrigin,
+                    authoritativeSourceDurationSeconds: authoritativeDuration,
+                    isRemuxMounted: true)
+                seekable = emittedDuration.isFinite && emittedDuration > 0
+                if let authoritativeDuration,
+                   authoritativeDuration.isFinite, authoritativeDuration > 0 {
+                    DiagnosticsLog.log(
+                        "dv",
+                        "authoritative remux source duration \(Int(authoritativeDuration))s (player duration \(Int(dur.isFinite ? dur : 0))s)")
+                } else if dur.isFinite, dur > 0 {
+                    DiagnosticsLog.log(
+                        "dv",
+                        "mapped remux source duration \(Int(emittedDuration))s (origin \(Int(remuxTimelineOrigin))s + player duration \(Int(dur))s)")
                 }
             }
             if seekable { emit(MPVProperty.duration, emittedDuration, loadToken: loadToken) }

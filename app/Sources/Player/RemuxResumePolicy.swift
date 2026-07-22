@@ -26,7 +26,7 @@ import Foundation
 /// the two are not reconciled at a single point, a resumed title saves its progress an hour early and wipes the
 /// viewer's real position. So the engine converts at its one chokepoint: everything it REPORTS is
 /// `presented(playerSeconds:origin:)`, and everything it is ASKED to seek to goes through
-/// `playerSeek(sourceSeconds:origin:producedEdgePlayerSeconds:)`.
+/// `playerSeek`, which clamps in source time, maps through the origin, then clamps in player time.
 ///
 /// # What is deliberately NOT reachable
 ///
@@ -105,7 +105,13 @@ enum RemuxResumePolicy {
     /// The PLAYER second to seek to for a seek expressed in source seconds, clamped to what the mount can
     /// actually serve.
     ///
-    /// Two clamps, both of which exist to keep a seek from stranding the mount with no frame:
+    /// The ordering is the contract. Source and player duration are different domains after a resumed mount:
+    /// AVPlayer may say the produced item is 3600s long while the source is 7200s long and begins at 3600s.
+    /// Clamping a 5000s SOURCE request against the 3600s PLAYER duration before mapping incorrectly lands at
+    /// player zero. Clamp the source target to the authoritative source duration first, subtract the origin,
+    /// then apply the player duration and produced edge.
+    ///
+    /// The remaining boundary clamps keep a seek from stranding the mount with no frame:
     ///  - BELOW the origin: content before the origin was never produced, so the target clamps to the origin
     ///    (player second 0). A backward scrub past the resume point lands at the resume point instead of
     ///    failing. This is the cost named in the type comment.
@@ -114,14 +120,42 @@ enum RemuxResumePolicy {
     ///    a wrong cap would be worse than none).
     static func playerSeek(sourceSeconds: Double,
                            origin: Double,
+                           authoritativeSourceDurationSeconds: Double? = nil,
+                           playerDurationSeconds: Double = 0,
                            producedEdgePlayerSeconds: Double) -> Double {
         guard sourceSeconds.isFinite else { return 0 }
-        var target = sourceSeconds - origin
+        var sourceTarget = sourceSeconds
+        if let sourceDuration = authoritativeSourceDurationSeconds,
+           sourceDuration.isFinite, sourceDuration > 0 {
+            sourceTarget = min(max(sourceTarget, 0), max(sourceDuration - 1, 0))
+        }
+        var target = sourceTarget - origin
         if target < 0 { target = 0 }
+        if playerDurationSeconds.isFinite, playerDurationSeconds > 0 {
+            target = min(target, max(playerDurationSeconds - 1, 0))
+        }
         if producedEdgePlayerSeconds > 0, target > producedEdgePlayerSeconds {
             target = producedEdgePlayerSeconds
         }
         return target
+    }
+
+    /// Duration published to SOURCE-time chrome. A remux item's finite duration is measured from player zero,
+    /// so an unknown source duration needs its achieved origin added back. The demuxer's duration is
+    /// authoritative when present. A non-remux value is returned unchanged.
+    static func reportedDuration(playerDurationSeconds: Double,
+                                 origin: Double,
+                                 authoritativeSourceDurationSeconds: Double?,
+                                 isRemuxMounted: Bool) -> Double {
+        guard isRemuxMounted else { return playerDurationSeconds }
+        if let sourceDuration = authoritativeSourceDurationSeconds,
+           sourceDuration.isFinite, sourceDuration > 0 {
+            return sourceDuration
+        }
+        guard playerDurationSeconds.isFinite, playerDurationSeconds > 0,
+              origin.isFinite else { return playerDurationSeconds }
+        let sourceDuration = origin + playerDurationSeconds
+        return sourceDuration.isFinite ? sourceDuration : playerDurationSeconds
     }
 
     // MARK: - The pre-start (resume) seek

@@ -899,6 +899,14 @@ enum PlayerLiveContractTests {
             tvPlayer,
             from: "private func loadIntoPlayer(",
             to: "/// Switch the playing source")
+        let remuxSeekMapping = sourceSection(
+            engine,
+            from: "func seek(to seconds: Double)",
+            to: "func seek(by seconds: Double)")
+        let remuxDurationMapping = sourceSection(
+            engine,
+            from: "private func handleStatus(_ item: AVPlayerItem",
+            to: "private func logDVVideoTrackDiagnostics(")
         let manualSelection = sourceSection(engine, from: "private func select(", to: "/// The overlay host")
         let groupLoad = sourceSection(engine, from: "private func loadSelectionGroups()",
                                       to: "/// Rebuild cached selected flags")
@@ -1110,6 +1118,25 @@ enum PlayerLiveContractTests {
                 "let requestedRemuxOrigin = currentLoadResumeOrigin",
                 "VortXRemuxHLSServer.make(",
                 "startAtSeconds: requestedRemuxOrigin",
+              ]))
+        check("wiring: remux seek maps source bounds before player bounds and preserves the non-remux clamp",
+              sourceContainsInOrder(remuxSeekMapping, [
+                "let sourceDuration =",
+                "sourceSeconds: seconds",
+                "authoritativeSourceDurationSeconds: sourceDuration",
+                "playerDurationSeconds: dur",
+                "producedEdgePlayerSeconds: producedEdgeSeconds",
+                "} else {",
+                "clamped = (dur.isFinite && dur > 1)",
+              ]))
+        check("wiring: ready status always maps remux duration into source time",
+              sourceContainsInOrder(remuxDurationMapping, [
+                "let authoritativeDuration =",
+                "RemuxResumePolicy.reportedDuration(",
+                "playerDurationSeconds: dur",
+                "origin: remuxTimelineOrigin",
+                "authoritativeSourceDurationSeconds: authoritativeDuration",
+                "seekable = emittedDuration.isFinite && emittedDuration > 0",
               ]))
         check("wiring: initial AV host configures its origin immediately before the synchronous load",
               sourceContainsInOrder(initialAVMount, [
