@@ -116,6 +116,13 @@ enum HubTarget: Hashable {
         case .decade(let d): return d.title
         }
     }
+
+    /// A user-picked streaming SERVICE tile (vs a Discover card, genre, or decade). Drives the browse grid's
+    /// empty-state copy: an empty service grid is a region issue, not "nothing here".
+    var isService: Bool {
+        if case .service = self { return true }
+        return false
+    }
 }
 
 // MARK: - Sub-catalogs
@@ -196,7 +203,9 @@ enum CollectionsCatalog {
         // ids come back canonical-first then ascending, so the joined query is stable and the edge never
         // fragments on ordering. Monetization tiers come from the ONE shared constant (subscription + ads +
         // free, never rent/buy) so the hub's sub-catalogs and the Home rails always agree on what "streaming" is.
-        let family = TMDBClient.providerFamilyMembers(id).map(String.init).joined(separator: "%7C")
+        // Canonicalize the id first (region alias -> canonical), exactly like discoverProviderPage, so the
+        // hub grid and the Home rail query the SAME provider family and never diverge on a region-alias id.
+        let family = TMDBClient.providerFamilyMembers(TMDBClient.canonicalProviderID(id)).map(String.init).joined(separator: "%7C")
         return "with_watch_providers=\(family)&with_watch_monetization_types=\(TMDBClient.streamingMonetizationTypes)"
     }
 
@@ -318,23 +327,26 @@ enum CollectionsCatalog {
     /// Fetch the movie + TV buckets (skipping a nil bucket) and interleave, de-duplicating by id. When a SELECTED
     /// service is empty in the viewer's region, retry once against US so the tile is not a dead end.
     private static func mergedDiscover(movie: String?, tv: String?, region: String, page: Int, serviceRegionFallback: Bool = false) async -> [MetaPreview] {
-        let merged = await mergeBuckets(movie: movie, tv: tv, region: region, page: page)
+        // `serviceRegionFallback` is true for exactly the SERVICE grids (set by scopedSubs); reuse it as the
+        // provider-fallback flag so a tt-less India title (JioHotstar/ZEE5) survives as `tmdb:<id>` here, while
+        // genre/decade/Discover grids keep the strict tt-only gate.
+        let merged = await mergeBuckets(movie: movie, tv: tv, region: region, page: page, providerFallback: serviceRegionFallback)
         // Gated hard: a service target ONLY, on the FIRST page ONLY, with a selection active ONLY, and not
         // already US. Genres/decades/Discover and the AUTO region list never take this path, so no empty genre
         // page ever double-calls TMDB fleet-wide.
         guard merged.isEmpty, serviceRegionFallback, page == 1, region != "US",
               !CollectionsHubModel.selectedProviders().isEmpty else { return merged }
-        return await mergeBuckets(movie: movie, tv: tv, region: "US", page: page)
+        return await mergeBuckets(movie: movie, tv: tv, region: "US", page: page, providerFallback: serviceRegionFallback)
     }
 
-    private static func mergeBuckets(movie: String?, tv: String?, region: String, page: Int) async -> [MetaPreview] {
+    private static func mergeBuckets(movie: String?, tv: String?, region: String, page: Int, providerFallback: Bool = false) async -> [MetaPreview] {
         // Opt these curated discover rows (decade / genre / service windows) into the catalogs worker's daily
         // shuffle (#6): `vxday=1` is an unknown, harmless no-op until the worker ships the shuffle, then it
         // reorders the SAME window once per day so a static curated row does not read identically forever.
         let movie = movie.map { $0 + "&vxday=1" }
         let tv = tv.map { $0 + "&vxday=1" }
-        async let m: [MetaPreview] = { if let e = movie { return await TMDBClient.discoverTitles(media: "movie", extra: e, region: region, page: page) } else { return [] } }()
-        async let t: [MetaPreview] = { if let e = tv { return await TMDBClient.discoverTitles(media: "tv", extra: e, region: region, page: page) } else { return [] } }()
+        async let m: [MetaPreview] = { if let e = movie { return await TMDBClient.discoverTitles(media: "movie", extra: e, region: region, page: page, providerFallback: providerFallback) } else { return [] } }()
+        async let t: [MetaPreview] = { if let e = tv { return await TMDBClient.discoverTitles(media: "tv", extra: e, region: region, page: page, providerFallback: providerFallback) } else { return [] } }()
         let movies = await m, shows = await t
         var out: [MetaPreview] = []
         var seen = Set<String>()

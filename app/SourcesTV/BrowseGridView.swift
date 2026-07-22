@@ -432,7 +432,9 @@ struct TVCategoryBrowse: View {
     @ViewBuilder private var grid: some View {
         if items.isEmpty {
             if done {
-                Text("Nothing here yet.").font(Theme.Typography.label)
+                Text(LocalizedStringKey(CatalogRowResolution.emptyGridMessage(isServiceTarget: target.isService)))
+                    .font(Theme.Typography.label)
+                    .multilineTextAlignment(.center)
                     .foregroundStyle(Theme.Palette.textSecondary).padding(Theme.Space.xxl).frame(maxWidth: .infinity)
             } else {
                 BigSpinner().padding(Theme.Space.xxl).frame(maxWidth: .infinity)

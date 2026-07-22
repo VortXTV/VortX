@@ -310,11 +310,15 @@ enum TMDBClient {
                 for (offset, row) in batch.enumerated() {
                     let i = start + offset
                     group.addTask {
-                        guard let ext = await get("/\(row.media)/\(row.tmdbID)/external_ids?api_key=\(key)"),
-                              let imdb = ext["imdb_id"] as? String, imdb.hasPrefix("tt"),
-                              row.poster?.isEmpty == false else { return nil }
+                        guard row.poster?.isEmpty == false else { return nil }
+                        // This is a PROVIDER rail: keep a tt-less India-regional title as `tmdb:<id>` (still
+                        // playable) rather than dropping it, so JioHotstar/ZEE5 rails are not empty (see
+                        // CatalogRowResolution). Mirrors the provider-grid path in resolveRows.
+                        let ext = await get("/\(row.media)/\(row.tmdbID)/external_ids?api_key=\(key)")
+                        guard let id = CatalogRowResolution.playableID(imdbID: ext?["imdb_id"] as? String,
+                                                                       tmdbID: row.tmdbID, providerFallback: true) else { return nil }
                         let type = row.media == "tv" ? "series" : "movie"
-                        return (i, MetaPreview(id: imdb, type: type, name: row.name, poster: row.poster, posterShape: nil, popularity: nil))
+                        return (i, MetaPreview(id: id, type: type, name: row.name, poster: row.poster, posterShape: nil, popularity: nil))
                     }
                 }
                 var out: [(Int, MetaPreview)] = []
@@ -423,7 +427,7 @@ enum TMDBClient {
     /// resolve each tmdb id -> tt in CAPPED chunks (~6 in flight) so several rails don't burst hundreds of
     /// concurrent requests at TMDB (429s silently thin rails), preserve order, de-dup, and cap at `limit`.
     /// This is the exact resolve path `streamingProviderTitles` uses, factored out for the new rails.
-    private static func resolveRows(_ rows: [DiscoverRow], key: String, limit: Int) async -> [MetaPreview] {
+    private static func resolveRows(_ rows: [DiscoverRow], key: String, limit: Int, providerFallback: Bool = false) async -> [MetaPreview] {
         let slice = Array(rows.prefix(limit * 2))
         var resolved: [(Int, MetaPreview)] = []
         for start in stride(from: 0, to: slice.count, by: 6) {
@@ -433,11 +437,14 @@ enum TMDBClient {
                 for (offset, row) in batch.enumerated() {
                     let i = start + offset
                     group.addTask {
-                        guard let ext = await get("/\(row.media)/\(row.tmdbID)/external_ids?api_key=\(key)"),
-                              let imdb = ext["imdb_id"] as? String, imdb.hasPrefix("tt"),
-                              row.poster?.isEmpty == false else { return nil }
+                        guard row.poster?.isEmpty == false else { return nil }
+                        // Resolve external_ids -> tt when TMDB has one; on a provider path keep a tt-less
+                        // India title as `tmdb:<id>` (still playable) instead of dropping it (see CatalogRowResolution).
+                        let ext = await get("/\(row.media)/\(row.tmdbID)/external_ids?api_key=\(key)")
+                        guard let id = CatalogRowResolution.playableID(imdbID: ext?["imdb_id"] as? String,
+                                                                       tmdbID: row.tmdbID, providerFallback: providerFallback) else { return nil }
                         let type = row.media == "tv" ? "series" : "movie"
-                        return (i, MetaPreview(id: imdb, type: type, name: row.name, poster: row.poster, posterShape: nil, popularity: nil))
+                        return (i, MetaPreview(id: id, type: type, name: row.name, poster: row.poster, posterShape: nil, popularity: nil))
                     }
                 }
                 var out: [(Int, MetaPreview)] = []
@@ -714,10 +721,10 @@ enum TMDBClient {
     /// One TMDB /discover page with arbitrary extra params (with_watch_providers / with_genres / sort_by /
     /// date windows), resolved to tt previews. `extra` is a pre-built query fragment (no leading `&`). The
     /// sub-catalog grids (Movies / Shows / New / Top week-month-year / Trending) are built from this.
-    static func discoverTitles(media: String, extra: String, region: String = deviceRegion, page: Int = 1, limit: Int = 40) async -> [MetaPreview] {
+    static func discoverTitles(media: String, extra: String, region: String = deviceRegion, page: Int = 1, limit: Int = 40, providerFallback: Bool = false) async -> [MetaPreview] {
         let key = ApiKeys.effectiveTMDBKey()
         let full = "/discover/\(media)?api_key=\(key)&language=en-US&watch_region=\(region)&page=\(page)&\(extra)"
-        return await resolveRows(parseDiscover(await get(full), media: media), key: key, limit: limit)
+        return await resolveRows(parseDiscover(await get(full), media: media), key: key, limit: limit, providerFallback: providerFallback)
     }
 
     /// A representative 16:9 backdrop for a genre tile: the most popular in-region title in that genre's

@@ -422,7 +422,9 @@ struct iOSCategoryBrowse: View {
                 pills
                 if items.isEmpty {
                     if done {
-                        Text("Nothing here yet.").font(Theme.Typography.label)
+                        Text(LocalizedStringKey(CatalogRowResolution.emptyGridMessage(isServiceTarget: target.isService)))
+                            .font(Theme.Typography.label)
+                            .multilineTextAlignment(.center)
                             .foregroundStyle(Theme.Palette.textSecondary).frame(maxWidth: .infinity).padding(Theme.Space.xxl)
                     } else {
                         ProgressView().frame(maxWidth: .infinity).padding(Theme.Space.xxl)
