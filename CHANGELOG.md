@@ -18,13 +18,13 @@ The correctness beta. (Beta 4 exists as a tag and release page but never carried
 
 ### Added
 
-- **Android: VortX account sign-in with realtime profile sync.** Sign in on Android and your profiles, other members' watch overlays, and profile deletions sync live with your other devices, on the same account and encryption as everywhere else; library, settings, and API-key sync are still being ported. Android phone and TV.
+- **Android: VortX account sign-in with realtime profile sync.** Sign in on your Android phone and your profiles, other members' watch overlays, and profile deletions sync live with your other devices, on the same account and encryption as everywhere else; library, settings, and API-key sync are still being ported. Android phone. TV sign-in and TV account binding are not wired yet; they arrive in a later wave.
 - **Android: raw torrents play.** An in-process streaming server now runs inside the app, so torrent sources play directly, on the same engine lane the Apple apps use. Android phone and TV.
 - **Android TV: a real 10-foot experience.** Home, Detail, and playback plus Discover, Library, Search, and Settings on a proper TV navigation shell. Android TV.
 - **Android: profiles with per-profile watch isolation.** The profile picker arrives on phone and TV; one household member's progress never bleeds into another's. Android phone and TV.
 - **Android: preference-driven source ranking.** Sources rank by your quality and provider preferences on phone and TV; Smart Source auto-pick and source pins are managed on the phone. Android.
 - **Android: offline downloads.** The downloads path is reachable, with a real queue, storage policy, and pause and resume semantics. Android phone and tablet.
-- **Android: IPTV playlists.** Add M3U and Xtream playlists with XMLTV guide data in Settings and play your live channels. Android phone and TV.
+- **Android: IPTV playlists.** Add M3U and Xtream playlists with XMLTV guide data in Settings and play your live channels. Android phone. The TV IPTV lane lands in a later wave.
 - **Android: Picture-in-Picture, gesture controls, and system media integration.** PiP, swipe gestures for brightness, volume, and seeking, lock-screen and notification-shade media controls, and audio-focus, headset, and assistant handling. Android phone.
 - **Android: 1080p trailers, subtitle fetching, and add-on management.** Full-HD client-side YouTube trailers and automatic subtitle add-on fetching on phone and TV; add-on reorder and toggle and mark-watched from a card on phone and tablet; plus a player lock. Android.
 - **Apple: a touch lock for the player.** Lock the on-screen controls so a stray touch cannot pause, seek, or exit. iPhone and iPad.
