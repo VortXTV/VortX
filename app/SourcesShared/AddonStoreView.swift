@@ -1,18 +1,4 @@
-#if PORTRAIT_ADAPTIVE_LAYOUT_CONTRACT_ONLY
-import Foundation
-#else
 import SwiftUI
-#endif
-
-/// Pure production seam for choosing the narrow portrait composition. Keeping the predicate here lets
-/// the standalone contract compile and execute the exact decision the SwiftUI views use.
-enum PortraitAdaptiveLayoutContract {
-    static func usesCompactPortrait(horizontalIsCompact: Bool, verticalIsCompact: Bool) -> Bool {
-        horizontalIsCompact && !verticalIsCompact
-    }
-}
-
-#if !PORTRAIT_ADAPTIVE_LAYOUT_CONTRACT_ONLY
 
 /// One add-on in the official community collection. Decodes only the fields the store shows; the manifest
 /// carries far more (resources, catalogs, version), which Codable ignores. `id` is the transport URL so the
@@ -85,10 +71,6 @@ final class CommunityAddonStore: ObservableObject {
 struct AddonStoreView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
-    #if os(iOS)
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @Environment(\.verticalSizeClass) private var verticalSizeClass
-    #endif
     @ObservedObject private var catalog = CommunityAddonStore.shared
     @ObservedObject private var health = AddonHealthStore.shared
     @State private var query = ""
@@ -101,20 +83,6 @@ struct AddonStoreView: View {
     #endif
 
     private var installed: Set<String> { Set(core.addons.map(\.transportUrl)) }
-
-    /// iPhone portrait needs a different composition, not smaller padding: its horizontal size class is
-    /// compact while its vertical class is regular. Keeping the regular composition when vertical space
-    /// is compact preserves the existing iPhone-landscape row, and non-iOS targets never enter this path.
-    private var usesCompactPortraitLayout: Bool {
-        #if os(iOS)
-        PortraitAdaptiveLayoutContract.usesCompactPortrait(
-            horizontalIsCompact: horizontalSizeClass == .compact,
-            verticalIsCompact: verticalSizeClass == .compact
-        )
-        #else
-        false
-        #endif
-    }
 
     /// Normalize a manifest URL exactly as `CoreBridge.installAddon` does before storing it (trim, then
     /// append `/manifest.json` if missing), so an already-installed add-on is recognized as Installed even
@@ -223,16 +191,50 @@ struct AddonStoreView: View {
         let isInstalled = installed.contains(normalizedManifestURL(addon.transportUrl))
         let isInstalling = installing.contains(addon.transportUrl)
         let h = health.status[addon.transportUrl] ?? .unknown
-        let content = Group {
-            #if os(iOS)
-            if usesCompactPortraitLayout {
-                compactStoreRowContent(addon, health: h, isInstalled: isInstalled, isInstalling: isInstalling)
-            } else {
-                regularStoreRowContent(addon, health: h, isInstalled: isInstalled, isInstalling: isInstalling)
+        let content = HStack(alignment: .top, spacing: Theme.Space.md) {
+            AsyncImage(url: addon.manifest.logo.flatMap(URL.init(string:))) { image in
+                image.resizable().aspectRatio(contentMode: .fit)
+            } placeholder: {
+                Image(systemName: "puzzlepiece.extension.fill")
+                    .font(.system(size: 28)).foregroundStyle(Theme.Palette.textTertiary)
             }
-            #else
-            regularStoreRowContent(addon, health: h, isInstalled: isInstalled, isInstalling: isInstalling)
-            #endif
+            .frame(width: 52, height: 52)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 8) {
+                // Pin the name to its intrinsic one-line width so it can never be compressed to a ~1pt
+                // vertical sliver (the "T / O / R / R / E / N / T / I / O" squeeze) when the chips row
+                // and trailing button demand the row width on a narrow iPhone.
+                Text(addon.name).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !addon.summary.isEmpty {
+                    Text(addon.summary)
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                        .lineLimit(2)
+                }
+                if !addon.types.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(addon.types.prefix(4), id: \.self) { type in
+                            Text(type.capitalized)
+                                .font(Theme.Typography.label)
+                                .lineLimit(1)
+                                .padding(.horizontal, 8).padding(.vertical, 3)
+                                // Warm glass type chip (idle), matching the shared chip flip, instead of the
+                                // flat surface2 capsule.
+                                .vortxGlassChip(selected: false)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .fixedSize()   // each chip keeps its intrinsic size, never pressuring the name
+                        }
+                    }
+                }
+                HStack(spacing: 6) {
+                    Circle().fill(h.color).frame(width: 8, height: 8)
+                    Text(h.label).font(Theme.Typography.label).foregroundStyle(h.color)
+                }
+            }
+            Spacer(minLength: Theme.Space.sm)
+            installControl(addon, isInstalled: isInstalled, isInstalling: isInstalling)
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -257,109 +259,6 @@ struct AddonStoreView: View {
             // Lazy per-row probe: only visible rows hit the network, so a 200-entry catalog never bursts.
             .task { health.probeOne(addon.transportUrl) }
         #endif
-    }
-
-    /// The existing wide/landscape composition, kept intact for tvOS, Mac, iPad regular width, and
-    /// iPhone landscape. Only the portrait compact branch below changes the row hierarchy.
-    private func regularStoreRowContent(_ addon: StoreAddon, health h: AddonHealth,
-                                        isInstalled: Bool, isInstalling: Bool) -> some View {
-        HStack(alignment: .top, spacing: Theme.Space.md) {
-            addonLogo(addon)
-            VStack(alignment: .leading, spacing: 8) {
-                addonIdentity(addon, nameLineLimit: 1)
-                regularTypeChips(addon)
-                healthBadge(h)
-            }
-            Spacer(minLength: Theme.Space.sm)
-            installControl(addon, isInstalled: isInstalled, isInstalling: isInstalling)
-        }
-    }
-
-    /// Narrow portrait separates three independently intrinsic surfaces. The logo/text can use the full
-    /// line, type chips wrap in source order, and the fixed-size Install action owns a trailing line rather
-    /// than competing with the name for width.
-    #if os(iOS)
-    private func compactStoreRowContent(_ addon: StoreAddon, health h: AddonHealth,
-                                        isInstalled: Bool, isInstalling: Bool) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Space.sm) {
-            HStack(alignment: .top, spacing: Theme.Space.md) {
-                addonLogo(addon)
-                addonIdentity(addon, nameLineLimit: 2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            compactTypeChips(addon)
-            healthBadge(h)
-            HStack {
-                Spacer(minLength: 0)
-                installControl(addon, isInstalled: isInstalled, isInstalling: isInstalling)
-            }
-        }
-    }
-    #endif
-
-    private func addonLogo(_ addon: StoreAddon) -> some View {
-        AsyncImage(url: addon.manifest.logo.flatMap(URL.init(string:))) { image in
-            image.resizable().aspectRatio(contentMode: .fit)
-        } placeholder: {
-            Image(systemName: "puzzlepiece.extension.fill")
-                .font(.system(size: 28)).foregroundStyle(Theme.Palette.textTertiary)
-        }
-        .frame(width: 52, height: 52)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    private func addonIdentity(_ addon: StoreAddon, nameLineLimit: Int) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(addon.name)
-                .font(Theme.Typography.cardTitle)
-                .foregroundStyle(Theme.Palette.textPrimary)
-                .lineLimit(nameLineLimit)
-                .fixedSize(horizontal: false, vertical: true)
-            if !addon.summary.isEmpty {
-                Text(addon.summary)
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(Theme.Palette.textSecondary)
-                    .lineLimit(2)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func regularTypeChips(_ addon: StoreAddon) -> some View {
-        if !addon.types.isEmpty {
-            HStack(spacing: 6) {
-                ForEach(addon.types.prefix(4), id: \.self) { type in typeChip(type) }
-            }
-        }
-    }
-
-    #if os(iOS)
-    @ViewBuilder
-    private func compactTypeChips(_ addon: StoreAddon) -> some View {
-        if !addon.types.isEmpty {
-            FlowLayout(spacing: 6) {
-                ForEach(addon.types.prefix(4), id: \.self) { type in typeChip(type) }
-            }
-        }
-    }
-    #endif
-
-    private func typeChip(_ type: String) -> some View {
-        Text(type.capitalized)
-            .font(Theme.Typography.label)
-            .lineLimit(1)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .vortxGlassChip(selected: false)
-            .foregroundStyle(Theme.Palette.textSecondary)
-            .fixedSize()
-    }
-
-    private func healthBadge(_ h: AddonHealth) -> some View {
-        HStack(spacing: 6) {
-            Circle().fill(h.color).frame(width: 8, height: 8)
-            Text(h.label).font(Theme.Typography.label).foregroundStyle(h.color)
-        }
     }
 
     @ViewBuilder
@@ -414,4 +313,3 @@ struct AddonStoreView: View {
             .padding(.top, Theme.Space.sm)
     }
 }
-#endif
