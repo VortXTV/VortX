@@ -39,6 +39,13 @@ private func append(_ bytes: [UInt8], to buffer: VortXRemuxBuffer) {
     }
 }
 
+private func scratchDirectory(_ label: String) -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("vortx-player-live-\(label)-\(UUID().uuidString)", isDirectory: true)
+    try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
+}
+
 private func playlistSegmentIDs(_ lines: [String]) -> [Int] {
     lines.compactMap { line in
         guard line.hasPrefix("seg"), line.hasSuffix(".m4s") else { return nil }
@@ -53,7 +60,22 @@ private func sourceSection(_ source: String?, from start: String, to end: String
     return String(source[startRange.lowerBound..<endRange.lowerBound])
 }
 
+private func sourceContainsInOrder(_ source: String?, _ needles: [String]) -> Bool {
+    guard let source else { return false }
+    var cursor = source.startIndex
+    for needle in needles {
+        guard let range = source.range(of: needle, range: cursor..<source.endIndex) else { return false }
+        cursor = range.upperBound
+    }
+    return true
+}
+
 private final class FakeDisplayManager {}
+
+private final class SpoolProbeState {
+    var calls = 0
+    var attemptedTrim = false
+}
 
 private final class ManualSegmentSender {
     private(set) var payloads: [Data] = []
@@ -77,6 +99,10 @@ enum PlayerLiveContractTests {
         testInitialMountPinsStartupBytes()
         testResidentSlidingPlaylistAndAbsoluteRequests()
         testReadLeaseLifecycle()
+        testSessionSpoolAdmissionAndFailures()
+        testPlaylistRetentionAndFileLeases()
+        testSpoolResponsePump()
+        testSessionLifecycleAndScavenge()
         testDisplayRequestLifecycle()
         testSelectionRefreshLifecycle()
         testProductionWiring()
@@ -286,7 +312,7 @@ enum PlayerLiveContractTests {
             trimAndCheckHeld("lease pump: invalidation waits for the pending header callback", buffer)
             invalidated = true
             sender.completeNext(true)
-            check("lease pump: header completion observes invalidation before sending a body", 
+            check("lease pump: header completion observes invalidation before sending a body",
                   terminal == .cancelled && sender.payloads.count == 1)
             trimAndCheckReleased("lease pump: header-stage invalidation releases the lease", buffer)
         }
@@ -327,6 +353,476 @@ enum PlayerLiveContractTests {
             check("lease pump: a source failure terminates before another send", terminal == .readError)
             check("lease pump: source failure cannot enqueue a stale tail", sender.payloads.count == 2)
         }
+    }
+
+    private static func testSessionSpoolAdmissionAndFailures() {
+        let root = scratchDirectory("spool-admission")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = VortXRemuxBuffer(windowFloorBytes: 1)
+        append(Array(UInt8(0)..<UInt8(16)), to: source)
+        check("spool source: bounded snapshot reads exact resident chunks without advancing RAM",
+              source.snapshotChunk(offset: 2, length: 3) == Data([2, 3, 4])
+                  && source.residentByteRange.lowerBound == 0)
+
+        guard let exact = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 8,
+            chunkSize: 3,
+            scavengeStaleSessions: false) else {
+            check("spool: exact-cap session directory is creatable", false)
+            return
+        }
+        let video0 = VortXHLSSessionSpool.ResourceKey.video(segmentID: 0)
+        let exactResource = VortXHLSSessionSpool.SpillResource(
+            key: video0, buffer: source, offset: 0, length: 8, durationMilliseconds: 4_000)
+        check("spool admission: a reservation exactly equal to the session cap commits",
+              exact.spill([exactResource]))
+        check("spool accounting: committed bytes replace, rather than stack with, their reservation",
+              exact.accounting.finalBytes == 8
+                  && exact.accounting.reservedBytes == 0
+                  && exact.accounting.temporaryBytes == 0
+                  && exact.accounting.admittedBytes == 8)
+        let video1 = VortXHLSSessionSpool.ResourceKey.video(segmentID: 1)
+        check("spool admission: cap plus one fails before creating a temporary file",
+              !exact.spill([.init(
+                  key: video1, buffer: source, offset: 8, length: 1,
+                  durationMilliseconds: 1_000)]))
+        check("spool admission: rejection never evicts protected committed media",
+              exact.contains(video0) && !exact.contains(video1) && exact.accounting.finalBytes == 8)
+        let namesAfterFirstCommit = exact.fileNamesOnDisk
+        check("spool de-dup: the same key and exact bytes are idempotent across variant/cohort publication",
+              exact.spill([exactResource])
+                  && exact.fileNamesOnDisk == namesAfterFirstCommit
+                  && exact.accounting.finalBytes == 8)
+        check("spool de-dup: the same key with conflicting bytes fails without rewriting backing",
+              !exact.spill([.init(
+                  key: video0, buffer: source, offset: 8, length: 8,
+                  durationMilliseconds: 4_000)])
+                  && exact.fileNamesOnDisk == namesAfterFirstCommit
+                  && exact.accounting.finalBytes == 8)
+
+        guard let tooSmall = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 7,
+            chunkSize: 3,
+            scavengeStaleSessions: false) else {
+            check("spool: cap-minus-one session directory is creatable", false)
+            return
+        }
+        check("spool admission: an eight-byte cohort is rejected by a seven-byte cap",
+              !tooSmall.spill([exactResource]) && tooSmall.accounting.admittedBytes == 0)
+
+        guard let partial = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 16,
+            chunkSize: 4,
+            failureInjection: .write(afterBytes: 3),
+            scavengeStaleSessions: false) else {
+            check("spool: partial-write fixture is creatable", false)
+            return
+        }
+        check("spool failure: an injected partial write publishes no backing",
+              !partial.spill([exactResource]) && !partial.contains(video0))
+        check("spool failure: partial bytes and reservations are both removed from live accounting",
+              partial.accounting.finalBytes == 0
+                  && partial.accounting.temporaryBytes == 0
+                  && partial.accounting.reservedBytes == 0
+                  && partial.accounting.peakTemporaryBytes == 3
+                  && partial.accounting.peakReservedBytes == 8)
+        check("spool failure: no .part survives a partial write",
+              !partial.fileNamesOnDisk.contains(where: { $0.hasSuffix(".part") }))
+
+        guard let diskFull = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 16,
+            chunkSize: 4,
+            failureInjection: .diskFull(afterBytes: 5),
+            scavengeStaleSessions: false) else {
+            check("spool: disk-full fixture is creatable", false)
+            return
+        }
+        check("spool failure: disk-full rolls back its partial cohort and accounting",
+              !diskFull.spill([exactResource])
+                  && diskFull.accounting.admittedBytes == 0
+                  && diskFull.fileNamesOnDisk.isEmpty)
+
+        guard let renameFailure = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 16,
+            chunkSize: 2,
+            failureInjection: .rename(afterSuccessfulMoves: 1),
+            scavengeStaleSessions: false) else {
+            check("spool: rename-failure fixture is creatable", false)
+            return
+        }
+        let pair: [VortXHLSSessionSpool.SpillResource] = [
+            .init(key: video0, buffer: source, offset: 0, length: 4, durationMilliseconds: 2_000),
+            .init(key: video1, buffer: source, offset: 4, length: 4, durationMilliseconds: 2_000),
+        ]
+        check("spool failure: a second rename failure rolls back the first renamed cohort member",
+              !renameFailure.spill(pair)
+                  && !renameFailure.contains(video0)
+                  && !renameFailure.contains(video1)
+                  && renameFailure.fileNamesOnDisk.isEmpty)
+
+        guard let sizeMismatch = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 16,
+            chunkSize: 4,
+            failureInjection: .sizeMismatch,
+            scavengeStaleSessions: false) else {
+            check("spool: size-mismatch fixture is creatable", false)
+            return
+        }
+        check("spool failure: exact-size mismatch after write cannot rename or register",
+              !sizeMismatch.spill([exactResource])
+                  && !sizeMismatch.contains(video0)
+                  && sizeMismatch.accounting.admittedBytes == 0
+                  && sizeMismatch.fileNamesOnDisk.isEmpty)
+
+        guard let overflow = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: Int.max,
+            chunkSize: 4,
+            scavengeStaleSessions: false) else {
+            check("spool: overflow fixture is creatable", false)
+            return
+        }
+        check("spool arithmetic: summing Int.max plus one rejects before reservation or file creation",
+              !overflow.spill([
+                  .init(key: .video(segmentID: 90), buffer: source, offset: 0,
+                        length: Int.max, durationMilliseconds: 1),
+                  .init(key: .video(segmentID: 91), data: Data([1]), durationMilliseconds: 1),
+              ])
+                  && overflow.accounting.admittedBytes == 0
+                  && overflow.fileNamesOnDisk.isEmpty)
+        check("spool validation: negative ranges, nonpositive durations and empty payloads fail before admission",
+              !overflow.spill([.init(
+                  key: .video(segmentID: 92), buffer: source, offset: -1,
+                  length: 1, durationMilliseconds: 1)])
+                  && !overflow.spill([.init(
+                      key: .video(segmentID: 93), data: Data([1]), durationMilliseconds: 0)])
+                  && !overflow.spill([.init(
+                      key: .video(segmentID: 94), data: Data(), durationMilliseconds: 1)]))
+
+        guard let overlap = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 16,
+            chunkSize: 2,
+            scavengeStaleSessions: false) else {
+            check("spool: overlap fixture is creatable", false)
+            return
+        }
+        let probe = SpoolProbeState()
+        overlap.installFileOperationProbe { owner in
+            probe.calls += 1
+            _ = owner.accounting
+            if !probe.attemptedTrim {
+                probe.attemptedTrim = true
+                source.markEngineReady()
+                _ = source.discardPrefix(before: 8)
+            }
+        }
+        check("spool locking: filesystem callbacks can re-enter coordinator reads without a held state lock",
+              overlap.spill([.init(
+                  key: .video(segmentID: 95), buffer: source, offset: 0,
+                  length: 8, durationMilliseconds: 4_000)])
+                  && probe.calls > 0)
+        check("spool source lease: an eviction attempt between chunk writes cannot undercut the staged range",
+              overlap.contains(.video(segmentID: 95))
+                  && source.residentByteRange.lowerBound == 0)
+        check("spool memory: segment spill never snapshots more than its configured bounded chunk",
+              exact.accounting.peakChunkBytes <= 3)
+        check("spool production: the default session admission cap is exactly 512 MiB",
+              VortXHLSSessionSpool.defaultCapacityBytes == 512 * 1024 * 1024)
+        let bytesAt44Point7MbitForFourSeconds = 44_700_000 / 8 * 4
+        check("spool bitrate: 44.7 Mbit/s stays under the byte guard while the four-second IDR rule remains decisive",
+              bytesAt44Point7MbitForFourSeconds < 32 * 1024 * 1024
+                  && VortXHLSBoundaryPolicy.decision(
+                      hasOpenSegment: true,
+                      incomingIsIDR: false,
+                      elapsed: 4,
+                      openBytes: bytesAt44Point7MbitForFourSeconds) == .failSoft)
+    }
+
+    private static func testPlaylistRetentionAndFileLeases() {
+        let root = scratchDirectory("spool-retention")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = VortXRemuxBuffer(windowFloorBytes: 1)
+        append(Array(repeating: 0x5a, count: 64), to: source)
+        guard let spool = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 128,
+            chunkSize: 4,
+            scavengeStaleSessions: false) else {
+            check("retention: session directory is creatable", false)
+            return
+        }
+        let v0 = VortXHLSSessionSpool.ResourceKey.video(segmentID: 0)
+        let v1 = VortXHLSSessionSpool.ResourceKey.video(segmentID: 1)
+        let v2 = VortXHLSSessionSpool.ResourceKey.video(segmentID: 2)
+        check("retention: one durable cohort registers each shared video resource exactly once",
+              spool.spill([
+                  .init(key: v0, buffer: source, offset: 0, length: 10, durationMilliseconds: 4_000),
+                  .init(key: v1, buffer: source, offset: 10, length: 10, durationMilliseconds: 5_000),
+                  .init(key: v2, buffer: source, offset: 20, length: 10, durationMilliseconds: 6_000),
+              ]) && spool.accounting.finalBytes == 30)
+
+        _ = spool.recordPlaylistGeneration(
+            playlistID: "video-dv", resourceKeys: [v0, v1], now: 100)
+        _ = spool.recordPlaylistGeneration(
+            playlistID: "video-hdr", resourceKeys: [v0, v1], now: 101)
+        _ = spool.recordPlaylistGeneration(
+            playlistID: "video-dv", resourceKeys: [v1, v2], now: 110)
+        check("retention: removal from one duplicate variant does not start expiry while another still contains it",
+              spool.retentionDeadline(for: v0) == nil)
+        _ = spool.recordPlaylistGeneration(
+            playlistID: "video-hdr", resourceKeys: [v1, v2], now: 120)
+        check("retention: last removal uses removal + segment duration + longest containing playlist duration",
+              spool.retentionDeadline(for: v0) == 133)
+        _ = spool.recordPlaylistGeneration(
+            playlistID: "video-dv", resourceKeys: [v0, v1, v2], now: 125)
+        check("retention: reappearing before expiry cancels the old removal deadline",
+              spool.retentionDeadline(for: v0) == nil)
+        _ = spool.recordPlaylistGeneration(
+            playlistID: "video-dv", resourceKeys: [v1, v2], now: 130)
+        check("retention: a later removal recomputes from the new removal time and longer generation",
+              spool.retentionDeadline(for: v0) == 149)
+        check("retention: every distributed variant generation is recorded without double-counting shared bytes",
+              spool.playlistGenerationCount(playlistID: "video-dv") == 4
+                  && spool.playlistGenerationCount(playlistID: "video-hdr") == 2
+                  && spool.accounting.finalBytes == 30)
+
+        let before = spool.openResource(v0, now: 148.999)
+        check("retention: a request immediately before expiry atomically opens its backing", before != nil)
+        before?.close(now: 148.999)
+        let at = spool.openResource(v0, now: 149)
+        check("retention: the exact lower-bound deadline remains serveable", at != nil)
+        at?.close(now: 149)
+        check("retention: a request after expiry is rejected and unleased backing is reclaimed",
+              spool.openResource(v0, now: 149.001) == nil && !spool.contains(v0))
+
+        _ = spool.recordPlaylistGeneration(playlistID: "video-dv", resourceKeys: [], now: 130)
+        _ = spool.recordPlaylistGeneration(playlistID: "video-hdr", resourceKeys: [], now: 131)
+        let protectedLease = spool.openResource(v1, now: 150.999)
+        check("retention lease: a response can acquire backing immediately before its exact deadline",
+              protectedLease != nil)
+        spool.collectExpired(now: 152)
+        check("retention lease: expiry cannot delete a file beneath an active response",
+              spool.contains(v1) && spool.openResource(v1, now: 152) == nil)
+        protectedLease?.close(now: 152)
+        check("retention lease: terminal callback releases and reclaims an already-expired backing",
+              !spool.contains(v1))
+
+        let audio0 = VortXHLSSessionSpool.ResourceKey.audio(renditionID: 7, segmentID: 0)
+        let subtitle0 = VortXHLSSessionSpool.ResourceKey.subtitle(renditionID: 3, segmentID: 0)
+        check("retention topology: alternate audio and rendered subtitle share the same session cap",
+              spool.spill([
+                  .init(key: audio0, buffer: source, offset: 30, length: 8, durationMilliseconds: 4_000),
+                  .init(key: subtitle0, data: Data("WEBVTT\n\n".utf8), durationMilliseconds: 4_000),
+              ]))
+        _ = spool.recordPlaylistGeneration(
+            playlistID: "audio-7", resourceKeys: [audio0], now: 200)
+        _ = spool.recordPlaylistGeneration(
+            playlistID: "subs-3", resourceKeys: [subtitle0], now: 200)
+        _ = spool.recordPlaylistGeneration(playlistID: "audio-7", resourceKeys: [], now: 210)
+        _ = spool.recordPlaylistGeneration(playlistID: "subs-3", resourceKeys: [], now: 210)
+        check("retention topology: audio and subtitle deadlines use their own distributed generations",
+              spool.retentionDeadline(for: audio0) == 218
+                  && spool.retentionDeadline(for: subtitle0) == 218)
+
+        guard let arithmetic = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 1,
+            chunkSize: 1,
+            scavengeStaleSessions: false) else {
+            check("retention arithmetic: overflow fixture is creatable", false)
+            return
+        }
+        let extreme = VortXHLSSessionSpool.ResourceKey.video(segmentID: Int.max)
+        check("retention arithmetic: an extreme duration can be registered without eager overflow",
+              arithmetic.spill([.init(
+                  key: extreme, data: Data([1]), durationMilliseconds: Int.max)])
+                  && arithmetic.recordPlaylistGeneration(
+                      playlistID: "extreme", resourceKeys: [extreme], now: 0) != nil)
+        check("retention arithmetic: duration plus longest-generation overflow fails atomically",
+              arithmetic.recordPlaylistGeneration(
+                  playlistID: "extreme", resourceKeys: [], now: 1) == nil
+                  && arithmetic.playlistGenerationCount(playlistID: "extreme") == 1
+                  && arithmetic.retentionDeadline(for: extreme) == nil)
+
+        guard let nonfinite = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 1,
+            chunkSize: 1,
+            scavengeStaleSessions: false) else {
+            check("retention arithmetic: deadline fixture is creatable", false)
+            return
+        }
+        let finite = VortXHLSSessionSpool.ResourceKey.video(segmentID: Int.max - 1)
+        _ = nonfinite.spill([.init(key: finite, data: Data([2]), durationMilliseconds: 1)])
+        _ = nonfinite.recordPlaylistGeneration(
+            playlistID: "finite", resourceKeys: [finite], now: 0)
+        check("retention arithmetic: a nonfinite clock fails closed without advancing the generation",
+              nonfinite.recordPlaylistGeneration(
+                  playlistID: "finite", resourceKeys: [],
+                  now: .infinity) == nil
+                  && nonfinite.playlistGenerationCount(playlistID: "finite") == 1
+                  && nonfinite.retentionDeadline(for: finite) == nil)
+    }
+
+    private static func testSpoolResponsePump() {
+        let root = scratchDirectory("spool-pump")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = VortXRemuxBuffer(windowFloorBytes: 1)
+        let bytes = Array(UInt8(0)..<UInt8(8))
+        append(bytes, to: source)
+        guard let spool = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 24,
+            chunkSize: 2,
+            scavengeStaleSessions: false) else {
+            check("file pump: session directory is creatable", false)
+            return
+        }
+        let key = VortXHLSSessionSpool.ResourceKey.video(segmentID: 0)
+        guard spool.spill([.init(
+            key: key, buffer: source, offset: 0, length: 8, durationMilliseconds: 4_000)]),
+              let lease = spool.openResource(key, now: 1),
+              let response = VortXSpoolResponsePump(lease: lease, chunkSize: 2) else {
+            check("file pump: durable resource opens before any response header", false)
+            return
+        }
+        let sender = ManualSegmentSender()
+        var terminal: VortXSpoolResponsePump.Terminal?
+        var routeOwner: VortXSpoolResponsePump? = response
+        routeOwner?.start(
+            header: Data("head".utf8),
+            cancelled: { false },
+            send: sender.send,
+            terminal: { terminal = $0 })
+        routeOwner = nil
+        sender.completeNext(true)
+        sender.completeNext(true)
+        sender.completeNext(true)
+        sender.completeNext(true)
+        sender.completeNext(true)
+        check("file pump: one open handle stays owned through header and every bounded body callback",
+              terminal == .complete
+                  && sender.payloads == [
+                      Data("head".utf8), Data(bytes[0..<2]), Data(bytes[2..<4]),
+                      Data(bytes[4..<6]), Data(bytes[6..<8]),
+                  ])
+        check("file pump: terminal completion releases the request lease", spool.activeLeaseCount == 0)
+
+        let errorKey = VortXHLSSessionSpool.ResourceKey.video(segmentID: 1)
+        _ = spool.spill([.init(
+            key: errorKey, buffer: source, offset: 0, length: 8, durationMilliseconds: 4_000)])
+        if let errorLease = spool.openResource(errorKey, now: 1),
+           let errorPump = VortXSpoolResponsePump(lease: errorLease, chunkSize: 2) {
+            let errorSender = ManualSegmentSender()
+            var errorTerminal: VortXSpoolResponsePump.Terminal?
+            errorPump.start(
+                header: Data("head".utf8), cancelled: { false },
+                send: errorSender.send, terminal: { errorTerminal = $0 })
+            errorSender.completeNext(true)
+            errorSender.completeNext(false)
+            check("file pump: a mid-body send failure drains its file lease exactly once",
+                  errorTerminal == .sendError && spool.activeLeaseCount == 0)
+        } else {
+            check("file pump: send-failure fixture opens", false)
+        }
+
+        let cancellationKey = VortXHLSSessionSpool.ResourceKey.video(segmentID: 2)
+        _ = spool.spill([.init(
+            key: cancellationKey, buffer: source, offset: 0, length: 8,
+            durationMilliseconds: 4_000)])
+        if let cancellationLease = spool.openResource(cancellationKey, now: 1),
+           let cancellationPump = VortXSpoolResponsePump(lease: cancellationLease, chunkSize: 2) {
+            let cancellationSender = ManualSegmentSender()
+            var cancelled = false
+            var cancellationTerminal: VortXSpoolResponsePump.Terminal?
+            cancellationPump.start(
+                header: Data("head".utf8), cancelled: { cancelled },
+                send: cancellationSender.send, terminal: { cancellationTerminal = $0 })
+            cancellationSender.completeNext(true)
+            cancelled = true
+            cancellationSender.completeNext(true)
+            check("file pump: mid-body cancellation stops before another read and drains its lease",
+                  cancellationTerminal == .cancelled
+                      && cancellationSender.payloads.count == 2
+                      && spool.activeLeaseCount == 0)
+        } else {
+            check("file pump: cancellation fixture opens", false)
+        }
+    }
+
+    private static func testSessionLifecycleAndScavenge() {
+        let root = scratchDirectory("spool-lifecycle")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = VortXRemuxBuffer(windowFloorBytes: 1)
+        append(Array(repeating: 0x33, count: 8), to: source)
+        guard let first = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 16,
+            chunkSize: 2,
+            scavengeStaleSessions: false) else {
+            check("lifecycle: first session directory is creatable", false)
+            return
+        }
+        let key = VortXHLSSessionSpool.ResourceKey.video(segmentID: 0)
+        _ = first.spill([.init(
+            key: key, buffer: source, offset: 0, length: 8, durationMilliseconds: 4_000)])
+        first.producerDidReachEOF()
+        check("lifecycle: EOF is not teardown and keeps the UUID session directory intact",
+              FileManager.default.fileExists(atPath: first.sessionDirectory.path))
+        let lease = first.openResource(key, now: 0)
+        first.invalidateSession()
+        check("lifecycle: invalidation alone cannot delete files while listener ownership remains",
+              FileManager.default.fileExists(atPath: first.sessionDirectory.path))
+        first.listenerDidRetire()
+        check("lifecycle: invalidation plus listener retirement still waits for request-lease drain",
+              FileManager.default.fileExists(atPath: first.sessionDirectory.path))
+        lease?.close(now: 0)
+        lease?.close(now: 0)
+        first.invalidateSession()
+        first.listenerDidRetire()
+        check("lifecycle: zero bytes remain only after invalidation, listener retirement and lease drain",
+              !FileManager.default.fileExists(atPath: first.sessionDirectory.path))
+
+        guard let activeSibling = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 16,
+            chunkSize: 2,
+            scavengeStaleSessions: false) else {
+            check("scavenge: active sibling is creatable", false)
+            return
+        }
+        let stale = root.appendingPathComponent("stale-session", isDirectory: true)
+        try? FileManager.default.createDirectory(at: stale, withIntermediateDirectories: true)
+        try? Data([1]).write(to: stale.appendingPathComponent("orphan.part"))
+        guard let laterLaunch = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 16,
+            chunkSize: 2,
+            scavengeStaleSessions: true) else {
+            check("scavenge: later session is creatable", false)
+            return
+        }
+        check("scavenge: a later launch removes a prior orphan but never an active sibling",
+              !FileManager.default.fileExists(atPath: stale.path)
+                  && FileManager.default.fileExists(atPath: activeSibling.sessionDirectory.path)
+                  && FileManager.default.fileExists(atPath: laterLaunch.sessionDirectory.path))
+        let siblingKey = VortXHLSSessionSpool.ResourceKey.video(segmentID: 7)
+        _ = activeSibling.spill([.init(
+            key: siblingKey, buffer: source, offset: 0, length: 8,
+            durationMilliseconds: 4_000)])
+        laterLaunch.invalidateSession()
+        laterLaunch.listenerDidRetire()
+        check("lifecycle overlap: cleaning one simultaneous session cannot cross-delete its sibling backing",
+              activeSibling.contains(siblingKey)
+                  && FileManager.default.fileExists(atPath: activeSibling.sessionDirectory.path))
+        withExtendedLifetime((activeSibling, laterLaunch)) {}
     }
 
     private static func testDisplayRequestLifecycle() {
@@ -381,6 +877,10 @@ enum PlayerLiveContractTests {
                                   encoding: .utf8)
         let engine = try? String(contentsOf: playerURL.appendingPathComponent("AVPlayerEngine.swift"),
                                  encoding: .utf8)
+        let engineContract = try? String(contentsOf: playerURL.appendingPathComponent("PlayerEngine.swift"),
+                                         encoding: .utf8)
+        let resumePolicy = try? String(contentsOf: playerURL.appendingPathComponent("RemuxResumePolicy.swift"),
+                                       encoding: .utf8)
         let manualSelection = sourceSection(engine, from: "private func select(", to: "/// The overlay host")
         let groupLoad = sourceSection(engine, from: "private func loadSelectionGroups()",
                                       to: "/// Rebuild cached selected flags")
@@ -396,6 +896,22 @@ enum PlayerLiveContractTests {
             server,
             from: "private func serveAudioSegment(",
             to: "// MARK: - Optional settled subtitle renditions")
+        let spoolResourceResponse = sourceSection(
+            server,
+            from: "private func serveSpoolResource(",
+            to: "// MARK: - Response helpers")
+        let masterPublication = sourceSection(
+            server,
+            from: "private func prepareMasterPublication()",
+            to: "private func logStartupCohortTimeout()")
+        let rollingPublication = sourceSection(
+            server,
+            from: "private func currentPublication()",
+            to: "private func topologyMatches(")
+        let publicationReceipt = sourceSection(
+            server,
+            from: "private func recordPublication(",
+            to: "private func exactWindow(")
         let subtitleInvalidation = sourceSection(
             stream,
             from: "private func invalidateSubtitles(",
@@ -442,23 +958,50 @@ enum PlayerLiveContractTests {
               server?.contains("DVPlaybackPolicy.mediaPlaylistLines(window:") == true)
         check("wiring: server uses the byte-compared production master renderer",
               server?.contains("DVPlaybackPolicy.masterPlaylistData(") == true)
-        check("wiring: segment requests resolve absolute ids through the window",
-              server?.contains("window.segment(id: index)") == true)
-        check("wiring: video and audio use the executable lease-owning response pump",
-              videoSegmentResponse?.contains("VortXSegmentResponsePump(") == true
-                  && audioSegmentResponse?.contains("VortXSegmentResponsePump(") == true
-                  && videoSegmentResponse?.contains("response.start(") == true
-                  && audioSegmentResponse?.contains("response.start(") == true)
-        check("wiring: production selects a bounded chunk size for both response pumps",
-              videoSegmentResponse?.contains("chunkSize: Self.segmentChunk") == true
-                  && audioSegmentResponse?.contains("chunkSize: Self.segmentChunk") == true
+        check("wiring: segment URIs resolve directly through durable absolute-id spool keys",
+              videoSegmentResponse?.contains("key: .video(segmentID: index)") == true
+                  && videoSegmentResponse?.contains("window.segment(id:") == false
+                  && audioSegmentResponse?.contains(
+                    "key: .audio(renditionID: renditionID, segmentID: segmentID)") == true)
+        check("wiring: every media route opens its durable lease before constructing a 200 response",
+              sourceContainsInOrder(spoolResourceResponse, [
+                "stream.openHLSResource(key)",
+                "VortXSpoolResponsePump(",
+                "HTTP/1.1 200 OK",
+                "response.start(",
+              ]))
+        check("wiring: the shared durable response pump uses one bounded 512 KiB chunk size",
+              spoolResourceResponse?.contains("chunkSize: Self.segmentChunk") == true
                   && server?.contains("private static let segmentChunk = 512 * 1024") == true)
-        check("wiring: one snapshot binds the resident video base and optional feature state",
-              immutableSnapshot?.contains("buffer.residentWindow(segments: _hlsSegments)") == true
+        check("wiring: one snapshot binds durable video backing and optional feature state",
+              immutableSnapshot?.contains("_hlsSegments.filter") == true
+                  && immutableSnapshot?.contains("hlsSpool?.contains(.video(segmentID: $0.id))") == true
                   && immutableSnapshot?.contains(
                       "let audioPublished = _alternateAudioState == .ready && _alternateAudioPlan != nil") == true
                   && immutableSnapshot?.contains("audioPlan: audioPublished ? _alternateAudioPlan : nil") == true
                   && immutableSnapshot?.contains("subtitleFailureReason: _subtitleSettlement.invalidationReason") == true)
+        check("wiring: master waits for one exact six-segment fifteen-second common cohort",
+              masterPublication?.contains("DVPlaybackPolicy.pinnedStartupCohort(") == true
+                  && masterPublication?.contains("minimumSegmentCount: Self.minimumStartupSegments") == true
+                  && masterPublication?.contains(
+                    "minimumRenderedDurationMilliseconds: Self.minimumStartupDurationMilliseconds") == true
+                  && server?.contains("private static let minimumStartupSegments = 6") == true
+                  && server?.contains(
+                    "private static let minimumStartupDurationMilliseconds = 15_000") == true)
+        check("wiring: post-ready reloads advance only one common contiguous rendition frontier",
+              rollingPublication?.contains("greatestCommonContiguousWindow(") == true
+                  && rollingPublication?.contains("DVPlaybackPolicy.minimumConformingSuffix(") == true
+                  && rollingPublication?.contains(
+                    "HLS publication frontier lost a previously advertised segment") == true)
+        check("wiring: every logical playlist receipt is committed before a publication body is returned",
+              sourceContainsInOrder(rollingPublication, [
+                "recordPublication(",
+                "return Publication(",
+              ])
+                  && publicationReceipt?.contains("stream.recordHLSPlaylist(\"/media.m3u8\"") == true
+                  && publicationReceipt?.contains("/media-hdr.m3u8") == true
+                  && publicationReceipt?.contains("/audio\\(plan.alternate.id).m3u8") == true
+                  && publicationReceipt?.contains("/sub\\(rendition.id).m3u8") == true)
         check("wiring: alternate audio owns a separate muxer and cloned packet references",
               stream?.contains("private final class VortXAlternateAudioMuxer") == true
                   && stream?.contains("av_packet_clone(packet)") == true
@@ -496,10 +1039,10 @@ enum PlayerLiveContractTests {
                   && alternateCloseSegment?.contains("decodeStart: start") == false)
         check("wiring: audio playlist alignment uses the authoritative video-frame drift bound",
               immutableSnapshot?.contains("videoFrameDuration: videoFrameDuration") == true)
-        check("wiring: an unselected alternate trims to the primary resident window",
-              immutableSnapshot?.contains("MultiAudioPolicy.retentionFloor(") == true
-                  && immutableSnapshot?.contains("audioMuxer.buffer.discardPrefix(before: audioFloor)") == true
-                  && immutableSnapshot?.contains("$0.segmentID < firstVideoID") == true)
+        check("wiring: alternate publication is filtered to durable resources sharing the video id frontier",
+              immutableSnapshot?.contains("let residentIDs = Set(videoWindow.segments.map(\\.id))") == true
+                  && immutableSnapshot?.contains("residentIDs.contains($0.segmentID)") == true
+                  && immutableSnapshot?.contains("hlsSpool?.contains(.audio(") == true)
         check("wiring: alternate cap failure is typed and tears down held refs without primary failure",
               stream?.contains("markAlternateAudioFailed(muxer.failureCategory ?? .muxer)") == true
                   && stream?.contains("discardHeldAudio(alignment: &alignment, packets: &packets)") == true)
@@ -517,10 +1060,11 @@ enum PlayerLiveContractTests {
         check("wiring: audio and subtitle resource paths route through their tested parsers",
               server?.contains("MultiAudioPolicy.parseRequest(path: path)") == true
                   && server?.contains("SubtitleRenditionPolicy.parseRequest(path: path)") == true)
-        check("wiring: subtitle playlists wait for a settled nonempty shared window or EOF",
-              subtitlePlaylist?.contains("guard let window = snapshot.subtitleWindow") == true
-                  && subtitlePlaylist?.contains("!window.segments.isEmpty || snapshot.ended") == true
-                  && subtitlePlaylist?.contains("return .invalidated") == true)
+        check("wiring: subtitle playlists render only the coordinator-approved common publication",
+              subtitlePlaylist?.contains("self.currentPublication()") == true
+                  && subtitlePlaylist?.contains("publication.subtitles.contains") == true
+                  && subtitlePlaylist?.contains("publication.subtitleWindow") == true
+                  && subtitlePlaylist?.contains("snapshot.subtitleWindow") == false)
         check("wiring: every subtitle cap removes the optional publication with a typed reason",
               subtitleCollection?.contains("invalidateSubtitles(.payloadBound)") == true
                   && subtitleCollection?.contains("invalidateSubtitles(.storedBound)") == true
@@ -530,13 +1074,34 @@ enum PlayerLiveContractTests {
                   && subtitleInvalidation?.contains("_subtitleCues.removeAll") == true
                   && subtitleInvalidation?.contains("buffer.fail") == false
                   && subtitleInvalidation?.contains("_hlsSegments") == false)
-        check("wiring: optional player features remain default-off",
-              stream?.contains("isFeatureOn(\"dvRemuxMultiAudio\", default: false)") == true
-                  && stream?.contains("isFeatureOn(\"dvRemuxSubtitles\", default: false)") == true)
-        check("wiring: remux resume has no production launch caller",
-              engine?.contains("resumeStartSeconds") == false
-                  && engine?.contains("remuxTimelineOrigin") == false
-                  && stream?.contains("startAtSeconds") == false)
+        check("wiring: optional audio and subtitle renditions ship default-on with local rollback keys",
+              stream?.contains("isFeatureOn(\"dvRemuxMultiAudio\", default: true)") == true
+                  && stream?.contains("isFeatureOn(\"dvRemuxSubtitles\", default: true)") == true
+                  && stream?.contains("stremiox.dvRemuxMultiAudio") == true
+                  && stream?.contains("stremiox.dvRemuxSubtitles") == true)
+        check("wiring: PlayerEngine exposes the exact pre-load resume-origin API",
+              engineContract?.contains("func configureResumeOrigin(seconds: Double)") == true
+                  && engine?.contains("func configureResumeOrigin(seconds: Double)") == true)
+        check("wiring: a configured nonzero origin is consumed before the remux server is constructed",
+              sourceContainsInOrder(engine, [
+                "resumeConfiguration.consumeForNextLoad()",
+                "let requestedRemuxOrigin = currentLoadResumeOrigin",
+                "VortXRemuxHLSServer.make(",
+                "startAtSeconds: requestedRemuxOrigin",
+              ]))
+        check("wiring: the server forwards the configured origin into the remux stream",
+              sourceContainsInOrder(server, [
+                "startAtSeconds: Double = 0",
+                "VortXMKVRemuxStream(",
+                "startAtSeconds: startAtSeconds",
+              ]))
+        check("wiring: resume seek, base-video origin latch and packet rebase are all live",
+              stream?.contains("avformat_seek_file(") == true
+                  && stream?.contains("RemuxResumePolicy.canEstablishOrigin(") == true
+                  && stream?.contains("rebaseFromOrigin(p, timeBase:") == true
+                  && stream?.contains("rebaseFromOrigin(pkt, timeBase:") == true
+                  && engine?.contains("remuxHLSServer?.timelineOriginSeconds") == true
+                  && resumePolicy?.contains("static let isEnabledByDefault = true") == true)
         check("wiring: display manager uses the success-aware request ledger",
               display?.contains("displayRequestLedger.begin") == true
                   && display?.contains("displayRequestLedger.complete") == true

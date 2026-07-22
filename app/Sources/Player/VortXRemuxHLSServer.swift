@@ -59,26 +59,52 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private(set) var port: UInt16 = 0
     private let stateLock = NSLock()
     private var invalidated = false
+    private var listenerRetired = false
     private var connections: [ObjectIdentifier: NWConnection] = [:]
-    /// Single-flight for the concurrent startup media-playlist fetches (#76, reshaped by #143). CoreMedia
-    /// opens BOTH variants' playlists at startup; if the two HELD requests poll the remux 100ms apart they
-    /// can capture a DIFFERENT segment count. Since #143 the two variants have distinct URIs (media.m3u8 /
-    /// media-hdr.m3u8), so the shared state is the SEGMENT-LIST SNAPSHOT rather than one body: the first
-    /// held request stores the (segments, ended) it saw when the startup gate opened, every other held
-    /// request renders its own flavor (its own EXT-X-MAP URI) from those SAME segments, and the two startup
-    /// playlists can never disagree on content. Reloads after startup build a fresh resident sliding window.
-    private let mediaGateLock = NSLock()
+    /// One cross-rendition publication coordinator. It freezes the exact common startup cohort before the
+    /// master advertises any rendition, then advances both video variants and every advertised audio/subtitle
+    /// route through one shared absolute-ID frontier. Disk work and playlist receipts happen while this lock is
+    /// held, so no concurrent request can expose half of a generation.
+    private let publicationLock = NSLock()
     private var startupMediaList: (window: VortXHLSWindow, ended: Bool)?
+    private var publishedVideoWindow: VortXHLSWindow?
+    private var advertisedAudioPlan: MultiAudioPolicy.RenditionPlan?
+    private var advertisedSubtitles: [SubtitleRenditionPolicy.Rendition] = []
+    private var advertisedDolbyVision = false
+    private var engineReady = false
+    private var startupTimeoutLogged = false
+
+    private struct Publication {
+        let videoWindow: VortXHLSWindow
+        let audioWindow: VortXHLSWindow?
+        let subtitleWindow: VortXHLSWindow?
+        let audioPlan: MultiAudioPolicy.RenditionPlan?
+        let subtitles: [SubtitleRenditionPolicy.Rendition]
+        let ended: Bool
+    }
+
+    private struct MasterPublication {
+        let audioPlan: MultiAudioPolicy.RenditionPlan?
+        let subtitles: [SubtitleRenditionPolicy.Rendition]
+    }
 
     /// Build the remux stream + local server for an MKV URL. Returns nil when the listener cannot bind
     /// (the caller fails soft to libmpv). The caller must `start()` the returned server to begin remuxing.
     /// `mode` (#147): `.dolbyVision` (the default, the original lane) or `.plain` for a non-DV MKV kept on
     /// AVPlayer for Picture in Picture; the mode flows into classify + signaling (see VortXMKVRemuxStream.Mode).
+    /// `startAtSeconds` is a sanitized source-timeline origin consumed by AVPlayer before this mount exists.
+    /// The stream seeks once before muxing, then publishes the base-video timestamp it actually reached.
     static func make(input: URL, headers: [String: String]?,
-                     mode: VortXMKVRemuxStream.Mode = .dolbyVision) -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
-        let stream = VortXMKVRemuxStream(input: input.absoluteString, headers: headers, indexForHLS: true, mode: mode)
+                     mode: VortXMKVRemuxStream.Mode = .dolbyVision,
+                     startAtSeconds: Double = 0) -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
+        let stream = VortXMKVRemuxStream(
+            input: input.absoluteString,
+            headers: headers,
+            indexForHLS: true,
+            mode: mode,
+            startAtSeconds: startAtSeconds)
         let server = VortXRemuxHLSServer(stream: stream)
-        guard server.listen() else { return nil }
+        guard server.listen() else { server.invalidate(); return nil }
         var comps = URLComponents()
         comps.scheme = "http"
         comps.host = "127.0.0.1"
@@ -97,11 +123,18 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     /// F3: forward the engine's first-frame readiness to the buffer so its producer lead widens from the
     /// reduced pre-ready value to the full lead. Called from AVPlayerEngine's readyToPlay handler.
-    func markEngineReady() { stream.markEngineReady() }
+    func markEngineReady() {
+        publicationLock.lock(); engineReady = true; publicationLock.unlock()
+        stream.markEngineReady()
+    }
 
     /// The source MKV runtime in seconds (0 until parsed / when unknown). The engine reads it at readyToPlay
     /// to synthesize a finite VOD duration, since the live HLS delivery keeps AVPlayerItem.duration INDEFINITE.
     var sourceDurationSeconds: Double { stream.sourceDurationSeconds }
+
+    /// The achieved source-timeline second represented by player clock zero. It is established only by a
+    /// mapped base-video packet after a successful input seek, never by earlier audio/subtitle packets.
+    var timelineOriginSeconds: Double { stream.timelineOriginSeconds }
 
     /// The classifier's session-authoritative frame rate. AVPlayer's asset track can be absent for local HLS;
     /// callers must prefer this value and must not replace it with an invented 60Hz fallback.
@@ -133,6 +166,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         stream.cancel()
         listener?.cancel()
         open.forEach { $0.cancel() }
+        if listener == nil { retireListenerOnce() }
     }
 
     private var isInvalidated: Bool {
@@ -159,6 +193,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                     portLock.lock(); boundPort = newListener.port?.rawValue ?? 0; portLock.unlock()
                     ready.signal()
                 case .failed, .cancelled:
+                    self.retireListenerOnce()
                     ready.signal()
                 default:
                     break
@@ -180,6 +215,14 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             DiagnosticsLog.log("dv", "hls server listener start failed: \(error)")
             return false
         }
+    }
+
+    private func retireListenerOnce() {
+        stateLock.lock()
+        let shouldRetire = !listenerRetired
+        listenerRetired = true
+        stateLock.unlock()
+        if shouldRetire { stream.listenerDidRetire() }
     }
 
     // MARK: - Per-connection handling
@@ -361,8 +404,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         // whenever Match Dynamic Range never started a switch, so this is a no-op except on the tvOS DV path.
         _ = waitFor(seconds: 6) { HDRDisplayMode.isSwitchSettled ? true : nil }
 
-        // Alternate readiness is hard-bounded and fail-open. A timeout permanently omits the alternate for
-        // this session and immediately releases the primary master; subtitle metadata never delays primary.
+        // Alternate qualification is hard-bounded and fail-open. Once this step finishes, the common startup
+        // gate below treats the resulting topology as immutable: every advertised rendition must contribute
+        // the same absolute startup IDs before the master can expose it.
         var featureSnapshot = stream.hlsWindowSnapshot()
         if featureSnapshot.audioState == .pending {
             if let resolved = waitFor(seconds: MultiAudioPolicy.alternateStartupWaitSeconds, {
@@ -375,10 +419,21 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 featureSnapshot = stream.hlsWindowSnapshot()
             }
         }
-        let audioPlan = featureSnapshot.audioPlan
+        guard let publication = waitFor(seconds: Self.resourceWaitSeconds, {
+            self.prepareMasterPublication()
+        }) else {
+            if !isInvalidated, stream.buffer.status().failure == nil {
+                logStartupCohortTimeout()
+            }
+            DiagnosticsLog.log("dv", "hls 404 /master.m3u8")
+            close(connection, status: "404 Not Found")
+            return
+        }
+
+        let audioPlan = publication.audioPlan
         let audioTags = MultiAudioPolicy.mediaTags(audioPlan)
         let audioAttribute = MultiAudioPolicy.streamInfAttribute(plan: audioPlan)
-        let subtitleRenditions = featureSnapshot.subtitleRenditions
+        let subtitleRenditions = publication.subtitles
         let subtitleTags = subtitleRenditions.map(SubtitleRenditionPolicy.mediaTag)
         let subtitleAttribute = SubtitleRenditionPolicy.streamInfAttribute(
             renditionCount: subtitleRenditions.count)
@@ -400,58 +455,324 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
     }
 
-    /// Segments the FIRST media-playlist answer waits for, so AVPlayer's startup buffer math never sees a
-    /// near-empty window (a finished-early remux is exempt: `ended` publishes whatever exists).
-    private static let minStartupSegments = 2
+    private static let minimumStartupSegments = 6
+    private static let minimumStartupDurationMilliseconds = 15_000
 
-    /// Sliding media playlist over one immutable resident window. The first answer waits for
-    /// `minStartupSegments`; later reloads advance MEDIA-SEQUENCE as old bytes leave the buffer.
-    private func serveMedia(_ connection: NWConnection, hdr: Bool) {
-        struct Ready { let window: VortXHLSWindow; let ended: Bool }
-        let path = hdr ? "/media-hdr.m3u8" : "/media.m3u8"
-        // Was the startup gate already open on the FIRST probe? If not, this is a HELD startup request (the
-        // concurrent per-variant fetches) and must share ONE segment snapshot with its sibling so the two
-        // variants' startup playlists never disagree on content (#76). A request that finds the gate already
-        // open is a post-startup reload and builds a fresh resident sliding window below.
-        let gateOpenOnEntry: Bool = {
-            let snap = stream.hlsWindowSnapshot()
-            return snap.initData != nil && !snap.window.segments.isEmpty
-                && (snap.window.segments.count >= Self.minStartupSegments || snap.ended)
-        }()
-        let ready = waitFor(seconds: Self.resourceWaitSeconds) { () -> Ready? in
-            let snap = stream.hlsWindowSnapshot()
-            guard snap.initData != nil, !snap.window.segments.isEmpty,
-                  snap.window.segments.count >= Self.minStartupSegments || snap.ended else { return nil }
-            return Ready(window: snap.window, ended: snap.ended)
+    /// Freeze the shortest absolute-zero cohort that satisfies every rendition's rendered-duration floor.
+    /// The master is the topology publication edge, so subtitle WebVTT resources are materialized and every
+    /// required durable key is rechecked before the topology becomes visible.
+    private func prepareMasterPublication() -> MasterPublication? {
+        publicationLock.lock(); defer { publicationLock.unlock() }
+
+        if startupMediaList != nil {
+            let snapshot = stream.hlsWindowSnapshot()
+            guard topologyMatches(snapshot) else { return nil }
+            return MasterPublication(
+                audioPlan: advertisedAudioPlan,
+                subtitles: advertisedSubtitles)
         }
-        guard var ready else {
+
+        var snapshot = stream.hlsWindowSnapshot()
+        guard snapshot.initData != nil,
+              snapshot.audioState != .pending,
+              !snapshot.window.segments.isEmpty else { return nil }
+        let audioPlan = snapshot.audioPlan
+        let subtitles = snapshot.subtitleRenditions
+        var requiredWindows = [snapshot.window]
+        if audioPlan != nil {
+            guard snapshot.audioInitData != nil, let audioWindow = snapshot.audioWindow else { return nil }
+            requiredWindows.append(audioWindow)
+        }
+        if !subtitles.isEmpty {
+            guard snapshot.subtitleFailureReason == nil,
+                  let subtitleWindow = snapshot.subtitleWindow else { return nil }
+            requiredWindows.append(subtitleWindow)
+        }
+        guard let cohort = DVPlaybackPolicy.pinnedStartupCohort(
+            windows: requiredWindows,
+            ended: snapshot.ended,
+            minimumSegmentCount: Self.minimumStartupSegments,
+            minimumRenderedDurationMilliseconds: Self.minimumStartupDurationMilliseconds) else { return nil }
+        let ids = cohort.window.segments.map(\.id)
+        guard exactWindow(snapshot.window, ids: ids) != nil else { return nil }
+        let audioWindow = audioPlan == nil ? nil : snapshot.audioWindow.flatMap { exactWindow($0, ids: ids) }
+        guard audioPlan == nil || audioWindow != nil else { return nil }
+
+        if !subtitles.isEmpty {
+            guard let subtitleWindow = snapshot.subtitleWindow.flatMap({ exactWindow($0, ids: ids) }) else {
+                return nil
+            }
+            for rendition in subtitles {
+                guard rendition.id >= 0, rendition.id < snapshot.subtitleCues.count,
+                      stream.ensureSubtitleBacking(
+                          renditionID: rendition.id,
+                          window: subtitleWindow,
+                          cues: snapshot.subtitleCues[rendition.id]) else { return nil }
+            }
+        }
+
+        // Optional state can change while WebVTT files are written. Re-read it before committing the master;
+        // stale files are harmless session-local artifacts, while a stale advertised topology would not be.
+        snapshot = stream.hlsWindowSnapshot()
+        guard snapshot.audioPlan == audioPlan,
+              snapshot.subtitleRenditions == subtitles,
+              snapshot.subtitleFailureReason == nil || subtitles.isEmpty,
+              let finalVideoWindow = exactWindow(snapshot.window, ids: ids),
+              ids.allSatisfy({ stream.hasHLSResource(.video(segmentID: $0)) }) else { return nil }
+        var finalAudioWindow: VortXHLSWindow?
+        if let audioPlan {
+            guard snapshot.audioInitData != nil,
+                  let window = snapshot.audioWindow.flatMap({ exactWindow($0, ids: ids) }),
+                  ids.allSatisfy({ stream.hasHLSResource(.audio(
+                      renditionID: audioPlan.alternate.id, segmentID: $0)) }) else { return nil }
+            finalAudioWindow = window
+        }
+        if !subtitles.isEmpty {
+            guard snapshot.subtitleWindow.flatMap({ exactWindow($0, ids: ids) }) != nil else { return nil }
+            for rendition in subtitles where !ids.allSatisfy({
+                stream.hasHLSResource(.subtitle(renditionID: rendition.id, segmentID: $0))
+            }) { return nil }
+        }
+
+        let ended = cohort.ended
+            && finalVideoWindow.segments.last?.id == snapshot.window.segments.last?.id
+            && (finalAudioWindow == nil
+                || finalAudioWindow?.segments.last?.id == snapshot.audioWindow?.segments.last?.id)
+        startupMediaList = (finalVideoWindow, ended)
+        publishedVideoWindow = finalVideoWindow
+        advertisedAudioPlan = audioPlan
+        advertisedSubtitles = subtitles
+        advertisedDolbyVision = snapshot.signaling?.dolbyVision == true
+        return MasterPublication(audioPlan: audioPlan, subtitles: subtitles)
+    }
+
+    private func logStartupCohortTimeout() {
+        let progress = startupCommonProgress()
+        publicationLock.lock()
+        let shouldLog = !startupTimeoutLogged
+        startupTimeoutLogged = true
+        publicationLock.unlock()
+        guard shouldLog else { return }
+        DiagnosticsLog.log(
+            "dv",
+            "hls_startup_cohort_timeout waitedMs=60000 requiredCount=6 requiredDurationMs=15000 actualCount=\(progress.count) actualDuration=\(progress.durationMilliseconds)")
+    }
+
+    private func startupCommonProgress() -> (count: Int, durationMilliseconds: Int) {
+        let snapshot = stream.hlsWindowSnapshot()
+        guard snapshot.audioState != .pending else { return (0, 0) }
+        var windows = [snapshot.window]
+        if snapshot.audioPlan != nil {
+            guard let audio = snapshot.audioWindow else { return (0, 0) }
+            windows.append(audio)
+        }
+        if !snapshot.subtitleRenditions.isEmpty {
+            guard let subtitles = snapshot.subtitleWindow else { return (0, 0) }
+            windows.append(subtitles)
+        }
+        guard let window = greatestCommonContiguousWindow(windows: windows, startingAt: 0) else {
+            return (0, 0)
+        }
+        return (
+            window.segments.count,
+            DVPlaybackPolicy.renderedDurationMilliseconds(of: window) ?? 0)
+    }
+
+    /// Both video variants and every optional media route render one coordinator-owned generation. Before any
+    /// body is sent, all logical playlist receipts are recorded so unselected optional tracks cannot leak their
+    /// old backing forever and a URI remains openable through its distributed-playlist deadline.
+    private func currentPublication() -> Publication? {
+        publicationLock.lock(); defer { publicationLock.unlock() }
+        guard let startup = startupMediaList,
+              let current = publishedVideoWindow else { return nil }
+        let snapshot = stream.hlsWindowSnapshot()
+        guard topologyMatches(snapshot) else {
+            stream.failHLS("advertised HLS rendition topology became unavailable")
+            return nil
+        }
+
+        let selectedVideo: VortXHLSWindow
+        let ended: Bool
+        if !engineReady {
+            selectedVideo = startup.window
+            ended = startup.ended
+        } else {
+            var requiredWindows = [snapshot.window]
+            if advertisedAudioPlan != nil {
+                guard let audioWindow = snapshot.audioWindow else { return nil }
+                requiredWindows.append(audioWindow)
+            }
+            if !advertisedSubtitles.isEmpty {
+                guard let subtitleWindow = snapshot.subtitleWindow else { return nil }
+                for rendition in advertisedSubtitles {
+                    guard rendition.id >= 0, rendition.id < snapshot.subtitleCues.count,
+                          stream.ensureSubtitleBacking(
+                              renditionID: rendition.id,
+                              window: subtitleWindow,
+                              cues: snapshot.subtitleCues[rendition.id]) else {
+                        stream.failHLS("subtitle HLS backing could not be committed")
+                        return nil
+                    }
+                }
+                requiredWindows.append(subtitleWindow)
+            }
+            guard let common = greatestCommonContiguousWindow(
+                windows: requiredWindows,
+                startingAt: current.mediaSequence),
+                  Array(common.segments.prefix(current.segments.count).map(\.id))
+                    == current.segments.map(\.id) else {
+                stream.failHLS("HLS publication frontier lost a previously advertised segment")
+                return nil
+            }
+            let commonReachedEOF = snapshot.ended
+                && common.segments.last?.id == snapshot.window.segments.last?.id
+                && (snapshot.audioWindow == nil
+                    || common.segments.last?.id == snapshot.audioWindow?.segments.last?.id)
+                && (snapshot.subtitleWindow == nil
+                    || common.segments.last?.id == snapshot.subtitleWindow?.segments.last?.id)
+            if commonReachedEOF,
+               (common.segments.count < Self.minimumStartupSegments
+                || (DVPlaybackPolicy.renderedDurationMilliseconds(of: common) ?? 0)
+                    < Self.minimumStartupDurationMilliseconds) {
+                selectedVideo = common
+            } else {
+                guard let suffix = DVPlaybackPolicy.minimumConformingSuffix(
+                    window: common,
+                    minimumSegmentCount: Self.minimumStartupSegments,
+                    minimumRenderedDurationMilliseconds: Self.minimumStartupDurationMilliseconds) else {
+                    return nil
+                }
+                selectedVideo = suffix
+            }
+            publishedVideoWindow = selectedVideo
+            ended = commonReachedEOF
+        }
+
+        let ids = selectedVideo.segments.map(\.id)
+        let selectedAudio = advertisedAudioPlan == nil
+            ? nil : snapshot.audioWindow.flatMap { exactWindow($0, ids: ids) }
+        guard advertisedAudioPlan == nil || selectedAudio != nil else { return nil }
+        let selectedSubtitles = advertisedSubtitles.isEmpty
+            ? nil : snapshot.subtitleWindow.flatMap { exactWindow($0, ids: ids) }
+        guard advertisedSubtitles.isEmpty || selectedSubtitles != nil else { return nil }
+        guard recordPublication(
+            videoWindow: selectedVideo,
+            audioWindow: selectedAudio,
+            subtitleWindow: selectedSubtitles) else {
+            stream.failHLS("HLS playlist receipt could not be recorded")
+            return nil
+        }
+        return Publication(
+            videoWindow: selectedVideo,
+            audioWindow: selectedAudio,
+            subtitleWindow: selectedSubtitles,
+            audioPlan: advertisedAudioPlan,
+            subtitles: advertisedSubtitles,
+            ended: ended)
+    }
+
+    private func topologyMatches(_ snapshot: VortXMKVRemuxStream.HLSWindowSnapshot) -> Bool {
+        guard snapshot.signaling?.dolbyVision == advertisedDolbyVision else { return false }
+        if let advertisedAudioPlan {
+            guard snapshot.audioPlan == advertisedAudioPlan,
+                  snapshot.audioInitData != nil else { return false }
+        }
+        guard snapshot.subtitleFailureReason == nil || advertisedSubtitles.isEmpty,
+              advertisedSubtitles.allSatisfy({ snapshot.subtitleRenditions.contains($0) }) else {
+            return false
+        }
+        return true
+    }
+
+    private func recordPublication(videoWindow: VortXHLSWindow,
+                                   audioWindow: VortXHLSWindow?,
+                                   subtitleWindow: VortXHLSWindow?) -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        let videoKeys = videoWindow.segments.map {
+            VortXHLSSessionSpool.ResourceKey.video(segmentID: $0.id)
+        }
+        guard stream.recordHLSPlaylist("/media.m3u8", resourceKeys: videoKeys, now: now) else {
+            return false
+        }
+        if advertisedDolbyVision,
+           !stream.recordHLSPlaylist("/media-hdr.m3u8", resourceKeys: videoKeys, now: now) {
+            return false
+        }
+        if let plan = advertisedAudioPlan, let audioWindow {
+            let keys = audioWindow.segments.map {
+                VortXHLSSessionSpool.ResourceKey.audio(
+                    renditionID: plan.alternate.id, segmentID: $0.id)
+            }
+            guard stream.recordHLSPlaylist(
+                "/audio\(plan.alternate.id).m3u8", resourceKeys: keys, now: now) else { return false }
+        }
+        if let subtitleWindow {
+            for rendition in advertisedSubtitles {
+                let keys = subtitleWindow.segments.map {
+                    VortXHLSSessionSpool.ResourceKey.subtitle(
+                        renditionID: rendition.id, segmentID: $0.id)
+                }
+                guard stream.recordHLSPlaylist(
+                    "/sub\(rendition.id).m3u8", resourceKeys: keys, now: now) else { return false }
+            }
+        }
+        return true
+    }
+
+    private func exactWindow(_ window: VortXHLSWindow, ids: [Int]) -> VortXHLSWindow? {
+        guard !ids.isEmpty, Set(ids).count == ids.count else { return nil }
+        let grouped = Dictionary(grouping: window.segments, by: \.id)
+        var selected: [VortXHLSSegment] = []
+        selected.reserveCapacity(ids.count)
+        for id in ids {
+            guard let matches = grouped[id], matches.count == 1 else { return nil }
+            selected.append(matches[0])
+        }
+        return VortXHLSWindow(segments: selected)
+    }
+
+    private func greatestCommonContiguousWindow(windows: [VortXHLSWindow],
+                                                 startingAt firstID: Int) -> VortXHLSWindow? {
+        guard firstID >= 0, let base = windows.first, !windows.isEmpty else { return nil }
+        let grouped = windows.map { Dictionary(grouping: $0.segments, by: \.id) }
+        guard grouped.allSatisfy({ $0.values.allSatisfy({ $0.count == 1 }) }),
+              let startIndex = base.segments.firstIndex(where: { $0.id == firstID }) else { return nil }
+        var expected = firstID
+        var selected: [VortXHLSSegment] = []
+        for segment in base.segments[startIndex...] {
+            guard segment.id == expected,
+                  grouped.allSatisfy({ $0[expected]?.count == 1 }) else { break }
+            selected.append(segment)
+            if expected == Int.max { break }
+            expected += 1
+        }
+        return selected.isEmpty ? nil : VortXHLSWindow(segments: selected)
+    }
+
+    /// Both video variants render the exact same coordinator-owned absolute-ID frontier.
+    private func serveMedia(_ connection: NWConnection, hdr: Bool) {
+        let path = hdr ? "/media-hdr.m3u8" : "/media.m3u8"
+        publicationLock.lock()
+        let hdrAdvertised = advertisedDolbyVision
+        publicationLock.unlock()
+        guard !hdr || hdrAdvertised,
+              let publication = waitFor(seconds: Self.resourceWaitSeconds, {
+                  self.currentPublication()
+              }) else {
             DiagnosticsLog.log("dv", "hls 404 \(path)")
             close(connection, status: "404 Not Found")
             return
         }
-        // A FAILED remux must stop feeding AVPlayer (never ENDLIST: that would end playback "successfully"
-        // mid-movie and auto-advance). 404 the reload so AVPlayer errors into the libmpv demotion.
-        if stream.buffer.status().failure != nil, !ready.ended {
+        if stream.buffer.status().failure != nil, !publication.ended {
             DiagnosticsLog.log("dv", "hls 404 \(path) (remux failed)")
             close(connection, status: "404 Not Found")
             return
         }
-        // Single-flight the held startup answers (#76): the first held request stores the segment snapshot it
-        // saw when the gate opened; every concurrent held sibling (either flavor) renders from those SAME
-        // segments. Reloads build fresh.
-        let singleFlight = !gateOpenOnEntry
-        if singleFlight {
-            mediaGateLock.lock()
-            if let cached = startupMediaList {
-                ready = Ready(window: cached.window, ended: cached.ended)
-            } else {
-                startupMediaList = (ready.window, ready.ended)
-            }
-            mediaGateLock.unlock()
-        }
-        let body = Self.buildMediaBody(window: ready.window, ended: ready.ended,
-                                       mapURI: hdr ? "init-hdr.mp4" : "init.mp4")
-        DiagnosticsLog.log("dv", "hls resp \(path) seq=\(ready.window.mediaSequence) segs=\(ready.window.segments.count) ended=\(ready.ended) \(body.count)B\(singleFlight ? " [startup single-flight]" : "")")
+        let body = Self.buildMediaBody(
+            window: publication.videoWindow,
+            ended: publication.ended,
+            mapURI: hdr ? "init-hdr.mp4" : "init.mp4")
+        DiagnosticsLog.log("dv", "hls resp \(path) seq=\(publication.videoWindow.mediaSequence) segs=\(publication.videoWindow.segments.count) ended=\(publication.ended) \(body.count)B")
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
     }
 
@@ -480,37 +801,14 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         respond(connection, body: initData, contentType: "video/mp4")
     }
 
-    /// One closed media segment, streamed out of the remux buffer in bounded chunks with send backpressure.
-    /// A segment that fell out of the sliding window 404s (fail-soft into the demotion path) BEFORE any
-    /// headers are sent; a read failure mid-body closes the connection (AVPlayer retries, then errors).
+    /// Resource lookup is independent of the current playlist window. A URI removed from a later generation
+    /// stays openable through its receipt-derived deadline, and the lease is acquired before any 200 bytes.
     private func serveSegment(_ connection: NWConnection, index: Int) {
-        let window = stream.hlsWindowSnapshot().window
-        guard let seg = window.segment(id: index) else {
-            DiagnosticsLog.log("dv", "hls 404 /seg\(index).m4s")
-            close(connection, status: "404 Not Found")
-            return
-        }
-        guard let response = VortXSegmentResponsePump(
-            source: stream.buffer,
-            offset: seg.byteOffset,
-            length: seg.byteLength,
-            chunkSize: Self.segmentChunk,
-            cancelled: { [weak self] in self?.isInvalidated ?? true }) else {
-            DiagnosticsLog.log("dv", "hls 404 /seg\(index).m4s (not resident for lease)")
-            close(connection, status: "404 Not Found")
-            return
-        }
-        DiagnosticsLog.log("dv", "hls resp /seg\(index).m4s \(seg.byteLength)B")
-        let head = "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: \(seg.byteLength)\r\nConnection: close\r\n\r\n"
-        response.start(
-            header: Data(head.utf8),
-            cancelled: { [weak self] in self?.isInvalidated ?? true },
-            send: { content, completion in
-                connection.send(content: content, completion: .contentProcessed { error in
-                    completion(error == nil)
-                })
-            },
-            terminal: { _ in connection.cancel() })
+        serveSpoolResource(
+            connection,
+            key: .video(segmentID: index),
+            path: "/seg\(index).m4s",
+            contentType: "video/mp4")
     }
 
     private static let segmentChunk = 512 * 1024
@@ -518,16 +816,17 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     // MARK: - Optional aligned audio rendition
 
     private func serveAudioPlaylist(_ connection: NWConnection, renditionID: Int) {
-        let snapshot = stream.hlsWindowSnapshot()
-        guard snapshot.audioPlan?.alternate.id == renditionID,
-              let window = snapshot.audioWindow else {
+        guard let publication = waitFor(seconds: Self.resourceWaitSeconds, {
+            self.currentPublication()
+        }), publication.audioPlan?.alternate.id == renditionID,
+              let window = publication.audioWindow else {
             close(connection, status: "404 Not Found")
             return
         }
         let lines = MultiAudioPolicy.mediaPlaylist(
             renditionID: renditionID,
             window: window,
-            ended: snapshot.ended,
+            ended: publication.ended,
             targetDuration: VortXMKVRemuxStream.hlsTargetDuration)
         let body = Data(lines.joined(separator: "\n").utf8)
         DiagnosticsLog.log("dv", "hls resp /audio\(renditionID).m3u8 seq=\(window.mediaSequence) segs=\(window.segments.count)")
@@ -535,8 +834,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     }
 
     private func serveAudioInit(_ connection: NWConnection, renditionID: Int) {
+        publicationLock.lock()
+        let advertised = advertisedAudioPlan?.alternate.id == renditionID
+        publicationLock.unlock()
         let snapshot = stream.hlsWindowSnapshot()
-        guard snapshot.audioPlan?.alternate.id == renditionID,
+        guard advertised, snapshot.audioPlan?.alternate.id == renditionID,
               let data = snapshot.audioInitData else {
             close(connection, status: "404 Not Found")
             return
@@ -547,70 +849,34 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private func serveAudioSegment(_ connection: NWConnection,
                                    renditionID: Int,
                                    segmentID: Int) {
-        let snapshot = stream.hlsWindowSnapshot()
-        guard snapshot.audioPlan?.alternate.id == renditionID,
-              let source = snapshot.audioBuffer,
-              let segment = snapshot.audioWindow?.segment(id: segmentID) else {
+        publicationLock.lock()
+        let advertised = advertisedAudioPlan?.alternate.id == renditionID
+        publicationLock.unlock()
+        guard advertised else {
             close(connection, status: "404 Not Found")
             return
         }
-        guard let response = VortXSegmentResponsePump(
-            source: source,
-            offset: segment.byteOffset,
-            length: segment.byteLength,
-            chunkSize: Self.segmentChunk,
-            cancelled: { [weak self] in self?.isInvalidated ?? true }) else {
-            close(connection, status: "404 Not Found")
-            return
-        }
-        let head = "HTTP/1.1 200 OK\r\nContent-Type: audio/mp4\r\nContent-Length: \(segment.byteLength)\r\nConnection: close\r\n\r\n"
-        response.start(
-            header: Data(head.utf8),
-            cancelled: { [weak self] in self?.isInvalidated ?? true },
-            send: { content, completion in
-                connection.send(content: content, completion: .contentProcessed { error in
-                    completion(error == nil)
-                })
-            },
-            terminal: { _ in connection.cancel() })
+        serveSpoolResource(
+            connection,
+            key: .audio(renditionID: renditionID, segmentID: segmentID),
+            path: "/audio\(renditionID)-seg\(segmentID).m4s",
+            contentType: "audio/mp4")
     }
 
     // MARK: - Optional settled subtitle renditions
 
     private func serveSubtitlePlaylist(_ connection: NWConnection, renditionID: Int) {
-        enum Probe {
-            case ready(window: VortXHLSWindow, ended: Bool)
-            case invalidated
-        }
-
-        let initial = stream.hlsWindowSnapshot()
-        guard initial.subtitleRenditions.contains(where: { $0.id == renditionID }),
-              initial.subtitleFailureReason == nil else {
-            close(connection, status: "404 Not Found")
-            return
-        }
-        let probe = waitFor(seconds: Self.resourceWaitSeconds) { () -> Probe? in
-            let snapshot = stream.hlsWindowSnapshot()
-            if snapshot.subtitleFailureReason != nil
-                || !snapshot.subtitleRenditions.contains(where: { $0.id == renditionID }) {
-                return .invalidated
-            }
-            guard let window = snapshot.subtitleWindow,
-                  !window.segments.isEmpty || snapshot.ended else { return nil }
-            return .ready(window: window, ended: snapshot.ended)
-        }
-        guard let probe else {
-            close(connection, status: "404 Not Found")
-            return
-        }
-        guard case .ready(let window, let ended) = probe else {
+        guard let publication = waitFor(seconds: Self.resourceWaitSeconds, {
+            self.currentPublication()
+        }), publication.subtitles.contains(where: { $0.id == renditionID }),
+              let window = publication.subtitleWindow else {
             close(connection, status: "404 Not Found")
             return
         }
         let lines = SubtitleRenditionPolicy.mediaPlaylist(
             renditionID: renditionID,
             window: window,
-            ended: ended,
+            ended: publication.ended,
             targetDuration: VortXMKVRemuxStream.hlsTargetDuration)
         respond(connection,
                 body: Data(lines.joined(separator: "\n").utf8),
@@ -620,20 +886,44 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private func serveSubtitleSegment(_ connection: NWConnection,
                                       renditionID: Int,
                                       segmentID: Int) {
-        let snapshot = stream.hlsWindowSnapshot()
-        guard snapshot.subtitleRenditions.contains(where: { $0.id == renditionID }),
-              renditionID >= 0,
-              renditionID < snapshot.subtitleCues.count,
-              let segment = snapshot.subtitleWindow?.segment(id: segmentID) else {
+        publicationLock.lock()
+        let advertised = advertisedSubtitles.contains(where: { $0.id == renditionID })
+        publicationLock.unlock()
+        guard advertised else {
             close(connection, status: "404 Not Found")
             return
         }
-        let cues = SubtitleRenditionPolicy.cues(
-            snapshot.subtitleCues[renditionID],
-            overlapping: segment.start,
-            end: segment.end)
-        let body = Data(SubtitleRenditionPolicy.webVTTDocument(cues: cues).utf8)
-        respond(connection, body: body, contentType: "text/vtt")
+        serveSpoolResource(
+            connection,
+            key: .subtitle(renditionID: renditionID, segmentID: segmentID),
+            path: SubtitleRenditionPolicy.segmentURI(
+                renditionID: renditionID, segmentID: segmentID),
+            contentType: "text/vtt")
+    }
+
+    private func serveSpoolResource(_ connection: NWConnection,
+                                    key: VortXHLSSessionSpool.ResourceKey,
+                                    path: String,
+                                    contentType: String) {
+        guard let lease = stream.openHLSResource(key),
+              let response = VortXSpoolResponsePump(
+                  lease: lease,
+                  chunkSize: Self.segmentChunk) else {
+            DiagnosticsLog.log("dv", "hls 404 \(path)")
+            close(connection, status: "404 Not Found")
+            return
+        }
+        DiagnosticsLog.log("dv", "hls resp \(path) \(lease.length)B")
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: \(contentType)\r\nContent-Length: \(lease.length)\r\nConnection: close\r\n\r\n"
+        response.start(
+            header: Data(head.utf8),
+            cancelled: { [weak self] in self?.isInvalidated ?? true },
+            send: { content, completion in
+                connection.send(content: content, completion: .contentProcessed { error in
+                    completion(error == nil)
+                })
+            },
+            terminal: { _ in connection.cancel() })
     }
 
     // MARK: - Response helpers

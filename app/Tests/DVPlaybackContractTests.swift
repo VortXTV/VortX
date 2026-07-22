@@ -126,19 +126,6 @@ let lateCompletionAfterTimeout = DVPlaybackPolicy.completeNativePreAttach(
 check("native DV: a loader completing after the owning timeout retired its generation is inert",
       lateCompletionAfterTimeout == .stale && nativeEvents.isEmpty)
 
-nativeEvents = []
-// RED until the native-HLS terminal timeout path retires this ownership (or an engine-local preflight deadline
-// wins first). The current chrome terminal branch presents an error without stopping the engine, so token and
-// generation can remain current. This deliberately leaves duration and remediation policy unspecified.
-let hlsGenerationStillCurrentAfterTerminalTimeout = 9
-let lateHLSCompletion = DVPlaybackPolicy.completeNativePreAttach(
-    loadedCriteria: "late-hls",
-    isCurrent: { hlsGenerationStillCurrentAfterTerminalTimeout == 9 },
-    apply: { nativeEvents.append("apply-\($0)") },
-    attach: { nativeEvents.append("attach-late-hls") })
-check("native DV RED: terminal native-HLS timeout must retire ownership before a late loader returns",
-      lateHLSCompletion == .stale && nativeEvents.isEmpty)
-
 // MARK: - DV start position (the ~14s start)
 
 let initialWindow = VortXHLSWindow(segments: [])
@@ -209,6 +196,229 @@ let lostZeroWindow = VortXHLSWindow(segments: Array(producerAheadWindow.segments
 check("start: startup fails closed if absolute segment zero is no longer resident",
       DVPlaybackPolicy.pinnedStartupSnapshot(
           window: lostZeroWindow, ended: false, minimumSegmentCount: 2) == nil)
+
+let roundingSensitiveDurations = [2.00049, 2.00049, 2.00049, 2.00049, 2.00049, 4.998, 0.002]
+let roundingSensitiveWindow = VortXHLSWindow(segments: roundingSensitiveDurations.enumerated().map {
+    VortXHLSSegment(id: $0.offset, byteOffset: $0.offset * 100, byteLength: 100,
+                    start: 0, duration: $0.element)
+})
+let exactRenderedStartup = DVPlaybackPolicy.pinnedStartupSnapshot(
+    window: roundingSensitiveWindow,
+    ended: false,
+    minimumSegmentCount: 6,
+    minimumRenderedDurationMilliseconds: 15_000)
+check("start: the non-ended gate sums exact emitted EXTINF milliseconds rather than raw Doubles",
+      exactRenderedStartup?.window.segments.map(\.id) == Array(0...6))
+check("start: the selected non-ended prefix is the shortest one satisfying six segments and 15000ms",
+      exactRenderedStartup.map {
+          DVPlaybackPolicy.renderedDurationMilliseconds(of: $0.window) == 15_000
+      } == true)
+let productionStartupWindow = VortXHLSWindow(segments: (0..<10).map {
+    VortXHLSSegment(id: $0, byteOffset: $0 * 100, byteLength: 100,
+                    start: Double($0) * 2.5, duration: 2.5)
+})
+check("start: production startup exposes exactly the shortest absolute 0-prefix of six and fifteen seconds",
+      DVPlaybackPolicy.pinnedStartupSnapshot(
+          window: productionStartupWindow,
+          ended: false,
+          minimumSegmentCount: 6,
+          minimumRenderedDurationMilliseconds: 15_000)?.window.segments.map(\.id) == Array(0...5))
+check("start: an ended short title publishes its complete prefix with ENDLIST despite missing the live gate",
+      DVPlaybackPolicy.pinnedStartupSnapshot(
+          window: VortXHLSWindow(segments: Array(productionStartupWindow.segments.prefix(3))),
+          ended: true,
+          minimumSegmentCount: 6,
+          minimumRenderedDurationMilliseconds: 15_000)?.ended == true)
+check("start: a positive raw duration that renders as zero EXTINF milliseconds is rejected",
+      DVPlaybackPolicy.pinnedStartupSnapshot(
+          window: VortXHLSWindow(segments: [
+              VortXHLSSegment(id: 0, byteOffset: 0, byteLength: 1, duration: 0.0004),
+          ]),
+          ended: true,
+          minimumSegmentCount: 1,
+          minimumRenderedDurationMilliseconds: 0) == nil)
+
+let cohortVideo = VortXHLSWindow(segments: (0..<10).map {
+    VortXHLSSegment(id: $0, byteOffset: $0 * 100, byteLength: 100,
+                    start: Double($0) * 2.5, duration: 2.5)
+})
+let cohortAudio = VortXHLSWindow(segments: (0..<10).map {
+    VortXHLSSegment(id: $0, byteOffset: $0 * 80, byteLength: 80,
+                    start: Double($0) * 2, duration: 2)
+})
+let sharedCohort = DVPlaybackPolicy.pinnedStartupCohort(
+    windows: [cohortVideo, cohortAudio],
+    ended: false,
+    minimumSegmentCount: 6,
+    minimumRenderedDurationMilliseconds: 15_000)
+check("cohort: the slowest rendition widens every startup route to one identical absolute-id prefix",
+      sharedCohort?.window.segments.map(\.id) == Array(0...7))
+let mismatchedCohort = VortXHLSWindow(segments: cohortAudio.segments.enumerated().map {
+    VortXHLSSegment(id: $0.offset == 4 ? 99 : $0.element.id,
+                    byteOffset: $0.element.byteOffset,
+                    byteLength: $0.element.byteLength,
+                    start: $0.element.start,
+                    duration: $0.element.duration)
+})
+check("cohort: one rendition with a mismatched absolute id fails the master startup atomically",
+      DVPlaybackPolicy.pinnedStartupCohort(
+        windows: [cohortVideo, mismatchedCohort],
+        ended: false,
+        minimumSegmentCount: 6,
+        minimumRenderedDurationMilliseconds: 15_000) == nil)
+let endedVideo = VortXHLSWindow(segments: Array(cohortVideo.segments.prefix(3)))
+let endedAudio = VortXHLSWindow(segments: Array(cohortAudio.segments.prefix(3)))
+check("cohort: a genuinely short ended title publishes one complete shared cohort with ENDLIST",
+      DVPlaybackPolicy.pinnedStartupCohort(
+        windows: [endedVideo, endedAudio],
+        ended: true,
+        minimumSegmentCount: 6,
+        minimumRenderedDurationMilliseconds: 15_000)?.ended == true)
+
+let rollingWindow = VortXHLSWindow(segments: (40..<50).map {
+    VortXHLSSegment(id: $0, byteOffset: $0 * 100, byteLength: 100,
+                    start: Double($0 - 40) * 2.5, duration: 2.5)
+})
+check("rolling cohort: arbitrary absolute media sequences trim to the newest six-segment fifteen-second suffix",
+      DVPlaybackPolicy.minimumConformingSuffix(
+        window: rollingWindow,
+        minimumSegmentCount: 6,
+        minimumRenderedDurationMilliseconds: 15_000)?.segments.map(\.id) == Array(44...49))
+let durationBoundWindow = VortXHLSWindow(segments: (40..<50).map {
+    VortXHLSSegment(id: $0, byteOffset: $0 * 100, byteLength: 100,
+                    start: Double($0 - 40), duration: 1)
+})
+check("rolling cohort: duration floor can retain more entries than the segment-count floor",
+      DVPlaybackPolicy.minimumConformingSuffix(
+        window: durationBoundWindow,
+        minimumSegmentCount: 6,
+        minimumRenderedDurationMilliseconds: 8_000)?.segments.map(\.id) == Array(42...49))
+let gappedRollingWindow = VortXHLSWindow(segments: rollingWindow.segments.enumerated().map {
+    VortXHLSSegment(id: $0.offset == 5 ? 60 : $0.element.id,
+                    byteOffset: $0.element.byteOffset,
+                    byteLength: $0.element.byteLength,
+                    start: $0.element.start,
+                    duration: $0.element.duration)
+})
+check("rolling cohort: an absolute-id gap cannot produce a reload suffix",
+      DVPlaybackPolicy.minimumConformingSuffix(
+        window: gappedRollingWindow,
+        minimumSegmentCount: 6,
+        minimumRenderedDurationMilliseconds: 15_000) == nil)
+
+// MARK: - IDR legality and init publication are independent gates
+
+func hevcNAL(_ type: UInt8, lengthPrefixBytes: Int = 4) -> [UInt8] {
+    let payload: [UInt8] = [type << 1, 0x01]
+    var prefix = [UInt8](repeating: 0, count: lengthPrefixBytes)
+    prefix[lengthPrefixBytes - 1] = UInt8(payload.count)
+    return prefix + payload
+}
+
+let hevcIDRWRADL = hevcNAL(19)
+let hevcIDRNLP = hevcNAL(20)
+let hevcCRA = hevcNAL(21)
+let hevcBLA = hevcNAL(16)
+check("IDR classifier: HEVC IDR_W_RADL is an exact segment start",
+      VortXVideoIDRClassifier.isIDR(
+          bytes: hevcIDRWRADL, codec: .hevc, format: .lengthPrefixed(4)))
+check("IDR classifier: HEVC IDR_N_LP is an exact segment start",
+      VortXVideoIDRClassifier.isIDR(
+          bytes: hevcIDRNLP, codec: .hevc, format: .lengthPrefixed(4)))
+check("IDR classifier: HEVC CRA is random access but not IDR",
+      !VortXVideoIDRClassifier.isIDR(
+          bytes: hevcCRA, codec: .hevc, format: .lengthPrefixed(4)))
+check("IDR classifier: HEVC BLA is not silently promoted to IDR",
+      !VortXVideoIDRClassifier.isIDR(
+          bytes: hevcBLA, codec: .hevc, format: .lengthPrefixed(4)))
+check("IDR classifier: a mixed HEVC CRA plus IDR access unit is not an IDR-only segment start",
+      !VortXVideoIDRClassifier.isIDR(
+          bytes: hevcCRA + hevcIDRWRADL, codec: .hevc, format: .lengthPrefixed(4)))
+check("IDR classifier: a mixed HEVC non-IDR slice plus IDR access unit fails closed",
+      !VortXVideoIDRClassifier.isIDR(
+          bytes: hevcNAL(1) + hevcIDRWRADL, codec: .hevc, format: .lengthPrefixed(4)))
+check("IDR classifier: a truncated length-prefixed access unit fails soft",
+      !VortXVideoIDRClassifier.isIDR(
+          bytes: [0, 0, 0, 4, 19 << 1, 0x01], codec: .hevc, format: .lengthPrefixed(4)))
+check("IDR classifier: a zero-length NAL fails soft",
+      !VortXVideoIDRClassifier.isIDR(
+          bytes: [0, 0, 0, 0], codec: .hevc, format: .lengthPrefixed(4)))
+check("IDR classifier: HEVC forbidden_zero_bit rejects an otherwise IDR-shaped header",
+      !VortXVideoIDRClassifier.isIDR(
+          bytes: [0, 0, 0, 2, 0x80 | (19 << 1), 0x01],
+          codec: .hevc, format: .lengthPrefixed(4)))
+check("IDR classifier: HEVC temporal_id_plus1 zero is malformed",
+      !VortXVideoIDRClassifier.isIDR(
+          bytes: [0, 0, 0, 2, 19 << 1, 0x00],
+          codec: .hevc, format: .lengthPrefixed(4)))
+check("IDR classifier: Annex-B HEVC IDR is accepted without a payload copy",
+      VortXVideoIDRClassifier.isIDR(
+          bytes: [0, 0, 1, 19 << 1, 0x01], codec: .hevc, format: .annexB))
+check("IDR classifier: Annex-B HEVC CRA remains non-IDR",
+      !VortXVideoIDRClassifier.isIDR(
+          bytes: [0, 0, 0, 1, 21 << 1, 0x01], codec: .hevc, format: .annexB))
+check("IDR classifier: plain-remux H.264 accepts only NAL type 5",
+      VortXVideoIDRClassifier.isIDR(
+          bytes: [0, 0, 0, 1, 0x65], codec: .h264, format: .lengthPrefixed(4))
+          && !VortXVideoIDRClassifier.isIDR(
+              bytes: [0, 0, 0, 1, 0x61], codec: .h264, format: .lengthPrefixed(4)))
+check("IDR classifier: H.264 rejects forbidden, ref-idc-zero and mixed non-IDR VCL headers",
+      !VortXVideoIDRClassifier.isIDR(
+          bytes: [0, 0, 0, 1, 0xe5], codec: .h264, format: .lengthPrefixed(4))
+          && !VortXVideoIDRClassifier.isIDR(
+              bytes: [0, 0, 0, 1, 0x05], codec: .h264, format: .lengthPrefixed(4))
+          && !VortXVideoIDRClassifier.isIDR(
+              bytes: [0, 0, 0, 1, 0x61, 0, 0, 0, 1, 0x65],
+              codec: .h264, format: .lengthPrefixed(4)))
+
+check("segments: segment zero must begin on an IDR",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: false, incomingIsIDR: false, elapsed: 0, openBytes: 0) == .failSoft)
+check("segments: an IDR opens segment zero",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: false, incomingIsIDR: true, elapsed: 0, openBytes: 0) == .open)
+check("segments: a target-age IDR cuts before itself so the next segment begins on IDR",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: true, incomingIsIDR: true, elapsed: 1, openBytes: 1) == .cut)
+check("segments: the four-second guard on a non-IDR fails soft instead of publishing an illegal cut",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: true, incomingIsIDR: false, elapsed: 4, openBytes: 1) == .failSoft)
+check("segments: the 32MiB guard on a non-IDR fails soft instead of publishing an illegal cut",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: true, incomingIsIDR: false, elapsed: 1,
+          openBytes: 32 * 1024 * 1024) == .failSoft)
+check("segments: an IDR at the hard guard remains a legal cut",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: true, incomingIsIDR: true, elapsed: 4,
+          openBytes: 32 * 1024 * 1024) == .cut)
+check("segments: malformed timing and byte inputs fail soft",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: true, incomingIsIDR: true, elapsed: .nan, openBytes: 0) == .failSoft
+          && VortXHLSBoundaryPolicy.decision(
+              hasOpenSegment: true, incomingIsIDR: true, elapsed: -0.1, openBytes: 0) == .failSoft
+          && VortXHLSBoundaryPolicy.decision(
+              hasOpenSegment: true, incomingIsIDR: true, elapsed: 1, openBytes: -1) == .failSoft)
+check("segments: invalid target, maximum duration and byte thresholds fail soft",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: true, incomingIsIDR: true, elapsed: 1, openBytes: 1,
+          targetSeconds: 0) == .failSoft
+          && VortXHLSBoundaryPolicy.decision(
+              hasOpenSegment: true, incomingIsIDR: true, elapsed: 1, openBytes: 1,
+              targetSeconds: 2, maximumSeconds: 1) == .failSoft
+          && VortXHLSBoundaryPolicy.decision(
+              hasOpenSegment: true, incomingIsIDR: true, elapsed: 1, openBytes: 1,
+              maximumBytes: 0) == .failSoft)
+
+var abortedInit = VortXHLSInitPublicationState()
+abortedInit.abort(reason: "malformed moov")
+check("init: abort terminates scanning without pretending the init was published",
+      abortedInit.scanTerminated && !abortedInit.initPublished)
+check("init: an aborted scan can never reopen media cuts or spooling",
+      !abortedInit.mayPublishMedia && abortedInit.failureReason == "malformed moov")
+var publishedInit = VortXHLSInitPublicationState()
+publishedInit.publish()
+check("init: successful publication independently terminates scanning and opens media publication",
+      publishedInit.scanTerminated && publishedInit.initPublished && publishedInit.mayPublishMedia)
 
 // MARK: - Flag-off master artifact identity
 

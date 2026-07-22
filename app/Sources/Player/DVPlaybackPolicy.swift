@@ -49,15 +49,136 @@ enum DVPlaybackPolicy {
     /// cannot carry ENDLIST while later produced segments are intentionally hidden.
     static func pinnedStartupSnapshot(window: VortXHLSWindow,
                                       ended: Bool,
-                                      minimumSegmentCount: Int) -> StartupMediaSnapshot? {
-        guard minimumSegmentCount > 0,
-              !window.segments.isEmpty,
-              window.mediaSequence == 0,
-              window.segments.count >= minimumSegmentCount || ended else { return nil }
-        let pinnedSegments = Array(window.segments.prefix(minimumSegmentCount))
+                                      minimumSegmentCount: Int,
+                                      minimumRenderedDurationMilliseconds: Int = 0) -> StartupMediaSnapshot? {
+        guard minimumSegmentCount > 0, minimumRenderedDurationMilliseconds >= 0,
+              !window.segments.isEmpty, window.mediaSequence == 0 else { return nil }
+        for (expectedID, segment) in window.segments.enumerated() where segment.id != expectedID {
+            return nil
+        }
+
+        var renderedMilliseconds = 0
+        var prefixCount: Int?
+        for (index, segment) in window.segments.enumerated() {
+            guard let milliseconds = renderedDurationMilliseconds(segment.duration) else { return nil }
+            let (sum, overflow) = renderedMilliseconds.addingReportingOverflow(milliseconds)
+            guard !overflow else { return nil }
+            renderedMilliseconds = sum
+            if index + 1 >= minimumSegmentCount,
+               renderedMilliseconds >= minimumRenderedDurationMilliseconds {
+                prefixCount = index + 1
+                break
+            }
+        }
+        // A completed short source cannot grow into the live startup threshold. Publish its complete, legal
+        // segment-zero prefix with ENDLIST. A completed source that already satisfies the threshold keeps the
+        // same capped first body as a live producer, so an ahead-of-client mux cannot widen startup to its tail.
+        guard let selectedCount = prefixCount else {
+            guard ended else { return nil }
+            return StartupMediaSnapshot(window: window, ended: true)
+        }
+        let pinnedSegments = Array(window.segments.prefix(selectedCount))
         return StartupMediaSnapshot(
             window: VortXHLSWindow(segments: pinnedSegments),
             ended: ended && pinnedSegments.count == window.segments.count)
+    }
+
+    /// Select one startup cohort shared by video, every advertised alternate-audio rendition, and subtitles.
+    /// Each rendition must independently satisfy the rendered-duration floor, and every absolute ID must match
+    /// the video base. The returned segment timing is the first window's timing; sibling routes use the same IDs
+    /// with their own EXTINF values.
+    static func pinnedStartupCohort(windows: [VortXHLSWindow],
+                                    ended: Bool,
+                                    minimumSegmentCount: Int,
+                                    minimumRenderedDurationMilliseconds: Int) -> StartupMediaSnapshot? {
+        guard let base = windows.first, !windows.isEmpty else { return nil }
+        var requiredCount = 0
+        for window in windows {
+            guard let snapshot = pinnedStartupSnapshot(
+                window: window,
+                ended: ended,
+                minimumSegmentCount: minimumSegmentCount,
+                minimumRenderedDurationMilliseconds: minimumRenderedDurationMilliseconds) else { return nil }
+            requiredCount = max(requiredCount, snapshot.window.segments.count)
+        }
+        guard requiredCount > 0, base.segments.count >= requiredCount else { return nil }
+        let ids = Array(base.segments.prefix(requiredCount).map(\.id))
+        for window in windows {
+            let prefix = VortXHLSWindow(segments: Array(window.segments.prefix(requiredCount)))
+            guard prefix.segments.map(\.id) == ids,
+                  prefix.segments.count >= minimumSegmentCount || ended,
+                  let duration = renderedDurationMilliseconds(of: prefix),
+                  duration >= minimumRenderedDurationMilliseconds || ended else { return nil }
+        }
+        let selected = VortXHLSWindow(segments: Array(base.segments.prefix(requiredCount)))
+        return StartupMediaSnapshot(
+            window: selected,
+            ended: ended && windows.allSatisfy { $0.segments.count == requiredCount })
+    }
+
+    /// Trim an already-contiguous rolling generation as far forward as possible while retaining both live
+    /// floors. The caller appends only contiguous, previously unadvertised IDs before invoking this helper.
+    static func minimumConformingSuffix(window: VortXHLSWindow,
+                                         minimumSegmentCount: Int,
+                                         minimumRenderedDurationMilliseconds: Int) -> VortXHLSWindow? {
+        guard minimumSegmentCount > 0, minimumRenderedDurationMilliseconds >= 0,
+              window.segments.count >= minimumSegmentCount else { return nil }
+        guard let firstID = window.segments.first?.id, firstID >= 0 else { return nil }
+        for (offset, segment) in window.segments.enumerated() {
+            let (expectedID, overflow) = firstID.addingReportingOverflow(offset)
+            guard !overflow, segment.id == expectedID else { return nil }
+        }
+        for index in window.segments.indices.dropFirst() {
+            let candidate = VortXHLSWindow(segments: Array(window.segments[index...]))
+            guard candidate.segments.count >= minimumSegmentCount else { break }
+            guard let duration = renderedDurationMilliseconds(of: candidate) else { return nil }
+            if duration >= minimumRenderedDurationMilliseconds { continue }
+            let previous = VortXHLSWindow(segments: Array(window.segments[(index - 1)...]))
+            return previous
+        }
+        guard let duration = renderedDurationMilliseconds(of: window),
+              duration >= minimumRenderedDurationMilliseconds else { return nil }
+        if window.segments.count == minimumSegmentCount {
+            return window
+        }
+        let last = VortXHLSWindow(segments: Array(window.segments.suffix(minimumSegmentCount)))
+        if let lastDuration = renderedDurationMilliseconds(of: last),
+           lastDuration >= minimumRenderedDurationMilliseconds {
+            return last
+        }
+        return window
+    }
+
+    /// The media renderer emits EXTINF to exactly three decimal places. Startup admission must total those
+    /// emitted values, not the source Doubles: a client sees the rendered milliseconds and RFC duration math is
+    /// defined over the distributed playlist. Parsing the shared formatter also avoids a second rounding rule.
+    static func renderedDurationMilliseconds(of window: VortXHLSWindow) -> Int? {
+        var total = 0
+        for segment in window.segments {
+            guard let milliseconds = renderedDurationMilliseconds(segment.duration) else { return nil }
+            let (sum, overflow) = total.addingReportingOverflow(milliseconds)
+            guard !overflow else { return nil }
+            total = sum
+        }
+        return total
+    }
+
+    private static func renderedDurationMilliseconds(_ duration: Double) -> Int? {
+        guard duration.isFinite, duration >= 0 else { return nil }
+        let rendered = renderedDuration(duration)
+        let fields = rendered.split(separator: ".", omittingEmptySubsequences: false)
+        guard fields.count == 2,
+              let seconds = Int(fields[0]),
+              let fraction = Int(fields[1]),
+              fields[1].count == 3 else { return nil }
+        let (scaled, multiplyOverflow) = seconds.multipliedReportingOverflow(by: 1_000)
+        let (milliseconds, addOverflow) = scaled.addingReportingOverflow(fraction)
+        guard !multiplyOverflow, !addOverflow, milliseconds > 0 else { return nil }
+        return milliseconds
+    }
+
+    private static func renderedDuration(_ duration: Double) -> String {
+        String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), duration)
     }
 
     /// Render exactly one immutable resident window. A sliding playlist cannot declare EVENT because an EVENT
@@ -76,7 +197,7 @@ enum DVPlaybackPolicy {
         }
         lines.append("#EXT-X-MAP:URI=\"\(mapURI)\"")
         for segment in window.segments {
-            lines.append(String(format: "#EXTINF:%.3f,", segment.duration))
+            lines.append("#EXTINF:\(renderedDuration(segment.duration)),")
             lines.append("seg\(segment.id).m4s")
         }
         if ended { lines.append("#EXT-X-ENDLIST") }
@@ -220,5 +341,177 @@ enum DVPlaybackPolicy {
 
     static func selectedFlags(optionCount: Int, selectedIndex: Int?) -> [Bool] {
         (0..<max(0, optionCount)).map { $0 == selectedIndex }
+    }
+}
+
+/// Exact access-unit classifier for the two video codecs the remux lane can publish. FFmpeg's KEY flag also
+/// covers HEVC CRA/BLA pictures; Apple segment independence requires IDR, so production passes the packet bytes
+/// through this parser before asking the boundary policy to open or cut a segment.
+enum VortXVideoIDRClassifier {
+    enum Codec: Equatable, Sendable { case hevc, h264 }
+    enum PacketFormat: Equatable, Sendable {
+        case lengthPrefixed(Int)
+        case annexB
+    }
+
+    static func isIDR(bytes: [UInt8], codec: Codec, format: PacketFormat) -> Bool {
+        bytes.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return false }
+            return isIDR(bytes: base, count: buffer.count, codec: codec, format: format)
+        }
+    }
+
+    static func isIDR(bytes: UnsafePointer<UInt8>, count: Int,
+                      codec: Codec, format: PacketFormat) -> Bool {
+        guard count > 0 else { return false }
+        switch format {
+        case .lengthPrefixed(let prefixBytes):
+            return lengthPrefixedContainsIDR(
+                bytes: bytes, count: count, prefixBytes: prefixBytes, codec: codec)
+        case .annexB:
+            return annexBContainsIDR(bytes: bytes, count: count, codec: codec)
+        }
+    }
+
+    private static func lengthPrefixedContainsIDR(bytes: UnsafePointer<UInt8>, count: Int,
+                                                  prefixBytes: Int, codec: Codec) -> Bool {
+        guard prefixBytes == 1 || prefixBytes == 2 || prefixBytes == 4 else { return false }
+        var cursor = 0
+        var foundIDR = false
+        while cursor < count {
+            guard prefixBytes <= count - cursor else { return false }
+            var nalLength = 0
+            for index in 0..<prefixBytes {
+                let (shifted, overflow) = nalLength.multipliedReportingOverflow(by: 256)
+                guard !overflow else { return false }
+                let (next, addOverflow) = shifted.addingReportingOverflow(Int(bytes[cursor + index]))
+                guard !addOverflow else { return false }
+                nalLength = next
+            }
+            cursor += prefixBytes
+            let headerBytes = codec == .hevc ? 2 : 1
+            guard nalLength >= headerBytes, nalLength <= count - cursor else { return false }
+            switch classifyNAL(bytes: bytes + cursor, length: nalLength, codec: codec) {
+            case .malformed, .otherVCL: return false
+            case .idrVCL: foundIDR = true
+            case .nonVCL: break
+            }
+            cursor += nalLength
+        }
+        return cursor == count && foundIDR
+    }
+
+    private static func annexBContainsIDR(bytes: UnsafePointer<UInt8>, count: Int,
+                                          codec: Codec) -> Bool {
+        guard let first = annexBStart(bytes: bytes, count: count, from: 0) else { return false }
+        for index in 0..<first.offset where bytes[index] != 0 { return false }
+        var start = first
+        var foundIDR = false
+        while true {
+            let payloadStart = start.offset + start.length
+            let next = annexBStart(bytes: bytes, count: count, from: payloadStart)
+            let payloadEnd = next?.offset ?? count
+            let headerBytes = codec == .hevc ? 2 : 1
+            guard payloadEnd - payloadStart >= headerBytes else { return false }
+            switch classifyNAL(bytes: bytes + payloadStart, length: payloadEnd - payloadStart, codec: codec) {
+            case .malformed, .otherVCL: return false
+            case .idrVCL: foundIDR = true
+            case .nonVCL: break
+            }
+            guard let next else { return foundIDR }
+            start = next
+        }
+    }
+
+    private static func annexBStart(bytes: UnsafePointer<UInt8>, count: Int,
+                                    from: Int) -> (offset: Int, length: Int)? {
+        guard from >= 0, from < count else { return nil }
+        var index = from
+        while index + 3 <= count {
+            if index + 4 <= count,
+               bytes[index] == 0, bytes[index + 1] == 0,
+               bytes[index + 2] == 0, bytes[index + 3] == 1 {
+                return (index, 4)
+            }
+            if bytes[index] == 0, bytes[index + 1] == 0, bytes[index + 2] == 1 {
+                return (index, 3)
+            }
+            index += 1
+        }
+        return nil
+    }
+
+    private enum NALClassification { case nonVCL, idrVCL, otherVCL, malformed }
+
+    private static func classifyNAL(bytes: UnsafePointer<UInt8>, length: Int,
+                                    codec: Codec) -> NALClassification {
+        switch codec {
+        case .hevc:
+            guard length >= 2,
+                  bytes[0] & 0x80 == 0,
+                  bytes[1] & 0x07 != 0 else { return .malformed }
+            let type = (bytes[0] >> 1) & 0x3f
+            guard type <= 31 else { return .nonVCL }
+            return type == 19 || type == 20 ? .idrVCL : .otherVCL
+        case .h264:
+            guard length >= 1, bytes[0] & 0x80 == 0 else { return .malformed }
+            let type = bytes[0] & 0x1f
+            let isVCL = (1...5).contains(type) || (19...21).contains(type)
+            guard isVCL else { return .nonVCL }
+            guard type == 5 else { return .otherVCL }
+            return bytes[0] & 0x60 == 0 ? .malformed : .idrVCL
+        }
+    }
+}
+
+/// Legal video segmentation decision shared by the FFmpeg owner and the standalone mutation harness. Every
+/// segment opens on the incoming packet, so segment zero and every cut packet must be IDR. The time/byte guards
+/// are safety limits, not permission to publish a non-decodable boundary.
+enum VortXHLSBoundaryPolicy {
+    enum Decision: Equatable, Sendable {
+        case open
+        case continueOpen
+        case cut
+        case failSoft
+    }
+
+    static func decision(hasOpenSegment: Bool,
+                         incomingIsIDR: Bool,
+                         elapsed: Double,
+                         openBytes: Int,
+                         targetSeconds: Double = 1,
+                         maximumSeconds: Double = 4,
+                         maximumBytes: Int = 32 * 1024 * 1024) -> Decision {
+        guard elapsed.isFinite, elapsed >= 0, openBytes >= 0,
+              targetSeconds.isFinite, targetSeconds > 0,
+              maximumSeconds.isFinite, maximumSeconds >= targetSeconds,
+              maximumBytes > 0 else { return .failSoft }
+        guard hasOpenSegment else { return incomingIsIDR ? .open : .failSoft }
+        let hardLimitReached = elapsed >= maximumSeconds || openBytes >= maximumBytes
+        if hardLimitReached { return incomingIsIDR ? .cut : .failSoft }
+        if incomingIsIDR, elapsed >= targetSeconds { return .cut }
+        return .continueOpen
+    }
+}
+
+/// The init scanner reaching a terminal state and the init becoming publishable are independent properties.
+/// An aborted scan must never masquerade as successful publication and reopen media cuts.
+struct VortXHLSInitPublicationState: Equatable, Sendable {
+    private(set) var scanTerminated = false
+    private(set) var initPublished = false
+    private(set) var failureReason: String?
+
+    var mayPublishMedia: Bool { initPublished && failureReason == nil }
+
+    mutating func publish() {
+        guard failureReason == nil else { return }
+        scanTerminated = true
+        initPublished = true
+    }
+
+    mutating func abort(reason: String) {
+        guard !initPublished else { return }
+        scanTerminated = true
+        failureReason = failureReason ?? reason
     }
 }

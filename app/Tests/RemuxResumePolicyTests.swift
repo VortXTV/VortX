@@ -109,8 +109,28 @@ check("origin latch: a mapped audio or subtitle packet cannot establish video or
 check("origin latch: an unmapped packet cannot establish video origin even if its index matches",
       !RemuxResumePolicy.canEstablishOrigin(
         packetStreamIndex: 3, baseVideoStreamIndex: 3, isMapped: false))
-check("shipping: resume remains default-off until a real launch caller is reviewed",
-      !RemuxResumePolicy.isEnabledByDefault)
+check("shipping: resume is enabled now that the pre-load origin lifecycle is wired",
+      RemuxResumePolicy.isEnabledByDefault)
+
+// MARK: - one-shot engine handoff
+
+var configuration = RemuxResumeConfiguration()
+check("configuration: no caller value means the next load has no configured origin",
+      configuration.consumeForNextLoad() == nil)
+configuration.configure(seconds: 1830.25)
+check("configuration: a nonzero source origin is stored exactly",
+      configuration.pendingOriginSeconds == 1830.25)
+check("configuration: the next load consumes the configured nonzero origin",
+      configuration.consumeForNextLoad() == 1830.25)
+check("configuration: consumption is one-shot so a later title cannot inherit it",
+      configuration.consumeForNextLoad() == nil)
+configuration.configure(seconds: .infinity)
+check("configuration: an explicit invalid value becomes an explicit start-at-zero request",
+      configuration.consumeForNextLoad() == 0)
+configuration.configure(seconds: 600)
+configuration.reset()
+check("configuration: stop/reset clears an unconsumed request",
+      configuration.consumeForNextLoad() == nil)
 
 // MARK: - presented (player clock -> source seconds)
 

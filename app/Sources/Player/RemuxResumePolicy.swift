@@ -39,9 +39,11 @@ enum RemuxResumePolicy {
 
     // MARK: - Should this mount start part-way in?
 
-    /// This policy is deliberately dark. It may be linked and tested, but no launch path may act on it until
-    /// the full origin lifecycle has an independently reviewed caller.
-    static let isEnabledByDefault = false
+    /// The launch contract is now complete: the chrome configures a one-shot origin before `loadFile`, the
+    /// AVPlayer engine consumes it before constructing the remux mount, and every reported/accepted clock is
+    /// mapped through the achieved origin. Keep this explicit so a rollback can disable the feature without
+    /// weakening the sanitisation or timeline-mapping tests below.
+    static let isEnabledByDefault = true
 
     /// The smallest resume point worth seeking the input for.
     ///
@@ -154,6 +156,30 @@ enum RemuxResumePolicy {
         let ahead = target - origin
         if ahead <= originToleranceSeconds { return .satisfied }
         return .unreachable(ahead)
+    }
+}
+
+/// One-shot handoff from player chrome to the next engine load.
+///
+/// `Double?` is intentional: `nil` means the caller did not configure this load, while `.some(0)` means it
+/// explicitly asked to begin at the start. That distinction lets an internal retry carrying the same logical
+/// load token reuse its already-consumed origin without allowing an unrelated later title to inherit it.
+struct RemuxResumeConfiguration {
+    private(set) var pendingOriginSeconds: Double?
+
+    mutating func configure(seconds: Double) {
+        pendingOriginSeconds = RemuxResumePolicy.isEnabledByDefault
+            ? RemuxResumePolicy.originRequest(resumeSeconds: seconds)
+            : 0
+    }
+
+    mutating func consumeForNextLoad() -> Double? {
+        defer { pendingOriginSeconds = nil }
+        return pendingOriginSeconds
+    }
+
+    mutating func reset() {
+        pendingOriginSeconds = nil
     }
 }
 
