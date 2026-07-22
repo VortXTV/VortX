@@ -21,10 +21,20 @@ import Foundation
 enum FMP4 {
 
     /// nil when sample-0 sync status cannot be determined from the segment alone
-    /// (no flags in trun or tfhd - would require the moov `trex` defaults).
-    static func firstSampleIsSync(_ data: Data) -> Bool? {
+    /// (no flags in trun or tfhd - would require the moov `trex` defaults), OR when the
+    /// video traf cannot be resolved.
+    ///
+    /// `videoTrackID` MUST identify the video track (resolved from the init segment's moov
+    /// via `videoTrackID(inInit:)`). We select the `traf` whose `tfhd.track_ID` matches, and
+    /// NEVER default to the first traf: a multi-track fragment that carries audio first would
+    /// otherwise false-pass the video IDR check against the audio track. When the track cannot
+    /// be identified (nil id, or no matching traf), we fail SAFE to nil (indeterminate) rather
+    /// than inspect the wrong track. A single unnamed track is still resolvable when its lone
+    /// traf matches the id.
+    static func firstSampleIsSync(_ data: Data, videoTrackID: UInt32?) -> Bool? {
         guard let moof = topLevelBox(named: "moof", in: data, from: data.startIndex) else { return nil }
-        guard let traf = childBox(named: "traf", inContainer: moof, of: data) else { return nil }
+        guard let videoTrackID else { return nil }
+        guard let traf = trafForTrack(videoTrackID, inMoof: moof, of: data) else { return nil }
 
         var defaultSampleFlags: UInt32?
         if let tfhd = childBox(named: "tfhd", inContainer: traf, of: data) {
@@ -36,6 +46,44 @@ enum FMP4 {
         if let first = trunFirstSampleFlags(trun, of: data) { return isSync(first) }
         if let perSample0 = trunFirstPerSampleFlags(trun, of: data) { return isSync(perSample0) }
         return defaultSampleFlags.map(isSync)
+    }
+
+    /// The `traf` whose `tfhd.track_ID` matches `trackID`, iterating ALL traf boxes in the moof
+    /// (not just the first). tfhd payload is version/flags(4) then track_ID(4).
+    private static func trafForTrack(_ trackID: UInt32, inMoof moof: Range<Data.Index>, of d: Data) -> Range<Data.Index>? {
+        var i = moof.lowerBound
+        while let (box, next) = nextBox(d, i, moof.upperBound) {
+            if box.type == "traf",
+               let tfhd = childBox(named: "tfhd", inContainer: box.payload, of: d),
+               tfhd.count >= 8,
+               be32(d, tfhd.lowerBound + 4) == trackID {
+                return box.payload
+            }
+            i = next
+        }
+        return nil
+    }
+
+    /// Resolve the video track's track_ID from an init segment's moov: the `trak` whose
+    /// `mdia > hdlr` handler_type is 'vide', reading its `tkhd` track_ID.
+    static func videoTrackID(inInit data: Data) -> UInt32? {
+        guard let moov = topLevelBox(named: "moov", in: data, from: data.startIndex) else { return nil }
+        var i = moov.lowerBound
+        while let (box, next) = nextBox(data, i, moov.upperBound) {
+            if box.type == "trak",
+               let mdia = childBox(named: "mdia", inContainer: box.payload, of: data),
+               let hdlr = childBox(named: "hdlr", inContainer: mdia, of: data),
+               hdlr.count >= 12,
+               String(bytes: data[(hdlr.lowerBound + 8) ..< (hdlr.lowerBound + 12)], encoding: .ascii) == "vide",
+               let tkhd = childBox(named: "tkhd", inContainer: box.payload, of: data),
+               tkhd.count >= 1 {
+                let version = data[tkhd.lowerBound]
+                let idOffset = tkhd.lowerBound + 4 + (version == 1 ? 16 : 8)   // vf(4) + [creation+mod: 16 v1 / 8 v0]
+                if idOffset + 4 <= tkhd.upperBound { return be32(data, idOffset) }
+            }
+            i = next
+        }
+        return nil
     }
 
     /// sample_is_non_sync_sample is bit 16 of the sample_flags word (ISO 14496-12).

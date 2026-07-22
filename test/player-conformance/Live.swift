@@ -81,11 +81,18 @@ enum Live {
             var ev: [String] = []
             var offenders: [Int] = []
             var checked = 0, indeterminate = 0
+            // Resolve the VIDEO track_ID from the init segment so the IDR check inspects the
+            // video traf, not the first (audio-first fragments would otherwise false-pass).
+            let videoTID: UInt32? = get(port: port, path: "/init.mp4").flatMap {
+                $0.status == 200 ? FMP4.videoTrackID(inInit: $0.body) : nil
+            }
+            if let videoTID { ev.append("resolved video track_ID \(videoTID) from init.mp4") }
+            else { ev.append("could not resolve video track_ID from init.mp4; IDR check fails safe to indeterminate") }
             if let p = parsed {
                 for seg in p.segments.prefix(segmentSampleCap) {
                     guard let r = get(port: port, path: "/seg\(seg.id).m4s"), r.status == 200 else { continue }
                     checked += 1
-                    switch FMP4.firstSampleIsSync(r.body) {
+                    switch FMP4.firstSampleIsSync(r.body, videoTrackID: videoTID) {
                     case .some(true): break
                     case .some(false): offenders.append(seg.id)
                     case .none: indeterminate += 1

@@ -89,8 +89,12 @@ func runSelfTest() -> Bool {
     expect("round-trip sees ENDLIST", rp.endlist)
 
     // fMP4 first-sample sync parser.
-    expect("synthetic sync segment reads as IDR", FMP4.firstSampleIsSync(FMP4.syntheticSegment(firstSampleSync: true)) == true)
-    expect("synthetic non-sync segment reads as non-IDR", FMP4.firstSampleIsSync(FMP4.syntheticSegment(firstSampleSync: false)) == false)
+    // The synthetic moof carries a single traf with track_ID 1, so we select it explicitly;
+    // the parser must never guess the first traf (an audio-first fragment would false-pass).
+    expect("synthetic sync segment reads as IDR", FMP4.firstSampleIsSync(FMP4.syntheticSegment(firstSampleSync: true), videoTrackID: 1) == true)
+    expect("synthetic non-sync segment reads as non-IDR", FMP4.firstSampleIsSync(FMP4.syntheticSegment(firstSampleSync: false), videoTrackID: 1) == false)
+    expect("a wrong track id yields indeterminate, never a false pass", FMP4.firstSampleIsSync(FMP4.syntheticSegment(firstSampleSync: true), videoTrackID: 99) == nil)
+    expect("a nil track id yields indeterminate, never a false pass", FMP4.firstSampleIsSync(FMP4.syntheticSegment(firstSampleSync: true), videoTrackID: nil) == nil)
 
     print(paint("== oracle self-test ==", "1"))
     var ok = true
