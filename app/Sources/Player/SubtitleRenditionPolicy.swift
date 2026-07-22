@@ -31,7 +31,7 @@ enum SubtitleRenditionPolicy {
     /// Carried as a case rather than a libav codec id because AVCodecID raw values are not stable across
     /// FFmpeg versions, and this file must stay free of libav. The caller maps `codec_id` to a case (and to
     /// `nil` for every bitmap codec) where the libav headers are already imported.
-    enum TextFormat: Equatable {
+    enum TextFormat: Equatable, Sendable {
         /// SubRip. The demuxer hands over the cue text itself, which may carry `<i>`/`<b>`/`<u>` markup that
         /// WebVTT understands unchanged.
         case subRip
@@ -50,7 +50,7 @@ enum SubtitleRenditionPolicy {
     // MARK: - Track qualification
 
     /// One TEXT subtitle track of the source, carried as plain values so this file needs no libav types.
-    struct SourceTrack: Equatable {
+    struct SourceTrack: Equatable, Sendable {
         let index: Int          // the libav input stream index; the caller's key for routing packets back
         let format: TextFormat
         let language: String    // the stream's "language" metadata tag, raw
@@ -70,13 +70,14 @@ enum SubtitleRenditionPolicy {
     }
 
     /// One subtitle rendition as it will be advertised and served.
-    struct Rendition: Equatable {
+    struct Rendition: Equatable, Sendable {
         let id: Int             // 0-based ordinal; names every URI this rendition serves
         let sourceIndex: Int
         let format: TextFormat
         let name: String        // the human label AVPlayer shows in its subtitle picker
-        let language: String    // normalised language key, or "" when the source proved none
+        let language: String    // normalised language key, or the explicit HLS fallback "und"
         let isDefault: Bool
+        let isAutoSelect: Bool
         let isForced: Bool
     }
 
@@ -162,27 +163,66 @@ enum SubtitleRenditionPolicy {
     ///     itself marked default. We never invent a default: turning subtitles on for a user who did not ask
     ///     is a worse failure than leaving them off.
     static func renditions(from tracks: [SourceTrack]) -> [Rendition] {
-        var out: [Rendition] = []
-        var taken = Set<String>()
+        var drafts: [Rendition] = []
+        var takenIdentities = Set<String>()
+        var takenNames = Set<String>()
         var defaultTaken = false
         for track in tracks {
-            if out.count >= maxRenditions { break }
+            if drafts.count >= maxRenditions { break }
             let key = languageKey(track.language)
-            let name = displayName(language: track.language, title: track.title, isForced: track.isForced)
-            let identity = "\(key)|\(track.isForced)|\(name.lowercased())"
-            if taken.contains(identity) { continue }
-            taken.insert(identity)
+            let language = isUnknownLanguage(key) ? "und" : key
+            let sourceName = displayName(language: track.language, title: track.title, isForced: track.isForced)
+            let identity = "\(language)|\(track.isForced)|\(sourceName.lowercased())"
+            if takenIdentities.contains(identity) { continue }
+            takenIdentities.insert(identity)
+
+            var name = sourceName
+            if takenNames.contains(name.lowercased()) {
+                name = "\(sourceName) (\(language.uppercased()))"
+            }
+            let disambiguationBase = name
+            var disambiguator = 1
+            while takenNames.contains(name.lowercased()) {
+                name = "\(disambiguationBase) \(disambiguator)"
+                disambiguator += 1
+            }
+            takenNames.insert(name.lowercased())
+
             let isDefault = track.isDefault && !defaultTaken
             if isDefault { defaultTaken = true }
-            out.append(Rendition(id: out.count,
-                                 sourceIndex: track.index,
-                                 format: track.format,
-                                 name: name,
-                                 language: isUnknownLanguage(key) ? "" : key,
-                                 isDefault: isDefault,
-                                 isForced: track.isForced))
+            drafts.append(Rendition(id: drafts.count,
+                                    sourceIndex: track.index,
+                                    format: track.format,
+                                    name: name,
+                                    language: language,
+                                    isDefault: isDefault,
+                                    isAutoSelect: false,
+                                    isForced: track.isForced))
         }
-        return out
+
+        // RFC 8216 requires every AUTOSELECT=YES member of one group to have a distinct selection tuple.
+        // Prefer the source's one default inside its tuple, then the first source-ordered rendition.
+        var autoSelectWinner: [String: Int] = [:]
+        for rendition in drafts where rendition.isDefault {
+            autoSelectWinner[autoSelectTuple(rendition)] = rendition.id
+        }
+        for rendition in drafts where autoSelectWinner[autoSelectTuple(rendition)] == nil {
+            autoSelectWinner[autoSelectTuple(rendition)] = rendition.id
+        }
+        return drafts.map { rendition in
+            Rendition(id: rendition.id,
+                      sourceIndex: rendition.sourceIndex,
+                      format: rendition.format,
+                      name: rendition.name,
+                      language: rendition.language,
+                      isDefault: rendition.isDefault,
+                      isAutoSelect: autoSelectWinner[autoSelectTuple(rendition)] == rendition.id,
+                      isForced: rendition.isForced)
+        }
+    }
+
+    private static func autoSelectTuple(_ rendition: Rendition) -> String {
+        "\(rendition.language)|\(rendition.isForced)"
     }
 
     // MARK: - Master playlist advertising
@@ -195,12 +235,12 @@ enum SubtitleRenditionPolicy {
     static func playlistURI(_ rendition: Rendition) -> String { "subs\(rendition.id).m3u8" }
 
     /// The URI of one WebVTT segment of a rendition, relative to the master.
-    static func segmentURI(renditionID: Int, segmentIndex: Int) -> String { "subs\(renditionID)-\(segmentIndex).vtt" }
+    static func segmentURI(renditionID: Int, segmentID: Int) -> String { "subs\(renditionID)-\(segmentID).vtt" }
 
     /// What a request path names, when it names a subtitle resource at all.
-    enum Request: Equatable {
+    enum Request: Equatable, Sendable {
         case playlist(renditionID: Int)
-        case segment(renditionID: Int, index: Int)
+        case segment(renditionID: Int, segmentID: Int)
     }
 
     /// Parse a request path into the subtitle resource it names, or nil when it names none.
@@ -218,24 +258,20 @@ enum SubtitleRenditionPolicy {
         }
         if body.hasSuffix(".vtt") {
             let parts = body.dropLast(".vtt".count).components(separatedBy: "-")
-            guard parts.count == 2, let id = Int(parts[0]), let index = Int(parts[1]),
-                  id >= 0, index >= 0 else { return nil }
-            return .segment(renditionID: id, index: index)
+            guard parts.count == 2, let id = Int(parts[0]), let segmentID = Int(parts[1]),
+                  id >= 0, segmentID >= 0 else { return nil }
+            return .segment(renditionID: id, segmentID: segmentID)
         }
         return nil
     }
 
-    /// One `EXT-X-MEDIA` line. LANGUAGE is omitted rather than written empty when the source proved no
-    /// language: an empty LANGUAGE attribute is not a valid tag value, and a rendition is still selectable by
-    /// NAME alone.
+    /// One `EXT-X-MEDIA` line. LANGUAGE is always present; unknown source metadata is represented by the
+    /// standard `und` code so every row has a valid, non-empty selection tuple.
     static func mediaTag(_ rendition: Rendition) -> String {
         var tag = "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"\(groupID)\",NAME=\"\(quoteSafe(rendition.name))\""
-        if !rendition.language.isEmpty { tag += ",LANGUAGE=\"\(rendition.language)\"" }
+        tag += ",LANGUAGE=\"\(quoteSafe(rendition.language))\""
         tag += ",DEFAULT=\(rendition.isDefault ? "YES" : "NO")"
-        // AUTOSELECT lets the player pick this rendition when the user's system language matches. A FORCED
-        // track is never auto-selected on language alone: forced subtitles are meant to follow the audio
-        // choice, and auto-selecting one puts permanent subtitles on screen for a user who asked for none.
-        tag += ",AUTOSELECT=\(rendition.isForced ? "NO" : "YES")"
+        tag += ",AUTOSELECT=\(rendition.isAutoSelect ? "YES" : "NO")"
         tag += ",FORCED=\(rendition.isForced ? "YES" : "NO")"
         tag += ",URI=\"\(playlistURI(rendition))\""
         return tag
@@ -260,26 +296,24 @@ enum SubtitleRenditionPolicy {
 
     // MARK: - Subtitle media playlist
 
-    /// A rendition's media playlist. Mirrors the VIDEO playlist's segment count and durations exactly, which
-    /// is what keeps the renditions aligned with the video timeline: the caller passes the same closed-segment
-    /// list the video playlist was built from. EVENT, MEDIA-SEQUENCE 0 and the same explicit start point as
-    /// the video playlist, for the same reason (`DVPlaybackPolicy.mediaPlaylistHeader`): without an explicit
-    /// start a client applies the live-edge rule to a playlist with no ENDLIST.
+    /// A rendition's media playlist mirrors the one immutable resident VIDEO window. Absolute ids survive
+    /// eviction, durations are inherited from video, and a sliding active playlist is never falsely EVENT.
     ///
     /// There is deliberately no `EXT-X-MAP`: WebVTT segments are self-contained documents with no init.
-    static func mediaPlaylist(renditionID: Int, segmentDurations: [Double],
+    static func mediaPlaylist(renditionID: Int, window: VortXHLSWindow,
                               ended: Bool, targetDuration: Int) -> [String] {
         var lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:7",
-            "#EXT-X-TARGETDURATION:\(targetDuration)",
-            "#EXT-X-MEDIA-SEQUENCE:0",
-            "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES",
-            "#EXT-X-PLAYLIST-TYPE:EVENT",
+            "#EXT-X-TARGETDURATION:\(max(1, targetDuration))",
+            "#EXT-X-MEDIA-SEQUENCE:\(window.mediaSequence)",
         ]
-        for (index, duration) in segmentDurations.enumerated() {
-            lines.append(String(format: "#EXTINF:%.3f,", duration))
-            lines.append(segmentURI(renditionID: renditionID, segmentIndex: index))
+        if window.mediaSequence == 0 {
+            lines.append("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES")
+        }
+        for segment in window.segments {
+            lines.append(String(format: "#EXTINF:%.3f,", segment.duration))
+            lines.append(segmentURI(renditionID: renditionID, segmentID: segment.id))
         }
         if ended { lines.append("#EXT-X-ENDLIST") }
         return lines
@@ -287,8 +321,24 @@ enum SubtitleRenditionPolicy {
 
     // MARK: - Cues
 
+    /// Bounds applied by the demux caller before it copies a packet and again before decoded text is retained.
+    /// Checked subtraction in `canStore` makes the combined bound safe even for hostile integer inputs.
+    static let maxPacketBytes = 1 << 20
+    static let maxStoredBytes = 8 << 20
+
+    static func canDecodePayload(byteCount: Int) -> Bool {
+        byteCount >= 0 && byteCount <= maxPacketBytes
+    }
+
+    static func canStore(existingBytes: Int, incomingBytes: Int) -> Bool {
+        guard existingBytes >= 0,
+              existingBytes <= maxStoredBytes,
+              canDecodePayload(byteCount: incomingBytes) else { return false }
+        return incomingBytes <= maxStoredBytes - existingBytes
+    }
+
     /// One subtitle cue on the OUTPUT timeline, in seconds.
-    struct Cue: Equatable {
+    struct Cue: Equatable, Sendable {
         let start: Double
         let end: Double
         let text: String
@@ -309,6 +359,9 @@ enum SubtitleRenditionPolicy {
     /// A cue may not outlast this. A malformed duration field (seen as multi-hour values on badly muxed rips)
     /// would otherwise pin one line on screen for the rest of the film.
     static let maxCueDuration = 30.0
+    /// Seven days is far beyond any supported playback asset while keeping millisecond conversion safely
+    /// inside `Int` on every product architecture.
+    static let maximumTimelineSeconds = 7.0 * 24 * 60 * 60
 
     /// Build one cue from a demuxed packet, or nil when the payload carries nothing displayable.
     ///
@@ -318,11 +371,15 @@ enum SubtitleRenditionPolicy {
     /// because a malformed document costs the whole rendition.
     static func cue(payload: Data, format: TextFormat,
                     startSeconds: Double, durationSeconds: Double) -> Cue? {
-        guard startSeconds >= 0, startSeconds.isFinite else { return nil }
+        guard canDecodePayload(byteCount: payload.count),
+              startSeconds >= 0,
+              startSeconds.isFinite,
+              startSeconds <= maximumTimelineSeconds else { return nil }
         guard let text = plainText(payload: payload, format: format) else { return nil }
         var duration = durationSeconds
         if !duration.isFinite || duration <= 0 { duration = fallbackCueDuration }
         duration = min(max(duration, minCueDuration), maxCueDuration)
+        guard duration <= maximumTimelineSeconds - startSeconds else { return nil }
         return Cue(start: startSeconds, end: startSeconds + duration, text: text)
     }
 
@@ -454,10 +511,15 @@ enum SubtitleRenditionPolicy {
     // MARK: - WebVTT documents
 
     /// `HH:MM:SS.mmm`, the only timestamp form WebVTT accepts for a cue over an hour, and accepted for shorter
-    /// cues too, so one form covers everything. Negative and non-finite inputs clamp to zero rather than
-    /// formatting as garbage.
+    /// cues too, so one form covers everything. Negative and non-finite inputs clamp to zero; huge positive
+    /// values clamp to the supported timeline before integer conversion, so malformed metadata cannot trap.
     static func timestamp(_ seconds: Double) -> String {
-        let safe = (seconds.isFinite && seconds > 0) ? seconds : 0
+        let safe: Double
+        if !seconds.isFinite || seconds <= 0 {
+            safe = 0
+        } else {
+            safe = min(seconds, maximumTimelineSeconds)
+        }
         let totalMillis = Int((safe * 1000).rounded())
         let millis = totalMillis % 1000
         let totalSeconds = totalMillis / 1000
@@ -475,6 +537,75 @@ enum SubtitleRenditionPolicy {
     static func cues(_ all: [Cue], overlapping start: Double, end: Double) -> [Cue] {
         guard end > start else { return [] }
         return all.filter { $0.end > start && $0.start < end }.sorted { $0.start < $1.start }
+    }
+
+    // MARK: - Global demux settlement
+
+    /// A bounded allowance for normal packet interleave. Segment completeness advances from the maximum
+    /// timestamp observed across the whole demux, never from the next subtitle packet, so a dialogue-free
+    /// stretch can still publish valid empty WebVTT segments.
+    static let interleaveMarginSeconds = 2.0
+
+    enum InvalidationReason: String, Equatable, Sendable {
+        case lateTimestampRegression
+        case timelineBounds
+        case payloadBound
+        case storedBound
+        case cueCountBound
+    }
+
+    struct SettlementState: Equatable, Sendable {
+        private var maximumGlobalTimestamp = 0.0
+        private(set) var settledBefore = 0.0
+        private(set) var isValid = true
+        private(set) var invalidationReason: InvalidationReason?
+        private var reachedEOF = false
+
+        mutating func invalidate(_ reason: InvalidationReason) {
+            guard isValid else { return }
+            isValid = false
+            invalidationReason = reason
+        }
+
+        /// Returns false and permanently invalidates this optional feature when input arrives behind the
+        /// already published frontier or outside the supported timeline.
+        mutating func observeGlobalTimestamp(_ timestamp: Double) -> Bool {
+            guard isValid else { return false }
+            guard timestamp.isFinite,
+                  timestamp >= 0,
+                  timestamp <= maximumTimelineSeconds else {
+                invalidate(.timelineBounds)
+                return false
+            }
+            guard timestamp >= settledBefore else {
+                invalidate(.lateTimestampRegression)
+                return false
+            }
+            maximumGlobalTimestamp = max(maximumGlobalTimestamp, timestamp)
+            settledBefore = max(settledBefore, maximumGlobalTimestamp - interleaveMarginSeconds)
+            return true
+        }
+
+        mutating func finish() {
+            guard isValid else { return }
+            reachedEOF = true
+            settledBefore = maximumTimelineSeconds
+        }
+
+        /// Returns the fully settled prefix of the exact resident video window. A failure is represented by
+        /// nil so the caller omits subtitle signaling; an empty-but-valid prefix is a real empty window.
+        func settledWindow(videoWindow: VortXHLSWindow) -> VortXHLSWindow? {
+            guard isValid,
+                  videoWindow.segments.allSatisfy({
+                      $0.start.isFinite && $0.duration.isFinite && $0.duration > 0
+                  }) else { return nil }
+            if reachedEOF { return videoWindow }
+            let settled = Array(videoWindow.segments.prefix {
+                $0.end <= settledBefore
+            })
+            guard !settled.isEmpty else { return nil }
+            return VortXHLSWindow(segments: settled)
+        }
     }
 
     /// A complete WebVTT segment document.

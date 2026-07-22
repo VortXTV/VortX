@@ -1,6 +1,7 @@
 // Executable harness for the remux resume (timeline origin) decisions.
 //
-//   xcrun swiftc -o /tmp/remux-resume-policy-test \
+//   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
+//     -o /tmp/remux-resume-policy-test \
 //     app/Sources/Player/RemuxResumePolicy.swift \
 //     app/Tests/RemuxResumePolicyTests.swift && /tmp/remux-resume-policy-test
 //
@@ -21,8 +22,8 @@
 
 import Foundation
 
-var failures = 0
-func check(_ name: String, _ condition: Bool) {
+@MainActor var failures = 0
+@MainActor func check(_ name: String, _ condition: Bool) {
     if condition { print("PASS  \(name)") } else { failures += 1; print("FAIL  \(name)") }
 }
 
@@ -32,10 +33,10 @@ func near(_ a: Double, _ b: Double) -> Bool { abs(a - b) < 1e-9 }
 
 @main
 enum RemuxResumePolicyTests {
-    static func main() { run() }
+    @MainActor static func main() { run() }
 }
 
-func run() {
+@MainActor func run() {
 
 // MARK: - originRequest
 
@@ -68,6 +69,48 @@ check("origin: a position just past the trivial floor is accepted",
 // exists for, and no assertion above would notice.
 check("origin: the trivial floor stays small",
       RemuxResumePolicy.minimumResumeSeconds > 0 && RemuxResumePolicy.minimumResumeSeconds <= 30)
+check("origin: the maximum is finite and comfortably above a feature film",
+      RemuxResumePolicy.maximumResumeSeconds >= 12 * 60 * 60
+        && RemuxResumePolicy.maximumResumeSeconds <= 7 * 24 * 60 * 60)
+check("origin: the exact supported maximum is accepted",
+      RemuxResumePolicy.originRequest(resumeSeconds: RemuxResumePolicy.maximumResumeSeconds)
+        == RemuxResumePolicy.maximumResumeSeconds)
+check("origin: a value above the supported maximum is refused",
+      RemuxResumePolicy.originRequest(
+        resumeSeconds: RemuxResumePolicy.maximumResumeSeconds + 1) == 0)
+check("origin: a pathological finite value is refused without conversion",
+      RemuxResumePolicy.originRequest(resumeSeconds: Double.greatestFiniteMagnitude) == 0)
+
+// MARK: - checked FFmpeg seek conversion
+
+check("timestamp: a valid resume point converts exactly to microseconds",
+      RemuxResumePolicy.seekTimestampMicroseconds(resumeSeconds: 1830.25) == 1_830_250_000)
+check("timestamp: the exact maximum converts without overflow",
+      RemuxResumePolicy.seekTimestampMicroseconds(
+        resumeSeconds: RemuxResumePolicy.maximumResumeSeconds)
+        == Int64(RemuxResumePolicy.maximumResumeSeconds * 1_000_000))
+check("timestamp: values at the trivial floor do not request an input seek",
+      RemuxResumePolicy.seekTimestampMicroseconds(
+        resumeSeconds: RemuxResumePolicy.minimumResumeSeconds) == nil)
+check("timestamp: an above-maximum or huge finite value is rejected before Int64 conversion",
+      RemuxResumePolicy.seekTimestampMicroseconds(
+        resumeSeconds: RemuxResumePolicy.maximumResumeSeconds + 1) == nil
+        && RemuxResumePolicy.seekTimestampMicroseconds(
+          resumeSeconds: Double.greatestFiniteMagnitude) == nil)
+
+// MARK: - origin latch source
+
+check("origin latch: only a mapped base-video packet may establish the timeline origin",
+      RemuxResumePolicy.canEstablishOrigin(
+        packetStreamIndex: 3, baseVideoStreamIndex: 3, isMapped: true))
+check("origin latch: a mapped audio or subtitle packet cannot establish video origin",
+      !RemuxResumePolicy.canEstablishOrigin(
+        packetStreamIndex: 4, baseVideoStreamIndex: 3, isMapped: true))
+check("origin latch: an unmapped packet cannot establish video origin even if its index matches",
+      !RemuxResumePolicy.canEstablishOrigin(
+        packetStreamIndex: 3, baseVideoStreamIndex: 3, isMapped: false))
+check("shipping: resume remains default-off until a real launch caller is reviewed",
+      !RemuxResumePolicy.isEnabledByDefault)
 
 // MARK: - presented (player clock -> source seconds)
 

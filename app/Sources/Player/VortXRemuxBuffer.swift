@@ -1,5 +1,38 @@
 import Foundation
 
+/// One published fMP4 media segment. `id` is absolute for the session and never changes when older bytes leave
+/// the resident window. Keeping this outside the FFmpeg-owning stream lets the real storage/request contract run
+/// in the standalone regression harness.
+struct VortXHLSSegment: Equatable, Sendable {
+    let id: Int
+    let byteOffset: Int
+    let byteLength: Int
+    let start: Double
+    let duration: Double
+
+    init(id: Int, byteOffset: Int, byteLength: Int, start: Double = 0, duration: Double) {
+        self.id = id
+        self.byteOffset = byteOffset
+        self.byteLength = byteLength
+        self.start = start
+        self.duration = duration
+    }
+
+    var end: Double { start + duration }
+}
+
+/// One immutable view of the media bytes the server can advertise right now. Video is the only Beta 7 consumer;
+/// future subtitle renditions must consume this same absolute-id window rather than manufacturing array offsets.
+struct VortXHLSWindow: Equatable, Sendable {
+    let segments: [VortXHLSSegment]
+
+    var mediaSequence: Int { segments.first?.id ?? 0 }
+
+    func segment(id: Int) -> VortXHLSSegment? {
+        segments.first { $0.id == id }
+    }
+}
+
 /// A thread-safe, forward-only growing byte buffer for the DV-for-MKV streaming remux (Phase 1). The remux
 /// thread (`VortXMKVRemuxStream`) appends muxed fragmented-MP4 bytes as they are produced; the local HLS
 /// server (`VortXRemuxHLSServer`, the default delivery) reads closed-segment byte ranges out of it, and the
@@ -16,8 +49,9 @@ import Foundation
 ///   handed those bytes (the init segment is not served until it is fully indexed) always sees the corrected value.
 /// - BOUNDED SLIDING WINDOW at the tail. Both deliveries consume the stream front-to-back: the legacy loader
 ///   advertises NO byte-range access (`isByteRangeAccessSupported = false`) so AVPlayer streams strictly
-///   sequentially from offset 0, and the HLS server only serves CLOSED segments of an append-only EVENT
-///   playlist, so once a byte has been read it is essentially never re-requested. We therefore drop bytes that
+///   sequentially from offset 0, and the HLS server only advertises CLOSED segments whose bytes remain in its
+///   sliding resident window. Once bytes fall below the re-read floor, their segment URIs disappear before the
+///   bytes are evicted. We therefore drop bytes that
 ///   sit well below the reader's low-water mark, keeping only a small re-read floor plus a bounded producer
 ///   lead (the producer BLOCKS in `append` once resident bytes hit floor + lead, so a slow/paused reader can
 ///   never let it run away). This caps RAM at roughly (floor + producer lead) instead of the whole
@@ -43,6 +77,8 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     private var storageBase = 0
     private var isFinished = false
     private var failureMessage: String?
+    private var nextReadLeaseID = 0
+    private var activeReadRanges: [Int: Range<Int>] = [:]
 
     /// Total bytes produced so far across the whole session (monotonic; NOT storage.count once eviction starts).
     private(set) var producedCount: Int = 0
@@ -64,7 +100,7 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// fleet dial change only ever took effect on the NEXT playback anyway, so capturing at init changes nothing
     /// observable. Floored at the two-segment design minimum so a bad remote value can never degenerate the
     /// window.
-    private let windowFloorBytes: Int = max(VortXRemuxBuffer.windowFloorMinMiB, RemoteConfig.snapshot.dvRemuxWindowMiB) * 1024 * 1024
+    private let windowFloorBytes: Int
 
     // --- F3 two-stage producer lead (ONE-LINE REVERT: delete `engineReady` + `markEngineReady` and set the
     // ceiling in `append` back to `windowFloorBytes + producerLeadFull`). The producer-lead budget is the slack
@@ -85,6 +121,13 @@ final class VortXRemuxBuffer: @unchecked Sendable {
 
     /// Bytes currently held in `storage` (delivered floor plus producer lead). Caller holds the lock.
     private var residentCount: Int { storage.count }
+
+    /// Production uses the fleet-clamped MiB floor. The explicit byte floor exists so the production buffer's
+    /// eviction contract can be executed quickly by the standalone regression harness.
+    init(windowFloorBytes: Int? = nil) {
+        self.windowFloorBytes = max(1, windowFloorBytes
+            ?? max(Self.windowFloorMinMiB, RemoteConfig.snapshot.dvRemuxWindowMiB) * 1024 * 1024)
+    }
 
     // MARK: Producer side (remux thread)
 
@@ -110,6 +153,40 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         producedCount += count
         condition.signal()
         condition.unlock()
+    }
+
+    /// Nonblocking append for an OPTIONAL producer that must never stall the primary remux thread. The caller
+    /// supplies its own finite resident cap; crossing it returns false without appending or changing buffer
+    /// status, so that caller can fail and tear down only its optional lane. The primary `append` path above is
+    /// deliberately unchanged and retains its existing backpressure contract.
+    func appendIfWithinResidentLimit(_ bytes: UnsafePointer<UInt8>, count: Int, limit: Int) -> Bool {
+        guard count > 0 else { return true }
+        condition.lock()
+        defer { condition.unlock() }
+        guard !isFinished,
+              limit >= 0,
+              residentCount <= limit,
+              count <= limit - residentCount else { return false }
+        storage.append(bytes, count: count)
+        producedCount += count
+        condition.signal()
+        return true
+    }
+
+    /// Advance an explicit retention floor without reading or copying the discarded payload. This is used by
+    /// optional renditions whose bytes may never be requested: their floor follows the first absolute segment
+    /// still resident in the primary window, while retaining the documented re-read floor behind it. Active
+    /// response leases clamp the trim further so a playlist reload cannot evict bytes beneath an open segment
+    /// response. The offset must identify an already-produced resident byte.
+    @discardableResult
+    func discardPrefix(before absoluteOffset: Int) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard absoluteOffset >= storageBase, absoluteOffset <= producedCount else { return false }
+        let floorStart = absoluteOffset > windowFloorBytes
+            ? absoluteOffset - windowFloorBytes : storageBase
+        discardPrefixLocked(before: max(storageBase, floorStart))
+        return true
     }
 
     /// F3: mark that the playback engine has reached first-frame readiness, so `append` switches from the
@@ -190,12 +267,72 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         var failure: String?    // non-nil if the remux failed OR the range fell below the evicted window
     }
 
+    /// Lifetime token for one advertised resource response. The buffer stores only the protected range, not
+    /// the token, so dropping the final reference on completion, cancellation or error deterministically
+    /// releases the lease without a buffer/token retain cycle.
+    final class ReadLease: @unchecked Sendable {
+        private weak var owner: VortXRemuxBuffer?
+        private let id: Int
+
+        fileprivate init(owner: VortXRemuxBuffer, id: Int) {
+            self.owner = owner
+            self.id = id
+        }
+
+        deinit { owner?.releaseReadLease(id: id) }
+    }
+
+    /// Protect a complete resident resource before its first byte is read. nil means the range is malformed or
+    /// no longer wholly resident, so the server can return a clean 404 before committing response headers.
+    func beginReadLease(offset: Int, length: Int) -> ReadLease? {
+        guard offset >= 0, length > 0 else { return nil }
+        let (end, overflow) = offset.addingReportingOverflow(length)
+        guard !overflow else { return nil }
+        condition.lock()
+        guard offset >= storageBase, end <= producedCount else {
+            condition.unlock()
+            return nil
+        }
+        let id = nextReadLeaseID
+        nextReadLeaseID &+= 1
+        activeReadRanges[id] = offset..<end
+        condition.unlock()
+        return ReadLease(owner: self, id: id)
+    }
+
+    private func releaseReadLease(id: Int) {
+        condition.lock()
+        activeReadRanges.removeValue(forKey: id)
+        condition.signal()
+        condition.unlock()
+    }
+
     /// Snapshot of stream state without blocking. Used by the HLS server's poll loops to detect a remux
     /// failure, and by the loader to answer a content-information request / decide whether a data request
     /// can be served immediately.
     func status() -> (produced: Int, finished: Bool, failure: String?) {
         condition.lock(); defer { condition.unlock() }
         return (producedCount, isFinished, failureMessage)
+    }
+
+    /// Absolute byte interval resident at this instant. Used for diagnostics and the executable window contract.
+    var residentByteRange: Range<Int> {
+        condition.lock(); defer { condition.unlock() }
+        return storageBase..<producedCount
+    }
+
+    /// Freeze the published segment list to ranges wholly resident in this buffer. A segment is either present in
+    /// full or omitted; partial ranges can never leak into a playlist. The returned ids remain absolute, so removing
+    /// a prefix advances MEDIA-SEQUENCE without renumbering requests.
+    func residentWindow(segments: [VortXHLSSegment]) -> VortXHLSWindow {
+        condition.lock(); defer { condition.unlock() }
+        let resident = storageBase..<producedCount
+        let readable = segments.filter { segment in
+            guard segment.byteOffset >= resident.lowerBound, segment.byteLength > 0 else { return false }
+            let (end, overflow) = segment.byteOffset.addingReportingOverflow(segment.byteLength)
+            return !overflow && end <= resident.upperBound
+        }
+        return VortXHLSWindow(segments: readable)
     }
 
     /// Copy the first `length` produced bytes, or nil if they are not (or no longer) fully resident from absolute
@@ -271,8 +408,19 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// Drop already-delivered bytes so only a `windowFloorBytes` re-read floor remains behind `readHead`.
     /// Caller holds the lock. Keeps `storageBase` and `storage` consistent (storage[0] == absolute storageBase).
     private func evictBelow(_ readHead: Int) {
+        // The two startup playlists and their first segment fetches race one another. Until AVPlayer reports
+        // readyToPlay, retain the initial bytes so every URI in that first immutable window remains readable.
+        guard engineReady else { return }
         let keepFrom = max(storageBase, readHead - windowFloorBytes)
-        let dropCount = keepFrom - storageBase
+        discardPrefixLocked(before: keepFrom)
+    }
+
+    /// Caller holds `condition`. `Data.removeFirst` advances the logical start without copying on the normal
+    /// trim path; occasional compaction releases the old backing allocation after one full floor has moved.
+    private func discardPrefixLocked(before keepFrom: Int) {
+        let leasedFloor = activeReadRanges.values.map(\.lowerBound).min()
+        let protectedKeepFrom = min(keepFrom, leasedFloor ?? keepFrom)
+        let dropCount = protectedKeepFrom - storageBase
         guard dropCount > 0, dropCount <= storage.count else { return }
         storage.removeFirst(dropCount)
         storageBase += dropCount
@@ -287,5 +435,120 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         }
         // Resident bytes dropped: wake a producer parked on the high-water mark in `append`.
         condition.signal()
+    }
+}
+
+/// Dependency-free segment response state machine shared by the video and alternate-audio HLS routes.
+/// It owns the buffer lease from the clean pre-header residency probe through every asynchronous send callback,
+/// and releases it on the first terminal edge. Only one bounded chunk is read at a time.
+final class VortXSegmentResponsePump: @unchecked Sendable {
+
+    enum Terminal: Equatable, Sendable {
+        case complete
+        case cancelled
+        case sendError
+        case readError
+    }
+
+    typealias Send = (Data, @escaping (Bool) -> Void) -> Void
+
+    private let source: VortXRemuxBuffer
+    private let chunkSize: Int
+    private var nextOffset: Int
+    private var remaining: Int
+    private var firstChunk: Data?
+    private var lease: VortXRemuxBuffer.ReadLease?
+    private var started = false
+    private var terminated = false
+
+    /// Acquires the full resource lease and probes at most one chunk before headers are committed. nil is the
+    /// clean 404 path: the range is no longer wholly resident, cancellation already won, or the first read failed.
+    init?(source: VortXRemuxBuffer,
+          offset: Int,
+          length: Int,
+          chunkSize: Int,
+          cancelled: @escaping () -> Bool) {
+        guard chunkSize > 0,
+              let lease = source.beginReadLease(offset: offset, length: length) else { return nil }
+        let first = source.read(
+            offset: offset,
+            length: min(chunkSize, length),
+            cancelled: cancelled)
+        guard first.failure == nil, !first.data.isEmpty else { return nil }
+        self.source = source
+        self.chunkSize = chunkSize
+        self.nextOffset = offset + first.data.count
+        self.remaining = length - first.data.count
+        self.firstChunk = first.data
+        self.lease = lease
+    }
+
+    /// Sends headers, the probed first chunk and each subsequent bounded chunk in strict callback order.
+    /// `send` reports only success/failure, keeping Network.framework out of this executable seam.
+    func start(header: Data,
+               cancelled: @escaping () -> Bool,
+               send: @escaping Send,
+               terminal: @escaping (Terminal) -> Void) {
+        guard !started, !terminated else { return }
+        started = true
+        guard !cancelled() else {
+            finish(.cancelled, terminal: terminal)
+            return
+        }
+        send(header) { [self] succeeded in
+            guard succeeded else {
+                finish(.sendError, terminal: terminal)
+                return
+            }
+            sendNext(cancelled: cancelled, send: send, terminal: terminal)
+        }
+    }
+
+    private func sendNext(cancelled: @escaping () -> Bool,
+                          send: @escaping Send,
+                          terminal: @escaping (Terminal) -> Void) {
+        guard !terminated else { return }
+        guard !cancelled() else {
+            finish(.cancelled, terminal: terminal)
+            return
+        }
+
+        let data: Data
+        if let firstChunk {
+            data = firstChunk
+            self.firstChunk = nil
+        } else if remaining > 0 {
+            let chunk = source.read(
+                offset: nextOffset,
+                length: min(chunkSize, remaining),
+                cancelled: cancelled)
+            guard chunk.failure == nil, !chunk.data.isEmpty else {
+                finish(cancelled() ? .cancelled : .readError, terminal: terminal)
+                return
+            }
+            data = chunk.data
+            nextOffset += data.count
+            remaining -= data.count
+        } else {
+            finish(.complete, terminal: terminal)
+            return
+        }
+
+        send(data) { [self] succeeded in
+            guard succeeded else {
+                finish(.sendError, terminal: terminal)
+                return
+            }
+            sendNext(cancelled: cancelled, send: send, terminal: terminal)
+        }
+    }
+
+    private func finish(_ outcome: Terminal,
+                        terminal: (Terminal) -> Void) {
+        guard !terminated else { return }
+        terminated = true
+        firstChunk = nil
+        lease = nil
+        terminal(outcome)
     }
 }

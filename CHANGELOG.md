@@ -4,6 +4,16 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 7 - 2026-07-21
+
+A live-player stabilization beta. Alternate-audio and embedded-text subtitle HLS lanes are present only behind default-off rollback flags for staged validation, not as user-facing Beta 7 features. Remux resume remains dark and has no player launch caller. The shipped changes below affect paths that are live today.
+
+### Fixed
+
+- **Dolby Vision playlists only advertise video that is still resident.** The local HLS playlist now contains one immutable window of complete, readable segments, carries the absolute id of its first segment as MEDIA-SEQUENCE, and resolves requests by that absolute id. Initial bytes stay resident until AVPlayer reaches readyToPlay; after that, evicted segments leave the playlist instead of remaining as links that return 404. Apple TV.
+- **Dolby Vision keeps its classified frame rate.** A local HLS asset can report no nominal frame rate even after the remux classifier found 23.976. The ready path now preserves the classified rate, never invents 60 when both sources are unknown, and scopes pending and applied display criteria to the manager that accepted them so a replacement or reset can re-apply correctly. Apple TV.
+- **AVPlayer track checkmarks follow the real selection.** Cached audio and subtitle rows rebuild after a successful manual choice, including subtitle Off, and after AVPlayer reports a system-driven media-selection change. Apple TV, iPhone, iPad, and Mac.
+
 ## 0.3.14 Beta 6 - 2026-07-20
 
 A hotfix over Beta 5. Beta 5 could not launch on Apple TV: the Settings screen had accumulated enough sections that its compiled view type grew too large for the tvOS runtime to construct at launch, and the release build (produced on a regressed CI toolchain lane) emitted it in a form the device runtime rejected, so the app crashed within a fraction of a second of starting and returned to the Home screen. Two-layer fix: the Settings screen is restructured so its type stays small regardless of how many sections it holds, and the release pipeline is pinned to the verified known-good toolchain with fail-closed minimum-OS assertions and an automatic launch-smoke check, so a build that does not open can no longer ship. Everything in Beta 5 is carried forward unchanged; iPhone, iPad, Mac, and Android were never affected.

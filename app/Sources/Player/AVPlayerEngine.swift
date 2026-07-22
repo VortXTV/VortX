@@ -48,6 +48,14 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// delivery must also prove that the AVPlayerItem generation that emitted the event is still mounted.
     private var itemGeneration: UInt64 = 0
     private(set) var activeLoadToken: PlayerLoadToken?
+    #if os(tvOS)
+    /// Current native-DV preflight. A new load/stop cancels it, and its completion must also match both the
+    /// logical load token and exact item generation before it may switch the display or attach anything.
+    private var nativePreAttachTask: Task<Void, Never>?
+    /// The exact object loaded from `AVAsset.preferredDisplayCriteria`. Ready-to-play may reapply this same
+    /// Apple-owned object if the window's display manager was replaced; it never constructs a second criterion.
+    private var nativeDisplayCriteria: AVDisplayCriteria?
+    #endif
     private var isReady = false
     private var didStart = false
     /// One fatal `endFileError` per loaded item. The item's `.failed` KVO and the failed-to-play-to-end
@@ -108,6 +116,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     private var subGroup: AVMediaSelectionGroup?
     private var audioTracks: [MPVTrack] = []
     private var subTracks: [MPVTrack] = []
+    private var selectionRefreshState = DVPlaybackPolicy.SelectionRefreshState()
     // External-subtitle rendering (add-on + community-pooled srt/vtt). AVFoundation has no API to side-load or
     // time-shift an external SRT, so VortX owns it: parse the file into cues and draw the active cue in
     // `subtitleOverlay` (a view above the AVPlayerLayer), synced to the player clock, with `setSubDelay` as an
@@ -133,43 +142,11 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     // delivery AVFoundation supports for a growing fMP4 (the progressive loader path above never framed on
     // device). Held for the whole session; torn down in stop()/loadFile().
     private var remuxHLSServer: VortXRemuxHLSServer?
-    /// Whether the forward-only DV remux is mounted for the CURRENT item (either delivery). The remux produces
-    /// bytes linearly, so a seek past what it has produced lands in bytes that do not exist yet, no frame ever
-    /// arrives, and the start watchdog demotes the whole session to libmpv (killing BOTH true DV and Atmos).
-    /// The chrome reads this for its progress-aware start watchdog, its scrub-preview ceiling, its post-exit
-    /// memory re-assert, and (still) to suppress its Continue-Watching resume seek.
-    ///
-    /// That last use is now the WRONG shape and is the one thing this engine cannot fix from inside: resuming
-    /// no longer needs a seek at all, because `resumeStartSeconds` opens the mount AT the resume point. The
-    /// chrome one-liner that would complete it is recorded on `resumeStartSeconds`. This property must keep
-    /// reporting the truth regardless, because the other three uses (the watchdog above all) are correct and
-    /// depend on it: a forward-only remux IS mounted, whatever second it starts at.
+    /// Whether the forward-only DV remux is mounted for the CURRENT item (either delivery). The chrome reads
+    /// this to suppress its Continue-Watching resume seek: the remux produces bytes linearly, so a pre-start
+    /// seek lands in bytes that do not exist yet, no frame ever arrives, and the start watchdog demotes the
+    /// whole session to libmpv (killing BOTH true DV and Atmos on every replay).
     var isRemuxMounted: Bool { remuxLoader != nil || remuxHLSServer != nil }
-
-    /// The source second the CURRENT load should start producing at, set by the launch site BEFORE `loadFile`
-    /// (the same pre-load plumbing as `contentIsDolbyVision`) and consumed by exactly that one load.
-    ///
-    /// This is how a Dolby Vision title resumes. The remux cannot be seeked once it is producing, so the
-    /// resume point has to be known before the mount exists, which is earlier than any seek the chrome can
-    /// issue: its `maybeResume` runs at duration-known, long after `loadFile` mounted the remux at 0. Setting
-    /// this instead moves the resume from a seek (impossible on a forward-only producer) to an origin
-    /// (trivial for it).
-    ///
-    /// OWED, in the chrome, outside this file's write scope: at each launch site that resolves a resume point,
-    /// assign it here before calling `loadFile`, and drop the `isRemuxMounted` early return in
-    /// `maybeResume` (TVPlayerView) so the resume is no longer suppressed. Until that lands the engine simply
-    /// never receives a resume point, `originRequest` answers 0, and every mount behaves exactly as it does
-    /// today; nothing here is load-bearing for a non-resuming play.
-    var resumeStartSeconds: Double = 0
-
-    /// The source second the mounted remux actually began producing at, latched at readyToPlay and held for
-    /// the whole item. 0 for every non-remux item, every non-resuming mount, and every mount whose input seek
-    /// failed, which is why the mapping below is inert in all of those cases.
-    ///
-    /// Latched once rather than read live because the engine reports positions ~4 Hz and answers seeks from
-    /// several surfaces: an origin that could change underneath those would put the scrubber and the progress
-    /// save on different timelines. The remux publishes it on its first packet, long before readyToPlay.
-    private var remuxTimelineOrigin: Double = 0
 
     /// Progress counters for the mounted DV remux (either delivery), or nil when no remux is mounted. The
     /// chrome's PROGRESS-AWARE start watchdog polls this ~1 Hz to tell a slow-but-alive 4K source (counters
@@ -184,12 +161,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// The furthest position the forward-only DV remux has actually produced, used to clamp forward seeks at
     /// the one engine chokepoint (`seek(to:)`) so a scrub / nudge / skip past the produced bytes can't strand
     /// the mount frameless and demote the whole true-DV session to libmpv. Prefer the item's seekable ranges
-    /// (the HLS EVENT playlist advertises produced media there); fall back to the loaded (player-buffered)
+    /// (the HLS sliding playlist advertises produced media there); fall back to the loaded (player-buffered)
     /// edge for the legacy loader delivery. 0 means "unknown / no produced edge yet" (callers do not clamp).
-    ///
-    /// In PLAYER seconds, not source seconds: it is read straight off the item's own ranges, and on a resumed
-    /// mount those begin at 0 while the film is already an origin's worth in. `RemuxResumePolicy.playerSeek`
-    /// is where the two meet, and it takes this value in exactly this unit.
     var producedEdgeSeconds: Double {
         guard let item else { return 0 }
         var edge = 0.0
@@ -240,18 +213,30 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                   reusing loadToken: PlayerLoadToken?) -> PlayerLoadToken {
         let issuedToken = loadToken ?? PlayerLoadToken()
         itemGeneration &+= 1
+        let issuedGeneration = itemGeneration
         // Invalidate first so callbacks from the retired item cannot publish during replacement setup.
         // The new logical request becomes active before any mount failure or observer can emit.
         invalidateLoadToken()
         activeLoadToken = issuedToken
+        #if os(tvOS)
+        nativePreAttachTask?.cancel()
+        nativePreAttachTask = nil
+        nativeDisplayCriteria = nil
+        #endif
         teardownObservers()
         teardownRemux()
+        // Native-DV criteria loading is asynchronous. Retire the old item now so it cannot keep playing behind
+        // the new title's preflight; the guarded attach closure below is the only place a replacement mounts.
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        item = nil
+        videoOutput = nil
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false; healthyMountRetried = false
-        remuxTimelineOrigin = 0   // a new load starts on a fresh timeline; re-latched at readyToPlay
         incompatibleEntryHandled = false; plainRemuxRetried = false
         lastLoadURL = url; lastLoadHeaders = headers; lastLoadLive = live
         videoFrameEverProduced = false; audioOverBlackSince = 0; audioOverBlackFired = false
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []; loadedChapters = []; containerFPS = 0
+        selectionRefreshState.reset()
         disableExternalSubtitle()   // a new title starts with no external overlay sub
         // Claim .playback before play so PiP and locked-screen audio work, and advertise multichannel so the
         // system passes through Atmos (#78) and applies AirPods Spatial Audio (#88). Idempotent with the
@@ -296,17 +281,9 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             && (forcePlainRemux || PlayerEngineRouter.shouldPlainRemux(url: url))
         forcePlainRemux = false
         let wantsRemux = wantsDVRemux || wantsPlainRemux
-        // RESUME: the source second this mount should BEGIN producing at. Consumed here, once, so a value set
-        // for one launch can never leak into the next load (an in-player source or episode switch must start
-        // from its own resume point, or from the beginning). 0 for everything else, which is the state that
-        // reproduces the pre-resume mount exactly. The LEGACY loader delivery below is deliberately not given
-        // an origin: it is the rollback path and gains nothing from being changed.
-        let remuxOrigin = RemuxResumePolicy.originRequest(resumeSeconds: resumeStartSeconds)
-        resumeStartSeconds = 0
         if wantsRemux, VortXRemuxHLSServer.deliveryEnabled,
            let mounted = VortXRemuxHLSServer.make(input: url, headers: headers,
-                                                  mode: wantsPlainRemux ? .plain : .dolbyVision,
-                                                  startAtSeconds: remuxOrigin) {
+                                                  mode: wantsPlainRemux ? .plain : .dolbyVision) {
             remuxHLSServer = mounted.server
             mounted.server.start()
             newAsset = AVURLAsset(url: mounted.playlistURL)
@@ -345,7 +322,6 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             newAsset = AVURLAsset(url: url, options: options)
         }
         let newItem = AVPlayerItem(asset: newAsset)
-        item = newItem
         if remuxHLSServer != nil {
             // The remux window bounds OUR buffer, but AVPlayer keeps its OWN forward buffer of the served HLS
             // and, left unset, sizes it at its discretion (hundreds of MB at 4K DV bitrates, in the SAME
@@ -358,7 +334,6 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
         ])
         newItem.add(output)
-        videoOutput = output
         #if os(tvOS)
         // TRUE DOLBY VISION: switch the panel into DV mode BEFORE the item is attached (Apple Tech Talk 503:
         // "perform this switch before assigning the AVPlayerItem"; current tvOS can even reject mismatched
@@ -378,12 +353,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             // resetting on the remux path, just deferring the request.
             DiagnosticsLog.log("dv", "Dolby Vision display switch deferred to classify (remux lane)")
         } else if contentIsDolbyVision {
-            // NATIVE DV lane (DV-flagged MP4/MOV/HLS on raw AVPlayer): the profile is NOT knowable before the
-            // item demuxes, so keep the pre-attach switch on the text-parse DV flag. The readyToPlay re-assert
-            // below corrects fps/size. An hev1/dvhe entry is re-routed to the remux lane post-attach (#76), so a
-            // genuinely undecodable native DV file does not linger switched.
-            HDRDisplayMode.request(.dolbyVision, fps: 0, width: 0, height: 0, in: nil)
-            DiagnosticsLog.log("dv", "requested Dolby Vision display mode pre-attach (native DV lane, dvFlag=true)")
+            // NATIVE DV lane: `request(... fps: 0)` was a dead pre-attach path because unknown rates are
+            // correctly rejected. The async preflight below loads Apple's own preferredDisplayCriteria, applies
+            // that exact object, then attaches. No criterion is constructed from the text-parse DV hint.
+            DiagnosticsLog.log("dv", "native Dolby Vision item awaiting asset-owned display criteria before attach")
         } else {
             // A non-DV stream loading into this SAME engine (an in-player source/episode switch) must not
             // inherit a previous title's DV criteria. Idempotent: reset only clears when criteria are set.
@@ -399,15 +372,112 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // timePos) -> on tvOS that read as "AVPlayer plays nothing" and tripped the libmpv fallback for every
         // stream. We drive our own start watchdog + stall handling, so let playback begin at the first samples.
         player.automaticallyWaitsToMinimizeStalling = false
-        player.replaceCurrentItem(with: newItem)
         player.allowsExternalPlayback = true   // AirPlay
         DiagnosticsLog.log("avplayer", "load host=\(url.host ?? "?") scheme=\(url.scheme ?? "?") ext=\(url.pathExtension) headers=\(headers?.count ?? 0) live=\(live)")
-        observe(newItem, loadToken: issuedToken)
-        // Drive the current status now: the KVO below uses [.initial, .new], but an item that is already
-        // readyToPlay at attach time still benefits from an explicit kick so play() is never skipped.
-        if newItem.status != .unknown { handleStatus(newItem, loadToken: issuedToken) }
+        #if os(tvOS)
+        if contentIsDolbyVision && !isRemuxMounted {
+            beginNativeDVPreAttach(
+                asset: newAsset,
+                item: newItem,
+                output: output,
+                loadToken: issuedToken,
+                generation: issuedGeneration)
+            return issuedToken
+        }
+        #endif
+        attachPreparedItem(
+            newItem,
+            output: output,
+            loadToken: issuedToken,
+            generation: issuedGeneration)
         return issuedToken
     }
+
+    private func pendingLoadIsCurrent(loadToken: PlayerLoadToken, generation: UInt64) -> Bool {
+        activeLoadToken == loadToken && itemGeneration == generation
+    }
+
+    /// The only initial-item attach point. There is no suspension inside this main-actor method, but each
+    /// side effect still rechecks token + generation so the ownership contract stays explicit and auditable.
+    private func attachPreparedItem(_ newItem: AVPlayerItem,
+                                    output: AVPlayerItemVideoOutput,
+                                    loadToken: PlayerLoadToken,
+                                    generation: UInt64) {
+        guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation) else { return }
+        item = newItem
+        guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation) else { return }
+        videoOutput = output
+        guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation) else { return }
+        player.replaceCurrentItem(with: newItem)
+        guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation),
+              player.currentItem === newItem else { return }
+        observe(newItem, loadToken: loadToken)
+        // KVO uses [.initial, .new], but an already-ready item still gets an explicit kick.
+        if newItem.status != .unknown { handleStatus(newItem, loadToken: loadToken) }
+    }
+
+    #if os(tvOS)
+    private func beginNativeDVPreAttach(asset: AVAsset,
+                                        item newItem: AVPlayerItem,
+                                        output: AVPlayerItemVideoOutput,
+                                        loadToken: PlayerLoadToken,
+                                        generation: UInt64) {
+        nativePreAttachTask?.cancel()
+        nativePreAttachTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let criteria = try await asset.load(.preferredDisplayCriteria)
+                guard !Task.isCancelled else { return }
+                let outcome = DVPlaybackPolicy.completeNativePreAttach(
+                    loadedCriteria: criteria,
+                    isCurrent: {
+                        self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation)
+                            && !Task.isCancelled
+                    },
+                    apply: { loadedCriteria in
+                        self.nativeDisplayCriteria = loadedCriteria
+                        let applied = HDRDisplayMode.applyNativePreferredCriteria(loadedCriteria, in: nil)
+                        DiagnosticsLog.log(
+                            "dv", "native asset-owned criteria pre-attach apply=\(applied ? "accepted" : "fail-soft") generation=\(generation)")
+                    },
+                    attach: {
+                        self.attachPreparedItem(
+                            newItem,
+                            output: output,
+                            loadToken: loadToken,
+                            generation: generation)
+                    })
+                if self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation) {
+                    self.nativePreAttachTask = nil
+                }
+                DiagnosticsLog.log("dv", "native display preflight completed outcome=\(String(describing: outcome)) generation=\(generation)")
+            } catch {
+                guard !Task.isCancelled else { return }
+                let outcome = DVPlaybackPolicy.completeNativePreAttach(
+                    loadedCriteria: Optional<AVDisplayCriteria>.none,
+                    isCurrent: {
+                        self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation)
+                            && !Task.isCancelled
+                    },
+                    apply: { _ in },
+                    attach: {
+                        self.attachPreparedItem(
+                            newItem,
+                            output: output,
+                            loadToken: loadToken,
+                            generation: generation)
+                    })
+                if self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation) {
+                    self.nativePreAttachTask = nil
+                }
+                DiagnosticsLog.log(
+                    "dv", "native preferredDisplayCriteria load failed; attach fail-soft outcome=\(String(describing: outcome)) error=\(error.localizedDescription)")
+            }
+        }
+        DiagnosticsLog.log(
+            "dv", "native display preflight started; retired item detached, existing chrome start watchdogs remain the outer slow-load bound generation=\(generation)")
+    }
+    #endif
 
     /// #147 reactive-net gate: should this item failure be retried through the PLAIN remux lane instead of
     /// demoting to libmpv? True only when ALL hold:
@@ -483,46 +553,33 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // own. A seek past the produced bytes lands in content that does not exist yet, no frame arrives, and
         // the start / stall watchdog demotes the whole true-DV session to libmpv (losing DV + Atmos). Backward
         // seeks and non-remux items are unaffected (min() only lowers the ceiling; a 0 edge is "unknown", skip).
-        // The RESUME twin of that clamp, and the source-to-player conversion, in the same one place. `seconds`
-        // arrives in SOURCE seconds (what the chrome speaks); the player's clock starts at the mount's origin.
-        // Content BEFORE the origin was never produced, so a backward scrub past it lands at the origin rather
-        // than failing. Both clamps and the conversion live in RemuxResumePolicy so they are executable.
         if isRemuxMounted {
-            clamped = RemuxResumePolicy.playerSeek(sourceSeconds: clamped,
-                                                   origin: remuxTimelineOrigin,
-                                                   producedEdgePlayerSeconds: producedEdgeSeconds)
+            let edge = producedEdgeSeconds
+            if edge > 0, clamped > edge { clamped = edge }
         }
         player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
-        // Everything REPORTED is in source seconds, so the play head, the progress save and the subtitle clock
-        // stay on the timeline the chrome understands. An origin of 0 makes this an identity.
-        let reported = RemuxResumePolicy.presented(playerSeconds: clamped, origin: remuxTimelineOrigin)
         if let item, let loadToken = activeLoadToken,
            owns(item, loadToken: loadToken) {
             emit(
                 MPVProperty.timePos,
-                PlayerTimePositionEvent(seconds: reported, loadToken: loadToken),
+                PlayerTimePositionEvent(seconds: clamped, loadToken: loadToken),
                 loadToken: loadToken
             )
         }
-        updateSubtitleOverlay(atClock: reported)   // re-check the cue now; the observer is only ~4 Hz
+        updateSubtitleOverlay(atClock: clamped)   // re-check the cue now; the observer is only ~4 Hz
     }
-    /// Relative seek. Built on `playbackPositionSeconds` (which already reports SOURCE seconds) rather than the
-    /// raw player clock, so a nudge on a resumed mount moves from where the viewer actually is; using the raw
-    /// clock would jump back to the origin on the first press.
-    func seek(by seconds: Double) { seek(to: playbackPositionSeconds + seconds) }
+    func seek(by seconds: Double) { seek(to: player.currentTime().seconds + seconds) }
 
     func setSpeed(_ speed: Double) {
         requestedRate = Float(speed)
         if player.timeControlStatus != .paused { player.rate = requestedRate }
     }
 
-    /// Live playback position in SOURCE seconds, for the wall-clock trickplay capture driver and the relative
-    /// seek below. On a resumed remux mount the player clock starts at the mount's origin, so the origin is
-    /// added back here: trickplay frames are keyed by the second of the FILM they show, not by how long this
-    /// session has been running. An unreadable clock (AVPlayer reports NaN before the first sample) answers the
-    /// origin, which is where playback is about to begin, and 0 for every mount that starts at the beginning.
+    /// Live playback position (AVPlayer currentTime), for the wall-clock trickplay capture driver. 0 / NaN
+    /// before the first sample is normalised to 0.
     var playbackPositionSeconds: Double {
-        RemuxResumePolicy.presented(playerSeconds: player.currentTime().seconds, origin: remuxTimelineOrigin)
+        let t = player.currentTime().seconds
+        return t.isFinite ? max(0, t) : 0
     }
 
     /// Live audio volume. AVPlayer.volume is a 0...1 gain; map the chrome's 0...100 scale onto it. Muting is
@@ -535,6 +592,11 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     func stop() {
         invalidateLoadToken()
         itemGeneration &+= 1
+        #if os(tvOS)
+        nativePreAttachTask?.cancel()
+        nativePreAttachTask = nil
+        nativeDisplayCriteria = nil
+        #endif
         teardownObservers()
         teardownRemux()
         #if os(tvOS)
@@ -607,8 +669,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// Select option `id` (its index in the group) on the current item, or deselect for mpv's -1 = off.
     private func select(_ id: Int, in group: AVMediaSelectionGroup?) {
         guard let group, let item = player.currentItem else { return }
-        if id < 0 { item.select(nil, in: group) }
-        else if id < group.options.count { item.select(group.options[id], in: group) }
+        let requested: AVMediaSelectionOption?
+        if id < 0 {
+            requested = nil
+        } else {
+            guard id < group.options.count else { return }
+            requested = group.options[id]
+        }
+        item.select(requested, in: group)
+        guard item.currentMediaSelection.selectedMediaOption(in: group) == requested else { return }
+        refreshSelectionTracks(for: item)
     }
 
     /// The overlay host (in `AVPlayerEngineView`) installs its subtitle overlay here so the engine can push the
@@ -646,9 +716,14 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 self.subtitleRenderer.load(cues: cues)
                 self.externalSubActive = true
                 // Turn off any embedded/HLS legible track so we don't render two subtitle streams at once.
-                if let group = self.subGroup { self.player.currentItem?.select(nil, in: group) }
+                if let group = self.subGroup, let item = self.player.currentItem {
+                    item.select(nil, in: group)
+                    if item.currentMediaSelection.selectedMediaOption(in: group) == nil {
+                        self.refreshSelectionTracks(for: item)
+                    }
+                }
                 self.subtitleOverlay?.applyStyle()
-                self.updateSubtitleOverlay(atClock: self.playbackPositionSeconds)
+                self.updateSubtitleOverlay(atClock: self.player.currentTime().seconds)
                 finish(true)
             }
         }
@@ -666,7 +741,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// as the renderer's offset, so the change is live: the next overlay update uses the new offset immediately.
     func setSubDelay(_ seconds: Double) {
         subtitleRenderer.offset = seconds
-        if externalSubActive { updateSubtitleOverlay(atClock: playbackPositionSeconds) }
+        if externalSubActive { updateSubtitleOverlay(atClock: player.currentTime().seconds) }
     }
     /// No-op: AVFoundation exposes no audio-track time offset (unlike libmpv `audio-delay`). The chrome hides
     /// the audio-sync rows when this engine is active, so this is never reached from the UI on the AVPlayer path.
@@ -984,17 +1059,12 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                       self.owns(item, loadToken: loadToken) else { return }
                 // Cheap, every tick: the play head (scrubber smoothness) and the subtitle overlay clock. These
                 // must stay at the full 0.25s cadence or the progress bar and external subs visibly lag.
-                // Reported in SOURCE seconds: on a resumed remux mount the player clock starts at the mount's
-                // origin, and this tick is what the chrome's scrubber and its periodic progress save read. An
-                // origin of 0 (every non-resuming mount) makes the conversion an identity.
-                let position = RemuxResumePolicy.presented(playerSeconds: time.seconds,
-                                                           origin: self.remuxTimelineOrigin)
                 self.emit(
                     MPVProperty.timePos,
-                    PlayerTimePositionEvent(seconds: position, loadToken: loadToken),
+                    PlayerTimePositionEvent(seconds: time.seconds, loadToken: loadToken),
                     loadToken: loadToken
                 )
-                self.updateSubtitleOverlay(atClock: position)   // sync external-sub overlay to the clock
+                self.updateSubtitleOverlay(atClock: time.seconds)   // sync external-sub overlay to the clock
                 // Gate the two EXPENSIVE side effects (the NSLock probe write and the loadedTimeRanges scan)
                 // behind the same PerformanceMode-scaled interval the libmpv path uses (0.5s reduced, else
                 // 0.25s), so a constrained device is not doing an unconditional lock + O(ranges) loop 4x/sec.
@@ -1007,7 +1077,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 if clock - self.lastProbeEmit >= minInterval {
                     self.lastProbeEmit = clock
                     let dur = self.item?.duration.seconds ?? 0
-                    VXProbeState.shared.setPlayer(pos: position.isFinite ? Int(position) : 0,
+                    VXProbeState.shared.setPlayer(pos: time.seconds.isFinite ? Int(time.seconds) : 0,
                                                   dur: dur.isFinite && dur > 0 ? Int(dur) : nil,
                                                   engine: "avplayer")
                 }
@@ -1026,15 +1096,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                         if now >= start - 1 && now <= end { aheadEdge = max(aheadEdge, end) }
                     }
                     if aheadEdge > 0 {
-                        // Emitted in SOURCE seconds, like the play head: the chrome draws this band on the
-                        // scrubber and reads it as the scrub-preview ceiling, so a resumed mount reporting a
-                        // raw player-clock edge would paint the band an origin's worth too early and pin the
-                        // preview behind the play head. The ranges themselves stay in player time above,
-                        // because that is what AVPlayer measures them in.
-                        self.emit(MPVProperty.demuxerCacheTime,
-                                  RemuxResumePolicy.presented(playerSeconds: aheadEdge,
-                                                              origin: self.remuxTimelineOrigin),
-                                  loadToken: loadToken)
+                        self.emit(MPVProperty.demuxerCacheTime, aheadEdge, loadToken: loadToken)
                     }
                 }
             }
@@ -1043,10 +1105,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                                                name: .AVPlayerItemDidPlayToEndTime, object: item)
         NotificationCenter.default.addObserver(self, selector: #selector(failedToEnd(_:)),
                                                name: .AVPlayerItemFailedToPlayToEndTime, object: item)
+        NotificationCenter.default.addObserver(self, selector: #selector(mediaSelectionDidChange(_:)),
+                                               name: AVPlayerItem.mediaSelectionDidChangeNotification,
+                                               object: item)
         #if canImport(UIKit)
         // Jetsam relief (mirrors MPVMetalViewController.shedForMemoryPressure): a paused AVPlayer keeps
         // filling its forward buffer at its own discretion, and a 4K / DV-remux HLS stream buffers
-        // hundreds of MB — on tvOS the pause also lets the screensaver (its own 4K pipeline) start on
+        // hundreds of MB; on tvOS the pause also lets the screensaver (its own 4K pipeline) start on
         // top, and jetsam reaps this app. The memory warning is the system's last call before that;
         // respond by capping the item's forward buffer so AVFoundation trims instead of being killed.
         // Registered per-load because teardownObservers() drops every observer on this object.
@@ -1078,18 +1143,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             // may re-open the same 4K stream on libmpv) is past. No-op on a non-remux item.
             remuxHLSServer?.markEngineReady()
             remuxLoader?.markEngineReady()
-            // RESUME: latch the mount's timeline origin for this item, before ANY position is reported or any
-            // seek is answered. From here the engine reports `origin + player clock` and converts every
-            // incoming seek the other way, so the chrome keeps speaking source seconds and its stored progress
-            // stays correct. 0 (the overwhelmingly common case) makes every conversion below an identity.
-            if let origin = remuxHLSServer?.timelineOriginSeconds, origin > 0 {
-                remuxTimelineOrigin = origin
-                DiagnosticsLog.log("dv", "remux timeline origin \(Int(origin))s: player clock 0 is source \(Int(origin))s")
-            }
             let dur = item.duration.seconds
             var seekable = dur.isFinite && dur > 0   // an indefinite duration is a live stream
             var emittedDuration = dur
-            // DV-REMUX KNOWN DURATION: a remux mount serves a mid-production fMP4 EVENT playlist with no
+            // DV-REMUX KNOWN DURATION: a remux mount serves a mid-production fMP4 sliding playlist with no
             // EXT-X-ENDLIST, so AVPlayerItem.duration reads INDEFINITE at readyToPlay for the whole session
             // even though the source MKV runtime is known. Left uncorrected the chrome treats the entire DV
             // play as a live stream: it never arms the launch resume floor, and disables its periodic/exit
@@ -1115,20 +1172,14 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             loadContainerFrameRate(item)       // Gap 8: cache the video track fps for the subtitle fingerprint
             if let target = pendingSeek, seekable {
                 pendingSeek = nil
-                // FORWARD-ONLY REMUX: a pre-start (resume) seek is never ISSUED on a remux mount. The remux
-                // produces bytes linearly, so seeking into not-yet-produced bytes yields no frame and the
-                // chrome's start watchdog then demotes to libmpv (HDR10 + no Atmos) on EVERY resume of a DV
-                // title. What changed is that it usually no longer needs to be issued: when the mount was
-                // opened AT the requested point (`resumeStartSeconds` -> the remux's origin seek), the target
-                // is already where playback begins and the seek is simply satisfied. A target the origin did
-                // NOT reach is still dropped, exactly as before, so the safety property is unchanged.
+                // FORWARD-ONLY REMUX: never apply a pre-start (resume) seek while the DV remux is mounted.
+                // The remux produces bytes linearly and advertises no byte-range access, so seeking into
+                // not-yet-produced bytes yields no frame and the chrome's start watchdog then demotes to
+                // libmpv (HDR10 + no Atmos) on EVERY resume of a DV title. Start at 0 instead; the chrome
+                // keeps its resume offset for progress-save continuity. Belt-and-braces with the chrome's
+                // own remux-aware resume suppression (TVPlayerView.maybeResume).
                 if isRemuxMounted {
-                    switch RemuxResumePolicy.preStartSeek(target: target, origin: remuxTimelineOrigin) {
-                    case .satisfied:
-                        DiagnosticsLog.log("dv", "pre-start seek to \(Int(target))s already satisfied by the remux origin \(Int(remuxTimelineOrigin))s")
-                    case .unreachable(let ahead):
-                        DiagnosticsLog.log("dv", "dropped pre-start resume seek to \(Int(target))s: \(Int(ahead))s past the remux origin \(Int(remuxTimelineOrigin))s and the remux is forward-only")
-                    }
+                    DiagnosticsLog.log("dv", "dropped pre-start resume seek to \(Int(target))s: DV remux is forward-only, starting from 0")
                 } else {
                     player.seek(to: CMTime(seconds: max(target, 0), preferredTimescale: 600))
                 }
@@ -1150,17 +1201,31 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 VXProbeState.shared.setPlayer(state: "playing", source: host, engine: "avplayer")
                 VXProbe.event("player", "ready \(host)")
                 #if os(tvOS)
-                // TRUE DOLBY VISION: re-assert the DV display mode with the REAL fps/size now that the item
-                // is ready (the authoritative request already fired pre-attach in loadFile, per Tech Talk 503
-                // ordering). Covers the remux lane (it only mounts for DV) AND any DV-flagged native route
-                // (DV MP4/MOV/HLS); window:nil uses HDRDisplayMode's fallback window. reset() on stop()
-                // returns the TV to its default mode.
-                if isRemuxMounted || contentIsDolbyVision {
+                // TRUE DOLBY VISION: the remux lane re-asserts its classifier-derived request now that the
+                // item has real size/rate. Native DV never constructs such a request: it only reapplies the
+                // exact AVAsset.preferredDisplayCriteria object loaded and applied before attach, which covers
+                // a replaced display manager without inventing metadata. reset() on stop returns the default.
+                if isRemuxMounted {
                     let size = item.presentationSize
-                    let fps = item.tracks.first { $0.assetTrack?.mediaType == .video }?.assetTrack?.nominalFrameRate ?? 0
-                    HDRDisplayMode.request(.dolbyVision, fps: Double(fps),
-                                           width: Int(size.width), height: Int(size.height), in: nil)
-                    VXProbe.log("dv", "AVPlayer ready -> re-asserted Dolby Vision display mode fps=\(fps) \(Int(size.width))x\(Int(size.height)) remux=\(isRemuxMounted)")
+                    let assetFPS = Double(item.tracks.first {
+                        $0.assetTrack?.mediaType == .video
+                    }?.assetTrack?.nominalFrameRate ?? 0)
+                    let classifiedFPS = remuxHLSServer?.authoritativeFrameRate ?? 0
+                    if let fps = DVPlaybackPolicy.frameRate(
+                        classified: classifiedFPS, assetTrack: assetFPS) {
+                        HDRDisplayMode.request(.dolbyVision, fps: fps,
+                                               width: Int(size.width), height: Int(size.height), in: nil)
+                        VXProbe.log("dv", "AVPlayer ready -> re-asserted Dolby Vision display mode fps=\(fps) \(Int(size.width))x\(Int(size.height)) remux=\(isRemuxMounted)")
+                    } else {
+                        VXProbe.log("dv", "AVPlayer ready -> display mode deferred: frame rate unknown \(Int(size.width))x\(Int(size.height)) remux=\(isRemuxMounted)")
+                    }
+                } else if contentIsDolbyVision, let nativeDisplayCriteria {
+                    let reapplied = HDRDisplayMode.applyNativePreferredCriteria(nativeDisplayCriteria, in: nil)
+                    VXProbe.log(
+                        "dv", "AVPlayer ready -> re-applied same asset-owned native display criteria accepted=\(reapplied)")
+                } else if contentIsDolbyVision {
+                    VXProbe.log(
+                        "dv", "AVPlayer ready -> native criteria unavailable after fail-soft preflight; no criterion constructed")
                 }
                 #endif
                 // Case-C visibility (#76 b166): a NATIVE DV mp4 reached readyToPlay on ozdek's device, played
@@ -1442,20 +1507,46 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             guard player.currentItem === item else { return }   // a newer file loaded meanwhile
             audioGroup = ag
             subGroup = sg
-            audioTracks = ag.map { Self.mpvTracks(from: $0, type: "audio", item: item) } ?? []
-            subTracks = sg.map { Self.mpvTracks(from: $0, type: "sub", item: item) } ?? []
+            // A selection notification may arrive before the groups finish loading and publish an empty
+            // snapshot. Force the newly available option topology to publish once even when both are Off.
+            selectionRefreshState.reset()
+            refreshSelectionTracks(for: item)
             applyEmbeddedSubtitleTextStyle()   // P5: style native legible tracks from the start (best-effort)
+        }
+    }
+
+    /// Rebuild cached selected flags from AVPlayer's authoritative currentMediaSelection. Called after a
+    /// successful explicit selection and from AVPlayer's system-driven selection-change notification.
+    private func refreshSelectionTracks(for item: AVPlayerItem) {
+        guard player.currentItem === item else { return }
+        let audioID = audioGroup.flatMap { Self.selectedIndex(in: $0, item: item) }
+        let subtitleID = subGroup.flatMap { Self.selectedIndex(in: $0, item: item) }
+        audioTracks = audioGroup.map { Self.mpvTracks(from: $0, type: "audio", item: item) } ?? []
+        subTracks = subGroup.map { Self.mpvTracks(from: $0, type: "sub", item: item) } ?? []
+        if selectionRefreshState.update(audio: audioID, subtitle: subtitleID) {
             emit(MPVProperty.trackList, nil)
         }
     }
 
+    private static func selectedIndex(in group: AVMediaSelectionGroup, item: AVPlayerItem) -> Int? {
+        guard let selected = item.currentMediaSelection.selectedMediaOption(in: group) else { return nil }
+        return group.options.firstIndex(of: selected)
+    }
+
     private static func mpvTracks(from group: AVMediaSelectionGroup, type: String, item: AVPlayerItem) -> [MPVTrack] {
-        let selected = item.currentMediaSelection.selectedMediaOption(in: group)
+        let selectedIndex = selectedIndex(in: group, item: item)
+        let flags = DVPlaybackPolicy.selectedFlags(optionCount: group.options.count, selectedIndex: selectedIndex)
         return group.options.enumerated().map { idx, opt in
             MPVTrack(id: idx, type: type, title: opt.displayName,
-                     lang: opt.extendedLanguageTag ?? "", selected: opt == selected,
+                     lang: opt.extendedLanguageTag ?? "", selected: flags[idx],
                      forced: opt.hasMediaCharacteristic(.containsOnlyForcedSubtitles))
         }
+    }
+
+    @objc private func mediaSelectionDidChange(_ note: Notification) {
+        guard let changedItem = note.object as? AVPlayerItem,
+              changedItem === player.currentItem else { return }
+        refreshSelectionTracks(for: changedItem)
     }
 
     private func teardownObservers() {

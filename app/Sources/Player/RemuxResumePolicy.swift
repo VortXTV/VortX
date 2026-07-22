@@ -39,6 +39,10 @@ enum RemuxResumePolicy {
 
     // MARK: - Should this mount start part-way in?
 
+    /// This policy is deliberately dark. It may be linked and tested, but no launch path may act on it until
+    /// the full origin lifecycle has an independently reviewed caller.
+    static let isEnabledByDefault = false
+
     /// The smallest resume point worth seeking the input for.
     ///
     /// Below this the seek costs a keyframe hunt (a real network round trip on a debrid link, inside the cold
@@ -47,14 +51,40 @@ enum RemuxResumePolicy {
     /// which resume points are real.
     static let minimumResumeSeconds: Double = 5.0
 
+    /// A hard conversion bound. Seven days is beyond supported media duration and keeps the FFmpeg
+    /// microsecond timestamp many orders of magnitude below `Int64.max`.
+    static let maximumResumeSeconds: Double = 7.0 * 24 * 60 * 60
+
     /// The source second the remux should begin producing at, or 0 for "start at the beginning" (which
     /// reproduces today's behavior byte for byte, because 0 disables the input seek AND the packet rebase).
     ///
     /// Returns 0 rather than the raw value for anything not worth or not safe to act on: a non-finite value, a
     /// negative one, or a position inside the trivial floor.
     static func originRequest(resumeSeconds: Double) -> Double {
-        guard resumeSeconds.isFinite, resumeSeconds > minimumResumeSeconds else { return 0 }
+        guard resumeSeconds.isFinite,
+              resumeSeconds > minimumResumeSeconds,
+              resumeSeconds <= maximumResumeSeconds else { return 0 }
         return resumeSeconds
+    }
+
+    /// Checked conversion for `av_seek_frame`'s AV_TIME_BASE timestamp. Invalid and inactive requests return
+    /// nil before any floating-point-to-integer conversion can trap.
+    static func seekTimestampMicroseconds(resumeSeconds: Double) -> Int64? {
+        let origin = originRequest(resumeSeconds: resumeSeconds)
+        guard origin > 0 else { return nil }
+        // `originRequest` has already proved 0 < origin <= seven days. At one million ticks per second the
+        // largest result is 604,800,000,000, many orders below Int64.max, so this conversion is bounded by
+        // the load-bearing maximum test rather than a second unreachable guard.
+        let microseconds = origin * 1_000_000
+        return Int64(microseconds.rounded())
+    }
+
+    /// The output timeline origin belongs to mapped base video. Audio, subtitles, data streams and unmapped
+    /// packets may arrive first after a seek, but none may establish the clock used by every video segment.
+    static func canEstablishOrigin(packetStreamIndex: Int,
+                                   baseVideoStreamIndex: Int,
+                                   isMapped: Bool) -> Bool {
+        isMapped && packetStreamIndex >= 0 && packetStreamIndex == baseVideoStreamIndex
     }
 
     // MARK: - Player time <-> source time
@@ -95,7 +125,7 @@ enum RemuxResumePolicy {
     // MARK: - The pre-start (resume) seek
 
     /// What to do with a seek that was issued BEFORE the item became playable, once it is.
-    enum PreStartSeek: Equatable {
+    enum PreStartSeek: Equatable, Sendable {
         /// The mount already starts at (or past) the requested point: there is nothing to seek. This is the
         /// case a successful origin seek produces, and it is why resume now works without seeking at all.
         case satisfied
