@@ -1,6 +1,7 @@
 // Executable harness for the remux resume (timeline origin) decisions.
 //
-//   xcrun swiftc -o /tmp/remux-resume-policy-test \
+//   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
+//     -o /tmp/remux-resume-policy-test \
 //     app/Sources/Player/RemuxResumePolicy.swift \
 //     app/Tests/RemuxResumePolicyTests.swift && /tmp/remux-resume-policy-test
 //
@@ -21,8 +22,8 @@
 
 import Foundation
 
-var failures = 0
-func check(_ name: String, _ condition: Bool) {
+@MainActor var failures = 0
+@MainActor func check(_ name: String, _ condition: Bool) {
     if condition { print("PASS  \(name)") } else { failures += 1; print("FAIL  \(name)") }
 }
 
@@ -32,10 +33,10 @@ func near(_ a: Double, _ b: Double) -> Bool { abs(a - b) < 1e-9 }
 
 @main
 enum RemuxResumePolicyTests {
-    static func main() { run() }
+    @MainActor static func main() { run() }
 }
 
-func run() {
+@MainActor func run() {
 
 // MARK: - originRequest
 
@@ -68,6 +69,68 @@ check("origin: a position just past the trivial floor is accepted",
 // exists for, and no assertion above would notice.
 check("origin: the trivial floor stays small",
       RemuxResumePolicy.minimumResumeSeconds > 0 && RemuxResumePolicy.minimumResumeSeconds <= 30)
+check("origin: the maximum is finite and comfortably above a feature film",
+      RemuxResumePolicy.maximumResumeSeconds >= 12 * 60 * 60
+        && RemuxResumePolicy.maximumResumeSeconds <= 7 * 24 * 60 * 60)
+check("origin: the exact supported maximum is accepted",
+      RemuxResumePolicy.originRequest(resumeSeconds: RemuxResumePolicy.maximumResumeSeconds)
+        == RemuxResumePolicy.maximumResumeSeconds)
+check("origin: a value above the supported maximum is refused",
+      RemuxResumePolicy.originRequest(
+        resumeSeconds: RemuxResumePolicy.maximumResumeSeconds + 1) == 0)
+check("origin: a pathological finite value is refused without conversion",
+      RemuxResumePolicy.originRequest(resumeSeconds: Double.greatestFiniteMagnitude) == 0)
+
+// MARK: - checked FFmpeg seek conversion
+
+check("timestamp: a valid resume point converts exactly to microseconds",
+      RemuxResumePolicy.seekTimestampMicroseconds(resumeSeconds: 1830.25) == 1_830_250_000)
+check("timestamp: the exact maximum converts without overflow",
+      RemuxResumePolicy.seekTimestampMicroseconds(
+        resumeSeconds: RemuxResumePolicy.maximumResumeSeconds)
+        == Int64(RemuxResumePolicy.maximumResumeSeconds * 1_000_000))
+check("timestamp: values at the trivial floor do not request an input seek",
+      RemuxResumePolicy.seekTimestampMicroseconds(
+        resumeSeconds: RemuxResumePolicy.minimumResumeSeconds) == nil)
+check("timestamp: an above-maximum or huge finite value is rejected before Int64 conversion",
+      RemuxResumePolicy.seekTimestampMicroseconds(
+        resumeSeconds: RemuxResumePolicy.maximumResumeSeconds + 1) == nil
+        && RemuxResumePolicy.seekTimestampMicroseconds(
+          resumeSeconds: Double.greatestFiniteMagnitude) == nil)
+
+// MARK: - origin latch source
+
+check("origin latch: only a mapped base-video packet may establish the timeline origin",
+      RemuxResumePolicy.canEstablishOrigin(
+        packetStreamIndex: 3, baseVideoStreamIndex: 3, isMapped: true))
+check("origin latch: a mapped audio or subtitle packet cannot establish video origin",
+      !RemuxResumePolicy.canEstablishOrigin(
+        packetStreamIndex: 4, baseVideoStreamIndex: 3, isMapped: true))
+check("origin latch: an unmapped packet cannot establish video origin even if its index matches",
+      !RemuxResumePolicy.canEstablishOrigin(
+        packetStreamIndex: 3, baseVideoStreamIndex: 3, isMapped: false))
+check("shipping: resume is enabled now that the pre-load origin lifecycle is wired",
+      RemuxResumePolicy.isEnabledByDefault)
+
+// MARK: - one-shot engine handoff
+
+var configuration = RemuxResumeConfiguration()
+check("configuration: no caller value means the next load has no configured origin",
+      configuration.consumeForNextLoad() == nil)
+configuration.configure(seconds: 1830.25)
+check("configuration: a nonzero source origin is stored exactly",
+      configuration.pendingOriginSeconds == 1830.25)
+check("configuration: the next load consumes the configured nonzero origin",
+      configuration.consumeForNextLoad() == 1830.25)
+check("configuration: consumption is one-shot so a later title cannot inherit it",
+      configuration.consumeForNextLoad() == nil)
+configuration.configure(seconds: .infinity)
+check("configuration: an explicit invalid value becomes an explicit start-at-zero request",
+      configuration.consumeForNextLoad() == 0)
+configuration.configure(seconds: 600)
+configuration.reset()
+check("configuration: stop/reset clears an unconsumed request",
+      configuration.consumeForNextLoad() == nil)
 
 // MARK: - presented (player clock -> source seconds)
 
@@ -90,6 +153,59 @@ check("presented: a negative clock cannot report earlier than the origin",
       near(RemuxResumePolicy.presented(playerSeconds: -3, origin: 1830), 1830))
 
 // MARK: - playerSeek (source seconds -> player clock, clamped)
+
+// Regression: AVPlayer's duration is in PLAYER time after an origin remux. Clamping the SOURCE request to
+// that value before subtracting the origin turns a valid 5000s source seek into player second zero. The source
+// duration must win in source space first, then the mapped player target may be bounded in player space.
+check("seek: source duration clamps before origin mapping and player bounds",
+      near(RemuxResumePolicy.playerSeek(
+        sourceSeconds: 5000,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 3600,
+        producedEdgePlayerSeconds: 2000), 1400))
+check("seek: a source target before the resumed origin still maps to player zero",
+      near(RemuxResumePolicy.playerSeek(
+        sourceSeconds: 1200,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 3600,
+        producedEdgePlayerSeconds: 2000), 0))
+check("seek: the authoritative source end is applied before the player-duration end",
+      near(RemuxResumePolicy.playerSeek(
+        sourceSeconds: 9000,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 3600,
+        producedEdgePlayerSeconds: 5000), 3599))
+
+// A remux duration is reported in SOURCE time. Prefer the demuxer's authoritative duration even when
+// AVPlayer returns a finite player duration; if the source duration is unavailable, add the origin to that
+// finite player duration. The same helper must leave every non-remux duration byte-for-byte unchanged.
+check("duration: authoritative remux source duration wins over finite player duration",
+      near(RemuxResumePolicy.reportedDuration(
+        playerDurationSeconds: 3600,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: 7200,
+        isRemuxMounted: true), 7200))
+check("duration: authoritative remux source duration wins over indefinite player duration",
+      near(RemuxResumePolicy.reportedDuration(
+        playerDurationSeconds: Double.nan,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: 7200,
+        isRemuxMounted: true), 7200))
+check("duration: unknown remux source falls back to origin plus finite player duration",
+      near(RemuxResumePolicy.reportedDuration(
+        playerDurationSeconds: 3600,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: nil,
+        isRemuxMounted: true), 7200))
+check("duration: non-remux duration is an exact identity",
+      RemuxResumePolicy.reportedDuration(
+        playerDurationSeconds: 3600,
+        origin: 3600,
+        authoritativeSourceDurationSeconds: 7200,
+        isRemuxMounted: false) == 3600)
 
 // The ordinary case: a scrub inside the produced band converts by subtracting the origin.
 check("seek: a target inside the produced band converts by subtracting the origin",

@@ -31,6 +31,10 @@ protocol PlayerEngine: AnyObject {
     /// the engine is between requests, was invalidated, or has stopped.
     var activeLoadToken: PlayerLoadToken? { get }
     func invalidateLoadToken()
+    /// Configure the SOURCE-timeline second at which the next logical load should begin. AVPlayer consumes
+    /// this before a remux mount is constructed; engines without a remux-origin path use the no-op default.
+    /// The value is one-shot so an unrelated later title can never inherit an earlier resume point.
+    func configureResumeOrigin(seconds: Double)
     /// The launch site sets this from the stream's Dolby Vision flag BEFORE `loadFile`. The AVPlayer lane
     /// (true DV) uses it to switch the Apple TV into Dolby Vision mode before the item attaches; the libmpv
     /// lane renders DV as a tone-mapped PQ base layer, so it requests only HDR10 (a decoded-pixel pipeline
@@ -55,6 +59,9 @@ protocol PlayerEngine: AnyObject {
     func setSubtitleTrack(_ id: Int)
     func addExternalSubtitle(url: String, title: String, lang: String,
                              timeout: TimeInterval, completion: ((Bool) -> Void)?)
+    /// Whether the currently selected subtitle path can apply `setSubDelay` live. libmpv supports this for
+    /// every selected subtitle; AVPlayer supports it only while the VortX external-cue overlay is active.
+    var subtitleDelayAvailable: Bool { get }
     func setSubDelay(_ seconds: Double)
     func setAudioDelay(_ seconds: Double)
     func applySubtitleStyle()
@@ -98,6 +105,14 @@ protocol PlayerEngine: AnyObject {
 }
 
 extension PlayerEngine {
+    /// libmpv already receives its resume as an ordinary post-load seek. Only the AVPlayer remux lane needs a
+    /// pre-mount origin, so other engines intentionally ignore this one-shot configuration call.
+    func configureResumeOrigin(seconds: Double) {}
+
+    /// libmpv is the established full-capability path. The AVPlayer conformer overrides this with its
+    /// current-track external-overlay state, so adding the capability does not widen every concrete engine.
+    var subtitleDelayAvailable: Bool { true }
+
     /// The chrome calls `addExternalSubtitle(url:title:lang:)` (the rest defaulted). Protocol requirements
     /// can't carry default values, so this convenience forwards to the full requirement — needed once the
     /// chrome holds the engine as `any PlayerEngine`. `MPVMetalViewController`'s own defaulted overload still

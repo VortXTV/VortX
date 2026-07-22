@@ -1,6 +1,8 @@
 // Executable harness for the embedded-subtitle rendition decisions.
 //
-//   xcrun swiftc -o /tmp/subtitle-rendition-policy-test \
+//   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
+//     -o /tmp/subtitle-rendition-policy-test \
+//     app/Sources/Player/VortXRemuxBuffer.swift \
 //     app/Sources/Player/SubtitleRenditionPolicy.swift \
 //     app/Tests/SubtitleRenditionPolicyTests.swift && /tmp/subtitle-rendition-policy-test
 //
@@ -20,8 +22,13 @@
 
 import Foundation
 
-var failures = 0
-func check(_ name: String, _ condition: Bool) {
+struct RemoteConfig {
+    struct Snapshot { let dvRemuxWindowMiB: Int }
+    static let snapshot = Snapshot(dvRemuxWindowMiB: 64)
+}
+
+@MainActor var failures = 0
+@MainActor func check(_ name: String, _ condition: Bool) {
     if condition { print("PASS  \(name)") } else { failures += 1; print("FAIL  \(name)") }
 }
 
@@ -59,10 +66,10 @@ func parseVTT(_ document: String) -> (header: String, cues: [(time: String, body
 // is a function invoked from `@main`, matching the other standalone suites in this directory.
 @main
 enum SubtitleRenditionPolicyTests {
-    static func main() { run() }
+    @MainActor static func main() { run() }
 }
 
-func run() {
+@MainActor func run() {
 
 // MARK: - Language + naming
 
@@ -117,10 +124,10 @@ check("renditions: a source with no default track gets no default",
       Policy.renditions(from: [
         Track(index: 1, format: .subRip, language: "eng", title: "", isDefault: false, isForced: false),
       ]).allSatisfy { !$0.isDefault })
-check("renditions: an unknown language is published as no language",
+check("renditions: an unknown language is published explicitly as und",
       Policy.renditions(from: [
         Track(index: 1, format: .subRip, language: "und", title: "Commentary", isDefault: false, isForced: false),
-      ]).first?.language == "")
+      ]).first?.language == "und")
 check("renditions: a known language is published normalised",
       Policy.renditions(from: [
         Track(index: 1, format: .subRip, language: "ENG", title: "", isDefault: false, isForced: false),
@@ -135,6 +142,31 @@ check("renditions: one under the cap is not capped",
       Policy.renditions(from: Array(many.prefix(Policy.maxRenditions - 1))).count == Policy.maxRenditions - 1)
 check("renditions: exactly the cap is not truncated further",
       Policy.renditions(from: Array(many.prefix(Policy.maxRenditions))).count == Policy.maxRenditions)
+
+let collidingMetadata = Policy.renditions(from: [
+    Track(index: 10, format: .subRip, language: "eng", title: "Main", isDefault: false, isForced: false),
+    Track(index: 11, format: .subRip, language: "spa", title: "Main", isDefault: false, isForced: false),
+    Track(index: 12, format: .subRip, language: "eng", title: "Commentary", isDefault: true, isForced: false),
+    Track(index: 13, format: .subRip, language: "eng", title: "Forced", isDefault: false, isForced: true),
+])
+check("renditions: colliding source titles become unique advertised names",
+      Set(collidingMetadata.map { $0.name.lowercased() }).count == collidingMetadata.count)
+let chainedNameCollision = Policy.renditions(from: [
+    Track(index: 1, format: .subRip, language: "eng", title: "Main", isDefault: false, isForced: false),
+    Track(index: 2, format: .subRip, language: "spa", title: "Main (SPA)", isDefault: false, isForced: false),
+    Track(index: 3, format: .subRip, language: "fre", title: "Main (SPA) 12", isDefault: false, isForced: false),
+    Track(index: 12, format: .subRip, language: "spa", title: "Main", isDefault: false, isForced: false),
+])
+check("renditions: hostile chained source titles cannot occupy every fixed disambiguation suffix",
+      chainedNameCollision.count == 4
+          && Set(chainedNameCollision.map { $0.name.lowercased() }).count == 4)
+let autoSelected = collidingMetadata.filter(\.isAutoSelect)
+let autoSelectTuples = autoSelected.map { "\($0.language)|\($0.isForced)" }
+check("renditions: every AUTOSELECT=YES tuple is unique within the group",
+      Set(autoSelectTuples).count == autoSelectTuples.count)
+check("renditions: the one default is also auto-selectable",
+      collidingMetadata.filter(\.isDefault).count == 1
+        && collidingMetadata.first(where: \.isDefault)?.isAutoSelect == true)
 
 // MARK: - Master advertising
 
@@ -159,12 +191,17 @@ check("master: a non-default track is advertised DEFAULT=NO",
       Policy.mediaTag(forced).contains(",DEFAULT=NO"))
 check("master: a normal track is auto-selectable",
       englishTag.contains(",AUTOSELECT=YES") && englishTag.contains(",FORCED=NO"))
-check("master: a forced track is NOT auto-selected",
-      Policy.mediaTag(forced).contains(",AUTOSELECT=NO") && Policy.mediaTag(forced).contains(",FORCED=YES"))
+check("master: a forced track carries its distinct FORCED tuple",
+      Policy.mediaTag(forced).contains(",AUTOSELECT=YES") && Policy.mediaTag(forced).contains(",FORCED=YES"))
 check("master: a language is advertised when the source proved one",
       englishTag.contains("LANGUAGE=\"eng\""))
-check("master: no LANGUAGE attribute is written for an untagged track",
-      !Policy.mediaTag(untagged).contains("LANGUAGE="))
+check("master: an untagged track is advertised with explicit und language",
+      Policy.mediaTag(untagged).contains("LANGUAGE=\"und\""))
+check("master: every subtitle row has a non-empty LANGUAGE attribute",
+      [english, forced, untagged].allSatisfy {
+          let tag = Policy.mediaTag($0)
+          return tag.contains("LANGUAGE=") && !tag.contains("LANGUAGE=\"\"")
+      })
 check("master: a quote is removed from a source title",
       Policy.quoteSafe("He said \"hi\"") == "He said 'hi'")
 check("master: a quote in a source title cannot close the NAME attribute early",
@@ -188,10 +225,14 @@ let routedRendition = Policy.renditions(from: [
 check("route: the URI the master advertises parses back to that rendition",
       Policy.parseRequest(path: "/" + Policy.playlistURI(routedRendition)) == .playlist(renditionID: 0))
 check("route: the URI a playlist advertises parses back to that segment",
-      Policy.parseRequest(path: "/" + Policy.segmentURI(renditionID: 2, segmentIndex: 37))
-        == .segment(renditionID: 2, index: 37))
+      Policy.parseRequest(path: "/" + Policy.segmentURI(renditionID: 2, segmentID: 37))
+        == .segment(renditionID: 2, segmentID: 37))
 check("route: every generated segment URI of a real playlist is routable",
-      Policy.mediaPlaylist(renditionID: 3, segmentDurations: [6, 6, 6], ended: true, targetDuration: 6)
+      Policy.mediaPlaylist(renditionID: 3, window: VortXHLSWindow(segments: [
+          VortXHLSSegment(id: 8, byteOffset: 0, byteLength: 1, start: 0, duration: 6),
+          VortXHLSSegment(id: 9, byteOffset: 1, byteLength: 1, start: 6, duration: 6),
+          VortXHLSSegment(id: 10, byteOffset: 2, byteLength: 1, start: 12, duration: 6),
+      ]), ended: true, targetDuration: 6)
         .filter { $0.hasSuffix(".vtt") }
         .allSatisfy { Policy.parseRequest(path: "/\($0)") != nil })
 check("route: a video resource is not a subtitle resource",
@@ -213,11 +254,19 @@ check("route: a malformed subtitle path is not routed",
 
 // MARK: - Media playlist
 
-let playlist = Policy.mediaPlaylist(renditionID: 1, segmentDurations: [6.0, 5.5], ended: false, targetDuration: 6)
+let playlistWindow = VortXHLSWindow(segments: [
+    VortXHLSSegment(id: 8, byteOffset: 0, byteLength: 100, start: 48, duration: 6.0),
+    VortXHLSSegment(id: 9, byteOffset: 100, byteLength: 100, start: 54, duration: 5.5),
+])
+let playlist = Policy.mediaPlaylist(
+    renditionID: 1, window: playlistWindow, ended: false, targetDuration: 6)
 check("playlist: it is a playlist", playlist.first == "#EXTM3U")
-check("playlist: the start point is stated so no client applies the live-edge rule",
-      playlist.contains("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES"))
-check("playlist: it is an EVENT playlist", playlist.contains("#EXT-X-PLAYLIST-TYPE:EVENT"))
+check("playlist: media sequence is the resident window's first absolute id",
+      playlist.contains("#EXT-X-MEDIA-SEQUENCE:8"))
+check("playlist: a nonzero window never claims the session-zero start",
+      !playlist.contains { $0.hasPrefix("#EXT-X-START:") })
+check("playlist: a sliding subtitle rendition is not falsely EVENT",
+      !playlist.contains("#EXT-X-PLAYLIST-TYPE:EVENT"))
 check("playlist: WebVTT segments carry no init map",
       !playlist.contains { $0.hasPrefix("#EXT-X-MAP") })
 check("playlist: one EXTINF and one URI per video segment",
@@ -225,16 +274,37 @@ check("playlist: one EXTINF and one URI per video segment",
         && playlist.filter { $0.hasSuffix(".vtt") }.count == 2)
 check("playlist: durations mirror the video segments exactly",
       playlist.contains("#EXTINF:6.000,") && playlist.contains("#EXTINF:5.500,"))
-check("playlist: segment URIs name their own rendition and index",
-      playlist.contains("subs1-0.vtt") && playlist.contains("subs1-1.vtt"))
+check("playlist: segment URIs preserve rendition and absolute video ids",
+      playlist.contains("subs1-8.vtt") && playlist.contains("subs1-9.vtt")
+        && !playlist.contains("subs1-0.vtt"))
 check("playlist: an unfinished remux gets NO endlist",
       !playlist.contains("#EXT-X-ENDLIST"))
 check("playlist: a finished remux gets an endlist",
-      Policy.mediaPlaylist(renditionID: 0, segmentDurations: [6.0], ended: true, targetDuration: 6)
+      Policy.mediaPlaylist(renditionID: 0, window: playlistWindow, ended: true, targetDuration: 6)
         .last == "#EXT-X-ENDLIST")
-check("playlist: a segment-less playlist is still valid",
-      Policy.mediaPlaylist(renditionID: 0, segmentDurations: [], ended: false, targetDuration: 6)
-        .filter { $0.hasPrefix("#EXTINF") }.isEmpty)
+let zeroWindowPlaylist = Policy.mediaPlaylist(
+    renditionID: 0,
+    window: VortXHLSWindow(segments: [
+        VortXHLSSegment(id: 0, byteOffset: 0, byteLength: 1, start: 0, duration: 6),
+    ]),
+    ended: false,
+    targetDuration: 6)
+check("playlist: only the session-zero window carries the explicit start",
+      zeroWindowPlaylist.contains("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES"))
+
+// MARK: - Preallocation bounds
+
+check("bounds: a packet exactly at the decode cap is accepted before allocation",
+      Policy.canDecodePayload(byteCount: Policy.maxPacketBytes))
+check("bounds: an oversized packet is rejected before allocation",
+      !Policy.canDecodePayload(byteCount: Policy.maxPacketBytes + 1)
+        && !Policy.canDecodePayload(byteCount: -1))
+check("bounds: stored plus incoming bytes may exactly reach the cap",
+      Policy.canStore(existingBytes: Policy.maxStoredBytes - 1, incomingBytes: 1))
+check("bounds: stored plus incoming bytes are checked together before append",
+      !Policy.canStore(existingBytes: Policy.maxStoredBytes - 1, incomingBytes: 2))
+check("bounds: checked subtraction makes pathological counts reject without overflow",
+      !Policy.canStore(existingBytes: Int.max, incomingBytes: Int.max))
 
 // MARK: - Payload decoding
 
@@ -331,6 +401,12 @@ check("cue: a non-finite start is dropped",
 check("cue: a non-finite duration falls back",
       Policy.cue(payload: data("Hi"), format: .subRip, startSeconds: 1, durationSeconds: .nan)?.end
         == 1 + Policy.fallbackCueDuration)
+check("cue: a timestamp beyond the supported timeline is rejected",
+      Policy.cue(payload: data("Hi"), format: .subRip,
+                 startSeconds: Policy.maximumTimelineSeconds + 1, durationSeconds: 2) == nil)
+check("cue: an end beyond the supported timeline is rejected without overflow",
+      Policy.cue(payload: data("Hi"), format: .subRip,
+                 startSeconds: Policy.maximumTimelineSeconds, durationSeconds: 2) == nil)
 
 // MARK: - Timestamps
 
@@ -340,6 +416,9 @@ check("time: minutes roll over", Policy.timestamp(61.25) == "00:01:01.250")
 check("time: hours roll over", Policy.timestamp(3661.001) == "01:01:01.001")
 check("time: past an hour the hour field is not truncated", Policy.timestamp(7200) == "02:00:00.000")
 check("time: a negative time clamps rather than formatting garbage", Policy.timestamp(-5) == "00:00:00.000")
+check("time: a huge finite value clamps safely instead of trapping Int conversion",
+      Policy.timestamp(Double.greatestFiniteMagnitude)
+        == Policy.timestamp(Policy.maximumTimelineSeconds))
 
 // MARK: - Segment windows
 
@@ -367,6 +446,69 @@ check("window: an empty window yields nothing",
 check("window: results are start-ordered",
       Policy.cues([Cue(start: 9, end: 10, text: "b"), Cue(start: 7, end: 8, text: "a")],
                   overlapping: 0, end: 20).map(\.text) == ["a", "b"])
+
+// MARK: - Global demux settlement
+
+let absoluteVideoWindow = VortXHLSWindow(segments: [
+    VortXHLSSegment(id: 40, byteOffset: 0, byteLength: 10, start: 0, duration: 4),
+    VortXHLSSegment(id: 41, byteOffset: 10, byteLength: 10, start: 4, duration: 4),
+    VortXHLSSegment(id: 42, byteOffset: 20, byteLength: 10, start: 8, duration: 4),
+])
+check("settlement: the interleave margin is positive and hard bounded",
+      Policy.interleaveMarginSeconds > 0 && Policy.interleaveMarginSeconds <= 2)
+var settlement = Policy.SettlementState()
+check("settlement: global video progress is accepted without a subtitle packet",
+      settlement.observeGlobalTimestamp(10))
+check("settlement: the monotonic watermark settles through max minus margin",
+      settlement.settledBefore == 10 - Policy.interleaveMarginSeconds)
+check("settlement: a long subtitle gap still publishes every fully settled absolute segment",
+      settlement.settledWindow(videoWindow: absoluteVideoWindow)?.segments.map(\.id) == [40, 41])
+check("settlement: modest interleave reordering above the settled frontier is accepted",
+      settlement.observeGlobalTimestamp(9))
+check("settlement: later global progress settles the remaining empty subtitle segment",
+      settlement.observeGlobalTimestamp(14)
+        && settlement.settledWindow(videoWindow: absoluteVideoWindow)?.segments.map(\.id) == [40, 41, 42])
+
+var readiness = Policy.SettlementState()
+let futureWindow = VortXHLSWindow(segments: [
+    VortXHLSSegment(id: 70, byteOffset: 0, byteLength: 10, start: 8, duration: 4),
+])
+check("settlement: a premature empty prefix is not publishable or cacheable",
+      readiness.settledWindow(videoWindow: futureWindow) == nil)
+_ = readiness.observeGlobalTimestamp(14)
+check("settlement: the same shared window becomes visible after its boundary settles",
+      readiness.settledWindow(videoWindow: futureWindow)?.segments.map(\.id) == [70])
+
+var eofSettlement = Policy.SettlementState()
+_ = eofSettlement.observeGlobalTimestamp(1)
+eofSettlement.finish()
+check("settlement: EOF settles the complete resident video window",
+      eofSettlement.settledWindow(videoWindow: absoluteVideoWindow) == absoluteVideoWindow)
+var emptyEOFSettlement = Policy.SettlementState()
+emptyEOFSettlement.finish()
+check("settlement: EOF is the only valid empty publication state",
+      emptyEOFSettlement.settledWindow(videoWindow: VortXHLSWindow(segments: []))
+        == VortXHLSWindow(segments: []))
+
+var capFailure = Policy.SettlementState()
+_ = capFailure.observeGlobalTimestamp(20)
+capFailure.invalidate(.payloadBound)
+check("settlement: a typed cap failure invalidates optional publication atomically",
+      !capFailure.isValid
+        && capFailure.invalidationReason == .payloadBound
+        && capFailure.settledWindow(videoWindow: absoluteVideoWindow) == nil)
+
+var regression = Policy.SettlementState()
+_ = regression.observeGlobalTimestamp(20)
+check("settlement: a packet behind the already settled frontier invalidates the feature",
+      !regression.observeGlobalTimestamp(17)
+        && !regression.isValid
+        && regression.settledWindow(videoWindow: absoluteVideoWindow) == nil)
+
+var hugeWatermark = Policy.SettlementState()
+check("settlement: an impossible global timestamp fails safely",
+      !hugeWatermark.observeGlobalTimestamp(Double.greatestFiniteMagnitude)
+        && !hugeWatermark.isValid)
 
 // MARK: - Documents
 
