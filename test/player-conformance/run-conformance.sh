@@ -208,7 +208,7 @@ build_harness() {
   mkdir -p "$DD/bin"
   echo "[build] swiftc -> $BIN"
   swiftc -O -o "$BIN" \
-    "$HERE/Contract.swift" "$HERE/Playlist.swift" "$HERE/FMP4.swift" "$HERE/FMP4Fixtures.swift" \
+    "$HERE/Contract.swift" "$HERE/HLSWindow.swift" "$HERE/Playlist.swift" "$HERE/FMP4.swift" "$HERE/FMP4Fixtures.swift" \
     "$HERE/Trace.swift" "$HERE/Live.swift" "$HERE/main.swift" "$POLICY"
 }
 
