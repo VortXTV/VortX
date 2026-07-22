@@ -73,7 +73,9 @@ jobs:
     timeout-minutes: 90
     # GitHub-owned actions are SHA-pinned too (a mutable tag -- even on an actions/* repo -- can be
     # repointed, and this job holds ENGINE_REPO_TOKEN + the release secrets). Each pin carries the
-    # tag it resolved from.
+    # tag it resolved from. Every pin in this file was re-verified against the upstream repo with
+    # `git ls-remote --tags` (the pinned SHA is the tag's peeled commit). Zero mutable action refs
+    # remain in this workflow.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

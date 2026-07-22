@@ -18,9 +18,34 @@ name: Build Android APK
 # fetch, no secrets in the job), out of scope here. Do not re-add `pull_request` -- and never
 # `pull_request_target` -- to THIS workflow.
 
+# PRIVILEGED-LANE TRIGGER SURFACE (finding: privileged trust boundary). This job holds
+# ENGINE_REPO_TOKEN plus the Trakt/SIMKL secrets, so the push trigger is constrained to the EXACT
+# integration branches -- main and beta -- and nothing else. The former `android/**` glob is
+# REMOVED: it let a push to ANY android/* feature branch reach the token-bearing job, i.e. arbitrary
+# unreviewed branch code executing next to the secret (gradle + cargo build scripts run in the same
+# job that reads the token). Feature-branch build feedback belongs to the future SECRETLESS workflow
+# (no engine fetch, no secrets in the job), not this lane. Proof runs on the CI branch use
+# `workflow_dispatch` below, which needs no push entry here.
+#
+# WORKFLOW-SIDE vs REPO-SETTINGS split (stated honestly, not silently -- the workflow closes only its
+# half of the HIGH):
+#   WORKFLOW-SIDE (closed here): exact-branch push surface {main, beta}; no glob; secrets already
+#     scoped to the individual steps that read them (no workflow-level or job-level secret env --
+#     ENGINE_REPO_TOKEN appears only in the preflight step + the two engine checkouts; TRAKT/SIMKL
+#     only in the build step).
+#   REPO-SETTINGS (owner/CEO, NOT editable in this file -- REMAINS OPEN):
+#     - `workflow_dispatch` can be launched from ANY ref; only the `engine-ci` environment's
+#       deployment-branch policy stops a dispatch from an unlisted ref reaching the token. That
+#       environment must EXIST and list only {main, beta, + the temporary ci/engine-token proof
+#       entry, removed at integration} plus the release `v*` tag lane.
+#     - main and beta need branch protection / a ruleset with required reviewers: today the repo has
+#       ZERO environments and beta is unprotected, so a direct push to beta is still unreviewed code
+#       beside the secret until the owner adds that protection.
+#     - Move the ENGINE_REPO_TOKEN secret INTO the `engine-ci` environment (value re-entry) so it is
+#       unreachable to any job that has not passed the environment gate.
 on:
   push:
-    branches: [main, beta, "android/**"]
+    branches: [main, beta]
     paths:
       - "android/**"
       - ".github/workflows/android.yml"
@@ -31,16 +56,19 @@ permissions:
 
 jobs:
   build-android:
-    # Environment gate for the token-bearing job (trust boundary): the `engine-ci` environment
-    # carries explicit deployment protection policies: BRANCH entries (beta, main, ci/engine-token)
-    # plus a `v*` TAG policy (the tag lane is used by the release workflow; this workflow only ever
-    # runs on branch refs, which enter via the branch entries). A push to any OTHER branch -- e.g.
-    # the android/** trigger patterns above -- still starts the workflow but the job BLOCKS at this
-    # gate before any step runs, which makes ENGINE_REPO_TOKEN unreachable from arbitrary branches.
-    # The ci/engine-token entry in that policy is TEMPORARY, for proof runs on the CI branch, and
-    # is removed at integration. Moving the ENGINE_REPO_TOKEN secret itself INTO the environment
-    # (value re-entry) is a queued owner step; until then the gate still stops arbitrary-branch jobs
-    # from ever reaching the fetch steps that read it.
+    # Environment gate for the token-bearing job (trust boundary, SECOND layer after the exact-branch
+    # trigger surface documented at the top `on:` block): the `engine-ci` environment carries
+    # explicit deployment protection policies -- BRANCH entries (beta, main, ci/engine-token) plus a
+    # `v*` TAG policy (the tag lane is used by the release workflow; this workflow only ever runs on
+    # branch refs). With the push trigger now constrained to {main, beta}, this gate's remaining job
+    # is to bound the `workflow_dispatch` lane, which can be launched from any ref: a dispatch from an
+    # unlisted ref still starts the workflow but the job BLOCKS here before any step runs, keeping
+    # ENGINE_REPO_TOKEN unreachable from arbitrary refs. The ci/engine-token entry is TEMPORARY, for
+    # proof runs on the CI branch, and is removed at integration. NOTE the environment itself is
+    # repo-settings and is NOT provable from this file; see the top `on:` block for the full
+    # repo-settings residual owed to the owner. Moving the ENGINE_REPO_TOKEN secret INTO the
+    # environment (value re-entry) is a queued owner step; until then the gate still stops
+    # arbitrary-ref jobs from ever reaching the fetch steps that read it.
     environment: engine-ci
     # Pinned explicit runner label: `ubuntu-latest` is a MOVING alias (it means ubuntu-24.04 today,
     # per actions/runner-images), and a silent alias flip would swap the whole toolchain -- JDK
@@ -51,7 +79,10 @@ jobs:
     runs-on: ubuntu-24.04
     # GitHub-owned actions are SHA-pinned too (finishing the supply-chain pass that already pinned
     # the third-party actions): a mutable tag -- even on an actions/* repo -- can be repointed, and
-    # this job holds ENGINE_REPO_TOKEN. Each pin carries the tag it resolved from.
+    # this job holds ENGINE_REPO_TOKEN. Each pin carries the tag it resolved from. Every pin in this
+    # file was re-verified against the upstream repo with `git ls-remote --tags` (the pinned SHA is
+    # the tag's peeled commit; for the annotated Swatinem/rust-cache v2.9.1 tag the peeled `^{}`
+    # commit is pinned, not the tag object). Zero mutable action refs remain in this workflow.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
