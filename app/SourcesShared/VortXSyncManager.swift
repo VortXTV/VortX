@@ -396,6 +396,32 @@ final class VortXSyncManager: ObservableObject {
         )
     }
 
+    // CREDENTIAL_SESSION_GATE_BEGIN
+    /// The ONE systematic session-stamp gate for any credential-scoped apply that spans an `await`.
+    ///
+    /// A max-effort review found the session-TOCTOU is systemic, not local to the pull path: EVERY apply that
+    /// suspends between reading the authenticated session and writing a result can land under whatever account
+    /// is current AFTER the await, not the one the work began under. This helper is the single answer. It
+    /// captures the session BEFORE the suspension, runs `work`, then re-validates the SAME session AFTER. A
+    /// sign-out, account switch, or same-account re-auth during the await advances `credentialSessionGeneration`
+    /// (via `beginCredentialSessionMutation`) or clears `account`, so the post-await `isCurrentCredentialSession`
+    /// check fails and the result is DISCARDED (returned as nil) instead of being applied under the now-current
+    /// account. Returns nil when there is no authenticated session to gate at all.
+    ///
+    /// Single-`await` applies funnel through this wrapper directly. Multi-`await` paths (syncUp,
+    /// mergeLocalIntoDoc, the recover re-add loop) capture the session once via `credentialSessionStamp` and
+    /// re-guard after EACH await with `isCurrentCredentialSession(_:)` — the identical capture / revalidate /
+    /// discard, unrolled so a switch between any two awaits is caught at the next one. Everything is
+    /// main-actor-isolated (the manager is `@MainActor`), so `work` crosses no isolation boundary and needs no
+    /// `Sendable` constraint.
+    private func withCredentialSessionGate<T>(_ work: () async -> T) async -> T? {
+        guard let session = credentialSessionStamp else { return nil }
+        let result = await work()
+        guard isCurrentCredentialSession(session) else { return nil }
+        return result
+    }
+    // CREDENTIAL_SESSION_GATE_END
+
     private func persist() {
         guard let token, let account, let dataKey,
               let data = try? JSONEncoder().encode(Persisted(token: token, account: account, dataKey: dataKey.base64EncodedString())),
@@ -657,9 +683,22 @@ final class VortXSyncManager: ObservableObject {
     /// (safe to start from an empty doc) from "the pull failed" (must NOT push, or it clobbers the
     /// account's existing document). A non-200/non-404 response or an undecryptable document is a failure.
     private enum SyncDocPull { case doc([String: Any]); case empty; case failed }
-    private func pullSyncDocResult() async -> SyncDocPull {
+    /// `session` threads the SAME systematic session gate as `pullDocVersionedResult`: the apply-path callers
+    /// (mergeLocalIntoDoc on the push side, hydrateEngineFromOwnedAddons on the hydrate side) capture the
+    /// authenticated session before the pull and pass it here so a mid-await sign-out / account switch turns the
+    /// result into `.failed` rather than handing account A's document to code now running under account B. The
+    /// read-only decision probes (accountHasSyncData / rosterConflictWithAccount / accountDocReachable / …) pass
+    /// nil: they only RETURN a verdict to a caller that acts within its own session, so gating them would change
+    /// no write. nil therefore preserves their exact prior behavior.
+    private func pullSyncDocResult(session: CredentialSessionStamp? = nil) async -> SyncDocPull {
+        // CREDENTIAL_MERGE_PULL_GATE_BEGIN
+        if let session, !isCurrentCredentialSession(session) { return .failed }
         guard dataKey != nil else { return .failed }
         let (code, json) = await request("GET", "/v1/backup", auth: true)
+        // Revalidate AFTER the await, before any state is derived from the response: a switch during the pull
+        // discards the doc so it can never seed a merge/hydrate under the wrong account (order: await -> gate).
+        if let session, !isCurrentCredentialSession(session) { return .failed }
+        // CREDENTIAL_MERGE_PULL_GATE_END
         if code == 404 { return .empty }                 // no backup yet
         guard code == 200 else { return .failed }        // network/server error: do not clobber
         guard let docStr = json?["document"] as? String, !docStr.isEmpty else { return .empty } // 200, no document
@@ -752,16 +791,19 @@ final class VortXSyncManager: ObservableObject {
                 dataKey: dataKey, plaintext: pt, accountId: accountID,
                 version: version, writeV2: Self.writeSyncDocV2
               ) else { return .error }
-        let (code, json) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true)
         // CREDENTIAL_PUSH_COMPLETION_GATE_BEGIN
+        let (code, json) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true)
+        // 2b: revalidate the captured session AFTER the PUT completes and BEFORE any success is stamped. A stale
+        // completion of account A's push, landing after a switch to B, must never advance B's lastSyncedVersion
+        // or stamp B's "last synced". This ordering (await -> gate -> stamp) is load-bearing, not merely present.
         guard isCurrentCredentialSession(pushSession) else { return .error }
-        // CREDENTIAL_PUSH_COMPLETION_GATE_END
         guard code == 200 else { return .error }
         // accepted defaults to true so an older worker without the field (which stored the write) still
         // advances the version, matching the website's `accepted !== false` read.
         let accepted = (json?["accepted"] as? Bool) ?? true
         if accepted {
             lastSyncedVersion = max(lastSyncedVersion, version)
+            // CREDENTIAL_PUSH_COMPLETION_GATE_END
             persistLastSyncedVersion()   // survive relaunch so the version guard stays consistent
             if Self.writeSyncDocV2 { Self.markSawDocV2(accountID) }  // H-1: account's stored doc is now v2
             stampSyncSuccess()           // the account now holds this device's doc: "last synced" = now
@@ -1105,7 +1147,10 @@ final class VortXSyncManager: ObservableObject {
     /// happens when an unattended push decides on the user's behalf.
     @discardableResult
     func syncUp(afterUserChoseThisDevice: Bool = false) async -> Bool {
-        guard isSignedIn else { return false }
+        // Capture the authenticated session up front: it threads through the whole push so a mid-await A->B
+        // account switch cannot push A's merged document over B's server doc (stronger than the old
+        // `isSignedIn`, which said nothing about WHICH account is current after each suspension point).
+        guard let syncSession = credentialSessionStamp else { return false }
         // #145 M1, THE ORDERING RULE: A DEVICE THAT HAS NOT YET APPLIED THE ACCOUNT'S DOC MUST NOT PUSH OVER IT.
         // Restore first, then push. Every destructive-push path in the bug funnels through here (the debounced
         // observer push, the engine-driven pushThisDevice calls, the background push), so this one gate closes
@@ -1118,6 +1163,11 @@ final class VortXSyncManager: ObservableObject {
             // this is what turns "push over the account" into "restore, then push". Single-flight, so several
             // blocked pushes plus the sign-in kick await ONE restore instead of stampeding the endpoint.
             await restoreAccountDocIfNeeded()
+            // CREDENTIAL_SYNCUP_RESTORE_GATE_BEGIN
+            // Discard after the restore await: if the account switched while restore ran, this push belongs to a
+            // session that is no longer current and must not proceed against the now-current account.
+            guard isCurrentCredentialSession(syncSession) else { return false }
+            // CREDENTIAL_SYNCUP_RESTORE_GATE_END
             guard hasAppliedAccountDoc else {
                 NSLog("[sync] push refused: this device has not applied the account's doc yet (#145 gate)")
                 return false
@@ -1127,8 +1177,14 @@ final class VortXSyncManager: ObservableObject {
         // recovery: if a concurrent write wins the race, re-run this exact merge onto the winner's doc and
         // retry (bounded). The rebuild closure re-pulls a fresh base each attempt so the recovered push
         // never clobbers the winner; it returns nil on a failed pull so the retry aborts safely.
-        guard let initial = await mergeLocalIntoDoc(base: nil) else { return false }
-        return await pushDerivedDoc(initial, rebuild: { await self.mergeLocalIntoDoc(base: nil) })
+        guard let initial = await mergeLocalIntoDoc(base: nil, session: syncSession) else { return false }
+        // CREDENTIAL_SYNCUP_PUSH_GATE_BEGIN
+        // Final ordering gate between the last merge await and the destructive push. Even though
+        // mergeLocalIntoDoc discards on a switch and pushSyncDocAt gates its own completion, a switch landing in
+        // the gap between the merge returning and the push starting must still abort here (order: gate -> push).
+        guard isCurrentCredentialSession(syncSession) else { return false }
+        return await pushDerivedDoc(initial, rebuild: { await self.mergeLocalIntoDoc(base: nil, session: syncSession) })
+        // CREDENTIAL_SYNCUP_PUSH_GATE_END
     }
 
     /// Build the doc to push by MERGING this device's profiles + settings + keys + add-on order onto a
@@ -1138,13 +1194,17 @@ final class VortXSyncManager: ObservableObject {
     /// unused today (each call re-pulls) but kept so a caller could pass a known base to avoid a re-pull.
     /// Returns nil on a FAILED pull (network error / undecryptable doc): a failed pull must NEVER overwrite
     /// the account's existing document, or it wipes keys other surfaces wrote.
-    private func mergeLocalIntoDoc(base: [String: Any]?) async -> [String: Any]? {
+    private func mergeLocalIntoDoc(base: [String: Any]?, session: CredentialSessionStamp) async -> [String: Any]? {
         var doc: [String: Any]
-        switch await pullSyncDocResult() {
+        switch await pullSyncDocResult(session: session) {
         case .failed: return nil
         case .empty: doc = [:]
         case .doc(let existing): doc = existing
         }
+        // Revalidate after the base pull: pullSyncDocResult already returns .failed on a mid-pull switch (handled
+        // above), and this is the explicit belt-and-suspenders gate for the merge that follows, so nothing built
+        // from account A's base is ever pushed once the session has moved to B.
+        guard isCurrentCredentialSession(session) else { return nil }
         // Read-merge the pulled doc's tombstone stamps into the local stores BEFORE vortxSummary rebuilds them
         // from local state, so a push that raced a peer's fresh re-add stamp adopts that stamp instead of
         // overwriting the doc with a local-only view; this also re-seeds the maps after a b171 peer push that
@@ -1196,6 +1256,17 @@ final class VortXSyncManager: ObservableObject {
         // Debrid keys ride the same encrypted apiKeys channel so they follow the account across devices
         // (they live in the Keychain, which SettingsBackup deliberately excludes, so they need this mirror).
         // Set only when configured locally; do NOT remove a key absent locally (another device authored it).
+        // M3 SCOPE DECISION (device-global credentials mirror) — DELIBERATELY NOT CHANGED HERE, flagged for a
+        // separate scope pass. The debrid keys below, and the ApiKeys (tmdb/mdblist/fanart) above and the
+        // Trakt / SIMKL / media-server / IPTV mirrors that follow, read this device's CURRENT local credential
+        // stores and fold them into the doc being pushed to whatever account is current when the push lands.
+        // DebridKeys is already owner-scoped and rebinds on switch (DebridKeys.bind), and the session gate on
+        // this whole merge (post-pull + post-token guards, and the pre-push gate in syncUp) discards the merge on
+        // a mid-flight switch; but ApiKeys/Trakt/SIMKL/IPTV are device-global stores with no per-account scope,
+        // so a key entered under account A remains readable to a later account B on the same device and would
+        // mirror into B's doc. Narrowing that device-global mirror to per-owner scope is a separate, larger
+        // decision (it touches those four stores' persistence model) and is intentionally out of scope for the
+        // INS-06 session-TOCTOU hardening. Do not "fix" it inline here.
         let debrid = DebridKeys.shared
         if debrid.isConfigured(.realDebrid) { keys["realDebrid"] = debrid.key(for: .realDebrid) }
         if debrid.isConfigured(.allDebrid)  { keys["allDebrid"]  = debrid.key(for: .allDebrid) }
@@ -1206,15 +1277,21 @@ final class VortXSyncManager: ObservableObject {
         // SettingsBackup deliberately excludes, so this mirror is the only carrier. Set only when connected
         // locally; NEVER remove a key that is absent locally (another device authored it) - the same
         // asymmetric read-merge guard as the debrid keys above.
+        // CREDENTIAL_MERGE_TOKEN_GATE_BEGIN
         if let t = await TraktAuth.shared.syncableTokens() {
             keys["traktAccess"] = t.access
             keys["traktRefresh"] = t.refresh
             keys["traktExpiry"] = String(t.expiryUnix)
         }
+        // Revalidate after the Trakt token await (one of the two remaining suspension points in this merge).
+        guard isCurrentCredentialSession(session) else { return nil }
         if let s = await SIMKLAuth.shared.syncableTokens() {
             keys["simklAccess"] = s.access
             keys["simklExpiry"] = String(s.expiryUnix)
         }
+        // Revalidate after the SIMKL token await, the last suspension point before the doc is returned to push.
+        guard isCurrentCredentialSession(session) else { return nil }
+        // CREDENTIAL_MERGE_TOKEN_GATE_END
         // Media servers (Plex / Jellyfin / Emby, lane E) ride the SAME encrypted apiKeys channel as ONE JSON
         // blob so a server connected on one device follows the account. Tokens are Keychain-only; the blob
         // carries them only when the per-device sync-logins toggle is ON (syncBlob reads UserDefaults + the
@@ -1354,11 +1431,14 @@ final class VortXSyncManager: ObservableObject {
         let effectiveForce = force || mustRestore
         if !effectiveForce, hasPendingPush { return false }
         let pulled: (doc: [String: Any], version: Int)
+        // CREDENTIAL_SYNCDOWN_FINAL_APPLY_GATE_BEGIN
         let pullResult = await pullDocVersionedRetrying(session: syncSession)
         // This is the final apply gate as well as defense in depth for every request/retry check above. A
         // sign-out, account switch, or same-account re-auth while the pull was suspended discards the result
-        // before even an `.empty` response can open a per-account restore gate.
+        // before even an `.empty` response can open a per-account restore gate. Ordering (await -> gate) is
+        // load-bearing: removing or reordering this guard lets account A's pulled doc apply under account B.
         guard isCurrentCredentialSession(syncSession) else { return false }
+        // CREDENTIAL_SYNCDOWN_FINAL_APPLY_GATE_END
         switch pullResult {
         case .doc(let doc, let version):
             pulled = (doc, version)
@@ -1446,18 +1526,39 @@ final class VortXSyncManager: ObservableObject {
             // Keychain via an actor, so it hops out of this synchronous suppressed region in a Task.
             if let a = keys["traktAccess"], let r = keys["traktRefresh"], !a.isEmpty, !r.isEmpty {
                 let expiry = Int(keys["traktExpiry"] ?? "") ?? 0
-                Task { await TraktAuth.shared.adoptTokens(access: a, refresh: r, expiryUnix: expiry) }
+                // CREDENTIAL_SYNCDOWN_TRAKT_TASK_BEGIN
+                // MEDIUM (deferred-Task re-check): adoptTokens hops off this synchronous apply into an
+                // unstructured Task that runs LATER. Re-check the captured syncSession inside the Task body so a
+                // switch to account B between spawning and running never writes account A's Trakt tokens under B.
+                Task { @MainActor in
+                    guard self.isCurrentCredentialSession(syncSession) else { return }
+                    await TraktAuth.shared.adoptTokens(access: a, refresh: r, expiryUnix: expiry)
+                }
+                // CREDENTIAL_SYNCDOWN_TRAKT_TASK_END
             }
             if let a = keys["simklAccess"], !a.isEmpty {
                 let expiry = Int(keys["simklExpiry"] ?? "") ?? 0
-                Task { await SIMKLAuth.shared.adoptTokens(access: a, expiryUnix: expiry) }
+                // CREDENTIAL_SYNCDOWN_SIMKL_TASK_BEGIN
+                // MEDIUM (deferred-Task re-check): same as the Trakt adoption above, for the SIMKL token.
+                Task { @MainActor in
+                    guard self.isCurrentCredentialSession(syncSession) else { return }
+                    await SIMKLAuth.shared.adoptTokens(access: a, expiryUnix: expiry)
+                }
+                // CREDENTIAL_SYNCDOWN_SIMKL_TASK_END
             }
             // Media servers (lane E): adopt a server connected on another device. applySyncBlob union-merges by
             // id, honors removal tombstones, and writes a synced token to the Keychain only when the local slot
             // is empty (Keychain stays authoritative). Apply only when present so a doc without it never clears
             // a locally-connected server (the same never-delete-on-absence guard as the tokens above).
             if let blob = keys["vortx.mediaServers"] {
-                Task { @MainActor in MediaServerStore.shared.applySyncBlob(blob) }
+                // CREDENTIAL_SYNCDOWN_MEDIASERVER_TASK_BEGIN
+                // MEDIUM (deferred-Task re-check): applySyncBlob runs in a later main-actor Task; re-check the
+                // captured session so account A's media-server blob is never merged into account B after a switch.
+                Task { @MainActor in
+                    guard self.isCurrentCredentialSession(syncSession) else { return }
+                    MediaServerStore.shared.applySyncBlob(blob)
+                }
+                // CREDENTIAL_SYNCDOWN_MEDIASERVER_TASK_END
             }
             // IPTV playlists (Live TV): adopt a playlist registered on another device, and re-seed the Keychain
             // credentials a reinstall dropped, which is what makes a restored playlist live again instead of a
@@ -1588,7 +1689,12 @@ final class VortXSyncManager: ObservableObject {
             // Runs AFTER the outer withRemoteApplySuppressed window has cleared isApplyingRemote, so wrap the
             // uninstall loop in its own suppression: uninstallAddon writes UserDefaults, which would otherwise
             // fire the observer and re-arm a self-echo push of the just-applied removal.
+            // CREDENTIAL_SYNCDOWN_UNINSTALL_TASK_BEGIN
+            // MEDIUM (deferred-Task re-check): this uninstall sweep runs in a later main-actor Task. Re-check the
+            // captured session before mutating the engine so a switch to account B does not drive account A's
+            // add-on removals against B's installed set.
             Task { @MainActor in
+                guard Self.shared.isCurrentCredentialSession(syncSession) else { return }
                 Self.shared.withRemoteApplySuppressed {
                     for addon in CoreBridge.shared.addons
                     where removedAddonSet.contains(AddonTombstones.normalize(addon.transportUrl))
@@ -1597,6 +1703,7 @@ final class VortXSyncManager: ObservableObject {
                     }
                 }
             }
+            // CREDENTIAL_SYNCDOWN_UNINSTALL_TASK_END
         }
         if let vortx = doc["vortx"] as? [String: Any], let byProfile = vortx["byProfile"] as? [String: Any] {
             for (idStr, raw) in byProfile {
@@ -1667,8 +1774,14 @@ final class VortXSyncManager: ObservableObject {
     /// Hydration installs only descriptors the engine lacks (idempotent). Library recovery is gated to
     /// "engine account library empty AND the account owns one" so it runs at most once per fresh install.
     func hydrateEngineFromOwnedAddons() async {
-        guard isSignedIn else { return }
-        guard case let .doc(doc) = await pullSyncDocResult() else { return }   // .failed/.empty: do nothing
+        // Stamp the whole hydrate. Every await below (the pull, the library recover loop) must be able to stop
+        // applying account A's owned add-ons + library to an engine that now serves account B after a switch.
+        guard let hydrateSession = credentialSessionStamp else { return }
+        // CREDENTIAL_HYDRATE_GATE_BEGIN
+        guard case let .doc(doc) = await pullSyncDocResult(session: hydrateSession) else { return }   // .failed/.empty or a mid-pull switch: do nothing
+        // Revalidate after the pull, before any engine mutation is derived from the doc (order: await -> gate).
+        guard isCurrentCredentialSession(hydrateSession) else { return }
+        // CREDENTIAL_HYDRATE_GATE_END
         // Fold the doc's tombstone stamps into the local stores BEFORE computing the hydrate + recovery sets,
         // so a cold launch (no prior syncDown) honors the removals the doc already carries: ownedAddons(from:)
         // reads AddonTombstones.all() and recoverOwnerLibraryIfEmpty reads LibraryTombstones.all(), both of
@@ -1682,7 +1795,9 @@ final class VortXSyncManager: ObservableObject {
         // The engine now holds the hydrated add-ons, so baseline-stamp them once (a no-op once syncDown or a
         // prior hydrate already did it, or while the installed set is still empty).
         baselineInstalledAddonsOnce()
-        await recoverOwnerLibraryIfEmpty(from: doc)
+        await recoverOwnerLibraryIfEmpty(from: doc, session: hydrateSession)
+        // Revalidate after the recover await, before the final Continue-Watching rebuild paints account state.
+        guard isCurrentCredentialSession(hydrateSession) else { return }
         // recoverOwnerLibraryIfEmpty just refreshed OwnerResumeStore (and, on a cold device, re-added the owner
         // library at time 0). Paint Continue Watching once here from the engine preview UNION those cached
         // offsets, so the rail fills immediately on a cold / migrated launch (#149) even for a warm device that
@@ -1745,7 +1860,7 @@ final class VortXSyncManager: ObservableObject {
     /// `AddToLibrary`/`addCatalogItemToAccount` path (real Cinemeta meta = schema-safe). NEVER writes app
     /// data into a libraryItem doc (the poisoned-account incident). Owner-profile semantics only: items
     /// land in the account library, which is the owner profile's history.
-    private func recoverOwnerLibraryIfEmpty(from doc: [String: Any]) async {
+    private func recoverOwnerLibraryIfEmpty(from doc: [String: Any], session: CredentialSessionStamp) async {
         guard let vortx = doc["vortx"] as? [String: Any] else { return }
         // doc.vortx.library is the owner library; fall back to doc.library (web Stremio import) if present.
         let ownedLibrary = (vortx["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
@@ -1774,6 +1889,13 @@ final class VortXSyncManager: ObservableObject {
         // resurrecting a removed title.
         var recovered = 0
         for item in ownedLibrary {
+            // CREDENTIAL_RECOVER_LOOP_GATE_BEGIN
+            // PER-ITERATION session check: each re-add is an `await addCatalogItemToAccount`, so a switch to
+            // account B partway through this loop must STOP adding account A's titles into what is now B's
+            // account library. Checked at the top of every iteration, before this iteration's await, so the
+            // switch that landed during the PREVIOUS iteration's await halts the loop before the next add.
+            guard isCurrentCredentialSession(session) else { break }
+            // CREDENTIAL_RECOVER_LOOP_GATE_END
             guard let id = item["id"] as? String, !id.isEmpty,
                   !removedLibrary.contains(LibraryTombstones.normalize(id)),
                   // Real catalog ids only (tt… / tmdb…); never a synthetic id, or it poisons account sync.
@@ -2048,13 +2170,22 @@ final class VortXSyncManager: ObservableObject {
     /// Refresh account fields from /me (e.g. two-factor was toggled on the website), so the app's view
     /// of the account is not stuck at whatever sign-in returned (Bug 1).
     func refreshAccount() async {
-        guard isSignedIn, var a = account else { return }
-        let (code, json) = await request("GET", "/v1/auth/me", auth: true)
+        guard var a = account else { return }
+        // CREDENTIAL_REFRESH_ACCOUNT_GATE_BEGIN
+        // HIGH (systematic session gate): route the /me round-trip through the session gate. A stale completion
+        // after a mid-await account switch or sign-out must NOT clobber the now-current `account` object, nor
+        // persist account A's identity under session B. The gate captures the session before the await and
+        // discards the response (nil) if it changed, so `account = a` / `persist()` are reached only while the
+        // session that started this refresh is still current.
+        guard let (code, json) = await withCredentialSessionGate({
+            await self.request("GET", "/v1/auth/me", auth: true)
+        }) else { return }
         guard code == 200, let acct = json?["account"] as? [String: Any] else { return }
         a.username = acct["username"] as? String ?? a.username
         a.twoFactorEnabled = acct["twoFactorEnabled"] as? Bool ?? a.twoFactorEnabled
         account = a
         persist()
+        // CREDENTIAL_REFRESH_ACCOUNT_GATE_END
     }
 
     // MARK: - VortX-account QR sign-in (device pairing)
