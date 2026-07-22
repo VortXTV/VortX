@@ -1196,23 +1196,24 @@ final class VortXHLSPendingPublicationMachine<Payload> {
         performPostInitDrain: () -> Bool,
         publish: (Entry, FragmentProof) -> Bool) -> AdvanceResult {
         var performedPostInitDrain = false
-        var publishedAfterPostInitDrain = false
+        var publishedInThisAdvance = false
         while let pending = storage.first {
             guard initMayPublishMedia() else { return .waitingForInit }
             if let proof = proveNextFragment() {
                 guard publish(pending, proof) else { return .failed(.publishFailed) }
                 storage.removeFirst()
-                if performedPostInitDrain { publishedAfterPostInitDrain = true }
+                publishedInThisAdvance = true
                 continue
             }
             guard allowPostInitDrain else {
                 return incompleteIsTerminal ? .failed(.incompleteAtEnd) : .waitingForFragment
             }
             guard !performedPostInitDrain else {
-                // A single drain can complete one queued fragment while a later, already-bounded fragment still
-                // needs another ordinary packet or EOF trailer. Retain that next FIFO head after concrete forward
-                // progress; only a drain that proves nothing is a terminal malformed-output signal.
-                return publishedAfterPostInitDrain ? .waitingForFragment : .failed(.incompleteAfterDrain)
+                // A complete head can publish either before or after the one drain while a later, already-bounded
+                // fragment still needs another ordinary packet or EOF trailer. Retain that next FIFO head after
+                // concrete progress in this advance; only an advance that proves nothing is terminal malformed
+                // output.
+                return publishedInThisAdvance ? .waitingForFragment : .failed(.incompleteAfterDrain)
             }
             guard performPostInitDrain() else { return .failed(.drainFailed) }
             performedPostInitDrain = true

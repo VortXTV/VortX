@@ -1379,6 +1379,40 @@ private enum HLSFragmentPublicationIntegrationTests {
                 checks.check("first-fragment proof: one advance publishes two queued real fragments as distinct FIFO ranges",
                              twoQueuedResult == .settled
                                  && publishedEndpoints == [firstRange.count, twoCompleteRanges.count])
+                let completeThenPartial = VortXHLSPendingPublicationMachine<Void>()
+                _ = completeThenPartial.append(
+                    segmentID: 0, startSeconds: 0, endSeconds: 3, payload: ())
+                _ = completeThenPartial.append(
+                    segmentID: 1, startSeconds: 3, endSeconds: 6, payload: ())
+                var partialFrontier = 0
+                var partialPublishedEndpoints: [Int] = []
+                var partialDrainCount = 0
+                let completeThenPartialResult = completeThenPartial.advance(
+                    initMayPublishMedia: { true },
+                    proveNextFragment: {
+                        let suffix = Data(completePlusPartial.dropFirst(partialFrontier))
+                        guard let proof = VortXFMP4FragmentParser.proveFirstMediaFragment(
+                            suffix,
+                            trackID: audioFirst.videoTrackID,
+                            requireFirstSampleSync: true) else { return nil as Int? }
+                        return partialFrontier + proof.mediaEnd
+                    },
+                    performPostInitDrain: {
+                        partialDrainCount += 1
+                        return true
+                    },
+                    publish: { _, endpoint in
+                        guard endpoint > partialFrontier else { return false }
+                        partialFrontier = endpoint
+                        partialPublishedEndpoints.append(endpoint)
+                        return true
+                    })
+                checks.check("first-fragment proof: a complete real head before one drain leaves its partial successor waiting",
+                             completeThenPartialResult == .waitingForFragment
+                                 && partialPublishedEndpoints == [firstRange.count]
+                                 && partialDrainCount == 1
+                                 && completeThenPartial.count == 1
+                                 && completeThenPartial.first?.segmentID == 1)
             }
             if let pressured = results.first(where: { $0.name == "high-bitrate byte pressure" }) {
                 checks.check("multi-MiB packet pressure: complete media range exceeds two MiB",

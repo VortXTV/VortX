@@ -592,6 +592,68 @@ check("pending boundary: parser proof consumes only the FIFO head",
           && pendingBoundaries.count == 1
           && pendingBoundaries.first?.segmentID == 1)
 
+let progressBeforeDrain = VortXHLSPendingPublicationMachine<String?>()
+_ = progressBeforeDrain.append(
+    segmentID: 0, startSeconds: 0, endSeconds: 3, payload: nil)
+_ = progressBeforeDrain.append(
+    segmentID: 1, startSeconds: 3, endSeconds: 6, payload: nil)
+var preDrainProofAvailable = true
+var preDrainCalls = 0
+var preDrainPublishedIDs: [Int] = []
+let progressBeforeDrainResult = progressBeforeDrain.advance(
+    initMayPublishMedia: { true },
+    proveNextFragment: {
+        guard preDrainProofAvailable else { return nil as Int? }
+        preDrainProofAvailable = false
+        return 42
+    },
+    performPostInitDrain: {
+        preDrainCalls += 1
+        return true
+    },
+    publish: { boundary, _ in
+        preDrainPublishedIDs.append(boundary.segmentID)
+        return true
+    })
+check("pending boundary: a complete head before the one drain lets its partial successor keep waiting",
+      progressBeforeDrainResult == .waitingForFragment
+          && preDrainCalls == 1
+          && preDrainPublishedIDs == [0]
+          && progressBeforeDrain.count == 1
+          && progressBeforeDrain.first?.segmentID == 1)
+
+let terminalAfterProgress = VortXHLSPendingPublicationMachine<String?>()
+_ = terminalAfterProgress.append(
+    segmentID: 0, startSeconds: 0, endSeconds: 3, payload: nil)
+_ = terminalAfterProgress.append(
+    segmentID: 1, startSeconds: 3, endSeconds: 6, payload: nil)
+var terminalProofAvailable = true
+var terminalDrainCalls = 0
+var terminalPublishedIDs: [Int] = []
+let terminalAfterProgressResult = terminalAfterProgress.advance(
+    initMayPublishMedia: { true },
+    allowPostInitDrain: false,
+    incompleteIsTerminal: true,
+    proveNextFragment: {
+        guard terminalProofAvailable else { return nil as Int? }
+        terminalProofAvailable = false
+        return 42
+    },
+    performPostInitDrain: {
+        terminalDrainCalls += 1
+        return true
+    },
+    publish: { boundary, _ in
+        terminalPublishedIDs.append(boundary.segmentID)
+        return true
+    })
+check("pending boundary: EOF stays terminal after publishing a complete head before a partial successor",
+      terminalAfterProgressResult == .failed(.incompleteAtEnd)
+          && terminalDrainCalls == 0
+          && terminalPublishedIDs == [0]
+          && terminalAfterProgress.count == 1
+          && terminalAfterProgress.first?.segmentID == 1)
+
 let noProgressAfterDrain = VortXHLSPendingPublicationMachine<String?>()
 _ = noProgressAfterDrain.append(
     segmentID: 0, startSeconds: 0, endSeconds: 3, payload: nil)
