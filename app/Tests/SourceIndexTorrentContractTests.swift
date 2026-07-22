@@ -976,7 +976,7 @@ struct SourceIndexTorrentContractTests {
 
         let tokenWaitGate = LockedGate(true)
         let tokenWaitTransport = AttemptProbe()
-        let tokenWaitResult = await SourceIndexClient.fetchPooledUsing(
+        let tokenWaitResult = await SourceIndexClient.fetchPooledUsingForTesting(
             contentID: "tt1234567",
             isSignedIn: true,
             gate: { tokenWaitGate.value() },
@@ -998,7 +998,7 @@ struct SourceIndexTorrentContractTests {
 
         let preTransportGate = SequencedGate([true, true, false])
         let preTransportProbe = AttemptProbe()
-        let preTransportResult = await SourceIndexClient.fetchPooledUsing(
+        let preTransportResult = await SourceIndexClient.fetchPooledUsingForTesting(
             contentID: "tt1234567",
             isSignedIn: true,
             gate: { preTransportGate.value() },
@@ -1016,7 +1016,7 @@ struct SourceIndexTorrentContractTests {
                "GET rechecks its live gate immediately before transport")
 
         let missingMoatTransport = AttemptProbe()
-        let missingMoat = await SourceIndexClient.fetchPooledUsing(
+        let missingMoat = await SourceIndexClient.fetchPooledUsingForTesting(
             contentID: "tt1234567",
             isSignedIn: true,
             gate: { true },
@@ -1035,7 +1035,7 @@ struct SourceIndexTorrentContractTests {
 
         let postResponseGate = SequencedGate([true, true, true, false])
         let postResponseTransport = AttemptProbe()
-        let postResponseResult = await SourceIndexClient.fetchPooledUsing(
+        let postResponseResult = await SourceIndexClient.fetchPooledUsingForTesting(
             contentID: "tt1234567",
             isSignedIn: true,
             gate: { postResponseGate.value() },
@@ -1140,19 +1140,25 @@ struct SourceIndexTorrentContractTests {
         let pipelineSourceCount = await pipelineSourceTransport.count()
         expect(pipelineTorCount == 1 && pipelineSourceCount == 1,
                "REQ-56: the production pipeline sends the exact episode target to both owners")
-        let pipelineMerged = AuxiliarySourcePipeline.merged(
-            into: ordinaryGroups,
+        let pipelineSnapshot = AuxiliarySourcePipeline.snapshot(
             target: episodeZeroTarget,
             torBox: pipelineTorBox,
             sourceIndex: pipelineSourceIndex
         )
+        let pipelineMerged = AuxiliarySourcePipeline.merged(
+            into: ordinaryGroups,
+            snapshot: pipelineSnapshot
+        )
         expect(pipelineMerged.map(\.id) == ["ordinary", "vortx.torbox.search", SourceIndexClient.groupID],
                "REQ-56: production merge preserves engine groups and adds both exact-target owners")
-        expect(AuxiliarySourcePipeline.merged(
-            into: ordinaryGroups,
+        let wrongTargetSnapshot = AuxiliarySourcePipeline.snapshot(
             target: publicationTarget("tt1375666"),
             torBox: pipelineTorBox,
             sourceIndex: pipelineSourceIndex
+        )
+        expect(AuxiliarySourcePipeline.merged(
+            into: ordinaryGroups,
+            snapshot: wrongTargetSnapshot
         ).map(\.id) == ["ordinary"],
                "REQ-56: production merge cannot lend episode rows to a different download target")
 
@@ -1175,11 +1181,14 @@ struct SourceIndexTorrentContractTests {
                "REQ-56: relational forgery launches zero transport in both production owners")
         expect(pipelineTorBox.streams.isEmpty && pipelineSourceIndex.streams.isEmpty,
                "REQ-56: relational forgery clears both owners with zero publication")
-        expect(AuxiliarySourcePipeline.merged(
-            into: ordinaryGroups,
+        let forgedSnapshot = AuxiliarySourcePipeline.snapshot(
             target: forgedTarget,
             torBox: pipelineTorBox,
             sourceIndex: pipelineSourceIndex
+        )
+        expect(AuxiliarySourcePipeline.merged(
+            into: ordinaryGroups,
+            snapshot: forgedSnapshot
         ).map(\.id) == ["ordinary"],
                "REQ-56: relational forgery preserves only ordinary engine groups")
 
@@ -1239,18 +1248,24 @@ struct SourceIndexTorrentContractTests {
                delayedSourceIndex.streams.first?.infoHash == secondHash { break }
             await Task.yield()
         }
-        expect(AuxiliarySourcePipeline.merged(
-            into: ordinaryGroups,
+        let delayedASnapshot = AuxiliarySourcePipeline.snapshot(
             target: delayedTargetA,
             torBox: delayedTorBox,
             sourceIndex: delayedSourceIndex
-        ).map(\.id) == ["ordinary"],
-               "REQ-56: delayed target B rows remain unavailable to target A ranking and download")
+        )
         expect(AuxiliarySourcePipeline.merged(
             into: ordinaryGroups,
+            snapshot: delayedASnapshot
+        ).map(\.id) == ["ordinary"],
+               "REQ-56: delayed target B rows remain unavailable to target A ranking and download")
+        let delayedBSnapshot = AuxiliarySourcePipeline.snapshot(
             target: delayedTargetB,
             torBox: delayedTorBox,
             sourceIndex: delayedSourceIndex
+        )
+        expect(AuxiliarySourcePipeline.merged(
+            into: ordinaryGroups,
+            snapshot: delayedBSnapshot
         ).map(\.id) == ["ordinary", "vortx.torbox.search", SourceIndexClient.groupID],
                "REQ-56: target B receives both exact-owner rows for ranking and download")
 
@@ -2374,8 +2389,8 @@ struct SourceIndexTorrentContractTests {
         _ = SourceIndexClient.contentID(imdbId: hostileID, season: 3, episode: 5)
         _ = SourceIndexClient.contentID(imdbId: hugeID, season: 3, episode: 5)
         _ = SourceIndexClient.contentID(imdbId: secretID, season: 3, episode: nil)
-        await SourceIndexClient.contribute(contentID: secretID, descriptors: [])
-        _ = await SourceIndexClient.fetchPooledUsing(
+        await SourceIndexClient.contributeForTesting(contentID: secretID, descriptors: [])
+        _ = await SourceIndexClient.fetchPooledUsingForTesting(
             contentID: secretID, isSignedIn: false,
             gate: { false }, moatProvider: { nil }, transport: { _ in throw SequenceFetchError.failed }
         )
@@ -2430,7 +2445,7 @@ struct SourceIndexTorrentContractTests {
             let capture = CapturedDiagnostics()
             let previous = SourceIndexClient.diagnosticSink
             SourceIndexClient.diagnosticSink = { capture.append($0) }
-            _ = await SourceIndexClient.fetchPooledUsing(
+            _ = await SourceIndexClient.fetchPooledUsingForTesting(
                 contentID: "tt0903747:3:5", isSignedIn: true,
                 gate: { true }, moatProvider: { "moat" },
                 transport: { _ in
@@ -2469,7 +2484,7 @@ struct SourceIndexTorrentContractTests {
             let capture = CapturedDiagnostics()
             let previous = SourceIndexClient.diagnosticSink
             SourceIndexClient.diagnosticSink = { capture.append($0) }
-            await SourceIndexClient.contribute(contentID: "tt0903747:3:5", descriptors: [])
+            await SourceIndexClient.contributeForTesting(contentID: "tt0903747:3:5", descriptors: [])
             SourceIndexClient.diagnosticSink = previous
             RemoteConfigTestState.fleetOverride = nil
             MoatConsent.contributeAndConsume = true
@@ -2494,7 +2509,7 @@ struct SourceIndexTorrentContractTests {
             let previous = SourceIndexClient.diagnosticSink
             SourceIndexClient.diagnosticSink = { capture.append($0) }
             let gate = SequencedGate(sequence)
-            _ = await SourceIndexClient.fetchPooledUsing(
+            _ = await SourceIndexClient.fetchPooledUsingForTesting(
                 contentID: "tt0903747:3:5", isSignedIn: true,
                 gate: { gate.value() }, moatProvider: { "moat" },
                 transport: { _ in

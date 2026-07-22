@@ -22,7 +22,8 @@
 //
 // WHAT IT DOES NOT CLAIM. R1 through R5, R7, and R8 remain narrow source-shape guards; they do not prove the
 // surrounding code is correct. The access check below is compiler-negative and proves a module peer cannot
-// construct `PublicationTarget`. Refresh, merge, stale-result, and mutation behavior live in the production-
+// construct `PublicationTarget`, `Call`, or `Snapshot`, nor invoke a raw owner transport. Refresh, merge,
+// stale-result, and mutation behavior live in the production-
 // linked SourceIndex and TorBox executable suites, which invoke the same pipeline as all three real callers.
 // This file also governs the SOURCE-INDEX / TorBox identity path only. Unrelated reads of the shared meta
 // slot outside the two fenced detail screens (for example the watchlist chip, which has no page id to fence
@@ -38,7 +39,7 @@ import Foundation
 
 /// A stall must FAIL, not hang. Every phase runs under this watchdog, so a pathological input (an enormous
 /// file, a runaway scan) exits non-zero instead of sitting in CI forever.
-private let watchdogSeconds = 60.0
+private let watchdogSeconds = 180.0
 private let watchdog = Thread {
     Thread.sleep(forTimeInterval: watchdogSeconds)
     FileHandle.standardError.write(
@@ -156,46 +157,228 @@ private func requiring(_ file: SourceFile, _ needle: String, why: String) -> [St
     file.lines(containing: needle).isEmpty ? ["\(file.path) \(why) (missing `\(needle)`)"] : []
 }
 
-private func directTargetConstructionIsRejected(repoRoot: String) -> Bool {
+private func constructionFixtureIsRejected(
+    repoRoot: String,
+    name: String,
+    source: String,
+    expectedDiagnostics: [String],
+    rejectionDiagnostics: [String]
+) -> Bool {
     let fileManager = FileManager.default
     let directory = fileManager.temporaryDirectory
-        .appendingPathComponent("vortx-target-access-\(UUID().uuidString)", isDirectory: true)
+        .appendingPathComponent("vortx-identity-access-\(UUID().uuidString)", isDirectory: true)
     do {
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: directory) }
-        let fixture = directory.appendingPathComponent("main.swift")
-        try """
-        import Foundation
-        let target = SourceIndexIdentity.PublicationTarget(
-            titleID: "tt0903747", contentID: "tt1375666:1:1", season: 1, episode: 1
-        )
-        print(target)
-        """.write(to: fixture, atomically: true, encoding: .utf8)
+        let fixture = directory.appendingPathComponent("PeerConstruction.swift")
+        try source.write(to: fixture, atomically: true, encoding: .utf8)
 
         let process = Process()
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
         process.arguments = [
             "swiftc", "-swift-version", "6", "-strict-concurrency=complete", "-warnings-as-errors",
+            "-D", "SOURCE_INDEX_IDENTITY_TESTING", "-typecheck",
             repoRoot + "/app/SourcesShared/SourceIndexContract.swift",
             repoRoot + "/app/SourcesShared/SourceIndexIdentity.swift",
+            repoRoot + "/app/SourcesShared/MoatToken.swift",
+            repoRoot + "/app/SourcesShared/SourceIndexClient.swift",
+            repoRoot + "/app/SourcesShared/TorBoxSearchSource.swift",
+            repoRoot + "/app/Tests/SourceIndexTorrentContractTests.swift",
             fixture.path,
-            "-o", directory.appendingPathComponent("forged-target").path,
         ]
         process.standardOutput = output
         process.standardError = output
         try process.run()
         process.waitUntilExit()
         let diagnostic = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        let rejectedForAccess = process.terminationStatus != 0
-            && diagnostic.contains("PublicationTarget")
-            && diagnostic.contains("inaccessible")
-        if !rejectedForAccess { print("      direct-construction diagnostic: \(diagnostic)") }
-        return rejectedForAccess
+        let rejectedForExpectedReason = process.terminationStatus != 0
+            && expectedDiagnostics.allSatisfy(diagnostic.contains)
+            && rejectionDiagnostics.contains(where: diagnostic.contains)
+        if !rejectedForExpectedReason { print("      \(name) diagnostic: \(diagnostic)") }
+        return rejectedForExpectedReason
     } catch {
-        print("      direct-construction proof could not run: \(error)")
+        print("      \(name) proof could not run: \(error)")
         return false
     }
+}
+
+private func directConstructionIsRejected(repoRoot: String) -> Bool {
+    constructionFixtureIsRejected(
+        repoRoot: repoRoot,
+        name: "direct construction",
+        source: """
+        import Foundation
+
+        func attemptDirectConstruction() {
+            _ = SourceIndexIdentity.PublicationTarget(
+                titleID: "tt0903747", contentID: "tt1375666:1:1", season: 1, episode: 1
+            )
+            _ = AuxiliarySourcePipeline.Call(resolution: .absent)
+            _ = AuxiliarySourcePipeline.RefreshReceipt(target: .absent)
+            _ = AuxiliarySourcePipeline.Snapshot(
+                target: nil, torBoxStreams: [], sourceIndexStreams: []
+            )
+        }
+        """,
+        expectedDiagnostics: ["PublicationTarget", "AuxiliarySourcePipeline.Call", "AuxiliarySourcePipeline.RefreshReceipt", "AuxiliarySourcePipeline.Snapshot"],
+        rejectionDiagnostics: ["inaccessible"]
+    )
+}
+
+private func synthesizedConstructionIsRejected(repoRoot: String) -> Bool {
+    constructionFixtureIsRejected(
+        repoRoot: repoRoot,
+        name: "synthesized storage construction",
+        source: """
+        import Foundation
+
+        func attemptSynthesizedConstruction() {
+            _ = SourceIndexIdentity.PublicationTarget(
+                titleIDStorage: "tt0903747", contentIDStorage: "tt0903747",
+                seasonStorage: nil, episodeStorage: nil
+            )
+            _ = AuxiliarySourcePipeline.Call(resolutionStorage: .absent)
+            _ = AuxiliarySourcePipeline.RefreshReceipt(targetStorage: .absent)
+            _ = AuxiliarySourcePipeline.Snapshot(
+                targetStorage: nil, torBoxStreamsStorage: [], sourceIndexStreamsStorage: []
+            )
+        }
+        """,
+        expectedDiagnostics: ["PublicationTarget", "AuxiliarySourcePipeline.Call", "AuxiliarySourcePipeline.RefreshReceipt", "AuxiliarySourcePipeline.Snapshot"],
+        rejectionDiagnostics: ["extra argument", "incorrect argument labels", "no exact matches"]
+    )
+}
+
+private func peerPrivateStorageConstructionIsRejected(repoRoot: String) -> Bool {
+    constructionFixtureIsRejected(
+        repoRoot: repoRoot,
+        name: "peer private-storage construction",
+        source: """
+        import Foundation
+
+        extension SourceIndexIdentity.PublicationTarget {
+            init(forgedTitleID: String, forgedContentID: String, season: Int?, episode: Int?) {
+                self.titleIDStorage = forgedTitleID
+                self.contentIDStorage = forgedContentID
+                self.seasonStorage = season
+                self.episodeStorage = episode
+            }
+        }
+
+        extension AuxiliarySourcePipeline.Call {
+            init(forgedResolution: SourceIndexIdentity.TargetResolution) {
+                self.resolutionStorage = forgedResolution
+            }
+        }
+
+        extension AuxiliarySourcePipeline.RefreshReceipt {
+            init(forgedTarget: SourceIndexIdentity.TargetResolution) {
+                self.targetStorage = forgedTarget
+            }
+        }
+
+        extension AuxiliarySourcePipeline.Snapshot {
+            init(forgedTarget: SourceIndexIdentity.PublicationTarget?) {
+                self.targetStorage = forgedTarget
+                self.torBoxStreamsStorage = []
+                self.sourceIndexStreamsStorage = []
+            }
+        }
+        """,
+        expectedDiagnostics: ["titleIDStorage", "resolutionStorage", "targetStorage"],
+        rejectionDiagnostics: ["inaccessible"]
+    )
+}
+
+private func peerProjectionMutationIsRejected(repoRoot: String) -> Bool {
+    constructionFixtureIsRejected(
+        repoRoot: repoRoot,
+        name: "peer projection mutation",
+        source: """
+        import Foundation
+
+        extension SourceIndexIdentity.PublicationTarget {
+            mutating func forgeProjection() {
+                titleID = "tt0903747"
+                contentID = "tt1375666"
+            }
+        }
+
+        extension AuxiliarySourcePipeline.Call {
+            mutating func forgeProjection() {
+                resolution = .absent
+            }
+        }
+
+        extension AuxiliarySourcePipeline.RefreshReceipt {
+            mutating func forgeProjection() {
+                target = .absent
+            }
+        }
+
+        extension AuxiliarySourcePipeline.Snapshot {
+            mutating func forgeProjection() {
+                target = nil
+                torBoxStreams = []
+                sourceIndexStreams = []
+            }
+        }
+        """,
+        expectedDiagnostics: ["titleID", "resolution", "target"],
+        rejectionDiagnostics: ["get-only property"]
+    )
+}
+
+private func droppedRefreshReceiptIsRejected(repoRoot: String) -> Bool {
+    constructionFixtureIsRejected(
+        repoRoot: repoRoot,
+        name: "dropped refresh receipt",
+        source: """
+        import Foundation
+
+        @MainActor
+        func attemptDroppedRefresh(
+            target: SourceIndexIdentity.TargetResolution,
+            torBox: TorBoxSearchSource,
+            sourceIndex: SourceIndexServeSource,
+            refreshContributors: Bool
+        ) {
+            let snapshot: AuxiliarySourcePipeline.Snapshot
+            if refreshContributors {
+                // Mutation: the real refresh call and its receipt declaration were deleted.
+                snapshot = AuxiliarySourcePipeline.snapshot(
+                    receipt: receipt, torBox: torBox, sourceIndex: sourceIndex
+                )
+            } else {
+                snapshot = AuxiliarySourcePipeline.snapshot(
+                    target: target, torBox: torBox, sourceIndex: sourceIndex
+                )
+            }
+            _ = snapshot.target
+        }
+        """,
+        expectedDiagnostics: ["receipt"],
+        rejectionDiagnostics: ["cannot find 'receipt' in scope"]
+    )
+}
+
+private func rawTransportEntryPointsAreRejected(repoRoot: String) -> Bool {
+    constructionFixtureIsRejected(
+        repoRoot: repoRoot,
+        name: "raw transport entry points",
+        source: """
+        import Foundation
+
+        func attemptRawTransport() async {
+            await SourceIndexClient.contribute(contentID: "tt0903747", descriptors: [])
+            _ = await SourceIndexClient.fetchPooled(contentID: "tt0903747", isSignedIn: true)
+            _ = await TorBoxSearch.streams(imdbId: "tt0903747", apiKey: "test-key")
+        }
+        """,
+        expectedDiagnostics: ["contribute", "fetchPooled", "streams"],
+        rejectionDiagnostics: ["inaccessible"]
+    )
 }
 
 private let rules: [Rule] = [
@@ -390,8 +573,28 @@ let arguments = CommandLine.arguments
 let repoRoot = arguments.count > 1 ? arguments[1] : FileManager.default.currentDirectoryPath
 
 results.expect(
-    directTargetConstructionIsRejected(repoRoot: repoRoot),
-    "ACCESS: a module peer cannot directly construct PublicationTarget"
+    directConstructionIsRejected(repoRoot: repoRoot),
+    "ACCESS: declared initializers cannot construct PublicationTarget, Call, RefreshReceipt, or Snapshot"
+)
+results.expect(
+    synthesizedConstructionIsRejected(repoRoot: repoRoot),
+    "ACCESS: synthesized storage initializers do not exist for the identity capability types"
+)
+results.expect(
+    peerPrivateStorageConstructionIsRejected(repoRoot: repoRoot),
+    "ACCESS: a same-module peer extension cannot initialize private identity backing state"
+)
+results.expect(
+    peerProjectionMutationIsRejected(repoRoot: repoRoot),
+    "ACCESS: identity projections are read-only to same-module peers"
+)
+results.expect(
+    droppedRefreshReceiptIsRejected(repoRoot: repoRoot),
+    "MUTANT: deleting the typed refresh receipt makes orchestration fail compilation"
+)
+results.expect(
+    rawTransportEntryPointsAreRejected(repoRoot: repoRoot),
+    "ACCESS: same-module peers cannot invoke raw auxiliary transport entry points"
 )
 
 // Phase 0: every governed file must be present and readable. A rule whose files vanished covers nothing, and

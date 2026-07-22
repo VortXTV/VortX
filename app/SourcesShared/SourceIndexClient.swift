@@ -458,7 +458,7 @@ enum SourceIndexClient {
     /// globally spaced start time, including overlapping detached detail/resume call sites. Each POST is
     /// fire-and-forget from the caller. A started POST has one attempt; any non-2xx or transport failure stops
     /// the current title's remaining batches and extends the shared pacing boundary by one interval.
-    static func contribute(contentID: String, descriptors: [Descriptor]) async {
+    fileprivate static func contribute(contentID: String, descriptors: [Descriptor]) async {
         // Every bail below used to be SILENT. A give-to-get pool whose "give" half fails invisibly is why this
         // shipped dead in the field: a full day of playback produced zero contributions and left no trace.
         // Each exit now names its reason exactly once, so the next diag log answers "why" without a code read.
@@ -591,6 +591,12 @@ enum SourceIndexClient {
             }
         }
     }
+
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    static func contributeForTesting(contentID: String, descriptors: [Descriptor]) async {
+        await contribute(contentID: contentID, descriptors: descriptors)
+    }
+    #endif
 
     /// Revalidate and normalize arbitrary descriptor values immediately before upload, deduped by canonical
     /// infohash. This is the final confidentiality boundary used by both the POST path and deterministic tests.
@@ -738,7 +744,7 @@ enum SourceIndexClient {
     /// Read the corroborated pooled sources for `contentID`. Returns `[]` unless the Singularity SERVE toggle is
     /// on AND the user is signed in AND consent is granted AND the fleet flag is on. Fail-soft to `[]` on any
     /// error, on the worker's `login_required` empty read, or when disabled.
-    static func fetchPooled(contentID: String, isSignedIn: Bool) async -> [PooledSource] {
+    fileprivate static func fetchPooled(contentID: String, isSignedIn: Bool) async -> [PooledSource] {
         let lifecycle = SourceIndexLifecycleClock.snapshot()
         let liveGate: @Sendable () async -> Bool = {
             guard SourceIndexLifecycleClock.snapshot() == lifecycle,
@@ -761,7 +767,7 @@ enum SourceIndexClient {
     /// The live GET decision boundary with injectable gate/token/transport seams. The gate is checked before
     /// token work, immediately after token mint/cache lookup, and again immediately before transport. A current
     /// nonempty moat token is mandatory, matching the worker's binding read gate.
-    static func fetchPooledUsing(
+    fileprivate static func fetchPooledUsing(
         contentID: String,
         isSignedIn: Bool,
         gate: @escaping @Sendable () async -> Bool,
@@ -842,6 +848,24 @@ enum SourceIndexClient {
             return []
         }
     }
+
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    static func fetchPooledUsingForTesting(
+        contentID: String,
+        isSignedIn: Bool,
+        gate: @escaping @Sendable () async -> Bool,
+        moatProvider: @escaping @Sendable () async -> String?,
+        transport: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse)
+    ) async -> [PooledSource] {
+        await fetchPooledUsing(
+            contentID: contentID,
+            isSignedIn: isSignedIn,
+            gate: gate,
+            moatProvider: moatProvider,
+            transport: transport
+        )
+    }
+    #endif
 
     /// Turn canonical pooled torrent infohashes into playable `CoreStream`s. Every non-torrent or malformed row
     /// is dropped before it can enter the user's existing debrid pipeline. Fail-soft.
@@ -1310,11 +1334,47 @@ actor SourceIndexFetchCoalescer {
 enum AuxiliarySourcePipeline {
     /// Capability passed to the two owners. Its initializer is file-scoped, so production callers cannot bypass
     /// this pipeline even though the owner implementations live in separate source files.
-    struct Call: Sendable {
-        let resolution: SourceIndexIdentity.TargetResolution
+    struct Call: Equatable, Sendable {
+        private let resolutionStorage: SourceIndexIdentity.TargetResolution
+
+        var resolution: SourceIndexIdentity.TargetResolution { resolutionStorage }
 
         fileprivate init(resolution: SourceIndexIdentity.TargetResolution) {
-            self.resolution = resolution
+            resolutionStorage = resolution
+        }
+    }
+
+    /// Proof that this pipeline paired both owner refreshes for one typed target. Real platform callers feed
+    /// the returned receipt into their immediate snapshot, so deleting the refresh call is a compile failure.
+    struct RefreshReceipt: Equatable, Sendable {
+        private let targetStorage: SourceIndexIdentity.TargetResolution
+
+        var target: SourceIndexIdentity.TargetResolution { targetStorage }
+
+        fileprivate init(target: SourceIndexIdentity.TargetResolution) {
+            targetStorage = target
+        }
+    }
+
+    /// One immutable, relationally validated view of both auxiliary owners for a single typed target. The
+    /// source-list and batch selectors consume this value instead of reading owner arrays beside a raw id.
+    struct Snapshot: @unchecked Sendable {
+        private let targetStorage: SourceIndexIdentity.PublicationTarget?
+        private let torBoxStreamsStorage: [CoreStream]
+        private let sourceIndexStreamsStorage: [CoreStream]
+
+        var target: SourceIndexIdentity.PublicationTarget? { targetStorage }
+        var torBoxStreams: [CoreStream] { torBoxStreamsStorage }
+        var sourceIndexStreams: [CoreStream] { sourceIndexStreamsStorage }
+
+        fileprivate init(
+            target: SourceIndexIdentity.PublicationTarget?,
+            torBoxStreams: [CoreStream],
+            sourceIndexStreams: [CoreStream]
+        ) {
+            targetStorage = target
+            torBoxStreamsStorage = torBoxStreams
+            sourceIndexStreamsStorage = sourceIndexStreams
         }
     }
 
@@ -1325,45 +1385,66 @@ enum AuxiliarySourcePipeline {
     #endif
 
     @MainActor
+    @discardableResult
     static func refresh(
         target: SourceIndexIdentity.TargetResolution,
         torBox: TorBoxSearchSource,
         sourceIndex: SourceIndexServeSource,
         isSignedIn: Bool
-    ) {
+    ) -> RefreshReceipt {
         let call = Call(resolution: target)
         torBox.refresh(call: call)
         sourceIndex.refresh(call: call, isSignedIn: isSignedIn)
+        return RefreshReceipt(target: target)
     }
 
+    /// Snapshot both owners only when their publication tokens match the same validated target. Invalid,
+    /// absent, mismatched, or stale inputs produce an empty capability and leave ordinary engine groups intact.
     @MainActor
-    static func torBoxMerged(
-        into groups: [CoreStreamSourceGroup],
-        target: SourceIndexIdentity.TargetResolution,
-        torBox: TorBoxSearchSource
-    ) -> [CoreStreamSourceGroup] {
-        torBox.merged(into: groups, call: Call(resolution: target))
-    }
-
-    @MainActor
-    static func sourceIndexMerged(
-        into groups: [CoreStreamSourceGroup],
-        target: SourceIndexIdentity.TargetResolution,
-        sourceIndex: SourceIndexServeSource
-    ) -> [CoreStreamSourceGroup] {
-        sourceIndex.merged(into: groups, call: Call(resolution: target))
-    }
-
-    @MainActor
-    static func merged(
-        into groups: [CoreStreamSourceGroup],
+    static func snapshot(
         target: SourceIndexIdentity.TargetResolution,
         torBox: TorBoxSearchSource,
         sourceIndex: SourceIndexServeSource
+    ) -> Snapshot {
+        guard let validated = SourceIndexIdentity.validatedTarget(target) else {
+            return Snapshot(target: nil, torBoxStreams: [], sourceIndexStreams: [])
+        }
+        let contentID = validated.contentID
+        return Snapshot(
+            target: validated,
+            torBoxStreams: torBox.publishedContentID == contentID ? torBox.streams : [],
+            sourceIndexStreams: sourceIndex.publishedContentID == contentID ? sourceIndex.streams : []
+        )
+    }
+
+    @MainActor
+    static func snapshot(
+        receipt: RefreshReceipt,
+        torBox: TorBoxSearchSource,
+        sourceIndex: SourceIndexServeSource
+    ) -> Snapshot {
+        snapshot(target: receipt.target, torBox: torBox, sourceIndex: sourceIndex)
+    }
+
+    static func torBoxMerged(
+        into groups: [CoreStreamSourceGroup],
+        snapshot: Snapshot
     ) -> [CoreStreamSourceGroup] {
-        let call = Call(resolution: target)
-        let withTorBox = torBox.merged(into: groups, call: call)
-        return sourceIndex.merged(into: withTorBox, call: call)
+        TorBoxSearchSource.merge(snapshot.torBoxStreams, into: groups)
+    }
+
+    static func sourceIndexMerged(
+        into groups: [CoreStreamSourceGroup],
+        snapshot: Snapshot
+    ) -> [CoreStreamSourceGroup] {
+        SourceIndexServeSource.merge(snapshot.sourceIndexStreams, into: groups)
+    }
+
+    static func merged(
+        into groups: [CoreStreamSourceGroup],
+        snapshot: Snapshot
+    ) -> [CoreStreamSourceGroup] {
+        sourceIndexMerged(into: torBoxMerged(into: groups, snapshot: snapshot), snapshot: snapshot)
     }
 
     static func hoard(

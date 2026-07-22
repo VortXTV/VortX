@@ -2175,23 +2175,34 @@ struct iOSDetailView: View {
         refreshContributors: Bool = true
     ) {
         let target = auxiliaryTarget
+        let snapshot: AuxiliarySourcePipeline.Snapshot
         if refreshContributors {
-            AuxiliarySourcePipeline.refresh(
+            let receipt = AuxiliarySourcePipeline.refresh(
                 target: target,
                 torBox: torboxSearch,
                 sourceIndex: sourceIndex,
                 isSignedIn: VortXSyncManager.shared.isSignedIn
             )
+            snapshot = AuxiliarySourcePipeline.snapshot(
+                receipt: receipt,
+                torBox: torboxSearch,
+                sourceIndex: sourceIndex
+            )
+        } else {
+            snapshot = AuxiliarySourcePipeline.snapshot(
+                target: target,
+                torBox: torboxSearch,
+                sourceIndex: sourceIndex
+            )
         }
-        guard SourceIndexIdentity.validatedTarget(target) != nil else { return }
+        guard snapshot.target != nil else { return }
         // HOARD: report the anonymized descriptors from the UNFILTERED assembled groups (the pool should see
         // torrents even when the user hides them locally). Includes the TorBox search sources. No user data.
         // Pool-EXCLUDED: the caller's torbox-base when it already merged one, else self-merge. NEVER the
         // Singularity-pool-inclusive set: hoarding the pool's own results back into itself would be wrong.
         let groups = torboxMerged ?? AuxiliarySourcePipeline.torBoxMerged(
             into: core.streamGroups(),
-            target: target,
-            torBox: torboxSearch
+            snapshot: snapshot
         )
         guard !groups.isEmpty else { return }
         Task.detached { await AuxiliarySourcePipeline.hoard(target: target, groups: groups) }
@@ -2208,15 +2219,18 @@ struct iOSDetailView: View {
             try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
             guard !Task.isCancelled else { return }
             let target = auxiliaryTarget
+            let snapshot = AuxiliarySourcePipeline.snapshot(
+                target: target,
+                torBox: torboxSearch,
+                sourceIndex: sourceIndex
+            )
             let torboxBase = AuxiliarySourcePipeline.torBoxMerged(
                 into: core.streamGroups(),
-                target: target,
-                torBox: torboxSearch
+                snapshot: snapshot
             )   // pool-EXCLUDED (hoard set)
             debridCache.refresh(from: AuxiliarySourcePipeline.sourceIndexMerged(
                 into: torboxBase,
-                target: target,
-                sourceIndex: sourceIndex
+                snapshot: snapshot
             ))   // pool-INCLUDED (debrid set)
             refreshSourceIndex(torboxMerged: torboxBase, refreshContributors: false)
         }
@@ -2377,12 +2391,12 @@ struct iOSDetailView: View {
         // source-index sources (no-op unless the Singularity toggle is on + signed in), then apply the
         // Direct-links-only filter so a search/community torrent source is filtered on the same rule as an
         // add-on's — keeps the filter contract intact.
-        let withSearch = AuxiliarySourcePipeline.merged(
-            into: groups,
+        let snapshot = AuxiliarySourcePipeline.snapshot(
             target: auxiliaryTarget,
             torBox: torboxSearch,
             sourceIndex: sourceIndex
         )
+        let withSearch = AuxiliarySourcePipeline.merged(into: groups, snapshot: snapshot)
         guard PlaybackSettings.directLinksOnly else { return withSearch }
         return withSearch.compactMap { group in
             let streams = group.streams.filter { !$0.isTorrent }
@@ -2405,7 +2419,7 @@ struct iOSDetailView: View {
     private func rankedMovie() -> (groups: [CoreStreamSourceGroup], best: CoreStream?) {
         sourceList.setContext(
             metaId: id, streamId: nil, continuity: rememberedQuality, pin: sourcePin,
-            auxiliaryContentID: sourceContentID,
+            auxiliaryTarget: auxiliaryTarget,
             mediaServerTargetID: mediaServerTargetID
         )
         return (sourceList.groups, sourceList.best)
@@ -2417,7 +2431,7 @@ struct iOSDetailView: View {
     private func rankedLive() -> [CoreStreamSourceGroup] {
         sourceList.setContext(
             metaId: id, streamId: nil, continuity: nil, pin: sourcePin,
-            auxiliaryContentID: sourceContentID,
+            auxiliaryTarget: auxiliaryTarget,
             mediaServerTargetID: mediaServerTargetID
         )
         return sourceList.groups
@@ -4202,12 +4216,12 @@ struct iOSEpisodeStreams: View {
     /// auto-plays one — the same `displayGroups` filter the tvOS `CoreStreamList` applies. Merges the
     /// TorBox search sources first (no-op with no TorBox key / no results).
     private func displayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        let withSearch = AuxiliarySourcePipeline.merged(
-            into: groups,
+        let snapshot = AuxiliarySourcePipeline.snapshot(
             target: episodeAuxiliaryTarget,
             torBox: torboxSearch,
             sourceIndex: sourceIndex
         )
+        let withSearch = AuxiliarySourcePipeline.merged(into: groups, snapshot: snapshot)
         guard PlaybackSettings.directLinksOnly else { return withSearch }
         return withSearch.compactMap { group in
             let streams = group.streams.filter { !$0.isTorrent }
@@ -4223,7 +4237,7 @@ struct iOSEpisodeStreams: View {
     private func rankedEpisode() -> [CoreStreamSourceGroup] {
         sourceList.setContext(
             metaId: meta.id, streamId: shownVideo.id, continuity: rememberedQuality, pin: sourcePin,
-            auxiliaryContentID: episodeContentID,
+            auxiliaryTarget: episodeAuxiliaryTarget,
             mediaServerTargetID: mediaServerEpisodeTargetID
         )
         return sourceList.groups
@@ -4278,21 +4292,32 @@ struct iOSEpisodeStreams: View {
         refreshContributors: Bool = true
     ) {
         let target = episodeAuxiliaryTarget
+        let snapshot: AuxiliarySourcePipeline.Snapshot
         if refreshContributors {
-            AuxiliarySourcePipeline.refresh(
+            let receipt = AuxiliarySourcePipeline.refresh(
                 target: target,
                 torBox: torboxSearch,
                 sourceIndex: sourceIndex,
                 isSignedIn: VortXSyncManager.shared.isSignedIn
             )
+            snapshot = AuxiliarySourcePipeline.snapshot(
+                receipt: receipt,
+                torBox: torboxSearch,
+                sourceIndex: sourceIndex
+            )
+        } else {
+            snapshot = AuxiliarySourcePipeline.snapshot(
+                target: target,
+                torBox: torboxSearch,
+                sourceIndex: sourceIndex
+            )
         }
-        guard SourceIndexIdentity.validatedTarget(target) != nil else { return }
+        guard snapshot.target != nil else { return }
         // Pool-EXCLUDED hoard set: the caller's episode-scoped torbox-base when it merged one, else self-merge.
         // NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into itself is wrong.
         let groups = torboxMerged ?? AuxiliarySourcePipeline.torBoxMerged(
             into: core.streamGroups(forStreamId: shownVideo.id),
-            target: target,
-            torBox: torboxSearch
+            snapshot: snapshot
         )
         guard !groups.isEmpty else { return }
         Task.detached { await AuxiliarySourcePipeline.hoard(target: target, groups: groups) }
@@ -4309,15 +4334,18 @@ struct iOSEpisodeStreams: View {
             try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
             guard !Task.isCancelled else { return }
             let target = episodeAuxiliaryTarget
+            let snapshot = AuxiliarySourcePipeline.snapshot(
+                target: target,
+                torBox: torboxSearch,
+                sourceIndex: sourceIndex
+            )
             let torboxBase = AuxiliarySourcePipeline.torBoxMerged(
                 into: core.streamGroups(forStreamId: shownVideo.id),
-                target: target,
-                torBox: torboxSearch
+                snapshot: snapshot
             )   // pool-EXCLUDED
             debridCache.refresh(from: AuxiliarySourcePipeline.sourceIndexMerged(
                 into: torboxBase,
-                target: target,
-                sourceIndex: sourceIndex
+                snapshot: snapshot
             ))   // pool-INCLUDED (debrid set)
             refreshSourceIndex(torboxMerged: torboxBase, refreshContributors: false)
         }

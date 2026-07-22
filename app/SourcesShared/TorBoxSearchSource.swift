@@ -88,7 +88,7 @@ enum TorBoxSearch {
     /// caller backs off instead of re-firing on the next title and burning more of the quota. `transportError`
     /// is `true` when a leg's request never completed (offline, DNS/TLS failure, timeout), so the caller keeps
     /// the empty result OUT of the session cache and re-fetches for real once the network is back.
-    static func streams(imdbId: String, season: Int? = nil, episode: Int? = nil, apiKey: String) async -> (streams: [CoreStream], rateLimited: Bool, transportError: Bool) {
+    fileprivate static func streams(imdbId: String, season: Int? = nil, episode: Int? = nil, apiKey: String) async -> (streams: [CoreStream], rateLimited: Bool, transportError: Bool) {
         guard imdbId.hasPrefix("tt") else { return ([], false, false) }
         async let usenet = fetch(kind: "usenet", imdbId: imdbId, season: season, episode: episode, apiKey: apiKey)
         async let torrents = fetch(kind: "torrents", imdbId: imdbId, season: season, episode: episode, apiKey: apiKey)

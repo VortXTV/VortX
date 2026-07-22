@@ -2008,7 +2008,7 @@ struct CoreStreamList: View {
         // seriesPage) scoped too. Movies and live pass nil -> unscoped, unchanged.
         sourceList.setContext(
             metaId: meta?.libraryId ?? "", streamId: episodeStreamId, continuity: remembered, pin: sourcePin,
-            auxiliaryContentID: sourceContentID,
+            auxiliaryTarget: auxiliaryTarget,
             mediaServerTargetID: mediaServerTargetID
         )
         let groups = sourceList.groups                               // best source first within each add-on
@@ -2504,22 +2504,33 @@ struct CoreStreamList: View {
         refreshContributors: Bool = true
     ) {
         let target = auxiliaryTarget
+        let snapshot: AuxiliarySourcePipeline.Snapshot
         if refreshContributors {
-            AuxiliarySourcePipeline.refresh(
+            let receipt = AuxiliarySourcePipeline.refresh(
                 target: target,
                 torBox: torboxSearch,
                 sourceIndex: sourceIndex,
                 isSignedIn: VortXSyncManager.shared.isSignedIn
             )
+            snapshot = AuxiliarySourcePipeline.snapshot(
+                receipt: receipt,
+                torBox: torboxSearch,
+                sourceIndex: sourceIndex
+            )
+        } else {
+            snapshot = AuxiliarySourcePipeline.snapshot(
+                target: target,
+                torBox: torboxSearch,
+                sourceIndex: sourceIndex
+            )
         }
-        guard SourceIndexIdentity.validatedTarget(target) != nil else { return }
+        guard snapshot.target != nil else { return }
         // Pool-EXCLUDED hoard set: the caller's torbox-base when it already merged one (avoids a second walk),
         // else self-merge. NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into
         // itself would be wrong.
         let groups = torboxMerged ?? AuxiliarySourcePipeline.torBoxMerged(
             into: targetCoreGroups,
-            target: target,
-            torBox: torboxSearch
+            snapshot: snapshot
         )
         guard !groups.isEmpty else { return }
         Task.detached { await AuxiliarySourcePipeline.hoard(target: target, groups: groups) }
@@ -2534,18 +2545,21 @@ struct CoreStreamList: View {
             try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
             guard !Task.isCancelled else { return }
             let target = auxiliaryTarget
+            let snapshot = AuxiliarySourcePipeline.snapshot(
+                target: target,
+                torBox: torboxSearch,
+                sourceIndex: sourceIndex
+            )
             let torboxBase = AuxiliarySourcePipeline.torBoxMerged(
                 into: targetCoreGroups,
-                target: target,
-                torBox: torboxSearch
+                snapshot: snapshot
             )   // pool-EXCLUDED (hoard set)
             // Pool-INCLUDED: cache awareness needs raw torrents and TorBox-search NZBs that the Direct-links-only
             // filter would drop, plus Singularity's torrent-only pool sources. Torrents resolve through debrid;
             // TorBox-search NZBs resolve through TorBox. This remains orthogonal to the display filter.
             debridCache.refresh(from: AuxiliarySourcePipeline.sourceIndexMerged(
                 into: torboxBase,
-                target: target,
-                sourceIndex: sourceIndex
+                snapshot: snapshot
             ))
             refreshSourceIndex(torboxMerged: torboxBase, refreshContributors: false)
         }

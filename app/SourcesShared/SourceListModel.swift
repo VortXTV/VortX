@@ -66,7 +66,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     struct Context: Equatable {
         var metaId = ""              // for the pin scope + the health-metric log only
         var streamId: String?        // nil = all loaded groups (movie/live); set = one episode's groups (iOS + tvOS episode pages)
-        var auxiliaryContentID: String?   // canonical query token for TorBox Search + Singularity
+        var auxiliaryTarget: SourceIndexIdentity.TargetResolution = .absent
+                                            // typed target for TorBox Search + Singularity
         var mediaServerTargetID: String?  // exact page token, including IMDb-less title/year fallback pages
         var continuity: String?      // remembered quality signature for the best() pick (nil for live)
         var pin: ResolvedPin?        // resolved pinned source, from the view's SourcePinStore lookup
@@ -91,7 +92,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     private struct OutputIdentity: Equatable {
         let metaId: String
         let streamId: String?
-        let auxiliaryContentID: String?
+        let auxiliaryTarget: SourceIndexIdentity.TargetResolution
         let mediaServerTargetID: String?
     }
 
@@ -159,11 +160,12 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     /// cheap reads plus an equality check, publishes nothing synchronously, and only nudges the
     /// coalescer when an input actually moved.
     func setContext(metaId: String, streamId: String?, continuity: String?, pin: ResolvedPin?,
-                    auxiliaryContentID: String? = nil, mediaServerTargetID: String? = nil) {
+                    auxiliaryTarget: SourceIndexIdentity.TargetResolution = .absent,
+                    mediaServerTargetID: String? = nil) {
         var next = Context()
         next.metaId = metaId
         next.streamId = streamId
-        next.auxiliaryContentID = auxiliaryContentID
+        next.auxiliaryTarget = auxiliaryTarget
         next.mediaServerTargetID = mediaServerTargetID
         next.continuity = continuity
         next.pin = pin
@@ -173,7 +175,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         next.disabledAddons = ProfileStore.activeDisabledAddons()
         guard next != context else { return }
         let identityChanged = next.metaId != context.metaId || next.streamId != context.streamId
-            || next.auxiliaryContentID != context.auxiliaryContentID
+            || next.auxiliaryTarget != context.auxiliaryTarget
             || next.mediaServerTargetID != context.mediaServerTargetID
         context = next
         if identityChanged {
@@ -191,7 +193,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         OutputIdentity(
             metaId: context.metaId,
             streamId: context.streamId,
-            auxiliaryContentID: context.auxiliaryContentID,
+            auxiliaryTarget: context.auxiliaryTarget,
             mediaServerTargetID: context.mediaServerTargetID
         )
     }
@@ -208,7 +210,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         var hasher = Hasher()
         hasher.combine(ctx.metaId)
         hasher.combine(ctx.streamId)
-        hasher.combine(ctx.auxiliaryContentID)
+        hasher.combine(ctx.auxiliaryTarget)
         hasher.combine(ctx.mediaServerTargetID)
         hasher.combine(ctx.continuity)
         hasher.combine(String(describing: ctx.pin))
@@ -230,9 +232,13 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
 
         // Immutable snapshot on the main actor; everything below is value types.
         let raw = ctx.streamId.map { core.streamGroups(forStreamId: $0) } ?? core.streamGroups()
-        let target = ctx.auxiliaryContentID
-        let torboxStreams = target != nil && torbox.publishedContentID == target ? torbox.streams : []
-        let singularityStreams = target != nil && singularity.publishedContentID == target ? singularity.streams : []
+        let auxiliarySnapshot = AuxiliarySourcePipeline.snapshot(
+            target: ctx.auxiliaryTarget,
+            torBox: torbox,
+            sourceIndex: singularity
+        )
+        let torboxStreams = auxiliarySnapshot.torBoxStreams
+        let singularityStreams = auxiliarySnapshot.sourceIndexStreams
         let singularityEpoch = singularity.epoch
         let sourceLifecycle = SourceIndexLifecycleClock.snapshot()
         let includedSingularity = !singularityStreams.isEmpty
@@ -258,9 +264,10 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             // Merge order preserved from the old per-body displayGroups: TorBox search first, then the
             // Singularity pool, then the media-server direct-play groups, then the direct-links filter so a
             // merged torrent obeys the same rule. Final rank order is decided by StreamRanking, not merge order.
-            assembled = MediaServerSource.merge(mediaServerGroups,
-                          into: SourceIndexServeSource.merge(singularityStreams,
-                                  into: TorBoxSearchSource.merge(torboxStreams, into: assembled)))
+            assembled = MediaServerSource.merge(
+                mediaServerGroups,
+                into: AuxiliarySourcePipeline.merged(into: assembled, snapshot: auxiliarySnapshot)
+            )
             if ctx.directLinksOnly {
                 assembled = assembled.compactMap { group in
                     let streams = group.streams.filter { !$0.isTorrent }

@@ -106,24 +106,29 @@ enum SourceIndexIdentity {
 
     /// One exact target shared by auxiliary transport, publication, merge, rank, and download assembly.
     struct PublicationTarget: Equatable, Hashable, Sendable {
-        let titleID: String
-        let contentID: String
-        let season: Int?
-        let episode: Int?
+        private let titleIDStorage: String
+        private let contentIDStorage: String
+        private let seasonStorage: Int?
+        private let episodeStorage: Int?
+
+        var titleID: String { titleIDStorage }
+        var contentID: String { contentIDStorage }
+        var season: Int? { seasonStorage }
+        var episode: Int? { episodeStorage }
 
         /// Construction stays in this file so every target originates from the role resolver and tuple-exact
         /// content-key composer below. Module peers can inspect a target, but cannot forge unrelated fields.
         fileprivate init(titleID: String, contentID: String, season: Int?, episode: Int?) {
-            self.titleID = titleID
-            self.contentID = contentID
-            self.season = season
-            self.episode = episode
+            titleIDStorage = titleID
+            contentIDStorage = contentID
+            seasonStorage = season
+            episodeStorage = episode
         }
     }
 
     /// The typed result of resolving a publication target. `mismatch` must remain distinguishable from an
     /// ordinary title with no IMDb identity so tests can pin the conflicting-head failure contract.
-    enum TargetResolution: Equatable, Sendable {
+    enum TargetResolution: Equatable, Hashable, Sendable {
         case target(PublicationTarget)
         case absent
         case mismatch

@@ -150,6 +150,7 @@ final class BatchDownloadCoordinator: ObservableObject {
     /// The series whose contributors were last refreshed, so the refresh fires once per series, not
     /// per episode (both clients also dedup internally; this keeps the intent explicit).
     private var contributorSeriesKey: String?
+    private var contributorReceipt: AuxiliarySourcePipeline.RefreshReceipt?
 
     /// Pending one-shot failure swaps, keyed by the DownloadRecord id the batch queued (#119 remainder). An
     /// entry is registered ONLY when a distinct next-best source exists, and is CONSUMED on the first swap
@@ -248,8 +249,8 @@ final class BatchDownloadCoordinator: ObservableObject {
                 tally?.alreadyDownloaded += 1
                 continue
             }
-            let target = refreshContributorsIfNeeded(for: job)
-            switch await resolveAndQueue(job, auxiliaryTarget: target) {
+            let receipt = refreshContributorsIfNeeded(for: job)
+            switch await resolveAndQueue(job, auxiliaryReceipt: receipt) {
             case .queued: tally?.queued += 1
             case .noSource: tally?.skipped.append(episodeLabel(job.video))
             case .cancelled: break
@@ -274,7 +275,7 @@ final class BatchDownloadCoordinator: ObservableObject {
     /// published results, leaving the TorBox session cache + scraper-cooldown state and the
     /// Singularity result bank intact (those protect the APIs session-wide, which is why the
     /// instances are cleared rather than recreated).
-    private func refreshContributorsIfNeeded(for job: Job) -> SourceIndexIdentity.TargetResolution {
+    private func refreshContributorsIfNeeded(for job: Job) -> AuxiliarySourcePipeline.RefreshReceipt {
         let season = job.video.season
         let episode = job.video.episode
         // The episode ACTUALLY being resolved supplies the current-video role, so the key this batch
@@ -282,20 +283,21 @@ final class BatchDownloadCoordinator: ObservableObject {
         let roles = job.identityRoles.selecting(currentVideoID: job.video.id)
         let target = SourceIndexIdentity.publicationTarget(roles, season: season, episode: episode)
         let ownerKey = target.target?.contentID ?? "meta:\(job.seriesId)|video:\(job.video.id)"
-        guard ownerKey != contributorSeriesKey else { return target }
+        if ownerKey == contributorSeriesKey, let contributorReceipt { return contributorReceipt }
         contributorSeriesKey = ownerKey
         // Reset FIRST, unconditionally: this also closes the valid-id window where the previous
         // series' streams linger until the new series' own fetch lands (Singularity does not clear
         // on a content-id change until its fetch returns).
         torboxSearch.clearResults()
         sourceIndex.clearResults()
-        AuxiliarySourcePipeline.refresh(
+        let receipt = AuxiliarySourcePipeline.refresh(
             target: target,
             torBox: torboxSearch,
             sourceIndex: sourceIndex,
             isSignedIn: VortXSyncManager.shared.isSignedIn
         )
-        return target
+        contributorReceipt = receipt
+        return receipt
     }
 
     /// The per-episode pipeline, mirroring the manual episode page step for step (load + settle with
@@ -304,7 +306,7 @@ final class BatchDownloadCoordinator: ObservableObject {
     /// dead episode.
     private func resolveAndQueue(
         _ job: Job,
-        auxiliaryTarget: SourceIndexIdentity.TargetResolution
+        auxiliaryReceipt: AuxiliarySourcePipeline.RefreshReceipt
     ) async -> Outcome {
         let core = CoreBridge.shared
         // Point the engine's SINGLE shared meta_details slot at THIS episode's streams. The slot is
@@ -331,11 +333,14 @@ final class BatchDownloadCoordinator: ObservableObject {
             // The manual `displayGroups` composition: TorBox search merged first, the community pool
             // second, THEN the Direct-links-only filter, so a search/pool torrent obeys the same rule
             // as an add-on's. Re-merged every iteration so contributor results landing mid-settle count.
-            groups = iOSDisplayGroups(AuxiliarySourcePipeline.merged(
-                into: core.streamGroups(forStreamId: job.video.id),
-                target: auxiliaryTarget,
+            let auxiliarySnapshot = AuxiliarySourcePipeline.snapshot(
+                receipt: auxiliaryReceipt,
                 torBox: torboxSearch,
                 sourceIndex: sourceIndex
+            )
+            groups = iOSDisplayGroups(AuxiliarySourcePipeline.merged(
+                into: core.streamGroups(forStreamId: job.video.id),
+                snapshot: auxiliarySnapshot
             ))
             if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
             let progress = core.streamLoadProgress(forStreamId: job.video.id)
@@ -471,6 +476,7 @@ final class BatchDownloadCoordinator: ObservableObject {
         plannedBySeries = [:]
         startedBySeries = [:]
         contributorSeriesKey = nil
+        contributorReceipt = nil
         statusText = nil
         runningSeriesIds = []
         remainingBySeries = [:]

@@ -21,6 +21,35 @@ struct CoreStreamSourceGroup: Equatable, Sendable {
 
 struct ResolvedPin: Equatable, Sendable {}
 
+enum SourceIndexIdentity {
+    struct PublicationTarget: Equatable, Hashable, Sendable {
+        let titleID: String
+        let contentID: String
+        let season: Int?
+        let episode: Int?
+    }
+
+    enum TargetResolution: Equatable, Hashable, Sendable {
+        case target(PublicationTarget)
+        case absent
+        case mismatch
+    }
+
+    static func target(
+        _ titleID: String,
+        contentID: String? = nil,
+        season: Int? = nil,
+        episode: Int? = nil
+    ) -> TargetResolution {
+        .target(PublicationTarget(
+            titleID: titleID,
+            contentID: contentID ?? titleID,
+            season: season,
+            episode: episode
+        ))
+    }
+}
+
 struct SourceIndexLifecycleSnapshot: Equatable, Sendable {
     let sourceGeneration: UInt64
     let sessionGeneration: UInt64
@@ -122,6 +151,40 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     }
 }
 
+enum AuxiliarySourcePipeline {
+    struct Snapshot: Sendable {
+        let target: SourceIndexIdentity.PublicationTarget?
+        let torBoxStreams: [CoreStream]
+        let sourceIndexStreams: [CoreStream]
+    }
+
+    @MainActor
+    static func snapshot(
+        target: SourceIndexIdentity.TargetResolution,
+        torBox: TorBoxSearchSource,
+        sourceIndex: SourceIndexServeSource
+    ) -> Snapshot {
+        guard case let .target(validated) = target else {
+            return Snapshot(target: nil, torBoxStreams: [], sourceIndexStreams: [])
+        }
+        return Snapshot(
+            target: validated,
+            torBoxStreams: torBox.publishedContentID == validated.contentID ? torBox.streams : [],
+            sourceIndexStreams: sourceIndex.publishedContentID == validated.contentID ? sourceIndex.streams : []
+        )
+    }
+
+    nonisolated static func merged(
+        into groups: [CoreStreamSourceGroup],
+        snapshot: Snapshot
+    ) -> [CoreStreamSourceGroup] {
+        SourceIndexServeSource.merge(
+            snapshot.sourceIndexStreams,
+            into: TorBoxSearchSource.merge(snapshot.torBoxStreams, into: groups)
+        )
+    }
+}
+
 @MainActor
 final class MediaServerSource: ObservableObject {
     @Published var groups: [CoreStreamSourceGroup] = [] { didSet { epoch &+= 1 } }
@@ -216,7 +279,8 @@ enum StreamRanking {
         pin: ResolvedPin?,
         debridCachedHashes: Set<String>
     ) -> CoreStream? {
-        groups.first?.streams.first
+        groups.lazy.flatMap(\.streams).first { $0.id.hasPrefix("downloadable") }
+            ?? groups.first?.streams.first
     }
 
     static func tiers(_ groups: [CoreStreamSourceGroup]) -> [String] {
@@ -249,11 +313,30 @@ enum VXProbe {
 @main
 struct SourceIndexSourceListLifecycleTests {
     @MainActor
+    private static func waitUntil(_ predicate: () -> Bool) async -> Bool {
+        for _ in 0..<2_000 {
+            if predicate() { return true }
+            try? await Task<Never, Never>.sleep(nanoseconds: 500_000)
+        }
+        return predicate()
+    }
+
+    @MainActor
     static func main() async {
         let ordinary = CoreStream(id: "ordinary", infoHash: nil, isTorrent: false)
         let pooled = CoreStream(id: "pooled", infoHash: String(repeating: "a", count: 40), isTorrent: true)
-        let torboxRow = CoreStream(id: "torbox-row", infoHash: String(repeating: "b", count: 40), isTorrent: true)
+        let torboxRow = CoreStream(
+            id: "downloadable-A",
+            infoHash: String(repeating: "b", count: 40),
+            isTorrent: true
+        )
         let mediaRow = CoreStream(id: "media-row", infoHash: nil, isTorrent: false)
+        let targetA = SourceIndexIdentity.target(
+            "tt0903747", contentID: "tt0903747:1:1", season: 1, episode: 1
+        )
+        let targetB = SourceIndexIdentity.target(
+            "tt0903747", contentID: "tt0903747:1:2", season: 1, episode: 2
+        )
         let core = CoreBridge(groups: [
             CoreStreamSourceGroup(id: "ordinary", addon: "Ordinary", streams: [ordinary]),
         ])
@@ -272,7 +355,7 @@ struct SourceIndexSourceListLifecycleTests {
         let model = SourceListModel()
         model.setContext(
             metaId: "tt0903747", streamId: "tt0903747:1:1", continuity: nil, pin: nil,
-            auxiliaryContentID: "tt0903747:1:1", mediaServerTargetID: "page:tt0903747:1:1"
+            auxiliaryTarget: targetA, mediaServerTargetID: "page:tt0903747:1:1"
         )
 
         model.bind(
@@ -282,26 +365,22 @@ struct SourceIndexSourceListLifecycleTests {
             mediaServers: mediaServers,
             debridCache: debridCache
         )
-        for _ in 0..<2_000 {
-            if model.groups.contains(where: { $0.id == "singularity" }) { break }
-            await Task.yield()
-        }
+        _ = await waitUntil { model.groups.contains(where: { $0.id == "singularity" }) }
         let initialPublished = ["torbox", "singularity", "media"].allSatisfy { id in
             model.groups.contains { $0.id == id }
         }
+        let targetAReachesFinalDownloadChoice = model.best?.id == "downloadable-A"
+        let ordinaryEnginePreserved = model.groups.contains { $0.id == "ordinary" }
 
         model.setContext(
             metaId: "tt0903747", streamId: "tt0903747:1:2", continuity: nil, pin: nil,
-            auxiliaryContentID: "tt0903747:1:2", mediaServerTargetID: "page:tt0903747:1:2"
+            auxiliaryTarget: targetB, mediaServerTargetID: "page:tt0903747:1:2"
         )
         let identityClearedSynchronously = model.groups.isEmpty
             && model.best == nil
             && model.tiers.isEmpty
             && model.resolutionOptions.isEmpty
-        for _ in 0..<4_000 {
-            if model.groups.contains(where: { $0.id == "ordinary" }) { break }
-            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
-        }
+        _ = await waitUntil { model.groups.contains(where: { $0.id == "ordinary" }) }
         let staleAuxiliaryExcluded = ["torbox", "singularity", "media"].allSatisfy { id in
             !model.groups.contains { $0.id == id }
         }
@@ -314,34 +393,71 @@ struct SourceIndexSourceListLifecycleTests {
         mediaServers.groups = [
             CoreStreamSourceGroup(id: "media", addon: "My Server", streams: [mediaRow]),
         ]
-        for _ in 0..<4_000 {
+        _ = await waitUntil {
             let ids = Set(model.groups.map(\.id))
-            if ids.isSuperset(of: ["torbox", "singularity", "media"]) { break }
-            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+            return ids.isSuperset(of: ["torbox", "singularity", "media"])
         }
         let matchingAuxiliaryIncluded = ["torbox", "singularity", "media"].allSatisfy { id in
             model.groups.contains { $0.id == id }
         }
 
         model.setContext(
+            metaId: "tt0903747", streamId: "mismatch", continuity: nil, pin: nil,
+            auxiliaryTarget: .mismatch
+        )
+        _ = await waitUntil { model.groups.map(\.id) == ["ordinary"] }
+        let mismatchPreservesOrdinary = model.groups.map(\.id) == ["ordinary"]
+            && model.best?.id == "ordinary"
+
+        model.setContext(
+            metaId: "tt0903747", streamId: "absent", continuity: nil, pin: nil,
+            auxiliaryTarget: .absent
+        )
+        _ = await waitUntil { model.groups.map(\.id) == ["ordinary"] }
+        let absentPreservesOrdinary = model.groups.map(\.id) == ["ordinary"]
+            && model.best?.id == "ordinary"
+
+        model.setContext(
+            metaId: "tt0903747", streamId: "nil-default", continuity: nil, pin: nil
+        )
+        _ = await waitUntil { model.groups.map(\.id) == ["ordinary"] }
+        let nilDefaultPreservesOrdinary = model.groups.map(\.id) == ["ordinary"]
+            && model.best?.id == "ordinary"
+
+        let episodeOnlyTarget = SourceIndexIdentity.target(
+            "tt0903747", contentID: "tt0903747:3:0", season: 3, episode: 0
+        )
+        torbox.publishedContentID = "tt0903747:3:0"
+        torbox.streams = [torboxRow]
+        singularity.publishedContentID = "tt0903747:3:0"
+        singularity.streams = [pooled]
+        model.setContext(
+            metaId: "tt0903747", streamId: "tt0903747:3:0", continuity: nil, pin: nil,
+            auxiliaryTarget: episodeOnlyTarget
+        )
+        _ = await waitUntil {
+            Set(model.groups.map(\.id)).isSuperset(of: ["ordinary", "torbox", "singularity"])
+        }
+        let episodeOnlyIncluded = Set(model.groups.map(\.id)).isSuperset(
+            of: ["ordinary", "torbox", "singularity"]
+        ) && model.best?.id == "downloadable-A"
+
+        model.setContext(
             metaId: "tt0903747", streamId: "tt0903747:1:3", continuity: nil, pin: nil,
-            auxiliaryContentID: "tt0903747:1:3", mediaServerTargetID: "page:tt0903747:1:3"
+            auxiliaryTarget: SourceIndexIdentity.target(
+                "tt0903747", contentID: "tt0903747:1:3", season: 1, episode: 3
+            ),
+            mediaServerTargetID: "page:tt0903747:1:3"
         )
         let nextEpisodeClearedSynchronously = model.groups.isEmpty
             && model.best == nil
             && model.tiers.isEmpty
             && model.resolutionOptions.isEmpty
-        for _ in 0..<4_000 {
-            if model.groups.contains(where: { $0.id == "singularity" }) { break }
-            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
-        }
+        _ = await waitUntil { model.groups.contains(where: { $0.id == "ordinary" }) }
 
         RankingBlocker.shared.arm()
         core.streamsEpoch &+= 1
-        for _ in 0..<2_000 {
-            if RankingBlocker.shared.hasBlocked() { break }
-            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
-        }
+        _ = await waitUntil { RankingBlocker.shared.hasBlocked() }
         let detachedRankBlocked = RankingBlocker.shared.hasBlocked()
 
         let retired = SourceIndexLifecycleClock.closeSource()
@@ -353,21 +469,30 @@ struct SourceIndexSourceListLifecycleTests {
             && model.resolutionOptions.isEmpty
 
         RankingBlocker.shared.release()
-        for _ in 0..<4_000 {
-            if model.groups.map(\.id) == ["ordinary"] && model.best?.id == "ordinary" { break }
-            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
-        }
+        _ = await waitUntil { model.groups.map(\.id) == ["ordinary"] && model.best?.id == "ordinary" }
         let staleCompletionFenced = model.groups.map(\.id) == ["ordinary"]
             && model.best?.id == "ordinary"
             && !model.groups.contains(where: { $0.id == "singularity" })
 
-        if initialPublished && identityClearedSynchronously && staleAuxiliaryExcluded
-            && matchingAuxiliaryIncluded && nextEpisodeClearedSynchronously
-            && detachedRankBlocked && clearedSynchronously && staleCompletionFenced {
-            print("PASS  SourceListModel clears identities, excludes stale auxiliary rows, and fences stale ranks")
-            exit(0)
+        let checks = [
+            (initialPublished, "typed target A includes exact auxiliary owners"),
+            (targetAReachesFinalDownloadChoice, "typed target A reaches the final downloadable choice"),
+            (ordinaryEnginePreserved, "ordinary engine groups remain available beside auxiliary rows"),
+            (identityClearedSynchronously, "target change clears published selection synchronously"),
+            (staleAuxiliaryExcluded, "delayed target A owners cannot enter target B"),
+            (matchingAuxiliaryIncluded, "target B includes both exact owner publications"),
+            (mismatchPreservesOrdinary, "mismatch excludes auxiliary rows and preserves ordinary engine"),
+            (absentPreservesOrdinary, "absent target excludes auxiliary rows and preserves ordinary engine"),
+            (nilDefaultPreservesOrdinary, "default nil-equivalent target preserves ordinary engine"),
+            (episodeOnlyIncluded, "episode-only target reaches merge, rank, and final choice"),
+            (nextEpisodeClearedSynchronously, "next episode clears the prior selection synchronously"),
+            (detachedRankBlocked, "lifecycle test holds a detached rank in flight"),
+            (clearedSynchronously, "lifecycle close clears every published output synchronously"),
+            (staleCompletionFenced, "retired detached rank cannot republish auxiliary rows"),
+        ]
+        for (passed, name) in checks {
+            print("\(passed ? "PASS" : "FAIL")  \(name)")
         }
-        print("FAIL  initial=\(initialPublished) identityClear=\(identityClearedSynchronously) auxScope=\(staleAuxiliaryExcluded) auxMatch=\(matchingAuxiliaryIncluded) nextClear=\(nextEpisodeClearedSynchronously) blocked=\(detachedRankBlocked) clear=\(clearedSynchronously) fenced=\(staleCompletionFenced)")
-        exit(1)
+        exit(checks.allSatisfy(\.0) ? 0 : 1)
     }
 }
