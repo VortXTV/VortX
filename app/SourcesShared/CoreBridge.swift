@@ -35,6 +35,15 @@ final class CoreBridge: ObservableObject {
     /// Raw addon descriptors keyed by transportUrl, kept so we can round-trip a full Descriptor back
     /// to the engine for UninstallAddon (which takes the whole descriptor, not just a URL).
     private var rawAddonsByUrl: [String: [String: Any]] = [:]
+
+    /// Short-lived cache of a manifest that `previewAddonManifest` just fetched + validated, keyed by normalized
+    /// URL, so a following `installAddon` for the SAME URL reuses those exact bytes instead of re-fetching. This
+    /// is the fix for the QR pairing view's preview-then-install DOUBLE FETCH: a second fetch could see a
+    /// different (or transiently failing) response than the one the user confirmed, so the row could flip
+    /// ready -> failed on install for no real reason. Consume-once, short TTL; a miss just fetches fresh. Only
+    /// touched on the main actor (preview + install are `@MainActor`).
+    private var manifestPreviewCache: [String: (manifest: [String: Any], fetchedAt: Date)] = [:]
+    private static let manifestCacheTTL: TimeInterval = 60
     private var started = false
     /// Coalesces the Home-board rebuild. The engine emits a BURST of `board` events during launch and while a
     /// catalog page lands (one per catalog settling), and each event used to trigger a full `buildBoardRows()`
@@ -300,72 +309,142 @@ final class CoreBridge: ObservableObject {
         return url.absoluteString
     }
 
+    /// Back-compat facade for the non-pairing install callers (paste-a-URL, batch imports, the store). Maps the
+    /// confirmed outcome to the legacy `String?` (nil = success): an already-installed add-on is now a SUCCESS,
+    /// not an error, and the returned nil means the engine has CONFIRMED the add-on, not merely that a dispatch
+    /// was fired. `installAddonConfirmed` is the typed path the QR pairing view uses.
     @MainActor
     func installAddon(urlString: String, replacingExisting: Bool = false) async -> String? {
+        switch await installAddonConfirmed(urlString: urlString, replacingExisting: replacingExisting) {
+        case .installed, .alreadyInstalled:
+            return nil
+        case .failed(_, let message):
+            return message
+        }
+    }
+
+    /// Install an add-on and return a CONFIRMED, typed outcome. The single hardened installer: normalize -> SSRF
+    /// fetch (reusing a fresh preview fetch when present) -> validate -> dispatch InstallAddon -> AWAIT the engine
+    /// actually holding the add-on before reporting success. Never marks success on dispatch alone (defect: the
+    /// old path returned nil right after dispatch). `alreadyInstalled` is a success. A transient fetch failure is
+    /// RETRYABLE; a bad URL / private-address block / invalid manifest / unconfirmed dispatch is terminal or
+    /// retryable per its cause.
+    @MainActor
+    func installAddonConfirmed(urlString: String, replacingExisting: Bool = false) async -> AddonInstallOutcome {
         guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else {
-            return "Enter a valid add-on URL (https://…/manifest.json)."
+            return .failed(retryable: false, message: "Enter a valid add-on URL (https://…/manifest.json).")
         }
         let alreadyInstalled = addons.contains(where: { $0.transportUrl == normalized })
-        if alreadyInstalled, !replacingExisting { return "That add-on is already installed." }
-        // SSRF guard: fetch through AddonURLGuard, which validates the host + every RESOLVED address (and each
-        // redirect hop) against the private/loopback/link-local/CGNAT/ULA ranges and refuses a private target.
-        // A pasted or QR-relayed URL can never point the install fetch at 127.0.0.1 / a LAN service / a cloud
-        // metadata endpoint. Fail-closed for private targets; normal public manifests are unaffected.
+        if alreadyInstalled, !replacingExisting { return .alreadyInstalled }
+
+        // Reuse the manifest a just-preceding preview fetched + validated for this URL (single-fetch), else fetch
+        // now. SSRF guard: AddonURLGuard validates the host + every RESOLVED address (and each redirect hop)
+        // against the private/loopback/link-local/CGNAT/ULA ranges. A pasted or QR-relayed URL can never point
+        // the fetch at 127.0.0.1 / a LAN service / a cloud metadata endpoint. A reused preview manifest already
+        // passed that exact gate moments ago.
+        let manifest: [String: Any]
+        if let cached = takeCachedManifest(normalized) {
+            manifest = cached
+        } else {
+            switch await AddonURLGuard.fetch(url) {
+            case .failure(let rejection):
+                return .failed(retryable: Self.isRetryable(rejection), message: rejection.message)
+            case .success(let (data, _)):
+                guard let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                      parsed["id"] != nil, parsed["name"] != nil else {
+                    return .failed(retryable: false, message: "That URL did not return a valid add-on manifest.")
+                }
+                manifest = parsed
+            }
+        }
+
+        // Update in place: drop the existing descriptor ONLY now that the new manifest is validated, so a flaky
+        // fetch / bad manifest can never leave the user with NEITHER the old nor the new add-on. The engine
+        // processes Uninstall before Install, so the freshly-fetched manifest replaces the old one.
+        if alreadyInstalled, let existing = rawAddonsByUrl[normalized] {
+            dispatchCtx(["action": "UninstallAddon", "args": existing])
+        }
+        // An EXPLICIT install supersedes any prior removal tombstone for this URL: clear it so the freshly
+        // installed add-on is not instantly re-uninstalled by refreshAddons' tombstone enforcement, and so the
+        // next sync push stops carrying the stale removal. A genuine fresh install of a previously-deleted add-on
+        // therefore works on every device.
+        AddonTombstones.forget(url.absoluteString)
+        let descriptor: [String: Any] = [
+            "transportUrl": url.absoluteString,
+            "manifest": manifest,
+            "flags": ["official": false, "protected": false],
+        ]
+        dispatchCtx(["action": "InstallAddon", "args": descriptor])
+        // CONFIRM the install: the engine applies InstallAddon asynchronously and emits a ctx event that
+        // refreshAddons folds into `addons`. Wait for the add-on to actually appear before reporting success, so
+        // the UI never shows "Installed" for a dispatch the engine silently dropped. A timeout is a RETRYABLE
+        // failure (dispatched but unconfirmed), not a false success.
+        if await awaitAddonInstalled(normalized) {
+            return .installed
+        }
+        return .failed(retryable: true, message: "Install did not confirm. Check your connection and try again.")
+    }
+
+    /// Poll the published `addons` set until it holds `normalizedURL` (the engine has applied the install) or a
+    /// bounded timeout elapses. Fast path returns immediately when it is already present.
+    @MainActor
+    private func awaitAddonInstalled(_ normalizedURL: String, timeout: TimeInterval = 6) async -> Bool {
+        if addons.contains(where: { $0.transportUrl == normalizedURL }) { return true }
+        let stepNanos: UInt64 = 100_000_000            // 0.1s poll cadence
+        let deadlineNanos = UInt64(timeout * 1_000_000_000)
+        var elapsed: UInt64 = 0
+        while elapsed < deadlineNanos {
+            try? await Task.sleep(nanoseconds: stepNanos)
+            if addons.contains(where: { $0.transportUrl == normalizedURL }) { return true }
+            elapsed += stepNanos
+        }
+        return addons.contains(where: { $0.transportUrl == normalizedURL })
+    }
+
+    /// Map an `AddonURLGuard.Rejection` to whether the install is worth retrying. Only a transport / DNS blip
+    /// (`unresolvable`) is transient; a bad scheme, an SSRF-blocked private address, or a redirect loop is
+    /// terminal. Kept aligned with `addonFetchIsRetryable` (the dependency-free rule the pairing reducer tests).
+    private static func isRetryable(_ rejection: AddonURLGuard.Rejection) -> Bool {
+        switch rejection {
+        case .unresolvable: return true
+        case .invalidScheme, .privateAddress, .tooManyRedirects: return false
+        }
+    }
+
+    /// Consume the cached preview manifest for `normalizedURL` if it is still fresh. Consume-once so a stale
+    /// entry can never be reused twice.
+    @MainActor
+    private func takeCachedManifest(_ normalizedURL: String) -> [String: Any]? {
+        guard let cached = manifestPreviewCache[normalizedURL] else { return nil }
+        manifestPreviewCache[normalizedURL] = nil
+        guard Date().timeIntervalSince(cached.fetchedAt) < Self.manifestCacheTTL else { return nil }
+        return cached.manifest
+    }
+
+    /// Fetch + validate a manifest URL the way `installAddonConfirmed` does, WITHOUT installing, returning a typed
+    /// outcome the QR pairing view maps to a row state (ready / already-installed / rejected, retryable or not).
+    /// Caches the fetched manifest so the following install reuses it (single fetch). This never mutates engine
+    /// state; the install still goes through `installAddonConfirmed`, so its validation is never bypassed.
+    @MainActor
+    func previewAddonManifest(urlString: String) async -> AddonPreviewOutcome {
+        guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else {
+            return .rejected(retryable: false, message: "Enter a valid add-on URL (https://…/manifest.json).")
+        }
+        let alreadyInstalled = addons.contains(where: { $0.transportUrl == normalized })
+        // SSRF guard: the same private-address gate the install uses, so a manifest URL pointing at a
+        // private/loopback/LAN address never even previews.
         switch await AddonURLGuard.fetch(url) {
         case .failure(let rejection):
-            return rejection.message
+            return .rejected(retryable: Self.isRetryable(rejection), message: rejection.message)
         case .success(let (data, _)):
             guard let manifest = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  manifest["id"] != nil, manifest["name"] != nil else {
-                return "That URL did not return a valid add-on manifest."
+                  manifest["id"] != nil,
+                  let name = manifest["name"] as? String, !name.isEmpty else {
+                return .rejected(retryable: false, message: "That URL did not return a valid add-on manifest.")
             }
-            // Update in place: drop the existing descriptor ONLY now that the new manifest is fetched +
-            // validated, so a flaky fetch / bad manifest can never leave the user with NEITHER the old nor
-            // the new add-on (the install-first invariant the Change-URL path also holds). The engine
-            // processes Uninstall before Install, so the freshly-fetched manifest replaces the old one.
-            if alreadyInstalled, let existing = rawAddonsByUrl[normalized] {
-                dispatchCtx(["action": "UninstallAddon", "args": existing])
-            }
-            // An EXPLICIT install supersedes any prior removal tombstone for this URL: clear it so the
-            // freshly-installed add-on is not instantly re-uninstalled by refreshAddons' tombstone
-            // enforcement, and so the next sync push stops carrying the stale removal in the account doc.
-            // A genuine fresh install of a previously-deleted add-on therefore works on every device.
-            AddonTombstones.forget(url.absoluteString)
-            let descriptor: [String: Any] = [
-                "transportUrl": url.absoluteString,
-                "manifest": manifest,
-                "flags": ["official": false, "protected": false],
-            ]
-            dispatchCtx(["action": "InstallAddon", "args": descriptor])
-            return nil
+            manifestPreviewCache[normalized] = (manifest, Date())
+            return alreadyInstalled ? .alreadyInstalled(name: name) : .ready(name: name)
         }
-    }
-
-    /// Result of validating a pasted / QR-relayed manifest URL WITHOUT installing it. Used by the
-    /// Install-by-QR pairing view to show "Install <name>?" and to know whether a URL is already
-    /// installed, using the SAME fetch + validation `installAddon` performs (same normalization, same
-    /// 200 + `id`/`name` manifest check). This never mutates engine state; `installAddon` stays the
-    /// one and only installer, so its validation is not bypassed or weakened.
-    struct AddonManifestPreview: Equatable {
-        let normalizedURL: String
-        let name: String
-        let alreadyInstalled: Bool
-    }
-
-    /// Fetch + validate a manifest URL the way `installAddon` does, returning its name (for a confirm
-    /// prompt) without installing. Returns nil when the URL is invalid or the manifest fails validation.
-    /// The actual install still goes through `installAddon`, which re-fetches and re-validates.
-    @MainActor
-    func previewAddonManifest(urlString: String) async -> AddonManifestPreview? {
-        guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else { return nil }
-        let alreadyInstalled = addons.contains(where: { $0.transportUrl == normalized })
-        // SSRF guard: same private-address gate `installAddon` uses (the QR confirm resolves the name here),
-        // so a manifest URL pointing at a private/loopback/LAN address never even previews. Fail-soft to nil.
-        guard case let .success((data, _)) = await AddonURLGuard.fetch(url),
-              let manifest = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              manifest["id"] != nil,
-              let name = manifest["name"] as? String, !name.isEmpty else { return nil }
-        return AddonManifestPreview(normalizedURL: normalized, name: name, alreadyInstalled: alreadyInstalled)
     }
 
     /// True when the engine has NO stream-capable add-on installed (every title would report "no

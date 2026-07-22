@@ -28,22 +28,35 @@ enum AddonPairingClient {
         var isExpired: Bool { Date() >= expiresAt }
     }
 
-    /// One manifest URL the phone has added to the session, with when it landed (unix ms).
+    /// One delivery the phone has added to the session: a durable delivery id (relay-minted, STABLE across
+    /// session-token rotation), the raw URL, when it landed, and the install status the relay currently holds
+    /// (`pending` until the TV acks a confirmed `installed` / `failed`). `deliveryId` is the stable identity so a
+    /// row's install state survives token rotation; a legacy relay that omits it falls back to the URL.
     struct IncomingManifest: Equatable, Identifiable {
+        let deliveryId: String
         let url: String
         let addedAtMs: Double
+        let status: String
         /// Stable identity so SwiftUI rows keep their per-row install state as the list grows.
-        var id: String { url }
+        var id: String { deliveryId }
     }
 
-    /// The current state of a polled session: the live list plus whether it expired or was closed.
+    /// The current state of a polled session: the live list, the session revision, plus whether it expired or was
+    /// closed.
     struct Poll: Equatable {
         let manifests: [IncomingManifest]
         let expiresAtMs: Double
         let closed: Bool
+        let rev: Int
 
         var expiresAt: Date { Date(timeIntervalSince1970: expiresAtMs / 1000) }
         var isExpired: Bool { Date() >= expiresAt }
+    }
+
+    /// One TV install acknowledgement: the delivery id and its confirmed terminal status.
+    struct DeliveryAck: Equatable {
+        let deliveryId: String
+        let status: String   // "installed" | "failed"
     }
 
     /// A poll outcome. `.gone` maps the relay's 404 (expired / unknown token) so the view can rotate
@@ -92,14 +105,40 @@ enum AddonPairingClient {
             let rawManifests = (obj["manifests"] as? [[String: Any]]) ?? []
             let manifests: [IncomingManifest] = rawManifests.compactMap { entry in
                 guard let url = entry["url"] as? String, !url.isEmpty else { return nil }
-                return IncomingManifest(url: url, addedAtMs: numeric(entry["addedAt"]) ?? 0)
+                // Fall back to the URL as the delivery id for a legacy relay that predates durable ids, so rows
+                // still get a stable identity.
+                let deliveryId = (entry["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? url
+                let status = (entry["status"] as? String) ?? "pending"
+                return IncomingManifest(deliveryId: deliveryId, url: url, addedAtMs: numeric(entry["addedAt"]) ?? 0, status: status)
             }
             let expiresAt = numeric(obj["expiresAt"]) ?? 0
             let closed = (obj["closed"] as? Bool) ?? false
-            return .ok(Poll(manifests: manifests, expiresAtMs: expiresAt, closed: closed))
+            let rev = Int(numeric(obj["rev"]) ?? 0)
+            return .ok(Poll(manifests: manifests, expiresAtMs: expiresAt, closed: closed, rev: rev))
         } catch {
             return .failed
         }
+    }
+
+    // MARK: - POST /pair/<token>/ack
+
+    /// Report CONFIRMED per-delivery install results back to the relay so the phone's Done can show the truth.
+    /// Best-effort: a `.gone` (404, the session rotated / expired) or a transport error is not fatal to the
+    /// install itself (the add-on is already in the engine); it just means the phone can no longer be updated.
+    /// Returns true only on a 2xx. Never logs the URL or token.
+    @discardableResult
+    static func ack(token: String, deliveries: [DeliveryAck]) async -> Bool {
+        guard !deliveries.isEmpty else { return true }
+        let safeToken = token.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? token
+        var req = URLRequest(url: baseURL.appendingPathComponent("pair").appendingPathComponent(safeToken).appendingPathComponent("ack"),
+                             timeoutInterval: 10)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.setValue("application/json", forHTTPHeaderField: "accept")
+        let body: [String: Any] = ["deliveries": deliveries.map { ["id": $0.deliveryId, "status": $0.status] }]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        VortXEdgeAuth.sign(&req)   // gated host (add.vortx.tv /pair/<token>/ack POST): stamp X-VX-Ts / X-VX-Sig
+        return await performData(req) != nil
     }
 
     // MARK: - Session persistence (resume across sheet opens)
