@@ -7,15 +7,12 @@ import Foundation
 //   selftest                         Validate the oracle (cohort boundary cases,
 //                                     EXTINF integer-ms parsing, fMP4 sync parser,
 //                                     server-faithful build/parse round trip).
-//   trace <log> [--index N]          Evaluate contract points 1,3,4,6,7 from a
-//                                     captured request-trace (real server lines).
+//   trace <log> [--index N] [--only-point7]
+//                                     Evaluate a captured production trace.
+//   fixture-assert <normal> <timeout> Assert only fixture-observable facts.
 //   live  --container <dir>          Full battery over loopback + filesystem while
-//         [--port N] [--log <file>]  a plain-remux playback is LIVE. Decides all
-//         [--spool <dir>]            seven points; the acceptance gate.
-//         [--spool-bound-mib N]
-//         [--sample N]
-//   spool <dir>                      Print total bytes under <dir> (runner uses it
-//                                     for the post-teardown zero check).
+//         [--port N] [--log <file>]  a plain-remux playback is LIVE.
+//   spool --container <dir> [--expect-active|--expect-empty]
 //
 // Exit code for trace/live is the GATE: 0 only when every point is GREEN/EXEMPT.
 // Against current beta it is non-zero (points are RED); it turns 0 when the rework
@@ -34,7 +31,7 @@ func colorFor(_ v: Verdict) -> String {
 func report(_ title: String, _ findings: [Finding]) -> Bool {
     print("")
     print(paint("== \(title) ==", "1"))
-    var accept = true
+    var accept = !findings.isEmpty
     for p in Point.allCases {
         guard let f = findings.first(where: { $0.point == p }) else { continue }
         if !f.verdict.acceptable { accept = false }
@@ -46,19 +43,6 @@ func report(_ title: String, _ findings: [Finding]) -> Bool {
     print(accept ? paint("GATE: PASS (all points GREEN/EXEMPT)", "1;32")
                  : paint("GATE: FAIL (not every point is GREEN/EXEMPT)", "1;31"))
     return accept
-}
-
-func traceFindingsWithObservedAvailability(_ session: TraceSession) -> [Finding] {
-    Trace.findings(session).map { finding in
-        guard finding.point == .noAdvertised404, session.advertised404s.isEmpty else { return finding }
-        return Finding(
-            point: .noAdvertised404,
-            verdict: .indeterminate,
-            evidence: finding.evidence + [
-                "resident-window arithmetic is diagnostic only; this trace contains no complete advertised-id 404/410 proof"
-            ]
-        )
-    }
 }
 
 private final class URLProtocolScript: @unchecked Sendable {
@@ -100,7 +84,14 @@ private func protocolResponse(_ request: URLRequest, status: Int, length: Int) -
 
 // MARK: - selftest
 
-func runSelfTest(mutation: FMP4.Mutation? = nil) -> Bool {
+enum HarnessMutation: String {
+    case startupReadinessOr = "startup-readiness-or"
+}
+
+func runSelfTest(
+    mutation: FMP4.Mutation? = nil,
+    harnessMutation: HarnessMutation? = nil
+) -> Bool {
     var checks: [(String, Bool)] = []
     func expect(_ name: String, _ cond: Bool) { checks.append((name, cond)) }
 
@@ -109,46 +100,207 @@ func runSelfTest(mutation: FMP4.Mutation? = nil) -> Bool {
     func cohort(_ durs: [Double], ended: Bool = false) -> (Int, Int, Bool) {
         let body = Playlist.buildMediaBodyLikeServer(durations: durs, ended: ended)
         let p = Playlist.parseMedia(body)
-        return (p.count, p.totalMs, Playlist.cohortReady(count: p.count, totalMs: p.totalMs))
+        let ready = harnessMutation == .startupReadinessOr
+            ? (p.count >= Contract.minStartupSegments || p.totalMs >= Contract.minStartupMs)
+            : Playlist.cohortReady(count: p.count, totalMs: p.totalMs)
+        return (p.count, p.totalMs, ready)
     }
-    let a = cohort(Array(repeating: 4.000, count: 5))
-    expect("5x4.000s stays CLOSED (count 5<6)", a == (5, 20000, false))
-    let b = cohort(Array(repeating: 3.000, count: 6))
-    expect("6x3.000s OPENS (6 segs, 18000 ms)", b == (6, 18000, true))
-    let c = cohort(Array(repeating: 1.000, count: 15))
-    expect("15x1.000s OPENS (15 segs, 15000 ms)", c == (15, 15000, true))
-    let d = cohort([2.500, 2.500, 2.500, 2.500, 2.500, 2.499])
-    expect("14.999s (6 segs) stays CLOSED (14999<15000, 1 ms)", d == (6, 14999, false))
-    let e = cohort([2.500, 2.500, 2.500, 2.500, 2.500, 2.500])
-    expect("15.000s (6 segs) OPENS (integer >= 15000)", e == (6, 15000, true))
+    let productionReadiness = VortXHLSStartupReadiness(
+        frozenTarget: VortXHLSTargetPolicy.conservativeTarget)
+    expect("contract target mirrors production conservative target 12",
+           Contract.hlsTargetDuration == 12
+               && VortXHLSTargetPolicy.conservativeSeconds == Contract.hlsTargetDuration)
+    expect("contract startup floors mirror production 6 segments and 36000 ms",
+           productionReadiness?.minimumSegmentCount == Contract.minStartupSegments
+               && productionReadiness?.minimumRenderedDurationMilliseconds == Contract.minStartupMs)
+
+    func productionStartup(_ durations: [Double], ended: Bool = false) -> DVPlaybackPolicy.StartupMediaSnapshot? {
+        let segments = durations.enumerated().map {
+            VortXHLSSegment(id: $0.offset, byteOffset: 0, byteLength: 1, duration: $0.element)
+        }
+        return DVPlaybackPolicy.pinnedStartupSnapshot(
+            window: VortXHLSWindow(segments: segments),
+            ended: ended,
+            minimumSegmentCount: Contract.minStartupSegments,
+            minimumRenderedDurationMilliseconds: Contract.minStartupMs)
+    }
+
+    let a = cohort(Array(repeating: 8.000, count: 5))
+    expect("5 segments stay CLOSED even above 36000 ms", a == (5, 40000, false))
+    let b = cohort([6.000, 6.000, 6.000, 6.000, 6.000, 5.999])
+    expect("6 segments at 35999 ms stay CLOSED by 1 ms", b == (6, 35999, false))
+    let c = cohort(Array(repeating: 6.000, count: 6))
+    expect("6 segments at exactly 36000 ms OPEN", c == (6, 36000, true))
+    expect("production gate rejects 5 segments even above 36000 ms",
+           productionStartup(Array(repeating: 8.000, count: 5)) == nil)
+    expect("production gate rejects the 35999 ms boundary",
+           productionStartup([6.000, 6.000, 6.000, 6.000, 6.000, 5.999]) == nil)
+    expect("production gate accepts exactly 6 segments and 36000 rendered ms",
+           productionStartup(Array(repeating: 6.000, count: 6))?.window.segments.count == 6)
+    expect("ended short source is explicitly exempt",
+           Playlist.startupDisposition(count: 1, totalMs: 1_000, ended: true) == .endedExempt
+               && productionStartup([1.000], ended: true)?.ended == true)
+    expect("same short non-ended source remains closed",
+           Playlist.startupDisposition(count: 1, totalMs: 1_000, ended: false) == .notReady
+               && productionStartup([1.000], ended: false) == nil)
+
+    expect("production wall deadline mirrors the separate 30000 ms contract",
+           Int(VortXHLSMountDeadlineState.productionDuration * 1_000) == Contract.sloMountToReadyMs)
+    var beforeEdge = VortXHLSMountDeadlineState()
+    expect("monotonic wall deadline starts once and cannot be reset",
+           beforeEdge.start(now: 100) == 130 && beforeEdge.start(now: 101) == nil)
+    expect("ready strictly before the wall edge wins",
+           beforeEdge.markReady(now: 129.999).accepted)
+    var atEdge = VortXHLSMountDeadlineState()
+    _ = atEdge.start(now: 100)
+    let exactEdge = atEdge.markReady(now: 130)
+    expect("ready exactly at the wall edge loses and expires once",
+           !exactEdge.accepted && exactEdge.didExpire && atEdge.phase == .timedOut)
 
     // EXTINF text -> integer ms, no float.
     expect("EXTINF 4.000 -> 4000 ms", Playlist.msFromExtinf("#EXTINF:4.000,") == 4000)
-    expect("EXTINF 14.999 -> 14999 ms", Playlist.msFromExtinf("#EXTINF:14.999,") == 14999)
-    expect("EXTINF 15.000 -> 15000 ms", Playlist.msFromExtinf("#EXTINF:15.000,") == 15000)
-    expect("EXTINF 15 -> 15000 ms", Playlist.msFromExtinf("#EXTINF:15,") == 15000)
+    expect("EXTINF 35.999 -> 35999 ms", Playlist.msFromExtinf("#EXTINF:35.999,") == 35999)
+    expect("EXTINF 36.000 -> 36000 ms", Playlist.msFromExtinf("#EXTINF:36.000,") == 36000)
+    expect("EXTINF 36 -> 36000 ms", Playlist.msFromExtinf("#EXTINF:36,") == 36000)
     expect("EXTINF 1.5 -> 1500 ms", Playlist.msFromExtinf("#EXTINF:1.5,") == 1500)
 
     // The real DVPlaybackPolicy header is compiled in and used by the builder.
-    let body = Playlist.buildMediaBodyLikeServer(durations: [4.0, 4.0, 4.0], ended: true)
-    expect("builder emits TARGETDURATION 5", body.contains("#EXT-X-TARGETDURATION:5"))
-    expect("builder emits the load-bearing EXT-X-START", body.contains("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES"))
+    let body = Playlist.buildMediaBodyLikeServer(
+        durations: Array(repeating: 6.0, count: 6), ended: false, startID: 8)
+    expect("builder emits frozen TARGETDURATION 12", body.contains("#EXT-X-TARGETDURATION:12"))
+    expect("sliding builder omits zero-only EXT-X-START", !body.contains("#EXT-X-START:"))
     expect("builder emits EXT-X-MAP init.mp4", body.contains("#EXT-X-MAP:URI=\"init.mp4\""))
     let rp = Playlist.parseMedia(body)
-    expect("round-trip recovers 3 segments ids 0..2", rp.segments.map(\.id) == [0, 1, 2])
-    expect("round-trip sees ENDLIST", rp.endlist)
+    expect("sliding round-trip uses seq as first absolute id and segs as cardinality",
+           rp.mediaSequence == 8 && rp.count == 6 && rp.advertisedRange == 8..<14
+               && rp.segments.map(\.id) == Array(8..<14) && rp.isValidAdvertisedWindow)
+    expect("sliding playlist never declares EVENT", !rp.hasPlaylistTypeEvent)
+    let mismatchedIDs = Playlist.parseMedia(body.replacingOccurrences(of: "seg8.m4s", with: "seg7.m4s"))
+    expect("URI id must equal seq plus its cardinal offset", !mismatchedIDs.isValidAdvertisedWindow)
+    let overflowingRange = Playlist.parseMedia("""
+    #EXTM3U
+    #EXT-X-TARGETDURATION:12
+    #EXT-X-MEDIA-SEQUENCE:\(Int.max)
+    #EXTINF:6.000,
+    seg\(Int.max).m4s
+    """)
+    expect("advertised [seq, seq+segs) overflow fails closed",
+           overflowingRange.advertisedRange == nil && !overflowingRange.isValidAdvertisedWindow)
 
-    var predictedOnlyTrace = TraceSession()
-    predictedOnlyTrace.advertisedMax = 100
-    predictedOnlyTrace.segResponseBytes = [0: 2 * 1024 * 1024]
-    let predictedOnlyPoint = traceFindingsWithObservedAvailability(predictedOnlyTrace)
-        .first { $0.point == .noAdvertised404 }
-    expect("resident-window prediction alone is diagnostic, not RED",
-           predictedOnlyPoint?.verdict == .indeterminate)
-    predictedOnlyTrace.advertised404s = [0]
-    let observed404Point = traceFindingsWithObservedAvailability(predictedOnlyTrace)
-        .first { $0.point == .noAdvertised404 }
-    expect("observed advertised-id 404 remains RED", observed404Point?.verdict == .red)
+    let audioBody = """
+    #EXTM3U
+    #EXT-X-VERSION:7
+    #EXT-X-TARGETDURATION:12
+    #EXT-X-MEDIA-SEQUENCE:8
+    #EXT-X-MAP:URI="audio0-init.mp4"
+    #EXTINF:6.000,
+    audio0-seg8.m4s
+    #EXTINF:6.000,
+    audio0-seg9.m4s
+    """
+    let audioParsed = Playlist.parseMedia(audioBody)
+    expect("exact audio<ID>-seg<ID>.m4s grammar parses absolute ids",
+           audioParsed.isValidAdvertisedWindow
+               && audioParsed.segments.map(\.uri) == ["audio0-seg8.m4s", "audio0-seg9.m4s"])
+    expect("retired aseg alias is rejected",
+           Playlist.segmentIdentity(fromURI: "aseg0.m4s") == nil)
+    expect("segment URI queries and paths are rejected",
+           Playlist.segmentIdentity(fromURI: "seg0.m4s?token=1") == nil
+               && Playlist.segmentIdentity(fromURI: "nested/seg0.m4s") == nil)
+    let duplicateMap = Playlist.parseMedia(body.replacingOccurrences(
+        of: "#EXT-X-MAP:URI=\"init.mp4\"",
+        with: "#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-MAP:URI=\"init.mp4\""))
+    expect("duplicate EXT-X-MAP fails closed", !duplicateMap.isValidAdvertisedWindow)
+    let validMaster = """
+    #EXTM3U
+    #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",LANGUAGE="eng",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2"
+    #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Spanish",LANGUAGE="spa",DEFAULT=NO,AUTOSELECT=YES,CHANNELS="2",URI="audio0.m3u8"
+    """
+    expect("master requires one in-band primary and one exact alternate playlist URI",
+           Live.audioRenditionURI(validMaster) == "audio0.m3u8")
+    expect("master rejects an alternate with the primary language",
+           Live.audioRenditionURI(validMaster.replacingOccurrences(of: "LANGUAGE=\"spa\"", with: "LANGUAGE=\"eng\"")) == nil)
+    expect("master rejects unknown-language topology",
+           Live.audioRenditionURI(validMaster.replacingOccurrences(of: "LANGUAGE=\"spa\"", with: "LANGUAGE=\"und\"")) == nil)
+
+    var timeout = TraceSession()
+    timeout.masterRequestOrdinals = [0]
+    timeout.master404Ordinals = [2]
+    timeout.timeoutEventOrdinals = [1]
+    timeout.timeoutEvents = [.init(
+        ordinal: 1, waitedMs: 30_000, requiredCount: 6, requiredDurationMs: 36_000,
+        actualCount: 1, actualDurationMs: 6_000)]
+    expect("point7 accepts exactly one current event then /master 404 and no ready",
+           Trace.failSoftTimeoutFinding(timeout).verdict == .green)
+    var wrongPath = timeout
+    wrongPath.master404Ordinals = []
+    wrongPath.advertisedFailures = ["/seg0.m4s"]
+    expect("point7 rejects a media-segment 404 in place of /master 404",
+           Trace.failSoftTimeoutFinding(wrongPath).verdict == .red)
+    var duplicate = timeout
+    duplicate.timeoutEvents.append(.init(
+        ordinal: 2, waitedMs: 30_000, requiredCount: 6, requiredDurationMs: 36_000,
+        actualCount: 1, actualDurationMs: 6_000))
+    expect("point7 rejects duplicate timeout events",
+           Trace.failSoftTimeoutFinding(duplicate).verdict == .red)
+    var malformedDuplicate = timeout
+    malformedDuplicate.timeoutEventOrdinals.append(3)
+    expect("point7 rejects an extra malformed timeout marker",
+           Trace.failSoftTimeoutFinding(malformedDuplicate).verdict == .red)
+    var lateMasterRequest = timeout
+    lateMasterRequest.masterRequestOrdinals = [2]
+    expect("point7 requires the startup master request before the event",
+           Trace.failSoftTimeoutFinding(lateMasterRequest).verdict == .red)
+    var staleFields = timeout
+    staleFields.timeoutEvents = [.init(
+        ordinal: 1, waitedMs: 30_000, requiredCount: 6, requiredDurationMs: 15_000,
+        actualCount: 1, actualDurationMs: 6_000)]
+    expect("point7 rejects stale event fields",
+           Trace.failSoftTimeoutFinding(staleFields).verdict == .red)
+    var reachedReady = timeout
+    reachedReady.readyAt = Date()
+    expect("point7 rejects readyToPlay on the timeout path",
+           Trace.failSoftTimeoutFinding(reachedReady).verdict == .red)
+
+    expect("512 MiB exact admission boundary is accepted",
+           SpoolLayout.withinAdmissionCeiling(512 * 1024 * 1024))
+    expect("512 MiB plus one byte is rejected",
+           !SpoolLayout.withinAdmissionCeiling(512 * 1024 * 1024 + 1))
+
+    let layoutRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("player-conformance-layout-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: layoutRoot) }
+    let sessionDirectory = layoutRoot.appendingPathComponent(
+        "Library/Caches/VortXHLS/launch-A/session-A", isDirectory: true)
+    try? FileManager.default.createDirectory(at: sessionDirectory, withIntermediateDirectories: true)
+    try? Data([0x01]).write(to: sessionDirectory.appendingPathComponent("video-0.m4s"))
+    let oneSession = SpoolLayout.inspect(containerPath: layoutRoot.path)
+    expect("whole-root discovery accepts exactly one launch and session",
+           oneSession.hasOneActiveLaunchAndSession && oneSession.bytes == 1)
+    let secondSession = layoutRoot.appendingPathComponent(
+        "Library/Caches/VortXHLS/launch-B/session-B", isDirectory: true)
+    try? FileManager.default.createDirectory(at: secondSession, withIntermediateDirectories: true)
+    expect("whole-root discovery rejects multiple active launches",
+           !SpoolLayout.inspect(containerPath: layoutRoot.path).hasOneActiveLaunchAndSession)
+    try? FileManager.default.removeItem(at: secondSession.deletingLastPathComponent())
+    let siblingSession = sessionDirectory.deletingLastPathComponent()
+        .appendingPathComponent("session-B", isDirectory: true)
+    try? FileManager.default.createDirectory(at: siblingSession, withIntermediateDirectories: true)
+    expect("whole-root discovery rejects multiple active sessions in one launch",
+           !SpoolLayout.inspect(containerPath: layoutRoot.path).hasOneActiveLaunchAndSession)
+
+    var edge = TraceSession()
+    edge.mountAt = Date(timeIntervalSince1970: 0)
+    edge.readyAt = Date(timeIntervalSince1970: 30)
+    let edgeFinding = Trace.findings(edge).first { $0.point == .startupLatency }
+    expect("ready exactly at 30000 ms loses the strict monotonic edge",
+           edgeFinding?.verdict == .red)
+    var reversed = TraceSession()
+    reversed.mountAt = Date(timeIntervalSince1970: 30)
+    reversed.readyAt = Date(timeIntervalSince1970: 0)
+    let reversedFinding = Trace.findings(reversed).first { $0.point == .startupLatency }
+    expect("ready timestamp before mount fails closed",
+           reversedFinding?.verdict == .red)
 
     // fMP4 first-video-sample parser. These are complete ffmpeg-produced fragmented
     // MP4 fixtures, stored as base64 so the repository does not carry opaque binary
@@ -373,42 +525,6 @@ func runSelfTest(mutation: FMP4.Mutation? = nil) -> Bool {
                    && partialSegment.transportError?.contains("incomplete body") == true
                    && partialSegment.body.isEmpty)
 
-        if let avc {
-            let masterBody = Data("#EXTM3U\n".utf8)
-            let mediaBody = Data(Playlist.buildMediaBodyLikeServer(durations: [4.0], ended: false).utf8)
-            let initBody = avc.initSegment
-            HarnessURLProtocol.script.install { request in
-                let path = request.request.url?.path ?? ""
-                let body: Data
-                let advertisedLength: Int
-                switch path {
-                case "/master.m3u8":
-                    body = masterBody; advertisedLength = body.count
-                case "/media.m3u8":
-                    body = mediaBody; advertisedLength = body.count
-                case "/init.mp4":
-                    body = initBody; advertisedLength = body.count
-                default:
-                    body = Data("short".utf8); advertisedLength = body.count + 50
-                }
-                let response = protocolResponse(request.request, status: 200, length: advertisedLength)
-                request.client?.urlProtocol(request, didReceive: response, cacheStoragePolicy: .notAllowed)
-                request.client?.urlProtocol(request, didLoad: body)
-                request.client?.urlProtocolDidFinishLoading(request)
-            }
-            let partialAvailability = Live.evaluate(
-                port: 80,
-                trace: TraceSession(),
-                spoolPath: nil,
-                spoolBoundMiB: Contract.windowFloorMiB * 2,
-                segmentSampleCap: 1,
-                session: session
-            )
-            let availabilityPoint = partialAvailability.findings.first { $0.point == .noAdvertised404 }
-            expect("partial advertised segment makes availability INFRA, never GREEN or RED",
-                   partialAvailability.infra != nil && availabilityPoint?.verdict == .indeterminate)
-        }
-
         let lateCompletion = DispatchSemaphore(value: 0)
         HarnessURLProtocol.script.install { request in
             DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) {
@@ -429,7 +545,8 @@ func runSelfTest(mutation: FMP4.Mutation? = nil) -> Bool {
         session.invalidateAndCancel()
     }
 
-    let title = mutation.map { "== oracle self-test (MUTANT: \($0.rawValue)) ==" } ?? "== oracle self-test =="
+    let mutationName = mutation?.rawValue ?? harnessMutation?.rawValue
+    let title = mutationName.map { "== oracle self-test (MUTANT: \($0)) ==" } ?? "== oracle self-test =="
     print(paint(title, "1"))
     var ok = true
     for (name, pass) in checks {
@@ -439,6 +556,58 @@ func runSelfTest(mutation: FMP4.Mutation? = nil) -> Bool {
     print("")
     print(ok ? paint("SELF-TEST OK (oracle validated)", "1;32") : paint("SELF-TEST FAILED", "1;31"))
     return ok
+}
+
+func runFixtureAssert(normalPath: String, timeoutPath: String) -> Bool {
+    var checks: [(String, Bool)] = []
+    func expect(_ name: String, _ condition: Bool) { checks.append((name, condition)) }
+
+    let normal = Trace.session(inFileAt: normalPath)
+    let timeout = Trace.session(inFileAt: timeoutPath)
+    expect("normal fixture has exactly one session", Trace.sessionCount(inFileAt: normalPath) == 1)
+    expect("timeout fixture has exactly one session", Trace.sessionCount(inFileAt: timeoutPath) == 1)
+
+    if let normal, let first = normal.firstMediaResponse {
+        expect("normal first response is absolute zero with six-segment cardinality",
+               first.sequence == 0 && first.segmentCount == 6 && first.advertisedRange == 0..<6)
+        expect("normal fixture keeps duration proof scoped to live playlist bytes",
+               Trace.startupRenderedMilliseconds(normal, response: first) == nil)
+        expect("normal fixture proves a valid nonzero sliding response",
+               normal.mediaResponses.dropFirst().contains {
+                   $0.sequence > 0 && $0.advertisedRange != nil
+               })
+        expect("normal alternate playlist starts at the same absolute-zero cohort",
+               normal.audioResponses.first?.sequence == 0
+                   && normal.audioResponses.first?.segmentCount == 6)
+        expect("normal first requests use real video and audio URI grammar at segment zero",
+               normal.firstVideoSegReq == 0 && normal.audioSegReqs.first?.segmentID == 0)
+        expect("normal trace has no EVENT marker or advertised 404",
+               !normal.sawEventPlaylist && normal.advertisedFailures.isEmpty)
+        let points = Trace.findings(normal)
+        expect("normal success path is under the separate wall deadline",
+               points.first { $0.point == .startupLatency }?.verdict == .green)
+        expect("normal success path emits no timeout tuple",
+               points.first { $0.point == .failSoftCounted }?.verdict == .green)
+    } else {
+        expect("normal fixture parses", false)
+    }
+
+    if let timeout {
+        expect("timeout fixture proves only the complete point7 tuple",
+               Trace.failSoftTimeoutFinding(timeout).verdict == .green)
+    } else {
+        expect("timeout fixture parses", false)
+    }
+
+    print(paint("== dedicated fixture assertions ==", "1"))
+    var passed = true
+    for (name, condition) in checks {
+        passed = passed && condition
+        print("[\(paint(condition ? "PASS" : "FAIL", condition ? "32" : "31"))] \(name)")
+    }
+    print("")
+    print(passed ? paint("FIXTURES OK", "1;32") : paint("FIXTURES FAILED", "1;31"))
+    return passed
 }
 
 // MARK: - arg helpers
@@ -456,37 +625,55 @@ let cmd = args.first ?? "selftest"
 switch cmd {
 case "selftest":
     let mutation: FMP4.Mutation?
+    let harnessMutation: HarnessMutation?
     if let name = value("--mutant", args) {
-        guard let parsed = FMP4.Mutation(rawValue: name) else {
-            let names = FMP4.Mutation.allCases.map(\.rawValue).joined(separator: " | ")
+        if let parsed = FMP4.Mutation(rawValue: name) {
+            mutation = parsed
+            harnessMutation = nil
+        } else if let parsed = HarnessMutation(rawValue: name) {
+            mutation = nil
+            harnessMutation = parsed
+        } else {
+            let names = (FMP4.Mutation.allCases.map(\.rawValue) + [HarnessMutation.startupReadinessOr.rawValue])
+                .joined(separator: " | ")
             FileHandle.standardError.write(Data("unknown mutant \(name); use \(names)\n".utf8)); exit(2)
         }
-        mutation = parsed
     } else {
         mutation = nil
+        harnessMutation = nil
     }
-    exit(runSelfTest(mutation: mutation) ? 0 : 1)
+    exit(runSelfTest(mutation: mutation, harnessMutation: harnessMutation) ? 0 : 1)
 
 case "trace":
     guard let path = args.dropFirst().first(where: { !$0.hasPrefix("-") }) else {
-        FileHandle.standardError.write(Data("usage: trace <log> [--index N]\n".utf8)); exit(2)
+        FileHandle.standardError.write(Data("usage: trace <log> [--index N] [--only-point7]\n".utf8)); exit(2)
     }
     let idx = Int(value("--index", args) ?? "0") ?? 0
     guard let s = Trace.session(inFileAt: path, index: idx) else {
         FileHandle.standardError.write(Data("no plain-remux HLS session #\(idx) in \(path)\n".utf8)); exit(2)
     }
+    let findings = args.contains("--only-point7")
+        ? [Trace.failSoftTimeoutFinding(s)] : Trace.findings(s)
     let accept = report(
         "trace channel: \(path) (session #\(idx), port \(s.port.map(String.init) ?? "?"))",
-        traceFindingsWithObservedAvailability(s)
-    )
+        findings)
     exit(accept ? 0 : 1)
 
+case "fixture-assert":
+    let paths = Array(args.dropFirst())
+    guard paths.count == 2 else {
+        FileHandle.standardError.write(Data("usage: fixture-assert <normal.trace> <timeout.trace>\n".utf8)); exit(2)
+    }
+    exit(runFixtureAssert(normalPath: paths[0], timeoutPath: paths[1]) ? 0 : 1)
+
 case "live":
-    let container = value("--container", args)
+    guard let container = value("--container", args) else {
+        FileHandle.standardError.write(Data("usage: live --container <appDataDir> [--port N] [--log <file>]\n".utf8)); exit(2)
+    }
     var logPath = value("--log", args)
-    if logPath == nil, let c = container { logPath = c + "/Library/Caches/diagnostics.log" }
+    if logPath == nil { logPath = container + "/Library/Caches/diagnostics.log" }
     guard let logPath else {
-        FileHandle.standardError.write(Data("usage: live --container <appDataDir> [--port N] [--log <file>] [--spool <dir>]\n".utf8)); exit(2)
+        FileHandle.standardError.write(Data("usage: live --container <appDataDir> [--port N] [--log <file>]\n".utf8)); exit(2)
     }
     guard let s = Trace.session(inFileAt: logPath) else {
         FileHandle.standardError.write(Data("no live plain-remux session in \(logPath) (is a plain MKV playing?)\n".utf8)); exit(2)
@@ -494,10 +681,6 @@ case "live":
     guard let port = Int(value("--port", args) ?? "") ?? s.port else {
         FileHandle.standardError.write(Data("could not determine loopback port (pass --port N)\n".utf8)); exit(2)
     }
-    let spool = value("--spool", args)
-    let bound = Int(value("--spool-bound-mib", args) ?? "") ?? (Contract.windowFloorMiB * 2)
-    let sample = Int(value("--sample", args) ?? "") ?? 12
-
     // Provenance of the port, printed on every run: probing a STALE port is one of the
     // ways this channel can silently measure the wrong thing, and it must be visible.
     let sessions = Trace.sessionCount(inFileAt: logPath)
@@ -507,7 +690,7 @@ case "live":
         FileHandle.standardError.write(Data("""
 
         [INFRA] the captured log contains \(sessions) plain-remux sessions, not 1.
-        [INFRA] The session that was waited on and soaked is NOT necessarily the one still
+        [INFRA] The session that was waited on is NOT necessarily the one still
         [INFRA] listening, so any probe result would be ambiguous and the port may be dead.
         [INFRA] This means the app was relaunched or re-mounted mid-run.
         [INFRA] exit 3 - could not stand up a probeable playback session.
@@ -516,7 +699,7 @@ case "live":
         exit(3)
     }
 
-    let outcome = Live.evaluate(port: port, trace: s, spoolPath: spool, spoolBoundMiB: bound, segmentSampleCap: sample)
+    let outcome = Live.evaluate(port: port, trace: s, containerPath: container)
     if let infra = outcome.infra {
         // Print whatever WAS observed, explicitly marked as not a verdict, then exit 3.
         if !outcome.findings.isEmpty {
@@ -535,13 +718,20 @@ case "live":
     exit(accept ? 0 : 1)
 
 case "spool":
-    guard let dir = args.dropFirst().first else {
-        FileHandle.standardError.write(Data("usage: spool <dir>\n".utf8)); exit(2)
+    guard let container = value("--container", args) else {
+        FileHandle.standardError.write(Data("usage: spool --container <appDataDir> [--expect-active|--expect-empty]\n".utf8)); exit(2)
     }
-    if let b = Live.directoryBytes(dir) { print("\(b)"); exit(0) }
-    FileHandle.standardError.write(Data("no directory at \(dir)\n".utf8)); exit(2)
+    let snapshot = SpoolLayout.inspect(containerPath: container)
+    print("root=\(snapshot.rootPath) bytes=\(snapshot.bytes) launches=\(snapshot.launchDirectories.count) sessions=\(snapshot.sessionDirectories.count) errors=\(snapshot.errors)")
+    if snapshot.inspectionFailed { exit(2) }
+    if args.contains("--expect-active") {
+        exit(snapshot.hasOneActiveLaunchAndSession
+            && SpoolLayout.withinAdmissionCeiling(snapshot.bytes) ? 0 : 1)
+    }
+    if args.contains("--expect-empty") { exit(snapshot.isReclaimed ? 0 : 1) }
+    exit(0)
 
 default:
-    FileHandle.standardError.write(Data("unknown command \(cmd); use selftest | trace | live | spool\n".utf8))
+    FileHandle.standardError.write(Data("unknown command \(cmd); use selftest | fixture-assert | trace | live | spool\n".utf8))
     exit(2)
 }

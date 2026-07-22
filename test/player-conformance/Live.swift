@@ -1,34 +1,147 @@
 import Foundation
 
-// =============================================================================
-// Live channel: talk to the running server over loopback and read segment bytes
-// + the filesystem, for the parts a trace cannot decide.
-//
-// The tvOS simulator shares the host's loopback, so a server the app bound to
-// 127.0.0.1:PORT inside the sim is reachable from this process at the same
-// address. The port is discovered from the app's request log; the harness then
-// fetches the master + media playlists and individual segments, and measures the
-// Caches spool directory. Requires a plain-remux playback to be LIVE.
-// =============================================================================
+enum SpoolLayout {
+    struct Snapshot {
+        let rootPath: String
+        let rootExists: Bool
+        let launchDirectories: [String]
+        let sessionDirectories: [String]
+        let bytes: Int
+        let errors: [String]
+
+        var hasOneActiveLaunchAndSession: Bool {
+            rootExists && launchDirectories.count == 1 && sessionDirectories.count == 1 && errors.isEmpty
+        }
+
+        var isReclaimed: Bool {
+            bytes == 0 && sessionDirectories.isEmpty && errors.isEmpty
+        }
+
+        var inspectionFailed: Bool {
+            errors.contains {
+                $0.hasPrefix("app container")
+                    || $0.hasPrefix("VortXHLS root is not")
+                    || $0.hasPrefix("directory discovery failed")
+                    || $0.hasPrefix("enumeration failed")
+                    || $0.hasPrefix("stat failed")
+                    || $0.hasPrefix("could not enumerate")
+                    || $0.hasPrefix("whole-root byte total overflow")
+            }
+        }
+    }
+
+    static func withinAdmissionCeiling(_ bytes: Int) -> Bool {
+        bytes >= 0 && bytes <= Contract.spoolAdmissionBytes
+    }
+
+    /// Resolve the production root from the one authoritative app container and
+    /// account every regular file beneath it. Directory ordering is sorted so
+    /// evidence is deterministic across filesystems.
+    static func inspect(containerPath: String) -> Snapshot {
+        let manager = FileManager.default
+        let root = URL(fileURLWithPath: containerPath, isDirectory: true)
+            .appendingPathComponent("Library/Caches/VortXHLS", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        guard manager.fileExists(atPath: containerPath, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return Snapshot(rootPath: root.path, rootExists: false, launchDirectories: [],
+                            sessionDirectories: [], bytes: 0,
+                            errors: ["app container does not exist or is not a directory"])
+        }
+        guard manager.fileExists(atPath: root.path, isDirectory: &isDirectory) else {
+            return Snapshot(rootPath: root.path, rootExists: false, launchDirectories: [],
+                            sessionDirectories: [], bytes: 0, errors: [])
+        }
+        guard isDirectory.boolValue else {
+            return Snapshot(rootPath: root.path, rootExists: true, launchDirectories: [],
+                            sessionDirectories: [], bytes: 0,
+                            errors: ["VortXHLS root is not a directory"])
+        }
+
+        let keys: Set<URLResourceKey> = [
+            .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey,
+        ]
+        var errors: [String] = []
+        var launches: [String] = []
+        var sessions: [String] = []
+        do {
+            let rootChildren = try manager.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: Array(keys), options: [])
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            for child in rootChildren {
+                let values = try child.resourceValues(forKeys: keys)
+                if values.isSymbolicLink == true {
+                    errors.append("symlink at VortXHLS root: \(child.lastPathComponent)")
+                } else if values.isDirectory == true && child.lastPathComponent.hasPrefix("launch-") {
+                    launches.append(child.path)
+                    let launchChildren = try manager.contentsOfDirectory(
+                        at: child, includingPropertiesForKeys: Array(keys), options: [])
+                        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                    for launchChild in launchChildren {
+                        let childValues = try launchChild.resourceValues(forKeys: keys)
+                        if childValues.isSymbolicLink == true {
+                            errors.append("symlink in launch directory: \(launchChild.lastPathComponent)")
+                        } else if childValues.isDirectory == true
+                                    && launchChild.lastPathComponent.hasPrefix("session-") {
+                            sessions.append(launchChild.path)
+                        } else {
+                            errors.append("unexpected launch entry: \(launchChild.lastPathComponent)")
+                        }
+                    }
+                } else {
+                    errors.append("unexpected VortXHLS root entry: \(child.lastPathComponent)")
+                }
+            }
+        } catch {
+            errors.append("directory discovery failed: \(error.localizedDescription)")
+        }
+
+        var bytes = 0
+        if let enumerator = manager.enumerator(
+            at: root, includingPropertiesForKeys: Array(keys), options: [], errorHandler: { url, error in
+                errors.append("enumeration failed at \(url.path): \(error.localizedDescription)")
+                return true
+            }) {
+            for case let url as URL in enumerator {
+                do {
+                    let values = try url.resourceValues(forKeys: keys)
+                    if values.isSymbolicLink == true {
+                        if !errors.contains(where: { $0.contains(url.lastPathComponent) }) {
+                            errors.append("symlink below VortXHLS root: \(url.lastPathComponent)")
+                        }
+                    } else if values.isRegularFile == true {
+                        guard let size = values.fileSize, size >= 0 else {
+                            errors.append("stat failed at \(url.path): missing or negative file size")
+                            continue
+                        }
+                        let (sum, overflow) = bytes.addingReportingOverflow(size)
+                        if overflow {
+                            errors.append("whole-root byte total overflow")
+                            bytes = Int.max
+                            break
+                        }
+                        bytes = sum
+                    }
+                } catch {
+                    errors.append("stat failed at \(url.path): \(error.localizedDescription)")
+                }
+            }
+        } else {
+            errors.append("could not enumerate VortXHLS root")
+        }
+
+        return Snapshot(rootPath: root.path, rootExists: true,
+                        launchDirectories: launches.sorted(), sessionDirectories: sessions.sorted(),
+                        bytes: bytes, errors: errors)
+    }
+}
 
 enum Live {
-
-    /// Ceiling on point 4's active probes, so a long EVENT playlist with a large
-    /// predicted-evicted range cannot turn one gate run into hundreds of fetches.
-    /// The targets are chosen most-at-risk first (see the point 4 block), so the cap
-    /// trims the least informative probes.
-    static let availabilityProbeCap = 16
-
-    /// A probe result that can EXPLAIN itself. `status == -1` means the request never
-    /// got an HTTP response at all, and `transportError` says why. Collapsing that case
-    /// to a bare `nil` is exactly what let "the live server was unreachable" masquerade
-    /// as a contract verdict; every failure here has to stay attributable.
     struct Response {
         let status: Int
         let body: Data
         let transportError: String?
+
         var ok: Bool { status == 200 && transportError == nil }
-        /// Short description for evidence and INFRA lines.
         var describe: String {
             if let transportError {
                 return "HTTP \(status >= 0 ? String(status) : "none"); transport error: \(transportError)"
@@ -54,18 +167,13 @@ enum Live {
 
         func wait(seconds: TimeInterval) -> Response? {
             guard signal.wait(timeout: .now() + seconds) == .success else { return nil }
-            lock.lock()
-            defer { lock.unlock() }
+            lock.lock(); defer { lock.unlock() }
             return response
         }
 
         func sealTimeout(_ value: Response) -> Response {
-            lock.lock()
-            defer { lock.unlock() }
-            if !sealed {
-                sealed = true
-                response = value
-            }
+            lock.lock(); defer { lock.unlock() }
+            if !sealed { sealed = true; response = value }
             return response ?? value
         }
     }
@@ -81,22 +189,15 @@ enum Live {
             return Response(status: -1, body: Data(), transportError: "malformed URL for \(path)")
         }
         let timeoutResponse = Response(
-            status: -1,
-            body: Data(),
-            transportError: "no complete response within \(timeout)s"
-        )
+            status: -1, body: Data(), transportError: "no complete response within \(timeout)s")
         let latch = ResponseLatch()
-        var req = URLRequest(url: url)
-        req.timeoutInterval = timeout
-        let task = session.dataTask(with: req) { data, response, error in
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        let task = session.dataTask(with: request) { data, response, error in
             let http = response as? HTTPURLResponse
             let status = http?.statusCode ?? -1
             if let error {
-                latch.publish(Response(
-                    status: status,
-                    body: Data(),
-                    transportError: error.localizedDescription
-                ))
+                latch.publish(Response(status: status, body: Data(), transportError: error.localizedDescription))
                 return
             }
             guard let http else {
@@ -107,10 +208,8 @@ enum Live {
             let expected = http.expectedContentLength
             if expected >= 0 && UInt64(body.count) != UInt64(expected) {
                 latch.publish(Response(
-                    status: status,
-                    body: Data(),
-                    transportError: "incomplete body: received \(body.count) of \(expected) advertised bytes"
-                ))
+                    status: status, body: Data(),
+                    transportError: "incomplete body: received \(body.count) of \(expected) advertised bytes"))
                 return
             }
             latch.publish(Response(status: status, body: body, transportError: nil))
@@ -122,359 +221,283 @@ enum Live {
         return sealed
     }
 
-    static func directoryBytes(_ path: String) -> Int? {
-        let fm = FileManager.default
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return nil }
-        guard let en = fm.enumerator(at: URL(fileURLWithPath: path), includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey]) else { return nil }
-        var total = 0
-        for case let u as URL in en {
-            let v = try? u.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
-            if v?.isRegularFile == true { total += v?.fileSize ?? 0 }
-        }
-        return total
-    }
-
-    /// The result of a live battery. `infra` non-nil means the channel could NOT
-    /// OBSERVE the session and no verdict in `findings` may be trusted or reported as
-    /// a product signal: the caller must exit 3, not 1.
-    ///
-    /// The distinction this type exists to encode, which the harness previously got
-    /// wrong: "there is nothing to measure" (point 5 with no spool directory, a
-    /// legitimate INDETERMINATE) versus "I could not reach the thing I meant to
-    /// measure" (the live server was gone at probe time, an INFRA failure). The second
-    /// case degrading to INDETERMINATE, and the run then exiting 1 with "gate ran and
-    /// decided", is worse than crashing because it looks authoritative.
     struct Outcome {
         let findings: [Finding]
         let infra: String?
     }
 
-    /// Full live battery. `trace` supplies mount/ready timing (6) and the
-    /// success-path event count (7); the loopback fetches decide 1 (exact ms), 2,
-    /// 3 and 4; `spoolPath` measures 5.
+    private struct AudioTopology {
+        let primaryLanguage: String
+        let alternateLanguage: String
+        let alternateURI: String
+        let alternateID: Int
+    }
+
+    private struct SegmentFetch {
+        let segment: Playlist.Segment
+        let response: Response
+    }
+
     static func evaluate(
         port: Int,
         trace: TraceSession,
-        spoolPath: String?,
-        spoolBoundMiB: Int,
-        segmentSampleCap: Int,
+        containerPath: String,
         session: URLSession = .shared
     ) -> Outcome {
-        var out: [Finding] = []
-        // Set by any check that could not REACH what it meant to measure. Distinct from
-        // a legitimate INDETERMINATE ("there is nothing to measure", e.g. no spool dir).
-        var probeInfra: String?
-        var audioFetchInfra: String?
-
-        let master = get(port: port, path: "/master.m3u8", session: session)
-        let masterText = String(data: master.body, encoding: .utf8) ?? ""
-        let media = get(port: port, path: "/media.m3u8", session: session)
-        if !master.ok {
-            audioFetchInfra = "the live master playlist was not completely retrievable: \(master.describe)."
+        let masterResponse = get(port: port, path: "/master.m3u8", session: session)
+        let mediaResponse = get(port: port, path: "/media.m3u8", session: session)
+        if let error = masterResponse.transportError ?? mediaResponse.transportError {
+            return Outcome(findings: [], infra: "manifest transport was incomplete: \(error)")
         }
 
-        // HARD GATE. The media playlist is the spine of this channel: points 2, 3 and
-        // point 4's active strand all enumerate advertised segments from it. If it is
-        // unreachable there is nothing to probe, and the ONLY honest report is INFRA.
-        // Never degrade to INDETERMINATE here and never let point 4 stand on its
-        // latent (predicted) strand alone, which we specifically decided must not be
-        // a verdict by itself.
-        guard media.ok, let mediaText = String(data: media.body, encoding: .utf8) else {
-            let why = """
-            could not fetch the live media playlist from the session's own HLS server.
-              GET http://127.0.0.1:\(port)/media.m3u8 -> \(media.describe)
-              GET http://127.0.0.1:\(port)/master.m3u8 -> \(master.describe)
-            The port above was read from the session's `hls server listening` line. The
-            server is gone, was never reachable, or the session was torn down before the
-            probe ran. Points 2, 3 and point 4's ACTIVE strand cannot be observed at all,
-            so no product verdict is reported for them. This is an observation failure,
-            NOT a player regression.
-            """
-            return Outcome(findings: out, infra: why)
-        }
-        let parsed: Playlist.Parsed? = Playlist.parseMedia(mediaText)
+        let masterText = String(data: masterResponse.body, encoding: .utf8) ?? ""
+        let mediaText = String(data: mediaResponse.body, encoding: .utf8) ?? ""
+        let media = Playlist.parseMedia(mediaText)
+        let topology = audioTopology(masterText)
 
-        // (1) Exact startup cohort. Best measured from the FIRST response the server
-        // ever gave (the trace). The live playlist additionally proves the exact ms
-        // arithmetic on real EXTINF text and that TARGETDURATION covers every EXTINF.
-        do {
-            var ev: [String] = []
-            var verdict = Verdict.indeterminate
-            if let firstSegs = trace.firstMediaSegs {
-                ev.append("first /media.m3u8 (trace) served segs=\(firstSegs) ended=\(trace.firstMediaEnded ?? false)")
-                if trace.firstMediaEnded == true && firstSegs < Contract.minStartupSegments {
-                    verdict = .exempt; ev.append("ended short clip -> exempt")
-                } else {
-                    verdict = firstSegs >= Contract.minStartupSegments ? .green : .red
+        var audioResponse: Response?
+        var audio: Playlist.Parsed?
+        if let topology, let path = requestPath(topology.alternateURI) {
+            let response = get(port: port, path: path, session: session)
+            if let error = response.transportError {
+                return Outcome(findings: [], infra: "alternate playlist transport was incomplete: \(error)")
+            }
+            audioResponse = response
+            if let text = String(data: response.body, encoding: .utf8) {
+                audio = Playlist.parseMedia(text)
+            }
+        }
+
+        var transportFailures: [String] = []
+        func fetch(_ parsed: Playlist.Parsed?) -> [SegmentFetch] {
+            guard let parsed else { return [] }
+            return parsed.segments.compactMap { segment in
+                guard let path = requestPath(segment.uri) else { return nil }
+                let response = get(port: port, path: path, session: session)
+                if let error = response.transportError {
+                    transportFailures.append("\(path): \(error)")
                 }
+                return SegmentFetch(segment: segment, response: response)
             }
-            if let p = parsed {
-                let firstN = Array(p.segments.prefix(max(Contract.minStartupSegments, 1)))
-                let exactMs = firstN.reduce(0) { $0 + max(0, $1.ms) }
-                ev.append("live playlist: \(p.count) segs, first \(firstN.count) sum to \(exactMs) ms (EXACT integer ms from EXTINF text)")
-                ev.append("TARGETDURATION=\(p.targetDuration) s; max EXTINF=\(p.segments.map(\.ms).max() ?? 0) ms")
-            }
-            out.append(Finding(point: .startupCohort, verdict: verdict, evidence: ev))
+        }
+        let videoFetches = fetch(mediaResponse.status == 200 ? media : nil)
+        let audioFetches = fetch(audioResponse?.status == 200 ? audio : nil)
+
+        var initResponse: Response?
+        if let map = media.mapURI, let path = requestPath(map), mediaResponse.status == 200 {
+            let response = get(port: port, path: path, session: session)
+            if let error = response.transportError { transportFailures.append("\(path): \(error)") }
+            initResponse = response
         }
 
-        // (2) IDR-start on every published segment (sampled).
-        do {
-            var ev: [String] = []
+        var findings: [Finding] = []
+
+        // (1) The first response trace supplies the startup edge. The currently
+        // advertised body supplies exact rendered duration and renderer invariants.
+        var startupEvidence = [
+            "GET /master.m3u8 -> \(masterResponse.describe)",
+            "GET /media.m3u8 -> \(mediaResponse.describe)",
+        ]
+        var startupVerdict = Verdict.red
+        if let first = trace.firstMediaResponse {
+            startupEvidence.append("first response seq=\(first.sequence) segs=\(first.segmentCount) ended=\(first.ended)")
+            startupEvidence.append("live rendered window=\(media.totalMs) ms across \(media.count) segments")
+            startupEvidence.append("target=\(media.targetDuration.map(String.init) ?? "missing"), EVENT=\(media.hasPlaylistTypeEvent)")
+            let livePlaylistValid = masterResponse.status == 200 && mediaResponse.status == 200
+                && media.targetDuration == Contract.hlsTargetDuration
+                && !media.hasPlaylistTypeEvent && media.isValidAdvertisedWindow
+            if first.ended {
+                let stableFinalWindow = livePlaylistValid && media.endlist
+                    && first.sequence == 0 && media.mediaSequence == 0
+                    && first.segmentCount == media.count
+                if stableFinalWindow {
+                    startupVerdict = Playlist.cohortReady(count: media.count, totalMs: media.totalMs)
+                        ? .green : .exempt
+                }
+            } else {
+                let ready = livePlaylistValid && first.sequence == 0
+                    && first.segmentCount >= Contract.minStartupSegments
+                    && Playlist.cohortReady(count: media.count, totalMs: media.totalMs)
+                startupVerdict = ready ? .green : .red
+            }
+        } else {
+            startupEvidence.append("missing first media response trace")
+        }
+        findings.append(Finding(point: .startupCohort, verdict: startupVerdict, evidence: startupEvidence))
+
+        // (2) Every video URI in the current advertised range is checked.
+        var idrEvidence: [String] = []
+        var idrVerdict = Verdict.indeterminate
+        if initResponse?.status == 200,
+           let initData = initResponse?.body,
+           let track = FMP4.videoTrack(inInit: initData),
+           videoFetches.count == media.count,
+           videoFetches.allSatisfy({ $0.response.status == 200 && $0.response.transportError == nil }) {
             var offenders: [Int] = []
-            var checked = 0, indeterminate = 0, evictedSkipped = 0, unexpected = 0
-            var lastUnexpectedWhy = ""
-            let initResponse = get(port: port, path: "/init.mp4", session: session)
-            let videoTrack = initResponse.ok ? FMP4.videoTrack(inInit: initResponse.body) : nil
-            if let videoTrack {
-                ev.append("resolved video track_ID \(videoTrack.id) and \(videoTrack.codec.name) NAL framing from init.mp4")
-            } else {
-                ev.append("could not resolve the video track and codec from init.mp4 (\(initResponse.describe)); point 2 fails closed")
-                probeInfra = probeInfra ?? "point 2 could not read and resolve a complete /init.mp4 response: \(initResponse.describe)."
+            var undecidable: [Int] = []
+            for fetch in videoFetches {
+                switch FMP4.firstVideoSampleIsIDR(
+                    fetch.response.body, videoTrackID: track.id, codec: track.codec) {
+                case .some(true): break
+                case .some(false): offenders.append(fetch.segment.id)
+                case .none: undecidable.append(fetch.segment.id)
+                }
             }
-            if let p = parsed {
-                // Walk the advertised list and check the first `segmentSampleCap`
-                // segments that are actually RETRIEVABLE, rather than the first
-                // `segmentSampleCap` advertised ids. Once the run is sized so the
-                // window genuinely evicts (which point 4 requires), the lowest
-                // advertised ids are exactly the evicted ones, and a fixed
-                // `prefix(cap)` spends its whole budget on 404s and reports
-                // "checked 0 segments" - point 2 stops being decided at all.
-                // Same predicate, same verdict mapping: only the aim changes.
-                var unreachable = 0
-                var lastUnreachableWhy = ""
-                for seg in p.segments {
-                    if checked >= segmentSampleCap { break }
-                    let r = get(port: port, path: "/seg\(seg.id).m4s", session: session)
-                    if r.transportError != nil {
-                        unreachable += 1; lastUnreachableWhy = r.describe; continue
-                    }
-                    guard r.ok else {
-                        if r.status == 404 || r.status == 410 {
-                            evictedSkipped += 1
-                        } else {
-                            unexpected += 1
-                            lastUnexpectedWhy = r.describe
-                        }
-                        continue
-                    }
-                    checked += 1
-                    switch FMP4.firstVideoSampleIsIDR(
-                        r.body,
-                        videoTrackID: videoTrack?.id,
-                        codec: videoTrack?.codec
-                    ) {
-                    case .some(true): break
-                    case .some(false): offenders.append(seg.id)
-                    case .none: indeterminate += 1
-                    }
-                }
-                ev.append("checked \(checked) retrievable segments (sample cap \(segmentSampleCap)) using BOTH MP4 sync metadata and first-video-sample IDR NAL bytes; non-IDR/disagreement: \(offenders); indeterminate: \(indeterminate)")
-                if evictedSkipped > 0 {
-                    ev.append("skipped \(evictedSkipped) advertised-but-unfetchable segments while sampling (that is point 4's finding, not point 2's)")
-                }
-                if unreachable > 0 {
-                    ev.append("\(unreachable) segment fetches could not reach the server (\(lastUnreachableWhy))")
-                }
-                if unexpected > 0 {
-                    ev.append("\(unexpected) segment fetches returned an unexpected complete response (\(lastUnexpectedWhy))")
-                    probeInfra = probeInfra ?? ("point 2 received an unexpected response while reading an advertised segment: "
-                        + lastUnexpectedWhy + ". Only complete HTTP 404/410 is an eviction observation.")
-                }
-                if checked == 0 {
-                    // Could not read a single segment's bytes. Whether the server died or
-                    // every advertised segment was evicted, this channel did not OBSERVE
-                    // point 2 and must not imply it did.
-                    probeInfra = probeInfra ?? ("point 2 could not read the bytes of a single advertised segment "
-                        + "(\(p.segments.count) advertised, \(evictedSkipped) unfetchable, \(unreachable) unreachable"
-                        + (lastUnreachableWhy.isEmpty ? "" : ": \(lastUnreachableWhy)") + ").")
-                }
-                let verdict: Verdict
-                if !offenders.isEmpty { verdict = .red }
-                else if checked > 0 && indeterminate == 0 { verdict = .green }
-                else { verdict = .indeterminate }
-                out.append(Finding(point: .idrStart, verdict: verdict, evidence: ev))
-            } else {
-                out.append(Finding(point: .idrStart, verdict: .indeterminate, evidence: ["no live media playlist to enumerate segments"]))
-            }
+            idrEvidence.append("checked all \(videoFetches.count) advertised video URIs; non-IDR=\(offenders), undecidable=\(undecidable)")
+            idrVerdict = offenders.isEmpty && undecidable.isEmpty ? .green : .red
+        } else {
+            idrEvidence.append("could not parse init or receive complete 200 for every advertised video segment")
         }
+        findings.append(Finding(point: .idrStart, verdict: idrVerdict, evidence: idrEvidence))
 
-        // (3) First video + first alternate-audio segment id == 0.
-        do {
-            var ev: [String] = []
-            var verdict = Verdict.red
-            if let p = parsed, let firstVideo = p.segments.map(\.id).min() {
-                ev.append("live video playlist lowest advertised id: \(firstVideo)")
-                verdict = firstVideo == 0 ? .green : .red
-            }
-            // Alternate audio rendition from the master's EXT-X-MEDIA URI.
-            if let audioURI = audioRenditionURI(masterText) {
-                ev.append("master advertises alternate audio rendition: \(audioURI)")
-                let a = get(port: port, path: "/\(audioURI)", session: session)
-                if a.ok, let atext = String(data: a.body, encoding: .utf8) {
-                    let ap = Playlist.parseMedia(atext)
-                    let firstAudio = ap.segments.map(\.id).min() ?? -1
-                    ev.append("audio rendition lowest advertised id: \(firstAudio)")
-                    if firstAudio != 0 { verdict = .red }
-                } else {
-                    // The master ADVERTISES this rendition, so failing to fetch it is a
-                    // reachability failure, not evidence about the contract.
-                    audioFetchInfra = "the master advertises an alternate audio rendition at /\(audioURI) "
-                                    + "but it could not be fetched: \(a.describe)"
-                    ev.append("audio playlist fetch FAILED: \(a.describe)")
-                }
-            } else {
-                ev.append("master advertises NO alternate audio rendition (audio muxed inline) -> audio half UNMET")
-                verdict = .red
-            }
-            out.append(Finding(point: .firstSegmentZero, verdict: verdict, evidence: ev))
+        // (3) Use first requests from the trace, not the lowest id in a later
+        // sliding playlist. The master must expose one in-band primary and one
+        // different-known-language alternate.
+        let firstVideo = trace.firstVideoSegReq
+        let firstAudio = trace.audioSegReqs.first
+        var firstEvidence = ["first video request id=\(firstVideo.map(String.init) ?? "missing")"]
+        if let firstAudio {
+            firstEvidence.append("first alternate request=/audio\(firstAudio.renditionID)-seg\(firstAudio.segmentID).m4s")
+        } else {
+            firstEvidence.append("no exact alternate segment request")
         }
-
-        // (4) Availability window. One evidentiary strand plus diagnostics:
-        //
-        //   ACTIVE  - GET advertised segments and see whether any 404. Aimed at the
-        //             ids the resident-window arithmetic predicts are already gone,
-        //             plus the lowest advertised id, the highest, and a spread across
-        //             the advertised range. Probing ONLY the lowest id (what this
-        //             check used to do) aims at whichever segment is most likely to
-        //             still be resident, so it could report GREEN on a session the
-        //             trace channel proved RED from the identical log.
-        //   LATENT  - resident-window arithmetic from `Trace.availabilityWindow`.
-        //             This chooses useful probe targets and remains diagnostic only.
-        //
-        // RED requires a complete HTTP 404/410 response for an id advertised by the
-        // successfully fetched current playlist. Arithmetic never decides the gate.
-        //
-        // This widens what is OBSERVED. The bar is unchanged: contract point 4 has
-        // always been "no advertised-segment 404 through the RFC 8216 s6.2.2
-        // availability window" (Contract.swift), and neither its text nor its
-        // threshold is touched here.
-        do {
-            var ev: [String] = []
-            var verdict = Verdict.indeterminate
-            let w = Trace.availabilityWindow(trace)
-
-            // --- ACTIVE strand
-            var probed: [(id: Int, status: Int)] = []
-            var unreachable: [(id: Int, why: String)] = []
-            var unexpected: [(id: Int, status: Int)] = []
-            var atRisk = Set<Int>()
-            if let p = parsed, !p.segments.isEmpty {
-                let ids = p.segments.map(\.id).sorted()
-                // Ordered MOST-AT-RISK FIRST so `availabilityProbeCap` trims the least
-                // informative probes rather than the ones aimed at the defect.
-                var targets: [Int] = []
-                func add(_ id: Int) { if !targets.contains(id) { targets.append(id) } }
-                atRisk = Set(w.predictedEvictedIds).intersection(ids)
-                for id in atRisk.sorted() { add(id) }        // predicted evicted
-                if let lowest = ids.first { add(lowest) }    // the classic seg0 case
-                let step = max(1, ids.count / 6)             // spread across the range
-                for i in stride(from: 0, to: ids.count, by: step) { add(ids[i]) }
-                if let highest = ids.last { add(highest) }   // the newest published
-
-                for id in targets.prefix(Live.availabilityProbeCap) {
-                    let r = get(port: port, path: "/seg\(id).m4s", session: session)
-                    // A TRANSPORT failure is not a 404: it means we could not ask the
-                    // question. Track it separately so it can never be scored as a
-                    // contract violation.
-                    if r.transportError != nil {
-                        unreachable.append((id, r.describe))
-                    } else {
-                        probed.append((id, r.status))
-                        if r.status != 200 && r.status != 404 && r.status != 410 {
-                            unexpected.append((id, r.status))
-                        }
-                    }
-                }
-                probed.sort { $0.id < $1.id }
-                let retired = probed.filter { $0.status == 404 || $0.status == 410 }
-                ev.append("ACTIVE: received \(probed.count) complete responses for advertised ids \(probed.map(\.id)) "
-                          + "(lowest + highest + \(atRisk.count) predicted-evicted + a spread); "
-                          + "complete 404/410: \(retired.isEmpty ? "none" : retired.map { "seg\($0.id)->HTTP\($0.status)" }.joined(separator: ", "))")
-                if !retired.isEmpty {
-                    ev.append("PROOF: an ADVERTISED segment returned a complete HTTP 404/410 response -> availability-window violation (RFC 8216 s6.2.2)")
-                }
-            } else {
-                ev.append("ACTIVE: no live media playlist to enumerate advertised segments")
-            }
-
-            // --- LATENT diagnostics (identical arithmetic to the trace channel)
-            if !w.observed404s.isEmpty {
-                ev.append("DIAGNOSTIC trace: advertised segments logged as 404 during playback: \(w.observed404s)")
-            }
-            if w.avgSegmentBytes > 0 {
-                ev.append("DIAGNOSTIC prediction: resident window ~= \(Contract.windowFloorMiB) MiB / \(w.avgSegmentBytes) B ≈ \(w.residentSegments) segments; playlist advertised up to \(w.advertisedMax) (MEDIA-SEQUENCE stays 0)")
-                if let evictedUpTo = w.evictedUpTo {
-                    ev.append("DIAGNOSTIC prediction only: segment 0..\(evictedUpTo) may no longer be resident; this does not decide the verdict")
-                }
-            } else {
-                ev.append("DIAGNOSTIC prediction unavailable: no served-segment byte sizes in the log yet")
-            }
-
-            // --- verdict.
-            let activeFired = probed.contains { $0.status == 404 || $0.status == 410 }
-
-            if !unreachable.isEmpty {
-                ev.append("ACTIVE: \(unreachable.count) probes lacked a complete response "
-                          + "(e.g. seg\(unreachable[0].id): \(unreachable[0].why))")
-            }
-            if !unexpected.isEmpty {
-                ev.append("ACTIVE: unexpected complete statuses: "
-                          + unexpected.map { "seg\($0.id)->HTTP\($0.status)" }.joined(separator: ", "))
-            }
-
-            if activeFired {
-                verdict = .red
-            } else if probed.isEmpty || !unreachable.isEmpty || !unexpected.isEmpty {
-                probeInfra = "point 4 did not receive a complete 200 or evidentiary 404/410 response for every selected advertised segment. "
-                           + "Incomplete and unexpected responses cannot decide availability, and the resident-window prediction is diagnostic only."
-                verdict = .indeterminate
-                ev.append("point 4 NOT DECIDED: no complete advertised-id 404/410 was observed, and at least one target lacked a trustworthy response.")
-            } else {
-                verdict = .green
-            }
-
-            // --- a disagreement between observation and prediction is useful context,
-            //     but it never changes the observed verdict.
-            if w.evictedUpTo != nil && !activeFired && !probed.isEmpty {
-                let stillResident = Set(probed.filter { $0.status == 200 }.map(\.id))
-                    .intersection(atRisk).sorted()
-                ev.append("NOTE: the strands DISAGREE. The arithmetic predicts 0..\(w.evictedUpTo.map(String.init) ?? "?") are evicted, "
-                          + "but \(stillResident.isEmpty ? "no probed at-risk id" : "ids \(stillResident)") still returned 200. "
-                          + "Either the window retains more than the \(Contract.windowFloorMiB) MiB floor the estimate uses, or eviction "
-                          + "had not run yet. The prediction remains diagnostic and does not make the verdict RED.")
-            }
-            out.append(Finding(point: .noAdvertised404, verdict: verdict, evidence: ev))
+        if let topology {
+            firstEvidence.append("primary language=\(topology.primaryLanguage), alternate language=\(topology.alternateLanguage), URI=\(topology.alternateURI)")
+        } else {
+            firstEvidence.append("master does not contain exactly one in-band primary and one known-language alternate")
         }
+        findings.append(Finding(
+            point: .firstSegmentZero,
+            verdict: firstVideo == 0 && firstAudio?.segmentID == 0
+                && firstAudio?.renditionID == topology?.alternateID && topology != nil ? .green : .red,
+            evidence: firstEvidence))
 
-        // (5) Spool bounded (during-session sample). Post-session zero is a second
-        // measurement the runner takes after teardown (see run-conformance.sh).
-        do {
-            if let path = spoolPath, let bytes = directoryBytes(path) {
-                let mib = bytes / (1024 * 1024)
-                let ok = mib <= spoolBoundMiB
-                out.append(Finding(point: .spoolBounded, verdict: ok ? .green : .red,
-                                   evidence: ["spool \(path) = \(bytes) B (\(mib) MiB); mid-session bound \(spoolBoundMiB) MiB",
-                                              "post-session-zero must be confirmed by re-measuring after teardown (runner does this)"]))
-            } else {
-                out.append(Finding(point: .spoolBounded, verdict: .indeterminate,
-                                   evidence: ["no spool directory to measure (pass --spool <dir> once the rework names it)"]))
-            }
+        // (4) Parse seq as the first absolute id and segs as cardinality, then
+        // fetch every actual URI in both current advertised ranges.
+        let allFetches = videoFetches + audioFetches
+        let failed = allFetches.filter { $0.response.transportError == nil && $0.response.status != 200 }
+        let windowsValid = mediaResponse.status == 200 && media.isValidAdvertisedWindow
+            && !media.hasPlaylistTypeEvent
+            && media.targetDuration == Contract.hlsTargetDuration
+            && topology != nil && audioResponse?.status == 200
+            && audio?.isValidAdvertisedWindow == true
+            && audio?.hasPlaylistTypeEvent == false
+            && audio?.targetDuration == Contract.hlsTargetDuration
+            && audio?.advertisedRange == media.advertisedRange
+            && audio?.segments.allSatisfy({ $0.renditionID == topology?.alternateID }) == true
+        var availabilityEvidence = [
+            "video range=\(describe(media.advertisedRange)), URIs=\(media.count), fetched=\(videoFetches.count)",
+            "audio range=\(describe(audio?.advertisedRange)), URIs=\(audio?.count ?? 0), fetched=\(audioFetches.count)",
+            "complete non-200 advertised responses=\(failed.map { "\($0.segment.uri)->\($0.response.status)" })",
+        ]
+        if !trace.advertisedFailures.isEmpty {
+            availabilityEvidence.append("product trace advertised 404s=\(trace.advertisedFailures)")
         }
+        findings.append(Finding(
+            point: .noAdvertised404,
+            verdict: windowsValid && failed.isEmpty && trace.advertisedFailures.isEmpty
+                && allFetches.count == media.count + (audio?.count ?? 0) ? .green : .red,
+            evidence: availabilityEvidence))
 
-        // (6) + (7) from the trace facts already parsed from the live container log.
-        out.append(contentsOf: Trace.findings(trace).filter { $0.point == .startupLatency || $0.point == .failSoftCounted })
-        return Outcome(findings: out, infra: probeInfra ?? audioFetchInfra)
+        // (5) Account the whole root derived from the authoritative container.
+        let spool = SpoolLayout.inspect(containerPath: containerPath)
+        let spoolOK = spool.hasOneActiveLaunchAndSession
+            && SpoolLayout.withinAdmissionCeiling(spool.bytes)
+        findings.append(Finding(
+            point: .spoolBounded,
+            verdict: spoolOK ? .green : .red,
+            evidence: [
+                "root=\(spool.rootPath), bytes=\(spool.bytes), ceiling=\(Contract.spoolAdmissionBytes)",
+                "launches=\(spool.launchDirectories.count), sessions=\(spool.sessionDirectories.count), errors=\(spool.errors)",
+            ]))
+
+        findings.append(contentsOf: Trace.findings(trace).filter {
+            $0.point == .startupLatency || $0.point == .failSoftCounted
+        })
+
+        let infra: String?
+        if !transportFailures.isEmpty {
+            infra = "incomplete advertised-resource transport: \(transportFailures.joined(separator: "; "))"
+        } else if spool.inspectionFailed {
+            infra = "could not safely inspect the whole VortXHLS root: \(spool.errors.joined(separator: "; "))"
+        } else {
+            infra = nil
+        }
+        return Outcome(findings: findings, infra: infra)
     }
 
-    /// The URI attribute of the master's audio `#EXT-X-MEDIA:TYPE=AUDIO,...` line.
     static func audioRenditionURI(_ master: String) -> String? {
-        for line in master.split(separator: "\n") where line.contains("#EXT-X-MEDIA:") && line.contains("TYPE=AUDIO") {
-            if let uriRange = line.range(of: "URI=\"") {
-                let rest = line[uriRange.upperBound...]
-                if let end = rest.firstIndex(of: "\"") { return String(rest[..<end]) }
-            }
+        audioTopology(master)?.alternateURI
+    }
+
+    private static func audioTopology(_ master: String) -> AudioTopology? {
+        let rows = master.split(separator: "\n").map(String.init)
+            .filter { $0.hasPrefix("#EXT-X-MEDIA:") && attributes($0)["TYPE"] == "AUDIO" }
+        guard rows.count == 2 else { return nil }
+        let parsed = rows.map(attributes)
+        guard let primary = parsed.first(where: { $0["DEFAULT"] == "YES" && $0["URI"] == nil }),
+              let alternate = parsed.first(where: { $0["DEFAULT"] != "YES" && $0["URI"] != nil }),
+              let primaryLanguage = primary["LANGUAGE"],
+              let alternateLanguage = alternate["LANGUAGE"],
+              let uri = alternate["URI"],
+              let alternateID = audioPlaylistRenditionID(uri),
+              primary["GROUP-ID"] == alternate["GROUP-ID"],
+              !isUnknownLanguage(primaryLanguage),
+              !isUnknownLanguage(alternateLanguage),
+              primaryLanguage.lowercased() != alternateLanguage.lowercased() else { return nil }
+        return AudioTopology(
+            primaryLanguage: primaryLanguage,
+            alternateLanguage: alternateLanguage,
+            alternateURI: uri,
+            alternateID: alternateID)
+    }
+
+    private static func attributes(_ line: String) -> [String: String] {
+        guard let colon = line.firstIndex(of: ":") else { return [:] }
+        let source = line[line.index(after: colon)...]
+        var fields: [String] = []
+        var current = ""
+        var quoted = false
+        for character in source {
+            if character == "\"" { quoted.toggle(); current.append(character) }
+            else if character == "," && !quoted { fields.append(current); current = "" }
+            else { current.append(character) }
         }
-        return nil
+        fields.append(current)
+        var output: [String: String] = [:]
+        for field in fields {
+            guard let equals = field.firstIndex(of: "=") else { continue }
+            let key = String(field[..<equals])
+            var value = String(field[field.index(after: equals)...])
+            if value.hasPrefix("\"") && value.hasSuffix("\"") && value.count >= 2 {
+                value = String(value.dropFirst().dropLast())
+            }
+            output[key] = value
+        }
+        return output
+    }
+
+    private static func isUnknownLanguage(_ language: String) -> Bool {
+        let key = language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return key.isEmpty || ["und", "unk", "mis", "zxx"].contains(key)
+    }
+
+    private static func audioPlaylistRenditionID(_ uri: String) -> Int? {
+        let name = uri.split(separator: "/").last.map(String.init) ?? uri
+        guard name.hasPrefix("audio"), name.hasSuffix(".m3u8") else { return nil }
+        let digits = String(name.dropFirst(5).dropLast(5))
+        guard !digits.isEmpty, digits.allSatisfy(\.isNumber), let id = Int(digits), id >= 0 else { return nil }
+        return id
+    }
+
+    private static func requestPath(_ uri: String) -> String? {
+        guard !uri.isEmpty, !uri.contains("://") else { return nil }
+        let path = uri.split(separator: "?", maxSplits: 1).first.map(String.init) ?? uri
+        guard !path.split(separator: "/").contains("..") else { return nil }
+        return path.hasPrefix("/") ? path : "/\(path)"
+    }
+
+    private static func describe(_ range: Range<Int>?) -> String {
+        range.map { "[\($0.lowerBound),\($0.upperBound))" } ?? "invalid"
     }
 }

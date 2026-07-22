@@ -8,10 +8,10 @@ import Foundation
 // (VortXRemuxHLSServer) against these values; it never asserts on source text.
 //
 // The plain remux lane and the Dolby Vision lane share the two mechanisms the
-// contract governs - the startup gate in `serveMedia` and the playlist builder
-// `VortXRemuxHLSServer.buildMediaBody` (which delegates the header to the
-// dependency-free `DVPlaybackPolicy.mediaPlaylistHeader`). So every behaviour
-// below is observable with a plain (non-DV) MKV, which is all this machine has.
+// contract governs - the startup gate in `serveMaster` and the playlist builder
+// `VortXRemuxHLSServer.buildMediaBody` (which delegates to the dependency-free
+// `DVPlaybackPolicy.mediaPlaylistLines`). So every behaviour below is observable
+// with a plain (non-DV) MKV.
 // =============================================================================
 
 enum Contract {
@@ -21,7 +21,7 @@ enum Contract {
     /// as INTEGER milliseconds derived from the exact three-decimal EXTINF TEXT
     /// (never a float, never an internal packet double).
     static let minStartupSegments = 6
-    static let minStartupMs = 15_000
+    static let minStartupMs = 36_000
 
     /// (6) Startup latency SLO: mount -> readyToPlay.
     static let sloMountToReadyMs = 30_000
@@ -31,25 +31,13 @@ enum Contract {
     /// successful start or a user cancellation.
     static let cohortTimeoutEvent = "hls_startup_cohort_timeout"
 
-    // --- Values mirrored from beta source, used only to REASON about observed
-    //     behaviour (e.g. to recognise a hard-cut segment or size the resident
-    //     window). They are not themselves the contract. ---
+    /// Frozen conservative segment target. Startup requires three targets of
+    /// rendered media, independently of the 30-second wall-clock deadline.
+    static let hlsTargetDuration = 12
 
-    /// VortXMKVRemuxStream.hlsMaxSegmentSecs - the hard time cut that fires on
-    /// ANY frame (not only a keyframe). A non-final segment whose media duration
-    /// equals this is a hard cut, which begins the NEXT segment mid-GOP: exactly
-    /// the (2) non-IDR-start violation the rework must remove.
-    static let hardCutSecs = 4.0
-    /// VortXMKVRemuxStream.hlsMaxSegmentBytes - the 32 MiB hard byte cut, same
-    /// non-keyframe hazard as the time cut.
-    static let hardCutBytes = 32 << 20
-    /// VortXMKVRemuxStream.hlsTargetDuration - EXT-X-TARGETDURATION (>= every
-    /// EXTINF, constant across reloads).
-    static let hlsTargetDuration = 5
-    /// VortXRemuxBuffer window floor (dvRemuxWindowMiB default) in MiB. The
-    /// resident sliding window is roughly this plus the producer lead; used to
-    /// compute when an EVENT-advertised low segment has been evicted (point 4).
-    static let windowFloorMiB = 64
+    /// Exact session-global durable-spool admission ceiling. This is an
+    /// admission bound, not an eviction target or a resident-window estimate.
+    static let spoolAdmissionBytes = 536_870_912 // 512 * 1024 * 1024
 }
 
 /// The seven acceptance gates, in contract order.
@@ -64,13 +52,13 @@ enum Point: Int, CaseIterable {
 
     var title: String {
         switch self {
-        case .startupCohort:   return "Startup cohort >= 6 segs AND >= 15000 ms (integer-ms from EXTINF text)"
+        case .startupCohort:   return "Startup cohort >= 6 segs AND >= 36000 rendered-media ms (ended sources exempt)"
         case .idrStart:        return "Every published segment starts on an IDR frame"
         case .firstSegmentZero:return "First video seg id == 0 AND first alternate-audio seg id == 0"
-        case .noAdvertised404: return "No advertised-segment 404 through the RFC 8216 s6.2.2 availability window"
-        case .spoolBounded:    return "Spool bounded (Caches, session-global) and reclaimed to zero after session"
-        case .startupLatency:  return "Startup latency SLO: mount -> readyToPlay <= 30000 ms"
-        case .failSoftCounted: return "Fail-soft counted: exactly one cohort-timeout event + 404 on timeout, none otherwise"
+        case .noAdvertised404: return "Every URI in each advertised [seq, seq+segs) window remains fetchable"
+        case .spoolBounded:    return "Whole Caches/VortXHLS root <= 512 MiB with one active launch/session; reclaimed after teardown"
+        case .startupLatency:  return "Separate wall SLO: mount -> readyToPlay strictly before 30000 ms"
+        case .failSoftCounted: return "Timeout tuple: exactly one cohort event + /master.m3u8 404 + no ready"
         }
     }
 }

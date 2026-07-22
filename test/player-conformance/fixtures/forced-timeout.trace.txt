@@ -1,6 +1,8 @@
 2026-07-22 05:00:00.000 [dv] hls server listening on 127.0.0.1:60001
 2026-07-22 05:00:00.010 [avplayer] plain-remux mount (local HLS) host=192.168.1.5 -> 127.0.0.1:60001
 2026-07-22 05:00:00.050 [dv] hls signaling codecs=avc1.64001F,mp4a.40.2 supplemental=none range=none fps=24.000 bw=3000000 dv=false
-2026-07-22 05:00:00.300 [dv] hls media segment 0 published +0.3s after mount (500000B, 2.60s media)
-2026-07-22 05:00:30.000 [dv] hls_startup_cohort_timeout after 30000ms with 1 segment(s) (< 6); failing soft to libmpv
-2026-07-22 05:00:30.001 [dv] hls 404 /media.m3u8 (cohort timeout)
+2026-07-22 05:00:00.100 [dv] hls req /master.m3u8
+2026-07-22 05:00:00.300 [dv] hls media segment 0 published +0.3s after mount (500000B, 6.00s media)
+2026-07-22 05:00:30.000 [dv] hls_startup_cohort_timeout waitedMs=30000 requiredCount=6 requiredDurationMs=36000 actualCount=1 actualDuration=6000
+2026-07-22 05:00:30.001 [dv] hls 404 /master.m3u8
+2026-07-22 05:00:30.002 [dv] hls_mount_to_ready_timeout count=1 waitedMs=30000 -> fail-soft

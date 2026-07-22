@@ -1,46 +1,71 @@
 import Foundation
 
-// =============================================================================
-// Request-trace analysis.
-//
-// The server writes one durable line per request/response to the app's
-// Caches request log (the same channel the overnight run used). Every line is
-// "yyyy-MM-dd HH:mm:ss.SSS [category] message". We slice out ONE plain-remux HLS
-// session and read the contract-observable facts straight from the real lines the
-// running server emitted - this is runtime behaviour, not source text.
-//
-// Facts a trace can decide on its own: (1) cohort segment count + approximate
-// startup ms, (3) first video segment id, (4) any advertised-segment 404 plus the
-// latent EVENT-window eviction, (6) mount -> readyToPlay latency, (7) count of
-// fail-soft cohort-timeout events on this (successful) session. Points (2) and (5)
-// need segment bytes / the filesystem and are left to the live channel.
-// =============================================================================
-
 struct TraceSession {
+    struct MediaResponse: Equatable {
+        let sequence: Int
+        let segmentCount: Int
+        let ended: Bool
+
+        var advertisedRange: Range<Int>? {
+            guard sequence >= 0, segmentCount >= 0 else { return nil }
+            let (end, overflow) = sequence.addingReportingOverflow(segmentCount)
+            return overflow ? nil : sequence..<end
+        }
+    }
+
+    struct AudioResponse: Equatable {
+        let renditionID: Int
+        let sequence: Int
+        let segmentCount: Int
+
+        var advertisedRange: Range<Int>? {
+            guard renditionID >= 0, sequence >= 0, segmentCount >= 0 else { return nil }
+            let (end, overflow) = sequence.addingReportingOverflow(segmentCount)
+            return overflow ? nil : sequence..<end
+        }
+    }
+
+    struct TimeoutEvent: Equatable {
+        let ordinal: Int
+        let waitedMs: Int
+        let requiredCount: Int
+        let requiredDurationMs: Int
+        let actualCount: Int
+        let actualDurationMs: Int
+    }
+
+    struct AudioRequest: Equatable {
+        let renditionID: Int
+        let segmentID: Int
+    }
+
     var lines: [(t: Date?, raw: String)] = []
     var port: Int?
     var mountAt: Date?
     var readyAt: Date?
-    var firstMediaSegs: Int?
-    var firstMediaEnded: Bool?
-    var publishedDurations: [Int: Double] = [:]     // segIndex -> media seconds (from "published" lines)
+    var publishedDurationsMs: [Int: Int] = [:]
     var firstVideoSegReq: Int?
-    var audioSegReqs: [Int] = []
-    var advertisedMax: Int = 0
-    var segResponseBytes: [Int: Int] = [:]          // segIndex -> byte length served
-    var advertised404s: [Int] = []
-    var sawAny404 = false
-    var cohortTimeoutEvents = 0
-    var mediaResponses: [(segs: Int, ended: Bool)] = []
+    var audioSegReqs: [AudioRequest] = []
+    var mediaResponses: [MediaResponse] = []
+    var audioResponses: [AudioResponse] = []
+    var advertisedFailures: [String] = []
+    var masterRequestOrdinals: [Int] = []
+    var master404Ordinals: [Int] = []
+    var timeoutEventOrdinals: [Int] = []
+    var timeoutEvents: [TimeoutEvent] = []
+    var sawEventPlaylist = false
+
+    var firstMediaResponse: MediaResponse? { mediaResponses.first }
+    var masterRequestCount: Int { masterRequestOrdinals.count }
 }
 
 enum Trace {
     private static let stamp: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone.current
-        return f
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        return formatter
     }()
 
     private static func timestamp(_ line: String) -> Date? {
@@ -49,243 +74,257 @@ enum Trace {
     }
 
     private static func firstMatch(_ pattern: String, _ text: String) -> [String]? {
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
-        let r = NSRange(text.startIndex..., in: text)
-        guard let m = re.firstMatch(in: text, range: r) else { return nil }
-        return (0..<m.numberOfRanges).compactMap { idx in
-            guard let rg = Range(m.range(at: idx), in: text) else { return nil }
-            return String(text[rg])
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..., in: text)
+        guard let match = expression.firstMatch(in: text, range: range) else { return nil }
+        return (0..<match.numberOfRanges).compactMap { index in
+            guard let matchRange = Range(match.range(at: index), in: text) else { return nil }
+            return String(text[matchRange])
         }
     }
 
-    /// Slice the Nth (default first) plain-remux HLS session out of a trace file.
-    /// A session begins at "hls server listening on 127.0.0.1:PORT" and runs until
-    /// the next such line (or EOF).
     static func session(inFileAt path: String, index: Int = 0) -> TraceSession? {
-        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        guard index >= 0,
+              let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
         let all = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var starts: [Int] = []
-        for (i, l) in all.enumerated() where l.contains("hls server listening on 127.0.0.1:") { starts.append(i) }
+        let starts = all.indices.filter { all[$0].contains("hls server listening on 127.0.0.1:") }
         guard index < starts.count else { return nil }
-        let lo = starts[index]
-        let hi = index + 1 < starts.count ? starts[index + 1] : all.count
-        return build(Array(all[lo..<hi]))
+        let lower = starts[index]
+        let upper = index + 1 < starts.count ? starts[index + 1] : all.count
+        return build(Array(all[lower..<upper]))
     }
 
-    /// How many plain-remux sessions the file contains. More than one in a slice that
-    /// is meant to cover a single run means the app was relaunched or re-mounted
-    /// mid-run, so the port the live channel would probe may belong to a DEAD session.
     static func sessionCount(inFileAt path: String) -> Int {
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return 0 }
         return text.split(separator: "\n", omittingEmptySubsequences: false)
-                   .filter { $0.contains("hls server listening on 127.0.0.1:") }.count
+            .filter { $0.contains("hls server listening on 127.0.0.1:") }.count
     }
 
     private static func build(_ raw: [String]) -> TraceSession {
-        var s = TraceSession()
-        for line in raw {
-            s.lines.append((timestamp(line), line))
+        var session = TraceSession()
+        var videoRange: Range<Int>?
+        var audioRanges: [Int: Range<Int>] = [:]
 
-            if s.port == nil, let m = firstMatch(#"hls server listening on 127\.0\.0\.1:(\d+)"#, line) {
-                s.port = Int(m[1])
+        for (ordinal, line) in raw.enumerated() {
+            session.lines.append((timestamp(line), line))
+            if session.port == nil,
+               let match = firstMatch(#"hls server listening on 127\.0\.0\.1:(\d+)"#, line) {
+                session.port = Int(match[1])
             }
-            if s.mountAt == nil, line.contains("plain-remux mount") { s.mountAt = timestamp(line) }
-            if s.readyAt == nil, line.contains("readyToPlay -> play") { s.readyAt = timestamp(line) }
+            if session.mountAt == nil, line.contains("plain-remux mount") {
+                session.mountAt = timestamp(line)
+            }
+            if session.readyAt == nil, line.contains("readyToPlay -> play") {
+                session.readyAt = timestamp(line)
+            }
+            if line.contains("#EXT-X-PLAYLIST-TYPE:EVENT") { session.sawEventPlaylist = true }
 
-            if let m = firstMatch(#"hls media segment (\d+) published .*\((\d+)B, ([0-9]+\.[0-9]+)s media\)"#, line) {
-                if let idx = Int(m[1]), let d = Double(m[3]) { s.publishedDurations[idx] = d }
+            if let match = firstMatch(
+                #"hls media segment (\d+) published .*\([0-9]+B, ([0-9]+\.[0-9]+)s media\)"#,
+                line),
+               let id = Int(match[1]),
+               let milliseconds = Playlist.msFromSecondsText(match[2]) {
+                session.publishedDurationsMs[id] = milliseconds
             }
-            if let m = firstMatch(#"hls resp /media\.m3u8 segs=(\d+) ended=(true|false)"#, line) {
-                let segs = Int(m[1]) ?? 0
-                let ended = m[2] == "true"
-                s.mediaResponses.append((segs, ended))
-                s.advertisedMax = max(s.advertisedMax, segs)
-                if s.firstMediaSegs == nil { s.firstMediaSegs = segs; s.firstMediaEnded = ended }
+
+            if let match = firstMatch(
+                #"hls resp /media\.m3u8 seq=(\d+) segs=(\d+) ended=(true|false)"#,
+                line),
+               let sequence = Int(match[1]), let count = Int(match[2]) {
+                let response = TraceSession.MediaResponse(
+                    sequence: sequence, segmentCount: count, ended: match[3] == "true")
+                session.mediaResponses.append(response)
+                videoRange = response.advertisedRange
             }
-            if let m = firstMatch(#"hls req /seg(\d+)\.m4s"#, line), let idx = Int(m[1]) {
-                if s.firstVideoSegReq == nil { s.firstVideoSegReq = idx }
+            if let match = firstMatch(
+                #"hls resp /audio(\d+)\.m3u8 seq=(\d+) segs=(\d+)"#,
+                line),
+               let rendition = Int(match[1]),
+               let sequence = Int(match[2]),
+               let count = Int(match[3]) {
+                let response = TraceSession.AudioResponse(
+                    renditionID: rendition, sequence: sequence, segmentCount: count)
+                session.audioResponses.append(response)
+                audioRanges[rendition] = response.advertisedRange
             }
-            // Alternate-audio rendition segment request (rework-introduced). Match a
-            // few plausible shapes so the check works whatever the rework names it.
-            if let m = firstMatch(#"hls req /(?:aseg|audio-?seg|aud)(\d+)\.(?:m4s|aac|mp4)"#, line), let idx = Int(m[1]) {
-                s.audioSegReqs.append(idx)
+
+            if let match = firstMatch(#"hls req /seg(\d+)\.m4s"#, line),
+               let id = Int(match[1]), session.firstVideoSegReq == nil {
+                session.firstVideoSegReq = id
             }
-            if let m = firstMatch(#"hls resp /seg(\d+)\.m4s (\d+)B"#, line), let idx = Int(m[1]), let b = Int(m[2]) {
-                s.segResponseBytes[idx] = b
+            if let match = firstMatch(#"hls req /audio(\d+)-seg(\d+)\.m4s"#, line),
+               let rendition = Int(match[1]), let id = Int(match[2]) {
+                session.audioSegReqs.append(.init(renditionID: rendition, segmentID: id))
             }
-            if line.contains("hls 404") { s.sawAny404 = true }
-            if let m = firstMatch(#"hls 404 /seg(\d+)\.m4s"#, line), let idx = Int(m[1]) {
-                // Advertised at the time iff below the max the playlist ever grew to.
-                if idx < s.advertisedMax { s.advertised404s.append(idx) }
+
+            if line.contains("hls req /master.m3u8") { session.masterRequestOrdinals.append(ordinal) }
+            if line.contains("hls 404 /master.m3u8") { session.master404Ordinals.append(ordinal) }
+            if line.contains(Contract.cohortTimeoutEvent) {
+                session.timeoutEventOrdinals.append(ordinal)
             }
-            if line.contains(Contract.cohortTimeoutEvent) { s.cohortTimeoutEvents += 1 }
+
+            if let match = firstMatch(#"hls 404 /seg(\d+)\.m4s"#, line),
+               let id = Int(match[1]), videoRange?.contains(id) == true {
+                session.advertisedFailures.append("/seg\(id).m4s")
+            }
+            if let match = firstMatch(#"hls 404 /audio(\d+)-seg(\d+)\.m4s"#, line),
+               let rendition = Int(match[1]), let id = Int(match[2]),
+               audioRanges[rendition]?.contains(id) == true {
+                session.advertisedFailures.append("/audio\(rendition)-seg\(id).m4s")
+            }
+
+            if let match = firstMatch(
+                #"hls_startup_cohort_timeout waitedMs=(\d+) requiredCount=(\d+) requiredDurationMs=(\d+) actualCount=(\d+) actualDuration=(\d+)"#,
+                line),
+               let waited = Int(match[1]),
+               let requiredCount = Int(match[2]),
+               let requiredDuration = Int(match[3]),
+               let actualCount = Int(match[4]),
+               let actualDuration = Int(match[5]) {
+                session.timeoutEvents.append(.init(
+                    ordinal: ordinal,
+                    waitedMs: waited,
+                    requiredCount: requiredCount,
+                    requiredDurationMs: requiredDuration,
+                    actualCount: actualCount,
+                    actualDurationMs: actualDuration))
+            }
         }
-        return s
+        return session
     }
 
-    // MARK: - Availability window (point 4), shared by both channels
-
-    /// The resident-window arithmetic behind contract point 4, factored out so the
-    /// trace channel and the live channel evaluate the SAME numbers. When these
-    /// lived only inside `Trace.findings`, the live channel probed just the lowest
-    /// advertised segment and could report GREEN on a session this arithmetic
-    /// proved RED from the identical log. That was a harness UNDER-OBSERVATION bug,
-    /// not a contract difference: point 4 has always been "no advertised-segment
-    /// 404 through the RFC 8216 s6.2.2 availability window", and the live channel
-    /// simply was not looking at the segments most likely to violate it.
-    struct AvailabilityWindow {
-        /// Mean served segment size, from the real `hls resp /segN.m4s <bytes>B` lines.
-        let avgSegmentBytes: Int
-        /// How many segments of that size the resident window can hold.
-        let residentSegments: Int
-        /// Highest segment count the playlist ever advertised.
-        let advertisedMax: Int
-        /// Highest advertised id the window can no longer hold, or nil when the whole
-        /// advertised range still fits. Ids `0...evictedUpTo` are advertised-but-gone.
-        let evictedUpTo: Int?
-        /// Advertised ids that actually 404'd during playback (proof, not prediction).
-        let observed404s: [Int]
-
-        /// Ids the arithmetic predicts are advertised but no longer resident.
-        var predictedEvictedIds: [Int] { evictedUpTo.map { Array(0...$0) } ?? [] }
+    static func startupRenderedMilliseconds(
+        _ session: TraceSession,
+        response: TraceSession.MediaResponse
+    ) -> Int? {
+        guard let range = response.advertisedRange else { return nil }
+        var total = 0
+        for id in range {
+            guard let duration = session.publishedDurationsMs[id] else { return nil }
+            let (sum, overflow) = total.addingReportingOverflow(duration)
+            guard !overflow else { return nil }
+            total = sum
+        }
+        return total
     }
 
-    static func availabilityWindow(_ s: TraceSession) -> AvailabilityWindow {
-        let avg = s.segResponseBytes.isEmpty ? 0
-                : s.segResponseBytes.values.reduce(0, +) / s.segResponseBytes.count
-        let resident = avg > 0 ? (Contract.windowFloorMiB * 1024 * 1024) / avg : 0
-        var evictedUpTo: Int?
-        if avg > 0, s.advertisedMax > resident { evictedUpTo = s.advertisedMax - resident - 1 }
-        return AvailabilityWindow(avgSegmentBytes: avg, residentSegments: resident,
-                                  advertisedMax: s.advertisedMax, evictedUpTo: evictedUpTo,
-                                  observed404s: s.advertised404s.sorted())
+    static func failSoftTimeoutFinding(_ session: TraceSession) -> Finding {
+        let events = session.timeoutEvents
+        var evidence = [
+            "timeout events=\(events.count), master requests=\(session.masterRequestCount), /master 404s=\(session.master404Ordinals.count), ready=\(session.readyAt != nil)"
+        ]
+        guard events.count == 1,
+              session.timeoutEventOrdinals.count == 1,
+              session.timeoutEventOrdinals[0] == events[0].ordinal else {
+            evidence.append("expected exactly one fully parseable \(Contract.cohortTimeoutEvent); raw markers=\(session.timeoutEventOrdinals.count)")
+            return Finding(point: .failSoftCounted, verdict: .red, evidence: evidence)
+        }
+        let event = events[0]
+        let fieldsMatch = event.waitedMs == Contract.sloMountToReadyMs
+            && event.requiredCount == Contract.minStartupSegments
+            && event.requiredDurationMs == Contract.minStartupMs
+            && !Playlist.cohortReady(count: event.actualCount, totalMs: event.actualDurationMs)
+        evidence.append(
+            "event waitedMs=\(event.waitedMs) requiredCount=\(event.requiredCount) requiredDurationMs=\(event.requiredDurationMs) actualCount=\(event.actualCount) actualDuration=\(event.actualDurationMs)")
+        let masterRequestBeforeEvent = session.masterRequestOrdinals.contains { $0 < event.ordinal }
+        let master404AfterEvent = session.master404Ordinals.contains { $0 > event.ordinal }
+        if !masterRequestBeforeEvent { evidence.append("no startup /master.m3u8 request before the timeout event") }
+        if !master404AfterEvent { evidence.append("no /master.m3u8 404 after the timeout event") }
+        if session.readyAt != nil { evidence.append("readyToPlay appeared on the timeout path") }
+        return Finding(
+            point: .failSoftCounted,
+            verdict: fieldsMatch && masterRequestBeforeEvent && master404AfterEvent
+                && session.readyAt == nil ? .green : .red,
+            evidence: evidence)
     }
 
-    // MARK: - Contract evaluation from a trace
+    static func findings(_ session: TraceSession) -> [Finding] {
+        var output: [Finding] = []
 
-    static func findings(_ s: TraceSession) -> [Finding] {
-        var out: [Finding] = []
-
-        // (1) Startup cohort - count is authoritative from the trace; startup ms is
-        // the sum of the cohort segments' published durations (2-dp log precision,
-        // which is ample to decide the 15 000 ms floor). `ended` short clips exempt.
-        do {
-            let segs = s.firstMediaSegs ?? -1
-            let ended = s.firstMediaEnded ?? false
-            var approxMs = 0
-            if segs > 0 { for i in 0..<segs { approxMs += Int(((s.publishedDurations[i] ?? 0) * 1000).rounded()) } }
-            let ev = [
-                "first /media.m3u8 response: segs=\(segs) ended=\(ended)",
-                "cohort startup duration ~= \(approxMs) ms (sum of \(max(segs,0)) published segment durations, 2-dp log)",
-                "floors: segments >= \(Contract.minStartupSegments) AND duration >= \(Contract.minStartupMs) ms",
+        if let first = session.firstMediaResponse {
+            var evidence = [
+                "first /media.m3u8 response: seq=\(first.sequence) segs=\(first.segmentCount) ended=\(first.ended)",
+                "advertised range: \(first.advertisedRange.map { "[\($0.lowerBound),\($0.upperBound))" } ?? "invalid")",
             ]
-            if segs < 0 {
-                out.append(Finding(point: .startupCohort, verdict: .indeterminate, evidence: ["no /media.m3u8 response in session"]))
-            } else if ended && segs < Contract.minStartupSegments {
-                out.append(Finding(point: .startupCohort, verdict: .exempt,
-                                   evidence: ev + ["source ENDED before the cohort could fill; short-clip exemption"]))
-            } else {
-                let ok = segs >= Contract.minStartupSegments && approxMs >= Contract.minStartupMs
-                out.append(Finding(point: .startupCohort, verdict: ok ? .green : .red, evidence: ev))
-            }
-        }
-
-        // (2) IDR-start - not decidable from a trace. Heuristic note only.
-        do {
-            let hardCut = s.publishedDurations.filter { abs($0.value - Contract.hardCutSecs) < 0.005 }.keys.sorted()
-            var ev = ["segment bytes are not in the trace; the IDR check needs the live channel (fMP4 parse)"]
-            if !hardCut.isEmpty {
-                ev.append("heuristic: segments \(hardCut) are exactly \(Contract.hardCutSecs)s (the hard cut) -> the FOLLOWING segment likely starts mid-GOP (non-IDR)")
-            }
-            out.append(Finding(point: .idrStart, verdict: .indeterminate, evidence: ev))
-        }
-
-        // (3) First segment ids.
-        do {
-            var ev: [String] = []
-            var verdict = Verdict.red
-            if let v = s.firstVideoSegReq {
-                ev.append("first video segment requested: /seg\(v).m4s -> id \(v) (want 0)")
-                verdict = v == 0 ? .green : .red
-            } else {
-                ev.append("no video segment request seen"); verdict = .indeterminate
-            }
-            if let a = s.audioSegReqs.first {
-                ev.append("first alternate-audio segment requested: id \(a) (want 0)")
-                if a != 0 { verdict = .red }
-            } else {
-                ev.append("no alternate-audio rendition requests in trace (beta muxes audio inline) -> audio half UNMET until the rework serves a separate audio rendition starting at seg 0")
-                verdict = .red
-            }
-            out.append(Finding(point: .firstSegmentZero, verdict: verdict, evidence: ev))
-        }
-
-        // (4) Advertised-segment availability. Same numbers the live channel uses
-        // (see `availabilityWindow`); the two channels must never disagree on them.
-        do {
-            var ev: [String] = []
-            var verdict = Verdict.green
-            let w = availabilityWindow(s)
-            if !w.observed404s.isEmpty {
-                ev.append("advertised segments 404'd: \(w.observed404s)")
-                verdict = .red
-            } else {
-                ev.append("no advertised-segment 404 fired during this forward-only playback")
-            }
-            // Latent EVENT-window eviction: MEDIA-SEQUENCE stays 0, so the playlist keeps
-            // advertising low segments after the resident window has slid past them.
-            if w.avgSegmentBytes > 0 {
-                ev.append("resident window ~= \(Contract.windowFloorMiB) MiB / \(w.avgSegmentBytes) B ≈ \(w.residentSegments) segments; playlist advertised up to \(w.advertisedMax) (MEDIA-SEQUENCE stays 0)")
-                if let evictedUpTo = w.evictedUpTo {
-                    ev.append("LATENT: segment 0..\(evictedUpTo) advertised but evicted -> a client that re-requests one (RFC 8216 s6.2.2 window) gets a 404")
-                    verdict = .red
+            if first.ended {
+                if first.sequence != 0 || first.advertisedRange == nil {
+                    evidence.append("ended startup response is not a valid absolute-zero range")
+                    output.append(Finding(point: .startupCohort, verdict: .red, evidence: evidence))
+                } else if let milliseconds = startupRenderedMilliseconds(session, response: first),
+                   Playlist.cohortReady(count: first.segmentCount, totalMs: milliseconds) {
+                    evidence.append("rendered startup duration=\(milliseconds) ms")
+                    output.append(Finding(point: .startupCohort, verdict: .green, evidence: evidence))
+                } else {
+                    evidence.append("completed source is exempt from the live startup floors")
+                    output.append(Finding(point: .startupCohort, verdict: .exempt, evidence: evidence))
                 }
-            }
-            out.append(Finding(point: .noAdvertised404, verdict: verdict, evidence: ev))
-        }
-
-        // (5) Spool - filesystem only.
-        out.append(Finding(point: .spoolBounded, verdict: .indeterminate,
-                           evidence: ["spool byte accounting is not in the trace; needs the live/filesystem channel"]))
-
-        // (6) Startup latency.
-        do {
-            if let m = s.mountAt, let r = s.readyAt {
-                let ms = Int(r.timeIntervalSince(m) * 1000)
-                out.append(Finding(point: .startupLatency, verdict: ms <= Contract.sloMountToReadyMs ? .green : .red,
-                                   evidence: ["mount -> readyToPlay = \(ms) ms (SLO <= \(Contract.sloMountToReadyMs) ms)"]))
+            } else if let milliseconds = startupRenderedMilliseconds(session, response: first) {
+                evidence.append("rendered startup duration=\(milliseconds) ms")
+                let ready = first.sequence == 0
+                    && Playlist.cohortReady(count: first.segmentCount, totalMs: milliseconds)
+                output.append(Finding(point: .startupCohort, verdict: ready ? .green : .red, evidence: evidence))
             } else {
-                out.append(Finding(point: .startupLatency, verdict: .indeterminate,
-                                   evidence: ["missing mount or readyToPlay line in session"]))
+                evidence.append("trace lacks every segment duration; exact duration needs the live playlist")
+                output.append(Finding(point: .startupCohort, verdict: .indeterminate, evidence: evidence))
             }
+        } else {
+            output.append(Finding(point: .startupCohort, verdict: .indeterminate,
+                                  evidence: ["no /media.m3u8 response in session"]))
         }
 
-        // (7) Fail-soft counted. Two observable sub-invariants:
-        //   (a) success path - 0 timeout events on a start that reaches readyToPlay;
-        //   (b) timeout path - EXACTLY ONE event + a 404 (into the demotion) + no ready.
-        // A forced-timeout fixture session proves (b); a normal session proves (a) but
-        // cannot prove the mechanism exists, so it stays PENDING (run the fixture too).
-        do {
-            let reachedReady = s.readyAt != nil
-            let n = s.cohortTimeoutEvents
-            var ev = ["\(Contract.cohortTimeoutEvent) events in session: \(n); saw a 404: \(s.sawAny404); reached readyToPlay: \(reachedReady)"]
-            var verdict: Verdict
-            if n > 1 {
-                ev.append("duplicate fail-soft accounting (>1 event)"); verdict = .red
-            } else if n == 1 && reachedReady {
-                ev.append("a timeout event fired on a start that still succeeded"); verdict = .red
-            } else if n == 1 && !reachedReady {
-                if s.sawAny404 { ev.append("timeout path verified: one event then a 404 into the demotion"); verdict = .green }
-                else { ev.append("one timeout event but no 404 into the demotion"); verdict = .red }
-            } else if n == 0 && reachedReady {
-                ev.append("success-path invariant holds (0 events); the counted-timeout path is unproven here - run the forced-timeout fixture")
-                verdict = .pending
-            } else {
-                verdict = .indeterminate
-            }
-            out.append(Finding(point: .failSoftCounted, verdict: verdict, evidence: ev))
+        output.append(Finding(point: .idrStart, verdict: .indeterminate,
+                              evidence: ["segment bytes require the live channel"]))
+
+        var firstEvidence: [String] = []
+        let videoZero = session.firstVideoSegReq == 0
+        firstEvidence.append("first video request id=\(session.firstVideoSegReq.map(String.init) ?? "missing")")
+        let audioZero = session.audioSegReqs.first?.segmentID == 0
+        if let audio = session.audioSegReqs.first {
+            firstEvidence.append("first alternate request=/audio\(audio.renditionID)-seg\(audio.segmentID).m4s")
+        } else {
+            firstEvidence.append("no exact /audio<ID>-seg<ID>.m4s request")
+        }
+        output.append(Finding(point: .firstSegmentZero,
+                              verdict: videoZero && audioZero ? .green : .red,
+                              evidence: firstEvidence))
+
+        output.append(Finding(
+            point: .noAdvertised404,
+            verdict: session.advertisedFailures.isEmpty ? .indeterminate : .red,
+            evidence: session.advertisedFailures.isEmpty
+                ? ["no advertised URI failure observed; complete coverage requires the live channel"]
+                : ["advertised URIs returned 404: \(session.advertisedFailures)"]))
+
+        output.append(Finding(point: .spoolBounded, verdict: .indeterminate,
+                              evidence: ["whole-root byte accounting requires the live filesystem channel"]))
+
+        if let mount = session.mountAt, let ready = session.readyAt {
+            let interval = ready.timeIntervalSince(mount)
+            let milliseconds = Int((interval * 1_000).rounded())
+            output.append(Finding(
+                point: .startupLatency,
+                verdict: interval >= 0
+                    && interval < Double(Contract.sloMountToReadyMs) / 1_000 ? .green : .red,
+                evidence: ["mount -> readyToPlay = \(milliseconds) ms; readiness must win strictly before \(Contract.sloMountToReadyMs) ms"]))
+        } else {
+            output.append(Finding(point: .startupLatency, verdict: .indeterminate,
+                                  evidence: ["missing mount or readyToPlay timestamp"]))
         }
 
-        return out
+        if session.readyAt != nil {
+            let success = session.timeoutEventOrdinals.isEmpty
+                && session.timeoutEvents.isEmpty && session.master404Ordinals.isEmpty
+            output.append(Finding(
+                point: .failSoftCounted,
+                verdict: success ? .green : .red,
+                evidence: ["success path: timeout events=\(session.timeoutEvents.count), /master 404s=\(session.master404Ordinals.count)"]))
+        } else if !session.timeoutEventOrdinals.isEmpty
+                    || !session.timeoutEvents.isEmpty || !session.master404Ordinals.isEmpty {
+            output.append(failSoftTimeoutFinding(session))
+        } else {
+            output.append(Finding(point: .failSoftCounted, verdict: .indeterminate,
+                                  evidence: ["neither success nor timeout terminal tuple is present"]))
+        }
+        return output
     }
 }
