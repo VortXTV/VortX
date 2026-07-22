@@ -285,36 +285,43 @@ final class DownloadPickCoordinator: ObservableObject {
                 type: meta.type, season: meta.season, episode: meta.episode,
                 videoID: meta.videoId
             )
-            let resolved: URL?
-            if isEpisode, head.url == nil, episode == nil {
-                resolved = nil
-            } else {
-                resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: head, episode: episode)
+            func queueResolved(_ resolved: URL?) -> Bool {
+                guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
+                    isUsenet: head.isUsenet, resolvedURL: resolved,
+                    fallbackURL: head.playableURL(isEpisode: isEpisode)
+                ) else { return false }
+                if resolved == nil, head.isTorrent { _ = prepareTorrentStream(head) }
+                let record = DownloadManager.shared.download(
+                    stream: head, meta: meta, resolvedURL: url,
+                    sourceName: head.name, qualityText: StreamRanking.signature(head)
+                )
+                if DownloadStore.shared.record(id: record.id)?.state == .failed {
+                    DownloadManager.shared.cancel(id: record.id)
+                    return false
+                }
+                if let failedID {
+                    DownloadManager.shared.cancel(id: failedID)
+                    DownloadStore.shared.update(id: record.id) {
+                        $0.retryNote = String(localized: "Switched to next-best source (previous source failed)")
+                    }
+                }
+                if !queue.isEmpty {
+                    chains[record.id] = Chain(remaining: queue, meta: meta, episode: episode)
+                }
+                return true
             }
-            guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
-                isUsenet: head.isUsenet, resolvedURL: resolved,
-                fallbackURL: head.playableURL(isEpisode: isEpisode)
-            ) else { continue }
-            if resolved == nil, head.isTorrent { _ = prepareTorrentStream(head) }
-            let record = DownloadManager.shared.download(stream: head, meta: meta, resolvedURL: url,
-                                                         sourceName: head.name,
-                                                         qualityText: StreamRanking.signature(head))
-            // download() can refuse synchronously (an HLS source on a device that can't save HLS, or a storage
-            // shortfall): that record is born `.failed`. Discard it and try the next candidate.
-            if DownloadStore.shared.record(id: record.id)?.state == .failed {
-                DownloadManager.shared.cancel(id: record.id)
+            if isEpisode, head.url == nil, episode == nil {
+                if queueResolved(nil) { return }
                 continue
             }
-            // A live replacement is queued: NOW drop the prior failed original and note the swap on the new row.
-            if let failedID {
-                DownloadManager.shared.cancel(id: failedID)
-                DownloadStore.shared.update(id: record.id) {
-                    $0.retryNote = String(localized: "Switched to next-best source (previous source failed)")
-                }
-            }
-            // Arm whatever ranked candidates remain as this download's automatic next-best swaps.
-            if !queue.isEmpty { chains[record.id] = Chain(remaining: queue, meta: meta, episode: episode) }
-            return
+            let pickerResult = await DebridCoordinator.shared
+                .resolvedPlaybackURLVersioned(for: head, episode: episode)
+            var queued = false
+            guard DebridCredentialSnapshotStore.shared.compareAndPublish(
+                revision: pickerResult.revision,
+                mutation: { queued = queueResolved(pickerResult.value) }
+            ) else { return }
+            if queued { return }
         }
         // Nothing in the list could be queued. A prior `.failed` row (`failedID`) is left in place as the
         // honest failure, never cancelled, so the user sees it rather than a vanished download.

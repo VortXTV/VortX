@@ -35,6 +35,29 @@ private struct Mutation: Sendable {
     let replacement: String
 }
 
+private struct PublicationBinding: Sendable {
+    let scopeStart: String
+    let scopeEnd: String?
+    let revisionNeedle: String
+    let mutationNeedle: String
+}
+
+private struct PublicationSite: Sendable {
+    let label: String
+    let path: String
+    let callScopeStart: String
+    let callScopeEnd: String?
+    let versionedCall: String
+    let plainCall: String
+    let bindings: [PublicationBinding]
+    let transportNeedles: [String]
+}
+
+private struct PublicationBodyMatch {
+    let body: Range<String.Index>
+    let guardEnd: String.Index
+}
+
 private func load(root: String, path: String) -> SourceFile? {
     let absolute = root + "/" + path
     guard let text = try? String(contentsOfFile: absolute, encoding: .utf8) else { return nil }
@@ -62,6 +85,176 @@ private func occurrenceCount(_ needle: String, in text: String) -> Int {
     return text.components(separatedBy: needle).count - 1
 }
 
+private func scopedRange(in text: String, start: String, end: String?) -> Range<String.Index>? {
+    guard let startRange = text.range(of: start) else { return nil }
+    guard let end else { return startRange.lowerBound..<text.endIndex }
+    guard let endRange = text.range(of: end, range: startRange.upperBound..<text.endIndex) else {
+        return nil
+    }
+    return startRange.lowerBound..<endRange.lowerBound
+}
+
+private func matchingBrace(in text: String, opening: String.Index) -> String.Index? {
+    enum LexicalState {
+        case code
+        case string
+        case lineComment
+        case blockComment(Int)
+    }
+
+    func following(_ index: String.Index) -> String.Index? {
+        let next = text.index(after: index)
+        return next < text.endIndex ? next : nil
+    }
+
+    var state = LexicalState.code
+    var depth = 1
+    var index = text.index(after: opening)
+    while index < text.endIndex {
+        let character = text[index]
+        let nextIndex = following(index)
+        let nextCharacter = nextIndex.map { text[$0] }
+
+        switch state {
+        case .code:
+            if character == "\"" {
+                state = .string
+            } else if character == "/", nextCharacter == "/" {
+                state = .lineComment
+                index = nextIndex!
+            } else if character == "/", nextCharacter == "*" {
+                state = .blockComment(1)
+                index = nextIndex!
+            } else if character == "{" {
+                depth += 1
+            } else if character == "}" {
+                depth -= 1
+                if depth == 0 { return index }
+            }
+        case .string:
+            if character == "\\", let nextIndex {
+                index = nextIndex
+            } else if character == "\"" {
+                state = .code
+            }
+        case .lineComment:
+            if character == "\n" { state = .code }
+        case .blockComment(let nesting):
+            if character == "/", nextCharacter == "*" {
+                state = .blockComment(nesting + 1)
+                index = nextIndex!
+            } else if character == "*", nextCharacter == "/" {
+                state = nesting == 1 ? .code : .blockComment(nesting - 1)
+                index = nextIndex!
+            }
+        }
+        index = text.index(after: index)
+    }
+    return nil
+}
+
+private func publicationBodyMatch(
+    in text: String,
+    binding: PublicationBinding
+) -> PublicationBodyMatch? {
+    guard let scope = scopedRange(in: text, start: binding.scopeStart, end: binding.scopeEnd) else {
+        return nil
+    }
+    let callNeedles = [
+        "DebridCredentialSnapshotStore.shared.compareAndPublish(",
+        "credentialStore.compareAndPublish(",
+    ]
+    let mutationNeedle = "mutation: {"
+    var cursor = scope.lowerBound
+    while let call = callNeedles.compactMap({
+        text.range(of: $0, range: cursor..<scope.upperBound)
+    }).min(by: { $0.lowerBound < $1.lowerBound }) {
+        guard let mutation = text.range(of: mutationNeedle, range: call.upperBound..<scope.upperBound) else {
+            return nil
+        }
+        let header = text[call.lowerBound..<mutation.lowerBound]
+        let opening = text.index(before: mutation.upperBound)
+        guard let closing = matchingBrace(in: text, opening: opening) else { return nil }
+        let body = text.index(after: opening)..<closing
+        if header.contains(binding.revisionNeedle), text[body].contains(binding.mutationNeedle) {
+            guard let closeParenthesis = text.range(
+                of: ")",
+                range: text.index(after: closing)..<scope.upperBound
+            ), let elseRange = text.range(
+                of: "else",
+                range: closeParenthesis.upperBound..<scope.upperBound
+            ), let elseOpening = text.range(
+                of: "{",
+                range: elseRange.upperBound..<scope.upperBound
+            ), let elseClosing = matchingBrace(in: text, opening: elseOpening.lowerBound) else {
+                return nil
+            }
+            return PublicationBodyMatch(body: body, guardEnd: text.index(after: elseClosing))
+        }
+        cursor = text.index(after: closing)
+    }
+    return nil
+}
+
+private func publicationSiteViolations(
+    _ site: PublicationSite,
+    files: [String: SourceFile]
+) -> [String] {
+    guard let file = files[site.path] else { return ["missing non-player caller \(site.path)"] }
+    guard let callScope = scopedRange(
+        in: file.text,
+        start: site.callScopeStart,
+        end: site.callScopeEnd
+    ) else {
+        return ["\(site.path): \(site.label) call scope is missing"]
+    }
+    let scopedCallText = String(file.text[callScope])
+    var violations: [String] = []
+    let versionedCount = occurrenceCount(site.versionedCall, in: scopedCallText)
+    if versionedCount != 1 {
+        violations.append(
+            "\(site.path): \(site.label) expected one exact versioned call, found \(versionedCount)"
+        )
+    }
+    if scopedCallText.contains(site.plainCall) {
+        violations.append("\(site.path): \(site.label) regressed to its plain result wrapper")
+    }
+    for binding in site.bindings where publicationBodyMatch(in: file.text, binding: binding) == nil {
+        violations.append(
+            "\(site.path): \(site.label) does not bind `\(binding.mutationNeedle)` "
+                + "to `\(binding.revisionNeedle)` inside one atomic mutation body"
+        )
+    }
+    for needle in site.transportNeedles where !file.text.contains(needle) {
+        violations.append("\(site.path): \(site.label) lost revision transport (`\(needle)`)")
+    }
+    return violations
+}
+
+private func stripPublicationRevision(_ site: PublicationSite, from file: SourceFile) -> SourceFile? {
+    guard let scope = scopedRange(in: file.text, start: site.callScopeStart, end: site.callScopeEnd),
+          let call = file.text.range(of: site.versionedCall, range: scope),
+          file.text.range(of: site.versionedCall, range: call.upperBound..<scope.upperBound) == nil else {
+        return nil
+    }
+    var text = file.text
+    text.replaceSubrange(call, with: site.plainCall)
+    return SourceFile(path: file.path, text: text)
+}
+
+private func movePublicationOutsideSeam(_ site: PublicationSite, from file: SourceFile) -> SourceFile? {
+    guard let binding = site.bindings.first,
+          let match = publicationBodyMatch(in: file.text, binding: binding) else { return nil }
+    let body = String(file.text[match.body])
+    let text = String(file.text[..<match.body.lowerBound])
+        + String(file.text[match.body.upperBound..<match.guardEnd])
+        + "\n"
+        + body
+        + "\n"
+        + String(file.text[match.guardEnd...])
+    return SourceFile(path: file.path, text: text)
+}
+
 private func requireCount(_ file: SourceFile, _ needle: String, _ expected: Int,
                           _ reason: String) -> [String] {
     let count = occurrenceCount(needle, in: file.code)
@@ -86,6 +279,382 @@ private let keychainPath = "app/SourcesShared/Keychain.swift"
 private let coreModelsPath = "app/SourcesShared/CoreModels.swift"
 private let syncPath = "app/SourcesShared/VortXSyncManager.swift"
 private let torBoxSearchPath = "app/SourcesShared/TorBoxSearchSource.swift"
+private let tvDetailPath = "app/SourcesTV/DetailView.swift"
+private let tvHomePath = "app/SourcesTV/HomeView.swift"
+private let tvEpisodePath = "app/SourcesTV/TVEpisodePanel.swift"
+private let debridLibraryPath = "app/SourcesiOS/DebridLibraryView.swift"
+private let downloadPickerPath = "app/SourcesiOS/DownloadQualityPickerView.swift"
+private let batchDownloadPath = "app/SourcesiOS/iOSBatchDownloadCoordinator.swift"
+private let iosDetailPath = "app/SourcesiOS/iOSDetailView.swift"
+private let iosRootPath = "app/SourcesiOS/iOSRootView.swift"
+private let playerScreenPath = "app/Sources/PlayerScreen.swift"
+private let tvPlayerPath = "app/SourcesTV/TVPlayerView.swift"
+
+private let publicationSites: [PublicationSite] = [
+    PublicationSite(
+        label: "TV detail download",
+        path: tvDetailPath,
+        callScopeStart: "let tvDownloadResult = await DebridCoordinator.shared",
+        callScopeEnd: "/// The episode context for a debrid resolve",
+        versionedCall: ".resolvedPlaybackURLVersioned(for: best, episode: hint)",
+        plainCall: ".resolvedPlaybackURL(for: best, episode: hint)",
+        bindings: [PublicationBinding(
+            scopeStart: "let tvDownloadResult = await DebridCoordinator.shared",
+            scopeEnd: "/// The episode context for a debrid resolve",
+            revisionNeedle: "revision: tvDownloadResult.revision",
+            mutationNeedle: "queueDownload(tvDownloadResult.value)"
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "TV detail resume",
+        path: tvDetailPath,
+        callScopeStart: "tvResumeResult = await CWResume.resolvedURLVersioned(for: entry)",
+        callScopeEnd: "// Candidate order =",
+        versionedCall: "CWResume.resolvedURLVersioned(for: entry)",
+        plainCall: "CWResume.resolvedURL(for: entry)",
+        bindings: [PublicationBinding(
+            scopeStart: "tvResumeResult = await CWResume.resolvedURLVersioned(for: entry)",
+            scopeEnd: "// Candidate order =",
+            revisionNeedle: "revision: tvResumeResult.revision",
+            mutationNeedle: "presenter.request = PlaybackRequest("
+        )],
+        transportNeedles: [
+            "let tvResumeResult: DebridVersionedResult<(url: URL, refreshed: Bool)>?",
+            "mutation: {}",
+        ]
+    ),
+    PublicationSite(
+        label: "TV detail cached race",
+        path: tvDetailPath,
+        callScopeStart: "let tvRaceResult = await DebridCoordinator.shared.resolveFirstPlayableVersioned(",
+        callScopeEnd: "// No parallel-cached winner:",
+        versionedCall: "resolveFirstPlayableVersioned(",
+        plainCall: "resolveFirstPlayable(",
+        bindings: [PublicationBinding(
+            scopeStart: "let tvRaceResult = await DebridCoordinator.shared.resolveFirstPlayableVersioned(",
+            scopeEnd: "// No parallel-cached winner:",
+            revisionNeedle: "revision: tvRaceResult.revision",
+            mutationNeedle: "presenter.request = PlaybackRequest("
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "TV detail manual playback",
+        path: tvDetailPath,
+        callScopeStart: "let tvPlaybackResult = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(",
+        callScopeEnd: "private func filterBar(",
+        versionedCall: "resolvedPlaybackRefVersioned(",
+        plainCall: "resolvedPlaybackRef(",
+        bindings: [PublicationBinding(
+            scopeStart: "let tvPlaybackResult = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(",
+            scopeEnd: "private func filterBar(",
+            revisionNeedle: "revision: tvPlaybackResult.revision",
+            mutationNeedle: "presenter.request = PlaybackRequest("
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "TV home resume",
+        path: tvHomePath,
+        callScopeStart: "let homeResumeResult = await CWResume.resolvedURLVersioned(for: entry)",
+        callScopeEnd: "private func resumeSource(",
+        versionedCall: "CWResume.resolvedURLVersioned(for: entry)",
+        plainCall: "CWResume.resolvedURL(for: entry)",
+        bindings: [
+            PublicationBinding(
+                scopeStart: "let homeResumeResult = await CWResume.resolvedURLVersioned(for: entry)",
+                scopeEnd: "if refreshed, let service = entry.debridService",
+                revisionNeedle: "revision: homeResumeResult.revision",
+                mutationNeedle: "bridge.loadMeta("
+            ),
+            PublicationBinding(
+                scopeStart: "if refreshed, let service = entry.debridService",
+                scopeEnd: "// No fresh link",
+                revisionNeedle: "revision: homeResumeResult.revision",
+                mutationNeedle: "presenter.request = PlaybackRequest("
+            ),
+            PublicationBinding(
+                scopeStart: "NSLog(\"[cw-probe] tv directResume: svc=%@ hash=%@ fileIdx=%@ reresolve=NIL",
+                scopeEnd: "private func resumeSource(",
+                revisionNeedle: "revision: homeResumeResult.revision",
+                mutationNeedle: "presenter.request = PlaybackRequest("
+            ),
+        ],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "TV episode selection",
+        path: tvEpisodePath,
+        callScopeStart: "let candidateResult = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(",
+        callScopeEnd: "guard let selected else",
+        versionedCall: "resolvedPlaybackRefVersioned(",
+        plainCall: "resolvedPlaybackRef(",
+        bindings: [
+            PublicationBinding(
+                scopeStart: "let candidateResult = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(",
+                scopeEnd: "guard let selected else",
+                revisionNeedle: "revision: candidateResult.revision",
+                mutationNeedle: "selected = (candidate, url, candidateResult.value, candidateResult.revision)"
+            ),
+            PublicationBinding(
+                scopeStart: "guard let revision = selected.revision",
+                scopeEnd: "/// Tell the embedded server",
+                revisionNeedle: "revision: revision",
+                mutationNeedle: "request = makeRequest()"
+            ),
+        ],
+        transportNeedles: [
+            "var selected: (stream: CoreStream, url: URL, ref: DebridPlaybackRef?, revision: UInt64?)?",
+            "guard let revision = selected.revision else { return makeRequest() }",
+        ]
+    ),
+    PublicationSite(
+        label: "cloud library browse",
+        path: debridLibraryPath,
+        callScopeStart: "loader: @escaping DebridLibraryLoadStateMachine<Library>.Loader = {",
+        callScopeEnd: "    ) {",
+        versionedCall: "cloudLibraryVersioned()",
+        plainCall: "cloudLibrary()",
+        bindings: [PublicationBinding(
+            scopeStart: "let result = await loader()",
+            scopeEnd: "private func beginAttempt(",
+            revisionNeedle: "revision: result.revision",
+            mutationNeedle: "phase = .loaded"
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "download picker",
+        path: downloadPickerPath,
+        callScopeStart: "let pickerResult = await DebridCoordinator.shared",
+        callScopeEnd: "// Nothing in the list could be queued.",
+        versionedCall: ".resolvedPlaybackURLVersioned(for: head, episode: episode)",
+        plainCall: ".resolvedPlaybackURL(for: head, episode: episode)",
+        bindings: [PublicationBinding(
+            scopeStart: "let pickerResult = await DebridCoordinator.shared",
+            scopeEnd: "// Nothing in the list could be queued.",
+            revisionNeedle: "revision: pickerResult.revision",
+            mutationNeedle: "queued = queueResolved(pickerResult.value)"
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "batch queue",
+        path: batchDownloadPath,
+        callScopeStart: "let batchJobResult = await DebridCoordinator.shared",
+        callScopeEnd: "private func sameSource(",
+        versionedCall: ".resolvedPlaybackURLVersioned(for: best, episode: ep)",
+        plainCall: ".resolvedPlaybackURL(for: best, episode: ep)",
+        bindings: [PublicationBinding(
+            scopeStart: "let batchJobResult = await DebridCoordinator.shared",
+            scopeEnd: "private func sameSource(",
+            revisionNeedle: "revision: batchJobResult.revision",
+            mutationNeedle: "outcome = queueResolved(batchJobResult.value)"
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "batch retry",
+        path: batchDownloadPath,
+        callScopeStart: "let batchRetryResult = await DebridCoordinator.shared.resolvedPlaybackURLVersioned(",
+        callScopeEnd: "private func queueRetrySwap(",
+        versionedCall: "resolvedPlaybackURLVersioned(",
+        plainCall: "resolvedPlaybackURL(",
+        bindings: [PublicationBinding(
+            scopeStart: "let batchRetryResult = await DebridCoordinator.shared.resolvedPlaybackURLVersioned(",
+            scopeEnd: "private func queueRetrySwap(",
+            revisionNeedle: "revision: batchRetryResult.revision",
+            mutationNeedle: "queueRetrySwap(resolved: batchRetryResult.value"
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "iOS episode request",
+        path: iosDetailPath,
+        callScopeStart: "let episodeRequestResult: DebridVersionedResult<DebridPlaybackRef?>?",
+        callScopeEnd: "let ref = episodeRequestResult?.value",
+        versionedCall: "resolvedPlaybackRefVersioned(",
+        plainCall: "resolvedPlaybackRef(",
+        bindings: [PublicationBinding(
+            scopeStart: "guard let episodeRequestResult else { return makeStream() }",
+            scopeEnd: "/// A left-to-right layout",
+            revisionNeedle: "revision: episodeRequestResult.revision",
+            mutationNeedle: "output = makeStream()"
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "iOS movie resume",
+        path: iosDetailPath,
+        callScopeStart: "let movieResumeResult = await CWResume.resolvedURLVersioned(for: entry)",
+        callScopeEnd: "// CACHED DEBRID:",
+        versionedCall: "CWResume.resolvedURLVersioned(for: entry)",
+        plainCall: "CWResume.resolvedURL(for: entry)",
+        bindings: [PublicationBinding(
+            scopeStart: "let movieResumeResult = await CWResume.resolvedURLVersioned(for: entry)",
+            scopeEnd: "// CACHED DEBRID:",
+            revisionNeedle: "revision: movieResumeResult.revision",
+            mutationNeedle: "core.loadEnginePlayer(for: stream)"
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "iOS movie cached race",
+        path: iosDetailPath,
+        callScopeStart: "let movieRaceResult = await DebridCoordinator.shared.resolveFirstPlayableVersioned(",
+        callScopeEnd: "// INSTANT FIRST-PLAY:",
+        versionedCall: "resolveFirstPlayableVersioned(",
+        plainCall: "resolveFirstPlayable(",
+        bindings: [PublicationBinding(
+            scopeStart: "let movieRaceResult = await DebridCoordinator.shared.resolveFirstPlayableVersioned(",
+            scopeEnd: "// INSTANT FIRST-PLAY:",
+            revisionNeedle: "revision: movieRaceResult.revision",
+            mutationNeedle: "core.loadEnginePlayer(for: win.stream)"
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "iOS movie fallback",
+        path: iosDetailPath,
+        callScopeStart: "let moviePlaybackResult = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(",
+        callScopeEnd: "/// #95: play a source-list TRAILER row",
+        versionedCall: "resolvedPlaybackRefVersioned(",
+        plainCall: "resolvedPlaybackRef(",
+        bindings: [PublicationBinding(
+            scopeStart: "let moviePlaybackResult = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(",
+            scopeEnd: "/// #95: play a source-list TRAILER row",
+            revisionNeedle: "revision: moviePlaybackResult.revision",
+            mutationNeedle: "presentation = .player(PlayerLaunch("
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "iOS movie manual playback",
+        path: iosDetailPath,
+        callScopeStart: "let manualMovieResult = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(",
+        callScopeEnd: "#if !os(tvOS)",
+        versionedCall: "resolvedPlaybackRefVersioned(",
+        plainCall: "resolvedPlaybackRef(",
+        bindings: [PublicationBinding(
+            scopeStart: "let manualMovieResult = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(",
+            scopeEnd: "#if !os(tvOS)",
+            revisionNeedle: "revision: manualMovieResult.revision",
+            mutationNeedle: "presentation = .player(PlayerLaunch("
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "iOS movie download",
+        path: iosDetailPath,
+        callScopeStart: "let movieDownloadResult = await DebridCoordinator.shared.resolvedPlaybackURLVersioned(for: stream)",
+        callScopeEnd: "/// Present the pre-download quality picker",
+        versionedCall: "resolvedPlaybackURLVersioned(for: stream)",
+        plainCall: "resolvedPlaybackURL(for: stream)",
+        bindings: [PublicationBinding(
+            scopeStart: "let movieDownloadResult = await DebridCoordinator.shared.resolvedPlaybackURLVersioned(for: stream)",
+            scopeEnd: "/// Present the pre-download quality picker",
+            revisionNeedle: "revision: movieDownloadResult.revision",
+            mutationNeedle: "DownloadManager.shared.download("
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "iOS episode cached race",
+        path: iosDetailPath,
+        callScopeStart: "let episodeRaceResult = await DebridCoordinator.shared.resolveFirstPlayableVersioned(",
+        callScopeEnd: "preparing = false   // release before the fallback",
+        versionedCall: "resolveFirstPlayableVersioned(",
+        plainCall: "resolveFirstPlayable(",
+        bindings: [PublicationBinding(
+            scopeStart: "let episodeRaceResult = await DebridCoordinator.shared.resolveFirstPlayableVersioned(",
+            scopeEnd: "preparing = false   // release before the fallback",
+            revisionNeedle: "revision: episodeRaceResult.revision",
+            mutationNeedle: "lastBinge = win.stream.behaviorHints?.bingeGroup"
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "iOS episode playback helper",
+        path: iosDetailPath,
+        callScopeStart: "let episodePlaybackResult = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(",
+        callScopeEnd: "private func resume(",
+        versionedCall: "resolvedPlaybackRefVersioned(",
+        plainCall: "resolvedPlaybackRef(",
+        bindings: [
+            PublicationBinding(
+                scopeStart: "let episodePlayResult = await playbackRef(for: stream, episode: ep)",
+                scopeEnd: "private func playBest(",
+                revisionNeedle: "revision: episodePlayResult.revision",
+                mutationNeedle: "publishEpisodePlayback()"
+            ),
+            PublicationBinding(
+                scopeStart: "let episodeDownloadResult = await playbackRef(",
+                scopeEnd: "#else",
+                revisionNeedle: "revision: episodeDownloadResult.revision",
+                mutationNeedle: "publishEpisodeDownload()"
+            ),
+        ],
+        transportNeedles: [
+            "return episodePlaybackResult.map { ref in",
+            "let episodePlayResult = await playbackRef(for: stream, episode: ep)",
+            "let episodeDownloadResult = await playbackRef(",
+        ]
+    ),
+    PublicationSite(
+        label: "iOS next episode",
+        path: iosDetailPath,
+        callScopeStart: "let nextEpisodeResult: DebridVersionedResult<DebridPlaybackRef?>?",
+        callScopeEnd: "let ref = nextEpisodeResult?.value",
+        versionedCall: "resolvedPlaybackRefVersioned(for: best, episode: episodeHint)",
+        plainCall: "resolvedPlaybackRef(for: best, episode: episodeHint)",
+        bindings: [PublicationBinding(
+            scopeStart: "guard let nextEpisodeResult else { return makeStream() }",
+            scopeEnd: "/// F6 preload:",
+            revisionNeedle: "revision: nextEpisodeResult.revision",
+            mutationNeedle: "output = makeStream()"
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "iOS preload",
+        path: iosDetailPath,
+        callScopeStart: "let preloadResult: DebridVersionedResult<DebridPlaybackRef?>?",
+        callScopeEnd: "let ref = preloadResult?.value",
+        versionedCall: "resolvedPlaybackRefVersioned(for: best, episode: hint)",
+        plainCall: "resolvedPlaybackRef(for: best, episode: hint)",
+        bindings: [PublicationBinding(
+            scopeStart: "await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in",
+            scopeEnd: "// MARK: - iOS / macOS presentation helpers",
+            revisionNeedle: "revision: preloadResult.revision",
+            mutationNeedle: "task.resume()"
+        )],
+        transportNeedles: []
+    ),
+    PublicationSite(
+        label: "iOS root resume",
+        path: iosRootPath,
+        callScopeStart: "let rootResumeResult = await CWResume.resolvedURLVersioned(for: entry)",
+        callScopeEnd: "let (resolvedURL, refreshed) = rootResumeResult.value",
+        versionedCall: "CWResume.resolvedURLVersioned(for: entry)",
+        plainCall: "CWResume.resolvedURL(for: entry)",
+        bindings: [
+            PublicationBinding(
+                scopeStart: "let resume: Double",
+                scopeEnd: "// For a series, give the player",
+                revisionNeedle: "revision: rootResumeResult.revision",
+                mutationNeedle: "core.loadMeta("
+            ),
+            PublicationBinding(
+                scopeStart: "var launch: iOSPlayerLaunch?",
+                scopeEnd: "return launch",
+                revisionNeedle: "revision: rootResumeResult.revision",
+                mutationNeedle: "launch = iOSPlayerLaunch("
+            ),
+        ],
+        transportNeedles: []
+    ),
+]
 
 private let monotonicRule = "snapshot publication is monotonic and cold bootstrap is synchronous"
 private let ownerRule = "canonical owners and envelope accounts stay disjoint"
@@ -104,6 +673,10 @@ private let detachedRule = "detached configured-service reads use the immutable 
 private let authRule = "restore and adopt validate canonical owners before mutation"
 private let torBoxSearchRule = "TorBox search carries one revision through both sends and every mutation"
 private let syncPayloadRule = "sync payload revision is fenced at actual task resume"
+private let nonPlayerPublicationRule = "non-player callers publish versioned results only through the atomic seam"
+private let libraryLivenessRule = "cloud library load state is revision and attempt fenced"
+private let libraryRecoveryOwnershipRule =
+    "cloud library recovery preserves newer same-revision attempt ownership"
 
 private let rules: [Rule] = [
     Rule(name: monotonicRule, files: [statePath], violations: { files in
@@ -431,6 +1004,205 @@ private let rules: [Rule] = [
         )
         return violations
     }),
+    Rule(name: libraryLivenessRule, files: [debridLibraryPath], violations: { files in
+        guard let file = files[debridLibraryPath] else {
+            return ["missing DebridLibrary model"]
+        }
+        let model = file
+        var violations: [String] = []
+        violations += require(file, ".task(id: debrid.revision) {", "revision-keyed view task")
+        violations += requireCount(
+            file, "let snapshot = debrid.snapshot", 3,
+            "task, pull-to-refresh, and refresh button must each capture one coherent snapshot"
+        )
+        violations += requireCount(
+            file, "await model.loadIfNeeded(snapshot: snapshot)", 1,
+            "initial task must pass its captured snapshot"
+        )
+        violations += requireCount(
+            file, "await model.reload(snapshot: snapshot)", 2,
+            "both manual refresh paths must pass their captured snapshot"
+        )
+        violations += forbid(model, "private var didLoad", "one-shot Boolean load state remains")
+        violations += require(model, "private(set) var loadedRevision: UInt64?", "loaded revision state")
+        violations += requireOrdered(model, [
+            "private(set) var nextAttemptID: UInt64 = 0",
+            "private(set) var activeAttemptID: UInt64?",
+            "precondition(nextAttemptID < UInt64.max",
+            "nextAttemptID += 1",
+            "let attemptID = nextAttemptID",
+        ], "strictly monotonic load-attempt token")
+        violations += requireCount(
+            model, "self.credentialStore.load() == snapshot", 3,
+            "attempt activation, guarded mutation, and success publication need the exact current snapshot"
+        )
+        violations += require(
+            model,
+            "guard result.revision == snapshot.revision else {",
+            "returned library revision must equal the captured snapshot"
+        )
+        violations += require(
+            model,
+            "guard self.activeAttemptID == attemptID,\n                      self.credentialStore.load() == snapshot,\n                      !Task.isCancelled else { return }",
+            "success publication must retain exact active-attempt ownership"
+        )
+        violations += require(
+            model,
+            "guard mutateIfActive(attemptID: attemptID, snapshot: snapshot, mutation: {\n            phase = .loading\n        }) else { return }",
+            "loading state mutation through the active-attempt seam"
+        )
+        violations += requireOrdered(model, [
+            "guard !Task.isCancelled else {",
+            "recoverAfterInterruptedAttempt(attemptID: attemptID, snapshot: snapshot)",
+            "guard result.revision == snapshot.revision else {",
+            "recoverAfterInterruptedAttempt(attemptID: attemptID, snapshot: snapshot)",
+        ], "cancellation and mismatched-result recovery")
+        violations += requireOrdered(model, [
+            "private func recoverAfterInterruptedAttempt(",
+            "mutateIfActive(attemptID: attemptID, snapshot: snapshot, mutation: {",
+            "activeAttemptID = nil",
+            "phase = loadedRevision == snapshot.revision ? .loaded : .idle",
+        ], "interrupted initial and manual refresh recovery")
+        violations += require(
+            model,
+            "credentialStore: DebridCredentialSnapshotStore = .shared",
+            "production model defaults to the shared credential store"
+        )
+        violations += require(
+            model,
+            "await DebridCoordinator.shared.cloudLibraryVersioned()",
+            "production model defaults to the versioned shared library loader"
+        )
+        violations += require(
+            model,
+            "await loadState.reload(snapshot: snapshot)",
+            "production model delegates refresh to the production-tested state machine"
+        )
+        return violations
+    }),
+    Rule(name: libraryRecoveryOwnershipRule, files: [debridLibraryPath], violations: { files in
+        guard let file = files[debridLibraryPath] else {
+            return ["missing DebridLibrary model"]
+        }
+        guard let mutationSeam = section(
+            file,
+            start: "private func mutateIfActive(",
+            end: "private func recoverAfterInterruptedAttempt("
+        ) else {
+            return ["DebridLibrary mutateIfActive seam is missing"]
+        }
+        return require(
+            mutationSeam,
+            "guard self.activeAttemptID == attemptID,\n                      self.credentialStore.load() == snapshot else { return }",
+            "recovery mutation must retain exact active-attempt ownership"
+        )
+    }),
+    Rule(
+        name: nonPlayerPublicationRule,
+        files: [
+            tvDetailPath, tvHomePath, tvEpisodePath, debridLibraryPath, downloadPickerPath,
+            batchDownloadPath, iosDetailPath, iosRootPath, playerScreenPath, tvPlayerPath,
+        ],
+        violations: { files in
+            let expectedVersionedCalls: [String: [(String, Int)]] = [
+                tvDetailPath: [
+                    ("CWResume.resolvedURLVersioned(", 1),
+                    (".resolveFirstPlayableVersioned(", 1),
+                    (".resolvedPlaybackRefVersioned(", 1),
+                    (".resolvedPlaybackURLVersioned(", 1),
+                ],
+                tvHomePath: [("CWResume.resolvedURLVersioned(", 1)],
+                tvEpisodePath: [(".resolvedPlaybackRefVersioned(", 1)],
+                debridLibraryPath: [(".cloudLibraryVersioned(", 1)],
+                downloadPickerPath: [(".resolvedPlaybackURLVersioned(", 1)],
+                batchDownloadPath: [(".resolvedPlaybackURLVersioned(", 2)],
+                iosDetailPath: [
+                    ("CWResume.resolvedURLVersioned(", 1),
+                    (".resolveFirstPlayableVersioned(", 2),
+                    (".resolvedPlaybackRefVersioned(", 6),
+                    (".resolvedPlaybackURLVersioned(", 1),
+                ],
+                iosRootPath: [("CWResume.resolvedURLVersioned(", 1)],
+            ]
+            let forbiddenPlainCalls = [
+                "CWResume.resolvedURL(",
+                ".resolveFirstPlayable(",
+                ".resolvedPlaybackRef(",
+                ".resolvedPlaybackURL(",
+                ".cloudLibrary(",
+            ]
+            var violations: [String] = []
+            if publicationSites.count != 21 || Set(publicationSites.map(\.label)).count != 21 {
+                violations.append("the non-player inventory must contain 21 distinct labeled sites")
+            }
+            for site in publicationSites {
+                violations += publicationSiteViolations(site, files: files)
+            }
+            for (path, expectedCalls) in expectedVersionedCalls {
+                guard let file = files[path] else {
+                    violations.append("missing non-player caller \(path)")
+                    continue
+                }
+                for (needle, expected) in expectedCalls {
+                    violations += requireCount(
+                        file, needle, expected,
+                        "versioned caller count changed for \(needle)"
+                    )
+                }
+                for needle in forbiddenPlainCalls {
+                    violations += forbid(file, needle, "plain credential-derived result escaped")
+                }
+                violations += forbid(
+                    file,
+                    "DebridCredentialSnapshotStore.shared.isCurrent(revision:",
+                    "caller split its check from the later publication"
+                )
+            }
+            if let library = files[debridLibraryPath] {
+                violations += requireCount(
+                    library,
+                    ".resolveLibraryItem(",
+                    1,
+                    "the provenance-blocked library-item resolve must remain explicitly parked"
+                )
+                violations += requireCount(
+                    library,
+                    ".resolveLibraryItemVersioned(",
+                    0,
+                    "library-item resolution cannot claim a current revision without item provenance"
+                )
+            }
+            if let player = files[playerScreenPath] {
+                violations += requireCount(
+                    player, ".reresolve(", 1,
+                    "the deferred PlayerScreen caller inventory changed"
+                )
+                violations += requireCount(
+                    player, "Versioned(", 0,
+                    "PlayerScreen was changed in the non-player lane"
+                )
+            }
+            if let player = files[tvPlayerPath] {
+                violations += requireCount(
+                    player, ".reresolve(", 1,
+                    "the deferred TVPlayer reresolve inventory changed"
+                )
+                violations += requireCount(
+                    player, ".cacheCheck(", 1,
+                    "the deferred TVPlayer cache inventory changed"
+                )
+                violations += requireCount(
+                    player, ".resolvedPlaybackRef(", 3,
+                    "the deferred TVPlayer playback inventory changed"
+                )
+                violations += requireCount(
+                    player, "Versioned(", 0,
+                    "TVPlayer was changed in the non-player lane"
+                )
+            }
+            return violations
+        }
+    ),
     Rule(name: detachedRule, files: [coreModelsPath], violations: { files in
         guard let file = files[coreModelsPath] else { return ["missing CoreModels"] }
         return require(file, "DebridCredentialSnapshotStore.shared.isConfigured(.torBox)",
@@ -731,6 +1503,42 @@ private let mutations: [Mutation] = [
     Mutation(name: "M58 skip global recovery winner proof", rule: envelopeRule, path: statePath,
              find: "case .committed(let verified) = load(owner: owner, read: io.read),\n              verified.slot == target, verified.envelope == fresh",
              replacement: "true"),
+    Mutation(name: "M59 detach cloud library task from credential revision", rule: libraryLivenessRule,
+             path: debridLibraryPath,
+             find: ".task(id: debrid.revision) {",
+             replacement: ".task {"),
+    Mutation(name: "M60 recapture cloud library task snapshot at the model call", rule: libraryLivenessRule,
+             path: debridLibraryPath,
+             find: "let snapshot = debrid.snapshot\n            await model.loadIfNeeded(snapshot: snapshot)",
+             replacement: "await model.loadIfNeeded(snapshot: debrid.snapshot)"),
+    Mutation(name: "M61 restore one-shot cloud library load state", rule: libraryLivenessRule,
+             path: debridLibraryPath,
+             find: "private(set) var loadedRevision: UInt64?",
+             replacement: "private var didLoad = false"),
+    Mutation(name: "M62 reuse a cloud library attempt token", rule: libraryLivenessRule,
+             path: debridLibraryPath,
+             find: "nextAttemptID += 1",
+             replacement: "_ = nextAttemptID"),
+    Mutation(name: "M63 accept a cloud result from another credential revision", rule: libraryLivenessRule,
+             path: debridLibraryPath,
+             find: "guard result.revision == snapshot.revision else {",
+             replacement: "if false {"),
+    Mutation(name: "M64 publish cloud loading outside the active-attempt seam", rule: libraryLivenessRule,
+             path: debridLibraryPath,
+             find: "guard mutateIfActive(attemptID: attemptID, snapshot: snapshot, mutation: {\n            phase = .loading\n        }) else { return }",
+             replacement: "phase = .loading"),
+    Mutation(name: "M65 strand a canceled initial cloud library load", rule: libraryLivenessRule,
+             path: debridLibraryPath,
+             find: "guard !Task.isCancelled else {\n            recoverAfterInterruptedAttempt(attemptID: attemptID, snapshot: snapshot)\n            return\n        }",
+             replacement: "guard !Task.isCancelled else { return }"),
+    Mutation(name: "M66 let an older same-revision cloud refresh publish", rule: libraryLivenessRule,
+             path: debridLibraryPath,
+             find: "guard self.activeAttemptID == attemptID,\n                      self.credentialStore.load() == snapshot,\n                      !Task.isCancelled else { return }",
+             replacement: "guard self.activeAttemptID == attemptID || true,\n                      self.credentialStore.load() == snapshot,\n                      !Task.isCancelled else { return }"),
+    Mutation(name: "M67 let older cloud recovery clear newer attempt ownership",
+             rule: libraryRecoveryOwnershipRule, path: debridLibraryPath,
+             find: "guard self.activeAttemptID == attemptID,\n                      self.credentialStore.load() == snapshot else { return }",
+             replacement: "guard self.activeAttemptID == attemptID || true,\n                      self.credentialStore.load() == snapshot else { return }"),
 ]
 
 @main
@@ -796,6 +1604,52 @@ private enum DebridCredentialCallerGateRunner {
                 print("FAIL  \(mutation.name)")
             } else {
                 print("PASS  \(mutation.name)")
+            }
+        }
+
+        guard let publicationRule = rules.first(where: { $0.name == nonPlayerPublicationRule }) else {
+            failures.append("missing named rule \(nonPlayerPublicationRule)")
+            print("FAIL  non-player publication mutant setup")
+            if !failures.isEmpty {
+                print("FAILED \(failures.count) finding(s) across \(checks) checks")
+                for failure in failures { print(" - \(failure)") }
+                exit(1)
+            }
+            return
+        }
+        for site in publicationSites {
+            for mutationKind in ["strip revision", "move mutation"] {
+                checks += 1
+                let name = "\(site.label): \(mutationKind)"
+                var mutated: [String: SourceFile] = [:]
+                for path in publicationRule.files {
+                    guard let file = load(root: root, path: path) else {
+                        failures.append("\(name): missing production file \(path)")
+                        continue
+                    }
+                    mutated[path] = file
+                }
+                guard let target = mutated[site.path] else {
+                    failures.append("\(name): target is outside named rule")
+                    print("FAIL  \(name)")
+                    continue
+                }
+                let changed = mutationKind == "strip revision"
+                    ? stripPublicationRevision(site, from: target)
+                    : movePublicationOutsideSeam(site, from: target)
+                guard let changed else {
+                    failures.append("\(name): expected one live site-specific mutation target")
+                    print("FAIL  \(name)")
+                    continue
+                }
+                mutated[site.path] = changed
+                let findings = publicationRule.violations(mutated)
+                if !findings.contains(where: { $0.contains(site.label) }) {
+                    failures.append("\(name): site-specific live-source mutation survived")
+                    print("FAIL  \(name)")
+                } else {
+                    print("PASS  \(name)")
+                }
             }
         }
 

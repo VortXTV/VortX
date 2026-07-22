@@ -1,9 +1,11 @@
 // Standalone executable gate over the production credential state and persistence primitives.
 //
 //   DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swiftc \
-//     -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+//     -parse-as-library -D DEBRID_LIBRARY_LIVENESS_TEST \
+//     -strict-concurrency=complete -warnings-as-errors \
 //     app/SourcesShared/Keychain.swift \
 //     app/SourcesShared/DebridCredentialState.swift \
+//     app/SourcesiOS/DebridLibraryView.swift \
 //     app/Tests/DebridCredentialOrderingTests.swift \
 //     -o /tmp/debrid-credential-ordering && /tmp/debrid-credential-ordering
 //
@@ -145,6 +147,44 @@ private final class CacheAwarenessProbe {
             self.cachedHashes.removeAll()
             self.cachedUsenet.removeAll()
         }
+    }
+}
+
+private actor ControlledDebridLibraryLoader {
+    typealias LibraryResult = DebridVersionedResult<[String]>
+
+    private var planned: [String] = []
+    private var started: Set<String> = []
+    private var startWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var resultWaiters: [String: CheckedContinuation<LibraryResult, Never>] = [:]
+
+    func plan(_ id: String) {
+        planned.append(id)
+    }
+
+    func loadNext() async -> LibraryResult {
+        precondition(!planned.isEmpty, "unplanned controlled library load")
+        let id = planned.removeFirst()
+        precondition(resultWaiters[id] == nil, "duplicate controlled library load id")
+        started.insert(id)
+        startWaiters.removeValue(forKey: id)?.forEach { $0.resume() }
+        return await withCheckedContinuation { continuation in
+            resultWaiters[id] = continuation
+        }
+    }
+
+    func waitUntilStarted(_ id: String) async {
+        if started.contains(id) { return }
+        await withCheckedContinuation { continuation in
+            startWaiters[id, default: []].append(continuation)
+        }
+    }
+
+    func finish(_ id: String, value: [String], revision: UInt64) {
+        guard let continuation = resultWaiters.removeValue(forKey: id) else {
+            preconditionFailure("controlled library load was not waiting")
+        }
+        continuation.resume(returning: DebridVersionedResult(value: value, revision: revision))
     }
 }
 
@@ -409,6 +449,265 @@ private func testRequestAndPublicationFences(_ results: inout Results) {
                    "an observable callback can re-enter snapshot reads without deadlocking")
     results.expect(serializedStore.publish(b2) && serializedStore.load() == b2,
                    "accepted A mutation completes before later B publication")
+}
+
+@MainActor
+private func testNonPlayerCallerPublicationSchedules(_ results: inout Results) {
+    let callerSites = [
+        "TV detail download",
+        "TV detail resume",
+        "TV detail cached race",
+        "TV detail manual playback",
+        "TV home resume",
+        "TV episode selection",
+        "cloud library browse",
+        "download picker",
+        "batch queue",
+        "batch retry",
+        "iOS episode request",
+        "iOS movie resume",
+        "iOS movie cached race",
+        "iOS movie fallback",
+        "iOS movie manual playback",
+        "iOS movie download",
+        "iOS episode cached race",
+        "iOS episode playback helper",
+        "iOS next episode",
+        "iOS preload",
+        "iOS root resume",
+    ]
+    results.expect(callerSites.count == 21,
+                   "non-player atomic caller inventory covers 21 distinct convertible sites")
+
+    for caller in callerSites {
+        let a1 = snapshot(ownerA, 1, [.realDebrid: "a"])
+        let b2 = snapshot(ownerB, 2, [.realDebrid: "b"])
+        let store = DebridCredentialSnapshotStore(initial: a1)
+        let aResult = DebridVersionedResult(value: "A", revision: 1)
+        var visible: String?
+
+        results.expect(store.isCurrent(revision: aResult.revision),
+                       "\(caller) control reaches A's detached precheck")
+        results.expect(store.publish(b2),
+                       "\(caller) lets B win after A returns and before mutation")
+        let staleAccepted = store.compareAndPublish(revision: aResult.revision) {
+            visible = aResult.value
+        }
+        results.expect(!staleAccepted && visible == nil,
+                       "\(caller) publishes none of stale A after B")
+
+        let bResult = DebridVersionedResult(value: "B", revision: 2)
+        let currentAccepted = store.compareAndPublish(revision: bResult.revision) {
+            visible = bResult.value
+        }
+        results.expect(currentAccepted && visible == "B",
+                       "\(caller) publishes the current B result through the same seam")
+    }
+}
+
+@MainActor
+private func testDebridLibraryLivenessSchedules(_ results: inout Results) async {
+    do {
+        let a1 = snapshot(ownerA, 1, [.realDebrid: "a"])
+        let b2 = snapshot(ownerA, 2, [.realDebrid: "b"])
+        let store = DebridCredentialSnapshotStore(initial: a1)
+        let loader = ControlledDebridLibraryLoader()
+        let model = DebridLibraryLoadStateMachine(
+            credentialStore: store,
+            initialValue: [String](),
+            emptyValue: [],
+            loader: { await loader.loadNext() }
+        )
+
+        await loader.plan("revision-a")
+        let aTask = Task {
+            await model.reload(snapshot: a1)
+        }
+        await loader.waitUntilStarted("revision-a")
+        results.expect(model.phase == .loading,
+                       "cloud library revision A reaches a deterministic blocked load")
+        results.expect(store.publish(b2),
+                       "cloud library revision B publishes while A is blocked")
+        await loader.plan("revision-b")
+        let bTask = Task {
+            await model.loadIfNeeded(snapshot: b2)
+        }
+        await loader.waitUntilStarted("revision-b")
+        await loader.finish("revision-b", value: ["b"], revision: 2)
+        await bTask.value
+        results.expect(model.phase == .loaded && model.value == ["b"] && model.loadedRevision == 2,
+                       "cloud library B completes and publishes its current revision")
+        await loader.finish("revision-a", value: ["late-a"], revision: 1)
+        await aTask.value
+        results.expect(model.phase == .loaded && model.value == ["b"] && model.loadedRevision == 2,
+                       "late cloud library A cannot overwrite B or strand its spinner")
+    }
+
+    do {
+        let a1 = snapshot(ownerA, 1, [.realDebrid: "a"])
+        let store = DebridCredentialSnapshotStore(initial: a1)
+        let loader = ControlledDebridLibraryLoader()
+        let model = DebridLibraryLoadStateMachine(
+            credentialStore: store,
+            initialValue: [String](),
+            emptyValue: [],
+            loader: { await loader.loadNext() }
+        )
+
+        await loader.plan("same-revision-older")
+        let olderTask = Task {
+            await model.reload(snapshot: a1)
+        }
+        await loader.waitUntilStarted("same-revision-older")
+        let olderAttempt = model.activeAttemptID
+        await loader.plan("same-revision-newer")
+        let newerTask = Task {
+            await model.reload(snapshot: a1)
+        }
+        await loader.waitUntilStarted("same-revision-newer")
+        let newerAttempt = model.activeAttemptID
+        results.expect(olderAttempt != nil && newerAttempt != nil && newerAttempt! > olderAttempt!,
+                       "same-revision cloud refreshes receive monotonic unique attempt ids")
+        await loader.finish("same-revision-newer", value: ["newer"], revision: 1)
+        await newerTask.value
+        await loader.finish("same-revision-older", value: ["older"], revision: 1)
+        await olderTask.value
+        results.expect(model.phase == .loaded && model.value == ["newer"],
+                       "late same-revision older refresh cannot overwrite the newer refresh")
+    }
+
+    do {
+        let a1 = snapshot(ownerA, 1, [.realDebrid: "a"])
+        let store = DebridCredentialSnapshotStore(initial: a1)
+        let loader = ControlledDebridLibraryLoader()
+        let model = DebridLibraryLoadStateMachine(
+            credentialStore: store,
+            initialValue: [String](),
+            emptyValue: [],
+            loader: { await loader.loadNext() }
+        )
+
+        await loader.plan("mismatched-older")
+        let olderTask = Task {
+            await model.reload(snapshot: a1)
+        }
+        await loader.waitUntilStarted("mismatched-older")
+        let olderAttempt = model.activeAttemptID
+
+        await loader.plan("mismatched-newer")
+        let newerTask = Task {
+            await model.reload(snapshot: a1)
+        }
+        await loader.waitUntilStarted("mismatched-newer")
+        let newerAttempt = model.activeAttemptID
+        results.expect(olderAttempt != nil && newerAttempt != nil && newerAttempt! > olderAttempt!,
+                       "mismatched-result recovery fixture gives the newer refresh ownership")
+
+        await loader.finish("mismatched-older", value: ["wrong-revision"], revision: 2)
+        await olderTask.value
+        results.expect(model.phase == .loading && model.activeAttemptID == newerAttempt
+                       && model.value.isEmpty,
+                       "older mismatched-result recovery cannot clear newer same-revision ownership")
+
+        await loader.finish("mismatched-newer", value: ["newer"], revision: 1)
+        await newerTask.value
+        results.expect(model.phase == .loaded && model.activeAttemptID == nil
+                       && model.loadedRevision == 1 && model.value == ["newer"],
+                       "newer same-revision refresh publishes after older mismatched recovery")
+    }
+
+    do {
+        let noKeyA = snapshot(.signedOutDevice, 1)
+        let keyedB = snapshot(ownerA, 2, [.realDebrid: "b"])
+        let store = DebridCredentialSnapshotStore(initial: noKeyA)
+        let loader = ControlledDebridLibraryLoader()
+        let model = DebridLibraryLoadStateMachine(
+            credentialStore: store,
+            initialValue: [String](),
+            emptyValue: [],
+            loader: { await loader.loadNext() }
+        )
+
+        results.expect(store.publish(keyedB),
+                       "keyed cloud library B publishes after a no-key A snapshot was captured")
+        await loader.plan("keyed-b")
+        let bTask = Task {
+            await model.loadIfNeeded(snapshot: keyedB)
+        }
+        await loader.waitUntilStarted("keyed-b")
+        await loader.finish("keyed-b", value: ["keyed-b"], revision: 2)
+        await bTask.value
+        await model.reload(snapshot: noKeyA)
+        results.expect(model.phase == .loaded && model.value == ["keyed-b"]
+                       && model.loadedRevision == keyedB.revision,
+                       "stale no-key A cannot clear keyed B content")
+    }
+
+    do {
+        let a1 = snapshot(ownerA, 1, [.realDebrid: "a"])
+        let store = DebridCredentialSnapshotStore(initial: a1)
+        let loader = ControlledDebridLibraryLoader()
+        let model = DebridLibraryLoadStateMachine(
+            credentialStore: store,
+            initialValue: [String](),
+            emptyValue: [],
+            loader: { await loader.loadNext() }
+        )
+
+        await loader.plan("initial-canceled")
+        let canceled = Task {
+            await model.loadIfNeeded(snapshot: a1)
+        }
+        await loader.waitUntilStarted("initial-canceled")
+        canceled.cancel()
+        await loader.finish("initial-canceled", value: ["discarded"], revision: 1)
+        await canceled.value
+        results.expect(model.phase == .idle && model.loadedRevision == nil && model.value.isEmpty,
+                       "canceled initial cloud load restores idle state")
+
+        await loader.plan("initial-retry")
+        let retry = Task {
+            await model.loadIfNeeded(snapshot: a1)
+        }
+        await loader.waitUntilStarted("initial-retry")
+        await loader.finish("initial-retry", value: ["retry"], revision: 1)
+        await retry.value
+        results.expect(model.phase == .loaded && model.value == ["retry"]
+                       && model.loadedRevision == 1,
+                       "same-revision reappearance retries after initial cancellation")
+    }
+
+    do {
+        let a1 = snapshot(ownerA, 1, [.realDebrid: "a"])
+        let store = DebridCredentialSnapshotStore(initial: a1)
+        let loader = ControlledDebridLibraryLoader()
+        let model = DebridLibraryLoadStateMachine(
+            credentialStore: store,
+            initialValue: [String](),
+            emptyValue: [],
+            loader: { await loader.loadNext() }
+        )
+
+        await loader.plan("manual-initial")
+        let initial = Task {
+            await model.loadIfNeeded(snapshot: a1)
+        }
+        await loader.waitUntilStarted("manual-initial")
+        await loader.finish("manual-initial", value: ["prior"], revision: 1)
+        await initial.value
+
+        await loader.plan("manual-canceled")
+        let canceledRefresh = Task {
+            await model.reload(snapshot: a1)
+        }
+        await loader.waitUntilStarted("manual-canceled")
+        canceledRefresh.cancel()
+        await loader.finish("manual-canceled", value: ["discarded"], revision: 1)
+        await canceledRefresh.value
+        results.expect(model.phase == .loaded && model.value == ["prior"]
+                       && model.loadedRevision == 1 && model.activeAttemptID == nil,
+                       "canceled same-revision manual refresh preserves prior loaded state")
+    }
 }
 
 @MainActor
@@ -1172,6 +1471,8 @@ private enum DebridCredentialOrderingTestRunner {
         testRevisionOrdering(&results)
         testMutableState(&results)
         testRequestAndPublicationFences(&results)
+        testNonPlayerCallerPublicationSchedules(&results)
+        await testDebridLibraryLivenessSchedules(&results)
         await testTorBoxTwoLegAndStateSchedules(&results)
         testSyncPayloadActualIssuanceFence(&results)
         testNestedRevisionPinSchedules(&results)
