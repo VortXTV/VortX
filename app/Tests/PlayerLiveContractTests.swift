@@ -87,6 +87,41 @@ private final class SpoolPermissionProbeState {
     var partMode: Int?
 }
 
+private final class BlockingStageProbe: @unchecked Sendable {
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var blocked = false
+
+    func callAsFunction(_ owner: VortXHLSSessionSpool) {
+        _ = owner.accounting
+        lock.lock()
+        let shouldBlock = !blocked
+        if shouldBlock { blocked = true }
+        lock.unlock()
+        if shouldBlock {
+            entered.signal()
+            release.wait()
+        }
+    }
+}
+
+private final class LockedBool: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored = false
+
+    var value: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return stored
+    }
+
+    func set(_ value: Bool) {
+        lock.lock()
+        stored = value
+        lock.unlock()
+    }
+}
+
 private final class ManualSegmentSender {
     private(set) var payloads: [Data] = []
     private var completions: [(Bool) -> Void] = []
@@ -110,6 +145,8 @@ enum PlayerLiveContractTests {
         testResidentSlidingPlaylistAndAbsoluteRequests()
         testReadLeaseLifecycle()
         testSessionSpoolAdmissionAndFailures()
+        testMutableOpenStageContract()
+        testMutableOpenStageFailuresAndCleanup()
         testPlaylistRetentionAndFileLeases()
         testSpoolResponsePump()
         testSessionLifecycleAndScavenge()
@@ -588,6 +625,1179 @@ enum PlayerLiveContractTests {
                       incomingIsIDR: false,
                       incomingHasKeyFlag: false,
                       elapsed: 8) == .continueOpen)
+    }
+
+    private static func readAll(_ lease: VortXHLSSessionSpool.ResourceLease?) -> Data? {
+        guard let lease else { return nil }
+        defer { lease.close(now: 0) }
+        var result = Data()
+        do {
+            while result.count < lease.length {
+                let chunk = try lease.read(maxLength: 3)
+                guard !chunk.isEmpty else { return nil }
+                result.append(chunk)
+            }
+            return result
+        } catch {
+            return nil
+        }
+    }
+
+    /// Phase-2 open-GOP storage contract. Tiny producer limits make every RAM -> disk edge executable without
+    /// allocating the production 80 MiB pre-ready window; the linked movenc harness owns the real >80 MiB case.
+    private static func testMutableOpenStageContract() {
+        let root = scratchDirectory("open-stage")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let buffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 8)
+        guard let spool = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 64,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+              let stage = spool.attachOpenStage(to: buffer) else {
+            check("open stage: session and attachment are creatable", false)
+            return
+        }
+
+        append([0, 1, 2, 3, 4, 5, 6, 7], to: buffer)
+        check("open stage adoption: arming after init adopts every already-produced media byte",
+              stage.arm(base: 4)
+                  && stage.snapshot.storage == .memory
+                  && stage.snapshot.baseOffset == 4
+                  && stage.snapshot.logicalEndOffset == 8
+                  && spool.accounting.openBytes == 4
+                  && spool.accounting.admittedBytes == 4)
+
+        let straddlingPatch: [UInt8] = [90, 91, 92, 93]
+        let patched = straddlingPatch.withUnsafeBufferPointer { raw in
+            buffer.overwrite(at: 2, bytes: raw.baseAddress!, count: raw.count)
+        }
+        var adoptedBytes: Data?
+        if let claim = stage.claim() {
+            _ = claim.withBytes { adoptedBytes = Data([UInt8]($0)) }
+            claim.release()
+        }
+        check("open stage mutation: a closed-prefix/open-prefix straddling patch updates the mutable suffix",
+              patched && adoptedBytes == Data([92, 93, 6, 7]))
+
+        append([8, 9, 10, 11], to: buffer)
+        let active = stage.snapshot
+        check("open stage activation: projected RAM pressure backfills under a lease before the append crosses",
+              active.storage == .active
+                  && active.baseOffset == 4
+                  && active.logicalEndOffset == 12
+                  && active.durableEndOffset == 12
+                  && spool.accounting.openBytes == 8)
+        check("open stage permissions: UUID directories are 0700 and the live stage is 0600",
+              posixMode(root) == 0o700
+                  && posixMode(spool.sessionDirectory.deletingLastPathComponent()) == 0o700
+                  && posixMode(spool.sessionDirectory) == 0o700
+                  && active.fileURL.flatMap(posixMode) == 0o600)
+        check("open stage pressure: durable bytes leave the resident buffer instead of parking at its ceiling",
+              buffer.residentByteRange.lowerBound == buffer.residentByteRange.upperBound)
+
+        let whollyClosedPatch: [UInt8] = [40, 41]
+        let whollyClosedBestEffort = whollyClosedPatch.withUnsafeBufferPointer { raw in
+            buffer.overwrite(at: 0, bytes: raw.baseAddress!, count: raw.count)
+        }
+        var bytesAfterWhollyClosedPatch: Data?
+        if let claim = stage.claim() {
+            _ = claim.withBytes { bytesAfterWhollyClosedPatch = Data([UInt8]($0)) }
+            claim.release()
+        }
+        check("open stage mutation: a patch wholly below the mutable base remains a safe best effort",
+              whollyClosedBestEffort
+                  && bytesAfterWhollyClosedPatch == Data([92, 93, 6, 7, 8, 9, 10, 11]))
+
+        let exactUpperPatch: [UInt8] = [60, 61]
+        let exactUpperAccepted = exactUpperPatch.withUnsafeBufferPointer { raw in
+            buffer.overwrite(at: 10, bytes: raw.baseAddress!, count: raw.count)
+        }
+        check("open stage mutation: a patch ending exactly at the produced head is accepted",
+              exactUpperAccepted && stage.snapshot.logicalEndOffset == 12)
+
+        let closedPrefixPatch: [UInt8] = [70, 71, 72, 73, 74, 75]
+        let closedPrefixBestEffort = closedPrefixPatch.withUnsafeBufferPointer { raw in
+            buffer.overwrite(at: 1, bytes: raw.baseAddress!, count: raw.count)
+        }
+        var patchedOpenBytes: Data?
+        if let claim = stage.claim() {
+            _ = claim.withBytes { patchedOpenBytes = Data([UInt8]($0)) }
+            claim.release()
+        }
+        check("open stage mutation: an evicted closed prefix is best effort but overlapping mutable bytes are mandatory",
+              closedPrefixBestEffort
+                  && patchedOpenBytes?.prefix(3) == Data([73, 74, 75]))
+
+        guard let activeClaim = stage.claim() else {
+            check("open stage: active prefix can be claimed", false)
+            return
+        }
+        var mappedCopy: Data?
+        let mapped = activeClaim.withBytes { mappedCopy = Data([UInt8]($0)) }
+        check("open stage mmap: a claim exposes the full durable prefix synchronously and returns no mapping",
+              mapped
+                  && mappedCopy == Data([73, 74, 75, 7, 8, 9, 60, 61])
+                  && stage.snapshot.activeClaimReads == 0)
+
+        let readEntered = DispatchSemaphore(value: 0)
+        let allowReadFinish = DispatchSemaphore(value: 0)
+        let readFinished = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            _ = activeClaim.withBytes { _ in
+                readEntered.signal()
+                allowReadFinish.wait()
+            }
+            readFinished.signal()
+        }
+        let blockingReadStarted = readEntered.wait(timeout: .now() + 2) == .success
+        let fileBytesBeforeBlockedClose = active.fileURL.flatMap { try? Data(contentsOf: $0) }
+        let blockedKey = VortXHLSSessionSpool.ResourceKey.video(segmentID: 99)
+        let closeWhileReading = stage.closePrefix(
+            activeClaim,
+            endOffset: 8,
+            key: blockedKey,
+            durationMilliseconds: 4_000,
+            additionalResources: [])
+        let duringBlockedClose = stage.snapshot
+        let fileBytesAfterBlockedClose = active.fileURL.flatMap { try? Data(contentsOf: $0) }
+        check("open stage claim race: close cannot consume, truncate, or rename while claim bytes are in use",
+              blockingReadStarted
+                  && !closeWhileReading
+                  && duringBlockedClose.storage == .active
+                  && duringBlockedClose.activeClaimReads == 1
+                  && duringBlockedClose.baseOffset == 4
+                  && duringBlockedClose.logicalEndOffset == 12
+                  && !spool.contains(blockedKey)
+                  && fileBytesAfterBlockedClose == fileBytesBeforeBlockedClose)
+        allowReadFinish.signal()
+        let blockingReadFinished = readFinished.wait(timeout: .now() + 2) == .success
+        check("open stage claim race: completing the read restores the same exact claim for close",
+              blockingReadFinished && stage.snapshot.activeClaimReads == 0)
+
+        let video0 = VortXHLSSessionSpool.ResourceKey.video(segmentID: 0)
+        check("open stage active P+S: close copies only S and atomically transfers P into final accounting",
+              stage.closePrefix(
+                  activeClaim,
+                  endOffset: 8,
+                  key: video0,
+                  durationMilliseconds: 4_000,
+                  additionalResources: [])
+                  && spool.contains(video0)
+                  && readAll(spool.openResource(video0, now: 0)) == Data([73, 74, 75, 7])
+                  && stage.snapshot.baseOffset == 8
+                  && stage.snapshot.logicalEndOffset == 12
+                  && stage.snapshot.storage == .active
+                  && spool.accounting.finalBytes == 4
+                  && spool.accounting.openBytes == 4
+                  && spool.accounting.transientCopyBytes == 0
+                  && spool.accounting.peakTransientCopyBytes == 4
+                  && spool.accounting.admittedBytes == 8
+                  && spool.accounting.physicalBytes == 8)
+
+        let activeAppendRoot = scratchDirectory("open-stage-active-append-physical-cap")
+        defer { try? FileManager.default.removeItem(at: activeAppendRoot) }
+        let activeAppendBuffer = VortXRemuxBuffer(windowFloorBytes: 8, producerLeadBytes: 1)
+        if let activeAppendSpool = VortXHLSSessionSpool(
+            parentDirectory: activeAppendRoot,
+            capacityBytes: 26,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+           let activeAppendStage = activeAppendSpool.attachOpenStage(to: activeAppendBuffer) {
+            let auxiliaryAccepted = activeAppendSpool.setAuxiliaryBytes(2)
+            append([0, 1, 2, 3, 4, 5, 6, 7, 8], to: activeAppendBuffer)
+            let armed = activeAppendStage.arm(base: 1)
+            let exactCapAuxiliaryAccepted = activeAppendSpool.setAuxiliaryBytes(8)
+            let backingAfterActivation = activeAppendBuffer.residentBackingSnapshot
+            append([9, 10], to: activeAppendBuffer)
+            append([11, 12], to: activeAppendBuffer)
+            append([13, 14], to: activeAppendBuffer)
+
+            let blocker = BlockingStageProbe()
+            activeAppendSpool.installFileOperationProbe(blocker.callAsFunction)
+            let finished = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInitiated).async {
+                append([15, 16], to: activeAppendBuffer)
+                finished.signal()
+            }
+            let entered = blocker.entered.wait(timeout: .now() + 2) == .success
+            let peak = activeAppendSpool.accounting
+            let backingAtExactCap = activeAppendBuffer.residentBackingSnapshot
+            let claimDuringAppend = activeAppendStage.claim()
+            claimDuringAppend?.release()
+            let spillRejected = !activeAppendSpool.spill([.init(
+                key: .subtitle(renditionID: 0, segmentID: 19),
+                data: Data([1]),
+                durationMilliseconds: 1_000)])
+            let auxiliaryRejected = !activeAppendSpool.setAuxiliaryBytes(9)
+            blocker.release.signal()
+            let ended = finished.wait(timeout: .now() + 2) == .success
+            let backingAfterAppends = activeAppendBuffer.residentBackingSnapshot
+            let snapshot = activeAppendStage.snapshot
+            var claimedBytes: Data?
+            if let claim = activeAppendStage.claim() {
+                _ = claim.withBytes { claimedBytes = Data([UInt8]($0)) }
+                claim.release()
+            }
+            let fileBytes = snapshot.fileURL.flatMap { try? Data(contentsOf: $0) }
+            check("open stage active append physical cap: each sub-floor append is admitted at the exact ceiling",
+                  auxiliaryAccepted
+                      && armed
+                      && exactCapAuxiliaryAccepted
+                      && entered
+                      && peak.openBytes == 14
+                      && peak.reservedBytes == 2
+                      && peak.admittedBytes == 24
+                      && peak.transientCopyBytes == 2
+                      && peak.physicalBytes == 26
+                      && claimDuringAppend == nil
+                      && spillRejected
+                      && auxiliaryRejected
+                      && ended
+                      && activeAppendSpool.accounting.openBytes == 16
+                      && activeAppendSpool.accounting.reservedBytes == 0
+                      && activeAppendSpool.accounting.transientCopyBytes == 0
+                      && activeAppendSpool.accounting.physicalBytes == 24)
+            check("open stage active append backing: durable appends never materialize into resident Data",
+                  backingAfterActivation.capacityBytes == 0
+                      && backingAfterActivation.logicalBytes == 0
+                      && backingAtExactCap == backingAfterActivation
+                      && backingAfterAppends == backingAfterActivation
+                      && activeAppendBuffer.residentByteRange == 17..<17)
+            check("open stage active append continuity: durable storage owns every byte with no buffer gap",
+                  activeAppendBuffer.status().produced == 17
+                      && activeAppendBuffer.status().failure == nil
+                      && snapshot.storage == .active
+                      && snapshot.baseOffset == 1
+                      && snapshot.logicalEndOffset == 17
+                      && snapshot.durableEndOffset == 17
+                      && fileBytes == Data([1, 2, 3, 4, 5, 6, 7, 8,
+                                            9, 10, 11, 12, 13, 14, 15, 16])
+                      && claimedBytes == fileBytes)
+        } else {
+            check("open stage active append physical cap: fixture is creatable", false)
+        }
+
+        let ramBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 32)
+        guard let ramSpool = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 35,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+              let ramStage = ramSpool.attachOpenStage(to: ramBuffer) else {
+            check("open stage RAM P+S: fixture is creatable", false)
+            return
+        }
+        append([0, 1, 2, 3], to: ramBuffer)
+        guard ramStage.arm(base: 4) else {
+            check("open stage RAM P+S: empty frontier arms", false)
+            return
+        }
+        append([10, 11, 12, 13, 14, 15], to: ramBuffer)
+        guard let ramClaim = ramStage.claim() else {
+            check("open stage RAM P+S: prefix can be claimed", false)
+            return
+        }
+        let ramVideo = VortXHLSSessionSpool.ResourceKey.video(segmentID: 20)
+        let ramClosed = ramStage.closePrefix(
+            ramClaim,
+            endOffset: 7,
+            key: ramVideo,
+            durationMilliseconds: 3_000,
+            additionalResources: [])
+        check("open stage RAM P+S: duplicate-copy charge spans the full old backing until exact compaction",
+              ramClosed
+                  && readAll(ramSpool.openResource(ramVideo, now: 0)) == Data([10, 11, 12])
+                  && ramStage.snapshot.storage == .memory
+                  && ramStage.snapshot.baseOffset == 7
+                  && ramStage.snapshot.logicalEndOffset == 10
+                  && ramSpool.accounting.finalBytes == 3
+                  && ramSpool.accounting.openBytes == 3
+                  && ramSpool.accounting.transientCopyBytes == 0
+                  && ramSpool.accounting.peakTransientCopyBytes == 19
+                  && ramSpool.accounting.physicalBytes == 19
+                  && ramBuffer.residentBackingSnapshot.capacityBytes == 16
+                  && ramBuffer.residentBackingSnapshot.logicalBytes == 3
+                  && ramBuffer.residentByteRange == 7..<10
+                  && ramBuffer.snapshotChunk(offset: 7, length: 3) == Data([13, 14, 15]))
+
+        let ramCapRoot = scratchDirectory("open-stage-ram-physical-cap")
+        defer { try? FileManager.default.removeItem(at: ramCapRoot) }
+        let ramCapBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 32)
+        if let ramCapSpool = VortXHLSSessionSpool(
+            parentDirectory: ramCapRoot,
+            capacityBytes: Int.max,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+           let ramCapStage = ramCapSpool.attachOpenStage(to: ramCapBuffer) {
+            let auxiliary = Int.max - 35
+            _ = ramCapSpool.setAuxiliaryBytes(auxiliary)
+            append([0, 1, 2, 3], to: ramCapBuffer)
+            _ = ramCapStage.arm(base: 4)
+            append([10, 11, 12, 13, 14, 15], to: ramCapBuffer)
+            if let claim = ramCapStage.claim() {
+                let blocker = BlockingStageProbe()
+                ramCapSpool.installFileOperationProbe(blocker.callAsFunction)
+                let result = LockedBool()
+                let finished = DispatchSemaphore(value: 0)
+                let key = VortXHLSSessionSpool.ResourceKey.video(segmentID: 21)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    result.set(ramCapStage.closePrefix(
+                        claim,
+                        endOffset: 7,
+                        key: key,
+                        durationMilliseconds: 3_000,
+                        additionalResources: []))
+                    finished.signal()
+                }
+                let entered = blocker.entered.wait(timeout: .now() + 2) == .success
+                let peak = ramCapSpool.accounting
+                let spillRejected = !ramCapSpool.spill([.init(
+                    key: .subtitle(renditionID: 0, segmentID: 21),
+                    data: Data([1]),
+                    durationMilliseconds: 3_000)])
+                let auxiliaryRejected = !ramCapSpool.setAuxiliaryBytes(auxiliary + 1)
+                blocker.release.signal()
+                let ended = finished.wait(timeout: .now() + 2) == .success
+                check("open stage RAM physical cap: full old backing is reserved at exact capacity",
+                      entered
+                          && peak.admittedBytes == Int.max - 29
+                          && peak.transientCopyBytes == 19
+                          && peak.physicalBytes == Int.max
+                          && spillRejected
+                          && auxiliaryRejected
+                          && ended
+                          && result.value
+                          && ramCapSpool.contains(key)
+                          && ramCapSpool.accounting.transientCopyBytes == 0
+                          && ramCapSpool.accounting.physicalBytes == Int.max - 16
+                          && ramCapBuffer.residentByteRange == 7..<10)
+            } else {
+                check("open stage RAM physical cap: exact claim is available", false)
+            }
+        } else {
+            check("open stage RAM physical cap: fixture is creatable", false)
+        }
+
+        let ramRejectRoot = scratchDirectory("open-stage-ram-transient-reject")
+        defer { try? FileManager.default.removeItem(at: ramRejectRoot) }
+        let ramRejectBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 32)
+        if let ramRejectSpool = VortXHLSSessionSpool(
+            parentDirectory: ramRejectRoot,
+            capacityBytes: 16,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+           let ramRejectStage = ramRejectSpool.attachOpenStage(to: ramRejectBuffer) {
+            append([0, 1, 2, 3], to: ramRejectBuffer)
+            _ = ramRejectStage.arm(base: 4)
+            append([10, 11, 12, 13, 14, 15], to: ramRejectBuffer)
+            if let claim = ramRejectStage.claim() {
+                let rejected = !ramRejectStage.closePrefix(
+                    claim,
+                    endOffset: 7,
+                    key: .video(segmentID: 22),
+                    durationMilliseconds: 3_000,
+                    additionalResources: [])
+                check("open stage RAM physical cap: no transient headroom rejects before any artifact",
+                      rejected
+                          && ramRejectSpool.accounting.openBytes == 6
+                          && ramRejectSpool.accounting.reservedBytes == 0
+                          && ramRejectSpool.accounting.transientCopyBytes == 0
+                          && ramRejectSpool.fileNamesOnDisk.isEmpty
+                          && ramRejectBuffer.status().failure != nil)
+            } else {
+                check("open stage RAM physical cap rejection: exact claim is available", false)
+            }
+        } else {
+            check("open stage RAM physical cap rejection: fixture is creatable", false)
+        }
+
+        let retainedInitRoot = scratchDirectory("open-stage-retained-init-cap")
+        defer { try? FileManager.default.removeItem(at: retainedInitRoot) }
+        let retainedInitBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 8)
+        if let retainedInitSpool = VortXHLSSessionSpool(
+            parentDirectory: retainedInitRoot,
+            capacityBytes: 4,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+           let retainedInitStage = retainedInitSpool.attachOpenStage(to: retainedInitBuffer) {
+            append([0, 1, 2, 3, 4, 5, 6, 7], to: retainedInitBuffer)
+            check("open stage arm physical cap: retained pre-base backing cannot hide outside admission",
+                  !retainedInitStage.arm(base: 4)
+                      && retainedInitStage.snapshot.storage == .dormant
+                      && retainedInitSpool.accounting.openBytes == 0
+                      && retainedInitSpool.accounting.physicalBytes == 0)
+        } else {
+            check("open stage arm physical cap: retained-init fixture is creatable", false)
+        }
+    }
+
+    private static func testMutableOpenStageFailuresAndCleanup() {
+        func makeStage(
+            _ label: String,
+            injection: VortXHLSSessionSpool.FailureInjection
+        ) -> (URL, VortXRemuxBuffer, VortXHLSSessionSpool, VortXHLSSessionSpool.OpenStage)? {
+            let root = scratchDirectory(label)
+            let buffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 4)
+            guard let spool = VortXHLSSessionSpool(
+                parentDirectory: root,
+                capacityBytes: 34,
+                chunkSize: 2,
+                failureInjection: injection,
+                scavengeStaleSessions: false),
+                  let stage = spool.attachOpenStage(to: buffer) else {
+                try? FileManager.default.removeItem(at: root)
+                return nil
+            }
+            append([0, 1, 2, 3, 4], to: buffer)
+            guard stage.arm(base: 1) else {
+                try? FileManager.default.removeItem(at: root)
+                return nil
+            }
+            return (root, buffer, spool, stage)
+        }
+
+        if let (root, buffer, spool, stage) = makeStage(
+            "open-stage-rollback",
+            injection: .openStageForwardWrite(afterBytes: 1, rollbackFails: false)) {
+            defer { try? FileManager.default.removeItem(at: root) }
+            let before = spool.accounting
+            append([5, 6, 7], to: buffer)
+            check("open stage failure: a partial forward write truncates to the old durable end",
+                  buffer.status().failure != nil
+                      && stage.snapshot.storage == .active
+                      && stage.snapshot.logicalEndOffset == 5
+                      && stage.snapshot.durableEndOffset == 5)
+            check("open stage failure: failed growth releases its uncovered reservation",
+                  spool.accounting.openBytes == before.openBytes
+                      && spool.accounting.reservedBytes == 0
+                      && spool.accounting.admittedBytes == before.admittedBytes)
+        } else {
+            check("open stage failure: rollback fixture is creatable", false)
+        }
+
+        if let (root, buffer, spool, stage) = makeStage(
+            "open-stage-future-backpatch",
+            injection: .openStageFstat) {
+            defer { try? FileManager.default.removeItem(at: root) }
+            let futurePatch: [UInt8] = [80, 81]
+            let accepted = futurePatch.withUnsafeBufferPointer { raw in
+                buffer.overwrite(at: 4, bytes: raw.baseAddress!, count: raw.count)
+            }
+            check("open stage mutation: a patch extending beyond the produced head is terminally rejected",
+                  !accepted
+                      && buffer.status().failure != nil
+                      && stage.snapshot.logicalEndOffset == 5)
+            withExtendedLifetime(spool) {}
+        } else {
+            check("open stage mutation: future-backpatch fixture is creatable", false)
+        }
+
+        if let (root, buffer, spool, stage) = makeStage(
+            "open-stage-poison",
+            injection: .openStageForwardWrite(afterBytes: 1, rollbackFails: true)) {
+            defer { try? FileManager.default.removeItem(at: root) }
+            append([5, 6, 7], to: buffer)
+            let laterAdmissionRejected = !spool.setAuxiliaryBytes(1)
+            check("open stage failure: failed partial-write rollback poisons the stage",
+                  buffer.status().failure != nil
+                      && stage.snapshot.storage == .poisoned
+                      && laterAdmissionRejected)
+            withExtendedLifetime(spool) {}
+        } else {
+            check("open stage failure: poison fixture is creatable", false)
+        }
+
+        let activationCapRoot = scratchDirectory("open-stage-activation-physical-cap")
+        defer { try? FileManager.default.removeItem(at: activationCapRoot) }
+        let activationCapBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 4)
+        if let activationCapSpool = VortXHLSSessionSpool(
+            parentDirectory: activationCapRoot,
+            capacityBytes: Int.max,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+           let activationCapStage = activationCapSpool.attachOpenStage(to: activationCapBuffer) {
+            let auxiliary = Int.max - 20
+            _ = activationCapSpool.setAuxiliaryBytes(auxiliary)
+            append([0, 1, 2, 3, 4], to: activationCapBuffer)
+            let blocker = BlockingStageProbe()
+            activationCapSpool.installFileOperationProbe(blocker.callAsFunction)
+            let armed = LockedBool()
+            let finished = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInitiated).async {
+                armed.set(activationCapStage.arm(base: 1))
+                finished.signal()
+            }
+            let entered = blocker.entered.wait(timeout: .now() + 2) == .success
+            let peak = activationCapSpool.accounting
+            let spillRejected = !activationCapSpool.spill([.init(
+                key: .subtitle(renditionID: 0, segmentID: 30),
+                data: Data([1]),
+                durationMilliseconds: 1_000)])
+            let auxiliaryRejected = !activationCapSpool.setAuxiliaryBytes(auxiliary + 1)
+            blocker.release.signal()
+            let ended = finished.wait(timeout: .now() + 2) == .success
+            check("open stage activation physical cap: full RAM range is charged at exact capacity",
+                  entered
+                      && peak.admittedBytes == Int.max - 16
+                      && peak.transientCopyBytes == 4
+                      && peak.physicalBytes == Int.max
+                      && spillRejected
+                      && auxiliaryRejected
+                      && ended
+                      && armed.value
+                      && activationCapStage.snapshot.storage == .active
+                      && activationCapSpool.accounting.transientCopyBytes == 0
+                      && activationCapSpool.accounting.physicalBytes
+                          == activationCapSpool.accounting.admittedBytes
+                      && activationCapBuffer.residentByteRange == 5..<5)
+        } else {
+            check("open stage activation physical cap: fixture is creatable", false)
+        }
+
+        let activationRejectRoot = scratchDirectory("open-stage-activation-transient-reject")
+        defer { try? FileManager.default.removeItem(at: activationRejectRoot) }
+        let activationRejectBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 4)
+        if let activationRejectSpool = VortXHLSSessionSpool(
+            parentDirectory: activationRejectRoot,
+            capacityBytes: 19,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+           let activationRejectStage = activationRejectSpool.attachOpenStage(to: activationRejectBuffer) {
+            _ = activationRejectSpool.setAuxiliaryBytes(3)
+            append([0, 1, 2, 3, 4], to: activationRejectBuffer)
+            let rejected = !activationRejectStage.arm(base: 1)
+            check("open stage activation physical cap: no transient headroom fails before file creation",
+                  rejected
+                      && activationRejectStage.snapshot.storage == .poisoned
+                      && activationRejectSpool.accounting.openBytes == 0
+                      && activationRejectSpool.accounting.auxiliaryBytes == 3
+                      && activationRejectSpool.accounting.reservedBytes == 0
+                      && activationRejectSpool.accounting.transientCopyBytes == 0
+                      && activationRejectSpool.fileNamesOnDisk.isEmpty
+                      && activationRejectBuffer.status().failure != nil)
+        } else {
+            check("open stage activation physical cap rejection: fixture is creatable", false)
+        }
+
+        let activationCancelRoot = scratchDirectory("open-stage-activation-cancel")
+        defer { try? FileManager.default.removeItem(at: activationCancelRoot) }
+        let activationCancelBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 4)
+        if let activationCancelSpool = VortXHLSSessionSpool(
+            parentDirectory: activationCancelRoot,
+            capacityBytes: 32,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+           let activationCancelStage = activationCancelSpool.attachOpenStage(to: activationCancelBuffer) {
+            append([0, 1, 2, 3, 4], to: activationCancelBuffer)
+            let blocker = BlockingStageProbe()
+            activationCancelSpool.installFileOperationProbe(blocker.callAsFunction)
+            let armed = LockedBool()
+            let finished = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInitiated).async {
+                armed.set(activationCancelStage.arm(base: 1))
+                finished.signal()
+            }
+            let entered = blocker.entered.wait(timeout: .now() + 2) == .success
+            activationCancelSpool.invalidateSession()
+            blocker.release.signal()
+            let ended = finished.wait(timeout: .now() + 2) == .success
+            check("open stage activation cancellation: cleanup balances the transient reservation",
+                  entered
+                      && ended
+                      && !armed.value
+                      && activationCancelStage.snapshot.storage == .poisoned
+                      && activationCancelSpool.accounting.openBytes == 0
+                      && activationCancelSpool.accounting.reservedBytes == 0
+                      && activationCancelSpool.accounting.transientCopyBytes == 0
+                      && activationCancelSpool.fileNamesOnDisk.isEmpty
+                      && activationCancelBuffer.status().failure != nil)
+            activationCancelSpool.producerDidTerminate()
+            activationCancelSpool.listenerDidRetire()
+            check("open stage activation cancellation: terminal cleanup releases the session",
+                  !FileManager.default.fileExists(
+                      atPath: activationCancelSpool.sessionDirectory.path)
+                      && activationCancelSpool.accounting.physicalBytes == 0)
+        } else {
+            check("open stage activation cancellation: fixture is creatable", false)
+        }
+
+        let activationQuarantineRoot = scratchDirectory("open-stage-activation-quarantine")
+        defer { try? FileManager.default.removeItem(at: activationQuarantineRoot) }
+        let activationQuarantineBuffer = VortXRemuxBuffer(
+            windowFloorBytes: 1, producerLeadBytes: 4)
+        if let activationQuarantineSpool = VortXHLSSessionSpool(
+            parentDirectory: activationQuarantineRoot,
+            capacityBytes: 32,
+            chunkSize: 2,
+            failureInjection: .openStageActivationCleanupRemoveOnce,
+            scavengeStaleSessions: false),
+           let activationQuarantineStage = activationQuarantineSpool.attachOpenStage(
+               to: activationQuarantineBuffer) {
+            append([0, 1, 2, 3, 4], to: activationQuarantineBuffer)
+            let rejected = !activationQuarantineStage.arm(base: 1)
+            let retained = activationQuarantineSpool.accounting
+            let receipts = activationQuarantineSpool.quarantinedFileNames
+            let spillRejected = !activationQuarantineSpool.spill([.init(
+                key: .subtitle(renditionID: 0, segmentID: 31),
+                data: Data([1]),
+                durationMilliseconds: 1_000)])
+            check("open stage activation cleanup failure: surviving receipt is quarantined before charge release",
+                  rejected
+                      && receipts.count == 1
+                      && activationQuarantineSpool.fileNamesOnDisk == receipts
+                      && retained.openBytes == 0
+                      && retained.reservedBytes == 0
+                      && retained.transientCopyBytes == 0
+                      && retained.quarantinedBytes == 4
+                      && retained.physicalBytes == 4
+                      && spillRejected
+                      && activationQuarantineStage.snapshot.storage == .poisoned
+                      && activationQuarantineBuffer.status().failure != nil)
+            activationQuarantineSpool.producerDidTerminate()
+            activationQuarantineSpool.listenerDidRetire()
+            check("open stage activation cleanup failure: terminal retry clears quarantine accounting",
+                  !FileManager.default.fileExists(
+                      atPath: activationQuarantineSpool.sessionDirectory.path)
+                      && activationQuarantineSpool.quarantinedFileNames.isEmpty
+                      && activationQuarantineSpool.accounting.physicalBytes == 0)
+        } else {
+            check("open stage activation cleanup failure: fixture is creatable", false)
+        }
+
+        for (label, injection) in [
+            ("create", VortXHLSSessionSpool.FailureInjection.openStageCreatePermission),
+            ("move", VortXHLSSessionSpool.FailureInjection.openStageMovePermission),
+        ] {
+            let root = scratchDirectory("open-stage-\(label)-permission")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let buffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 32)
+            guard let spool = VortXHLSSessionSpool(
+                parentDirectory: root,
+                capacityBytes: 34,
+                chunkSize: 2,
+                failureInjection: injection,
+                scavengeStaleSessions: false),
+                  let stage = spool.attachOpenStage(to: buffer) else {
+                check("open stage permission: \(label) fixture is creatable", false)
+                continue
+            }
+            append([0, 1, 2, 3, 4, 5], to: buffer)
+            guard stage.arm(base: 2), let claim = stage.claim() else {
+                check("open stage permission: \(label) RAM claim is available", false)
+                continue
+            }
+            let key = VortXHLSSessionSpool.ResourceKey.video(
+                segmentID: label == "create" ? 93 : 94)
+            check("open stage permission: post-\(label) verification failure rolls back every artifact",
+                  !stage.closePrefix(
+                      claim,
+                      endOffset: 4,
+                      key: key,
+                      durationMilliseconds: 2_000,
+                      additionalResources: [])
+                      && !spool.contains(key)
+                      && spool.accounting.finalBytes == 0
+                      && spool.accounting.reservedBytes == 0
+                      && spool.fileNamesOnDisk.isEmpty
+                      && buffer.status().failure != nil)
+        }
+
+        let quarantineRoot = scratchDirectory("open-stage-permission-quarantine")
+        defer { try? FileManager.default.removeItem(at: quarantineRoot) }
+        let quarantineBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 2)
+        if let quarantineSpool = VortXHLSSessionSpool(
+            parentDirectory: quarantineRoot,
+            capacityBytes: 32,
+            chunkSize: 2,
+            failureInjection: .openStageMovePermissionCleanupRemoveOnce,
+            scavengeStaleSessions: false),
+           let quarantineStage = quarantineSpool.attachOpenStage(to: quarantineBuffer) {
+            append([0, 1, 2, 3, 4, 5, 6, 7, 8], to: quarantineBuffer)
+            if quarantineStage.arm(base: 1), let claim = quarantineStage.claim() {
+                let failed = !quarantineStage.closePrefix(
+                    claim,
+                    endOffset: 5,
+                    key: .video(segmentID: 98),
+                    durationMilliseconds: 4_000,
+                    additionalResources: [])
+                let retained = quarantineSpool.accounting
+                let receiptNames = quarantineSpool.quarantinedFileNames
+                let diskNames = quarantineSpool.fileNamesOnDisk
+                let spillRejected = !quarantineSpool.spill([.init(
+                    key: .subtitle(renditionID: 0, segmentID: 98),
+                    data: Data([1]),
+                    durationMilliseconds: 4_000)])
+                let auxiliaryRejected = !quarantineSpool.setAuxiliaryBytes(1)
+                check("open stage permission quarantine: failed first removal retains receipt, charge and invalidation",
+                      failed
+                          && receiptNames.count == 1
+                          && diskNames == receiptNames
+                          && retained.openBytes == 8
+                          && retained.reservedBytes == 0
+                          && retained.transientCopyBytes == 0
+                          && retained.quarantinedBytes == 4
+                          && retained.physicalBytes == 12
+                          && spillRejected
+                          && auxiliaryRejected
+                          && quarantineBuffer.status().failure != nil)
+                quarantineSpool.producerDidTerminate()
+                quarantineSpool.listenerDidRetire()
+                check("open stage permission quarantine: terminal directory retry clears receipts and accounting",
+                      !FileManager.default.fileExists(atPath: quarantineSpool.sessionDirectory.path)
+                          && quarantineSpool.quarantinedFileNames.isEmpty
+                          && quarantineSpool.accounting.admittedBytes == 0
+                          && quarantineSpool.accounting.physicalBytes == 0
+                          && VortXHLSSessionSpool.registeredSessionCount(
+                              parentDirectory: quarantineRoot) == 0)
+            } else {
+                check("open stage permission quarantine: active claim is available", false)
+            }
+        } else {
+            check("open stage permission quarantine: fixture is creatable", false)
+        }
+
+        for (label, injection) in [
+            ("fstat", VortXHLSSessionSpool.FailureInjection.openStageFstat),
+            ("mmap", VortXHLSSessionSpool.FailureInjection.openStageMMap),
+        ] {
+            guard let (root, buffer, spool, stage) = makeStage("open-stage-\(label)", injection: injection) else {
+                check("open stage failure: \(label) fixture is creatable", false)
+                continue
+            }
+            defer { try? FileManager.default.removeItem(at: root) }
+            let claim = stage.claim()
+            let mapped = claim?.withBytes { _ in } ?? false
+            claim?.release()
+            check("open stage failure: injected \(label) failure is terminal instead of falling back to RAM",
+                  !mapped && buffer.status().failure != nil)
+            withExtendedLifetime(spool) {}
+        }
+
+        let atomicRoot = scratchDirectory("open-stage-atomic-arm")
+        defer { try? FileManager.default.removeItem(at: atomicRoot) }
+        let atomicBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 8)
+        if let atomicSpool = VortXHLSSessionSpool(
+            parentDirectory: atomicRoot,
+            capacityBytes: 18,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+           let atomicStage = atomicSpool.attachOpenStage(to: atomicBuffer) {
+            _ = atomicSpool.setAuxiliaryBytes(2)
+            append([0, 1, 2, 3], to: atomicBuffer)
+            check("open stage arm: next auxiliary plus adopted open bytes reject atomically at the cap",
+                  !atomicStage.arm(base: 2, auxiliaryBytes: 5)
+                      && atomicStage.snapshot.storage == .dormant
+                      && atomicSpool.accounting.auxiliaryBytes == 2
+                      && atomicSpool.accounting.openBytes == 0
+                      && atomicSpool.accounting.admittedBytes == 2)
+        } else {
+            check("open stage arm: atomic-admission fixture is creatable", false)
+        }
+
+        let auxiliaryRoot = scratchDirectory("open-stage-auxiliary-generation")
+        defer { try? FileManager.default.removeItem(at: auxiliaryRoot) }
+        let auxiliaryBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 2)
+        if let auxiliarySpool = VortXHLSSessionSpool(
+            parentDirectory: auxiliaryRoot,
+            capacityBytes: 31,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+           let auxiliaryStage = auxiliarySpool.attachOpenStage(to: auxiliaryBuffer) {
+            let auxiliaryLedger = VortXHLSAuxiliaryAccounting(spool: auxiliarySpool)
+            let audioCharged = auxiliaryLedger.update(alternateAudioInit: 4)
+            append([0, 1, 2, 3, 4, 5, 6, 7], to: auxiliaryBuffer)
+            let activationBlocker = BlockingStageProbe()
+            auxiliarySpool.installFileOperationProbe(activationBlocker.callAsFunction)
+            let armResult = LockedBool()
+            let armFinished = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInitiated).async {
+                armResult.set(auxiliaryLedger.armPrimary(
+                    stage: auxiliaryStage,
+                    base: 2,
+                    primaryInitBytes: 3))
+                armFinished.signal()
+            }
+            let activationEntered = activationBlocker.entered.wait(timeout: .now() + 2) == .success
+            let timeoutCleared = auxiliaryLedger.omitAlternateAudioInitOnTimeout()
+            let afterTimeout = auxiliarySpool.accounting
+            let componentSnapshot = auxiliaryLedger.snapshot
+            let retainedPrimaryConsumesCapacity = !auxiliarySpool.spill([.init(
+                key: .subtitle(renditionID: 0, segmentID: 96),
+                data: Data(repeating: 7, count: 23),
+                durationMilliseconds: 4_000)])
+            activationBlocker.release.signal()
+            let armEnded = armFinished.wait(timeout: .now() + 2) == .success
+            check("open stage auxiliary transaction: timeout after coordinator charge retains primary init capacity",
+                  audioCharged
+                      && activationEntered
+                      && timeoutCleared
+                      && afterTimeout.openBytes == 6
+                      && afterTimeout.auxiliaryBytes == 3
+                      && afterTimeout.transientCopyBytes == 6
+                      && afterTimeout.physicalBytes == 25
+                      && componentSnapshot.primaryInitBytes == 3
+                      && componentSnapshot.alternateAudioInitBytes == 0
+                      && retainedPrimaryConsumesCapacity
+                      && armEnded
+                      && armResult.value
+                      && auxiliaryStage.snapshot.storage == .active)
+        } else {
+            check("open stage auxiliary transaction: fixture is creatable", false)
+        }
+
+        let armingAppendRoot = scratchDirectory("open-stage-arming-append")
+        defer { try? FileManager.default.removeItem(at: armingAppendRoot) }
+        let armingAppendBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 16)
+        if let armingAppendSpool = VortXHLSSessionSpool(
+            parentDirectory: armingAppendRoot,
+            capacityBytes: 16,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+           let armingAppendStage = armingAppendSpool.attachOpenStage(to: armingAppendBuffer) {
+            append([0, 1, 2, 3], to: armingAppendBuffer)
+            let accountingBlocker = BlockingStageProbe()
+            armingAppendSpool.installOpenStageArmAccountingProbe(accountingBlocker.callAsFunction)
+            let armResult = LockedBool()
+            let armFinished = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInitiated).async {
+                armResult.set(armingAppendStage.arm(base: 1))
+                armFinished.signal()
+            }
+            let accountingEntered = accountingBlocker.entered.wait(timeout: .now() + 2) == .success
+            let appendFinished = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInitiated).async {
+                append([4, 5], to: armingAppendBuffer)
+                appendFinished.signal()
+            }
+            let duringArming = armingAppendStage.snapshot
+            let initiallyCharged = armingAppendSpool.accounting.openBytes
+            accountingBlocker.release.signal()
+            let armEnded = armFinished.wait(timeout: .now() + 2) == .success
+            let appendEnded = appendFinished.wait(timeout: .now() + 2) == .success
+            let adopted = armingAppendStage.snapshot
+            check("open stage arming: a forward append racing the first snapshot is adopted exactly once",
+                  accountingEntered
+                      && duringArming.storage == .arming
+                      && initiallyCharged == 3
+                      && armEnded
+                      && appendEnded
+                      && armResult.value
+                      && adopted.storage == .memory
+                      && adopted.baseOffset == 1
+                      && adopted.logicalEndOffset == 6
+                      && armingAppendSpool.accounting.openBytes == 5
+                      && armingAppendBuffer.producedCount == 6
+                      && armingAppendBuffer.status().failure == nil)
+        } else {
+            check("open stage arming: append-race fixture is creatable", false)
+        }
+
+        let repeatedArmRoot = scratchDirectory("open-stage-repeated-arm")
+        defer { try? FileManager.default.removeItem(at: repeatedArmRoot) }
+        let repeatedArmBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 2)
+        if let repeatedArmSpool = VortXHLSSessionSpool(
+            parentDirectory: repeatedArmRoot,
+            capacityBytes: 24,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+           let repeatedArmStage = repeatedArmSpool.attachOpenStage(to: repeatedArmBuffer) {
+            append([0, 1, 2, 3, 4, 5, 6, 7, 8], to: repeatedArmBuffer)
+            if repeatedArmStage.arm(base: 1), let claim = repeatedArmStage.claim() {
+                let closeBlocker = BlockingStageProbe()
+                repeatedArmSpool.installFileOperationProbe(closeBlocker.callAsFunction)
+                let closeResult = LockedBool()
+                let closeFinished = DispatchSemaphore(value: 0)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    closeResult.set(repeatedArmStage.closePrefix(
+                        claim,
+                        endOffset: 5,
+                        key: .video(segmentID: 97),
+                        durationMilliseconds: 4_000,
+                        additionalResources: []))
+                    closeFinished.signal()
+                }
+                let closeEntered = closeBlocker.entered.wait(timeout: .now() + 2) == .success
+                let peak = repeatedArmSpool.accounting
+                let repeatedAccountingBlocker = BlockingStageProbe()
+                repeatedArmSpool.installOpenStageArmAccountingProbe(
+                    repeatedAccountingBlocker.callAsFunction)
+                let repeatedResult = LockedBool()
+                let repeatedFinished = DispatchSemaphore(value: 0)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    repeatedResult.set(repeatedArmStage.arm(base: 9, auxiliaryBytes: 7))
+                    repeatedFinished.signal()
+                }
+                let repeatedEnded = repeatedFinished.wait(timeout: .now() + 1) == .success
+                let accountingWasTouched = repeatedAccountingBlocker.entered.wait(
+                    timeout: .now() + 0.05) == .success
+                if accountingWasTouched { repeatedAccountingBlocker.release.signal() }
+                closeBlocker.release.signal()
+                let closeEnded = closeFinished.wait(timeout: .now() + 2) == .success
+                check("open stage arming: repeated arm during transient close never mutates coordinator accounting",
+                      closeEntered
+                          && peak.openBytes == 8
+                          && peak.transientCopyBytes == 4
+                          && peak.physicalBytes == 12
+                          && repeatedEnded
+                          && !repeatedResult.value
+                          && !accountingWasTouched
+                          && repeatedArmSpool.accounting.auxiliaryBytes == 0
+                          && closeEnded
+                          && closeResult.value)
+            } else {
+                check("open stage arming: repeated-arm claim is available", false)
+            }
+        } else {
+            check("open stage arming: repeated-arm fixture is creatable", false)
+        }
+
+        let physicalRoot = scratchDirectory("open-stage-physical-cap")
+        defer { try? FileManager.default.removeItem(at: physicalRoot) }
+        let physicalBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 8)
+        if let physicalSpool = VortXHLSSessionSpool(
+            parentDirectory: physicalRoot,
+            capacityBytes: Int.max,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+           let physicalStage = physicalSpool.attachOpenStage(to: physicalBuffer) {
+            let initialAuxiliary = Int.max - 12
+            append([0, 1, 2, 3, 4, 5, 6, 7, 8], to: physicalBuffer)
+            let armed = physicalStage.arm(base: 1)
+            let auxiliaryCharged = physicalSpool.setAuxiliaryBytes(initialAuxiliary)
+            if armed, auxiliaryCharged, let claim = physicalStage.claim() {
+                let blocker = BlockingStageProbe()
+                physicalSpool.installFileOperationProbe(blocker.callAsFunction)
+                let finished = DispatchSemaphore(value: 0)
+                let key = VortXHLSSessionSpool.ResourceKey.video(segmentID: 95)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    _ = physicalStage.closePrefix(
+                        claim,
+                        endOffset: 5,
+                        key: key,
+                        durationMilliseconds: 4_000,
+                        additionalResources: [])
+                    finished.signal()
+                }
+                let entered = blocker.entered.wait(timeout: .now() + 2) == .success
+                let peak = physicalSpool.accounting
+                let spillRejected = !physicalSpool.spill([.init(
+                    key: .subtitle(renditionID: 0, segmentID: 95),
+                    data: Data([1]),
+                    durationMilliseconds: 4_000)])
+                let auxiliaryRejected = !physicalSpool.setAuxiliaryBytes(Int.max - 11)
+                blocker.release.signal()
+                let ended = finished.wait(timeout: .now() + 2) == .success
+                check("open stage physical cap: transient suffix copy blocks concurrent spill and auxiliary growth",
+                      entered
+                          && peak.admittedBytes == Int.max - 4
+                          && peak.transientCopyBytes == 4
+                          && peak.physicalBytes == Int.max
+                          && spillRejected
+                          && auxiliaryRejected
+                          && ended
+                          && physicalSpool.contains(key)
+                          && physicalSpool.accounting.transientCopyBytes == 0)
+            } else {
+                check("open stage physical cap: exact active claim is available", false)
+            }
+        } else {
+            check("open stage physical cap: fixture is creatable", false)
+        }
+
+        let raceRoot = scratchDirectory("open-stage-registry-race")
+        defer { try? FileManager.default.removeItem(at: raceRoot) }
+        let raceBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 4)
+        if let raceSpool = VortXHLSSessionSpool(
+            parentDirectory: raceRoot,
+            capacityBytes: 32,
+            chunkSize: 2,
+            failureInjection: .openStageCancelBeforeRegistry,
+            scavengeStaleSessions: false),
+           let raceStage = raceSpool.attachOpenStage(to: raceBuffer) {
+            append([0, 1, 2, 3, 4], to: raceBuffer)
+            _ = raceStage.arm(base: 1)
+            let key = VortXHLSSessionSpool.ResourceKey.video(segmentID: 90)
+            if let claim = raceStage.claim() {
+                check("open stage promotion race: cancellation between moves and registry publishes no partial final",
+                      !raceStage.closePrefix(
+                          claim,
+                          endOffset: 3,
+                          key: key,
+                          durationMilliseconds: 2_000,
+                          additionalResources: [])
+                          && !raceSpool.contains(key)
+                          && raceSpool.accounting.finalBytes == 0
+                          && raceSpool.accounting.reservedBytes == 0
+                          && raceSpool.accounting.transientCopyBytes == 0
+                          && raceStage.snapshot.storage == .poisoned
+                          && raceBuffer.status().failure != nil
+                          && raceSpool.fileNamesOnDisk.isEmpty)
+            } else {
+                check("open stage promotion race: exact active claim is available", false)
+            }
+        } else {
+            check("open stage promotion race: fixture is creatable", false)
+        }
+
+        let postCommitRoot = scratchDirectory("open-stage-post-commit-cancel")
+        defer { try? FileManager.default.removeItem(at: postCommitRoot) }
+        let postCommitBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 4)
+        if let postCommitSpool = VortXHLSSessionSpool(
+            parentDirectory: postCommitRoot,
+            capacityBytes: 32,
+            chunkSize: 2,
+            failureInjection: .openStageCancelAfterRegistry,
+            scavengeStaleSessions: false),
+           let postCommitStage = postCommitSpool.attachOpenStage(to: postCommitBuffer) {
+            append([0, 1, 2, 3, 4], to: postCommitBuffer)
+            _ = postCommitStage.arm(base: 1)
+            let key = VortXHLSSessionSpool.ResourceKey.video(segmentID: 91)
+            if let claim = postCommitStage.claim() {
+                let published = postCommitStage.closePrefix(
+                    claim,
+                    endOffset: 3,
+                    key: key,
+                    durationMilliseconds: 2_000,
+                    additionalResources: [])
+                check("open stage post-commit race: cancellation prevents the close success used for playlist publication",
+                      !published
+                          && postCommitSpool.contains(key)
+                          && postCommitSpool.accounting.finalBytes == 2
+                          && postCommitSpool.accounting.openBytes == 2
+                          && postCommitSpool.accounting.reservedBytes == 0
+                          && postCommitSpool.accounting.transientCopyBytes == 0
+                          && postCommitStage.snapshot.storage == .poisoned
+                          && postCommitBuffer.status().failure != nil)
+                postCommitSpool.producerDidTerminate()
+                postCommitSpool.listenerDidRetire()
+                check("open stage post-commit race: committed ownership drains only through terminal cleanup",
+                      !FileManager.default.fileExists(atPath: postCommitSpool.sessionDirectory.path)
+                          && !postCommitSpool.contains(key)
+                          && postCommitSpool.accounting.admittedBytes == 0
+                          && postCommitSpool.accounting.physicalBytes == 0)
+            } else {
+                check("open stage post-commit race: exact active claim is available", false)
+            }
+        } else {
+            check("open stage post-commit race: fixture is creatable", false)
+        }
+
+        let orphanRoot = scratchDirectory("open-stage-owner-release")
+        defer { try? FileManager.default.removeItem(at: orphanRoot) }
+        let orphanBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 8)
+        var orphanSpool: VortXHLSSessionSpool? = VortXHLSSessionSpool(
+            parentDirectory: orphanRoot,
+            capacityBytes: 32,
+            chunkSize: 2,
+            scavengeStaleSessions: false)
+        weak let releasedOwner = orphanSpool
+        if let orphanStage = orphanSpool?.attachOpenStage(to: orphanBuffer) {
+            append([0, 1, 2, 3], to: orphanBuffer)
+            _ = orphanStage.arm(base: 1)
+            if let orphanClaim = orphanStage.claim() {
+                orphanSpool = nil
+                let closeWithoutOwner = orphanStage.closePrefix(
+                    orphanClaim,
+                    endOffset: 3,
+                    key: .video(segmentID: 92),
+                    durationMilliseconds: 2_000,
+                    additionalResources: [])
+                orphanClaim.release()
+                let replacement = orphanStage.claim()
+                check("open stage owner loss: close does not consume and strand a claim after spool teardown",
+                      releasedOwner == nil && !closeWithoutOwner && replacement != nil)
+                replacement?.release()
+            } else {
+                check("open stage owner loss: exact claim is available", false)
+            }
+        } else {
+            check("open stage owner loss: fixture is creatable", false)
+        }
+
+        let normalDeinitRoot = scratchDirectory("open-stage-normal-deinit")
+        defer { try? FileManager.default.removeItem(at: normalDeinitRoot) }
+        var normalSpool: VortXHLSSessionSpool? = VortXHLSSessionSpool(
+            parentDirectory: normalDeinitRoot,
+            capacityBytes: 32,
+            chunkSize: 2,
+            scavengeStaleSessions: false)
+        let normalSessionDirectory = normalSpool?.sessionDirectory
+        let joinedBeforeDeinit = VortXHLSSessionSpool.registeredSessionCount(
+            parentDirectory: normalDeinitRoot)
+        normalSpool = nil
+        check("open stage registry: normal deinit leaves membership while preserving the orphan for scavenging",
+              joinedBeforeDeinit == 1
+                  && VortXHLSSessionSpool.registeredSessionCount(
+                      parentDirectory: normalDeinitRoot) == 0
+                  && normalSessionDirectory.map {
+                      FileManager.default.fileExists(atPath: $0.path)
+                  } == true)
+
+        let cleanupRoot = scratchDirectory("open-stage-cleanup-retry")
+        defer { try? FileManager.default.removeItem(at: cleanupRoot) }
+        let cleanupBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 8)
+        guard let cleanupSpool = VortXHLSSessionSpool(
+            parentDirectory: cleanupRoot,
+            capacityBytes: 32,
+            chunkSize: 2,
+            failureInjection: .cleanupRemove(failures: 1),
+            scavengeStaleSessions: false),
+              let cleanupStage = cleanupSpool.attachOpenStage(to: cleanupBuffer) else {
+            check("open stage cleanup: fixture is creatable", false)
+            return
+        }
+        append([0, 1, 2, 3], to: cleanupBuffer)
+        _ = cleanupStage.arm(base: 1)
+        cleanupSpool.invalidateSession()
+        cleanupSpool.listenerDidRetire()
+        check("open stage cleanup: invalidation still waits for the producer terminal edge",
+              FileManager.default.fileExists(atPath: cleanupSpool.sessionDirectory.path))
+        cleanupSpool.producerDidReachEOF()
+        check("open stage cleanup: a failed directory removal remains retryable and registered",
+              FileManager.default.fileExists(atPath: cleanupSpool.sessionDirectory.path)
+                  && VortXHLSSessionSpool.registeredSessionCount(
+                      parentDirectory: cleanupRoot) == 1)
+        cleanupSpool.invalidateSession()
+        check("open stage cleanup: a later lifecycle edge retries and completes directory removal",
+              !FileManager.default.fileExists(atPath: cleanupSpool.sessionDirectory.path)
+                  && VortXHLSSessionSpool.registeredSessionCount(
+                      parentDirectory: cleanupRoot) == 0)
+
+        let operationRoot = scratchDirectory("open-stage-cleanup-operation")
+        defer { try? FileManager.default.removeItem(at: operationRoot) }
+        let operationBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 4)
+        guard let operationSpool = VortXHLSSessionSpool(
+            parentDirectory: operationRoot,
+            capacityBytes: 32,
+            chunkSize: 2,
+            scavengeStaleSessions: false),
+              let operationStage = operationSpool.attachOpenStage(to: operationBuffer) else {
+            check("open stage cleanup operation: fixture is creatable", false)
+            return
+        }
+        append([0, 1, 2, 3, 4], to: operationBuffer)
+        let blocker = BlockingStageProbe()
+        operationSpool.installFileOperationProbe(blocker.callAsFunction)
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = operationStage.arm(base: 1)
+            finished.signal()
+        }
+        let entered = blocker.entered.wait(timeout: .now() + 2) == .success
+        operationSpool.invalidateSession()
+        operationSpool.listenerDidRetire()
+        operationSpool.producerDidTerminate()
+        check("open stage cleanup operation: teardown waits for an in-flight stage filesystem operation",
+              entered
+                  && operationSpool.activeOpenStageOperationCount == 1
+                  && FileManager.default.fileExists(atPath: operationSpool.sessionDirectory.path))
+        blocker.release.signal()
+        let ended = finished.wait(timeout: .now() + 2) == .success
+        check("open stage cleanup operation: the last operation completion triggers gated cleanup",
+              ended
+                  && operationSpool.activeOpenStageOperationCount == 0
+                  && !FileManager.default.fileExists(atPath: operationSpool.sessionDirectory.path))
     }
 
     private static func testPlaylistRetentionAndFileLeases() {
@@ -1069,6 +2279,26 @@ enum PlayerLiveContractTests {
             stream,
             from: "private func hlsCloseSegment(",
             to: "private func hlsBuildSignaling(")
+        let runLifecycle = sourceSection(
+            stream,
+            from: "private func run()",
+            to: "// MARK: - Custom AVIO write/seek")
+        let openStageClose = sourceSection(
+            remuxBuffer,
+            from: "func closePrefix(_ claim: OpenClaim,",
+            to: "fileprivate func releaseClaim(id:")
+        let openStageForward = sourceSection(
+            remuxBuffer,
+            from: "fileprivate func acceptForward(",
+            to: "fileprivate func completeForward(")
+        let openStageClaimRead = sourceSection(
+            remuxBuffer,
+            from: "private func withClaimBytes(",
+            to: "private func finishClaimRead()")
+        let spoolDeinit = sourceSection(
+            remuxBuffer,
+            from: "deinit {\n        var removed =",
+            to: "var accounting: Accounting")
         let videoTiming = sourceSection(
             stream,
             from: "private func hlsVideoStep(",
@@ -1176,6 +2406,11 @@ enum PlayerLiveContractTests {
                   && alternateTimeout?.contains("markAlternateAudioFailed") == false
                   && immutableSnapshot?.contains(
                       "_alternateAudioState = MultiAudioPolicy.snapshotState(") == true)
+        check("wiring: primary arm and alternate timeout share the versioned auxiliary ledger",
+              stream?.contains("hlsAuxiliaryAccounting.armPrimary(") == true
+                  && alternateTimeout?.contains(
+                      "hlsAuxiliaryAccounting?.omitAlternateAudioInitOnTimeout()") == true
+                  && remuxBuffer?.contains("final class VortXHLSAuxiliaryAccounting") == true)
         check("wiring: alternate output uses a nonblocking cap and propagates callback failure",
               alternateMuxer?.contains("buffer.appendIfWithinResidentLimit(") == true
                   && alternateMuxer?.contains("fail(.byteBudget)") == true
@@ -1237,6 +2472,52 @@ enum PlayerLiveContractTests {
                   "proveNextFragment: { hlsParserProvenFirstSegmentEndByte() }",
                   "publish: { pending, provenEndByte in",
                   "hlsCloseSegment(",
+              ]))
+        check("wiring: every pre-close parser-claim failure releases the exact stored claim",
+              sourceContainsInOrder(pendingVideoPublication, [
+                  "guard pending.segmentID == nextPublishedID",
+                  "releaseHLSParserOpenClaim()",
+                  "HLS pending boundary did not match the publication frontier",
+              ])
+                  && sourceContainsInOrder(closeVideoSegment, [
+                      "hlsSegmentStartPacketProven else {",
+                      "releaseHLSParserOpenClaim()",
+                      "guard let endByte",
+                      "releaseHLSParserOpenClaim()",
+                      "hlsParserOpenClaim = nil",
+                      "defer { openClaim.release() }",
+                  ]))
+        check("wiring: remux-thread exit releases any terminal parser claim before producer teardown",
+              sourceContainsInOrder(runLifecycle, [
+                  "defer {",
+                  "releaseHLSParserOpenClaim()",
+                  "hlsSpool?.producerDidTerminate()",
+              ]))
+        check("wiring: owner loss cannot consume and strand the exact open-stage claim",
+              sourceContainsInOrder(openStageClose, [
+                  "guard let owner",
+                  "claim.consume()",
+                  "owner.closeOpenStagePrefix(",
+              ]))
+        check("wiring: RAM forwards copy directly into the one accounted resident backing",
+              openStageForward?.contains("residentData = Data(bytes:") == false
+                  && remuxBuffer?.contains("residentData: Data?") == false)
+        check("wiring: RAM parser claims borrow the accounted backing without snapshot allocation",
+              openStageClaimRead?.contains("snapshotChunk(") == false
+                  && openStageClaimRead?.contains("withResidentBytes(") == true)
+        check("wiring: physical proof reports the live resident allocation rather than helper-call receipts",
+              remuxBuffer?.contains("struct ResidentBackingReceipt") == false
+                  && remuxBuffer?.contains("residentBackingSnapshot") == true
+                  && remuxBuffer?.contains("malloc_size(") == true
+                  && remuxBuffer?.contains("MAP_PRIVATE | MAP_ANON") == true
+                  && remuxBuffer?.contains("munmap(pointer, capacity)") == true)
+        check("wiring: normal deinit leaves the registry while failed invalidated cleanup remains registered",
+              spoolDeinit?.contains("if registryJoined, !invalidated || removed") == true)
+        check("wiring: a failed durable close cannot cross the production playlist-publication guard",
+              sourceContainsInOrder(closeVideoSegment, [
+                  "guard hlsOpenStage.closePrefix(",
+                  "return false",
+                  "_hlsSegments.append(videoSegment)",
               ]))
         check("wiring: aggregate parser proof remains separate from first-fragment FIFO proof",
               pendingVideoPublication?.contains(
