@@ -203,10 +203,18 @@ enum CWResume {
         // Older than the window (or no mint timestamp): mint a FRESH link for the SAME file through the SAME
         // provider. On TorBox this is a single requestdl off the stored torrentId+fileId (no re-add); other
         // providers may re-add only when a semantic episode selector proves the target file.
-        if let fresh = try? await DebridCoordinator.shared.reresolveVersioned(
-            service: service, infoHash: infoHash,
-            torrentId: entry.debridTorrentId, fileId: entry.debridFileId, fileIdx: entry.fileIdx,
-            episode: episodeHint, requiresSemanticSelection: isEpisode) {
+        let coordinator = DebridCoordinator.shared
+        if let generation = await coordinator.resolverGeneration(pinning: entryRevision),
+           let fresh = try? await coordinator.reresolveVersioned(
+               service: service,
+               infoHash: infoHash,
+               torrentId: entry.debridTorrentId,
+               fileId: entry.debridFileId,
+               fileIdx: entry.fileIdx,
+               episode: episodeHint,
+               requiresSemanticSelection: isEpisode,
+               generation: generation
+           ) {
             return fresh.map { ($0, true) }
         }
         // Same source is genuinely unavailable (evicted / no key): fall back to the stored link, letting the

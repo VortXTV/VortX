@@ -80,9 +80,9 @@ private final class TorBoxContributorProbe {
             NotificationCenter.default.addObserver(
                 forName: DebridCredentialSnapshotStore.didPublishNotification,
                 object: credentialStore,
-                queue: .main
+                queue: nil
             ) { [weak self] _ in
-                Task { @MainActor [weak self] in
+                MainActor.assumeIsolated {
                     guard let self else { return }
                     _ = self.adopt(self.credentialStore.load().revision)
                 }
@@ -104,22 +104,37 @@ private final class TorBoxContributorProbe {
         }
     }
 
-    func waitForRevision(_ revision: UInt64) async -> Bool {
-        for _ in 0..<20 {
-            if credentialRevision == revision { return true }
-            await Task.yield()
-        }
-        return credentialRevision == revision
-    }
 }
 
 @MainActor
 private final class CacheAwarenessProbe {
+    private let credentialStore: DebridCredentialSnapshotStore
+    private var credentialObserver: DebridCredentialNotificationToken?
     var credentialRevision: UInt64?
     var lastHashes: Set<String> = []
     var lastUsenet: Set<String> = []
     var cachedHashes: Set<String> = []
     var cachedUsenet: Set<String> = []
+
+    init(credentialStore: DebridCredentialSnapshotStore) {
+        self.credentialStore = credentialStore
+        credentialRevision = credentialStore.load().revision
+        credentialObserver = DebridCredentialNotificationToken(
+            NotificationCenter.default.addObserver(
+                forName: DebridCredentialSnapshotStore.didPublishNotification,
+                object: credentialStore,
+                queue: nil
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    _ = self.adopt(
+                        self.credentialStore.load().revision,
+                        store: self.credentialStore
+                    )
+                }
+            }
+        )
+    }
 
     func adopt(_ revision: UInt64, store: DebridCredentialSnapshotStore) -> Bool {
         store.compareAndPublish(revision: revision) {
@@ -137,13 +152,37 @@ private final class MemoryCredentialStorage {
     var values: [String: String] = [:]
     var failWrites: Set<String> = []
     var corruptWrites: Set<String> = []
+    var failWriteCalls: Set<Int> = []
+    var corruptWriteCalls: Set<Int> = []
     var failDeletes: Set<String> = []
+    var failReadCalls: Set<Int> = []
+    private(set) var readCallCount = 0
+    private(set) var writeCallCount = 0
 
-    func read(_ account: String) -> String? { values[account] }
+    func read(_ account: String) -> String? {
+        readCallCount += 1
+        if failReadCalls.remove(readCallCount) != nil { return nil }
+        return values[account]
+    }
+
+    func resetReadSchedule() {
+        readCallCount = 0
+        failReadCalls.removeAll()
+    }
+
+    func resetWriteSchedule() {
+        writeCallCount = 0
+        failWriteCalls.removeAll()
+        corruptWriteCalls.removeAll()
+    }
 
     func write(_ value: String, _ account: String) -> Bool {
-        guard !failWrites.contains(account) else { return false }
-        values[account] = corruptWrites.contains(account) ? "corrupt" : value
+        writeCallCount += 1
+        guard !failWrites.contains(account), failWriteCalls.remove(writeCallCount) == nil else {
+            return false
+        }
+        let corrupt = corruptWrites.contains(account) || corruptWriteCalls.remove(writeCallCount) != nil
+        values[account] = corrupt ? "corrupt" : value
         return true
     }
 
@@ -410,13 +449,12 @@ private func testTorBoxTwoLegAndStateSchedules(_ results: inout Results) async {
         state.visible = ["visible-a"]
     }, "TorBox A pre-send in-flight and visible mutations use the current revision seam")
     results.expect(stateStore.publish(b2), "TorBox B wins after A marks the title in flight")
-    let observedB = await state.waitForRevision(2)
-    results.expect(observedB
+    results.expect(state.credentialRevision == 2
                    && state.inFlightKey == nil && state.inFlightRevision == nil
                    && state.cache.isEmpty && !state.cooldown
                    && state.shownKey == nil && state.publishedContentID == nil
                    && state.visible.isEmpty,
-                   "TorBox B publication clears A visible rows and contributor state without a refresh")
+                   "TorBox B publication synchronously clears A state before publish returns")
 
     let staleCompletionApplied = stateStore.compareAndPublish(revision: 1) {
         state.inFlightKey = nil
@@ -451,16 +489,14 @@ private func testTorBoxTwoLegAndStateSchedules(_ results: inout Results) async {
 
     let removed3 = snapshot(ownerB, 3, [:])
     let removedPublished = stateStore.publish(removed3)
-    let observedRemoval = await state.waitForRevision(3)
-    results.expect(removedPublished && observedRemoval
+    results.expect(removedPublished && state.credentialRevision == 3
                    && state.cache.isEmpty && !state.cooldown && state.visible.isEmpty,
-                   "TorBox key removal clears B cache, cooldown, in-flight, and visible state")
+                   "TorBox key removal synchronously clears B cache, cooldown, in-flight, and visible state")
 
     let readded4 = snapshot(ownerB, 4, [.torBox: "b2"])
     let readdedPublished = stateStore.publish(readded4)
-    let observedReadd = await state.waitForRevision(4)
-    results.expect(readdedPublished && observedReadd,
-                   "TorBox key re-add starts from a clean credential generation")
+    results.expect(readdedPublished && state.credentialRevision == 4,
+                   "TorBox key re-add synchronously starts from a clean credential generation")
     _ = stateStore.compareAndPublish(revision: 4) {
         state.cache[content] = ["readded"]
         state.cooldown = true
@@ -470,11 +506,10 @@ private func testTorBoxTwoLegAndStateSchedules(_ results: inout Results) async {
     }
     let unrelated5 = snapshot(ownerB, 5, [.torBox: "b2", .realDebrid: "changed"])
     let unrelatedPublished = stateStore.publish(unrelated5)
-    let observedUnrelatedChange = await state.waitForRevision(5)
-    results.expect(unrelatedPublished && observedUnrelatedChange
+    results.expect(unrelatedPublished && state.credentialRevision == 5
                    && state.cache.isEmpty && !state.cooldown
                    && state.shownKey == nil && state.publishedContentID == nil && state.visible.isEmpty,
-                   "an unrelated-service credential revision cannot reuse TorBox-derived state")
+                   "an unrelated-service revision synchronously invalidates TorBox-derived state")
 }
 
 @MainActor
@@ -506,11 +541,40 @@ private func testSyncPayloadActualIssuanceFence(_ results: inout Results) {
 }
 
 @MainActor
+private func testNestedRevisionPinSchedules(_ results: inout Results) {
+    func staleChild(_ label: String, results: inout Results) {
+        let a1 = snapshot(ownerA, 1, [.realDebrid: "a", .torBox: "a-tb"])
+        let b2 = snapshot(ownerB, 2, [.realDebrid: "b", .torBox: "b-tb"])
+        let store = DebridCredentialSnapshotStore(initial: a1)
+        let entryRevision = store.load().revision
+        // This is the exact production child-entry seam used by every generation-pinned nested coordinator path.
+        let child = DebridCredentialPinnedChildEntry(revision: entryRevision, store: store)
+        let issued = BoolBox()
+        results.expect(store.publish(b2), "\(label) publishes B before nested child entry")
+        let entry = child.enter()
+        var accepted = false
+        if let token = entry.value {
+            accepted = token.authorizeAndIssue { issued.setTrue() }
+        }
+        results.expect(!issued.current && !accepted && entry.value == nil && entry.revision == entryRevision,
+                       "\(label) seam issues zero providers and returns only A's revision")
+    }
+
+    staleChild("torrent playback", results: &results)
+    staleChild("usenet playback", results: &results)
+    staleChild("singleton cached race", results: &results)
+    staleChild("fanout cached race", results: &results)
+    staleChild("Continue Watching reresolve", results: &results)
+    staleChild("torrent cache-awareness child", results: &results)
+    staleChild("usenet cache-awareness child", results: &results)
+}
+
+@MainActor
 private func testCacheAwarenessRevisionReset(_ results: inout Results) {
     let a1 = snapshot(ownerA, 1, [.torBox: "a"])
     let b2 = snapshot(ownerB, 2, [.torBox: "b"])
     let store = DebridCredentialSnapshotStore(initial: a1)
-    let state = CacheAwarenessProbe()
+    let state = CacheAwarenessProbe(credentialStore: store)
     let hashes: Set<String> = ["same-hash"]
     let urls: Set<String> = ["same-nzb"]
 
@@ -534,10 +598,10 @@ private func testCacheAwarenessRevisionReset(_ results: inout Results) {
                    "B publication emits a post-lock signal whose observer can re-enter snapshot reads")
     NotificationCenter.default.removeObserver(observer)
 
-    results.expect(state.adopt(2, store: store)
+    results.expect(state.credentialRevision == 2
                    && state.lastHashes.isEmpty && state.lastUsenet.isEmpty
                    && state.cachedHashes.isEmpty && state.cachedUsenet.isEmpty,
-                   "B revision clears A torrent/usenet dedupe and visible badge state")
+                   "B revision synchronously clears A cache-awareness state before publish returns")
     var sameInputMayStart = false
     _ = store.compareAndPublish(revision: 2) {
         sameInputMayStart = hashes != state.lastHashes && urls != state.lastUsenet
@@ -554,6 +618,23 @@ private func testCacheAwarenessRevisionReset(_ results: inout Results) {
 }
 
 private func testBootstrapAndEnvelopeCommit(_ results: inout Results) {
+    do {
+        let namespace = ownerA.storageNamespace
+        let envelopeRaw = #"{"format":1,"generation":7,"keys":{"realDebrid":"old"},"ownerNamespace":"\#(namespace)"}"#
+        let markerRaw = #"{"format":1,"generation":7,"ownerNamespace":"\#(namespace)","slot":"a"}"#
+        let envelope = DebridCredentialPersistence.decodeCanonical(
+            DebridCredentialPersistedEnvelope.self, from: envelopeRaw
+        )
+        let marker = DebridCredentialPersistence.decodeCanonical(
+            DebridCredentialCommitMarker.self, from: markerRaw
+        )
+        results.expect(envelope?.recoveryPhase == nil && marker?.recoveryPhase == nil,
+                       "pre-recovery-field canonical v3 artifacts remain readable")
+        results.expect(envelope.flatMap(DebridCredentialPersistence.encodeCanonical) == envelopeRaw
+                       && marker.flatMap(DebridCredentialPersistence.encodeCanonical) == markerRaw,
+                       "pre-recovery-field v3 artifacts preserve their canonical encoding")
+    }
+
     do {
         let storage = MemoryCredentialStorage()
         storage.values[DebridService.realDebrid.keychainAccount(owner: .signedOutDevice)] = "device-rd"
@@ -581,6 +662,227 @@ private func testBootstrapAndEnvelopeCommit(_ results: inout Results) {
                        "exact committed envelope reads back as one generation")
         results.expect(committedKeys(storage, owner: ownerB).isEmpty,
                        "another owner cannot read A's envelope")
+    }
+}
+
+private func testActiveSlotSelectionSurvivesTransientRead(_ results: inout Results) {
+    let storage = MemoryCredentialStorage()
+    let old: [DebridService: String] = [.realDebrid: "old"]
+    let fresh: [DebridService: String] = [.realDebrid: "fresh", .torBox: "fresh-tb"]
+    results.expect(commit(storage, owner: ownerA, keys: old).succeeded,
+                   "active-slot transient fixture commits generation one in slot A")
+    let accounts = DebridCredentialStorageAccounts(owner: ownerA)
+    let activeEnvelope = storage.values[accounts.envelopeA]
+    let activeMarker = storage.values[accounts.markerA]
+
+    storage.resetReadSchedule()
+    // The first load consumes two guard reads plus two marker/envelope pairs. Read seven is where the removed
+    // rediscovery would have re-read active marker A; the corrected path reads only inactive marker B there.
+    storage.failReadCalls = [7]
+    results.expect(commit(storage, owner: ownerA, keys: fresh).succeeded,
+                   "one-shot failure at the removed slot-rediscovery schedule cannot redirect the write")
+    results.expect(storage.values[accounts.envelopeA] == activeEnvelope
+                   && storage.values[accounts.markerA] == activeMarker,
+                   "the retained winning slot prevents active envelope or marker overwrite")
+    storage.values.removeValue(forKey: accounts.markerB)
+    storage.values.removeValue(forKey: accounts.envelopeB)
+    results.expect(committedKeys(storage, owner: ownerA) == old,
+                   "prior committed keys survive loss of the newly written inactive slot")
+}
+
+private enum FirstV3MarkerFailure: CaseIterable {
+    case writeRejected
+    case corruptReadback
+
+    var label: String {
+        switch self {
+        case .writeRejected: return "rejected marker write"
+        case .corruptReadback: return "partial or corrupt marker readback"
+        }
+    }
+}
+
+private func testFirstV3MarkerFailureRecovery(_ results: inout Results) {
+    let authoritative: [DebridService: String] = [.realDebrid: "fresh", .torBox: "fresh-tb"]
+    let legacyAccount = DebridService.realDebrid.keychainAccount(owner: ownerA)
+    let accounts = DebridCredentialStorageAccounts(owner: ownerA)
+
+    for failure in FirstV3MarkerFailure.allCases {
+        let storage = MemoryCredentialStorage()
+        storage.values[legacyAccount] = "legacy-must-not-revive"
+        switch failure {
+        case .writeRejected:
+            storage.failWrites.insert(accounts.markerA)
+        case .corruptReadback:
+            storage.corruptWrites.insert(accounts.markerA)
+        }
+
+        results.expect(!commit(storage, owner: ownerA, keys: authoritative).succeeded,
+                       "literal first-v3 \(failure.label) is surfaced")
+        if case .quarantined = DebridCredentialPersistence.load(owner: ownerA, read: storage.read) {
+            results.expect(true, "literal first-v3 \(failure.label) relaunch is quarantined")
+        } else {
+            results.expect(false, "literal first-v3 \(failure.label) relaunch is quarantined")
+        }
+        results.expect(DebridCredentialPersistence.loadKeys(owner: ownerA, read: storage.read).isEmpty,
+                       "literal first-v3 \(failure.label) cannot revive the legacy key")
+        results.expect(!commit(storage, owner: ownerA, keys: [:]).succeeded,
+                       "literal first-v3 \(failure.label) rejects an authority-free empty repair")
+
+        storage.failWrites.removeAll()
+        storage.corruptWrites.removeAll()
+        results.expect(commit(storage, owner: ownerA, keys: authoritative).succeeded,
+                       "authoritative retry repairs literal first-v3 \(failure.label)")
+        results.expect(committedKeys(storage, owner: ownerA) == authoritative,
+                       "repaired literal first-v3 \(failure.label) exposes only fresh keys")
+    }
+}
+
+private enum RecoveryFailurePosition: CaseIterable {
+    case afterGuard
+    case afterTargetMarkerDelete
+    case afterFreshEnvelopeWrite
+    case afterFreshMarkerWrite
+    case atStaleMarkerDelete
+    case atStaleEnvelopeDelete
+    case beforeGuardDelete
+    case atFinalMarkerWrite
+    case atFinalMarkerReadback
+
+    var label: String {
+        switch self {
+        case .afterGuard: return "after guard"
+        case .afterTargetMarkerDelete: return "after target marker delete"
+        case .afterFreshEnvelopeWrite: return "after fresh envelope write"
+        case .afterFreshMarkerWrite: return "after fresh marker write"
+        case .atStaleMarkerDelete: return "at stale marker delete"
+        case .atStaleEnvelopeDelete: return "at stale envelope delete"
+        case .beforeGuardDelete: return "before guard delete"
+        case .atFinalMarkerWrite: return "at final marker write"
+        case .atFinalMarkerReadback: return "at final marker readback"
+        }
+    }
+}
+
+private func quarantinedRecoveryStorage() -> MemoryCredentialStorage {
+    let storage = MemoryCredentialStorage()
+    let accounts = DebridCredentialStorageAccounts(owner: ownerA)
+    storage.values[accounts.markerA] = "corrupt-a"
+    storage.values[accounts.envelopeA] = "partial-a"
+    storage.values[accounts.markerB] = "corrupt-b"
+    storage.values[accounts.envelopeB] = "partial-b"
+    storage.values[DebridService.realDebrid.keychainAccount(owner: ownerA)] = "legacy-must-not-revive"
+    return storage
+}
+
+private func testQuarantinedFreshRecovery(_ results: inout Results) {
+    let authoritative: [DebridService: String] = [.realDebrid: "fresh", .torBox: "fresh-tb"]
+    let accounts = DebridCredentialStorageAccounts(owner: ownerA)
+
+    for position in RecoveryFailurePosition.allCases {
+        let storage = quarantinedRecoveryStorage()
+        switch position {
+        case .afterGuard:
+            storage.failDeletes.insert(accounts.markerA)
+        case .afterTargetMarkerDelete:
+            storage.failWrites.insert(accounts.envelopeA)
+        case .afterFreshEnvelopeWrite:
+            storage.corruptWrites.insert(accounts.envelopeA)
+        case .afterFreshMarkerWrite:
+            storage.corruptWrites.insert(accounts.markerA)
+        case .atStaleMarkerDelete:
+            storage.failDeletes.insert(accounts.markerB)
+        case .atStaleEnvelopeDelete:
+            storage.failDeletes.insert(accounts.envelopeB)
+        case .beforeGuardDelete:
+            storage.failDeletes.insert(accounts.recoveryGuard)
+        case .atFinalMarkerWrite:
+            storage.failWriteCalls = [5]
+        case .atFinalMarkerReadback:
+            storage.corruptWriteCalls = [5]
+        }
+
+        let first = commit(storage, owner: ownerA, keys: authoritative)
+        results.expect(!first.succeeded, "recovery \(position.label) failure is surfaced")
+        storage.resetReadSchedule()
+        storage.failReadCalls = [1]
+        if case .quarantined = DebridCredentialPersistence.load(owner: ownerA, read: storage.read) {
+            results.expect(true, "relaunch \(position.label) survives first guard-read miss")
+        } else {
+            results.expect(false, "relaunch \(position.label) survives first guard-read miss")
+        }
+        storage.resetReadSchedule()
+        storage.failReadCalls = [2]
+        results.expect(DebridCredentialPersistence.loadKeys(owner: ownerA, read: storage.read).isEmpty,
+                       "relaunch \(position.label) second guard-read miss exposes no credentials or fallback")
+
+        storage.failWrites.removeAll()
+        storage.corruptWrites.removeAll()
+        storage.failWriteCalls.removeAll()
+        storage.corruptWriteCalls.removeAll()
+        storage.failDeletes.removeAll()
+        results.expect(commit(storage, owner: ownerA, keys: authoritative).succeeded,
+                       "authoritative retry repairs \(position.label) interruption")
+        results.expect(committedKeys(storage, owner: ownerA) == authoritative,
+                       "repaired \(position.label) exposes exactly the fresh candidate")
+        results.expect(storage.values[accounts.recoveryGuard] == nil,
+                       "repaired \(position.label) clears the durable recovery guard")
+    }
+
+    do {
+        let storage = preparedTwoGenerationStorage()
+        let staged = DebridCredentialPersistedEnvelope(
+            generation: 1,
+            owner: ownerA,
+            keys: authoritative,
+            recoveryPhase: .staging
+        )
+        let stagedMarker = DebridCredentialCommitMarker(
+            generation: 1,
+            owner: ownerA,
+            slot: .a,
+            recoveryPhase: .staging
+        )
+        storage.values[accounts.envelopeA] = DebridCredentialPersistence.encodeCanonical(staged)!
+        storage.values[accounts.markerA] = DebridCredentialPersistence.encodeCanonical(stagedMarker)!
+        storage.values[accounts.recoveryGuard] = DebridCredentialPersistence.encodeCanonical(
+            DebridCredentialRecoveryGuard(owner: ownerA)
+        )!
+        storage.resetReadSchedule()
+        storage.failReadCalls = [1, 2]
+        if case .quarantined = DebridCredentialPersistence.load(owner: ownerA, read: storage.read) {
+            results.expect(true,
+                           "staged pair quarantines when both guard reads miss beside an older valid candidate")
+        } else {
+            results.expect(false,
+                           "staged pair quarantines when both guard reads miss beside an older valid candidate")
+        }
+        storage.resetReadSchedule()
+        storage.failReadCalls = [1, 2]
+        results.expect(DebridCredentialPersistence.loadKeys(owner: ownerA, read: storage.read).isEmpty,
+                       "staged recovery never exposes fresh, old, or legacy credentials before cleanup")
+    }
+
+    do {
+        let storage = MemoryCredentialStorage()
+        results.expect(commit(storage, owner: ownerA, keys: authoritative).succeeded,
+                       "leftover-guard fixture has one fully valid fresh candidate")
+        storage.values[accounts.recoveryGuard] = DebridCredentialPersistence.encodeCanonical(
+            DebridCredentialRecoveryGuard(owner: ownerA)
+        )!
+        storage.resetReadSchedule()
+        storage.failReadCalls = [1]
+        if case .quarantined = DebridCredentialPersistence.load(owner: ownerA, read: storage.read) {
+            results.expect(true,
+                           "valid fresh candidate plus leftover guard stays closed on first guard-read miss")
+        } else {
+            results.expect(false,
+                           "valid fresh candidate plus leftover guard stays closed on first guard-read miss")
+        }
+        storage.resetReadSchedule()
+        storage.failReadCalls = [2]
+        results.expect(DebridCredentialPersistence.loadKeys(owner: ownerA, read: storage.read).isEmpty,
+                       "valid fresh candidate plus leftover guard stays closed on second guard-read miss")
     }
 }
 
@@ -872,8 +1174,12 @@ private enum DebridCredentialOrderingTestRunner {
         testRequestAndPublicationFences(&results)
         await testTorBoxTwoLegAndStateSchedules(&results)
         testSyncPayloadActualIssuanceFence(&results)
+        testNestedRevisionPinSchedules(&results)
         testCacheAwarenessRevisionReset(&results)
         testBootstrapAndEnvelopeCommit(&results)
+        testActiveSlotSelectionSurvivesTransientRead(&results)
+        testFirstV3MarkerFailureRecovery(&results)
+        testQuarantinedFreshRecovery(&results)
         testRemoteFailurePositions(&results)
         testCrashRecovery(&results)
         testLocalDurableMutation(&results)

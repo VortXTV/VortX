@@ -1109,6 +1109,14 @@ enum DebridHTTP {
 
 // MARK: - Coordinator
 
+/// One immutable resolver set built from exactly one credential envelope. High-level operations pass this value
+/// through every nested child call so actor re-entry can never swap A-derived input onto B's resolver objects.
+struct DebridResolverGeneration: Sendable {
+    let revision: UInt64
+    fileprivate let resolvers: [DebridService: any DebridResolving]
+    fileprivate let torboxUsenet: TorBoxUsenetResolver?
+}
+
 /// Builds resolvers from the user's stored keys and drives cache-check + playback resolution. TorBox is
 /// wired now; Real-Debrid (add-then-poll, no instant cache-check), AllDebrid, and Premiumize slot in as
 /// further `DebridResolving` conformers. Owned by the stream/play layer.
@@ -1171,15 +1179,50 @@ actor DebridCoordinator {
         return appliedSnapshot ?? current
     }
 
+    private func ensureCurrentGeneration() -> DebridResolverGeneration {
+        let snapshot = ensureCurrentSnapshot()
+        return DebridResolverGeneration(
+            revision: snapshot.revision,
+            resolvers: resolvers,
+            torboxUsenet: torboxUsenet
+        )
+    }
+
+    /// Capture the resolver generation for a revision already owned by an outer operation. It never reloads a
+    /// newer snapshot to satisfy old input. If actor state or durable state has advanced, the caller fails soft.
+    func resolverGeneration(pinning revision: UInt64) -> DebridResolverGeneration? {
+        if appliedSnapshot?.revision != revision {
+            let current = credentialStore.load()
+            guard current.revision == revision else { return nil }
+            _ = reload(snapshot: current)
+        }
+        guard appliedSnapshot?.revision == revision else { return nil }
+        return DebridResolverGeneration(
+            revision: revision,
+            resolvers: resolvers,
+            torboxUsenet: torboxUsenet
+        )
+    }
+
     /// One load-bearing wrapper for every provider await. The first guard is the credential-use boundary;
     /// the second prevents an old owner or key result from leaving the coordinator after a revision change.
     private func withCurrentCredential<T: Sendable>(
         revision: UInt64,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
-        guard credentialStore.isCurrent(revision: revision) else { throw DebridError.credentialsChanged }
+        try await withCurrentCredential(
+            token: DebridCredentialRevisionToken(revision: revision, store: credentialStore),
+            operation: operation
+        )
+    }
+
+    private func withCurrentCredential<T: Sendable>(
+        token: DebridCredentialRevisionToken,
+        operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        guard token.isCurrent() else { throw DebridError.credentialsChanged }
         let result = try await operation()
-        guard credentialStore.resultIsCurrent(revision: revision) else { throw DebridError.credentialsChanged }
+        guard token.resultIsCurrent() else { throw DebridError.credentialsChanged }
         return result
     }
 
@@ -1203,16 +1246,38 @@ actor DebridCoordinator {
 
     func cacheCheckVersioned(hashes: [String]) async
         -> DebridVersionedResult<[String: (service: DebridService, files: [DebridFile])]> {
-        let revision = ensureCurrentSnapshot().revision
-        guard !resolvers.isEmpty, !hashes.isEmpty else {
+        await cacheCheckVersioned(hashes: hashes, generation: ensureCurrentGeneration())
+    }
+
+    func cacheCheckVersioned(hashes: [String], pinning revision: UInt64) async
+        -> DebridVersionedResult<[String: (service: DebridService, files: [DebridFile])]> {
+        guard let generation = resolverGeneration(pinning: revision) else {
             return DebridVersionedResult(value: [:], revision: revision)
+        }
+        return await cacheCheckVersioned(hashes: hashes, generation: generation)
+    }
+
+    private func cacheCheckVersioned(
+        hashes: [String],
+        generation: DebridResolverGeneration
+    ) async -> DebridVersionedResult<[String: (service: DebridService, files: [DebridFile])]> {
+        let revision = generation.revision
+        guard !generation.resolvers.isEmpty, !hashes.isEmpty else {
+            return DebridVersionedResult(value: [:], revision: revision)
+        }
+        let childEntry = DebridCredentialPinnedChildEntry(
+            revision: revision,
+            store: credentialStore
+        ).enter()
+        guard let credentialToken = childEntry.value else {
+            return DebridVersionedResult(value: [:], revision: childEntry.revision)
         }
         let maps: [DebridService: [String: [DebridFile]]] = await withTaskGroup(
             of: (DebridService, [String: [DebridFile]]).self
         ) { group in
-            for (service, resolver) in resolvers {
+            for (service, resolver) in generation.resolvers {
                 group.addTask {
-                    let result = try? await self.withCurrentCredential(revision: revision) {
+                    let result = try? await self.withCurrentCredential(token: credentialToken) {
                         try await resolver.checkCache(hashes: hashes)
                     }
                     return (service, result ?? [:])
@@ -1229,7 +1294,7 @@ actor DebridCoordinator {
                 out[hash] = (service, files)
             }
         }
-        guard credentialStore.resultIsCurrent(revision: revision) else {
+        guard credentialToken.resultIsCurrent() else {
             return DebridVersionedResult(value: [:], revision: revision)
         }
         return DebridVersionedResult(value: out, revision: revision)
@@ -1270,9 +1335,34 @@ actor DebridCoordinator {
         -> DebridVersionedResult<(
             result: (url: URL, torrentId: Int?, fileId: Int?), service: DebridService
         )> {
-        let revision = ensureCurrentSnapshot().revision
-        guard let resolver = pick(service) else { throw DebridError.noKey }
-        let r = try await withCurrentCredential(revision: revision) {
+        try await resolveWithIdsVersioned(
+            service: service,
+            infoHash: infoHash,
+            magnet: magnet,
+            fileIdx: fileIdx,
+            episode: episode,
+            generation: ensureCurrentGeneration()
+        )
+    }
+
+    private func resolveWithIdsVersioned(
+        service: DebridService? = nil,
+        infoHash: String,
+        magnet: String,
+        fileIdx: Int?,
+        episode: DebridEpisode?,
+        generation: DebridResolverGeneration
+    ) async throws -> DebridVersionedResult<(
+        result: (url: URL, torrentId: Int?, fileId: Int?), service: DebridService
+    )> {
+        let revision = generation.revision
+        guard let resolver = pick(service, from: generation) else { throw DebridError.noKey }
+        let childEntry = DebridCredentialPinnedChildEntry(
+            revision: revision,
+            store: credentialStore
+        ).enter()
+        guard let credentialToken = childEntry.value else { throw DebridError.credentialsChanged }
+        let r = try await withCurrentCredential(token: credentialToken) {
             try await resolver.resolveWithIds(
                 infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode
             )
@@ -1302,9 +1392,36 @@ actor DebridCoordinator {
         episode: DebridEpisode? = nil,
         requiresSemanticSelection: Bool
     ) async throws -> DebridVersionedResult<URL> {
-        let revision = ensureCurrentSnapshot().revision
-        guard let resolver = resolvers[service] else { throw DebridError.noKey }
-        let url = try await withCurrentCredential(revision: revision) {
+        try await reresolveVersioned(
+            service: service,
+            infoHash: infoHash,
+            torrentId: torrentId,
+            fileId: fileId,
+            fileIdx: fileIdx,
+            episode: episode,
+            requiresSemanticSelection: requiresSemanticSelection,
+            generation: ensureCurrentGeneration()
+        )
+    }
+
+    func reresolveVersioned(
+        service: DebridService,
+        infoHash: String,
+        torrentId: Int?,
+        fileId: Int?,
+        fileIdx: Int?,
+        episode: DebridEpisode? = nil,
+        requiresSemanticSelection: Bool,
+        generation: DebridResolverGeneration
+    ) async throws -> DebridVersionedResult<URL> {
+        let revision = generation.revision
+        guard let resolver = generation.resolvers[service] else { throw DebridError.noKey }
+        let childEntry = DebridCredentialPinnedChildEntry(
+            revision: revision,
+            store: credentialStore
+        ).enter()
+        guard let credentialToken = childEntry.value else { throw DebridError.credentialsChanged }
+        let url = try await withCurrentCredential(token: credentialToken) {
             try await resolver.reresolveLink(
                 infoHash: infoHash, torrentId: torrentId, fileId: fileId, fileIdx: fileIdx,
                 episode: episode, requiresSemanticSelection: requiresSemanticSelection
@@ -1316,6 +1433,14 @@ actor DebridCoordinator {
     private func pick(_ service: DebridService?) -> (any DebridResolving)? {
         if let service { return resolvers[service] }
         return resolvers.values.first
+    }
+
+    private func pick(
+        _ service: DebridService?,
+        from generation: DebridResolverGeneration
+    ) -> (any DebridResolving)? {
+        if let service { return generation.resolvers[service] }
+        return generation.resolvers.values.first
     }
 
     // MARK: Usenet (TorBox-only)
@@ -1337,9 +1462,32 @@ actor DebridCoordinator {
         fileIdx: Int?,
         episode: DebridEpisode?
     ) async throws -> DebridVersionedResult<URL> {
-        let revision = ensureCurrentSnapshot().revision
-        guard let usenet = torboxUsenet else { throw DebridError.noKey }
-        let url = try await withCurrentCredential(revision: revision) {
+        try await resolveUsenetVersioned(
+            nzbUrl: nzbUrl,
+            knownHash: knownHash,
+            fileMustInclude: fileMustInclude,
+            fileIdx: fileIdx,
+            episode: episode,
+            generation: ensureCurrentGeneration()
+        )
+    }
+
+    private func resolveUsenetVersioned(
+        nzbUrl: String,
+        knownHash: String? = nil,
+        fileMustInclude: String?,
+        fileIdx: Int?,
+        episode: DebridEpisode?,
+        generation: DebridResolverGeneration
+    ) async throws -> DebridVersionedResult<URL> {
+        let revision = generation.revision
+        guard let usenet = generation.torboxUsenet else { throw DebridError.noKey }
+        let childEntry = DebridCredentialPinnedChildEntry(
+            revision: revision,
+            store: credentialStore
+        ).enter()
+        guard let credentialToken = childEntry.value else { throw DebridError.credentialsChanged }
+        let url = try await withCurrentCredential(token: credentialToken) {
             try await usenet.resolve(
                 nzbUrl: nzbUrl, knownHash: knownHash, fileMustInclude: fileMustInclude,
                 fileIdx: fileIdx, episode: episode
@@ -1356,11 +1504,33 @@ actor DebridCoordinator {
     }
 
     func usenetCacheCheckVersioned(nzbMD5s: [String]) async -> DebridVersionedResult<Set<String>> {
-        let revision = ensureCurrentSnapshot().revision
-        guard let usenet = torboxUsenet, !nzbMD5s.isEmpty else {
+        await usenetCacheCheckVersioned(nzbMD5s: nzbMD5s, generation: ensureCurrentGeneration())
+    }
+
+    func usenetCacheCheckVersioned(nzbMD5s: [String], pinning revision: UInt64) async
+        -> DebridVersionedResult<Set<String>> {
+        guard let generation = resolverGeneration(pinning: revision) else {
             return DebridVersionedResult(value: [], revision: revision)
         }
-        let map = (try? await withCurrentCredential(revision: revision) {
+        return await usenetCacheCheckVersioned(nzbMD5s: nzbMD5s, generation: generation)
+    }
+
+    private func usenetCacheCheckVersioned(
+        nzbMD5s: [String],
+        generation: DebridResolverGeneration
+    ) async -> DebridVersionedResult<Set<String>> {
+        let revision = generation.revision
+        guard let usenet = generation.torboxUsenet, !nzbMD5s.isEmpty else {
+            return DebridVersionedResult(value: [], revision: revision)
+        }
+        let childEntry = DebridCredentialPinnedChildEntry(
+            revision: revision,
+            store: credentialStore
+        ).enter()
+        guard let credentialToken = childEntry.value else {
+            return DebridVersionedResult(value: [], revision: childEntry.revision)
+        }
+        let map = (try? await withCurrentCredential(token: credentialToken) {
             try await usenet.checkCache(hashes: nzbMD5s)
         }) ?? [:]
         return DebridVersionedResult(
@@ -1459,7 +1629,23 @@ extension DebridCoordinator {
         confirmedCachedHashes: Set<String>? = nil,
         confirmedUsenetURLs: Set<String>? = nil
     ) async -> DebridVersionedResult<DebridPlaybackRef?> {
-        let entryRevision = ensureCurrentSnapshot().revision
+        await resolvedPlaybackRefVersioned(
+            for: stream,
+            episode: episode,
+            confirmedCachedHashes: confirmedCachedHashes,
+            confirmedUsenetURLs: confirmedUsenetURLs,
+            generation: ensureCurrentGeneration()
+        )
+    }
+
+    private func resolvedPlaybackRefVersioned(
+        for stream: CoreStream,
+        episode: DebridEpisode?,
+        confirmedCachedHashes: Set<String>?,
+        confirmedUsenetURLs: Set<String>?,
+        generation: DebridResolverGeneration
+    ) async -> DebridVersionedResult<DebridPlaybackRef?> {
+        let entryRevision = generation.revision
         func noResult() -> DebridVersionedResult<DebridPlaybackRef?> {
             DebridVersionedResult(value: nil, revision: entryRevision)
         }
@@ -1475,7 +1661,7 @@ extension DebridCoordinator {
         // exactly as today (no playable link). NOT a torrent: the minted URL is a plain direct stream (no
         // infoHash carried).
         if stream.url == nil, let nzb = stream.nzbUrl, !nzb.isEmpty {
-            guard torboxUsenet != nil else { return noResult() }
+            guard generation.torboxUsenet != nil else { return noResult() }
             // CACHE-GATE (instant first-play): when the caller passed a confirmed-cached set, a not-confirmed
             // usenet row returns nil here with ZERO network (no add-then-poll), so a tap falls straight through
             // to today's embedded path instead of burning the resolve budget. nil set = pre-gate behaviour.
@@ -1492,7 +1678,7 @@ extension DebridCoordinator {
                     do {
                         let result = try await DebridCoordinator.shared.resolveUsenetVersioned(
                             nzbUrl: nzb, knownHash: knownHash, fileMustInclude: mustInclude,
-                            fileIdx: fileIdx, episode: selectionEpisode
+                            fileIdx: fileIdx, episode: selectionEpisode, generation: generation
                         )
                         return result.map { url -> DebridPlaybackRef? in
                             // Usenet is a plain direct link: no infoHash / torrentId to carry.
@@ -1519,7 +1705,7 @@ extension DebridCoordinator {
         }
         // No-key fast path: no network, zero behaviour change (only the at-most-once lazy warm hop). This is
         // the byte-identical guarantee.
-        guard !resolvers.isEmpty else {
+        guard !generation.resolvers.isEmpty else {
             DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) NO-KEY (no resolver configured) -> nil, embedded path")
             return noResult()
         }
@@ -1553,7 +1739,7 @@ extension DebridCoordinator {
                 do {
                     let result = try await DebridCoordinator.shared.resolveWithIdsVersioned(
                         infoHash: hash, magnet: magnet, fileIdx: fileIdx,
-                        episode: selectionEpisode
+                        episode: selectionEpisode, generation: generation
                     )
                     return result.map { resolved -> DebridPlaybackRef? in
                         DebridPlaybackRef(
@@ -1647,7 +1833,8 @@ extension DebridCoordinator {
         labeledBest: CoreStream? = nil,
         max: Int = 4
     ) async -> DebridVersionedResult<(ref: DebridPlaybackRef, stream: CoreStream)?> {
-        let entryRevision = ensureCurrentSnapshot().revision
+        let generation = ensureCurrentGeneration()
+        let entryRevision = generation.revision
         func noResult() -> DebridVersionedResult<(ref: DebridPlaybackRef, stream: CoreStream)?> {
             DebridVersionedResult(value: nil, revision: entryRevision)
         }
@@ -1655,8 +1842,8 @@ extension DebridCoordinator {
         // before any provider contact (only the at-most-once lazy warm hop), so the caller's fallback runs
         // its unchanged path. Evaluate both awaited flags first: `await` cannot live in `||`'s autoclosure,
         // and both are cheap (idempotent warm), so eager evaluation is fine.
-        let hasTorrentResolver = !resolvers.isEmpty
-        let hasUsenet = torboxUsenet != nil
+        let hasTorrentResolver = !generation.resolvers.isEmpty
+        let hasUsenet = generation.torboxUsenet != nil
         guard hasTorrentResolver || hasUsenet else { return noResult() }
         guard !cachedHashes.isEmpty || !cachedUsenetURLs.isEmpty else { return noResult() }
 
@@ -1712,7 +1899,8 @@ extension DebridCoordinator {
                 for: racing[0],
                 episode: episode,
                 confirmedCachedHashes: cachedHashes,
-                confirmedUsenetURLs: cachedUsenetURLs
+                confirmedUsenetURLs: cachedUsenetURLs,
+                generation: generation
             )
             return result.map { ref in ref.map { ($0, racing[0]) } }
         }
@@ -1729,7 +1917,8 @@ extension DebridCoordinator {
                         for: stream,
                         episode: episode,
                         confirmedCachedHashes: cachedHashes,
-                        confirmedUsenetURLs: cachedUsenetURLs
+                        confirmedUsenetURLs: cachedUsenetURLs,
+                        generation: generation
                     )
                     return result.map { ref in ref.map { ($0, stream) } }
                 }
@@ -1789,9 +1978,11 @@ final class DebridCacheAwareness: ObservableObject {
             NotificationCenter.default.addObserver(
                 forName: DebridCredentialSnapshotStore.didPublishNotification,
                 object: credentialStore,
-                queue: .main
+                queue: nil
             ) { [weak self] _ in
-                Task { @MainActor [weak self] in self?.adoptCurrentCredentialRevision() }
+                // Snapshot publication is MainActor-isolated and NotificationCenter delivers a nil-queue
+                // observer synchronously on the posting executor. Keep invalidation inside publish(B)'s call.
+                MainActor.assumeIsolated { self?.adoptCurrentCredentialRevision() }
             }
         )
     }
@@ -1836,7 +2027,10 @@ final class DebridCacheAwareness: ObservableObject {
             guard hashes != self.lastQueried else { return }
             self.task?.cancel()
             self.task = Task { [weak self] in
-                let result = await DebridCoordinator.shared.cacheCheckVersioned(hashes: Array(hashes))
+                let result = await DebridCoordinator.shared.cacheCheckVersioned(
+                    hashes: Array(hashes),
+                    pinning: snapshot.revision
+                )
                 guard !Task.isCancelled, let self else { return }
                 _ = self.credentialStore.compareAndPublish(revision: result.revision) {
                     // Commit the queried set ONLY after a real current result, so a failed/cancelled/stale check
@@ -1869,7 +2063,8 @@ final class DebridCacheAwareness: ObservableObject {
             self.usenetTask?.cancel()
             self.usenetTask = Task { [weak self] in
                 let cachedMD5s = await DebridCoordinator.shared.usenetCacheCheckVersioned(
-                    nzbMD5s: Array(byMD5.keys)
+                    nzbMD5s: Array(byMD5.keys),
+                    pinning: revision
                 )
                 guard !Task.isCancelled, let self else { return }
                 _ = self.credentialStore.compareAndPublish(revision: cachedMD5s.revision) {

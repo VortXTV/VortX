@@ -247,6 +247,14 @@ struct DebridCredentialRevisionToken: Sendable {
     func authorizeAndIssue(_ issue: () -> Void) -> Bool {
         store.authorizeAndIssue(revision: revision, issue: issue)
     }
+
+    func isCurrent() -> Bool {
+        store.isCurrent(revision: revision)
+    }
+
+    func resultIsCurrent() -> Bool {
+        store.resultIsCurrent(revision: revision)
+    }
 }
 
 /// Result shape required by the out-of-lease caller conversion. The value remains unusable for publication until
@@ -257,6 +265,26 @@ struct DebridVersionedResult<Value: Sendable>: Sendable {
 
     func map<Output: Sendable>(_ transform: (Value) -> Output) -> DebridVersionedResult<Output> {
         DebridVersionedResult<Output>(value: transform(value), revision: revision)
+    }
+}
+
+/// The single child-entry seam for work derived from an outer credential generation. The returned token is the
+/// same revision capability consumed by the coordinator fence and by every resolver's actual issuance fence.
+struct DebridCredentialPinnedChildEntry: Sendable {
+    let revision: UInt64
+    private let store: DebridCredentialSnapshotStore
+
+    init(revision: UInt64, store: DebridCredentialSnapshotStore) {
+        self.revision = revision
+        self.store = store
+    }
+
+    func enter() -> DebridVersionedResult<DebridCredentialRevisionToken?> {
+        let token = DebridCredentialRevisionToken(revision: revision, store: store)
+        return DebridVersionedResult(
+            value: token.isCurrent() ? token : nil,
+            revision: revision
+        )
     }
 }
 
@@ -273,7 +301,7 @@ struct DebridCredentialRevisionFence {
 
 // MARK: - Durable versioned envelope
 
-enum DebridCredentialEnvelopeSlot: String, CaseIterable, Codable, Sendable {
+enum DebridCredentialEnvelopeSlot: String, CaseIterable, Codable, Hashable, Sendable {
     case a, b
 
     var other: DebridCredentialEnvelopeSlot { self == .a ? .b : .a }
@@ -284,6 +312,7 @@ struct DebridCredentialStorageAccounts: Equatable, Sendable {
     let envelopeB: String
     let markerA: String
     let markerB: String
+    let recoveryGuard: String
 
     init(owner: DebridOwnerScope) {
         let base = "vortx.debrid.v3.envelope." + owner.storageNamespace
@@ -291,6 +320,7 @@ struct DebridCredentialStorageAccounts: Equatable, Sendable {
         envelopeB = base + ".slot.b"
         markerA = base + ".commit.a"
         markerB = base + ".commit.b"
+        recoveryGuard = base + ".recovery"
     }
 
     func envelope(_ slot: DebridCredentialEnvelopeSlot) -> String {
@@ -309,11 +339,18 @@ struct DebridCredentialPersistedEnvelope: Codable, Equatable, Sendable {
     let generation: UInt64
     let ownerNamespace: String
     let keys: [String: String]
+    let recoveryPhase: DebridCredentialRecoveryPhase?
 
-    init(generation: UInt64, owner: DebridOwnerScope, keys: [DebridService: String]) {
+    init(
+        generation: UInt64,
+        owner: DebridOwnerScope,
+        keys: [DebridService: String],
+        recoveryPhase: DebridCredentialRecoveryPhase? = nil
+    ) {
         format = Self.currentFormat
         self.generation = generation
         ownerNamespace = owner.storageNamespace
+        self.recoveryPhase = recoveryPhase
         self.keys = Dictionary(uniqueKeysWithValues: DebridCredentialMutableState.normalized(keys).map {
             ($0.key.rawValue, $0.value)
         })
@@ -340,12 +377,37 @@ struct DebridCredentialCommitMarker: Codable, Equatable, Sendable {
     let generation: UInt64
     let ownerNamespace: String
     let slot: DebridCredentialEnvelopeSlot
+    let recoveryPhase: DebridCredentialRecoveryPhase?
 
-    init(generation: UInt64, owner: DebridOwnerScope, slot: DebridCredentialEnvelopeSlot) {
+    init(
+        generation: UInt64,
+        owner: DebridOwnerScope,
+        slot: DebridCredentialEnvelopeSlot,
+        recoveryPhase: DebridCredentialRecoveryPhase? = nil
+    ) {
         format = Self.currentFormat
         self.generation = generation
         ownerNamespace = owner.storageNamespace
         self.slot = slot
+        self.recoveryPhase = recoveryPhase
+    }
+}
+
+enum DebridCredentialRecoveryPhase: String, Codable, Equatable, Sendable {
+    case staging
+}
+
+/// A non-secret durable barrier used only while replacing a quarantined first-generation write. Its presence
+/// keeps every load fail-closed, including after a crash between stale-marker deletion and fresh publication.
+struct DebridCredentialRecoveryGuard: Codable, Equatable, Sendable {
+    static let currentFormat = 1
+
+    let format: Int
+    let ownerNamespace: String
+
+    init(owner: DebridOwnerScope) {
+        format = Self.currentFormat
+        ownerNamespace = owner.storageNamespace
     }
 }
 
@@ -355,14 +417,28 @@ struct DebridCredentialStorageIO {
     let delete: (String) -> Bool
 }
 
+struct DebridCredentialCommittedSelection: Equatable, Sendable {
+    let slot: DebridCredentialEnvelopeSlot
+    let envelope: DebridCredentialPersistedEnvelope
+}
+
+struct DebridCredentialQuarantine: Equatable, Sendable {
+    let artifactSlots: Set<DebridCredentialEnvelopeSlot>
+    let hasRecoveryGuard: Bool
+}
+
 enum DebridCredentialEnvelopeLoad: Equatable {
     case none
-    case committed(DebridCredentialPersistedEnvelope)
-    case quarantined
+    case committed(DebridCredentialCommittedSelection)
+    case quarantined(DebridCredentialQuarantine)
+
+    var selection: DebridCredentialCommittedSelection? {
+        if case .committed(let selection) = self { return selection }
+        return nil
+    }
 
     var envelope: DebridCredentialPersistedEnvelope? {
-        if case .committed(let envelope) = self { return envelope }
-        return nil
+        selection?.envelope
     }
 }
 
@@ -375,6 +451,10 @@ enum DebridCredentialCommitFailure: Equatable {
     case markerWriteFailed
     case markerReadbackMismatch
     case commitValidationFailed
+    case recoveryGuardWriteFailed
+    case recoveryGuardReadbackMismatch
+    case recoveryArtifactDeleteFailed
+    case recoveryGuardDeleteFailed
 }
 
 enum DebridCredentialCommitResult: Equatable {
@@ -396,28 +476,68 @@ enum DebridCredentialPersistence {
         let envelope: DebridCredentialPersistedEnvelope
     }
 
+    private struct SlotObservation {
+        let slot: DebridCredentialEnvelopeSlot
+        let markerRaw: String?
+        let envelopeRaw: String?
+        let candidate: Candidate?
+        let hasRecoveryStaging: Bool
+
+        var hasArtifact: Bool { markerRaw != nil || envelopeRaw != nil }
+    }
+
     static func load(owner: DebridOwnerScope, read: (String) -> String?)
         -> DebridCredentialEnvelopeLoad {
         let accounts = DebridCredentialStorageAccounts(owner: owner)
-        let candidates = DebridCredentialEnvelopeSlot.allCases.compactMap { slot in
-            candidate(owner: owner, slot: slot, accounts: accounts, read: read)
+        // Two independent reads make a single transient guard miss fail-closed. The staged target pair below is
+        // the durable structural barrier once it exists, but this covers the first instruction after guard write.
+        let recoveryGuardReadOne = read(accounts.recoveryGuard)
+        let recoveryGuardReadTwo = read(accounts.recoveryGuard)
+        let recoveryGuardPresent = recoveryGuardReadOne != nil || recoveryGuardReadTwo != nil
+        let observations = DebridCredentialEnvelopeSlot.allCases.map { slot in
+            observation(owner: owner, slot: slot, accounts: accounts, read: read)
         }
+        let artifacts = Set(observations.filter(\.hasArtifact).map(\.slot))
+        if recoveryGuardPresent {
+            return .quarantined(DebridCredentialQuarantine(
+                artifactSlots: artifacts,
+                hasRecoveryGuard: true
+            ))
+        }
+        if observations.contains(where: \.hasRecoveryStaging) {
+            return .quarantined(DebridCredentialQuarantine(
+                artifactSlots: artifacts,
+                hasRecoveryGuard: false
+            ))
+        }
+        let candidates = observations.compactMap(\.candidate)
         if let maximum = candidates.map(\.envelope.generation).max() {
             let winners = candidates.filter { $0.envelope.generation == maximum }
-            guard winners.count == 1 else { return .quarantined }
-            return .committed(winners[0].envelope)
+            guard winners.count == 1 else {
+                return .quarantined(DebridCredentialQuarantine(
+                    artifactSlots: artifacts,
+                    hasRecoveryGuard: false
+                ))
+            }
+            return .committed(DebridCredentialCommittedSelection(
+                slot: winners[0].slot,
+                envelope: winners[0].envelope
+            ))
         }
-        let hasMarker = DebridCredentialEnvelopeSlot.allCases.contains {
-            read(accounts.marker($0)) != nil
+        guard artifacts.isEmpty else {
+            return .quarantined(DebridCredentialQuarantine(
+                artifactSlots: artifacts,
+                hasRecoveryGuard: false
+            ))
         }
-        return hasMarker ? .quarantined : .none
+        return .none
     }
 
     static func loadKeys(owner: DebridOwnerScope, read: (String) -> String?)
         -> [DebridService: String] {
         switch load(owner: owner, read: read) {
-        case .committed(let envelope):
-            return envelope.decodedKeys(owner: owner) ?? [:]
+        case .committed(let selection):
+            return selection.envelope.decodedKeys(owner: owner) ?? [:]
         case .quarantined:
             return [:]
         case .none:
@@ -427,8 +547,8 @@ enum DebridCredentialPersistence {
 
     static func committedKeys(owner: DebridOwnerScope, read: (String) -> String?)
         -> [DebridService: String] {
-        guard case .committed(let envelope) = load(owner: owner, read: read) else { return [:] }
-        return envelope.decodedKeys(owner: owner) ?? [:]
+        guard case .committed(let selection) = load(owner: owner, read: read) else { return [:] }
+        return selection.envelope.decodedKeys(owner: owner) ?? [:]
     }
 
     static func bootstrapSignedOutSnapshot(read: (String) -> String?) -> DebridCredentialSnapshot {
@@ -441,20 +561,28 @@ enum DebridCredentialPersistence {
 
     static func commit(owner: DebridOwnerScope, keys: [DebridService: String], io: DebridCredentialStorageIO)
         -> DebridCredentialCommitResult {
-        let loadResult = load(owner: owner, read: io.read)
-        if case .quarantined = loadResult { return .failed(.quarantinedCurrent) }
-        let current = loadResult.envelope
         let normalized = DebridCredentialMutableState.normalized(keys)
+        let loadResult = load(owner: owner, read: io.read)
+        if case .quarantined(let quarantine) = loadResult {
+            // Debris alone is not authority to erase or replace credentials. Recovery starts only after a
+            // repaste or remote restore supplies at least one concrete credential value.
+            guard !normalized.isEmpty else { return .failed(.quarantinedCurrent) }
+            return recoverQuarantined(
+                owner: owner,
+                keys: normalized,
+                quarantine: quarantine,
+                io: io
+            )
+        }
+        let currentSelection = loadResult.selection
+        let current = currentSelection?.envelope
         if let current, current.decodedKeys(owner: owner) == normalized { return .unchanged(current) }
         guard current?.generation != UInt64.max else { return .failed(.generationExhausted) }
 
         let accounts = DebridCredentialStorageAccounts(owner: owner)
-        let currentSlot = current.flatMap { envelope -> DebridCredentialEnvelopeSlot? in
-            DebridCredentialEnvelopeSlot.allCases.first {
-                candidate(owner: owner, slot: $0, accounts: accounts, read: io.read)?.envelope == envelope
-            }
-        }
-        let nextSlot = currentSlot?.other ?? .a
+        // The winning slot and envelope are one immutable load result. Re-reading the slots here could turn a
+        // transient read failure into a false "no active slot" and make the fallback overwrite the live commit.
+        let nextSlot = currentSelection?.slot.other ?? .a
         let markerAccount = accounts.marker(nextSlot)
         if io.read(markerAccount) != nil {
             guard io.delete(markerAccount), io.read(markerAccount) == nil else {
@@ -476,7 +604,8 @@ enum DebridCredentialPersistence {
         guard let markerString = encodeCanonical(marker) else { return .failed(.markerWriteFailed) }
         guard io.write(markerString, markerAccount) else { return .failed(.markerWriteFailed) }
         guard io.read(markerAccount) == markerString else { return .failed(.markerReadbackMismatch) }
-        guard case .committed(let verified) = load(owner: owner, read: io.read), verified == next else {
+        guard case .committed(let verified) = load(owner: owner, read: io.read),
+              verified.envelope == next, verified.slot == nextSlot else {
             return .failed(.commitValidationFailed)
         }
         return .committed(next)
@@ -495,22 +624,141 @@ enum DebridCredentialPersistence {
         return decoded
     }
 
-    private static func candidate(
+    private static func observation(
         owner: DebridOwnerScope,
         slot: DebridCredentialEnvelopeSlot,
         accounts: DebridCredentialStorageAccounts,
         read: (String) -> String?
-    ) -> Candidate? {
-        guard let markerRaw = read(accounts.marker(slot)),
-              let marker = decodeCanonical(DebridCredentialCommitMarker.self, from: markerRaw),
+    ) -> SlotObservation {
+        let markerRaw = read(accounts.marker(slot))
+        let envelopeRaw = read(accounts.envelope(slot))
+        let marker = markerRaw.flatMap {
+            decodeCanonical(DebridCredentialCommitMarker.self, from: $0)
+        }
+        let envelope = envelopeRaw.flatMap {
+            decodeCanonical(DebridCredentialPersistedEnvelope.self, from: $0)
+        }
+        let candidate: Candidate?
+        if let marker,
               marker.format == DebridCredentialCommitMarker.currentFormat,
               marker.ownerNamespace == owner.storageNamespace,
               marker.slot == slot,
-              let envelopeRaw = read(accounts.envelope(slot)),
-              let envelope = decodeCanonical(DebridCredentialPersistedEnvelope.self, from: envelopeRaw),
+              marker.recoveryPhase == nil,
+              let envelope,
               envelope.generation == marker.generation,
-              envelope.decodedKeys(owner: owner) != nil else { return nil }
-        return Candidate(slot: slot, envelope: envelope)
+              envelope.recoveryPhase == nil,
+              envelope.decodedKeys(owner: owner) != nil {
+            candidate = Candidate(slot: slot, envelope: envelope)
+        } else {
+            candidate = nil
+        }
+        return SlotObservation(
+            slot: slot,
+            markerRaw: markerRaw,
+            envelopeRaw: envelopeRaw,
+            candidate: candidate,
+            hasRecoveryStaging: marker?.recoveryPhase == .staging
+                || envelope?.recoveryPhase == .staging
+        )
+    }
+
+    private static func recoverQuarantined(
+        owner: DebridOwnerScope,
+        keys: [DebridService: String],
+        quarantine: DebridCredentialQuarantine,
+        io: DebridCredentialStorageIO
+    ) -> DebridCredentialCommitResult {
+        let accounts = DebridCredentialStorageAccounts(owner: owner)
+        let guardValue = DebridCredentialRecoveryGuard(owner: owner)
+        guard let guardRaw = encodeCanonical(guardValue),
+              io.write(guardRaw, accounts.recoveryGuard) else {
+            return .failed(.recoveryGuardWriteFailed)
+        }
+        guard io.read(accounts.recoveryGuard) == guardRaw else {
+            return .failed(.recoveryGuardReadbackMismatch)
+        }
+
+        // Prefer a slot with no observed artifact. When both slots contain debris, the durable guard is already
+        // exact-readback verified before one marker is removed, so a crash can quarantine but never fall back.
+        let target: DebridCredentialEnvelopeSlot
+        if !quarantine.artifactSlots.contains(.a) { target = .a }
+        else if !quarantine.artifactSlots.contains(.b) { target = .b }
+        else { target = .a }
+
+        let targetMarker = accounts.marker(target)
+        guard io.delete(targetMarker), io.read(targetMarker) == nil else {
+            return .failed(.recoveryArtifactDeleteFailed)
+        }
+
+        let staged = DebridCredentialPersistedEnvelope(
+            generation: 1,
+            owner: owner,
+            keys: keys,
+            recoveryPhase: .staging
+        )
+        guard let stagedEnvelopeRaw = encodeCanonical(staged) else {
+            return .failed(.envelopeWriteFailed)
+        }
+        let targetEnvelope = accounts.envelope(target)
+        guard io.write(stagedEnvelopeRaw, targetEnvelope) else {
+            return .failed(.envelopeWriteFailed)
+        }
+        guard io.read(targetEnvelope) == stagedEnvelopeRaw else {
+            return .failed(.envelopeReadbackMismatch)
+        }
+        let stagedMarker = DebridCredentialCommitMarker(
+            generation: 1,
+            owner: owner,
+            slot: target,
+            recoveryPhase: .staging
+        )
+        guard let stagedMarkerRaw = encodeCanonical(stagedMarker),
+              io.write(stagedMarkerRaw, targetMarker) else {
+            return .failed(.markerWriteFailed)
+        }
+        guard io.read(targetMarker) == stagedMarkerRaw else {
+            return .failed(.markerReadbackMismatch)
+        }
+        guard io.read(targetEnvelope) == stagedEnvelopeRaw,
+              io.read(targetMarker) == stagedMarkerRaw else {
+            return .failed(.commitValidationFailed)
+        }
+
+        // Only a proven staged pair permits stale cleanup. A normal load rejects that pair even if both guard
+        // reads miss, so neither the fresh keys nor a surviving older candidate can escape before cleanup.
+        for slot in DebridCredentialEnvelopeSlot.allCases where slot != target {
+            guard io.delete(accounts.marker(slot)), io.read(accounts.marker(slot)) == nil,
+                  io.delete(accounts.envelope(slot)), io.read(accounts.envelope(slot)) == nil else {
+                return .failed(.recoveryArtifactDeleteFailed)
+            }
+        }
+        guard io.read(targetEnvelope) == stagedEnvelopeRaw,
+              io.read(targetMarker) == stagedMarkerRaw else {
+            return .failed(.commitValidationFailed)
+        }
+
+        // Convert the envelope first while its marker is still staging. After the guard is removed, the pair
+        // remains structurally invalid until the final normal marker exact-readbacks, so every crash stays closed.
+        let fresh = DebridCredentialPersistedEnvelope(generation: 1, owner: owner, keys: keys)
+        guard let envelopeRaw = encodeCanonical(fresh), io.write(envelopeRaw, targetEnvelope) else {
+            return .failed(.envelopeWriteFailed)
+        }
+        guard io.read(targetEnvelope) == envelopeRaw else {
+            return .failed(.envelopeReadbackMismatch)
+        }
+        guard io.delete(accounts.recoveryGuard), io.read(accounts.recoveryGuard) == nil else {
+            return .failed(.recoveryGuardDeleteFailed)
+        }
+        let marker = DebridCredentialCommitMarker(generation: 1, owner: owner, slot: target)
+        guard let markerRaw = encodeCanonical(marker), io.write(markerRaw, targetMarker) else {
+            return .failed(.markerWriteFailed)
+        }
+        guard io.read(targetMarker) == markerRaw,
+              case .committed(let verified) = load(owner: owner, read: io.read),
+              verified.slot == target, verified.envelope == fresh else {
+            return .failed(.commitValidationFailed)
+        }
+        return .committed(fresh)
     }
 
     private static func legacyFallbackKeys(

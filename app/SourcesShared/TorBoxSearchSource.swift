@@ -307,9 +307,11 @@ final class TorBoxSearchSource: ObservableObject {
             NotificationCenter.default.addObserver(
                 forName: DebridCredentialSnapshotStore.didPublishNotification,
                 object: credentialStore,
-                queue: .main
+                queue: nil
             ) { [weak self] _ in
-                Task { @MainActor [weak self] in self?.adoptCurrentCredentialRevision() }
+                // Snapshot publication is MainActor-isolated and NotificationCenter delivers a nil-queue
+                // observer synchronously on the posting executor. Keep invalidation inside publish(B)'s call.
+                MainActor.assumeIsolated { self?.adoptCurrentCredentialRevision() }
             }
         )
     }

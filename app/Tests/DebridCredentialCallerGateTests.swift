@@ -138,16 +138,52 @@ private let rules: [Rule] = [
                                    end: "static func encodeCanonical") else {
             return ["missing credential envelope commit"]
         }
-        return require(file, "let nextSlot = currentSlot?.other ?? .a", "inactive-slot selection")
-            + require(file, "guard winners.count == 1 else { return .quarantined }",
+        return require(file, "let currentSelection = loadResult.selection",
+                       "one load retains the winning slot and envelope")
+            + require(file, "guard !normalized.isEmpty else { return .failed(.quarantinedCurrent) }",
+                      "quarantine recovery requires positive authoritative credential evidence")
+            + require(file, "let nextSlot = currentSelection?.slot.other ?? .a",
+                      "inactive-slot selection from the retained winner")
+            + forbid(commit, "candidate(owner: owner, slot:",
+                     "commit re-reads slots to rediscover the active selection")
+            + require(file, "guard winners.count == 1 else {",
                       "ambiguous-generation quarantine")
             + requireOrdered(commit, [
                 "guard io.write(envelopeString, envelopeAccount)",
                 "guard io.read(envelopeAccount) == envelopeString",
                 "guard io.write(markerString, markerAccount)",
                 "guard io.read(markerAccount) == markerString",
-                "guard case .committed(let verified) = load(owner: owner, read: io.read), verified == next",
+                "guard case .committed(let verified) = load(owner: owner, read: io.read)",
+                "verified.envelope == next, verified.slot == nextSlot",
             ], "envelope payload/readback/marker/readback/final-validation order")
+            + requireOrdered(file, [
+                "let recoveryGuardReadOne = read(accounts.recoveryGuard)",
+                "let recoveryGuardReadTwo = read(accounts.recoveryGuard)",
+                "let recoveryGuardPresent = recoveryGuardReadOne != nil || recoveryGuardReadTwo != nil",
+                "if recoveryGuardPresent {",
+                "return .quarantined(DebridCredentialQuarantine(",
+            ], "two independent reads keep a leftover recovery guard fail-closed")
+            + require(file, "observations.contains(where:",
+                      "staged pair structurally quarantines even when guard reads miss")
+            + require(file, "marker.recoveryPhase == nil", "normal candidate rejects staging marker")
+            + require(file, "envelope.recoveryPhase == nil", "normal candidate rejects staging envelope")
+            + requireOrdered(file, [
+                "io.write(guardRaw, accounts.recoveryGuard)",
+                "io.read(accounts.recoveryGuard) == guardRaw",
+                "io.delete(targetMarker)",
+                "io.write(stagedEnvelopeRaw, targetEnvelope)",
+                "io.read(targetEnvelope) == stagedEnvelopeRaw",
+                "io.write(stagedMarkerRaw, targetMarker)",
+                "io.read(targetMarker) == stagedMarkerRaw",
+                "for slot in DebridCredentialEnvelopeSlot.allCases where slot != target",
+                "io.write(envelopeRaw, targetEnvelope)",
+                "io.delete(accounts.recoveryGuard)",
+                "io.read(accounts.recoveryGuard) == nil",
+                "io.write(markerRaw, targetMarker)",
+                "io.read(targetMarker) == markerRaw",
+                "case .committed(let verified) = load(owner: owner, read: io.read)",
+                "verified.slot == target, verified.envelope == fresh",
+            ], "guarded quarantine recovery proves fresh data before exact stale cleanup")
     }),
     Rule(name: durableMutationRule, files: [statePath], violations: { files in
         guard let file = files[statePath],
@@ -278,9 +314,10 @@ private let rules: [Rule] = [
             return ["missing result escape wrapper"]
         }
         return requireOrdered(wrapper, [
-            "guard credentialStore.isCurrent(revision: revision) else { throw DebridError.credentialsChanged }",
+            "token: DebridCredentialRevisionToken",
+            "guard token.isCurrent() else { throw DebridError.credentialsChanged }",
             "let result = try await operation()",
-            "guard credentialStore.resultIsCurrent(revision: revision) else { throw DebridError.credentialsChanged }",
+            "guard token.resultIsCurrent() else { throw DebridError.credentialsChanged }",
             "return result",
         ], "coordinator pre and post await result fencing")
     }),
@@ -314,6 +351,16 @@ private let rules: [Rule] = [
             + require(cache, "DebridCredentialSnapshotStore.didPublishNotification",
                       "long-lived cache invalidation subscription")
             + requireOrdered(cache, [
+                "queue: nil",
+                "MainActor.assumeIsolated { self?.adoptCurrentCredentialRevision() }",
+            ], "cache invalidation completes synchronously inside publication")
+            + forbid(cache, "Task { @MainActor [weak self] in self?.adoptCurrentCredentialRevision() }",
+                     "cache invalidation remains deferred behind an unstructured task")
+            + require(cache, "pinning: snapshot.revision",
+                      "torrent cache child call retains its A-derived input revision")
+            + require(cache, "pinning: revision",
+                      "usenet cache child call retains its A-derived input revision")
+            + requireOrdered(cache, [
                 "guard self.credentialRevision != revision else { return }",
                 "self.lastQueried.removeAll()",
                 "self.lastUsenetQueried.removeAll()",
@@ -321,8 +368,9 @@ private let rules: [Rule] = [
                 "self.cachedUsenetURLs.removeAll()",
             ], "revision change clears both dedupe and visible cache state")
     }),
-    Rule(name: apiRule, files: [resolverPath, coreModelsPath], violations: { files in
-        guard let resolver = files[resolverPath], let core = files[coreModelsPath] else {
+    Rule(name: apiRule, files: [statePath, resolverPath, coreModelsPath], violations: { files in
+        guard let state = files[statePath], let resolver = files[resolverPath],
+              let core = files[coreModelsPath] else {
             return ["missing versioned coordinator API files"]
         }
         let coordinatorAPIs = [
@@ -348,9 +396,29 @@ private let rules: [Rule] = [
         )
         violations += require(
             core,
-            "DebridCoordinator.shared.reresolveVersioned(",
+            "coordinator.reresolveVersioned(",
             "continue-watching revision propagation"
         )
+        violations += require(core, "resolverGeneration(pinning: entryRevision)",
+                              "continue-watching pins the entry resolver generation")
+        violations += require(core, "generation: generation",
+                              "continue-watching spends only its pinned resolver generation")
+        violations += require(resolver, "struct DebridResolverGeneration: Sendable",
+                              "immutable resolver generation value")
+        violations += require(resolver, "func resolverGeneration(pinning revision: UInt64)",
+                              "outer-operation revision pin API")
+        violations += require(state, "struct DebridCredentialPinnedChildEntry: Sendable",
+                              "production-used pinned child-entry seam")
+        violations += require(state, "func enter() -> DebridVersionedResult<DebridCredentialRevisionToken?>",
+                              "child-entry returns the exact A revision token")
+        violations += require(state, "value: token.isCurrent() ? token : nil",
+                              "child-entry rejects a stale revision before its child can run")
+        violations += requireCount(resolver, ").enter()", 5,
+                                   "all nested child implementations consume the shared entry seam")
+        violations += requireCount(resolver, "withCurrentCredential(token: credentialToken)", 5,
+                                   "all nested child implementations consume the seam's returned token")
+        violations += requireCount(resolver, "generation: generation", 6,
+                                   "torrent, usenet, singleton race, fanout race, and pinned cache propagation")
         violations += require(
             resolver,
             "DebridCoordinator.shared.resolveUsenetVersioned(",
@@ -410,8 +478,11 @@ private let rules: [Rule] = [
                 "init(credentialStore: DebridCredentialSnapshotStore = .shared)",
                 "forName: DebridCredentialSnapshotStore.didPublishNotification",
                 "object: credentialStore",
-                "Task { @MainActor [weak self] in self?.adoptCurrentCredentialRevision() }",
+                "queue: nil",
+                "MainActor.assumeIsolated { self?.adoptCurrentCredentialRevision() }",
             ], "live revision publication invalidates the injected store's contributor state")
+            + forbid(source, "Task { @MainActor [weak self] in self?.adoptCurrentCredentialRevision() }",
+                     "TorBox invalidation remains deferred behind an unstructured task")
             + require(source, "credentialStore: requestCredentialStore",
                       "injected credential store reaches both guarded search legs")
             + requireCount(source, "compareAndPublish(revision:", 4,
@@ -491,8 +562,8 @@ private let mutations: [Mutation] = [
              find: "guard let uuid = UUID(uuidString: raw), uuid.uuidString.lowercased() == raw else { return nil }",
              replacement: "guard let uuid = UUID(uuidString: raw) else { return nil }"),
     Mutation(name: "M05 overwrite the active envelope slot", rule: envelopeRule, path: statePath,
-             find: "let nextSlot = currentSlot?.other ?? .a",
-             replacement: "let nextSlot = currentSlot ?? .a"),
+             find: "let nextSlot = currentSelection?.slot.other ?? .a",
+             replacement: "let nextSlot = currentSelection?.slot ?? .a"),
     Mutation(name: "M06 remove envelope exact readback", rule: envelopeRule, path: statePath,
              find: "guard io.read(envelopeAccount) == envelopeString else { return .failed(.envelopeReadbackMismatch) }",
              replacement: "_ = io.read(envelopeAccount)"),
@@ -542,8 +613,8 @@ private let mutations: [Mutation] = [
              find: "actor RealDebridResolver: DebridResolving {\n    nonisolated let service: DebridService = .realDebrid\n    private let apiKey: String\n    private let credentialToken: DebridCredentialRevisionToken",
              replacement: "actor RealDebridResolver: DebridResolving {\n    nonisolated let service: DebridService = .realDebrid\n    private let apiKey: String"),
     Mutation(name: "M22 remove coordinator post-await result fence", rule: resultRule, path: resolverPath,
-             find: "guard credentialStore.resultIsCurrent(revision: revision) else { throw DebridError.credentialsChanged }",
-             replacement: "_ = revision"),
+             find: "guard token.resultIsCurrent() else { throw DebridError.credentialsChanged }",
+             replacement: "_ = token"),
     Mutation(name: "M23 separate cache check from caller mutation", rule: callerRule, path: resolverPath,
              find: "_ = self.credentialStore.compareAndPublish(revision: result.revision) {",
              replacement: "if DebridCredentialSnapshotStore.shared.isCurrent(revision: result.revision) {"),
@@ -563,8 +634,8 @@ private let mutations: [Mutation] = [
              find: "func resolveLibraryItemVersioned(_ item: DebridLibraryItem)",
              replacement: "func resolveLibraryItemUnchecked(_ item: DebridLibraryItem)"),
     Mutation(name: "M29 strip revision from continue-watching reresolve", rule: apiRule, path: coreModelsPath,
-             find: "DebridCoordinator.shared.reresolveVersioned(",
-             replacement: "DebridCoordinator.shared.reresolve("),
+             find: "coordinator.reresolveVersioned(",
+             replacement: "coordinator.reresolve("),
     Mutation(name: "M30 acknowledge sync after failed remote envelope", rule: remoteRule, path: syncPath,
              find: "guard debrid.applyRemoteKeys(remoteDebrid) else {\n                debridGenerationApplied = false\n                return\n            }",
              replacement: "_ = debrid.applyRemoteKeys(remoteDebrid)"),
@@ -621,6 +692,45 @@ private let mutations: [Mutation] = [
              path: torBoxSearchPath,
              find: "forName: DebridCredentialSnapshotStore.didPublishNotification,",
              replacement: "forName: Notification.Name(\"mutant.torbox.no-invalidation\"),"),
+    Mutation(name: "M46 omit durable quarantine recovery guard", rule: envelopeRule, path: statePath,
+             find: "io.write(guardRaw, accounts.recoveryGuard)",
+             replacement: "true"),
+    Mutation(name: "M47 recapture playback usenet child", rule: apiRule, path: resolverPath,
+             find: "nzbUrl: nzb, knownHash: knownHash, fileMustInclude: mustInclude,\n                            fileIdx: fileIdx, episode: selectionEpisode, generation: generation",
+             replacement: "nzbUrl: nzb, knownHash: knownHash, fileMustInclude: mustInclude,\n                            fileIdx: fileIdx, episode: selectionEpisode"),
+    Mutation(name: "M48 recapture playback torrent child", rule: apiRule, path: resolverPath,
+             find: "infoHash: hash, magnet: magnet, fileIdx: fileIdx,\n                        episode: selectionEpisode, generation: generation",
+             replacement: "infoHash: hash, magnet: magnet, fileIdx: fileIdx,\n                        episode: selectionEpisode"),
+    Mutation(name: "M49 recapture singleton cached-race child", rule: apiRule, path: resolverPath,
+             find: "let result = await resolvedPlaybackRefVersioned(\n                for: racing[0],\n                episode: episode,\n                confirmedCachedHashes: cachedHashes,\n                confirmedUsenetURLs: cachedUsenetURLs,\n                generation: generation",
+             replacement: "let result = await resolvedPlaybackRefVersioned(\n                for: racing[0],\n                episode: episode,\n                confirmedCachedHashes: cachedHashes,\n                confirmedUsenetURLs: cachedUsenetURLs"),
+    Mutation(name: "M50 recapture fanout cached-race child", rule: apiRule, path: resolverPath,
+             find: "let result = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(\n                        for: stream,\n                        episode: episode,\n                        confirmedCachedHashes: cachedHashes,\n                        confirmedUsenetURLs: cachedUsenetURLs,\n                        generation: generation",
+             replacement: "let result = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(\n                        for: stream,\n                        episode: episode,\n                        confirmedCachedHashes: cachedHashes,\n                        confirmedUsenetURLs: cachedUsenetURLs"),
+    Mutation(name: "M51 recapture torrent cache-awareness child", rule: callerRule, path: resolverPath,
+             find: "hashes: Array(hashes),\n                    pinning: snapshot.revision",
+             replacement: "hashes: Array(hashes)"),
+    Mutation(name: "M52 recapture usenet cache-awareness child", rule: callerRule, path: resolverPath,
+             find: "nzbMD5s: Array(byMD5.keys),\n                    pinning: revision",
+             replacement: "nzbMD5s: Array(byMD5.keys)"),
+    Mutation(name: "M53 recapture Continue Watching generation", rule: apiRule, path: coreModelsPath,
+             find: "resolverGeneration(pinning: entryRevision)",
+             replacement: "resolverGeneration(pinning: DebridCredentialSnapshotStore.shared.load().revision)"),
+    Mutation(name: "M54 drop Continue Watching pinned spend", rule: apiRule, path: coreModelsPath,
+             find: "requiresSemanticSelection: isEpisode,\n               generation: generation",
+             replacement: "requiresSemanticSelection: isEpisode"),
+    Mutation(name: "M55 let stale child enter", rule: apiRule, path: statePath,
+             find: "value: token.isCurrent() ? token : nil",
+             replacement: "value: token"),
+    Mutation(name: "M56 bypass returned child-entry token", rule: apiRule, path: resolverPath,
+             find: "let r = try await withCurrentCredential(token: credentialToken) {",
+             replacement: "let r = try await withCurrentCredential(revision: revision) {"),
+    Mutation(name: "M57 allow authority-free quarantine repair", rule: envelopeRule, path: statePath,
+             find: "guard !normalized.isEmpty else { return .failed(.quarantinedCurrent) }",
+             replacement: "_ = normalized"),
+    Mutation(name: "M58 skip global recovery winner proof", rule: envelopeRule, path: statePath,
+             find: "case .committed(let verified) = load(owner: owner, read: io.read),\n              verified.slot == target, verified.envelope == fresh",
+             replacement: "true"),
 ]
 
 @main
