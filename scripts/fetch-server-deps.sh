@@ -27,44 +27,31 @@ verify_sha256() { # <file> <expected-hash> <label>
 # --- symlink hygiene -------------------------------------------------------
 # A symlink `app/Resources/fonts/fonts -> /Users/daksh/vortx/app/Resources/fonts`
 # (absolute, pointing back at its own parent through the case-insensitive vortx/VortX
-# alias) once got copied into every Release bundle. The mechanism was `ln -s <src> <dest>`
-# run WITHOUT first proving <dest> absent: when <dest> already exists as a directory, `ln -s`
-# does not replace it, it drops a NESTED `<dest>/<basename>` link inside it. Two rules kill
-# the whole class at the source:
-#   * safe_symlink() refuses to create a link whose destination already exists.
-#   * assert_no_symlinks_under() guarantees the fetched tree leaves NO symlink under
-#     app/Resources/, scrubbing any stray it finds (e.g. a nested fonts/fonts from an earlier
-#     bad run) and then failing closed if one somehow survives.
-# Nothing under app/Resources/ is legitimately a symlink: server.js and node-darwin-arm64 are
-# copied/downloaded regular files, fonts/ holds real .ttf/.otf files, and shaders/ +
-# streaming-logos/ are real folders. So removing any symlink there is always the correct repair.
-safe_symlink() { # <target> <link-path>
-    local target="$1" link="$2"
-    if [ -e "$link" ] || [ -L "$link" ]; then
-        echo "ERROR: refusing to symlink '$link' -> '$target': destination already exists" >&2
-        echo "       (a bare 'ln -s' here would nest a link inside it; remove it first)" >&2
-        exit 1
-    fi
-    ln -s "$target" "$link"
-}
-
-assert_no_symlinks_under() { # <dir>
-    local dir="$1" found removed=0 leftover
+# alias) once got copied into every Release bundle. The exact creating invocation is not
+# preserved, so this fix targets the unsafe PATTERN, not a specific command: a link-creating
+# step that does not prove its destination absent first (the archetype is `ln -s <src> <dest>`
+# while <dest> already exists as a directory) drops a NESTED `<dest>/<basename>` link inside
+# that directory instead of replacing it.
+#
+# assert_no_symlinks_under() is the fail-closed gate that enforces the invariant "the fetched
+# tree leaves NO symlink under app/Resources/". Nothing there is legitimately a symlink:
+# server.js and node-darwin-arm64 are copied/downloaded regular files, fonts/ holds real
+# .ttf/.otf files, and shaders/ + streaming-logos/ are real folders. Detection and remediation
+# are deliberately kept separate: this gate DETECTS and FAILS; it does not delete. A gate that
+# silently scrubbed would hide recurrence and could not prove the class is actually gone, so a
+# stray link stops the fetch and names itself for a human to remove.
+assert_no_symlinks_under() { # <dir> ; lists any symlink under <dir> and returns non-zero, no delete
+    local dir="$1" found count=0
     [ -d "$dir" ] || return 0
     while IFS= read -r -d '' found; do
-        echo "WARNING: scrubbing stray symlink under $dir: '$found' -> '$(readlink "$found")'" >&2
-        rm -f "$found"
-        removed=$((removed + 1))
+        echo "ERROR: unexpected symlink under $dir: '$found' -> '$(readlink "$found")'" >&2
+        count=$((count + 1))
     done < <(find "$dir" -type l -print0)
-    # Fail closed if anything still resolves as a symlink after the scrub.
-    leftover="$(find "$dir" -type l -print -quit 2>/dev/null || true)"
-    if [ -n "$leftover" ]; then
-        echo "ERROR: symlink still present under $dir after scrub: $leftover" >&2
-        exit 1
+    if [ "$count" -gt 0 ]; then
+        echo "ERROR: $count symlink(s) under $dir; refusing to proceed (remove them and re-run)" >&2
+        return 1
     fi
-    if [ "$removed" -gt 0 ]; then
-        echo "Removed $removed stray symlink(s) under $dir."
-    fi
+    return 0
 }
 
 # 1) NodeMobile.xcframework. The official nodejs-mobile v18.20.4 release is
@@ -122,8 +109,8 @@ if [ -z "$(ls "$FONTS_DIR"/*.ttf "$FONTS_DIR"/*.otf 2>/dev/null)" ]; then
 else
     echo "Subtitle fonts already present."
 fi
-# The pinned font archive contains six regular font files and zero symlink entries, but scrub the
-# fonts tree right here so a nested fonts/fonts left by any earlier run can never survive into a build.
+# The pinned font archive contains six regular font files and zero symlink entries; assert that here
+# so a nested fonts/fonts left by any earlier run stops the fetch loudly instead of riding into a build.
 assert_no_symlinks_under "$FONTS_DIR"
 
 echo "Done. NodeMobile + server.js + fonts ready. Next: scripts/build-core-xcframework.sh"
@@ -136,7 +123,7 @@ echo "(+ scripts/build-ffi-xcframework.sh on the engine/apple-cutover branch), t
 bash scripts/patch-server-yt.sh
 
 # Final fail-closed gate: the fetched tree must leave NO symlink under app/Resources/. This is the
-# durable fix for the shipped fonts/fonts defect — every path that populates app/Resources/ has run
+# durable fix for the shipped fonts/fonts defect. Every path that populates app/Resources/ has run
 # by now, so any symlink here would otherwise ride into the bundle via the fonts folder resource rule.
 assert_no_symlinks_under app/Resources
 echo "Verified: no symlinks under app/Resources/."
