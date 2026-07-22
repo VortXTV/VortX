@@ -158,14 +158,20 @@ struct AddonsView: View {
                             }
                             // tvOS: `.plain` left the system focus platter on over this settings-card row. See ChipButtonStyle.
                             .vortxCardButton()
-                            // Drag add-ons into the order you want. The order is the PRIORITY spine (which
+                            // Reorder add-ons into the order you want. The order is the PRIORITY spine (which
                             // add-on's catalogs and sources come first) and syncs to the dashboard + your
                             // other devices via doc.addonOrder, the same order the dashboard drag writes.
-                            // iOS / Mac only: the drag-reorder List needs the touch/pointer drag tvOS lacks
-                            // (tvOS reorder is a separate focus-based UX); the dashboard covers tvOS ordering.
-                            #if !os(tvOS)
+                            // iOS / Mac use a drag List (`AddonReorderView`); tvOS has no pointer drag, so it
+                            // gets a focus-native move-up / move-down screen (`AddonReorderTVView`). Both
+                            // write the SAME `applyInAppAddonOrder`, so the resolution order is identical.
                             if core.addons.count > 1 {
-                                NavigationLink { AddonReorderView() } label: {
+                                NavigationLink {
+                                    #if os(tvOS)
+                                    AddonReorderTVView()
+                                    #else
+                                    AddonReorderView()
+                                    #endif
+                                } label: {
                                     HStack(spacing: Theme.Space.md) {
                                         Label("Reorder add-ons", systemImage: "arrow.up.arrow.down")
                                             .font(Theme.Typography.cardTitle)
@@ -177,9 +183,14 @@ struct AddonsView: View {
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .vortxSettingsCard()
                                 }
+                                // tvOS: `.plain` alone leaves the system focus platter; match the other
+                                // settings-card nav rows in this file.
+                                #if os(tvOS)
+                                .vortxCardButton()
+                                #else
                                 .buttonStyle(.plain)
+                                #endif
                             }
-                            #endif
                             hint("Tap the eye to turn an add-on off for \(profiles.active?.name ?? "this profile") only. It stays installed on your account and stays on for your other profiles.")
                             HStack {
                                 // tvOS: keep the button LEFT-aligned so it sits directly above the first
@@ -497,6 +508,108 @@ struct AddonReorderView: View {
     private func move(from source: IndexSet, to destination: Int) {
         ordered.move(fromOffsets: source, toOffset: destination)
         VortXSyncManager.shared.applyInAppAddonOrder(ordered.map { $0.transportUrl })
+    }
+}
+#endif
+
+#if os(tvOS)
+/// tvOS reorder: Apple TV has no pointer/touch drag, so the priority order is set with focus-native
+/// move-up / move-down buttons on each row instead of the iOS drag List. Each nudge writes the SAME
+/// `VortXSyncManager.applyInAppAddonOrder` the iOS drag and the web dashboard write, so a reordered add-on
+/// answers first for catalogs, sources and meta on tvOS exactly as on the other platforms, and the order
+/// syncs to every device via `doc.addonOrder`.
+///
+/// FOCUS: the two chevrons are ordinary focusable `Button`s inside the focusable ScrollView, so the remote
+/// steps onto them geometrically. They stay ENABLED at the list ends (a boundary press is a clamped no-op
+/// via `AddonPriorityOrder.moved`) rather than disabling, because a disabled control drops focus on tvOS;
+/// after a move, `@FocusState` re-pins the SAME row's same-direction button so a user can hold focus and
+/// keep nudging one add-on up (or down) the list without the cursor jumping away.
+struct AddonReorderTVView: View {
+    @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+    @ObservedObject private var orderObserver = AddonOrderObserver.shared   // re-seed on a remote reorder
+    @State private var ordered: [CoreDescriptor] = []
+
+    /// Which move control holds focus, so it can be re-pinned to the SAME add-on after a reorder.
+    private struct MoveFocus: Hashable { let url: String; let direction: Int }   // -1 = up, +1 = down
+    @FocusState private var focused: MoveFocus?
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: Theme.Space.sm) {
+                Text("Move an add-on up to make its catalogs and sources answer first.")
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.bottom, Theme.Space.sm)
+                ForEach(Array(ordered.enumerated()), id: \.element.id) { index, addon in
+                    row(addon, index: index)
+                }
+            }
+            .padding(.horizontal, Theme.Space.screenInset)
+            .padding(.vertical, Theme.Space.xl)
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        .navigationTitle("Reorder Add-ons")
+        .onAppear { reload() }
+        .onChange(of: core.addons.count) { reload() }        // an install/remove elsewhere re-seeds the list
+        .onChange(of: orderObserver.revision) { reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local move
+    }
+
+    private func row(_ addon: CoreDescriptor, index: Int) -> some View {
+        HStack(spacing: Theme.Space.md) {
+            Text("\(index + 1)")
+                .font(.system(size: 20, weight: .semibold, design: .rounded).monospacedDigit())
+                .foregroundStyle(Theme.Palette.textTertiary)
+                .frame(minWidth: 44, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(addon.manifest.name)
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(1)
+                Text(addon.host)
+                    .font(.system(size: 16, design: .monospaced))
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            Spacer()
+            Button { nudge(index, by: -1) } label: {
+                Label("Move up", systemImage: "chevron.up").labelStyle(.iconOnly)
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            .fixedSize()
+            .focused($focused, equals: MoveFocus(url: addon.transportUrl, direction: -1))
+            .opacity(index == 0 ? 0.35 : 1)   // dim, not disabled: keeps focus reachable at the top
+            Button { nudge(index, by: 1) } label: {
+                Label("Move down", systemImage: "chevron.down").labelStyle(.iconOnly)
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            .fixedSize()
+            .focused($focused, equals: MoveFocus(url: addon.transportUrl, direction: 1))
+            .opacity(index == ordered.count - 1 ? 0.35 : 1)
+        }
+        .padding(Theme.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .vortxSettingsCard()
+    }
+
+    /// Re-seed from the live add-on set in the currently-applied order. Preserves the user's order and folds
+    /// in any add-on installed since (appended at the end by orderedByApplied).
+    private func reload() {
+        ordered = VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl })
+    }
+
+    /// Move the row at `index` one step (`by` = -1 up, +1 down) and persist through the SAME canonical
+    /// path the iOS drag uses. Boundary presses are clamped no-ops (AddonPriorityOrder.moved), so nothing
+    /// is pushed and the order is unchanged. Focus is re-pinned to the moved add-on's same-direction button
+    /// so repeated presses keep walking the same add-on.
+    private func nudge(_ index: Int, by delta: Int) {
+        let addon = ordered[index]
+        let next = AddonPriorityOrder.moved(ordered, from: index, to: index + delta)
+        guard next.map(\.transportUrl) != ordered.map(\.transportUrl) else { return }   // clamped no-op at an end
+        ordered = next
+        VortXSyncManager.shared.applyInAppAddonOrder(next.map { $0.transportUrl })
+        focused = MoveFocus(url: addon.transportUrl, direction: delta)
     }
 }
 #endif

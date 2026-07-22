@@ -196,20 +196,10 @@ final class VortXSyncManager: ObservableObject {
     /// (a fresh install) keep their original relative order at the END so they are never hidden. An empty
     /// order returns the input unchanged, so this is a no-op until the user actually reorders.
     static func orderedByApplied<T>(_ items: [T], url: (T) -> String) -> [T] {
-        let order = appliedAddonOrder
-        guard !order.isEmpty else { return items }
-        var index: [String: Int] = [:]
-        for (i, u) in order.enumerated() { index[u] = i }
-        return items.enumerated().sorted { a, b in
-            let ia = index[AddonTombstones.normalize(url(a.element))]
-            let ib = index[AddonTombstones.normalize(url(b.element))]
-            switch (ia, ib) {
-            case let (x?, y?): return x < y
-            case (_?, nil):    return true                 // ordered items before not-yet-ordered
-            case (nil, _?):    return false
-            case (nil, nil):   return a.offset < b.offset  // stable for the un-ordered tail
-            }
-        }.map(\.element)
+        // The Add-ons list, the source (stream) groups (CoreBridge.assembleStreamGroups) and the Home
+        // catalog rows (CoreBridge.buildBoardRows) all sort by ONE rule (AddonPriorityOrder); keep this a
+        // thin adapter that supplies the live applied order so there is a single ordering behavior to test.
+        AddonPriorityOrder.order(items, applied: appliedAddonOrder, base: url)
     }
 
     /// Persist a user-chosen add-on order (the in-app Reorder screen) and push it to the account IMMEDIATELY

@@ -1003,7 +1003,15 @@ final class CoreBridge: ObservableObject {
                                                     streams: streams))
             }
         }
-        return groups
+        // SOURCE-RESOLUTION ORDER: the engine hands these groups back in raw `profile.addons` order (the
+        // `AggrRequest::AllOfResource` walk), which the add-on reorder never rewrites. Re-order them by the
+        // user's applied priority so a reordered add-on genuinely ANSWERS FIRST for streams. This is the
+        // single chokepoint feeding every stream consumer (the source list, StreamRanking.best's
+        // add-on-order first pick + rankedGroups' between-group order, and the tvOS auto-advance /
+        // Watch-Now paths in HomeView / DetailView / TVPlayerView), so ordering here moves all of them at
+        // once. Groups are keyed by `id` == the add-on transport base; an empty applied order is a no-op
+        // (engine order preserved), and add-ons the user has not placed keep their engine order at the end.
+        return AddonPriorityOrder.order(groups, applied: VortXSyncManager.appliedAddonOrder, base: { $0.id })
     }
 
     /// True when a stream group's source add-on (keyed by its transport base URL, which is the
@@ -2302,11 +2310,23 @@ final class CoreBridge: ObservableObject {
             rows.append(CoreBoardRow(id: key, title: titles[key] ?? request.path.id,
                                      type: request.path.type, items: items, engineIndex: engineIndex))
         }
-        // Apply the user's catalog order; unlisted catalogs keep the engine's relative order after the listed ones.
-        return rows.enumerated().sorted { a, b in
-            let ra = CatalogPrefsStore.rank(a.element.id), rb = CatalogPrefsStore.rank(b.element.id)
-            return ra != rb ? ra < rb : a.offset < b.offset
-        }.map(\.element)
+        // Apply the user's order. The EXPLICIT per-catalog order (catalog manager, `CatalogPrefsStore.rank`)
+        // still wins where set; among catalogs the user has not explicitly placed, the add-on PRIORITY order
+        // (the reorder) groups each add-on's catalogs together so a reordered add-on's catalogs come first on
+        // Home, not just in the list; the engine catalog index is the final stable tiebreak. Previously the
+        // fallback was raw engine order, so the reorder never touched Home at all.
+        return AddonPriorityOrder.orderCatalogRows(
+            rows,
+            applied: VortXSyncManager.appliedAddonOrder,
+            base: { Self.catalogBase(of: $0.id) },
+            catalogRank: { CatalogPrefsStore.rank($0.id) },
+            engineIndex: { $0.engineIndex })
+    }
+
+    /// The add-on transport base embedded in a catalog key (`base|type|id`), for priority-ordering the
+    /// Home board rows by their source add-on. Mirrors `CatalogPreferences`' own key split.
+    private static func catalogBase(of key: String) -> String {
+        key.components(separatedBy: "|").first ?? key
     }
 
     /// One catalog an installed add-on provides, for the catalog manager editor.
