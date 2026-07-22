@@ -143,10 +143,16 @@ enum VortxShadowRanking {
                         cachedHashes: Set<String>, prefs: SourcePreferences.Snapshot, metaId: String) {
         guard VortxShadowFlag.isOn else { return }
         #if canImport(VortxEngine)
+        // Redacted AFTER the flag gate (the doc contract above: flag OFF stays a single boolean read) and
+        // BEFORE anything else sees the value: the meta id is a catalog id (viewing history) and every use
+        // past this point is an os.Logger line with privacy: .public, so `diff`/`report` only ever receive
+        // the producer-side redaction token -- the same convention as SourceListModel's health line. Lines
+        // about one title still correlate within one run, which is all the divergence log needs.
+        let metaToken = VXProbeRedaction.identityToken(metaId)
         Task.detached(priority: .utility) {
             SourcePreferences.$readingOverride.withValue(prefs) {
                 diff(groups: groups, continuity: continuity, pin: pin,
-                     cachedHashes: cachedHashes, metaId: metaId)
+                     cachedHashes: cachedHashes, metaToken: metaToken)
             }
         }
         #else
@@ -158,8 +164,11 @@ enum VortxShadowRanking {
 
     #if canImport(VortxEngine)
 
+    /// `metaToken` is the ALREADY-REDACTED stand-in for the page's meta id (`VXProbeRedaction.identityToken`,
+    /// applied once in `observe`). Inside this function and everything it calls the value is used for log
+    /// lines ONLY -- it keys nothing, fetches nothing, and must never be re-joined with an engine input.
     private static func diff(groups: [CoreStreamSourceGroup], continuity: String?, pin: ResolvedPin?,
-                             cachedHashes: Set<String>, metaId: String) {
+                             cachedHashes: Set<String>, metaToken: String) {
         // The shared playable universe, in flat add-on/list order: the same filter playablePairs
         // applies inside StreamRanking (playable and not a bare YouTube trailer row).
         let candidates = groups.flatMap { g in g.streams.map { $0 } }
@@ -179,7 +188,7 @@ enum VortxShadowRanking {
             (s.infoHash?.lowercased()).map(cachedHashes.contains) == true
         }
         guard let rankedIndices = VortxBridge.shared.rankStreams(streams, cached: cached) else {
-            log.error("shadow[\(metaId, privacy: .public)]: engine unavailable or bad response; no diff")
+            log.error("shadow[\(metaToken, privacy: .public)]: engine unavailable or bad response; no diff")
             return
         }
         // Map back to streams, then deduplicate by playable URL in ENGINE order (keep the engine's
@@ -190,16 +199,15 @@ enum VortxShadowRanking {
             return seen.insert(url).inserted ? url : nil
         }
 
-        report(metaId: metaId, swiftKeys: swiftKeys, engineKeys: engineKeys,
+        report(metaToken: metaToken, swiftKeys: swiftKeys, engineKeys: engineKeys,
                labelFor: labelIndex(sent), truncated: candidates.count > sent.count, pinned: pin != nil)
     }
 
     /// Compare the two orders and emit one summary line (plus a first-divergence detail when they
     /// disagree). Divergence here is DATA, not failure: the engine ranks with its own default prefs
     /// profile in this slice, so the log is the parity work list for retiring StreamRanking.
-    private static func report(metaId: String, swiftKeys: [String], engineKeys: [String],
+    private static func report(metaToken: String, swiftKeys: [String], engineKeys: [String],
                                labelFor: [String: String], truncated: Bool, pinned: Bool) {
-        let meta = metaId.isEmpty ? "-" : metaId
         // The universes can differ at the margin (Swift's user filters may drop junk/filtered rows
         // that the engine kept). Diff the ORDER over the intersection so a size mismatch does not
         // drown the ordering signal, but report both counts.
@@ -213,16 +221,16 @@ enum VortxShadowRanking {
         let sameTop = swiftShared.first == engineShared.first
 
         if agreePrefix == total, swiftShared.count == engineShared.count {
-            log.info("shadow[\(meta, privacy: .public)]: AGREE order n=\(total) swift=\(swiftKeys.count) engine=\(engineKeys.count) pinned=\(pinned) truncated=\(truncated)")
+            log.info("shadow[\(metaToken, privacy: .public)]: AGREE order n=\(total) swift=\(swiftKeys.count) engine=\(engineKeys.count) pinned=\(pinned) truncated=\(truncated)")
             return
         }
         let swiftTop = swiftShared.first.flatMap { labelFor[$0] } ?? "-"
         let engineTop = engineShared.first.flatMap { labelFor[$0] } ?? "-"
-        log.notice("shadow[\(meta, privacy: .public)]: DIVERGE sameTop=\(sameTop) agreePrefix=\(agreePrefix)/\(total) swift=\(swiftKeys.count) engine=\(engineKeys.count) pinned=\(pinned) truncated=\(truncated)")
+        log.notice("shadow[\(metaToken, privacy: .public)]: DIVERGE sameTop=\(sameTop) agreePrefix=\(agreePrefix)/\(total) swift=\(swiftKeys.count) engine=\(engineKeys.count) pinned=\(pinned) truncated=\(truncated)")
         if agreePrefix < total {
             let sLabel = labelFor[swiftShared[agreePrefix]] ?? "-"
             let eLabel = labelFor[engineShared[agreePrefix]] ?? "-"
-            log.notice("shadow[\(meta, privacy: .public)]: first diff at #\(agreePrefix): swift=\(sLabel, privacy: .public) engine=\(eLabel, privacy: .public) | swiftTop=\(swiftTop, privacy: .public) engineTop=\(engineTop, privacy: .public)")
+            log.notice("shadow[\(metaToken, privacy: .public)]: first diff at #\(agreePrefix): swift=\(sLabel, privacy: .public) engine=\(eLabel, privacy: .public) | swiftTop=\(swiftTop, privacy: .public) engineTop=\(engineTop, privacy: .public)")
         }
     }
 

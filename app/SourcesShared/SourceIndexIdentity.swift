@@ -174,20 +174,28 @@ enum SourceIndexIdentity {
     }
 
     /// The ONLY factory for `MergeAuthorization`. `published` is the sealed target the auxiliary source
-    /// actually fetched and published for; `pageContentID` is the page's witness token. The witness can only
-    /// SELECT: when it is byte-identical to the published target's canonical content id the merge is authorized
-    /// FOR THAT PUBLISHED TARGET, and in every other case (absent, stale, forged, oversized, non-canonical)
-    /// there is no authorization and the merge is a pass-through. The witness string itself is never stored,
-    /// never logged, and never becomes part of any output: the authorization carries the published target only.
+    /// actually fetched and published for; `page` is the page's OWN typed resolution, the same value every
+    /// screen computes via `publicationTarget(_:)`. Both sides re-validate through `validatedTarget` and the
+    /// canonical content ids must match byte for byte; in every other case (absent, mismatch, stale, forged)
+    /// there is no authorization and the merge is a pass-through.
+    ///
+    /// THE PAGE SIDE IS SEALED TOO, and that is the point of this signature. The previous factory took
+    /// `pageContentID: String?`, and every view immediately FLATTENED its resolved `TargetResolution` to
+    /// `.target?.contentID` just to feed it -- which kept one public raw-string route into the merge gate:
+    /// any module peer holding a matching string could open a merge without ever running the role resolver.
+    /// Requiring the resolution closes that route (a `.target` payload has no ordinary construction route
+    /// outside this file; the memory-safety opt-outs noted on `MediaServerTarget` are the one exclusion),
+    /// and the page still can only SELECT: the authorization carries the published target, never anything
+    /// derived from the page beyond the byte comparison.
     static func mergeAuthorization(
         published: PublicationTarget?,
-        pageContentID: String?
+        page: TargetResolution
     ) -> MergeAuthorization? {
         guard let published,
-              validatedTarget(.target(published)) != nil,
-              let pageContentID,
-              published.contentID == pageContentID else { return nil }
-        return MergeAuthorization(target: published)
+              let validPublished = validatedTarget(.target(published)),
+              let validPage = validatedTarget(page),
+              validPublished.contentID == validPage.contentID else { return nil }
+        return MergeAuthorization(target: validPublished)
     }
 
     /// The typed result of resolving a publication target. `mismatch` must remain distinguishable from an
@@ -201,6 +209,177 @@ enum SourceIndexIdentity {
             guard case let .target(value) = self else { return nil }
             return value
         }
+    }
+
+    // MARK: Media-server identity (the deliberately non-IMDb lane)
+
+    /// The sealed page identity for the media-server lane (Plex / Jellyfin / Emby direct play).
+    ///
+    /// WHY A SECOND SEALED TYPE rather than reusing `PublicationTarget`: media-server lookup also supports
+    /// IMDb-LESS title/year matching, so its page identity is deliberately broader than the canonical IMDb
+    /// contract `PublicationTarget` exists to enforce. Widening `PublicationTarget` to admit `meta:` tokens
+    /// would break the one invariant every other consumer of it relies on. Instead the media lane gets its
+    /// own sealed value whose token is either the canonical content id (IMDb pages, derived VERBATIM from a
+    /// validated resolution) or a `meta:<id>` / `meta:<id>|video:<id>` fallback FORMATTED BY THIS FILE. The
+    /// two namespaces cannot collide: a canonical content id always begins `tt`, never `meta:`.
+    ///
+    /// INJECTIVITY (distinct pages -> distinct tokens), stated at the grain that actually holds. The
+    /// STRUCTURAL argument: the canonical form is `tt<digits>[:<s>:<e>]` -- no `|`, never `meta:`-prefixed
+    /// -- and the fallback form always begins `meta:` with every part passed through
+    /// `mediaServerFallbackPart`, which REJECTS the `|` separator. So the canonical and fallback namespaces
+    /// are disjoint, a one-part fallback token contains no `|` while a two-part token contains exactly one,
+    /// and within each form the parts recover uniquely. That argument survives Unicode normalization,
+    /// because `|` (U+007C) has no canonical decomposition and no other scalar's canonical decomposition
+    /// contains it (checked exhaustively against this toolchain's Unicode tables), so canonical equivalence
+    /// can neither create nor consume a separator.
+    ///
+    /// THE GRAIN: the encoding is injective UP TO Swift `String` equality, which is Unicode CANONICAL
+    /// EQUIVALENCE, not byte equality. `mediaServerTarget(metaID: "caf\u{00E9}")` (5 UTF-8 bytes) and
+    /// `mediaServerTarget(metaID: "cafe\u{0301}")` (6 bytes) format tokens that compare `==`, and
+    /// `mediaServerMergeAuthorization` between them authorizes. That is the correct grain rather than a
+    /// leak: Swift `==` is the comparison every consumer of these tokens uses -- the merge gate below,
+    /// `MediaServerSource`'s `shownKey`/`fetchKey` comparisons, and its `[String: ...]` session cache all
+    /// fold canonically equivalent spellings the same way, so such spellings behave as ONE page end to end
+    /// (one fetch, one cache entry, one merge identity), while two pages distinct under `==` compose
+    /// fetchKeys that miss each other's cache. COMPATIBILITY equivalence does NOT fold ("\u{FB01}le" !=
+    /// "file"), so no wider NFKC-style collapse hides behind this. Injectivity was overclaimed twice here:
+    /// the encoding was not injective at all before the separator gate (sealing decides WHO can build a
+    /// token; injectivity decides whether two DIFFERENT pages can build the SAME one, and the encoding
+    /// previously guaranteed only the first), and a later revision then claimed distinct (metaID, videoID)
+    /// statements could "never format the same token" -- byte-level injectivity, which Swift `String`
+    /// comparison never offered.
+    ///
+    /// SEALED exactly like `PublicationTarget`, for the same reproduced reason (see that type's comment for
+    /// the SE-0189 forge this shape kills): the token lives in a nested `private struct Storage` behind ONE
+    /// private stored property, the public `token` is a get-only computed view, and the explicit
+    /// `fileprivate init` suppresses the synthesized memberwise init. What that covers, precisely: every
+    /// ORDINARY construction route outside this file is a compile error -- a same-module extension can
+    /// neither assign `token` (get-only), nor name `Storage` (private is file-scoped), nor call the init,
+    /// and there is no synthesized memberwise init left to call. What it does NOT cover: deliberate
+    /// memory-safety opt-outs (`unsafeBitCast`, `withUnsafeMutableBytes` pointer writes) can still conjure
+    /// the bit pattern of any Swift value type; that route is out of scope here exactly as it is for
+    /// `PublicationTarget`, because code that has opted out of memory safety is outside any type-level
+    /// boundary's threat model. The lifecycle suite compiles the forging extension in both spellings,
+    /// pins the literal rejections, and re-widens a COPY of this file to prove each fixture compiles again
+    /// (a guard that cannot be shown to fail is not verified).
+    ///
+    /// THE OUTER EDGE OF WHAT THE SEAL BUYS: it governs which token SHAPES can exist, not who may claim to
+    /// BE a page. `publicationTarget(_:)` is internal and takes plain `Roles` (add-on/catalog-controlled
+    /// text), so any module peer can state the roles of a page it merely names, derive that page's
+    /// canonical `MediaServerTarget` (or `PublicationTarget`) through the ordinary factories, and two
+    /// peer-minted equal tokens authorize each other through the merge factories below. That is by design,
+    /// and consistent with the merge-authorization contract above (the page side can only SELECT what a
+    /// source published; it cannot inject rows): the seal guarantees every token was FORMATTED OR DERIVED
+    /// by this file from stated roles -- well-formed, bounded, separator-free -- not that the stating
+    /// caller is the screen the user is looking at. The seal does not authenticate its caller.
+    struct MediaServerTarget: Equatable, Hashable, Sendable {
+        private struct Storage: Equatable, Hashable, Sendable {
+            let token: String
+        }
+
+        private let storage: Storage
+
+        /// The exact page token the media-server source keys and compares on.
+        var token: String { storage.token }
+
+        fileprivate init(token: String) {
+            storage = Storage(token: token)
+        }
+    }
+
+    /// The IMDb path: derive the media-server token from the page's own typed resolution, so an IMDb page's
+    /// token is the canonical content id VERBATIM (re-validated through `validatedTarget`, like every other
+    /// consumer of a resolution at an owner boundary). `.absent` and `.mismatch` yield nil.
+    static func mediaServerTarget(page: TargetResolution) -> MediaServerTarget? {
+        guard let target = validatedTarget(page) else { return nil }
+        return MediaServerTarget(token: target.contentID)
+    }
+
+    /// The IMDb-less fallback: the caller states the raw PARTS (the page's meta id, plus the shown video id
+    /// when the page is episode-scoped) and THIS FILE formats the token, so the shape of every fallback
+    /// token is decided here, reviewably -- a caller can never hand over a pre-baked token string. The parts
+    /// are add-on-controlled text, so every part passes `mediaServerFallbackPart` (ONE gate: the shared
+    /// 128-byte identity cap AND rejection of the `|` token separator), and an unusable part fails the WHOLE
+    /// target rather than being dropped: silently dropping a bad video part would widen an episode page's
+    /// identity to the whole title.
+    ///
+    /// SCOPE EDGE (deliberate, and slightly wider than the collision fix): `boundedIdentityInput` also
+    /// rejects the EMPTY string, so an IMDb-less page whose meta id is "" gets NO media-server target at
+    /// all (an empty metaID fails before videoID is even considered) -- the owner's `refresh` then clears,
+    /// darkening the media-server lane for that page entirely, title/year fallback included. The pre-lane
+    /// code published such a page under a degenerate `"meta:"` token (the iOS movie page composed
+    /// `sourceContentID ?? "meta:\(id)"`) and still fetched by title. Fail-closed and effectively
+    /// unreachable, but it is a real feature delta that predates FIX-1's separator gate, not a
+    /// consequence of it.
+    static func mediaServerTarget(metaID: String?, videoID: String? = nil) -> MediaServerTarget? {
+        guard let meta = mediaServerFallbackPart(metaID) else { return nil }
+        guard let videoID else { return MediaServerTarget(token: "meta:\(meta)") }
+        guard let video = mediaServerFallbackPart(videoID) else { return nil }
+        return MediaServerTarget(token: "meta:\(meta)|video:\(video)")
+    }
+
+    /// The ONE gate every fallback part passes before it is formatted into a token: the same 128-byte cap
+    /// every identity candidate gets, AND rejection of the `|` separator, together in one helper so a future
+    /// third part cannot apply one and forget the other.
+    ///
+    /// `|` is REJECTED, not escaped, and the choice is load-bearing:
+    ///  (a) INJECTIVITY BY CONSTRUCTION, not convention. Without this gate the encoding was not injective:
+    ///      `mediaServerTarget(metaID: "kitsu:42|video:kitsu:42:7")` (a movie page, metaID only) and
+    ///      `mediaServerTarget(metaID: "kitsu:42", videoID: "kitsu:42:7")` (an episode page) formatted the
+    ///      byte-identical token, so `mediaServerMergeAuthorization` authorized merging one page's
+    ///      direct-play rows into the other -- and meta ids are add-on/catalog-controlled text. With `|`
+    ///      excluded from every part, a one-part token contains no `|` and a two-part token contains exactly
+    ///      one, so `meta:A` can never equal `meta:A'|video:B'`, the two forms are provably distinguishable,
+    ///      and each token recovers its parts uniquely.
+    ///  (b) Rejecting is how this file already resolves ambiguity: `contentKey` REJECTS a partial coordinate
+    ///      pair instead of silently widening it.
+    ///  (c) A `|` inside a real meta/video id is pathological. Failing closed costs at most the media-server
+    ///      lane on one degenerate page; failing open costs a cross-page merge of the user's own files.
+    private static func mediaServerFallbackPart(_ raw: String?) -> String? {
+        guard let part = boundedIdentityInput(raw), !part.contains("|") else { return nil }
+        return part
+    }
+
+    /// What every detail screen actually wants, as ONE call: the typed page target when the page resolved
+    /// one, else the formatted fallback parts (media-server lookup is the one lane that legitimately serves
+    /// IMDb-less pages, so `.absent`/`.mismatch` fall through instead of killing the lane).
+    static func mediaServerTarget(
+        preferring page: TargetResolution,
+        metaID: String?,
+        videoID: String? = nil
+    ) -> MediaServerTarget? {
+        mediaServerTarget(page: page) ?? mediaServerTarget(metaID: metaID, videoID: videoID)
+    }
+
+    /// A typed, validated permission to merge the media-server source's published rows into a page's source
+    /// list -- the media-lane analog of `MergeAuthorization`, closing the last raw-token comparison on the
+    /// main merge path. Same sealing rationale as `MergeAuthorization`: `private` storage plus a
+    /// `fileprivate` init keeps a same-module extension from synthesizing a permission for a page the source
+    /// never published. `Sendable` because `SourceListModel` builds it in the main-actor snapshot and
+    /// captures it into the detached assembly.
+    struct MediaServerMergeAuthorization: Equatable, Sendable {
+        private let storedTarget: MediaServerTarget
+
+        /// The published target the merge was authorized against.
+        var target: MediaServerTarget { storedTarget }
+
+        fileprivate init(target: MediaServerTarget) {
+            storedTarget = target
+        }
+    }
+
+    /// The ONLY factory for `MediaServerMergeAuthorization`. Both sides are sealed values with no ordinary
+    /// construction route outside this file's factories -- `published` built by the source when it resolved,
+    /// `page` by the screen's computed var -- so the equality below is between two tokens this file
+    /// formatted or derived. The comparison is Swift `String` equality (Unicode canonical equivalence, the
+    /// same grain as every other consumer of these tokens; see the INJECTIVITY note on `MediaServerTarget`).
+    /// Authorization exists exactly when the tokens compare equal, and it carries the PUBLISHED target only.
+    static func mediaServerMergeAuthorization(
+        published: MediaServerTarget?,
+        page: MediaServerTarget?
+    ) -> MediaServerMergeAuthorization? {
+        guard let published, let page, published.token == page.token else { return nil }
+        return MediaServerMergeAuthorization(target: published)
     }
 
     /// Identity inputs are add-on-controlled text. Cap BEFORE any parsing so a megabyte-long "id" cannot be

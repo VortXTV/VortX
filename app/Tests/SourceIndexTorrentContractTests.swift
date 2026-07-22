@@ -1053,12 +1053,14 @@ struct SourceIndexTorrentContractTests {
                "GET gate closing after response prevents decoded rows from escaping")
 
         // The static merge now REQUIRES a typed authorization (built only by the identity file from a sealed
-        // published target); an authorized call still applies the canonical-torrent-only row filter.
-        let mergeTarget = SourceIndexIdentity.validatedTarget(publicationTarget("tt1234567"))
+        // published target); an authorized call still applies the canonical-torrent-only row filter. The page
+        // side is the resolver-built RESOLUTION itself -- the raw-string witness form of the factory is gone.
+        let mergeResolution = publicationTarget("tt1234567")
+        let mergeTarget = SourceIndexIdentity.validatedTarget(mergeResolution)
         let mergeAuthorization = SourceIndexIdentity.mergeAuthorization(
-            published: mergeTarget, pageContentID: mergeTarget?.contentID)
+            published: mergeTarget, page: mergeResolution)
         expect(mergeAuthorization != nil,
-               "merge authorization is grantable for a resolver-built published target and matching witness")
+               "merge authorization is grantable for a resolver-built published target and matching page")
         let merged = SourceIndexServeSource.merge(
             authorizedBy: mergeAuthorization,
             served + [CoreStream(name: "direct", url: privateURL), CoreStream(name: "nzb", nzbUrl: privateNZB)],
@@ -1068,10 +1070,11 @@ struct SourceIndexTorrentContractTests {
         // unchanged and still enforced: the appended direct and nzb rows must NOT appear in the merged output.
         expect(merged.count == 1 && merged.first?.streams.count == 2,
                "merge admits only canonical torrent streams (direct/nzb rows excluded)")
-        // A nil authorization (no published target / stale or forged witness) must be a pure pass-through.
+        // A nil authorization (no published target / a page that resolved a DIFFERENT title) must be a pure
+        // pass-through. The stale page is itself resolver-built: there is no raw-string route to express it.
         expect(SourceIndexServeSource.merge(
             authorizedBy: SourceIndexIdentity.mergeAuthorization(
-                published: mergeTarget, pageContentID: "tt7654321"),
+                published: mergeTarget, page: publicationTarget("tt7654321")),
             served, into: []
         ).isEmpty,
                "merge without a matching typed authorization merges nothing")

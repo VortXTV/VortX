@@ -163,7 +163,7 @@ struct TorBoxIdentityBoundaryTests {
         let mismatchCalls = await probe.calls()
         expect(mismatchCalls.isEmpty,
                "REQ-50: a typed mismatch launches zero TorBox transport")
-        expect(source.streams.isEmpty && source.publishedContentID == nil,
+        expect(source.streams.isEmpty && source.publishedTarget?.contentID == nil,
                "REQ-50: a typed mismatch publishes no TorBox rows")
 
         let forged = SourceIndexIdentity.uncheckedTargetForTesting(
@@ -177,7 +177,7 @@ struct TorBoxIdentityBoundaryTests {
         let forgedCalls = await probe.calls()
         expect(forgedCalls.isEmpty,
                "REQ-56: a relationally forged target launches zero TorBox transport")
-        expect(source.streams.isEmpty && source.publishedContentID == nil,
+        expect(source.streams.isEmpty && source.publishedTarget?.contentID == nil,
                "REQ-56: a relationally forged target publishes no TorBox rows")
 
         let cancellation = CancellationProbe()
@@ -228,7 +228,7 @@ struct TorBoxIdentityBoundaryTests {
 
         await probe.release(targetB.target!.contentID, streams: [rowB])
         await waitUntil { source.streams == [rowB] }
-        expect(source.publishedContentID == targetB.target?.contentID,
+        expect(source.publishedTarget?.contentID == targetB.target?.contentID,
                "REQ-50: TorBox publication records the exact fetched target")
         expect(source.merged(into: ordinary, for: targetA).count == ordinary.count,
                "REQ-50: title B rows cannot merge into title A")
@@ -236,7 +236,7 @@ struct TorBoxIdentityBoundaryTests {
                "REQ-50: rows merge only for their exact publication target")
 
         source.refresh(target: mismatch)
-        expect(source.streams.isEmpty && source.publishedContentID == nil,
+        expect(source.streams.isEmpty && source.publishedTarget?.contentID == nil,
                "REQ-50: a later mismatch synchronously clears the previous publication")
         expect(source.merged(into: ordinary, for: mismatch).count == ordinary.count,
                "REQ-50: mismatch preserves the ordinary engine-only groups")

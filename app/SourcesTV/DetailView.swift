@@ -1998,8 +1998,9 @@ struct CoreStreamList: View {
         // Read the ranked list from the SourceListModel's published output. This body still re-evaluates
         // on every CoreBridge @Published bump while the list is open, but each eval is now a couple of
         // published-array reads: the assembly (merges + tombstones + direct-links filter) AND the rank
-        // both run off-main inside the model, coalesced to at most ~4 rebuilds/sec. setContext is a few
-        // cheap reads behind an equality guard, safe from body.
+        // both run off-main inside the model, coalesced to at most ~4 rebuilds/sec. setContext is small
+        // constant work behind an equality guard, safe from body (its typed-identity arguments and the
+        // identity-change check re-validate the page target via per-call regexes -- no per-stream work).
         // SCOPE TO THIS EPISODE (binge-desync fix, symptom 3's stream half): the episodic page passes the
         // episode's own id (episodeStreamId) so the list only ever assembles + plays THIS episode's stream
         // groups, never whatever episode the engine's meta_details last resolved (a binge-advanced later
@@ -2008,8 +2009,8 @@ struct CoreStreamList: View {
         // seriesPage) scoped too. Movies and live pass nil -> unscoped, unchanged.
         sourceList.setContext(
             metaId: meta?.libraryId ?? "", streamId: episodeStreamId, continuity: remembered, pin: sourcePin,
-            auxiliaryContentID: sourceContentID,
-            mediaServerTargetID: mediaServerTargetID
+            auxiliaryTarget: auxiliaryTarget,
+            mediaServerTarget: mediaServerTarget
         )
         let groups = sourceList.groups                               // best source first within each add-on
         let best = sourceList.best
@@ -2279,12 +2280,12 @@ struct CoreStreamList: View {
             sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
                             mediaServers: mediaServers, debridCache: debridCache)
             mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
-                                 title: meta?.name, publicationTarget: mediaServerTargetID)
+                                 title: meta?.name, publicationTarget: mediaServerTarget)
             refreshSourceIndex()
         }
-        .onChange(of: mediaServerTargetID) { _ in
+        .onChange(of: mediaServerTarget) { _ in
             mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
-                                 title: meta?.name, publicationTarget: mediaServerTargetID)
+                                 title: meta?.name, publicationTarget: mediaServerTarget)
             refreshSourceIndex()
             scheduleSourceRefresh()
         }
@@ -2480,15 +2481,18 @@ struct CoreStreamList: View {
         )
     }
 
-    private var sourceContentID: String? {
-        auxiliaryTarget.target?.contentID
-    }
-
-    private var mediaServerTargetID: String {
-        if let sourceContentID { return sourceContentID }
-        let libraryID = meta?.libraryId ?? titleIdentity.titleID ?? "unknown"
-        let videoID = episodeStreamId ?? meta?.videoId ?? "title"
-        return "meta:\(libraryID)|video:\(videoID)"
+    /// The page's sealed media-server token: the typed page target when one resolved, else the
+    /// identity-file-formatted `meta:<library>|video:<video>` fallback (media-server lookup legitimately
+    /// serves IMDb-less pages). The fallback PARTS keep their previous chains verbatim; the token shape is
+    /// owned by the identity factory, never formatted here. COST: each eval re-runs the resolver +
+    /// `validatedTarget`, whose canonical checks are per-call regex evaluations -- a fixed handful per body
+    /// eval, small constant work, deliberately uncached.
+    private var mediaServerTarget: SourceIndexIdentity.MediaServerTarget? {
+        SourceIndexIdentity.mediaServerTarget(
+            preferring: auxiliaryTarget,
+            metaID: meta?.libraryId ?? titleIdentity.titleID ?? "unknown",
+            videoID: episodeStreamId ?? meta?.videoId ?? "title"
+        )
     }
 
     /// Community source index (tvOS): SERVE refresh + HOARD contribution for this title/episode. Fully gated

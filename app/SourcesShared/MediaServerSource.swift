@@ -16,8 +16,14 @@ final class MediaServerSource: ObservableObject {
     /// rebuild signature.
     @Published private(set) var groups: [CoreStreamSourceGroup] = [] { didSet { epoch &+= 1 } }
     private(set) var epoch = 0
-    /// Canonical title/episode identity for the currently published direct-play groups.
-    private(set) var publishedContentID: String?
+    /// The SEALED identity for the currently published direct-play groups: the exact `MediaServerTarget` the
+    /// resolve was issued for, with no ordinary construction route outside SourceIndexIdentity.swift (the
+    /// seal and its memory-safety exclusions are documented on the type). `SourceListModel`
+    /// authorizes its merge against this typed value (via `SourceIndexIdentity.mediaServerMergeAuthorization`),
+    /// so an instance reused across episodes can never lend one episode's direct-play rows to another, and no
+    /// raw page token can stand in for the published identity. This replaced `publishedContentID: String?`,
+    /// the merge path's last raw-string identity.
+    private(set) var publishedTarget: SourceIndexIdentity.MediaServerTarget?
 
     /// The title currently shown (its fetch key). Switching titles resets `groups`.
     private var shownKey: String?
@@ -30,22 +36,25 @@ final class MediaServerSource: ObservableObject {
     /// Resolve the current title on the connected servers, if any. Fail-soft and session-cached. Safe on every
     /// meta change / `.onAppear`. `imdb` is the detail id (imdb `tt...` or tmdb `tmdb:...`); `title`/`year` are
     /// the name+year fallback for GUID-less libraries; `season`/`episode` scope a series to one episode.
+    /// `publicationTarget` is the SEALED page identity the published groups will be merge-gated against,
+    /// buildable through no ordinary route but the `SourceIndexIdentity.mediaServerTarget` factories; a nil
+    /// target publishes nothing. That includes an IMDb-less page whose meta id is the empty string (the
+    /// factories reject empty parts), so such a page darkens this lane entirely, title/year fallback
+    /// included -- fail-closed, effectively unreachable; see the SCOPE EDGE note on the fallback factory.
     func refresh(imdb: String?, season: Int? = nil, episode: Int? = nil, title: String? = nil,
-                 year: Int? = nil, publicationTarget: String? = nil) {
+                 year: Int? = nil, publicationTarget: SourceIndexIdentity.MediaServerTarget?) {
         // DORMANCY GATE (synchronous, before any resolver work): no server -> no network, ever.
         guard !MediaServerStore.shared.servers.isEmpty else { clearResults(); return }
+        // No sealed page identity -> nothing may publish or merge, so nothing may fetch either. The old
+        // internal `idKey:season:episode` token composition is gone: the caller always states the typed
+        // target, so this owner never derives a page identity of its own.
+        guard let target = publicationTarget else { clearResults(); return }
         let idKey = imdb ?? ""
         guard !idKey.isEmpty || !(title ?? "").isEmpty else { clearResults(); return }
-
-        let target = publicationTarget ?? {
-            if let season, let episode { return "\(idKey):\(season):\(episode)" }
-            return idKey
-        }()
-        guard !target.isEmpty else { clearResults(); return }
-        let fetchKey = "\(idKey)|\(season ?? -1)|\(episode ?? -1)|\(title ?? "")|\(year ?? -1)|\(target)"
+        let fetchKey = "\(idKey)|\(season ?? -1)|\(episode ?? -1)|\(title ?? "")|\(year ?? -1)|\(target.token)"
         if fetchKey != shownKey {
             shownKey = fetchKey
-            publishedContentID = target
+            publishedTarget = target
             groups = cache[fetchKey] ?? []
         }
         if cache[fetchKey] != nil { return }          // cached: already published above
@@ -67,7 +76,7 @@ final class MediaServerSource: ObservableObject {
     /// across titles). A title that cannot resolve (no server / no id) must see it EMPTY.
     func clearResults() {
         shownKey = nil
-        publishedContentID = nil
+        publishedTarget = nil
         if !groups.isEmpty { groups = [] }
     }
 
@@ -120,8 +129,19 @@ final class MediaServerSource: ObservableObject {
 
     /// Merge the per-server groups into `groups`, deduped by url against streams already present. `nonisolated
     /// static` so `SourceListModel`'s off-main assembly can run it over a snapshot. Pass-through when empty.
-    nonisolated static func merge(_ extra: [CoreStreamSourceGroup], into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        guard !extra.isEmpty else { return groups }
+    ///
+    /// AUTHORIZATION-REQUIRED, mirroring `TorBoxSearchSource.merge` / `SourceIndexServeSource.merge`: the
+    /// identity-free signature left `SourceListModel` gating this merge on a hand-rolled comparison of two raw
+    /// page tokens, the last raw-identifier route on the main merge path. The required
+    /// `MediaServerMergeAuthorization` has no ordinary construction route outside the identity file, which
+    /// builds it only from the sealed target this source published, so a caller that has not proven "these
+    /// rows belong to this page" cannot merge: a nil authorization is a pure pass-through.
+    nonisolated static func merge(
+        authorizedBy authorization: SourceIndexIdentity.MediaServerMergeAuthorization?,
+        _ extra: [CoreStreamSourceGroup],
+        into groups: [CoreStreamSourceGroup]
+    ) -> [CoreStreamSourceGroup] {
+        guard authorization != nil, !extra.isEmpty else { return groups }
         var seenURLs: Set<String> = []
         for g in groups { for s in g.streams { if let u = s.url { seenURLs.insert(u) } } }
         let fresh = extra.compactMap { g -> CoreStreamSourceGroup? in

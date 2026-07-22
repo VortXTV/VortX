@@ -66,15 +66,18 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     struct Context: Equatable {
         var metaId = ""              // for the pin scope + the health-metric log only
         var streamId: String?        // nil = all loaded groups (movie/live); set = one episode's groups (iOS + tvOS episode pages)
-        /// The page's WITNESS token for the TorBox + Singularity merges. This is the one identifier the view
-        /// layer still hands over as a raw `String?` (the detail screens derive it from their own resolved
-        /// `TargetResolution` and `setContext`'s callers live outside this file's ownership), and it is INERT
-        /// by construction: the merge itself is opened only by `SourceIndexIdentity.mergeAuthorization`, which
-        /// compares this witness against the SEALED `publishedTarget` each auxiliary source fetched for. A
-        /// witness that matches nothing merges nothing; a matching witness merges exactly the rows the typed
-        /// source legitimately published. It is never formatted into output, a key, a request, or a log line.
-        var auxiliaryContentID: String?
-        var mediaServerTargetID: String?  // exact page token, including IMDb-less title/year fallback pages
+        /// The page's TYPED identity for the TorBox + Singularity merges: the same `TargetResolution` each
+        /// detail screen computes via `SourceIndexIdentity.publicationTarget(_:)`, handed over WITHOUT
+        /// flattening. The previous field was the flattened `String?` content id, which kept one public
+        /// raw-string route into the merge gate. The merge witness is now DERIVED from this sealed value
+        /// inside `rebuild()` by `SourceIndexIdentity.mergeAuthorization(published:page:)`, which compares it
+        /// against the SEALED `publishedTarget` each auxiliary source fetched for; `.absent` and `.mismatch`
+        /// authorize nothing. It is never formatted into output, a key, a request, or a log line.
+        var auxiliaryTarget: SourceIndexIdentity.TargetResolution = .absent
+        /// The page's SEALED media-server token (IMDb pages ride the canonical content id; IMDb-less pages
+        /// ride the identity-file-formatted `meta:` fallback -- see `SourceIndexIdentity.MediaServerTarget`).
+        /// Same role as `auxiliaryTarget`, for the media-server lane's own typed gate.
+        var mediaServerTarget: SourceIndexIdentity.MediaServerTarget?
         var continuity: String?      // remembered quality signature for the best() pick (nil for live)
         var pin: ResolvedPin?        // resolved pinned source, from the view's SourcePinStore lookup
         var prefsSignature = ""      // SourcePreferences.rankingSignature (filter/rank settings)
@@ -95,11 +98,18 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         let inputsHash: Int
     }
 
+    /// The identity a published output belongs to. The auxiliary field is the DERIVED canonical content id
+    /// (`validatedTarget(...)?.contentID`), deliberately NOT the `TargetResolution` enum: two resolutions
+    /// that derive the same merge witness are the SAME output identity. `.absent` and `.mismatch` both
+    /// derive nil and both authorize nothing, so a transition between them (reachable when an add-on later
+    /// emits a `defaultVideoId` from a different title) is a no-op again, exactly as it was when this field
+    /// was a flattened `String?`. Carrying the enum here made that transition an identity change, which
+    /// blanked the ENGINE rows too -- a <=250 ms empty source list until the throttled rebuild landed.
     private struct OutputIdentity: Equatable {
         let metaId: String
         let streamId: String?
         let auxiliaryContentID: String?
-        let mediaServerTargetID: String?
+        let mediaServerTarget: SourceIndexIdentity.MediaServerTarget?
     }
 
     /// Sendable weak indirection for the detached worker's main-actor publish. Capturing `weak self` directly
@@ -162,16 +172,25 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         rebuild()
     }
 
-    /// Update the view-owned ranking inputs. Safe (and intended) to call from `body`: it is a few
-    /// cheap reads plus an equality check, publishes nothing synchronously, and only nudges the
-    /// coalescer when an input actually moved.
+    /// Update the view-owned ranking inputs. Safe (and intended) to call from `body`: it publishes nothing
+    /// synchronously and only nudges the coalescer when an input actually moved. Cost honesty: this is no
+    /// longer "a few cheap reads" -- deciding `identityChanged` derives the output identity twice, and each
+    /// derivation re-validates the page target (`validatedTarget` -> `canonicalTitleID`/`canonicalContentID`,
+    /// each a per-call regex evaluation). Fixed small work per call, no per-stream work; see the signature
+    /// comment in `rebuild()` for the same accounting.
+    ///
+    /// BOTH identity inputs are REQUIRED -- no defaults, deliberately, mirroring the owners' refresh entry
+    /// points (`refresh(target:)` / `refresh(publicationTarget:)` also default nothing): a new screen that
+    /// forgot the old `= .absent` / `= nil` defaults compiled cleanly and silently got a permanently dead
+    /// merge lane with no diagnostic. Now it fails to compile instead.
     func setContext(metaId: String, streamId: String?, continuity: String?, pin: ResolvedPin?,
-                    auxiliaryContentID: String? = nil, mediaServerTargetID: String? = nil) {
+                    auxiliaryTarget: SourceIndexIdentity.TargetResolution,
+                    mediaServerTarget: SourceIndexIdentity.MediaServerTarget?) {
         var next = Context()
         next.metaId = metaId
         next.streamId = streamId
-        next.auxiliaryContentID = auxiliaryContentID
-        next.mediaServerTargetID = mediaServerTargetID
+        next.auxiliaryTarget = auxiliaryTarget
+        next.mediaServerTarget = mediaServerTarget
         next.continuity = continuity
         next.pin = pin
         next.prefsSignature = SourcePreferences.shared.rankingSignature
@@ -179,9 +198,9 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         next.directLinksOnly = PlaybackSettings.directLinksOnly
         next.disabledAddons = ProfileStore.activeDisabledAddons()
         guard next != context else { return }
-        let identityChanged = next.metaId != context.metaId || next.streamId != context.streamId
-            || next.auxiliaryContentID != context.auxiliaryContentID
-            || next.mediaServerTargetID != context.mediaServerTargetID
+        // Compare the DERIVED output identities, not the raw context fields: `.absent` -> `.mismatch`
+        // derives the same nil witness and must NOT retire the published output (see `OutputIdentity`).
+        let identityChanged = outputIdentity(for: next) != outputIdentity(for: context)
         context = next
         if identityChanged {
             // A detached rebuild for the prior title/episode may still be running. Retire its generation and
@@ -194,12 +213,15 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         trigger.send()
     }
 
+    /// Derive the output identity for a context. Runs `validatedTarget` (regex-backed canonical
+    /// re-validation) on each call, including the published-getter comparisons above -- a fixed handful of
+    /// regex evaluations per access, which is small constant work, deliberately NOT cached.
     private func outputIdentity(for context: Context) -> OutputIdentity {
         OutputIdentity(
             metaId: context.metaId,
             streamId: context.streamId,
-            auxiliaryContentID: context.auxiliaryContentID,
-            mediaServerTargetID: context.mediaServerTargetID
+            auxiliaryContentID: SourceIndexIdentity.validatedTarget(context.auxiliaryTarget)?.contentID,
+            mediaServerTarget: context.mediaServerTarget
         )
     }
 
@@ -211,12 +233,25 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         let tombstones = AddonTombstones.all()
         let cachedHashes = debridCache.cachedHashes
 
-        // O(1)-ish signature: three epochs + one fold of the small inputs. No per-stream work.
+        // Per-rebuild-constant signature: four epochs + one fold of the small inputs. No per-stream work,
+        // but no longer just "epochs + one fold of small inputs" either: the fold below and the two
+        // `mergeAuthorization` calls further down each run `validatedTarget`, whose
+        // `canonicalTitleID`/`canonicalContentID` checks are per-call regex evaluations
+        // (`String.range(of:options:.regularExpression)` compiles per call) -- a fixed handful of regex
+        // constructions per rebuild. At the 250 ms throttle (~4 rebuilds/sec) that is negligible real cost
+        // (~1 ms/sec worst case), and deliberately NOT cached.
+        // `TargetResolution` is deliberately NOT Hashable (widening its conformances for one hasher fold
+        // would invite hashing raw resolutions elsewhere), so fold the derived canonical content id -- the
+        // exact value the merge authorization compares. `.absent` and `.mismatch` both fold as nil, which is
+        // correct here: both authorize nothing, so they produce identical output -- and `OutputIdentity`
+        // treats them as the same identity for the same reason, so a transition between them changes neither
+        // the signature nor the published output: a no-op, as it was before the typed witness landed.
+        // `MediaServerTarget` is Hashable and folds directly.
         var hasher = Hasher()
         hasher.combine(ctx.metaId)
         hasher.combine(ctx.streamId)
-        hasher.combine(ctx.auxiliaryContentID)
-        hasher.combine(ctx.mediaServerTargetID)
+        hasher.combine(SourceIndexIdentity.validatedTarget(ctx.auxiliaryTarget)?.contentID)
+        hasher.combine(ctx.mediaServerTarget)
         hasher.combine(ctx.continuity)
         hasher.combine(String(describing: ctx.pin))
         hasher.combine(ctx.prefsSignature)
@@ -238,21 +273,22 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         // Immutable snapshot on the main actor; everything below is value types.
         let raw = ctx.streamId.map { core.streamGroups(forStreamId: $0) } ?? core.streamGroups()
         // The TYPED merge gate (REQ: no raw-identifier route on this path). Each auxiliary source publishes
-        // the SEALED target its rows were fetched for; the page witness can only select that typed value via
-        // the identity file's factory. Both authorizations are captured here, in the same main-actor snapshot
-        // that captures the streams they authorize, and the detached merges below cannot run without them.
+        // the SEALED target its rows were fetched for; the page's typed identity can only select that value
+        // via the identity file's factories. All three authorizations are captured here, in the same
+        // main-actor snapshot that captures the streams they authorize, and the detached merges below cannot
+        // run without them.
         let torboxAuthorization = SourceIndexIdentity.mergeAuthorization(
-            published: torbox.publishedTarget, pageContentID: ctx.auxiliaryContentID)
+            published: torbox.publishedTarget, page: ctx.auxiliaryTarget)
         let singularityAuthorization = SourceIndexIdentity.mergeAuthorization(
-            published: singularity.publishedTarget, pageContentID: ctx.auxiliaryContentID)
+            published: singularity.publishedTarget, page: ctx.auxiliaryTarget)
         let torboxStreams = torboxAuthorization != nil ? torbox.streams : []
         let singularityStreams = singularityAuthorization != nil ? singularity.streams : []
         let singularityEpoch = singularity.epoch
         let sourceLifecycle = SourceIndexLifecycleClock.snapshot()
         let includedSingularity = !singularityStreams.isEmpty
-        let mediaTarget = ctx.mediaServerTargetID
-        let mediaServerGroups = mediaTarget != nil && mediaServers.publishedContentID == mediaTarget
-            ? mediaServers.groups : []
+        let mediaServerAuthorization = SourceIndexIdentity.mediaServerMergeAuthorization(
+            published: mediaServers.publishedTarget, page: ctx.mediaServerTarget)
+        let mediaServerGroups = mediaServerAuthorization != nil ? mediaServers.groups : []
         // Freeze the ranking prefs HERE, on the main actor. StreamRanking reads SourcePreferences live at
         // score/filter time; its excludeRegex/includeRegex refs + @Published flags are reassigned on the
         // main thread (Settings edits, profile reload()), so reading them from the detached rank below
@@ -272,10 +308,10 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             // Merge order preserved from the old per-body displayGroups: TorBox search first, then the
             // Singularity pool, then the media-server direct-play groups, then the direct-links filter so a
             // merged torrent obeys the same rule. Final rank order is decided by StreamRanking, not merge order.
-            // The TorBox and Singularity merges REQUIRE the typed authorizations snapshotted above; the
-            // media-server lane still compares its own raw page token (see the remaining-route note on
-            // `Context.mediaServerTargetID`'s witness field and the boundary report).
-            assembled = MediaServerSource.merge(mediaServerGroups,
+            // ALL THREE merges REQUIRE the typed authorizations snapshotted above; there is no raw-identifier
+            // route left on this path (the media-server lane's raw page-token comparison was the last one).
+            assembled = MediaServerSource.merge(authorizedBy: mediaServerAuthorization,
+                          mediaServerGroups,
                           into: SourceIndexServeSource.merge(authorizedBy: singularityAuthorization,
                                   singularityStreams,
                                   into: TorBoxSearchSource.merge(authorizedBy: torboxAuthorization,

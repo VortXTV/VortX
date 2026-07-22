@@ -231,9 +231,6 @@ final class TorBoxSearchSource: ObservableObject {
     /// string can stand in for the published identity. This replaced a raw `publishedContentID: String?`
     /// stored token, which was the merge path's last identifier that did not carry its own validation.
     private(set) var publishedTarget: SourceIndexIdentity.PublicationTarget?
-    /// Derived, read-only string view of the published identity for the existing boundary suites. It cannot
-    /// be set independently of `publishedTarget`, so it can never disagree with the typed value.
-    var publishedContentID: String? { publishedTarget?.contentID }
 
     /// The title currently shown (its fetch key). Switching titles resets `streams` so a previous title's
     /// results can never leak onto one we don't (or can't) fetch.
@@ -357,7 +354,7 @@ final class TorBoxSearchSource: ObservableObject {
     ) -> [CoreStreamSourceGroup] {
         let authorization = SourceIndexIdentity.mergeAuthorization(
             published: publishedTarget,
-            pageContentID: SourceIndexIdentity.validatedTarget(call.resolution)?.contentID
+            page: call.resolution
         )
         return Self.merge(authorizedBy: authorization, streams, into: groups)
     }

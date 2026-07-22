@@ -14,20 +14,38 @@
 //   1. FORGE PROOF (compile-negative): the exact same-module-extension fixture that BROKE commit 9a017a1 --
 //      an extension of `SourceIndexIdentity.PublicationTarget` in another file of the module that directly
 //      initializes the stored properties (SE-0189) and prints an identity pair that never passed the role
-//      resolver -- must now FAIL TO COMPILE, in both its pre-fix spelling and its seal-aware spelling.
+//      resolver -- must now FAIL TO COMPILE, in both its pre-fix spelling and its seal-aware spelling. The
+//      SAME proof now also covers `SourceIndexIdentity.MediaServerTarget` (the sealed media-server page
+//      identity): its get-only spelling, its storage spelling, AND its direct-init spelling must all be
+//      rejected, so no ORDINARY construction route can smuggle a pre-baked media page token past the
+//      identity file's factories (memory-safety opt-outs like `unsafeBitCast` are outside this proof's
+//      scope, as documented on the type).
 //
 //   2. MUTATION PROOF: a guard that cannot be shown to fail is not verified. A COPY of the production
-//      identity file is re-widened two ways (drop `private` from the sealed storage; make the fileprivate
+//      identity file is re-widened four ways (drop `private` from each sealed storage; make each fileprivate
 //      init internal) and the corresponding forge fixture must COMPILE AND RUN again against each widened
-//      copy, printing the forged pair. This pins that the seal, and nothing else, is what stops the forge.
+//      copy, printing the forged value. This pins that the seal, and nothing else, is what stops the forge.
 //
 //   3. LIFECYCLE (production-linked, async): the REAL SourceListModel, driven through the REAL sealed
-//      `SourceIndexIdentity.PublicationTarget` + `mergeAuthorization` gate, must publish matching auxiliary
-//      rows, exclude stale ones synchronously on an identity change, fence detached stale ranks, and clear
-//      on a Source Index lifecycle close. The auxiliary stubs publish TYPED targets built by the real
-//      resolver -- there is no raw-string route left to drive them with.
+//      `SourceIndexIdentity.PublicationTarget` + `mergeAuthorization(published:page:)` gate AND the sealed
+//      `MediaServerTarget` + `mediaServerMergeAuthorization` gate, must publish matching auxiliary rows,
+//      exclude stale ones synchronously on an identity change, keep both the published output AND any
+//      in-flight detached rebuild across an `.absent` -> `.mismatch` witness step (the derived-identity
+//      comparison in `setContext`), fence detached stale ranks, and clear on a Source Index lifecycle
+//      close. The auxiliary stubs publish TYPED targets built by the real resolver and the real media
+//      factories -- there is no raw-string route left to drive them with.
 //
-// CAPTURED COMPILER OUTPUT (literal, from this machine, so "does not compile" is checkable prose):
+// CAPTURED COMPILER OUTPUT (literal, from this machine, so "does not compile" is checkable prose).
+// Recaptured 2026-07-22 by reproducing `compileForge`'s exact invocation (fixture written as main.swift,
+// compiled with `xcrun swiftc -swift-version 6 <contract> <identity copy> main.swift -o <bin>`) under
+// Apple Swift 6.3.2 (swiftlang-6.3.2.1.108). The compiler prints each error with an annotated source
+// snippet and `note:` lines pointing into the (per-run temp) identity copy; only the `error:` lines are
+// quoted below, with the per-run temp directory prefix elided to the file's basename. An earlier revision
+// of this header quoted fixture (A)'s errors at lines 13-16 and fixture (B)'s at line 6, and omitted (B)'s
+// two follow-on `nil` errors. The provenance of those old numbers could not be reconstructed: they match
+// neither the main.swift the harness writes (fixture (A)'s four assignments sit at its lines 5-8, and
+// fixture (B)'s storage assignment at its line 5) nor where either fixture's string literal sits in this
+// file. The block below is a fresh capture, not a correction of the old one. What the compiler really prints:
 //
 // The PRE-FIX run of fixture (A) against 9a017a1's SourceIndexIdentity.swift compiled with exit 0 and printed:
 //
@@ -36,20 +54,43 @@
 // which is the reviewer's bypass 1 reproduced verbatim: `internal` stored properties behind a `fileprivate`
 // init are NOT a boundary inside one module.
 //
-// The POST-FIX run of fixture (A) (assigning the old stored names) fails with:
+// The POST-FIX run of fixture (A) (assigning the old stored names) exits 1 with:
 //
-//     main.swift:13:14: error: cannot assign to property: 'titleID' is a get-only property
-//     main.swift:14:14: error: cannot assign to property: 'contentID' is a get-only property
-//     main.swift:15:14: error: cannot assign to property: 'season' is a get-only property
-//     main.swift:16:14: error: cannot assign to property: 'episode' is a get-only property
+//     main.swift:5:14: error: cannot assign to property: 'titleID' is a get-only property
+//     main.swift:6:14: error: cannot assign to property: 'contentID' is a get-only property
+//     main.swift:7:14: error: cannot assign to property: 'season' is a get-only property
+//     main.swift:8:14: error: cannot assign to property: 'episode' is a get-only property
 //
-// The POST-FIX run of fixture (B) (assigning the sealed storage directly) fails with:
+// The POST-FIX run of fixture (B) (assigning the sealed storage directly) exits 1 with:
 //
-//     main.swift:6:24: error: 'Storage' is inaccessible due to 'private' protection level
-//     main.swift:6:14: error: 'storage' is inaccessible due to 'private' protection level
+//     main.swift:5:24: error: 'Storage' is inaccessible due to 'private' protection level
+//     main.swift:5:14: error: 'storage' is inaccessible due to 'private' protection level
+//     main.swift:5:92: error: 'nil' requires a contextual type
+//     main.swift:5:106: error: 'nil' requires a contextual type
 //
-// and the MUTATION run (same fixture (B), `private` dropped from `struct Storage` and `let storage` in a
-// temp copy) compiles with exit 0 and prints `FORGED pair: titleID=tt0000001 contentID=tt9999999:9:9` again.
+// (the two `nil` errors are fallout of the same seal: with `Storage` inaccessible, its memberwise init is
+// unknown, so the `season:`/`episode:` nil literals have no type to adopt), and the MUTATION run (same
+// fixture (B), `private` dropped from `struct Storage` and `let storage` in a temp copy) compiles with
+// exit 0 and prints `FORGED pair: titleID=tt0000001 contentID=tt9999999:9:9` again.
+//
+// The MEDIA-SERVER fixtures, captured against the sealed MediaServerTarget on this machine the same way:
+//
+// Fixture (D) (assigning the get-only `token` from a same-module extension) exits 1 with:
+//
+//     main.swift:5:14: error: cannot assign to property: 'token' is a get-only property
+//
+// Fixture (E) (assigning the sealed media storage directly) exits 1 with:
+//
+//     main.swift:5:24: error: 'Storage' is inaccessible due to 'private' protection level
+//     main.swift:5:14: error: 'storage' is inaccessible due to 'private' protection level
+//
+// Fixture (F) (calling the fileprivate init directly) exits 1 with (one line in the real output):
+//
+//     main.swift:3:14: error: 'SourceIndexIdentity.MediaServerTarget' initializer is inaccessible due to 'fileprivate' protection level
+//
+// and BOTH media mutation runs (fixture (E) against a copy whose media Storage block loses `private`;
+// fixture (F) against a copy whose `fileprivate init(token:)` becomes internal) compile with exit 0 and
+// print `FORGED media token: meta:forged|video:forged` again.
 
 import Foundation
 import Combine
@@ -103,6 +144,45 @@ let forged = SourceIndexIdentity.PublicationTarget(
     titleID: "tt0000001", contentID: "tt9999999:9:9", season: nil, episode: nil
 )
 print("FORGED pair: titleID=\\(forged.titleID) contentID=\\(forged.contentID)")
+"""
+
+/// Fixture (D): the media-lane forge, pre-fix spelling -- a same-module extension of the sealed
+/// `MediaServerTarget` assigning its exposed property directly, which would let any file hand the merge gate
+/// a pre-baked page token that no factory formatted.
+private let forgeMediaPreFixShape = """
+import Foundation
+
+extension SourceIndexIdentity.MediaServerTarget {
+    init(forgedToken: String) {
+        self.token = forgedToken
+    }
+}
+
+let forged = SourceIndexIdentity.MediaServerTarget(forgedToken: "meta:forged|video:forged")
+print("FORGED media token: \\(forged.token)")
+"""
+
+/// Fixture (E): the seal-aware spelling of the media forge, targeting the sealed nested storage.
+private let forgeMediaStorageShape = """
+import Foundation
+
+extension SourceIndexIdentity.MediaServerTarget {
+    init(forgedToken: String) {
+        self.storage = Storage(token: forgedToken)
+    }
+}
+
+let forged = SourceIndexIdentity.MediaServerTarget(forgedToken: "meta:forged|video:forged")
+print("FORGED media token: \\(forged.token)")
+"""
+
+/// Fixture (F): direct construction of `MediaServerTarget` through the declared init. Rejected while the
+/// init stays fileprivate; the widened-init mutation below must re-admit it.
+private let forgeMediaDirectInitShape = """
+import Foundation
+
+let forged = SourceIndexIdentity.MediaServerTarget(token: "meta:forged|video:forged")
+print("FORGED media token: \\(forged.token)")
 """
 
 private struct CompileOutcome {
@@ -191,12 +271,52 @@ private func forgeProofFailures(repoRoot: String) -> [String] {
         failures.append("FORGE: storage forge failed for an unexpected reason:\n\(sealAware.diagnostics)")
     }
 
+    // Phase 1c: the media-lane pre-fix forge (assigning the exposed `token`) must be rejected as get-only.
+    let mediaPreFix = compileForge(fixture: forgeMediaPreFixShape, contractPath: contractPath,
+                                   identitySource: identitySource, label: "media-prefix-shape")
+    if mediaPreFix.exitCode == 0 {
+        failures.append("FORGE: the media-target extension forge COMPILED; output: \(mediaPreFix.runOutput)")
+    } else if !mediaPreFix.diagnostics.contains("cannot assign to property: 'token' is a get-only property") {
+        failures.append("FORGE: media pre-fix forge failed for an unexpected reason:\n\(mediaPreFix.diagnostics)")
+    }
+
+    // Phase 1d: the media storage-targeting forge must be rejected as INACCESSIBLE private storage.
+    let mediaSealAware = compileForge(fixture: forgeMediaStorageShape, contractPath: contractPath,
+                                      identitySource: identitySource, label: "media-storage-shape")
+    if mediaSealAware.exitCode == 0 {
+        failures.append("FORGE: the media storage forge COMPILED; output: \(mediaSealAware.runOutput)")
+    } else if !mediaSealAware.diagnostics.contains("'storage' is inaccessible due to 'private' protection level") {
+        failures.append("FORGE: media storage forge failed for an unexpected reason:\n\(mediaSealAware.diagnostics)")
+    }
+
+    // Phase 1e: direct construction of MediaServerTarget must be rejected while the init stays fileprivate
+    // (PublicationTarget's sealed direction is pinned by the IdentityCallerGateTests ACCESS check; the media
+    // type has no such external pin, so this file carries both directions itself).
+    let mediaDirect = compileForge(fixture: forgeMediaDirectInitShape, contractPath: contractPath,
+                                   identitySource: identitySource, label: "media-direct-init")
+    if mediaDirect.exitCode == 0 {
+        failures.append("FORGE: direct MediaServerTarget construction COMPILED; output: \(mediaDirect.runOutput)")
+    } else if !mediaDirect.diagnostics.contains("initializer is inaccessible due to 'fileprivate' protection level") {
+        failures.append("FORGE: media direct init failed for an unexpected reason:\n\(mediaDirect.diagnostics)")
+    }
+
     // Phase 2 preconditions: the exact sealed spellings must exist in the production source, so the widening
-    // below provably bites. A rename that silently defeated the mutation would otherwise pass forever.
+    // below provably bites. A rename that silently defeated the mutation would otherwise pass forever. The
+    // media storage needle is MULTI-LINE (it includes `let token: String`) because `private struct Storage` /
+    // `private let storage: Storage` now name two seals; the scoped needle keeps each mutation minimal.
     let sealedStorageDecl = "private struct Storage"
     let sealedStorageLet = "private let storage: Storage"
     let sealedInit = "fileprivate init(titleID: String, contentID: String, season: Int?, episode: Int?)"
-    for needle in [sealedStorageDecl, sealedStorageLet, sealedInit] where !identitySource.contains(needle) {
+    let sealedMediaStorage = [
+        "        private struct Storage: Equatable, Hashable, Sendable {",
+        "            let token: String",
+        "        }",
+        "",
+        "        private let storage: Storage",
+    ].joined(separator: "\n")
+    let sealedMediaInit = "fileprivate init(token: String)"
+    for needle in [sealedStorageDecl, sealedStorageLet, sealedInit, sealedMediaStorage, sealedMediaInit]
+    where !identitySource.contains(needle) {
         failures.append("MUTATION: expected sealed spelling `\(needle)` not found; the widening proof is dead")
     }
     guard failures.isEmpty else { return failures }
@@ -226,6 +346,36 @@ private func forgeProofFailures(repoRoot: String) -> [String] {
     } else if !reopenedInit.runOutput.contains("FORGED pair: titleID=tt0000001") {
         failures.append("MUTATION: widened-init forge compiled but did not print the forged pair: "
                         + reopenedInit.runOutput)
+    }
+
+    // Phase 2c: drop `private` from ONLY the media storage block -> the media storage forge must COMPILE AND
+    // RUN again, which proves the media seal (and nothing else) is what stops fixture (E).
+    let widenedMediaStorage = identitySource.replacingOccurrences(
+        of: sealedMediaStorage,
+        with: sealedMediaStorage
+            .replacingOccurrences(of: "private struct Storage", with: "struct Storage")
+            .replacingOccurrences(of: "private let storage", with: "let storage"))
+    let reopenedMedia = compileForge(fixture: forgeMediaStorageShape, contractPath: contractPath,
+                                     identitySource: widenedMediaStorage, label: "widened-media-storage")
+    if reopenedMedia.exitCode != 0 {
+        failures.append("MUTATION: re-widened media storage did NOT re-open the media forge:\n"
+                        + reopenedMedia.diagnostics)
+    } else if !reopenedMedia.runOutput.contains("FORGED media token: meta:forged|video:forged") {
+        failures.append("MUTATION: widened media forge compiled but did not print the forged token: "
+                        + reopenedMedia.runOutput)
+    }
+
+    // Phase 2d: make the media fileprivate init internal -> direct construction must COMPILE AND RUN again.
+    let widenedMediaInit = identitySource.replacingOccurrences(
+        of: sealedMediaInit, with: "init(token: String)")
+    let reopenedMediaInit = compileForge(fixture: forgeMediaDirectInitShape, contractPath: contractPath,
+                                         identitySource: widenedMediaInit, label: "widened-media-init")
+    if reopenedMediaInit.exitCode != 0 {
+        failures.append("MUTATION: internal-again media init did NOT re-open direct construction:\n"
+                        + reopenedMediaInit.diagnostics)
+    } else if !reopenedMediaInit.runOutput.contains("FORGED media token: meta:forged|video:forged") {
+        failures.append("MUTATION: widened-media-init forge compiled but did not print the forged token: "
+                        + reopenedMediaInit.runOutput)
     }
     return failures
 }
@@ -352,16 +502,22 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     }
 }
 
+/// Media-server stub: publishes the REAL sealed `MediaServerTarget` type and requires the REAL typed
+/// authorization, mirroring the production owner. As with the TorBox stub, there is deliberately NO
+/// raw-string identity setter -- the only way to point this stub at a page is a target built by the real
+/// identity-file factories.
 @MainActor
 final class MediaServerSource: ObservableObject {
     @Published var groups: [CoreStreamSourceGroup] = [] { didSet { epoch &+= 1 } }
     var epoch = 0
-    var publishedContentID: String?
+    var publishedTarget: SourceIndexIdentity.MediaServerTarget?
 
     nonisolated static func merge(
+        authorizedBy authorization: SourceIndexIdentity.MediaServerMergeAuthorization?,
         _ mediaGroups: [CoreStreamSourceGroup], into groups: [CoreStreamSourceGroup]
     ) -> [CoreStreamSourceGroup] {
-        groups + mediaGroups
+        guard authorization != nil else { return groups }
+        return groups + mediaGroups
     }
 }
 
@@ -484,15 +640,34 @@ enum VXProbeRedaction {
 
 @main
 struct SourceIndexSourceListLifecycleTests {
-    /// A resolver-built series episode target. The ONLY identity constructor this harness has.
+    /// A resolver-built series episode resolution -- what a page computes and hands to `setContext`.
     @MainActor
-    static func episodeTarget(_ catalogID: String, season: Int, episode: Int)
-        -> SourceIndexIdentity.PublicationTarget {
-        guard let target = SourceIndexIdentity.publicationTarget(
+    static func episodeResolution(_ catalogID: String, season: Int, episode: Int)
+        -> SourceIndexIdentity.TargetResolution {
+        SourceIndexIdentity.publicationTarget(
             SourceIndexIdentity.Roles(
                 catalogID: catalogID, defaultVideoID: nil, currentVideoID: nil, kind: .series),
             season: season, episode: episode
-        ).target else { fatalError("fixture target must resolve") }
+        )
+    }
+
+    /// The sealed target out of the resolution above -- what an auxiliary source publishes. Together these
+    /// are the ONLY identity constructors this harness has.
+    @MainActor
+    static func episodeTarget(_ catalogID: String, season: Int, episode: Int)
+        -> SourceIndexIdentity.PublicationTarget {
+        guard let target = episodeResolution(catalogID, season: season, episode: episode).target
+        else { fatalError("fixture target must resolve") }
+        return target
+    }
+
+    /// A factory-built media-server page target (the IMDb-less `meta:<id>|video:<id>` lane, which is the
+    /// shape the identity file itself formats). The harness cannot spell a token by hand.
+    @MainActor
+    static func mediaTarget(_ metaID: String, video videoID: String)
+        -> SourceIndexIdentity.MediaServerTarget {
+        guard let target = SourceIndexIdentity.mediaServerTarget(metaID: metaID, videoID: videoID)
+        else { fatalError("fixture media target must build") }
         return target
     }
 
@@ -505,24 +680,90 @@ struct SourceIndexSourceListLifecycleTests {
         let forgeFailures = forgeProofFailures(repoRoot: repoRoot)
         for failure in forgeFailures { print("FAIL  \(failure)") }
         if forgeFailures.isEmpty {
-            print("PASS  forge: same-module extension forge rejected in both spellings; both re-widenings re-open it")
+            print("PASS  forge: PublicationTarget + MediaServerTarget forges rejected in every spelling; "
+                  + "all four re-widenings re-open them")
         }
 
-        // The authorization factory's contract, pinned directly against resolver-built targets.
+        // The authorization factory's contract, pinned directly against resolver-built values. The page side
+        // is a typed resolution now: `.absent` / `.mismatch` are the only spellings of "no page identity"
+        // left, and a stale page is expressed as a different resolver-built episode -- there is no string
+        // parameter through which anything else could be said.
+        let r1 = episodeResolution("tt0903747", season: 1, episode: 1)
+        let r2 = episodeResolution("tt0903747", season: 1, episode: 2)
         let e1 = episodeTarget("tt0903747", season: 1, episode: 1)
         let e2 = episodeTarget("tt0903747", season: 1, episode: 2)
         let authorizationContract =
-            SourceIndexIdentity.mergeAuthorization(published: e1, pageContentID: e1.contentID) != nil
-            && SourceIndexIdentity.mergeAuthorization(published: e1, pageContentID: e2.contentID) == nil
-            && SourceIndexIdentity.mergeAuthorization(published: nil, pageContentID: e1.contentID) == nil
-            && SourceIndexIdentity.mergeAuthorization(published: e1, pageContentID: nil) == nil
-            && SourceIndexIdentity.mergeAuthorization(published: e1, pageContentID: "") == nil
+            SourceIndexIdentity.mergeAuthorization(published: e1, page: r1) != nil
+            && SourceIndexIdentity.mergeAuthorization(published: e1, page: r2) == nil
+            && SourceIndexIdentity.mergeAuthorization(published: e2, page: r1) == nil
+            && SourceIndexIdentity.mergeAuthorization(published: nil, page: r1) == nil
+            && SourceIndexIdentity.mergeAuthorization(published: e1, page: .absent) == nil
+            && SourceIndexIdentity.mergeAuthorization(published: e1, page: .mismatch) == nil
         print(authorizationContract
-              ? "PASS  authorization: granted only for a published target whose content id the witness matches"
+              ? "PASS  authorization: granted only for a published target whose canonical content id the page resolution matches"
               : "FAIL  authorization: factory contract broken")
 
-        // Phase 3: the real SourceListModel over the typed merge gate.
+        // The media-server factories' contract: the identity file formats every token (IMDb pages ride the
+        // canonical content id verbatim; IMDb-less pages ride the formatted parts), each part is bounded by
+        // the 128-byte identity cap, and an unusable part fails the WHOLE target instead of widening it.
+        let oversized = String(repeating: "x", count: 200)
+        let mediaFactoryContract =
+            SourceIndexIdentity.mediaServerTarget(page: r1)?.token == e1.contentID
+            && SourceIndexIdentity.mediaServerTarget(page: .absent) == nil
+            && SourceIndexIdentity.mediaServerTarget(page: .mismatch) == nil
+            && SourceIndexIdentity.mediaServerTarget(metaID: "meta-1")?.token == "meta:meta-1"
+            && SourceIndexIdentity.mediaServerTarget(metaID: "meta-1", videoID: "vid-1")?.token
+                == "meta:meta-1|video:vid-1"
+            && SourceIndexIdentity.mediaServerTarget(metaID: nil) == nil
+            && SourceIndexIdentity.mediaServerTarget(metaID: "") == nil
+            && SourceIndexIdentity.mediaServerTarget(metaID: oversized) == nil
+            && SourceIndexIdentity.mediaServerTarget(metaID: "meta-1", videoID: oversized) == nil
+            && SourceIndexIdentity.mediaServerTarget(metaID: "meta-1", videoID: "") == nil
+            && SourceIndexIdentity.mediaServerTarget(preferring: r1, metaID: "meta-1", videoID: "vid-1")?.token
+                == e1.contentID
+            && SourceIndexIdentity.mediaServerTarget(preferring: .absent, metaID: "meta-1", videoID: "vid-1")?.token
+                == "meta:meta-1|video:vid-1"
+        print(mediaFactoryContract
+              ? "PASS  media factory: tokens are derived or formatted only by the identity file, parts bounded, no partial fallback"
+              : "FAIL  media factory: contract broken")
+
+        let msA = mediaTarget("tt0903747", video: "tt0903747:1:1")
+        let msB = mediaTarget("tt0903747", video: "tt0903747:1:2")
+        let mediaAuthorizationContract =
+            SourceIndexIdentity.mediaServerMergeAuthorization(published: msA, page: msA) != nil
+            && SourceIndexIdentity.mediaServerMergeAuthorization(published: msA, page: msB) == nil
+            && SourceIndexIdentity.mediaServerMergeAuthorization(published: nil, page: msA) == nil
+            && SourceIndexIdentity.mediaServerMergeAuthorization(published: msA, page: nil) == nil
+        print(mediaAuthorizationContract
+              ? "PASS  media authorization: granted only when the published and page tokens compare equal (Swift String equality)"
+              : "FAIL  media authorization: factory contract broken")
+
+        // INJECTIVITY of the fallback encoding (the separator gate). Before the gate, these two DIFFERENT
+        // pages formatted the byte-identical token `meta:kitsu:42|video:kitsu:42:7` -- a movie page whose
+        // add-on/catalog-controlled meta id embeds the separator, and a legitimate episode page -- and
+        // `mediaServerMergeAuthorization` then authorized merging one page's direct-play rows into the
+        // other. The crafted spelling must now build NOTHING (a separator-bearing part fails the whole
+        // target, fail-closed), the legitimate two-part page must still build its exact token, and the
+        // authorization must refuse to bridge the two pages in either direction.
+        let craftedCollision = SourceIndexIdentity.mediaServerTarget(metaID: "kitsu:42|video:kitsu:42:7")
+        let legitimateEpisodePage = SourceIndexIdentity.mediaServerTarget(metaID: "kitsu:42",
+                                                                          videoID: "kitsu:42:7")
+        let separatorInjectivityContract =
+            craftedCollision == nil
+            && legitimateEpisodePage?.token == "meta:kitsu:42|video:kitsu:42:7"
+            && SourceIndexIdentity.mediaServerTarget(metaID: "kitsu:42", videoID: "kit|su:42:7") == nil
+            && SourceIndexIdentity.mediaServerMergeAuthorization(
+                published: craftedCollision, page: legitimateEpisodePage) == nil
+            && SourceIndexIdentity.mediaServerMergeAuthorization(
+                published: legitimateEpisodePage, page: craftedCollision) == nil
+        print(separatorInjectivityContract
+              ? "PASS  media injectivity: separator-bearing parts are rejected, so the crafted one-part/two-part collision is unbuildable"
+              : "FAIL  media injectivity: the colliding pair is constructible again")
+
+        // Phase 3: the real SourceListModel over the typed merge gates (all three lanes).
+        let r3 = episodeResolution("tt0903747", season: 1, episode: 3)
         let e3 = episodeTarget("tt0903747", season: 1, episode: 3)
+        let msC = mediaTarget("tt0903747", video: "tt0903747:1:3")
         let ordinary = CoreStream(id: "ordinary", infoHash: nil, isTorrent: false)
         let pooled = CoreStream(id: "pooled", infoHash: String(repeating: "a", count: 40), isTorrent: true)
         let torboxRow = CoreStream(id: "torbox-row", infoHash: String(repeating: "b", count: 40), isTorrent: true)
@@ -535,17 +776,17 @@ struct SourceIndexSourceListLifecycleTests {
         torbox.streams = [torboxRow]
         let singularity = SourceIndexServeSource(streams: [pooled], publishedTarget: e1)
         let mediaServers = MediaServerSource()
-        mediaServers.publishedContentID = "page:tt0903747:1:1"
+        mediaServers.publishedTarget = msA
         mediaServers.groups = [
             CoreStreamSourceGroup(id: "media", addon: "My Server", streams: [mediaRow]),
         ]
         let debridCache = DebridCacheAwareness()
         let model = SourceListModel()
-        // The witness the views hand over is the resolver target's content id, exactly as the detail screens
-        // derive it (`auxiliaryTarget.target?.contentID`).
+        // The page hands over its TYPED resolutions, exactly as the detail screens now do (`auxiliaryTarget`
+        // and the factory-built `mediaServerTarget` computed vars) -- nothing here is a string.
         model.setContext(
             metaId: "tt0903747", streamId: e1.contentID, continuity: nil, pin: nil,
-            auxiliaryContentID: e1.contentID, mediaServerTargetID: "page:tt0903747:1:1"
+            auxiliaryTarget: r1, mediaServerTarget: msA
         )
 
         model.bind(
@@ -565,7 +806,7 @@ struct SourceIndexSourceListLifecycleTests {
 
         model.setContext(
             metaId: "tt0903747", streamId: e2.contentID, continuity: nil, pin: nil,
-            auxiliaryContentID: e2.contentID, mediaServerTargetID: "page:tt0903747:1:2"
+            auxiliaryTarget: r2, mediaServerTarget: msB
         )
         let identityClearedSynchronously = model.groups.isEmpty
             && model.best == nil
@@ -585,7 +826,7 @@ struct SourceIndexSourceListLifecycleTests {
         torbox.streams = [torboxRow]
         singularity.publishedTarget = e2
         singularity.streams = [pooled]
-        mediaServers.publishedContentID = "page:tt0903747:1:2"
+        mediaServers.publishedTarget = msB
         mediaServers.groups = [
             CoreStreamSourceGroup(id: "media", addon: "My Server", streams: [mediaRow]),
         ]
@@ -600,7 +841,7 @@ struct SourceIndexSourceListLifecycleTests {
 
         model.setContext(
             metaId: "tt0903747", streamId: e3.contentID, continuity: nil, pin: nil,
-            auxiliaryContentID: e3.contentID, mediaServerTargetID: "page:tt0903747:1:3"
+            auxiliaryTarget: r3, mediaServerTarget: msC
         )
         let nextEpisodeClearedSynchronously = model.groups.isEmpty
             && model.best == nil
@@ -610,6 +851,82 @@ struct SourceIndexSourceListLifecycleTests {
             if model.groups.contains(where: { $0.id == "singularity" }) { break }
             try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
         }
+
+        // Restored `.absent` <-> `.mismatch` semantics (both derive a nil witness): stepping the page's
+        // typed resolution between the two "no usable identity" states is NOT an identity change, so the
+        // published ENGINE rows must stay painted synchronously -- no <=250 ms empty flash. Reachable in
+        // production when an add-on later emits a `defaultVideoId` from a different title; it regressed
+        // when the output identity carried the resolution enum instead of the derived canonical witness.
+        model.setContext(
+            metaId: "tt0903747", streamId: e3.contentID, continuity: nil, pin: nil,
+            auxiliaryTarget: .absent, mediaServerTarget: nil
+        )
+        for _ in 0..<4_000 {
+            if model.groups.contains(where: { $0.id == "ordinary" }) { break }
+            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+        }
+        let paintedUnderAbsent = model.groups.contains { $0.id == "ordinary" }
+        model.setContext(
+            metaId: "tt0903747", streamId: e3.contentID, continuity: nil, pin: nil,
+            auxiliaryTarget: .mismatch, mediaServerTarget: nil
+        )
+        let absentMismatchKeepsEngineRows = paintedUnderAbsent
+            && model.groups.contains { $0.id == "ordinary" }
+
+        // PIN (SourceListModel.setContext, the derived-identity comparison): `identityChanged` must be
+        // decided on the DERIVED output identities, not field-wise on the raw context fields. A field-wise
+        // comparison over the typed fields leaves every check above green -- `.absent` -> `.mismatch`
+        // derives the same nil witness either way, so the getters never blank -- but it silently makes the
+        // transition retire work again: `generation` bumps (discarding a live detached rebuild) and
+        // `publishedSignature` nulls (forcing a redundant reassembly). Observed through the public surface:
+        // park a detached rebuild that carries a NEW engine group on the ranking blocker, step `.absent` ->
+        // `.mismatch` while it is parked, and the new group must NOT surface -- under the field-wise
+        // regression the step retires the parked rebuild and the coalescer runs a SECOND, unparked assembly
+        // that publishes the group while the first still sits on the blocker. After release, the parked
+        // rebuild's own result must land, proving its generation was never retired.
+        model.setContext(
+            metaId: "tt0903747", streamId: e3.contentID, continuity: nil, pin: nil,
+            auxiliaryTarget: .absent, mediaServerTarget: nil
+        )
+        let lateRow = CoreStream(id: "late-row", infoHash: nil, isTorrent: false)
+        core.groups = [
+            CoreStreamSourceGroup(id: "ordinary", addon: "Ordinary", streams: [ordinary]),
+            CoreStreamSourceGroup(id: "late", addon: "Late", streams: [lateRow]),
+        ]
+        RankingBlocker.shared.arm()
+        core.streamsEpoch &+= 1
+        for _ in 0..<4_000 {
+            if RankingBlocker.shared.hasBlocked() { break }
+            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+        }
+        let lateRebuildParked = RankingBlocker.shared.hasBlocked()
+        model.setContext(
+            metaId: "tt0903747", streamId: e3.contentID, continuity: nil, pin: nil,
+            auxiliaryTarget: .mismatch, mediaServerTarget: nil
+        )
+        // Generous window vs the 250 ms coalescer: with the derived comparison, "late" CANNOT surface while
+        // the only assembly that computed it is parked (the coalesced re-trigger bails on the pending
+        // signature before any assembly); the field-wise regression publishes it inside this window.
+        var lateSurfacedWhileParked = false
+        for _ in 0..<4_000 {
+            if model.groups.contains(where: { $0.id == "late" }) {
+                lateSurfacedWhileParked = true
+                break
+            }
+            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+        }
+        RankingBlocker.shared.release()
+        for _ in 0..<4_000 {
+            if model.groups.contains(where: { $0.id == "late" }) { break }
+            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+        }
+        let parkedRebuildLanded = model.groups.contains { $0.id == "late" }
+        let absentMismatchKeepsInFlightRebuild = lateRebuildParked && !lateSurfacedWhileParked
+            && parkedRebuildLanded
+        // Restore the plain engine snapshot for the phases below (the next epoch bump re-snapshots it).
+        core.groups = [
+            CoreStreamSourceGroup(id: "ordinary", addon: "Ordinary", streams: [ordinary]),
+        ]
 
         RankingBlocker.shared.arm()
         core.streamsEpoch &+= 1
@@ -638,14 +955,16 @@ struct SourceIndexSourceListLifecycleTests {
 
         let lifecycleHolds = initialPublished && identityClearedSynchronously && staleAuxiliaryExcluded
             && matchingAuxiliaryIncluded && nextEpisodeClearedSynchronously
+            && absentMismatchKeepsEngineRows && absentMismatchKeepsInFlightRebuild
             && detachedRankBlocked && clearedSynchronously && staleCompletionFenced
         if lifecycleHolds {
-            print("PASS  SourceListModel clears identities, excludes stale auxiliary rows via the typed gate, and fences stale ranks")
+            print("PASS  SourceListModel clears identities, excludes stale auxiliary rows via the typed gate, keeps engine rows AND in-flight rebuilds across absent<->mismatch, and fences stale ranks")
         } else {
-            print("FAIL  initial=\(initialPublished) identityClear=\(identityClearedSynchronously) auxScope=\(staleAuxiliaryExcluded) auxMatch=\(matchingAuxiliaryIncluded) nextClear=\(nextEpisodeClearedSynchronously) blocked=\(detachedRankBlocked) clear=\(clearedSynchronously) fenced=\(staleCompletionFenced)")
+            print("FAIL  initial=\(initialPublished) identityClear=\(identityClearedSynchronously) auxScope=\(staleAuxiliaryExcluded) auxMatch=\(matchingAuxiliaryIncluded) nextClear=\(nextEpisodeClearedSynchronously) absentMismatch=\(absentMismatchKeepsEngineRows) inFlight=\(absentMismatchKeepsInFlightRebuild) parked=\(lateRebuildParked) surfacedWhileParked=\(lateSurfacedWhileParked) landed=\(parkedRebuildLanded) blocked=\(detachedRankBlocked) clear=\(clearedSynchronously) fenced=\(staleCompletionFenced)")
         }
 
-        let allPassed = forgeFailures.isEmpty && authorizationContract && lifecycleHolds
+        let allPassed = forgeFailures.isEmpty && authorizationContract && mediaFactoryContract
+            && mediaAuthorizationContract && separatorInjectivityContract && lifecycleHolds
         print(allPassed ? "ALL PASS" : "FAILURES PRESENT")
         exit(allPassed ? 0 : 1)
     }

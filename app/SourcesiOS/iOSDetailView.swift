@@ -674,14 +674,14 @@ struct iOSDetailView: View {
         .onChange(of: meta?.id) { _ in
             if effectiveType != "series" {
                 mediaServers.refresh(imdb: titleIdentity.titleID, title: meta?.name,
-                                     publicationTarget: mediaServerTargetID)
+                                     publicationTarget: mediaServerTarget)
                 refreshSourceIndex()
             }
         }
         .onAppear {
             if effectiveType != "series" {
                 mediaServers.refresh(imdb: titleIdentity.titleID, title: meta?.name,
-                                     publicationTarget: mediaServerTargetID)
+                                     publicationTarget: mediaServerTarget)
                 refreshSourceIndex()
             }
         }
@@ -2160,14 +2160,14 @@ struct iOSDetailView: View {
         SourceIndexIdentity.publicationTarget(identityRoles)
     }
 
-    private var sourceContentID: String? {
-        auxiliaryTarget.target?.contentID
-    }
-
-    /// Media-server lookup also supports IMDb-less title matching. Its merge fence therefore uses an exact
-    /// page token even when the indexed contributors have no canonical query id.
-    private var mediaServerTargetID: String {
-        sourceContentID ?? "meta:\(id)"
+    /// Media-server lookup also supports IMDb-less title matching, so its merge fence uses a SEALED exact
+    /// page token even when the page has no canonical query id: the typed page target when one resolved,
+    /// else the identity-file-formatted `meta:` fallback. The view no longer formats or flattens any token
+    /// itself -- the factory owns the shape. COST: each eval re-runs the resolver + `validatedTarget`, whose
+    /// canonical checks are per-call regex evaluations -- a fixed handful per body eval, small constant
+    /// work, deliberately uncached.
+    private var mediaServerTarget: SourceIndexIdentity.MediaServerTarget? {
+        SourceIndexIdentity.mediaServerTarget(preferring: auxiliaryTarget, metaID: id)
     }
 
     private func refreshSourceIndex(
@@ -2400,13 +2400,15 @@ struct iOSDetailView: View {
 
     /// The ranked groups + best for the MOVIE source set, read from `SourceListModel`'s published
     /// output. The old per-body-eval assembly (streamGroups rebuild + merges + an O(N) signature
-    /// string over every stream) is gone: setContext is a handful of cheap reads behind an equality
-    /// guard, and the heavy assemble + rank happens off-main inside the model, once per real change.
+    /// string over every stream) is gone: setContext is small constant work behind an equality guard
+    /// (computing its typed-identity arguments and deciding identity change re-validate the page target,
+    /// a fixed handful of regex evaluations -- no per-stream work), and the heavy assemble + rank
+    /// happens off-main inside the model, once per real change.
     private func rankedMovie() -> (groups: [CoreStreamSourceGroup], best: CoreStream?) {
         sourceList.setContext(
             metaId: id, streamId: nil, continuity: rememberedQuality, pin: sourcePin,
-            auxiliaryContentID: sourceContentID,
-            mediaServerTargetID: mediaServerTargetID
+            auxiliaryTarget: auxiliaryTarget,
+            mediaServerTarget: mediaServerTarget
         )
         return (sourceList.groups, sourceList.best)
     }
@@ -2417,8 +2419,8 @@ struct iOSDetailView: View {
     private func rankedLive() -> [CoreStreamSourceGroup] {
         sourceList.setContext(
             metaId: id, streamId: nil, continuity: nil, pin: sourcePin,
-            auxiliaryContentID: sourceContentID,
-            mediaServerTargetID: mediaServerTargetID
+            auxiliaryTarget: auxiliaryTarget,
+            mediaServerTarget: mediaServerTarget
         )
         return sourceList.groups
     }
@@ -3673,12 +3675,12 @@ struct iOSEpisodeStreams: View {
         // the same content token before merging.
         .onAppear {
             mediaServers.refresh(imdb: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode,
-                                 title: meta.name, publicationTarget: mediaServerEpisodeTargetID)
+                                 title: meta.name, publicationTarget: mediaServerEpisodeTarget)
             refreshSourceIndex()
         }
         .onChange(of: shownVideo.id) { _ in
             mediaServers.refresh(imdb: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode,
-                                 title: meta.name, publicationTarget: mediaServerEpisodeTargetID)
+                                 title: meta.name, publicationTarget: mediaServerEpisodeTarget)
             refreshSourceIndex()
             scheduleSourceRefresh()
         }
@@ -4218,13 +4220,14 @@ struct iOSEpisodeStreams: View {
 
     /// The ranked groups for the EPISODE source set, read from `SourceListModel`'s published output.
     /// The episode's stream id scopes the model's snapshot (streamGroups(forStreamId:)) so a struct
-    /// instance reused for another episode can't serve a stale rank; setContext is cheap and
-    /// equality-guarded, and the heavy assemble + rank runs off-main inside the model.
+    /// instance reused for another episode can't serve a stale rank; setContext is small constant work
+    /// behind an equality guard (its typed-identity arguments re-validate via per-call regexes -- no
+    /// per-stream work), and the heavy assemble + rank runs off-main inside the model.
     private func rankedEpisode() -> [CoreStreamSourceGroup] {
         sourceList.setContext(
             metaId: meta.id, streamId: shownVideo.id, continuity: rememberedQuality, pin: sourcePin,
-            auxiliaryContentID: episodeContentID,
-            mediaServerTargetID: mediaServerEpisodeTargetID
+            auxiliaryTarget: episodeAuxiliaryTarget,
+            mediaServerTarget: mediaServerEpisodeTarget
         )
         return sourceList.groups
     }
@@ -4258,11 +4261,13 @@ struct iOSEpisodeStreams: View {
             episode: auxiliaryEpisode
         )
     }
-    private var episodeContentID: String? {
-        episodeAuxiliaryTarget.target?.contentID
-    }
-    private var mediaServerEpisodeTargetID: String {
-        episodeContentID ?? "meta:\(meta.id)|video:\(shownVideo.id)"
+    /// The episode page's sealed media-server token: the typed episode target when the show resolved one,
+    /// else the identity-file-formatted `meta:<show>|video:<episode>` fallback for IMDb-less libraries.
+    /// COST: each eval re-runs the resolver + `validatedTarget` (per-call regex evaluations) -- a fixed
+    /// handful per body eval, small constant work, deliberately uncached.
+    private var mediaServerEpisodeTarget: SourceIndexIdentity.MediaServerTarget? {
+        SourceIndexIdentity.mediaServerTarget(
+            preferring: episodeAuxiliaryTarget, metaID: meta.id, videoID: shownVideo.id)
     }
 
     /// Community source index (episode): SERVE refresh + HOARD contribution for THIS episode. Fully gated +

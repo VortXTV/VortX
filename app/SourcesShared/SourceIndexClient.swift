@@ -1401,13 +1401,10 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     /// last fetch was issued for, constructible only by the role resolver. The source-list assembler
     /// authorizes its merge against this typed value (via `SourceIndexIdentity.mergeAuthorization`) so a
     /// detached E2 snapshot cannot be reused for E3 and no raw string can stand in for the published
-    /// identity. This replaced the raw `lastContentID: String?` stored token on the published side; the
-    /// wire-facing content-id string below is DERIVED from this value, never stored independently.
+    /// identity. This replaced the raw `lastContentID: String?` stored token on the published side; every
+    /// wire-facing content-id string is DERIVED from a target at the point of use, never stored independently.
     private var lastTarget: SourceIndexIdentity.PublicationTarget?
     var publishedTarget: SourceIndexIdentity.PublicationTarget? { lastTarget }
-    /// Derived, read-only string view of the published identity for the existing boundary suites. It cannot
-    /// be set independently of `publishedTarget`, so it can never disagree with the typed value.
-    var publishedContentID: String? { lastTarget?.contentID }
     private var task: Task<Void, Never>?
 
     typealias FetchPooled = @Sendable (String, Bool) async throws -> [SourceIndexClient.PooledSource]
@@ -1532,7 +1529,7 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     ) -> [CoreStreamSourceGroup] {
         let authorization = SourceIndexIdentity.mergeAuthorization(
             published: lastTarget,
-            pageContentID: SourceIndexIdentity.validatedTarget(call.resolution)?.contentID
+            page: call.resolution
         )
         return Self.merge(authorizedBy: authorization, streams, into: groups)
     }
