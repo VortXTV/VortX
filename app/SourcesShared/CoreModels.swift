@@ -154,12 +154,22 @@ enum CWResume {
     /// window); false only when we fell back to a possibly-stale stored link because the source could not be
     /// reresolved, so the caller keeps its stale-link failover priming. Never throws.
     static func resolvedURL(for entry: LastStreamStore.Entry) async -> (url: URL, refreshed: Bool) {
+        await resolvedURLVersioned(for: entry).value
+    }
+
+    static func resolvedURLVersioned(for entry: LastStreamStore.Entry) async
+        -> DebridVersionedResult<(url: URL, refreshed: Bool)> {
+        let entryRevision = DebridCredentialSnapshotStore.shared.load().revision
+        func result(_ url: URL, _ refreshed: Bool)
+            -> DebridVersionedResult<(url: URL, refreshed: Bool)> {
+            DebridVersionedResult(value: (url, refreshed), revision: entryRevision)
+        }
         let stored = URL(string: entry.url)
         // No debrid provenance (plain-direct / torrent / usenet with no reresolve id): the stored link is
         // all we have. Return it unchanged so these paths behave exactly as before.
         guard let serviceRaw = entry.debridService, let service = DebridService(rawValue: serviceRaw),
               let infoHash = entry.infoHash, !infoHash.isEmpty else {
-            return (stored ?? URL(fileURLWithPath: "/"), false)
+            return result(stored ?? URL(fileURLWithPath: "/"), false)
         }
         // An episodic provider-array fallback needs a positive S/E hint. The original Stremio fileIdx is
         // source provenance only and cannot index a provider-local array. TorBox's stored torrentId+fileId
@@ -178,7 +188,7 @@ enum CWResume {
         let hasExactProviderIDs = service == .torBox
             && entry.debridTorrentId != nil && entry.debridFileId != nil
         if isEpisode, episodeHint == nil, !hasExactProviderIDs {
-            return (stored ?? URL(fileURLWithPath: "/"), false)
+            return result(stored ?? URL(fileURLWithPath: "/"), false)
         }
         // INSTANT RESUME (Step 4): the previous behaviour reresolved a fresh link on EVERY resume, a blocking
         // network round-trip before the player appeared (the "CW resume is slow" regression). But a debrid
@@ -188,20 +198,28 @@ enum CWResume {
         // dead-ends (strictly safer than today's fallback, which already plays a possibly-STALE stored link).
         if let stored, let savedAt = entry.linkSavedAt {
             let age = Date().timeIntervalSince(savedAt)
-            if age >= 0, age < Self.freshLinkWindow { return (stored, true) }
+            if age >= 0, age < Self.freshLinkWindow { return result(stored, true) }
         }
         // Older than the window (or no mint timestamp): mint a FRESH link for the SAME file through the SAME
         // provider. On TorBox this is a single requestdl off the stored torrentId+fileId (no re-add); other
         // providers may re-add only when a semantic episode selector proves the target file.
-        if let fresh = try? await DebridCoordinator.shared.reresolve(
-            service: service, infoHash: infoHash,
-            torrentId: entry.debridTorrentId, fileId: entry.debridFileId, fileIdx: entry.fileIdx,
-            episode: episodeHint, requiresSemanticSelection: isEpisode) {
-            return (fresh, true)
+        let coordinator = DebridCoordinator.shared
+        if let generation = await coordinator.resolverGeneration(pinning: entryRevision),
+           let fresh = try? await coordinator.reresolveVersioned(
+               service: service,
+               infoHash: infoHash,
+               torrentId: entry.debridTorrentId,
+               fileId: entry.debridFileId,
+               fileIdx: entry.fileIdx,
+               episode: episodeHint,
+               requiresSemanticSelection: isEpisode,
+               generation: generation
+           ) {
+            return fresh.map { ($0, true) }
         }
         // Same source is genuinely unavailable (evicted / no key): fall back to the stored link, letting the
         // player's existing load-failure failover take over only now.
-        return (stored ?? URL(fileURLWithPath: "/"), false)
+        return result(stored ?? URL(fileURLWithPath: "/"), false)
     }
 }
 
@@ -1183,7 +1201,8 @@ struct CoreStream: Decodable, Identifiable, Equatable {
         // this, every usenet row rendered as a dead disabled label (every row gate keys on this
         // property). No TorBox key -> nil, the pre-usenet behavior. Deliberately NOT behind the
         // torrents gate: usenet resolves to a remote link, no embedded server needed (Lite plays it).
-        if isUsenet, DebridKeys.shared.isConfigured(.torBox), let nzb = nzbUrl, let parsed = URL(string: nzb) {
+        if isUsenet, DebridCredentialSnapshotStore.shared.isConfigured(.torBox),
+           let nzb = nzbUrl, let parsed = URL(string: nzb) {
             return parsed
         }
         if let ytId, !ytId.isEmpty {

@@ -1,5 +1,140 @@
 import Foundation
+#if !DEBRID_LIBRARY_LIVENESS_TEST
 import SwiftUI
+#endif
+
+/// Credential-revision and attempt ordering for one asynchronously loaded debrid-library value.
+/// Foundation-only so the standalone ordering gate compiles and exercises this exact production type.
+@MainActor
+final class DebridLibraryLoadStateMachine<Value: Sendable> {
+    enum Phase: Equatable { case idle, loading, loaded }
+    typealias Loader = @Sendable () async -> DebridVersionedResult<Value>
+
+    private let credentialStore: DebridCredentialSnapshotStore
+    private let emptyValue: Value
+    private let loader: Loader
+
+    private(set) var phase: Phase = .idle
+    private(set) var value: Value
+    private(set) var loadedRevision: UInt64?
+    private(set) var nextAttemptID: UInt64 = 0
+    private(set) var activeAttemptID: UInt64?
+    var stateDidChange: (@MainActor (DebridLibraryLoadStateMachine<Value>) -> Void)?
+
+    init(
+        credentialStore: DebridCredentialSnapshotStore,
+        initialValue: Value,
+        emptyValue: Value,
+        loader: @escaping Loader
+    ) {
+        self.credentialStore = credentialStore
+        self.value = initialValue
+        self.emptyValue = emptyValue
+        self.loader = loader
+    }
+
+    func loadIfNeeded(snapshot: DebridCredentialSnapshot) async {
+        guard loadedRevision != snapshot.revision else { return }
+        await performLoad(snapshot: snapshot)
+    }
+
+    func reload(snapshot: DebridCredentialSnapshot) async {
+        await performLoad(snapshot: snapshot)
+    }
+
+    private func performLoad(snapshot: DebridCredentialSnapshot) async {
+        guard let attemptID = beginAttempt(for: snapshot) else { return }
+        guard !snapshot.keys.isEmpty else {
+            _ = mutateIfActive(attemptID: attemptID, snapshot: snapshot) {
+                value = emptyValue
+                loadedRevision = snapshot.revision
+                phase = .loaded
+                activeAttemptID = nil
+            }
+            return
+        }
+
+        guard mutateIfActive(attemptID: attemptID, snapshot: snapshot, mutation: {
+            phase = .loading
+        }) else { return }
+
+        let result = await loader()
+        guard !Task.isCancelled else {
+            recoverAfterInterruptedAttempt(attemptID: attemptID, snapshot: snapshot)
+            return
+        }
+        guard result.revision == snapshot.revision else {
+            recoverAfterInterruptedAttempt(attemptID: attemptID, snapshot: snapshot)
+            return
+        }
+
+        var didPublish = false
+        let revisionAccepted = credentialStore.compareAndPublish(
+            revision: result.revision,
+            mutation: {
+                guard self.activeAttemptID == attemptID,
+                      self.credentialStore.load() == snapshot,
+                      !Task.isCancelled else { return }
+                value = result.value
+                loadedRevision = snapshot.revision
+                phase = .loaded
+                activeAttemptID = nil
+                stateDidChange?(self)
+                didPublish = true
+            }
+        )
+        guard revisionAccepted && didPublish else {
+            recoverAfterInterruptedAttempt(attemptID: attemptID, snapshot: snapshot)
+            return
+        }
+    }
+
+    private func beginAttempt(for snapshot: DebridCredentialSnapshot) -> UInt64? {
+        precondition(nextAttemptID < UInt64.max, "debrid library attempt id exhausted")
+        nextAttemptID += 1
+        let attemptID = nextAttemptID
+        var activated = false
+        _ = credentialStore.compareAndPublish(revision: snapshot.revision) {
+            guard self.credentialStore.load() == snapshot else { return }
+            self.activeAttemptID = attemptID
+            self.stateDidChange?(self)
+            activated = true
+        }
+        return activated ? attemptID : nil
+    }
+
+    @discardableResult
+    private func mutateIfActive(
+        attemptID: UInt64,
+        snapshot: DebridCredentialSnapshot,
+        mutation: @MainActor () -> Void
+    ) -> Bool {
+        var mutated = false
+        let revisionAccepted = credentialStore.compareAndPublish(
+            revision: snapshot.revision,
+            mutation: {
+                guard self.activeAttemptID == attemptID,
+                      self.credentialStore.load() == snapshot else { return }
+                mutation()
+                stateDidChange?(self)
+                mutated = true
+            }
+        )
+        return revisionAccepted && mutated
+    }
+
+    private func recoverAfterInterruptedAttempt(
+        attemptID: UInt64,
+        snapshot: DebridCredentialSnapshot
+    ) {
+        _ = mutateIfActive(attemptID: attemptID, snapshot: snapshot, mutation: {
+            activeAttemptID = nil
+            phase = loadedRevision == snapshot.revision ? .loaded : .idle
+        })
+    }
+}
+
+#if !DEBRID_LIBRARY_LIVENESS_TEST
 
 /// Browse-your-debrid-cloud: lists what is ALREADY sitting in the user's configured debrid accounts
 /// (finished torrents / stored files on Real-Debrid, AllDebrid, Premiumize, TorBox) and plays a chosen
@@ -33,8 +168,14 @@ struct DebridLibraryView: View {
             .frame(maxWidth: .infinity, alignment: .center)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .task { await model.loadIfNeeded(hasKey: debrid.hasAnyKey) }
-        .refreshable { await model.reload(hasKey: debrid.hasAnyKey) }
+        .task(id: debrid.revision) {
+            let snapshot = debrid.snapshot
+            await model.loadIfNeeded(snapshot: snapshot)
+        }
+        .refreshable {
+            let snapshot = debrid.snapshot
+            await model.reload(snapshot: snapshot)
+        }
         .iOSPlayerCover($launch, account: account, core: core)
     }
 
@@ -61,7 +202,10 @@ struct DebridLibraryView: View {
         // press/hover feedback) instead of a hand-rolled surface2 circle, so this matches the hero back /
         // overflow discs everywhere else.
         CircleIconButton(systemName: "arrow.clockwise", diameter: Theme.Control.circleChrome) {
-            Task { await model.reload(hasKey: debrid.hasAnyKey) }
+            Task {
+                let snapshot = debrid.snapshot
+                await model.reload(snapshot: snapshot)
+            }
         }
         .disabled(model.phase == .loading || !debrid.hasAnyKey)
         .opacity(model.phase == .loading ? 0.5 : 1)
@@ -260,12 +404,13 @@ private struct DebridLibrarySection: Identifiable {
 
 // MARK: - View model
 
-/// Loads the cloud library once (and on manual refresh) and tracks the in-flight resolve. `@MainActor` so
-/// every published mutation lands on the UI thread; the actual list/resolve work is awaited on the
-/// `DebridCoordinator` actor. No key -> instantly `.loaded` with no sections (no network).
+/// Loads the cloud library once per credential revision (and on manual refresh) and tracks the in-flight
+/// resolve. `@MainActor` keeps attempt ownership and every published mutation serialized while the actual
+/// list/resolve work is awaited on the `DebridCoordinator` actor. No key instantly loads no sections.
 @MainActor
 final class DebridLibraryModel: ObservableObject {
-    enum Phase: Equatable { case idle, loading, loaded }
+    typealias Library = [DebridService: [DebridLibraryItem]]
+    typealias Phase = DebridLibraryLoadStateMachine<Library>.Phase
 
     @Published private(set) var phase: Phase = .idle
     @Published fileprivate private(set) var sections: [DebridLibrarySection] = []
@@ -274,29 +419,42 @@ final class DebridLibraryModel: ObservableObject {
     /// A user-facing resolve failure, shown inline above the sections. Cleared on the next play attempt.
     @Published var resolveError: String?
 
-    private var didLoad = false
+    private let loadState: DebridLibraryLoadStateMachine<Library>
 
-    /// First appearance load, guarded so tab re-entry does not re-hit every provider.
-    func loadIfNeeded(hasKey: Bool) async {
-        guard !didLoad else { return }
-        didLoad = true
-        await reload(hasKey: hasKey)
+    init(
+        credentialStore: DebridCredentialSnapshotStore = .shared,
+        loader: @escaping DebridLibraryLoadStateMachine<Library>.Loader = {
+            await DebridCoordinator.shared.cloudLibraryVersioned()
+        }
+    ) {
+        let state = DebridLibraryLoadStateMachine(
+            credentialStore: credentialStore,
+            initialValue: [:],
+            emptyValue: [:],
+            loader: loader
+        )
+        loadState = state
+        state.stateDidChange = { [weak self] state in
+            self?.apply(state)
+        }
+    }
+
+    /// First appearance load, guarded per credential revision so tab re-entry does not re-hit every provider.
+    func loadIfNeeded(snapshot: DebridCredentialSnapshot) async {
+        await loadState.loadIfNeeded(snapshot: snapshot)
     }
 
     /// (Re)read every configured provider's cloud library and group it in a deterministic provider order.
-    func reload(hasKey: Bool) async {
-        guard hasKey else {
-            sections = []
-            phase = .loaded
-            return
-        }
-        phase = .loading
-        let library = await DebridCoordinator.shared.cloudLibrary()
-        // DebridService.allCases order keeps the sections stable (Real-Debrid first, TorBox last).
+    func reload(snapshot: DebridCredentialSnapshot) async {
+        await loadState.reload(snapshot: snapshot)
+    }
+
+    private func apply(_ state: DebridLibraryLoadStateMachine<Library>) {
+        phase = state.phase
         sections = DebridService.allCases.compactMap { service -> DebridLibrarySection? in
-            guard let items = library[service], !items.isEmpty else { return nil }
+            guard let items = state.value[service], !items.isEmpty else { return nil }
             return DebridLibrarySection(service: service, items: items)
         }
-        phase = .loaded
     }
 }
+#endif

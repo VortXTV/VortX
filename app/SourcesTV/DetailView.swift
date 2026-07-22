@@ -2365,22 +2365,30 @@ struct CoreStreamList: View {
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
         guard let pm = meta else { return }
         let hint = downloadEpisode(pm)
-        let resolved: URL?
+        func queueDownload(_ resolved: URL?) {
+            guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
+                isUsenet: best.isUsenet, resolvedURL: resolved,
+                fallbackURL: best.playableURL(isEpisode: episodeStreamId != nil)
+            ) else { return }
+            guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
+            DownloadManager.shared.download(
+                stream: best, meta: pm, resolvedURL: url,
+                sourceName: best.name, qualityText: StreamRanking.signature(best)
+            )
+        }
         if episodeStreamId != nil, best.url == nil, hint == nil {
-            resolved = nil
+            queueDownload(nil)
         } else {
-            resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: best, episode: hint)
+            let tvDownloadResult = await DebridCoordinator.shared
+                .resolvedPlaybackURLVersioned(for: best, episode: hint)
             guard targetIsCurrent(
                 videoID: targetVideoID, generation: targetGeneration
             ) else { return }
+            guard DebridCredentialSnapshotStore.shared.compareAndPublish(
+                revision: tvDownloadResult.revision,
+                mutation: { queueDownload(tvDownloadResult.value) }
+            ) else { return }
         }
-        guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
-            isUsenet: best.isUsenet, resolvedURL: resolved,
-            fallbackURL: best.playableURL(isEpisode: episodeStreamId != nil)
-        ) else { return }
-        guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
-        DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: url,
-                                        sourceName: best.name, qualityText: StreamRanking.signature(best))
     }
 
     /// The episode context for a debrid resolve, so a series episode resolves to the right file inside a
@@ -2607,15 +2615,17 @@ struct CoreStreamList: View {
            // Movie: always this title. Series: only when the stored episode is the one being played.
            (!isEpisodePlayback || entry.videoId == (episodeStreamId ?? m.videoId)),
            !(PlaybackSettings.torrentsDisabled && entry.torrent == true) {
-            let resumeResult: (url: URL, refreshed: Bool)
+            let tvResumeResult: DebridVersionedResult<(url: URL, refreshed: Bool)>?
             if isEpisodePlayback, entry.fileIdx == nil, episodeHint == nil {
-                resumeResult = (URL(string: entry.url) ?? URL(fileURLWithPath: "/"), false)
+                tvResumeResult = nil
             } else {
-                resumeResult = await CWResume.resolvedURL(for: entry)
+                tvResumeResult = await CWResume.resolvedURLVersioned(for: entry)
                 guard targetIsCurrent(
                     videoID: targetVideoID, generation: targetGeneration
                 ) else { return }
             }
+            let resumeResult = tvResumeResult?.value
+                ?? (URL(string: entry.url) ?? URL(fileURLWithPath: "/"), false)
             let (url, refreshed) = resumeResult
             if refreshed, let service = entry.debridService.flatMap(DebridService.init(rawValue:)) {
                 // A fresh link for the SAME source: play it as an EXPLICIT pick (no silent hop) so the resume
@@ -2630,43 +2640,73 @@ struct CoreStreamList: View {
                 guard targetIsCurrent(
                     videoID: targetVideoID, generation: targetGeneration
                 ) else { return }
-                let engineVideoID = bindEngine(to: resumeSource, resolvedURL: url, in: groups)
-                guard targetIsCurrent(
-                    videoID: targetVideoID, generation: targetGeneration
+                guard let tvResumeResult else { return }
+                guard DebridCredentialSnapshotStore.shared.compareAndPublish(
+                    revision: tvResumeResult.revision,
+                    mutation: {
+                        guard targetIsCurrent(
+                            videoID: targetVideoID, generation: targetGeneration
+                        ) else { return }
+                        let engineVideoID = bindEngine(to: resumeSource, resolvedURL: url, in: groups)
+                        guard targetIsCurrent(
+                            videoID: targetVideoID, generation: targetGeneration
+                        ) else { return }
+                        presenter.request = PlaybackRequest(
+                            url: url, title: title, meta: meta, episodes: episodes,
+                            sourceHint: entry.qualityText, torrent: false,
+                            bingeGroup: entry.bingeGroup, headers: entry.headers,
+                            debridRef: ref, sourceStream: resumeSource,
+                            enginePlayerVideoId: engineVideoID,
+                            wasExplicitPick: true, wasResume: true, startFromZero: fromStart,
+                            startAtSeconds: startAt
+                        )
+                    }
                 ) else { return }
-                presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
-                                                    sourceHint: entry.qualityText, torrent: false,
-                                                    bingeGroup: entry.bingeGroup, headers: entry.headers,
-                                                    debridRef: ref, sourceStream: resumeSource,
-                                                    enginePlayerVideoId: engineVideoID,
-                                                    wasExplicitPick: true, wasResume: true, startFromZero: fromStart,
-                                                    startAtSeconds: startAt)
                 return
+            }
+            if let tvResumeResult {
+                guard DebridCredentialSnapshotStore.shared.compareAndPublish(
+                    revision: tvResumeResult.revision,
+                    mutation: {}
+                ) else { return }
             }
         }
         // Candidate order = the already-ranked list order (continuity/binge/pin preserved), best first.
         let candidates = groups.flatMap(\.streams)
-        if (!isEpisodePlayback || episodeHint != nil),
-           let win = await DebridCoordinator.shared.resolveFirstPlayable(
-            candidates: candidates, episode: episodeHint, cachedHashes: debridCache.cachedHashes,
-            cachedUsenetURLs: debridCache.cachedUsenetURLs, labeledBest: best) {
-            guard targetIsCurrent(
-                videoID: targetVideoID, generation: targetGeneration
-            ) else { return }
-            // A parallel-cached winner is a remote direct link: present it exactly as the single-resolve
-            // debrid branch does (engine wired for state, torrent:false, no /create, no closeTorrent).
-            let engineVideoID = bindEngine(to: win.stream, resolvedURL: win.ref.url, in: groups)
-            guard targetIsCurrent(
-                videoID: targetVideoID, generation: targetGeneration
-            ) else { return }
-            presenter.request = PlaybackRequest(url: win.ref.url, title: title, meta: meta, episodes: episodes,
-                                                sourceHint: StreamRanking.signature(win.stream), torrent: false,
-                                                bingeGroup: win.stream.behaviorHints?.bingeGroup,
-                                                headers: win.stream.requestHeaders, debridRef: win.ref,
-                                                sourceStream: win.stream,
-                                                enginePlayerVideoId: engineVideoID, startFromZero: fromStart,
-                                                startAtSeconds: startAt)
-            return
+        if !isEpisodePlayback || episodeHint != nil {
+            let tvRaceResult = await DebridCoordinator.shared.resolveFirstPlayableVersioned(
+                candidates: candidates, episode: episodeHint, cachedHashes: debridCache.cachedHashes,
+                cachedUsenetURLs: debridCache.cachedUsenetURLs, labeledBest: best
+            )
+            if let win = tvRaceResult.value {
+                guard targetIsCurrent(
+                    videoID: targetVideoID, generation: targetGeneration
+                ) else { return }
+                guard DebridCredentialSnapshotStore.shared.compareAndPublish(
+                    revision: tvRaceResult.revision,
+                    mutation: {
+                        guard targetIsCurrent(
+                            videoID: targetVideoID, generation: targetGeneration
+                        ) else { return }
+                        let engineVideoID = bindEngine(
+                            to: win.stream, resolvedURL: win.ref.url, in: groups
+                        )
+                        guard targetIsCurrent(
+                            videoID: targetVideoID, generation: targetGeneration
+                        ) else { return }
+                        presenter.request = PlaybackRequest(
+                            url: win.ref.url, title: title, meta: meta, episodes: episodes,
+                            sourceHint: StreamRanking.signature(win.stream), torrent: false,
+                            bingeGroup: win.stream.behaviorHints?.bingeGroup,
+                            headers: win.stream.requestHeaders, debridRef: win.ref,
+                            sourceStream: win.stream,
+                            enginePlayerVideoId: engineVideoID, startFromZero: fromStart,
+                            startAtSeconds: startAt
+                        )
+                    }
+                ) else { return }
+                return
+            }
         }
         // No parallel-cached winner: today's single-resolve path on the ranked best, unchanged. This is an
         // AUTO pick (the Watch-Now fallback), so it may hop normally on a start-timeout.
@@ -2686,33 +2726,59 @@ struct CoreStreamList: View {
         // cached pick runs the blocking debrid resolve (~1 round trip to the direct link); a not-confirmed pick
         // returns nil with zero network and falls straight through to the embedded path below, which plays in a
         // snap (its own playableURL + prepareTorrent) exactly like the pre-511c973 instant path.
-        let ref: DebridPlaybackRef?
         if canResolveNatively(stream) {
-            ref = await DebridCoordinator.shared.resolvedPlaybackRef(
+            let tvPlaybackResult = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(
                 for: stream, episode: targetHint,
                 confirmedCachedHashes: debridCache.cachedHashes,
                 confirmedUsenetURLs: debridCache.cachedUsenetURLs)
             guard targetIsCurrent(
                 videoID: targetVideoID, generation: targetGeneration
             ) else { return }
-        } else {
-            ref = nil
-        }
-        if let ref {
-            guard targetIsCurrent(
-                videoID: targetVideoID, generation: targetGeneration
+            guard DebridCredentialSnapshotStore.shared.compareAndPublish(
+                revision: tvPlaybackResult.revision,
+                mutation: {
+                    if let ref = tvPlaybackResult.value {
+                        guard targetIsCurrent(
+                            videoID: targetVideoID, generation: targetGeneration
+                        ) else { return }
+                        let engineVideoID = bindEngine(to: stream, resolvedURL: ref.url)
+                        guard targetIsCurrent(
+                            videoID: targetVideoID, generation: targetGeneration
+                        ) else { return }
+                        presenter.request = PlaybackRequest(
+                            url: ref.url, title: title, meta: meta, episodes: episodes,
+                            sourceHint: StreamRanking.signature(stream), torrent: false,
+                            bingeGroup: stream.behaviorHints?.bingeGroup,
+                            headers: stream.requestHeaders, debridRef: ref,
+                            sourceStream: stream,
+                            enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
+                            startFromZero: fromStart, startAtSeconds: startAt
+                        )
+                        return
+                    }
+                    guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
+                        isUsenet: stream.isUsenet, resolvedURL: nil,
+                        fallbackURL: playableURL(for: stream)
+                    ) else { return }
+                    guard targetIsCurrent(
+                        videoID: targetVideoID, generation: targetGeneration
+                    ) else { return }
+                    let engineVideoID = bindEngine(to: stream)
+                    prepareTorrent(stream)
+                    guard targetIsCurrent(
+                        videoID: targetVideoID, generation: targetGeneration
+                    ) else { return }
+                    presenter.request = PlaybackRequest(
+                        url: url, title: title, meta: meta, episodes: episodes,
+                        sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
+                        bingeGroup: stream.behaviorHints?.bingeGroup,
+                        headers: stream.requestHeaders, sourceStream: stream,
+                        enginePlayerVideoId: engineVideoID,
+                        wasExplicitPick: explicit,
+                        startFromZero: fromStart, startAtSeconds: startAt
+                    )
+                }
             ) else { return }
-            let engineVideoID = bindEngine(to: stream, resolvedURL: ref.url)
-            guard targetIsCurrent(
-                videoID: targetVideoID, generation: targetGeneration
-            ) else { return }
-            presenter.request = PlaybackRequest(url: ref.url, title: title, meta: meta, episodes: episodes,
-                                                sourceHint: StreamRanking.signature(stream), torrent: false,
-                                                bingeGroup: stream.behaviorHints?.bingeGroup,
-                                                headers: stream.requestHeaders, debridRef: ref,
-                                                sourceStream: stream,
-                                                enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
-                                                startFromZero: fromStart, startAtSeconds: startAt)
             return
         }
         // A raw NZB URL is a descriptor for the resolver, never media bytes for the player.

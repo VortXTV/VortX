@@ -433,7 +433,8 @@ final class VortXSyncManager: ObservableObject {
         guard let str = Keychain.string(kcAccount), let data = str.data(using: .utf8),
               let p = try? JSONDecoder().decode(Persisted.self, from: data),
               let dk = Data(base64Encoded: p.dataKey),
-              let accountID = CredentialOwnerIdentity.remoteAccountID(p.account.id)
+              let accountID = CredentialOwnerIdentity.remoteAccountID(p.account.id),
+              let debridOwner = DebridOwnerScope.canonicalAccount(accountID)
         else { return }
         beginCredentialSessionMutation()
         token = p.token
@@ -448,7 +449,7 @@ final class VortXSyncManager: ObservableObject {
         // Point the debrid credential store at THIS account before anything can read a key. Restoring a
         // session is the earliest moment the device's real owner is known, and it is also where the one-time
         // adoption of the old unscoped entries happens, so an existing user keeps their keys without a re-paste.
-        DebridKeys.shared.bind(owner: accountID)
+        DebridKeys.shared.bind(owner: debridOwner)
         reloadLastSyncStamp()   // show this account's persisted "last synced" immediately on relaunch
         // A Keychain-restored session (app relaunch / reinstall) sets isSignedIn WITHOUT going through
         // adopt(), so nothing would open the sync channel until the first scenePhase foreground transition.
@@ -471,7 +472,7 @@ final class VortXSyncManager: ObservableObject {
         // own Keychain scope and return if the same account signs back in. What must not happen is the next
         // account on this device inheriting them, which is exactly what used to happen when these entries were
         // global and sign-out left them behind.
-        DebridKeys.shared.bind(owner: DebridKeys.signedOutOwner)
+        DebridKeys.shared.bind(owner: .signedOutDevice)
         // The shared add-on ORDER is a global static with no account context, so a switched-in account would
         // otherwise inherit the previous account's order until its own pull lands. Clear it here so the next
         // account starts from the descriptor spine and converges on its own doc.addonOrder. The per-account
@@ -481,7 +482,14 @@ final class VortXSyncManager: ObservableObject {
 
     // MARK: - HTTP
 
-    private func request(_ method: String, _ path: String, body: [String: Any]? = nil, auth: Bool = false, bearer: String? = nil) async -> (Int, [String: Any]?) {
+    private func request(
+        _ method: String,
+        _ path: String,
+        body: [String: Any]? = nil,
+        auth: Bool = false,
+        bearer: String? = nil,
+        debridCredentialToken: DebridCredentialRevisionToken? = nil
+    ) async -> (Int, [String: Any]?) {
         guard let url = URL(string: base + path) else { return (0, nil) }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -493,7 +501,15 @@ final class VortXSyncManager: ObservableObject {
         // token BEFORE it is adopted); otherwise `auth` uses the stored session token.
         if let t = bearer ?? (auth ? token : nil) { req.setValue("Bearer " + t, forHTTPHeaderField: "authorization") }
         do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let response: (Data, URLResponse)
+            if let debridCredentialToken {
+                response = try await DebridAuthenticatedHTTP.data(
+                    URLSession.shared, for: req, credentialToken: debridCredentialToken
+                )
+            } else {
+                response = try await URLSession.shared.data(for: req)
+            }
+            let (data, resp) = response
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             return (code, json)
@@ -503,7 +519,8 @@ final class VortXSyncManager: ObservableObject {
     @discardableResult
     private func adopt(token: String, account acct: [String: Any], dataKey: Data) -> Bool {
         guard let rawAccountID = acct["id"] as? String,
-              let accountID = CredentialOwnerIdentity.remoteAccountID(rawAccountID)
+              let accountID = CredentialOwnerIdentity.remoteAccountID(rawAccountID),
+              let debridOwner = DebridOwnerScope.canonicalAccount(accountID)
         else { return false }
         beginCredentialSessionMutation()
         self.token = token
@@ -516,7 +533,7 @@ final class VortXSyncManager: ObservableObject {
         self.isSignedIn = true
         // Rebind debrid credentials to the account that just signed in. Without this a switched-in account
         // would keep reading the previous owner's keys out of memory even though the Keychain is now scoped.
-        DebridKeys.shared.bind(owner: accountID)
+        DebridKeys.shared.bind(owner: debridOwner)
         reloadLastSyncStamp()   // a re-sign-in to a known account restores its persisted "last synced"
         persist()
         // A fresh sign-in is a foreground action, so open the real-time channel immediately (if the app
@@ -782,7 +799,25 @@ final class VortXSyncManager: ObservableObject {
     /// accepted==true: advancing it on a rejected write (the old bug) suppressed the recovery pull, so a
     /// write that LOST the race was silently dropped and the device stayed diverged.
     private enum PushOutcome { case accepted(version: Int); case rejected(storedVersion: Int?); case error }
-    private func pushSyncDocAt(_ obj: [String: Any], version: Int) async -> PushOutcome {
+
+    /// A locally derived document carries the exact credential revision whose keys it embedded. The payload
+    /// may cross later awaits, but its PUT cannot issue after another credential revision has published.
+    private struct DerivedSyncDocument {
+        let object: [String: Any]
+        let debridRevision: UInt64
+    }
+
+    private func pushSyncDocAt(
+        _ obj: [String: Any],
+        version: Int,
+        debridRevision: UInt64
+    ) async -> PushOutcome {
+        // Debrid D3 issuance fence: a doc derived from an older debrid credential revision must not even
+        // START its PUT once a newer revision has published (the actual send below is additionally fenced
+        // inside DebridAuthenticatedHTTP at the irreversible issuance point).
+        guard DebridCredentialSnapshotStore.shared.isCurrent(revision: debridRevision) else {
+            return .error
+        }
         guard let pushSession = credentialSessionStamp,
               let dataKey,
               let accountID = CredentialOwnerIdentity.remoteAccountID(account?.id),
@@ -791,8 +826,14 @@ final class VortXSyncManager: ObservableObject {
                 dataKey: dataKey, plaintext: pt, accountId: accountID,
                 version: version, writeV2: Self.writeSyncDocV2
               ) else { return .error }
+        let credentialToken = DebridCredentialRevisionToken(
+            revision: debridRevision, store: DebridCredentialSnapshotStore.shared
+        )
         // CREDENTIAL_PUSH_COMPLETION_GATE_BEGIN
-        let (code, json) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true)
+        let (code, json) = await request(
+            "PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true,
+            debridCredentialToken: credentialToken
+        )
         // 2b: revalidate the captured session AFTER the PUT completes and BEFORE any success is stamped. A stale
         // completion of account A's push, landing after a switch to B, must never advance B's lastSyncedVersion
         // or stamp B's "last synced". This ordering (await -> gate -> stamp) is load-bearing, not merely present.
@@ -820,12 +861,17 @@ final class VortXSyncManager: ObservableObject {
     /// re-merging the local pending changes onto the winner's doc and retrying at storedVersion+1 (up to
     /// `maxRetries`). This preserves the caller's merge semantics (LWW, never clobber libraryItem) on every
     /// attempt. On exhaustion lastSyncedVersion is left unadvanced so the next natural pull reconciles.
-    private func pushDerivedDoc(_ initial: [String: Any], rebuild: () async -> [String: Any]?) async -> Bool {
+    private func pushDerivedDoc(
+        _ initial: DerivedSyncDocument,
+        rebuild: () async -> DerivedSyncDocument?
+    ) async -> Bool {
         let maxRetries = 3
         var doc = initial
         var version = Int(Date().timeIntervalSince1970 * 1000)
         for attempt in 0..<maxRetries {
-            switch await pushSyncDocAt(doc, version: version) {
+            switch await pushSyncDocAt(
+                doc.object, version: version, debridRevision: doc.debridRevision
+            ) {
             case .accepted:
                 return true
             case .error:
@@ -1163,7 +1209,7 @@ final class VortXSyncManager: ObservableObject {
     /// unused today (each call re-pulls) but kept so a caller could pass a known base to avoid a re-pull.
     /// Returns nil on a FAILED pull (network error / undecryptable doc): a failed pull must NEVER overwrite
     /// the account's existing document, or it wipes keys other surfaces wrote.
-    private func mergeLocalIntoDoc(base: [String: Any]?, session: CredentialSessionStamp) async -> [String: Any]? {
+    private func mergeLocalIntoDoc(base: [String: Any]?, session: CredentialSessionStamp) async -> DerivedSyncDocument? {
         var doc: [String: Any]
         switch await pullSyncDocResult(session: session) {
         case .failed: return nil
@@ -1225,22 +1271,16 @@ final class VortXSyncManager: ObservableObject {
         // Debrid keys ride the same encrypted apiKeys channel so they follow the account across devices
         // (they live in the Keychain, which SettingsBackup deliberately excludes, so they need this mirror).
         // Set only when configured locally; do NOT remove a key absent locally (another device authored it).
-        // M3 SCOPE DECISION (device-global credentials mirror) — DELIBERATELY NOT CHANGED HERE, flagged for a
-        // separate scope pass. The debrid keys below, and the ApiKeys (tmdb/mdblist/fanart) above and the
-        // Trakt / SIMKL / media-server / IPTV mirrors that follow, read this device's CURRENT local credential
-        // stores and fold them into the doc being pushed to whatever account is current when the push lands.
-        // DebridKeys is already owner-scoped and rebinds on switch (DebridKeys.bind), and the session gate on
-        // this whole merge (post-pull + post-token guards, and the pre-push gate in syncUp) discards the merge on
-        // a mid-flight switch; but ApiKeys/Trakt/SIMKL/IPTV are device-global stores with no per-account scope,
-        // so a key entered under account A remains readable to a later account B on the same device and would
-        // mirror into B's doc. Narrowing that device-global mirror to per-owner scope is a separate, larger
-        // decision (it touches those four stores' persistence model) and is intentionally out of scope for the
-        // INS-06 session-TOCTOU hardening. Do not "fix" it inline here.
-        let debrid = DebridKeys.shared
-        if debrid.isConfigured(.realDebrid) { keys["realDebrid"] = debrid.key(for: .realDebrid) }
-        if debrid.isConfigured(.allDebrid)  { keys["allDebrid"]  = debrid.key(for: .allDebrid) }
-        if debrid.isConfigured(.premiumize) { keys["premiumize"] = debrid.key(for: .premiumize) }
-        if debrid.isConfigured(.torBox)     { keys["torBox"]     = debrid.key(for: .torBox) }
+        // M3 (INS-260722-06R v2, RESOLVED = PER-ACCOUNT): the debrid mirror below reads the lock-protected
+        // owner-scoped snapshot store (bound to the current owner at restore/adopt/signOut), and the Trakt /
+        // SIMKL / media-server / IPTV mirrors that follow read their own per-owner Keychain scopes, so a key
+        // entered under account A can no longer be read under, or mirrored into, a later account B's doc.
+        // The captured debridSnapshot.revision rides the derived doc so the PUT is fenced at issuance.
+        let debridSnapshot = DebridCredentialSnapshotStore.shared.load()
+        if let value = debridSnapshot.keys[.realDebrid] { keys["realDebrid"] = value }
+        if let value = debridSnapshot.keys[.allDebrid] { keys["allDebrid"] = value }
+        if let value = debridSnapshot.keys[.premiumize] { keys["premiumize"] = value }
+        if let value = debridSnapshot.keys[.torBox] { keys["torBox"] = value }
         // External sync provider tokens (Trakt Lane C, SIMKL Lane D) ride the SAME encrypted apiKeys
         // channel so a connection made on one device follows the account. They live in the Keychain, which
         // SettingsBackup deliberately excludes, so this mirror is the only carrier. Set only when connected
@@ -1289,7 +1329,7 @@ final class VortXSyncManager: ObservableObject {
         let defaultTerms = SearchHistoryStore.allTerms(for: nil)
         if !defaultTerms.isEmpty { searches["default"] = defaultTerms }
         if searches.isEmpty { doc.removeValue(forKey: "searches") } else { doc["searches"] = searches }
-        return doc
+        return DerivedSyncDocument(object: doc, debridRevision: debridSnapshot.revision)
     }
 
     /// The current add-on order this device holds, as normalized transportUrls in the engine's true
@@ -1435,6 +1475,7 @@ final class VortXSyncManager: ObservableObject {
         if !effectiveForce, pulled.version <= lastSyncedVersion { return false }
         let doc = pulled.doc
         var restored = false
+        var debridGenerationApplied = true
         // SUPPRESS THE OBSERVER for the whole apply region. SettingsBackup.restore + the apiKeys/overlay/
         // tombstone/profileEdits writes below all hit UserDefaults; without suppression each fires the
         // global didChangeNotification observer, which calls requestSyncSoon() -> re-arms hasPendingPush and
@@ -1479,15 +1520,21 @@ final class VortXSyncManager: ObservableObject {
             if let f = keys["fanart"] { ApiKeys.shared.fanart = f }
             // Debrid keys: apply only when present so a doc without them never clears a locally-entered key.
             let debrid = DebridKeys.shared
-            if let v = keys["realDebrid"], v != debrid.key(for: .realDebrid) { debrid.setKey(v, for: .realDebrid) }
-            if let v = keys["allDebrid"],  v != debrid.key(for: .allDebrid)  { debrid.setKey(v, for: .allDebrid) }
-            if let v = keys["premiumize"], v != debrid.key(for: .premiumize) { debrid.setKey(v, for: .premiumize) }
-            if let v = keys["torBox"],     v != debrid.key(for: .torBox)     { debrid.setKey(v, for: .torBox) }
-            // A key that ARRIVED from another device must take effect here too. Route the final combined
-            // snapshot through DebridKeys' generation fence: a direct coordinator Task could run after an
-            // account switch and re-install this old account's credentials as the final resolver state.
+            var remoteDebrid: [DebridService: String] = [:]
+            if let value = keys["realDebrid"] { remoteDebrid[.realDebrid] = value }
+            if let value = keys["allDebrid"] { remoteDebrid[.allDebrid] = value }
+            if let value = keys["premiumize"] { remoteDebrid[.premiumize] = value }
+            if let value = keys["torBox"] { remoteDebrid[.torBox] = value }
+            // A failed durable debrid envelope is a partial apply, never an acknowledged sync generation. Stop
+            // before the version/applied/success stamps so this exact remote version remains retryable.
             // CREDENTIAL_SYNC_RESOLVER_RELOAD_BEGIN
-            debrid.reloadResolvers()
+            // The atomic remote apply publishes ONE monotonic snapshot revision; the coordinator's revision
+            // fence and every resolver's issuance fence then make a stale generation unusable (never observable
+            // as final state, never spendable at a send), which supersedes the old LatestCredentialReload fence.
+            guard debrid.applyRemoteKeys(remoteDebrid) else {
+                debridGenerationApplied = false
+                return
+            }
             // CREDENTIAL_SYNC_RESOLVER_RELOAD_END
             // External sync provider tokens (Trakt Lane C, SIMKL Lane D): adopt a connection authored on
             // another device. Apply only when present so a doc without them never clears a locally-connected
@@ -1725,6 +1772,7 @@ final class VortXSyncManager: ObservableObject {
         // spurious push of the just-applied doc (the same self-echo class this region exists to prevent).
         stampSyncSuccess()
         }   // end withRemoteApplySuppressed
+        guard debridGenerationApplied else { return false }
         return restored
     }
 
