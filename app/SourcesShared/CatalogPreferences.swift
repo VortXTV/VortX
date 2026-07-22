@@ -1,4 +1,26 @@
+#if PORTRAIT_ADAPTIVE_LAYOUT_CONTRACT_ONLY
+import Foundation
+#else
 import SwiftUI
+#endif
+
+/// Pure mutation seam used by the real catalog controls and compiled directly into the portrait contract.
+/// Returning nil for an invalid move keeps the production caller fail-soft without duplicating the rules.
+enum CatalogRowMutationContract {
+    static func moving(_ keys: [String], from: Int, to: Int) -> [String]? {
+        guard keys.indices.contains(from), keys.indices.contains(to) else { return nil }
+        var next = keys
+        let item = next.remove(at: from)
+        next.insert(item, at: to)
+        return next
+    }
+
+    static func toggledHidden(_ isHidden: Bool) -> Bool {
+        !isHidden
+    }
+}
+
+#if !PORTRAIT_ADAPTIVE_LAYOUT_CONTRACT_ONLY
 
 /// Per-device catalog customization (#0.3.8 add-on manager): which catalog rows show on Home and in
 /// what order. Keyed by the same `base|type|id` string CoreBridge.catalogKey builds. The read helpers
@@ -343,7 +365,24 @@ final class CatalogPreferences: ObservableObject {
 /// (cross-platform; tvOS has no drag-to-reorder, so explicit buttons work on every target).
 struct CatalogManagerView: View {
     @EnvironmentObject private var core: CoreBridge
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    #endif
     @ObservedObject private var prefs = CatalogPreferences.shared
+
+    /// iPhone portrait is compact horizontally and regular vertically. The vertical check keeps the
+    /// established landscape row unchanged while narrow portrait receives the wrapped action surface.
+    private var usesCompactPortraitLayout: Bool {
+        #if os(iOS)
+        PortraitAdaptiveLayoutContract.usesCompactPortrait(
+            horizontalIsCompact: horizontalSizeClass == .compact,
+            verticalIsCompact: verticalSizeClass == .compact
+        )
+        #else
+        false
+        #endif
+    }
 
     private var ordered: [CoreBridge.CatalogInfo] {
         // Fall back to the LIVE Home order (boardRows) when the user hasn't set an explicit order, so the
@@ -379,10 +418,20 @@ struct CatalogManagerView: View {
             if !ordered.isEmpty {
                 // One-tap: group every add-on's catalogs together, in add-on (priority) order.
                 Button { groupByAddonOrder() } label: {
-                    Label("Group by add-on order", systemImage: "rectangle.3.group")
+                    // Use an explicit title instead of Label's adaptive icon-only presentation. Keeping
+                    // horizontal sizing flexible lets the title wrap inside a narrow List proposal without
+                    // turning the chip into the all-axis fixed, full-height pill seen on iPhone portrait.
+                    HStack(alignment: .firstTextBaseline, spacing: Theme.Space.xs) {
+                        Image(systemName: "rectangle.3.group")
+                            .accessibilityHidden(true)
+                        Text("Group by add-on order")
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
-                .fixedSize()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel("Group by add-on order")
             }
         }
     }
@@ -449,36 +498,16 @@ struct CatalogManagerView: View {
     @ViewBuilder
     private func row(_ info: CoreBridge.CatalogInfo, index: Int, total: Int, keys: [String]) -> some View {
         let isHidden = prefs.isHidden(info.key)
-        HStack(spacing: Theme.Space.md) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(info.title)
-                    .font(Theme.Typography.cardTitle)
-                    .foregroundStyle(isHidden ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
-                    .lineLimit(1)
-                Text(info.addonName)
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(Theme.Palette.textTertiary)
-                    .lineLimit(1)
+        Group {
+            #if os(iOS)
+            if usesCompactPortraitLayout {
+                compactCatalogRow(info, index: index, total: total, keys: keys, isHidden: isHidden)
+            } else {
+                regularCatalogRow(info, index: index, total: total, keys: keys, isHidden: isHidden)
             }
-            Spacer(minLength: Theme.Space.sm)
-            // Move to top -> up -> down -> bottom, then the show/hide eye. Send-to-top / send-to-bottom
-            // are the fast path on a long catalog list (and the only practical reorder on Apple TV).
-            Button { move(keys, from: index, to: 0) } label: { Image(systemName: "arrow.up.to.line") }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .disabled(index == 0)
-            Button { move(keys, from: index, to: index - 1) } label: { Image(systemName: "chevron.up") }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .disabled(index == 0)
-            Button { move(keys, from: index, to: index + 1) } label: { Image(systemName: "chevron.down") }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .disabled(index == total - 1)
-            Button { move(keys, from: index, to: total - 1) } label: { Image(systemName: "arrow.down.to.line") }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .disabled(index == total - 1)
-            Button { prefs.setHidden(info.key, !isHidden) } label: {
-                Image(systemName: isHidden ? "eye.slash" : "eye")
-            }
-            .buttonStyle(ChipButtonStyle(selected: !isHidden))
+            #else
+            regularCatalogRow(info, index: index, total: total, keys: keys, isHidden: isHidden)
+            #endif
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -493,11 +522,96 @@ struct CatalogManagerView: View {
         #endif
     }
 
+    /// The established wide and landscape composition, with the same identity/action order and spacing.
+    private func regularCatalogRow(_ info: CoreBridge.CatalogInfo, index: Int, total: Int,
+                                   keys: [String], isHidden: Bool) -> some View {
+        HStack(spacing: Theme.Space.md) {
+            catalogIdentity(info, isHidden: isHidden, lineLimit: 1)
+            Spacer(minLength: Theme.Space.sm)
+            HStack(spacing: Theme.Space.md) {
+                moveToTopButton(keys, index: index)
+                moveUpButton(keys, index: index)
+                moveDownButton(keys, index: index, total: total)
+                moveToBottomButton(keys, index: index, total: total)
+                visibilityButton(info, isHidden: isHidden)
+            }
+        }
+    }
+
+    /// Compact portrait gives catalog identity the full row, then lays every action out as an individual
+    /// FlowLayout child. Nothing is hidden: all four reorder commands and visibility remain reachable and
+    /// preserve their existing actions, while a second line absorbs intrinsic control width when needed.
+    #if os(iOS)
+    private func compactCatalogRow(_ info: CoreBridge.CatalogInfo, index: Int, total: Int,
+                                   keys: [String], isHidden: Bool) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            catalogIdentity(info, isHidden: isHidden, lineLimit: 2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            FlowLayout(spacing: Theme.Space.sm) {
+                moveToTopButton(keys, index: index)
+                moveUpButton(keys, index: index)
+                moveDownButton(keys, index: index, total: total)
+                moveToBottomButton(keys, index: index, total: total)
+                visibilityButton(info, isHidden: isHidden)
+            }
+        }
+    }
+    #endif
+
+    private func catalogIdentity(_ info: CoreBridge.CatalogInfo, isHidden: Bool,
+                                 lineLimit: Int) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(info.title)
+                .font(Theme.Typography.cardTitle)
+                .foregroundStyle(isHidden ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
+                .lineLimit(lineLimit)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(info.addonName)
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textTertiary)
+                .lineLimit(lineLimit)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func moveToTopButton(_ keys: [String], index: Int) -> some View {
+        Button { move(keys, from: index, to: 0) } label: { Image(systemName: "arrow.up.to.line") }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            .disabled(index == 0)
+            .accessibilityLabel("Move to top")
+    }
+
+    private func moveUpButton(_ keys: [String], index: Int) -> some View {
+        Button { move(keys, from: index, to: index - 1) } label: { Image(systemName: "chevron.up") }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            .disabled(index == 0)
+            .accessibilityLabel("Move up")
+    }
+
+    private func moveDownButton(_ keys: [String], index: Int, total: Int) -> some View {
+        Button { move(keys, from: index, to: index + 1) } label: { Image(systemName: "chevron.down") }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            .disabled(index == total - 1)
+            .accessibilityLabel("Move down")
+    }
+
+    private func moveToBottomButton(_ keys: [String], index: Int, total: Int) -> some View {
+        Button { move(keys, from: index, to: total - 1) } label: { Image(systemName: "arrow.down.to.line") }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            .disabled(index == total - 1)
+            .accessibilityLabel("Move to bottom")
+    }
+
+    private func visibilityButton(_ info: CoreBridge.CatalogInfo, isHidden: Bool) -> some View {
+        Button { prefs.setHidden(info.key, CatalogRowMutationContract.toggledHidden(isHidden)) } label: {
+            Image(systemName: isHidden ? "eye.slash" : "eye")
+        }
+        .buttonStyle(ChipButtonStyle(selected: !isHidden))
+        .accessibilityLabel(isHidden ? "Show catalog" : "Hide catalog")
+    }
+
     private func move(_ keys: [String], from: Int, to: Int) {
-        guard to >= 0, to < keys.count else { return }
-        var next = keys
-        let item = next.remove(at: from)
-        next.insert(item, at: to)
+        guard let next = CatalogRowMutationContract.moving(keys, from: from, to: to) else { return }
         prefs.reorder(next)
     }
 
@@ -878,3 +992,4 @@ final class ImportedCatalogs: ObservableObject {
         ImportedCatalogsStore.save(next)
     }
 }
+#endif
