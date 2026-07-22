@@ -10,6 +10,9 @@
 #
 # Modes:
 #   ./run-conformance.sh selftest         Validate the oracle only (no sim needed).
+#   ./run-conformance.sh mutants          Prove every load-bearing fMP4 oracle
+#                                          protection turns the selftest RED when
+#                                          removed one at a time.
 #   ./run-conformance.sh trace [logfile]  Evaluate points 1,3,4,6,7 from a captured
 #                                          trace. Defaults to the booted sim's live
 #                                          container log.
@@ -27,6 +30,11 @@
 #                                          in this mode is the fail-soft FIRING, so a
 #                                          libmpv demotion is the EXPECTED outcome and
 #                                          is NOT the INFRA condition it is elsewhere.
+#   ./run-conformance.sh live-auto --no-reader
+#                                          Historical AVPlayer-only read-head control.
+#   ./run-conformance.sh live-auto --rotation-control
+#                                          Force a real diagnostics.log rollover after
+#                                          the immutable product-only snapshot.
 #   ./run-conformance.sh all              build + selftest + trace (default).
 #   ./run-conformance.sh app-build        (Re)build VortXTV into /tmp/dd-harness so
 #                                          a fresh trace can be generated.
@@ -120,12 +128,14 @@ SLO_MOUNT_READY_MS="$(contract_int sloMountToReadyMs)"   # 30000: point 6 SLO
 
 # How far past the window floor the READ HEAD must travel before we trust point 4.
 # The buffer evicts at `readHead - windowFloorBytes`, so seg0 survives until the read
-# head passes windowFloorBytes; the read head advances at roughly playback rate. A
-# margin of 1 would put the run exactly on that knife edge, which is how the earlier
+# head passes windowFloorBytes. The derivation uses playback rate as a conservative
+# timing budget; the default explicit reader may advance faster. A 100% margin would
+# put the run exactly on that knife edge, which is how the earlier
 # 92 MiB fixture produced 15 predicted-evicted ids that all still returned 200. The
-# soak is DERIVED from this and the fixture's own bitrate, never hardcoded.
+# timing budget is DERIVED from this and the fixture's own bitrate, never hardcoded.
 EVICTION_MARGIN_PERCENT="${VORTX_EVICTION_MARGIN_PERCENT:-120}"
-# Explicit --soak wins; empty means "derive it" (see derive_soak).
+# Explicit --soak wins. In the default mode this is the reader deadline base; in the
+# historical --no-reader control it remains a literal idle soak.
 SOAK_SECS="${VORTX_SOAK_SECS:-}"
 # Delivery pacing, as a PERCENT of the fixture's own average bitrate.
 #
@@ -136,28 +146,47 @@ SOAK_SECS="${VORTX_SOAK_SECS:-}"
 #    VOD and the startup gate point 1 measures is never exercised. Anything at or
 #    above ~1x already loses that race, because the gate needs 2 closed segments
 #    (~6 s of media) while AVPlayer asks at ~0.3 s.
-#  UPPER BOUND (session survival): the producer parks in `VortXRemuxBuffer.append`
+#  UPPER BOUND (session survival): without an active reader, the producer parks in
+#    `VortXRemuxBuffer.append`
 #    once resident bytes reach `windowFloorBytes + producerLead`. Parking blocks
 #    inside the SOURCE READ path, so the app's own stall detector sees no source
 #    progress and FAILS the remux. Measured at 4x: "live source read stalled 48.2s
 #    (rc=-5, produced=125901614B)" then "hls 404 /media.m3u8 (remux failed)" and a
 #    demotion, roughly 95 s in, killing the session before the probe.
 #
-# So the surplus rate (delivery minus playback) must be small enough that it cannot
-# fill the buffer before the probe runs. That is derived in `safe_rate_percent`
-# from windowFloorMiB and the soak, not chosen. This value is only the CEILING that
-# derivation is allowed to clamp down from.
+# `safe_rate_percent` retains that historical model as a conservative source-rate
+# ceiling. The default explicit reader, not the estimate, now guarantees read-head
+# progress after readiness.
 FIXTURE_RATE_PERCENT="${VORTX_FIXTURE_RATE_PERCENT:-150}"
-# How much margin to keep between "buffer full" and "probe time".
-# Measured, not modelled. A safety of 2 (delivery clamped to 125%) STILL parked the
-# producer: the playlist froze at segs=70 for 40 s while AVPlayer polled /media.m3u8,
-# then AVPlayer gave up with "mid-play AVPlayer endFileError (Playback Stopped) ->
-# demote to libmpv in place". The read head evidently lags playback by more than the
-# simple model assumes, so the surplus must be small enough that the producer never
-# builds a meaningful lead at all. 5 clamps delivery to ~110%.
+# Historical no-reader pacing model. A safety of 2 (delivery clamped to 125%) still
+# parked the producer because AVPlayer stopped consuming non-IDR media; no finite
+# model based on playback time can repair a read head that has stopped. The default
+# synthetic reader now advances the read head explicitly. Keep this calculation for
+# the --no-reader diagnostic control and for conservative pre-readiness pacing, but
+# do not treat it as proof that AVPlayer will continue consuming.
 PARK_SAFETY="${VORTX_PARK_SAFETY:-1}"
-# Extra bounded wait for the eviction positive control (see confirm_eviction).
+# Extra bounded wait used only by the historical --no-reader diagnostic control.
 EVICTION_CONFIRM_SECS="${VORTX_EVICTION_CONFIRM_SECS:-120}"
+
+# Normal live-auto runs use an EXPLICIT synthetic HLS reader after the product-only
+# observation boundary. Point 2 deliberately feeds AVPlayer non-IDR segment starts;
+# the current product can stop requesting media on that defect while continuing to
+# poll the EVENT playlist. If the harness then waits for AVPlayer to advance the one
+# global buffer read head, the producer reaches its expected 128 MiB back-pressure
+# ceiling, the playlist stops changing, and AVPlayer eventually reports "Playback
+# Stopped" and demotes. That destroys the HLS server before point 4 can observe it.
+# The synthetic reader consumes only manifest-advertised segments, in exact id order,
+# for a bounded window. It reports the stale-advertisement defect when two complete
+# 404/410 responses prove it, but a conforming served or playlist-removed segment also
+# proceeds to the same acceptance battery. Every request is counted in a sidecar and
+# excluded from trace/verdict evidence by a byte boundary recorded BEFORE it starts.
+# `--no-reader` retains the historical defect-reproduction control.
+SYNTHETIC_READER=1
+# Explicit reliability control: after snapshotting the product-only trace, drive
+# diagnostics.log through a real app-side rollover and prove the saved trace stays
+# nonempty and byte-identical. Off during ordinary runs; enable with
+# `live-auto --rotation-control`.
+ROTATION_CONTROL=0
 
 # --- starve mode (point 7's positive path) ----------------------------------
 # Contract point 7 wants EXACTLY ONE `hls_startup_cohort_timeout` plus a 404 into the
@@ -179,8 +208,263 @@ build_harness() {
   mkdir -p "$DD/bin"
   echo "[build] swiftc -> $BIN"
   swiftc -O -o "$BIN" \
-    "$HERE/Contract.swift" "$HERE/Playlist.swift" "$HERE/FMP4.swift" \
+    "$HERE/Contract.swift" "$HERE/Playlist.swift" "$HERE/FMP4.swift" "$HERE/FMP4Fixtures.swift" \
     "$HERE/Trace.swift" "$HERE/Live.swift" "$HERE/main.swift" "$POLICY"
+}
+
+run_mutants() {
+  local mutants=(
+    wrong-track
+    nil-unmatched-track
+    unknown-tkhd-version
+    sync-flag-only
+    nal-only
+    audio-first-order
+    video-first-order
+    hevc-idr-layer-zero
+    short-tkhd-payload
+  )
+  local mutant rc failed=0
+  for mutant in "${mutants[@]}"; do
+    echo ""
+    echo "[mutant] $mutant: selftest MUST turn RED"
+    set +e
+    "$BIN" selftest --mutant "$mutant"
+    rc=$?
+    set -e
+    if [ "$rc" = "1" ]; then
+      echo "[mutant] PASS: $mutant was killed (selftest exit 1)"
+    else
+      echo "[mutant] FAIL: $mutant escaped (selftest exit $rc; expected 1)"
+      failed=1
+    fi
+  done
+  echo ""
+  echo "[mutant] retirement-defect-required: conforming controls MUST turn RED"
+  set +e
+  retirement_acceptance_regressions 1
+  rc=$?
+  set -e
+  if [ "$rc" = "1" ]; then
+    echo "[mutant] PASS: retirement-defect-required was killed (control exit 1)"
+  else
+    echo "[mutant] FAIL: retirement-defect-required escaped (control exit $rc; expected 1)"
+    failed=1
+  fi
+  [ "$failed" = "0" ] || return 1
+  echo ""
+  echo "[mutant] ALL 10 LOAD-BEARING MUTANTS KILLED"
+}
+
+# Curl can produce an HTTP status before discovering that the advertised body was
+# truncated. HTTP status and transfer completion are therefore independent facts.
+# These helpers preserve both, discard partial bodies, and never let a status from a
+# nonzero transfer become evidence. Callers record CURL_RC and CURL_STATUS together.
+CURL_RC=0
+CURL_STATUS=000
+curl_capture_complete() {   # $1 = destination, $2 = timeout seconds, $3 = URL
+  local destination="$1" timeout="$2" url="$3" partial="${1}.partial.$$" status rc
+  rm -f "$partial" "$destination"
+  set +e
+  status="$(curl -sS -o "$partial" -w '%{http_code}' --max-time "$timeout" "$url" 2>/dev/null)"
+  rc=$?
+  set -e
+  CURL_RC="$rc"
+  CURL_STATUS="${status:-000}"
+  if [ "$CURL_RC" = "0" ]; then
+    mv "$partial" "$destination"
+  else
+    rm -f "$partial" "$destination"
+  fi
+}
+
+curl_probe_complete() {   # $1 = timeout seconds, $2 = URL
+  local timeout="$1" url="$2" status rc
+  set +e
+  status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time "$timeout" "$url" 2>/dev/null)"
+  rc=$?
+  set -e
+  CURL_RC="$rc"
+  CURL_STATUS="${status:-000}"
+}
+
+curl_transport_regressions() {
+  local root portfile server_log server_pid waited=0 port url failed=0
+  local destination next_id retired_streak failures
+  root="$(mktemp -d /tmp/player-curl-regressions.XXXXXX)"
+  portfile="$root/port"
+  server_log="$root/server.log"
+  python3 - "$portfile" >"$server_log" 2>&1 <<'PY' &
+import http.server
+import socketserver
+import sys
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        status = 200
+        if "retire-410" in self.path:
+            status = 410
+        elif "retire" in self.path or "rotation" in self.path:
+            status = 404
+        body = b"short"
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body) + 40))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        self.close_connection = True
+
+    def log_message(self, format, *args):
+        pass
+
+with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
+    with open(sys.argv[1], "w", encoding="utf-8") as handle:
+        handle.write(str(server.server_address[1]))
+        handle.flush()
+    server.serve_forever()
+PY
+  server_pid=$!
+  while [ ! -s "$portfile" ] && [ "$waited" -lt 50 ]; do
+    sleep 0.02
+    waited=$((waited + 1))
+  done
+  if [ ! -s "$portfile" ]; then
+    echo "[curl-selftest] FAIL: truncated-response server did not start" >&2
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    rm -rf "$root"
+    return 1
+  fi
+  port="$(cat "$portfile")"
+  url="http://127.0.0.1:$port"
+  destination="$root/media.m3u8"
+
+  curl_capture_complete "$destination" 2 "$url/truncated-manifest"
+  if [ "$CURL_RC" = "0" ] || [ "$CURL_STATUS" != "200" ] || [ -e "$destination" ]; then
+    echo "[curl-selftest] FAIL: truncated 200 manifest was trusted (rc=$CURL_RC status=$CURL_STATUS)" >&2
+    failed=1
+  fi
+
+  next_id=7
+  curl_probe_complete 2 "$url/truncated-segment"
+  if [ "$CURL_RC" = "0" ] && [ "$CURL_STATUS" = "200" ]; then next_id=$((next_id + 1)); fi
+  if [ "$next_id" != "7" ]; then
+    echo "[curl-selftest] FAIL: truncated 200 segment advanced the reader" >&2
+    failed=1
+  fi
+
+  retired_streak=1
+  curl_probe_complete 2 "$url/truncated-retire"
+  if [ "$CURL_RC" = "0" ] && { [ "$CURL_STATUS" = "404" ] || [ "$CURL_STATUS" = "410" ]; }; then
+    retired_streak=$((retired_streak + 1))
+  else
+    retired_streak=0
+  fi
+  if [ "$retired_streak" != "0" ]; then
+    echo "[curl-selftest] FAIL: truncated retirement response advanced the proof streak" >&2
+    failed=1
+  fi
+
+  failures=0
+  for _ in 1 2 3; do
+    curl_probe_complete 2 "$url/truncated-retire-410"
+    if [ "$CURL_RC" != "0" ]; then failures=$((failures + 1)); fi
+  done
+  if [ "$failures" != "3" ]; then
+    echo "[curl-selftest] FAIL: repeated truncated retirement responses were not transport failures" >&2
+    failed=1
+  fi
+
+  curl_probe_complete 2 "$url/truncated-rotation"
+  if [ "$CURL_RC" = "0" ] || [ "$CURL_STATUS" != "404" ]; then
+    echo "[curl-selftest] FAIL: truncated rotation response did not preserve rc plus HTTP status" >&2
+    failed=1
+  fi
+
+  kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+  rm -rf "$root"
+  [ "$failed" = "0" ] || return 1
+  echo "[curl-selftest] PASS: truncated 200 manifest, 200 segment, 404/410 retirement, and rotation responses stayed transport failures"
+}
+
+# Pure decision seam for the optional stale-retirement observation. The acceptance
+# battery must run on both conforming shapes: an advertised segment may remain served,
+# or it may be removed from the playlist before retirement. Only a prior complete 200
+# followed by two complete 404/410 responses while the id remains advertised proves
+# the beta defect. `mutant=1` deliberately restores the old defect-required behavior.
+RETIREMENT_NEXT_STREAK=0
+RETIREMENT_DECISION=continue
+retirement_observation_step() { # prior200 advertised curl_rc http streak window_complete [mutant]
+  local prior200="$1" advertised="$2" curl_rc="$3" http="$4" streak="$5"
+  local window_complete="$6" mutant="${7:-0}"
+  RETIREMENT_NEXT_STREAK=0
+  RETIREMENT_DECISION=continue
+
+  if [ "$advertised" != "1" ]; then
+    RETIREMENT_DECISION=proceed-removed
+  elif [ "$curl_rc" = "0" ] && { [ "$http" = "404" ] || [ "$http" = "410" ]; } \
+      && [ "$prior200" = "1" ]; then
+    RETIREMENT_NEXT_STREAK=$((streak + 1))
+    if [ "$RETIREMENT_NEXT_STREAK" -ge 2 ]; then
+      RETIREMENT_DECISION=defect-observed
+    elif [ "$window_complete" = "1" ]; then
+      RETIREMENT_DECISION=proceed-unobserved
+    fi
+  elif [ "$window_complete" = "1" ]; then
+    if [ "$curl_rc" = "0" ] && [ "$http" = "200" ]; then
+      RETIREMENT_DECISION=proceed-served
+    else
+      RETIREMENT_DECISION=proceed-unobserved
+    fi
+  fi
+
+  if [ "$mutant" = "1" ]; then
+    case "$RETIREMENT_DECISION" in
+      proceed-*) RETIREMENT_DECISION=infra ;;
+    esac
+  fi
+}
+
+retirement_acceptance_regressions() { # optional $1 = old defect-required mutant
+  local mutant="${1:-0}" failed=0 first_streak
+
+  retirement_observation_step 1 1 0 200 0 1 "$mutant"
+  if [ "$RETIREMENT_DECISION" = "proceed-served" ]; then
+    echo "[retirement-selftest] PASS: fully served advertised segment proceeds to the battery"
+  else
+    echo "[retirement-selftest] FAIL: fully served behavior produced '$RETIREMENT_DECISION'" >&2
+    failed=1
+  fi
+
+  retirement_observation_step 1 0 0 000 0 0 "$mutant"
+  if [ "$RETIREMENT_DECISION" = "proceed-removed" ]; then
+    echo "[retirement-selftest] PASS: playlist removal proceeds without probing an unadvertised id"
+  else
+    echo "[retirement-selftest] FAIL: removed-segment behavior produced '$RETIREMENT_DECISION'" >&2
+    failed=1
+  fi
+
+  retirement_observation_step 1 1 0 404 0 0 "$mutant"
+  first_streak="$RETIREMENT_NEXT_STREAK"
+  retirement_observation_step 1 1 0 404 "$first_streak" 0 "$mutant"
+  if [ "$RETIREMENT_DECISION" = "defect-observed" ] && [ "$RETIREMENT_NEXT_STREAK" = "2" ]; then
+    echo "[retirement-selftest] PASS: two complete advertised-id 404s report the stale-retirement defect"
+  else
+    echo "[retirement-selftest] FAIL: stale-retirement proof produced '$RETIREMENT_DECISION'/$RETIREMENT_NEXT_STREAK" >&2
+    failed=1
+  fi
+
+  retirement_observation_step 1 1 18 404 1 0 "$mutant"
+  if [ "$RETIREMENT_DECISION" = "continue" ] && [ "$RETIREMENT_NEXT_STREAK" = "0" ]; then
+    echo "[retirement-selftest] PASS: truncated 404 resets proof and never reports the defect"
+  else
+    echo "[retirement-selftest] FAIL: truncated 404 produced '$RETIREMENT_DECISION'/$RETIREMENT_NEXT_STREAK" >&2
+    failed=1
+  fi
+
+  [ "$failed" = "0" ] || return 1
 }
 
 container_log() {
@@ -324,6 +608,7 @@ derive_soak() {
   rate="$(media_byte_rate)"
   need=$(( EVICTION_MARGIN_PERCENT * WINDOW_FLOOR_MIB * 1024 * 1024 / 100 ))
   soak=$(( need / rate ))
+  [ "$soak" -gt 0 ] || soak=1
   echo "[live-auto] eviction sizing: buffer evicts at (readHead - ${WINDOW_FLOOR_MIB} MiB), read head advances" >&2
   echo "[live-auto]   at playback rate ${rate} B/s. Need read head past ${EVICTION_MARGIN_PERCENT}% of ${WINDOW_FLOOR_MIB} MiB" >&2
   echo "[live-auto]   = ${need} B, so soak = ${need} / ${rate} = ${soak}s (fixture is ${FIXTURE_SECS}s of media)." >&2
@@ -334,14 +619,13 @@ derive_soak() {
   echo "$soak"
 }
 
-# The largest delivery percent that cannot park the producer before the probe runs.
-# The producer's SURPLUS over playback accumulates in the buffer; once it reaches the
-# park ceiling the source read blocks and the app fails the remux (see the constraint
-# note above). Requiring
+# Historical upper-bound estimate for delivery pacing. When a consumer advances the
+# read head, the producer's SURPLUS over consumption accumulates in the buffer; once
+# it reaches the park ceiling the source read blocks. Requiring
 #     windowFloorBytes / surplus  >  soak x PARK_SAFETY
-# keeps the buffer from filling until well after the battery has run. windowFloorBytes
-# is the conservative choice: the real ceiling is floor + producer lead, so this errs
-# on the safe side. Derived from Contract.swift and the soak, never picked.
+# estimates a rate that keeps the buffer from filling before the battery runs.
+# `--no-reader` demonstrates why this estimate is not sufficient when AVPlayer stops
+# consuming entirely. The default explicit reader makes progress deterministic.
 safe_rate_percent() {
   local rate surplus_max percent
   rate="$(media_byte_rate)"
@@ -473,10 +757,10 @@ wait_for_ready() {   # $1 = full log, $2 = offset, $3 = slice path
         infra "the router sent THIS session to libmpv, not AVFoundation (silent demotion).
         marker: $(grep "route file=$token .*-> engine=mpv" "$slice" | tail -1)"
       fi
-      if grep -q 'demote in place\|remux demoted' "$slice"; then
+      if grep -q 'demote.*in place\|remux demoted' "$slice"; then
         printf "\n"
         infra "the AVPlayer session was demoted to libmpv before it became ready.
-        marker: $(grep 'demote in place\|remux demoted' "$slice" | tail -1)"
+        marker: $(grep 'demote.*in place\|remux demoted' "$slice" | tail -1)"
       fi
     fi
     if [ "$saw_accept" = "1" ] && grep -q 'readyToPlay -> play' "$slice"; then
@@ -538,7 +822,7 @@ starve_wait() {   # $1 = full log, $2 = offset, $3 = slice path
         outcome="cohort-timeout-event"; break
       fi
       # The beta's ACTUAL fail-soft: it demotes without emitting a counted event.
-      if grep -q 'demote in place\|remux demoted' "$slice"; then
+      if grep -q 'demote.*in place\|remux demoted' "$slice"; then
         outcome="demoted-without-event"; break
       fi
       # Starvation failed: the source still filled the cohort and playback started.
@@ -568,7 +852,7 @@ starve_wait() {   # $1 = full log, $2 = offset, $3 = slice path
       echo "[starve]   Point 7's positive path is now exercisable end to end." ;;
     demoted-without-event)
       echo "[starve] OUTCOME: the session demoted to libmpv WITHOUT a counted '$event'."
-      echo "[starve]   marker: $(grep 'demote in place\|remux demoted' "$slice" | tail -1)"
+      echo "[starve]   marker: $(grep 'demote.*in place\|remux demoted' "$slice" | tail -1)"
       echo "[starve]   This is the EXPECTED result against the current beta: the counted"
       echo "[starve]   fail-soft is part of the pending rework and does not exist yet. The"
       echo "[starve]   demotion is the contract's intended fail-soft behaviour, so it is NOT"
@@ -615,11 +899,11 @@ $(tail -12 "$WORK/server.log" 2>/dev/null || echo '  (no server log)')"
         ceiling, and parking blocks the source read. Lower VORTX_FIXTURE_RATE_PERCENT
         (or raise VORTX_PARK_SAFETY) so the surplus cannot fill the buffer before the probe."
     fi
-    if grep -q 'demote in place\|remux demoted' "$slice"; then
+    if grep -q 'demote.*in place\|remux demoted' "$slice"; then
       printf "\n"
       infra "the AVPlayer session was demoted to libmpv DURING the soak, so the battery
         would have probed a dead HLS server.
-        marker: $(grep 'demote in place\|remux demoted' "$slice" | tail -1)"
+        marker: $(grep 'demote.*in place\|remux demoted' "$slice" | tail -1)"
     fi
     # SUPERSESSION. A second `hls server listening` means the app relaunched or
     # re-mounted, so the session we waited on is dead and its port is stale: the battery
@@ -649,6 +933,238 @@ $(tail -12 "$WORK/server.log" 2>/dev/null || echo '  (no server log)')"
   printf "\n"
 }
 
+# Drive the real HLS buffer read head without depending on AVPlayer to survive the
+# non-IDR defect point 2 is intentionally exposing. This is a TEST READER, not
+# product traffic:
+#   * the caller records the product-only byte boundary before entering;
+#   * data is consumed only for segment ids in the latest successful manifest;
+#     the separate retirement control deliberately probes seg0;
+#   * ids are consumed strictly in order, never skipped and never raced ahead;
+#   * manifest and reader transport failures remain INFRA, while the separate optional
+#     stale-retirement observation can never block the acceptance battery;
+#   * the beta defect is reported only after TWO complete HTTP 404/410 responses for
+#     an advertised seg0 that this reader previously fetched with a complete 200;
+#   * a server that keeps seg0 served or removes it from the playlist proceeds to the
+#     same live battery instead of failing for lack of the defect;
+#   * every synthetic request + status is counted in the stable reader sidecar.
+synthetic_reader_for_window() {   # $1 = full log, $2 = offset, $3 = live slice
+  local log="$1" offset="$2" slice="$3"
+  local port elapsed=0 deadline next_id=0 highest=-1
+  local manifest_gets=0 segment_gets=0 control_gets=0
+  local manifest_failures=0 segment_failures=0 retired_streak=0
+  local saw_seg0_200=0 seg0_advertised=0
+  local manifest_file="$WORK/reader-media.m3u8" reader_log="$DD/last-reader-control.log"
+  local manifest_code manifest_rc segment_code segment_rc control_code control_rc sessions advertised
+  local window_complete decision
+
+  port="$(grep -o 'hls server listening on 127\.0\.0\.1:[0-9]*' "$slice" | tail -1 | grep -o '[0-9]*$' || true)"
+  [ -n "$port" ] || infra "synthetic reader could not find this session's HLS port in the product trace."
+  deadline="$SOAK_SECS"
+  [ "$deadline" -gt 0 ] || deadline=1
+  : > "$reader_log"
+
+  echo "[live-auto] synthetic reader ACTIVE on 127.0.0.1:$port after the product-only boundary."
+  echo "[live-auto]   It will consume manifest-advertised segments in exact id order for ${deadline}s."
+  echo "[live-auto]   Its optional seg0 control reports the stale-advertisement defect when proven;"
+  echo "[live-auto]   absence of that defect never blocks the acceptance battery."
+
+  while [ "$elapsed" -lt "$deadline" ]; do
+    slice_log "$log" "$offset" "$slice"
+
+    if [ -n "$SERVER_PID" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      printf "\n"
+      infra "the FIXTURE SERVER died ${elapsed}s into the synthetic-reader phase.
+        last lines of the fixture server log:
+$(tail -12 "$WORK/server.log" 2>/dev/null || echo '  (no server log)')"
+    fi
+    if grep -q 'live source read stalled' "$slice"; then
+      printf "\n"
+      infra "the app declared the SOURCE READ STALLED during the synthetic-reader phase.
+        marker: $(grep 'live source read stalled' "$slice" | tail -1)"
+    fi
+    if grep -q 'demote.*in place\|remux demoted' "$slice"; then
+      printf "\n"
+      infra "the AVPlayer session demoted while the synthetic reader was advancing the
+        HLS read head.
+        marker: $(grep 'demote.*in place\|remux demoted' "$slice" | tail -1)"
+    fi
+    sessions="$(grep -c 'hls server listening on 127\.0\.0\.1:' "$slice" || true)"
+    if [ "${sessions:-0}" -gt 1 ]; then
+      printf "\n"
+      infra "the playback session was SUPERSEDED ${elapsed}s into the synthetic-reader phase
+        (${sessions} HLS listener markers in this launch slice)."
+    fi
+
+    curl_capture_complete "$manifest_file" 5 "http://127.0.0.1:$port/media.m3u8"
+    manifest_rc="$CURL_RC"
+    manifest_code="$CURL_STATUS"
+    manifest_gets=$((manifest_gets + 1))
+    printf 'manifest GET %d rc=%s status=%s\n' "$manifest_gets" "$manifest_rc" "$manifest_code" >> "$reader_log"
+    if [ "$manifest_rc" != "0" ] || [ "$manifest_code" != "200" ]; then
+      manifest_failures=$((manifest_failures + 1))
+      retired_streak=0
+      if [ "$manifest_failures" -ge 3 ]; then
+        printf "\n"
+        infra "the synthetic reader could not fetch /media.m3u8 three consecutive times
+        (last transfer rc '$manifest_rc', HTTP status '$manifest_code'). No incomplete
+        response was retained and no transport failure was treated as
+        retirement.
+        app process alive: $(app_alive)
+        fixture server alive: $(server_alive)"
+      fi
+      printf "\r[live-auto] synthetic reader ... %ds/%ds (manifest rc=%s status=%s, retry %d/3)   " \
+        "$elapsed" "$deadline" "$manifest_rc" "$manifest_code" "$manifest_failures"
+      sleep 1
+      elapsed=$((elapsed + 1))
+      continue
+    fi
+    manifest_failures=0
+    if grep -qx 'seg0\.m4s' "$manifest_file"; then seg0_advertised=1; else seg0_advertised=0; fi
+
+    if [ "$seg0_advertised" = "0" ]; then
+      retirement_observation_step "$saw_seg0_200" 0 0 000 "$retired_streak" 0
+      printf "\n"
+      echo "[live-auto] optional stale-retirement observation: seg0 is no longer advertised."
+      echo "[live-auto]   This is a conforming removal shape, so no unadvertised path was probed."
+      echo "[live-auto]   Continuing to the acceptance battery; requests: manifests=$manifest_gets segments=$segment_gets controls=$control_gets."
+      return 0
+    fi
+
+    # Consume the contiguous advertised prefix from next_id. The exact grep is the
+    # race guard: even if a later id appears, the reader never jumps over a missing
+    # id and never asks for a path not present in THIS successfully fetched manifest.
+    while grep -qx "seg${next_id}\.m4s" "$manifest_file"; do
+      curl_probe_complete 10 "http://127.0.0.1:$port/seg${next_id}.m4s"
+      segment_rc="$CURL_RC"
+      segment_code="$CURL_STATUS"
+      segment_gets=$((segment_gets + 1))
+      printf 'segment GET id=%d rc=%s status=%s\n' "$next_id" "$segment_rc" "$segment_code" >> "$reader_log"
+      if [ "$segment_rc" != "0" ]; then
+        segment_failures=$((segment_failures + 1))
+        retired_streak=0
+        if [ "$segment_failures" -ge 3 ]; then
+          printf "\n"
+          infra "the synthetic reader failed to consume advertised seg${next_id} three
+        consecutive times (last transfer rc '$segment_rc', HTTP status '$segment_code').
+        It discarded every incomplete response, did not advance that id, and did not
+        count transport failure as retirement."
+        fi
+        break
+      fi
+      case "$segment_code" in
+        200)
+          segment_failures=0
+          if [ "$next_id" = "0" ]; then saw_seg0_200=1; fi
+          highest="$next_id"
+          next_id=$((next_id + 1)) ;;
+        404|410)
+          segment_failures=0
+          # A manifest-advertised id retired before this sequential reader reached
+          # it. Do not skip it; the independent seg0 control below decides whether
+          # the required positive control has actually been reached.
+          break ;;
+        *)
+          segment_failures=$((segment_failures + 1))
+          if [ "$segment_failures" -ge 3 ]; then
+            printf "\n"
+            infra "the synthetic reader failed to consume advertised seg${next_id} three
+        consecutive times (last transfer rc '$segment_rc', HTTP status '$segment_code'). It did not skip or
+        race ahead of that manifest entry, and no transport failure counted as retirement."
+          fi
+          break ;;
+      esac
+    done
+
+    # Optional defect observation. Proof requires this same reader to have received a
+    # complete seg0 200 earlier, the current complete manifest still to advertise
+    # seg0, and two consecutive complete 404/410 responses now. Absence of the beta
+    # defect never blocks the full acceptance battery.
+    curl_probe_complete 5 "http://127.0.0.1:$port/seg0.m4s"
+    control_rc="$CURL_RC"
+    control_code="$CURL_STATUS"
+    control_gets=$((control_gets + 1))
+    printf 'retirement GET %d rc=%s status=%s prior-seg0-200=%s currently-advertised=%s\n' \
+      "$control_gets" "$control_rc" "$control_code" "$saw_seg0_200" "$seg0_advertised" >> "$reader_log"
+    window_complete=0
+    if [ $((elapsed + 1)) -ge "$deadline" ]; then window_complete=1; fi
+    retirement_observation_step \
+      "$saw_seg0_200" "$seg0_advertised" "$control_rc" "$control_code" \
+      "$retired_streak" "$window_complete"
+    retired_streak="$RETIREMENT_NEXT_STREAK"
+    decision="$RETIREMENT_DECISION"
+
+    advertised="$(grep -c '^seg[0-9][0-9]*\.m4s$' "$manifest_file" || true)"
+    printf "\r[live-auto] synthetic reader ... %ds/%ds (advertised=%s, drained-through=%d, seg0-rc=%s, seg0-http=%s, retire-proof=%d/2)   " \
+      "$elapsed" "$deadline" "${advertised:-0}" "$highest" "$control_rc" "$control_code" "$retired_streak"
+
+    case "$decision" in
+      defect-observed)
+        printf "\n"
+        echo "[live-auto] stale-advertisement defect OBSERVED after ${elapsed}s:"
+        echo "[live-auto]   same-session seg0 first returned complete HTTP 200, remained advertised,"
+        echo "[live-auto]   then returned complete HTTP $control_code twice; highest sequential id consumed=$highest."
+        echo "[live-auto]   Continuing to the acceptance battery, which independently decides point 4."
+        echo "[live-auto]   synthetic requests: manifests=$manifest_gets segments=$segment_gets retirement-controls=$control_gets."
+        echo "[live-auto]   Full request/status sidecar: $DD/last-reader-control.log"
+        return 0 ;;
+      proceed-served)
+        printf "\n"
+        echo "[live-auto] optional stale-retirement observation: seg0 remained advertised and served."
+        echo "[live-auto]   No defect was manufactured from its absence; continuing to the acceptance battery."
+        return 0 ;;
+      proceed-unobserved)
+        printf "\n"
+        echo "[live-auto] optional stale-retirement observation was inconclusive after ${deadline}s"
+        echo "[live-auto]   (last transfer rc=$control_rc HTTP=$control_code, proof=$retired_streak/2)."
+        echo "[live-auto]   Continuing to the acceptance battery; incomplete control evidence is not a verdict."
+        return 0 ;;
+    esac
+
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  printf "\n"
+  echo "[live-auto] optional stale-retirement observation ended without defect proof."
+  echo "[live-auto]   Continuing to the acceptance battery; requests: manifests=$manifest_gets segments=$segment_gets retirement-controls=$control_gets."
+  return 0
+}
+
+# Force a REAL DiagnosticsLog rollover after the product snapshot. Unknown paths are
+# ideal control traffic: the HLS listener logs one request + one 404, but touches no
+# manifest, segment, read head, or verdict predicate. A long fixed-safe path reaches
+# the rolling cap in hundreds rather than thousands of requests. This phase is
+# explicit (`--rotation-control`), post-boundary, counted, and never part of the
+# product trace. The caller checks the saved trace fingerprint again afterwards.
+force_diagnostics_rollover() {   # $1 = diagnostics.log, $2 = HLS port
+  local log="$1" port="$2" before after code rc requests=0 observed=0 padding
+  local rotation_log="$DD/last-rotation-control.log"
+  printf -v padding '%0900d' 0
+  : > "$rotation_log"
+  before="$(wc -c < "$log" | tr -d ' ')"
+  while [ "$requests" -lt 2000 ]; do
+    curl_probe_complete 5 "http://127.0.0.1:$port/rotation-control-${requests}-${padding}"
+    rc="$CURL_RC"
+    code="$CURL_STATUS"
+    requests=$((requests + 1))
+    printf 'rotation GET %d rc=%s status=%s\n' "$requests" "$rc" "$code" >> "$rotation_log"
+    [ "$rc" = "0" ] && [ "$code" = "404" ] || infra "rotation control lost a complete
+        404 response from the HLS listener at request $requests (transfer rc '$rc',
+        HTTP status '$code'); no rollover claim was made."
+    after="$(wc -c < "$log" | tr -d ' ')"
+    if [ "$after" -lt "$before" ]; then
+      observed=1
+      break
+    fi
+    before="$after"
+  done
+  [ "$observed" = "1" ] || infra "rotation control issued $requests labeled post-boundary
+        requests but never observed diagnostics.log shrink. The saved product trace
+        was not claimed rollover-safe without a real rollover."
+  echo "[rotation-control] REAL diagnostics.log rollover observed after $requests post-boundary requests."
+  echo "[rotation-control] request/status sidecar -> $DD/last-rotation-control.log"
+}
+
 # POSITIVE CONTROL for point 4. The derived soak says eviction SHOULD have happened by
 # now; this proves it actually did, by asking the server for the lowest advertised
 # segment and seeing a real non-200. A timer alone is not enough: measured across four
@@ -656,61 +1172,134 @@ $(tail -12 "$WORK/server.log" 2>/dev/null || echo '  (no server log)')"
 # `simctl install`) had evicted nothing, which left point 4 resting on the latent
 # prediction rather than proof. Polling for the actual eviction removes that variance.
 confirm_eviction() {   # $1 = slice path
-  local slice="$1" port elapsed=0 code
+  local slice="$1" port elapsed=0 code rc manifest_code manifest_rc
+  local saw_seg0_200=0 retired_streak=0 manifest_failures=0 control_failures=0
+  local manifest="$WORK/eviction-media.m3u8"
+  local control_log="$DD/last-no-reader-retirement-control.log" attempts=0
   port="$(grep -o 'hls server listening on 127\.0\.0\.1:[0-9]*' "$slice" | tail -1 | grep -o '[0-9]*$' || true)"
   if [ -z "$port" ]; then
     echo "[live-auto] eviction check skipped: no HLS port in the captured session yet." >&2
     return 0
   fi
+  : > "$control_log"
   while [ "$elapsed" -lt "$EVICTION_CONFIRM_SECS" ]; do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$port/seg0.m4s" 2>/dev/null || echo 000)"
-    case "$code" in
-      200)
-        : ;;   # still resident, keep waiting
-      404|410)
-        echo ""
-        echo "[live-auto] eviction CONFIRMED after ${elapsed}s: GET /seg0.m4s -> HTTP $code."
-        echo "[live-auto]   Point 4's active strand now has something real to find."
-        return 0 ;;
+    curl_capture_complete "$manifest" 5 "http://127.0.0.1:$port/media.m3u8"
+    manifest_rc="$CURL_RC"
+    manifest_code="$CURL_STATUS"
+    attempts=$((attempts + 1))
+    printf 'manifest GET %d rc=%s status=%s\n' "$attempts" "$manifest_rc" "$manifest_code" >> "$control_log"
+    if [ "$manifest_rc" != "0" ] || [ "$manifest_code" != "200" ]; then
+      manifest_failures=$((manifest_failures + 1))
+      retired_streak=0
+      [ "$manifest_failures" -lt 3 ] || infra "eviction control could not fetch a complete current
+        manifest three times (transfer rc '$manifest_rc', HTTP status '$manifest_code')."
+      sleep 5
+      elapsed=$((elapsed + 5))
+      continue
+    fi
+    manifest_failures=0
+    if ! grep -qx 'seg0\.m4s' "$manifest"; then
+      retired_streak=0
+      control_failures=0
+      printf "\r[live-auto] confirming eviction ... %ds/%ds (seg0 no longer advertised)   " \
+        "$elapsed" "$EVICTION_CONFIRM_SECS"
+      sleep 5
+      elapsed=$((elapsed + 5))
+      continue
+    fi
+
+    curl_probe_complete 5 "http://127.0.0.1:$port/seg0.m4s"
+    rc="$CURL_RC"
+    code="$CURL_STATUS"
+    printf 'retirement GET %d rc=%s status=%s prior-seg0-200=%s currently-advertised=1\n' \
+      "$attempts" "$rc" "$code" "$saw_seg0_200" >> "$control_log"
+    if [ "$rc" != "0" ]; then
+      control_failures=$((control_failures + 1))
+      retired_streak=0
+      [ "$control_failures" -lt 3 ] || infra "eviction control had three consecutive incomplete
+        seg0 transfers (transfer rc '$rc', HTTP status '$code'). This is INFRA."
+    else
+      control_failures=0
+    fi
+    case "$rc:$code" in
+      0:200)
+        saw_seg0_200=1
+        retired_streak=0 ;;
+      0:404|0:410)
+        if [ "$saw_seg0_200" = "1" ]; then retired_streak=$((retired_streak + 1)); else retired_streak=0; fi
+        if [ "$retired_streak" -ge 2 ]; then
+          echo ""
+          echo "[live-auto] eviction CONFIRMED after ${elapsed}s: seg0 was observed complete HTTP 200,"
+          echo "[live-auto]   remained advertised, then returned complete HTTP $code twice."
+          echo "[live-auto]   Point 4's active strand now has something real to find."
+          return 0
+        fi ;;
+      0:*)
+        retired_streak=0 ;;
       *)
-        # 000 (or anything that is not a real HTTP status) means the request never
-        # reached the server. That is NOT eviction. Treating "could not reach" as
-        # "observed a 404" is the exact false-evidence class this lane exists to
-        # remove, and it would hand point 4 a fabricated positive control.
-        printf "\n"
-        infra "the session's HLS server became UNREACHABLE while confirming eviction
-        (${elapsed}s in): GET http://127.0.0.1:$port/seg0.m4s -> curl code '$code'.
-        The session died before the battery could probe it. This is NOT eviction and is
-        NOT a player verdict.
-        app process alive: $(app_alive)
-        fixture server alive: $(server_alive)" ;;
+        : ;;
     esac
-    printf "\r[live-auto] confirming eviction ... %ds/%ds (seg0 still HTTP %s)   " \
-      "$elapsed" "$EVICTION_CONFIRM_SECS" "$code"
+    printf "\r[live-auto] confirming eviction ... %ds/%ds (seg0 rc=%s HTTP=%s, proof=%d/2)   " \
+      "$elapsed" "$EVICTION_CONFIRM_SECS" "$rc" "$code" "$retired_streak"
     sleep 5
     elapsed=$((elapsed + 5))
   done
-  echo ""
-  echo "[live-auto] eviction NOT confirmed within ${EVICTION_CONFIRM_SECS}s: seg0 still returns 200."
-  echo "[live-auto]   The window is retaining more than the ${WINDOW_FLOOR_MIB} MiB floor the estimate assumes."
-  echo "[live-auto]   Point 4's ACTIVE strand will find nothing and the verdict will rest on the"
-  echo "[live-auto]   latent arithmetic, which the output marks with an explicit NOTE. Reported,"
-  echo "[live-auto]   not hidden."
-  return 0
+  printf "\n"
+  infra "eviction was not confirmed within ${EVICTION_CONFIRM_SECS}s. Prior complete
+        seg0 200 observed: $saw_seg0_200. A timeout or prediction is not retirement,
+        so this control is INFRA rather than a product verdict."
+}
+
+live_auto_usage_error() {
+  echo "live-auto usage error: $1" >&2
+  echo "usage: $0 live-auto [--spool D] [--url U] [--timeout POSITIVE_SECONDS]" >&2
+  echo "       [--soak POSITIVE_SECONDS] [--starve] [--no-reader] [--rotation-control]" >&2
+  exit 2
+}
+
+require_positive_integer() {   # $1 = display name, $2 = value
+  local name="$1" value="$2"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || live_auto_usage_error "$name must be a positive integer, got '$value'"
+  [ "${#value}" -le 10 ] && [ "$value" -le 2147483647 ] \
+    || live_auto_usage_error "$name is outside the supported range 1...2147483647: '$value'"
 }
 
 live_auto() {
   local spool="" url_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --spool)   spool="${2:-}"; shift 2 ;;
-      --url)     url_override="${2:-}"; shift 2 ;;   # diagnostic escape hatch
-      --timeout) READY_TIMEOUT="${2:-}"; shift 2 ;;
-      --soak)    SOAK_SECS="${2:-}"; shift 2 ;;
+      --spool)
+        [ $# -ge 2 ] && [ -n "$2" ] || live_auto_usage_error "--spool requires a path"
+        spool="$2"; shift 2 ;;
+      --url)
+        [ $# -ge 2 ] && [ -n "$2" ] || live_auto_usage_error "--url requires a URL"
+        url_override="$2"; shift 2 ;;   # diagnostic escape hatch
+      --timeout)
+        [ $# -ge 2 ] || live_auto_usage_error "--timeout requires a value"
+        require_positive_integer "--timeout" "$2"
+        READY_TIMEOUT="$2"; shift 2 ;;
+      --soak)
+        [ $# -ge 2 ] || live_auto_usage_error "--soak requires a value"
+        require_positive_integer "--soak" "$2"
+        SOAK_SECS="$2"; shift 2 ;;
       --starve)  MODE_STARVE=1; shift ;;
+      --no-reader) SYNTHETIC_READER=0; shift ;;
+      --rotation-control) ROTATION_CONTROL=1; shift ;;
       *) echo "unknown live-auto flag: $1" >&2; exit 2 ;;
     esac
   done
+  if [ "$ROTATION_CONTROL" = "1" ] && [ "$SYNTHETIC_READER" != "1" ]; then
+    live_auto_usage_error "--rotation-control requires the default synthetic reader (do not combine with --no-reader)"
+  fi
+  require_positive_integer "VORTX_READY_TIMEOUT" "$READY_TIMEOUT"
+  require_positive_integer "VORTX_FIXTURE_SECS" "$FIXTURE_SECS"
+  require_positive_integer "VORTX_FIXTURE_RATE_PERCENT" "$FIXTURE_RATE_PERCENT"
+  require_positive_integer "VORTX_EVICTION_MARGIN_PERCENT" "$EVICTION_MARGIN_PERCENT"
+  require_positive_integer "VORTX_PARK_SAFETY" "$PARK_SAFETY"
+  require_positive_integer "VORTX_EVICTION_CONFIRM_SECS" "$EVICTION_CONFIRM_SECS"
+  require_positive_integer "VORTX_STARVE_FACTOR" "$STARVE_FACTOR"
+  require_positive_integer "VORTX_STARVE_TIMEOUT" "$STARVE_TIMEOUT"
+  if [ -n "$SOAK_SECS" ]; then require_positive_integer "VORTX_SOAK_SECS/--soak" "$SOAK_SECS"; fi
 
   trap cleanup EXIT INT TERM
   WORK="$(mktemp -d /tmp/live-auto.XXXXXX)"
@@ -736,6 +1325,7 @@ live_auto() {
       SOAK_SECS="$(derive_soak)"
     fi
     [ -n "$SOAK_SECS" ] || SOAK_SECS=0
+    if [ "$MODE_STARVE" != "1" ]; then require_positive_integer "derived soak" "$SOAK_SECS"; fi
     local ip port
     ip="$(lan_address)"
     # NOT `port="$(start_fixture_server)"`: a command substitution runs in a SUBSHELL,
@@ -782,31 +1372,70 @@ live_auto() {
     [ "$rc" = "2" ] && infra "the harness could not read a plain-remux session out of the starved log"
   else
     wait_for_ready "$log" "$offset" "$slice"
-    soak "$log" "$offset" "$slice"
     slice_log "$log" "$offset" "$slice"
 
-    # OBSERVATION WINDOW. Everything the app logs from this byte onward may include the
-    # harness's OWN probe traffic, which must never be read back as product evidence.
-    # Record the boundary before the first probe fires. See slice_window.
-    local probe_start
-    probe_start="$(wc -c < "$log" | tr -d ' ')"
-    confirm_eviction "$slice"
+    # OBSERVATION WINDOW. The default path starts a synthetic HLS reader next, so its
+    # product-only boundary MUST be taken immediately after readiness and before that
+    # reader's first manifest GET. The historical --no-reader control has no synthetic
+    # traffic during soak, so it preserves the longer product-only timeline and takes
+    # the boundary immediately before its old seg0 confirmation poll.
+    local probe_start trace_slice="$WORK/product-session.log" trace_snapshot="$DD/last-session.log"
+    local trace_fingerprint trace_after reader_port
+    if [ "$SYNTHETIC_READER" = "1" ]; then
+      probe_start="$(wc -c < "$log" | tr -d ' ')"
+      echo "[live-auto] product-only observation boundary recorded at container byte $probe_start"
+      echo "[live-auto]   BEFORE the synthetic reader's first request. Later reader traffic is counted"
+      echo "[live-auto]   in a sidecar and excluded from trace/verdict evidence."
+      # Snapshot NOW, not after the reader. diagnostics.log is a rolling cache; a
+      # reader phase that crosses its rotation threshold can make the old absolute
+      # byte range disappear. Deferring this copy produced an empty verdict trace
+      # even though the live session and reader both completed successfully.
+      slice_window "$log" "$offset" "$probe_start" "$trace_slice"
+      [ -s "$trace_slice" ] || infra "the bounded product-only trace is empty before
+        the synthetic reader has made a request. Refusing to run a verdict on no evidence."
+      cp "$trace_slice" "$trace_snapshot" || infra "could not persist the product-only trace at $trace_snapshot."
+      trace_fingerprint="$(cksum "$trace_snapshot")"
+      if [ "$ROTATION_CONTROL" = "1" ]; then
+        reader_port="$(grep -o 'hls server listening on 127\.0\.0\.1:[0-9]*' "$trace_slice" | tail -1 | grep -o '[0-9]*$' || true)"
+        [ -n "$reader_port" ] || infra "rotation control could not resolve the HLS port from the saved product trace."
+        force_diagnostics_rollover "$log" "$reader_port"
+      fi
+      synthetic_reader_for_window "$log" "$offset" "$slice"
+    else
+      echo "[no-reader] historical control ACTIVE: AVPlayer alone owns the HLS read head."
+      echo "[no-reader] this intentionally preserves the old post-install failure chain for reproduction."
+      soak "$log" "$offset" "$slice"
+      slice_log "$log" "$offset" "$slice"
+      probe_start="$(wc -c < "$log" | tr -d ' ')"
+      slice_window "$log" "$offset" "$probe_start" "$trace_slice"
+      [ -s "$trace_slice" ] || infra "the no-reader control produced an empty product trace."
+      cp "$trace_slice" "$trace_snapshot" || infra "could not persist the no-reader product trace at $trace_snapshot."
+      trace_fingerprint="$(cksum "$trace_snapshot")"
+      confirm_eviction "$slice"
+    fi
 
-    # Cut the trace at the probe boundary, so the gate's evidence is session traffic
-    # ONLY. `live`'s own segment probes cannot pollute it either: the binary reads this
-    # file once, up front, before it issues a single request.
-    slice_window "$log" "$offset" "$probe_start" "$slice"
+    trace_after="$(cksum "$trace_snapshot")"
+    [ "$trace_after" = "$trace_fingerprint" ] || infra "the saved product-only trace changed after
+        post-boundary harness traffic. Before: '$trace_fingerprint'; after: '$trace_after'."
+    echo "[live-auto] product-only trace remained nonempty and byte-stable after post-boundary traffic."
+
+    # Cut the trace at the product-only boundary, so the gate's trace evidence never
+    # includes either the synthetic reader, confirm_eviction, or `live`'s own probes.
+    # Refresh and preserve the full session separately for reliability diagnosis.
+    slice_log "$log" "$offset" "$slice"
     echo "[live-auto] trace window: container bytes ${offset}..${probe_start}; harness probe traffic"
     echo "[live-auto]   after that boundary is EXCLUDED from verdict evidence (it is ours, not the app's)."
-    # Keep the captured session at a stable path (WORK is deleted on exit) so the
-    # same run can be re-examined with `trace` without replaying it on the sim.
-    cp "$slice" "$DD/last-session.log" 2>/dev/null || true
-    echo "[live-auto] captured session log -> $DD/last-session.log"
+    # Keep both views at stable paths (WORK is deleted on exit): last-session.log is
+    # the bounded product trace used for verdicts; last-full-session.log includes the
+    # labeled synthetic traffic and exists only for reliability diagnosis.
+    cp "$slice" "$DD/last-full-session.log" 2>/dev/null || true
+    echo "[live-auto] captured product-only trace -> $DD/last-session.log"
+    echo "[live-auto] captured full diagnostic timeline -> $DD/last-full-session.log"
     set +e
     if [ -n "$spool" ]; then
-      "$BIN" live --log "$slice" --spool "$spool"
+      "$BIN" live --log "$trace_snapshot" --spool "$spool"
     else
-      "$BIN" live --log "$slice"
+      "$BIN" live --log "$trace_snapshot"
     fi
     rc=$?
     set -e
@@ -865,7 +1494,12 @@ live_auto() {
 MODE="${1:-all}"
 case "$MODE" in
   selftest)
-    build_harness; "$BIN" selftest ;;
+    build_harness
+    "$BIN" selftest
+    curl_transport_regressions
+    retirement_acceptance_regressions ;;
+  mutants)
+    build_harness; run_mutants ;;
   trace)
     build_harness
     LOG="${2:-$(container_log)}"
@@ -885,6 +1519,8 @@ case "$MODE" in
   all)
     build_harness
     "$BIN" selftest || true
+    curl_transport_regressions || true
+    retirement_acceptance_regressions || true
     LOG="$(container_log)" || LOG=""
     if [ -n "$LOG" ] && [ -f "$LOG" ]; then
       echo "[trace] $LOG"
@@ -893,8 +1529,9 @@ case "$MODE" in
       echo "[trace] no container log yet - play a plain MKV, then re-run: ./run-conformance.sh trace"
     fi ;;
   *)
-    echo "usage: $0 [selftest|trace [logfile]|live [--spool D]" >&2
-    echo "       |live-auto [--spool D] [--timeout S] [--soak S] [--starve] [--url U]|app-build|all]" >&2
+    echo "usage: $0 [selftest|mutants|trace [logfile]|live [--spool D]" >&2
+    echo "       |live-auto [--spool D] [--timeout S] [--soak S] [--starve] [--no-reader]" >&2
+    echo "                  [--rotation-control] [--url U]|app-build|all]" >&2
     echo "       live / live-auto exit: 0 = all points GREEN/EXEMPT, 1 = a point is RED (product)," >&2
     echo "       3 = INFRA (no probeable session; not a player regression), 2 = bad usage." >&2
     exit 2 ;;

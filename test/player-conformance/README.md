@@ -16,15 +16,20 @@ every point is observable with a plain MKV - which is all this machine has.
 ```bash
 cd test/player-conformance
 ./run-conformance.sh selftest          # validate the oracle (no sim needed)
+./run-conformance.sh mutants           # every load-bearing oracle mutant must die
 ./run-conformance.sh trace             # points 1,3,4,6,7 from the sim's live container log
 ./run-conformance.sh live-auto          # UNATTENDED full 7-point battery (no human)
 ./run-conformance.sh live-auto --starve # point 7's timeout path, also unattended
+./run-conformance.sh live-auto --rotation-control # force a real diagnostics rollover
+./run-conformance.sh live-auto --no-reader        # historical AVPlayer-only control
 ```
 
 `live-auto` is the whole thing end to end: it generates a fixture MKV with `ffmpeg`,
 serves it range-capably from the Mac's LAN address, starts playback headlessly through
 the DEBUG playback hook (`DEBUG-PLAYBACK-HOOK.md`), waits for the real
-`readyToPlay -> play()` line, runs the battery, and tears the session down. Add
+`readyToPlay -> play()` line, snapshots the exact product-only trace, advances the HLS
+read head with an explicitly labeled test reader, runs the battery, and tears the
+session down. Add
 `--spool <dir>` once the rework names a spool directory. The manual flow still works
 unchanged if you would rather drive playback yourself:
 
@@ -58,9 +63,9 @@ also run directly: `/tmp/dd-harness/bin/player-conformance {selftest|trace <log>
 | # | Point | Channel | Beta now |
 |---|-------|---------|----------|
 | 1 | Startup cohort ≥6 segs AND ≥15000 ms (integer-ms from EXTINF text) | trace + live | **RED** - first `/media.m3u8` served at `segs=2`, ~8000 ms |
-| 2 | Every published segment starts on an IDR frame | live (fMP4 parse) | **RED** - of 12 retrievable segments sampled, every one starts on a non-sync sample |
+| 2 | Every published segment starts on an IDR frame | live (init + fMP4 parse) | **RED** - the sampled first video access units fail the combined MP4-sync and AVC/HEVC-IDR test |
 | 3 | First video seg id == 0 AND first alt-audio seg id == 0 | trace + live | **RED** - video half is 0; no alternate-audio rendition exists (audio muxed) |
-| 4 | No advertised-segment 404 through the RFC 8216 §6.2.2 window | trace (latent) + live (active probe **and** the same latent arithmetic) | **RED, proven** - playlist advertised 116 while ~34 are resident; 16 advertised ids probed, all `HTTP 404` |
+| 4 | No advertised-segment 404 through the RFC 8216 §6.2.2 window | trace diagnostics + live complete-response probes | **RED, proven** - playlist advertised 116 while ~34 are resident; 16 advertised ids probed, all returned complete `HTTP 404` responses |
 | 5 | Spool bounded (Caches, session-global) + reclaimed to zero after session | live (filesystem) | **INDETERMINATE** - no on-disk spool exists yet; needs the rework's spool dir |
 | 6 | Startup latency: mount → readyToPlay ≤ 30000 ms | trace | **GREEN** - 1177 ms in the overnight run |
 | 7 | Fail-soft counted: exactly one `hls_startup_cohort_timeout` + 404 on timeout, none otherwise | trace (both paths, via `live-auto --starve`) | **PENDING / INDETERMINATE** - event absent in beta; success-path invariant holds, and `--starve` now drives the timeout path unattended |
@@ -89,11 +94,18 @@ also run directly: `/tmp/dd-harness/bin/player-conformance {selftest|trace <log>
   "display switch skipped: the simulator has no HDMI display modes" - and is out of
   this harness's scope regardless (it is a plain-remux gate).
 
-## The `live-auto` fixture (generated, never committed)
+## The `live-auto` source fixture (generated, never committed)
 
 `live-auto` builds its own source with `ffmpeg` into `/tmp/dd-harness/fixtures`, beside
 the stable derived-data path. No media binary is ever committed and no file from anyone's
 library is used.
+
+This is distinct from the two small byte-exact fragmented-MP4 fixtures committed as
+base64 for the oracle self-test. Those files are real `ffmpeg` output, not synthetic
+box builders: one is AVC with video-first `traf` order and one is HEVC with audio-first
+order. The self-test decodes them in memory, resolves the `vide` track from
+`moov/trak/tkhd/mdia/hdlr/stsd`, reads NAL framing from `avcC` or `hvcC`, and then
+matches that track by `tfhd.track_ID` in the media fragment.
 
 **Four** properties of the fixture are load-bearing, and none is obvious from reading the
 script, so the reasoning is recorded here in full. Each was found the same way: a
@@ -152,7 +164,7 @@ Pacing is safe because `serveMedia` HOLDS the request until the gate opens
 fixture's own size and duration, never hardcoded, so swapping the fixture cannot silently
 unpace it.
 
-### Sized and soaked so the window GENUINELY EVICTS (point 4)
+### Sized and actively drained so the window GENUINELY EVICTS (point 4)
 
 Point 4 asks whether the playlist advertises segments the server can no longer serve. If
 nothing has been evicted, the question is unanswerable and the point cannot fail. The
@@ -171,27 +183,35 @@ The buffer's two relevant rules, both in `VortXRemuxBuffer.swift`:
   `windowFloorBytes + producerLeadFull` = 64 + 64 = **128 MiB** (`:80-81`, `:101`).
 
 A ~92 MiB fixture never reaches that ceiling and its read head barely grazes the 64 MiB
-floor, so nothing is ever evicted. The run is now sized from those numbers instead:
+floor, so nothing is ever evicted. The current source fixture is sized from those
+numbers, and the bounded reader deadline is derived rather than guessed:
 
 ```
-soak = EVICTION_MARGIN x windowFloorMiB / (fixture bytes / fixture seconds)
+reader deadline base = EVICTION_MARGIN x windowFloorMiB
+                       / (fixture bytes / fixture seconds)
 ```
 
 `windowFloorMiB` is read out of `Contract.swift` at runtime rather than restated in the
-script, and `EVICTION_MARGIN` defaults to 2 so the read head travels comfortably past the
-floor rather than sitting on the knife edge that produced the misleading result. At the
-current 420 s fixture that derives a 209 s soak, and the runner logs the arithmetic:
+script, and `EVICTION_MARGIN_PERCENT` defaults to 120 so the deadline is comfortably
+past the floor rather than sitting on the knife edge that produced the misleading
+result. The runner logs the exact arithmetic for the generated fixture.
 
 ```
 [live-auto] eviction sizing: buffer evicts at (readHead - 64 MiB), read head advances
-[live-auto]   at playback rate 641791 B/s. Need read head past 2 x 64 MiB
-[live-auto]   = 134217728 B, so soak = 134217728 / 641791 = 209s (fixture is 420s of media).
+[live-auto]   at playback rate <measured B/s>. Need read head past 120% of 64 MiB
+[live-auto]   = <derived bytes>, so soak = <derived bytes> / <measured B/s> = <derived>s.
 ```
 
-Point 4 now carries proof rather than prediction: 16 advertised ids probed, all `HTTP 404`.
+Point 4 is decided by the live battery's complete-response probes, never by prediction.
+The synthetic reader also carries an optional beta-defect observation: it must first
+observe a complete `HTTP 200` for `seg0.m4s`; a successfully fetched current manifest
+must still advertise that id; and only then can two consecutive complete `HTTP 404` or
+`410` responses report stale retirement. Curl transfer completion and HTTP status are
+recorded separately. A nonzero transfer result, a partial response, a timeout, or a
+single transient response resets that proof and can never report the defect.
 
-**Pacing is the hard constraint, and the window is narrow.** One knob controls two
-opposed requirements, so it cannot simply be turned up:
+**Pacing still controls startup, but AVPlayer no longer owns test progress.** One source
+rate still has two opposed requirements, so it cannot simply be turned up:
 
 - Too FAST and the producer runs ahead into the buffer's park ceiling. Parking blocks
   inside the SOURCE READ, so the app's own detector fails the remux. Measured at 4x:
@@ -203,17 +223,41 @@ opposed requirements, so it cannot simply be turned up:
   before becoming ready. Measured at 113%: the gate opened 5.3 s after mount and
   AVPlayer issued no further request after receiving the playlist.
 
-The runner derives the rate from `windowFloorMiB` and the soak and logs the arithmetic,
-but treat that as a starting point rather than a proof: the read head lags playback by
-more than the simple model assumes. Both failure modes are now detected explicitly and
-reported as INFRA naming the harness as the cause, instead of surfacing as a mystery.
+The second failure was the key reliability finding. Point 2 deliberately exposes
+non-IDR starts, and AVPlayer can stop fetching those media segments. Once that happens,
+waiting for AVPlayer to advance the single buffer read head is circular: expected
+128 MiB back-pressure freezes production, AVPlayer reports `Playback Stopped`, and the
+product intentionally demotes to libmpv. The HLS listener disappearing at that point is
+therefore expected fail-soft behavior, not a crash or an unexplained source stall.
 
-**Eviction is confirmed, not assumed.** After the soak the runner polls `GET /seg0.m4s`
-until it returns a real non-200, the positive control that point 4's active strand has
-something to find. A timer alone is not enough: three consecutive runs evicted 19
-segments by probe time while a run immediately after `simctl install` had evicted
-nothing, leaving point 4 on the latent prediction. If eviction cannot be confirmed in the
-bounded wait, the runner says so and the NOTE marks the verdict as prediction-only.
+The default run now takes an immutable product-only trace snapshot immediately after
+readiness and before any test traffic, then starts a synthetic HLS reader. The reader:
+
+- consumes data only for ids present in a successfully fetched live manifest, while
+  the separate retirement control deliberately probes `seg0.m4s`;
+- consumes them in exact numeric order and never skips or races ahead;
+- records every manifest, segment, and retirement request with both curl transfer result
+  and HTTP status in
+  `/tmp/dd-harness/last-reader-control.log`;
+- classifies repeated manifest or advertised-segment read failures as INFRA;
+- reports the stale-retirement defect only after prior same-session complete 200,
+  current advertisement, and two consecutive complete 404/410 responses; and
+- proceeds to the same acceptance battery when seg0 remains served, disappears from
+  the playlist, or the optional defect control remains inconclusive.
+
+The synthetic requests are excluded from trace verdict evidence at the byte boundary.
+`/tmp/dd-harness/last-session.log` is the product-only snapshot, while
+`/tmp/dd-harness/last-full-session.log` retains the later diagnostic timeline. The
+snapshot must remain nonempty and have the same `cksum` after all test traffic.
+
+**Acceptance does not require the defect.** A timer or prediction never becomes a
+point-4 verdict. If every advertised segment remains completely served, the default run
+continues and the live battery can score that conforming behavior GREEN. If seg0 is
+removed from the current playlist, the reader does not probe the unadvertised path and
+continues. If stale retirement is proven, it is reported and the same live battery
+independently scores the advertised-id 404/410. `--no-reader` deliberately retains the
+historical AVPlayer-only soak and confirmation path as a diagnostic control; it is
+expected to reproduce the old demotion chain on the affected beta.
 
 One knock-on worth knowing about, because it will bite anyone who tunes these numbers.
 Once the run really evicts, the LOWEST advertised ids are precisely the dead ones, so
@@ -232,10 +276,55 @@ bug, so `python3 -m http.server` is not usable here; `range-server.py` is, and
 `live-auto` verifies a real `curl -r` returns `206` with a correct `Content-Range` before
 it launches the app.
 
-`live-auto` streams for the derived `--soak` period after `readyToPlay` before probing,
-because at the instant of readiness the EVENT playlist holds only the two segments the
-beta's gate opened on. It keeps the captured session log at
-`/tmp/dd-harness/last-session.log` so the same run can be re-read with `trace`.
+The default `live-auto` begins its explicit reader after `readyToPlay`; `--soak` sets the
+derived deadline base rather than an idle delay. The historical `--no-reader` control
+still idles for that period. The product-only session at
+`/tmp/dd-harness/last-session.log` can be re-read with `trace`.
+
+## Point 2's fail-closed oracle
+
+Point 2 accepts a segment only when both independent signals agree for the first sample
+of the resolved video track:
+
+1. ISO-BMFF sample flags say the sample is sync (`sample_is_non_sync_sample` is clear).
+2. The length-prefixed access unit contains an AVC IDR NAL type 5 or a base-layer
+   (`nuh_layer_id == 0`) HEVC IDR NAL type 19/20, using the NAL length size from the
+   init segment. Nonzero-layer IDR-type NALs remain structurally valid but are not
+   base-layer random-access proof.
+
+Missing or unmatched `track_ID`, ambiguous video tracks, duplicate matching `traf`
+boxes, unresolved multiple sample descriptions, unsupported FullBox versions or flags,
+unknown codec/framing, bad sample ranges, short NAL headers, invalid reserved bits,
+absent flags, and malformed NAL tails all fail closed as unknown. Every `trun` record
+declared by `sample_count` must fit exactly, and the NAL walker reaches exact sample
+termination before reporting an IDR. There is no first-`traf` or last-`traf` fallback.
+`./run-conformance.sh selftest` exercises the real AVC video-first and HEVC audio-first
+two-track fixtures plus malformed structural and NAL fixtures. It also uses a deterministic
+`URLProtocol` to cover response-plus-error, post-timeout completion, and an advertised
+partial segment. The shell self-test serves truncated 200, 404, and 410 responses locally
+and proves they remain transport failures. Separate shell controls prove that both
+fully served and playlist-removed conforming behaviors proceed to the battery, while
+two complete stale advertised-id 404s are still reported. `mutants` removes each
+load-bearing guard one at a time; all ten mutants must die: wrong track,
+nil/unmatched track fallback, unknown `tkhd`, sync-only, NAL-only, audio-first order,
+video-first order, HEVC IDR without the base-layer guard, and restoration of the old
+defect-required acceptance path. The tenth mutates the 4-byte `tkhd` FullBox-header
+guard so real-init-derived 1-, 2-, and 3-byte malformed payloads turn the self-test RED.
+
+## Reliability controls and evidence boundary
+
+`live-auto --rotation-control` proves the product snapshot survives a real rolling-log
+boundary. After the snapshot, it sends labeled unknown-path requests that return 404 and
+do not touch manifests, segments, or the read head. It proceeds only after observing the
+real `diagnostics.log` byte size shrink, preserves counts in
+`/tmp/dd-harness/last-rotation-control.log`, and then rechecks the snapshot fingerprint.
+
+The predecessor default path completed three consecutive warm runs and three consecutive
+runs immediately following `simctl install`; all six observed the beta defect and
+reached the expected product-gate exit 1 instead of INFRA. Those runs are historical
+reliability evidence, not a requirement that a corrected server reproduce the defect.
+A separate rollover run observed a real log shrink after 498 labeled requests and
+retained the same nonempty product snapshot.
 
 ## `live-auto --starve`: point 7's positive path
 
@@ -284,25 +373,22 @@ already produces `saw a 404: true, reached readyToPlay: false`, so the only miss
 ingredient is the event itself. The moment the rework emits it, this same command
 verifies the positive path with no human and no new fixture.
 
-## KNOWN OPEN RISKS (read before trusting a run)
+## Known limits and historical controls
 
-Written down rather than hoped away. Each is DETECTED and correctly classified as INFRA
-(exit 3), so none can be misread as a player regression, but none is fully understood.
+**1. The retained post-install trace shows a failure at roughly 55 s, but not a proven
+single root cause.** Its primary evidence records the source fixture and app process
+remaining alive, media requests stopping, later `Playback Stopped`, and an in-place
+demotion. Buffer-ceiling interaction is a plausible explanation supported by the wider
+diagnostic timeline, not a fact established by the retained excerpt alone. The reliable
+harness conclusion is narrower: depending on AVPlayer alone to advance the read head
+made the test unable to preserve a probeable HLS session. The explicit reader removes
+that circular dependency without claiming more than the evidence proves.
 
-**1. The post-install path is flaky: measured 1 pass in 3.** Three consecutive runs, each
-preceded by a fresh `xcrun simctl install`, gave exit 3, exit 3, exit 1. The two failures
-were identical: the app's HLS server became unreachable ~55 s into the eviction
-confirmation, with `app process alive: YES` and `fixture server alive: YES`, so the app
-process was up but the playback session had ended. The consistent 55 s timing points to a
-deterministic cause rather than noise, most likely the same producer-park class as the
-pacing constraint above. **Do not treat a single green post-install run as proof.** The
-warm path (no reinstall) ran three consecutive times with byte-identical verdicts.
+**2. `--no-reader` is intentionally not the reliable gate.** It preserves the old path
+for reproducing and diagnosing the beta behavior. A listener loss there remains INFRA,
+not a product verdict. Use the default reader for acceptance results.
 
-**2. "Session became unreachable" cannot yet be attributed.** The runner names the harness
-as the cause wherever it can (source-read stall, fixture-server death, supersession), but
-this case is reported honestly as unattributed rather than blamed on the player.
-
-**3. Fixture-server liveness reporting was wrong until recently, so older run logs lie.**
+**3. Fixture-server liveness reporting was wrong in still-older logs.**
 `start_fixture_server` was called in a command substitution, which runs in a SUBSHELL, so
 `SERVER_PID=$!` never reached the parent shell. That silently disabled both the cleanup
 trap's kill and the soak's liveness check, and made `server_alive()` report a permanent
@@ -335,10 +421,12 @@ of the repo.)
 
 - `Contract.swift` - the numeric contract + the 7 points + verdict types.
 - `Playlist.swift` - EXTINF→integer-ms (no float), media-playlist parse, cohort predicate, server-faithful body build (uses the real `DVPlaybackPolicy` header).
-- `FMP4.swift` - `moof/traf/tfhd/trun` walk to decide if a segment's first sample is a sync (IDR) frame.
+- `FMP4.swift` - resolves the video track and codec from init data, matches `tfhd.track_ID`, locates the first video sample, and requires MP4 sync plus a real AVC/HEVC IDR NAL.
+- `FMP4Fixtures.swift` - decodes and splits the two committed byte-exact real fMP4 fixtures used by self-test.
+- `fixtures/*.mp4.b64` - real AVC video-first and HEVC audio-first two-track `ffmpeg` output, base64 encoded for source control.
 - `Trace.swift` - slices one plain-remux session from a request log and evaluates points 1,3,4,6,7.
-- `Live.swift` - loopback fetch + segment/IDR + availability probe + spool measure. Point 4 there ORs two strands: an active probe aimed at the ids the window arithmetic says are already evicted, and that arithmetic itself (shared with `Trace` via `Trace.availabilityWindow`, so the two channels can never disagree on the numbers).
-- `main.swift` - CLI + oracle self-test (boundary cases 5×4.000 closed, 6×3.000 open, 15×1.000 open, 14.999 closed, 15.000 open).
+- `Live.swift` - loopback fetch + init/segment oracle + availability probe + spool measure. Point 4 there ORs two strands: an active probe aimed at the ids the window arithmetic says are already evicted, and that arithmetic itself (shared with `Trace` via `Trace.availabilityWindow`, so the two channels can never disagree on the numbers).
+- `main.swift` - CLI + oracle self-test, including real init/media fixtures, track-order permutations, fail-closed corruptions, and playlist boundary cases.
 - `run-conformance.sh` - builds the harness at `/tmp/dd-harness` and drives the modes, including the unattended `live-auto`.
 - `range-server.py` - range-capable (206), rate-paced, non-loopback single-file server for the `live-auto` fixture.
 - `DEBUG-PLAYBACK-HOOK.md` - the app-side contract for the headless playback trigger `live-auto` drives.

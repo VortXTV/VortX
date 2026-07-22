@@ -27,29 +27,99 @@ enum Live {
         let status: Int
         let body: Data
         let transportError: String?
-        var ok: Bool { status == 200 }
+        var ok: Bool { status == 200 && transportError == nil }
         /// Short description for evidence and INFRA lines.
-        var describe: String { transportError.map { "transport error: \($0)" } ?? "HTTP \(status)" }
+        var describe: String {
+            if let transportError {
+                return "HTTP \(status >= 0 ? String(status) : "none"); transport error: \(transportError)"
+            }
+            return "HTTP \(status)"
+        }
     }
 
-    static func get(host: String = "127.0.0.1", port: Int, path: String, timeout: TimeInterval = 8) -> Response {
+    private final class ResponseLatch: @unchecked Sendable {
+        private let lock = NSLock()
+        private let signal = DispatchSemaphore(value: 0)
+        private var sealed = false
+        private var response: Response?
+
+        func publish(_ value: Response) {
+            lock.lock()
+            guard !sealed else { lock.unlock(); return }
+            sealed = true
+            response = value
+            lock.unlock()
+            signal.signal()
+        }
+
+        func wait(seconds: TimeInterval) -> Response? {
+            guard signal.wait(timeout: .now() + seconds) == .success else { return nil }
+            lock.lock()
+            defer { lock.unlock() }
+            return response
+        }
+
+        func sealTimeout(_ value: Response) -> Response {
+            lock.lock()
+            defer { lock.unlock() }
+            if !sealed {
+                sealed = true
+                response = value
+            }
+            return response ?? value
+        }
+    }
+
+    static func get(
+        host: String = "127.0.0.1",
+        port: Int,
+        path: String,
+        timeout: TimeInterval = 8,
+        session: URLSession = .shared
+    ) -> Response {
         guard let url = URL(string: "http://\(host):\(port)\(path)") else {
             return Response(status: -1, body: Data(), transportError: "malformed URL for \(path)")
         }
-        var out = Response(status: -1, body: Data(), transportError: "no response within \(Int(timeout))s")
-        let sem = DispatchSemaphore(value: 0)
+        let timeoutResponse = Response(
+            status: -1,
+            body: Data(),
+            transportError: "no complete response within \(timeout)s"
+        )
+        let latch = ResponseLatch()
         var req = URLRequest(url: url)
         req.timeoutInterval = timeout
-        URLSession.shared.dataTask(with: req) { data, resp, err in
-            if let http = resp as? HTTPURLResponse {
-                out = Response(status: http.statusCode, body: data ?? Data(), transportError: nil)
-            } else if let err {
-                out = Response(status: -1, body: Data(), transportError: err.localizedDescription)
+        let task = session.dataTask(with: req) { data, response, error in
+            let http = response as? HTTPURLResponse
+            let status = http?.statusCode ?? -1
+            if let error {
+                latch.publish(Response(
+                    status: status,
+                    body: Data(),
+                    transportError: error.localizedDescription
+                ))
+                return
             }
-            sem.signal()
-        }.resume()
-        _ = sem.wait(timeout: .now() + timeout + 1)
-        return out
+            guard let http else {
+                latch.publish(Response(status: -1, body: Data(), transportError: "missing HTTP response"))
+                return
+            }
+            let body = data ?? Data()
+            let expected = http.expectedContentLength
+            if expected >= 0 && UInt64(body.count) != UInt64(expected) {
+                latch.publish(Response(
+                    status: status,
+                    body: Data(),
+                    transportError: "incomplete body: received \(body.count) of \(expected) advertised bytes"
+                ))
+                return
+            }
+            latch.publish(Response(status: status, body: body, transportError: nil))
+        }
+        task.resume()
+        if let response = latch.wait(seconds: timeout) { return response }
+        let sealed = latch.sealTimeout(timeoutResponse)
+        task.cancel()
+        return sealed
     }
 
     static func directoryBytes(_ path: String) -> Int? {
@@ -83,16 +153,26 @@ enum Live {
     /// Full live battery. `trace` supplies mount/ready timing (6) and the
     /// success-path event count (7); the loopback fetches decide 1 (exact ms), 2,
     /// 3 and 4; `spoolPath` measures 5.
-    static func evaluate(port: Int, trace: TraceSession, spoolPath: String?, spoolBoundMiB: Int, segmentSampleCap: Int) -> Outcome {
+    static func evaluate(
+        port: Int,
+        trace: TraceSession,
+        spoolPath: String?,
+        spoolBoundMiB: Int,
+        segmentSampleCap: Int,
+        session: URLSession = .shared
+    ) -> Outcome {
         var out: [Finding] = []
         // Set by any check that could not REACH what it meant to measure. Distinct from
         // a legitimate INDETERMINATE ("there is nothing to measure", e.g. no spool dir).
         var probeInfra: String?
         var audioFetchInfra: String?
 
-        let master = get(port: port, path: "/master.m3u8")
+        let master = get(port: port, path: "/master.m3u8", session: session)
         let masterText = String(data: master.body, encoding: .utf8) ?? ""
-        let media = get(port: port, path: "/media.m3u8")
+        let media = get(port: port, path: "/media.m3u8", session: session)
+        if !master.ok {
+            audioFetchInfra = "the live master playlist was not completely retrievable: \(master.describe)."
+        }
 
         // HARD GATE. The media playlist is the spine of this channel: points 2, 3 and
         // point 4's active strand all enumerate advertised segments from it. If it is
@@ -142,7 +222,16 @@ enum Live {
         do {
             var ev: [String] = []
             var offenders: [Int] = []
-            var checked = 0, indeterminate = 0, evictedSkipped = 0
+            var checked = 0, indeterminate = 0, evictedSkipped = 0, unexpected = 0
+            var lastUnexpectedWhy = ""
+            let initResponse = get(port: port, path: "/init.mp4", session: session)
+            let videoTrack = initResponse.ok ? FMP4.videoTrack(inInit: initResponse.body) : nil
+            if let videoTrack {
+                ev.append("resolved video track_ID \(videoTrack.id) and \(videoTrack.codec.name) NAL framing from init.mp4")
+            } else {
+                ev.append("could not resolve the video track and codec from init.mp4 (\(initResponse.describe)); point 2 fails closed")
+                probeInfra = probeInfra ?? "point 2 could not read and resolve a complete /init.mp4 response: \(initResponse.describe)."
+            }
             if let p = parsed {
                 // Walk the advertised list and check the first `segmentSampleCap`
                 // segments that are actually RETRIEVABLE, rather than the first
@@ -156,24 +245,41 @@ enum Live {
                 var lastUnreachableWhy = ""
                 for seg in p.segments {
                     if checked >= segmentSampleCap { break }
-                    let r = get(port: port, path: "/seg\(seg.id).m4s")
+                    let r = get(port: port, path: "/seg\(seg.id).m4s", session: session)
                     if r.transportError != nil {
                         unreachable += 1; lastUnreachableWhy = r.describe; continue
                     }
-                    guard r.ok else { evictedSkipped += 1; continue }
+                    guard r.ok else {
+                        if r.status == 404 || r.status == 410 {
+                            evictedSkipped += 1
+                        } else {
+                            unexpected += 1
+                            lastUnexpectedWhy = r.describe
+                        }
+                        continue
+                    }
                     checked += 1
-                    switch FMP4.firstSampleIsSync(r.body) {
+                    switch FMP4.firstVideoSampleIsIDR(
+                        r.body,
+                        videoTrackID: videoTrack?.id,
+                        codec: videoTrack?.codec
+                    ) {
                     case .some(true): break
                     case .some(false): offenders.append(seg.id)
                     case .none: indeterminate += 1
                     }
                 }
-                ev.append("checked \(checked) retrievable segments (sample cap \(segmentSampleCap)); non-IDR starts: \(offenders); indeterminate: \(indeterminate)")
+                ev.append("checked \(checked) retrievable segments (sample cap \(segmentSampleCap)) using BOTH MP4 sync metadata and first-video-sample IDR NAL bytes; non-IDR/disagreement: \(offenders); indeterminate: \(indeterminate)")
                 if evictedSkipped > 0 {
                     ev.append("skipped \(evictedSkipped) advertised-but-unfetchable segments while sampling (that is point 4's finding, not point 2's)")
                 }
                 if unreachable > 0 {
                     ev.append("\(unreachable) segment fetches could not reach the server (\(lastUnreachableWhy))")
+                }
+                if unexpected > 0 {
+                    ev.append("\(unexpected) segment fetches returned an unexpected complete response (\(lastUnexpectedWhy))")
+                    probeInfra = probeInfra ?? ("point 2 received an unexpected response while reading an advertised segment: "
+                        + lastUnexpectedWhy + ". Only complete HTTP 404/410 is an eviction observation.")
                 }
                 if checked == 0 {
                     // Could not read a single segment's bytes. Whether the server died or
@@ -183,7 +289,11 @@ enum Live {
                         + "(\(p.segments.count) advertised, \(evictedSkipped) unfetchable, \(unreachable) unreachable"
                         + (lastUnreachableWhy.isEmpty ? "" : ": \(lastUnreachableWhy)") + ").")
                 }
-                out.append(Finding(point: .idrStart, verdict: offenders.isEmpty ? (checked > 0 ? .green : .indeterminate) : .red, evidence: ev))
+                let verdict: Verdict
+                if !offenders.isEmpty { verdict = .red }
+                else if checked > 0 && indeterminate == 0 { verdict = .green }
+                else { verdict = .indeterminate }
+                out.append(Finding(point: .idrStart, verdict: verdict, evidence: ev))
             } else {
                 out.append(Finding(point: .idrStart, verdict: .indeterminate, evidence: ["no live media playlist to enumerate segments"]))
             }
@@ -200,7 +310,7 @@ enum Live {
             // Alternate audio rendition from the master's EXT-X-MEDIA URI.
             if let audioURI = audioRenditionURI(masterText) {
                 ev.append("master advertises alternate audio rendition: \(audioURI)")
-                let a = get(port: port, path: "/\(audioURI)")
+                let a = get(port: port, path: "/\(audioURI)", session: session)
                 if a.ok, let atext = String(data: a.body, encoding: .utf8) {
                     let ap = Playlist.parseMedia(atext)
                     let firstAudio = ap.segments.map(\.id).min() ?? -1
@@ -220,7 +330,7 @@ enum Live {
             out.append(Finding(point: .firstSegmentZero, verdict: verdict, evidence: ev))
         }
 
-        // (4) Availability window. TWO independent strands, ORed into one verdict:
+        // (4) Availability window. One evidentiary strand plus diagnostics:
         //
         //   ACTIVE  - GET advertised segments and see whether any 404. Aimed at the
         //             ids the resident-window arithmetic predicts are already gone,
@@ -229,14 +339,11 @@ enum Live {
         //             check used to do) aims at whichever segment is most likely to
         //             still be resident, so it could report GREEN on a session the
         //             trace channel proved RED from the identical log.
-        //   LATENT  - the resident-window arithmetic itself, taken from
-        //             `Trace.availabilityWindow` so both channels share one
-        //             implementation, plus any advertised-id 404 the request log
-        //             actually recorded during playback.
+        //   LATENT  - resident-window arithmetic from `Trace.availabilityWindow`.
+        //             This chooses useful probe targets and remains diagnostic only.
         //
-        // RED if EITHER strand fires. Both are always printed, so a reader can tell
-        // PROOF (a real 404) from PREDICTION (arithmetic) - including when they
-        // disagree, which is itself a fact about the retention behaviour.
+        // RED requires a complete HTTP 404/410 response for an id advertised by the
+        // successfully fetched current playlist. Arithmetic never decides the gate.
         //
         // This widens what is OBSERVED. The bar is unchanged: contract point 4 has
         // always been "no advertised-segment 404 through the RFC 8216 s6.2.2
@@ -250,6 +357,7 @@ enum Live {
             // --- ACTIVE strand
             var probed: [(id: Int, status: Int)] = []
             var unreachable: [(id: Int, why: String)] = []
+            var unexpected: [(id: Int, status: Int)] = []
             var atRisk = Set<Int>()
             if let p = parsed, !p.segments.isEmpty {
                 let ids = p.segments.map(\.id).sorted()
@@ -265,79 +373,76 @@ enum Live {
                 if let highest = ids.last { add(highest) }   // the newest published
 
                 for id in targets.prefix(Live.availabilityProbeCap) {
-                    let r = get(port: port, path: "/seg\(id).m4s")
+                    let r = get(port: port, path: "/seg\(id).m4s", session: session)
                     // A TRANSPORT failure is not a 404: it means we could not ask the
                     // question. Track it separately so it can never be scored as a
                     // contract violation.
-                    if r.transportError != nil { unreachable.append((id, r.describe)) }
-                    probed.append((id, r.status))
+                    if r.transportError != nil {
+                        unreachable.append((id, r.describe))
+                    } else {
+                        probed.append((id, r.status))
+                        if r.status != 200 && r.status != 404 && r.status != 410 {
+                            unexpected.append((id, r.status))
+                        }
+                    }
                 }
                 probed.sort { $0.id < $1.id }
-                let missing = probed.filter { $0.status != 200 && $0.status != -1 }
-                ev.append("ACTIVE: probed \(probed.count) advertised ids \(probed.map(\.id)) "
+                let retired = probed.filter { $0.status == 404 || $0.status == 410 }
+                ev.append("ACTIVE: received \(probed.count) complete responses for advertised ids \(probed.map(\.id)) "
                           + "(lowest + highest + \(atRisk.count) predicted-evicted + a spread); "
-                          + "non-200: \(missing.isEmpty ? "none" : missing.map { "seg\($0.id)->HTTP\($0.status)" }.joined(separator: ", "))")
-                if !missing.isEmpty {
-                    ev.append("PROOF: an ADVERTISED segment is not fetchable -> availability-window violation (RFC 8216 s6.2.2)")
+                          + "complete 404/410: \(retired.isEmpty ? "none" : retired.map { "seg\($0.id)->HTTP\($0.status)" }.joined(separator: ", "))")
+                if !retired.isEmpty {
+                    ev.append("PROOF: an ADVERTISED segment returned a complete HTTP 404/410 response -> availability-window violation (RFC 8216 s6.2.2)")
                 }
             } else {
                 ev.append("ACTIVE: no live media playlist to enumerate advertised segments")
             }
 
-            // --- LATENT strand (identical arithmetic to the trace channel)
+            // --- LATENT diagnostics (identical arithmetic to the trace channel)
             if !w.observed404s.isEmpty {
-                ev.append("LATENT: advertised segments that 404'd during playback: \(w.observed404s)")
+                ev.append("DIAGNOSTIC trace: advertised segments logged as 404 during playback: \(w.observed404s)")
             }
             if w.avgSegmentBytes > 0 {
-                ev.append("LATENT: resident window ~= \(Contract.windowFloorMiB) MiB / \(w.avgSegmentBytes) B ≈ \(w.residentSegments) segments; playlist advertised up to \(w.advertisedMax) (MEDIA-SEQUENCE stays 0)")
+                ev.append("DIAGNOSTIC prediction: resident window ~= \(Contract.windowFloorMiB) MiB / \(w.avgSegmentBytes) B ≈ \(w.residentSegments) segments; playlist advertised up to \(w.advertisedMax) (MEDIA-SEQUENCE stays 0)")
                 if let evictedUpTo = w.evictedUpTo {
-                    ev.append("LATENT: segment 0..\(evictedUpTo) advertised but evicted -> a client that re-requests one (RFC 8216 s6.2.2 window) gets a 404")
+                    ev.append("DIAGNOSTIC prediction only: segment 0..\(evictedUpTo) may no longer be resident; this does not decide the verdict")
                 }
             } else {
-                ev.append("LATENT: no served-segment byte sizes in the log yet; window arithmetic unavailable")
+                ev.append("DIAGNOSTIC prediction unavailable: no served-segment byte sizes in the log yet")
             }
 
             // --- verdict.
-            // A -1 status is a TRANSPORT failure, never a 404, so it can never count as
-            // the active strand firing.
-            let activeFired = probed.contains { $0.status != 200 && $0.status != -1 }
-            let activeRan = !probed.isEmpty && unreachable.count < probed.count
-            let latentFired = w.evictedUpTo != nil || !w.observed404s.isEmpty
+            let activeFired = probed.contains { $0.status == 404 || $0.status == 410 }
 
             if !unreachable.isEmpty {
-                ev.append("ACTIVE: \(unreachable.count) of \(probed.count) probes could not reach the server at all "
+                ev.append("ACTIVE: \(unreachable.count) probes lacked a complete response "
                           + "(e.g. seg\(unreachable[0].id): \(unreachable[0].why))")
             }
+            if !unexpected.isEmpty {
+                ev.append("ACTIVE: unexpected complete statuses: "
+                          + unexpected.map { "seg\($0.id)->HTTP\($0.status)" }.joined(separator: ", "))
+            }
 
-            if !activeRan {
-                // The active strand could not run. The latent strand is a PREDICTION
-                // from the resident-window arithmetic, and we decided deliberately that
-                // a prediction must not stand as a verdict on its own: a correct
-                // implementation whose real retention exceeds the estimate's floor would
-                // be scored RED for no observed failure. So this is INFRA, not a verdict.
-                probeInfra = "point 4's ACTIVE strand could not run: "
-                           + (probed.isEmpty
-                              ? "no advertised segments could be enumerated to probe."
-                              : "every one of the \(probed.count) segment probes failed to reach the server "
-                                + "(e.g. seg\(unreachable.first?.id ?? -1): \(unreachable.first?.why ?? "unknown")).")
-                           + " Refusing to report point 4 RED from the latent arithmetic alone."
-                verdict = .indeterminate
-                ev.append("point 4 NOT DECIDED: the active strand could not run, and the latent strand is a prediction that may not stand alone.")
-            } else if activeFired || latentFired {
+            if activeFired {
                 verdict = .red
+            } else if probed.isEmpty || !unreachable.isEmpty || !unexpected.isEmpty {
+                probeInfra = "point 4 did not receive a complete 200 or evidentiary 404/410 response for every selected advertised segment. "
+                           + "Incomplete and unexpected responses cannot decide availability, and the resident-window prediction is diagnostic only."
+                verdict = .indeterminate
+                ev.append("point 4 NOT DECIDED: no complete advertised-id 404/410 was observed, and at least one target lacked a trustworthy response.")
             } else {
                 verdict = .green
             }
 
-            // --- a disagreement between the strands is information, not something to
-            //     quietly resolve in favour of whichever strand is more convenient.
-            if latentFired && !activeFired && !probed.isEmpty {
+            // --- a disagreement between observation and prediction is useful context,
+            //     but it never changes the observed verdict.
+            if w.evictedUpTo != nil && !activeFired && !probed.isEmpty {
                 let stillResident = Set(probed.filter { $0.status == 200 }.map(\.id))
                     .intersection(atRisk).sorted()
                 ev.append("NOTE: the strands DISAGREE. The arithmetic predicts 0..\(w.evictedUpTo.map(String.init) ?? "?") are evicted, "
                           + "but \(stillResident.isEmpty ? "no probed at-risk id" : "ids \(stillResident)") still returned 200. "
                           + "Either the window retains more than the \(Contract.windowFloorMiB) MiB floor the estimate uses, or eviction "
-                          + "had not run yet. RED stands on the latent strand: the playlist advertises a range the window is not sized to guarantee.")
+                          + "had not run yet. The prediction remains diagnostic and does not make the verdict RED.")
             }
             out.append(Finding(point: .noAdvertised404, verdict: verdict, evidence: ev))
         }
