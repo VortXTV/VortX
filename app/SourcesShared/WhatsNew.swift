@@ -7,7 +7,6 @@ import Foundation
 enum WhatsNew {
     static let version = "0.3.14"
     static let highlights: [String] = [
-        "On Apple TV, installing an add-on by QR now works: an add-on sent from your phone installs automatically as soon as it arrives, with a focusable Install as a manual fallback. You can also reorder your installed add-ons on Apple TV, and the order drives which one answers first. Apple TV.",
         "On the true Dolby Vision lane, you can now choose a title's audio track and turn on its built-in text subtitles. A Dolby Vision file that carries a surround or Atmos bed alongside a stereo downmix, a commentary, or another language now offers all of them in the audio menu instead of being fixed to whichever came first, and text subtitles carried inside the file appear in the subtitle menu like any other. Titles also start more cleanly. Apple TV.",
         "Home customization is reachable again on Apple TV. The control that opened it sat where the remote could never land, so it could not be focused; Home customization now lives as a proper row in Settings, under Appearance, reachable with the remote and by search. Apple TV.",
         "On iPhone, the Add-on Discover and Catalog customize screens fit portrait again. Both could run off the side of the screen and clip their content in portrait; the type chips now wrap and the install action is set apart, so both screens fit. iPhone.",

@@ -11,13 +11,11 @@ A fix beta over Beta 6. Dolby Vision titles on Apple TV now start at the beginni
 This wave also reworks the Dolby Vision lane on Apple TV: a title's alternate audio tracks and its own built-in text subtitles are now selectable in true Dolby Vision, and titles start more cleanly. Home customization on Apple TV is reachable again, from a proper Settings row the remote can focus; on iPhone, the Add-on Discover and Catalog customize screens fit portrait instead of clipping; and every built app bundle is now audited before packaging, so a stray build-machine path can never ship inside a download.
 
 ### Added
-- **Reorder your installed add-ons on Apple TV.** The installed add-on list could be reordered on iPhone but not on Apple TV; a remote-native move-up and move-down control now sets the order, and it drives which add-on answers first, the same order iPhone uses. Apple TV.
 
 - **Dolby Vision: choose a title's audio track.** A Dolby Vision title that carries more than one audio track, a surround or Atmos bed alongside a stereo downmix, a commentary, or another language, now offers all of them in the player's audio menu on the true Dolby Vision lane, instead of being fixed to whichever track happened to come first. The picture stays real Dolby Vision throughout. Apple TV.
 - **Dolby Vision: a title's built-in subtitles appear in the menu.** Text subtitles carried inside the file (SubRip, ASS, and the like) are now served alongside the Dolby Vision stream and can be turned on from the subtitle menu, the same as any other subtitle. Image-based subtitles, which are pictures rather than text, are not among them, exactly as before. Apple TV.
 
 ### Fixed
-- **Installing an add-on by QR on Apple TV now works.** Add-ons sent from your phone appeared on the TV but the Install button could not be focused and Done left without installing; a valid submission now installs automatically as soon as it arrives, Install stays reachable as a manual fallback, and Done reflects whether an install is still in progress. Apple TV.
 
 - **Dolby Vision titles start at the beginning instead of about fourteen seconds in.** The player was never told where to begin, so it applied the rule meant for live streams and skipped ahead by three segment lengths before the first frame you asked for. It now starts where it should. Apple TV.
 - **Dolby Vision no longer flickers several times before it settles.** Starting a title could ask the TV to change display mode repeatedly, and every one of those requests renegotiates the HDMI link, which is the flash you saw. Identical requests are now ignored, so the mode changes once; anything that genuinely differs, a different frame rate or resolution, still switches as it should. Apple TV.
