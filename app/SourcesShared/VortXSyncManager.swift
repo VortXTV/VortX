@@ -292,13 +292,14 @@ final class VortXSyncManager: ObservableObject {
     private func restore() {
         guard let str = Keychain.string(kcAccount), let data = str.data(using: .utf8),
               let p = try? JSONDecoder().decode(Persisted.self, from: data),
-              let dk = Data(base64Encoded: p.dataKey) else { return }
+              let dk = Data(base64Encoded: p.dataKey),
+              let debridOwner = DebridOwnerScope.canonicalAccount(p.account.id) else { return }
         SourceIndexLifecycleScope.shared.sessionWillMutate()
         token = p.token; account = p.account; dataKey = dk; isSignedIn = true
         // Point the debrid credential store at THIS account before anything can read a key. Restoring a
         // session is the earliest moment the device's real owner is known, and it is also where the one-time
         // adoption of the old unscoped entries happens, so an existing user keeps their keys without a re-paste.
-        DebridKeys.shared.bind(owner: p.account.id)
+        DebridKeys.shared.bind(owner: debridOwner)
         reloadLastSyncStamp()   // show this account's persisted "last synced" immediately on relaunch
         // A Keychain-restored session (app relaunch / reinstall) sets isSignedIn WITHOUT going through
         // adopt(), so nothing would open the sync channel until the first scenePhase foreground transition.
@@ -321,7 +322,7 @@ final class VortXSyncManager: ObservableObject {
         // own Keychain scope and return if the same account signs back in. What must not happen is the next
         // account on this device inheriting them, which is exactly what used to happen when these entries were
         // global and sign-out left them behind.
-        DebridKeys.shared.bind(owner: DebridKeys.signedOutOwner)
+        DebridKeys.shared.bind(owner: .signedOutDevice)
         // The shared add-on ORDER is a global static with no account context, so a switched-in account would
         // otherwise inherit the previous account's order until its own pull lands. Clear it here so the next
         // account starts from the descriptor spine and converges on its own doc.addonOrder. The per-account
@@ -350,19 +351,22 @@ final class VortXSyncManager: ObservableObject {
         } catch { return (0, nil) }
     }
 
-    private func adopt(token: String, account acct: [String: Any], dataKey: Data) {
+    @discardableResult
+    private func adopt(token: String, account acct: [String: Any], dataKey: Data) -> Bool {
+        guard let accountID = acct["id"] as? String,
+              let debridOwner = DebridOwnerScope.canonicalAccount(accountID) else { return false }
         SourceIndexLifecycleScope.shared.sessionWillMutate()
         self.token = token
         self.dataKey = dataKey
         self.account = Account(
-            id: acct["id"] as? String ?? "",
+            id: accountID,
             email: acct["email"] as? String ?? "",
             username: acct["username"] as? String ?? "",
             twoFactorEnabled: acct["twoFactorEnabled"] as? Bool ?? false)
         self.isSignedIn = true
         // Rebind debrid credentials to the account that just signed in. Without this a switched-in account
         // would keep reading the previous owner's keys out of memory even though the Keychain is now scoped.
-        DebridKeys.shared.bind(owner: self.account?.id ?? DebridKeys.signedOutOwner)
+        DebridKeys.shared.bind(owner: debridOwner)
         reloadLastSyncStamp()   // a re-sign-in to a known account restores its persisted "last synced"
         persist()
         // A fresh sign-in is a foreground action, so open the real-time channel immediately (if the app
@@ -389,6 +393,7 @@ final class VortXSyncManager: ObservableObject {
         }
         // Reconciliation is decided by the UI after sign-in (reconcileAfterSignIn), so a sign-in never
         // blindly overwrites either side. A new account just gets seeded.
+        return true
     }
 
     enum AuthResult: Equatable { case ok, totpRequired, failed(String) }
@@ -419,7 +424,9 @@ final class VortXSyncManager: ObservableObject {
         ]
         let (code, json) = await request("POST", "/v1/auth/register", body: body)
         if code == 200, let token = json?["token"] as? String, let acct = json?["account"] as? [String: Any] {
-            adopt(token: token, account: acct, dataKey: dataKey)
+            guard adopt(token: token, account: acct, dataKey: dataKey) else {
+                return (.failed("Could not verify the account identity."), nil)
+            }
             return (.ok, recoveryCode)
         }
         switch json?["error"] as? String {
@@ -445,7 +452,9 @@ final class VortXSyncManager: ObservableObject {
               let dk = VortXSyncCrypto.open(key: masterKey, wrappedPw) else {
             return .failed(code == 401 ? "Wrong login or password." : "Could not sign in.")
         }
-        adopt(token: token, account: acct, dataKey: dk)
+        guard adopt(token: token, account: acct, dataKey: dk) else {
+            return .failed("Could not verify the account identity.")
+        }
         return .ok
     }
 
@@ -471,7 +480,9 @@ final class VortXSyncManager: ObservableObject {
         ]
         let (code, json) = await request("POST", "/v1/auth/recover-complete", body: body)
         if code == 200, let token = json?["token"] as? String, let acct = json?["account"] as? [String: Any] {
-            adopt(token: token, account: acct, dataKey: dk)
+            guard adopt(token: token, account: acct, dataKey: dk) else {
+                return .failed("Could not verify the account identity.")
+            }
             return .ok
         }
         return .failed("Recovery failed.")
@@ -1263,21 +1274,12 @@ final class VortXSyncManager: ObservableObject {
             if let f = keys["fanart"] { ApiKeys.shared.fanart = f }
             // Debrid keys: apply only when present so a doc without them never clears a locally-entered key.
             let debrid = DebridKeys.shared
-            if let v = keys["realDebrid"], v != debrid.key(for: .realDebrid) { debrid.setKey(v, for: .realDebrid) }
-            if let v = keys["allDebrid"],  v != debrid.key(for: .allDebrid)  { debrid.setKey(v, for: .allDebrid) }
-            if let v = keys["premiumize"], v != debrid.key(for: .premiumize) { debrid.setKey(v, for: .premiumize) }
-            if let v = keys["torBox"],     v != debrid.key(for: .torBox)     { debrid.setKey(v, for: .torBox) }
-            // A key that ARRIVED from another device must take effect here too: rebuild the resolvers so
-            // the changed/new key is live (setKey already nudges this on a local edit; this covers the pull
-            // path explicitly). DebridCoordinator is now an `actor`, so the reload hops onto it off-main.
-            // We are on the main actor here, so capture the fully-applied key snapshot NOW and hand the
-            // immutable value to the actor: the actor must never read DebridKeys' @Published dictionary
-            // itself (that would race these main-actor setKey writes).
-            // No withRemoteApplySuppressed wrapper is needed: reload(keys:) only rebuilds resolver instances
-            // from the passed-in key snapshot and writes no sync-doc / @Published state, so it can never
-            // re-arm a self-echo push.
-            let debridSnapshot = debrid.snapshot
-            Task { await DebridCoordinator.shared.reload(keys: debridSnapshot) }
+            var remoteDebrid: [DebridService: String] = [:]
+            if let value = keys["realDebrid"] { remoteDebrid[.realDebrid] = value }
+            if let value = keys["allDebrid"] { remoteDebrid[.allDebrid] = value }
+            if let value = keys["premiumize"] { remoteDebrid[.premiumize] = value }
+            if let value = keys["torBox"] { remoteDebrid[.torBox] = value }
+            debrid.applyRemoteKeys(remoteDebrid)
             // External sync provider tokens (Trakt Lane C, SIMKL Lane D): adopt a connection authored on
             // another device. Apply only when present so a doc without them never clears a locally-connected
             // session (mirrors the debrid guard just above; never delete on absence). adoptTokens writes the
@@ -1950,7 +1952,7 @@ final class VortXSyncManager: ObservableObject {
         // Fetch the account this session belongs to, authing with the freshly issued token (not yet adopted).
         let (mc, mj) = await request("GET", "/v1/auth/me", bearer: token)
         guard mc == 200, let acct = mj?["account"] as? [String: Any] else { return .failed }
-        adopt(token: token, account: acct, dataKey: dk)
+        guard adopt(token: token, account: acct, dataKey: dk) else { return .failed }
         return .signedIn(email: acct["email"] as? String ?? "")
     }
 

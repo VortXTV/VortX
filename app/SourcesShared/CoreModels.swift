@@ -1183,7 +1183,8 @@ struct CoreStream: Decodable, Identifiable, Equatable {
         // this, every usenet row rendered as a dead disabled label (every row gate keys on this
         // property). No TorBox key -> nil, the pre-usenet behavior. Deliberately NOT behind the
         // torrents gate: usenet resolves to a remote link, no embedded server needed (Lite plays it).
-        if isUsenet, DebridKeys.shared.isConfigured(.torBox), let nzb = nzbUrl, let parsed = URL(string: nzb) {
+        if isUsenet, DebridCredentialSnapshotStore.shared.isConfigured(.torBox),
+           let nzb = nzbUrl, let parsed = URL(string: nzb) {
             return parsed
         }
         if let ytId, !ytId.isEmpty {

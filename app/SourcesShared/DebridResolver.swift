@@ -72,6 +72,7 @@ struct DebridEpisode: Sendable, Equatable {
 
 enum DebridError: Error, Equatable {
     case noKey
+    case credentialsChanged
     case invalidKey
     case notCached
     case noMatchingFile
@@ -997,10 +998,10 @@ enum DebridHTTP {
 
 /// Builds resolvers from the user's stored keys and drives cache-check + playback resolution. TorBox is
 /// wired now; Real-Debrid (add-then-poll, no instant cache-check), AllDebrid, and Premiumize slot in as
-/// further `DebridResolving` conformers. Owned by the stream/play layer; reads `DebridKeys.shared`.
+/// further `DebridResolving` conformers. Owned by the stream/play layer.
 ///
 /// ISOLATION: this is an `actor`, NOT `@MainActor`. Its only state (`resolvers`, `torboxUsenet`) is mutated
-/// in `reload(keys:)` / `warmIfNeeded()` and read in the async resolve/cache-check methods, so the actor's own serial executor keeps
+/// in `reload(snapshot:)` and read in the async resolve/cache-check methods, so the actor's own serial executor keeps
 /// those accesses race-free WITHOUT pinning them to the main thread. This matters for `cacheCheck`: the
 /// per-provider probes are already off-main (the resolvers are actors), but under the old `@MainActor` the
 /// O(services x hashes) merge loop AND every `await` continuation resumed on the main actor, so a cacheCheck
@@ -1009,30 +1010,24 @@ enum DebridHTTP {
 actor DebridCoordinator {
     static let shared = DebridCoordinator()
 
+    nonisolated private let credentialStore = DebridCredentialSnapshotStore.shared
     private var resolvers: [DebridService: any DebridResolving] = [:]
     /// The TorBox usenet resolver, built only when a TorBox key is configured (usenet is a TorBox-only
     /// backend among the four services). Separate from `resolvers` because usenet resolves off an nzb link,
     /// not the infohash/magnet the `DebridResolving` protocol takes. nil = no TorBox key = usenet inert.
     private var torboxUsenet: TorBoxUsenetResolver?
 
-    /// Whether the resolvers have been built at least once (from `reload(keys:)` or the lazy warm). A no-key
-    /// user leaves `resolvers` empty, so `resolvers.isEmpty` alone cannot tell "never warmed" from "warmed,
-    /// no keys" and would re-hop to the main actor on every resolve. This flag makes the lazy warm hop AT
-    /// MOST ONCE until a key change explicitly reloads, preserving the cheap no-key fast path.
-    private var didWarm = false
+    private var revisionFence = DebridCredentialRevisionFence()
+    private var appliedSnapshot: DebridCredentialSnapshot?
 
-    /// (Re)build resolvers from a Sendable key SNAPSHOT. Call after a key changes.
-    ///
-    /// RACE-SAFETY: takes a `[DebridService: String]` value, NOT the `DebridKeys` reference. `DebridKeys.keys`
-    /// is a plain `@Published` dictionary mutated on the MAIN actor (per-keystroke `setKey`, and the
-    /// sync-apply path). Reading that dictionary from THIS actor's background executor while main mutates it
-    /// is a concurrent Dictionary read/write == undefined behavior. So every caller captures a snapshot on
-    /// the main actor and hands us the value; we only ever touch the immutable copy.
-    func reload(keys: [DebridService: String]) {
+    /// Rebuild only from a strictly newer complete envelope. Delayed proactive tasks are harmless.
+    @discardableResult
+    func reload(snapshot: DebridCredentialSnapshot) -> Bool {
+        guard revisionFence.accept(snapshot) else { return false }
         resolvers.removeAll()
         torboxUsenet = nil
         func keyFor(_ s: DebridService) -> String? {
-            guard let k = keys[s], !k.isEmpty else { return nil }
+            guard let k = snapshot.keys[s], !k.isEmpty else { return nil }
             return k
         }
         if let k = keyFor(.torBox) {
@@ -1042,29 +1037,38 @@ actor DebridCoordinator {
         if let k = keyFor(.realDebrid) { resolvers[.realDebrid] = RealDebridResolver(apiKey: k) }
         if let k = keyFor(.allDebrid) { resolvers[.allDebrid] = AllDebridResolver(apiKey: k) }
         if let k = keyFor(.premiumize) { resolvers[.premiumize] = PremiumizeResolver(apiKey: k) }
-        didWarm = true
+        appliedSnapshot = snapshot
+        return true
     }
 
-    /// Lazy first-use warm: build the resolvers from a fresh main-actor snapshot IF they have not been built
-    /// yet. Replaces the old synchronous `if resolvers.isEmpty { reload() }` warm, which read `DebridKeys`
-    /// off-main (the race). Hopping to the main actor for the snapshot keeps the read serialized with the
-    /// key writers; the `reload` that follows only touches actor-isolated state on this executor.
-    private func warmIfNeeded() async {
-        guard !didWarm else { return }
-        let snapshot = await MainActor.run { DebridKeys.shared.snapshot }
-        // Re-check under the actor: a concurrent warm (or an explicit reload) may have run across the await.
-        guard !didWarm else { return }
-        reload(keys: snapshot)
+    /// Every operation catches up from the lock-protected store before it selects a credential-bearing resolver.
+    @discardableResult
+    private func ensureCurrentSnapshot() -> DebridCredentialSnapshot {
+        let current = credentialStore.load()
+        _ = reload(snapshot: current)
+        return appliedSnapshot ?? current
+    }
+
+    /// One load-bearing wrapper for every provider await. The first guard is the credential-use boundary;
+    /// the second prevents an old owner or key result from leaving the coordinator after a revision change.
+    private func withCurrentCredential<T: Sendable>(
+        revision: UInt64,
+        operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        guard credentialStore.isCurrent(revision: revision) else { throw DebridError.credentialsChanged }
+        let result = try await operation()
+        guard credentialStore.resultIsCurrent(revision: revision) else { throw DebridError.credentialsChanged }
+        return result
     }
 
     /// True when a usenet resolve is possible (a TorBox key is configured). Gates both the usenet play
     /// path and the usenet cache-check; with no TorBox key everything usenet behaves exactly as before.
     var hasUsenetResolver: Bool {
-        get async { await warmIfNeeded(); return torboxUsenet != nil }
+        get async { ensureCurrentSnapshot(); return torboxUsenet != nil }
     }
 
     var hasAnyResolver: Bool {
-        get async { await warmIfNeeded(); return !resolvers.isEmpty }
+        get async { ensureCurrentSnapshot(); return !resolvers.isEmpty }
     }
 
     /// Which provider has each hash cached (first configured provider that reports it), with the files.
@@ -1072,13 +1076,18 @@ actor DebridCoordinator {
     /// then merges in a deterministic `DebridService.allCases` priority order so the chosen provider for a
     /// hash is stable. Previously this looped providers sequentially AND in nondeterministic dict order.
     func cacheCheck(hashes: [String]) async -> [String: (service: DebridService, files: [DebridFile])] {
-        await warmIfNeeded()
+        let revision = ensureCurrentSnapshot().revision
         guard !resolvers.isEmpty, !hashes.isEmpty else { return [:] }
         let maps: [DebridService: [String: [DebridFile]]] = await withTaskGroup(
             of: (DebridService, [String: [DebridFile]]).self
         ) { group in
             for (service, resolver) in resolvers {
-                group.addTask { (service, (try? await resolver.checkCache(hashes: hashes)) ?? [:]) }
+                group.addTask {
+                    let result = try? await self.withCurrentCredential(revision: revision) {
+                        try await resolver.checkCache(hashes: hashes)
+                    }
+                    return (service, result ?? [:])
+                }
             }
             var collected: [DebridService: [String: [DebridFile]]] = [:]
             for await (service, map) in group { collected[service] = map }
@@ -1091,26 +1100,33 @@ actor DebridCoordinator {
                 out[hash] = (service, files)
             }
         }
+        guard credentialStore.resultIsCurrent(revision: revision) else { return [:] }
         return out
     }
 
     /// Resolve a torrent to a direct stream URL via the given (or first available) provider.
     func resolve(service: DebridService? = nil, infoHash: String, magnet: String,
                  fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
-        await warmIfNeeded()
+        let revision = ensureCurrentSnapshot().revision
         let resolver = pick(service)
         guard let resolver else { throw DebridError.noKey }
-        return try await resolver.resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
+        return try await withCurrentCredential(revision: revision) {
+            try await resolver.resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
+        }
     }
 
     /// Resolve, surfacing the provider + ids (for a later `reresolve`). Chooses the given service or the
     /// first configured resolver (the same choice `resolve` makes).
     func resolveWithIds(service: DebridService? = nil, infoHash: String, magnet: String,
-                        fileIdx: Int?, episode: DebridEpisode?)
+        fileIdx: Int?, episode: DebridEpisode?)
         async throws -> (result: (url: URL, torrentId: Int?, fileId: Int?), service: DebridService) {
-        await warmIfNeeded()
+        let revision = ensureCurrentSnapshot().revision
         guard let resolver = pick(service) else { throw DebridError.noKey }
-        let r = try await resolver.resolveWithIds(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
+        let r = try await withCurrentCredential(revision: revision) {
+            try await resolver.resolveWithIds(
+                infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode
+            )
+        }
         return (r, resolver.service)
     }
 
@@ -1121,12 +1137,14 @@ actor DebridCoordinator {
     func reresolve(service: DebridService, infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?,
                    episode: DebridEpisode? = nil, requiresSemanticSelection: Bool)
         async throws -> URL {
-        await warmIfNeeded()
+        let revision = ensureCurrentSnapshot().revision
         guard let resolver = resolvers[service] else { throw DebridError.noKey }
-        return try await resolver.reresolveLink(
-            infoHash: infoHash, torrentId: torrentId, fileId: fileId, fileIdx: fileIdx,
-            episode: episode, requiresSemanticSelection: requiresSemanticSelection
-        )
+        return try await withCurrentCredential(revision: revision) {
+            try await resolver.reresolveLink(
+                infoHash: infoHash, torrentId: torrentId, fileId: fileId, fileIdx: fileIdx,
+                episode: episode, requiresSemanticSelection: requiresSemanticSelection
+            )
+        }
     }
 
     private func pick(_ service: DebridService?) -> (any DebridResolving)? {
@@ -1140,18 +1158,25 @@ actor DebridCoordinator {
     /// `.noKey` when no TorBox key is configured, so the bounded resolve below collapses it to `nil`.
     /// `knownHash` = the stream's authoritative NZB md5 when its emitter carried one (nil otherwise).
     func resolveUsenet(nzbUrl: String, knownHash: String? = nil, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
-        await warmIfNeeded()
+        let revision = ensureCurrentSnapshot().revision
         guard let usenet = torboxUsenet else { throw DebridError.noKey }
-        return try await usenet.resolve(nzbUrl: nzbUrl, knownHash: knownHash, fileMustInclude: fileMustInclude, fileIdx: fileIdx, episode: episode)
+        return try await withCurrentCredential(revision: revision) {
+            try await usenet.resolve(
+                nzbUrl: nzbUrl, knownHash: knownHash, fileMustInclude: fileMustInclude,
+                fileIdx: fileIdx, episode: episode
+            )
+        }
     }
 
     /// Which nzb md5s the user's TorBox usenet account has cached (drives the ⚡ on usenet rows). Empty (a
     /// no-op) when no TorBox key is configured. Keys are the lowercased md5 identifiers, matching
     /// `TorBoxUsenetResolver.identifier(forNzbURL:)`.
     func usenetCacheCheck(nzbMD5s: [String]) async -> Set<String> {
-        await warmIfNeeded()
+        let revision = ensureCurrentSnapshot().revision
         guard let usenet = torboxUsenet, !nzbMD5s.isEmpty else { return [] }
-        let map = (try? await usenet.checkCache(hashes: nzbMD5s)) ?? [:]
+        let map = (try? await withCurrentCredential(revision: revision) {
+            try await usenet.checkCache(hashes: nzbMD5s)
+        }) ?? [:]
         return Set(map.filter { !$0.value.isEmpty }.keys)
     }
 }
@@ -1759,23 +1784,32 @@ extension DebridCoordinator {
     /// actors). FAIL-SOFT: with no key the map is empty; a provider that errors or is empty simply does not
     /// appear (its `try?` collapses to no entry), so the browse UI hides that section rather than erroring.
     func cloudLibrary() async -> [DebridService: [DebridLibraryItem]] {
-        await warmIfNeeded()
+        let revision = ensureCurrentSnapshot().revision
         guard !resolvers.isEmpty else { return [:] }
-        return await withTaskGroup(of: (DebridService, [DebridLibraryItem]).self) { group in
+        let result = await withTaskGroup(of: (DebridService, [DebridLibraryItem]).self) { group in
             for (service, resolver) in resolvers {
-                group.addTask { (service, (try? await resolver.listCloudLibrary()) ?? []) }
+                group.addTask {
+                    let items = try? await self.withCurrentCredential(revision: revision) {
+                        try await resolver.listCloudLibrary()
+                    }
+                    return (service, items ?? [])
+                }
             }
             var out: [DebridService: [DebridLibraryItem]] = [:]
             for await (service, items) in group where !items.isEmpty { out[service] = items }
             return out
         }
+        guard credentialStore.resultIsCurrent(revision: revision) else { return [:] }
+        return result
     }
 
     /// Resolve a chosen library item to a direct, streamable URL through its own provider's resolver.
     /// Throws `.noKey` when that provider is no longer configured; other `DebridError`s when the file is gone.
     func resolveLibraryItem(_ item: DebridLibraryItem) async throws -> URL {
-        await warmIfNeeded()
+        let revision = ensureCurrentSnapshot().revision
         guard let resolver = resolvers[item.service] else { throw DebridError.noKey }
-        return try await resolver.resolveLibraryItem(item)
+        return try await withCurrentCredential(revision: revision) {
+            try await resolver.resolveLibraryItem(item)
+        }
     }
 }

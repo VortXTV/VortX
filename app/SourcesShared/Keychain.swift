@@ -45,7 +45,8 @@ enum Keychain {
         queue.sync { load()[account] }
     }
 
-    static func set(_ value: String?, for account: String) {
+    @discardableResult
+    static func set(_ value: String?, for account: String) -> Bool {
         queue.sync {
             var store = load()
             if let value {
@@ -53,7 +54,8 @@ enum Keychain {
             } else {
                 store.removeValue(forKey: account)   // delete = remove the key
             }
-            save(store)
+            guard save(store) else { return false }
+            return load()[account] == value
         }
     }
 
@@ -66,24 +68,31 @@ enum Keychain {
         return (decoded as? [String: String]) ?? [:]
     }
 
-    private static func save(_ store: [String: String]) {
+    private static func save(_ store: [String: String]) -> Bool {
         let fm = FileManager.default
         let dir = storeURL.deletingLastPathComponent()
         // Create the dir owner-only (0700) if missing.
         if !fm.fileExists(atPath: dir.path) {
-            try? fm.createDirectory(at: dir, withIntermediateDirectories: true,
-                                    attributes: [.posixPermissions: 0o700])
+            do {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true,
+                                       attributes: [.posixPermissions: 0o700])
+            } catch {
+                NSLog("%@", "[Keychain] failed to create credentials directory: \(error)")
+                return false
+            }
         }
 
         guard let data = try? PropertyListSerialization.data(fromPropertyList: store,
-                                                             format: .binary, options: 0) else { return }
+                                                             format: .binary, options: 0) else { return false }
         // Atomic write so a crash mid-write can't corrupt the store.
         do {
             try data.write(to: storeURL, options: [.atomic])
             // Atomic writes replace the inode, so re-assert owner-only perms (0600) afterwards.
-            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storeURL.path)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storeURL.path)
+            return true
         } catch {
             NSLog("%@", "[Keychain] failed to persist credentials file: \(error)")
+            return false
         }
     }
 #else
@@ -107,7 +116,8 @@ enum Keychain {
         return UserDefaults.standard.string(forKey: fallbackKey(account))
     }
 
-    static func set(_ value: String?, for account: String) {
+    @discardableResult
+    static func set(_ value: String?, for account: String) -> Bool {
         let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: account,
@@ -116,7 +126,7 @@ enum Keychain {
 
         guard let value, let data = value.data(using: .utf8) else {
             UserDefaults.standard.removeObject(forKey: fallbackKey(account))   // clearing the token
-            return
+            return string(account) == nil
         }
 
         var add = base
@@ -130,6 +140,7 @@ enum Keychain {
             // Keychain unavailable (unsigned Simulator, entitlement mismatch) → keep it working.
             UserDefaults.standard.set(value, forKey: fallbackKey(account))
         }
+        return string(account) == value
     }
 #endif
 }
