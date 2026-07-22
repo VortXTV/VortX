@@ -16,13 +16,13 @@ import Network
 ///     its declarations (the on-device -12927 rejections matched a declaration/content cross-check failing
 ///     right after /init.mp4): the DV variant's init carries the declared db1p/db4h compatibility brand,
 ///     the lifeboat's init has the dvvC stripped (it declares no Dolby Vision, so it serves none).
-///   - `/media.m3u8`: a sliding playlist of closed segments whose bytes are currently resident, with an
+///   - `/media.m3u8`: a sliding playlist of closed, durably staged segments, with an
 ///     absolute MEDIA-SEQUENCE and EXT-X-ENDLIST once the trailer is written. The first answer is held until
 ///     a small startup window exists, and those startup bytes remain pinned until AVPlayer is ready.
-///   - `/media-hdr.m3u8`: the lifeboat's view of that same immutable resident window.
+///   - `/media-hdr.m3u8`: the lifeboat's view of that same immutable durable window.
 ///   - `/init.mp4`:    the ftyp+moov init segment (retained in memory for the whole session).
 ///   - `/init-hdr.mp4`: the lifeboat's init: same moov with the DV config box stripped (#143).
-///   - `/seg{N}.m4s`:  one closed segment (shared by both variants), read out of the sliding-window buffer.
+///   - `/seg{N}.m4s`:  one closed segment (shared by both variants), read from the private session spool.
 ///
 /// Follows the proven `VXTrailerProxy` NWListener pattern: bound to 127.0.0.1 on an OS-assigned ephemeral
 /// port (never reachable off-device), per-connection fail-soft (a bad request / evicted range / gone client
@@ -73,6 +73,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private var advertisedDolbyVision = false
     private var engineReady = false
     private var startupTimeoutLogged = false
+    private let startupReadiness: VortXHLSStartupReadiness
+    private let onStartupTimeout: @Sendable (VortXRemuxHLSServer) -> Void
+    private let deadlineLock = NSLock()
+    private var mountDeadline = VortXHLSMountDeadlineState()
+    private var mountDeadlineWorkItem: DispatchWorkItem?
 
     private struct Publication {
         let videoWindow: VortXHLSWindow
@@ -96,14 +101,16 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// The stream seeks once before muxing, then publishes the base-video timestamp it actually reached.
     static func make(input: URL, headers: [String: String]?,
                      mode: VortXMKVRemuxStream.Mode = .dolbyVision,
-                     startAtSeconds: Double = 0) -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
+                     startAtSeconds: Double = 0,
+                     onStartupTimeout: @escaping @Sendable (VortXRemuxHLSServer) -> Void = { _ in })
+        -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
         let stream = VortXMKVRemuxStream(
             input: input.absoluteString,
             headers: headers,
             indexForHLS: true,
             mode: mode,
             startAtSeconds: startAtSeconds)
-        let server = VortXRemuxHLSServer(stream: stream)
+        let server = VortXRemuxHLSServer(stream: stream, onStartupTimeout: onStartupTimeout)
         guard server.listen() else { server.invalidate(); return nil }
         var comps = URLComponents()
         comps.scheme = "http"
@@ -114,18 +121,45 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         return (server, url)
     }
 
-    private init(stream: VortXMKVRemuxStream) {
+    private init(stream: VortXMKVRemuxStream,
+                 onStartupTimeout: @escaping @Sendable (VortXRemuxHLSServer) -> Void) {
         self.stream = stream
+        self.startupReadiness = VortXHLSStartupReadiness(
+            frozenTarget: stream.frozenHLSTarget)!
+        self.onStartupTimeout = onStartupTimeout
     }
 
     /// Begin remuxing. Call once, after the asset is (about to be) mounted.
-    func start() { stream.start() }
+    func start() {
+        let now = ProcessInfo.processInfo.systemUptime
+        deadlineLock.lock()
+        guard let deadline = mountDeadline.start(now: now) else {
+            deadlineLock.unlock()
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in self?.expireMountIfNeeded() }
+        mountDeadlineWorkItem = work
+        deadlineLock.unlock()
+        queue.asyncAfter(deadline: .now() + max(0, deadline - now), execute: work)
+        stream.start()
+    }
 
     /// F3: forward the engine's first-frame readiness to the buffer so its producer lead widens from the
     /// reduced pre-ready value to the full lead. Called from AVPlayerEngine's readyToPlay handler.
-    func markEngineReady() {
+    @discardableResult
+    func markEngineReady() -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        deadlineLock.lock()
+        let transition = mountDeadline.markReady(now: now)
+        let work = transition.accepted ? mountDeadlineWorkItem : nil
+        if transition.accepted { mountDeadlineWorkItem = nil }
+        deadlineLock.unlock()
+        if transition.didExpire { handleMountTimeout() }
+        guard transition.accepted else { return false }
+        work?.cancel()
         publicationLock.lock(); engineReady = true; publicationLock.unlock()
         stream.markEngineReady()
+        return true
     }
 
     /// The source MKV runtime in seconds (0 until parsed / when unknown). The engine reads it at readyToPlay
@@ -163,6 +197,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         connections.removeAll()
         stateLock.unlock()
         guard !already else { return }
+        deadlineLock.lock()
+        mountDeadline.cancel()
+        let deadlineWork = mountDeadlineWorkItem
+        mountDeadlineWorkItem = nil
+        deadlineLock.unlock()
+        deadlineWork?.cancel()
         stream.cancel()
         listener?.cancel()
         open.forEach { $0.cancel() }
@@ -338,7 +378,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// Poll `probe` until it yields a value, the deadline passes, the server is invalidated, or the remux
     /// FAILS (its classify fail-fast / mid-stream error). Returns nil on every non-success path; the caller
     /// answers 404 and AVPlayer's error path drives the libmpv demotion.
-    private func waitFor<T>(seconds: TimeInterval, _ probe: () -> T?) -> T? {
+    private func waitForResource<T>(seconds: TimeInterval, _ probe: () -> T?) -> T? {
         let end = Date().addingTimeInterval(seconds)
         while Date() < end {
             if isInvalidated { return nil }
@@ -349,13 +389,56 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         return probe()
     }
 
+    /// Poll within the one server-owned monotonic mount-to-ready budget. A stage may have a smaller local cap,
+    /// but no stage can reset or extend the absolute 30-second deadline. The hard edge never performs a final
+    /// probe after expiry, so playlist publication cannot race a timeout that already won.
+    private func waitForMount<T>(maximumStageSeconds: TimeInterval? = nil,
+                                 _ probe: () -> T?) -> T? {
+        let started = ProcessInfo.processInfo.systemUptime
+        let stageDeadline = maximumStageSeconds.flatMap { maximum -> TimeInterval? in
+            guard maximum.isFinite, maximum > 0 else { return nil }
+            return started + maximum
+        }
+        while true {
+            let now = ProcessInfo.processInfo.systemUptime
+            let remaining = remainingMountBudget(now: now)
+            guard remaining > 0, !isInvalidated else { return nil }
+            if let value = probe() { return value }
+            if stream.buffer.status().failure != nil { return nil }
+            if let stageDeadline, now >= stageDeadline { return probe() }
+            let stageRemaining = stageDeadline.map { max(0, $0 - now) } ?? .infinity
+            Thread.sleep(forTimeInterval: min(0.1, remaining, stageRemaining))
+        }
+    }
+
+    private func remainingMountBudget(now: TimeInterval = ProcessInfo.processInfo.systemUptime)
+        -> TimeInterval {
+        deadlineLock.lock()
+        let result = mountDeadline.remaining(now: now)
+        deadlineLock.unlock()
+        if result.didExpire { handleMountTimeout() }
+        return result.seconds
+    }
+
+    private func expireMountIfNeeded() {
+        _ = remainingMountBudget()
+    }
+
+    private func handleMountTimeout() {
+        DiagnosticsLog.log(
+            "dv", "hls_mount_to_ready_timeout count=1 waitedMs=30000 -> fail-soft")
+        stream.failHLS("HLS mount did not reach AVPlayer readyToPlay within 30 seconds")
+        invalidate()
+        onStartupTimeout(self)
+    }
+
     // MARK: - Resources
 
     /// Master playlist: TWO variants (DV -> media.m3u8, lifeboat -> media-hdr.m3u8, #143). Held until the
     /// remux has classified the source
     /// and written its header (the signaling exists from then on).
     private func serveMaster(_ connection: NWConnection) {
-        guard let sig = waitFor(seconds: Self.resourceWaitSeconds, { stream.hlsSnapshot().signaling }) else {
+        guard let sig = waitForMount({ stream.hlsSnapshot().signaling }) else {
             DiagnosticsLog.log("dv", "hls 404 /master.m3u8")
             close(connection, status: "404 Not Found")
             return
@@ -391,7 +474,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             }
             DiagnosticsLog.log("dv", "remux classify confirmed DV -> requested Dolby Vision display mode before mount (fps=\(String(format: "%.3f", dvFps)) \(dvWidth)x\(dvHeight))")
         }
-        if switched.wait(timeout: .now() + 2) == .timedOut {   // bounded: a wedged main must not hang the serve task
+        let switchBudget = min(2, remainingMountBudget())
+        if switchBudget <= 0 || switched.wait(timeout: .now() + switchBudget) == .timedOut {
             DiagnosticsLog.log("dv", "DV display switch request not confirmed within 2s (main queue busy); the switch may land after the master is served")
         }
         }   // end sig.dolbyVision (#147)
@@ -402,24 +486,32 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         // lifeboat (HDR10 output) for the whole title. Bounded and fail-OPEN: on timeout the lifeboat still
         // guarantees a playable variant. HDRDisplayMode.isSwitchSettled is always true on iOS/macOS and
         // whenever Match Dynamic Range never started a switch, so this is a no-op except on the tvOS DV path.
-        _ = waitFor(seconds: 6) { HDRDisplayMode.isSwitchSettled ? true : nil }
+        _ = waitForMount(maximumStageSeconds: 6) {
+            HDRDisplayMode.isSwitchSettled ? true : nil
+        }
 
         // Alternate qualification is hard-bounded and fail-open. Once this step finishes, the common startup
         // gate below treats the resulting topology as immutable: every advertised rendition must contribute
         // the same absolute startup IDs before the master can expose it.
         var featureSnapshot = stream.hlsWindowSnapshot()
         if featureSnapshot.audioState == .pending {
-            if let resolved = waitFor(seconds: MultiAudioPolicy.alternateStartupWaitSeconds, {
+            if let resolved = waitForMount(
+                maximumStageSeconds: MultiAudioPolicy.alternateStartupWaitSeconds, {
                 let snapshot = stream.hlsWindowSnapshot()
                 return snapshot.audioState == .pending ? nil : snapshot
             }) {
                 featureSnapshot = resolved
             } else {
+                guard remainingMountBudget() > 0 else {
+                    DiagnosticsLog.log("dv", "hls 404 /master.m3u8")
+                    close(connection, status: "404 Not Found")
+                    return
+                }
                 stream.omitPendingAlternateAudioOnTimeout()
                 featureSnapshot = stream.hlsWindowSnapshot()
             }
         }
-        guard let publication = waitFor(seconds: Self.resourceWaitSeconds, {
+        guard let publication = waitForMount({
             self.prepareMasterPublication()
         }) else {
             if !isInvalidated, stream.buffer.status().failure == nil {
@@ -455,9 +547,6 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
     }
 
-    private static let minimumStartupSegments = 6
-    private static let minimumStartupDurationMilliseconds = 15_000
-
     /// Freeze the shortest absolute-zero cohort that satisfies every rendition's rendered-duration floor.
     /// The master is the topology publication edge, so subtitle WebVTT resources are materialized and every
     /// required durable key is rechecked before the topology becomes visible.
@@ -488,11 +577,16 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                   let subtitleWindow = snapshot.subtitleWindow else { return nil }
             requiredWindows.append(subtitleWindow)
         }
+        guard requiredWindows.allSatisfy(windowConformsToFrozenTarget) else {
+            stream.failHLS("HLS rendition interval exceeded the frozen target before master publication")
+            return nil
+        }
         guard let cohort = DVPlaybackPolicy.pinnedStartupCohort(
             windows: requiredWindows,
             ended: snapshot.ended,
-            minimumSegmentCount: Self.minimumStartupSegments,
-            minimumRenderedDurationMilliseconds: Self.minimumStartupDurationMilliseconds) else { return nil }
+            minimumSegmentCount: startupReadiness.minimumSegmentCount,
+            minimumRenderedDurationMilliseconds:
+                startupReadiness.minimumRenderedDurationMilliseconds) else { return nil }
         let ids = cohort.window.segments.map(\.id)
         guard exactWindow(snapshot.window, ids: ids) != nil else { return nil }
         let audioWindow = audioPlan == nil ? nil : snapshot.audioWindow.flatMap { exactWindow($0, ids: ids) }
@@ -555,7 +649,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         guard shouldLog else { return }
         DiagnosticsLog.log(
             "dv",
-            "hls_startup_cohort_timeout waitedMs=60000 requiredCount=6 requiredDurationMs=15000 actualCount=\(progress.count) actualDuration=\(progress.durationMilliseconds)")
+            "hls_startup_cohort_timeout waitedMs=30000 requiredCount=\(startupReadiness.minimumSegmentCount) requiredDurationMs=\(startupReadiness.minimumRenderedDurationMilliseconds) actualCount=\(progress.count) actualDuration=\(progress.durationMilliseconds)")
     }
 
     private func startupCommonProgress() -> (count: Int, durationMilliseconds: Int) {
@@ -616,6 +710,10 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 }
                 requiredWindows.append(subtitleWindow)
             }
+            guard requiredWindows.allSatisfy(windowConformsToFrozenTarget) else {
+                stream.failHLS("HLS rendition interval exceeded the frozen target before playlist publication")
+                return nil
+            }
             guard let common = greatestCommonContiguousWindow(
                 windows: requiredWindows,
                 startingAt: current.mediaSequence),
@@ -631,15 +729,16 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 && (snapshot.subtitleWindow == nil
                     || common.segments.last?.id == snapshot.subtitleWindow?.segments.last?.id)
             if commonReachedEOF,
-               (common.segments.count < Self.minimumStartupSegments
+               (common.segments.count < startupReadiness.minimumSegmentCount
                 || (DVPlaybackPolicy.renderedDurationMilliseconds(of: common) ?? 0)
-                    < Self.minimumStartupDurationMilliseconds) {
+                    < startupReadiness.minimumRenderedDurationMilliseconds) {
                 selectedVideo = common
             } else {
                 guard let suffix = DVPlaybackPolicy.minimumConformingSuffix(
                     window: common,
-                    minimumSegmentCount: Self.minimumStartupSegments,
-                    minimumRenderedDurationMilliseconds: Self.minimumStartupDurationMilliseconds) else {
+                    minimumSegmentCount: startupReadiness.minimumSegmentCount,
+                    minimumRenderedDurationMilliseconds:
+                        startupReadiness.minimumRenderedDurationMilliseconds) else {
                     return nil
                 }
                 selectedVideo = suffix
@@ -672,6 +771,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     }
 
     private func topologyMatches(_ snapshot: VortXMKVRemuxStream.HLSWindowSnapshot) -> Bool {
+        guard snapshot.frozenTarget == startupReadiness.frozenTarget else { return false }
         guard snapshot.signaling?.dolbyVision == advertisedDolbyVision else { return false }
         if let advertisedAudioPlan {
             guard snapshot.audioPlan == advertisedAudioPlan,
@@ -682,6 +782,14 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             return false
         }
         return true
+    }
+
+    private func windowConformsToFrozenTarget(_ window: VortXHLSWindow) -> Bool {
+        window.segments.allSatisfy {
+            VortXHLSTargetPolicy.accepts(
+                intervalSeconds: $0.duration,
+                frozenTargetSeconds: startupReadiness.frozenTarget.seconds)
+        }
     }
 
     private func recordPublication(videoWindow: VortXHLSWindow,
@@ -756,7 +864,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         let hdrAdvertised = advertisedDolbyVision
         publicationLock.unlock()
         guard !hdr || hdrAdvertised,
-              let publication = waitFor(seconds: Self.resourceWaitSeconds, {
+              let publication = waitForResource(seconds: Self.resourceWaitSeconds, {
                   self.currentPublication()
               }) else {
             DiagnosticsLog.log("dv", "hls 404 \(path)")
@@ -768,7 +876,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
-        let body = Self.buildMediaBody(
+        let body = buildMediaBody(
             window: publication.videoWindow,
             ended: publication.ended,
             mapURI: hdr ? "init-hdr.mp4" : "init.mp4")
@@ -777,9 +885,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     }
 
     /// Pure rendering of the exact immutable storage window used for request lookup.
-    private static func buildMediaBody(window: VortXHLSWindow, ended: Bool, mapURI: String) -> Data {
+    private func buildMediaBody(window: VortXHLSWindow, ended: Bool, mapURI: String) -> Data {
         let lines = DVPlaybackPolicy.mediaPlaylistLines(window: window, ended: ended,
-            targetDuration: VortXMKVRemuxStream.hlsTargetDuration, mapURI: mapURI)
+            targetDuration: startupReadiness.frozenTarget.seconds, mapURI: mapURI)
         return Data(lines.joined(separator: "\n").utf8)
     }
 
@@ -788,7 +896,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// whichever exists implies both do (the nil-coalesce is a belt-and-braces fallback, not a lane).
     private func serveInit(_ connection: NWConnection, hdr: Bool) {
         let path = hdr ? "/init-hdr.mp4" : "/init.mp4"
-        let initData = waitFor(seconds: Self.resourceWaitSeconds) { () -> Data? in
+        let initData = waitForResource(seconds: Self.resourceWaitSeconds) { () -> Data? in
             let snap = stream.hlsSnapshot()
             return hdr ? (snap.initDataHDR ?? snap.initData) : snap.initData
         }
@@ -816,7 +924,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     // MARK: - Optional aligned audio rendition
 
     private func serveAudioPlaylist(_ connection: NWConnection, renditionID: Int) {
-        guard let publication = waitFor(seconds: Self.resourceWaitSeconds, {
+        guard let publication = waitForResource(seconds: Self.resourceWaitSeconds, {
             self.currentPublication()
         }), publication.audioPlan?.alternate.id == renditionID,
               let window = publication.audioWindow else {
@@ -827,7 +935,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             renditionID: renditionID,
             window: window,
             ended: publication.ended,
-            targetDuration: VortXMKVRemuxStream.hlsTargetDuration)
+            targetDuration: startupReadiness.frozenTarget.seconds)
         let body = Data(lines.joined(separator: "\n").utf8)
         DiagnosticsLog.log("dv", "hls resp /audio\(renditionID).m3u8 seq=\(window.mediaSequence) segs=\(window.segments.count)")
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
@@ -866,7 +974,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     // MARK: - Optional settled subtitle renditions
 
     private func serveSubtitlePlaylist(_ connection: NWConnection, renditionID: Int) {
-        guard let publication = waitFor(seconds: Self.resourceWaitSeconds, {
+        guard let publication = waitForResource(seconds: Self.resourceWaitSeconds, {
             self.currentPublication()
         }), publication.subtitles.contains(where: { $0.id == renditionID }),
               let window = publication.subtitleWindow else {
@@ -877,7 +985,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             renditionID: renditionID,
             window: window,
             ended: publication.ended,
-            targetDuration: VortXMKVRemuxStream.hlsTargetDuration)
+            targetDuration: startupReadiness.frozenTarget.seconds)
         respond(connection,
                 body: Data(lines.joined(separator: "\n").utf8),
                 contentType: "application/vnd.apple.mpegurl")

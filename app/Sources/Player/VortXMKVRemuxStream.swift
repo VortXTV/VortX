@@ -64,6 +64,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private let input: String
     private let headers: [String: String]?
     private let mode: Mode
+    /// Frozen once during construction. Current production deliberately has no validated complete index, so
+    /// every mount uses the conservative 12-second authority for its whole lifetime.
+    private let hlsTarget: VortXHLSFrozenTarget
     /// One cross-rendition disk coordinator for every closed video, alternate-audio and rendered subtitle
     /// resource in this playback. nil only on the legacy non-HLS delivery or an initialization failure.
     private let hlsSpool: VortXHLSSessionSpool?
@@ -123,6 +126,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         self.headers = headers
         self.hlsIndexingEnabled = indexForHLS
         self.mode = mode
+        self.hlsTarget = VortXHLSTargetPolicy.freeze(indexEvidence: nil)!
         self.requestedOriginSeconds = RemuxResumePolicy.isEnabledByDefault
             ? RemuxResumePolicy.originRequest(resumeSeconds: startAtSeconds)
             : 0
@@ -135,6 +139,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     // MARK: - HLS output index (b166; populated only when `hlsIndexingEnabled`)
 
     typealias HLSSegment = VortXHLSSegment
+
+    var hlsTargetDuration: Int { hlsTarget.seconds }
+    var frozenHLSTarget: VortXHLSFrozenTarget { hlsTarget }
 
     /// What the master playlist needs to advertise so tvOS engages TRUE Dolby Vision: the RFC-6381 codec
     /// strings, the DV SUPPLEMENTAL-CODECS compatibility brand, and VIDEO-RANGE. Apple's HLS authoring spec
@@ -319,6 +326,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let subtitleCues: [[SubtitleRenditionPolicy.Cue]]
         let subtitleWindow: VortXHLSWindow?
         let subtitleFailureReason: SubtitleRenditionPolicy.InvalidationReason?
+        let frozenTarget: VortXHLSFrozenTarget
     }
 
     /// One immutable playlist/request view. The absolute resident video window is the base. Alternate audio
@@ -388,7 +396,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             subtitleRenditions: subtitleValid ? _subtitleRenditions : [],
             subtitleCues: subtitleValid ? _subtitleCues : [],
             subtitleWindow: subtitleWindow,
-            subtitleFailureReason: _subtitleSettlement.invalidationReason)
+            subtitleFailureReason: _subtitleSettlement.invalidationReason,
+            frozenTarget: hlsTarget)
     }
 
     /// Monotonic mount-progress counters for the chrome's PROGRESS-AWARE start watchdog. Every field only
@@ -445,14 +454,6 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var hlsVideoEndState = MultiAudioPolicy.MediaEndState()
     private var hlsSignaledVideoFrameDuration: Double?
     private static let hlsTargetSegmentSecs = 1.0   // cut at the first keyframe past this
-    private static let hlsMaxSegmentSecs = 4.0      // hard cut so one long GOP cannot outgrow TARGETDURATION
-    /// Byte-size hard cut: the producer parks once (windowFloor + producerLead) bytes are resident, and only
-    /// PUBLISHED (closed) segments are readable, so an open segment must never be able to swallow the whole
-    /// producer lead (64 MiB) or the pipeline would stall un-publishable at extreme bitrates. 32 MiB keeps
-    /// the open tail comfortably under the lead; at sane bitrates the time cuts always fire first.
-    private static let hlsMaxSegmentBytes = 32 << 20
-    /// The playlist's EXT-X-TARGETDURATION: must be >= every EXTINF and stay constant across reloads.
-    static let hlsTargetDuration = 5
     /// Init-starve guard (#76/#134): if a moov size-0 placeholder is located but its size backpatch never
     /// lands within this window while packets still flow, the init is starved and the mount is dead; fail so
     /// the demotion runs in ~1s rather than at the start watchdog. With the pre-init cut gate (#134) the only
@@ -2453,28 +2454,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // keeps T=3 alive when T=6 arrives and prevents either key from replacing the other.
         let logicalStart = hlsPendingBoundaries.logicalSegmentStartSeconds ?? publishedStart
         let elapsed = sec - logicalStart
-        let openBytes = buffer.producedCount - (hlsSegmentStartByte ?? 0)
         let decision = VortXHLSBoundaryPolicy.decision(
             hasOpenSegment: true,
             incomingIsIDR: isIDR,
             incomingHasKeyFlag: hasKeyFlag,
             elapsed: elapsed,
-            openBytes: openBytes,
             targetSeconds: Self.hlsTargetSegmentSecs,
-            maximumSeconds: Self.hlsMaxSegmentSecs,
-            maximumBytes: Self.hlsMaxSegmentBytes)
-        let mayDeferHardLimitFailure = VortXHLSBoundaryPolicy.mayDeferHardLimitFailure(
-            hasOpenSegment: true,
-            incomingIsIDR: isIDR,
-            incomingHasKeyFlag: hasKeyFlag,
-            elapsed: elapsed,
-            openBytes: openBytes,
-            targetSeconds: Self.hlsTargetSegmentSecs,
-            maximumSeconds: Self.hlsMaxSegmentSecs,
-            maximumBytes: Self.hlsMaxSegmentBytes)
-        switch hlsPendingBoundaries.effectiveBoundaryDecision(
-            decision,
-            deferHardLimitFailure: mayDeferHardLimitFailure) {
+            frozenTargetSeconds: Double(hlsTarget.seconds))
+        switch decision {
         case .open:
             return HLSVideoStep(seconds: sec, boundary: nil, failure: nil)
         case .continueOpen:
@@ -2483,7 +2470,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             return HLSVideoStep(
                 seconds: sec,
                 boundary: nil,
-                failure: "HLS segment hard limit reached before matching IDR NAL and key-flag evidence")
+                failure: "HLS newest segment interval exceeded frozen target duration")
         case .cut:
             break
         }
@@ -2535,7 +2522,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             initMayPublishMedia: { hlsInitState.mayPublishMedia },
             allowPostInitDrain: allowPostInitDrain,
             incompleteIsTerminal: incompleteIsTerminal,
-            proveNextFragment: { hlsParserProvenSegmentEndByte() },
+            proveNextFragment: { hlsParserProvenFirstSegmentEndByte() },
             performPostInitDrain: {
                 // The state machine invokes this closure only after init publication and only after the parser
                 // reports an incomplete candidate. No production or test caller owns a second drain decision.
@@ -2606,6 +2593,28 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         return endByte > segStartByte && endByte <= candidateEnd ? endByte : nil
     }
 
+    /// Publication-only proof for the FIFO head. Unlike the aggregate parser above, this returns the first
+    /// complete parser-proven fragment and ignores any complete or partial successor bytes already produced.
+    private func hlsParserProvenFirstSegmentEndByte() -> Int? {
+        guard hlsIndexingEnabled,
+              hlsInitState.mayPublishMedia,
+              let segStartByte = hlsSegmentStartByte,
+              let videoTrackID = hlsVideoTrackID,
+              let outputVideoFormat = hlsOutputVideoFormat else { return nil }
+        let candidateEnd = buffer.producedCount
+        guard candidateEnd > segStartByte,
+              let candidate = buffer.snapshotChunk(
+                  offset: segStartByte, length: candidateEnd - segStartByte),
+              let mediaProof = VortXFMP4FragmentParser.proveFirstMediaFragment(
+                  candidate, trackID: videoTrackID, requireFirstSampleSync: true),
+              VortXVideoIDRClassifier.isIDR(
+                  bytes: [UInt8](mediaProof.firstSampleBytes),
+                  codec: outputVideoFormat.codec,
+                  format: outputVideoFormat.packetFormat) else { return nil }
+        let endByte = segStartByte + mediaProof.mediaEnd
+        return endByte > segStartByte && endByte <= candidateEnd ? endByte : nil
+    }
+
     /// Publish the open segment as CLOSED (byte range + exact duration). Only closed segments appear in the
     /// media playlist, so a segment's bytes are always fully produced before AVPlayer can request them.
     private func hlsCloseSegment(endSec: Double,
@@ -2628,7 +2637,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             return false
         }
         let duration = endSec - startSec
-        guard duration.isFinite, duration > 0 else { return false }
+        guard VortXHLSTargetPolicy.accepts(
+            intervalSeconds: duration,
+            frozenTargetSeconds: hlsTarget.seconds) else {
+            buffer.fail("HLS video interval exceeded frozen target before publication")
+            return false
+        }
         hlsLock.lock()
         let idx = _hlsSegments.count
         let audioMuxer = _alternateAudioMuxer
@@ -2656,6 +2670,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         ]
         if let audioResource, audioResource.segmentID == idx, let audioMuxer {
             let audioDuration = audioResource.decodeEnd - audioResource.decodeStart
+            guard VortXHLSTargetPolicy.accepts(
+                intervalSeconds: audioDuration,
+                frozenTargetSeconds: hlsTarget.seconds) else {
+                buffer.fail("HLS alternate-audio interval exceeded frozen target before publication")
+                return false
+            }
             let renderedAudio = VortXHLSSegment(
                 id: idx,
                 byteOffset: audioResource.byteOffset,
@@ -2696,13 +2716,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             _ = audioMuxer.buffer.discardDurablyBackedPrefix(
                 before: audioResource.byteOffset + audioResource.byteLength)
         }
-        // Startup-timing breadcrumbs for the progress-aware start watchdog trail: the media playlist's first
-        // answer is HELD until minStartupSegments (2) exist, so these two lines put the exact time-to-serve
-        // in every device log (the demote-vs-extend decision is judged against them). One-shot each.
+        // Early-segment timing breadcrumbs for the mount-deadline trail. These first two one-shot lines retain
+        // useful production timing evidence without claiming that either segment alone opens the startup gate.
         if idx <= 1 {
             let elapsed = String(format: "%.1f", Date().timeIntervalSince(mountedAt))
             let media = String(format: "%.2f", duration)
-            DiagnosticsLog.log("dv", "hls media segment \(idx) published +\(elapsed)s after mount (\(endByte - segStartByte)B, \(media)s media)\(idx == 1 ? " -> startup playlist gate open" : "")")
+            DiagnosticsLog.log("dv", "hls media segment \(idx) published +\(elapsed)s after mount (\(endByte - segStartByte)B, \(media)s media)")
         }
         return true
     }
@@ -2730,6 +2749,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             return
         }
         let duration = resource.decodeEnd - resource.decodeStart
+        guard VortXHLSTargetPolicy.accepts(
+            intervalSeconds: duration,
+            frozenTargetSeconds: hlsTarget.seconds) else {
+            buffer.fail("HLS alternate-audio interval exceeded frozen target before publication")
+            return
+        }
         let rendered = VortXHLSSegment(
             id: resource.segmentID,
             byteOffset: resource.byteOffset,

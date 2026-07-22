@@ -83,13 +83,11 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// Total bytes produced so far across the whole session (monotonic; NOT storage.count once eviction starts).
     private(set) var producedCount: Int = 0
 
-    /// Design minimum for the re-read window, in MiB: two full HLS segments' worth, i.e. 2 x
-    /// VortXMKVRemuxStream.hlsMaxSegmentBytes (2 x 32 MiB = 64). Keep in lockstep with that constant. This is the
-    /// worst-case concurrent two-segment read skew, so any floor below it can evict a range that is still being
-    /// served on an open connection: the reader's next request then falls below `storageBase`, the HLS
-    /// connection is cut, and AVPlayer demotes Dolby Vision to HDR10. The shipped RemoteConfig default
-    /// (`dvRemuxWindowMiB` = 64) is exactly this value, so this constant is a fleet no-op today; it exists only
-    /// so a pathological remote value can never starve the window below the two-segment minimum.
+    /// Design minimum for the in-memory re-read window, in MiB. This is not a segment-size limit: legal GOPs
+    /// may exceed the retired 32 MiB threshold. Active read leases independently prevent eviction beneath an
+    /// open response, while this floor keeps ordinary near-frontier re-reads from churning. The shipped
+    /// RemoteConfig default (`dvRemuxWindowMiB` = 64) is exactly this value, so the clamp is a fleet no-op today
+    /// and only protects against a pathological smaller remote value.
     private static let windowFloorMinMiB = 64
 
     /// The re-read floor (bytes): how many already-delivered bytes to keep behind the reader's low-water mark
@@ -109,10 +107,10 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     // the memory-constrained Apple TV. Resident RAM is bounded to (floor + lead). We run a REDUCED lead until
     // the engine reports first-frame readiness, so the pre-first-frame window cannot stack the full 64 MiB lead
     // into the shared jetsam budget at the exact moment mpv may be re-opening the same 4K stream on a demote;
-    // once ready, the full lead restores steady-state headroom. The 16 MiB reduced lead is not itself the
-    // operative bound against the 32 MiB open-segment cap: it is added on top of windowFloorBytes (at least
-    // 64 MiB), so the pre-ready CEILING stays at least 80 MiB published, comfortably above the 32 MiB
-    // open-segment cap plus init, and the publish pipeline cannot stall. ---
+    // once ready, the full lead restores steady-state headroom. The 16 MiB reduced lead is added on top of
+    // windowFloorBytes (at least 64 MiB), so the pre-ready resident ceiling stays at least 80 MiB. This is a
+    // capacity control only. With the obsolete 32 MiB open-segment limit retired, it does not prove that an
+    // arbitrarily large in-progress fragment cannot stall; that requires separate spill/staging work. ---
     private static let producerLeadPreReady = 16 * 1024 * 1024   // F3: reduced lead before first-frame readiness
     private static let producerLeadFull      = 64 * 1024 * 1024   // F3: full lead once the engine is ready
     /// Set once via `markEngineReady()` when AVPlayerEngine reports readyToPlay/first frame; guarded by
@@ -601,6 +599,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         case injectedRename
         case invalidRead
         case invalidLength
+        case invalidPermissions
     }
 
     private struct Entry {
@@ -692,8 +691,9 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
             requestScavenge: scavengeStaleSessions)
         self.sessionDirectory = joined.launch.appendingPathComponent(self.sessionName, isDirectory: true)
         do {
-            try FileManager.default.createDirectory(
-                at: sessionDirectory, withIntermediateDirectories: true)
+            try Self.ensureOwnerOnlyDirectory(parentDirectory)
+            try Self.ensureOwnerOnlyDirectory(joined.launch)
+            try Self.ensureOwnerOnlyDirectory(sessionDirectory)
         } catch {
             Self.launchRegistry.leave(parent: parentDirectory, sessionName: self.sessionName)
             registryJoined = false
@@ -818,9 +818,13 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         do {
             for item in staged {
                 notifyFileOperation()
-                guard FileManager.default.createFile(atPath: item.partURL.path, contents: nil) else {
+                guard FileManager.default.createFile(
+                    atPath: item.partURL.path,
+                    contents: nil,
+                    attributes: [.posixPermissions: NSNumber(value: 0o600)]) else {
                     throw SpoolError.invalidSource
                 }
+                try Self.ensureOwnerOnlyFile(item.partURL)
                 notifyFileOperation()
                 let handle = try FileHandle(forWritingTo: item.partURL)
                 do {
@@ -870,6 +874,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
                 }
                 notifyFileOperation()
                 try FileManager.default.moveItem(at: item.partURL, to: item.finalURL)
+                try Self.ensureOwnerOnlyFile(item.finalURL)
                 successfulMoves += 1
             }
             guard commit(
@@ -1241,6 +1246,32 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         let keepPath = launch.standardizedFileURL.path
         for child in children where child.standardizedFileURL.path != keepPath {
             try? FileManager.default.removeItem(at: child)
+        }
+    }
+
+    private static func ensureOwnerOnlyDirectory(_ url: URL) throws {
+        let permissions = NSNumber(value: 0o700)
+        try FileManager.default.createDirectory(
+            at: url,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: permissions])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: permissions], ofItemAtPath: url.path)
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let actual = attributes[.posixPermissions] as? NSNumber,
+              actual.intValue & 0o777 == 0o700 else {
+            throw SpoolError.invalidPermissions
+        }
+    }
+
+    private static func ensureOwnerOnlyFile(_ url: URL) throws {
+        let permissions = NSNumber(value: 0o600)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: permissions], ofItemAtPath: url.path)
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let actual = attributes[.posixPermissions] as? NSNumber,
+              actual.intValue & 0o777 == 0o600 else {
+            throw SpoolError.invalidPermissions
         }
     }
 }

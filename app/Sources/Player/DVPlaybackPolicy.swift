@@ -614,6 +614,47 @@ enum VortXFMP4FragmentParser {
             firstSampleBytes: firstSampleBytes)
     }
 
+    /// Proves exactly the first complete `moof` + following `mdat` at the front of a media range. Bytes for a
+    /// complete or partial successor fragment are deliberately ignored. The HLS publication FIFO uses this
+    /// narrower proof so one producer advance can never collapse two queued boundaries into one byte range.
+    /// Callers that need an aggregate EOF/media proof continue to use `proveMediaRange` above.
+    static func proveFirstMediaFragment(_ data: Data,
+                                        trackID: UInt32,
+                                        requireFirstSampleSync: Bool) -> MediaRangeProof? {
+        guard trackID != 0, !data.isEmpty else { return nil }
+        var cursor = data.startIndex
+        var pending: FragmentSummary?
+        while cursor < data.endIndex {
+            guard let box = box(in: data, start: cursor, limit: data.endIndex) else { return nil }
+            cursor = box.end
+            switch box.type {
+            case "styp", "sidx", "emsg", "prft", "free", "skip":
+                guard pending == nil else { return nil }
+            case "moof":
+                guard pending == nil,
+                      let summary = fragmentSummary(
+                          in: data, moof: box, trackID: trackID) else { return nil }
+                pending = summary
+            case "mdat":
+                guard let summary = pending,
+                      summary.firstSampleRange.lowerBound >= box.payload.lowerBound,
+                      summary.firstSampleRange.upperBound <= box.payload.upperBound else { return nil }
+                let firstSampleBytes = Data(data[summary.firstSampleRange])
+                guard !firstSampleBytes.isEmpty,
+                      !requireFirstSampleSync || summary.firstSampleIsSync == true else { return nil }
+                return MediaRangeProof(
+                    mediaEnd: box.end - data.startIndex,
+                    fragmentCount: 1,
+                    sampleCount: summary.sampleCount,
+                    firstSampleIsSync: summary.firstSampleIsSync,
+                    firstSampleBytes: firstSampleBytes)
+            default:
+                return nil
+            }
+        }
+        return nil
+    }
+
     private struct Box {
         let type: String
         let start: Data.Index
@@ -880,9 +921,149 @@ enum VortXAlternateAudioMovencPolicy {
     static let movflags = "empty_moov+default_base_moof+delay_moov+frag_every_frame"
 }
 
+struct VortXHLSKeyframeIndexEvidence: Equatable, Sendable {
+    enum Completeness: Equatable, Sendable {
+        case incomplete
+        case validatedComplete
+    }
+
+    let completeness: Completeness
+    let adjacentIntervalsSeconds: [Double]
+}
+
+struct VortXHLSFrozenTarget: Equatable, Sendable {
+    enum Authority: Equatable, Sendable {
+        case conservativeFallback
+        case validatedCompleteIndex
+    }
+
+    let seconds: Int
+    let authority: Authority
+}
+
+struct VortXHLSStartupReadiness: Equatable, Sendable {
+    let frozenTarget: VortXHLSFrozenTarget
+    let minimumSegmentCount: Int
+    let minimumRenderedDurationMilliseconds: Int
+
+    init?(frozenTarget: VortXHLSFrozenTarget, minimumSegmentCount: Int = 6) {
+        guard frozenTarget.seconds >= VortXHLSTargetPolicy.minimumSeconds,
+              frozenTarget.seconds <= VortXHLSTargetPolicy.conservativeSeconds,
+              minimumSegmentCount > 0 else { return nil }
+        let (threeTargets, targetOverflow) = frozenTarget.seconds.multipliedReportingOverflow(by: 3)
+        let (milliseconds, millisecondsOverflow) = threeTargets.multipliedReportingOverflow(by: 1_000)
+        guard !targetOverflow, !millisecondsOverflow else { return nil }
+        self.frozenTarget = frozenTarget
+        self.minimumSegmentCount = minimumSegmentCount
+        self.minimumRenderedDurationMilliseconds = milliseconds
+    }
+}
+
+/// Session target authority. FFmpeg indexes and container cues are not completeness proof, so current
+/// production passes no evidence and freezes the conservative value once for the entire mount.
+enum VortXHLSTargetPolicy {
+    static let minimumSeconds = 5
+    static let conservativeSeconds = 12
+
+    static func freeze(indexEvidence: VortXHLSKeyframeIndexEvidence?) -> VortXHLSFrozenTarget? {
+        guard let indexEvidence,
+              indexEvidence.completeness == .validatedComplete,
+              !indexEvidence.adjacentIntervalsSeconds.isEmpty else {
+            return VortXHLSFrozenTarget(
+                seconds: conservativeSeconds,
+                authority: .conservativeFallback)
+        }
+        var maximum = 0.0
+        for interval in indexEvidence.adjacentIntervalsSeconds {
+            guard interval.isFinite, interval > 0, interval <= Double(conservativeSeconds) else {
+                return nil
+            }
+            maximum = max(maximum, interval)
+        }
+        let rounded = Int(ceil(maximum))
+        guard rounded <= conservativeSeconds else { return nil }
+        return VortXHLSFrozenTarget(
+            seconds: max(minimumSeconds, rounded),
+            authority: .validatedCompleteIndex)
+    }
+
+    static func accepts(intervalSeconds: Double, frozenTargetSeconds: Int) -> Bool {
+        intervalSeconds.isFinite
+            && intervalSeconds > 0
+            && frozenTargetSeconds >= minimumSeconds
+            && frozenTargetSeconds <= conservativeSeconds
+            && intervalSeconds <= Double(frozenTargetSeconds)
+    }
+}
+
+/// Pure monotonic state machine for the one mount-to-ready deadline. Production supplies system uptime; tests
+/// supply exact timestamps so sequential waits, the exact expiry edge, and ready/timeout races are executable.
+struct VortXHLSMountDeadlineState: Equatable, Sendable {
+    enum Phase: Equatable, Sendable {
+        case idle
+        case running(deadline: TimeInterval)
+        case ready
+        case timedOut
+        case cancelled
+    }
+
+    static let productionDuration: TimeInterval = 30
+    private(set) var phase: Phase = .idle
+
+    mutating func start(now: TimeInterval,
+                        duration: TimeInterval = productionDuration) -> TimeInterval? {
+        guard case .idle = phase,
+              now.isFinite, duration.isFinite, duration > 0 else { return nil }
+        let deadline = now + duration
+        guard deadline.isFinite else { return nil }
+        phase = .running(deadline: deadline)
+        return deadline
+    }
+
+    /// Remaining shared wall budget. Returning zero transitions the state exactly once at `now >= deadline`.
+    mutating func remaining(now: TimeInterval) -> (seconds: TimeInterval, didExpire: Bool) {
+        guard now.isFinite else {
+            let didExpire = phase != .timedOut
+            phase = .timedOut
+            return (0, didExpire)
+        }
+        switch phase {
+        case .running(let deadline):
+            guard now < deadline else {
+                phase = .timedOut
+                return (0, true)
+            }
+            return (deadline - now, false)
+        case .idle, .timedOut, .cancelled:
+            return (0, false)
+        case .ready:
+            return (.infinity, false)
+        }
+    }
+
+    /// Ready wins only strictly before the deadline. `didExpire` tells the owner to run the one terminal edge.
+    mutating func markReady(now: TimeInterval) -> (accepted: Bool, didExpire: Bool) {
+        let budget = remaining(now: now)
+        guard budget.seconds > 0, case .running = phase else {
+            return (false, budget.didExpire)
+        }
+        phase = .ready
+        return (true, false)
+    }
+
+    mutating func cancel() {
+        switch phase {
+        case .idle, .running:
+            phase = .cancelled
+        case .ready, .timedOut, .cancelled:
+            break
+        }
+    }
+}
+
 /// Legal video segmentation decision shared by the FFmpeg owner and the standalone mutation harness. Every
-/// segment opens on the incoming packet, so segment zero and every cut packet must be IDR. The time/byte guards
-/// are safety limits, not permission to publish a non-decodable boundary.
+/// segment opens on the incoming packet, so segment zero and every cut packet must be IDR. A segment remains
+/// legal through the exact frozen target and fails soft only after the newest logical interval exceeds it.
 enum VortXHLSBoundaryPolicy {
     enum Decision: Equatable, Sendable {
         case open
@@ -895,43 +1076,20 @@ enum VortXHLSBoundaryPolicy {
                          incomingIsIDR: Bool,
                          incomingHasKeyFlag: Bool,
                          elapsed: Double,
-                         openBytes: Int,
                          targetSeconds: Double = 1,
-                         maximumSeconds: Double = 4,
-                         maximumBytes: Int = 32 * 1024 * 1024) -> Decision {
-        guard elapsed.isFinite, elapsed >= 0, openBytes >= 0,
+                         frozenTargetSeconds: Double = 12) -> Decision {
+        guard elapsed.isFinite, elapsed >= 0,
               targetSeconds.isFinite, targetSeconds > 0,
-              maximumSeconds.isFinite, maximumSeconds >= targetSeconds,
-              maximumBytes > 0 else { return .failSoft }
+              frozenTargetSeconds.isFinite,
+              frozenTargetSeconds >= targetSeconds,
+              frozenTargetSeconds <= Double(VortXHLSTargetPolicy.conservativeSeconds) else {
+            return .failSoft
+        }
         let hasConfirmedStart = incomingIsIDR && incomingHasKeyFlag
         guard hasOpenSegment else { return hasConfirmedStart ? .open : .failSoft }
-        let hardLimitReached = elapsed >= maximumSeconds || openBytes >= maximumBytes
-        if hardLimitReached { return hasConfirmedStart ? .cut : .failSoft }
+        guard elapsed <= frozenTargetSeconds else { return .failSoft }
         if hasConfirmedStart, elapsed >= targetSeconds { return .cut }
         return .continueOpen
-    }
-
-    /// A pending, already-confirmed cut may defer only the hard-limit failure caused by the next packet lacking
-    /// matching IDR and key-flag evidence. Invalid timing, byte, or limit inputs remain fail-closed.
-    static func mayDeferHardLimitFailure(
-        hasOpenSegment: Bool,
-        incomingIsIDR: Bool,
-        incomingHasKeyFlag: Bool,
-        elapsed: Double,
-        openBytes: Int,
-        targetSeconds: Double = 1,
-        maximumSeconds: Double = 4,
-        maximumBytes: Int = 32 * 1024 * 1024
-    ) -> Bool {
-        guard hasOpenSegment,
-              elapsed.isFinite, elapsed >= 0,
-              openBytes >= 0,
-              targetSeconds.isFinite, targetSeconds > 0,
-              maximumSeconds.isFinite, maximumSeconds >= targetSeconds,
-              maximumBytes > 0 else { return false }
-        let hardLimitReached = elapsed >= maximumSeconds || openBytes >= maximumBytes
-        let hasConfirmedStart = incomingIsIDR && incomingHasKeyFlag
-        return hardLimitReached && !hasConfirmedStart
     }
 
     static func timestampSeconds(dts: Int64?,
@@ -1025,13 +1183,6 @@ final class VortXHLSPendingPublicationMachine<Payload> {
         guard let index = storage.firstIndex(where: { $0.segmentID == segmentID }) else { return false }
         storage[index].payload = payload
         return true
-    }
-
-    func effectiveBoundaryDecision(
-        _ decision: VortXHLSBoundaryPolicy.Decision,
-        deferHardLimitFailure: Bool
-    ) -> VortXHLSBoundaryPolicy.Decision {
-        hasPendingBoundary && deferHardLimitFailure && decision == .failSoft ? .continueOpen : decision
     }
 
     /// Runs the complete pending-publication transition against caller-owned side effects. The machine asks for

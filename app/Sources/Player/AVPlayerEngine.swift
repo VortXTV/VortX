@@ -305,7 +305,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         if wantsRemux, VortXRemuxHLSServer.deliveryEnabled,
            let mounted = VortXRemuxHLSServer.make(input: url, headers: headers,
                                                   mode: wantsPlainRemux ? .plain : .dolbyVision,
-                                                  startAtSeconds: requestedRemuxOrigin) {
+                                                  startAtSeconds: requestedRemuxOrigin,
+                                                  onStartupTimeout: { [weak self] timedOutServer in
+                Task { @MainActor [weak self] in
+                    self?.handleRemuxStartupTimeout(
+                        timedOutServer, loadToken: issuedToken)
+                }
+            }) {
             remuxHLSServer = mounted.server
             mounted.server.start()
             newAsset = AVURLAsset(url: mounted.playlistURL)
@@ -1190,15 +1196,32 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     }
     #endif
 
+    private func handleRemuxStartupTimeout(_ timedOutServer: VortXRemuxHLSServer,
+                                           loadToken: PlayerLoadToken) {
+        guard remuxHLSServer === timedOutServer,
+              activeLoadToken == loadToken,
+              !isReady,
+              !fatalErrorEmitted else { return }
+        fatalErrorEmitted = true
+        DiagnosticsLog.log(
+            "dv", "HLS mount-to-ready deadline expired -> endFileError demote")
+        emit(
+            MPVProperty.endFileError,
+            "HLS remux did not become ready within 30 seconds",
+            loadToken: loadToken)
+    }
+
     private func handleStatus(_ item: AVPlayerItem, loadToken: PlayerLoadToken) {
         guard owns(item, loadToken: loadToken) else { return }
         switch item.status {
         case .readyToPlay:
+            if let server = remuxHLSServer, !server.markEngineReady() {
+                return
+            }
             isReady = true
             // F3: the engine has a decodable first frame. Widen the remux producer lead from the reduced
             // pre-ready value to the full lead now that the pre-first-frame co-resident window (when a demote
             // may re-open the same 4K stream on libmpv) is past. No-op on a non-remux item.
-            remuxHLSServer?.markEngineReady()
             remuxLoader?.markEngineReady()
             // Latch the achieved base-video origin before reporting any position or resolving a pending seek.
             // The input seek may land on an earlier keyframe, so this authoritative value can differ slightly

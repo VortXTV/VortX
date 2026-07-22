@@ -264,6 +264,7 @@ private struct PendingInitBoundaryResult {
     let nextLogicalSegmentStartedAtThree: Bool
     let invalidPendingInputStayedFailClosed: Bool
     let consumedSegmentIDs: [Int]
+    let publishedByteEndpoints: [Int]
     let firstConsumedAudioToken: String?
     let parserIncompleteCandidateStayedUnpublished: Bool
     let preInitInterleaveDrainCount: Int
@@ -272,7 +273,6 @@ private struct PendingInitBoundaryResult {
     let pendingCountBeforeFirstPostInitDrain: Int?
     let producedBytesBeforeFirstPostInitDrain: Int?
     let producedBytesAfterFirstPostInitDrain: Int?
-    let progressAfterDrainRetainedNextBoundary: Bool
     let finalPublishedStartSeconds: Double
     let nextSegmentID: Int
 }
@@ -539,8 +539,7 @@ private func runScenario(_ config: ScenarioConfig,
                 hasOpenSegment: hasOpenSegment,
                 incomingIsIDR: parsedIDR,
                 incomingHasKeyFlag: event.keyFlag,
-                elapsed: hasOpenSegment ? seconds - segmentStartSeconds : 0,
-                openBytes: 0)
+                elapsed: hasOpenSegment ? seconds - segmentStartSeconds : 0)
             switch decision {
             case .open:
                 hasOpenSegment = true
@@ -764,6 +763,7 @@ private func runPendingInitBoundaryScenario(
     var videoTrackID: UInt32?
     let pending = VortXHLSPendingPublicationMachine<String?>()
     var consumedSegmentIDs: [Int] = []
+    var publishedByteEndpoints: [Int] = []
     var firstConsumedAudioToken: String?
     var initWasDelayedAtThree = false
     var retainedThreeAfterItsWrite = false
@@ -778,7 +778,6 @@ private func runPendingInitBoundaryScenario(
     var pendingCountBeforeFirstPostInitDrain: Int?
     var producedBytesBeforeFirstPostInitDrain: Int?
     var producedBytesAfterFirstPostInitDrain: Int?
-    var progressAfterDrainRetainedNextBoundary = false
     var eventOrdinal = 0
     var initPublicationOrdinal: Int?
     var segmentPublicationOrdinals: [Int] = []
@@ -817,7 +816,7 @@ private func runPendingInitBoundaryScenario(
                 let capture = Data(sink.bytes)
                 guard startByte < capture.count else { return nil }
                 let candidate = Data(capture[startByte..<capture.count])
-                guard let proof = VortXFMP4FragmentParser.proveMediaRange(
+                guard let proof = VortXFMP4FragmentParser.proveFirstMediaFragment(
                     candidate, trackID: trackID, requireFirstSampleSync: true),
                       packetIsIDR(proof.firstSampleBytes) else { return nil }
                 if !parserIncompleteCandidateStayedUnpublished, proof.mediaEnd > 1 {
@@ -831,7 +830,7 @@ private func runPendingInitBoundaryScenario(
                         initMayPublishMedia: { true },
                         allowPostInitDrain: false,
                         proveNextFragment: {
-                            VortXFMP4FragmentParser.proveMediaRange(
+                            VortXFMP4FragmentParser.proveFirstMediaFragment(
                                 incomplete,
                                 trackID: trackID,
                                 requireFirstSampleSync: true)?.mediaEnd
@@ -878,6 +877,7 @@ private func runPendingInitBoundaryScenario(
                 segmentPublicationOrdinals.append(eventOrdinal)
                 if firstConsumedAudioToken == nil { firstConsumedAudioToken = consumed.payload }
                 consumedSegmentIDs.append(consumed.segmentID)
+                publishedByteEndpoints.append(provenEndByte)
                 publishedStartSeconds = consumed.endSeconds
                 publishedStartByte = provenEndByte
                 return true
@@ -890,22 +890,12 @@ private func runPendingInitBoundaryScenario(
         if event.kind == .video {
             let logicalStart = pending.logicalSegmentStartSeconds ?? publishedStartSeconds
             let parsedIDR = packetIsIDR(event.packet.bytes)
-            let openBytes = event.seconds == 4 ? 32 * 1024 * 1024 : 0
             let rawDecision = VortXHLSBoundaryPolicy.decision(
                 hasOpenSegment: hasOpenSegment,
                 incomingIsIDR: parsedIDR,
                 incomingHasKeyFlag: event.keyFlag,
-                elapsed: hasOpenSegment ? event.seconds - logicalStart : 0,
-                openBytes: openBytes)
-            let mayDeferHardLimitFailure = VortXHLSBoundaryPolicy.mayDeferHardLimitFailure(
-                hasOpenSegment: hasOpenSegment,
-                incomingIsIDR: parsedIDR,
-                incomingHasKeyFlag: event.keyFlag,
-                elapsed: hasOpenSegment ? event.seconds - logicalStart : 0,
-                openBytes: openBytes)
-            switch pending.effectiveBoundaryDecision(
-                rawDecision,
-                deferHardLimitFailure: mayDeferHardLimitFailure) {
+                elapsed: hasOpenSegment ? event.seconds - logicalStart : 0)
+            switch rawDecision {
             case .open:
                 hasOpenSegment = true
                 publishedStartSeconds = event.seconds
@@ -967,13 +957,6 @@ private func runPendingInitBoundaryScenario(
         if case .failed(let failure) = advanceResult {
             throw HarnessError.failed("\(name): production pending machine failed \(failure)")
         }
-        if deferInitObservationUntilSix, event.seconds == 6 {
-            progressAfterDrainRetainedNextBoundary =
-                advanceResult == .waitingForFragment
-                && consumedSegmentIDs == [0]
-                && pending.first?.segmentID == 1
-        }
-
         if event.seconds == 3 {
             initWasDelayedAtThree = publishedStartByte == nil
             retainedThreeAfterItsWrite = pending.first?.segmentID == 0
@@ -982,20 +965,8 @@ private func runPendingInitBoundaryScenario(
                 hasOpenSegment: true,
                 incomingIsIDR: false,
                 incomingHasKeyFlag: false,
-                elapsed: -1,
-                openBytes: -1)
-            let invalidMayDefer = VortXHLSBoundaryPolicy.mayDeferHardLimitFailure(
-                hasOpenSegment: true,
-                incomingIsIDR: false,
-                incomingHasKeyFlag: false,
-                elapsed: -1,
-                openBytes: -1)
-            invalidPendingInputStayedFailClosed =
-                invalidDecision == .failSoft
-                && !invalidMayDefer
-                && pending.effectiveBoundaryDecision(
-                    invalidDecision,
-                    deferHardLimitFailure: invalidMayDefer) == .failSoft
+                elapsed: -1)
+            invalidPendingInputStayedFailClosed = invalidDecision == .failSoft
         }
     }
 
@@ -1025,6 +996,7 @@ private func runPendingInitBoundaryScenario(
         nextLogicalSegmentStartedAtThree: nextLogicalSegmentStartedAtThree,
         invalidPendingInputStayedFailClosed: invalidPendingInputStayedFailClosed,
         consumedSegmentIDs: consumedSegmentIDs,
+        publishedByteEndpoints: publishedByteEndpoints,
         firstConsumedAudioToken: firstConsumedAudioToken,
         parserIncompleteCandidateStayedUnpublished: parserIncompleteCandidateStayedUnpublished,
         preInitInterleaveDrainCount: preInitInterleaveDrainCount,
@@ -1033,7 +1005,6 @@ private func runPendingInitBoundaryScenario(
         pendingCountBeforeFirstPostInitDrain: pendingCountBeforeFirstPostInitDrain,
         producedBytesBeforeFirstPostInitDrain: producedBytesBeforeFirstPostInitDrain,
         producedBytesAfterFirstPostInitDrain: producedBytesAfterFirstPostInitDrain,
-        progressAfterDrainRetainedNextBoundary: progressAfterDrainRetainedNextBoundary,
         finalPublishedStartSeconds: publishedStartSeconds,
         nextSegmentID: consumedSegmentIDs.count)
     return result
@@ -1331,13 +1302,18 @@ private enum HLSFragmentPublicationIntegrationTests {
                          injectedFIFO.queuedThreeAndSixBeforeConsumption)
             checks.check("injected delayed observation: FIFO consumes both boundaries in exact order",
                          injectedFIFO.consumedSegmentIDs == [0, 1])
-            checks.check("injected delayed observation/parser latency: one real drain advances and retains next",
+            checks.check("injected delayed observation/parser latency: one real drain publishes two complete queued fragments separately",
                          injectedFIFO.postInitInterleaveDrainCount == 1
                              && injectedFIFO.consumedCountBeforeFirstPostInitDrain == 0
                              && injectedFIFO.pendingCountBeforeFirstPostInitDrain == 2
                              && (injectedFIFO.producedBytesAfterFirstPostInitDrain ?? 0)
                                  > (injectedFIFO.producedBytesBeforeFirstPostInitDrain ?? Int.max)
-                             && injectedFIFO.progressAfterDrainRetainedNextBoundary)
+                             && injectedFIFO.consumedSegmentIDs == [0, 1]
+                             && injectedFIFO.publishedByteEndpoints.count == 2
+                             && injectedFIFO.publishedByteEndpoints[0]
+                                 < injectedFIFO.publishedByteEndpoints[1]
+                             && injectedFIFO.publishedByteEndpoints[1]
+                                 <= (injectedFIFO.producedBytesAfterFirstPostInitDrain ?? 0))
             checks.check("injected delayed observation: init precedes both media publications",
                          injectedFIFO.publicationOrderWasInitFirst)
             checks.check("injected delayed observation: no pre-init nil drain occurs",
@@ -1359,6 +1335,50 @@ private enum HLSFragmentPublicationIntegrationTests {
                 checks.check("mutant first-traf shortcut executes and turns red",
                              mutantProof?.sampleCount == audioFirst.audioProof.sampleCount
                                  && mutantProof?.sampleCount != audioFirst.expectedVideoSamples)
+                let firstRange = audioFirst.mediaData
+                let secondRange = Data(audioFirst.nextMediaData.prefix(
+                    audioFirst.nextVideoProof.mediaEnd))
+                let twoCompleteRanges = firstRange + secondRange
+                let firstOnlyProof = VortXFMP4FragmentParser.proveFirstMediaFragment(
+                    twoCompleteRanges,
+                    trackID: audioFirst.videoTrackID,
+                    requireFirstSampleSync: true)
+                checks.check("first-fragment proof: two complete real movenc fragments return only the first endpoint",
+                             firstOnlyProof?.mediaEnd == firstRange.count
+                                 && firstOnlyProof?.fragmentCount == 1
+                                 && firstOnlyProof?.mediaEnd ?? 0 < twoCompleteRanges.count)
+                let completePlusPartial = firstRange + Data(secondRange.dropLast())
+                checks.check("first-fragment proof: a complete head ignores a partial real movenc successor",
+                             VortXFMP4FragmentParser.proveFirstMediaFragment(
+                                completePlusPartial,
+                                trackID: audioFirst.videoTrackID,
+                                requireFirstSampleSync: true)?.mediaEnd == firstRange.count)
+                let twoQueued = VortXHLSPendingPublicationMachine<Void>()
+                _ = twoQueued.append(segmentID: 0, startSeconds: 0, endSeconds: 3, payload: ())
+                _ = twoQueued.append(segmentID: 1, startSeconds: 3, endSeconds: 6, payload: ())
+                var byteFrontier = 0
+                var publishedEndpoints: [Int] = []
+                let twoQueuedResult = twoQueued.advance(
+                    initMayPublishMedia: { true },
+                    allowPostInitDrain: false,
+                    proveNextFragment: {
+                        let suffix = Data(twoCompleteRanges.dropFirst(byteFrontier))
+                        guard let proof = VortXFMP4FragmentParser.proveFirstMediaFragment(
+                            suffix,
+                            trackID: audioFirst.videoTrackID,
+                            requireFirstSampleSync: true) else { return nil as Int? }
+                        return byteFrontier + proof.mediaEnd
+                    },
+                    performPostInitDrain: { false },
+                    publish: { _, endpoint in
+                        guard endpoint > byteFrontier else { return false }
+                        byteFrontier = endpoint
+                        publishedEndpoints.append(endpoint)
+                        return true
+                    })
+                checks.check("first-fragment proof: one advance publishes two queued real fragments as distinct FIFO ranges",
+                             twoQueuedResult == .settled
+                                 && publishedEndpoints == [firstRange.count, twoCompleteRanges.count])
             }
             if let pressured = results.first(where: { $0.name == "high-bitrate byte pressure" }) {
                 checks.check("multi-MiB packet pressure: complete media range exceeds two MiB",
@@ -1369,22 +1389,25 @@ private enum HLSFragmentPublicationIntegrationTests {
                              hasOpenSegment: true,
                              incomingIsIDR: true,
                              incomingHasKeyFlag: false,
-                             elapsed: 1,
-                             openBytes: 1) == .continueOpen)
+                             elapsed: 1) == .continueOpen)
             checks.check("mutant key-flag-only acceptance turns red",
                          VortXHLSBoundaryPolicy.decision(
                              hasOpenSegment: true,
                              incomingIsIDR: false,
                              incomingHasKeyFlag: true,
-                             elapsed: 1,
-                             openBytes: 1) == .continueOpen)
-            checks.check("disagreement fails soft at the exact existing hard bound",
+                             elapsed: 1) == .continueOpen)
+            checks.check("non-IDR remains legal at the exact frozen target",
                          VortXHLSBoundaryPolicy.decision(
                              hasOpenSegment: true,
                              incomingIsIDR: true,
                              incomingHasKeyFlag: false,
-                             elapsed: 4,
-                             openBytes: 1) == .failSoft)
+                             elapsed: 12) == .continueOpen)
+            checks.check("non-IDR fails on the first positive delta beyond the frozen target",
+                         VortXHLSBoundaryPolicy.decision(
+                             hasOpenSegment: true,
+                             incomingIsIDR: true,
+                             incomingHasKeyFlag: false,
+                             elapsed: 12.000_001) == .failSoft)
             checks.check("mutant timestamp-less mux/publication turns red before any AVIO write",
                          timestampLessPublicationAttemptIsRejected(fixture: fixture))
             let alternate = try runAlternateAudioScenario(fixture: fixture)

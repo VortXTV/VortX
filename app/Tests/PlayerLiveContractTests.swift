@@ -46,6 +46,12 @@ private func scratchDirectory(_ label: String) -> URL {
     return url
 }
 
+private func posixMode(_ url: URL) -> Int? {
+    let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+    guard let permissions = attributes?[.posixPermissions] as? NSNumber else { return nil }
+    return permissions.intValue & 0o777
+}
+
 private func playlistSegmentIDs(_ lines: [String]) -> [Int] {
     lines.compactMap { line in
         guard line.hasPrefix("seg"), line.hasSuffix(".m4s") else { return nil }
@@ -75,6 +81,10 @@ private final class FakeDisplayManager {}
 private final class SpoolProbeState {
     var calls = 0
     var attemptedTrim = false
+}
+
+private final class SpoolPermissionProbeState {
+    var partMode: Int?
 }
 
 private final class ManualSegmentSender {
@@ -391,6 +401,40 @@ enum PlayerLiveContractTests {
         check("spool admission: rejection never evicts protected committed media",
               exact.contains(video0) && !exact.contains(video1) && exact.accounting.finalBytes == 8)
         let namesAfterFirstCommit = exact.fileNamesOnDisk
+        check("spool permissions: parent, launch and session directories are owner-only and traversable",
+              posixMode(root) == 0o700
+                  && posixMode(exact.sessionDirectory.deletingLastPathComponent()) == 0o700
+                  && posixMode(exact.sessionDirectory) == 0o700)
+        let committedURL = namesAfterFirstCommit.first.map {
+            exact.sessionDirectory.appendingPathComponent($0)
+        }
+        check("spool permissions: committed media is owner read-write only",
+              committedURL.flatMap(posixMode) == 0o600)
+        check("spool permissions: no staging part remains visible after atomic promotion",
+              !namesAfterFirstCommit.contains(where: { $0.hasSuffix(".part") }))
+
+        guard let permissionSpool = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 8,
+            chunkSize: 2,
+            scavengeStaleSessions: false) else {
+            check("spool permissions: live-part fixture is creatable", false)
+            return
+        }
+        let permissionProbe = SpoolPermissionProbeState()
+        permissionSpool.installFileOperationProbe { owner in
+            guard permissionProbe.partMode == nil,
+                  let partName = owner.fileNamesOnDisk.first(where: { $0.hasSuffix(".part") }) else {
+                return
+            }
+            permissionProbe.partMode = posixMode(
+                owner.sessionDirectory.appendingPathComponent(partName))
+        }
+        check("spool permissions: staging part is already 0600 while materialization is active",
+              permissionSpool.spill([.init(
+                  key: .video(segmentID: 200), data: Data([1, 2, 3, 4]),
+                  durationMilliseconds: 1_000)])
+                  && permissionProbe.partMode == 0o600)
         check("spool de-dup: the same key and exact bytes are idempotent across variant/cohort publication",
               exact.spill([exactResource])
                   && exact.fileNamesOnDisk == namesAfterFirstCommit
@@ -536,15 +580,14 @@ enum PlayerLiveContractTests {
               exact.accounting.peakChunkBytes <= 3)
         check("spool production: the default session admission cap is exactly 512 MiB",
               VortXHLSSessionSpool.defaultCapacityBytes == 512 * 1024 * 1024)
-        let bytesAt44Point7MbitForFourSeconds = 44_700_000 / 8 * 4
-        check("spool bitrate: 44.7 Mbit/s stays under the byte guard while the four-second IDR rule remains decisive",
-              bytesAt44Point7MbitForFourSeconds < 32 * 1024 * 1024
+        let legalLargeGOPBytes = 33 * 1024 * 1024
+        check("spool bitrate: a GOP above the retired 32 MiB guard remains logically legal through twelve seconds",
+              legalLargeGOPBytes > 32 * 1024 * 1024
                   && VortXHLSBoundaryPolicy.decision(
                       hasOpenSegment: true,
                       incomingIsIDR: false,
                       incomingHasKeyFlag: false,
-                      elapsed: 4,
-                      openBytes: bytesAt44Point7MbitForFourSeconds) == .failSoft)
+                      elapsed: 8) == .continueOpen)
     }
 
     private static func testPlaylistRetentionAndFileLeases() {
@@ -594,6 +637,22 @@ enum PlayerLiveContractTests {
               spool.playlistGenerationCount(playlistID: "video-dv") == 4
                   && spool.playlistGenerationCount(playlistID: "video-hdr") == 2
                   && spool.accounting.finalBytes == 30)
+
+        let overlappingLeaseA = spool.openResource(v1, now: 130)
+        let overlappingLeaseB = spool.openResource(v1, now: 130)
+        check("capacity union: retained plus two leases for the same key remains one committed byte range",
+              overlappingLeaseA != nil
+                  && overlappingLeaseB != nil
+                  && spool.activeLeaseCount == 2
+                  && spool.accounting.finalBytes == 30)
+        let disjointLease = spool.openResource(v2, now: 130)
+        check("capacity union: a disjoint leased key adds only its already-committed range once",
+              disjointLease != nil
+                  && spool.activeLeaseCount == 3
+                  && spool.accounting.finalBytes == 30)
+        overlappingLeaseA?.close(now: 130)
+        overlappingLeaseB?.close(now: 130)
+        disjointLease?.close(now: 130)
 
         let before = spool.openResource(v0, now: 148.999)
         check("retention: a request immediately before expiry atomically opens its backing", before != nil)
@@ -874,27 +933,23 @@ enum PlayerLiveContractTests {
                   hasOpenSegment: false,
                   incomingIsIDR: true,
                   incomingHasKeyFlag: false,
-                  elapsed: 0,
-                  openBytes: 0) == .failSoft
+                  elapsed: 0) == .failSoft
                   && VortXHLSBoundaryPolicy.decision(
                       hasOpenSegment: false,
                       incomingIsIDR: false,
                       incomingHasKeyFlag: true,
-                      elapsed: 0,
-                      openBytes: 0) == .failSoft)
+                      elapsed: 0) == .failSoft)
         check("boundary agreement: one-sided evidence cannot cut an open segment",
               VortXHLSBoundaryPolicy.decision(
                   hasOpenSegment: true,
                   incomingIsIDR: true,
                   incomingHasKeyFlag: false,
-                  elapsed: 1,
-                  openBytes: 1) == .continueOpen
+                  elapsed: 1) == .continueOpen
                   && VortXHLSBoundaryPolicy.decision(
                       hasOpenSegment: true,
                       incomingIsIDR: false,
                       incomingHasKeyFlag: true,
-                      elapsed: 1,
-                      openBytes: 1) == .continueOpen)
+                      elapsed: 1) == .continueOpen)
     }
 
     private static func testProductionWiring() {
@@ -906,6 +961,9 @@ enum PlayerLiveContractTests {
                                  encoding: .utf8)
         let policy = try? String(contentsOf: playerURL.appendingPathComponent("DVPlaybackPolicy.swift"),
                                  encoding: .utf8)
+        let remuxBuffer = try? String(
+            contentsOf: playerURL.appendingPathComponent("VortXRemuxBuffer.swift"),
+            encoding: .utf8)
         let display = try? String(contentsOf: playerURL.appendingPathComponent("HDRDisplayMode.swift"),
                                   encoding: .utf8)
         let engine = try? String(contentsOf: playerURL.appendingPathComponent("AVPlayerEngine.swift"),
@@ -971,6 +1029,14 @@ enum PlayerLiveContractTests {
             server,
             from: "private func recordPublication(",
             to: "private func exactWindow(")
+        let serverStartup = sourceSection(
+            server,
+            from: "func start()",
+            to: "/// The source MKV runtime")
+        let mountWaits = sourceSection(
+            server,
+            from: "private func waitForMount",
+            to: "// MARK: - Resources")
         let subtitleInvalidation = sourceSection(
             stream,
             from: "private func invalidateSubtitles(",
@@ -1055,14 +1121,18 @@ enum PlayerLiveContractTests {
                       "let audioPublished = _alternateAudioState == .ready && _alternateAudioPlan != nil") == true
                   && immutableSnapshot?.contains("audioPlan: audioPublished ? _alternateAudioPlan : nil") == true
                   && immutableSnapshot?.contains("subtitleFailureReason: _subtitleSettlement.invalidationReason") == true)
-        check("wiring: master waits for one exact six-segment fifteen-second common cohort",
+        check("wiring: master waits for six segments and three frozen target durations",
               masterPublication?.contains("DVPlaybackPolicy.pinnedStartupCohort(") == true
-                  && masterPublication?.contains("minimumSegmentCount: Self.minimumStartupSegments") == true
                   && masterPublication?.contains(
-                    "minimumRenderedDurationMilliseconds: Self.minimumStartupDurationMilliseconds") == true
-                  && server?.contains("private static let minimumStartupSegments = 6") == true
-                  && server?.contains(
-                    "private static let minimumStartupDurationMilliseconds = 15_000") == true)
+                    "minimumSegmentCount: startupReadiness.minimumSegmentCount") == true
+                  && masterPublication?.contains(
+                    "startupReadiness.minimumRenderedDurationMilliseconds") == true
+                  && policy?.contains("frozenTarget.seconds.multipliedReportingOverflow(by: 3)") == true
+                  && server?.contains("minimumStartupDurationMilliseconds = 15_000") == false)
+        check("wiring: one frozen target renders identically across video, audio and subtitle routes",
+              server?.components(separatedBy:
+                  "targetDuration: startupReadiness.frozenTarget.seconds").count == 4
+                  && stream?.contains("self.hlsTarget = VortXHLSTargetPolicy.freeze(indexEvidence: nil)!") == true)
         check("wiring: post-ready reloads advance only one common contiguous rendition frontier",
               rollingPublication?.contains("greatestCommonContiguousWindow(") == true
                   && rollingPublication?.contains("DVPlaybackPolicy.minimumConformingSuffix(") == true
@@ -1144,9 +1214,8 @@ enum PlayerLiveContractTests {
                       "let id = _hlsSegments.count + hlsPendingBoundaries.count") == true
                   && videoTiming?.contains("hlsPendingBoundaries.append(") == true
                   && videoTiming?.contains(
-                      "VortXHLSBoundaryPolicy.mayDeferHardLimitFailure(") == true
-                  && videoTiming?.contains(
-                      "deferHardLimitFailure: mayDeferHardLimitFailure") == true
+                      "frozenTargetSeconds: Double(hlsTarget.seconds)") == true
+                  && videoTiming?.contains("effectiveBoundaryDecision") == false
                   && videoTiming?.contains("guard hlsInitState.mayPublishMedia else") == false)
         check("wiring: one production machine owns the init gate and permitted nil drain",
               sourceContainsInOrder(pendingVideoPublication, [
@@ -1159,10 +1228,41 @@ enum PlayerLiveContractTests {
               ]))
         check("wiring: parser-incomplete bytes never advance or publish a pending boundary",
               sourceContainsInOrder(pendingVideoPublication, [
-                  "proveNextFragment: { hlsParserProvenSegmentEndByte() }",
+                  "proveNextFragment: { hlsParserProvenFirstSegmentEndByte() }",
                   "publish: { pending, provenEndByte in",
                   "hlsCloseSegment(",
               ]))
+        check("wiring: aggregate parser proof remains separate from first-fragment FIFO proof",
+              pendingVideoPublication?.contains(
+                  "VortXFMP4FragmentParser.proveFirstMediaFragment(") == true
+                  && pendingVideoPublication?.contains(
+                      "VortXFMP4FragmentParser.proveMediaRange(") == true)
+        check("wiring: one monotonic deadline starts before production and gates readyToPlay",
+              sourceContainsInOrder(serverStartup, [
+                  "mountDeadline.start(now: now)",
+                  "queue.asyncAfter",
+                  "stream.start()",
+                  "func markEngineReady() -> Bool",
+                  "mountDeadline.markReady(now: now)",
+              ])
+                  && mountWaits?.contains("remainingMountBudget(now: now)") == true
+                  && mountWaits?.contains("Date().addingTimeInterval") == false
+                  && engine?.contains(
+                      "if let server = remuxHLSServer, !server.markEngineReady()") == true)
+        check("wiring: timeout callback is generation-safe and emits one fatal chrome event",
+              engine?.contains("onStartupTimeout: { [weak self] timedOutServer in") == true
+                  && engine?.contains("remuxHLSServer === timedOutServer") == true
+                  && engine?.contains("activeLoadToken == loadToken") == true
+                  && engine?.contains("!isReady") == true
+                  && engine?.contains("!fatalErrorEmitted") == true
+                  && engine?.contains("fatalErrorEmitted = true") == true
+                  && engine?.contains("MPVProperty.endFileError") == true)
+        check("wiring: owner-only permissions are applied and verified for directories and media files",
+              remuxBuffer?.contains("NSNumber(value: 0o700)") == true
+                  && remuxBuffer?.contains("NSNumber(value: 0o600)") == true
+                  && remuxBuffer?.contains("ensureOwnerOnlyFile(item.partURL)") == true
+                  && remuxBuffer?.contains("ensureOwnerOnlyFile(item.finalURL)") == true
+                  && remuxBuffer?.contains("attributesOfItem(atPath:") == true)
         check("wiring: late alternate audio is retained by pending video ID",
               lateAlternatePublication?.contains("if !videoExists") == true
                   && lateAlternatePublication?.contains(

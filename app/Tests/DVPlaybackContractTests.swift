@@ -374,61 +374,120 @@ check("IDR classifier: H.264 rejects forbidden, ref-idc-zero and mixed non-IDR V
 check("segments: segment zero must begin on an IDR",
       VortXHLSBoundaryPolicy.decision(
           hasOpenSegment: false, incomingIsIDR: false, incomingHasKeyFlag: true,
-          elapsed: 0, openBytes: 0) == .failSoft)
+          elapsed: 0) == .failSoft)
 check("segments: segment zero rejects an IDR whose demux key flag disagrees",
       VortXHLSBoundaryPolicy.decision(
           hasOpenSegment: false, incomingIsIDR: true, incomingHasKeyFlag: false,
-          elapsed: 0, openBytes: 0) == .failSoft)
+          elapsed: 0) == .failSoft)
 check("segments: an IDR with matching key evidence opens segment zero",
       VortXHLSBoundaryPolicy.decision(
           hasOpenSegment: false, incomingIsIDR: true, incomingHasKeyFlag: true,
-          elapsed: 0, openBytes: 0) == .open)
+          elapsed: 0) == .open)
 check("segments: a target-age IDR with matching key evidence cuts before itself",
       VortXHLSBoundaryPolicy.decision(
           hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
-          elapsed: 1, openBytes: 1) == .cut)
-check("segments: either IDR/key disagreement extends below the hard guard",
+          elapsed: 1) == .cut)
+check("segments: either IDR/key disagreement extends below the frozen target",
       VortXHLSBoundaryPolicy.decision(
           hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: false,
-          elapsed: 1, openBytes: 1) == .continueOpen
+          elapsed: 1) == .continueOpen
           && VortXHLSBoundaryPolicy.decision(
               hasOpenSegment: true, incomingIsIDR: false, incomingHasKeyFlag: true,
-              elapsed: 1, openBytes: 1) == .continueOpen)
-check("segments: the four-second guard on a non-IDR fails soft instead of publishing an illegal cut",
+              elapsed: 1) == .continueOpen)
+check("segments: a non-IDR at exactly twelve seconds remains legal",
       VortXHLSBoundaryPolicy.decision(
           hasOpenSegment: true, incomingIsIDR: false, incomingHasKeyFlag: false,
-          elapsed: 4, openBytes: 1) == .failSoft)
-check("segments: the 32MiB guard on a non-IDR fails soft instead of publishing an illegal cut",
+          elapsed: 12) == .continueOpen)
+check("segments: the first positive delta beyond twelve seconds fails soft",
       VortXHLSBoundaryPolicy.decision(
-          hasOpenSegment: true, incomingIsIDR: false, incomingHasKeyFlag: false, elapsed: 1,
-          openBytes: 32 * 1024 * 1024) == .failSoft)
-check("segments: an IDR at the hard guard remains a legal cut",
-      VortXHLSBoundaryPolicy.decision(
-          hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true, elapsed: 4,
-          openBytes: 32 * 1024 * 1024) == .cut)
-check("segments: malformed timing and byte inputs fail soft",
+          hasOpenSegment: true, incomingIsIDR: false, incomingHasKeyFlag: false,
+          elapsed: 12.000_001) == .failSoft)
+check("segments: a both-confirmed key at exactly twelve seconds remains a legal cut",
       VortXHLSBoundaryPolicy.decision(
           hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
-          elapsed: .nan, openBytes: 0) == .failSoft
-          && VortXHLSBoundaryPolicy.decision(
-              hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
-              elapsed: -0.1, openBytes: 0) == .failSoft
-          && VortXHLSBoundaryPolicy.decision(
-              hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
-              elapsed: 1, openBytes: -1) == .failSoft)
-check("segments: invalid target, maximum duration and byte thresholds fail soft",
+          elapsed: 12) == .cut)
+check("segments: an eight-second GOP remains legal independent of aggregate byte size",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: true, incomingIsIDR: false, incomingHasKeyFlag: false,
+          elapsed: 8) == .continueOpen)
+check("segments: malformed timing fails soft",
       VortXHLSBoundaryPolicy.decision(
           hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
-          elapsed: 1, openBytes: 1,
-          targetSeconds: 0) == .failSoft
+          elapsed: .nan) == .failSoft
           && VortXHLSBoundaryPolicy.decision(
               hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
-              elapsed: 1, openBytes: 1,
-              targetSeconds: 2, maximumSeconds: 1) == .failSoft
+              elapsed: -0.1) == .failSoft)
+check("segments: invalid normal and frozen target inputs fail soft",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
+          elapsed: 1, targetSeconds: 0) == .failSoft
           && VortXHLSBoundaryPolicy.decision(
               hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
-              elapsed: 1, openBytes: 1,
-              maximumBytes: 0) == .failSoft)
+              elapsed: 1, targetSeconds: 2, frozenTargetSeconds: 1) == .failSoft
+          && VortXHLSBoundaryPolicy.decision(
+              hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
+              elapsed: 1, frozenTargetSeconds: 999) == .failSoft)
+
+let targetFallback = VortXHLSTargetPolicy.freeze(indexEvidence: nil)
+let incompleteTarget = VortXHLSTargetPolicy.freeze(indexEvidence: .init(
+    completeness: .incomplete, adjacentIntervalsSeconds: [.nan, -1, 99]))
+let emptyTarget = VortXHLSTargetPolicy.freeze(indexEvidence: .init(
+    completeness: .validatedComplete, adjacentIntervalsSeconds: []))
+check("target authority: absent, incomplete and empty evidence freeze conservative twelve",
+      targetFallback == .init(seconds: 12, authority: .conservativeFallback)
+          && incompleteTarget == targetFallback
+          && emptyTarget == targetFallback)
+check("target authority: validated complete intervals ceil their maximum with a five-second floor",
+      VortXHLSTargetPolicy.freeze(indexEvidence: .init(
+          completeness: .validatedComplete,
+          adjacentIntervalsSeconds: [4, 4.9])) == .init(
+              seconds: 5, authority: .validatedCompleteIndex)
+          && VortXHLSTargetPolicy.freeze(indexEvidence: .init(
+              completeness: .validatedComplete,
+              adjacentIntervalsSeconds: [5, 7.2])) == .init(
+                  seconds: 8, authority: .validatedCompleteIndex))
+check("target authority: exact twelve is valid while malformed or over-twelve complete evidence rejects",
+      VortXHLSTargetPolicy.freeze(indexEvidence: .init(
+          completeness: .validatedComplete,
+          adjacentIntervalsSeconds: [12])) == .init(
+              seconds: 12, authority: .validatedCompleteIndex)
+          && VortXHLSTargetPolicy.freeze(indexEvidence: .init(
+              completeness: .validatedComplete,
+              adjacentIntervalsSeconds: [.nan])) == nil
+          && VortXHLSTargetPolicy.freeze(indexEvidence: .init(
+              completeness: .validatedComplete,
+              adjacentIntervalsSeconds: [0])) == nil
+          && VortXHLSTargetPolicy.freeze(indexEvidence: .init(
+              completeness: .validatedComplete,
+              adjacentIntervalsSeconds: [12.000_001])) == nil)
+let targetSevenReadiness = VortXHLSStartupReadiness(
+    frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex))
+check("startup readiness: six segments and three frozen targets are one immutable contract",
+      targetSevenReadiness == .init(
+          frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex),
+          minimumSegmentCount: 6))
+check("startup readiness: target seven requires exactly 21000 rendered milliseconds",
+      targetSevenReadiness?.minimumRenderedDurationMilliseconds == 21_000)
+
+var sequentialDeadline = VortXHLSMountDeadlineState()
+check("mount deadline: start at monotonic 100 freezes one absolute edge at 130",
+      sequentialDeadline.start(now: 100) == 130)
+check("mount deadline: a later stage receives nineteen remaining seconds, never a fresh thirty",
+      sequentialDeadline.remaining(now: 111) == (19, false))
+check("mount deadline: a stage at 129.999 receives only the final millisecond",
+      abs(sequentialDeadline.remaining(now: 129.999).seconds - 0.001) < 0.000_001)
+let readyBeforeExpiry = sequentialDeadline.markReady(now: 129.999_9)
+check("mount deadline: ready just before expiry wins and stays terminal",
+      readyBeforeExpiry == (true, false)
+          && sequentialDeadline.remaining(now: 131).seconds == .infinity)
+var expiredDeadline = VortXHLSMountDeadlineState()
+_ = expiredDeadline.start(now: 100)
+let exactExpiry = expiredDeadline.remaining(now: 130)
+let repeatedExpiry = expiredDeadline.remaining(now: 131)
+check("mount deadline: exact expiry owns one transition and later polls cannot fire it again",
+      exactExpiry == (0, true) && repeatedExpiry == (0, false))
+check("mount deadline: ready after expiry is inert",
+      expiredDeadline.markReady(now: 131) == (false, false))
 
 var abortedInit = VortXHLSInitPublicationState()
 abortedInit.abort(reason: "malformed moov")
@@ -466,40 +525,18 @@ check("pending boundary: delayed init cannot force publication or an interleave 
           && delayedInitDrainCalls == 0
           && delayedInitPublishCalls == 0
           && pendingBoundaries.first?.segmentID == 0)
-let pendingHardLimitDecision = VortXHLSBoundaryPolicy.decision(
-    hasOpenSegment: true,
-    incomingIsIDR: false,
-    incomingHasKeyFlag: false,
-    elapsed: 4,
-    openBytes: 1)
-let pendingMayDeferHardLimit = VortXHLSBoundaryPolicy.mayDeferHardLimitFailure(
-    hasOpenSegment: true,
-    incomingIsIDR: false,
-    incomingHasKeyFlag: false,
-    elapsed: 4,
-    openBytes: 1)
-check("pending boundary: non-IDR hard failure is suppressed while a confirmed cut is unresolved",
-      pendingBoundaries.effectiveBoundaryDecision(
-          pendingHardLimitDecision,
-          deferHardLimitFailure: pendingMayDeferHardLimit) == .continueOpen)
-let invalidPendingDecision = VortXHLSBoundaryPolicy.decision(
-    hasOpenSegment: true,
-    incomingIsIDR: false,
-    incomingHasKeyFlag: false,
-    elapsed: -1,
-    openBytes: -1)
-let invalidPendingMayDefer = VortXHLSBoundaryPolicy.mayDeferHardLimitFailure(
-    hasOpenSegment: true,
-    incomingIsIDR: false,
-    incomingHasKeyFlag: false,
-    elapsed: -1,
-    openBytes: -1)
-check("pending boundary: invalid timing and byte inputs remain fail-closed",
-      invalidPendingDecision == .failSoft
-          && !invalidPendingMayDefer
-          && pendingBoundaries.effectiveBoundaryDecision(
-              invalidPendingDecision,
-              deferHardLimitFailure: invalidPendingMayDefer) == .failSoft)
+check("pending boundary: newest tail at exactly twelve remains legal while a pending prefix exists",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: true,
+          incomingIsIDR: false,
+          incomingHasKeyFlag: false,
+          elapsed: 12) == .continueOpen)
+check("pending boundary: newest tail beyond twelve fails and cannot be hidden by an older prefix",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: true,
+          incomingIsIDR: false,
+          incomingHasKeyFlag: false,
+          elapsed: 12.000_001) == .failSoft)
 check("pending boundary: key six appends behind key three instead of replacing it",
       pendingBoundaries.append(
           segmentID: 1, startSeconds: 3, endSeconds: 6, payload: nil)
