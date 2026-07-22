@@ -815,37 +815,6 @@ final class VortXSyncManager: ObservableObject {
         return .rejected(storedVersion: stored)
     }
 
-    /// Blind single-shot push of a fully-formed doc the caller does not re-derive (it holds no local pending
-    /// changes to re-merge, so on a rejection it just re-pushes the SAME doc above the winner). The version is
-    /// `max(storedVersion+1, epochMs)` so a device whose wall clock has skewed BACKWARD (a lower epoch-ms than
-    /// the stored version) can never lock itself out: it retries strictly above the stored version instead of
-    /// racing a permanently-lower epoch-ms. A rejection is retried once at storedVersion+1 (same as
-    /// pushDerivedDoc); a lost second race or a .error leaves lastSyncedVersion unadvanced so the next pull
-    /// reconciles.
-    @discardableResult
-    func pushSyncDoc(_ obj: [String: Any]) async -> Bool {
-        var version = Int(Date().timeIntervalSince1970 * 1000)
-        for attempt in 0..<2 {
-            switch await pushSyncDocAt(obj, version: version) {
-            case .accepted:
-                return true
-            case .error:
-                return false
-            case .rejected(let storedVersion):
-                // A concurrent write won. Retry strictly above the winner's echoed version (falling back to a
-                // fresh epoch-ms if the worker did not echo one). max(stored+1, epochMs) guarantees a backward
-                // clock still produces a higher version than the stored one, so the device is never locked out.
-                guard attempt < 1 else { return false }
-                if let stored = storedVersion {
-                    version = max(stored + 1, Int(Date().timeIntervalSince1970 * 1000))
-                } else {
-                    version = Int(Date().timeIntervalSince1970 * 1000)
-                }
-            }
-        }
-        return false
-    }
-
     /// Push a doc that is DERIVED from a pulled base, with optimistic-concurrency recovery. `rebuild`
     /// re-runs the caller's exact merge onto a freshly pulled base, so a lost race is recovered by
     /// re-merging the local pending changes onto the winner's doc and retrying at storedVersion+1 (up to

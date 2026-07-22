@@ -217,6 +217,18 @@ private enum CredentialOwnerScopingHarness {
         let sessionGateRevalidatesAfterWork = gateAfterAwait(
             sessionGateHelper, awaitToken: "await work()", gateToken: "isCurrentCredentialSession(session)"
         )
+        // M-1: revalidate-after-work alone is not enough. A mutant that MOVES the capture below `await work()`
+        // still leaves the revalidate after the await (so sessionGateRevalidatesAfterWork stays true) yet makes
+        // the gate a no-op: it captures + stamps whatever session is current AFTER the suspension. Assert the full
+        // capture -> await -> revalidate ordering so the stamp-after-await mutant turns red. The capture token is
+        // the code statement `let session = credentialSessionStamp` (not the bare identifier), so the doc comment's
+        // mention of `credentialSessionStamp` above the body cannot satisfy the ordering on its own.
+        let sessionGateCapturesBeforeWork = orderedAwaitGateApply(
+            sessionGateHelper,
+            awaitToken: "let session = credentialSessionStamp",
+            gateToken: "await work()",
+            applyToken: "isCurrentCredentialSession(session)"
+        )
         let refreshAccountGateOrdered = gateBeforeApply(
             refreshAccountGate, gateToken: "withCredentialSessionGate", applyToken: "account = a"
         )
@@ -259,6 +271,7 @@ import Foundation
 let productionSyncResolverReloadUsesFence = \#(syncResolverReloadUsesFence)
 let productionPushCompletionGateOrdered = \#(pushCompletionGateOrdered)
 let productionSessionGateRevalidatesAfterWork = \#(sessionGateRevalidatesAfterWork)
+let productionSessionGateCapturesBeforeWork = \#(sessionGateCapturesBeforeWork)
 let productionRefreshAccountGateOrdered = \#(refreshAccountGateOrdered)
 let productionSyncDownFinalGateOrdered = \#(syncDownFinalGateOrdered)
 let productionSyncUpPushGateOrdered = \#(syncUpPushGateOrdered)
@@ -495,6 +508,8 @@ enum CredentialOwnerScopingTests {
     static func testCentralSessionGateRevalidatesAfterWork() {
         expect(productionSessionGateRevalidatesAfterWork,
                "the central session gate revalidates AFTER running the work (capture / work / revalidate)")
+        expect(productionSessionGateCapturesBeforeWork,
+               "the central session gate captures the session BEFORE the await (stamp-after-await mutant is a no-op)")
     }
 
     static func testOldRestoreCleanupCannotClearNewSessionTask() async {
