@@ -612,6 +612,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             origin: remuxTimelineOrigin)
     }
 
+    /// The authoritative source-timeline origin once a remux item is ready. nil distinguishes "not ready yet"
+    /// from a ready remux whose input seek genuinely fell back to source second zero.
+    var achievedRemuxTimelineOriginSeconds: Double? {
+        guard isReady, isRemuxMounted else { return nil }
+        return remuxTimelineOrigin
+    }
+
     /// Live audio volume. AVPlayer.volume is a 0...1 gain; map the chrome's 0...100 scale onto it. Muting is
     /// separate (setMuted), so setting a level never un-mutes on its own.
     func setVolume(_ volume0to100: Double) {

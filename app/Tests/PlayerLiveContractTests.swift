@@ -879,8 +879,26 @@ enum PlayerLiveContractTests {
                                  encoding: .utf8)
         let engineContract = try? String(contentsOf: playerURL.appendingPathComponent("PlayerEngine.swift"),
                                          encoding: .utf8)
+        let avPlayerView = try? String(contentsOf: playerURL.appendingPathComponent("AVPlayerEngineView.swift"),
+                                      encoding: .utf8)
         let resumePolicy = try? String(contentsOf: playerURL.appendingPathComponent("RemuxResumePolicy.swift"),
                                        encoding: .utf8)
+        let playerScreen = try? String(contentsOf: testsURL.deletingLastPathComponent()
+            .appendingPathComponent("Sources/PlayerScreen.swift"), encoding: .utf8)
+        let tvPlayer = try? String(contentsOf: testsURL.deletingLastPathComponent()
+            .appendingPathComponent("SourcesTV/TVPlayerView.swift"), encoding: .utf8)
+        let initialAVMount = sourceSection(
+            avPlayerView,
+            from: "private func makeHostView()",
+            to: "#if os(macOS)")
+        let playerScreenLoad = sourceSection(
+            playerScreen,
+            from: "private func loadIntoPlayer(",
+            to: "private func retryResumeSameSource()")
+        let tvPlayerLoad = sourceSection(
+            tvPlayer,
+            from: "private func loadIntoPlayer(",
+            to: "/// Switch the playing source")
         let manualSelection = sourceSection(engine, from: "private func select(", to: "/// The overlay host")
         let groupLoad = sourceSection(engine, from: "private func loadSelectionGroups()",
                                       to: "/// Rebuild cached selected flags")
@@ -953,6 +971,10 @@ enum PlayerLiveContractTests {
                                    encoding: .utf8)
         let changelog = try? String(contentsOf: appURL.deletingLastPathComponent()
             .appendingPathComponent("CHANGELOG.md"), encoding: .utf8)
+        let beta7Changelog = sourceSection(
+            changelog,
+            from: "## 0.3.14 Beta 7",
+            to: "## 0.3.14 Beta 6")
 
         check("wiring: server renders the resident immutable window",
               server?.contains("DVPlaybackPolicy.mediaPlaylistLines(window:") == true)
@@ -1089,6 +1111,32 @@ enum PlayerLiveContractTests {
                 "VortXRemuxHLSServer.make(",
                 "startAtSeconds: requestedRemuxOrigin",
               ]))
+        check("wiring: initial AV host configures its origin immediately before the synchronous load",
+              sourceContainsInOrder(initialAVMount, [
+                "engine.configureResumeOrigin(seconds: resumeOriginSeconds)",
+                "engine.loadFile(",
+              ]))
+        check("wiring: both surfaces provide a pre-mount origin and tvOS waits for async account resume",
+              playerScreen?.contains(".resumeOrigin(avSurfaceResumeOrigin ?? resumeSeconds)") == true
+                  && tvPlayer?.contains("if let resumeOrigin = initialAVResumeOrigin") == true
+                  && tvPlayer?.contains(".resumeOrigin(resumeOrigin)") == true
+                  && tvPlayer?.contains("resumeSeconds = await account.resumeOffset(for: m)") == true)
+        check("wiring: every in-place surface load configures origin before loadFile",
+              sourceContainsInOrder(playerScreenLoad, [
+                "player.configureResumeOrigin(seconds: requestedResumeOrigin)",
+                "player.loadFile(",
+              ])
+                  && sourceContainsInOrder(tvPlayerLoad, [
+                    "player.configureResumeOrigin(seconds: requestedResumeOrigin)",
+                    "candidateToken = player.loadFile(",
+                  ]))
+        check("wiring: subtitle sync is gated by the exact live capability on both surfaces",
+              engineContract?.contains("var subtitleDelayAvailable: Bool { get }") == true
+                  && engine?.contains("var subtitleDelayAvailable: Bool { externalSubActive }") == true
+                  && playerScreen?.contains("coordinator.player?.subtitleDelayAvailable == true") == true
+                  && tvPlayer?.contains("coordinator.player?.subtitleDelayAvailable == true") == true
+                  && playerScreen?.contains("Sync unavailable · external subtitles only") == true
+                  && tvPlayer?.contains("Sync unavailable · external subtitles only") == true)
         check("wiring: the server forwards the configured origin into the remux stream",
               sourceContainsInOrder(server, [
                 "startAtSeconds: Double = 0",
@@ -1125,5 +1173,11 @@ enum PlayerLiveContractTests {
         check("release: rejected start and one-switch claims are gone",
               whatsNew?.contains("start at the beginning instead of about fourteen seconds") == false
                   && whatsNew?.contains("mode changes once") == false)
+        check("release: Beta 7 copy distinguishes fresh starts and states the real progress-aware fallback",
+              beta7Changelog?.contains("titles start at the beginning") == false
+                  && beta7Changelog?.contains("after about fifteen seconds without remux progress") == true
+                  && beta7Changelog?.contains("two-minute hard limit") == true
+                  && whatsNew?.contains("after about fifteen seconds without remux progress") == true
+                  && whatsNew?.contains("two-minute hard limit") == true)
     }
 }

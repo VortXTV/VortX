@@ -178,6 +178,9 @@ struct TVPlayerView: View {
     /// over a manual AVPlayer pick (a failed manual switch falls back to libmpv, no loop), and a fresh
     /// PlaybackRequest resets it via `.id(req.id)` like the latch.
     @State private var manualEngineAVPlayer: Bool?
+    /// Source-timeline origin handed to a newly mounted AVPlayer surface. nil means the initial account resume
+    /// is still unresolved; a manual engine swap replaces it with the live position before the host is built.
+    @State private var avSurfaceResumeOrigin: Double?
     // Timestamp of the last engine switch / demote. A KVO .failed queued on the main thread from the outgoing
     // AVPlayer can land AFTER the surface swap; within a short grace window (and once the AV engine is no
     // longer mounted) endFileError swallows it so it never cancels the fresh mpv load's watchdog or burns the
@@ -560,7 +563,10 @@ struct TVPlayerView: View {
                     }
                 }
             }
-            showInfo = true; selected = .play; scheduleHide(); startLoadTimeout()
+            showInfo = true; selected = .play; scheduleHide()
+            // The AV surface is intentionally withheld while an account resume lookup is unresolved, so its
+            // synchronous `makeHostView` cannot mount a remux at zero before the real origin arrives.
+            if !useAVPlayerEngine || initialAVResumeOrigin != nil { startLoadTimeout() }
             UIApplication.shared.isIdleTimerDisabled = true   // stop the Apple TV screensaver during playback
             if let explicit = startAtSeconds {
                 // Trakt "Resume from <time>": the viewer tapped a position another device reported. Seek there
@@ -589,7 +595,11 @@ struct TVPlayerView: View {
                     // own video_id match and returns 0 for a different episode, so the wrong-episode resume
                     // the engine's 0-answer guards against cannot happen. Overlay profiles keep their own
                     // private-history path inside resumeOffset, exactly as before.
-                    Task { @MainActor in resumeSeconds = await account.resumeOffset(for: m); maybeResume() }
+                    Task { @MainActor in
+                        resumeSeconds = await account.resumeOffset(for: m)
+                        startLoadTimeout()
+                        maybeResume()
+                    }
                 }
             } else {
                 resumeSeconds = 0   // selftest / no library context, nothing to resume
@@ -701,6 +711,17 @@ struct TVPlayerView: View {
             && PlayerEngineRouter.shouldPlainRemux(url: activeURL)
     }
 
+    /// Origin available before AVPlayer's initial synchronous mount. A nonzero engine resume is synchronous;
+    /// when only the account can answer, nil keeps the AV surface unmounted until `onAppear` resolves it.
+    private var initialAVResumeOrigin: Double? {
+        if initialLiveMode || startFromZero { return 0 }
+        if let explicit = startAtSeconds { return explicit }
+        if let configured = avSurfaceResumeOrigin ?? resumeSeconds { return configured }
+        guard let m = curMeta ?? meta else { return 0 }
+        if let engineResume = core.engineResumeSeconds(for: m), engineResume > 5 { return engineResume }
+        return nil
+    }
+
     /// The raw routing computation, mirroring PlayerScreen.routedToAVPlayer. Consulted only for the pre-onAppear
     /// renders and once to seed `engineLatch`; never re-consulted mid-playback, so a Settings / RemoteConfig
     /// refresh cannot flip the engine live. Routes on the RAW (un-proxied) launch URL: torrents and loopback
@@ -749,12 +770,19 @@ struct TVPlayerView: View {
     /// mirrors `PlayerScreen.playerSurface` on iOS / macOS.
     @ViewBuilder private var playerSurface: some View {
         if useAVPlayerEngine {
-            AVPlayerEngineView(coordinator: coordinator)
-                .play(initialPlayback.url, headers: initialPlayback.headers,
-                      isDolbyVision: StreamRanking.isDolbyVision(sourceHint ?? ""))
-                .live(initialLiveMode)
-                .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
-                .ignoresSafeArea()
+            if let resumeOrigin = initialAVResumeOrigin {
+                AVPlayerEngineView(coordinator: coordinator)
+                    // AVFoundation and the remux server apply required headers themselves. A loopback proxy
+                    // would hide the original container from remux routing and defeat the resume-origin mount.
+                    .play(url, headers: headers,
+                          isDolbyVision: StreamRanking.isDolbyVision(sourceHint ?? ""))
+                    .live(initialLiveMode)
+                    .resumeOrigin(resumeOrigin)
+                    .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
+                    .ignoresSafeArea()
+            } else {
+                Color.black.ignoresSafeArea()
+            }
         } else {
             MPVMetalPlayerView(coordinator: coordinator)
                 .play(initialPlayback.url, headers: initialPlayback.headers, audioSidecar: audioSidecarURL,
@@ -1726,6 +1754,9 @@ struct TVPlayerView: View {
                             // the row from the list with nothing rendering (dead until panel re-open).
                             if ok, player === coordinator.player { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
                             else if !ok { showEngineNote(String(localized: "Subtitle failed to load")) }   // honest failure (iOS shows an alert; tvOS showed nothing)
+                            if ok, player === coordinator.player, player.subtitleDelayAvailable, subDelay != 0 {
+                                player.setSubDelay(subDelay)
+                            }
                             refreshTracksSoon()
                             VXProbe.event("subs", "subs selected \(langName(sub.lang)) (add-on ok=\(ok))")
                         }
@@ -1753,15 +1784,17 @@ struct TVPlayerView: View {
             return rows
         case .subtitleSettings:
             let now = String(format: "%+.1fs", subDelay)
-            var rows = [OptionRow(label: String(localized: "Sync"), isHeader: true)]
-            // Sync works on BOTH engines: libmpv maps it to `sub-delay`; AVPlayer applies it as the offset on the
-            // external-subtitle overlay it renders itself (external srt/vtt only - native/embedded AVPlayer subs
-            // have no time-shift API). Later = subtitles appear later on both.
-            rows.append(OptionRow(label: String(localized: "Earlier  −\(Self.subSyncStepLabel)"), detail: now) { adjustSubDelay(-Self.subSyncStep) })
-            rows.append(OptionRow(label: String(localized: "Later  +\(Self.subSyncStepLabel)"), detail: now) { adjustSubDelay(Self.subSyncStep) })
-            rows.append(OptionRow(label: String(localized: "Earlier  −\(Self.subSyncFineLabel)"), detail: now) { adjustSubDelay(-Self.subSyncFine) })
-            rows.append(OptionRow(label: String(localized: "Later  +\(Self.subSyncFineLabel)"), detail: now) { adjustSubDelay(Self.subSyncFine) })
-            if subDelay != 0 { rows.append(OptionRow(label: String(localized: "Reset")) { adjustSubDelay(-subDelay) }) }
+            var rows: [OptionRow] = []
+            if coordinator.player?.subtitleDelayAvailable == true {
+                rows.append(OptionRow(label: String(localized: "Sync"), isHeader: true))
+                rows.append(OptionRow(label: String(localized: "Earlier  −\(Self.subSyncStepLabel)"), detail: now) { adjustSubDelay(-Self.subSyncStep) })
+                rows.append(OptionRow(label: String(localized: "Later  +\(Self.subSyncStepLabel)"), detail: now) { adjustSubDelay(Self.subSyncStep) })
+                rows.append(OptionRow(label: String(localized: "Earlier  −\(Self.subSyncFineLabel)"), detail: now) { adjustSubDelay(-Self.subSyncFine) })
+                rows.append(OptionRow(label: String(localized: "Later  +\(Self.subSyncFineLabel)"), detail: now) { adjustSubDelay(Self.subSyncFine) })
+                if subDelay != 0 { rows.append(OptionRow(label: String(localized: "Reset")) { adjustSubDelay(-subDelay) }) }
+            } else {
+                rows.append(OptionRow(label: "Sync unavailable · external subtitles only", isHeader: true))
+            }
             rows.append(OptionRow(label: String(localized: "Font"), isHeader: true))
             for f in SubtitleStyle.fonts { rows.append(OptionRow(label: Self.l10n(f.label), isSelected: subFont == f.id) { setSubtitleFont(f.id) }) }
             rows.append(OptionRow(label: String(localized: "Size"), isHeader: true))
@@ -2263,7 +2296,8 @@ struct TVPlayerView: View {
     @discardableResult
     private func loadIntoPlayer(_ url: URL, headers: [String: String]?, live: Bool,
                                 reusing loadToken: PlayerLoadToken? = nil,
-                                contentHint: String? = nil) -> PlayerLoadToken? {
+                                contentHint: String? = nil,
+                                resumeOrigin: Double? = nil) -> PlayerLoadToken? {
         // Keep the yt-direct audio sidecar ONLY when reloading the launch URL itself (a trailer retry);
         // any other target (episode/source switch) is a normal content stream and must load sidecar-free.
         let sidecar = (url == self.url) ? audioSidecarURL : nil
@@ -2276,8 +2310,20 @@ struct TVPlayerView: View {
             contentHint ?? curHint ?? sourceHint ?? ""
         )
         guard let player = coordinator.player else { return nil }
+        let requestedResumeOrigin = live ? 0 : (
+            resumeOrigin ?? avSurfaceResumeOrigin ?? (hasStartedPlaying ? currentTime : (resumeSeconds ?? 0))
+        )
+        avSurfaceResumeOrigin = requestedResumeOrigin
+        player.configureResumeOrigin(seconds: requestedResumeOrigin)
         let candidateToken: PlayerLoadToken
-        if let h = headers, !h.isEmpty, let proxied = StremioServer.proxiedURL(for: url, headers: h) {
+        // AVFoundation and the remux server consume the raw URL + headers. Only libmpv needs the embedded
+        // proxy's server-side header injection and playlist rewriting.
+        if player is AVPlayerEngineController {
+            candidateToken = player.loadFile(
+                url, headers: headers, live: live, audioSidecar: sidecar,
+                reusing: loadToken
+            )
+        } else if let h = headers, !h.isEmpty, let proxied = StremioServer.proxiedURL(for: url, headers: h) {
             candidateToken = player.loadFile(
                 proxied, headers: nil, live: live, audioSidecar: sidecar,
                 reusing: loadToken
@@ -2376,6 +2422,7 @@ struct TVPlayerView: View {
         // engines never pile up on the embedded server (the regression that bloated its RSS and
         // took it offline). A hop into another torrent is fine now that the old one is closed.
         let oldHash = currentTorrentHash
+        let resume = hasStartedPlaying ? currentTime : (resumeSeconds ?? 0)
         // A source switch DURING a pending advance (the auto-hop lane when the incoming episode's first
         // source is dead) swaps WHICH FILE will first-frame, not which episode: keep the pending record
         // pointed at the live URL (and issued - this loads synchronously below) so the first-frame commit
@@ -2397,7 +2444,8 @@ struct TVPlayerView: View {
         let nextHint = StreamRanking.signature(stream)
         let nextHeaders = stream.requestHeaders
         let issuedToken = loadIntoPlayer(
-            newURL, headers: nextHeaders, live: nextIsLive, contentHint: nextHint
+            newURL, headers: nextHeaders, live: nextIsLive, contentHint: nextHint,
+            resumeOrigin: resume
         )
         if pendingAdvance != nil {
             guard let issuedToken else {
@@ -2432,7 +2480,7 @@ struct TVPlayerView: View {
         if let oldHash, oldHash != stream.infoHash?.lowercased() { closeTorrent(hash: oldHash) }
         scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
         lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
-        resumeSeconds = currentTime
+        resumeSeconds = resume
         if let target {
             enginePlayerVideoId = bindEngine(
                 to: stream, meta: target, resolvedURL: debridRef?.url
@@ -2526,6 +2574,7 @@ struct TVPlayerView: View {
 
     /// Nudge subtitle sync by `delta` seconds (rounded to 0.1); keeps the panel open to repeat.
     private func adjustSubDelay(_ delta: Double) {
+        guard coordinator.player?.subtitleDelayAvailable == true else { return }
         subDelay = ((subDelay + delta) * 10).rounded() / 10
         coordinator.player?.setSubDelay(subDelay)
         VXProbe.event("subs", "subs sync \(subDelay)s")
@@ -2764,7 +2813,9 @@ struct TVPlayerView: View {
         // latch here suppresses the crowd seed so the viewer's own correction wins.
         if subDelay == 0, !pooledSeededOffset, let saved = SubtitleOffsetMemory.savedOffset(forContentKey: communityContentKey) {
             subDelay = saved
-            coordinator.player?.setSubDelay(saved)
+            if coordinator.player?.subtitleDelayAvailable == true {
+                coordinator.player?.setSubDelay(saved)
+            }
             pooledSeededOffset = true
         }
     }
@@ -2797,11 +2848,15 @@ struct TVPlayerView: View {
                      ?? subtitleTracks.first { $0.lang.lowercased() == l }
             coordinator.player?.setSubtitleTrack(match?.id ?? -1)
         case let .external(urlStr, title, lang):
-            let subtitleLoadToken = coordinator.player?.activeLoadToken
+            guard let player = coordinator.player else { return }
+            let subtitleLoadToken = player.activeLoadToken
             let subtitleVideoID = curMeta?.videoId
-            coordinator.player?.addExternalSubtitle(url: urlStr, title: title, lang: lang) { ok in
+            player.addExternalSubtitle(url: urlStr, title: title, lang: lang) { ok in
                 guard permitsSubtitlePublication(loadToken: subtitleLoadToken, videoID: subtitleVideoID) else { return }
-                if ok { addedSubURLs.insert(urlStr) }
+                if ok, player === coordinator.player {
+                    addedSubURLs.insert(urlStr)
+                    if player.subtitleDelayAvailable, subDelay != 0 { player.setSubDelay(subDelay) }
+                }
             }
         case let .pooled(id):
             if let sub = pooledSubs.first(where: { $0.id == id }) { selectPooledSubtitle(sub) }
@@ -2876,7 +2931,8 @@ struct TVPlayerView: View {
         resumeSeconds = currentTime
         appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false
         buffering = true
-        loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream)
+        loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
+                       resumeOrigin: currentTime)
     }
 
     /// REQ-260721-78 option A (surface side): the ONE way this view publishes a terminal load
@@ -3075,6 +3131,7 @@ struct TVPlayerView: View {
         // before the reset below, so the new engine re-applies it instead of the preference-derived auto pick.
         pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
         coordinator.player?.stop()          // straddle invariant: old engine fully down before the surface swap
+        avSurfaceResumeOrigin = reconcileResume
         manualEngineAVPlayer = toAVPlayer
         avEngineFailed = false              // a manual pick gets a fresh chance even after a prior demote
         engineSwitchedAt = Date()           // grace window swallows a stale event from the outgoing engine
@@ -3100,7 +3157,8 @@ struct TVPlayerView: View {
                       reissueMediaGeneration == resumeRetryGeneration,
                       reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
                 appliedResume = false
-                loadIntoPlayer(cu, headers: curHeaders, live: curIsLive)
+                loadIntoPlayer(cu, headers: curHeaders, live: curIsLive,
+                               resumeOrigin: reconcileResume)
             }
         }
         // Re-apply speed + subtitle sync once the new engine's controller is mounted (next render).
@@ -3112,7 +3170,9 @@ struct TVPlayerView: View {
                   reissueMediaGeneration == resumeRetryGeneration,
                   reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
             if abs(playSpeed - 1.0) > 0.01 { coordinator.player?.setSpeed(playSpeed) }
-            if subDelay != 0 { coordinator.player?.setSubDelay(subDelay) }
+            if subDelay != 0, coordinator.player?.subtitleDelayAvailable == true {
+                coordinator.player?.setSubDelay(subDelay)
+            }
         }
         withAnimation { showOptions = false }
     }
@@ -3574,11 +3634,13 @@ struct TVPlayerView: View {
     private func retryLoad(resetAutoRetries: Bool = true) {
         if resetAutoRetries { autoRetryCount = 0; reconnecting = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; recoveryDeadline?.cancel(); recoveryDeadline = nil }
         autoRetryTask?.cancel()
+        let resume = hasStartedPlaying ? currentTime : (resumeSeconds ?? 0)
         withAnimation { loadFailed = false }
         bufferedTime = 0   // reload: clear the buffered-ahead band until the demuxer re-reports
         buffering = true; hasStartedPlaying = false; appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false; loadErrorMsg = ""
         subtitleLoadingURL = nil   // self-heal: a subtitle load stranded by the old engine must not gate the reload's picks
-        loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream)
+        loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
+                       resumeOrigin: resume)
         startLoadTimeout()
     }
 
@@ -3695,6 +3757,9 @@ struct TVPlayerView: View {
                 subtitleLoadingURL = nil
                 // Same still-live-engine gate as the manual row: never record an add the live engine never saw.
                 if ok, player === coordinator.player { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
+                if ok, player === coordinator.player, player.subtitleDelayAvailable, subDelay != 0 {
+                    player.setSubDelay(subDelay)
+                }
                 refreshTracksSoon()
                 VXProbe.event("subs", "subs selected \(langName(sub.lang)) (add-on auto ok=\(ok))")
             }
@@ -3791,15 +3856,15 @@ struct TVPlayerView: View {
             // The pooled list can land AFTER autoSelectTracks already ran (and after an empty add-on list): give
             // the language-chain auto-select its turn on these candidates too (guards above keep it safe).
             autoSelectAddonSubtitleIfNeeded()
-            // P3 seed: apply the community-learned offset ONCE (seconds). Works on BOTH engines now: libmpv
-            // maps it to `sub-delay`; the AVPlayer engine applies it as the offset on the external-subtitle
-            // overlay it renders itself (a no-op until an external cue set is loaded, then it lands correctly).
-            // Never override a delay the user already dialed in.
+            // P3 seed: remember the community-learned offset once. Apply it only when the active subtitle path
+            // advertises live delay support (all libmpv subtitles, or AVPlayer's external cue overlay).
             if !pooledSeededOffset, subDelay == 0, let offsetMs = result.offsetMs, offsetMs != 0 {
                 pooledSeededOffset = true
                 let seconds = (Double(offsetMs) / 1000.0 * 10).rounded() / 10
                 subDelay = seconds
-                coordinator.player?.setSubDelay(seconds)
+                if coordinator.player?.subtitleDelayAvailable == true {
+                    coordinator.player?.setSubDelay(seconds)
+                }
                 VXProbe.log("subs", "subs sync \(seconds)s (community seed)")
             }
             if showOptions, panelKind == .subtitles { panelRows = optionRows }
@@ -3872,6 +3937,9 @@ struct TVPlayerView: View {
                 subtitleLoadingURL = nil
                 // Same still-live-engine gate as the add-on rows: never record an add the live engine never saw.
                 if ok, player === coordinator.player { addedPooledIDs.insert(sub.id) }
+                if ok, player === coordinator.player, player.subtitleDelayAvailable, subDelay != 0 {
+                    player.setSubDelay(subDelay)
+                }
                 if showOptions, panelKind == .subtitles { panelRows = optionRows }
                 VXProbe.event("subs", "subs selected \(langName(sub.lang)) (community ok=\(ok))")
             }
@@ -4509,7 +4577,7 @@ struct TVPlayerView: View {
                 guard let issuedToken = loadIntoPlayer(
                     pre.url, headers: pre.stream.requestHeaders,
                     live: isLiveMeta(newMeta) && !(pre.debridRef == nil && pre.stream.isTorrent),
-                    contentHint: pre.signature
+                    contentHint: pre.signature, resumeOrigin: resolvedResume
                 ) else {
                     if episodeSwitchIsCurrent(
                         generation: episodeGeneration, sourceGeneration: sourceGeneration,
@@ -4663,7 +4731,7 @@ struct TVPlayerView: View {
                     let nextIsLive = isLiveMeta(newMeta) && !nextIsTorrent
                     guard let issuedToken = loadIntoPlayer(
                         u, headers: s.requestHeaders, live: nextIsLive,
-                        contentHint: nextHint
+                        contentHint: nextHint, resumeOrigin: resolvedResume
                     ) else {
                         if episodeSwitchIsCurrent(
                             generation: episodeGeneration, sourceGeneration: sourceGeneration,
@@ -5045,19 +5113,23 @@ struct TVPlayerView: View {
         guard !appliedResume, duration > 0, let r = resumeSeconds else { return }
         appliedResume = true
         guard r > 5, r < duration - 10 else { return }   // ignore trivial / near-end positions
-        // FORWARD-ONLY DV REMUX: never fire the resume seek while the AVPlayer remux is mounted. The remux
-        // produces bytes linearly (isByteRangeAccessSupported=false), so a resume seek lands in bytes that do
-        // not exist yet, no frame ever arrives, and the 20s start watchdog demotes the session to libmpv,
-        // killing BOTH true Dolby Vision and Atmos on every replay/resume of a DV title (the "same on every
-        // 2nd+ test" report). Start at 0 instead, keep the stored resume as a progress-save floor (below), and
-        // tell the viewer once. Seekable remux (HTTP Range + keyframe restart) is the documented Phase-2 fix.
-        if (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true {
-            DiagnosticsLog.log("dv", "resume seek to \(Int(r))s suppressed: remux is forward-only; starting from 0 (progress floor keeps the resume point)")
-            suppressedResumeFloor = r
-            // #147: honest wording per lane (a plain remux mount is not a Dolby Vision stream).
-            showEngineNote(activeAVPlayerWouldRemux
-                ? "Dolby Vision stream starts from the beginning; resume for these comes in a later update"
-                : "This stream starts from the beginning on AVPlayer; resume for these comes in a later update")
+        // A remux resume is fulfilled before mount by rebuilding from the configured source origin. Do not seek
+        // AVPlayer into a forward-only playlist after mount. Verify the achieved keyframe origin instead; only
+        // a genuinely unreachable request needs the progress floor and an unavailable notice.
+        if let av = coordinator.player as? AVPlayerEngineController,
+           let origin = av.achievedRemuxTimelineOriginSeconds {
+            switch RemuxResumePolicy.preStartSeek(target: r, origin: origin) {
+            case .satisfied:
+                suppressedResumeFloor = nil
+                currentTime = origin
+                lastSaved = origin
+                DiagnosticsLog.log("dv", "resume to \(Int(r))s satisfied by remux origin \(Int(origin))s")
+            case .unreachable:
+                suppressedResumeFloor = r
+                lastSaved = r
+                showEngineNote("That resume point is unavailable for this source. Playing from the earliest available position.")
+                DiagnosticsLog.log("dv", "resume to \(Int(r))s unavailable from remux origin \(Int(origin))s; progress floor retained")
+            }
             return
         }
         coordinator.player?.seek(to: r)

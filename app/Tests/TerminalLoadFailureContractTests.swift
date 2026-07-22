@@ -18,11 +18,6 @@
 
 import Foundation
 
-var failures = 0
-func check(_ name: String, _ condition: Bool) {
-    if condition { print("PASS  \(name)") } else { failures += 1; print("FAIL  \(name)") }
-}
-
 /// A minimal model of the native engine's ownership gate: load() mints a ticket (the load token /
 /// item generation), stop() retires the mount and advances the generation, and the delayed
 /// display-criteria completion applies only while its mint still owns the engine (mirrors the
@@ -68,6 +63,10 @@ enum TerminalLoadFailureContractTests {
 }
 
 func run() {
+var failures = 0
+func check(_ name: String, _ condition: Bool) {
+    if condition { print("PASS  \(name)") } else { failures += 1; print("FAIL  \(name)") }
+}
 
 // MARK: - Scoping: which mounted engine gets retired
 
