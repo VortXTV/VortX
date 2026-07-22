@@ -81,7 +81,19 @@ struct VortXTVApp: App {
             // `directResume`) lifted into a shared helper. That is a refactor of the app's most
             // bug-historied path and does not belong inside a new feature's diff, so it is left as a
             // deliberate follow-up rather than duplicated out here where the two copies would drift.
-            .onOpenURL { DeepLinkRouter.shared.handle($0) }
+            .onOpenURL { url in
+                // DEBUG-only playback hook front door (`vortx://debug-play?url=…`), tried FIRST so a
+                // debug link is consumed here (accepted or loudly rejected) instead of dribbling into
+                // the production router. NOT an automation path: tvOS gates every `simctl openurl`
+                // behind an `Open in "VortX"?` confirmation, so this is a manual convenience only and
+                // the conformance harness uses the launch-environment trigger for BOTH cold start and
+                // re-trigger. Compiled out of Release, where the link falls through below and is
+                // ignored as "not ours". See DebugPlaybackHook and test/player-conformance/DEBUG-PLAYBACK-HOOK.md.
+                #if DEBUG
+                if DebugPlaybackHook.handleDeepLink(url, presenter: presenter) { return }
+                #endif
+                DeepLinkRouter.shared.handle(url)
+            }
             .onChange(of: scenePhase) { _, phase in
                 // Distinguishes "the system suspended us" (an unhandled menu press)
                 // from "we crashed" when a device report says the app vanished.
@@ -172,6 +184,13 @@ struct VortXTVApp: App {
                         await VortXSyncManager.shared.snapshotOwnedFromEngine()
                     }
                 }
+                // DEBUG-only headless playback hook (VORTX_DEBUG_PLAY_URL): the player-conformance
+                // harness's cold-start trigger. Validates + pins the AVFoundation engine override,
+                // then issues the playback request through the same presenter seam -tv-playertest
+                // uses below. One-shot, no-op without the env var, compiled out of Release.
+                #if DEBUG
+                DebugPlaybackHook.fireFromEnvironmentIfRequested(presenter: presenter)
+                #endif
                 // DIAGNOSTIC (-tv-playertest): exercise the real root-replacement path without an account.
                 guard ProcessInfo.processInfo.arguments.contains("-tv-playertest") else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
