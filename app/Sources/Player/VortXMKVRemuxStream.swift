@@ -325,7 +325,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         if UserDefaults.standard.object(forKey: multiAudioKey) != nil {
             return UserDefaults.standard.bool(forKey: multiAudioKey)
         }
-        return RemoteConfig.snapshot.isFeatureOn("dvRemuxMultiAudio", default: false)
+        return RemoteConfig.snapshot.isFeatureOn("dvRemuxMultiAudio", default: true)
     }
 
     // MARK: - Resume: producing from a mid-title origin (feature flag)
@@ -406,7 +406,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         if UserDefaults.standard.object(forKey: subtitleRenditionsKey) != nil {
             return UserDefaults.standard.bool(forKey: subtitleRenditionsKey)
         }
-        return RemoteConfig.snapshot.isFeatureOn("dvRemuxSubtitles", default: false)
+        return RemoteConfig.snapshot.isFeatureOn("dvRemuxSubtitles", default: true)
     }
 
     /// Per-rendition cue cap. A two-hour film runs to roughly 2000 cues; 20000 is far above any real track and
