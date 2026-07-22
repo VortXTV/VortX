@@ -114,6 +114,44 @@ enum Trace {
         return s
     }
 
+    // MARK: - Availability window (point 4), shared by both channels
+
+    /// The resident-window arithmetic behind contract point 4, factored out so the
+    /// trace channel and the live channel evaluate the SAME numbers. When these
+    /// lived only inside `Trace.findings`, the live channel probed just the lowest
+    /// advertised segment and could report GREEN on a session this arithmetic
+    /// proved RED from the identical log. That was a harness UNDER-OBSERVATION bug,
+    /// not a contract difference: point 4 has always been "no advertised-segment
+    /// 404 through the RFC 8216 s6.2.2 availability window", and the live channel
+    /// simply was not looking at the segments most likely to violate it.
+    struct AvailabilityWindow {
+        /// Mean served segment size, from the real `hls resp /segN.m4s <bytes>B` lines.
+        let avgSegmentBytes: Int
+        /// How many segments of that size the resident window can hold.
+        let residentSegments: Int
+        /// Highest segment count the playlist ever advertised.
+        let advertisedMax: Int
+        /// Highest advertised id the window can no longer hold, or nil when the whole
+        /// advertised range still fits. Ids `0...evictedUpTo` are advertised-but-gone.
+        let evictedUpTo: Int?
+        /// Advertised ids that actually 404'd during playback (proof, not prediction).
+        let observed404s: [Int]
+
+        /// Ids the arithmetic predicts are advertised but no longer resident.
+        var predictedEvictedIds: [Int] { evictedUpTo.map { Array(0...$0) } ?? [] }
+    }
+
+    static func availabilityWindow(_ s: TraceSession) -> AvailabilityWindow {
+        let avg = s.segResponseBytes.isEmpty ? 0
+                : s.segResponseBytes.values.reduce(0, +) / s.segResponseBytes.count
+        let resident = avg > 0 ? (Contract.windowFloorMiB * 1024 * 1024) / avg : 0
+        var evictedUpTo: Int?
+        if avg > 0, s.advertisedMax > resident { evictedUpTo = s.advertisedMax - resident - 1 }
+        return AvailabilityWindow(avgSegmentBytes: avg, residentSegments: resident,
+                                  advertisedMax: s.advertisedMax, evictedUpTo: evictedUpTo,
+                                  observed404s: s.advertised404s.sorted())
+    }
+
     // MARK: - Contract evaluation from a trace
 
     static func findings(_ s: TraceSession) -> [Finding] {
@@ -173,24 +211,24 @@ enum Trace {
             out.append(Finding(point: .firstSegmentZero, verdict: verdict, evidence: ev))
         }
 
-        // (4) Advertised-segment availability.
+        // (4) Advertised-segment availability. Same numbers the live channel uses
+        // (see `availabilityWindow`); the two channels must never disagree on them.
         do {
             var ev: [String] = []
             var verdict = Verdict.green
-            if !s.advertised404s.isEmpty {
-                ev.append("advertised segments 404'd: \(s.advertised404s.sorted())")
+            let w = availabilityWindow(s)
+            if !w.observed404s.isEmpty {
+                ev.append("advertised segments 404'd: \(w.observed404s)")
                 verdict = .red
             } else {
                 ev.append("no advertised-segment 404 fired during this forward-only playback")
             }
             // Latent EVENT-window eviction: MEDIA-SEQUENCE stays 0, so the playlist keeps
             // advertising low segments after the resident window has slid past them.
-            let avg = s.segResponseBytes.isEmpty ? 0 : s.segResponseBytes.values.reduce(0,+) / s.segResponseBytes.count
-            if avg > 0 {
-                let residentSegs = (Contract.windowFloorMiB * 1024 * 1024) / avg
-                ev.append("resident window ~= \(Contract.windowFloorMiB) MiB / \(avg) B ≈ \(residentSegs) segments; playlist advertised up to \(s.advertisedMax) (MEDIA-SEQUENCE stays 0)")
-                if s.advertisedMax > residentSegs {
-                    ev.append("LATENT: segment 0..\(s.advertisedMax - residentSegs - 1) advertised but evicted -> a client that re-requests one (RFC 8216 s6.2.2 window) gets a 404")
+            if w.avgSegmentBytes > 0 {
+                ev.append("resident window ~= \(Contract.windowFloorMiB) MiB / \(w.avgSegmentBytes) B ≈ \(w.residentSegments) segments; playlist advertised up to \(w.advertisedMax) (MEDIA-SEQUENCE stays 0)")
+                if let evictedUpTo = w.evictedUpTo {
+                    ev.append("LATENT: segment 0..\(evictedUpTo) advertised but evicted -> a client that re-requests one (RFC 8216 s6.2.2 window) gets a 404")
                     verdict = .red
                 }
             }

@@ -13,6 +13,12 @@ import Foundation
 
 enum Live {
 
+    /// Ceiling on point 4's active probes, so a long EVENT playlist with a large
+    /// predicted-evicted range cannot turn one gate run into hundreds of fetches.
+    /// The targets are chosen most-at-risk first (see the point 4 block), so the cap
+    /// trims the least informative probes.
+    static let availabilityProbeCap = 16
+
     struct Response { let status: Int; let body: Data }
 
     static func get(host: String = "127.0.0.1", port: Int, path: String, timeout: TimeInterval = 8) -> Response? {
@@ -80,10 +86,20 @@ enum Live {
         do {
             var ev: [String] = []
             var offenders: [Int] = []
-            var checked = 0, indeterminate = 0
+            var checked = 0, indeterminate = 0, evictedSkipped = 0
             if let p = parsed {
-                for seg in p.segments.prefix(segmentSampleCap) {
-                    guard let r = get(port: port, path: "/seg\(seg.id).m4s"), r.status == 200 else { continue }
+                // Walk the advertised list and check the first `segmentSampleCap`
+                // segments that are actually RETRIEVABLE, rather than the first
+                // `segmentSampleCap` advertised ids. Once the run is sized so the
+                // window genuinely evicts (which point 4 requires), the lowest
+                // advertised ids are exactly the evicted ones, and a fixed
+                // `prefix(cap)` spends its whole budget on 404s and reports
+                // "checked 0 segments" - point 2 stops being decided at all.
+                // Same predicate, same verdict mapping: only the aim changes.
+                for seg in p.segments {
+                    if checked >= segmentSampleCap { break }
+                    guard let r = get(port: port, path: "/seg\(seg.id).m4s") else { continue }
+                    guard r.status == 200 else { evictedSkipped += 1; continue }
                     checked += 1
                     switch FMP4.firstSampleIsSync(r.body) {
                     case .some(true): break
@@ -91,7 +107,10 @@ enum Live {
                     case .none: indeterminate += 1
                     }
                 }
-                ev.append("checked \(checked) segments (sample cap \(segmentSampleCap)); non-IDR starts: \(offenders); indeterminate: \(indeterminate)")
+                ev.append("checked \(checked) retrievable segments (sample cap \(segmentSampleCap)); non-IDR starts: \(offenders); indeterminate: \(indeterminate)")
+                if evictedSkipped > 0 {
+                    ev.append("skipped \(evictedSkipped) advertised-but-unfetchable segments while sampling (that is point 4's finding, not point 2's)")
+                }
                 out.append(Finding(point: .idrStart, verdict: offenders.isEmpty ? (checked > 0 ? .green : .indeterminate) : .red, evidence: ev))
             } else {
                 out.append(Finding(point: .idrStart, verdict: .indeterminate, evidence: ["no live media playlist to enumerate segments"]))
@@ -122,18 +141,96 @@ enum Live {
             out.append(Finding(point: .firstSegmentZero, verdict: verdict, evidence: ev))
         }
 
-        // (4) Availability window: directly GET the lowest advertised segment. On an
-        // EVENT playlist (MEDIA-SEQUENCE 0) that is seg0, which the resident window
-        // may have evicted while still advertising it.
+        // (4) Availability window. TWO independent strands, ORed into one verdict:
+        //
+        //   ACTIVE  - GET advertised segments and see whether any 404. Aimed at the
+        //             ids the resident-window arithmetic predicts are already gone,
+        //             plus the lowest advertised id, the highest, and a spread across
+        //             the advertised range. Probing ONLY the lowest id (what this
+        //             check used to do) aims at whichever segment is most likely to
+        //             still be resident, so it could report GREEN on a session the
+        //             trace channel proved RED from the identical log.
+        //   LATENT  - the resident-window arithmetic itself, taken from
+        //             `Trace.availabilityWindow` so both channels share one
+        //             implementation, plus any advertised-id 404 the request log
+        //             actually recorded during playback.
+        //
+        // RED if EITHER strand fires. Both are always printed, so a reader can tell
+        // PROOF (a real 404) from PREDICTION (arithmetic) - including when they
+        // disagree, which is itself a fact about the retention behaviour.
+        //
+        // This widens what is OBSERVED. The bar is unchanged: contract point 4 has
+        // always been "no advertised-segment 404 through the RFC 8216 s6.2.2
+        // availability window" (Contract.swift), and neither its text nor its
+        // threshold is touched here.
         do {
             var ev: [String] = []
             var verdict = Verdict.indeterminate
-            if let p = parsed, let lowest = p.segments.map(\.id).min() {
-                let r = get(port: port, path: "/seg\(lowest).m4s")
-                let st = r?.status ?? -1
-                ev.append("GET /seg\(lowest).m4s (lowest advertised) -> HTTP \(st)")
-                verdict = st == 200 ? .green : .red
-                if st != 200 { ev.append("advertised segment is not fetchable -> availability-window violation (RFC 8216 s6.2.2)") }
+            let w = Trace.availabilityWindow(trace)
+
+            // --- ACTIVE strand
+            var probed: [(id: Int, status: Int)] = []
+            var atRisk = Set<Int>()
+            if let p = parsed, !p.segments.isEmpty {
+                let ids = p.segments.map(\.id).sorted()
+                // Ordered MOST-AT-RISK FIRST so `availabilityProbeCap` trims the least
+                // informative probes rather than the ones aimed at the defect.
+                var targets: [Int] = []
+                func add(_ id: Int) { if !targets.contains(id) { targets.append(id) } }
+                atRisk = Set(w.predictedEvictedIds).intersection(ids)
+                for id in atRisk.sorted() { add(id) }        // predicted evicted
+                if let lowest = ids.first { add(lowest) }    // the classic seg0 case
+                let step = max(1, ids.count / 6)             // spread across the range
+                for i in stride(from: 0, to: ids.count, by: step) { add(ids[i]) }
+                if let highest = ids.last { add(highest) }   // the newest published
+
+                for id in targets.prefix(Live.availabilityProbeCap) {
+                    let r = get(port: port, path: "/seg\(id).m4s")
+                    probed.append((id, r?.status ?? -1))
+                }
+                probed.sort { $0.id < $1.id }
+                let missing = probed.filter { $0.status != 200 }
+                ev.append("ACTIVE: probed \(probed.count) advertised ids \(probed.map(\.id)) "
+                          + "(lowest + highest + \(atRisk.count) predicted-evicted + a spread); "
+                          + "non-200: \(missing.isEmpty ? "none" : missing.map { "seg\($0.id)->HTTP\($0.status)" }.joined(separator: ", "))")
+                if !missing.isEmpty {
+                    ev.append("PROOF: an ADVERTISED segment is not fetchable -> availability-window violation (RFC 8216 s6.2.2)")
+                }
+            } else {
+                ev.append("ACTIVE: no live media playlist to enumerate advertised segments")
+            }
+
+            // --- LATENT strand (identical arithmetic to the trace channel)
+            if !w.observed404s.isEmpty {
+                ev.append("LATENT: advertised segments that 404'd during playback: \(w.observed404s)")
+            }
+            if w.avgSegmentBytes > 0 {
+                ev.append("LATENT: resident window ~= \(Contract.windowFloorMiB) MiB / \(w.avgSegmentBytes) B ≈ \(w.residentSegments) segments; playlist advertised up to \(w.advertisedMax) (MEDIA-SEQUENCE stays 0)")
+                if let evictedUpTo = w.evictedUpTo {
+                    ev.append("LATENT: segment 0..\(evictedUpTo) advertised but evicted -> a client that re-requests one (RFC 8216 s6.2.2 window) gets a 404")
+                }
+            } else {
+                ev.append("LATENT: no served-segment byte sizes in the log yet; window arithmetic unavailable")
+            }
+
+            // --- verdict: either strand is sufficient
+            let activeFired = probed.contains { $0.status != 200 }
+            let latentFired = w.evictedUpTo != nil || !w.observed404s.isEmpty
+            if activeFired || latentFired {
+                verdict = .red
+            } else if !probed.isEmpty {
+                verdict = .green
+            }
+
+            // --- a disagreement between the strands is information, not something to
+            //     quietly resolve in favour of whichever strand is more convenient.
+            if latentFired && !activeFired && !probed.isEmpty {
+                let stillResident = Set(probed.filter { $0.status == 200 }.map(\.id))
+                    .intersection(atRisk).sorted()
+                ev.append("NOTE: the strands DISAGREE. The arithmetic predicts 0..\(w.evictedUpTo.map(String.init) ?? "?") are evicted, "
+                          + "but \(stillResident.isEmpty ? "no probed at-risk id" : "ids \(stillResident)") still returned 200. "
+                          + "Either the window retains more than the \(Contract.windowFloorMiB) MiB floor the estimate uses, or eviction "
+                          + "had not run yet. RED stands on the latent strand: the playlist advertises a range the window is not sized to guarantee.")
             }
             out.append(Finding(point: .noAdvertised404, verdict: verdict, evidence: ev))
         }
