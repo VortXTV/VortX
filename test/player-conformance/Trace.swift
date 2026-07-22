@@ -72,6 +72,15 @@ enum Trace {
         return build(Array(all[lo..<hi]))
     }
 
+    /// How many plain-remux sessions the file contains. More than one in a slice that
+    /// is meant to cover a single run means the app was relaunched or re-mounted
+    /// mid-run, so the port the live channel would probe may belong to a DEAD session.
+    static func sessionCount(inFileAt path: String) -> Int {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return 0 }
+        return text.split(separator: "\n", omittingEmptySubsequences: false)
+                   .filter { $0.contains("hls server listening on 127.0.0.1:") }.count
+    }
+
     private static func build(_ raw: [String]) -> TraceSession {
         var s = TraceSession()
         for line in raw {

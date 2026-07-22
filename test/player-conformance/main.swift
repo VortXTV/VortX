@@ -146,8 +146,41 @@ case "live":
     let spool = value("--spool", args)
     let bound = Int(value("--spool-bound-mib", args) ?? "") ?? (Contract.windowFloorMiB * 2)
     let sample = Int(value("--sample", args) ?? "") ?? 12
-    let accept = report("live channel: 127.0.0.1:\(port) (log \(logPath))",
-                        Live.findings(port: port, trace: s, spoolPath: spool, spoolBoundMiB: bound, segmentSampleCap: sample))
+
+    // Provenance of the port, printed on every run: probing a STALE port is one of the
+    // ways this channel can silently measure the wrong thing, and it must be visible.
+    let sessions = Trace.sessionCount(inFileAt: logPath)
+    print("[live] probing 127.0.0.1:\(port) (port read from this session's `hls server listening` line; "
+          + "\(sessions) plain-remux session(s) in \(logPath))")
+    if sessions > 1 {
+        FileHandle.standardError.write(Data("""
+
+        [INFRA] the captured log contains \(sessions) plain-remux sessions, not 1.
+        [INFRA] The session that was waited on and soaked is NOT necessarily the one still
+        [INFRA] listening, so any probe result would be ambiguous and the port may be dead.
+        [INFRA] This means the app was relaunched or re-mounted mid-run.
+        [INFRA] exit 3 - could not stand up a probeable playback session.
+
+        """.utf8))
+        exit(3)
+    }
+
+    let outcome = Live.evaluate(port: port, trace: s, spoolPath: spool, spoolBoundMiB: bound, segmentSampleCap: sample)
+    if let infra = outcome.infra {
+        // Print whatever WAS observed, explicitly marked as not a verdict, then exit 3.
+        if !outcome.findings.isEmpty {
+            _ = report("live channel (INCOMPLETE - NOT A VERDICT): 127.0.0.1:\(port)", outcome.findings)
+        }
+        FileHandle.standardError.write(Data("""
+
+        [INFRA] \(infra)
+        [INFRA] exit 3 - the live channel could not OBSERVE the session, so nothing above is
+        [INFRA] a product signal. This is NOT a player regression.
+
+        """.utf8))
+        exit(3)
+    }
+    let accept = report("live channel: 127.0.0.1:\(port) (log \(logPath))", outcome.findings)
     exit(accept ? 0 : 1)
 
 case "spool":

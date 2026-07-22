@@ -124,16 +124,40 @@ SLO_MOUNT_READY_MS="$(contract_int sloMountToReadyMs)"   # 30000: point 6 SLO
 # margin of 1 would put the run exactly on that knife edge, which is how the earlier
 # 92 MiB fixture produced 15 predicted-evicted ids that all still returned 200. The
 # soak is DERIVED from this and the fixture's own bitrate, never hardcoded.
-EVICTION_MARGIN="${VORTX_EVICTION_MARGIN:-2}"
+EVICTION_MARGIN_PERCENT="${VORTX_EVICTION_MARGIN_PERCENT:-120}"
 # Explicit --soak wins; empty means "derive it" (see derive_soak).
 SOAK_SECS="${VORTX_SOAK_SECS:-}"
-# Delivery pacing, as a multiple of the fixture's own average bitrate. See the
-# header of range-server.py: an unpaced LAN server delivers the whole fixture
-# before AVPlayer's first /media.m3u8 request, which turns the session into an
-# instant ENDLIST VOD and hides the startup gate that point 1 measures. 4x keeps
-# the producer comfortably ahead of 1x playback while still losing the race to
-# AVPlayer's first playlist request, which is the real-world condition.
-FIXTURE_RATE_MULTIPLE="${VORTX_FIXTURE_RATE_MULTIPLE:-4}"
+# Delivery pacing, as a PERCENT of the fixture's own average bitrate.
+#
+# Two opposing constraints, and the window between them is narrower than it looks:
+#
+#  LOWER BOUND (point 1): an unpaced LAN server delivers the whole fixture before
+#    AVPlayer's first /media.m3u8 request, so the session becomes an instant ENDLIST
+#    VOD and the startup gate point 1 measures is never exercised. Anything at or
+#    above ~1x already loses that race, because the gate needs 2 closed segments
+#    (~6 s of media) while AVPlayer asks at ~0.3 s.
+#  UPPER BOUND (session survival): the producer parks in `VortXRemuxBuffer.append`
+#    once resident bytes reach `windowFloorBytes + producerLead`. Parking blocks
+#    inside the SOURCE READ path, so the app's own stall detector sees no source
+#    progress and FAILS the remux. Measured at 4x: "live source read stalled 48.2s
+#    (rc=-5, produced=125901614B)" then "hls 404 /media.m3u8 (remux failed)" and a
+#    demotion, roughly 95 s in, killing the session before the probe.
+#
+# So the surplus rate (delivery minus playback) must be small enough that it cannot
+# fill the buffer before the probe runs. That is derived in `safe_rate_percent`
+# from windowFloorMiB and the soak, not chosen. This value is only the CEILING that
+# derivation is allowed to clamp down from.
+FIXTURE_RATE_PERCENT="${VORTX_FIXTURE_RATE_PERCENT:-150}"
+# How much margin to keep between "buffer full" and "probe time".
+# Measured, not modelled. A safety of 2 (delivery clamped to 125%) STILL parked the
+# producer: the playlist froze at segs=70 for 40 s while AVPlayer polled /media.m3u8,
+# then AVPlayer gave up with "mid-play AVPlayer endFileError (Playback Stopped) ->
+# demote to libmpv in place". The read head evidently lags playback by more than the
+# simple model assumes, so the surplus must be small enough that the producer never
+# builds a meaningful lead at all. 5 clamps delivery to ~110%.
+PARK_SAFETY="${VORTX_PARK_SAFETY:-1}"
+# Extra bounded wait for the eviction positive control (see confirm_eviction).
+EVICTION_CONFIRM_SECS="${VORTX_EVICTION_CONFIRM_SECS:-120}"
 
 # --- starve mode (point 7's positive path) ----------------------------------
 # Contract point 7 wants EXACTLY ONE `hls_startup_cohort_timeout` plus a 404 into the
@@ -184,6 +208,7 @@ app_build() {
 # =============================================================================
 
 SERVER_PID=""
+FIXTURE_PORT=""
 WORK=""
 APP_LAUNCHED=0
 MODE_STARVE=0
@@ -205,8 +230,20 @@ cleanup() {
   if [ "$APP_LAUNCHED" = "1" ]; then
     xcrun simctl terminate "$UDID" "$BUNDLE_ID" >/dev/null 2>&1 || true
   fi
+  if [ -n "$WORK" ] && [ -f "$WORK/server.log" ]; then
+    cp "$WORK/server.log" "$DD/last-fixture-server.log" 2>/dev/null || true
+  fi
   [ -n "$WORK" ] && rm -rf "$WORK"
   exit $rc
+}
+
+# Facts the Swift binary cannot see, used to make an INFRA report specific rather than
+# a shrug. Simulator apps run as host processes, so pgrep finds them.
+app_alive() {
+  if pgrep -f "$SCHEME.app/$SCHEME" >/dev/null 2>&1; then echo "YES"; else echo "NO (the app was gone)"; fi
+}
+server_alive() {
+  if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then echo "YES"; else echo "NO"; fi
 }
 
 preflight() {
@@ -218,6 +255,20 @@ preflight() {
     || infra "ffmpeg not found; live-auto generates its own fixture. Install it: brew install ffmpeg"
   command -v python3 >/dev/null \
     || infra "python3 not found; it runs the range-capable fixture server."
+  # Sweep fixture servers leaked by earlier runs. One still streaming at full rate is
+  # enough to skew the pacing this harness depends on.
+  # NOTE: `pgrep` exits 1 when nothing matches, and this script runs under
+  # `set -o pipefail`, so assigning a pgrep pipeline directly aborts the whole run on
+  # the (normal) no-strays path. Gate on the `if` instead, which set -e does not trap.
+  local stray=0
+  if pgrep -f "$HERE/range-server.py" >/dev/null 2>&1; then
+    stray="$(pgrep -f "$HERE/range-server.py" 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+  if [ "${stray:-0}" -gt 0 ]; then
+    echo "[live-auto] sweeping $stray leaked fixture server(s) from earlier runs"
+    pkill -f "$HERE/range-server.py" || true
+    sleep 1
+  fi
   # The 4th precondition - "the installed Debug build carries the DEBUG playback
   # hook" - cannot be checked cheaply before launch without inspecting the binary.
   # It is checked HONESTLY after launch instead: if no [debughook] marker of any
@@ -271,16 +322,32 @@ media_byte_rate() {
 derive_soak() {
   local rate need soak
   rate="$(media_byte_rate)"
-  need=$(( EVICTION_MARGIN * WINDOW_FLOOR_MIB * 1024 * 1024 ))
+  need=$(( EVICTION_MARGIN_PERCENT * WINDOW_FLOOR_MIB * 1024 * 1024 / 100 ))
   soak=$(( need / rate ))
   echo "[live-auto] eviction sizing: buffer evicts at (readHead - ${WINDOW_FLOOR_MIB} MiB), read head advances" >&2
-  echo "[live-auto]   at playback rate ${rate} B/s. Need read head past ${EVICTION_MARGIN} x ${WINDOW_FLOOR_MIB} MiB" >&2
+  echo "[live-auto]   at playback rate ${rate} B/s. Need read head past ${EVICTION_MARGIN_PERCENT}% of ${WINDOW_FLOOR_MIB} MiB" >&2
   echo "[live-auto]   = ${need} B, so soak = ${need} / ${rate} = ${soak}s (fixture is ${FIXTURE_SECS}s of media)." >&2
   if [ "$soak" -ge $(( FIXTURE_SECS - 30 )) ]; then
     echo "[live-auto]   WARNING: the fixture is too short to soak that long. Point 4's active" >&2
     echo "[live-auto]   strand may probe a window that never evicted. Raise VORTX_FIXTURE_SECS." >&2
   fi
   echo "$soak"
+}
+
+# The largest delivery percent that cannot park the producer before the probe runs.
+# The producer's SURPLUS over playback accumulates in the buffer; once it reaches the
+# park ceiling the source read blocks and the app fails the remux (see the constraint
+# note above). Requiring
+#     windowFloorBytes / surplus  >  soak x PARK_SAFETY
+# keeps the buffer from filling until well after the battery has run. windowFloorBytes
+# is the conservative choice: the real ceiling is floor + producer lead, so this errs
+# on the safe side. Derived from Contract.swift and the soak, never picked.
+safe_rate_percent() {
+  local rate surplus_max percent
+  rate="$(media_byte_rate)"
+  surplus_max=$(( WINDOW_FLOOR_MIB * 1024 * 1024 / (SOAK_SECS * PARK_SAFETY) ))
+  percent=$(( 100 + surplus_max * 100 / rate ))
+  echo "$percent"
 }
 
 start_fixture_server() {
@@ -295,11 +362,22 @@ start_fixture_server() {
     echo "[starve]   at this rate takes $(( STARVE_FACTOR * SLO_MOUNT_READY_MS / 1000 ))s, i.e. ${STARVE_FACTOR}x the ${SLO_MOUNT_READY_MS} ms" >&2
     echo "[starve]   mount->ready SLO, so the cohort provably cannot fill before any startup deadline." >&2
   else
-    # Pace at FIXTURE_RATE_MULTIPLE x the fixture's OWN average bitrate, derived from
-    # the file rather than hardcoded, so changing the fixture cannot silently unpace it.
-    rate=$(( bytes / FIXTURE_SECS * FIXTURE_RATE_MULTIPLE ))
+    local safe percent
+    safe="$(safe_rate_percent)"
+    percent="$FIXTURE_RATE_PERCENT"
+    if [ "$percent" -gt "$safe" ]; then
+      echo "[live-auto] pacing clamped ${percent}% -> ${safe}%: any faster and the producer's" >&2
+      echo "[live-auto]   surplus fills the ${WINDOW_FLOOR_MIB} MiB buffer before the ${SOAK_SECS}s probe, which parks" >&2
+      echo "[live-auto]   the source read and makes the app fail the remux ('live source read stalled')." >&2
+      percent="$safe"
+    fi
+    # Pace as a percent of the fixture's OWN average bitrate, derived from the file
+    # rather than hardcoded, so changing the fixture cannot silently unpace it.
+    rate=$(( bytes / FIXTURE_SECS * percent / 100 ))
     # stderr: stdout of this function is the port, captured by the caller.
-    echo "[live-auto] pacing delivery at ${rate} B/s (${FIXTURE_RATE_MULTIPLE}x the fixture's own bitrate)" >&2
+    echo "[live-auto] pacing delivery at ${rate} B/s (${percent}% of the fixture's own bitrate;" >&2
+    echo "[live-auto]   above 100% so the producer stays ahead of playback, far enough below the" >&2
+    echo "[live-auto]   park ceiling that the source read never stalls)" >&2
   fi
   python3 "$HERE/range-server.py" "$FIXTURE" "$portfile" 0.0.0.0 "$rate" >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
@@ -310,7 +388,7 @@ start_fixture_server() {
     waited=$((waited + 1))
     [ $waited -lt 50 ] || infra "fixture server never reported a port"
   done
-  cat "$portfile"
+  FIXTURE_PORT="$(cat "$portfile")"
 }
 
 verify_range() {   # $1 = url
@@ -331,6 +409,35 @@ $headers"
 
 slice_log() {   # $1 = full log, $2 = byte offset before launch, $3 = out
   if [ -f "$1" ]; then tail -c "+$(( $2 + 1 ))" "$1" > "$3" 2>/dev/null || : > "$3"; else : > "$3"; fi
+}
+
+# Slice a BOUNDED byte window [from, to) out of the container log.
+#
+# This exists for the observation-window correction. The harness's own probes hit the
+# app's HLS server, and the app logs them exactly like AVPlayer's requests: our
+# eviction control's `GET /seg0.m4s` lands in the log as `hls 404 /seg0.m4s`. Read back
+# as session evidence that is FALSE EVIDENCE. It flips point 7's `saw a 404` to true,
+# and `saw a 404` is one of the THREE conditions for point 7 going GREEN (the others
+# being no readyToPlay and exactly one cohort-timeout event). The moment the rework
+# emits that event, point 7 could go GREEN with one third of its proof supplied by our
+# own probe rather than by the product: a false GREEN with a fuse on it, timed to fire
+# exactly when the gate finally matters. It also mislabels harness traffic as playback
+# evidence in point 4's latent line.
+#
+# The harness knows precisely when its own probing starts, so it records that byte
+# boundary and cuts the trace there. Excluding by RECORDED BOUNDARY rather than by
+# matching request paths is deliberate: a path pattern silently stops working the
+# moment someone adds a probe that does not match it, and would fail open.
+#
+# No contract text, threshold or verdict mapping changes. This only makes the trace
+# honest about which requests belong to the session under test.
+slice_window() {   # $1 = full log, $2 = from byte, $3 = to byte (exclusive), $4 = out
+  local count=$(( $3 - $2 ))
+  if [ -f "$1" ] && [ "$count" -gt 0 ]; then
+    tail -c "+$(( $2 + 1 ))" "$1" 2>/dev/null | head -c "$count" > "$4" || : > "$4"
+  else
+    : > "$4"
+  fi
 }
 
 wait_for_ready() {   # $1 = full log, $2 = offset, $3 = slice path
@@ -480,22 +587,116 @@ starve_wait() {   # $1 = full log, $2 = offset, $3 = slice path
 # Let the session actually stream before probing it, still watching for a demotion:
 # a mid-soak flip to libmpv is exactly as much an INFRA failure as one before ready.
 soak() {   # $1 = full log, $2 = offset, $3 = slice path
-  local slice="$3" elapsed=0
+  local slice="$3" elapsed=0 advertised sessions
   [ "$SOAK_SECS" -gt 0 ] || return 0
   while [ "$elapsed" -lt "$SOAK_SECS" ]; do
     slice_log "$1" "$2" "$slice"
+    # FIXTURE SERVER DEATH. If our own server exits, the app's source read fails and
+    # the session collapses, which would otherwise surface as a confusing player-side
+    # error. Name it as OUR fault, immediately, with the server's own stderr.
+    if [ -n "$SERVER_PID" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      printf "\n"
+      infra "the FIXTURE SERVER (ours, not the app) died ${elapsed}s into the soak, so the app
+        lost its source mid-session. This is a harness failure, not a player defect.
+        last lines of the fixture server log:
+$(tail -12 "$WORK/server.log" 2>/dev/null || echo '  (no server log)')"
+    fi
+    # SOURCE-READ STALL. The most specific failure on this path and the one worth
+    # naming outright: the producer parked on the buffer ceiling, which blocks inside
+    # the source read, so the app declared the remux failed. That is a PACING fault in
+    # this harness, not a player defect, and the message has to say so or the next
+    # person reads it as a regression.
+    if grep -q 'live source read stalled' "$slice"; then
+      printf "\n"
+      infra "the app declared the SOURCE READ STALLED during the soak and failed the remux.
+        marker: $(grep 'live source read stalled' "$slice" | tail -1)
+        This is a harness PACING fault, not a player defect: the fixture was delivered
+        faster than playback drained it, the producer parked on the ${WINDOW_FLOOR_MIB} MiB buffer
+        ceiling, and parking blocks the source read. Lower VORTX_FIXTURE_RATE_PERCENT
+        (or raise VORTX_PARK_SAFETY) so the surplus cannot fill the buffer before the probe."
+    fi
     if grep -q 'demote in place\|remux demoted' "$slice"; then
       printf "\n"
       infra "the AVPlayer session was demoted to libmpv DURING the soak, so the battery
         would have probed a dead HLS server.
         marker: $(grep 'demote in place\|remux demoted' "$slice" | tail -1)"
     fi
-    printf "\r[live-auto] streaming before probe ... %ds/%ds (segments published: %s)   " \
-      "$elapsed" "$SOAK_SECS" "$(grep -c 'hls media segment .* published' "$slice" || true)"
+    # SUPERSESSION. A second `hls server listening` means the app relaunched or
+    # re-mounted, so the session we waited on is dead and its port is stale: the battery
+    # would probe a server that no longer exists. Catch it AT THE MOMENT IT HAPPENS
+    # rather than burning the rest of the soak and failing obscurely at probe time.
+    sessions="$(grep -c 'hls server listening on 127\.0\.0\.1:' "$slice" || true)"
+    if [ "${sessions:-0}" -gt 1 ]; then
+      printf "\n"
+      infra "the playback session was SUPERSEDED ${elapsed}s into the soak. The slice now holds
+        ${sessions} 'hls server listening' lines, so the app relaunched or re-mounted and the
+        session that was waited on and soaked is dead. Its port is stale, so the battery
+        would have probed a server that no longer exists.
+        listening lines: $(grep 'hls server listening on 127\.0\.0\.1:' "$slice" | sed 's/.*listening on/->/' | tr '\n' ' ')
+        Most likely another process launched $BUNDLE_ID mid-run (a concurrent harness run,
+        a manual launch, or Xcode). This run needs the simulator to itself."
+    fi
+    # Progress: how many segments the playlist currently ADVERTISES. Do NOT count
+    # `hls media segment N published` lines: that log site is gated `if idx <= 1`
+    # (VortXMKVRemuxStream.swift:2068), so it fires for segments 0 and 1 ONLY, and a
+    # counter built on it sticks at 2 forever however the session actually progresses.
+    advertised="$(grep -o 'hls resp /media\.m3u8 segs=[0-9]*' "$slice" | tail -1 | grep -o '[0-9]*$' || true)"
+    printf "\r[live-auto] streaming before probe ... %ds/%ds (playlist advertises %s segs)   " \
+      "$elapsed" "$SOAK_SECS" "${advertised:-0}"
     sleep 1
     elapsed=$((elapsed + 1))
   done
   printf "\n"
+}
+
+# POSITIVE CONTROL for point 4. The derived soak says eviction SHOULD have happened by
+# now; this proves it actually did, by asking the server for the lowest advertised
+# segment and seeing a real non-200. A timer alone is not enough: measured across four
+# runs, three evicted 19 segments by probe time and a fourth (immediately after a fresh
+# `simctl install`) had evicted nothing, which left point 4 resting on the latent
+# prediction rather than proof. Polling for the actual eviction removes that variance.
+confirm_eviction() {   # $1 = slice path
+  local slice="$1" port elapsed=0 code
+  port="$(grep -o 'hls server listening on 127\.0\.0\.1:[0-9]*' "$slice" | tail -1 | grep -o '[0-9]*$' || true)"
+  if [ -z "$port" ]; then
+    echo "[live-auto] eviction check skipped: no HLS port in the captured session yet." >&2
+    return 0
+  fi
+  while [ "$elapsed" -lt "$EVICTION_CONFIRM_SECS" ]; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$port/seg0.m4s" 2>/dev/null || echo 000)"
+    case "$code" in
+      200)
+        : ;;   # still resident, keep waiting
+      404|410)
+        echo ""
+        echo "[live-auto] eviction CONFIRMED after ${elapsed}s: GET /seg0.m4s -> HTTP $code."
+        echo "[live-auto]   Point 4's active strand now has something real to find."
+        return 0 ;;
+      *)
+        # 000 (or anything that is not a real HTTP status) means the request never
+        # reached the server. That is NOT eviction. Treating "could not reach" as
+        # "observed a 404" is the exact false-evidence class this lane exists to
+        # remove, and it would hand point 4 a fabricated positive control.
+        printf "\n"
+        infra "the session's HLS server became UNREACHABLE while confirming eviction
+        (${elapsed}s in): GET http://127.0.0.1:$port/seg0.m4s -> curl code '$code'.
+        The session died before the battery could probe it. This is NOT eviction and is
+        NOT a player verdict.
+        app process alive: $(app_alive)
+        fixture server alive: $(server_alive)" ;;
+    esac
+    printf "\r[live-auto] confirming eviction ... %ds/%ds (seg0 still HTTP %s)   " \
+      "$elapsed" "$EVICTION_CONFIRM_SECS" "$code"
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  echo ""
+  echo "[live-auto] eviction NOT confirmed within ${EVICTION_CONFIRM_SECS}s: seg0 still returns 200."
+  echo "[live-auto]   The window is retaining more than the ${WINDOW_FLOOR_MIB} MiB floor the estimate assumes."
+  echo "[live-auto]   Point 4's ACTIVE strand will find nothing and the verdict will rest on the"
+  echo "[live-auto]   latent arithmetic, which the output marks with an explicit NOTE. Reported,"
+  echo "[live-auto]   not hidden."
+  return 0
 }
 
 live_auto() {
@@ -529,16 +730,25 @@ live_auto() {
     echo "[$tag] using caller-supplied URL (fixture server NOT started): $url"
   else
     make_fixture
-    local ip port
-    ip="$(lan_address)"
-    port="$(start_fixture_server)"
-    url="http://$ip:$port/$FIXTURE_NAME"
-    echo "[$tag] serving fixture at $url (bound 0.0.0.0:$port, non-loopback host $ip)"
-    verify_range "$url"
-    # Derive the soak only for the normal mode; starve mode never gets that far.
+    # The soak must be derived BEFORE the rate: the safe delivery rate depends on how
+    # long the producer has to avoid filling the buffer, which is the soak.
     if [ "$MODE_STARVE" != "1" ] && [ -z "$SOAK_SECS" ]; then
       SOAK_SECS="$(derive_soak)"
     fi
+    [ -n "$SOAK_SECS" ] || SOAK_SECS=0
+    local ip port
+    ip="$(lan_address)"
+    # NOT `port="$(start_fixture_server)"`: a command substitution runs in a SUBSHELL,
+    # so the `SERVER_PID=$!` inside it never reaches this shell. That left SERVER_PID
+    # empty, which silently disabled BOTH the cleanup trap's kill and the soak's
+    # server-liveness check, and made server_alive() report a permanent false "NO".
+    # Nine fixture servers leaked across nine runs, several still streaming at full
+    # rate, competing for CPU and bandwidth with every subsequent run.
+    start_fixture_server
+    port="$FIXTURE_PORT"
+    url="http://$ip:$port/$FIXTURE_NAME"
+    echo "[$tag] serving fixture at $url (bound 0.0.0.0:$port, non-loopback host $ip)"
+    verify_range "$url"
   fi
   [ -n "$SOAK_SECS" ] || SOAK_SECS=0
 
@@ -573,9 +783,21 @@ live_auto() {
   else
     wait_for_ready "$log" "$offset" "$slice"
     soak "$log" "$offset" "$slice"
-
-    # Re-slice so the gate sees every line up to this instant, then run the battery.
     slice_log "$log" "$offset" "$slice"
+
+    # OBSERVATION WINDOW. Everything the app logs from this byte onward may include the
+    # harness's OWN probe traffic, which must never be read back as product evidence.
+    # Record the boundary before the first probe fires. See slice_window.
+    local probe_start
+    probe_start="$(wc -c < "$log" | tr -d ' ')"
+    confirm_eviction "$slice"
+
+    # Cut the trace at the probe boundary, so the gate's evidence is session traffic
+    # ONLY. `live`'s own segment probes cannot pollute it either: the binary reads this
+    # file once, up front, before it issues a single request.
+    slice_window "$log" "$offset" "$probe_start" "$slice"
+    echo "[live-auto] trace window: container bytes ${offset}..${probe_start}; harness probe traffic"
+    echo "[live-auto]   after that boundary is EXCLUDED from verdict evidence (it is ours, not the app's)."
     # Keep the captured session at a stable path (WORK is deleted on exit) so the
     # same run can be re-examined with `trace` without replaying it on the sim.
     cp "$slice" "$DD/last-session.log" 2>/dev/null || true
@@ -590,6 +812,14 @@ live_auto() {
     set -e
     # The binary's 2 means "could not find/parse a live session" - infra, not product.
     [ "$rc" = "2" ] && infra "the harness could not read a live plain-remux session out of the captured log"
+    # The binary's 3 means it could not OBSERVE the session (it has already explained
+    # why). Pass it straight through as INFRA and add the one fact only the runner
+    # knows: whether the app process was still alive when the probe ran.
+    if [ "$rc" = "3" ]; then
+      infra "the live channel could not observe the session (detail above).
+        app process alive at probe time: $(app_alive)
+        fixture server alive at probe time: $(server_alive)"
+    fi
   fi
 
   # --- teardown, then the post-session half of point 5 -----------------------

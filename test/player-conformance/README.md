@@ -36,10 +36,16 @@ unchanged if you would rather drive playback yourself:
 ```
 
 `live` and `live-auto` exit `0` when every point is GREEN/EXEMPT, `1` when the gate ran
-and at least one point is RED (the product signal), and `3` for INFRA: no probeable
-playback session could be stood up at all (sim not booted, app not installed, fixture
-server unreachable, the hook rejected the URL, a silent libmpv demotion, or no readiness
-marker before the timeout). CI must never read a `3` as a player regression.
+and at least one point is RED (the product signal), and `3` for INFRA: the session could
+not be stood up OR could not be OBSERVED. That second half matters. "I could not reach
+the thing I meant to measure" is INFRA, never a verdict: if the live channel cannot fetch
+the media playlist, or every segment probe fails to reach the server, the run exits `3`
+naming the port, where the port came from, the HTTP status or transport error, and
+whether the app and the fixture server were still alive. It does NOT degrade those points
+to INDETERMINATE and then exit `1`, which would report an observation failure as a
+product regression. "There is genuinely nothing to measure" (point 5 with no spool
+directory) stays a legitimate INDETERMINATE. CI must never read a `3` as a player
+regression.
 
 Everything builds under the stable derived-data path `/tmp/dd-harness` (never a
 per-run path). `./run-conformance.sh app-build` rebuilds `VortXTV` into that same
@@ -184,6 +190,31 @@ current 420 s fixture that derives a 209 s soak, and the runner logs the arithme
 
 Point 4 now carries proof rather than prediction: 16 advertised ids probed, all `HTTP 404`.
 
+**Pacing is the hard constraint, and the window is narrow.** One knob controls two
+opposed requirements, so it cannot simply be turned up:
+
+- Too FAST and the producer runs ahead into the buffer's park ceiling. Parking blocks
+  inside the SOURCE READ, so the app's own detector fails the remux. Measured at 4x:
+  `live source read stalled 48.2s (rc=-5, produced=125901614B)` then
+  `hls 404 /media.m3u8 (remux failed)` and a demotion, ~95 s in. At 125% it still parked,
+  later: the playlist froze at `segs=70` for 40 s while AVPlayer polled, then
+  `mid-play AVPlayer endFileError (Playback Stopped) -> demote to libmpv in place`.
+- Too SLOW and the startup cohort takes long enough that AVPlayer abandons the mount
+  before becoming ready. Measured at 113%: the gate opened 5.3 s after mount and
+  AVPlayer issued no further request after receiving the playlist.
+
+The runner derives the rate from `windowFloorMiB` and the soak and logs the arithmetic,
+but treat that as a starting point rather than a proof: the read head lags playback by
+more than the simple model assumes. Both failure modes are now detected explicitly and
+reported as INFRA naming the harness as the cause, instead of surfacing as a mystery.
+
+**Eviction is confirmed, not assumed.** After the soak the runner polls `GET /seg0.m4s`
+until it returns a real non-200, the positive control that point 4's active strand has
+something to find. A timer alone is not enough: three consecutive runs evicted 19
+segments by probe time while a run immediately after `simctl install` had evicted
+nothing, leaving point 4 on the latent prediction. If eviction cannot be confirmed in the
+bounded wait, the runner says so and the NOTE marks the verdict as prediction-only.
+
 One knock-on worth knowing about, because it will bite anyone who tunes these numbers.
 Once the run really evicts, the LOWEST advertised ids are precisely the dead ones, so
 point 2's segment sampler must walk to the first `--sample` segments that are actually
@@ -252,6 +283,38 @@ manufacture a GREEN.** What this buys is that the CHANNEL is wired and exercised
 already produces `saw a 404: true, reached readyToPlay: false`, so the only missing
 ingredient is the event itself. The moment the rework emits it, this same command
 verifies the positive path with no human and no new fixture.
+
+## KNOWN OPEN RISKS (read before trusting a run)
+
+Written down rather than hoped away. Each is DETECTED and correctly classified as INFRA
+(exit 3), so none can be misread as a player regression, but none is fully understood.
+
+**1. The post-install path is flaky: measured 1 pass in 3.** Three consecutive runs, each
+preceded by a fresh `xcrun simctl install`, gave exit 3, exit 3, exit 1. The two failures
+were identical: the app's HLS server became unreachable ~55 s into the eviction
+confirmation, with `app process alive: YES` and `fixture server alive: YES`, so the app
+process was up but the playback session had ended. The consistent 55 s timing points to a
+deterministic cause rather than noise, most likely the same producer-park class as the
+pacing constraint above. **Do not treat a single green post-install run as proof.** The
+warm path (no reinstall) ran three consecutive times with byte-identical verdicts.
+
+**2. "Session became unreachable" cannot yet be attributed.** The runner names the harness
+as the cause wherever it can (source-read stall, fixture-server death, supersession), but
+this case is reported honestly as unattributed rather than blamed on the player.
+
+**3. Fixture-server liveness reporting was wrong until recently, so older run logs lie.**
+`start_fixture_server` was called in a command substitution, which runs in a SUBSHELL, so
+`SERVER_PID=$!` never reached the parent shell. That silently disabled both the cleanup
+trap's kill and the soak's liveness check, and made `server_alive()` report a permanent
+false `NO`. **Nine fixture servers leaked across nine runs**, several still streaming at
+full rate and competing for CPU and bandwidth with every later run, which plausibly
+contributed to earlier flakiness. Fixed, plus a stray sweep at preflight. Any run log
+older than that fix showing `fixture server alive at probe time: NO` should be
+disbelieved.
+
+If the fixture server does die, its stderr is preserved at
+`/tmp/dd-harness/last-fixture-server.log` and the run exits 3 with
+`fixture server alive at probe time: NO`.
 
 ## Proving it is a real gate (not a RED stamp)
 

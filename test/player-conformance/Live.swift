@@ -19,16 +19,33 @@ enum Live {
     /// trims the least informative probes.
     static let availabilityProbeCap = 16
 
-    struct Response { let status: Int; let body: Data }
+    /// A probe result that can EXPLAIN itself. `status == -1` means the request never
+    /// got an HTTP response at all, and `transportError` says why. Collapsing that case
+    /// to a bare `nil` is exactly what let "the live server was unreachable" masquerade
+    /// as a contract verdict; every failure here has to stay attributable.
+    struct Response {
+        let status: Int
+        let body: Data
+        let transportError: String?
+        var ok: Bool { status == 200 }
+        /// Short description for evidence and INFRA lines.
+        var describe: String { transportError.map { "transport error: \($0)" } ?? "HTTP \(status)" }
+    }
 
-    static func get(host: String = "127.0.0.1", port: Int, path: String, timeout: TimeInterval = 8) -> Response? {
-        guard let url = URL(string: "http://\(host):\(port)\(path)") else { return nil }
-        var out: Response?
+    static func get(host: String = "127.0.0.1", port: Int, path: String, timeout: TimeInterval = 8) -> Response {
+        guard let url = URL(string: "http://\(host):\(port)\(path)") else {
+            return Response(status: -1, body: Data(), transportError: "malformed URL for \(path)")
+        }
+        var out = Response(status: -1, body: Data(), transportError: "no response within \(Int(timeout))s")
         let sem = DispatchSemaphore(value: 0)
         var req = URLRequest(url: url)
         req.timeoutInterval = timeout
-        URLSession.shared.dataTask(with: req) { data, resp, _ in
-            if let http = resp as? HTTPURLResponse { out = Response(status: http.statusCode, body: data ?? Data()) }
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            if let http = resp as? HTTPURLResponse {
+                out = Response(status: http.statusCode, body: data ?? Data(), transportError: nil)
+            } else if let err {
+                out = Response(status: -1, body: Data(), transportError: err.localizedDescription)
+            }
             sem.signal()
         }.resume()
         _ = sem.wait(timeout: .now() + timeout + 1)
@@ -48,16 +65,55 @@ enum Live {
         return total
     }
 
+    /// The result of a live battery. `infra` non-nil means the channel could NOT
+    /// OBSERVE the session and no verdict in `findings` may be trusted or reported as
+    /// a product signal: the caller must exit 3, not 1.
+    ///
+    /// The distinction this type exists to encode, which the harness previously got
+    /// wrong: "there is nothing to measure" (point 5 with no spool directory, a
+    /// legitimate INDETERMINATE) versus "I could not reach the thing I meant to
+    /// measure" (the live server was gone at probe time, an INFRA failure). The second
+    /// case degrading to INDETERMINATE, and the run then exiting 1 with "gate ran and
+    /// decided", is worse than crashing because it looks authoritative.
+    struct Outcome {
+        let findings: [Finding]
+        let infra: String?
+    }
+
     /// Full live battery. `trace` supplies mount/ready timing (6) and the
     /// success-path event count (7); the loopback fetches decide 1 (exact ms), 2,
     /// 3 and 4; `spoolPath` measures 5.
-    static func findings(port: Int, trace: TraceSession, spoolPath: String?, spoolBoundMiB: Int, segmentSampleCap: Int) -> [Finding] {
+    static func evaluate(port: Int, trace: TraceSession, spoolPath: String?, spoolBoundMiB: Int, segmentSampleCap: Int) -> Outcome {
         var out: [Finding] = []
+        // Set by any check that could not REACH what it meant to measure. Distinct from
+        // a legitimate INDETERMINATE ("there is nothing to measure", e.g. no spool dir).
+        var probeInfra: String?
+        var audioFetchInfra: String?
 
         let master = get(port: port, path: "/master.m3u8")
-        let masterText = master.flatMap { String(data: $0.body, encoding: .utf8) } ?? ""
+        let masterText = String(data: master.body, encoding: .utf8) ?? ""
         let media = get(port: port, path: "/media.m3u8")
-        let parsed = media.flatMap { String(data: $0.body, encoding: .utf8) }.map(Playlist.parseMedia)
+
+        // HARD GATE. The media playlist is the spine of this channel: points 2, 3 and
+        // point 4's active strand all enumerate advertised segments from it. If it is
+        // unreachable there is nothing to probe, and the ONLY honest report is INFRA.
+        // Never degrade to INDETERMINATE here and never let point 4 stand on its
+        // latent (predicted) strand alone, which we specifically decided must not be
+        // a verdict by itself.
+        guard media.ok, let mediaText = String(data: media.body, encoding: .utf8) else {
+            let why = """
+            could not fetch the live media playlist from the session's own HLS server.
+              GET http://127.0.0.1:\(port)/media.m3u8 -> \(media.describe)
+              GET http://127.0.0.1:\(port)/master.m3u8 -> \(master.describe)
+            The port above was read from the session's `hls server listening` line. The
+            server is gone, was never reachable, or the session was torn down before the
+            probe ran. Points 2, 3 and point 4's ACTIVE strand cannot be observed at all,
+            so no product verdict is reported for them. This is an observation failure,
+            NOT a player regression.
+            """
+            return Outcome(findings: out, infra: why)
+        }
+        let parsed: Playlist.Parsed? = Playlist.parseMedia(mediaText)
 
         // (1) Exact startup cohort. Best measured from the FIRST response the server
         // ever gave (the trace). The live playlist additionally proves the exact ms
@@ -96,10 +152,15 @@ enum Live {
                 // `prefix(cap)` spends its whole budget on 404s and reports
                 // "checked 0 segments" - point 2 stops being decided at all.
                 // Same predicate, same verdict mapping: only the aim changes.
+                var unreachable = 0
+                var lastUnreachableWhy = ""
                 for seg in p.segments {
                     if checked >= segmentSampleCap { break }
-                    guard let r = get(port: port, path: "/seg\(seg.id).m4s") else { continue }
-                    guard r.status == 200 else { evictedSkipped += 1; continue }
+                    let r = get(port: port, path: "/seg\(seg.id).m4s")
+                    if r.transportError != nil {
+                        unreachable += 1; lastUnreachableWhy = r.describe; continue
+                    }
+                    guard r.ok else { evictedSkipped += 1; continue }
                     checked += 1
                     switch FMP4.firstSampleIsSync(r.body) {
                     case .some(true): break
@@ -110,6 +171,17 @@ enum Live {
                 ev.append("checked \(checked) retrievable segments (sample cap \(segmentSampleCap)); non-IDR starts: \(offenders); indeterminate: \(indeterminate)")
                 if evictedSkipped > 0 {
                     ev.append("skipped \(evictedSkipped) advertised-but-unfetchable segments while sampling (that is point 4's finding, not point 2's)")
+                }
+                if unreachable > 0 {
+                    ev.append("\(unreachable) segment fetches could not reach the server (\(lastUnreachableWhy))")
+                }
+                if checked == 0 {
+                    // Could not read a single segment's bytes. Whether the server died or
+                    // every advertised segment was evicted, this channel did not OBSERVE
+                    // point 2 and must not imply it did.
+                    probeInfra = probeInfra ?? ("point 2 could not read the bytes of a single advertised segment "
+                        + "(\(p.segments.count) advertised, \(evictedSkipped) unfetchable, \(unreachable) unreachable"
+                        + (lastUnreachableWhy.isEmpty ? "" : ": \(lastUnreachableWhy)") + ").")
                 }
                 out.append(Finding(point: .idrStart, verdict: offenders.isEmpty ? (checked > 0 ? .green : .indeterminate) : .red, evidence: ev))
             } else {
@@ -128,12 +200,19 @@ enum Live {
             // Alternate audio rendition from the master's EXT-X-MEDIA URI.
             if let audioURI = audioRenditionURI(masterText) {
                 ev.append("master advertises alternate audio rendition: \(audioURI)")
-                if let a = get(port: port, path: "/\(audioURI)"), let atext = String(data: a.body, encoding: .utf8) {
+                let a = get(port: port, path: "/\(audioURI)")
+                if a.ok, let atext = String(data: a.body, encoding: .utf8) {
                     let ap = Playlist.parseMedia(atext)
                     let firstAudio = ap.segments.map(\.id).min() ?? -1
                     ev.append("audio rendition lowest advertised id: \(firstAudio)")
                     if firstAudio != 0 { verdict = .red }
-                } else { ev.append("audio playlist fetch failed"); verdict = .red }
+                } else {
+                    // The master ADVERTISES this rendition, so failing to fetch it is a
+                    // reachability failure, not evidence about the contract.
+                    audioFetchInfra = "the master advertises an alternate audio rendition at /\(audioURI) "
+                                    + "but it could not be fetched: \(a.describe)"
+                    ev.append("audio playlist fetch FAILED: \(a.describe)")
+                }
             } else {
                 ev.append("master advertises NO alternate audio rendition (audio muxed inline) -> audio half UNMET")
                 verdict = .red
@@ -170,6 +249,7 @@ enum Live {
 
             // --- ACTIVE strand
             var probed: [(id: Int, status: Int)] = []
+            var unreachable: [(id: Int, why: String)] = []
             var atRisk = Set<Int>()
             if let p = parsed, !p.segments.isEmpty {
                 let ids = p.segments.map(\.id).sorted()
@@ -186,10 +266,14 @@ enum Live {
 
                 for id in targets.prefix(Live.availabilityProbeCap) {
                     let r = get(port: port, path: "/seg\(id).m4s")
-                    probed.append((id, r?.status ?? -1))
+                    // A TRANSPORT failure is not a 404: it means we could not ask the
+                    // question. Track it separately so it can never be scored as a
+                    // contract violation.
+                    if r.transportError != nil { unreachable.append((id, r.describe)) }
+                    probed.append((id, r.status))
                 }
                 probed.sort { $0.id < $1.id }
-                let missing = probed.filter { $0.status != 200 }
+                let missing = probed.filter { $0.status != 200 && $0.status != -1 }
                 ev.append("ACTIVE: probed \(probed.count) advertised ids \(probed.map(\.id)) "
                           + "(lowest + highest + \(atRisk.count) predicted-evicted + a spread); "
                           + "non-200: \(missing.isEmpty ? "none" : missing.map { "seg\($0.id)->HTTP\($0.status)" }.joined(separator: ", "))")
@@ -213,12 +297,35 @@ enum Live {
                 ev.append("LATENT: no served-segment byte sizes in the log yet; window arithmetic unavailable")
             }
 
-            // --- verdict: either strand is sufficient
-            let activeFired = probed.contains { $0.status != 200 }
+            // --- verdict.
+            // A -1 status is a TRANSPORT failure, never a 404, so it can never count as
+            // the active strand firing.
+            let activeFired = probed.contains { $0.status != 200 && $0.status != -1 }
+            let activeRan = !probed.isEmpty && unreachable.count < probed.count
             let latentFired = w.evictedUpTo != nil || !w.observed404s.isEmpty
-            if activeFired || latentFired {
+
+            if !unreachable.isEmpty {
+                ev.append("ACTIVE: \(unreachable.count) of \(probed.count) probes could not reach the server at all "
+                          + "(e.g. seg\(unreachable[0].id): \(unreachable[0].why))")
+            }
+
+            if !activeRan {
+                // The active strand could not run. The latent strand is a PREDICTION
+                // from the resident-window arithmetic, and we decided deliberately that
+                // a prediction must not stand as a verdict on its own: a correct
+                // implementation whose real retention exceeds the estimate's floor would
+                // be scored RED for no observed failure. So this is INFRA, not a verdict.
+                probeInfra = "point 4's ACTIVE strand could not run: "
+                           + (probed.isEmpty
+                              ? "no advertised segments could be enumerated to probe."
+                              : "every one of the \(probed.count) segment probes failed to reach the server "
+                                + "(e.g. seg\(unreachable.first?.id ?? -1): \(unreachable.first?.why ?? "unknown")).")
+                           + " Refusing to report point 4 RED from the latent arithmetic alone."
+                verdict = .indeterminate
+                ev.append("point 4 NOT DECIDED: the active strand could not run, and the latent strand is a prediction that may not stand alone.")
+            } else if activeFired || latentFired {
                 verdict = .red
-            } else if !probed.isEmpty {
+            } else {
                 verdict = .green
             }
 
@@ -252,7 +359,7 @@ enum Live {
 
         // (6) + (7) from the trace facts already parsed from the live container log.
         out.append(contentsOf: Trace.findings(trace).filter { $0.point == .startupLatency || $0.point == .failSoftCounted })
-        return out
+        return Outcome(findings: out, infra: probeInfra ?? audioFetchInfra)
     }
 
     /// The URI attribute of the master's audio `#EXT-X-MEDIA:TYPE=AUDIO,...` line.
