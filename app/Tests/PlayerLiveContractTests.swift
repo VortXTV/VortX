@@ -105,6 +105,7 @@ enum PlayerLiveContractTests {
         testSessionLifecycleAndScavenge()
         testDisplayRequestLifecycle()
         testSelectionRefreshLifecycle()
+        testBoundaryKeyAgreement()
         testProductionWiring()
 
         print("")
@@ -541,6 +542,7 @@ enum PlayerLiveContractTests {
                   && VortXHLSBoundaryPolicy.decision(
                       hasOpenSegment: true,
                       incomingIsIDR: false,
+                      incomingHasKeyFlag: false,
                       elapsed: 4,
                       openBytes: bytesAt44Point7MbitForFourSeconds) == .failSoft)
     }
@@ -866,12 +868,43 @@ enum PlayerLiveContractTests {
               DVPlaybackPolicy.selectedFlags(optionCount: 3, selectedIndex: nil) == [false, false, false])
     }
 
+    private static func testBoundaryKeyAgreement() {
+        check("boundary agreement: segment zero rejects both one-sided IDR/key claims",
+              VortXHLSBoundaryPolicy.decision(
+                  hasOpenSegment: false,
+                  incomingIsIDR: true,
+                  incomingHasKeyFlag: false,
+                  elapsed: 0,
+                  openBytes: 0) == .failSoft
+                  && VortXHLSBoundaryPolicy.decision(
+                      hasOpenSegment: false,
+                      incomingIsIDR: false,
+                      incomingHasKeyFlag: true,
+                      elapsed: 0,
+                      openBytes: 0) == .failSoft)
+        check("boundary agreement: one-sided evidence cannot cut an open segment",
+              VortXHLSBoundaryPolicy.decision(
+                  hasOpenSegment: true,
+                  incomingIsIDR: true,
+                  incomingHasKeyFlag: false,
+                  elapsed: 1,
+                  openBytes: 1) == .continueOpen
+                  && VortXHLSBoundaryPolicy.decision(
+                      hasOpenSegment: true,
+                      incomingIsIDR: false,
+                      incomingHasKeyFlag: true,
+                      elapsed: 1,
+                      openBytes: 1) == .continueOpen)
+    }
+
     private static func testProductionWiring() {
         let testsURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
         let playerURL = testsURL.deletingLastPathComponent().appendingPathComponent("Sources/Player")
         let server = try? String(contentsOf: playerURL.appendingPathComponent("VortXRemuxHLSServer.swift"),
                                  encoding: .utf8)
         let stream = try? String(contentsOf: playerURL.appendingPathComponent("VortXMKVRemuxStream.swift"),
+                                 encoding: .utf8)
+        let policy = try? String(contentsOf: playerURL.appendingPathComponent("DVPlaybackPolicy.swift"),
                                  encoding: .utf8)
         let display = try? String(contentsOf: playerURL.appendingPathComponent("HDRDisplayMode.swift"),
                                   encoding: .utf8)
@@ -1087,6 +1120,11 @@ enum PlayerLiveContractTests {
                   && stream?.contains("hlsLastVideoSec + Self.hlsTargetSegmentSecs") == false
                   && closeVideoSegment?.contains("let duration = endSec - startSec") == true
                   && closeVideoSegment?.contains("max(0.04") == false)
+        check("wiring: key evidence is mandatory and production passes the actual packet flag",
+              policy?.contains("incomingHasKeyFlag: Bool = true") == false
+                  && videoTiming?.contains("let hasKeyFlag = pkt.pointee.flags & AV_PKT_FLAG_KEY_CONST != 0") == true
+                  && videoTiming?.contains("incomingHasKeyFlag: hasKeyFlag") == true
+                  && videoTiming?.contains("incomingHasKeyFlag: true") == false)
         check("wiring: audio and subtitle resource paths route through their tested parsers",
               server?.contains("MultiAudioPolicy.parseRequest(path: path)") == true
                   && server?.contains("SubtitleRenditionPolicy.parseRequest(path: path)") == true)

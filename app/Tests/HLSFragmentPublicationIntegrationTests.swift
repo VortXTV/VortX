@@ -1,0 +1,964 @@
+// Production-linked fragmented-MP4 publication harness.
+//
+//   MPV_ROOT=/path/to/DerivedData/VortX-*/SourcePackages/artifacts/mpvkit
+//   FRAMEWORK_KEYS=(Libavformat-GPL Libavcodec-GPL Libavutil-GPL Libavdevice-GPL Libavfilter-GPL
+//     Libswresample-GPL Libswscale-GPL Libssl Libcrypto Libass Libfreetype Libfribidi Libharfbuzz
+//     Libshaderc_combined lcms2 Libplacebo Libdovi Libunibreak Libsmbclient gmp nettle hogweed gnutls
+//     Libdav1d Libuavs3d)
+//   LINK_FLAGS=()
+//   for key in "${FRAMEWORK_KEYS[@]}"; do
+//     slice=$(find "$MPV_ROOT/$key" -type d -name macos-arm64_x86_64 | head -n 1)
+//     framework_dir=$(find "$slice" -maxdepth 1 -name '*.framework' -type d | head -n 1)
+//     LINK_FLAGS+=( -F "${framework_dir:h}" -framework "${framework_dir:t:r}" )
+//   done
+//   MOLTEN_ARCHIVE=$(find "$MPV_ROOT/MoltenVK" -path '*macos-arm64_x86_64/libMoltenVK.a' | head -n 1)
+//   SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
+//   xcrun swiftc -sdk "$SDK_PATH" -strict-concurrency=complete -warnings-as-errors \
+//     "${LINK_FLAGS[@]}" "$MOLTEN_ARCHIVE" \
+//     -framework AVFoundation -framework CoreAudio -framework AudioToolbox -framework CoreVideo \
+//     -framework CoreFoundation -framework CoreMedia -framework Metal -framework VideoToolbox \
+//     -framework Foundation -framework IOKit -framework IOSurface -framework QuartzCore \
+//     -lbz2 -liconv -lexpat -lresolv -lxml2 -lz -lc++ \
+//     -o /tmp/hls-fragment-publication-integration-test \
+//     app/Sources/Player/DVPlaybackPolicy.swift app/Sources/Player/VortXRemuxBuffer.swift \
+//     app/Tests/HLSFragmentPublicationIntegrationTests.swift
+//   /tmp/hls-fragment-publication-integration-test
+//
+// The embedded fixture was encoded once with FFmpeg 8.1.2 as HEVC hvc1 plus AC3. The harness demuxes only
+// enough data to obtain real codec parameters and one valid packet of each shape, then drives the exact shipped
+// libavformat 62.12.102 movenc through custom AVIO. All fragment decisions and byte proofs call production code.
+
+import Foundation
+import Libavformat
+import Libavcodec
+import Libavutil
+
+struct RemoteConfig {
+    struct Snapshot { let dvRemuxWindowMiB: Int }
+    static let snapshot = Snapshot(dvRemuxWindowMiB: 64)
+}
+
+private let avPacketFlagKey: Int32 = 0x0001
+private let avFormatFlagCustomIO: Int32 = 0x0080
+private let avSeekSize: Int32 = 0x10000
+private let avSeekForce: Int32 = 0x20000
+
+private enum HarnessError: Error, CustomStringConvertible {
+    case failed(String)
+    case timestampRejected(videoWrites: Int, avioWrites: Int, producedBytes: Int)
+
+    var description: String {
+        switch self {
+        case .failed(let message): return message
+        case .timestampRejected(let videoWrites, let avioWrites, let producedBytes):
+            return "timestamp rejected before videoWrites=\(videoWrites) avioWrites=\(avioWrites) bytes=\(producedBytes)"
+        }
+    }
+}
+
+private struct PacketTemplate {
+    let bytes: Data
+    let isIDR: Bool
+}
+
+private func packetIsIDR(_ data: Data) -> Bool {
+    data.withUnsafeBytes { raw in
+        guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+        return VortXVideoIDRClassifier.isIDR(
+            bytes: base, count: raw.count, codec: .hevc, format: .lengthPrefixed(4))
+    }
+}
+
+private final class Fixture {
+    let videoParameters: UnsafeMutablePointer<AVCodecParameters>
+    let audioParameters: UnsafeMutablePointer<AVCodecParameters>
+    let idr: PacketTemplate
+    let nonIDR: PacketTemplate
+    let audio: PacketTemplate
+
+    init(videoParameters: UnsafeMutablePointer<AVCodecParameters>,
+         audioParameters: UnsafeMutablePointer<AVCodecParameters>,
+         idr: PacketTemplate,
+         nonIDR: PacketTemplate,
+         audio: PacketTemplate) {
+        self.videoParameters = videoParameters
+        self.audioParameters = audioParameters
+        self.idr = idr
+        self.nonIDR = nonIDR
+        self.audio = audio
+    }
+
+    deinit {
+        var video: UnsafeMutablePointer<AVCodecParameters>? = videoParameters
+        var audio: UnsafeMutablePointer<AVCodecParameters>? = audioParameters
+        avcodec_parameters_free(&video)
+        avcodec_parameters_free(&audio)
+    }
+
+    static func load(from url: URL) throws -> Fixture {
+        var optionalInput: UnsafeMutablePointer<AVFormatContext>?
+        let openResult = avformat_open_input(&optionalInput, url.path, nil, nil)
+        guard openResult >= 0, let input = optionalInput else {
+            throw HarnessError.failed("fixture open failed (\(openResult))")
+        }
+        defer {
+            var optional: UnsafeMutablePointer<AVFormatContext>? = input
+            avformat_close_input(&optional)
+        }
+        let infoResult = avformat_find_stream_info(input, nil)
+        guard infoResult >= 0 else {
+            throw HarnessError.failed("fixture stream info failed (\(infoResult))")
+        }
+
+        var videoStream: UnsafeMutablePointer<AVStream>?
+        var audioStream: UnsafeMutablePointer<AVStream>?
+        for index in 0..<Int(input.pointee.nb_streams) {
+            guard let stream = input.pointee.streams[index], let parameters = stream.pointee.codecpar else { continue }
+            if parameters.pointee.codec_type == AVMEDIA_TYPE_VIDEO { videoStream = videoStream ?? stream }
+            if parameters.pointee.codec_type == AVMEDIA_TYPE_AUDIO { audioStream = audioStream ?? stream }
+        }
+        guard let videoStream, let audioStream,
+              let videoCopy = avcodec_parameters_alloc(),
+              let audioCopy = avcodec_parameters_alloc() else {
+            throw HarnessError.failed("fixture track allocation failed")
+        }
+        guard avcodec_parameters_copy(videoCopy, videoStream.pointee.codecpar) >= 0,
+              avcodec_parameters_copy(audioCopy, audioStream.pointee.codecpar) >= 0 else {
+            var video: UnsafeMutablePointer<AVCodecParameters>? = videoCopy
+            var audio: UnsafeMutablePointer<AVCodecParameters>? = audioCopy
+            avcodec_parameters_free(&video)
+            avcodec_parameters_free(&audio)
+            throw HarnessError.failed("fixture parameter copy failed")
+        }
+
+        guard let packet = av_packet_alloc() else {
+            var video: UnsafeMutablePointer<AVCodecParameters>? = videoCopy
+            var audio: UnsafeMutablePointer<AVCodecParameters>? = audioCopy
+            avcodec_parameters_free(&video)
+            avcodec_parameters_free(&audio)
+            throw HarnessError.failed("fixture packet allocation failed")
+        }
+        defer {
+            var optional: UnsafeMutablePointer<AVPacket>? = packet
+            av_packet_free(&optional)
+        }
+        var idr: PacketTemplate?
+        var nonIDR: PacketTemplate?
+        var audio: PacketTemplate?
+        while av_read_frame(input, packet) >= 0 {
+            let streamIndex = Int(packet.pointee.stream_index)
+            if packet.pointee.size > 0, let bytes = packet.pointee.data,
+               streamIndex >= 0, streamIndex < Int(input.pointee.nb_streams),
+               let stream = input.pointee.streams[streamIndex], let parameters = stream.pointee.codecpar {
+                let data = Data(bytes: bytes, count: Int(packet.pointee.size))
+                if parameters.pointee.codec_type == AVMEDIA_TYPE_VIDEO {
+                    let parsedIDR = packetIsIDR(data)
+                    if parsedIDR, idr == nil { idr = PacketTemplate(bytes: data, isIDR: true) }
+                    if !parsedIDR, nonIDR == nil { nonIDR = PacketTemplate(bytes: data, isIDR: false) }
+                } else if parameters.pointee.codec_type == AVMEDIA_TYPE_AUDIO, audio == nil {
+                    audio = PacketTemplate(bytes: data, isIDR: false)
+                }
+            }
+            av_packet_unref(packet)
+            if idr != nil, nonIDR != nil, audio != nil { break }
+        }
+        guard let idr, let nonIDR, let audio else {
+            var video: UnsafeMutablePointer<AVCodecParameters>? = videoCopy
+            var audioParameters: UnsafeMutablePointer<AVCodecParameters>? = audioCopy
+            avcodec_parameters_free(&video)
+            avcodec_parameters_free(&audioParameters)
+            throw HarnessError.failed("fixture did not contain IDR, non-IDR, and AC3 packets")
+        }
+        return Fixture(
+            videoParameters: videoCopy,
+            audioParameters: audioCopy,
+            idr: idr,
+            nonIDR: nonIDR,
+            audio: audio)
+    }
+}
+
+private final class RecordingSink {
+    private(set) var bytes: [UInt8] = []
+    private(set) var writeRanges: [Range<Int>] = []
+    private(set) var appendRanges: [Range<Int>] = []
+    var cursor = 0
+
+    func write(_ source: UnsafePointer<UInt8>, count: Int) -> Bool {
+        guard count > 0, cursor >= 0, cursor <= bytes.count else { return false }
+        let end = cursor + count
+        guard end >= cursor else { return false }
+        writeRanges.append(cursor..<end)
+        if cursor == bytes.count {
+            bytes.append(contentsOf: UnsafeBufferPointer(start: source, count: count))
+            appendRanges.append(cursor..<end)
+        } else {
+            let overlap = min(count, bytes.count - cursor)
+            if overlap > 0 {
+                bytes.replaceSubrange(cursor..<(cursor + overlap),
+                                      with: UnsafeBufferPointer(start: source, count: overlap))
+            }
+            if overlap < count {
+                bytes.append(contentsOf: UnsafeBufferPointer(start: source + overlap, count: count - overlap))
+                appendRanges.append((cursor + overlap)..<end)
+            }
+        }
+        cursor = end
+        return true
+    }
+
+    func seek(offset: Int64, whence: Int32) -> Int64 {
+        if whence & avSeekSize != 0 { return Int64(bytes.count) }
+        let operation = whence & ~avSeekForce
+        let target: Int64
+        switch operation {
+        case 0: target = offset
+        case 1: target = Int64(cursor) + offset
+        case 2: target = Int64(bytes.count) + offset
+        default: return -1
+        }
+        guard target >= 0, target <= Int64(Int.max) else { return -1 }
+        cursor = Int(target)
+        return target
+    }
+}
+
+private struct ScenarioConfig {
+    let name: String
+    let audioTrackFirst: Bool
+    let audioPacketFirst: Bool
+    let queueAudioPastBoundaryBeforeKey: Bool
+    let boundarySeconds: Double
+    let disagreement: Bool
+    let paddingBytesPerNonIDR: Int
+}
+
+private struct ScenarioResult {
+    let name: String
+    let initData: Data
+    let mediaData: Data
+    let writeRanges: [Range<Int>]
+    let appendRanges: [Range<Int>]
+    let videoTrackID: UInt32
+    let audioTrackID: UInt32
+    let trackOrder: [UInt32]
+    let videoProof: VortXFMP4FragmentParser.MediaRangeProof
+    let audioProof: VortXFMP4FragmentParser.MediaRangeProof
+    let nextMediaData: Data
+    let nextVideoProof: VortXFMP4FragmentParser.MediaRangeProof
+    let expectedVideoSamples: Int
+    let expectedAudioSamples: Int
+    let bytesBeforeBoundaryKey: Int
+    let bytesAfterBoundaryKey: Int
+    let bytesAfterBoundaryDrain: Int
+    let closingRangeCompleteAfterKeyWrite: Bool
+    let closingSamplesAfterKeyWrite: Int?
+}
+
+private struct AlternateAudioResult {
+    let prematureSampleCount: Int?
+    let firstSegmentProof: VortXFMP4FragmentParser.MediaRangeProof
+    let finalSegmentProof: VortXFMP4FragmentParser.MediaRangeProof
+    let firstSegmentByteCount: Int
+    let finalSegmentCandidateByteCount: Int
+    let finalTrailerMetadataIsComplete: Bool
+}
+
+/// Deliberately broken local mutant: treats the first `traf` as video instead of resolving `tfhd.track_ID`.
+private func firstTrafShortcutProof(_ result: ScenarioResult)
+    -> VortXFMP4FragmentParser.MediaRangeProof? {
+    guard let firstTrackID = result.trackOrder.first else { return nil }
+    return VortXFMP4FragmentParser.proveMediaRange(
+        result.mediaData, trackID: firstTrackID, requireFirstSampleSync: false)
+}
+
+private struct MuxEvent {
+    enum Kind { case video, audio }
+    let kind: Kind
+    let seconds: Double
+    let packet: PacketTemplate
+    let keyFlag: Bool
+}
+
+private func hvc1Tag() -> UInt32 {
+    UInt32(Character("h").asciiValue!) | UInt32(Character("v").asciiValue!) << 8
+        | UInt32(Character("c").asciiValue!) << 16 | UInt32(Character("1").asciiValue!) << 24
+}
+
+private func paddedHEVC(_ template: PacketTemplate, byteCount: Int) -> PacketTemplate {
+    guard byteCount > 6 else { return template }
+    let payloadCount = byteCount - 4
+    var bytes = template.bytes
+    let length = UInt32(payloadCount)
+    bytes.append(UInt8((length >> 24) & 0xff))
+    bytes.append(UInt8((length >> 16) & 0xff))
+    bytes.append(UInt8((length >> 8) & 0xff))
+    bytes.append(UInt8(length & 0xff))
+    bytes.append(38 << 1)
+    bytes.append(1)
+    bytes.append(Data(repeating: 0, count: payloadCount - 2))
+    return PacketTemplate(bytes: bytes, isIDR: template.isIDR)
+}
+
+private func makeEvents(config: ScenarioConfig, fixture: Fixture) -> [MuxEvent] {
+    var events: [MuxEvent] = []
+    if config.disagreement {
+        let video: [(Double, PacketTemplate, Bool)] = [
+            (0, fixture.idr, true),
+            (0.5, fixture.nonIDR, false),
+            (1, fixture.idr, false),
+            (1.5, fixture.nonIDR, false),
+            (2, fixture.nonIDR, true),
+            (2.5, fixture.nonIDR, false),
+            (config.boundarySeconds, fixture.idr, true),
+        ]
+        events.append(contentsOf: video.map {
+            MuxEvent(kind: .video, seconds: $0.0, packet: $0.1, keyFlag: $0.2)
+        })
+    } else {
+        var seconds = 0.0
+        while seconds <= config.boundarySeconds + 0.000_001 {
+            let boundary = abs(seconds - config.boundarySeconds) < 0.000_001
+            let base = seconds == 0 || boundary ? fixture.idr : fixture.nonIDR
+            let packet = !base.isIDR && config.paddingBytesPerNonIDR > 0
+                ? paddedHEVC(base, byteCount: config.paddingBytesPerNonIDR) : base
+            events.append(MuxEvent(
+                kind: .video, seconds: seconds, packet: packet, keyFlag: base.isIDR))
+            seconds += 0.25
+        }
+    }
+    var audioSeconds = 0.0
+    while audioSeconds < config.boundarySeconds - 0.000_001 {
+        events.append(MuxEvent(
+            kind: .audio, seconds: audioSeconds, packet: fixture.audio, keyFlag: true))
+        audioSeconds += 0.032
+    }
+    var ordered = events.sorted {
+        if abs($0.seconds - $1.seconds) > 0.000_001 { return $0.seconds < $1.seconds }
+        if $0.kind == $1.kind { return false }
+        return config.audioPacketFirst ? $0.kind == .audio : $0.kind == .video
+    }
+    if config.queueAudioPastBoundaryBeforeKey,
+       let boundaryIndex = ordered.firstIndex(where: {
+           $0.kind == .video && abs($0.seconds - config.boundarySeconds) < 0.000_001
+       }) {
+        // A legal per-stream audio packet from just beyond T is deliberately queued before the video key at T.
+        // That gives the interleaver both streams when the key is submitted and forces the schedule where the
+        // initial packet write, rather than the later nil drain, delivers the key into movenc.
+        ordered.insert(MuxEvent(
+            kind: .audio,
+            seconds: config.boundarySeconds + 0.032,
+            packet: fixture.audio,
+            keyFlag: true), at: boundaryIndex)
+    }
+    return ordered
+}
+
+private func initEnd(in bytes: Data) -> Int? {
+    func read32(_ offset: Int) -> Int {
+        Int(bytes[offset]) << 24 | Int(bytes[offset + 1]) << 16
+            | Int(bytes[offset + 2]) << 8 | Int(bytes[offset + 3])
+    }
+    var cursor = 0
+    while cursor + 8 <= bytes.count {
+        let size = read32(cursor)
+        guard size >= 8, size <= bytes.count - cursor else { return nil }
+        let type = String(bytes: bytes[(cursor + 4)..<(cursor + 8)], encoding: .ascii)
+        cursor += size
+        if type == "moov" { return cursor }
+    }
+    return nil
+}
+
+private func makePacket(template: PacketTemplate,
+                        streamIndex: Int32,
+                        timeBase: AVRational,
+                        seconds: Double,
+                        durationSeconds: Double,
+                        keyFlag: Bool) throws -> UnsafeMutablePointer<AVPacket> {
+    guard let packet = av_packet_alloc() else { throw HarnessError.failed("packet allocation failed") }
+    guard template.bytes.count <= Int(Int32.max),
+          av_new_packet(packet, Int32(template.bytes.count)) >= 0,
+          let destination = packet.pointee.data else {
+        var optional: UnsafeMutablePointer<AVPacket>? = packet
+        av_packet_free(&optional)
+        throw HarnessError.failed("packet payload allocation failed")
+    }
+    template.bytes.copyBytes(to: destination, count: template.bytes.count)
+    let scale = Double(timeBase.den) / Double(timeBase.num)
+    packet.pointee.pts = Int64((seconds * scale).rounded())
+    packet.pointee.dts = packet.pointee.pts
+    packet.pointee.duration = Int64((durationSeconds * scale).rounded())
+    packet.pointee.stream_index = streamIndex
+    packet.pointee.flags = keyFlag ? avPacketFlagKey : 0
+    packet.pointee.pos = -1
+    return packet
+}
+
+private func runScenario(_ config: ScenarioConfig,
+                         fixture: Fixture,
+                         timestampLessFirstVideo: Bool = false) throws -> ScenarioResult {
+    let sink = RecordingSink()
+    var optionalOutput: UnsafeMutablePointer<AVFormatContext>?
+    guard avformat_alloc_output_context2(&optionalOutput, nil, "mp4", nil) >= 0,
+          let output = optionalOutput else { throw HarnessError.failed("\(config.name): output allocation failed") }
+    var ioContext: UnsafeMutablePointer<AVIOContext>?
+    defer {
+        output.pointee.pb = nil
+        avformat_free_context(output)
+        if let ioContext {
+            let backing = ioContext.pointee.buffer
+            var optional: UnsafeMutablePointer<AVIOContext>? = ioContext
+            avio_context_free(&optional)
+            if let backing { av_free(backing) }
+        }
+    }
+
+    guard let ioBytes = av_malloc(256 * 1024)?.assumingMemoryBound(to: UInt8.self) else {
+        throw HarnessError.failed("\(config.name): AVIO allocation failed")
+    }
+    let opaque = Unmanaged.passUnretained(sink).toOpaque()
+    ioContext = avio_alloc_context(
+        ioBytes, 256 * 1024, 1, opaque, nil,
+        { opaque, bytes, size -> Int32 in
+            guard let opaque, let bytes, size > 0 else { return -1 }
+            let sink = Unmanaged<RecordingSink>.fromOpaque(opaque).takeUnretainedValue()
+            return sink.write(bytes, count: Int(size)) ? size : -1
+        },
+        { opaque, offset, whence -> Int64 in
+            guard let opaque else { return -1 }
+            return Unmanaged<RecordingSink>.fromOpaque(opaque).takeUnretainedValue()
+                .seek(offset: offset, whence: whence)
+        })
+    guard let ioContext else {
+        av_free(ioBytes)
+        throw HarnessError.failed("\(config.name): AVIO context creation failed")
+    }
+    output.pointee.pb = ioContext
+    output.pointee.flags |= avFormatFlagCustomIO
+
+    func addVideo() throws -> UnsafeMutablePointer<AVStream> {
+        guard let stream = avformat_new_stream(output, nil),
+              avcodec_parameters_copy(stream.pointee.codecpar, fixture.videoParameters) >= 0 else {
+            throw HarnessError.failed("\(config.name): video stream copy failed")
+        }
+        stream.pointee.codecpar.pointee.codec_tag = hvc1Tag()
+        stream.pointee.time_base = AVRational(num: 1, den: 1_000)
+        return stream
+    }
+    func addAudio() throws -> UnsafeMutablePointer<AVStream> {
+        guard let stream = avformat_new_stream(output, nil),
+              avcodec_parameters_copy(stream.pointee.codecpar, fixture.audioParameters) >= 0 else {
+            throw HarnessError.failed("\(config.name): audio stream copy failed")
+        }
+        stream.pointee.codecpar.pointee.codec_tag = 0
+        if stream.pointee.codecpar.pointee.frame_size == 0 {
+            stream.pointee.codecpar.pointee.frame_size = 1536
+        }
+        stream.pointee.time_base = AVRational(num: 1, den: 48_000)
+        return stream
+    }
+
+    let videoStream: UnsafeMutablePointer<AVStream>
+    let audioStream: UnsafeMutablePointer<AVStream>
+    if config.audioTrackFirst {
+        audioStream = try addAudio()
+        videoStream = try addVideo()
+    } else {
+        videoStream = try addVideo()
+        audioStream = try addAudio()
+    }
+
+    var options: OpaquePointer?
+    defer { av_dict_free(&options) }
+    guard av_dict_set(&options, "movflags", VortXHLSMovencPolicy.movflags, 0) >= 0,
+          av_dict_set(
+              &options, "min_frag_duration", VortXHLSMovencPolicy.minimumFragmentDurationMicroseconds, 0) >= 0,
+          av_dict_set(&options, "strict", "experimental", 0) >= 0 else {
+        throw HarnessError.failed("\(config.name): movenc option allocation failed")
+    }
+    let headerResult = avformat_write_header(output, &options)
+    guard headerResult >= 0 else {
+        throw HarnessError.failed("\(config.name): delayed AC3 header failed (\(headerResult))")
+    }
+
+    var hasOpenSegment = false
+    var segmentStartSeconds = 0.0
+    var cutCount = 0
+    var expectedVideoSamples = 0
+    var expectedAudioSamples = 0
+    var writtenVideoPackets = 0
+    var bytesBeforeBoundaryKey: Int?
+    var bytesAfterBoundaryKey: Int?
+    let events = makeEvents(config: config, fixture: fixture)
+    for event in events {
+        let stream = event.kind == .video ? videoStream : audioStream
+        var isBoundaryKey = false
+        if event.kind == .video {
+            let omitTimestamp = timestampLessFirstVideo && writtenVideoPackets == 0
+            guard let seconds = VortXHLSBoundaryPolicy.timestampSeconds(
+                dts: omitTimestamp ? nil : Int64((event.seconds * 1_000).rounded()),
+                pts: nil,
+                timeBaseNumerator: 1,
+                timeBaseDenominator: 1_000) else {
+                if omitTimestamp {
+                    throw HarnessError.timestampRejected(
+                        videoWrites: writtenVideoPackets,
+                        avioWrites: sink.writeRanges.count,
+                        producedBytes: sink.bytes.count)
+                }
+                throw HarnessError.failed("\(config.name): production timestamp gate rejected a valid packet")
+            }
+            let parsedIDR = packetIsIDR(event.packet.bytes)
+            guard parsedIDR == event.packet.isIDR else {
+                throw HarnessError.failed("\(config.name): embedded NAL classification changed")
+            }
+            let decision = VortXHLSBoundaryPolicy.decision(
+                hasOpenSegment: hasOpenSegment,
+                incomingIsIDR: parsedIDR,
+                incomingHasKeyFlag: event.keyFlag,
+                elapsed: hasOpenSegment ? seconds - segmentStartSeconds : 0,
+                openBytes: 0)
+            switch decision {
+            case .open:
+                hasOpenSegment = true
+                segmentStartSeconds = seconds
+            case .continueOpen:
+                break
+            case .cut:
+                cutCount += 1
+                isBoundaryKey = true
+            case .failSoft:
+                throw HarnessError.failed("\(config.name): production boundary policy failed before the expected cut")
+            }
+            if event.seconds < config.boundarySeconds - 0.000_001 { expectedVideoSamples += 1 }
+        } else if event.seconds < config.boundarySeconds - 0.000_001 {
+            expectedAudioSamples += 1
+        }
+
+        if isBoundaryKey {
+            avio_flush(output.pointee.pb)
+            bytesBeforeBoundaryKey = sink.bytes.count
+        }
+
+        let packet = try makePacket(
+            template: event.packet,
+            streamIndex: stream.pointee.index,
+            timeBase: stream.pointee.time_base,
+            seconds: event.seconds,
+            durationSeconds: event.kind == .video ? 0.25 : 0.032,
+            keyFlag: event.keyFlag)
+        let writeResult = av_interleaved_write_frame(output, packet)
+        var optional: UnsafeMutablePointer<AVPacket>? = packet
+        av_packet_free(&optional)
+        guard writeResult >= 0 else {
+            throw HarnessError.failed("\(config.name): interleaved packet write failed (\(writeResult))")
+        }
+        if isBoundaryKey {
+            avio_flush(output.pointee.pb)
+            bytesAfterBoundaryKey = sink.bytes.count
+        }
+        if event.kind == .video { writtenVideoPackets += 1 }
+    }
+    guard cutCount == 1 else {
+        throw HarnessError.failed("\(config.name): expected one both-confirmed boundary, got \(cutCount)")
+    }
+    let drainResult = av_interleaved_write_frame(output, nil)
+    guard drainResult >= 0 else {
+        throw HarnessError.failed("\(config.name): interleave drain failed (\(drainResult))")
+    }
+    avio_flush(output.pointee.pb)
+    let bytesAfterBoundaryDrain = sink.bytes.count
+
+    let closedCapture = Data(sink.bytes)
+    guard let initEnd = initEnd(in: closedCapture), initEnd < closedCapture.count,
+          let bytesBeforeBoundaryKey, let bytesAfterBoundaryKey,
+          bytesBeforeBoundaryKey <= bytesAfterBoundaryKey,
+          bytesAfterBoundaryKey <= bytesAfterBoundaryDrain else {
+        throw HarnessError.failed("\(config.name): delayed init or first media fragment was incomplete")
+    }
+    let initData = closedCapture.prefix(initEnd)
+    let mediaData = closedCapture[initEnd..<bytesAfterBoundaryDrain]
+    guard let videoTrackID = VortXFMP4FragmentParser.videoTrackID(inInit: Data(initData)),
+          let audioTrackID = VortXFMP4FragmentParser.audioTrackID(inInit: Data(initData)),
+          let trackOrder = VortXFMP4FragmentParser.trackIDsInFirstFragment(Data(mediaData)),
+          videoTrackID != audioTrackID,
+          Set(trackOrder).isSuperset(of: [videoTrackID, audioTrackID]) else {
+        throw HarnessError.failed("\(config.name): hvc1 and AC3 track IDs were not preserved")
+    }
+    guard let videoProof = VortXFMP4FragmentParser.proveMediaRange(
+              Data(mediaData), trackID: videoTrackID, requireFirstSampleSync: true),
+          let audioProof = VortXFMP4FragmentParser.proveMediaRange(
+              Data(mediaData), trackID: audioTrackID, requireFirstSampleSync: false) else {
+        throw HarnessError.failed("\(config.name): production fragment proof rejected shipped movenc output")
+    }
+    let afterKeyProof: VortXFMP4FragmentParser.MediaRangeProof? = {
+        guard bytesAfterBoundaryKey > initEnd else { return nil }
+        return VortXFMP4FragmentParser.proveMediaRange(
+            Data(closedCapture[initEnd..<bytesAfterBoundaryKey]),
+            trackID: videoTrackID,
+            requireFirstSampleSync: true)
+    }()
+    let trailerResult = av_write_trailer(output)
+    guard trailerResult >= 0 else {
+        throw HarnessError.failed("\(config.name): trailer failed (\(trailerResult))")
+    }
+    avio_flush(output.pointee.pb)
+    let finalCapture = Data(sink.bytes)
+    guard bytesAfterBoundaryDrain < finalCapture.count else {
+        throw HarnessError.failed("\(config.name): trailer did not complete the next media range")
+    }
+    let nextMediaData = Data(finalCapture[bytesAfterBoundaryDrain..<finalCapture.count])
+    guard let nextVideoProof = VortXFMP4FragmentParser.proveMediaRange(
+        nextMediaData, trackID: videoTrackID, requireFirstSampleSync: true) else {
+        throw HarnessError.failed("\(config.name): next range did not begin with the boundary key")
+    }
+
+    return ScenarioResult(
+        name: config.name,
+        initData: Data(initData),
+        mediaData: Data(mediaData),
+        writeRanges: sink.writeRanges,
+        appendRanges: sink.appendRanges,
+        videoTrackID: videoTrackID,
+        audioTrackID: audioTrackID,
+        trackOrder: trackOrder,
+        videoProof: videoProof,
+        audioProof: audioProof,
+        nextMediaData: nextMediaData,
+        nextVideoProof: nextVideoProof,
+        expectedVideoSamples: expectedVideoSamples,
+        expectedAudioSamples: expectedAudioSamples,
+        bytesBeforeBoundaryKey: bytesBeforeBoundaryKey,
+        bytesAfterBoundaryKey: bytesAfterBoundaryKey,
+        bytesAfterBoundaryDrain: bytesAfterBoundaryDrain,
+        closingRangeCompleteAfterKeyWrite: afterKeyProof?.sampleCount == expectedVideoSamples,
+        closingSamplesAfterKeyWrite: afterKeyProof?.sampleCount)
+}
+
+private func timestampLessPublicationAttemptIsRejected(fixture: Fixture) -> Bool {
+    let config = ScenarioConfig(
+        name: "timestamp-less first video",
+        audioTrackFirst: false,
+        audioPacketFirst: false,
+        queueAudioPastBoundaryBeforeKey: false,
+        boundarySeconds: 1,
+        disagreement: false,
+        paddingBytesPerNonIDR: 0)
+    do {
+        _ = try runScenario(config, fixture: fixture, timestampLessFirstVideo: true)
+        return false
+    } catch HarnessError.timestampRejected(let videoWrites, let avioWrites, let producedBytes) {
+        return videoWrites == 0 && avioWrites == 0 && producedBytes == 0
+    } catch {
+        return false
+    }
+}
+
+/// Drives the shipped movenc through the alternate lane's production flags and parser while mirroring the private
+/// pending-segment state machine. The fourth packet is the first packet of logical segment 1 and must complete
+/// exactly the three samples in segment 0. The trailer completes exactly the two samples in segment 1. This also
+/// proves that a plain AVIO flush would have advertised only two of the three logical samples.
+private func runAlternateAudioScenario(fixture: Fixture) throws -> AlternateAudioResult {
+    let sink = RecordingSink()
+    var optionalOutput: UnsafeMutablePointer<AVFormatContext>?
+    guard avformat_alloc_output_context2(&optionalOutput, nil, "mp4", nil) >= 0,
+          let output = optionalOutput else {
+        throw HarnessError.failed("alternate audio: output allocation failed")
+    }
+    var ioContext: UnsafeMutablePointer<AVIOContext>?
+    defer {
+        output.pointee.pb = nil
+        avformat_free_context(output)
+        if let ioContext {
+            let backing = ioContext.pointee.buffer
+            var optional: UnsafeMutablePointer<AVIOContext>? = ioContext
+            avio_context_free(&optional)
+            if let backing { av_free(backing) }
+        }
+    }
+    guard let ioBytes = av_malloc(256 * 1024)?.assumingMemoryBound(to: UInt8.self) else {
+        throw HarnessError.failed("alternate audio: AVIO allocation failed")
+    }
+    let opaque = Unmanaged.passUnretained(sink).toOpaque()
+    ioContext = avio_alloc_context(
+        ioBytes, 256 * 1024, 1, opaque, nil,
+        { opaque, bytes, size -> Int32 in
+            guard let opaque, let bytes, size > 0 else { return -1 }
+            let sink = Unmanaged<RecordingSink>.fromOpaque(opaque).takeUnretainedValue()
+            return sink.write(bytes, count: Int(size)) ? size : -1
+        },
+        { opaque, offset, whence -> Int64 in
+            guard let opaque else { return -1 }
+            return Unmanaged<RecordingSink>.fromOpaque(opaque).takeUnretainedValue()
+                .seek(offset: offset, whence: whence)
+        })
+    guard let ioContext else {
+        av_free(ioBytes)
+        throw HarnessError.failed("alternate audio: AVIO context creation failed")
+    }
+    output.pointee.pb = ioContext
+    output.pointee.flags |= avFormatFlagCustomIO
+
+    guard let stream = avformat_new_stream(output, nil),
+          avcodec_parameters_copy(stream.pointee.codecpar, fixture.audioParameters) >= 0 else {
+        throw HarnessError.failed("alternate audio: stream copy failed")
+    }
+    stream.pointee.codecpar.pointee.codec_tag = 0
+    if stream.pointee.codecpar.pointee.frame_size == 0 {
+        stream.pointee.codecpar.pointee.frame_size = 1536
+    }
+    stream.pointee.time_base = AVRational(num: 1, den: 48_000)
+
+    var options: OpaquePointer?
+    defer { av_dict_free(&options) }
+    guard av_dict_set(&options, "movflags", VortXAlternateAudioMovencPolicy.movflags, 0) >= 0,
+          av_dict_set(&options, "strict", "experimental", 0) >= 0,
+          avformat_write_header(output, &options) >= 0 else {
+        throw HarnessError.failed("alternate audio: delayed header failed")
+    }
+
+    func writePacket(at seconds: Double) throws {
+        let packet = try makePacket(
+            template: fixture.audio,
+            streamIndex: stream.pointee.index,
+            timeBase: stream.pointee.time_base,
+            seconds: seconds,
+            durationSeconds: 0.032,
+            keyFlag: true)
+        let result = av_interleaved_write_frame(output, packet)
+        var optional: UnsafeMutablePointer<AVPacket>? = packet
+        av_packet_free(&optional)
+        guard result >= 0 else {
+            throw HarnessError.failed("alternate audio: packet write failed (\(result))")
+        }
+    }
+
+    try writePacket(at: 0)
+    try writePacket(at: 0.032)
+    try writePacket(at: 0.064)
+    avio_flush(output.pointee.pb)
+    let prematureCapture = Data(sink.bytes)
+    guard let initEnd = initEnd(in: prematureCapture), initEnd < prematureCapture.count,
+          let audioTrackID = VortXFMP4FragmentParser.audioTrackID(
+              inInit: Data(prematureCapture.prefix(initEnd))) else {
+        throw HarnessError.failed("alternate audio: init or track ID was not proven")
+    }
+    let prematureProof = VortXFMP4FragmentParser.proveMediaRange(
+        Data(prematureCapture.dropFirst(initEnd)),
+        trackID: audioTrackID,
+        requireFirstSampleSync: false)
+
+    try writePacket(at: 0.096)
+    avio_flush(output.pointee.pb)
+    let firstFrontier = sink.bytes.count
+    let firstMedia = Data(Data(sink.bytes).dropFirst(initEnd))
+    guard let firstProof = VortXFMP4FragmentParser.proveMediaRange(
+              firstMedia, trackID: audioTrackID, requireFirstSampleSync: false),
+          firstProof.mediaEnd == firstMedia.count else {
+        throw HarnessError.failed("alternate audio: next-packet trigger did not prove segment 0")
+    }
+
+    try writePacket(at: 0.128)
+    guard av_write_trailer(output) >= 0 else {
+        throw HarnessError.failed("alternate audio: trailer failed")
+    }
+    avio_flush(output.pointee.pb)
+    let finalMedia = Data(Data(sink.bytes).dropFirst(firstFrontier))
+    guard let finalProof = VortXFMP4FragmentParser.proveMediaRange(
+        finalMedia, trackID: audioTrackID, requireFirstSampleSync: false) else {
+        throw HarnessError.failed("alternate audio: trailer did not prove final segment")
+    }
+    let trailerMetadataIsComplete: Bool = {
+        guard finalProof.mediaEnd < finalMedia.count else { return true }
+        let trailer = finalMedia.dropFirst(finalProof.mediaEnd)
+        guard trailer.count >= 8 else { return false }
+        let size = Int(trailer[trailer.startIndex]) << 24
+            | Int(trailer[trailer.startIndex + 1]) << 16
+            | Int(trailer[trailer.startIndex + 2]) << 8
+            | Int(trailer[trailer.startIndex + 3])
+        let type = String(
+            bytes: trailer[(trailer.startIndex + 4)..<(trailer.startIndex + 8)],
+            encoding: .ascii)
+        return size == trailer.count && type == "mfra"
+    }()
+    return AlternateAudioResult(
+        prematureSampleCount: prematureProof?.sampleCount,
+        firstSegmentProof: firstProof,
+        finalSegmentProof: finalProof,
+        firstSegmentByteCount: firstMedia.count,
+        finalSegmentCandidateByteCount: finalMedia.count,
+        finalTrailerMetadataIsComplete: trailerMetadataIsComplete)
+}
+
+private final class Checks {
+    private(set) var failures = 0
+
+    func check(_ name: String, _ condition: @autoclosure () -> Bool) {
+        if condition() {
+            print("PASS  \(name)")
+        } else {
+            failures += 1
+            print("FAIL  \(name)")
+        }
+    }
+}
+
+@main
+private enum HLSFragmentPublicationIntegrationTests {
+    static func main() {
+        let checks = Checks()
+        let version = avformat_version()
+        checks.check("pinned movenc: libavformat is exactly 62.12.102",
+                     version == (62 << 16 | 12 << 8 | 102))
+
+        guard let fixtureData = Data(base64Encoded: fixtureBase64, options: .ignoreUnknownCharacters) else {
+            print("FAIL  fixture base64 could not be decoded")
+            exit(1)
+        }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vortx-hls-fragment-\(UUID().uuidString)", isDirectory: true)
+        let fixtureURL = directory.appendingPathComponent("hevc-ac3.mp4")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+            try fixtureData.write(to: fixtureURL, options: .atomic)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let fixture = try Fixture.load(from: fixtureURL)
+            checks.check("fixture: opening HEVC packet is a parsed IDR NAL", fixture.idr.isIDR)
+            checks.check("fixture: disagreement packet is parsed non-IDR", !fixture.nonIDR.isIDR)
+
+            let scenarios = [
+                ScenarioConfig(
+                    name: "audio-track-first/video-packet-first short GOP",
+                    audioTrackFirst: true,
+                    audioPacketFirst: false,
+                    queueAudioPastBoundaryBeforeKey: true,
+                    boundarySeconds: 1,
+                    disagreement: false,
+                    paddingBytesPerNonIDR: 0),
+                ScenarioConfig(
+                    name: "video-track-first/audio-packet-first long GOP",
+                    audioTrackFirst: false,
+                    audioPacketFirst: true,
+                    queueAudioPastBoundaryBeforeKey: false,
+                    boundarySeconds: 3,
+                    disagreement: false,
+                    paddingBytesPerNonIDR: 0),
+                ScenarioConfig(
+                    name: "high-bitrate byte pressure",
+                    audioTrackFirst: true,
+                    audioPacketFirst: true,
+                    queueAudioPastBoundaryBeforeKey: false,
+                    boundarySeconds: 3,
+                    disagreement: false,
+                    paddingBytesPerNonIDR: 256 * 1024),
+                ScenarioConfig(
+                    name: "IDR/key disagreement extends",
+                    audioTrackFirst: true,
+                    audioPacketFirst: false,
+                    queueAudioPastBoundaryBeforeKey: false,
+                    boundarySeconds: 3,
+                    disagreement: true,
+                    paddingBytesPerNonIDR: 0),
+            ]
+            var results: [ScenarioResult] = []
+            for scenario in scenarios {
+                let result = try runScenario(scenario, fixture: fixture)
+                results.append(result)
+                checks.check("\(result.name): AVIO recorded writes", !result.writeRanges.isEmpty)
+                checks.check("\(result.name): complete moof+mdat ends at advertised byte",
+                             result.videoProof.mediaEnd == result.mediaData.count)
+                checks.check("\(result.name): first published video sample is sync",
+                             result.videoProof.firstSampleIsSync == true)
+                checks.check("\(result.name): first output video sample carries a parsed IDR NAL",
+                             packetIsIDR(result.videoProof.firstSampleBytes))
+                checks.check("\(result.name): tfhd video sample count is exact",
+                             result.videoProof.sampleCount == result.expectedVideoSamples)
+                checks.check("\(result.name): delayed AC3 track and samples survive",
+                             result.audioProof.sampleCount == result.expectedAudioSamples)
+                checks.check("\(result.name): boundary receipts are monotonic",
+                             result.bytesBeforeBoundaryKey <= result.bytesAfterBoundaryKey
+                                 && result.bytesAfterBoundaryKey <= result.bytesAfterBoundaryDrain)
+                checks.check("\(result.name): next published range begins with boundary IDR",
+                             result.nextVideoProof.firstSampleIsSync == true
+                                 && result.nextVideoProof.sampleCount == 1
+                                 && packetIsIDR(result.nextVideoProof.firstSampleBytes))
+                let afterKeySamples = result.closingSamplesAfterKeyWrite.map(String.init) ?? "none"
+                print("RECEIPT  \(result.name): bytes before-key=\(result.bytesBeforeBoundaryKey) after-key=\(result.bytesAfterBoundaryKey) after-drain=\(result.bytesAfterBoundaryDrain); closing-video-samples after-key=\(afterKeySamples) after-drain=\(result.videoProof.sampleCount); next-range-video-samples=\(result.nextVideoProof.sampleCount)")
+            }
+
+            checks.check("forced schedule: initial key write completes the closing range",
+                         results.first.map {
+                             $0.closingRangeCompleteAfterKeyWrite
+                                 && $0.bytesAfterBoundaryKey > $0.bytesBeforeBoundaryKey
+                         } == true)
+            checks.check("alternate schedule: nil drain completes a key-buffered closing range",
+                         results.dropFirst().contains { !$0.closingRangeCompleteAfterKeyWrite })
+
+            if let audioFirst = results.first {
+                checks.check("audio-track-first output: actual first traf is audio",
+                             audioFirst.trackOrder.first == audioFirst.audioTrackID)
+                checks.check("mutant mid-fragment advertised offset turns red",
+                             VortXFMP4FragmentParser.proveMediaRange(
+                                 Data(audioFirst.mediaData.dropLast()),
+                                 trackID: audioFirst.videoTrackID,
+                                 requireFirstSampleSync: true) == nil)
+                let mutantProof = firstTrafShortcutProof(audioFirst)
+                checks.check("mutant first-traf shortcut executes and turns red",
+                             mutantProof?.sampleCount == audioFirst.audioProof.sampleCount
+                                 && mutantProof?.sampleCount != audioFirst.expectedVideoSamples)
+            }
+            if let pressured = results.first(where: { $0.name == "high-bitrate byte pressure" }) {
+                checks.check("multi-MiB packet pressure: complete media range exceeds two MiB",
+                             pressured.mediaData.count > 2 * 1024 * 1024)
+            }
+            checks.check("mutant IDR-only acceptance turns red",
+                         VortXHLSBoundaryPolicy.decision(
+                             hasOpenSegment: true,
+                             incomingIsIDR: true,
+                             incomingHasKeyFlag: false,
+                             elapsed: 1,
+                             openBytes: 1) == .continueOpen)
+            checks.check("mutant key-flag-only acceptance turns red",
+                         VortXHLSBoundaryPolicy.decision(
+                             hasOpenSegment: true,
+                             incomingIsIDR: false,
+                             incomingHasKeyFlag: true,
+                             elapsed: 1,
+                             openBytes: 1) == .continueOpen)
+            checks.check("disagreement fails soft at the exact existing hard bound",
+                         VortXHLSBoundaryPolicy.decision(
+                             hasOpenSegment: true,
+                             incomingIsIDR: true,
+                             incomingHasKeyFlag: false,
+                             elapsed: 4,
+                             openBytes: 1) == .failSoft)
+            checks.check("mutant timestamp-less mux/publication turns red before any AVIO write",
+                         timestampLessPublicationAttemptIsRejected(fixture: fixture))
+            let alternate = try runAlternateAudioScenario(fixture: fixture)
+            checks.check("alternate audio mutant: AVIO flush alone omits the last logical sample",
+                         alternate.prematureSampleCount == 2)
+            checks.check("alternate audio: first next-segment packet completes exactly three samples",
+                         alternate.firstSegmentProof.sampleCount == 3
+                             && alternate.firstSegmentProof.mediaEnd == alternate.firstSegmentByteCount)
+            checks.check("alternate audio: trailer completes exactly two final samples",
+                         alternate.finalSegmentProof.sampleCount == 2
+                             && alternate.finalSegmentProof.mediaEnd
+                                 <= alternate.finalSegmentCandidateByteCount
+                             && alternate.finalTrailerMetadataIsComplete)
+        } catch {
+            checks.check("integration harness completed: \(error)", false)
+        }
+
+        if checks.failures == 0 {
+            print("\nALL PASS")
+        } else {
+            print("\n\(checks.failures) TEST(S) FAILED")
+            exit(1)
+        }
+    }
+}
+
+private let fixtureBase64 = """
+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
+"""

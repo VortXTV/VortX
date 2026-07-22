@@ -436,6 +436,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     // Segment-cut state (remux thread only).
     private var hlsSegmentStartSec: Double?   // first video DTS of the OPEN segment (input timebase seconds)
     private var hlsSegmentStartByte: Int?     // byte offset the open segment starts at (nil until init known)
+    private var hlsSegmentStartPacketProven = false
+    private var hlsVideoTrackID: UInt32?
+    private var hlsOutputVideoFormat: VortXFMP4FragmentParser.VideoSampleFormat?
     private var hlsLastVideoSec: Double = 0   // last written video DTS, used by the init-progress watchdog
     private var hlsVideoEndState = MultiAudioPolicy.MediaEndState()
     private var hlsSignaledVideoFrameDuration: Double?
@@ -460,9 +463,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// defers forever and no init can ever publish. Measured on the MEDIA clock, not wall time, on
     /// purpose: a slow chunked mount advances media slowly and must never be failed early (the
     /// progress-aware start watchdog owns that call); this trips only while packets are flowing briskly
-    /// and the moov is provably uncompletable. movenc attempts the auto-flush every 1s of media
-    /// (frag_duration), and the DV pre-scan drain is capped at 240 packets (under ~10s of media even if
-    /// all-video), so 12s of pure deferral is conclusive without ever tripping inside the drain.
+    /// and the moov is provably uncompletable. movenc attempts its force=0 auto-flush at each eligible
+    /// keyframe after the one-second minimum, and the DV pre-scan drain is capped at 240 packets (under ~10s
+    /// of media even if all-video), so 12s of pure deferral is conclusive without tripping inside the drain.
     private static let hlsPreInitMoovDeadlineSecs = 12.0
 
     // MARK: - Default-on Beta 7 HLS rendition flags
@@ -1239,25 +1242,24 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // but an AC3 audio track's parameters are only known once the first AC3 packet arrives, so movenc
         // rejects write_header with EINVAL ("Cannot write moov atom before AC3 packets. Set the delay_moov flag
         // to fix this."). delay_moov defers the moov to the first fragment, which is exactly what fMP4 wants.
-        // TIME-BASED FRAGMENTATION (NO frag_keyframe) is what finally lets a P7-with-AC3 DV remux PLAY, not just
-        // write_header. frag_keyframe cuts the first fragment at the opening video keyframe, and delay_moov then
-        // serializes the moov there BEFORE the AC3 track has delivered a packet, so movenc's dac3 writer (which
-        // needs a parsed AC3 packet: track->eac3_priv->ec3_done, it never reads extradata) aborts with "Cannot
-        // write moov before AC3 packets". A time-based cut lets av_interleaved_write_frame deliver the AC3
-        // track's first packet (DTS-ordered) into the muxer before the ~1s fragment flush, so the moov gets a
-        // valid dac3 box. frag_duration (the max-fragment-duration TRIGGER) is REQUIRED, not min_frag_duration
-        // (a floor only): movenc re-adds frag_keyframe in mov_write_header when there is no cut trigger, silently
-        // restoring the keyframe cut. Verified against libavformat 62.12.101 (the exact lib this app ships).
-        let movflagsRc = av_dict_set(&opts, "movflags", "empty_moov+default_base_moof+delay_moov", 0)
-        let fragDurationRc = av_dict_set(&opts, "frag_duration", "1000000", 0)   // 1s fragments in microseconds (the cut TRIGGER)
+        // Keyframe-triggered fragmentation makes every completed movenc fragment boundary coincide with the
+        // packet that can legally open the next HLS segment. The trigger runs only when the incoming key packet
+        // reaches movenc and the video track already has a sample, then mov_flush_fragment(force=0) still defers
+        // the delayed moov until every mapped track has data. That preserves the AC3/EAC3 parsed-packet runway
+        // which issue #134 requires. `min_frag_duration` is only a one-second floor on that key trigger. The
+        // production-linked MPVKit 62.12.102 harness executes video-first and audio-first HEVC+AC3 orderings and
+        // proves both tracks survive in the delayed init before this option set is accepted.
+        let movflagsRc = av_dict_set(&opts, "movflags", VortXHLSMovencPolicy.movflags, 0)
+        let minFragDurationRc = av_dict_set(
+            &opts, "min_frag_duration", VortXHLSMovencPolicy.minimumFragmentDurationMicroseconds, 0)
         // FLAC-in-mp4 is spec'd (and AVPlayer decodes it) but FFmpeg's mov muxer gates it behind strict
         // experimental; without this a FLAC-audio DV MKV would die at avformat_write_header.
         let strictRc = av_dict_set(&opts, "strict", "experimental", 0)
         // av_dict_set returns <0 on allocation failure and omits the option. Fail into the existing libmpv
         // fallback instead of silently running a muxer with a different fragmentation contract.
-        if movflagsRc < 0 || fragDurationRc < 0 || strictRc < 0 {
-            VXProbe.log("dv", "HDR10 FALLBACK: muxer option not applied (movflags rc=\(movflagsRc) frag_duration rc=\(fragDurationRc) strict rc=\(strictRc))")
-            buffer.fail("muxer options could not be set (movflags \(movflagsRc), frag_duration \(fragDurationRc), strict \(strictRc))")
+        if movflagsRc < 0 || minFragDurationRc < 0 || strictRc < 0 {
+            VXProbe.log("dv", "HDR10 FALLBACK: muxer option not applied (movflags rc=\(movflagsRc) min_frag_duration rc=\(minFragDurationRc) strict rc=\(strictRc))")
+            buffer.fail("muxer options could not be set (movflags \(movflagsRc), min_frag_duration \(minFragDurationRc), strict \(strictRc))")
             return
         }
 
@@ -1369,22 +1371,28 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             if convertP7, outIdx == baseVideoOut {
                 Self.convertPacketRPUToProfile81(p, nalLengthSize: nalLengthSize, stats: &rpuStats)
             }
-            // HLS lane: cut a segment boundary BEFORE this video packet when the open segment is long enough.
-            if hlsIndexingEnabled, outIdx == baseVideoOut,
-               let step = hlsVideoStep(
-                   pkt: p,
-                   timeBase: inStream.pointee.time_base,
-                   codec: hlsIDRCodec,
-                   packetFormat: hlsPacketFormat) {
+            // Classify before muxing so alternate audio can partition at the exact video timestamp. Publication
+            // happens only after this packet has passed through the one interleaved write API and the post-write
+            // drain has made movenc's preceding keyframe fragment complete.
+            var hlsStep: HLSVideoStep?
+            var audioResource: MultiAudioPolicy.AudioResource?
+            if hlsIndexingEnabled, outIdx == baseVideoOut {
+                guard let step = hlsVideoStep(
+                    pkt: p,
+                    timeBase: inStream.pointee.time_base,
+                    codec: hlsIDRCodec,
+                    packetFormat: hlsPacketFormat) else {
+                    buffer.fail("HLS base video boundary classification was unavailable")
+                    return
+                }
+                hlsStep = step
                 if let failure = step.failure {
                     buffer.fail(failure)
                     return
                 }
-                let audioResource = drainAlternateAudio(
+                audioResource = drainAlternateAudio(
                     to: step.seconds, boundary: step.boundary,
                     alignment: &audioAlignment, packets: &heldAudioPackets)
-                guard hlsApplyVideoStep(
-                    outCtx: outCtx, step: step, audioResource: audioResource) else { return }
             }
             p.pointee.stream_index = Int32(outIdx)
             av_packet_rescale_ts(p, inStream.pointee.time_base, outStream.pointee.time_base)
@@ -1398,6 +1406,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 DiagnosticsLog.log("dv", "av_interleaved_write_frame FAILED rc=\(wf) stream=\(outIdx == baseVideoOut ? "video" : "audio") outIdx=\(outIdx) preMoov=\(buffer.producedCount == 0) [prebuffered drain]")
                 buffer.fail("av_interleaved_write_frame failed (\(wf)) [prebuffered drain]")
                 return
+            }
+            if let hlsStep {
+                guard hlsApplyVideoStep(
+                    outCtx: outCtx, step: hlsStep, audioResource: audioResource) else { return }
             }
         }
 
@@ -1486,33 +1498,36 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             if convertP7, outIdx == baseVideoOut {
                 Self.convertPacketRPUToProfile81(pkt, nalLengthSize: nalLengthSize, stats: &rpuStats)
             }
-            // HLS lane: cut a segment boundary BEFORE this video packet when the open segment is long enough.
-            if hlsIndexingEnabled, outIdx == baseVideoOut,
-               let step = hlsVideoStep(
-                   pkt: pkt,
-                   timeBase: inStream.pointee.time_base,
-                   codec: hlsIDRCodec,
-                   packetFormat: hlsPacketFormat) {
+            // Classify before muxing so alternate audio can partition at the exact video timestamp. Publication
+            // remains post-write, after movenc has seen this key packet and completed the preceding fragment.
+            var hlsStep: HLSVideoStep?
+            var audioResource: MultiAudioPolicy.AudioResource?
+            if hlsIndexingEnabled, outIdx == baseVideoOut {
+                guard let step = hlsVideoStep(
+                    pkt: pkt,
+                    timeBase: inStream.pointee.time_base,
+                    codec: hlsIDRCodec,
+                    packetFormat: hlsPacketFormat) else {
+                    buffer.fail("HLS base video boundary classification was unavailable")
+                    av_packet_unref(pkt)
+                    return
+                }
+                hlsStep = step
                 if let failure = step.failure {
                     buffer.fail(failure)
                     av_packet_unref(pkt)
                     return
                 }
-                let audioResource = drainAlternateAudio(
+                audioResource = drainAlternateAudio(
                     to: step.seconds, boundary: step.boundary,
                     alignment: &audioAlignment, packets: &heldAudioPackets)
-                guard hlsApplyVideoStep(
-                    outCtx: outCtx, step: step, audioResource: audioResource) else {
-                    av_packet_unref(pkt)
-                    return
-                }
             }
             pkt.pointee.stream_index = Int32(outIdx)
             av_packet_rescale_ts(pkt, inStream.pointee.time_base, outStream.pointee.time_base)
             pkt.pointee.pos = -1
             let wf = av_interleaved_write_frame(outCtx, pkt)
-            av_packet_unref(pkt)
             if wf < 0 {
+                av_packet_unref(pkt)
                 if isCancelled { break }     // our write callback returned EXIT; expected on cancel
                 // Case-A visibility (#76 b166): the one silent death path between write_header and the delayed
                 // moov. preMoov=true means AVPlayer got ZERO bytes when the item then fails "Cannot Open"; the
@@ -1521,6 +1536,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 buffer.fail("av_interleaved_write_frame failed (\(wf))")
                 return
             }
+            if let hlsStep {
+                guard hlsApplyVideoStep(
+                    outCtx: outCtx, step: hlsStep, audioResource: audioResource) else {
+                    av_packet_unref(pkt)
+                    return
+                }
+            }
+            av_packet_unref(pkt)
         }
 
         if isCancelled {
@@ -1804,6 +1827,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             hlsAbortInitScan("init \(initLen)B (moov \(moovSize)B @\(moovStart)) not fully resident")
             return
         }
+        guard let videoTrackID = VortXFMP4FragmentParser.videoTrackID(inInit: initData),
+              let outputVideoFormat = VortXFMP4FragmentParser.videoSampleFormat(
+                  inInit: initData, trackID: videoTrackID) else {
+            hlsAbortInitScan("init video track or sample format could not be proven")
+            return
+        }
         hlsLock.lock(); let sig = _hlsSignaling; hlsLock.unlock()
         // "dvh1.08.06/db1p" -> "db1p" (nil for P5 / plain-HEVC signaling: nothing declared, nothing to add).
         let declaredBrand: String? = sig?.supplementalCodec.flatMap { s in
@@ -1856,6 +1885,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         _hlsInitDataHDR = servedHDR
         _primaryDec3Observation = primaryDec3
         hlsLock.unlock()
+        hlsVideoTrackID = videoTrackID
+        hlsOutputVideoFormat = outputVideoFormat
         hlsSegmentStartByte = initLen   // segment 0 starts right after the init (BUFFER offsets: original length)
         hlsInitState.publish(); hlsHeadBuf = []
         DiagnosticsLog.log("dv", "dec3 structured mux receipt: \(dec3Receipt)")
@@ -2196,10 +2227,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             discardHeldAudio(alignment: &alignment, packets: &packets)
             return nil
         }
+        // If a prior boundary had no next-segment lookahead yet, the first packet written above completed it.
+        // Its video segment is already public, so reconcile that delayed audio resource immediately.
+        for completed in muxer.takeCompletedSegments() {
+            publishAlternateAudioResource(completed)
+        }
         guard let boundary = actions.closedBoundary,
               let audioCut = actions.audioCut,
               let selectionFrameDuration = actions.selectionFrameDuration else { return nil }
-        guard let resource = muxer.closeSegment(
+        guard muxer.closeSegment(
             id: boundary.id,
             start: boundary.start,
             end: boundary.end,
@@ -2209,12 +2245,22 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             discardHeldAudio(alignment: &alignment, packets: &packets)
             return nil
         }
+        // A next-segment packet is the deterministic frag_every_frame trigger for the closing segment. When
+        // alignment does not have one yet, publication stays pending and a later normal-demux packet completes
+        // it through writeOwnedPacket. No producedCount-only range is ever exposed.
         guard writeHeldAudio(tokens: actions.writeNextSegment, muxer: muxer, packets: &packets) else {
             markAlternateAudioFailed(muxer.failureCategory ?? .muxer)
             discardHeldAudio(alignment: &alignment, packets: &packets)
             return nil
         }
-        return resource
+        let completed = muxer.takeCompletedSegments()
+        guard completed.count <= 1,
+              completed.first?.segmentID == boundary.id || completed.isEmpty else {
+            markAlternateAudioFailed(.discontinuity)
+            discardHeldAudio(alignment: &alignment, packets: &packets)
+            return nil
+        }
+        return completed.first
     }
 
     private func finishAlternateAudio(id: Int,
@@ -2243,13 +2289,24 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             discardHeldAudio(alignment: &alignment, packets: &packets)
             return nil
         }
-        guard let resource = muxer.closeFinalSegment(id: id, start: start, end: end) else {
+        for completed in muxer.takeCompletedSegments() {
+            publishAlternateAudioResource(completed)
+        }
+        guard muxer.closeFinalSegment(id: id, start: start, end: end) else {
             markAlternateAudioFailed(muxer.failureCategory ?? .incompleteCoverage)
             discardHeldAudio(alignment: &alignment, packets: &packets)
             return nil
         }
         muxer.finish()
-        return resource
+        let completed = muxer.takeCompletedSegments()
+        guard muxer.failureCategory == nil,
+              completed.count == 1,
+              completed[0].segmentID == id else {
+            markAlternateAudioFailed(muxer.failureCategory ?? .incompleteCoverage)
+            discardHeldAudio(alignment: &alignment, packets: &packets)
+            return nil
+        }
+        return completed[0]
     }
 
     private func writeHeldAudio(tokens: [Int],
@@ -2293,35 +2350,39 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         return seconds.isFinite && seconds > 0 ? seconds : nil
     }
 
-    /// Cut a segment boundary BEFORE writing this base-video packet when the open segment has reached the
-    /// target duration at a keyframe (clean, seekable cut) or the hard bound at any frame (so one long GOP
-    /// can never outgrow the playlist's fixed TARGETDURATION). The cut = drain the interleave queue + flush
-    /// the muxer's open fragment (`av_interleaved_write_frame(ctx, nil)`, the documented movenc fragment
-    /// cut) + flush the AVIO tail, after which `buffer.producedCount` is EXACTLY the segment's end byte.
-    /// movenc's own frag_duration auto-cuts continue as shipped; they simply become intra-segment fragments.
-    /// Cuts are GATED on the init segment being published (`hlsHeadDone`): pre-init a forced flush is both
-    /// useless (no segment can close before `hlsSegmentStartByte` exists) and DANGEROUS (see the #134 note
-    /// inside), so the delayed moov is left entirely to movenc's own safe frag_duration auto-flush. The
-    /// pre-init branch still pushes the AVIO tail on every base-video packet, so an auto-flushed moov
-    /// reaches the head scan on the next packet rather than on a 4 MiB AVIO-buffer overflow (note inside).
+    /// Classify a segment boundary before writing the incoming base-video packet, then publish only after that
+    /// packet has passed through `av_interleaved_write_frame`. movenc's `frag_keyframe` hook completes the
+    /// preceding fragment when the confirmed key packet reaches it; a post-write nil interleave drain ensures
+    /// the packet has actually arrived. The resulting byte range still must pass the fMP4 and IDR parser before
+    /// it can enter the playlist. Pre-init, the same post-write path flushes AVIO only and never forces movenc.
     private struct HLSVideoStep {
         let seconds: Double
         let boundary: MultiAudioPolicy.Boundary?
         let failure: String?
     }
 
-    /// Decide the boundary before the incoming base-video packet is written. Alternate audio uses this exact
-    /// pre-known T to partition its owned hold; the primary cut is then applied before the video packet.
+    /// Classify the boundary before the incoming base-video packet is written. Alternate audio uses this exact
+    /// pre-known T to partition its owned hold. The primary packet itself must then pass through
+    /// `av_interleaved_write_frame`; only after a nil interleave drain makes that packet reach movenc may the
+    /// completed preceding fragment be parsed and published.
     private func hlsVideoStep(pkt: UnsafeMutablePointer<AVPacket>,
                               timeBase: AVRational,
                               codec: VortXVideoIDRClassifier.Codec,
                               packetFormat: VortXVideoIDRClassifier.PacketFormat) -> HLSVideoStep? {
         guard hlsIndexingEnabled else { return nil }
+        let dts = pkt.pointee.dts == AV_NOPTS_VALUE_CONST ? nil : pkt.pointee.dts
+        let pts = pkt.pointee.pts == AV_NOPTS_VALUE_CONST ? nil : pkt.pointee.pts
+        guard let sec = VortXHLSBoundaryPolicy.timestampSeconds(
+            dts: dts,
+            pts: pts,
+            timeBaseNumerator: timeBase.num,
+            timeBaseDenominator: timeBase.den) else {
+            return HLSVideoStep(
+                seconds: hlsLastVideoSec,
+                boundary: nil,
+                failure: "HLS base video packet had no finite decode or presentation timestamp")
+        }
         let den = Double(timeBase.den)
-        guard den > 0 else { return nil }
-        let ts = pkt.pointee.dts != AV_NOPTS_VALUE_CONST ? pkt.pointee.dts : pkt.pointee.pts
-        guard ts != AV_NOPTS_VALUE_CONST else { return nil }
-        let sec = Double(ts) * Double(timeBase.num) / den
         hlsLastVideoSec = sec
         let packetDuration = pkt.pointee.duration > 0
             ? Double(pkt.pointee.duration) * Double(timeBase.num) / den : nil
@@ -2337,19 +2398,21 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 codec: codec,
                 format: packetFormat)
         }()
+        let hasKeyFlag = pkt.pointee.flags & AV_PKT_FLAG_KEY_CONST != 0
         guard let start = hlsSegmentStartSec else {
-            guard isIDR else {
+            guard isIDR, hasKeyFlag else {
                 return HLSVideoStep(
                     seconds: sec,
                     boundary: nil,
-                    failure: "first HLS video segment did not begin with an IDR access unit")
+                    failure: "first HLS video segment lacked matching IDR NAL and AV_PKT_FLAG_KEY evidence")
             }
-            hlsSegmentStartSec = sec   // the first exact IDR opens segment 0
+            hlsSegmentStartSec = sec
+            hlsSegmentStartPacketProven = true
             return HLSVideoStep(seconds: sec, boundary: nil, failure: nil)
         }
-        // #134 root cause: NEVER force a fragment flush before the init segment is published. The forced
-        // flush below reaches movenc as mov_flush_fragment(force=1), which BYPASSES the "all tracks have
-        // data" guard and tries to serialize the delayed moov even when the mapped audio track has no
+        // #134 root cause: NEVER send a nil packet to movenc before the init segment is published. Such a
+        // flush reaches movenc as mov_flush_fragment(force=1), which BYPASSES the "all tracks have data"
+        // guard and tries to serialize the delayed moov even when the mapped audio track has no
         // parsed packet yet (a probe window that re-delivered only video so far, or a first (E)AC3 burst
         // the parser has not finished). movenc then HALF-writes the moov into the AVIO buffer (ftyp +
         // video trak, dying at the audio sample entry: "Cannot write moov atom before (E)AC3 packets"),
@@ -2361,12 +2424,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // higher offset, invisible to the armed scan. Init never published -> media.m3u8 starved ->
         // "TRUE STALL -> libmpv HDR10" on ~half of all DV mounts (issue #134). So pre-init, ONLY the
         // forced flush is skipped. There is nothing to cut yet anyway (hlsCloseSegment no-ops until
-        // hlsFinalizeInit sets hlsSegmentStartByte); movenc's frag_duration auto-flush (force=0) DEFERS
+        // hlsFinalizeInit sets hlsSegmentStartByte); movenc's keyframe auto-flush (force=0) DEFERS
         // WHOLE until every mapped track really has data (mov_flush_fragment returns before writing a
         // byte), so it can never begin a moov it has to abandon: the first head bytes it ever emits are
         // a COMPLETE ftyp+moov with its size backpatched in-buffer, or the >AVIO-buffer overflow path
         // whose placeholder+backpatch the init-starve guard already polices. Cuts resume here on the
-        // first packet after the init publishes. hlsHeadDone also flips on hlsAbortInitScan, so a dead
+        // first packet after the init publishes. The keyframe-triggered force=0 path is safe because it keeps
+        // movenc's all-tracks-have-data guard. hlsHeadDone also flips on hlsAbortInitScan, so a dead
         // scan cannot park this gate forever (that mount is already failing over). Legacy loader
         // delivery is untouched (hlsIndexingEnabled guard).
         let elapsed = sec - start
@@ -2374,6 +2438,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let decision = VortXHLSBoundaryPolicy.decision(
             hasOpenSegment: true,
             incomingIsIDR: isIDR,
+            incomingHasKeyFlag: hasKeyFlag,
             elapsed: elapsed,
             openBytes: openBytes,
             targetSeconds: Self.hlsTargetSegmentSecs,
@@ -2388,7 +2453,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             return HLSVideoStep(
                 seconds: sec,
                 boundary: nil,
-                failure: "HLS segment hard limit reached before an IDR access unit")
+                failure: "HLS segment hard limit reached before matching IDR NAL and key-flag evidence")
         case .cut:
             break
         }
@@ -2407,11 +2472,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                                    audioResource: MultiAudioPolicy.AudioResource?) -> Bool {
         guard hlsIndexingEnabled else { return true }
         guard step.boundary != nil else {
-            // Pre-init only: push bytes movenc has already completed, but never force its delayed moov.
+            // Pre-init only: push bytes movenc has already completed, but never send a nil packet to movenc.
             if !hlsInitState.mayPublishMedia { avio_flush(outCtx.pointee.pb) }
             return buffer.status().failure == nil
         }
-        let flushRc = av_interleaved_write_frame(outCtx, nil)   // drain the interleave queue + flush the open fragment
+        // The incoming confirmed key packet was already submitted through this same API. Draining its
+        // interleave queue now makes movenc's automatic frag_keyframe completion observable in AVIO without
+        // mixing av_write_frame and av_interleaved_write_frame.
+        let flushRc = av_interleaved_write_frame(outCtx, nil)
         if flushRc < 0 {
             // Post-init only (the hlsHeadDone gate above): a failed cut means the interleave drain or the
             // fragment write died, so the pipeline is wedged; fail so the HLS server 404s and the demotion
@@ -2428,6 +2496,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         avio_flush(outCtx.pointee.pb)                 // push the AVIO tail so producedCount == the boundary
         guard hlsCloseSegment(endSec: step.seconds, audioResource: audioResource) else { return false }
         hlsSegmentStartSec = step.seconds
+        hlsSegmentStartPacketProven = true
         return true
     }
 
@@ -2439,9 +2508,31 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
               hlsInitState.mayPublishMedia,
               let hlsSpool,
               let segStartByte = hlsSegmentStartByte,
-              let startSec = hlsSegmentStartSec else { return false }
-        let endByte = buffer.producedCount
-        guard endByte > segStartByte else { return false }
+              let startSec = hlsSegmentStartSec,
+              hlsSegmentStartPacketProven,
+              let videoTrackID = hlsVideoTrackID,
+              let outputVideoFormat = hlsOutputVideoFormat else {
+            buffer.fail("HLS segment start or output video format was not proven")
+            return false
+        }
+        let candidateEnd = buffer.producedCount
+        guard candidateEnd > segStartByte,
+              let candidate = buffer.snapshotChunk(
+                  offset: segStartByte, length: candidateEnd - segStartByte),
+              let mediaProof = VortXFMP4FragmentParser.proveMediaRange(
+                  candidate, trackID: videoTrackID, requireFirstSampleSync: true),
+              VortXVideoIDRClassifier.isIDR(
+                  bytes: [UInt8](mediaProof.firstSampleBytes),
+                  codec: outputVideoFormat.codec,
+                  format: outputVideoFormat.packetFormat) else {
+            buffer.fail("HLS segment byte range, sync sample, or first-sample IDR could not be proven")
+            return false
+        }
+        let endByte = segStartByte + mediaProof.mediaEnd
+        guard endByte > segStartByte, endByte <= candidateEnd else {
+            buffer.fail("HLS parser returned an invalid media byte range")
+            return false
+        }
         let duration = endSec - startSec
         guard duration.isFinite, duration > 0 else { return false }
         hlsLock.lock()
@@ -2504,6 +2595,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         if let audioResource, audioResource.segmentID == idx {
             registerAlternateAudioResource(audioResource)
         }
+        hlsSegmentStartPacketProven = false
         hlsSegmentStartByte = endByte
         _ = buffer.discardDurablyBackedPrefix(before: endByte)
         if let audioResource, let audioMuxer {
@@ -3455,8 +3547,21 @@ private final class VortXAlternateAudioMuxer: @unchecked Sendable {
     private var headDone = false
     private var segmentStartByte: Int?
     private var trailerWritten = false
+    private var audioTrackID: UInt32?
+    private var logicalSegmentPacketCount = 0
+    private var pendingSegment: PendingSegment?
+    private var completedSegments: [MultiAudioPolicy.AudioResource] = []
     private let residentByteLimit: Int
     private var audioCoverage = MultiAudioPolicy.AudioCoverageState()
+
+    private struct PendingSegment {
+        let id: Int
+        let expectedSampleCount: Int
+        let decodeStart: Double
+        let decodeEnd: Double
+        let leadingPacketDuration: Double
+        let trailingPacketDuration: Double
+    }
 
     private static let avioSize = 256 * 1024
     private static let headCap = 4 << 20
@@ -3516,8 +3621,7 @@ private final class VortXAlternateAudioMuxer: @unchecked Sendable {
 
         var options: OpaquePointer?
         defer { av_dict_free(&options) }
-        guard av_dict_set(&options, "movflags", "empty_moov+default_base_moof+delay_moov", 0) >= 0,
-              av_dict_set(&options, "frag_duration", "1000000", 0) >= 0,
+        guard av_dict_set(&options, "movflags", VortXAlternateAudioMovencPolicy.movflags, 0) >= 0,
               av_dict_set(&options, "strict", "experimental", 0) >= 0,
               avformat_write_header(context, &options) >= 0 else {
             cleanup()
@@ -3564,6 +3668,15 @@ private final class VortXAlternateAudioMuxer: @unchecked Sendable {
             fail(.muxer)
             return false
         }
+        guard logicalSegmentPacketCount < Int.max else {
+            fail(.muxer)
+            return false
+        }
+        logicalSegmentPacketCount += 1
+        // frag_every_frame completes the preceding sample when this packet reaches the one-stream muxer. If a
+        // logical boundary was waiting for that trigger, validate and capture its exact moof+mdat range now,
+        // before another new-segment packet can make its own fragment visible in the same candidate range.
+        if pendingSegment != nil, !completePendingSegment() { return false }
         return true
     }
 
@@ -3573,48 +3686,33 @@ private final class VortXAlternateAudioMuxer: @unchecked Sendable {
                       start: Double,
                       end: Double,
                       audioCut: Double,
-                      selectionFrameDuration: Double) -> MultiAudioPolicy.AudioResource? {
+                      selectionFrameDuration: Double) -> Bool {
         let boundary = MultiAudioPolicy.Boundary(id: id, start: start, duration: end - start)
-        guard !aborted.get(), let context = outCtx,
+        guard !aborted.get(), pendingSegment == nil, logicalSegmentPacketCount > 0,
               let proof = audioCoverage.close(
                   boundary: boundary,
                   audioCut: audioCut,
                   selectionFrameDuration: selectionFrameDuration) else {
             fail(.incompleteCoverage)
-            return nil
+            return false
         }
-        guard av_interleaved_write_frame(context, nil) >= 0 else {
-            fail(.muxer)
-            return nil
-        }
-        avio_flush(context.pointee.pb)
-        guard initSnapshot() != nil,
-              let startByte = segmentStartByte else {
-            fail(.incompleteCoverage)
-            return nil
-        }
-        let endByte = buffer.producedCount
-        guard endByte > startByte else {
-            fail(.incompleteCoverage)
-            return nil
-        }
-        segmentStartByte = endByte
-        return MultiAudioPolicy.AudioResource(
-            segmentID: id,
-            byteOffset: startByte,
-            byteLength: endByte - startByte,
+        pendingSegment = PendingSegment(
+            id: id,
+            expectedSampleCount: logicalSegmentPacketCount,
             decodeStart: proof.decodeStart,
             decodeEnd: proof.decodeEnd,
             leadingPacketDuration: proof.leadingPacketDuration,
             trailingPacketDuration: proof.trailingPacketDuration)
+        logicalSegmentPacketCount = 0
+        return true
     }
 
     /// EOF has no following packet to select a boundary from. Close at the real end of the final accepted audio
     /// packet, and let AudioCoverageState require that its signed difference from the final video end is within
     /// half that observed packet duration.
-    func closeFinalSegment(id: Int, start: Double, end: Double) -> MultiAudioPolicy.AudioResource? {
+    func closeFinalSegment(id: Int, start: Double, end: Double) -> Bool {
         guard let audioCut = audioCoverage.currentDecodeEnd,
-              let frameDuration = audioCoverage.currentTrailingPacketDuration else { return nil }
+              let frameDuration = audioCoverage.currentTrailingPacketDuration else { return false }
         return closeSegment(
             id: id,
             start: start,
@@ -3648,7 +3746,59 @@ private final class VortXAlternateAudioMuxer: @unchecked Sendable {
             return
         }
         avio_flush(context.pointee.pb)
+        guard completePendingSegment(finalizedAtEOF: true) else { return }
         buffer.finish()
+    }
+
+    func takeCompletedSegments() -> [MultiAudioPolicy.AudioResource] {
+        let completed = completedSegments
+        completedSegments.removeAll(keepingCapacity: true)
+        return completed
+    }
+
+    /// Completes a staged logical segment only after movenc has a deterministic trigger: the first packet of
+    /// the next logical segment under frag_every_frame, or the trailer at EOF. The fMP4 parser, track ID, and
+    /// exact sample count are all required before the byte range leaves this muxer.
+    private func completePendingSegment(finalizedAtEOF: Bool = false) -> Bool {
+        guard let pending = pendingSegment else { return true }
+        guard !aborted.get(), let context = outCtx else { return false }
+        if !finalizedAtEOF {
+            // The first new-segment packet has already incremented this counter in writeOwnedPacket.
+            guard logicalSegmentPacketCount > 0 else { return true }
+        }
+        avio_flush(context.pointee.pb)
+        guard initSnapshot() != nil,
+              let trackID = audioTrackID,
+              let startByte = segmentStartByte else {
+            fail(.incompleteCoverage)
+            return false
+        }
+        let candidateEnd = buffer.producedCount
+        guard candidateEnd > startByte,
+              let candidate = buffer.snapshotChunk(
+                  offset: startByte, length: candidateEnd - startByte),
+              let mediaProof = VortXFMP4FragmentParser.proveMediaRange(
+                  candidate, trackID: trackID, requireFirstSampleSync: false),
+              mediaProof.sampleCount == pending.expectedSampleCount else {
+            fail(.incompleteCoverage)
+            return false
+        }
+        let endByte = startByte + mediaProof.mediaEnd
+        guard endByte > startByte, endByte <= candidateEnd else {
+            fail(.incompleteCoverage)
+            return false
+        }
+        completedSegments.append(MultiAudioPolicy.AudioResource(
+            segmentID: pending.id,
+            byteOffset: startByte,
+            byteLength: endByte - startByte,
+            decodeStart: pending.decodeStart,
+            decodeEnd: pending.decodeEnd,
+            leadingPacketDuration: pending.leadingPacketDuration,
+            trailingPacketDuration: pending.trailingPacketDuration))
+        segmentStartByte = endByte
+        pendingSegment = nil
+        return true
     }
 
     private func writeBytes(_ bytes: UnsafePointer<UInt8>, count: Int) -> Bool {
@@ -3744,12 +3894,17 @@ private final class VortXAlternateAudioMuxer: @unchecked Sendable {
               moovStart >= 0,
               moovSize >= 8,
               moovStart <= Int.max - moovSize,
-              let data = buffer.snapshotPrefix(length: moovStart + moovSize) else { abort(); return }
+              let data = buffer.snapshotPrefix(length: moovStart + moovSize),
+              let resolvedAudioTrackID = VortXFMP4FragmentParser.audioTrackID(inInit: data) else {
+            fail(.muxer)
+            return
+        }
         let dec3 = MultiAudioPolicy.dec3Observation(in: data)
         stateLock.lock()
         _initData = data
         _dec3Observation = dec3
         stateLock.unlock()
+        audioTrackID = resolvedAudioTrackID
         segmentStartByte = data.count
         headDone = true
         head.removeAll(keepingCapacity: false)

@@ -373,40 +373,61 @@ check("IDR classifier: H.264 rejects forbidden, ref-idc-zero and mixed non-IDR V
 
 check("segments: segment zero must begin on an IDR",
       VortXHLSBoundaryPolicy.decision(
-          hasOpenSegment: false, incomingIsIDR: false, elapsed: 0, openBytes: 0) == .failSoft)
-check("segments: an IDR opens segment zero",
+          hasOpenSegment: false, incomingIsIDR: false, incomingHasKeyFlag: true,
+          elapsed: 0, openBytes: 0) == .failSoft)
+check("segments: segment zero rejects an IDR whose demux key flag disagrees",
       VortXHLSBoundaryPolicy.decision(
-          hasOpenSegment: false, incomingIsIDR: true, elapsed: 0, openBytes: 0) == .open)
-check("segments: a target-age IDR cuts before itself so the next segment begins on IDR",
+          hasOpenSegment: false, incomingIsIDR: true, incomingHasKeyFlag: false,
+          elapsed: 0, openBytes: 0) == .failSoft)
+check("segments: an IDR with matching key evidence opens segment zero",
       VortXHLSBoundaryPolicy.decision(
-          hasOpenSegment: true, incomingIsIDR: true, elapsed: 1, openBytes: 1) == .cut)
+          hasOpenSegment: false, incomingIsIDR: true, incomingHasKeyFlag: true,
+          elapsed: 0, openBytes: 0) == .open)
+check("segments: a target-age IDR with matching key evidence cuts before itself",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
+          elapsed: 1, openBytes: 1) == .cut)
+check("segments: either IDR/key disagreement extends below the hard guard",
+      VortXHLSBoundaryPolicy.decision(
+          hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: false,
+          elapsed: 1, openBytes: 1) == .continueOpen
+          && VortXHLSBoundaryPolicy.decision(
+              hasOpenSegment: true, incomingIsIDR: false, incomingHasKeyFlag: true,
+              elapsed: 1, openBytes: 1) == .continueOpen)
 check("segments: the four-second guard on a non-IDR fails soft instead of publishing an illegal cut",
       VortXHLSBoundaryPolicy.decision(
-          hasOpenSegment: true, incomingIsIDR: false, elapsed: 4, openBytes: 1) == .failSoft)
+          hasOpenSegment: true, incomingIsIDR: false, incomingHasKeyFlag: false,
+          elapsed: 4, openBytes: 1) == .failSoft)
 check("segments: the 32MiB guard on a non-IDR fails soft instead of publishing an illegal cut",
       VortXHLSBoundaryPolicy.decision(
-          hasOpenSegment: true, incomingIsIDR: false, elapsed: 1,
+          hasOpenSegment: true, incomingIsIDR: false, incomingHasKeyFlag: false, elapsed: 1,
           openBytes: 32 * 1024 * 1024) == .failSoft)
 check("segments: an IDR at the hard guard remains a legal cut",
       VortXHLSBoundaryPolicy.decision(
-          hasOpenSegment: true, incomingIsIDR: true, elapsed: 4,
+          hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true, elapsed: 4,
           openBytes: 32 * 1024 * 1024) == .cut)
 check("segments: malformed timing and byte inputs fail soft",
       VortXHLSBoundaryPolicy.decision(
-          hasOpenSegment: true, incomingIsIDR: true, elapsed: .nan, openBytes: 0) == .failSoft
+          hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
+          elapsed: .nan, openBytes: 0) == .failSoft
           && VortXHLSBoundaryPolicy.decision(
-              hasOpenSegment: true, incomingIsIDR: true, elapsed: -0.1, openBytes: 0) == .failSoft
+              hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
+              elapsed: -0.1, openBytes: 0) == .failSoft
           && VortXHLSBoundaryPolicy.decision(
-              hasOpenSegment: true, incomingIsIDR: true, elapsed: 1, openBytes: -1) == .failSoft)
+              hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
+              elapsed: 1, openBytes: -1) == .failSoft)
 check("segments: invalid target, maximum duration and byte thresholds fail soft",
       VortXHLSBoundaryPolicy.decision(
-          hasOpenSegment: true, incomingIsIDR: true, elapsed: 1, openBytes: 1,
+          hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
+          elapsed: 1, openBytes: 1,
           targetSeconds: 0) == .failSoft
           && VortXHLSBoundaryPolicy.decision(
-              hasOpenSegment: true, incomingIsIDR: true, elapsed: 1, openBytes: 1,
+              hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
+              elapsed: 1, openBytes: 1,
               targetSeconds: 2, maximumSeconds: 1) == .failSoft
           && VortXHLSBoundaryPolicy.decision(
-              hasOpenSegment: true, incomingIsIDR: true, elapsed: 1, openBytes: 1,
+              hasOpenSegment: true, incomingIsIDR: true, incomingHasKeyFlag: true,
+              elapsed: 1, openBytes: 1,
               maximumBytes: 0) == .failSoft)
 
 var abortedInit = VortXHLSInitPublicationState()

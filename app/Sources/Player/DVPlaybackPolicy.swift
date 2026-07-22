@@ -464,6 +464,422 @@ enum VortXVideoIDRClassifier {
     }
 }
 
+/// Fail-closed ISO-BMFF proof used immediately before a muxed HLS byte range is published. A range is
+/// publishable only when every top-level box is complete, every `moof` is paired with the following `mdat`,
+/// and the requested track can be resolved from `tfhd.track_ID`. Video additionally proves that sample zero
+/// in the first fragment is sync. Packet-level IDR evidence remains a separate required gate because an MP4
+/// sync flag alone does not prove the encoded NAL is an IDR picture.
+enum VortXFMP4FragmentParser {
+    struct VideoSampleFormat: Equatable, Sendable {
+        let codec: VortXVideoIDRClassifier.Codec
+        let packetFormat: VortXVideoIDRClassifier.PacketFormat
+    }
+
+    struct MediaRangeProof: Equatable, Sendable {
+        let mediaEnd: Int
+        let fragmentCount: Int
+        let sampleCount: Int
+        let firstSampleIsSync: Bool?
+        let firstSampleBytes: Data
+    }
+
+    static func videoTrackID(inInit data: Data) -> UInt32? {
+        mediaTrackID(inInit: data, handlerType: "vide")
+    }
+
+    static func audioTrackID(inInit data: Data) -> UInt32? {
+        mediaTrackID(inInit: data, handlerType: "soun")
+    }
+
+    static func videoSampleFormat(inInit data: Data, trackID: UInt32) -> VideoSampleFormat? {
+        guard trackID != 0,
+              let top = boxes(in: data, range: data.startIndex..<data.endIndex),
+              let moov = top.first(where: { $0.type == "moov" }),
+              let moovChildren = boxes(in: data, range: moov.payload) else { return nil }
+        for trak in moovChildren where trak.type == "trak" {
+            guard let trakChildren = boxes(in: data, range: trak.payload),
+                  let tkhd = trakChildren.first(where: { $0.type == "tkhd" }),
+                  let candidateID = Self.trackID(inTKHD: tkhd, data: data) else { return nil }
+            guard candidateID == trackID else { continue }
+            guard let mdia = trakChildren.first(where: { $0.type == "mdia" }),
+                  let mdiaChildren = boxes(in: data, range: mdia.payload),
+                  let minf = mdiaChildren.first(where: { $0.type == "minf" }),
+                  let minfChildren = boxes(in: data, range: minf.payload),
+                  let stbl = minfChildren.first(where: { $0.type == "stbl" }),
+                  let stblChildren = boxes(in: data, range: stbl.payload),
+                  let stsd = stblChildren.first(where: { $0.type == "stsd" }),
+                  stsd.payload.count >= 8 else { return nil }
+            let entriesStart = stsd.payload.lowerBound + 8
+            guard let entries = boxes(in: data, range: entriesStart..<stsd.payload.upperBound),
+                  entries.count == 1, let entry = entries.first,
+                  entry.payload.count >= 78 else { return nil }
+            let codec: VortXVideoIDRClassifier.Codec
+            let configType: String
+            switch entry.type {
+            case "hvc1", "hev1", "dvh1", "dvhe":
+                codec = .hevc
+                configType = "hvcC"
+            case "avc1", "avc3":
+                codec = .h264
+                configType = "avcC"
+            default:
+                return nil
+            }
+            let childrenStart = entry.payload.lowerBound + 78
+            guard let entryChildren = boxes(in: data, range: childrenStart..<entry.payload.upperBound),
+                  let config = entryChildren.first(where: { $0.type == configType }) else { return nil }
+            let lengthSize: Int
+            switch codec {
+            case .hevc:
+                guard config.payload.count >= 22 else { return nil }
+                lengthSize = Int(data[config.payload.lowerBound + 21] & 0x03) + 1
+            case .h264:
+                guard config.payload.count >= 5 else { return nil }
+                lengthSize = Int(data[config.payload.lowerBound + 4] & 0x03) + 1
+            }
+            guard lengthSize == 1 || lengthSize == 2 || lengthSize == 4 else { return nil }
+            return VideoSampleFormat(codec: codec, packetFormat: .lengthPrefixed(lengthSize))
+        }
+        return nil
+    }
+
+    static func trackIDsInFirstFragment(_ data: Data) -> [UInt32]? {
+        guard let top = boxes(in: data, range: data.startIndex..<data.endIndex),
+              let moof = top.first(where: { $0.type == "moof" }),
+              let children = boxes(in: data, range: moof.payload) else { return nil }
+        var trackIDs: [UInt32] = []
+        for traf in children where traf.type == "traf" {
+            guard let trafChildren = boxes(in: data, range: traf.payload),
+                  let tfhdBox = trafChildren.first(where: { $0.type == "tfhd" }),
+                  let tfhd = trackFragmentHeader(in: tfhdBox, data: data) else { return nil }
+            trackIDs.append(tfhd.trackID)
+        }
+        return trackIDs.isEmpty ? nil : trackIDs
+    }
+
+    /// `mediaEnd` is relative to `data.startIndex`. It normally equals `data.count`; at EOF it may stop before
+    /// a fully parsed trailing `mfra`, which is index metadata and must not enter the final media byte range.
+    static func proveMediaRange(_ data: Data,
+                                trackID: UInt32,
+                                requireFirstSampleSync: Bool) -> MediaRangeProof? {
+        guard trackID != 0, !data.isEmpty,
+              let boxes = boxes(in: data, range: data.startIndex..<data.endIndex) else { return nil }
+        var pending: FragmentSummary?
+        var fragmentCount = 0
+        var sampleCount = 0
+        var firstSampleIsSync: Bool?
+        var firstSampleBytes: Data?
+        var mediaEnd: Int?
+        var sawTrailer = false
+
+        for box in boxes {
+            switch box.type {
+            case "styp", "sidx", "emsg", "prft", "free", "skip":
+                guard pending == nil, !sawTrailer else { return nil }
+            case "moof":
+                guard pending == nil, !sawTrailer,
+                      let summary = fragmentSummary(
+                          in: data, moof: box, trackID: trackID) else { return nil }
+                pending = summary
+            case "mdat":
+                guard let summary = pending else { return nil }
+                pending = nil
+                guard summary.firstSampleRange.lowerBound >= box.payload.lowerBound,
+                      summary.firstSampleRange.upperBound <= box.payload.upperBound else { return nil }
+                let (newSamples, overflow) = sampleCount.addingReportingOverflow(summary.sampleCount)
+                guard !overflow else { return nil }
+                sampleCount = newSamples
+                if fragmentCount == 0 {
+                    firstSampleIsSync = summary.firstSampleIsSync
+                    firstSampleBytes = Data(data[summary.firstSampleRange])
+                }
+                fragmentCount += 1
+                mediaEnd = box.end - data.startIndex
+            case "mfra":
+                guard pending == nil, mediaEnd != nil, !sawTrailer else { return nil }
+                sawTrailer = true
+            default:
+                return nil
+            }
+        }
+
+        guard pending == nil, fragmentCount > 0, sampleCount > 0,
+              let mediaEnd, let firstSampleBytes, !firstSampleBytes.isEmpty else { return nil }
+        if requireFirstSampleSync, firstSampleIsSync != true { return nil }
+        return MediaRangeProof(
+            mediaEnd: mediaEnd,
+            fragmentCount: fragmentCount,
+            sampleCount: sampleCount,
+            firstSampleIsSync: firstSampleIsSync,
+            firstSampleBytes: firstSampleBytes)
+    }
+
+    private struct Box {
+        let type: String
+        let start: Data.Index
+        let payload: Range<Data.Index>
+        let end: Data.Index
+    }
+
+    private struct FragmentSummary {
+        let sampleCount: Int
+        let firstSampleIsSync: Bool?
+        let firstSampleRange: Range<Data.Index>
+    }
+
+    private struct TrackFragmentHeader {
+        let trackID: UInt32
+        let defaultSampleSize: Int?
+        let defaultSampleFlags: UInt32?
+        let defaultBaseIsMoof: Bool
+    }
+
+    private struct TrackRunSummary {
+        let sampleCount: Int
+        let firstSampleFlags: UInt32?
+        let firstSampleSize: Int?
+        let dataOffset: Int32?
+    }
+
+    private static func mediaTrackID(inInit data: Data, handlerType: String) -> UInt32? {
+        guard let top = boxes(in: data, range: data.startIndex..<data.endIndex),
+              top.filter({ $0.type == "moov" }).count == 1,
+              let moov = top.first(where: { $0.type == "moov" }),
+              let moovChildren = boxes(in: data, range: moov.payload) else { return nil }
+        var resolved: UInt32?
+        for trak in moovChildren where trak.type == "trak" {
+            guard let trakChildren = boxes(in: data, range: trak.payload),
+                  let mdia = trakChildren.first(where: { $0.type == "mdia" }),
+                  let mdiaChildren = boxes(in: data, range: mdia.payload),
+                  let hdlr = mdiaChildren.first(where: { $0.type == "hdlr" }) else { return nil }
+            let handlerStart = hdlr.payload.lowerBound + 8
+            guard handlerStart + 4 <= hdlr.payload.upperBound else { return nil }
+            let handler = String(bytes: data[handlerStart..<(handlerStart + 4)], encoding: .ascii)
+            guard handler == handlerType else { continue }
+            guard let tkhd = trakChildren.first(where: { $0.type == "tkhd" }),
+                  let trackID = trackID(inTKHD: tkhd, data: data),
+                  resolved == nil else { return nil }
+            resolved = trackID
+        }
+        return resolved
+    }
+
+    private static func trackID(inTKHD tkhd: Box, data: Data) -> UInt32? {
+        guard tkhd.payload.count >= 1 else { return nil }
+        let version = data[tkhd.payload.lowerBound]
+        let offset: Int
+        switch version {
+        case 0: offset = 12
+        case 1: offset = 20
+        default: return nil
+        }
+        let start = tkhd.payload.lowerBound + offset
+        guard start + 4 <= tkhd.payload.upperBound else { return nil }
+        let value = be32(data, start)
+        return value == 0 ? nil : value
+    }
+
+    private static func fragmentSummary(in data: Data,
+                                        moof: Box,
+                                        trackID: UInt32) -> FragmentSummary? {
+        guard let children = boxes(in: data, range: moof.payload) else { return nil }
+        var matched: FragmentSummary?
+        for traf in children where traf.type == "traf" {
+            guard let trafChildren = boxes(in: data, range: traf.payload),
+                  let tfhdBox = trafChildren.first(where: { $0.type == "tfhd" }),
+                  let tfhd = trackFragmentHeader(in: tfhdBox, data: data) else { return nil }
+            guard tfhd.trackID == trackID else { continue }
+            guard matched == nil else { return nil }
+            var totalSamples = 0
+            var firstFlags: UInt32?
+            var firstSize: Int?
+            var firstDataOffset: Int32?
+            for trun in trafChildren where trun.type == "trun" {
+                guard let run = trackRunSummary(
+                    in: trun,
+                    data: data,
+                    defaultSampleSize: tfhd.defaultSampleSize,
+                    defaultSampleFlags: tfhd.defaultSampleFlags) else { return nil }
+                if totalSamples == 0, run.sampleCount > 0 {
+                    firstFlags = run.firstSampleFlags
+                    firstSize = run.firstSampleSize
+                    firstDataOffset = run.dataOffset
+                }
+                let (next, overflow) = totalSamples.addingReportingOverflow(run.sampleCount)
+                guard !overflow else { return nil }
+                totalSamples = next
+            }
+            guard totalSamples > 0,
+                  tfhd.defaultBaseIsMoof,
+                  let firstSize, firstSize > 0,
+                  let firstDataOffset else { return nil }
+            let (sampleStart, startOverflow) = moof.start.addingReportingOverflow(Int(firstDataOffset))
+            guard !startOverflow, sampleStart >= data.startIndex else { return nil }
+            let (sampleEnd, endOverflow) = sampleStart.addingReportingOverflow(firstSize)
+            guard !endOverflow, sampleEnd <= data.endIndex else { return nil }
+            matched = FragmentSummary(
+                sampleCount: totalSamples,
+                firstSampleIsSync: firstFlags.map { ($0 & 0x0001_0000) == 0 },
+                firstSampleRange: sampleStart..<sampleEnd)
+        }
+        return matched
+    }
+
+    private static func trackFragmentHeader(in box: Box, data: Data) -> TrackFragmentHeader? {
+        guard box.payload.count >= 8 else { return nil }
+        let flags = be32(data, box.payload.lowerBound) & 0x00ff_ffff
+        let trackID = be32(data, box.payload.lowerBound + 4)
+        guard trackID != 0 else { return nil }
+        var cursor = box.payload.lowerBound + 8
+        if flags & 0x000001 != 0 { cursor += 8 }
+        if flags & 0x000002 != 0 { cursor += 4 }
+        if flags & 0x000008 != 0 { cursor += 4 }
+        var defaultSize: Int?
+        if flags & 0x000010 != 0 {
+            guard cursor + 4 <= box.payload.upperBound else { return nil }
+            let raw = be32(data, cursor)
+            guard raw > 0, UInt64(raw) <= UInt64(Int.max) else { return nil }
+            defaultSize = Int(raw)
+            cursor += 4
+        }
+        var defaultFlags: UInt32?
+        if flags & 0x000020 != 0 {
+            guard cursor + 4 <= box.payload.upperBound else { return nil }
+            defaultFlags = be32(data, cursor)
+            cursor += 4
+        }
+        guard cursor == box.payload.upperBound else { return nil }
+        return TrackFragmentHeader(
+            trackID: trackID,
+            defaultSampleSize: defaultSize,
+            defaultSampleFlags: defaultFlags,
+            defaultBaseIsMoof: flags & 0x020000 != 0)
+    }
+
+    private static func trackRunSummary(in box: Box,
+                                        data: Data,
+                                        defaultSampleSize: Int?,
+                                        defaultSampleFlags: UInt32?) -> TrackRunSummary? {
+        guard box.payload.count >= 8 else { return nil }
+        let flags = be32(data, box.payload.lowerBound) & 0x00ff_ffff
+        let rawCount = be32(data, box.payload.lowerBound + 4)
+        guard UInt64(rawCount) <= UInt64(Int.max) else { return nil }
+        let sampleCount = Int(rawCount)
+        let hasFirstFlags = flags & 0x000004 != 0
+        let hasPerSampleFlags = flags & 0x000400 != 0
+        guard !(hasFirstFlags && hasPerSampleFlags) else { return nil }
+        var cursor = box.payload.lowerBound + 8
+        var dataOffset: Int32?
+        if flags & 0x000001 != 0 {
+            guard cursor + 4 <= box.payload.upperBound else { return nil }
+            dataOffset = Int32(bitPattern: be32(data, cursor))
+            cursor += 4
+        }
+        var explicitFirstFlags: UInt32?
+        if hasFirstFlags {
+            guard cursor + 4 <= box.payload.upperBound else { return nil }
+            explicitFirstFlags = be32(data, cursor)
+            cursor += 4
+        }
+
+        let fieldsPerSample = (flags & 0x000100 != 0 ? 1 : 0)
+            + (flags & 0x000200 != 0 ? 1 : 0)
+            + (hasPerSampleFlags ? 1 : 0)
+            + (flags & 0x000800 != 0 ? 1 : 0)
+        let (fieldBytes, multiplyOverflow) = sampleCount.multipliedReportingOverflow(by: fieldsPerSample * 4)
+        guard !multiplyOverflow, cursor <= box.payload.upperBound,
+              fieldBytes <= box.payload.upperBound - cursor else { return nil }
+
+        var perSampleFirstFlags: UInt32?
+        var perSampleFirstSize: Int?
+        if sampleCount > 0, hasPerSampleFlags {
+            var firstFlagsOffset = cursor
+            if flags & 0x000100 != 0 { firstFlagsOffset += 4 }
+            if flags & 0x000200 != 0 { firstFlagsOffset += 4 }
+            guard firstFlagsOffset + 4 <= box.payload.upperBound else { return nil }
+            perSampleFirstFlags = be32(data, firstFlagsOffset)
+        }
+        if sampleCount > 0, flags & 0x000200 != 0 {
+            var firstSizeOffset = cursor
+            if flags & 0x000100 != 0 { firstSizeOffset += 4 }
+            guard firstSizeOffset + 4 <= box.payload.upperBound else { return nil }
+            let raw = be32(data, firstSizeOffset)
+            guard raw > 0, UInt64(raw) <= UInt64(Int.max) else { return nil }
+            perSampleFirstSize = Int(raw)
+        }
+        cursor += fieldBytes
+        guard cursor == box.payload.upperBound else { return nil }
+        return TrackRunSummary(
+            sampleCount: sampleCount,
+            firstSampleFlags: explicitFirstFlags ?? perSampleFirstFlags ?? defaultSampleFlags,
+            firstSampleSize: perSampleFirstSize ?? defaultSampleSize,
+            dataOffset: dataOffset)
+    }
+
+    private static func boxes(in data: Data, range: Range<Data.Index>) -> [Box]? {
+        var result: [Box] = []
+        var cursor = range.lowerBound
+        while cursor < range.upperBound {
+            guard let box = box(in: data, start: cursor, limit: range.upperBound) else { return nil }
+            result.append(box)
+            cursor = box.end
+        }
+        return cursor == range.upperBound ? result : nil
+    }
+
+    private static func box(in data: Data, start: Data.Index, limit: Data.Index) -> Box? {
+        guard start >= data.startIndex, limit <= data.endIndex, start <= limit,
+              start + 8 <= limit else { return nil }
+        let size32 = be32(data, start)
+        var headerSize = 8
+        let size64: UInt64
+        switch size32 {
+        case 0:
+            return nil
+        case 1:
+            guard start + 16 <= limit else { return nil }
+            size64 = be64(data, start + 8)
+            headerSize = 16
+        default:
+            size64 = UInt64(size32)
+        }
+        guard size64 >= UInt64(headerSize), size64 <= UInt64(Int.max) else { return nil }
+        let size = Int(size64)
+        guard size <= limit - start else { return nil }
+        let type = String(bytes: data[(start + 4)..<(start + 8)], encoding: .ascii) ?? ""
+        guard type.utf8.count == 4 else { return nil }
+        let end = start + size
+        return Box(type: type, start: start, payload: (start + headerSize)..<end, end: end)
+    }
+
+    private static func be32(_ data: Data, _ offset: Data.Index) -> UInt32 {
+        UInt32(data[offset]) << 24 | UInt32(data[offset + 1]) << 16
+            | UInt32(data[offset + 2]) << 8 | UInt32(data[offset + 3])
+    }
+
+    private static func be64(_ data: Data, _ offset: Data.Index) -> UInt64 {
+        var value: UInt64 = 0
+        for index in 0..<8 { value = (value << 8) | UInt64(data[offset + index]) }
+        return value
+    }
+}
+
+/// One source of truth for the primary A/V muxer's fragmented-MP4 options and the integration harness that
+/// executes the shipped movenc binary. `frag_keyframe` is the automatic fragment trigger; `min_frag_duration`
+/// is only its one-second floor. No caller sends a nil packet through `av_write_frame`, so the public write API
+/// remains `av_interleaved_write_frame` end to end.
+enum VortXHLSMovencPolicy {
+    static let movflags = "empty_moov+default_base_moof+delay_moov+frag_keyframe"
+    static let minimumFragmentDurationMicroseconds = "1000000"
+}
+
+/// The audio-only muxer has no video keyframes to trigger deterministic boundaries. Fragmenting before every
+/// incoming audio sample means the first packet of the next logical segment completes the prior segment through
+/// the same interleaved write API. The final sample is completed by the trailer at EOF.
+enum VortXAlternateAudioMovencPolicy {
+    static let movflags = "empty_moov+default_base_moof+delay_moov+frag_every_frame"
+}
+
 /// Legal video segmentation decision shared by the FFmpeg owner and the standalone mutation harness. Every
 /// segment opens on the incoming packet, so segment zero and every cut packet must be IDR. The time/byte guards
 /// are safety limits, not permission to publish a non-decodable boundary.
@@ -477,6 +893,7 @@ enum VortXHLSBoundaryPolicy {
 
     static func decision(hasOpenSegment: Bool,
                          incomingIsIDR: Bool,
+                         incomingHasKeyFlag: Bool,
                          elapsed: Double,
                          openBytes: Int,
                          targetSeconds: Double = 1,
@@ -486,11 +903,23 @@ enum VortXHLSBoundaryPolicy {
               targetSeconds.isFinite, targetSeconds > 0,
               maximumSeconds.isFinite, maximumSeconds >= targetSeconds,
               maximumBytes > 0 else { return .failSoft }
-        guard hasOpenSegment else { return incomingIsIDR ? .open : .failSoft }
+        let hasConfirmedStart = incomingIsIDR && incomingHasKeyFlag
+        guard hasOpenSegment else { return hasConfirmedStart ? .open : .failSoft }
         let hardLimitReached = elapsed >= maximumSeconds || openBytes >= maximumBytes
-        if hardLimitReached { return incomingIsIDR ? .cut : .failSoft }
-        if incomingIsIDR, elapsed >= targetSeconds { return .cut }
+        if hardLimitReached { return hasConfirmedStart ? .cut : .failSoft }
+        if hasConfirmedStart, elapsed >= targetSeconds { return .cut }
         return .continueOpen
+    }
+
+    static func timestampSeconds(dts: Int64?,
+                                 pts: Int64?,
+                                 timeBaseNumerator: Int32,
+                                 timeBaseDenominator: Int32) -> Double? {
+        guard let timestamp = dts ?? pts,
+              timeBaseNumerator > 0,
+              timeBaseDenominator > 0 else { return nil }
+        let seconds = Double(timestamp) * Double(timeBaseNumerator) / Double(timeBaseDenominator)
+        return seconds.isFinite ? seconds : nil
     }
 }
 
