@@ -26,7 +26,7 @@ import Foundation
 /// the two are not reconciled at a single point, a resumed title saves its progress an hour early and wipes the
 /// viewer's real position. So the engine converts at its one chokepoint: everything it REPORTS is
 /// `presented(playerSeconds:origin:)`, and everything it is ASKED to seek to goes through
-/// `playerSeek(sourceSeconds:origin:producedEdgePlayerSeconds:)`.
+/// `playerSeek`, which clamps in source time, maps through the origin, then clamps in player time.
 ///
 /// # What is deliberately NOT reachable
 ///
@@ -39,6 +39,12 @@ enum RemuxResumePolicy {
 
     // MARK: - Should this mount start part-way in?
 
+    /// The launch contract is now complete: the chrome configures a one-shot origin before `loadFile`, the
+    /// AVPlayer engine consumes it before constructing the remux mount, and every reported/accepted clock is
+    /// mapped through the achieved origin. Keep this explicit so a rollback can disable the feature without
+    /// weakening the sanitisation or timeline-mapping tests below.
+    static let isEnabledByDefault = true
+
     /// The smallest resume point worth seeking the input for.
     ///
     /// Below this the seek costs a keyframe hunt (a real network round trip on a debrid link, inside the cold
@@ -47,14 +53,40 @@ enum RemuxResumePolicy {
     /// which resume points are real.
     static let minimumResumeSeconds: Double = 5.0
 
+    /// A hard conversion bound. Seven days is beyond supported media duration and keeps the FFmpeg
+    /// microsecond timestamp many orders of magnitude below `Int64.max`.
+    static let maximumResumeSeconds: Double = 7.0 * 24 * 60 * 60
+
     /// The source second the remux should begin producing at, or 0 for "start at the beginning" (which
     /// reproduces today's behavior byte for byte, because 0 disables the input seek AND the packet rebase).
     ///
     /// Returns 0 rather than the raw value for anything not worth or not safe to act on: a non-finite value, a
     /// negative one, or a position inside the trivial floor.
     static func originRequest(resumeSeconds: Double) -> Double {
-        guard resumeSeconds.isFinite, resumeSeconds > minimumResumeSeconds else { return 0 }
+        guard resumeSeconds.isFinite,
+              resumeSeconds > minimumResumeSeconds,
+              resumeSeconds <= maximumResumeSeconds else { return 0 }
         return resumeSeconds
+    }
+
+    /// Checked conversion for `av_seek_frame`'s AV_TIME_BASE timestamp. Invalid and inactive requests return
+    /// nil before any floating-point-to-integer conversion can trap.
+    static func seekTimestampMicroseconds(resumeSeconds: Double) -> Int64? {
+        let origin = originRequest(resumeSeconds: resumeSeconds)
+        guard origin > 0 else { return nil }
+        // `originRequest` has already proved 0 < origin <= seven days. At one million ticks per second the
+        // largest result is 604,800,000,000, many orders below Int64.max, so this conversion is bounded by
+        // the load-bearing maximum test rather than a second unreachable guard.
+        let microseconds = origin * 1_000_000
+        return Int64(microseconds.rounded())
+    }
+
+    /// The output timeline origin belongs to mapped base video. Audio, subtitles, data streams and unmapped
+    /// packets may arrive first after a seek, but none may establish the clock used by every video segment.
+    static func canEstablishOrigin(packetStreamIndex: Int,
+                                   baseVideoStreamIndex: Int,
+                                   isMapped: Bool) -> Bool {
+        isMapped && packetStreamIndex >= 0 && packetStreamIndex == baseVideoStreamIndex
     }
 
     // MARK: - Player time <-> source time
@@ -73,7 +105,13 @@ enum RemuxResumePolicy {
     /// The PLAYER second to seek to for a seek expressed in source seconds, clamped to what the mount can
     /// actually serve.
     ///
-    /// Two clamps, both of which exist to keep a seek from stranding the mount with no frame:
+    /// The ordering is the contract. Source and player duration are different domains after a resumed mount:
+    /// AVPlayer may say the produced item is 3600s long while the source is 7200s long and begins at 3600s.
+    /// Clamping a 5000s SOURCE request against the 3600s PLAYER duration before mapping incorrectly lands at
+    /// player zero. Clamp the source target to the authoritative source duration first, subtract the origin,
+    /// then apply the player duration and produced edge.
+    ///
+    /// The remaining boundary clamps keep a seek from stranding the mount with no frame:
     ///  - BELOW the origin: content before the origin was never produced, so the target clamps to the origin
     ///    (player second 0). A backward scrub past the resume point lands at the resume point instead of
     ///    failing. This is the cost named in the type comment.
@@ -82,20 +120,48 @@ enum RemuxResumePolicy {
     ///    a wrong cap would be worse than none).
     static func playerSeek(sourceSeconds: Double,
                            origin: Double,
+                           authoritativeSourceDurationSeconds: Double? = nil,
+                           playerDurationSeconds: Double = 0,
                            producedEdgePlayerSeconds: Double) -> Double {
         guard sourceSeconds.isFinite else { return 0 }
-        var target = sourceSeconds - origin
+        var sourceTarget = sourceSeconds
+        if let sourceDuration = authoritativeSourceDurationSeconds,
+           sourceDuration.isFinite, sourceDuration > 0 {
+            sourceTarget = min(max(sourceTarget, 0), max(sourceDuration - 1, 0))
+        }
+        var target = sourceTarget - origin
         if target < 0 { target = 0 }
+        if playerDurationSeconds.isFinite, playerDurationSeconds > 0 {
+            target = min(target, max(playerDurationSeconds - 1, 0))
+        }
         if producedEdgePlayerSeconds > 0, target > producedEdgePlayerSeconds {
             target = producedEdgePlayerSeconds
         }
         return target
     }
 
+    /// Duration published to SOURCE-time chrome. A remux item's finite duration is measured from player zero,
+    /// so an unknown source duration needs its achieved origin added back. The demuxer's duration is
+    /// authoritative when present. A non-remux value is returned unchanged.
+    static func reportedDuration(playerDurationSeconds: Double,
+                                 origin: Double,
+                                 authoritativeSourceDurationSeconds: Double?,
+                                 isRemuxMounted: Bool) -> Double {
+        guard isRemuxMounted else { return playerDurationSeconds }
+        if let sourceDuration = authoritativeSourceDurationSeconds,
+           sourceDuration.isFinite, sourceDuration > 0 {
+            return sourceDuration
+        }
+        guard playerDurationSeconds.isFinite, playerDurationSeconds > 0,
+              origin.isFinite else { return playerDurationSeconds }
+        let sourceDuration = origin + playerDurationSeconds
+        return sourceDuration.isFinite ? sourceDuration : playerDurationSeconds
+    }
+
     // MARK: - The pre-start (resume) seek
 
     /// What to do with a seek that was issued BEFORE the item became playable, once it is.
-    enum PreStartSeek: Equatable {
+    enum PreStartSeek: Equatable, Sendable {
         /// The mount already starts at (or past) the requested point: there is nothing to seek. This is the
         /// case a successful origin seek produces, and it is why resume now works without seeking at all.
         case satisfied
@@ -124,6 +190,30 @@ enum RemuxResumePolicy {
         let ahead = target - origin
         if ahead <= originToleranceSeconds { return .satisfied }
         return .unreachable(ahead)
+    }
+}
+
+/// One-shot handoff from player chrome to the next engine load.
+///
+/// `Double?` is intentional: `nil` means the caller did not configure this load, while `.some(0)` means it
+/// explicitly asked to begin at the start. That distinction lets an internal retry carrying the same logical
+/// load token reuse its already-consumed origin without allowing an unrelated later title to inherit it.
+struct RemuxResumeConfiguration {
+    private(set) var pendingOriginSeconds: Double?
+
+    mutating func configure(seconds: Double) {
+        pendingOriginSeconds = RemuxResumePolicy.isEnabledByDefault
+            ? RemuxResumePolicy.originRequest(resumeSeconds: seconds)
+            : 0
+    }
+
+    mutating func consumeForNextLoad() -> Double? {
+        defer { pendingOriginSeconds = nil }
+        return pendingOriginSeconds
+    }
+
+    mutating func reset() {
+        pendingOriginSeconds = nil
     }
 }
 
