@@ -332,7 +332,14 @@ final class VortXSyncManager: ObservableObject {
 
     // MARK: - HTTP
 
-    private func request(_ method: String, _ path: String, body: [String: Any]? = nil, auth: Bool = false, bearer: String? = nil) async -> (Int, [String: Any]?) {
+    private func request(
+        _ method: String,
+        _ path: String,
+        body: [String: Any]? = nil,
+        auth: Bool = false,
+        bearer: String? = nil,
+        debridCredentialToken: DebridCredentialRevisionToken? = nil
+    ) async -> (Int, [String: Any]?) {
         guard let url = URL(string: base + path) else { return (0, nil) }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -344,7 +351,15 @@ final class VortXSyncManager: ObservableObject {
         // token BEFORE it is adopted); otherwise `auth` uses the stored session token.
         if let t = bearer ?? (auth ? token : nil) { req.setValue("Bearer " + t, forHTTPHeaderField: "authorization") }
         do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let response: (Data, URLResponse)
+            if let debridCredentialToken {
+                response = try await DebridAuthenticatedHTTP.data(
+                    URLSession.shared, for: req, credentialToken: debridCredentialToken
+                )
+            } else {
+                response = try await URLSession.shared.data(for: req)
+            }
+            let (data, resp) = response
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             return (code, json)
@@ -607,10 +622,31 @@ final class VortXSyncManager: ObservableObject {
     /// accepted==true: advancing it on a rejected write (the old bug) suppressed the recovery pull, so a
     /// write that LOST the race was silently dropped and the device stayed diverged.
     private enum PushOutcome { case accepted(version: Int); case rejected(storedVersion: Int?); case error }
-    private func pushSyncDocAt(_ obj: [String: Any], version: Int) async -> PushOutcome {
+
+    /// A locally derived document carries the exact credential revision whose keys it embedded. The payload
+    /// may cross later awaits, but its PUT cannot issue after another credential revision has published.
+    private struct DerivedSyncDocument {
+        let object: [String: Any]
+        let debridRevision: UInt64
+    }
+
+    private func pushSyncDocAt(
+        _ obj: [String: Any],
+        version: Int,
+        debridRevision: UInt64
+    ) async -> PushOutcome {
+        guard DebridCredentialSnapshotStore.shared.isCurrent(revision: debridRevision) else {
+            return .error
+        }
         guard let dataKey, let pt = try? JSONSerialization.data(withJSONObject: obj),
               let ct = VortXSyncCrypto.sealDocument(dataKey: dataKey, plaintext: pt, accountId: account?.id ?? "", version: version, writeV2: Self.writeSyncDocV2) else { return .error }
-        let (code, json) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true)
+        let credentialToken = DebridCredentialRevisionToken(
+            revision: debridRevision, store: DebridCredentialSnapshotStore.shared
+        )
+        let (code, json) = await request(
+            "PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true,
+            debridCredentialToken: credentialToken
+        )
         guard code == 200 else { return .error }
         // accepted defaults to true so an older worker without the field (which stored the write) still
         // advances the version, matching the website's `accepted !== false` read.
@@ -628,48 +664,22 @@ final class VortXSyncManager: ObservableObject {
         return .rejected(storedVersion: stored)
     }
 
-    /// Blind single-shot push of a fully-formed doc the caller does not re-derive (it holds no local pending
-    /// changes to re-merge, so on a rejection it just re-pushes the SAME doc above the winner). The version is
-    /// `max(storedVersion+1, epochMs)` so a device whose wall clock has skewed BACKWARD (a lower epoch-ms than
-    /// the stored version) can never lock itself out: it retries strictly above the stored version instead of
-    /// racing a permanently-lower epoch-ms. A rejection is retried once at storedVersion+1 (same as
-    /// pushDerivedDoc); a lost second race or a .error leaves lastSyncedVersion unadvanced so the next pull
-    /// reconciles.
-    @discardableResult
-    func pushSyncDoc(_ obj: [String: Any]) async -> Bool {
-        var version = Int(Date().timeIntervalSince1970 * 1000)
-        for attempt in 0..<2 {
-            switch await pushSyncDocAt(obj, version: version) {
-            case .accepted:
-                return true
-            case .error:
-                return false
-            case .rejected(let storedVersion):
-                // A concurrent write won. Retry strictly above the winner's echoed version (falling back to a
-                // fresh epoch-ms if the worker did not echo one). max(stored+1, epochMs) guarantees a backward
-                // clock still produces a higher version than the stored one, so the device is never locked out.
-                guard attempt < 1 else { return false }
-                if let stored = storedVersion {
-                    version = max(stored + 1, Int(Date().timeIntervalSince1970 * 1000))
-                } else {
-                    version = Int(Date().timeIntervalSince1970 * 1000)
-                }
-            }
-        }
-        return false
-    }
-
     /// Push a doc that is DERIVED from a pulled base, with optimistic-concurrency recovery. `rebuild`
     /// re-runs the caller's exact merge onto a freshly pulled base, so a lost race is recovered by
     /// re-merging the local pending changes onto the winner's doc and retrying at storedVersion+1 (up to
     /// `maxRetries`). This preserves the caller's merge semantics (LWW, never clobber libraryItem) on every
     /// attempt. On exhaustion lastSyncedVersion is left unadvanced so the next natural pull reconciles.
-    private func pushDerivedDoc(_ initial: [String: Any], rebuild: () async -> [String: Any]?) async -> Bool {
+    private func pushDerivedDoc(
+        _ initial: DerivedSyncDocument,
+        rebuild: () async -> DerivedSyncDocument?
+    ) async -> Bool {
         let maxRetries = 3
         var doc = initial
         var version = Int(Date().timeIntervalSince1970 * 1000)
         for attempt in 0..<maxRetries {
-            switch await pushSyncDocAt(doc, version: version) {
+            switch await pushSyncDocAt(
+                doc.object, version: version, debridRevision: doc.debridRevision
+            ) {
             case .accepted:
                 return true
             case .error:
@@ -993,7 +1003,7 @@ final class VortXSyncManager: ObservableObject {
     /// unused today (each call re-pulls) but kept so a caller could pass a known base to avoid a re-pull.
     /// Returns nil on a FAILED pull (network error / undecryptable doc): a failed pull must NEVER overwrite
     /// the account's existing document, or it wipes keys other surfaces wrote.
-    private func mergeLocalIntoDoc(base: [String: Any]?) async -> [String: Any]? {
+    private func mergeLocalIntoDoc(base: [String: Any]?) async -> DerivedSyncDocument? {
         var doc: [String: Any]
         switch await pullSyncDocResult() {
         case .failed: return nil
@@ -1051,11 +1061,11 @@ final class VortXSyncManager: ObservableObject {
         // Debrid keys ride the same encrypted apiKeys channel so they follow the account across devices
         // (they live in the Keychain, which SettingsBackup deliberately excludes, so they need this mirror).
         // Set only when configured locally; do NOT remove a key absent locally (another device authored it).
-        let debrid = DebridKeys.shared
-        if debrid.isConfigured(.realDebrid) { keys["realDebrid"] = debrid.key(for: .realDebrid) }
-        if debrid.isConfigured(.allDebrid)  { keys["allDebrid"]  = debrid.key(for: .allDebrid) }
-        if debrid.isConfigured(.premiumize) { keys["premiumize"] = debrid.key(for: .premiumize) }
-        if debrid.isConfigured(.torBox)     { keys["torBox"]     = debrid.key(for: .torBox) }
+        let debridSnapshot = DebridCredentialSnapshotStore.shared.load()
+        if let value = debridSnapshot.keys[.realDebrid] { keys["realDebrid"] = value }
+        if let value = debridSnapshot.keys[.allDebrid] { keys["allDebrid"] = value }
+        if let value = debridSnapshot.keys[.premiumize] { keys["premiumize"] = value }
+        if let value = debridSnapshot.keys[.torBox] { keys["torBox"] = value }
         // External sync provider tokens (Trakt Lane C, SIMKL Lane D) ride the SAME encrypted apiKeys
         // channel so a connection made on one device follows the account. They live in the Keychain, which
         // SettingsBackup deliberately excludes, so this mirror is the only carrier. Set only when connected
@@ -1098,7 +1108,7 @@ final class VortXSyncManager: ObservableObject {
         let defaultTerms = SearchHistoryStore.allTerms(for: nil)
         if !defaultTerms.isEmpty { searches["default"] = defaultTerms }
         if searches.isEmpty { doc.removeValue(forKey: "searches") } else { doc["searches"] = searches }
-        return doc
+        return DerivedSyncDocument(object: doc, debridRevision: debridSnapshot.revision)
     }
 
     /// The current add-on order this device holds, as normalized transportUrls in the engine's true
@@ -1230,6 +1240,7 @@ final class VortXSyncManager: ObservableObject {
         if !effectiveForce, pulled.version <= lastSyncedVersion { return false }
         let doc = pulled.doc
         var restored = false
+        var debridGenerationApplied = true
         // SUPPRESS THE OBSERVER for the whole apply region. SettingsBackup.restore + the apiKeys/overlay/
         // tombstone/profileEdits writes below all hit UserDefaults; without suppression each fires the
         // global didChangeNotification observer, which calls requestSyncSoon() -> re-arms hasPendingPush and
@@ -1279,7 +1290,12 @@ final class VortXSyncManager: ObservableObject {
             if let value = keys["allDebrid"] { remoteDebrid[.allDebrid] = value }
             if let value = keys["premiumize"] { remoteDebrid[.premiumize] = value }
             if let value = keys["torBox"] { remoteDebrid[.torBox] = value }
-            debrid.applyRemoteKeys(remoteDebrid)
+            // A failed durable debrid envelope is a partial apply, never an acknowledged sync generation. Stop
+            // before the version/applied/success stamps so this exact remote version remains retryable.
+            guard debrid.applyRemoteKeys(remoteDebrid) else {
+                debridGenerationApplied = false
+                return
+            }
             // External sync provider tokens (Trakt Lane C, SIMKL Lane D): adopt a connection authored on
             // another device. Apply only when present so a doc without them never clears a locally-connected
             // session (mirrors the debrid guard just above; never delete on absence). adoptTokens writes the
@@ -1489,6 +1505,7 @@ final class VortXSyncManager: ObservableObject {
         // spurious push of the just-applied doc (the same self-echo class this region exists to prevent).
         stampSyncSuccess()
         }   // end withRemoteApplySuppressed
+        guard debridGenerationApplied else { return false }
         return restored
     }
 

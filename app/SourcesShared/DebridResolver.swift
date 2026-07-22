@@ -244,14 +244,16 @@ enum DebridResolve {
 actor TorBoxResolver: DebridResolving {
     nonisolated let service: DebridService = .torBox
     private let apiKey: String
+    private let credentialToken: DebridCredentialRevisionToken
     private let session: URLSession
     private static let base = "https://api.torbox.app/v1/api/torrents"
     /// Percent-encode a query VALUE (drops the sub-delimiters `&`/`=`/`+`/`,` that `.urlQueryAllowed` leaves
     /// intact) so a joined hash list can never break out of the `hash=` parameter.
     fileprivate static let queryValueAllowed = DebridQuery.valueAllowed
 
-    init(apiKey: String) {
+    init(apiKey: String, credentialToken: DebridCredentialRevisionToken) {
         self.apiKey = apiKey
+        self.credentialToken = credentialToken
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 20
         self.session = URLSession(configuration: cfg)
@@ -448,7 +450,9 @@ actor TorBoxResolver: DebridResolving {
     }
 
     private func send<T: Decodable>(_ req: URLRequest) async throws -> T {
-        let (data, response) = try await session.data(for: req)
+        let (data, response) = try await DebridAuthenticatedHTTP.data(
+            session, for: req, credentialToken: credentialToken
+        )
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         if code == 401 || code == 403 { throw DebridError.invalidKey }
         guard (200...299).contains(code) else { throw DebridError.providerError("HTTP \(code)") }
@@ -475,12 +479,14 @@ private extension Array {
 /// coordinator's bounded resolve collapses to `nil`.
 actor TorBoxUsenetResolver {
     private let apiKey: String
+    private let credentialToken: DebridCredentialRevisionToken
     private let session: URLSession
     private static let base = "https://api.torbox.app/v1/api/usenet"
     fileprivate static let queryValueAllowed = DebridQuery.valueAllowed
 
-    init(apiKey: String) {
+    init(apiKey: String, credentialToken: DebridCredentialRevisionToken) {
         self.apiKey = apiKey
+        self.credentialToken = credentialToken
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 20
         self.session = URLSession(configuration: cfg)
@@ -647,7 +653,9 @@ actor TorBoxUsenetResolver {
     }
 
     private func send<T: Decodable>(_ req: URLRequest) async throws -> T {
-        let (data, response) = try await session.data(for: req)
+        let (data, response) = try await DebridAuthenticatedHTTP.data(
+            session, for: req, credentialToken: credentialToken
+        )
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         if code == 401 || code == 403 { throw DebridError.invalidKey }
         guard (200...299).contains(code) else { throw DebridError.providerError("HTTP \(code)") }
@@ -667,11 +675,13 @@ actor TorBoxUsenetResolver {
 actor RealDebridResolver: DebridResolving {
     nonisolated let service: DebridService = .realDebrid
     private let apiKey: String
+    private let credentialToken: DebridCredentialRevisionToken
     private let session: URLSession
     private static let base = "https://api.real-debrid.com/rest/1.0"
 
-    init(apiKey: String) {
+    init(apiKey: String, credentialToken: DebridCredentialRevisionToken) {
         self.apiKey = apiKey
+        self.credentialToken = credentialToken
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 20
         self.session = URLSession(configuration: cfg)
@@ -752,7 +762,9 @@ actor RealDebridResolver: DebridResolving {
         try await send(formRequest(urlString, fields))
     }
     private func formVoid(_ urlString: String, _ fields: [String: String]) async throws {
-        let (_, resp) = try await session.data(for: formRequest(urlString, fields))   // selectFiles is 204, no body
+        let (_, resp) = try await DebridAuthenticatedHTTP.data(
+            session, for: formRequest(urlString, fields), credentialToken: credentialToken
+        )   // selectFiles is 204, no body
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         if code == 401 || code == 403 { throw DebridError.invalidKey }
         guard (200...299).contains(code) else { throw DebridError.providerError("HTTP \(code)") }
@@ -766,7 +778,9 @@ actor RealDebridResolver: DebridResolving {
         return req
     }
     private static let fallbackURL = URL(string: "https://api.real-debrid.com")!
-    private func send<T: Decodable>(_ req: URLRequest) async throws -> T { try await DebridHTTP.decode(session, req) }
+    private func send<T: Decodable>(_ req: URLRequest) async throws -> T {
+        try await DebridHTTP.decode(session, req, credentialToken: credentialToken)
+    }
 }
 
 // MARK: - AllDebrid resolver (torrents)
@@ -778,11 +792,13 @@ actor RealDebridResolver: DebridResolving {
 actor AllDebridResolver: DebridResolving {
     nonisolated let service: DebridService = .allDebrid
     private let apiKey: String
+    private let credentialToken: DebridCredentialRevisionToken
     private let session: URLSession
     private static let base = "https://api.alldebrid.com/v4"
 
-    init(apiKey: String) {
+    init(apiKey: String, credentialToken: DebridCredentialRevisionToken) {
         self.apiKey = apiKey
+        self.credentialToken = credentialToken
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 20
         self.session = URLSession(configuration: cfg)
@@ -863,7 +879,11 @@ actor AllDebridResolver: DebridResolving {
         c?.queryItems = [URLQueryItem(name: "agent", value: "vortx"), URLQueryItem(name: "apikey", value: apiKey)] + extra
         return c?.url ?? URL(string: Self.base)!
     }
-    private func get<T: Decodable>(_ url: URL) async throws -> T { try await DebridHTTP.decode(session, URLRequest(url: url)) }
+    private func get<T: Decodable>(_ url: URL) async throws -> T {
+        try await DebridHTTP.decode(
+            session, URLRequest(url: url), credentialToken: credentialToken
+        )
+    }
 }
 
 // MARK: - Premiumize resolver (torrents)
@@ -875,11 +895,13 @@ actor AllDebridResolver: DebridResolving {
 actor PremiumizeResolver: DebridResolving {
     nonisolated let service: DebridService = .premiumize
     private let apiKey: String
+    private let credentialToken: DebridCredentialRevisionToken
     private let session: URLSession
     private static let base = "https://www.premiumize.me/api"
 
-    init(apiKey: String) {
+    init(apiKey: String, credentialToken: DebridCredentialRevisionToken) {
         self.apiKey = apiKey
+        self.credentialToken = credentialToken
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 20
         self.session = URLSession(configuration: cfg)
@@ -953,7 +975,7 @@ actor PremiumizeResolver: DebridResolving {
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.httpBody = DebridForm.encode(fields)
-        return try await DebridHTTP.decode(session, req)
+        return try await DebridHTTP.decode(session, req, credentialToken: credentialToken)
     }
 
     /// POST with REPEATED form keys (the `[String: String]` `form` above collapses duplicate keys, but
@@ -967,7 +989,7 @@ actor PremiumizeResolver: DebridResolving {
         req.httpBody = pairs
             .map { "\($0.0)=\($0.1.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.1)" }
             .joined(separator: "&").data(using: .utf8)
-        return try await DebridHTTP.decode(session, req)
+        return try await DebridHTTP.decode(session, req, credentialToken: credentialToken)
     }
 }
 
@@ -981,11 +1003,102 @@ enum DebridForm {
     }
 }
 
+enum DebridAuthenticatedHTTP {
+    /// Create the task suspended, then validate and resume it while holding the snapshot publication lock. If B
+    /// published first, A never resumes. If A resumes first, it is an issued transport and B publishes afterwards.
+    static func data(
+        _ session: URLSession,
+        for request: URLRequest,
+        credentialToken: DebridCredentialRevisionToken
+    ) async throws -> (Data, URLResponse) {
+        let taskBox = DebridURLSessionTaskBox()
+        let resumeGate = DebridContinuationResumeGate()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    resumeGate.run { continuation.resume(throwing: CancellationError()) }
+                    return
+                }
+                let task = session.dataTask(with: request) { data, response, error in
+                    resumeGate.run {
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else if let data, let response {
+                            continuation.resume(returning: (data, response))
+                        } else {
+                            continuation.resume(throwing: URLError(.badServerResponse))
+                        }
+                    }
+                }
+                guard taskBox.install(task) else {
+                    task.cancel()
+                    resumeGate.run { continuation.resume(throwing: CancellationError()) }
+                    return
+                }
+                guard credentialToken.authorizeAndIssue({ task.resume() }) else {
+                    task.cancel()
+                    resumeGate.run { continuation.resume(throwing: DebridError.credentialsChanged) }
+                    return
+                }
+            }
+        } onCancel: {
+            taskBox.cancel()
+        }
+    }
+}
+
+/// URLSession cancellation can race task construction. This holder makes cancellation sticky without putting an
+/// await between credential validation and task resume.
+private final class DebridURLSessionTaskBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: URLSessionDataTask?
+    private var cancelled = false
+
+    func install(_ task: URLSessionDataTask) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { return false }
+        self.task = task
+        return true
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let task = task
+        lock.unlock()
+        task?.cancel()
+    }
+}
+
+/// A cancelled suspended task may still invoke its completion handler. Only one path may resume the continuation.
+private final class DebridContinuationResumeGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resumed = false
+
+    func run(_ body: () -> Void) {
+        lock.lock()
+        guard !resumed else {
+            lock.unlock()
+            return
+        }
+        resumed = true
+        lock.unlock()
+        body()
+    }
+}
+
 enum DebridHTTP {
     /// Send a request and decode JSON, mapping 401/403 to `.invalidKey`, other non-2xx to `.providerError`,
     /// and decode failures to `.providerError` — the same contract `TorBoxResolver.send` uses.
-    static func decode<T: Decodable>(_ session: URLSession, _ req: URLRequest) async throws -> T {
-        let (data, response) = try await session.data(for: req)
+    static func decode<T: Decodable>(
+        _ session: URLSession,
+        _ req: URLRequest,
+        credentialToken: DebridCredentialRevisionToken
+    ) async throws -> T {
+        let (data, response) = try await DebridAuthenticatedHTTP.data(
+            session, for: req, credentialToken: credentialToken
+        )
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         if code == 401 || code == 403 { throw DebridError.invalidKey }
         guard (200...299).contains(code) else { throw DebridError.providerError("HTTP \(code)") }
@@ -1026,17 +1139,26 @@ actor DebridCoordinator {
         guard revisionFence.accept(snapshot) else { return false }
         resolvers.removeAll()
         torboxUsenet = nil
+        let credentialToken = DebridCredentialRevisionToken(
+            revision: snapshot.revision, store: credentialStore
+        )
         func keyFor(_ s: DebridService) -> String? {
             guard let k = snapshot.keys[s], !k.isEmpty else { return nil }
             return k
         }
         if let k = keyFor(.torBox) {
-            resolvers[.torBox] = TorBoxResolver(apiKey: k)
-            torboxUsenet = TorBoxUsenetResolver(apiKey: k)
+            resolvers[.torBox] = TorBoxResolver(apiKey: k, credentialToken: credentialToken)
+            torboxUsenet = TorBoxUsenetResolver(apiKey: k, credentialToken: credentialToken)
         }
-        if let k = keyFor(.realDebrid) { resolvers[.realDebrid] = RealDebridResolver(apiKey: k) }
-        if let k = keyFor(.allDebrid) { resolvers[.allDebrid] = AllDebridResolver(apiKey: k) }
-        if let k = keyFor(.premiumize) { resolvers[.premiumize] = PremiumizeResolver(apiKey: k) }
+        if let k = keyFor(.realDebrid) {
+            resolvers[.realDebrid] = RealDebridResolver(apiKey: k, credentialToken: credentialToken)
+        }
+        if let k = keyFor(.allDebrid) {
+            resolvers[.allDebrid] = AllDebridResolver(apiKey: k, credentialToken: credentialToken)
+        }
+        if let k = keyFor(.premiumize) {
+            resolvers[.premiumize] = PremiumizeResolver(apiKey: k, credentialToken: credentialToken)
+        }
         appliedSnapshot = snapshot
         return true
     }
@@ -1076,8 +1198,15 @@ actor DebridCoordinator {
     /// then merges in a deterministic `DebridService.allCases` priority order so the chosen provider for a
     /// hash is stable. Previously this looped providers sequentially AND in nondeterministic dict order.
     func cacheCheck(hashes: [String]) async -> [String: (service: DebridService, files: [DebridFile])] {
+        await cacheCheckVersioned(hashes: hashes).value
+    }
+
+    func cacheCheckVersioned(hashes: [String]) async
+        -> DebridVersionedResult<[String: (service: DebridService, files: [DebridFile])]> {
         let revision = ensureCurrentSnapshot().revision
-        guard !resolvers.isEmpty, !hashes.isEmpty else { return [:] }
+        guard !resolvers.isEmpty, !hashes.isEmpty else {
+            return DebridVersionedResult(value: [:], revision: revision)
+        }
         let maps: [DebridService: [String: [DebridFile]]] = await withTaskGroup(
             of: (DebridService, [String: [DebridFile]]).self
         ) { group in
@@ -1100,19 +1229,30 @@ actor DebridCoordinator {
                 out[hash] = (service, files)
             }
         }
-        guard credentialStore.resultIsCurrent(revision: revision) else { return [:] }
-        return out
+        guard credentialStore.resultIsCurrent(revision: revision) else {
+            return DebridVersionedResult(value: [:], revision: revision)
+        }
+        return DebridVersionedResult(value: out, revision: revision)
     }
 
     /// Resolve a torrent to a direct stream URL via the given (or first available) provider.
     func resolve(service: DebridService? = nil, infoHash: String, magnet: String,
                  fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
+        try await resolveVersioned(
+            service: service, infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode
+        ).value
+    }
+
+    func resolveVersioned(service: DebridService? = nil, infoHash: String, magnet: String,
+                          fileIdx: Int?, episode: DebridEpisode?) async throws
+        -> DebridVersionedResult<URL> {
         let revision = ensureCurrentSnapshot().revision
         let resolver = pick(service)
         guard let resolver else { throw DebridError.noKey }
-        return try await withCurrentCredential(revision: revision) {
+        let url = try await withCurrentCredential(revision: revision) {
             try await resolver.resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
         }
+        return DebridVersionedResult(value: url, revision: revision)
     }
 
     /// Resolve, surfacing the provider + ids (for a later `reresolve`). Chooses the given service or the
@@ -1120,6 +1260,16 @@ actor DebridCoordinator {
     func resolveWithIds(service: DebridService? = nil, infoHash: String, magnet: String,
         fileIdx: Int?, episode: DebridEpisode?)
         async throws -> (result: (url: URL, torrentId: Int?, fileId: Int?), service: DebridService) {
+        try await resolveWithIdsVersioned(
+            service: service, infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode
+        ).value
+    }
+
+    func resolveWithIdsVersioned(service: DebridService? = nil, infoHash: String, magnet: String,
+        fileIdx: Int?, episode: DebridEpisode?) async throws
+        -> DebridVersionedResult<(
+            result: (url: URL, torrentId: Int?, fileId: Int?), service: DebridService
+        )> {
         let revision = ensureCurrentSnapshot().revision
         guard let resolver = pick(service) else { throw DebridError.noKey }
         let r = try await withCurrentCredential(revision: revision) {
@@ -1127,7 +1277,7 @@ actor DebridCoordinator {
                 infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode
             )
         }
-        return (r, resolver.service)
+        return DebridVersionedResult(value: (r, resolver.service), revision: revision)
     }
 
     /// Regenerate a fresh direct link for a previously-resolved file through the SAME provider, skipping the
@@ -1137,14 +1287,30 @@ actor DebridCoordinator {
     func reresolve(service: DebridService, infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?,
                    episode: DebridEpisode? = nil, requiresSemanticSelection: Bool)
         async throws -> URL {
+        try await reresolveVersioned(
+            service: service, infoHash: infoHash, torrentId: torrentId, fileId: fileId,
+            fileIdx: fileIdx, episode: episode, requiresSemanticSelection: requiresSemanticSelection
+        ).value
+    }
+
+    func reresolveVersioned(
+        service: DebridService,
+        infoHash: String,
+        torrentId: Int?,
+        fileId: Int?,
+        fileIdx: Int?,
+        episode: DebridEpisode? = nil,
+        requiresSemanticSelection: Bool
+    ) async throws -> DebridVersionedResult<URL> {
         let revision = ensureCurrentSnapshot().revision
         guard let resolver = resolvers[service] else { throw DebridError.noKey }
-        return try await withCurrentCredential(revision: revision) {
+        let url = try await withCurrentCredential(revision: revision) {
             try await resolver.reresolveLink(
                 infoHash: infoHash, torrentId: torrentId, fileId: fileId, fileIdx: fileIdx,
                 episode: episode, requiresSemanticSelection: requiresSemanticSelection
             )
         }
+        return DebridVersionedResult(value: url, revision: revision)
     }
 
     private func pick(_ service: DebridService?) -> (any DebridResolving)? {
@@ -1158,26 +1324,48 @@ actor DebridCoordinator {
     /// `.noKey` when no TorBox key is configured, so the bounded resolve below collapses it to `nil`.
     /// `knownHash` = the stream's authoritative NZB md5 when its emitter carried one (nil otherwise).
     func resolveUsenet(nzbUrl: String, knownHash: String? = nil, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
+        try await resolveUsenetVersioned(
+            nzbUrl: nzbUrl, knownHash: knownHash, fileMustInclude: fileMustInclude,
+            fileIdx: fileIdx, episode: episode
+        ).value
+    }
+
+    func resolveUsenetVersioned(
+        nzbUrl: String,
+        knownHash: String? = nil,
+        fileMustInclude: String?,
+        fileIdx: Int?,
+        episode: DebridEpisode?
+    ) async throws -> DebridVersionedResult<URL> {
         let revision = ensureCurrentSnapshot().revision
         guard let usenet = torboxUsenet else { throw DebridError.noKey }
-        return try await withCurrentCredential(revision: revision) {
+        let url = try await withCurrentCredential(revision: revision) {
             try await usenet.resolve(
                 nzbUrl: nzbUrl, knownHash: knownHash, fileMustInclude: fileMustInclude,
                 fileIdx: fileIdx, episode: episode
             )
         }
+        return DebridVersionedResult(value: url, revision: revision)
     }
 
     /// Which nzb md5s the user's TorBox usenet account has cached (drives the ⚡ on usenet rows). Empty (a
     /// no-op) when no TorBox key is configured. Keys are the lowercased md5 identifiers, matching
     /// `TorBoxUsenetResolver.identifier(forNzbURL:)`.
     func usenetCacheCheck(nzbMD5s: [String]) async -> Set<String> {
+        await usenetCacheCheckVersioned(nzbMD5s: nzbMD5s).value
+    }
+
+    func usenetCacheCheckVersioned(nzbMD5s: [String]) async -> DebridVersionedResult<Set<String>> {
         let revision = ensureCurrentSnapshot().revision
-        guard let usenet = torboxUsenet, !nzbMD5s.isEmpty else { return [] }
+        guard let usenet = torboxUsenet, !nzbMD5s.isEmpty else {
+            return DebridVersionedResult(value: [], revision: revision)
+        }
         let map = (try? await withCurrentCredential(revision: revision) {
             try await usenet.checkCache(hashes: nzbMD5s)
         }) ?? [:]
-        return Set(map.filter { !$0.value.isEmpty }.keys)
+        return DebridVersionedResult(
+            value: Set(map.filter { !$0.value.isEmpty }.keys), revision: revision
+        )
     }
 }
 
@@ -1227,9 +1415,26 @@ extension DebridCoordinator {
     func resolvedPlaybackURL(for stream: CoreStream, episode: DebridEpisode? = nil,
                              confirmedCachedHashes: Set<String>? = nil,
                              confirmedUsenetURLs: Set<String>? = nil) async -> URL? {
-        await resolvedPlaybackRef(for: stream, episode: episode,
-                                  confirmedCachedHashes: confirmedCachedHashes,
-                                  confirmedUsenetURLs: confirmedUsenetURLs)?.url
+        await resolvedPlaybackURLVersioned(
+            for: stream,
+            episode: episode,
+            confirmedCachedHashes: confirmedCachedHashes,
+            confirmedUsenetURLs: confirmedUsenetURLs
+        ).value
+    }
+
+    func resolvedPlaybackURLVersioned(
+        for stream: CoreStream,
+        episode: DebridEpisode? = nil,
+        confirmedCachedHashes: Set<String>? = nil,
+        confirmedUsenetURLs: Set<String>? = nil
+    ) async -> DebridVersionedResult<URL?> {
+        await resolvedPlaybackRefVersioned(
+            for: stream,
+            episode: episode,
+            confirmedCachedHashes: confirmedCachedHashes,
+            confirmedUsenetURLs: confirmedUsenetURLs
+        ).map { $0?.url }
     }
 
     /// The same bounded, fail-soft resolve as `resolvedPlaybackURL`, but returning the full
@@ -1240,6 +1445,24 @@ extension DebridCoordinator {
     func resolvedPlaybackRef(for stream: CoreStream, episode: DebridEpisode? = nil,
                              confirmedCachedHashes: Set<String>? = nil,
                              confirmedUsenetURLs: Set<String>? = nil) async -> DebridPlaybackRef? {
+        await resolvedPlaybackRefVersioned(
+            for: stream,
+            episode: episode,
+            confirmedCachedHashes: confirmedCachedHashes,
+            confirmedUsenetURLs: confirmedUsenetURLs
+        ).value
+    }
+
+    func resolvedPlaybackRefVersioned(
+        for stream: CoreStream,
+        episode: DebridEpisode? = nil,
+        confirmedCachedHashes: Set<String>? = nil,
+        confirmedUsenetURLs: Set<String>? = nil
+    ) async -> DebridVersionedResult<DebridPlaybackRef?> {
+        let entryRevision = ensureCurrentSnapshot().revision
+        func noResult() -> DebridVersionedResult<DebridPlaybackRef?> {
+            DebridVersionedResult(value: nil, revision: entryRevision)
+        }
         let selectionEpisode = episode.map {
             DebridEpisode(
                 season: $0.season, episode: $0.episode,
@@ -1252,46 +1475,53 @@ extension DebridCoordinator {
         // exactly as today (no playable link). NOT a torrent: the minted URL is a plain direct stream (no
         // infoHash carried).
         if stream.url == nil, let nzb = stream.nzbUrl, !nzb.isEmpty {
-            guard await hasUsenetResolver else { return nil }
+            guard torboxUsenet != nil else { return noResult() }
             // CACHE-GATE (instant first-play): when the caller passed a confirmed-cached set, a not-confirmed
             // usenet row returns nil here with ZERO network (no add-then-poll), so a tap falls straight through
             // to today's embedded path instead of burning the resolve budget. nil set = pre-gate behaviour.
             if let confirmed = confirmedUsenetURLs, !confirmed.contains(nzb) {
                 DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) gate=NOT-CONFIRMED (confirmedSet=\(confirmed.count)) -> nil ZERO-NETWORK, embedded path")
-                return nil
+                return noResult()
             }
             DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) gate=\(confirmedUsenetURLs == nil ? "OPEN(no set)" : "CONFIRMED-CACHED") -> running blocking usenet resolve")
             let mustInclude = stream.fileMustInclude
             let fileIdx = stream.fileIdx
             let knownHash = stream.usenetKnownHash
-            return await withTaskGroup(of: DebridPlaybackRef?.self) { group in
+            return await withTaskGroup(of: DebridVersionedResult<DebridPlaybackRef?>.self) { group in
                 group.addTask {
-                    guard let url = try? await DebridCoordinator.shared.resolveUsenet(
-                        nzbUrl: nzb, knownHash: knownHash, fileMustInclude: mustInclude,
-                        fileIdx: fileIdx, episode: selectionEpisode
-                    ) else { return nil }
-                    // Usenet is a plain direct link: no infoHash / torrentId to carry (no reresolve fast
-                    // path), so the ref's torrent fields are nil. The `url` alone lets the player open it.
-                    return DebridPlaybackRef(url: url, service: .torBox, infoHash: "",
+                    do {
+                        let result = try await DebridCoordinator.shared.resolveUsenetVersioned(
+                            nzbUrl: nzb, knownHash: knownHash, fileMustInclude: mustInclude,
+                            fileIdx: fileIdx, episode: selectionEpisode
+                        )
+                        return result.map { url -> DebridPlaybackRef? in
+                            // Usenet is a plain direct link: no infoHash / torrentId to carry.
+                            DebridPlaybackRef(url: url, service: .torBox, infoHash: "",
                                              torrentId: nil, fileId: nil, fileIdx: fileIdx)
+                        }
+                    } catch {
+                        return DebridVersionedResult(value: nil, revision: entryRevision)
+                    }
                 }
                 group.addTask {
                     try? await Task.sleep(for: DebridCoordinator.resolveTimeout)
-                    return nil   // timeout sentinel
+                    return DebridVersionedResult(value: nil, revision: entryRevision)
                 }
-                let first = await group.next() ?? nil
+                let first = await group.next() ?? noResult()
                 group.cancelAll()
                 return first
             }
         }
         // Raw torrent only: a stream WITH a `url` is already a direct/debrid link; one with neither url nor
         // infoHash (YouTube / external) isn't ours to resolve. Branch out before any provider work.
-        guard stream.url == nil, let hash = stream.infoHash?.lowercased(), !hash.isEmpty else { return nil }
+        guard stream.url == nil, let hash = stream.infoHash?.lowercased(), !hash.isEmpty else {
+            return noResult()
+        }
         // No-key fast path: no network, zero behaviour change (only the at-most-once lazy warm hop). This is
         // the byte-identical guarantee.
-        guard await hasAnyResolver else {
+        guard !resolvers.isEmpty else {
             DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) NO-KEY (no resolver configured) -> nil, embedded path")
-            return nil
+            return noResult()
         }
         // CACHE-GATE (instant first-play, restores pre-511c973 snap): when the caller passed a confirmed-cached
         // set, only a pick whose infoHash is account-confirmed cached runs the blocking resolve (~1 round trip
@@ -1305,7 +1535,7 @@ extension DebridCoordinator {
         // in flight), a genuinely-cached source is treated as uncached and skipped.
         if let confirmed = confirmedCachedHashes, !confirmed.contains(hash) {
             DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) gate=NOT-CONFIRMED (confirmedSet=\(confirmed.count) hashes) -> nil ZERO-NETWORK, caller uses embedded path")
-            return nil
+            return noResult()
         }
         DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) gate=\(confirmedCachedHashes == nil ? "OPEN(no set)" : "CONFIRMED-CACHED") -> running blocking resolve (\(DebridProbe.ms(DebridCoordinator.resolveTimeout))ms budget)")
 
@@ -1318,26 +1548,38 @@ extension DebridCoordinator {
         // Bounded resolve: race the provider resolve against a timeout sleep; whichever finishes first wins and
         // the loser is cancelled. Any throw / timeout collapses to `nil` → the caller falls soft.
         let srcProbeStart = Date()
-        let result = await withTaskGroup(of: DebridPlaybackRef?.self) { group in
+        let result = await withTaskGroup(of: DebridVersionedResult<DebridPlaybackRef?>.self) { group in
             group.addTask {
-                guard let (r, service) = try? await DebridCoordinator.shared.resolveWithIds(
-                    infoHash: hash, magnet: magnet, fileIdx: fileIdx,
-                    episode: selectionEpisode
-                ) else { return nil }
-                return DebridPlaybackRef(url: r.url, service: service, infoHash: hash,
-                                         torrentId: r.torrentId, fileId: r.fileId, fileIdx: fileIdx)
+                do {
+                    let result = try await DebridCoordinator.shared.resolveWithIdsVersioned(
+                        infoHash: hash, magnet: magnet, fileIdx: fileIdx,
+                        episode: selectionEpisode
+                    )
+                    return result.map { resolved -> DebridPlaybackRef? in
+                        DebridPlaybackRef(
+                            url: resolved.result.url,
+                            service: resolved.service,
+                            infoHash: hash,
+                            torrentId: resolved.result.torrentId,
+                            fileId: resolved.result.fileId,
+                            fileIdx: fileIdx
+                        )
+                    }
+                } catch {
+                    return DebridVersionedResult(value: nil, revision: entryRevision)
+                }
             }
             group.addTask {
                 try? await Task.sleep(for: DebridCoordinator.resolveTimeout)
-                return nil   // timeout sentinel
+                return DebridVersionedResult(value: nil, revision: entryRevision)
             }
-            let first = await group.next() ?? nil
+            let first = await group.next() ?? noResult()
             group.cancelAll()
             return first
         }
         // [src-probe] Blocking-resolve outcome. url=nil = the resolve threw (dead/evicted/uncached link) OR the
         // 5s timeout sentinel won the race (a stall). Either way the caller falls soft to the embedded path.
-        DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) blocking-resolve RESULT -> \(result.map { "\($0.service) url ok" } ?? "nil (throw or 5s timeout)") elapsed=\(DebridProbe.since(srcProbeStart))ms")
+        DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) blocking-resolve RESULT -> \(result.value.map { "\($0.service) url ok" } ?? "nil (throw or 5s timeout)") elapsed=\(DebridProbe.since(srcProbeStart))ms")
         return result
     }
 
@@ -1387,14 +1629,36 @@ extension DebridCoordinator {
                               cachedHashes: Set<String>, cachedUsenetURLs: Set<String> = [],
                               labeledBest: CoreStream? = nil,
                               max: Int = 4) async -> (ref: DebridPlaybackRef, stream: CoreStream)? {
+        await resolveFirstPlayableVersioned(
+            candidates: candidates,
+            episode: episode,
+            cachedHashes: cachedHashes,
+            cachedUsenetURLs: cachedUsenetURLs,
+            labeledBest: labeledBest,
+            max: max
+        ).value
+    }
+
+    func resolveFirstPlayableVersioned(
+        candidates: [CoreStream],
+        episode: DebridEpisode? = nil,
+        cachedHashes: Set<String>,
+        cachedUsenetURLs: Set<String> = [],
+        labeledBest: CoreStream? = nil,
+        max: Int = 4
+    ) async -> DebridVersionedResult<(ref: DebridPlaybackRef, stream: CoreStream)?> {
+        let entryRevision = ensureCurrentSnapshot().revision
+        func noResult() -> DebridVersionedResult<(ref: DebridPlaybackRef, stream: CoreStream)?> {
+            DebridVersionedResult(value: nil, revision: entryRevision)
+        }
         // No-key / nothing-to-race guarantee: with no resolver (or no confirmed-cached row) this returns nil
         // before any provider contact (only the at-most-once lazy warm hop), so the caller's fallback runs
         // its unchanged path. Evaluate both awaited flags first: `await` cannot live in `||`'s autoclosure,
         // and both are cheap (idempotent warm), so eager evaluation is fine.
-        let hasTorrentResolver = await hasAnyResolver
-        let hasUsenet = await hasUsenetResolver
-        guard hasTorrentResolver || hasUsenet else { return nil }
-        guard !cachedHashes.isEmpty || !cachedUsenetURLs.isEmpty else { return nil }
+        let hasTorrentResolver = !resolvers.isEmpty
+        let hasUsenet = torboxUsenet != nil
+        guard hasTorrentResolver || hasUsenet else { return noResult() }
+        guard !cachedHashes.isEmpty || !cachedUsenetURLs.isEmpty else { return noResult() }
 
         // Keep only the confirmed-cached, resolvable candidates, in the caller's rank order. A raw torrent
         // (url == nil) qualifies when its infoHash is in cachedHashes; a usenet stream (url == nil, nzbUrl set)
@@ -1406,7 +1670,7 @@ extension DebridCoordinator {
             if let nzb = s.nzbUrl, !nzb.isEmpty, cachedUsenetURLs.contains(nzb) { return true }
             return false
         }
-        guard !cached.isEmpty else { return nil }
+        guard !cached.isEmpty else { return noResult() }
 
         // Bound concurrency to <= 4 (and >= 1) so a group never hammers the provider with more than a handful
         // of parallel resolves; the losers are cancelled the moment one wins.
@@ -1441,26 +1705,33 @@ extension DebridCoordinator {
         // honour the gate: a lone winner below a confirmed-cached label is refused so the caller resolves the
         // labeled best instead.
         if racing.count == 1 {
-            guard acceptable(racing[0]) else { return nil }
+            guard acceptable(racing[0]) else { return noResult() }
             // Re-assert the confirmed-cached gate at resolve time: a candidate evicted between the cache check
             // and this call returns nil with ZERO network instead of starting an add-then-download.
-            guard let ref = await resolvedPlaybackRef(for: racing[0], episode: episode,
-                                                      confirmedCachedHashes: cachedHashes,
-                                                      confirmedUsenetURLs: cachedUsenetURLs) else { return nil }
-            return (ref, racing[0])
+            let result = await resolvedPlaybackRefVersioned(
+                for: racing[0],
+                episode: episode,
+                confirmedCachedHashes: cachedHashes,
+                confirmedUsenetURLs: cachedUsenetURLs
+            )
+            return result.map { ref in ref.map { ($0, racing[0]) } }
         }
 
-        return await withTaskGroup(of: (ref: DebridPlaybackRef, stream: CoreStream)?.self) { group in
+        return await withTaskGroup(
+            of: DebridVersionedResult<(ref: DebridPlaybackRef, stream: CoreStream)?>.self
+        ) { group in
             for stream in racing {
                 group.addTask {
                     // Each leg carries its own `DebridCoordinator.resolveTimeout` bound + RD fast-fail (it is a full resolvedPlaybackRef).
                     // Pass the confirmed-cached sets so a candidate evicted between the cache check and this
                     // leg returns nil with ZERO network rather than kicking off an add-then-download.
-                    guard let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream, episode: episode,
-                                                                                       confirmedCachedHashes: cachedHashes,
-                                                                                       confirmedUsenetURLs: cachedUsenetURLs)
-                    else { return nil }
-                    return (ref, stream)
+                    let result = await DebridCoordinator.shared.resolvedPlaybackRefVersioned(
+                        for: stream,
+                        episode: episode,
+                        confirmedCachedHashes: cachedHashes,
+                        confirmedUsenetURLs: cachedUsenetURLs
+                    )
+                    return result.map { ref in ref.map { ($0, stream) } }
                 }
             }
             // First leg to produce a real ref that PASSES the label-authoritative gate wins. A leg that
@@ -1469,12 +1740,15 @@ extension DebridCoordinator {
             // draining until an acceptable ref appears or every leg has reported. Then cancel the remaining
             // (in-flight) legs. When every resolved leg is below a confirmed-cached label the winner stays nil
             // and the caller single-resolves the labeled best, so the played quality matches the button.
-            var winner: (ref: DebridPlaybackRef, stream: CoreStream)?
+            var winner: DebridVersionedResult<(ref: DebridPlaybackRef, stream: CoreStream)?>?
             for await result in group {
-                if let result, acceptable(result.stream) { winner = result; break }
+                if let value = result.value, acceptable(value.stream) {
+                    winner = result
+                    break
+                }
             }
             group.cancelAll()
-            return winner
+            return winner ?? noResult()
         }
     }
 }
@@ -1491,6 +1765,10 @@ extension DebridCoordinator {
 /// hashes it last queried, so a re-render with the same torrents does not re-hit the provider.
 @MainActor
 final class DebridCacheAwareness: ObservableObject {
+    private let credentialStore: DebridCredentialSnapshotStore
+    private var credentialRevision: UInt64
+    private var credentialObserver: DebridCredentialNotificationToken?
+
     /// Lowercased infoHashes confirmed cached. Empty until a check completes (and always, with no key).
     @Published private(set) var cachedHashes: Set<String> = []
     /// nzb links whose TorBox usenet download is confirmed cached, so a usenet row can show the ⚡. Keyed
@@ -1504,12 +1782,49 @@ final class DebridCacheAwareness: ObservableObject {
     private var task: Task<Void, Never>?
     private var usenetTask: Task<Void, Never>?
 
+    init(credentialStore: DebridCredentialSnapshotStore = .shared) {
+        self.credentialStore = credentialStore
+        credentialRevision = credentialStore.load().revision
+        credentialObserver = DebridCredentialNotificationToken(
+            NotificationCenter.default.addObserver(
+                forName: DebridCredentialSnapshotStore.didPublishNotification,
+                object: credentialStore,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.adoptCurrentCredentialRevision() }
+            }
+        )
+    }
+
+    private func adoptCurrentCredentialRevision() {
+        let revision = credentialStore.load().revision
+        _ = adoptCredentialRevision(revision)
+    }
+
+    @discardableResult
+    private func adoptCredentialRevision(_ revision: UInt64) -> Bool {
+        credentialStore.compareAndPublish(revision: revision) {
+            guard self.credentialRevision != revision else { return }
+            self.task?.cancel()
+            self.usenetTask?.cancel()
+            self.task = nil
+            self.usenetTask = nil
+            self.credentialRevision = revision
+            self.lastQueried.removeAll()
+            self.lastUsenetQueried.removeAll()
+            self.cachedHashes.removeAll()
+            self.cachedUsenetURLs.removeAll()
+        }
+    }
+
     /// Collect the RAW-torrent infoHashes in `groups` (a raw torrent is `url == nil`, `infoHash != nil`)
     /// and, if that set changed since the last query, ask the coordinator which are cached. Cheap and
     /// debounced: identical input returns immediately, and an empty input or no-key path clears nothing
     /// it didn't set. Safe to call on every `groups` change / `.task`. Also fires a parallel usenet check.
     func refresh(from groups: [CoreStreamSourceGroup]) {
-        refreshUsenet(from: groups)
+        let snapshot = credentialStore.load()
+        guard adoptCredentialRevision(snapshot.revision) else { return }
+        refreshUsenet(from: groups, revision: snapshot.revision)
         var hashes: Set<String> = []
         for group in groups {
             for stream in group.streams where stream.url == nil {
@@ -1517,16 +1832,20 @@ final class DebridCacheAwareness: ObservableObject {
             }
         }
         guard !hashes.isEmpty else { return }          // nothing to check; leave any prior result intact
-        guard hashes != lastQueried else { return }    // same torrents already queried: no re-hit
-        task?.cancel()
-        task = Task { [weak self] in
-            let result = await DebridCoordinator.shared.cacheCheck(hashes: Array(hashes))
-            guard !Task.isCancelled, let self else { return }
-            // Commit the queried set ONLY after a real result, so a failed/cancelled check leaves
-            // lastQueried untouched and the next refresh re-hits the provider instead of being deduped away.
-            self.lastQueried = hashes
-            // result keys are already lowercased infoHashes (see TorBoxResolver.checkCache).
-            self.cachedHashes = Set(result.keys)
+        _ = credentialStore.compareAndPublish(revision: snapshot.revision) {
+            guard hashes != self.lastQueried else { return }
+            self.task?.cancel()
+            self.task = Task { [weak self] in
+                let result = await DebridCoordinator.shared.cacheCheckVersioned(hashes: Array(hashes))
+                guard !Task.isCancelled, let self else { return }
+                _ = self.credentialStore.compareAndPublish(revision: result.revision) {
+                    // Commit the queried set ONLY after a real current result, so a failed/cancelled/stale check
+                    // leaves lastQueried untouched and the next refresh re-hits the provider.
+                    self.lastQueried = hashes
+                    // Result keys are already lowercased infoHashes (see TorBoxResolver.checkCache).
+                    self.cachedHashes = Set(result.value.keys)
+                }
+            }
         }
     }
 
@@ -1535,7 +1854,7 @@ final class DebridCacheAwareness: ObservableObject {
     /// key is the stream's authoritative `usenethash:` marker when its emitter carried one (TorBox search
     /// results do); md5-of-the-link is the fallback for plain add-on usenet streams. No-op (leaves state
     /// intact) with no usenet stream present or no TorBox key. Debounced by the nzb-url set.
-    private func refreshUsenet(from groups: [CoreStreamSourceGroup]) {
+    private func refreshUsenet(from groups: [CoreStreamSourceGroup], revision: UInt64) {
         var byMD5: [String: String] = [:]   // md5 -> nzbUrl, so a cached md5 maps back to the row's raw link
         for group in groups {
             for stream in group.streams where stream.isUsenet {
@@ -1545,13 +1864,19 @@ final class DebridCacheAwareness: ObservableObject {
         }
         guard !byMD5.isEmpty else { return }
         let urls = Set(byMD5.values)
-        guard urls != lastUsenetQueried else { return }
-        usenetTask?.cancel()
-        usenetTask = Task { [weak self] in
-            let cachedMD5s = await DebridCoordinator.shared.usenetCacheCheck(nzbMD5s: Array(byMD5.keys))
-            guard !Task.isCancelled, let self else { return }
-            self.lastUsenetQueried = urls
-            self.cachedUsenetURLs = Set(cachedMD5s.compactMap { byMD5[$0] })
+        _ = credentialStore.compareAndPublish(revision: revision) {
+            guard urls != self.lastUsenetQueried else { return }
+            self.usenetTask?.cancel()
+            self.usenetTask = Task { [weak self] in
+                let cachedMD5s = await DebridCoordinator.shared.usenetCacheCheckVersioned(
+                    nzbMD5s: Array(byMD5.keys)
+                )
+                guard !Task.isCancelled, let self else { return }
+                _ = self.credentialStore.compareAndPublish(revision: cachedMD5s.revision) {
+                    self.lastUsenetQueried = urls
+                    self.cachedUsenetURLs = Set(cachedMD5s.value.compactMap { byMD5[$0] })
+                }
+            }
         }
     }
 }
@@ -1773,7 +2098,11 @@ extension PremiumizeResolver {
     private func getFolderList<T: Decodable>(_ path: String) async throws -> T {
         var c = URLComponents(string: Self.base + path)
         c?.queryItems = [URLQueryItem(name: "apikey", value: apiKey)]
-        return try await DebridHTTP.decode(session, URLRequest(url: c?.url ?? URL(string: Self.base)!))
+        return try await DebridHTTP.decode(
+            session,
+            URLRequest(url: c?.url ?? URL(string: Self.base)!),
+            credentialToken: credentialToken
+        )
     }
 }
 
@@ -1784,8 +2113,13 @@ extension DebridCoordinator {
     /// actors). FAIL-SOFT: with no key the map is empty; a provider that errors or is empty simply does not
     /// appear (its `try?` collapses to no entry), so the browse UI hides that section rather than erroring.
     func cloudLibrary() async -> [DebridService: [DebridLibraryItem]] {
+        await cloudLibraryVersioned().value
+    }
+
+    func cloudLibraryVersioned() async
+        -> DebridVersionedResult<[DebridService: [DebridLibraryItem]]> {
         let revision = ensureCurrentSnapshot().revision
-        guard !resolvers.isEmpty else { return [:] }
+        guard !resolvers.isEmpty else { return DebridVersionedResult(value: [:], revision: revision) }
         let result = await withTaskGroup(of: (DebridService, [DebridLibraryItem]).self) { group in
             for (service, resolver) in resolvers {
                 group.addTask {
@@ -1799,17 +2133,25 @@ extension DebridCoordinator {
             for await (service, items) in group where !items.isEmpty { out[service] = items }
             return out
         }
-        guard credentialStore.resultIsCurrent(revision: revision) else { return [:] }
-        return result
+        guard credentialStore.resultIsCurrent(revision: revision) else {
+            return DebridVersionedResult(value: [:], revision: revision)
+        }
+        return DebridVersionedResult(value: result, revision: revision)
     }
 
     /// Resolve a chosen library item to a direct, streamable URL through its own provider's resolver.
     /// Throws `.noKey` when that provider is no longer configured; other `DebridError`s when the file is gone.
     func resolveLibraryItem(_ item: DebridLibraryItem) async throws -> URL {
+        try await resolveLibraryItemVersioned(item).value
+    }
+
+    func resolveLibraryItemVersioned(_ item: DebridLibraryItem) async throws
+        -> DebridVersionedResult<URL> {
         let revision = ensureCurrentSnapshot().revision
         guard let resolver = resolvers[item.service] else { throw DebridError.noKey }
-        return try await withCurrentCredential(revision: revision) {
+        let url = try await withCurrentCredential(revision: revision) {
             try await resolver.resolveLibraryItem(item)
         }
+        return DebridVersionedResult(value: url, revision: revision)
     }
 }

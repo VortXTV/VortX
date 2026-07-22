@@ -10,22 +10,30 @@ final class DebridKeys: ObservableObject {
     /// Main-actor mirror of the current immutable state. Published so Settings and resolver UI react.
     @Published private(set) var keys: [DebridService: String]
 
+    /// A durable write failure is visible to the settings surface. Memory and sync remain on the last committed
+    /// generation, so this never reports a value that will disappear or reactivate after relaunch.
+    @Published private(set) var persistenceError: String?
+
     private var state: DebridCredentialMutableState
 
     var owner: DebridOwnerScope { state.owner }
     var revision: UInt64 { state.revision }
 
-    /// Global legacy adoption retains the shipped first-explicit-bind rule. Raw account-scope migration is
-    /// separate and is retried independently for every canonical account.
-    private var hasConsideredGlobalLegacy = false
+    private static var storageIO: DebridCredentialStorageIO {
+        DebridCredentialStorageIO(
+            read: Keychain.string,
+            write: { value, account in Keychain.set(value, for: account) },
+            delete: { account in Keychain.set(nil, for: account) }
+        )
+    }
 
-    /// Initialization reads only the permanent device-local scope. It never adopts a global or account source.
+    /// The snapshot store performs the synchronous signed-out bootstrap. Reusing its exact snapshot here avoids
+    /// a second owner that could transiently publish an empty device scope.
     private init() {
-        let initialOwner = DebridOwnerScope.signedOutDevice
-        let initialKeys = Self.loadScope(owner: initialOwner)
-        state = DebridCredentialMutableState(owner: initialOwner, keys: initialKeys)
+        let initial = DebridCredentialSnapshotStore.shared.load()
+        state = DebridCredentialMutableState(snapshot: initial)
         keys = state.keys
-        precondition(DebridCredentialSnapshotStore.shared.publish(state.snapshot))
+        persistenceError = nil
     }
 
     /// Bind a validated typed owner. Migration and full-scope load complete before one revision is published.
@@ -36,36 +44,55 @@ final class DebridKeys: ObservableObject {
         publish(snapshot)
     }
 
-    /// Raw canonical-account sources are considered on every account bind. The global source is considered
-    /// only on the first explicit bind. A source survives every failed or conflicting migration.
+    /// Raw canonical-account sources are considered on every account bind. Each global source has one permanent
+    /// owner claim, so the first explicit bind remains authoritative across process death and delete failure.
     private func migrateIfNeeded(for owner: DebridOwnerScope) {
-        let includeGlobal = !hasConsideredGlobalLegacy
+        let io = Self.storageIO
+        func targetKeys() -> [DebridService: String] {
+            DebridCredentialPersistence.committedKeys(owner: owner, read: io.read)
+        }
+        func commitTarget(_ keys: [DebridService: String]) -> Bool {
+            DebridCredentialPersistence.commit(owner: owner, keys: keys, io: io).succeeded
+        }
+
         for service in DebridService.allCases {
-            let target = service.keychainAccount(owner: owner)
-            var sources: [String] = []
             if case .account(let uuid) = owner {
-                sources.append(service.legacyRawAccountKeychainAccount(uuid))
+                // The exact prior artifact's v2 slot is checked first, then the shipped raw account slot.
+                let sources = [
+                    service.keychainAccount(owner: owner),
+                    service.legacyRawAccountKeychainAccount(uuid),
+                ]
+                for source in sources {
+                    _ = DebridCredentialMigration.migrate(
+                        service: service,
+                        owner: owner,
+                        sourceAccount: source,
+                        claimAccount: nil,
+                        targetKeys: targetKeys,
+                        commitTarget: commitTarget,
+                        read: io.read,
+                        write: io.write,
+                        delete: io.delete
+                    )
+                }
             }
-            if includeGlobal { sources.append(service.legacyGlobalKeychainAccount) }
-            _ = DebridCredentialMigration.migrateFirstAvailable(
-                target: target,
-                sources: sources,
-                read: Keychain.string,
-                write: { value, account in Keychain.set(value, for: account) },
-                delete: { account in Keychain.set(nil, for: account) }
+
+            _ = DebridCredentialMigration.migrate(
+                service: service,
+                owner: owner,
+                sourceAccount: service.legacyGlobalKeychainAccount,
+                claimAccount: DebridCredentialMigration.globalClaimAccount(for: service),
+                targetKeys: targetKeys,
+                commitTarget: commitTarget,
+                read: io.read,
+                write: io.write,
+                delete: io.delete
             )
         }
-        if includeGlobal { hasConsideredGlobalLegacy = true }
     }
 
     private static func loadScope(owner: DebridOwnerScope) -> [DebridService: String] {
-        var next: [DebridService: String] = [:]
-        for service in DebridService.allCases {
-            if let k = Keychain.string(service.keychainAccount(owner: owner)), !k.isEmpty {
-                next[service] = k
-            }
-        }
-        return next
+        DebridCredentialPersistence.loadKeys(owner: owner, read: Keychain.string)
     }
 
     func key(for service: DebridService) -> String { keys[service] ?? "" }
@@ -73,32 +100,65 @@ final class DebridKeys: ObservableObject {
 
     var snapshot: DebridCredentialSnapshot { state.snapshot }
 
-    /// Persist (or clear, on empty) a service's key in the Keychain and nudge the E2E sync.
-    func setKey(_ value: String, for service: DebridService) {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        _ = Keychain.set(trimmed.isEmpty ? nil : trimmed, for: service.keychainAccount(owner: owner))
-        guard let snapshot = state.setKey(trimmed, for: service) else { return }
-        publish(snapshot)
-        Task { @MainActor in VortXSyncManager.shared.requestSyncSoon() }
+    /// Persist one complete owner envelope first. Publish and sync only after the new generation's exact
+    /// envelope and commit marker both read back byte-identically.
+    @discardableResult
+    func setKey(_ value: String, for service: DebridService) -> Bool {
+        let io = Self.storageIO
+        let currentOwner = owner
+        let result = DebridCredentialDurableMutation.setKey(
+            value,
+            for: service,
+            state: &state,
+            persist: { keys in
+                DebridCredentialPersistence.commit(owner: currentOwner, keys: keys, io: io).succeeded
+            }
+        )
+        switch result {
+        case .unchanged:
+            persistenceError = nil
+            return true
+        case .persistenceFailed:
+            persistenceError = "Could not save debrid credentials. Your previous saved keys are still active."
+            return false
+        case .committed(let snapshot):
+            persistenceError = nil
+            publish(snapshot)
+            Task { @MainActor in VortXSyncManager.shared.requestSyncSoon() }
+            return true
+        }
     }
 
     /// Apply a remote document atomically. This path intentionally never schedules sync, so a remote pull
     /// cannot echo itself even after the surrounding suppression window drains.
-    func applyRemoteKeys(_ remote: [DebridService: String]) {
-        var normalized: [DebridService: String] = [:]
-        for (service, value) in remote {
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            normalized[service] = trimmed
-            guard trimmed != key(for: service) else { continue }
-            _ = Keychain.set(trimmed.isEmpty ? nil : trimmed, for: service.keychainAccount(owner: owner))
+    @discardableResult
+    func applyRemoteKeys(_ remote: [DebridService: String]) -> Bool {
+        let io = Self.storageIO
+        let currentOwner = owner
+        let result = DebridCredentialDurableMutation.applyRemoteKeys(
+            remote,
+            state: &state,
+            persist: { keys in
+                DebridCredentialPersistence.commit(owner: currentOwner, keys: keys, io: io).succeeded
+            }
+        )
+        switch result {
+        case .unchanged:
+            persistenceError = nil
+            return true
+        case .persistenceFailed:
+            persistenceError = "Could not apply synced debrid credentials. The previous generation remains active."
+            return false
+        case .committed(let snapshot):
+            persistenceError = nil
+            publish(snapshot)
+            return true
         }
-        guard let snapshot = state.applyRemoteKeys(normalized) else { return }
-        publish(snapshot)
     }
 
     private func publish(_ snapshot: DebridCredentialSnapshot) {
-        keys = snapshot.keys
         precondition(DebridCredentialSnapshotStore.shared.publish(snapshot))
+        keys = snapshot.keys
         Task { await DebridCoordinator.shared.reload(snapshot: snapshot) }
     }
 
@@ -130,6 +190,11 @@ struct DebridKeysView: View {
                 Text("Add your debrid API keys here. They stay on this device and sync, encrypted, to your VortX account. Cached torrents now play instantly straight from your debrid account, and adding more than one service checks them all at once.")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
+                if let error = debrid.persistenceError {
+                    Text(error)
+                        .font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.danger)
+                }
                 ForEach(DebridService.allCases) { service in
                     keyField(service)
                 }

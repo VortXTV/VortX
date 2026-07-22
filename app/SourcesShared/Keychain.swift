@@ -122,7 +122,10 @@ enum Keychain {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: account,
         ]
-        SecItemDelete(base as CFDictionary)   // replace any existing item
+        let deleteStatus = SecItemDelete(base as CFDictionary)   // replace any existing item
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            return false
+        }
 
         guard let value, let data = value.data(using: .utf8) else {
             UserDefaults.standard.removeObject(forKey: fallbackKey(account))   // clearing the token
