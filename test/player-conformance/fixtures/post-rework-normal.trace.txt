@@ -1,0 +1,24 @@
+2026-07-22 04:00:00.000 [dv] hls server listening on 127.0.0.1:59999
+2026-07-22 04:00:00.010 [avplayer] plain-remux mount (local HLS) host=192.168.1.5 -> 127.0.0.1:59999
+2026-07-22 04:00:00.050 [dv] hls signaling codecs=avc1.64001F,mp4a.40.2 supplemental=none range=none fps=24.000 bw=3000000 dv=false
+2026-07-22 04:00:00.100 [dv] hls req /master.m3u8
+2026-07-22 04:00:00.101 [dv] hls resp /master.m3u8 variants=1 (plain) subs=0 180B
+2026-07-22 04:00:00.300 [dv] hls media segment 0 published +0.3s after mount (600000B, 2.60s media)
+2026-07-22 04:00:00.600 [dv] hls media segment 1 published +0.6s after mount (600000B, 2.60s media)
+2026-07-22 04:00:00.900 [dv] hls media segment 2 published +0.9s after mount (600000B, 2.60s media)
+2026-07-22 04:00:01.200 [dv] hls media segment 3 published +1.2s after mount (600000B, 2.60s media)
+2026-07-22 04:00:01.500 [dv] hls media segment 4 published +1.5s after mount (600000B, 2.60s media)
+2026-07-22 04:00:01.800 [dv] hls media segment 5 published +1.8s after mount (600000B, 2.60s media) -> startup cohort satisfied
+2026-07-22 04:00:01.850 [dv] hls req /media.m3u8
+2026-07-22 04:00:01.851 [dv] hls resp /media.m3u8 segs=6 ended=false 330B
+2026-07-22 04:00:01.900 [dv] hls req /init.mp4
+2026-07-22 04:00:01.901 [dv] hls resp /init.mp4 1309B
+2026-07-22 04:00:01.950 [dv] hls req /seg0.m4s
+2026-07-22 04:00:01.951 [dv] hls resp /seg0.m4s 600000B
+2026-07-22 04:00:01.960 [dv] hls req /aseg0.m4s
+2026-07-22 04:00:01.961 [dv] hls resp /aseg0.m4s 90000B
+2026-07-22 04:00:02.010 [avplayer] readyToPlay -> play() rate=1.0 tcs=2 waitReason=none
+2026-07-22 04:00:05.000 [dv] hls req /media.m3u8
+2026-07-22 04:00:05.001 [dv] hls resp /media.m3u8 segs=20 ended=false 900B
+2026-07-22 04:00:05.100 [dv] hls req /seg6.m4s
+2026-07-22 04:00:05.101 [dv] hls resp /seg6.m4s 600000B
