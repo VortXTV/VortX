@@ -693,6 +693,19 @@ jobs:
             "app/build/ci/Build/Products/Release-appletvos/VortXTV.app/PlugIns/VortXTopShelf.appex/VortXTopShelf"
           echo "tvOS artifact metadata verified for Full, Lite, and Top Shelf"
 
+      # Fail closed on unsafe symlinks in the SHIPPED bundles. These are the exact .app trees that
+      # get zipped into the IPAs and the DMG below, so this is where the check has to run — a
+      # local-only checker protects nobody. It rejects any symlink that is absolute, dangling, or
+      # escapes its bundle (the shipped `fonts/fonts -> /Users/daksh/...` link was all three on CI),
+      # while allowing the legitimate RELATIVE framework symlinks that VortXMac's bundle contains.
+      - name: Audit bundle symlinks (fail closed)
+        run: |
+          bash scripts/audit-bundle-symlinks.sh \
+            "app/build/ci/Build/Products/Release-appletvos/VortXTV.app" \
+            "app/build/ci-lite/Build/Products/Release-appletvos/VortXTVLite.app" \
+            "app/build/ci-ios/Build/Products/Release-iphoneos/VortXiOSNative.app" \
+            "app/build/ci-mac/Build/Products/Release/VortX.app"
+
       - name: Package the IPAs
         run: |
           mkdir -p out/full/Payload out/lite/Payload out/ios/Payload
