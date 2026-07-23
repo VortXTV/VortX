@@ -45,6 +45,13 @@ final class VXDiagExport {
     /// Header-read deadline so a phone that connects and then stalls never leaks its connection.
     private static let headerDeadline: TimeInterval = 15
 
+    /// How long `startAsync()` keeps re-attempting the cold listener bring-up while Wi-Fi is present.
+    /// The FIRST export of a session pays for Network.framework init plus the local-network determination
+    /// on the `0.0.0.0` bind, which can outlast one `ensureListening()` `.ready` wait; the retry budget
+    /// covers that so the very first open produces the QR instead of only a later re-entry once warm.
+    private static let coldStartBudget: TimeInterval = 6
+    private static let coldStartRetryGap: TimeInterval = 0.3
+
     /// Set once the LAN server has actually served the log to a phone at least once this session. Two jobs,
     /// both guarded by `stateLock`: it is the ONE-SHOT gate (every later request is rejected without bytes),
     /// and it lets `stop()` (export screen dismissed) CLEAR the rolling log then and only then, giving the
@@ -86,6 +93,32 @@ final class VXDiagExport {
         // never written to a log line.
         NSLog("[diag] export: serving diagnostic log on port %d", boundPort)
         return (urlString, Image(decorative: cg, scale: 1))
+    }
+
+    /// `start()` off the main thread, retried through the cold bring-up. Apple TV opened the export screen
+    /// blank on the FIRST attempt and only filled it in on a later re-entry, because a single synchronous
+    /// `start()` on the main actor gave the cold LAN listener no time to reach `.ready` (Network.framework
+    /// init + local-network determination) inside one `ensureListening()` wait, so it returned nil and the
+    /// sheet showed its no-QR fallback. Here the work runs off the main thread (the caller shows a spinner)
+    /// and `start()` is re-attempted while Wi-Fi is present and we are inside `coldStartBudget`, so the QR
+    /// is produced as soon as the listener is actually ready.
+    ///
+    /// On the warm/happy path the first `start()` succeeds and the loop body never runs, so this is
+    /// byte-identical to a lone `start()`: same fresh capability, same one-shot `didServe` re-arm. When a
+    /// retry is needed, each `start()` re-mints the capability exactly as a fresh export should, and the
+    /// last successful attempt is the live one; the serve-once contract is untouched.
+    func startAsync() async -> (url: String, qr: Image)? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let deadline = Date().addingTimeInterval(Self.coldStartBudget)
+                var result = self.start()
+                while result == nil, Self.lanIPv4() != nil, Date() < deadline {
+                    Thread.sleep(forTimeInterval: Self.coldStartRetryGap)
+                    result = self.start()
+                }
+                continuation.resume(returning: result)
+            }
+        }
     }
 
     /// Tear the listener down so the log is no longer served. Safe to call when not started.
