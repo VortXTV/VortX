@@ -16,6 +16,11 @@ struct RemoteConfig {
     static let snapshot = Snapshot(dvRemuxWindowMiB: 64)
 }
 
+/// Standalone-compilation stub for the buffer's failure-reason funnel (same pattern as the RemoteConfig stub).
+enum DiagnosticsLog {
+    static func log(_ tag: String, _ message: String) { print("[\(tag)] \(message)") }
+}
+
 @MainActor private var failures = 0
 
 @MainActor private func check(_ name: String, _ condition: @autoclosure () -> Bool) {

@@ -31,6 +31,11 @@ struct RemoteConfig {
     static let snapshot = Snapshot(dvRemuxWindowMiB: 64)
 }
 
+/// Standalone-compilation stub for the buffer's failure-reason funnel (same pattern as the RemoteConfig stub).
+enum DiagnosticsLog {
+    static func log(_ tag: String, _ message: String) { print("[\(tag)] \(message)") }
+}
+
 @MainActor var failures = 0
 @MainActor func check(_ name: String, _ condition: Bool) {
     if condition { print("PASS  \(name)") } else { failures += 1; print("FAIL  \(name)") }
@@ -372,16 +377,19 @@ check("wired: the resumed playlist carries the frozen conservative target durati
       frozenTarget.seconds == 12
         && resumedPlaylist.contains("#EXT-X-TARGETDURATION:12"))
 let readiness = VortXHLSStartupReadiness(frozenTarget: frozenTarget)
+// The startup floor is the FLAT two-segment / four-second budget (the 6-segment / 3x-target floor held every
+// UHD master past the chrome's 10s start watchdog in the field - the build 189 regression), and resume must
+// not change it.
 check("wired: startup readiness admission is unchanged by resume",
-      readiness?.minimumSegmentCount == 6
-        && readiness?.minimumRenderedDurationMilliseconds == 36_000)
+      readiness?.minimumSegmentCount == 2
+        && readiness?.minimumRenderedDurationMilliseconds == 4_000)
 if let readiness {
     let pinned = DVPlaybackPolicy.pinnedStartupSnapshot(
         window: resumedWindow, ended: false,
         minimumSegmentCount: readiness.minimumSegmentCount,
         minimumRenderedDurationMilliseconds: readiness.minimumRenderedDurationMilliseconds)
     check("wired: the resumed window pins the same startup cohort as a fresh mount",
-          pinned?.window.segments.map(\.id) == Array(0..<9) && pinned?.ended == false)
+          pinned?.window.segments.map(\.id) == Array(0..<2) && pinned?.ended == false)
 } else {
     check("wired: startup readiness must construct for the frozen conservative target", false)
 }

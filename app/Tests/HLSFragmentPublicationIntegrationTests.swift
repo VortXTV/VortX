@@ -39,6 +39,11 @@ struct RemoteConfig {
     static let snapshot = Snapshot(dvRemuxWindowMiB: 64)
 }
 
+/// Standalone-compilation stub for the buffer's failure-reason funnel (same pattern as the RemoteConfig stub).
+enum DiagnosticsLog {
+    static func log(_ tag: String, _ message: String) { print("[\(tag)] \(message)") }
+}
+
 private let avPacketFlagKey: Int32 = 0x0001
 private let avFormatFlagCustomIO: Int32 = 0x0080
 private let avSeekSize: Int32 = 0x10000

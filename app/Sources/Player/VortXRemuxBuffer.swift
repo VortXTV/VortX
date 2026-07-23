@@ -409,35 +409,70 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         condition.unlock()
     }
 
+    /// How long the stage-append producer may PARK on a full session spool before the mount is declared dead.
+    /// Retention deadlines are seconds-to-a-minute (segment + longest-playlist duration), so a healthy playing
+    /// session reclaims space well inside this bound; only a genuinely wedged spool exhausts it.
+    private static let stageBackpressureLimitSeconds: TimeInterval = 120
+
     /// HLS-only append path. Stage admission and any filesystem write happen with the buffer condition unlocked;
     /// the producer then advances the buffer head. A memory stage materializes the bytes in RAM. An active stage
     /// is durable first and advances an already-empty resident frontier without copying those bytes into `Data`.
+    ///
+    /// A FULL session spool is BACKPRESSURE, not death (build 189 field lesson): the 512 MiB ceiling is
+    /// admission-only and expired-retention reclamation frees space as playback advances, so a producer that
+    /// out-runs the budget must PARK and retry exactly like the legacy resident-ceiling path above - failing
+    /// here killed every healthy UHD DV play ~25s in ("remux failed" 404s -> AVPlayer endFileError -> HDR10
+    /// demote). A stage that dies for a real reason fails the buffer through `poisonAndFail`, which ends the
+    /// retry loop with the honest first failure preserved.
     private func append(_ bytes: UnsafePointer<UInt8>, count: Int,
                         through stage: VortXHLSSessionSpool.OpenStage) {
-        condition.lock()
-        guard !isFinished else { condition.unlock(); return }
-        let head = producedCount
-        let resident = residentCount
-        let residentBackingBefore = storage.capacity
-        let residentBackingAfter = storage.projectedCapacity(adding: count)
-        let ceiling = windowFloorBytes
-            + (engineReady ? producerLeadFullBytes : producerLeadPreReadyBytes)
-        condition.unlock()
-        let (projectedResident, residentOverflow) = resident.addingReportingOverflow(count)
-        let (nextHead, headOverflow) = head.addingReportingOverflow(count)
-        guard !residentOverflow, !headOverflow, let residentBackingAfter else {
-            fail("HLS mutable open-stage resident arithmetic overflow")
-            return
-        }
+        let parkDeadline = Date().addingTimeInterval(Self.stageBackpressureLimitSeconds)
+        var forwardReceipt: VortXHLSSessionSpool.OpenStage.ForwardReceipt?
+        var head = 0
+        var nextHead = 0
+        while true {
+            condition.lock()
+            guard !isFinished else { condition.unlock(); return }
+            head = producedCount
+            let resident = residentCount
+            let residentBackingBefore = storage.capacity
+            let residentBackingAfter = storage.projectedCapacity(adding: count)
+            let ceiling = windowFloorBytes
+                + (engineReady ? producerLeadFullBytes : producerLeadPreReadyBytes)
+            condition.unlock()
+            let (projectedResident, residentOverflow) = resident.addingReportingOverflow(count)
+            let (nextHeadValue, headOverflow) = head.addingReportingOverflow(count)
+            guard !residentOverflow, !headOverflow, let residentBackingAfter else {
+                fail("HLS mutable open-stage resident arithmetic overflow")
+                return
+            }
+            nextHead = nextHeadValue
 
-        guard let forwardReceipt = stage.acceptForward(
-            bytes, count: count, at: head, projectedResidentBytes: projectedResident,
-            activationThresholdBytes: ceiling,
-            residentBackingCapacityBefore: residentBackingBefore,
-            residentBackingCapacityAfter: residentBackingAfter) else {
-            fail("HLS mutable open-stage append failed")
-            return
+            if let receipt = stage.acceptForward(
+                bytes, count: count, at: head, projectedResidentBytes: projectedResident,
+                activationThresholdBytes: ceiling,
+                residentBackingCapacityBefore: residentBackingBefore,
+                residentBackingCapacityAfter: residentBackingAfter) {
+                forwardReceipt = receipt
+                break
+            }
+            // nil admission with a healthy buffer = the spool is at capacity (or a transient state race).
+            // Sweep expired retention entries, park briefly, retry. A real stage death fails the buffer and
+            // the guard at the top of the loop returns on the next pass.
+            if Date() >= parkDeadline {
+                fail("HLS session spool stayed full for \(Int(Self.stageBackpressureLimitSeconds))s (backpressure limit)")
+                return
+            }
+            stage.reclaimExpiredForBackpressure()
+            condition.lock()
+            if !isFinished {
+                condition.wait(until: Date().addingTimeInterval(0.25))
+            }
+            let finished = isFinished
+            condition.unlock()
+            if finished { return }
         }
+        guard let forwardReceipt else { return }
         defer { stage.completeForward(forwardReceipt) }
 
         condition.lock()
@@ -706,7 +741,8 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// the chrome's AVPlayer -> libmpv fallback fires instead of hanging.
     func fail(_ message: String) {
         condition.lock()
-        if failureMessage == nil { failureMessage = message }
+        let isFirstFailure = failureMessage == nil
+        if isFirstFailure { failureMessage = message }
         isFinished = true
         // F2: release the resident window (up to floor + producer lead, ~128 MiB) at the DEMOTE EDGE, not at
         // remux-thread exit. On a stalled-CDN demote the remux thread can linger 10-20s in a blocked read
@@ -721,6 +757,12 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         storageBase = producedCount
         condition.broadcast()
         condition.unlock()
+        // Beta 7 field lesson (build 189, diag 7/8): every remux death demoted the play with NO reason in the
+        // diagnostics export, because many fail() call sites are silent. Log the FIRST failure reason here, at
+        // the one funnel every death passes through. "cancelled" is ordinary teardown and stays quiet.
+        if isFirstFailure, message != "cancelled" {
+            DiagnosticsLog.log("dv", "remux buffer FAILED: \(message)")
+        }
     }
 
     // MARK: Consumer side (resource loader queue)
@@ -1541,6 +1583,12 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
                 lock.broadcast()
             }
             lock.unlock()
+        }
+
+        /// Backpressure recovery sweep: a producer parked on a full spool collects expired retention entries
+        /// itself, so reclamation does not depend on client playlist traffic arriving while it is parked.
+        fileprivate func reclaimExpiredForBackpressure() {
+            owner?.collectExpired(now: ProcessInfo.processInfo.systemUptime)
         }
 
         fileprivate func requestAbort() {
