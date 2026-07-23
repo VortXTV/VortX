@@ -38,6 +38,9 @@ struct SettingsView: View {
     // Clear Continue Watching (Advanced): a durable, tombstoned bulk clear needs an explicit confirm.
     @State private var showClearCWConfirm = false
     @State private var diagExport: (url: String, qr: Image)?
+    // True while the LAN listener + QR are being generated: the sheet shows a spinner instead of a blank
+    // screen, then publishes the QR when startAsync() resolves (fixes the first-open-blank race).
+    @State private var diagExportGenerating = false
     // Per-tab bar visibility (#117): the four hideable tabs, one key each (TabBarPrefs). Home,
     // Add-ons, and Settings have no toggle so the app can never lose its anchor or this screen.
     @AppStorage(TabBarPrefs.hideLive) private var hideLiveTab = false
@@ -169,6 +172,7 @@ struct SettingsView: View {
         .fullScreenCover(isPresented: $showDiagExport, onDismiss: {
             VXDiagExport.shared.stop()
             diagExport = nil
+            diagExportGenerating = false
         }) {
             diagExportSheet
         }
@@ -1219,7 +1223,11 @@ struct SettingsView: View {
             // Apple TV has no share sheet, so the diagnostic log is exported over the LAN: this stands up a
             // tiny local server and shows a QR the owner scans with their phone to download the log file.
             Button {
-                diagExport = VXDiagExport.shared.start()
+                // Present immediately with a spinner, then generate off the main thread: the cold LAN
+                // listener can take a beat to come up, so a synchronous start() here left the first open
+                // blank until a re-entry warmed it. The sheet's .task publishes the QR when it is ready.
+                diagExport = nil
+                diagExportGenerating = true
                 showDiagExport = true
             } label: { Text("Export diagnostic log") }
                 .buttonStyle(ChipButtonStyle(selected: false))
@@ -1259,6 +1267,14 @@ struct SettingsView: View {
                 Text("Scan with your phone on the same Wi-Fi to download the log, then send it over.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                     .multilineTextAlignment(.center)
+            } else if diagExportGenerating {
+                // Never a silently blank screen: the cold listener bring-up shows a spinner until the QR
+                // is ready, at which point the .task below publishes it and this branch is replaced.
+                ProgressView()
+                    .frame(width: 420, height: 420)
+                Text("Preparing the download link…")
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
             } else {
                 Text("Connect this device to Wi-Fi to export the diagnostic log.")
                     .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
@@ -1268,12 +1284,21 @@ struct SettingsView: View {
                 showDiagExport = false
                 VXDiagExport.shared.stop()
                 diagExport = nil
+                diagExportGenerating = false
             } label: { Text("Done") }
                 .buttonStyle(ChipButtonStyle(selected: true))
         }
         .padding(Theme.Space.xl)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        // Generate once when the sheet appears, off the main thread; publish the payload back so the QR
+        // renders on this first open as soon as the listener is ready, not only on a warm re-entry.
+        .task {
+            guard diagExportGenerating else { return }
+            let result = await VXDiagExport.shared.startAsync()
+            diagExport = result
+            diagExportGenerating = false
+        }
     }
 
     private func choiceRow(_ label: String, _ options: [(id: String, label: String)],
