@@ -21,6 +21,11 @@ struct RemoteConfig {
     static let snapshot = Snapshot(dvRemuxWindowMiB: 64)
 }
 
+/// Standalone-compilation stub for the buffer's failure-reason funnel (same pattern as the RemoteConfig stub).
+enum DiagnosticsLog {
+    static func log(_ tag: String, _ message: String) { print("[\(tag)] \(message)") }
+}
+
 @MainActor private var failures = 0
 
 @MainActor private func check(_ name: String, _ condition: @autoclosure () -> Bool) {
@@ -2351,13 +2356,16 @@ enum PlayerLiveContractTests {
                       "let audioPublished = _alternateAudioState == .ready && _alternateAudioPlan != nil") == true
                   && immutableSnapshot?.contains("audioPlan: audioPublished ? _alternateAudioPlan : nil") == true
                   && immutableSnapshot?.contains("subtitleFailureReason: _subtitleSettlement.invalidationReason") == true)
-        check("wiring: master waits for six segments and three frozen target durations",
+        // The startup floor is the FLAT 4-second/two-segment budget; the 3x-target multiplication was the
+        // build 189 regression (36s of media before the master, while the start watchdog fires at 10s).
+        check("wiring: master waits for the flat two-segment startup floor",
               masterPublication?.contains("DVPlaybackPolicy.pinnedStartupCohort(") == true
                   && masterPublication?.contains(
                     "minimumSegmentCount: startupReadiness.minimumSegmentCount") == true
                   && masterPublication?.contains(
                     "startupReadiness.minimumRenderedDurationMilliseconds") == true
-                  && policy?.contains("frozenTarget.seconds.multipliedReportingOverflow(by: 3)") == true
+                  && policy?.contains("static let startupFloorMilliseconds = 4_000") == true
+                  && policy?.contains("frozenTarget.seconds.multipliedReportingOverflow(by: 3)") == false
                   && server?.contains("minimumStartupDurationMilliseconds = 15_000") == false)
         check("wiring: one frozen target renders identically across video, audio and subtitle routes",
               server?.components(separatedBy:

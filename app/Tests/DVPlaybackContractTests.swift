@@ -22,6 +22,11 @@ struct RemoteConfig {
     static let snapshot = Snapshot(dvRemuxWindowMiB: 64)
 }
 
+/// Standalone-compilation stub for the buffer's failure-reason funnel (same pattern as the RemoteConfig stub).
+enum DiagnosticsLog {
+    static func log(_ tag: String, _ message: String) { print("[\(tag)] \(message)") }
+}
+
 @MainActor var failures = 0
 @MainActor func check(_ name: String, _ condition: Bool) {
     if condition { print("PASS  \(name)") } else { failures += 1; print("FAIL  \(name)") }
@@ -325,14 +330,18 @@ check("IDR classifier: HEVC IDR_W_RADL is an exact segment start",
 check("IDR classifier: HEVC IDR_N_LP is an exact segment start",
       VortXVideoIDRClassifier.isIDR(
           bytes: hevcIDRNLP, codec: .hevc, format: .lengthPrefixed(4)))
-check("IDR classifier: HEVC CRA is random access but not IDR",
-      !VortXVideoIDRClassifier.isIDR(
+// CRA and BLA are sync IRAPs and LEGAL segment starts (a decoder tuning in discards their RASL leading
+// pictures). The IDR-only rule shipped in build 189 killed every open-GOP HEVC source: no cut for a whole
+// frozen target on fresh plays, no first segment on resume seeks landing on a CRA - both silent session
+// deaths into the HDR10 demote. Build 187 cut on FFmpeg's KEY flag, which covers exactly these types.
+check("IDR classifier: HEVC CRA is a sync IRAP segment start",
+      VortXVideoIDRClassifier.isIDR(
           bytes: hevcCRA, codec: .hevc, format: .lengthPrefixed(4)))
-check("IDR classifier: HEVC BLA is not silently promoted to IDR",
-      !VortXVideoIDRClassifier.isIDR(
+check("IDR classifier: HEVC BLA is a sync IRAP segment start",
+      VortXVideoIDRClassifier.isIDR(
           bytes: hevcBLA, codec: .hevc, format: .lengthPrefixed(4)))
-check("IDR classifier: a mixed HEVC CRA plus IDR access unit is not an IDR-only segment start",
-      !VortXVideoIDRClassifier.isIDR(
+check("IDR classifier: a mixed HEVC CRA plus IDR access unit is a sync segment start",
+      VortXVideoIDRClassifier.isIDR(
           bytes: hevcCRA + hevcIDRWRADL, codec: .hevc, format: .lengthPrefixed(4)))
 check("IDR classifier: a mixed HEVC non-IDR slice plus IDR access unit fails closed",
       !VortXVideoIDRClassifier.isIDR(
@@ -354,9 +363,14 @@ check("IDR classifier: HEVC temporal_id_plus1 zero is malformed",
 check("IDR classifier: Annex-B HEVC IDR is accepted without a payload copy",
       VortXVideoIDRClassifier.isIDR(
           bytes: [0, 0, 1, 19 << 1, 0x01], codec: .hevc, format: .annexB))
-check("IDR classifier: Annex-B HEVC CRA remains non-IDR",
-      !VortXVideoIDRClassifier.isIDR(
+check("IDR classifier: Annex-B HEVC CRA is a sync IRAP segment start",
+      VortXVideoIDRClassifier.isIDR(
           bytes: [0, 0, 0, 1, 21 << 1, 0x01], codec: .hevc, format: .annexB))
+check("IDR classifier: HEVC RASL leading pictures never open a segment",
+      !VortXVideoIDRClassifier.isIDR(
+          bytes: hevcNAL(8), codec: .hevc, format: .lengthPrefixed(4))
+          && !VortXVideoIDRClassifier.isIDR(
+              bytes: hevcNAL(9), codec: .hevc, format: .lengthPrefixed(4)))
 check("IDR classifier: plain-remux H.264 accepts only NAL type 5",
       VortXVideoIDRClassifier.isIDR(
           bytes: [0, 0, 0, 1, 0x65], codec: .h264, format: .lengthPrefixed(4))
@@ -463,12 +477,19 @@ check("target authority: exact twelve is valid while malformed or over-twelve co
               adjacentIntervalsSeconds: [12.000_001])) == nil)
 let targetSevenReadiness = VortXHLSStartupReadiness(
     frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex))
-check("startup readiness: six segments and three frozen targets are one immutable contract",
+// The startup floor is a FLAT two-segment / four-second budget, decoupled from the frozen target: the
+// 6-segment / 3x-target floor (36s at the conservative target) held every UHD master past the chrome's 10s
+// start watchdog and inflated the live window into the session spool's 512 MiB ceiling - the build 189
+// field regression, twice over.
+check("startup readiness: two segments and the flat four-second floor are one immutable contract",
       targetSevenReadiness == .init(
           frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex),
-          minimumSegmentCount: 6))
-check("startup readiness: target seven requires exactly 21000 rendered milliseconds",
-      targetSevenReadiness?.minimumRenderedDurationMilliseconds == 21_000)
+          minimumSegmentCount: 2))
+check("startup readiness: the startup floor is 4000 rendered milliseconds regardless of target",
+      targetSevenReadiness?.minimumRenderedDurationMilliseconds == 4_000
+          && VortXHLSStartupReadiness(
+              frozenTarget: VortXHLSTargetPolicy.conservativeTarget)?
+              .minimumRenderedDurationMilliseconds == 4_000)
 check("startup readiness: invalid target bounds and segment counts are rejected without a force unwrap",
       VortXHLSStartupReadiness(
           frozenTarget: .init(seconds: 4, authority: .validatedCompleteIndex)) == nil
