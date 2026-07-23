@@ -1,7 +1,9 @@
 import Foundation
 
 /// Decides which engine plays a given stream: the AVFoundation engine (`AVPlayerEngineController`) for Dolby
-/// Vision and HTTP/HLS, or the libmpv engine (`MPVMetalViewController`) for torrents and everything else.
+/// Vision, HTTP/HLS, and (iOS/tvOS, #147) any non-DV container AVPlayer can actually serve (natively or via
+/// the plain remux lane, restoring Picture in Picture for ordinary content), or the libmpv engine
+/// (`MPVMetalViewController`) for torrents and every container AVPlayer cannot serve.
 ///
 /// IMPORTANT: evaluate on the RAW (un-proxied) stream URL. `StremioServer.proxiedURL` rewrites the host to
 /// 127.0.0.1, which would make every proxied stream look like a loopback torrent and never reach AVPlayer.
@@ -81,11 +83,20 @@ enum PlayerEngineRouter {
     ///   - dvDisplayCapable: whether THIS display can present DV (`DVDisplaySupport.isCapable`). Gates the
     ///     DV-remux baked default so the owner mandate holds on every DV-capable Apple platform, macOS
     ///     included, and DV MKVs on a genuinely non-DV display still stay on libmpv (tone-mapped).
+    ///   - plainRemuxDelivery: whether the #147 remux HLS delivery lane is live
+    ///     (`VortXRemuxHLSServer.deliveryEnabled`; the chromes pass the live value). Gates the Matroska half
+    ///     of rule (4b) so a killed delivery lane never routes an MKV into a doomed raw-AVPlayer mount.
+    ///     Defaults true for callers/tests that don't track it; a wrong true is still bounded by the engine's
+    ///     own loadFile gate plus the chrome's .failed/watchdog demote to libmpv.
+    ///   - platformAllowsNonDVDefault: rule (4b)'s platform gate; see `nonDVAVPlayerDefaultPlatform`. Only
+    ///     the standalone router harness passes a non-default value (to execute the rule on a macOS host).
     static func engine(for url: URL,
                        isTorrent: Bool,
                        isDolbyVision: Bool,
                        override: Override = currentOverride,
-                       dvDisplayCapable: Bool = false) -> Engine {
+                       dvDisplayCapable: Bool = false,
+                       plainRemuxDelivery: Bool = true,
+                       platformAllowsNonDVDefault: Bool = nonDVAVPlayerDefaultPlatform) -> Engine {
         // (1) Torrents always play on libmpv: AVPlayer cannot replay the loopback server URL or run the
         // torrent warm-up. Belt and suspenders: trust the flag AND the loopback host.
         let host = (url.host ?? "").lowercased()
@@ -135,10 +146,51 @@ enum PlayerEngineRouter {
         if isHLS(url) { return .avfoundation }
         #endif
 
-        // (5) Direct / debrid non-HLS containers stay on libmpv (it demuxes arbitrary MP4/MKV/HEVC and
-        // applies per-stream request headers).
+        // (4b, #147 default flip) Non-DV content AVPlayer can ACTUALLY serve routes to AVPlayer BY DEFAULT.
+        // AVPlayer is the only engine with Picture in Picture (and native AirPlay), and the majority of
+        // debrid/scene content is a plain non-DV MKV/MP4 that used to fall through to libmpv (rule 5),
+        // silently losing PiP unless the viewer found the manual engine pick (the reporter's beta.6 log:
+        // "route file=...mkv isDV=false -> engine=mpv"). Two gates keep this probe-clean, so a source this
+        // rule cannot serve never wastes an attempt:
+        //   - an AVPlayer-NATIVE container (mp4/m4v/mov path, or an extensionless debrid link whose
+        //     filename/query carries an mp4-family token with no Matroska veto) mounts raw AVPlayer directly:
+        //     no remux, no new machinery;
+        //   - EXPLICIT Matroska evidence takes the #147 plain remux lane, and only when that lane can really
+        //     mount (plainRemuxEnabled + the caller's live HLS-delivery flag); a killed lane falls through to
+        //     libmpv, never a doomed attempt. The remux classify then probes the REAL bytes (stream-copyable
+        //     H.264/HEVC video) and fails fast pre-video when the container lied.
+        // Everything else (webm/avi/ts/flv..., extensionless with no container hint, live streams) stays on
+        // libmpv exactly as before: raw AVPlayer cannot demux those and the plain remux was never validated
+        // against them. FAIL-SOFT (never weakened): any mount this rule sends to AVPlayer that fails or never
+        // frames demotes to libmpv IN PLACE on the same URL via the machinery the DV lane already ships (the
+        // chrome's .failed handler, the progress-aware start watchdog, TerminalLoadFailurePolicy ordering for
+        // terminal presentation), so nothing that played before stops playing. `avPlayerDefaultEnabled` is
+        // the rollback switch for THIS rule alone: off restores the pre-flip routing (rule 5) without
+        // touching the manual engine pick, the reactive retry, or any DV rule. The explicit user override
+        // already won at rule (2), so a viewer's engine choice always beats this default. macOS is excluded
+        // (`nonDVAVPlayerDefaultPlatform`, the parameterized twin of rule 4's guard): it keeps its existing
+        // routing per the platform contract.
+        if platformAllowsNonDVDefault, !isDolbyVision, avPlayerDefaultEnabled() {
+            if isAVPlayerContainer(url) { return .avfoundation }
+            if plainRemuxDelivery, plainRemuxEnabled(), isPlainRemuxCandidate(url) { return .avfoundation }
+        }
+
+        // (5) Whatever remains stays on libmpv: every container AVPlayer cannot serve (webm/avi/ts/...),
+        // unknown extensionless links, and on macOS every non-DV non-torrent stream (rule 4 is compiled out
+        // and rule 4b platform-gated off there). libmpv demuxes arbitrary containers and applies per-stream
+        // request headers.
         return .mpv
     }
+
+    /// Platform gate for rule (4b): the non-DV AVPlayer default flip ships on iOS/tvOS only; macOS keeps its
+    /// existing routing (the same carve-out rule 4 makes with its `#if`). A stored per-platform constant
+    /// consumed as a parameter default, rather than an `#if` around the rule, so the standalone router
+    /// harness (which compiles as a macOS binary) can execute the REAL rule by passing true explicitly.
+    #if os(macOS)
+    static let nonDVAVPlayerDefaultPlatform = false
+    #else
+    static let nonDVAVPlayerDefaultPlatform = true
+    #endif
 
     /// True for an adaptive HLS playlist URL. Mirrors the rule `HLSPlayerView.handles` uses today.
     static func isHLS(_ url: URL) -> Bool {
@@ -252,10 +304,10 @@ enum PlayerEngineRouter {
     // MARK: - Plain (non-DV) remux lane (#147, the remaining item)
 
     /// Flag for the PLAIN (non-Dolby-Vision) MKV remux lane (#147). AVFoundation has no Matroska demuxer, so a
-    /// non-DV MKV that reaches AVPlayer (the "Prefer AVPlayer" override, the in-player engine pick, or the
-    /// reactive container-unsupported retry - NEVER Auto, which keeps non-DV MKVs on libmpv exactly as before)
-    /// used to mount raw, fail "Cannot Open", and demote to libmpv, losing Picture in Picture - the very thing
-    /// the viewer chose AVPlayer for. With this lane on, that MKV is served through the SAME local
+    /// non-DV MKV that reaches AVPlayer (rule (4b)'s Auto default, the "Prefer AVPlayer" override, the
+    /// in-player engine pick, or the reactive container-unsupported retry) used to mount raw, fail
+    /// "Cannot Open", and demote to libmpv, losing Picture in Picture - the very thing AVPlayer was chosen
+    /// for. With this lane on, that MKV is served through the SAME local
     /// remux -> fMP4/HLS machinery in `.plain` mode (a straight container re-wrap: no DV/RPU handling, no
     /// panel switch, unlabeled-range signaling) so AVPlayer demuxes it and PiP is retained.
     ///
@@ -277,6 +329,26 @@ enum PlayerEngineRouter {
         let onWhenAbsentFalse = snap.isFeatureOn("plainRemux", default: false)
         if onWhenAbsentTrue == onWhenAbsentFalse { return onWhenAbsentTrue }
         return true   // baked default ON (see the header: strictly replaces a guaranteed fail -> demote)
+    }
+
+    /// Rollback switch for rule (4b), the #147 DEFAULT flip that routes non-DV AVPlayer-servable content
+    /// (native mp4/m4v/mov, plus Matroska via the plain remux lane) to AVPlayer under Auto so Picture in
+    /// Picture works for ordinary content. Same resolution order as the other lane flags: an explicit
+    /// UserDefaults value always wins; else a PRESENT RemoteConfig `features.avPlayerDefault` value is the
+    /// fleet kill-switch; else the BAKED default is ON (the flip IS the #147 fix). OFF restores the previous
+    /// Auto routing (non-DV non-HLS -> libmpv, rule 5) while leaving the manual engine pick, the reactive
+    /// container-unsupported retry, and every DV rule untouched.
+    static let avPlayerDefaultKey = "stremiox.avPlayerDefault"
+    static func avPlayerDefaultEnabled() -> Bool {
+        if UserDefaults.standard.object(forKey: avPlayerDefaultKey) != nil {
+            return UserDefaults.standard.bool(forKey: avPlayerDefaultKey)   // explicit local value always wins
+        }
+        // Same set-vs-absent probe as dvRemuxEnabled/plainRemuxEnabled (see dvRemuxEnabled for the mechanism).
+        let snap = RemoteConfig.snapshot
+        let onWhenAbsentTrue = snap.isFeatureOn("avPlayerDefault", default: true)
+        let onWhenAbsentFalse = snap.isFeatureOn("avPlayerDefault", default: false)
+        if onWhenAbsentTrue == onWhenAbsentFalse { return onWhenAbsentTrue }
+        return true   // baked default ON: PiP for the common case, bounded by the probe gates + fail-soft
     }
 
     /// True for a URL the plain lane will PROACTIVELY remux: EXPLICIT Matroska evidence only (a real `.mkv`

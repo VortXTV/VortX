@@ -671,8 +671,11 @@ struct PlayerScreen: View {
         let isDV = StreamRanking.isDolbyVision(recordQualityText ?? "")
         // Pass this display's DV capability so the DV mandate holds on macOS too (DV -> the remux->AVPlayer
         // lane on any DV-capable display). Evaluated once at play start (this feeds engineLatch in onAppear).
+        // The live delivery flag gates rule (4b)'s Matroska half: with the HLS delivery lane rolled back a
+        // plain MKV stays on libmpv instead of attempting an AVPlayer mount the engine could not remux.
         let chosen = PlayerEngineRouter.engine(for: url, isTorrent: loopback, isDolbyVision: isDV,
-                                               dvDisplayCapable: DVDisplaySupport.isCapable)
+                                               dvDisplayCapable: DVDisplaySupport.isCapable,
+                                               plainRemuxDelivery: VortXRemuxHLSServer.deliveryEnabled)
         // [dv] routing probe: the first line of the DV trail (route -> mount -> classify -> fallback -> demote).
         // Gated (no-op unless probing is on), so it is free in shipping builds. If engine is AVPlayer on a DV
         // source it is the true-DV lane (VideoToolbox); if it is mpv here the DV source tone-maps to HDR10.
