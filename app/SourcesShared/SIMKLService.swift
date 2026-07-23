@@ -40,6 +40,52 @@ actor SIMKLService {
         try await write(path: "/sync/history/remove", items: items)
     }
 
+    // MARK: - Ratings (`POST /sync/ratings`, `/sync/ratings/remove`, and the `/sync/ratings/{type}` read-back)
+
+    /// Add (or change) the user's title ratings (`POST /sync/ratings`). Anime ride the `shows` array. Rate-gated
+    /// like every other SIMKL POST write.
+    @discardableResult
+    func addRatings(_ items: SIMKLRatingItems) async throws -> Int {
+        try await writeEncodable(path: "/sync/ratings", body: items)
+    }
+
+    /// Un-rate titles (`POST /sync/ratings/remove`): the ids alone identify what to clear, no `rating` field.
+    @discardableResult
+    func removeRatings(_ items: SIMKLRatingItems) async throws -> Int {
+        try await writeEncodable(path: "/sync/ratings/remove", body: items)
+    }
+
+    /// The user's own ratings across movies, shows AND anime (`POST /sync/ratings/{type}`).
+    ///
+    /// Read PER TYPE, not via a bare `POST /sync/ratings`: that path with no body is the ADD endpoint (it would
+    /// return an `{added,…}` envelope, not the ratings list), so the read MUST carry a `{type}` segment. Each
+    /// leg is a read (no state change), so it is NOT rate-gated and carries no body; a leg that throws
+    /// contributes nothing rather than failing the whole call (ratings convergence is additive - absence never
+    /// deletes - so a missing anime leg only defers that type a cycle, unlike the watched REPLACE). Sequential
+    /// for the same reason `planToWatch` is: three authenticated POSTs fired together is exactly the burst shape
+    /// that gets rate-limited.
+    func ratings() async throws -> SIMKLRatingsResponse {
+        _ = try await auth.validToken()
+        var movies: [SIMKLRatingEntry] = []
+        var shows: [SIMKLRatingEntry] = []
+        var anime: [SIMKLRatingEntry] = []
+        for type in SIMKLListType.allCases {
+            guard let leg = try? await ratingsRead(type: type) else { continue }
+            movies += leg.movies ?? []
+            shows += leg.shows ?? []
+            anime += leg.anime ?? []
+        }
+        return SIMKLRatingsResponse(movies: movies, shows: shows, anime: anime)
+    }
+
+    /// One ratings-read leg: `POST /sync/ratings/{type}` with no body, decoded to the ratings envelope.
+    private func ratingsRead(type: SIMKLListType) async throws -> SIMKLRatingsResponse {
+        let data = try await readPost(path: "/sync/ratings/\(type.rawValue)")
+        // SIMKL answers an EMPTY BODY for a type the user has rated nothing in; that is a success with zero rows.
+        guard !data.isEmpty else { return SIMKLRatingsResponse(movies: nil, shows: nil, anime: nil) }
+        return try decode(SIMKLRatingsResponse.self, from: data)
+    }
+
     // MARK: - Watchlist (plan-to-watch)
 
     /// Add items to the plan-to-watch list (`POST /sync/add-to-list`). Each item carries `to:"plantowatch"`.
@@ -140,6 +186,13 @@ actor SIMKLService {
     }
 
     private func write(path: String, items: SIMKLSyncItems) async throws -> Int {
+        try await writeEncodable(path: path, body: items)
+    }
+
+    /// A rate-gated authenticated POST carrying any Encodable body (history / watchlist / ratings all share
+    /// this). Generic so the ratings write paths reuse the exact same S-3 gate + S-4/S-5 headers as the history
+    /// and watchlist writes rather than forking a second POST path that could drift.
+    private func writeEncodable<T: Encodable>(path: String, body: T) async throws -> Int {
         let token = try await auth.validToken()
         try await rateGate()
         guard var components = URLComponents(string: SIMKLAuth.apiBase + path) else { throw SIMKLError.badURL }
@@ -154,10 +207,31 @@ actor SIMKLService {
         request.setValue(SIMKLAuth.clientID, forHTTPHeaderField: "simkl-api-key")
         request.setValue(SIMKLAuth.userAgent, forHTTPHeaderField: "User-Agent")   // S-5
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try JSONEncoder().encode(items)
+        request.httpBody = try JSONEncoder().encode(body)
         let (_, status) = try await perform(request)
         try expectSuccess(status)
         return status
+    }
+
+    /// An authenticated POST with NO body, used for the ratings read-back (`POST /sync/ratings/{type}`), which
+    /// SIMKL models as a POST even though it retrieves. NOT rate-gated: it is a read (the S-3 gate exists for the
+    /// 1-POST/sec WRITE limit, and gating reads would serialize convergence behind a user's "mark watched").
+    private func readPost(path: String) async throws -> Data {
+        let token = try await auth.validToken()
+        guard var components = URLComponents(string: SIMKLAuth.apiBase + path) else { throw SIMKLError.badURL }
+        components.queryItems = SIMKLAuth.requiredQueryItems
+        guard let url = components.url else { throw SIMKLError.badURL }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 20
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(SIMKLAuth.clientID, forHTTPHeaderField: "simkl-api-key")
+        request.setValue(SIMKLAuth.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, status) = try await perform(request)
+        try expectSuccess(status)
+        return data
     }
 
     /// S-3 serial 1-POST/sec gate. RESERVE-then-sleep: reading `nextPostSlot`, computing this call's slot,
