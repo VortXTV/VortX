@@ -805,16 +805,21 @@ check("flicker: the first request is accepted", ledger.begin(dv60, manager: mana
 check("flicker: an identical pending request is redundant", !ledger.begin(dv60, manager: manager))
 ledger.complete(dv60, manager: manager, applied: true)
 check("flicker: an identical applied request is redundant", !ledger.begin(dv60, manager: manager))
-// The property that keeps it SAFE: nothing that differs may ever be skipped, or a needed switch is lost.
+// The property that keeps it SAFE: anything that can change the negotiated mode may never be skipped.
 check("flicker: a different rate is NOT redundant",
       ledger.begin(Req(range: "dolbyVision", rate: 23.976, width: 3840, height: 2160),
                    manager: manager))
 check("flicker: a different range is NOT redundant",
       ledger.begin(Req(range: "hdr10", rate: 60, width: 3840, height: 2160), manager: manager))
-check("flicker: a different width is NOT redundant",
-      ledger.begin(Req(range: "dolbyVision", rate: 60, width: 1920, height: 2160), manager: manager))
-check("flicker: a different height is NOT redundant",
-      ledger.begin(Req(range: "dolbyVision", rate: 60, width: 3840, height: 1080), manager: manager))
+// Dimensions cannot change the negotiated mode (tvOS matches dynamic range + refresh rate; the output
+// resolution is the user's Settings choice, never content dims), and re-assigning criteria still
+// renegotiates the link. So a dims-only repeat of an applied mode is REDUNDANT: this is the readyToPlay
+// re-assert (presentationSize dims) after serveMaster's request (classifier dims), which blanked the
+// screen for a mode the panel was already in.
+check("flicker: a dims-only width change of an applied mode IS redundant",
+      !ledger.begin(Req(range: "dolbyVision", rate: 60, width: 1920, height: 2160), manager: manager))
+check("flicker: a dims-only height change of an applied mode IS redundant",
+      !ledger.begin(Req(range: "dolbyVision", rate: 60, width: 3840, height: 1080), manager: manager))
 ledger.reset()
 check("flicker: reset makes an identical request eligible", ledger.begin(dv60, manager: manager))
 

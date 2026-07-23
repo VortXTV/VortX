@@ -277,6 +277,17 @@ enum DVPlaybackPolicy {
             self.width = width
             self.height = height
         }
+
+        /// True when `other` can only negotiate the SAME HDMI mode as this request. tvOS display-mode
+        /// matching selects a mode by dynamic range and refresh rate; the output resolution is the
+        /// user's Settings choice and never follows content dimensions, so a width/height difference
+        /// cannot change the negotiated mode. Re-assigning criteria that differ only in dimensions
+        /// still renegotiates the link (a visible blank): the remux lane asks once with classifier
+        /// dimensions (serveMaster) and once with the item's presentationSize (readyToPlay), and on a
+        /// binge run those two ping-pong every episode, so the ledger must treat them as one mode.
+        func selectsSameMode(as other: DisplayRequest) -> Bool {
+            range == other.range && rate == other.rate
+        }
     }
 
     /// Resolve one session's display rate without inventing a value. The remux classifier is authoritative; an
@@ -301,7 +312,13 @@ enum DVPlaybackPolicy {
                 pending = nil
                 applied = nil
             }
-            guard pending != request, applied != request else { return false }
+            // Redundancy is judged on the fields that can actually change the negotiated HDMI mode
+            // (range + rate, see selectsSameMode). A dims-only repeat of an applied or in-flight mode
+            // is a no-op skip instead of a fresh criteria assignment, because tvOS renegotiates (and
+            // blanks) on assignment even when the resolved mode is identical. A range or rate change
+            // is never skipped, so a needed switch cannot be lost.
+            if let pending, request.selectsSameMode(as: pending) { return false }
+            if let applied, request.selectsSameMode(as: applied) { return false }
             pending = request
             return true
         }
