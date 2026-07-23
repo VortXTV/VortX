@@ -338,12 +338,16 @@ private func makeEvents(config: ScenarioConfig, fixture: Fixture) -> [MuxEvent] 
             MuxEvent(kind: .video, seconds: $0.0, packet: $0.1, keyFlag: $0.2)
         })
     } else {
+        // Reuse one immutable padded packet across timestamps. This keeps the real >80 MiB open-GOP fixture's
+        // source resident set bounded while movenc still receives and emits every full packet independently.
+        let paddedNonIDR = config.paddingBytesPerNonIDR > 0
+            ? paddedHEVC(fixture.nonIDR, byteCount: config.paddingBytesPerNonIDR)
+            : fixture.nonIDR
         var seconds = 0.0
         while seconds <= config.boundarySeconds + 0.000_001 {
             let boundary = abs(seconds - config.boundarySeconds) < 0.000_001
             let base = seconds == 0 || boundary ? fixture.idr : fixture.nonIDR
-            let packet = !base.isIDR && config.paddingBytesPerNonIDR > 0
-                ? paddedHEVC(base, byteCount: config.paddingBytesPerNonIDR) : base
+            let packet = !base.isIDR ? paddedNonIDR : base
             events.append(MuxEvent(
                 kind: .video, seconds: seconds, packet: packet, keyFlag: base.isIDR))
             seconds += 0.25
@@ -1178,6 +1182,124 @@ private final class Checks {
     }
 }
 
+private struct RealOpenStageResult {
+    let completedWithoutProducerPark: Bool
+    let openBytesBeforeClose: Int
+    let proofEndedAtFirstFragment: Bool
+    let firstSampleWasDetachedIDR: Bool
+    let closeCommitted: Bool
+    let finalLength: Int?
+    let successorBytes: Int
+    let successorRemainedOpen: Bool
+    let accountingWasExact: Bool
+    let residentRAMWasReleased: Bool
+}
+
+private func appendInBoundedCalls(_ data: Data, to buffer: VortXRemuxBuffer,
+                                  chunkSize: Int = 512 * 1024) {
+    data.withUnsafeBytes { raw in
+        guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+        var offset = 0
+        while offset < raw.count {
+            let count = min(chunkSize, raw.count - offset)
+            buffer.append(base + offset, count: count)
+            if buffer.status().failure != nil { return }
+            offset += count
+        }
+    }
+}
+
+/// Feeds real shipped-movenc bytes through the production OpenStage. The first fragment exceeds the exact
+/// 80 MiB pre-ready RAM threshold while remaining an 11-second legal GOP. A partial real successor is appended
+/// too, so the parser claim, P+S promotion, and successor retention all execute against private production state.
+private func runRealOpenStageScenario(_ result: ScenarioResult) throws -> RealOpenStageResult {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("vortx-real-open-stage-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let buffer = VortXRemuxBuffer()
+    guard let spool = VortXHLSSessionSpool(
+        parentDirectory: root,
+        capacityBytes: VortXHLSSessionSpool.defaultCapacityBytes,
+        chunkSize: VortXHLSSessionSpool.defaultChunkBytes,
+        scavengeStaleSessions: false),
+          let stage = spool.attachOpenStage(to: buffer) else {
+        throw HarnessError.failed("real open-stage fixture could not create session backing")
+    }
+    appendInBoundedCalls(result.initData, to: buffer)
+    guard stage.arm(base: result.initData.count, auxiliaryBytes: result.initData.count) else {
+        throw HarnessError.failed("real open-stage fixture could not arm after init")
+    }
+    let successor = Data(result.nextMediaData.dropLast())
+    guard !successor.isEmpty else {
+        throw HarnessError.failed("real open-stage fixture did not produce a partial successor")
+    }
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .userInitiated).async {
+        appendInBoundedCalls(result.mediaData, to: buffer)
+        appendInBoundedCalls(successor, to: buffer)
+        done.signal()
+    }
+    let completed = done.wait(timeout: .now() + 30) == .success
+    if !completed { buffer.fail("real open-stage fixture producer parked") }
+    let beforeClose = stage.snapshot
+    let activationPeak = spool.accounting.peakTransientCopyBytes
+    let openBytes = result.mediaData.count + successor.count
+    guard completed, let claim = stage.claim() else {
+        throw HarnessError.failed("real open-stage fixture did not yield an exact claim")
+    }
+    var proofEnd: Int?
+    var detachedIDR = false
+    let parsed = claim.withBytes { bytes in
+        guard let proof = VortXFMP4FragmentParser.proveFirstMediaFragment(
+            bytes,
+            trackID: result.videoTrackID,
+            requireFirstSampleSync: true) else { return }
+        let detached = Data(proof.firstSampleBytes)
+        proofEnd = proof.mediaEnd
+        detachedIDR = packetIsIDR(detached)
+    }
+    guard parsed, let proofEnd else {
+        claim.release()
+        throw HarnessError.failed("real open-stage mapped parser proof failed")
+    }
+    let key = VortXHLSSessionSpool.ResourceKey.video(segmentID: 700)
+    let absoluteEnd = result.initData.count + proofEnd
+    let committed = stage.closePrefix(
+        claim,
+        endOffset: absoluteEnd,
+        key: key,
+        durationMilliseconds: 11_000,
+        additionalResources: [])
+    let lease = spool.openResource(key, now: 0)
+    let finalLength = lease?.length
+    let firstBytes = try? lease?.read(maxLength: min(64, result.mediaData.count))
+    lease?.close(now: 0)
+    let afterClose = stage.snapshot
+    let accounting = spool.accounting
+    return RealOpenStageResult(
+        completedWithoutProducerPark: completed,
+        openBytesBeforeClose: openBytes,
+        proofEndedAtFirstFragment: proofEnd == result.mediaData.count,
+        firstSampleWasDetachedIDR: detachedIDR,
+        closeCommitted: committed
+            && firstBytes == Data(result.mediaData.prefix(min(64, result.mediaData.count))),
+        finalLength: finalLength,
+        successorBytes: successor.count,
+        successorRemainedOpen: afterClose.storage == .active
+            && afterClose.baseOffset == absoluteEnd
+            && afterClose.logicalEndOffset == result.initData.count + openBytes,
+        accountingWasExact: accounting.finalBytes == result.mediaData.count
+            && accounting.openBytes == successor.count
+            && accounting.reservedBytes == 0
+            && accounting.transientCopyBytes == 0
+            && activationPeak > successor.count
+            && accounting.peakTransientCopyBytes == max(activationPeak, successor.count)
+            && accounting.physicalBytes == accounting.admittedBytes,
+        residentRAMWasReleased: beforeClose.storage == .active
+            && buffer.residentByteRange.isEmpty)
+}
+
 @main
 private enum HLSFragmentPublicationIntegrationTests {
     static func main() {
@@ -1234,6 +1356,14 @@ private enum HLSFragmentPublicationIntegrationTests {
                     boundarySeconds: 3,
                     disagreement: true,
                     paddingBytesPerNonIDR: 0),
+                ScenarioConfig(
+                    name: "real >80MiB open GOP",
+                    audioTrackFirst: true,
+                    audioPacketFirst: true,
+                    queueAudioPastBoundaryBeforeKey: false,
+                    boundarySeconds: 11,
+                    disagreement: false,
+                    paddingBytesPerNonIDR: 2 * 1024 * 1024),
             ]
             var results: [ScenarioResult] = []
             for scenario in scenarios {
@@ -1417,6 +1547,28 @@ private enum HLSFragmentPublicationIntegrationTests {
             if let pressured = results.first(where: { $0.name == "high-bitrate byte pressure" }) {
                 checks.check("multi-MiB packet pressure: complete media range exceeds two MiB",
                              pressured.mediaData.count > 2 * 1024 * 1024)
+            }
+            if let openGOP = results.first(where: { $0.name == "real >80MiB open GOP" }) {
+                checks.check("real open stage fixture: shipped movenc emits a legal <=12s fragment above 80 MiB",
+                             openGOP.mediaData.count > 80 * 1024 * 1024)
+                let staged = try runRealOpenStageScenario(openGOP)
+                checks.check("real open stage: >80 MiB producer completes instead of parking at the RAM ceiling",
+                             staged.completedWithoutProducerPark
+                                 && staged.openBytesBeforeClose > 80 * 1024 * 1024
+                                 && staged.residentRAMWasReleased)
+                checks.check("real open stage: exact mapped claim proves only P before the partial successor",
+                             staged.proofEndedAtFirstFragment
+                                 && staged.firstSampleWasDetachedIDR)
+                checks.check("real open stage: P commits to the private registry and retains S as the next open stage",
+                             staged.closeCommitted
+                                 && staged.finalLength == openGOP.mediaData.count
+                                 && staged.successorBytes > 0
+                                 && staged.successorRemainedOpen)
+                checks.check("real open stage: activation and active close both balance their transient copies",
+                             staged.accountingWasExact)
+                print("RECEIPT  real open stage: P=\(openGOP.mediaData.count)B S=\(staged.successorBytes)B open-before=\(staged.openBytesBeforeClose)B target=11s")
+            } else {
+                checks.check("real open stage fixture: scenario result exists", false)
             }
             checks.check("mutant IDR-only acceptance turns red",
                          VortXHLSBoundaryPolicy.decision(

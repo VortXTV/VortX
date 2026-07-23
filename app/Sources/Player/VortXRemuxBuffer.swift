@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// One published fMP4 media segment. `id` is absolute for the session and never changes when older bytes leave
 /// the resident window. Keeping this outside the FFmpeg-owning stream lets the real storage/request contract run
@@ -68,6 +71,13 @@ struct VortXHLSWindow: Equatable, Sendable {
 /// about in isolation.
 final class VortXRemuxBuffer: @unchecked Sendable {
 
+    /// Monotonic receipt for bytes physically materialized into the resident `Data` store. Tests compare
+    /// receipts across active-stage appends so an empty logical range cannot hide retained `Data` backing.
+    struct ResidentBackingReceipt: Equatable, Sendable {
+        let materializationCount: Int
+        let materializedBytes: Int
+    }
+
     private let condition = NSCondition()
     /// The retained tail of the produced stream. `storage[storage.startIndex]` corresponds to absolute offset
     /// `storageBase`. The index base is NOT always 0: `evictBelow`'s `Data.removeFirst` advances an internal
@@ -79,6 +89,11 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     private var failureMessage: String?
     private var nextReadLeaseID = 0
     private var activeReadRanges: [Int: Range<Int>] = [:]
+    /// nil on the progressive rollback path. The HLS session spool owns this object; the buffer keeps only a
+    /// weak route to it so teardown cannot form buffer -> stage -> buffer ownership.
+    private weak var openStage: VortXHLSSessionSpool.OpenStage?
+    private var residentMaterializationCount = 0
+    private var residentMaterializedBytes = 0
 
     /// Total bytes produced so far across the whole session (monotonic; NOT storage.count once eviction starts).
     private(set) var producedCount: Int = 0
@@ -113,6 +128,8 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     // arbitrarily large in-progress fragment cannot stall; that requires separate spill/staging work. ---
     private static let producerLeadPreReady = 16 * 1024 * 1024   // F3: reduced lead before first-frame readiness
     private static let producerLeadFull      = 64 * 1024 * 1024   // F3: full lead once the engine is ready
+    private let producerLeadPreReadyBytes: Int
+    private let producerLeadFullBytes: Int
     /// Set once via `markEngineReady()` when AVPlayerEngine reports readyToPlay/first frame; guarded by
     /// `condition`. Selects the producer lead in `append` (reduced before, full after).
     private var engineReady = false
@@ -120,11 +137,35 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// Bytes currently held in `storage` (delivered floor plus producer lead). Caller holds the lock.
     private var residentCount: Int { storage.count }
 
+    /// Caller holds `condition`. Keeping all resident appends behind these helpers makes the backing receipt an
+    /// exact witness that an active-stage forward append did not materialize bytes in the resident `Data` store.
+    private func appendResidentLocked(_ bytes: UnsafePointer<UInt8>, count: Int) {
+        storage.append(bytes, count: count)
+        recordResidentMaterializationLocked(count)
+    }
+
+    /// Caller holds `condition`.
+    private func appendResidentLocked(_ data: Data) {
+        storage.append(data)
+        recordResidentMaterializationLocked(data.count)
+    }
+
+    /// Caller holds `condition`. Diagnostic counters saturate instead of influencing producer correctness.
+    private func recordResidentMaterializationLocked(_ count: Int) {
+        if residentMaterializationCount < Int.max { residentMaterializationCount += 1 }
+        if residentMaterializedBytes < Int.max {
+            let (next, overflow) = residentMaterializedBytes.addingReportingOverflow(count)
+            residentMaterializedBytes = overflow ? Int.max : next
+        }
+    }
+
     /// Production uses the fleet-clamped MiB floor. The explicit byte floor exists so the production buffer's
     /// eviction contract can be executed quickly by the standalone regression harness.
-    init(windowFloorBytes: Int? = nil) {
+    init(windowFloorBytes: Int? = nil, producerLeadBytes: Int? = nil) {
         self.windowFloorBytes = max(1, windowFloorBytes
             ?? max(Self.windowFloorMinMiB, RemoteConfig.snapshot.dvRemuxWindowMiB) * 1024 * 1024)
+        self.producerLeadPreReadyBytes = max(1, producerLeadBytes ?? Self.producerLeadPreReady)
+        self.producerLeadFullBytes = max(1, producerLeadBytes ?? Self.producerLeadFull)
     }
 
     // MARK: Producer side (remux thread)
@@ -138,8 +179,15 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     func append(_ bytes: UnsafePointer<UInt8>, count: Int) {
         guard count > 0 else { return }
         condition.lock()
+        let stage = openStage
+        if let stage, stage.isArmed {
+            condition.unlock()
+            append(bytes, count: count, through: stage)
+            return
+        }
         // F3 two-stage lead: reduced until the engine reports readiness, then full.
-        let ceiling = windowFloorBytes + (engineReady ? Self.producerLeadFull : Self.producerLeadPreReady)
+        let ceiling = windowFloorBytes
+            + (engineReady ? producerLeadFullBytes : producerLeadPreReadyBytes)
         while residentCount >= ceiling && !isFinished {
             condition.wait(until: Date().addingTimeInterval(0.25))
         }
@@ -147,8 +195,69 @@ final class VortXRemuxBuffer: @unchecked Sendable {
             condition.unlock()
             return
         }
-        storage.append(bytes, count: count)
+        appendResidentLocked(bytes, count: count)
         producedCount += count
+        condition.signal()
+        condition.unlock()
+    }
+
+    /// HLS-only append path. Stage admission and any filesystem write happen with the buffer condition unlocked;
+    /// the producer then advances the buffer head. A memory stage materializes the bytes in RAM. An active stage
+    /// is durable first and advances an already-empty resident frontier without copying those bytes into `Data`.
+    private func append(_ bytes: UnsafePointer<UInt8>, count: Int,
+                        through stage: VortXHLSSessionSpool.OpenStage) {
+        condition.lock()
+        guard !isFinished else { condition.unlock(); return }
+        let head = producedCount
+        let resident = residentCount
+        let ceiling = windowFloorBytes
+            + (engineReady ? producerLeadFullBytes : producerLeadPreReadyBytes)
+        condition.unlock()
+        let (projectedResident, residentOverflow) = resident.addingReportingOverflow(count)
+        let (nextHead, headOverflow) = head.addingReportingOverflow(count)
+        guard !residentOverflow, !headOverflow else {
+            fail("HLS mutable open-stage resident arithmetic overflow")
+            return
+        }
+
+        guard let forwardReceipt = stage.acceptForward(
+            bytes, count: count, at: head, projectedResidentBytes: projectedResident,
+            activationThresholdBytes: ceiling) else {
+            fail("HLS mutable open-stage append failed")
+            return
+        }
+        defer { stage.completeForward(forwardReceipt) }
+
+        condition.lock()
+        guard !isFinished, producedCount == head,
+              forwardReceipt.endOffset == nextHead else {
+            condition.unlock()
+            stage.requestAbort()
+            return
+        }
+        if forwardReceipt.isDurable {
+            // Activation exact-reclaims the prior resident range before it releases its transient reservation.
+            // Therefore every later active append must begin at an empty resident frontier. Advancing both
+            // absolute counters preserves storage == [storageBase, producedCount) without allocating a second
+            // copy that ordinary sub-floor eviction could retain in `Data` backing.
+            guard storageBase == head, storage.isEmpty else {
+                condition.unlock()
+                stage.requestAbort()
+                fail("HLS mutable open-stage durable frontier retained unexpected RAM backing")
+                return
+            }
+            storageBase = nextHead
+        } else {
+            guard let payload = forwardReceipt.residentData,
+                  payload.count == count else {
+                condition.unlock()
+                stage.requestAbort()
+                fail("HLS mutable open-stage RAM forward receipt was malformed")
+                return
+            }
+            appendResidentLocked(payload)
+        }
+        producedCount = nextHead
         condition.signal()
         condition.unlock()
     }
@@ -165,7 +274,7 @@ final class VortXRemuxBuffer: @unchecked Sendable {
               limit >= 0,
               residentCount <= limit,
               count <= limit - residentCount else { return false }
-        storage.append(bytes, count: count)
+        appendResidentLocked(bytes, count: count)
         producedCount += count
         condition.signal()
         return true
@@ -200,6 +309,34 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         return true
     }
 
+    /// Reclaims an exact durable prefix and compacts the remaining bytes before returning. Unlike the ordinary
+    /// sliding-window trim, this never advances partially beneath an active lease. Open-stage accounting keeps
+    /// the duplicate-copy charge until this method confirms that the old backing allocation is no longer owned.
+    fileprivate func reclaimDurablyBackedPrefix(before absoluteOffset: Int) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard absoluteOffset >= 0, absoluteOffset <= producedCount else { return false }
+        if absoluteOffset <= storageBase {
+            if storage.startIndex > 0 {
+                storage = storage.subdata(in: storage.startIndex..<storage.endIndex)
+            }
+            return true
+        }
+        if let leasedFloor = activeReadRanges.values.map(\.lowerBound).min(),
+           leasedFloor < absoluteOffset { return false }
+        let dropCount = absoluteOffset - storageBase
+        guard dropCount > 0, dropCount <= storage.count else { return false }
+        storage.removeFirst(dropCount)
+        storageBase = absoluteOffset
+        // Force a fresh suffix allocation even below the normal amortized compaction threshold. The caller is
+        // about to release a physical duplicate-copy reservation, so retaining the dropped prefix is not legal.
+        if storage.startIndex > 0 {
+            storage = storage.subdata(in: storage.startIndex..<storage.endIndex)
+        }
+        condition.signal()
+        return true
+    }
+
     /// F3: mark that the playback engine has reached first-frame readiness, so `append` switches from the
     /// reduced pre-ready producer lead to the full lead. Thread-safe; called from the AVPlayerEngine readyToPlay
     /// path via the remux server/loader. Signals so a producer parked on the lower ceiling wakes and may run on.
@@ -224,20 +361,130 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// and its children, all patched before the init is published) is still fully resident when it lands.
     func overwrite(at offset: Int, bytes: UnsafePointer<UInt8>, count: Int) -> Bool {
         guard count > 0 else { return true }
+        let patch = Data(bytes: bytes, count: count)
+        condition.lock()
+        let stage = openStage
+        if let stage, stage.isArmed {
+            condition.unlock()
+            return overwriteStaged(at: offset, data: patch, stage: stage)
+        }
+        let result = overwriteResidentLocked(at: offset, data: patch)
+        condition.unlock()
+        return result
+    }
+
+    /// After init publication, only the mutable open range is authoritative. Closed-prefix trailer patches are
+    /// best effort; a straddling patch is split so failure below the stage base cannot hide failure in the open
+    /// suffix. Active-stage bytes are patched durably first, then any overlapping RAM copy is brought in sync.
+    private func overwriteStaged(at offset: Int, data patch: Data,
+                                 stage: VortXHLSSessionSpool.OpenStage) -> Bool {
+        let range = stage.mutableRange
+        let (end, overflow) = offset.addingReportingOverflow(patch.count)
+        guard !overflow else { return false }
+        guard end <= range.upperBound else {
+            fail("HLS mutable open-stage backpatch extended beyond the produced head")
+            return false
+        }
+        let mutableStart = max(offset, range.lowerBound)
+        let closedEnd = min(end, range.lowerBound)
+
+        if offset < closedEnd {
+            bestEffortOverwriteResident(
+                at: offset,
+                data: patch.subdata(in: 0..<(closedEnd - offset)))
+        }
+        guard mutableStart < end else { return true }
+        let localStart = mutableStart - offset
+        let mutableData = patch.subdata(in: localStart..<(localStart + end - mutableStart))
+        switch stage.overwriteMutable(at: mutableStart, data: mutableData) {
+        case .memory:
+            guard overwriteResident(at: mutableStart, data: mutableData) else {
+                fail("HLS mutable open-stage RAM backpatch missed its resident range")
+                return false
+            }
+        case .active:
+            bestEffortOverwriteResident(at: mutableStart, data: mutableData)
+        case .failed:
+            fail("HLS mutable open-stage durable backpatch failed")
+            return false
+        }
+        return true
+    }
+
+    private func overwriteResident(at offset: Int, data: Data) -> Bool {
         condition.lock()
         defer { condition.unlock() }
+        return overwriteResidentLocked(at: offset, data: data)
+    }
+
+    /// Caller holds `condition`, binding the stage route decision and the resident mutation to one producer edge.
+    private func overwriteResidentLocked(at offset: Int, data: Data) -> Bool {
+        let (end, overflow) = offset.addingReportingOverflow(data.count)
         // Must lie fully within the resident, already-produced window. storage always spans exactly
         // [storageBase, producedCount) (eviction only drops BELOW storageBase, appends only grow the top), so
         // this bound alone guarantees the byte range is present.
-        guard offset >= storageBase, offset + count <= producedCount else { return false }
+        guard !overflow, offset >= storageBase, end <= producedCount else { return false }
         // `withUnsafeMutableBytes` exposes the LOGICAL content 0-based (it hides `storage.startIndex`), so the
         // byte at absolute `offset` maps to local index `offset - storageBase`, never a bare `startIndex` add.
         let local = offset - storageBase
         storage.withUnsafeMutableBytes { raw in
-            // local + count <= raw.count is guaranteed by the bound above (raw.count == producedCount - storageBase).
-            raw.baseAddress!.advanced(by: local).copyMemory(from: bytes, byteCount: count)
+            data.withUnsafeBytes { source in
+                // local + count <= raw.count is guaranteed by the bound above.
+                raw.baseAddress!.advanced(by: local).copyMemory(
+                    from: source.baseAddress!, byteCount: data.count)
+            }
         }
         return true
+    }
+
+    private func bestEffortOverwriteResident(at offset: Int, data: Data) {
+        guard !data.isEmpty else { return }
+        condition.lock()
+        let (dataEnd, overflow) = offset.addingReportingOverflow(data.count)
+        guard !overflow else { condition.unlock(); return }
+        let patchStart = max(offset, storageBase)
+        let patchEnd = min(dataEnd, producedCount)
+        if patchStart < patchEnd {
+            let sourceStart = patchStart - offset
+            let local = patchStart - storageBase
+            storage.withUnsafeMutableBytes { raw in
+                data.withUnsafeBytes { source in
+                    raw.baseAddress!.advanced(by: local).copyMemory(
+                        from: source.baseAddress!.advanced(by: sourceStart),
+                        byteCount: patchEnd - patchStart)
+                }
+            }
+        }
+        condition.unlock()
+    }
+
+    fileprivate func attachOpenStage(_ stage: VortXHLSSessionSpool.OpenStage) -> Bool {
+        condition.lock(); defer { condition.unlock() }
+        guard openStage == nil else { return openStage === stage }
+        openStage = stage
+        return true
+    }
+
+    fileprivate func stageActivationSnapshot() -> (produced: Int, resident: Int, threshold: Int, failed: Bool) {
+        condition.lock(); defer { condition.unlock() }
+        return (
+            producedCount,
+            residentCount,
+            windowFloorBytes + (engineReady ? producerLeadFullBytes : producerLeadPreReadyBytes),
+            isFinished)
+    }
+
+    /// Holds the producer boundary while an arming stage charges and adopts every byte appended since its first
+    /// snapshot. The closure performs accounting/state transitions only; filesystem work remains outside.
+    fileprivate func withStageActivationBarrier<T>(
+        _ operation: ((produced: Int, resident: Int, threshold: Int, failed: Bool)) -> T
+    ) -> T {
+        condition.lock(); defer { condition.unlock() }
+        return operation((
+            producedCount,
+            residentCount,
+            windowFloorBytes + (engineReady ? producerLeadFullBytes : producerLeadPreReadyBytes),
+            isFinished))
     }
 
     /// Mark the stream complete (the remux loop wrote its trailer). Readers waiting past the end return the
@@ -330,6 +577,15 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     var residentByteRange: Range<Int> {
         condition.lock(); defer { condition.unlock() }
         return storageBase..<producedCount
+    }
+
+    /// Receipt for physical materializations into the resident `Data` store. Unlike `residentByteRange`, this
+    /// remains changed after logical eviction, so tests can detect an append-and-trim path that retained backing.
+    var residentBackingReceipt: ResidentBackingReceipt {
+        condition.lock(); defer { condition.unlock() }
+        return ResidentBackingReceipt(
+            materializationCount: residentMaterializationCount,
+            materializedBytes: residentMaterializedBytes)
     }
 
     /// Freeze the published segment list to ranges wholly resident in this buffer. A segment is either present in
@@ -527,6 +783,16 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         case diskFull(afterBytes: Int)
         case rename(afterSuccessfulMoves: Int)
         case sizeMismatch
+        case openStageForwardWrite(afterBytes: Int, rollbackFails: Bool)
+        case openStageFstat
+        case openStageMMap
+        case openStageCancelBeforeRegistry
+        case openStageCancelAfterRegistry
+        case openStageCreatePermission
+        case openStageMovePermission
+        case openStageMovePermissionCleanupRemoveOnce
+        case openStageActivationCleanupRemoveOnce
+        case cleanupRemove(failures: Int)
     }
 
     struct Accounting: Equatable, Sendable {
@@ -534,13 +800,59 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         fileprivate(set) var temporaryBytes = 0
         fileprivate(set) var reservedBytes = 0
         fileprivate(set) var auxiliaryBytes = 0
+        fileprivate(set) var openBytes = 0
+        fileprivate(set) var transientCopyBytes = 0
+        fileprivate(set) var quarantinedBytes = 0
         fileprivate(set) var peakTemporaryBytes = 0
         fileprivate(set) var peakReservedBytes = 0
         fileprivate(set) var peakChunkBytes = 0
+        fileprivate(set) var peakTransientCopyBytes = 0
 
         /// Temporary bytes are a materialized subset of their reservation, so counting both would double-charge
-        /// one write. Admission is committed final + non-file auxiliary + the full outstanding reservation.
-        var admittedBytes: Int { finalBytes + auxiliaryBytes + reservedBytes }
+        /// one write. Admission is committed final + non-file auxiliary + open + reserved + quarantined bytes.
+        /// Public totals saturate only for diagnostics; every admission path below uses the checked variants and
+        /// therefore rejects arithmetic overflow instead of mistaking it for free capacity.
+        var admittedBytes: Int { checkedAdmittedBytes() ?? Int.max }
+        var physicalBytes: Int { checkedPhysicalBytes() ?? Int.max }
+
+        fileprivate func checkedPhysicalBytes(
+            replacingAuxiliaryWith replacement: Int? = nil
+        ) -> Int? {
+            guard let admitted = checkedAdmittedBytes(
+                replacingAuxiliaryWith: replacement) else { return nil }
+            return Self.checkedSum([admitted, transientCopyBytes])
+        }
+
+        private func checkedAdmittedBytes(
+            replacingAuxiliaryWith replacement: Int? = nil
+        ) -> Int? {
+            Self.checkedSum([
+                finalBytes,
+                replacement ?? auxiliaryBytes,
+                openBytes,
+                reservedBytes,
+                quarantinedBytes,
+            ])
+        }
+
+        private static func checkedSum(_ values: [Int]) -> Int? {
+            var total = 0
+            for value in values {
+                guard value >= 0 else { return nil }
+                let (next, overflow) = total.addingReportingOverflow(value)
+                guard !overflow else { return nil }
+                total = next
+            }
+            return total
+        }
+    }
+
+    fileprivate struct OpenStageArmReceipt: Sendable {
+        let id: UUID
+        let initialOpenBytes: Int
+        let priorAuxiliaryBytes: Int
+        let auxiliaryGenerationBefore: Int
+        let auxiliaryGenerationAfter: Int
     }
 
     struct PlaylistGeneration: Equatable, Sendable {
@@ -592,6 +904,794 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         deinit { close() }
     }
 
+    /// One mutable, session-owned backing for the currently open primary-video range. It is attached only to
+    /// the HLS buffer. The sole nested lock order is producer condition -> state lock during routing/adoption;
+    /// no path takes that pair in reverse. The state lock never spans spool, filesystem, parser, or callback work.
+    final class OpenStage: @unchecked Sendable {
+        enum Storage: Equatable, Sendable {
+            case dormant
+            case arming
+            case memory
+            case activating
+            case active
+            case promoting
+            case poisoned
+        }
+
+        struct Snapshot: Equatable, Sendable {
+            let storage: Storage
+            let baseOffset: Int
+            let logicalEndOffset: Int
+            let durableEndOffset: Int
+            let fileURL: URL?
+            let abortRequested: Bool
+            let activeClaimReads: Int
+        }
+
+        enum OverwriteResult { case memory, active, failed }
+
+        fileprivate struct ArmPreparation: Sendable {
+            let tokenID: UUID
+            var accountingReceipt: OpenStageArmReceipt
+            let baseOffset: Int
+            let initialEndOffset: Int
+
+            var auxiliaryGeneration: Int {
+                accountingReceipt.auxiliaryGenerationAfter
+            }
+        }
+
+        fileprivate struct ForwardReceipt: Sendable {
+            let id: UUID
+            let endOffset: Int
+            let isDurable: Bool
+            let residentData: Data?
+        }
+
+        final class OpenClaim: @unchecked Sendable {
+            let baseOffset: Int
+            let logicalEndOffset: Int
+            fileprivate let id: UUID
+            private weak var stage: OpenStage?
+            private let lock = NSLock()
+            private enum State { case available, inUse, consumed, released }
+            private var state: State = .available
+            private var releasePending = false
+
+            fileprivate init(stage: OpenStage, id: UUID, base: Int, end: Int) {
+                self.stage = stage
+                self.id = id
+                self.baseOffset = base
+                self.logicalEndOffset = end
+            }
+
+            /// The operation is nonescaping by default and completes before an active mmap is unmapped. Callers
+            /// that retain parsed bytes must copy them inside the closure.
+            func withBytes(_ operation: (Data) -> Void) -> Bool {
+                lock.lock()
+                guard case .available = state else { lock.unlock(); return false }
+                state = .inUse
+                lock.unlock()
+                let result = stage?.withClaimBytes(self, operation: operation) ?? false
+                finishUse()
+                return result
+            }
+
+            func release() {
+                lock.lock()
+                let releaseNow: Bool
+                switch state {
+                case .available:
+                    state = .released
+                    releaseNow = true
+                case .inUse:
+                    releasePending = true
+                    releaseNow = false
+                case .consumed, .released:
+                    releaseNow = false
+                }
+                lock.unlock()
+                if releaseNow { stage?.releaseClaim(id: id) }
+            }
+
+            fileprivate func consume() -> Bool {
+                lock.lock(); defer { lock.unlock() }
+                guard case .available = state else { return false }
+                state = .consumed
+                return true
+            }
+
+            private func finishUse() {
+                lock.lock()
+                guard case .inUse = state else { lock.unlock(); return }
+                let releaseNow = releasePending
+                state = releaseNow ? .released : .available
+                releasePending = false
+                lock.unlock()
+                if releaseNow { stage?.releaseClaim(id: id) }
+            }
+
+            deinit { release() }
+        }
+
+        private weak var owner: VortXHLSSessionSpool?
+        fileprivate weak var buffer: VortXRemuxBuffer?
+        private let lock = NSCondition()
+        private var storage: Storage = .dormant
+        private var baseOffset = 0
+        private var logicalEndOffset = 0
+        private var durableEndOffset = 0
+        private var fileURL: URL?
+        private var abortRequested = false
+        private var activeClaimID: UUID?
+        private var activeClaimReads = 0
+        private var closeTokenID: UUID?
+        private var armTokenID: UUID?
+        private var forwardCommitID: UUID?
+
+        fileprivate init(owner: VortXHLSSessionSpool, buffer: VortXRemuxBuffer) {
+            self.owner = owner
+            self.buffer = buffer
+        }
+
+        var snapshot: Snapshot {
+            lock.lock(); defer { lock.unlock() }
+            return Snapshot(
+                storage: storage,
+                baseOffset: baseOffset,
+                logicalEndOffset: logicalEndOffset,
+                durableEndOffset: durableEndOffset,
+                fileURL: fileURL,
+                abortRequested: abortRequested,
+                activeClaimReads: activeClaimReads)
+        }
+
+        var isArmed: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return (storage == .memory || storage == .activating
+                || storage == .active || storage == .promoting)
+                && !abortRequested
+        }
+
+        var mutableRange: Range<Int> {
+            lock.lock(); defer { lock.unlock() }
+            return baseOffset..<logicalEndOffset
+        }
+
+        func arm(base: Int, auxiliaryBytes: Int? = nil) -> Bool {
+            guard let preparation = prepareArm(
+                base: base,
+                auxiliaryBytes: auxiliaryBytes,
+                expectedAuxiliaryGeneration: nil) else { return false }
+            return finishArm(preparation, restoreAuxiliaryOnFailure: true)
+        }
+
+        /// Claims the one-shot arming transition before touching coordinator accounting. This phase performs
+        /// only lock-protected snapshots and checked accounting; the filesystem-capable activation is deferred
+        /// to `finishArm`, so an external auxiliary transaction can publish its matching generation first.
+        fileprivate func prepareArm(base: Int,
+                                    auxiliaryBytes: Int?,
+                                    expectedAuxiliaryGeneration: Int?) -> ArmPreparation? {
+            guard base >= 0, let owner, let buffer else { return nil }
+            let tokenID = UUID()
+            lock.lock()
+            guard storage == .dormant, armTokenID == nil, !abortRequested else {
+                lock.unlock()
+                return nil
+            }
+            storage = .arming
+            armTokenID = tokenID
+            lock.unlock()
+
+            let state = buffer.stageActivationSnapshot()
+            guard !state.failed, base <= state.produced else {
+                abandonArm(tokenID)
+                return nil
+            }
+            let initialOpen = state.produced - base
+            guard let accountingReceipt = owner.armOpenStageAtomically(
+                initialOpenBytes: initialOpen,
+                auxiliaryBytes: auxiliaryBytes,
+                expectedAuxiliaryGeneration: expectedAuxiliaryGeneration) else {
+                abandonArm(tokenID)
+                return nil
+            }
+            lock.lock()
+            let valid = storage == .arming && armTokenID == tokenID && !abortRequested
+            lock.unlock()
+            guard valid else {
+                owner.rollbackOpenStageArm(accountingReceipt, restoreAuxiliary: true)
+                abandonArm(tokenID)
+                return nil
+            }
+            return ArmPreparation(
+                tokenID: tokenID,
+                accountingReceipt: accountingReceipt,
+                baseOffset: base,
+                initialEndOffset: state.produced)
+        }
+
+        /// Reconciles every byte that reached the RAM buffer while `.arming` under the buffer's producer
+        /// barrier, then switches future appends to the stage before any filesystem activation begins.
+        fileprivate func finishArm(_ original: ArmPreparation,
+                                   restoreAuxiliaryOnFailure: Bool) -> Bool {
+            guard let owner, let buffer else { return false }
+            var preparation = original
+            let reconciled = buffer.withStageActivationBarrier { state -> Bool in
+                guard !state.failed,
+                      state.produced >= preparation.initialEndOffset,
+                      preparation.baseOffset <= state.produced else { return false }
+                let additionalOpen = state.produced - preparation.initialEndOffset
+                if additionalOpen > 0 {
+                    guard let extended = owner.extendOpenStageArm(
+                        preparation.accountingReceipt,
+                        additionalBytes: additionalOpen) else { return false }
+                    preparation.accountingReceipt = extended
+                }
+                lock.lock()
+                guard storage == .arming, armTokenID == preparation.tokenID,
+                      !abortRequested else {
+                    lock.unlock()
+                    return false
+                }
+                storage = .memory
+                baseOffset = preparation.baseOffset
+                logicalEndOffset = state.produced
+                durableEndOffset = preparation.baseOffset
+                lock.broadcast()
+                lock.unlock()
+                return true
+            }
+            guard reconciled else {
+                owner.rollbackOpenStageArm(
+                    preparation.accountingReceipt,
+                    restoreAuxiliary: restoreAuxiliaryOnFailure)
+                abandonArm(preparation.tokenID)
+                return false
+            }
+
+            let pressure = buffer.stageActivationSnapshot()
+            if pressure.resident >= pressure.threshold, !activateFromMemory() {
+                poisonAndFail("HLS mutable open-stage activation failed during adoption")
+                owner.rollbackOpenStageArm(
+                    preparation.accountingReceipt,
+                    restoreAuxiliary: restoreAuxiliaryOnFailure)
+                clearArmToken(preparation.tokenID)
+                return false
+            }
+            owner.completeOpenStageArm(preparation.accountingReceipt)
+            clearArmToken(preparation.tokenID)
+            return true
+        }
+
+        private func abandonArm(_ tokenID: UUID) {
+            lock.lock()
+            if armTokenID == tokenID {
+                storage = abortRequested ? .poisoned : .dormant
+                armTokenID = nil
+                lock.broadcast()
+            }
+            lock.unlock()
+        }
+
+        private func clearArmToken(_ tokenID: UUID) {
+            lock.lock()
+            if armTokenID == tokenID { armTokenID = nil }
+            lock.broadcast()
+            lock.unlock()
+        }
+
+        fileprivate func acceptForward(_ bytes: UnsafePointer<UInt8>, count: Int, at offset: Int,
+                                       projectedResidentBytes: Int,
+                                       activationThresholdBytes: Int) -> ForwardReceipt? {
+            guard count > 0, let owner else { return nil }
+            let reservationID = UUID()
+            guard owner.reserveOpenGrowth(id: reservationID, bytes: count) else { return nil }
+            lock.lock()
+            while storage == .activating && !abortRequested { lock.wait() }
+            let needsActivation = storage == .memory
+                && projectedResidentBytes >= activationThresholdBytes
+            let valid = storage != .dormant && storage != .poisoned
+                && !abortRequested && activeClaimID == nil && forwardCommitID == nil
+                && offset == logicalEndOffset
+            if valid { forwardCommitID = reservationID }
+            lock.unlock()
+            guard valid else {
+                owner.releaseOpenGrowth(id: reservationID)
+                return nil
+            }
+            if needsActivation, !activateFromMemory() {
+                poisonAndFail("HLS mutable open-stage backfill failed")
+                clearForwardCommit(reservationID)
+                owner.releaseOpenGrowth(id: reservationID)
+                return nil
+            }
+
+            lock.lock()
+            let currentStorage = storage
+            let url = fileURL
+            let oldDurableEnd = durableEndOffset
+            let stillValid = !abortRequested && activeClaimID == nil
+                && forwardCommitID == reservationID
+                && offset == logicalEndOffset
+            lock.unlock()
+            guard stillValid else {
+                clearForwardCommit(reservationID)
+                owner.releaseOpenGrowth(id: reservationID)
+                return nil
+            }
+
+            var residentData: Data?
+            if currentStorage == .active {
+                let transientID = UUID()
+                guard let url,
+                      owner.reserveTransientCopy(id: transientID, bytes: count) else {
+                    clearForwardCommit(reservationID)
+                    owner.releaseOpenGrowth(id: reservationID)
+                    return nil
+                }
+                // Growth admission owns the eventual durable bytes. The transient receipt owns the payload
+                // copy while it overlaps the file write. The helper's local `Data` lifetime ends before this
+                // scope releases that receipt or transfers growth admission into durable open ownership.
+                let wrote = writeForwardBytes(
+                    bytes, count: count, to: url, absoluteOffset: offset,
+                    oldDurableEnd: oldDurableEnd)
+                owner.releaseTransientCopy(id: transientID)
+                guard wrote else {
+                    clearForwardCommit(reservationID)
+                    owner.releaseOpenGrowth(id: reservationID)
+                    return nil
+                }
+            } else if currentStorage != .memory {
+                clearForwardCommit(reservationID)
+                owner.releaseOpenGrowth(id: reservationID)
+                return nil
+            } else {
+                // In-memory ownership is the admitted open byte itself, so construct it only after growth
+                // admission and return that exact value for resident materialization.
+                residentData = Data(bytes: bytes, count: count)
+            }
+
+            lock.lock()
+            let (nextEnd, endOverflow) = logicalEndOffset.addingReportingOverflow(count)
+            guard !abortRequested, storage == currentStorage,
+                  forwardCommitID == reservationID, logicalEndOffset == offset else {
+                lock.unlock()
+                clearForwardCommit(reservationID)
+                owner.releaseOpenGrowth(id: reservationID)
+                return nil
+            }
+            guard !endOverflow else {
+                lock.unlock()
+                poisonAndFail("HLS mutable open-stage offset overflow")
+                clearForwardCommit(reservationID)
+                owner.releaseOpenGrowth(id: reservationID)
+                return nil
+            }
+            logicalEndOffset = nextEnd
+            if storage == .active { durableEndOffset = logicalEndOffset }
+            lock.unlock()
+            guard owner.commitOpenGrowth(id: reservationID, bytes: count) else {
+                poisonAndFail("HLS mutable open-stage accounting commit failed")
+                clearForwardCommit(reservationID)
+                return nil
+            }
+            return ForwardReceipt(
+                id: reservationID,
+                endOffset: nextEnd,
+                isDurable: currentStorage == .active,
+                residentData: residentData)
+        }
+
+        fileprivate func completeForward(_ receipt: ForwardReceipt) {
+            clearForwardCommit(receipt.id)
+        }
+
+        private func clearForwardCommit(_ id: UUID) {
+            lock.lock()
+            if forwardCommitID == id {
+                forwardCommitID = nil
+                lock.broadcast()
+            }
+            lock.unlock()
+        }
+
+        fileprivate func requestAbort() {
+            lock.lock()
+            abortRequested = true
+            lock.broadcast()
+            lock.unlock()
+        }
+
+        fileprivate func overwriteMutable(at offset: Int, data: Data) -> OverwriteResult {
+            guard !data.isEmpty else { return .memory }
+            lock.lock()
+            let (end, overflow) = offset.addingReportingOverflow(data.count)
+            let currentStorage = storage
+            let url = fileURL
+            let valid = !abortRequested && activeClaimID == nil
+                && !overflow && offset >= baseOffset && end <= logicalEndOffset
+            lock.unlock()
+            guard valid else { return .failed }
+            if currentStorage == .memory { return .memory }
+            guard currentStorage == .active, let url, let owner,
+                  owner.beginStageOperation() else { return .failed }
+            defer { owner.endStageOperation() }
+            do {
+                owner.notifyFileOperation()
+                let handle = try FileHandle(forWritingTo: url)
+                defer { try? handle.close() }
+                try handle.seek(toOffset: UInt64(offset - snapshot.baseOffset))
+                try handle.write(contentsOf: data)
+                try handle.synchronize()
+                return .active
+            } catch {
+                poisonAndFail("HLS mutable open-stage backpatch write failed")
+                return .failed
+            }
+        }
+
+        func claim() -> OpenClaim? {
+            lock.lock(); defer { lock.unlock() }
+            guard !abortRequested, storage == .memory || storage == .active,
+                  activeClaimID == nil, forwardCommitID == nil,
+                  logicalEndOffset > baseOffset else { return nil }
+            let id = UUID()
+            activeClaimID = id
+            return OpenClaim(
+                stage: self, id: id, base: baseOffset, end: logicalEndOffset)
+        }
+
+        func closePrefix(_ claim: OpenClaim,
+                         endOffset: Int,
+                         key: ResourceKey,
+                         durationMilliseconds: Int,
+                         additionalResources: [SpillResource]) -> Bool {
+            // Acquire the weak owner before consuming the one-shot claim. If teardown already released the
+            // spool, the caller can still release this claim and clear activeClaimID instead of stranding it.
+            guard let owner, claim.consume() else { return false }
+            let result = owner.closeOpenStagePrefix(
+                stage: self,
+                claimID: claim.id,
+                claimedBase: claim.baseOffset,
+                claimedEnd: claim.logicalEndOffset,
+                endOffset: endOffset,
+                key: key,
+                durationMilliseconds: durationMilliseconds,
+                additionalResources: additionalResources)
+            if !result {
+                releaseClaim(id: claim.id)
+                buffer?.fail("HLS mutable open-stage close failed")
+            }
+            return result
+        }
+
+        fileprivate func releaseClaim(id: UUID) {
+            lock.lock()
+            if activeClaimID == id { activeClaimID = nil }
+            lock.unlock()
+        }
+
+        private func withClaimBytes(_ claim: OpenClaim,
+                                    operation: (Data) -> Void) -> Bool {
+            guard owner != nil, let buffer else { return false }
+            lock.lock()
+            let valid = activeClaimID == claim.id
+                && baseOffset == claim.baseOffset && logicalEndOffset == claim.logicalEndOffset
+                && !abortRequested && activeClaimReads == 0
+            let currentStorage = storage
+            let url = fileURL
+            let length = claim.logicalEndOffset - claim.baseOffset
+            if valid && length > 0 { activeClaimReads += 1 }
+            lock.unlock()
+            guard valid, length > 0 else { return false }
+            defer { finishClaimRead() }
+            if currentStorage == .memory {
+                let pressure = buffer.stageActivationSnapshot()
+                guard length < pressure.threshold,
+                      let lease = buffer.beginReadLease(offset: claim.baseOffset, length: length),
+                      let bytes = buffer.snapshotChunk(offset: claim.baseOffset, length: length) else {
+                    poisonAndFail("HLS mutable open-stage RAM claim exceeded its activation bound")
+                    return false
+                }
+                operation(bytes)
+                withExtendedLifetime(lease) {}
+                return true
+            }
+            guard currentStorage == .active, let url else { return false }
+            return withMappedPrefix(url: url, length: length, operation: operation)
+        }
+
+        private func finishClaimRead() {
+            lock.lock()
+            if activeClaimReads > 0 { activeClaimReads -= 1 }
+            lock.unlock()
+        }
+
+        /// Explicit nonescaping mapping. The Data owns munmap and is destroyed before this method returns, so
+        /// append, truncate, or rename cannot overlap a live mapping from a parser claim.
+        private func withMappedPrefix(url: URL, length: Int,
+                                      operation: (Data) -> Void) -> Bool {
+            guard let owner, owner.beginStageOperation() else { return false }
+            defer { owner.endStageOperation() }
+            var descriptor: Int32 = -1
+            do {
+                owner.notifyFileOperation()
+                descriptor = Darwin.open(url.path, O_RDONLY)
+                guard descriptor >= 0 else { throw SpoolError.invalidSource }
+                defer { Darwin.close(descriptor) }
+                if owner.failureInjection == .openStageFstat { throw SpoolError.injectedFstat }
+                var info = stat()
+                guard fstat(descriptor, &info) == 0,
+                      info.st_size >= 0,
+                      UInt64(info.st_size) >= UInt64(length) else { throw SpoolError.invalidLength }
+                if owner.failureInjection == .openStageMMap { throw SpoolError.injectedMMap }
+                guard let address = mmap(nil, length, PROT_READ, MAP_PRIVATE, descriptor, 0),
+                      address != MAP_FAILED else { throw SpoolError.injectedMMap }
+                do {
+                    let mapped = Data(bytesNoCopy: address, count: length, deallocator: .unmap)
+                    operation(mapped)
+                    withExtendedLifetime(mapped) {}
+                }
+                return true
+            } catch {
+                if descriptor >= 0 { /* defer closes it */ }
+                poisonAndFail("HLS mutable open-stage mmap/fstat failed")
+                return false
+            }
+        }
+
+        private func activateFromMemory() -> Bool {
+            guard let owner, let buffer, owner.beginStageOperation() else { return false }
+            defer { owner.endStageOperation() }
+            lock.lock()
+            while storage == .activating && !abortRequested { lock.wait() }
+            guard storage == .memory, activeClaimID == nil, !abortRequested else {
+                let alreadyActive = storage == .active
+                lock.unlock()
+                return alreadyActive
+            }
+            storage = .activating
+            let base = baseOffset
+            let end = logicalEndOffset
+            lock.unlock()
+
+            let length = end - base
+            let reservationID = UUID()
+            guard owner.reserveTransientCopy(id: reservationID, bytes: length) else {
+                restoreOrPoisonAfterActivationFailure()
+                return false
+            }
+            let partURL = owner.sessionDirectory.appendingPathComponent(
+                "open-\(UUID().uuidString).part")
+            let finalURL = owner.sessionDirectory.appendingPathComponent(
+                "open-\(UUID().uuidString).stage")
+            var cleanupReceipts: [URL] = []
+            var lease: VortXRemuxBuffer.ReadLease?
+            if length > 0 {
+                lease = buffer.beginReadLease(offset: base, length: length)
+                guard lease != nil else {
+                    owner.releaseTransientCopy(id: reservationID)
+                    restoreOrPoisonAfterActivationFailure()
+                    return false
+                }
+            }
+            do {
+                cleanupReceipts.append(partURL)
+                owner.notifyFileOperation()
+                guard FileManager.default.createFile(
+                    atPath: partURL.path, contents: nil,
+                    attributes: [.posixPermissions: NSNumber(value: 0o600)]) else {
+                    throw SpoolError.invalidSource
+                }
+                try VortXHLSSessionSpool.ensureOwnerOnlyFile(partURL)
+                let handle = try FileHandle(forWritingTo: partURL)
+                do {
+                    var copied = 0
+                    while copied < length {
+                        let count = min(owner.chunkSize, length - copied)
+                        guard let chunk = buffer.snapshotChunk(offset: base + copied, length: count) else {
+                            throw SpoolError.invalidSource
+                        }
+                        owner.notifyFileOperation()
+                        try handle.write(contentsOf: chunk)
+                        copied += chunk.count
+                    }
+                    try handle.synchronize()
+                    try handle.close()
+                } catch {
+                    try? handle.close()
+                    throw error
+                }
+                let values = try partURL.resourceValues(forKeys: [.fileSizeKey])
+                guard values.fileSize == length else { throw SpoolError.invalidLength }
+                cleanupReceipts.append(finalURL)
+                owner.notifyFileOperation()
+                try FileManager.default.moveItem(at: partURL, to: finalURL)
+                try VortXHLSSessionSpool.ensureOwnerOnlyFile(finalURL)
+                if owner.failureInjection == .openStageActivationCleanupRemoveOnce {
+                    throw SpoolError.injectedPermissions
+                }
+                lock.lock()
+                guard storage == .activating, !abortRequested,
+                      baseOffset == base, logicalEndOffset == end else {
+                    lock.unlock()
+                    throw SpoolError.invalidSource
+                }
+                storage = .active
+                durableEndOffset = end
+                fileURL = finalURL
+                lock.broadcast()
+                lock.unlock()
+                lease = nil
+                guard buffer.reclaimDurablyBackedPrefix(before: end) else {
+                    poisonAndFail("HLS mutable open-stage activation could not reclaim RAM backing")
+                    owner.invalidateSession()
+                    owner.releaseTransientCopy(id: reservationID)
+                    return false
+                }
+                owner.releaseTransientCopy(id: reservationID)
+                return true
+            } catch {
+                lease = nil
+                let cleanupComplete = owner.removeCloseArtifacts(cleanupReceipts)
+                if cleanupComplete {
+                    owner.releaseTransientCopy(id: reservationID)
+                } else {
+                    owner.quarantineOpenClose(
+                        stage: self,
+                        id: reservationID,
+                        keys: [],
+                        receipts: cleanupReceipts)
+                }
+                restoreOrPoisonAfterActivationFailure()
+                return false
+            }
+        }
+
+        private func restoreOrPoisonAfterActivationFailure() {
+            lock.lock()
+            storage = abortRequested ? .poisoned : .memory
+            lock.broadcast()
+            lock.unlock()
+        }
+
+        private func writeForward(_ data: Data, to url: URL,
+                                  absoluteOffset: Int, oldDurableEnd: Int) -> Bool {
+            guard let owner, owner.beginStageOperation() else { return false }
+            defer { owner.endStageOperation() }
+            let relative = oldDurableEnd - snapshot.baseOffset
+            guard relative >= 0 else { return false }
+            do {
+                owner.notifyFileOperation()
+                let handle = try FileHandle(forWritingTo: url)
+                defer { try? handle.close() }
+                try handle.seek(toOffset: UInt64(relative))
+                let written = try owner.writeOpenStageForward(data, to: handle)
+                guard written == data.count else {
+                    let rollbackFails: Bool
+                    if case .openStageForwardWrite(_, let injected) = owner.failureInjection {
+                        rollbackFails = injected
+                    } else {
+                        rollbackFails = false
+                    }
+                    if rollbackFails {
+                        lock.lock(); storage = .poisoned; lock.unlock()
+                    } else {
+                        try handle.truncate(atOffset: UInt64(relative))
+                        try handle.synchronize()
+                    }
+                    buffer?.fail("HLS mutable open-stage partial write")
+                    return false
+                }
+                try handle.synchronize()
+                return true
+            } catch {
+                lock.lock()
+                storage = .poisoned
+                lock.broadcast()
+                lock.unlock()
+                buffer?.fail("HLS mutable open-stage forward write failed")
+                return false
+            }
+        }
+
+        /// The caller owns a transient-copy receipt for this entire helper. Its nonescaping local payload is
+        /// destroyed on return, before the caller releases that receipt and commits durable open ownership.
+        private func writeForwardBytes(_ bytes: UnsafePointer<UInt8>, count: Int,
+                                       to url: URL, absoluteOffset: Int,
+                                       oldDurableEnd: Int) -> Bool {
+            let payload = Data(bytes: bytes, count: count)
+            return writeForward(
+                payload, to: url, absoluteOffset: absoluteOffset,
+                oldDurableEnd: oldDurableEnd)
+        }
+
+        fileprivate func poisonAndFail(_ reason: String) {
+            lock.lock()
+            storage = .poisoned
+            lock.broadcast()
+            lock.unlock()
+            buffer?.fail(reason)
+        }
+
+        fileprivate func closeSnapshot(claimID: UUID, base: Int, end: Int)
+            -> (storage: Storage, url: URL?)? {
+            lock.lock(); defer { lock.unlock() }
+            guard activeClaimID == claimID, baseOffset == base,
+                  logicalEndOffset == end, !abortRequested,
+                  activeClaimReads == 0,
+                  storage == .memory || storage == .active else { return nil }
+            return (storage, fileURL)
+        }
+
+        fileprivate struct CloseToken {
+            let id: UUID
+            let claimID: UUID
+            let oldStorage: Storage
+            let oldBase: Int
+            let newBase: Int
+            let oldEnd: Int
+            let nextStorage: Storage
+            let nextURL: URL?
+        }
+
+        fileprivate func prepareClosedPrefix(claimID: UUID, oldBase: Int,
+                                              newBase: Int, oldEnd: Int,
+                                              nextStorage: Storage,
+                                              nextURL: URL?) -> CloseToken? {
+            lock.lock(); defer { lock.unlock() }
+            guard activeClaimID == claimID, baseOffset == oldBase,
+                  logicalEndOffset == oldEnd, newBase > oldBase, newBase <= oldEnd,
+                  storage == .memory || storage == .active,
+                  activeClaimReads == 0, closeTokenID == nil else { return nil }
+            let token = CloseToken(
+                id: UUID(), claimID: claimID, oldStorage: storage,
+                oldBase: oldBase, newBase: newBase, oldEnd: oldEnd,
+                nextStorage: nextStorage, nextURL: nextURL)
+            closeTokenID = token.id
+            storage = .promoting
+            return token
+        }
+
+        /// This is the only post-registry gate. Cancellation is orthogonal to `.promoting`, so it must be
+        /// rechecked while the stage lock still protects the token and exact parser claim. A mismatch poisons
+        /// the stage and makes the caller invalidate the session; committed files remain owned by cleanup and
+        /// are never rolled back after becoming visible in the registry.
+        fileprivate func finalizeClosedPrefix(_ token: CloseToken) -> Bool {
+            lock.lock()
+            guard storage == .promoting, closeTokenID == token.id,
+                  activeClaimID == token.claimID, !abortRequested else {
+                storage = .poisoned
+                activeClaimID = nil
+                closeTokenID = nil
+                lock.unlock()
+                buffer?.fail("HLS mutable open-stage post-registry finalization was aborted")
+                return false
+            }
+            baseOffset = token.newBase
+            durableEndOffset = token.nextStorage == .active ? token.oldEnd : token.newBase
+            storage = token.nextStorage
+            fileURL = token.nextURL
+            activeClaimID = nil
+            closeTokenID = nil
+            lock.unlock()
+            return true
+        }
+
+        fileprivate func rollbackClosedPrefix(_ token: CloseToken, filesMutated: Bool) {
+            lock.lock()
+            guard storage == .promoting, closeTokenID == token.id else {
+                lock.unlock()
+                return
+            }
+            storage = filesMutated || abortRequested ? .poisoned : token.oldStorage
+            closeTokenID = nil
+            activeClaimID = nil
+            lock.unlock()
+        }
+    }
+
     private enum SpoolError: Error {
         case invalidSource
         case injectedWrite
@@ -600,6 +1700,9 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         case invalidRead
         case invalidLength
         case invalidPermissions
+        case injectedFstat
+        case injectedMMap
+        case injectedPermissions
     }
 
     private struct Entry {
@@ -649,6 +1752,12 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
             launch.sessions.remove(sessionName)
             launches[parentKey] = launch
         }
+
+        func sessionCount(parent: URL) -> Int {
+            let parentKey = parent.standardizedFileURL.path
+            lock.lock(); defer { lock.unlock() }
+            return launches[parentKey]?.sessions.count ?? 0
+        }
     }
 
     private static let launchRegistry = LaunchRegistry()
@@ -663,15 +1772,24 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     private var entries: [ResourceKey: Entry] = [:]
     private var pendingKeys: Set<ResourceKey> = []
     private var reservations: [UUID: Int] = [:]
+    private var transientCopyReservations: [UUID: Int] = [:]
     private var playlists: [String: PlaylistState] = [:]
     private var currentAccounting = Accounting()
     private var totalActiveLeases = 0
     private var invalidated = false
     private var listenerRetired = false
     private var producerEnded = false
+    private var activeStageOperations = 0
     private var cleanupClaimed = false
     private var registryJoined = true
+    private var mutableOpenStage: OpenStage?
+    private var cleanupRemovalFailuresRemaining = 0
+    private var closeArtifactRemovalFailuresRemaining = 0
+    private var quarantinedArtifacts: Set<URL> = []
+    private var auxiliaryGeneration = 0
+    private var openStageArmReceipt: OpenStageArmReceipt?
     private var fileOperationProbe: ((VortXHLSSessionSpool) -> Void)?
+    private var openStageArmAccountingProbe: ((VortXHLSSessionSpool) -> Void)?
 
     init?(parentDirectory: URL,
           sessionID: UUID = UUID(),
@@ -684,6 +1802,13 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         self.capacityBytes = capacityBytes
         self.chunkSize = chunkSize
         self.failureInjection = failureInjection
+        if case .cleanupRemove(let failures) = failureInjection {
+            self.cleanupRemovalFailuresRemaining = max(0, failures)
+        }
+        if failureInjection == .openStageMovePermissionCleanupRemoveOnce
+            || failureInjection == .openStageActivationCleanupRemoveOnce {
+            self.closeArtifactRemovalFailuresRemaining = 1
+        }
         self.sessionName = "session-\(sessionID.uuidString)"
         let joined = Self.launchRegistry.join(
             parent: parentDirectory,
@@ -713,9 +1838,25 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     }
 
     deinit {
-        if registryJoined {
+        var removed = !FileManager.default.fileExists(atPath: sessionDirectory.path)
+        if !removed, invalidated {
+            do {
+                try FileManager.default.removeItem(at: sessionDirectory)
+                removed = true
+            } catch {
+                removed = false
+            }
+        }
+        // A normal owner disappearance must leave the in-process registry even though its orphan directory is
+        // intentionally left for the next-launch scavenger. An invalidated cleanup that truly failed keeps its
+        // registry membership, so another live session cannot scavenge a directory whose ownership is unclear.
+        if registryJoined, !invalidated || removed {
             Self.launchRegistry.leave(parent: parentDirectory, sessionName: sessionName)
         }
+    }
+
+    static func registeredSessionCount(parentDirectory: URL) -> Int {
+        launchRegistry.sessionCount(parent: parentDirectory)
     }
 
     var accounting: Accounting {
@@ -728,11 +1869,26 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         return totalActiveLeases
     }
 
+    var activeOpenStageOperationCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return activeStageOperations
+    }
+
     var fileNamesOnDisk: [String] {
         (try? FileManager.default.contentsOfDirectory(
             at: sessionDirectory,
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]).map(\.lastPathComponent).sorted()) ?? []
+    }
+
+    var quarantinedFileNames: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return quarantinedArtifacts.map(\.lastPathComponent).sorted()
+    }
+
+    fileprivate var auxiliaryAccountingGeneration: Int {
+        lock.lock(); defer { lock.unlock() }
+        return auxiliaryGeneration
     }
 
     func contains(_ key: ResourceKey) -> Bool {
@@ -756,6 +1912,638 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         lock.lock()
         fileOperationProbe = probe
         lock.unlock()
+    }
+
+    /// Test seam for proving a rejected repeated arm never reaches coordinator accounting. Like the filesystem
+    /// probe, it is copied under the coordinator lock and invoked only after unlock.
+    func installOpenStageArmAccountingProbe(
+        _ probe: @escaping (VortXHLSSessionSpool) -> Void
+    ) {
+        lock.lock()
+        openStageArmAccountingProbe = probe
+        lock.unlock()
+    }
+
+    /// Creates exactly one mutable stage for this session and attaches it to the supplied HLS buffer. The
+    /// coordinator retains the stage; the buffer's reference is weak. A second attachment is rejected.
+    func attachOpenStage(to buffer: VortXRemuxBuffer) -> OpenStage? {
+        lock.lock()
+        guard !invalidated, mutableOpenStage == nil else {
+            lock.unlock()
+            return nil
+        }
+        let stage = OpenStage(owner: self, buffer: buffer)
+        mutableOpenStage = stage
+        lock.unlock()
+        guard buffer.attachOpenStage(stage) else {
+            lock.lock()
+            if mutableOpenStage === stage { mutableOpenStage = nil }
+            lock.unlock()
+            return nil
+        }
+        return stage
+    }
+
+    /// Arm-time admission is one coordinator transaction. The stage has already claimed its one-shot `.arming`
+    /// state before entering here, and every physical component participates in checked admission.
+    fileprivate func armOpenStageAtomically(initialOpenBytes: Int,
+                                             auxiliaryBytes: Int?,
+                                             expectedAuxiliaryGeneration: Int?)
+        -> OpenStageArmReceipt? {
+        guard initialOpenBytes >= 0 else { return nil }
+        let probe: ((VortXHLSSessionSpool) -> Void)?
+        let receipt: OpenStageArmReceipt
+        lock.lock()
+        guard !invalidated, openStageArmReceipt == nil,
+              expectedAuxiliaryGeneration == nil
+                  || expectedAuxiliaryGeneration == auxiliaryGeneration else {
+            lock.unlock()
+            return nil
+        }
+        let nextAuxiliary = auxiliaryBytes ?? currentAccounting.auxiliaryBytes
+        guard nextAuxiliary >= 0,
+              let physical = currentAccounting.checkedPhysicalBytes(
+                  replacingAuxiliaryWith: nextAuxiliary),
+              physical <= capacityBytes,
+              initialOpenBytes <= capacityBytes - physical else {
+            lock.unlock()
+            return nil
+        }
+        let nextGeneration: Int
+        if auxiliaryBytes != nil {
+            let (incremented, overflow) = auxiliaryGeneration.addingReportingOverflow(1)
+            guard !overflow else { lock.unlock(); return nil }
+            nextGeneration = incremented
+        } else {
+            nextGeneration = auxiliaryGeneration
+        }
+        let priorAuxiliary = currentAccounting.auxiliaryBytes
+        receipt = OpenStageArmReceipt(
+            id: UUID(),
+            initialOpenBytes: initialOpenBytes,
+            priorAuxiliaryBytes: priorAuxiliary,
+            auxiliaryGenerationBefore: auxiliaryGeneration,
+            auxiliaryGenerationAfter: nextGeneration)
+        currentAccounting.auxiliaryBytes = nextAuxiliary
+        currentAccounting.openBytes += initialOpenBytes
+        auxiliaryGeneration = nextGeneration
+        openStageArmReceipt = receipt
+        probe = openStageArmAccountingProbe
+        lock.unlock()
+        probe?(self)
+        return receipt
+    }
+
+    /// Extends the same pending arm receipt for RAM bytes that raced its first buffer snapshot. The buffer holds
+    /// its producer barrier while this executes, so switching `.arming -> .memory` closes the routing gap.
+    fileprivate func extendOpenStageArm(_ receipt: OpenStageArmReceipt,
+                                        additionalBytes: Int) -> OpenStageArmReceipt? {
+        guard additionalBytes >= 0 else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        guard !invalidated,
+              let stored = openStageArmReceipt,
+              stored.id == receipt.id,
+              let physical = currentAccounting.checkedPhysicalBytes(),
+              physical <= capacityBytes,
+              additionalBytes <= capacityBytes - physical else { return nil }
+        let (totalOpen, overflow) = stored.initialOpenBytes.addingReportingOverflow(additionalBytes)
+        guard !overflow else { return nil }
+        let updated = OpenStageArmReceipt(
+            id: stored.id,
+            initialOpenBytes: totalOpen,
+            priorAuxiliaryBytes: stored.priorAuxiliaryBytes,
+            auxiliaryGenerationBefore: stored.auxiliaryGenerationBefore,
+            auxiliaryGenerationAfter: stored.auxiliaryGenerationAfter)
+        currentAccounting.openBytes += additionalBytes
+        openStageArmReceipt = updated
+        return updated
+    }
+
+    fileprivate func rollbackOpenStageArm(_ receipt: OpenStageArmReceipt,
+                                          restoreAuxiliary: Bool) {
+        lock.lock()
+        if let stored = openStageArmReceipt, stored.id == receipt.id {
+            currentAccounting.openBytes = max(
+                0, currentAccounting.openBytes - stored.initialOpenBytes)
+            if restoreAuxiliary,
+               auxiliaryGeneration == stored.auxiliaryGenerationAfter {
+                let (nextGeneration, overflow) = auxiliaryGeneration.addingReportingOverflow(1)
+                if !overflow {
+                    currentAccounting.auxiliaryBytes = stored.priorAuxiliaryBytes
+                    auxiliaryGeneration = nextGeneration
+                }
+            }
+            openStageArmReceipt = nil
+        }
+        lock.unlock()
+    }
+
+    fileprivate func completeOpenStageArm(_ receipt: OpenStageArmReceipt) {
+        lock.lock()
+        if openStageArmReceipt?.id == receipt.id {
+            openStageArmReceipt = nil
+        }
+        lock.unlock()
+    }
+
+    fileprivate func reserveOpenGrowth(id: UUID, bytes: Int) -> Bool {
+        guard bytes > 0 else { return false }
+        lock.lock(); defer { lock.unlock() }
+        guard let physical = currentAccounting.checkedPhysicalBytes(),
+              !invalidated, reservations[id] == nil,
+              transientCopyReservations[id] == nil,
+              physical <= capacityBytes,
+              bytes <= capacityBytes - physical else { return false }
+        reservations[id] = bytes
+        currentAccounting.reservedBytes += bytes
+        currentAccounting.peakReservedBytes = max(
+            currentAccounting.peakReservedBytes, currentAccounting.reservedBytes)
+        return true
+    }
+
+    fileprivate func commitOpenGrowth(id: UUID, bytes: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard reservations[id] == bytes else { return false }
+        reservations.removeValue(forKey: id)
+        currentAccounting.reservedBytes -= bytes
+        currentAccounting.openBytes += bytes
+        return true
+    }
+
+    fileprivate func releaseOpenGrowth(id: UUID) {
+        let cleanup: URL?
+        lock.lock()
+        if let bytes = reservations.removeValue(forKey: id) {
+            currentAccounting.reservedBytes -= bytes
+        }
+        cleanup = claimCleanupIfReadyLocked()
+        lock.unlock()
+        if let cleanup { performCleanup(cleanup) }
+    }
+
+    /// Reserves physical headroom for a copy that duplicates bytes already counted in admitted ownership.
+    /// The reservation remains live until the caller proves that the source backing has been reclaimed.
+    fileprivate func reserveTransientCopy(id: UUID, bytes: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let physical = currentAccounting.checkedPhysicalBytes(),
+              !invalidated, reservations[id] == nil,
+              transientCopyReservations[id] == nil,
+              bytes >= 0, physical <= capacityBytes,
+              bytes <= capacityBytes - physical else { return false }
+        transientCopyReservations[id] = bytes
+        currentAccounting.transientCopyBytes += bytes
+        currentAccounting.peakTransientCopyBytes = max(
+            currentAccounting.peakTransientCopyBytes, currentAccounting.transientCopyBytes)
+        return true
+    }
+
+    fileprivate func releaseTransientCopy(id: UUID) {
+        let cleanup: URL?
+        lock.lock()
+        if let bytes = transientCopyReservations.removeValue(forKey: id) {
+            currentAccounting.transientCopyBytes -= bytes
+        }
+        cleanup = claimCleanupIfReadyLocked()
+        lock.unlock()
+        if let cleanup { performCleanup(cleanup) }
+    }
+
+    fileprivate func beginStageOperation() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !invalidated, !cleanupClaimed else { return false }
+        activeStageOperations += 1
+        return true
+    }
+
+    fileprivate func endStageOperation() {
+        let cleanup: URL?
+        lock.lock()
+        activeStageOperations = max(0, activeStageOperations - 1)
+        cleanup = claimCleanupIfReadyLocked()
+        lock.unlock()
+        if let cleanup { performCleanup(cleanup) }
+    }
+
+    fileprivate func writeOpenStageForward(_ data: Data, to handle: FileHandle) throws -> Int {
+        guard case .openStageForwardWrite(let afterBytes, _) = failureInjection else {
+            try handle.write(contentsOf: data)
+            return data.count
+        }
+        let amount = min(max(0, afterBytes), data.count)
+        if amount > 0 { try handle.write(contentsOf: data.prefix(amount)) }
+        return amount
+    }
+
+    /// Transactionally promotes an exact parser claim. The RAM path streams only P under a lease. The active
+    /// path copies only S, then truncates/renames the original P. Neither path advances the stage until every
+    /// cohort file and the coordinator registry are committed.
+    fileprivate func closeOpenStagePrefix(
+        stage: OpenStage,
+        claimID: UUID,
+        claimedBase: Int,
+        claimedEnd: Int,
+        endOffset: Int,
+        key: ResourceKey,
+        durationMilliseconds: Int,
+        additionalResources: [SpillResource]
+    ) -> Bool {
+        guard durationMilliseconds > 0,
+              endOffset > claimedBase, endOffset <= claimedEnd,
+              let buffer = stage.buffer,
+              let stageState = stage.closeSnapshot(
+                  claimID: claimID, base: claimedBase, end: claimedEnd) else { return false }
+        let prefixBytes = endOffset - claimedBase
+        let suffixBytes = claimedEnd - endOffset
+        let additionalBytes = validate(resources: additionalResources) ?? (additionalResources.isEmpty ? 0 : -1)
+        guard additionalBytes >= 0 else { return false }
+        let keys = [key] + additionalResources.map(\.key)
+        guard Set(keys).count == keys.count else { return false }
+        let reservationID = UUID()
+        let transientBytes = stageState.storage == .active
+            ? suffixBytes : claimedEnd - claimedBase
+        guard reserveOpenClose(
+            id: reservationID, keys: keys,
+            uncoveredBytes: additionalBytes, transientBytes: transientBytes) else { return false }
+
+        var sourceLeases: [VortXRemuxBuffer.ReadLease] = []
+        if stageState.storage == .memory {
+            guard let lease = buffer.beginReadLease(offset: claimedBase, length: prefixBytes) else {
+                releaseOpenClose(
+                    id: reservationID, keys: keys)
+                return false
+            }
+            sourceLeases.append(lease)
+        }
+        for resource in additionalResources {
+            if case .buffer(let source, let offset, let length) = resource.payload {
+                guard let lease = source.beginReadLease(offset: offset, length: length) else {
+                    releaseOpenClose(
+                        id: reservationID, keys: keys)
+                    return false
+                }
+                sourceLeases.append(lease)
+            }
+        }
+
+        guard beginStageOperation() else {
+            releaseOpenClose(id: reservationID, keys: keys)
+            return false
+        }
+        defer { endStageOperation() }
+
+        struct CloseFile {
+            let resource: SpillResource?
+            let part: URL
+            let final: URL
+            let length: Int
+        }
+        let operation = UUID().uuidString
+        let videoFinal = sessionDirectory.appendingPathComponent(key.fileName)
+        let videoPart = sessionDirectory.appendingPathComponent("\(key.fileName).\(operation).part")
+        let otherFiles = additionalResources.map { resource in
+            CloseFile(
+                resource: resource,
+                part: sessionDirectory.appendingPathComponent(
+                    "\(resource.key.fileName).\(operation).part"),
+                final: sessionDirectory.appendingPathComponent(resource.key.fileName),
+                length: resource.length)
+        }
+        let suffixPart = sessionDirectory.appendingPathComponent("open-\(operation).part")
+        let suffixFinal = sessionDirectory.appendingPathComponent("open-\(operation).stage")
+        var createdURLs: [URL] = []
+        var finalURLs: [URL] = []
+        var movedCount = 0
+        var stageFilesMutated = false
+        var closeToken: OpenStage.CloseToken?
+        do {
+            if stageState.storage == .memory {
+                try createOwnerOnlyFile(videoPart, cleanupReceipts: &createdURLs)
+                let handle = try FileHandle(forWritingTo: videoPart)
+                do {
+                    var copied = 0
+                    while copied < prefixBytes {
+                        let count = min(chunkSize, prefixBytes - copied)
+                        guard let chunk = buffer.snapshotChunk(
+                            offset: claimedBase + copied, length: count) else {
+                            throw SpoolError.invalidSource
+                        }
+                        notifyFileOperation()
+                        try handle.write(contentsOf: chunk)
+                        copied += chunk.count
+                    }
+                    try handle.synchronize()
+                    try handle.close()
+                } catch {
+                    try? handle.close()
+                    throw error
+                }
+                try requireFileSize(videoPart, prefixBytes)
+            } else {
+                guard let activeURL = stageState.url else { throw SpoolError.invalidSource }
+                if suffixBytes > 0 {
+                    try createOwnerOnlyFile(suffixPart, cleanupReceipts: &createdURLs)
+                    let source = try FileHandle(forReadingFrom: activeURL)
+                    let destination = try FileHandle(forWritingTo: suffixPart)
+                    do {
+                        try source.seek(toOffset: UInt64(prefixBytes))
+                        var copied = 0
+                        while copied < suffixBytes {
+                            notifyFileOperation()
+                            let part = try source.read(upToCount: min(chunkSize, suffixBytes - copied)) ?? Data()
+                            guard !part.isEmpty else { throw SpoolError.invalidSource }
+                            try destination.write(contentsOf: part)
+                            copied += part.count
+                        }
+                        try destination.synchronize()
+                        try source.close()
+                        try destination.close()
+                    } catch {
+                        try? source.close()
+                        try? destination.close()
+                        throw error
+                    }
+                    try requireFileSize(suffixPart, suffixBytes)
+                }
+            }
+
+            for file in otherFiles {
+                try createOwnerOnlyFile(file.part, cleanupReceipts: &createdURLs)
+                guard let resource = file.resource else { throw SpoolError.invalidSource }
+                let handle = try FileHandle(forWritingTo: file.part)
+                do {
+                    var copied = 0
+                    while copied < file.length {
+                        let count = min(chunkSize, file.length - copied)
+                        guard let bytes = chunk(for: resource, localOffset: copied, length: count) else {
+                            throw SpoolError.invalidSource
+                        }
+                        notifyFileOperation()
+                        try handle.write(contentsOf: bytes)
+                        copied += bytes.count
+                    }
+                    try handle.synchronize()
+                    try handle.close()
+                } catch {
+                    try? handle.close()
+                    throw error
+                }
+                try requireFileSize(file.part, file.length)
+            }
+
+            if stageState.storage == .active {
+                guard let activeURL = stageState.url else { throw SpoolError.invalidSource }
+                notifyFileOperation()
+                let handle = try FileHandle(forWritingTo: activeURL)
+                try handle.truncate(atOffset: UInt64(prefixBytes))
+                try handle.synchronize()
+                try handle.close()
+                try requireFileSize(activeURL, prefixBytes)
+                stageFilesMutated = true
+                try moveForClose(
+                    activeURL, to: videoFinal,
+                    successfulMoves: &movedCount,
+                    cleanupReceipts: &finalURLs)
+            } else {
+                try moveForClose(
+                    videoPart, to: videoFinal,
+                    successfulMoves: &movedCount,
+                    cleanupReceipts: &finalURLs)
+            }
+
+            var nextStageURL: URL?
+            if stageState.storage == .active, suffixBytes > 0 {
+                try moveForClose(
+                    suffixPart, to: suffixFinal,
+                    successfulMoves: &movedCount,
+                    cleanupReceipts: &finalURLs)
+                nextStageURL = suffixFinal
+            }
+            for file in otherFiles {
+                try moveForClose(
+                    file.part, to: file.final,
+                    successfulMoves: &movedCount,
+                    cleanupReceipts: &finalURLs)
+            }
+
+            let registered: [(ResourceKey, URL, Int, Int)] = [
+                (key, videoFinal, prefixBytes, durationMilliseconds),
+            ] + zip(additionalResources, otherFiles).map { resource, file in
+                (resource.key, file.final, resource.length, resource.durationMilliseconds)
+            }
+            let nextStorage: OpenStage.Storage = stageState.storage == .active && suffixBytes > 0
+                ? .active : .memory
+            guard let prepared = stage.prepareClosedPrefix(
+                claimID: claimID, oldBase: claimedBase, newBase: endOffset,
+                oldEnd: claimedEnd, nextStorage: nextStorage, nextURL: nextStageURL) else {
+                throw SpoolError.invalidSource
+            }
+            closeToken = prepared
+            if failureInjection == .openStageCancelBeforeRegistry {
+                invalidateSession()
+            }
+            guard commitOpenClose(
+                id: reservationID,
+                registered: registered,
+                prefixBytes: prefixBytes,
+                uncoveredBytes: additionalBytes,
+                transientBytes: transientBytes) else { throw SpoolError.invalidSource }
+            if failureInjection == .openStageCancelAfterRegistry {
+                invalidateSession()
+            }
+            guard stage.finalizeClosedPrefix(prepared) else {
+                // Registry publication already committed. Ownership now belongs to invalidation cleanup; do
+                // not delete files or rewrite accounting through the pre-commit rollback path.
+                closeToken = nil
+                sourceLeases.removeAll()
+                releaseOpenClose(id: reservationID, keys: [])
+                invalidateSession()
+                return false
+            }
+            closeToken = nil
+            sourceLeases.removeAll()
+            if stageState.storage == .memory,
+               !buffer.reclaimDurablyBackedPrefix(before: endOffset) {
+                stage.poisonAndFail("HLS open-stage promotion could not reclaim RAM backing")
+                invalidateSession()
+                releaseOpenClose(id: reservationID, keys: [])
+                return false
+            }
+            releaseOpenClose(id: reservationID, keys: [])
+            return true
+        } catch {
+            let cleanupComplete = removeCloseArtifacts(createdURLs + finalURLs)
+            if cleanupComplete {
+                releaseOpenClose(id: reservationID, keys: keys)
+            } else {
+                quarantineOpenClose(
+                    stage: stage,
+                    id: reservationID,
+                    keys: keys,
+                    receipts: createdURLs + finalURLs)
+            }
+            if let closeToken {
+                stage.rollbackClosedPrefix(closeToken, filesMutated: stageFilesMutated)
+            } else if stageState.storage == .active {
+                stage.poisonAndFail("HLS open-stage promotion failed")
+            }
+            withExtendedLifetime(sourceLeases) {}
+            return false
+        }
+    }
+
+    private func reserveOpenClose(id: UUID, keys: [ResourceKey],
+                                  uncoveredBytes: Int, transientBytes: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let keySet = Set(keys)
+        guard let physical = currentAccounting.checkedPhysicalBytes(),
+              !invalidated, reservations[id] == nil,
+              transientCopyReservations[id] == nil,
+              keySet.isDisjoint(with: pendingKeys),
+              keySet.allSatisfy({ entries[$0] == nil }),
+              uncoveredBytes >= 0, transientBytes >= 0,
+              physical <= capacityBytes,
+              uncoveredBytes <= capacityBytes - physical,
+              transientBytes <= capacityBytes - physical - uncoveredBytes else { return false }
+        reservations[id] = uncoveredBytes
+        transientCopyReservations[id] = transientBytes
+        pendingKeys.formUnion(keySet)
+        currentAccounting.reservedBytes += uncoveredBytes
+        currentAccounting.transientCopyBytes += transientBytes
+        currentAccounting.peakReservedBytes = max(
+            currentAccounting.peakReservedBytes, currentAccounting.reservedBytes)
+        currentAccounting.peakTransientCopyBytes = max(
+            currentAccounting.peakTransientCopyBytes, currentAccounting.transientCopyBytes)
+        return true
+    }
+
+    private func commitOpenClose(id: UUID,
+                                 registered: [(ResourceKey, URL, Int, Int)],
+                                 prefixBytes: Int,
+                                 uncoveredBytes: Int,
+                                 transientBytes: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !invalidated, reservations[id] == uncoveredBytes,
+              transientCopyReservations[id] == transientBytes,
+              currentAccounting.openBytes >= prefixBytes,
+              registered.allSatisfy({ entries[$0.0] == nil }) else { return false }
+        for (key, url, length, duration) in registered {
+            entries[key] = Entry(
+                url: url, length: length,
+                segmentDurationMilliseconds: duration)
+        }
+        reservations.removeValue(forKey: id)
+        pendingKeys.subtract(registered.map { $0.0 })
+        currentAccounting.reservedBytes -= uncoveredBytes
+        currentAccounting.openBytes -= prefixBytes
+        currentAccounting.finalBytes += registered.reduce(0) { $0 + $1.2 }
+        return true
+    }
+
+    private func releaseOpenClose(id: UUID, keys: [ResourceKey]) {
+        let cleanup: URL?
+        lock.lock()
+        if let bytes = reservations.removeValue(forKey: id) {
+            currentAccounting.reservedBytes -= bytes
+        }
+        if let bytes = transientCopyReservations.removeValue(forKey: id) {
+            currentAccounting.transientCopyBytes -= bytes
+        }
+        pendingKeys.subtract(keys)
+        cleanup = claimCleanupIfReadyLocked()
+        lock.unlock()
+        if let cleanup { performCleanup(cleanup) }
+    }
+
+    /// Attempts every post-effect receipt. A failed first removal never short-circuits later receipts, and a
+    /// path counts as removed only after the filesystem confirms it no longer exists.
+    private func removeCloseArtifacts(_ urls: [URL]) -> Bool {
+        var allRemoved = true
+        var attempted: Set<URL> = []
+        for url in urls where attempted.insert(url).inserted {
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            let injectFailure: Bool
+            lock.lock()
+            injectFailure = closeArtifactRemovalFailuresRemaining > 0
+            if injectFailure { closeArtifactRemovalFailuresRemaining -= 1 }
+            lock.unlock()
+            if !injectFailure {
+                notifyFileOperation()
+                try? FileManager.default.removeItem(at: url)
+            }
+            if FileManager.default.fileExists(atPath: url.path) { allRemoved = false }
+        }
+        return allRemoved
+    }
+
+    /// Converts a failed close rollback into session-owned quarantine. Reservation and transient charges move
+    /// rather than disappear, later admissions fail through invalidation, and only confirmed directory removal
+    /// clears the quarantine accounting and retained receipts.
+    private func quarantineOpenClose(stage: OpenStage,
+                                     id: UUID,
+                                     keys: [ResourceKey],
+                                     receipts: [URL]) {
+        stage.requestAbort()
+        let surviving = Set(receipts.filter {
+            FileManager.default.fileExists(atPath: $0.path)
+        })
+        let cleanup: URL?
+        lock.lock()
+        let reserved = reservations.removeValue(forKey: id) ?? 0
+        currentAccounting.reservedBytes = max(0, currentAccounting.reservedBytes - reserved)
+        let retainedTransient = transientCopyReservations.removeValue(forKey: id) ?? 0
+        currentAccounting.transientCopyBytes -= retainedTransient
+        let (quarantineCharge, chargeOverflow) = reserved.addingReportingOverflow(retainedTransient)
+        let (nextQuarantine, quarantineOverflow) = currentAccounting.quarantinedBytes
+            .addingReportingOverflow(chargeOverflow ? Int.max : quarantineCharge)
+        currentAccounting.quarantinedBytes = quarantineOverflow ? Int.max : nextQuarantine
+        pendingKeys.subtract(keys)
+        quarantinedArtifacts.formUnion(surviving)
+        invalidated = true
+        cleanup = claimCleanupIfReadyLocked()
+        lock.unlock()
+        if let cleanup { performCleanup(cleanup) }
+    }
+
+    private func createOwnerOnlyFile(_ url: URL,
+                                     cleanupReceipts: inout [URL]) throws {
+        notifyFileOperation()
+        guard FileManager.default.createFile(
+            atPath: url.path, contents: nil,
+            attributes: [.posixPermissions: NSNumber(value: 0o600)]) else {
+            throw SpoolError.invalidSource
+        }
+        cleanupReceipts.append(url)
+        if failureInjection == .openStageCreatePermission {
+            throw SpoolError.injectedPermissions
+        }
+        try Self.ensureOwnerOnlyFile(url)
+    }
+
+    private func requireFileSize(_ url: URL, _ expected: Int) throws {
+        notifyFileOperation()
+        let values = try url.resourceValues(forKeys: [.fileSizeKey])
+        guard values.fileSize == expected else { throw SpoolError.invalidLength }
+    }
+
+    private func moveForClose(_ source: URL, to destination: URL,
+                              successfulMoves: inout Int,
+                              cleanupReceipts: inout [URL]) throws {
+        if case .rename(let allowedMoves) = failureInjection,
+           successfulMoves >= max(0, allowedMoves) {
+            throw SpoolError.injectedRename
+        }
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            throw SpoolError.injectedRename
+        }
+        notifyFileOperation()
+        try FileManager.default.moveItem(at: source, to: destination)
+        cleanupReceipts.append(destination)
+        if failureInjection == .openStageMovePermission
+            || failureInjection == .openStageMovePermissionCleanupRemoveOnce {
+            throw SpoolError.injectedPermissions
+        }
+        try Self.ensureOwnerOnlyFile(destination)
+        successfulMoves += 1
     }
 
     /// Reserve the whole cohort before any file exists, lease every buffer source range, stream bounded chunks
@@ -905,13 +2693,31 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     /// Non-file resident state (currently subtitle cue storage) participates in the same admission ceiling.
     @discardableResult
     func setAuxiliaryBytes(_ bytes: Int) -> Bool {
-        guard bytes >= 0 else { return false }
+        setAuxiliaryBytesChecked(bytes, expectedGeneration: nil) != nil
+    }
+
+    /// Versioned compare-and-set used by the three-component auxiliary ledger. A stale writer cannot overwrite
+    /// a newer primary/audio/subtitle total even when its arithmetic was valid when first computed.
+    fileprivate func setAuxiliaryBytes(_ bytes: Int,
+                                       expectedGeneration: Int) -> Int? {
+        setAuxiliaryBytesChecked(bytes, expectedGeneration: expectedGeneration)
+    }
+
+    private func setAuxiliaryBytesChecked(_ bytes: Int,
+                                          expectedGeneration: Int?) -> Int? {
+        guard bytes >= 0 else { return nil }
         lock.lock(); defer { lock.unlock() }
-        guard !invalidated else { return false }
-        let withoutOld = currentAccounting.admittedBytes - currentAccounting.auxiliaryBytes
-        guard withoutOld <= capacityBytes, bytes <= capacityBytes - withoutOld else { return false }
+        guard !invalidated,
+              expectedGeneration == nil || expectedGeneration == auxiliaryGeneration,
+              let withoutOld = currentAccounting.checkedPhysicalBytes(
+                  replacingAuxiliaryWith: 0),
+              withoutOld <= capacityBytes,
+              bytes <= capacityBytes - withoutOld else { return nil }
+        let (nextGeneration, overflow) = auxiliaryGeneration.addingReportingOverflow(1)
+        guard !overflow else { return nil }
         currentAccounting.auxiliaryBytes = bytes
-        return true
+        auxiliaryGeneration = nextGeneration
+        return nextGeneration
     }
 
     @discardableResult
@@ -1024,11 +2830,22 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         urls.forEach { try? FileManager.default.removeItem(at: $0) }
     }
 
-    func producerDidReachEOF() {
-        lock.lock(); producerEnded = true; lock.unlock()
+    func producerDidReachEOF() { producerDidTerminate() }
+
+    func producerDidTerminate() {
+        let cleanup: URL?
+        lock.lock()
+        producerEnded = true
+        cleanup = claimCleanupIfReadyLocked()
+        lock.unlock()
+        if let cleanup { performCleanup(cleanup) }
     }
 
     func invalidateSession() {
+        lock.lock()
+        let stage = mutableOpenStage
+        lock.unlock()
+        stage?.requestAbort()
         let cleanup: URL?
         lock.lock()
         invalidated = true
@@ -1111,11 +2928,12 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     private func reserve(id: UUID, resources: [SpillResource], bytes: Int) -> Bool {
         lock.lock(); defer { lock.unlock() }
         let keys = Set(resources.map(\.key))
-        guard !invalidated,
+        guard let physical = currentAccounting.checkedPhysicalBytes(),
+              !invalidated,
               keys.isDisjoint(with: pendingKeys),
               keys.allSatisfy({ entries[$0] == nil }),
-              currentAccounting.admittedBytes <= capacityBytes,
-              bytes <= capacityBytes - currentAccounting.admittedBytes else { return false }
+              physical <= capacityBytes,
+              bytes <= capacityBytes - physical else { return false }
         reservations[id] = bytes
         pendingKeys.formUnion(keys)
         currentAccounting.reservedBytes += bytes
@@ -1223,17 +3041,50 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     }
 
     private func claimCleanupIfReadyLocked() -> URL? {
-        guard invalidated, listenerRetired, totalActiveLeases == 0,
-              reservations.isEmpty, !cleanupClaimed else { return nil }
+        guard invalidated, producerEnded, listenerRetired,
+              totalActiveLeases == 0, reservations.isEmpty,
+              transientCopyReservations.isEmpty,
+              activeStageOperations == 0, !cleanupClaimed else { return nil }
         cleanupClaimed = true
         return sessionDirectory
     }
 
     private func performCleanup(_ directory: URL) {
-        try? FileManager.default.removeItem(at: directory)
+        let injectFailure: Bool
         lock.lock()
-        let shouldLeave = registryJoined
-        registryJoined = false
+        injectFailure = cleanupRemovalFailuresRemaining > 0
+        if injectFailure { cleanupRemovalFailuresRemaining -= 1 }
+        lock.unlock()
+        var removed = false
+        if !injectFailure {
+            do {
+                try FileManager.default.removeItem(at: directory)
+                removed = true
+            } catch {
+                removed = !FileManager.default.fileExists(atPath: directory.path)
+            }
+        }
+        lock.lock()
+        if !removed { cleanupClaimed = false }
+        let shouldLeave = removed && registryJoined
+        if removed {
+            registryJoined = false
+            entries.removeAll()
+            playlists.removeAll()
+            pendingKeys.removeAll()
+            reservations.removeAll()
+            transientCopyReservations.removeAll()
+            openStageArmReceipt = nil
+            mutableOpenStage = nil
+            quarantinedArtifacts.removeAll()
+            currentAccounting.finalBytes = 0
+            currentAccounting.temporaryBytes = 0
+            currentAccounting.reservedBytes = 0
+            currentAccounting.auxiliaryBytes = 0
+            currentAccounting.openBytes = 0
+            currentAccounting.transientCopyBytes = 0
+            currentAccounting.quarantinedBytes = 0
+        }
         lock.unlock()
         if shouldLeave {
             Self.launchRegistry.leave(parent: parentDirectory, sessionName: sessionName)
@@ -1273,6 +3124,98 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
               actual.intValue & 0o777 == 0o600 else {
             throw SpoolError.invalidPermissions
         }
+    }
+}
+
+/// One versioned owner for the three non-file HLS components. Coordinator compare-and-set and local component
+/// publication happen under this short lock; mutable-stage filesystem activation always happens after unlock.
+final class VortXHLSAuxiliaryAccounting: @unchecked Sendable {
+    struct Snapshot: Equatable, Sendable {
+        let primaryInitBytes: Int
+        let alternateAudioInitBytes: Int
+        let subtitleBytes: Int
+        let generation: Int
+    }
+
+    private weak var spool: VortXHLSSessionSpool?
+    private let lock = NSLock()
+    private var primaryInitBytes = 0
+    private var alternateAudioInitBytes = 0
+    private var subtitleBytes = 0
+    private var generation: Int
+
+    init(spool: VortXHLSSessionSpool) {
+        self.spool = spool
+        self.generation = spool.auxiliaryAccountingGeneration
+    }
+
+    var snapshot: Snapshot {
+        lock.lock(); defer { lock.unlock() }
+        return Snapshot(
+            primaryInitBytes: primaryInitBytes,
+            alternateAudioInitBytes: alternateAudioInitBytes,
+            subtitleBytes: subtitleBytes,
+            generation: generation)
+    }
+
+    @discardableResult
+    func update(primaryInit: Int? = nil,
+                alternateAudioInit: Int? = nil,
+                subtitles: Int? = nil) -> Bool {
+        guard let spool else { return false }
+        lock.lock(); defer { lock.unlock() }
+        let nextPrimary = primaryInit ?? primaryInitBytes
+        let nextAudio = alternateAudioInit ?? alternateAudioInitBytes
+        let nextSubtitles = subtitles ?? subtitleBytes
+        guard nextPrimary >= 0, nextAudio >= 0, nextSubtitles >= 0 else { return false }
+        let (initTotal, initOverflow) = nextPrimary.addingReportingOverflow(nextAudio)
+        let (total, totalOverflow) = initTotal.addingReportingOverflow(nextSubtitles)
+        guard !initOverflow, !totalOverflow,
+              let nextGeneration = spool.setAuxiliaryBytes(
+                  total, expectedGeneration: generation) else { return false }
+        primaryInitBytes = nextPrimary
+        alternateAudioInitBytes = nextAudio
+        subtitleBytes = nextSubtitles
+        generation = nextGeneration
+        return true
+    }
+
+    @discardableResult
+    func omitAlternateAudioInitOnTimeout() -> Bool {
+        update(alternateAudioInit: 0)
+    }
+
+    /// The coordinator charge and all three local components are published as one version while the lock is
+    /// held. `finishArm` then reconciles racing RAM appends and performs any filesystem activation after unlock.
+    @discardableResult
+    func armPrimary(stage: VortXHLSSessionSpool.OpenStage,
+                    base: Int,
+                    primaryInitBytes nextPrimary: Int) -> Bool {
+        guard nextPrimary >= 0 else { return false }
+        lock.lock()
+        let priorPrimary = primaryInitBytes
+        let (initTotal, initOverflow) = nextPrimary.addingReportingOverflow(
+            alternateAudioInitBytes)
+        let (total, totalOverflow) = initTotal.addingReportingOverflow(subtitleBytes)
+        guard !initOverflow, !totalOverflow,
+              let preparation = stage.prepareArm(
+                  base: base,
+                  auxiliaryBytes: total,
+                  expectedAuxiliaryGeneration: generation) else {
+            lock.unlock()
+            return false
+        }
+        primaryInitBytes = nextPrimary
+        generation = preparation.auxiliaryGeneration
+        lock.unlock()
+
+        guard stage.finishArm(preparation, restoreAuxiliaryOnFailure: false) else {
+            // The stage has already removed its open-byte receipt. A fresh versioned reduction preserves any
+            // audio/subtitle update that won while filesystem activation was in flight.
+            _ = update(primaryInit: priorPrimary)
+            return false
+        }
+        return true
     }
 }
 

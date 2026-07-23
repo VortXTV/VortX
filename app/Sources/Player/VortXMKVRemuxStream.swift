@@ -59,7 +59,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// transcode, hvc1 extradata repair for HEVC, segmenting, buffer, fail-soft demotes) is shared unchanged.
     enum Mode { case dolbyVision, plain }
 
-    let buffer = VortXRemuxBuffer()
+    let buffer: VortXRemuxBuffer
 
     private let input: String
     private let headers: [String: String]?
@@ -70,6 +70,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// One cross-rendition disk coordinator for every closed video, alternate-audio and rendered subtitle
     /// resource in this playback. nil only on the legacy non-HLS delivery or an initialization failure.
     private let hlsSpool: VortXHLSSessionSpool?
+    /// Session-owned mutable backing attached only to the primary HLS buffer. nil on the progressive rollback
+    /// path. Parser claims from this exact object cross the proof -> publication callback synchronously.
+    private let hlsOpenStage: VortXHLSSessionSpool.OpenStage?
+    /// Versioned owner of primary-init, alternate-init and subtitle resident charges. It publishes the local
+    /// component tuple with the coordinator generation before open-stage filesystem activation can begin.
+    private let hlsAuxiliaryAccounting: VortXHLSAuxiliaryAccounting?
     private var thread: Thread?
     private let cancelledFlag = ManagedAtomicFlag()
 
@@ -122,6 +128,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
     init(input: String, headers: [String: String]?, indexForHLS: Bool = false,
          mode: Mode = .dolbyVision, startAtSeconds: Double = 0) {
+        let primaryBuffer = VortXRemuxBuffer()
+        let spool = indexForHLS ? VortXHLSSessionSpool.makeDefault() : nil
+        self.buffer = primaryBuffer
         self.input = input
         self.headers = headers
         self.hlsIndexingEnabled = indexForHLS
@@ -130,8 +139,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         self.requestedOriginSeconds = RemuxResumePolicy.isEnabledByDefault
             ? RemuxResumePolicy.originRequest(resumeSeconds: startAtSeconds)
             : 0
-        self.hlsSpool = indexForHLS ? VortXHLSSessionSpool.makeDefault() : nil
-        if indexForHLS, hlsSpool == nil {
+        self.hlsSpool = spool
+        self.hlsOpenStage = spool?.attachOpenStage(to: primaryBuffer)
+        self.hlsAuxiliaryAccounting = spool.map(VortXHLSAuxiliaryAccounting.init)
+        if indexForHLS, hlsOpenStage == nil {
             buffer.fail("HLS backing spool could not be created")
         }
     }
@@ -212,12 +223,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var subtitleCollectors: [Int: (renditionID: Int, format: SubtitleRenditionPolicy.TextFormat)] = [:]
     private var subtitleBytesStored: [Int: Int] = [:]
     /// Non-file resident HLS state participates in the same 512 MiB admission ceiling as durable media and
-    /// outstanding `.part` reservations. This lock is independent of hlsLock so a server snapshot never has to
-    /// perform filesystem/accounting work while it owns rendition metadata.
-    private let hlsAuxiliaryLock = NSLock()
-    private var primaryInitAuxiliaryBytes = 0
-    private var alternateAudioInitAuxiliaryBytes = 0
-    private var subtitleAuxiliaryBytes = 0
+    /// outstanding `.part` reservations through `hlsAuxiliaryAccounting`.
     // Known source runtime, read from the demuxer at find_stream_info time. Published under hlsLock (written
     // once on the remux thread, read from the player thread). 0 means "unknown / not yet parsed". The HLS
     // delivery advertises no ENDLIST while producing, so AVPlayerItem.duration stays INDEFINITE mid-play; the
@@ -296,19 +302,22 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private func updateHLSAuxiliaryBytes(primaryInit: Int? = nil,
                                          alternateAudioInit: Int? = nil,
                                          subtitles: Int? = nil) -> Bool {
-        guard let hlsSpool else { return !hlsIndexingEnabled }
-        hlsAuxiliaryLock.lock(); defer { hlsAuxiliaryLock.unlock() }
-        let nextPrimary = primaryInit ?? primaryInitAuxiliaryBytes
-        let nextAudio = alternateAudioInit ?? alternateAudioInitAuxiliaryBytes
-        let nextSubtitles = subtitles ?? subtitleAuxiliaryBytes
-        guard nextPrimary >= 0, nextAudio >= 0, nextSubtitles >= 0 else { return false }
-        let (initTotal, initOverflow) = nextPrimary.addingReportingOverflow(nextAudio)
-        let (total, totalOverflow) = initTotal.addingReportingOverflow(nextSubtitles)
-        guard !initOverflow, !totalOverflow, hlsSpool.setAuxiliaryBytes(total) else { return false }
-        primaryInitAuxiliaryBytes = nextPrimary
-        alternateAudioInitAuxiliaryBytes = nextAudio
-        subtitleAuxiliaryBytes = nextSubtitles
-        return true
+        guard let hlsAuxiliaryAccounting else { return !hlsIndexingEnabled }
+        return hlsAuxiliaryAccounting.update(
+            primaryInit: primaryInit,
+            alternateAudioInit: alternateAudioInit,
+            subtitles: subtitles)
+    }
+
+    /// The primary init copies and every already-produced open media byte enter one versioned coordinator
+    /// transaction. Filesystem activation begins only after that component tuple and generation are published.
+    @discardableResult
+    private func armPrimaryOpenStage(base: Int, primaryInitBytes: Int) -> Bool {
+        guard let hlsOpenStage, let hlsAuxiliaryAccounting else { return false }
+        return hlsAuxiliaryAccounting.armPrimary(
+            stage: hlsOpenStage,
+            base: base,
+            primaryInitBytes: primaryInitBytes)
     }
 
     struct HLSWindowSnapshot {
@@ -445,6 +454,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     // Segment-cut state (remux thread only).
     private var hlsSegmentStartSec: Double?   // first video DTS of the OPEN segment (input timebase seconds)
     private var hlsSegmentStartByte: Int?     // byte offset the open segment starts at (nil until init known)
+    /// Exact mutable-stage claim produced by the parser closure and synchronously consumed by hlsCloseSegment.
+    /// The pending FIFO transports only the endpoint, so this private handoff preserves the same base/end
+    /// snapshot across its immediate prove -> publish callback without changing the pure policy API.
+    private var hlsParserOpenClaim: VortXHLSSessionSpool.OpenStage.OpenClaim?
     private var hlsSegmentStartPacketProven = false
     private var hlsPendingBoundaries =
         VortXHLSPendingPublicationMachine<MultiAudioPolicy.AudioResource?>()
@@ -595,6 +608,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     }
 
     private func run() {
+        // Every guard/early return, cancellation, demotion and successful EOF reaches the real producer-terminal
+        // edge only as this remux thread unwinds. Cancellation itself merely requests abort and cannot claim it.
+        defer {
+            releaseHLSParserOpenClaim()
+            hlsSpool?.producerDidTerminate()
+        }
         var info = SourceInfo()
 
         // Open the source. libav's protocol layer handles http/https directly; pass request headers (debrid
@@ -1608,7 +1627,6 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             hlsLock.unlock()
         }
         buffer.finish()
-        hlsSpool?.producerDidReachEOF()
         NSLog("[dv-remux-stream] done: %d bytes muxed", buffer.producedCount)
     }
 
@@ -1892,7 +1910,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
         let (servedInitBytes, servedInitOverflow) = servedDV.count.addingReportingOverflow(servedHDR.count)
         guard !servedInitOverflow,
-              updateHLSAuxiliaryBytes(primaryInit: servedInitBytes) else {
+              armPrimaryOpenStage(base: initLen, primaryInitBytes: servedInitBytes) else {
             hlsAbortInitScan("served init copies exceeded HLS session admission")
             return
         }
@@ -2116,7 +2134,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         _alternateAudioMuxer = nil
         hlsLock.unlock()
         muxer?.abort()
-        _ = updateHLSAuxiliaryBytes(alternateAudioInit: 0)
+        _ = hlsAuxiliaryAccounting?.omitAlternateAudioInitOnTimeout()
         DiagnosticsLog.log("dv", "multi-audio omitted category=\(MultiAudioPolicy.AlternateFailureCategory.deadline.rawValue)")
     }
 
@@ -2540,6 +2558,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 hlsLock.unlock()
                 guard pending.segmentID == nextPublishedID,
                       hlsSegmentStartSec == pending.startSeconds else {
+                    releaseHLSParserOpenClaim()
                     buffer.fail("HLS pending boundary did not match the publication frontier")
                     return false
                 }
@@ -2577,20 +2596,29 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         guard hlsIndexingEnabled,
               hlsInitState.mayPublishMedia,
               let segStartByte = hlsSegmentStartByte,
+              let hlsOpenStage,
               let videoTrackID = hlsVideoTrackID,
               let outputVideoFormat = hlsOutputVideoFormat else { return nil }
-        let candidateEnd = buffer.producedCount
-        guard candidateEnd > segStartByte,
-              let candidate = buffer.snapshotChunk(
-                  offset: segStartByte, length: candidateEnd - segStartByte),
-              let mediaProof = VortXFMP4FragmentParser.proveMediaRange(
-                  candidate, trackID: videoTrackID, requireFirstSampleSync: true),
-              VortXVideoIDRClassifier.isIDR(
-                  bytes: [UInt8](mediaProof.firstSampleBytes),
-                  codec: outputVideoFormat.codec,
-                  format: outputVideoFormat.packetFormat) else { return nil }
-        let endByte = segStartByte + mediaProof.mediaEnd
-        return endByte > segStartByte && endByte <= candidateEnd ? endByte : nil
+        guard hlsParserOpenClaim == nil,
+              let claim = hlsOpenStage.claim(),
+              claim.baseOffset == segStartByte else { return nil }
+        var provenEnd: Int?
+        let read = claim.withBytes { candidate in
+            guard let mediaProof = VortXFMP4FragmentParser.proveMediaRange(
+                candidate, trackID: videoTrackID, requireFirstSampleSync: true) else { return }
+            // The mapped Data dies before withBytes returns. Detach the only payload used after parser return.
+            let firstSampleBytes = Data(mediaProof.firstSampleBytes)
+            guard VortXVideoIDRClassifier.isIDR(
+                bytes: [UInt8](firstSampleBytes),
+                codec: outputVideoFormat.codec,
+                format: outputVideoFormat.packetFormat) else { return }
+            let (end, overflow) = segStartByte.addingReportingOverflow(mediaProof.mediaEnd)
+            guard !overflow, end > segStartByte, end <= claim.logicalEndOffset else { return }
+            provenEnd = end
+        }
+        guard read, let provenEnd else { claim.release(); return nil }
+        hlsParserOpenClaim = claim
+        return provenEnd
     }
 
     /// Publication-only proof for the FIFO head. Unlike the aggregate parser above, this returns the first
@@ -2599,20 +2627,37 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         guard hlsIndexingEnabled,
               hlsInitState.mayPublishMedia,
               let segStartByte = hlsSegmentStartByte,
+              let hlsOpenStage,
               let videoTrackID = hlsVideoTrackID,
               let outputVideoFormat = hlsOutputVideoFormat else { return nil }
-        let candidateEnd = buffer.producedCount
-        guard candidateEnd > segStartByte,
-              let candidate = buffer.snapshotChunk(
-                  offset: segStartByte, length: candidateEnd - segStartByte),
-              let mediaProof = VortXFMP4FragmentParser.proveFirstMediaFragment(
-                  candidate, trackID: videoTrackID, requireFirstSampleSync: true),
-              VortXVideoIDRClassifier.isIDR(
-                  bytes: [UInt8](mediaProof.firstSampleBytes),
-                  codec: outputVideoFormat.codec,
-                  format: outputVideoFormat.packetFormat) else { return nil }
-        let endByte = segStartByte + mediaProof.mediaEnd
-        return endByte > segStartByte && endByte <= candidateEnd ? endByte : nil
+        guard hlsParserOpenClaim == nil,
+              let claim = hlsOpenStage.claim(),
+              claim.baseOffset == segStartByte else { return nil }
+        var provenEnd: Int?
+        let read = claim.withBytes { candidate in
+            guard let mediaProof = VortXFMP4FragmentParser.proveFirstMediaFragment(
+                candidate, trackID: videoTrackID, requireFirstSampleSync: true) else { return }
+            let firstSampleBytes = Data(mediaProof.firstSampleBytes)
+            guard VortXVideoIDRClassifier.isIDR(
+                bytes: [UInt8](firstSampleBytes),
+                codec: outputVideoFormat.codec,
+                format: outputVideoFormat.packetFormat) else { return }
+            let (end, overflow) = segStartByte.addingReportingOverflow(mediaProof.mediaEnd)
+            guard !overflow, end > segStartByte, end <= claim.logicalEndOffset else { return }
+            provenEnd = end
+        }
+        guard read, let provenEnd else { claim.release(); return nil }
+        hlsParserOpenClaim = claim
+        return provenEnd
+    }
+
+    /// Clears the one proof-owned claim on terminal paths that cannot reach hlsCloseSegment's local defer.
+    /// Success moves the same claim into a local before clearing this slot, so this helper never releases a
+    /// claim that is still legitimately needed by an in-flight durable close.
+    private func releaseHLSParserOpenClaim() {
+        let claim = hlsParserOpenClaim
+        hlsParserOpenClaim = nil
+        claim?.release()
     }
 
     /// Publish the open segment as CLOSED (byte range + exact duration). Only closed segments appear in the
@@ -2622,20 +2667,25 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                                  parserProvenEndByte: Int? = nil) -> Bool {
         guard hlsIndexingEnabled,
               hlsInitState.mayPublishMedia,
-              let hlsSpool,
+              let hlsOpenStage,
               let segStartByte = hlsSegmentStartByte,
               let startSec = hlsSegmentStartSec,
               hlsSegmentStartPacketProven else {
+            releaseHLSParserOpenClaim()
             buffer.fail("HLS segment start or output video format was not proven")
             return false
         }
-        let candidateEnd = buffer.producedCount
         guard let endByte = parserProvenEndByte ?? hlsParserProvenSegmentEndByte(),
+              let openClaim = hlsParserOpenClaim,
+              openClaim.baseOffset == segStartByte,
               endByte > segStartByte,
-              endByte <= candidateEnd else {
+              endByte <= openClaim.logicalEndOffset else {
+            releaseHLSParserOpenClaim()
             buffer.fail("HLS segment byte range, sync sample, or first-sample IDR could not be proven")
             return false
         }
+        hlsParserOpenClaim = nil
+        defer { openClaim.release() }
         let duration = endSec - startSec
         guard VortXHLSTargetPolicy.accepts(
             intervalSeconds: duration,
@@ -2660,14 +2710,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             buffer.fail("video segment duration could not be rendered")
             return false
         }
-        var resources: [VortXHLSSessionSpool.SpillResource] = [
-            .init(
-                key: .video(segmentID: idx),
-                buffer: buffer,
-                offset: segStartByte,
-                length: endByte - segStartByte,
-                durationMilliseconds: videoDuration),
-        ]
+        var additionalResources: [VortXHLSSessionSpool.SpillResource] = []
         if let audioResource, audioResource.segmentID == idx, let audioMuxer {
             let audioDuration = audioResource.decodeEnd - audioResource.decodeStart
             guard VortXHLSTargetPolicy.accepts(
@@ -2687,14 +2730,19 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 buffer.fail("alternate-audio segment duration could not be rendered")
                 return false
             }
-            resources.append(.init(
+            additionalResources.append(.init(
                 key: .audio(renditionID: renditionID, segmentID: idx),
                 buffer: audioMuxer.buffer,
                 offset: audioResource.byteOffset,
                 length: audioResource.byteLength,
                 durationMilliseconds: milliseconds))
         }
-        guard hlsSpool.spill(resources) else {
+        guard hlsOpenStage.closePrefix(
+            openClaim,
+            endOffset: endByte,
+            key: .video(segmentID: idx),
+            durationMilliseconds: videoDuration,
+            additionalResources: additionalResources) else {
             buffer.fail("HLS spool admission or durable write failed")
             return false
         }
@@ -2711,7 +2759,6 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
         hlsSegmentStartPacketProven = false
         hlsSegmentStartByte = endByte
-        _ = buffer.discardDurablyBackedPrefix(before: endByte)
         if let audioResource, let audioMuxer {
             _ = audioMuxer.buffer.discardDurablyBackedPrefix(
                 before: audioResource.byteOffset + audioResource.byteLength)
