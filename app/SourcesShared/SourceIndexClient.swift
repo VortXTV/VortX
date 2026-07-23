@@ -244,15 +244,19 @@ final class SourceIndexLifecycleScope {
 ///
 ///   1. HOARD (default ON, anonymous): whenever the app assembles a title's stream results from its add-ons /
 ///      debrid / usenet / torrent sources, it reports the source DESCRIPTORS -- NOT the media, NOT any account
-///      token or user id. Torrent-only v1 sends { kind, id, quality, sizeBytes, seeders? }, where `id` is an
-///      exact 40-hex infohash. Raw HTTP and usenet URLs are never uploaded. Fire-and-forget, batched, deduped
-///      by infohash.
+///      token or user id. Every link kind is contributed as a re-resolvable FACT (DEC-260723-D1):
+///      { kind, id, quality, sizeBytes, seeders?, provider? } where kind is torrent (id = 40-hex infohash),
+///      http (id = a credential-stripped public link), or usenet (id = a credential-stripped nzb link). A
+///      debrid-resolved row contributes the underlying torrent HASH (+ an optional provider fact), never the
+///      personal, expiring CDN link. Fire-and-forget, batched, deduped by (kind, id).
 ///
 ///   2. SERVE (opt-in): when the user turns the Singularity toggle ON AND is signed in, the detail / stream
-///      screen reads the corroborated pooled sources for the title and MERGES them into the stream list as
-///      community torrent sources. Each returned infohash is resolved by the user's own debrid pipeline.
-///      HTTP and usenet have no v1 consumer contract and are dropped. Empty on any miss; signed-out disables
-///      the read entirely (hard login gate, matching the worker).
+///      screen reads the corroborated pooled sources for ALL kinds and MERGES them into the stream list. Rows
+///      are filtered by what the REQUESTER can consume: torrent rows are shown to everyone (self-verifying,
+///      resolved via the requester's OWN debrid cache-check), http rows are shown as public direct links, and
+///      usenet rows are shown ONLY when the requester has a usenet-capable service. No user's personal link or
+///      credential is ever replayed to another user. Empty on any miss; signed-out disables the read entirely
+///      (hard login gate, matching the worker).
 ///
 /// GIVE-TO-GET: every method is additionally gated on `MoatConsent.contributeAndConsume`. If the user has
 /// opted out of the anonymized-data pool, this client neither contributes nor consumes.
@@ -263,16 +267,31 @@ enum SourceIndexClient {
 
     // MARK: - Public models
 
-    /// Torrent-only v1 has one wire kind.
-    enum Kind: String { case torrent }
+    /// The three wire kinds, matching the worker contract: a torrent infohash, a public http(s) direct link,
+    /// and a usenet nzb link. Every kind re-resolves through the REQUESTER's OWN debrid / usenet account; no
+    /// personal link or credential is ever pooled (see the descriptor path and the client-side strip).
+    enum Kind: String { case torrent, http, usenet }
 
     /// One anonymized source descriptor for the HOARD upload. Carries ONLY public, non-personal fields.
     struct Descriptor: Encodable, Sendable {
         let kind: String
-        let id: String            // normalized 40-hex torrent infohash
+        let id: String            // torrent: 40-hex infohash. http/usenet: the credential-stripped public link.
         let quality: String       // e.g. "4K", "1080p", "Other" (from StreamRanking.qualityLabel)
         let sizeBytes: Int64      // 0 when the add-on advertised no size
-        let seeders: Int?         // when advertised
+        let seeders: Int?         // torrent only, when advertised
+        /// Optional debrid provider fact (rd/tb/pm/ad): which provider THIS device confirmed had the source
+        /// cached. A media fact, never a user identity. nil (the common case) is omitted from the wire body by
+        /// the synthesized `encodeIfPresent`, so a provider-less torrent descriptor is byte-identical to v1.
+        let provider: String?
+
+        init(kind: String, id: String, quality: String, sizeBytes: Int64, seeders: Int?, provider: String? = nil) {
+            self.kind = kind
+            self.id = id
+            self.quality = quality
+            self.sizeBytes = sizeBytes
+            self.seeders = seeders
+            self.provider = provider
+        }
     }
 
     /// One corroborated source the pool returns for SERVE. `id` matches the descriptor id space.
@@ -283,6 +302,20 @@ enum SourceIndexClient {
         let sizeBytes: Int64?
         let seeders: Int?
         let corroboration: Int?   // number of distinct witnesses; the worker only returns >= its quarantine floor
+        /// The debrid providers (rd/tb/pm/ad) confirmed to have this source cached. Used to boost/badge a row
+        /// only for a requester who has that provider. Absent on legacy responses -> nil.
+        let providers: [String]?
+
+        init(kind: String?, id: String?, quality: String?, sizeBytes: Int64?, seeders: Int?,
+             corroboration: Int?, providers: [String]? = nil) {
+            self.kind = kind
+            self.id = id
+            self.quality = quality
+            self.sizeBytes = sizeBytes
+            self.seeders = seeders
+            self.corroboration = corroboration
+            self.providers = providers
+        }
     }
 
     private struct ContributionBody: Encodable {
@@ -403,19 +436,25 @@ enum SourceIndexClient {
     // MARK: - Descriptor extraction (pure; no user data)
 
     /// Build the anonymized descriptor set for a title's assembled source groups. Uses `StreamRanking` as the
-    /// single source of truth for quality / size / seeders / classification, so the pool's view matches the
-    /// app's. Skips YouTube trailers and every stream without an exact 40-hex torrent infohash. Deduped by
-    /// normalized infohash.
+    /// single source of truth for quality / size / classification, so the pool's view matches the app's. Skips
+    /// YouTube trailers. Deduped by (kind, id).
     ///
-    /// PRIVACY: the debrid-resolved `url` of a torrent that a service already unlocked is a personal link, so it
-    /// is never sent. Only the public torrent infohash crosses this boundary. HTTP and usenet identifiers have
-    /// no v1 contract and are ignored. No account token, user id, filename, or provider tag is included.
-    static func descriptors(from groups: [CoreStreamSourceGroup]) -> [Descriptor] {
+    /// PER-USER RESOLVE (DEC-260723-D1): EVERY link kind is contributed as a re-resolvable FACT: a torrent
+    /// infohash, a public http(s) direct link, or a usenet nzb link. `providerByHash` optionally tags a torrent
+    /// with the debrid provider THIS device confirmed had it cached (a media fact, never a user identity).
+    ///
+    /// PRIVACY: a debrid-resolved `url` produced FROM a hash is never sent as an http link -- the underlying
+    /// torrent hash + provider tag is contributed instead (hash-first precedence below), because a personal
+    /// debrid CDN link is user-bound and expires. A genuine public http(s) link (no recoverable hash) is
+    /// contributed only after the client-side credential strip. No account token, user id, or filename crosses
+    /// this boundary.
+    static func descriptors(from groups: [CoreStreamSourceGroup],
+                            providerByHash: [String: String] = [:]) -> [Descriptor] {
         var seen = Set<String>()
         var out: [Descriptor] = []
         for group in groups {
             for stream in group.streams where !stream.isYouTubeTrailer {
-                guard let d = descriptor(for: stream) else { continue }
+                guard let d = descriptor(for: stream, providerByHash: providerByHash) else { continue }
                 guard seen.insert(d.kind + "|" + d.id).inserted else { continue }
                 out.append(d)
             }
@@ -423,34 +462,65 @@ enum SourceIndexClient {
         return out
     }
 
-    /// One descriptor for one stream, or nil when it carries no public identity.
-    private static func descriptor(for stream: CoreStream) -> Descriptor? {
+    /// One descriptor for one stream, or nil when it carries no poolable public identity.
+    private static func descriptor(for stream: CoreStream, providerByHash: [String: String] = [:]) -> Descriptor? {
         let sizeGB = StreamRanking.sizeForSort(stream)               // GB (0 when unknown)
         let sizeBytes = sizeGB > 0 ? Int64((sizeGB * 1024 * 1024 * 1024).rounded()) : 0
         let quality = StreamRanking.qualityLabel(stream)
 
-        // A resolved torrent may also carry a personal URL. Only its public infohash crosses this boundary.
-        // Non-torrent streams have no accepted v1 descriptor and are a clean no-op.
-        // A DEBRID-mode add-on returns a resolved `url` row with NO `infoHash`; the public 40-hex then lives
-        // only in `sources` as the documented `dht:<40hex>` entry. Without that fallback the entire debrid
-        // population contributes nothing at all. The resolved `url` is DELIBERATELY not scanned: it carries a
-        // personal debrid token, and only add-on-declared public fields may cross this boundary.
+        // TORRENT (hash-first, most authoritative). A resolved torrent may also carry a personal URL; only its
+        // public infohash crosses this boundary. A DEBRID-mode add-on returns a resolved `url` row with NO
+        // `infoHash`; the public 40-hex then lives only in `sources` as the documented `dht:<40hex>` entry.
+        // The resolved `url` is DELIBERATELY not scanned as a torrent: it carries a personal debrid token.
         //
-        // PRECEDENCE IS SEMANTIC, most-authoritative first, and it used to be inverted. The explicit `infoHash`
-        // field IS the identity; `dht:<40hex>` is the one exactly-specified place a debrid row republishes it.
-        // The old order consulted free-form provider text BEFORE the documented `dht:` entry, so add-on-chosen
-        // bytes could override a real DHT hash the same row was carrying. That free-text recovery path is gone
-        // entirely (see the removal note on SourceIndexContract): with no anchored schema to justify it, the
-        // only shapes accepted here are the two that are specified.
-        // EXACT-SCHEMA ONLY. An earlier form of this fallback scanned any isolated 40-hex run, which would have
-        // lifted a PRIVATE TRACKER PASSKEY out of a `tracker:` URL in `sources` and uploaded it as an infohash
-        // (caught in cross-review, REQ-260721-05). `infoHashFromSourceEntry` requires a whole-token match.
+        // PRECEDENCE IS SEMANTIC, most-authoritative first. The explicit `infoHash` field IS the identity;
+        // `dht:<40hex>` is the one exactly-specified place a debrid row republishes it. Hash-first is also what
+        // makes a debrid-resolved row contribute the underlying HASH (+ provider tag) rather than the ephemeral
+        // personal CDN link: when a hash is recoverable, the `url` is never considered as an http descriptor.
+        // EXACT-SCHEMA ONLY (`infoHashFromSourceEntry` requires a whole-token match), so a private tracker
+        // passkey embedded in a `tracker:` URL is never mistaken for an infohash (REQ-260721-05).
         let declaredHash = SourceIndexContract.normalizeInfoHash(stream.infoHash)
             ?? stream.sources?.lazy.compactMap({ SourceIndexContract.infoHashFromSourceEntry($0) }).first
-        guard let hash = declaredHash else { return nil }
-        let seeders = StreamRanking.seedersForSort(stream)
-        return Descriptor(kind: Kind.torrent.rawValue, id: hash, quality: quality,
-                          sizeBytes: sizeBytes, seeders: seeders >= 0 ? seeders : nil)
+        if let hash = declaredHash {
+            let seeders = StreamRanking.seedersForSort(stream)
+            return Descriptor(kind: Kind.torrent.rawValue, id: hash, quality: quality,
+                              sizeBytes: sizeBytes, seeders: seeders >= 0 ? seeders : nil,
+                              provider: SourceIndexContract.normalizeProviderTag(providerByHash[hash]))
+        }
+
+        // HTTP (genuine public direct link only). A `url` on a stream that shows TORRENT LINEAGE (a `dht:` or
+        // `tracker:` sources marker, or a hash-shaped bingeGroup token) is a debrid-RESOLVED personal CDN link:
+        // it is user-bound and expires, so contributing it is useless + risky, and its underlying hash was
+        // either recovered above (via `dht:`) or is unrecoverable (only a tracker passkey / bingeGroup token,
+        // which must NEVER be pooled). So the http path fires ONLY for a stream with no torrent lineage at all,
+        // i.e. a real public direct link. The client-side strip then drops any credential/config material
+        // BEFORE the network boundary; the worker re-screens.
+        if let rawURL = stream.url, !rawURL.isEmpty, !hasTorrentLineage(stream),
+           let stripped = SourceIndexContract.normalizePooledNonTorrentID(kind: Kind.http.rawValue, raw: rawURL) {
+            return Descriptor(kind: Kind.http.rawValue, id: stripped, quality: quality,
+                              sizeBytes: sizeBytes, seeders: nil)
+        }
+
+        // USENET (nzb link, no direct url). Contribute the credential-stripped public nzb link so a requester
+        // with a usenet-capable service can resolve it through their OWN account.
+        if let rawNZB = stream.nzbUrl, !rawNZB.isEmpty,
+           let stripped = SourceIndexContract.normalizePooledNonTorrentID(kind: Kind.usenet.rawValue, raw: rawNZB) {
+            return Descriptor(kind: Kind.usenet.rawValue, id: stripped, quality: quality,
+                              sizeBytes: sizeBytes, seeders: nil)
+        }
+
+        return nil
+    }
+
+    /// Whether a stream carries TORRENT/DEBRID lineage, meaning any `url` it holds is a debrid-resolved personal
+    /// link (never poolable as http) rather than a genuine public direct link. Lineage = a `dht:`/`tracker:`
+    /// entry in `sources`, or a 40-hex-shaped token in the unconstrained `bingeGroup`. Deliberately conservative:
+    /// a debrid CDN link is excluded from the http path even when the strip would not catch its signed path.
+    private static func hasTorrentLineage(_ stream: CoreStream) -> Bool {
+        if (stream.sources ?? []).contains(where: { $0.hasPrefix("dht:") || $0.hasPrefix("tracker:") }) { return true }
+        if let bingeGroup = stream.behaviorHints?.bingeGroup,
+           bingeGroup.range(of: #"[0-9a-fA-F]{40}"#, options: .regularExpression) != nil { return true }
+        return false
     }
 
     // MARK: - HOARD: POST /sources/contribute (signed, fire-and-forget)
@@ -596,23 +666,38 @@ enum SourceIndexClient {
         }
     }
 
-    /// Revalidate and normalize arbitrary descriptor values immediately before upload, deduped by canonical
-    /// infohash. This is the final confidentiality boundary used by both the POST path and deterministic tests.
+    /// Revalidate and normalize arbitrary descriptor values immediately before upload, deduped by (kind, id).
+    /// This is the final confidentiality boundary used by both the POST path and deterministic tests. Each kind
+    /// re-runs its own canonicalizer here so a caller that built a `Descriptor` by hand (bypassing
+    /// `descriptors(from:)`) still cannot push a non-canonical torrent hash or a credential-bearing http/usenet
+    /// link across the boundary. seeders and the provider tag are torrent-only signals.
     static func uploadableDescriptors(_ descriptors: [Descriptor]) -> [Descriptor] {
         var seen: Set<String> = []
         return descriptors.compactMap { descriptor in
-            guard descriptor.kind == Kind.torrent.rawValue,
-                  let hash = SourceIndexContract.normalizeInfoHash(descriptor.id),
-                  seen.insert(hash).inserted else { return nil }
-            return Descriptor(
-                kind: Kind.torrent.rawValue,
-                id: hash,
-                quality: SourceIndexContract.normalizeQuality(descriptor.quality),
-                sizeBytes: min(max(0, descriptor.sizeBytes), SourceIndexContract.maxSafeSizeBytes),
-                seeders: descriptor.seeders.flatMap {
-                    (0...SourceIndexContract.maxSeeders).contains($0) ? $0 : nil
-                }
-            )
+            let quality = SourceIndexContract.normalizeQuality(descriptor.quality)
+            let sizeBytes = min(max(0, descriptor.sizeBytes), SourceIndexContract.maxSafeSizeBytes)
+            switch descriptor.kind {
+            case Kind.torrent.rawValue:
+                guard let hash = SourceIndexContract.normalizeInfoHash(descriptor.id),
+                      seen.insert(Kind.torrent.rawValue + "|" + hash).inserted else { return nil }
+                return Descriptor(
+                    kind: Kind.torrent.rawValue, id: hash, quality: quality, sizeBytes: sizeBytes,
+                    seeders: descriptor.seeders.flatMap {
+                        (0...SourceIndexContract.maxSeeders).contains($0) ? $0 : nil
+                    },
+                    provider: SourceIndexContract.normalizeProviderTag(descriptor.provider)
+                )
+            case Kind.http.rawValue, Kind.usenet.rawValue:
+                guard let id = SourceIndexContract.normalizePooledNonTorrentID(kind: descriptor.kind, raw: descriptor.id),
+                      seen.insert(descriptor.kind + "|" + id).inserted else { return nil }
+                return Descriptor(
+                    kind: descriptor.kind, id: id, quality: quality, sizeBytes: sizeBytes,
+                    seeders: nil,
+                    provider: SourceIndexContract.normalizeProviderTag(descriptor.provider)
+                )
+            default:
+                return nil
+            }
         }
     }
 
@@ -649,10 +734,12 @@ enum SourceIndexClient {
     }
 
     /// Convenience: extract descriptors from `groups` and contribute them for `contentID`. The HOARD entry the
-    /// detail screens call.
-    static func hoard(contentID: String, groups: [CoreStreamSourceGroup]) async {
+    /// detail screens call. `providerByHash` optionally tags each torrent hash with the debrid provider this
+    /// device confirmed had it cached (from the per-view cache-check), so the pool learns provider facts.
+    static func hoard(contentID: String, groups: [CoreStreamSourceGroup],
+                      providerByHash: [String: String] = [:]) async {
         guard isEnabled else { return }
-        let descriptors = descriptors(from: groups)
+        let descriptors = descriptors(from: groups, providerByHash: providerByHash)
         await contribute(contentID: contentID, descriptors: descriptors)
     }
 
@@ -843,23 +930,49 @@ enum SourceIndexClient {
         }
     }
 
-    /// Turn canonical pooled torrent infohashes into playable `CoreStream`s. Every non-torrent or malformed row
-    /// is dropped before it can enter the user's existing debrid pipeline. Fail-soft.
-    static func streams(from pooled: [PooledSource]) -> [CoreStream] {
+    /// What the REQUESTER can actually consume, so SERVE only builds rows this user can play or resolve through
+    /// their OWN account (DEC-260723-D1). Torrent rows are self-verifying and shown to everyone (resolved via
+    /// the requester's own debrid cache-check, exactly as today). A public http link is playable by anyone. A
+    /// usenet nzb needs a usenet-capable service, so it is built ONLY when the requester has one configured.
+    struct ServeCapabilities: Sendable {
+        let canPlayDirectHTTP: Bool
+        let hasUsenet: Bool
+        /// The v1 behaviour: torrent-only. Kept as the default so pure-torrent reconstruction (and the
+        /// deterministic contract tests) stay byte-identical to before this change.
+        static let torrentOnly = ServeCapabilities(canPlayDirectHTTP: false, hasUsenet: false)
+    }
+
+    /// Turn canonical pooled rows into playable `CoreStream`s, filtered by what the requester can consume.
+    /// Torrent rows are byte-identical to v1 (a lone `Other · Singularity` infohash stream). http rows become
+    /// direct-link streams only when the requester can play raw http; usenet rows become nzb streams only when
+    /// the requester has a usenet-capable service. Every row re-runs the client-side strip so a served link is
+    /// re-verified as public before it enters the user's pipeline. Fail-soft.
+    static func streams(from pooled: [PooledSource],
+                        capabilities: ServeCapabilities = .torrentOnly) -> [CoreStream] {
         let built: [CoreStream] = pooled.prefix(SourceIndexContract.maxServedSources).compactMap { src -> CoreStream? in
-            guard let kind = src.kind, let id = src.id, !id.isEmpty else { return nil }
-            // Name/desc both say "Singularity" so the source ROW is visibly a Singularity source (the group
-            // label is discarded by the quality re-grouping, but this per-stream text survives and renders).
-            // MIRROR the worker's serve floor; never exceed it. The worker already applied it before sending
-            // (serveFloorForKind() = 1 for torrents, "a torrent infohash is SELF-VERIFYING, so a lone early
-            // contributor is never stranded"; general floor env-tunable via CORROBORATION_MIN). This client
-            // check previously sat at 2 and discarded exactly the single-witness rows the worker deliberately
-            // served -- in a young pool nearly all of them. It is retained at the worker's own value purely as
-            // defence against a malformed/absent count, so real policy stays backend-tunable with no app release.
-            guard kind == Kind.torrent.rawValue,
-                  (src.corroboration ?? 0) >= SourceIndexContract.minimumServedCorroboration,
-                  let hash = SourceIndexContract.canonicalStoredInfoHash(id) else { return nil }
-            return make(name: "Other · Singularity", description: "Singularity source", infoHash: hash)
+            guard let kind = src.kind, let id = src.id, !id.isEmpty,
+                  // MIRROR the worker's serve floor; never exceed it (the worker already applied its kind-aware
+                  // floor before sending). Retained purely as defence against a malformed/absent count so real
+                  // policy stays backend-tunable with no app release.
+                  (src.corroboration ?? 0) >= SourceIndexContract.minimumServedCorroboration else { return nil }
+            switch kind {
+            case Kind.torrent.rawValue:
+                // Name/desc both say "Singularity" so the source ROW is visibly a Singularity source. Shown to
+                // every requester; their OWN debrid cache-check badges + resolves it (a wrong provider tag from
+                // the pool never fabricates a cached badge -- the own-key check is the authority).
+                guard let hash = SourceIndexContract.canonicalStoredInfoHash(id) else { return nil }
+                return make(name: "Other · Singularity", description: "Singularity source", infoHash: hash)
+            case Kind.http.rawValue:
+                guard capabilities.canPlayDirectHTTP,
+                      let link = SourceIndexContract.playableRemoteURL(kind: kind, id: id) else { return nil }
+                return make(name: "Other · Singularity", description: "Singularity source", url: link)
+            case Kind.usenet.rawValue:
+                guard capabilities.hasUsenet,
+                      let link = SourceIndexContract.playableRemoteURL(kind: kind, id: id) else { return nil }
+                return make(name: "Other · Singularity", description: "Singularity source", nzbUrl: link)
+            default:
+                return nil
+            }
         }
         diag(.streamsReconstruct, counts: [(.pooled, pooled.count), (.playable, built.count)])
         return built
@@ -963,8 +1076,25 @@ enum SourceIndexClient {
     /// One dedicated no-redirect session is shared by both signed GET and POST paths.
     private static let sourceIndexTransport = SourceIndexHTTPTransport.shared
 
+    /// Whether an id is already in its canonical pooled form for its kind, used by the upload coordinator's
+    /// at-most-once reservation. Torrent requires the exact stored 40-hex; http/usenet require only that the
+    /// client-side strip accepts the value (idempotency quirks of URL re-serialization must not silently drop a
+    /// legitimate contribution, and the dedup key is the id string either way).
+    static func isCanonicalPoolID(kind: String, id: String) -> Bool {
+        switch kind {
+        case Kind.torrent.rawValue:
+            return SourceIndexContract.canonicalStoredInfoHash(id) == id
+        case Kind.http.rawValue, Kind.usenet.rawValue:
+            return SourceIndexContract.normalizePooledNonTorrentID(kind: kind, raw: id) != nil
+        default:
+            return false
+        }
+    }
+
     /// Pure SERVE request builder shared with standalone tests. Invalid title keys return nil before telemetry
-    /// or network work, and the torrent-only kind is always explicit.
+    /// or network work. NO `kind` filter: the client asks for ALL kinds (DEC-260723-D1) and filters client-side
+    /// by the requester's configured services, so the worker applies its per-row corroboration floor across
+    /// torrent / http / usenet in one read.
     static func serveURL(contentID: String) -> URL? {
         guard SourceIndexContract.canonicalContentID(contentID) == contentID,
               var components = URLComponents(
@@ -973,7 +1103,6 @@ enum SourceIndexClient {
               ) else { return nil }
         components.queryItems = [
             URLQueryItem(name: "content_id", value: contentID),
-            URLQueryItem(name: "kind", value: Kind.torrent.rawValue),
         ]
         return components.url
     }
@@ -993,9 +1122,14 @@ enum SourceIndexClient {
     }
 
     /// Build a `CoreStream` via JSON decode (the all-optional field set has no memberwise init), mirroring
-    /// `TorBoxSearch.make`.
-    private static func make(name: String, description: String, infoHash: String) -> CoreStream? {
-        decodeStream(["name": name, "description": description, "infoHash": infoHash])
+    /// `TorBoxSearch.make`. Exactly one of infoHash / url / nzbUrl identifies the served row's kind.
+    private static func make(name: String, description: String,
+                             infoHash: String? = nil, url: String? = nil, nzbUrl: String? = nil) -> CoreStream? {
+        var json: [String: Any] = ["name": name, "description": description]
+        if let infoHash { json["infoHash"] = infoHash }
+        if let url { json["url"] = url }
+        if let nzbUrl { json["nzbUrl"] = nzbUrl }
+        return decodeStream(json)
     }
     private static func decodeStream(_ json: [String: Any]) -> CoreStream? {
         guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
@@ -1156,8 +1290,7 @@ actor SourceUploadCoordinator {
         var keys: [String] = []
         var local = Set<String>()
         for descriptor in descriptors {
-            guard descriptor.kind == SourceIndexClient.Kind.torrent.rawValue,
-                  SourceIndexContract.canonicalStoredInfoHash(descriptor.id) == descriptor.id else { continue }
+            guard SourceIndexClient.isCanonicalPoolID(kind: descriptor.kind, id: descriptor.id) else { continue }
             let key = contentID + "|" + descriptor.kind + "|" + descriptor.id
             guard !seen.contains(key), !pending.contains(key), local.insert(key).inserted else { continue }
             guard seen.count + pending.count + keys.count < maxEntries else { break }
@@ -1326,9 +1459,11 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     typealias FetchPooled = @Sendable (String, Bool) async throws -> [SourceIndexClient.PooledSource]
     typealias ServeGate = @Sendable () -> Bool
     typealias AccountGate = @MainActor @Sendable () -> Bool
+    typealias CapabilitiesProvider = @MainActor @Sendable () -> SourceIndexClient.ServeCapabilities
     private let fetchPooled: FetchPooled
     private let serveGate: ServeGate
     private let accountGate: AccountGate
+    private let capabilities: CapabilitiesProvider
     private let coalescer: SourceIndexFetchCoalescer
     private var refreshGeneration: UInt64 = 0
 
@@ -1342,11 +1477,21 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         accountGate: @escaping AccountGate = {
             VortXSyncManager.shared.isSignedIn
         },
+        capabilities: @escaping CapabilitiesProvider = {
+            // A public http(s) direct link is playable by anyone (no embedded server needed, plays on Lite
+            // too), so http rows are shown to every requester. A usenet nzb needs a usenet-capable service, so
+            // it is built only when the requester has TorBox configured (the one usenet backend among the four).
+            SourceIndexClient.ServeCapabilities(
+                canPlayDirectHTTP: true,
+                hasUsenet: DebridKeys.shared.isConfigured(.torBox)
+            )
+        },
         coalescer: SourceIndexFetchCoalescer = .shared
     ) {
         self.fetchPooled = fetchPooled
         self.serveGate = serveGate
         self.accountGate = accountGate
+        self.capabilities = capabilities
         self.coalescer = coalescer
         SourceIndexLifecycleScope.shared.register(self)
     }
@@ -1376,12 +1521,15 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         let serveGate = self.serveGate
         let accountGate = self.accountGate
         let coalescer = self.coalescer
+        // Snapshot the requester's capabilities on the main actor now, so the off-main reconstruction filters
+        // http/usenet rows by what THIS user can consume without reaching the main-actor DebridKeys later.
+        let serveCapabilities = capabilities()
         task = Task { [weak self] in
             guard accountGate(), SourceIndexLifecycleClock.snapshot() == lifecycle else { return }
             let pooled = await coalescer.fetch(contentID: contentID, isSignedIn: true, lifecycle: lifecycle) {
                 try await fetchPooled(contentID, true)
             }
-            let built = SourceIndexClient.streams(from: pooled)
+            let built = SourceIndexClient.streams(from: pooled, capabilities: serveCapabilities)
             guard !Task.isCancelled, let self,
                   self.refreshGeneration == generation,
                   self.lastContentID == contentID,
@@ -1449,9 +1597,20 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         var seen: Set<String> = []
         var own: [CoreStream] = []
         for s in extra {
-            // Torrent-only v1 keys each pooled source by its canonical 40-hex infohash.
-            guard let hash = SourceIndexContract.canonicalStoredInfoHash(s.infoHash) else { continue }
-            let key = "t:" + hash
+            // Each pooled source is keyed by its kind's natural id: torrent by canonical infohash, http by its
+            // direct url, usenet by its nzb link. The rows were already screened + built by
+            // `streams(from:capabilities:)`, so this only drops duplicates WITHIN Singularity's own list.
+            let key: String?
+            if let hash = SourceIndexContract.canonicalStoredInfoHash(s.infoHash) {
+                key = "t:" + hash
+            } else if let url = s.url, !url.isEmpty {
+                key = "h:" + url
+            } else if let nzb = s.nzbUrl, !nzb.isEmpty {
+                key = "u:" + nzb
+            } else {
+                key = nil
+            }
+            guard let key else { continue }
             if seen.insert(key).inserted { own.append(s) }
         }
         // NOTE: `own` is deduped ONLY within Singularity's own list by torrent infohash. It is deliberately NOT

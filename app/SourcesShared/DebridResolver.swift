@@ -1468,6 +1468,10 @@ extension DebridCoordinator {
 final class DebridCacheAwareness: ObservableObject {
     /// Lowercased infoHashes confirmed cached. Empty until a check completes (and always, with no key).
     @Published private(set) var cachedHashes: Set<String> = []
+    /// Lowercased infoHash -> the Singularity provider tag (rd/tb/pm/ad) of the debrid service that confirmed
+    /// it cached, so the HOARD path can contribute the FACT "provider X has hash H cached". Parallel to
+    /// `cachedHashes`; empty with no key. A media fact derived from the user's OWN cache-check, never a user id.
+    @Published private(set) var cachedProviderByHash: [String: String] = [:]
     /// nzb links whose TorBox usenet download is confirmed cached, so a usenet row can show the ⚡. Keyed
     /// by the raw `nzbUrl` string (not its md5) so the row check is a plain set lookup. Empty until a
     /// usenet check completes and always with no TorBox key. Parallel to `cachedHashes` for torrents.
@@ -1502,6 +1506,9 @@ final class DebridCacheAwareness: ObservableObject {
             self.lastQueried = hashes
             // result keys are already lowercased infoHashes (see TorBoxResolver.checkCache).
             self.cachedHashes = Set(result.keys)
+            // Keep the provider that confirmed each hash cached (the deterministic first-by-priority provider
+            // cacheCheck chose), so HOARD can tag the pooled torrent fact with it.
+            self.cachedProviderByHash = result.mapValues { $0.service.poolProviderTag }
         }
     }
 
