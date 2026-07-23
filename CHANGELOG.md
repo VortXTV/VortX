@@ -4,6 +4,12 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## Unreleased
+
+### Fixed
+
+- **Watch Stats fills in from your real history.** The Watch Stats screen (Settings, Watch Stats) could sit empty even for someone with a full watch history, because it drew its numbers from a single persisted library file and dropped that file whenever its stored account id did not match the one signed in right now, which happens when you are signed out, have just switched accounts, or are on a device that has not written the file yet. It now reads from your account's own live watch history as well, the same history that already powers Continue Watching and the watched checks on your covers, so your hours watched, titles, movies, series, episodes, top genres, and longest binge appear whenever that history is present. Time for a title only the live history knows about is estimated from its length and play count; the exact per-title time still comes from the engine's own record when it is available. iPhone, iPad, and Mac.
+
 ## 0.3.14 Beta 7 - 2026-07-22
 
 A fix beta over Beta 6. Dolby Vision titles on Apple TV now start at the beginning instead of roughly fourteen seconds in, and no longer flicker through repeated display-mode switches at the start of a title. The community (Singularity) source pool is collecting and appearing again, after four separate causes kept it empty. The diagnostic log you send us carries far less about you, and only you can fetch it. And debrid credentials are now scoped to the VortX account that owns them, so signing out and into a different account on the same device can no longer inherit the previous account's debrid keys.
