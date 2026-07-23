@@ -447,6 +447,20 @@ struct TVPlayerView: View {
 
             playerSurface
 
+            // BINGE-ADVANCE SURFACE GATE: while an episode advance is in flight (parked by play(episode:),
+            // cleared exactly at commitPendingAdvanceOnFirstFrame), the surface underneath still holds the
+            // OUTGOING episode: during the resolve window the old file is literally still rendering, and
+            // after the incoming load is issued AVPlayerLayer retains its last decoded contents across
+            // replaceCurrentItem (the mpv Metal layer likewise keeps its last drawable) until the incoming
+            // file's first frame. That read as "plays seconds of the OLD episode" on a binge advance. Hold
+            // an opaque cover for the whole pendingAdvance window; it drops on the same main-actor turn as
+            // the first-frame commit, so the first visible frame IS the committed episode. The published
+            // identity itself is untouched (still first-frame commit); this gates only what is VISIBLE.
+            // Source switches (switchStream) never park a pendingAdvance and are deliberately not covered.
+            if pendingAdvance != nil {
+                Color.black.ignoresSafeArea()
+            }
+
             // UIKit owns ALL remote input. Presented in a dedicated key window so the focus engine has no
             // competitor and every press falls through to here. Swipes come via the pan recognizer.
             RemoteCatcher(onPress: { handlePress($0) }, onSwipe: { noteInteraction(); if !stillWatching { showControls() } })

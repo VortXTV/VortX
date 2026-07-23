@@ -908,7 +908,13 @@ final class MPVMetalViewController: PlatformViewController {
 #if os(tvOS)
         // Hand the TV back its default display mode; the view can already be
         // detached here, so HDRDisplayMode falls back to the app's window.
-        HDRDisplayMode.reset(in: viewIfLoaded?.window)
+        // Ambient hero previews (#44, startMuted) never requested a mode, and their teardown runs on
+        // every hero change while scrolling (and right as full-screen playback starts), so a preview
+        // reset here cleared the MAIN player's criteria and wiped the request ledger: one more HDMI
+        // renegotiation per scroll step. Only non-preview instances reset the panel.
+        if !startMuted {
+            HDRDisplayMode.reset(in: viewIfLoaded?.window)
+        }
 #endif
         appliedDynamicRange = nil
         guard let handle = mpv else { return }
@@ -1480,11 +1486,21 @@ final class MPVMetalViewController: PlatformViewController {
         DiagnosticsLog.log("mpv", "output range → \(range.rawValue) (gamma=\(gamma) sigPeak=\(sigPeak))")
 
 #if os(tvOS)
-        HDRDisplayMode.request(range,
-                               fps: getDouble("container-fps"),
-                               width: getInt("video-params/w"),
-                               height: getInt("video-params/h"),
-                               in: view.window)
+        // Ambient hero previews (#44, startMuted) must NEVER drive the panel's display mode: assigning
+        // preferredDisplayCriteria renegotiates the HDMI link and blanks the screen, so a Home/Detail
+        // scroll that mounts one preview after another read as constant flicker on device. The preview
+        // keeps its layer colorspace tagging above (per-layer compositing, no HDMI effect); only genuine
+        // full-screen playback may switch the display. The main player never sets startMuted, so real
+        // HDR10/HLG output on the mpv lane is unchanged.
+        if startMuted {
+            DiagnosticsLog.log("hdr", "display switch suppressed: muted hero preview never drives the panel mode")
+        } else {
+            HDRDisplayMode.request(range,
+                                   fps: getDouble("container-fps"),
+                                   width: getInt("video-params/w"),
+                                   height: getInt("video-params/h"),
+                                   in: view.window)
+        }
 #endif
     }
     
