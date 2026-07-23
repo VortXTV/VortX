@@ -53,6 +53,7 @@ struct UserProfile: Codable, Identifiable, Equatable {
         var subColor: String
         var subBackground: String
         var subSizeScale: Double? = nil   // optional so older rosters decode
+        var subBrightness: String? = nil   // optional so older rosters decode (#155); nil = 100% default
         /// Stream source-ranking taste (Debrid-first vs Torrent-first, trust add-on order vs app
         /// order). Optional so older rosters decode; nil means "leave the flat keys as they are".
         var sourceTypeOrder: [String]? = nil   // raw SourceType values, top priority first
@@ -476,6 +477,7 @@ final class ProfileStore: ObservableObject {
             subColor: gatedSubColor(d["subColor"] as? String) ?? base?.subColor ?? "",
             subBackground: gatedSubBackground(d["subBackground"] as? String) ?? base?.subBackground ?? "",
             subSizeScale: gatedSubSizeScale(d["subSizeScale"] as? Double) ?? base?.subSizeScale,
+            subBrightness: gatedSubBrightness(d["subBrightness"] as? String) ?? base?.subBrightness,
             sourceTypeOrder: d["sourceTypeOrder"] as? [String] ?? base?.sourceTypeOrder,
             useAddonOrder: d["useAddonOrder"] as? Bool ?? base?.useAddonOrder,
             safetyMode: gatedSafetyMode(d["safetyMode"] as? String) ?? base?.safetyMode,
@@ -569,6 +571,12 @@ final class ProfileStore: ObservableObject {
                 legacy: ["shadow": "shaded", "none": SubtitleStyle.defaultBackground])
     }
 
+    /// SubtitleStyle.brightnessLevels is the authority (100 / 80 / 60 / 40). An unknown id degrades to the
+    /// default (100%, no dimming) rather than guessing a level (#155).
+    private static func gatedSubBrightness(_ raw: String?) -> String? {
+        gatedId(raw, allowed: SubtitleStyle.brightnessLevels.map { $0.id }, legacy: [:])
+    }
+
     /// The fine subtitle multiplier, clamped into SubtitleStyle.sizeScaleRange (0.60...1.80). A doc value
     /// outside the range would otherwise be stored and then re-clamped on every read; clamping on the way in
     /// keeps the stored value and the applied value the same number. The webapp's floor was 0.7.
@@ -615,6 +623,7 @@ final class ProfileStore: ObservableObject {
             subColor: d.string(forKey: SubtitleStyle.Key.color) ?? SubtitleStyle.defaultColor,
             subBackground: d.string(forKey: SubtitleStyle.Key.background) ?? SubtitleStyle.defaultBackground,
             subSizeScale: d.object(forKey: SubtitleStyle.Key.sizeScale) as? Double ?? 1.0,
+            subBrightness: d.string(forKey: SubtitleStyle.Key.brightness) ?? SubtitleStyle.defaultBrightness,
             sourceTypeOrder: SourcePreferences.shared.typeOrder.map(\.rawValue),
             useAddonOrder: SourcePreferences.shared.useAddonOrder,
             safetyMode: SourcePreferences.shared.safetyMode,
@@ -677,10 +686,12 @@ final class ProfileStore: ObservableObject {
             d.set(p.subColor, forKey: SubtitleStyle.Key.color)
             d.set(p.subBackground, forKey: SubtitleStyle.Key.background)
             d.set(p.subSizeScale ?? 1.0, forKey: SubtitleStyle.Key.sizeScale)
+            d.set(p.subBrightness ?? SubtitleStyle.defaultBrightness, forKey: SubtitleStyle.Key.brightness)
         } else if resetUnset {
             for key in [TrackPreferences.Key.audio, TrackPreferences.Key.subtitle,
                         TrackPreferences.Key.forced, SubtitleStyle.Key.font, SubtitleStyle.Key.size,
-                        SubtitleStyle.Key.color, SubtitleStyle.Key.background, SubtitleStyle.Key.sizeScale] {
+                        SubtitleStyle.Key.color, SubtitleStyle.Key.background, SubtitleStyle.Key.sizeScale,
+                        SubtitleStyle.Key.brightness] {
                 d.removeObject(forKey: key)
             }
         }

@@ -410,6 +410,7 @@ struct PlayerScreen: View {
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
     @AppStorage(SubtitleStyle.Key.background) private var subBackground = SubtitleStyle.defaultBackground
+    @AppStorage(SubtitleStyle.Key.brightness) private var subBrightness = SubtitleStyle.defaultBrightness
     // External subtitles from the account's subtitle add-ons, listed beside the file's embedded tracks.
     @State private var addonSubs: [AddonSubtitle] = []
     @State private var addedSubURLs: Set<String> = []
@@ -4776,6 +4777,8 @@ struct PlayerScreen: View {
             rs.append(Row(label: String(localized: "Bigger  +"), detail: scalePct) { adjustSubScale(1) })
             rs.append(Row(label: String(localized: "Colour"), isHeader: true))
             for c in SubtitleStyle.colors { rs.append(Row(label: Self.l10n(c.label), selected: subColor == c.id) { setSubtitleColor(c.id) }) }
+            rs.append(Row(label: String(localized: "Brightness"), isHeader: true))
+            for b in SubtitleStyle.brightnessLevels { rs.append(Row(label: b.label, selected: subBrightness == b.id) { setSubtitleBrightness(b.id) }) }
             rs.append(Row(label: String(localized: "Background"), isHeader: true))
             for b in SubtitleStyle.backgrounds { rs.append(Row(label: Self.l10n(b.label), selected: subBackground == b.id) { setSubtitleBackground(b.id) }) }
             return rs
@@ -5115,6 +5118,9 @@ struct PlayerScreen: View {
     }
     private func setSubtitleColor(_ id: String) {
         subColor = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
+    }
+    private func setSubtitleBrightness(_ id: String) {
+        subBrightness = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
     }
     private func setSubtitleBackground(_ id: String) {
         subBackground = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
