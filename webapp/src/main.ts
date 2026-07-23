@@ -346,9 +346,23 @@ function dismissSplash(): void {
   window.setTimeout(() => splash.remove(), 3000);
 }
 
+/** QR sign-in compatibility (#153). The tvOS/iOS joiner historically encoded the approval link as the real
+ *  path /approve?c=..&k=.. (params in the query string), but this client is hash-routed, so that URL boots
+ *  on the default Home route and the approve view never renders, so the signing-in device waits forever.
+ *  If we booted on the /approve path with no hash route, fold the path + query into the #/approve?c=..&k=..
+ *  hash the router understands. beta.7 encodes the hash form directly (pathname "/"), so this only rescues
+ *  links already in the field and a hand-typed vortx.tv/approve visit. */
+function normalizeApproveEntry(): void {
+  if (!/\/approve\/?$/.test(location.pathname)) return; // not the legacy /approve path
+  if (location.hash && location.hash !== "#" && location.hash !== "#/") return; // a hash route was given; leave it
+  const query = location.search.replace(/^\?/, "");
+  history.replaceState(null, "", location.pathname + (query ? `#/approve?${query}` : "#/approve"));
+}
+
 async function start(): Promise<void> {
   const app = el("app");
   if (!app) return;
+  normalizeApproveEntry(); // rescue the legacy /approve?c=..&k=.. path form into the hash route (#153)
   applySettings(); // theme + text size live before first paint (overrides the default :root tokens)
   dismissSplash();
   app.innerHTML = APP_SHELL;

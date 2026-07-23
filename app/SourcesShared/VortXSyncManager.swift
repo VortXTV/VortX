@@ -1921,7 +1921,24 @@ final class VortXSyncManager: ObservableObject {
         let ephemeral: Curve25519.KeyAgreement.PrivateKey
     }
 
-    enum QrJoinResult: Equatable { case pending, expired, failed, signedIn(email: String) }
+    enum QrJoinResult: Equatable { case pending, transportError, expired, failed, signedIn(email: String) }
+
+    /// Pure disposition of a `/v1/qr/status` poll from its HTTP status and whether the body already
+    /// carries an approval. Split out (no crypto, no network) so the joiner's poll loop is unit-testable
+    /// off device; VortX's Apple app has no XCTest bundle (see app/Tests/QRJoinerFlowTests.swift):
+    ///  - 404 / 410           -> the pairing aged out server-side; the joiner re-mints a fresh code.
+    ///  - 0 / 429 / >= 500    -> transport or relay trouble (offline, DNS/TLS, timeout, rate-limit, 5xx).
+    ///                           RETRIABLE: the joiner keeps polling, but must stop pretending it is merely
+    ///                           "waiting for approval" once it recurs, so the screen is never silently stuck.
+    ///  - 200 + approval      -> ready to unwrap the data key and adopt.
+    ///  - anything else       -> still pending (keep polling).
+    enum QrPollDisposition: Equatable { case ready, pending, expired, retriableError }
+    static func qrPollDisposition(status: Int, hasApproval: Bool) -> QrPollDisposition {
+        if status == 404 || status == 410 { return .expired }
+        if status == 0 || status == 429 || status >= 500 { return .retriableError }
+        if status == 200 && hasApproval { return .ready }
+        return .pending
+    }
 
     /// JOINER (TV): open a pairing. Returns the session to poll, or nil on a transport failure.
     func qrStart() async -> QrJoinSession? {
@@ -1937,21 +1954,28 @@ final class VortXSyncManager: ObservableObject {
     /// session with no decryptable data key can never leave a half-signed-in device.
     func qrPoll(_ session: QrJoinSession) async -> QrJoinResult {
         let (code, json) = await request("GET", "/v1/qr/status?id=\(session.pairingID)")
-        if code == 404 || code == 410 { return .expired }
-        guard code == 200 else { return .pending }
-        if json?["pending"] as? Bool == true { return .pending }
-        guard let token = json?["token"] as? String, let payloadStr = json?["payload"] as? String else { return .pending }
-        // Parse the {"claim","wrapped"} envelope and unwrap the sync data key with our ephemeral private key.
-        guard let pData = payloadStr.data(using: .utf8),
-              let env = (try? JSONSerialization.jsonObject(with: pData)) as? [String: Any],
-              let claim = env["claim"] as? String, let wrapped = env["wrapped"] as? String,
-              let dk = PairingCrypto.unwrapDataKey(wrapped: wrapped, holderPublicKey: claim, using: session.ephemeral)
-        else { return .failed }
-        // Fetch the account this session belongs to, authing with the freshly issued token (not yet adopted).
-        let (mc, mj) = await request("GET", "/v1/auth/me", bearer: token)
-        guard mc == 200, let acct = mj?["account"] as? [String: Any] else { return .failed }
-        adopt(token: token, account: acct, dataKey: dk)
-        return .signedIn(email: acct["email"] as? String ?? "")
+        let token = json?["token"] as? String
+        let payloadStr = json?["payload"] as? String
+        let isPending = (json?["pending"] as? Bool) == true
+        let hasApproval = token != nil && payloadStr != nil && !isPending
+        switch Self.qrPollDisposition(status: code, hasApproval: hasApproval) {
+        case .expired:        return .expired
+        case .retriableError: return .transportError   // relay unreachable / 5xx / rate-limited; keep polling
+        case .pending:        return .pending
+        case .ready:
+            guard let token, let payloadStr else { return .pending }
+            // Parse the {"claim","wrapped"} envelope and unwrap the sync data key with our ephemeral private key.
+            guard let pData = payloadStr.data(using: .utf8),
+                  let env = (try? JSONSerialization.jsonObject(with: pData)) as? [String: Any],
+                  let claim = env["claim"] as? String, let wrapped = env["wrapped"] as? String,
+                  let dk = PairingCrypto.unwrapDataKey(wrapped: wrapped, holderPublicKey: claim, using: session.ephemeral)
+            else { return .failed }
+            // Fetch the account this session belongs to, authing with the freshly issued token (not yet adopted).
+            let (mc, mj) = await request("GET", "/v1/auth/me", bearer: token)
+            guard mc == 200, let acct = mj?["account"] as? [String: Any] else { return .failed }
+            adopt(token: token, account: acct, dataKey: dk)
+            return .signedIn(email: acct["email"] as? String ?? "")
+        }
     }
 
     /// HOLDER (a signed-in device, and the shared shape the web holder mirrors): approve a joining device's
