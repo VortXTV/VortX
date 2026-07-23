@@ -98,6 +98,11 @@ enum ExternalSyncToggle {
     /// Default OFF: importing another service's history into the read path is opt-in, and it NEVER
     /// writes any engine libraryItem (additive-read only). Callers MUST read it with `default: false`.
     static let traktImportWatched = "vortx.trakt.importWatched"
+    /// Show titles COMPLETED on SIMKL (pulled into the local shadow cache by `SIMKLWatchedShadow`) as
+    /// watched in VortX rails. The SIMKL peer of `traktImportWatched`: same default OFF, same opt-in reason,
+    /// same additive-read-only invariant (never an engine libraryItem). Callers MUST read it with
+    /// `default: false`.
+    static let simklImportWatched = "vortx.simkl.importWatched"
     /// Rate titles from the detail page, and mirror those ratings to Trakt. Gates BOTH the rating control
     /// and its wire: with no native VortX rating store yet, a rating made with the mirror off would land
     /// only in a local file nothing else reads, so offering the control there would be a half-feature.

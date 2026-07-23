@@ -223,6 +223,9 @@ private struct SIMKLConnectCard: View {
 
     @AppStorage(ExternalSyncToggle.simklScrobble) private var scrobble = true
     @AppStorage(ExternalSyncToggle.simklWatchlist) private var watchlist = true
+    // Default OFF, matching Trakt's importWatched: importing another service's history into the read path is
+    // opt-in. Its default here MUST match the `default: false` every ExternalSyncToggle.isOn call site passes.
+    @AppStorage(ExternalSyncToggle.simklImportWatched) private var importWatched = false
 
     var body: some View {
         ProviderCard {
@@ -231,6 +234,16 @@ private struct SIMKLConnectCard: View {
                 Text("Connected").font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                 Toggle("Mark watched when you finish", isOn: $scrobble).tint(Theme.Palette.accent)
                 Toggle("Add to watchlist when you add to Library", isOn: $watchlist).tint(Theme.Palette.accent)
+                Toggle("Show titles watched on SIMKL as watched here", isOn: $importWatched)
+                    .tint(Theme.Palette.accent)
+                    .onChange(of: importWatched) { on in
+                        // Turning import ON must pull the SIMKL completed history NOW rather than on the next
+                        // unrelated rebuild tick. refreshNow forces the schedule past the staleness throttle
+                        // (see SIMKLWatchedShadow.refreshNow), so the just-enabled watched titles badge
+                        // immediately. Mirrors the Trakt import toggle.
+                        if on { SIMKLWatchedShadow.shared.refreshNow() }
+                        WatchedIndex.shared.externalShadowChanged()
+                    }
                 Button("Disconnect") { disconnect() }
                     .buttonStyle(ChipButtonStyle(selected: false))
             } else if let pin {
@@ -285,8 +298,13 @@ private struct SIMKLConnectCard: View {
     private func disconnect() {
         Task {
             await SIMKLAuth.shared.signOut()
+            // Wipe the local SIMKL watched shadow so the imported badges drop now and one account's SIMKL
+            // history can never badge covers for the next account that connects on this device (the same
+            // cross-account contamination rule as the Trakt disconnect wipe).
+            SIMKLWatchedShadow.shared.reset()
             await MainActor.run {
                 connected = false; pin = nil; qr = nil
+                WatchedIndex.shared.externalShadowChanged()   // rebuild the read path without the shadow set
                 NotificationCenter.default.post(name: SIMKLRailsModel.disconnectedNote, object: nil)   // clear the Home plan-to-watch rail now
             }
         }

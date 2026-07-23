@@ -47,7 +47,7 @@ final class WatchedIndex: ObservableObject {
     /// updates only the WatchedBitField). Purely in-memory and read-only; never written to engine / profile
     /// / disk. Cleared on a profile switch (see `rebuild`) so it never leaks across profiles.
     private var derivedSeriesWatched: Set<String> = []
-    /// Last published BASE set (engine buckets ∪ live ∪ Trakt shadow, or the overlay set), kept so
+    /// Last published BASE set (engine buckets ∪ live ∪ Trakt/SIMKL shadows, or the overlay set), kept so
     /// `noteSeriesWatched` can republish `base ∪ derivedSeriesWatched` without a full rebuild, preserving
     /// the `ids = base ∪ derived` invariant.
     private var lastBase: Set<String> = []
@@ -117,13 +117,16 @@ final class WatchedIndex: ObservableObject {
         // in the window before the resweep re-triggers rebuild via ctx events, and the generation
         // guard drops these passes' publishes.
         let expectedUID = CoreBridge.shared.currentUID()
-        // Trakt shadow (additive-read, opt-in): union the ids watched on Trakt into the badge set. The
-        // shadow holds BOTH identity forms per title (imdb `tt…` and `tmdb:<id>`), so a cover keyed by
-        // either identity matches the plain `ids.contains(item.id)` read below (issue #143). Empty when the
-        // import toggle is off. Kick a throttled refresh so a stale cache re-pulls; the pull calls back into
+        // External watched shadows (additive-read, each opt-in behind its OWN import toggle): union the ids
+        // watched on Trakt AND completed on SIMKL into the badge set. Each shadow holds BOTH identity forms
+        // per title (imdb `tt…` and `tmdb:<id>`), so a cover keyed by either identity matches the plain
+        // `ids.contains(item.id)` read below (issue #143). Each returns empty when its own import toggle is
+        // off. Kick each one's throttled refresh so a stale cache re-pulls; a pull calls back into
         // `externalShadowChanged` (one more rebuild) when it changes something. NEVER an engine write.
         TraktSyncEngine.shared.refreshIfStale()
+        SIMKLWatchedShadow.shared.refreshIfStale()
         let shadow = TraktSyncEngine.shared.shadowWatchedIDs()
+            .union(SIMKLWatchedShadow.shared.shadowWatchedIDs())
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let first = Self.bucketWatchedIDs(expectedUID: expectedUID)
             DispatchQueue.main.async { self?.publish(live.union(first).union(shadow), ifCurrent: gen) }

@@ -1,5 +1,5 @@
 // ExternalSyncToggleSyncTests: a standalone, runnable verification of the cross-surface carriage for the
-// five Trakt / SIMKL toggles (ExternalSyncToggleSync.swift).
+// six Trakt / SIMKL toggles (ExternalSyncToggleSync.swift).
 //
 // VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md), so this
 // follows the HouseholdCryptoTests / StreamRankingChipsTests convention: a self-contained executable run with
@@ -38,6 +38,7 @@ enum ExternalSyncToggle {
     static let simklScrobble = "vortx.simkl.scrobble"
     static let simklWatchlist = "vortx.simkl.watchlist"
     static let traktImportWatched = "vortx.trakt.importWatched"
+    static let simklImportWatched = "vortx.simkl.importWatched"
 
     static func isOn(_ key: String, default defaultOn: Bool = true) -> Bool {
         guard UserDefaults.standard.object(forKey: key) != nil else { return defaultOn }
@@ -76,24 +77,55 @@ func resetToggles() {
 /// The service block out of a summary, for brevity in the assertions below.
 func block(_ s: [String: Any], _ svc: String) -> [String: Any] { (s[svc] as? [String: Any]) ?? [:] }
 
+/// Parse the REAL `deviceLocalKeys` Set literal out of SettingsBackup.swift. Both device-local tests read
+/// this ONE source of truth instead of a hand-maintained mirror, so the incidental checks below cannot go
+/// stale every time SettingsBackup legitimately gains a per-device key (it just gained the two
+/// `vortx.downloads.*` keys, which is exactly what the old hardcoded mirror missed). Returns nil if the
+/// declaration cannot be located, which the callers surface as a failure.
+func realDeviceLocalKeys() -> Set<String>? {
+    let url = appSource("SourcesShared/SettingsBackup.swift")
+    guard let src = try? String(contentsOf: url, encoding: .utf8),
+          let start = src.range(of: "static let deviceLocalKeys: Set<String> = ["),
+          let end = src.range(of: "]", range: start.upperBound..<src.endIndex) else { return nil }
+    // Strip `//` comments FIRST. The real declaration carries trailing prose that itself contains quoted
+    // words (`... why enabling it never "took"`), and a naive string scan happily reads those as keys. This
+    // guard exists to catch drift, so it must not invent a key that is not there.
+    let body = String(src[start.upperBound..<end.lowerBound])
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map { line -> Substring in
+            guard let slashes = line.range(of: "//") else { return line }
+            return line[line.startIndex..<slashes.lowerBound]
+        }
+        .joined(separator: "\n")
+
+    let re = try! NSRegularExpression(pattern: #""([^"]+)""#)
+    let ns = body as NSString
+    var real: Set<String> = []
+    for m in re.matches(in: body, range: NSRange(location: 0, length: ns.length)) {
+        real.insert(ns.substring(with: m.range(at: 1)))
+    }
+    return real
+}
+
 // MARK: - 1. The table itself
 
 func testTableShape() {
-    expectEqual(ExternalSyncToggleSync.toggles.count, 5, "table carries exactly the five toggles")
+    expectEqual(ExternalSyncToggleSync.toggles.count, 6, "table carries exactly the six toggles")
 
     let keys = Set(ExternalSyncToggleSync.toggles.map(\.key))
-    expectEqual(keys.count, 5, "no duplicate UserDefaults keys")
+    expectEqual(keys.count, 6, "no duplicate UserDefaults keys")
     // The keys are the contract with every other surface (Android reads the same strings). Pin them literally:
     // a rename here is a silent cross-surface break, not a refactor.
     expectEqual(keys, ["vortx.trakt.scrobble", "vortx.trakt.watchlist", "vortx.trakt.importWatched",
-                       "vortx.simkl.scrobble", "vortx.simkl.watchlist"], "literal key strings")
+                       "vortx.simkl.scrobble", "vortx.simkl.watchlist", "vortx.simkl.importWatched"],
+                "literal key strings")
 
-    // Trakt owns three toggles, SIMKL two. importWatched is Trakt-only: the app has no such toggle on SIMKL
-    // and vault.ts:1005-1006 deliberately never invents it there.
+    // Trakt and SIMKL each own three toggles now. importWatched is on BOTH services: SIMKL gained its own
+    // watched import (SIMKLWatchedShadow), so it is a real toggle the app honors, not an invented one.
     expectEqual(Set(ExternalSyncToggleSync.toggles(for: .trakt).map(\.wire)), ["scrobble", "watchlist", "importWatched"],
                 "trakt block carries its three toggles")
-    expectEqual(Set(ExternalSyncToggleSync.toggles(for: .simkl).map(\.wire)), ["scrobble", "watchlist"],
-                "simkl block carries its two toggles")
+    expectEqual(Set(ExternalSyncToggleSync.toggles(for: .simkl).map(\.wire)), ["scrobble", "watchlist", "importWatched"],
+                "simkl block carries its three toggles")
 }
 
 // MARK: - 2a. The shim vs the real enum (drift guard)
@@ -127,6 +159,7 @@ func testShimMatchesRealEnum() {
         "simklScrobble": ExternalSyncToggle.simklScrobble,
         "simklWatchlist": ExternalSyncToggle.simklWatchlist,
         "traktImportWatched": ExternalSyncToggle.traktImportWatched,
+        "simklImportWatched": ExternalSyncToggle.simklImportWatched,
     ]
     for (name, want) in shim {
         guard let got = real[name] else {
@@ -158,7 +191,18 @@ func testDefaultsMatchAppStorageDeclarations() {
         declared[caseName] = value
     }
 
-    expectEqual(declared.count, 5, "found all five @AppStorage declarations in the settings view")
+    // The settings view declares MORE @AppStorage toggles than sync carries: traktResumeSuggestion,
+    // traktRatings and traktCheckin are app-local, deliberately NOT in the synced table. So DON'T pin a
+    // literal count of every declaration (that broke the moment those three landed). The drift guard is that
+    // every SYNCED toggle has a matching @AppStorage default, so derive the expected count from the table and
+    // count only the synced declarations found. The NEXT toggle added to the table - synced or app-local -
+    // then cannot silently break this: a synced one must appear here, an app-local one is simply not counted.
+    let syncedCaseNames = Set(ExternalSyncToggleSync.toggles.map {
+        $0.service.rawValue + $0.wire.prefix(1).uppercased() + $0.wire.dropFirst()
+    })
+    let declaredSyncedCount = declared.keys.filter { syncedCaseNames.contains($0) }.count
+    expectEqual(declaredSyncedCount, ExternalSyncToggleSync.toggles.count,
+                "every synced toggle has a matching @AppStorage declaration in the settings view")
 
     // The settings view declares by ENUM CASE name (traktScrobble); the table stores the service + the
     // in-block wire name (.trakt / "scrobble"). Rebuild the case name to map the two 1:1.
@@ -171,8 +215,9 @@ func testDefaultsMatchAppStorageDeclarations() {
         expectEqual(t.defaultOn, want, "default for \(caseName) matches its @AppStorage default")
     }
 
-    // Belt and braces on the one that is deliberately different from the rest.
+    // Belt and braces on the two that are deliberately different from the rest (opt-in, default OFF).
     expectEqual(declared["traktImportWatched"], false, "traktImportWatched is opt-in (default OFF)")
+    expectEqual(declared["simklImportWatched"], false, "simklImportWatched is opt-in (default OFF)")
 }
 
 // MARK: - 2c. The wire contract vs the dashboard (cross-REPO drift guard)
@@ -208,8 +253,9 @@ func testWireContractMatchesDashboard() {
     expectEqual(block(s, "trakt")["connected"] as? Bool, true, "trakt connection is reported per service")
     expectEqual(block(s, "simkl")["connected"] as? Bool, false, "simkl connection is independent of trakt")
 
-    // importWatched is Trakt-only. Inventing it on SIMKL would publish a toggle the app cannot honor.
-    expect(block(s, "simkl")["importWatched"] == nil, "importWatched is never invented on simkl")
+    // Both services carry importWatched now: SIMKL gained its own watched import (SIMKLWatchedShadow), so it
+    // is a real toggle the app honors, published on both blocks (never an invented one).
+    expect(block(s, "simkl")["importWatched"] != nil, "simkl carries importWatched (its own watched import)")
     expect(block(s, "trakt")["importWatched"] != nil, "trakt carries importWatched")
 
     // No devices key: the tokens ride doc.apiKeys (VortXSyncManager.swift:831-839, :960-966), so the
@@ -399,19 +445,18 @@ func testSummaryRoundTripsThroughJSONAndBack() {
 
 // MARK: - 7. doc.settings is the real source of truth (the premise this whole design rests on)
 
-func testAllFiveKeysAreSyncableThroughSettingsBackup() {
+func testAllSyncedToggleKeysAreSyncableThroughSettingsBackup() {
     // The premise: these keys already ride doc.settings, so this file is a cross-surface VIEW and not a new
-    // source of truth. That rests on SettingsBackup.isSyncable(key) being true for all five. SettingsBackup
-    // cannot be linked in standalone, so mirror its two rules literally (skipPrefixes at :25, deviceLocalKeys
-    // at :37-44) and assert against them. If anyone ever adds one of these keys to deviceLocalKeys, this
+    // source of truth. That rests on SettingsBackup.isSyncable(key) being true for every synced toggle.
+    // SettingsBackup cannot be linked in standalone, so mirror its skipPrefixes rule literally (:29) and
+    // DERIVE deviceLocalKeys straight from the source (rather than a hand-copied mirror that goes stale every
+    // time a per-device key is added). If anyone ever adds one of these toggle keys to deviceLocalKeys, this
     // fails loudly instead of silently dropping the toggle out of the account.
     let skipPrefixes = ["Apple", "NS", "com.apple.", "WebKit", "WebDatabase", "PK", "MetricKit", "INNext"]
-    let deviceLocalKeys: Set<String> = [
-        "stremiox.diskCacheBytes",
-        "stremiox.serverURL",
-        "stremiox.videoUpscaling",
-        "stremiox.dvRemux",
-    ]
+    guard let deviceLocalKeys = realDeviceLocalKeys() else {
+        failures.append("could not parse deviceLocalKeys from SettingsBackup.swift")
+        return
+    }
     for t in ExternalSyncToggleSync.toggles {
         expect(!skipPrefixes.contains { t.key.hasPrefix($0) }, "\(t.service.rawValue).\(t.wire) is an app pref")
         expect(!deviceLocalKeys.contains(t.key), "\(t.service.rawValue).\(t.wire) is not device-local, so it rides doc.settings")
@@ -419,37 +464,19 @@ func testAllFiveKeysAreSyncableThroughSettingsBackup() {
 }
 
 func testDeviceLocalKeysMirrorMatchesRealSource() {
-    // Guard the mirror above against the real file, so this premise cannot rot silently.
-    let url = appSource("SourcesShared/SettingsBackup.swift")
-    guard let src = try? String(contentsOf: url, encoding: .utf8) else {
-        failures.append("could not read SettingsBackup.swift at \(url.path)")
+    // The CONSCIOUS CANARY. `realDeviceLocalKeys()` is derived, so it never rots on its own; this test pins
+    // the exact set it should be so that a change to WHAT IS DEVICE-LOCAL - a sync/security-sensitive change -
+    // must update this literal deliberately and get reviewed, rather than sliding in unnoticed. Adding a
+    // per-device key (the way `vortx.downloads.maxConcurrent` / `.queueOrder` were added) is expected to touch
+    // exactly this line.
+    guard let real = realDeviceLocalKeys() else {
+        failures.append("could not parse deviceLocalKeys from SettingsBackup.swift")
         return
     }
-    guard let start = src.range(of: "static let deviceLocalKeys: Set<String> = ["),
-          let end = src.range(of: "]", range: start.upperBound..<src.endIndex) else {
-        failures.append("deviceLocalKeys not found in SettingsBackup.swift")
-        return
-    }
-    // Strip `//` comments FIRST. The real declaration carries trailing prose that itself contains quoted
-    // words (`... why enabling it never "took"`), and a naive string scan happily reads those as keys. This
-    // guard exists to catch drift, so it must not invent a key that is not there.
-    let body = String(src[start.upperBound..<end.lowerBound])
-        .split(separator: "\n", omittingEmptySubsequences: false)
-        .map { line -> Substring in
-            guard let slashes = line.range(of: "//") else { return line }
-            return line[line.startIndex..<slashes.lowerBound]
-        }
-        .joined(separator: "\n")
-
-    let re = try! NSRegularExpression(pattern: #""([^"]+)""#)
-    let ns = body as NSString
-    var real: Set<String> = []
-    for m in re.matches(in: body, range: NSRange(location: 0, length: ns.length)) {
-        real.insert(ns.substring(with: m.range(at: 1)))
-    }
-    expectEqual(real, ["stremiox.diskCacheBytes", "stremiox.serverURL", "stremiox.videoUpscaling", "stremiox.dvRemux"],
+    expectEqual(real, ["stremiox.diskCacheBytes", "stremiox.serverURL", "stremiox.videoUpscaling",
+                       "stremiox.dvRemux", "vortx.downloads.queueOrder", "vortx.downloads.maxConcurrent"],
                 "deviceLocalKeys mirror matches the real source")
-    // The actual invariant: none of the five is device-local.
+    // The actual invariant: none of the synced toggles is device-local.
     for t in ExternalSyncToggleSync.toggles {
         expect(!real.contains(t.key), "\(t.key) is not in the real deviceLocalKeys")
     }
@@ -483,7 +510,7 @@ struct ExternalSyncToggleSyncTests {
         testMalformedValuesNeverFlipAToggle()
         testBoolValueAcceptsTheWireShapes()
         testSummaryRoundTripsThroughJSONAndBack()
-        testAllFiveKeysAreSyncableThroughSettingsBackup()
+        testAllSyncedToggleKeysAreSyncableThroughSettingsBackup()
         testDeviceLocalKeysMirrorMatchesRealSource()
         // Leave no state behind: these tests write the REAL keys in the runner's own defaults domain.
         resetToggles()
