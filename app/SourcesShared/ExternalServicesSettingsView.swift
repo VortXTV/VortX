@@ -226,6 +226,9 @@ private struct SIMKLConnectCard: View {
     // Default OFF, matching Trakt's importWatched: importing another service's history into the read path is
     // opt-in. Its default here MUST match the `default: false` every ExternalSyncToggle.isOn call site passes.
     @AppStorage(ExternalSyncToggle.simklImportWatched) private var importWatched = false
+    // Default ON, the SIMKL peer of Trakt's ratings toggle, like scrobble/watchlist. Gates the detail page's
+    // SIMKL rating chip AND its mirror; turning it off never deletes a rating (they live in the local shadow).
+    @AppStorage(ExternalSyncToggle.simklRatings) private var ratings = true
 
     var body: some View {
         ProviderCard {
@@ -243,6 +246,15 @@ private struct SIMKLConnectCard: View {
                         // immediately. Mirrors the Trakt import toggle.
                         if on { SIMKLWatchedShadow.shared.refreshNow() }
                         WatchedIndex.shared.externalShadowChanged()
+                    }
+                // Gates the detail page's SIMKL rating chip AND its mirror. Turning it off never deletes a
+                // rating: they live in SIMKLRatingsStore's local shadow, so turning it back on brings them back.
+                Toggle("Rate titles and sync your ratings", isOn: $ratings)
+                    .tint(Theme.Palette.accent)
+                    .onChange(of: ratings) { on in
+                        // Turning it ON converges the user's existing SIMKL ratings now (drain any unpushed
+                        // local edits, then pull the read-back) rather than on the next detail-page open.
+                        if on { SIMKLRatingsStore.shared.refreshNow() }
                     }
                 Button("Disconnect") { disconnect() }
                     .buttonStyle(ChipButtonStyle(selected: false))
@@ -280,6 +292,10 @@ private struct SIMKLConnectCard: View {
                 let image = QRCodeImage.make(p.verificationUrl)
                 await MainActor.run { pin = p; qr = image; working = false; status = "Waiting for you to authorize…" }
                 _ = try await SIMKLAuth.shared.pollForToken(userCode: p.userCode, interval: p.interval, expiresIn: p.expiresIn)
+                // Converge the just-connected account's existing SIMKL ratings into the local shadow now, so a
+                // detail page shows "SIMKL rating · N" for titles already rated on SIMKL. Gated downstream on the
+                // ratings toggle; no-op when it is off.
+                SIMKLRatingsStore.shared.refreshNow()
                 await MainActor.run { connected = true; pin = nil; qr = nil; status = "" }
             } catch is CancellationError {
                 return
@@ -302,6 +318,9 @@ private struct SIMKLConnectCard: View {
             // history can never badge covers for the next account that connects on this device (the same
             // cross-account contamination rule as the Trakt disconnect wipe).
             SIMKLWatchedShadow.shared.reset()
+            // And the SIMKL ratings shadow: one person's SIMKL scores must not show as the next account's
+            // "SIMKL rating", nor drain to their SIMKL from this device. Same contamination rule as Trakt.
+            SIMKLRatingsStore.shared.reset()
             await MainActor.run {
                 connected = false; pin = nil; qr = nil
                 WatchedIndex.shared.externalShadowChanged()   // rebuild the read path without the shadow set
