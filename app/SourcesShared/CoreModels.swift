@@ -326,6 +326,19 @@ struct CoreDescriptor: Decodable, Identifiable {
     var providesStreams: Bool { (manifest.resources ?? []).contains { $0.name == "stream" } }
     var providesMeta: Bool { (manifest.resources ?? []).contains { $0.name == "meta" } }
     var providesSubtitles: Bool { (manifest.resources ?? []).contains { $0.name == "subtitles" } }
+    /// True when this add-on can resolve a raw `tmdb:` catalog id to meta: it exposes a `meta` resource AND
+    /// declares an id-prefix that a `tmdb:` id starts with (per-resource idPrefixes on the `meta` resource,
+    /// or manifest-level idPrefixes). This is the gate for keeping a `tt`-less India title as a `tmdb:` tile:
+    /// the engine resolves `tmdb:` meta ONLY through such an add-on, so without one a `tmdb:` tile dead-taps
+    /// (no meta, and imdb-keyed stream add-ons never match a `tmdb:` id). Rule lives in CatalogRowResolution
+    /// (pure, tested); here we just gather the prefixes it judges.
+    var providesTMDBMeta: Bool {
+        let metaResourcePrefixes = (manifest.resources ?? [])
+            .filter { $0.name == "meta" }
+            .flatMap { $0.idPrefixes ?? [] }
+        let prefixes = metaResourcePrefixes + (manifest.idPrefixes ?? [])
+        return CatalogRowResolution.metaHandlesTMDB(providesMeta: providesMeta, idPrefixes: prefixes)
+    }
     /// Base URL for resource requests: the transport URL minus the trailing `/manifest.json` (mirrors
     /// `AddonDescriptor.baseUrl`). The engine's installed add-ons became the source of truth once VortX went
     /// account-primary, so the subtitle fetch hits `\(baseUrl)/subtitles/…` off this.
@@ -356,10 +369,30 @@ struct CoreDescriptor: Decodable, Identifiable {
     }
 }
 
+/// A thread-safe, launch-persistent flag for "is a `tmdb:`-capable metadata add-on installed", so the
+/// off-main catalog resolvers can gate the `tmdb:` provider fallback without hopping to the MainActor
+/// `CoreBridge`. `CoreBridge.refreshAddons` (the SINGLE publish point for the installed add-on set) writes
+/// it from the final published descriptors; `TMDBClient`'s resolve loop reads it. Backed by UserDefaults so
+/// it is already correct on the first fetch after launch (from the last known state) and then kept current
+/// on every ctx cycle. Mirrors the nonisolated UserDefaults pattern `selectedProviders()` uses.
+enum AddonMetaGate {
+    private static let key = "vortx.addons.tmdbMetaInstalled"
+    nonisolated static func publish(_ installed: Bool) {
+        UserDefaults.standard.set(installed, forKey: key)
+    }
+    nonisolated static func tmdbMetaInstalled() -> Bool {
+        UserDefaults.standard.bool(forKey: key)
+    }
+}
+
 struct CoreManifest: Decodable {
     let name: String
     let catalogs: [CoreManifestCatalog]
     let resources: [CoreManifestResource]?
+    /// Manifest-level `idPrefixes` (Stremio convention): the id-prefix set the add-on serves when a resource
+    /// does not carry its own. Read by `CoreDescriptor.providesTMDBMeta` to detect a `tmdb:`-capable meta
+    /// add-on (a TMDB add-on typically declares `["tmdb:"]` here with bare-string resources). Optional.
+    let idPrefixes: [String]?
     /// Manifest-level behaviorHints; `configurable` means the add-on exposes a web configuration page.
     let behaviorHints: CoreManifestBehaviorHints?
     /// The add-on's logo URL (Stremio `manifest.logo`). AIOManager bakes a user's custom logo here, so
@@ -375,14 +408,23 @@ struct CoreManifestBehaviorHints: Decodable {
 }
 
 /// `ManifestResource` is `#[serde(untagged)]`: either a bare string ("stream") or an object
-/// ({ name: "stream", types: [...] }). Decode either into the resource name.
+/// ({ name: "stream", types: [...], idPrefixes: [...] }). Decode either into the resource name, plus the
+/// optional per-resource `types` / `idPrefixes` an object form may carry (a `meta` resource often scopes its
+/// own `tmdb:` id-prefix here rather than at manifest level).
 struct CoreManifestResource: Decodable {
     let name: String
+    let types: [String]?
+    let idPrefixes: [String]?
     init(from decoder: Decoder) throws {
-        if let short = try? decoder.singleValueContainer().decode(String.self) { name = short; return }
-        name = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .name)
+        if let short = try? decoder.singleValueContainer().decode(String.self) {
+            name = short; types = nil; idPrefixes = nil; return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        types = try? container.decode([String].self, forKey: .types)
+        idPrefixes = try? container.decode([String].self, forKey: .idPrefixes)
     }
-    enum CodingKeys: String, CodingKey { case name }
+    enum CodingKeys: String, CodingKey { case name, types, idPrefixes }
 }
 
 struct CoreDescriptorFlags: Decodable {

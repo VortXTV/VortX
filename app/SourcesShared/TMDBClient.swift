@@ -292,44 +292,15 @@ enum TMDBClient {
         async let tvRows = discoverProviderPage(media: "tv", providerID: providerID, region: region, key: key)
         let movies = await movieRows, series = await tvRows
         // Interleave movie + tv (each already popularity-ordered) so a rail blends both.
-        var rows: [(tmdbID: Int, media: String, name: String, poster: String?)] = []
+        var rows: [DiscoverRow] = []
         for i in 0..<max(movies.count, series.count) {
             if i < movies.count { rows.append(movies[i]) }
             if i < series.count { rows.append(series[i]) }
         }
-        // Over-fetch (some drop for a missing IMDb id), resolve each TMDB id -> tt concurrently, preserve order.
-        let slice = Array(rows.prefix(limit * 2))
-        // Resolve external_ids in CAPPED chunks (~6 in flight) instead of spawning all ~36 at once, so the
-        // 9 rails together never burst hundreds of concurrent requests at TMDB (429s silently thin the rails)
-        // and the in-flight count tracks URLSession's per-host socket budget. Order preserved by row index.
-        var resolved: [(Int, MetaPreview)] = []
-        for start in stride(from: 0, to: slice.count, by: 6) {
-            if resolved.count >= limit { break }   // enough resolved; stop the over-fetch early
-            let batch = Array(slice[start..<min(start + 6, slice.count)])
-            let part: [(Int, MetaPreview)] = await withTaskGroup(of: (Int, MetaPreview)?.self) { group in
-                for (offset, row) in batch.enumerated() {
-                    let i = start + offset
-                    group.addTask {
-                        guard row.poster?.isEmpty == false else { return nil }
-                        // This is a PROVIDER rail: keep a tt-less India-regional title as `tmdb:<id>` (still
-                        // playable) rather than dropping it, so JioHotstar/ZEE5 rails are not empty (see
-                        // CatalogRowResolution). Mirrors the provider-grid path in resolveRows.
-                        let ext = await get("/\(row.media)/\(row.tmdbID)/external_ids?api_key=\(key)")
-                        guard let id = CatalogRowResolution.playableID(imdbID: ext?["imdb_id"] as? String,
-                                                                       tmdbID: row.tmdbID, providerFallback: true) else { return nil }
-                        let type = row.media == "tv" ? "series" : "movie"
-                        return (i, MetaPreview(id: id, type: type, name: row.name, poster: row.poster, posterShape: nil, popularity: nil))
-                    }
-                }
-                var out: [(Int, MetaPreview)] = []
-                for await r in group { if let r { out.append(r) } }
-                return out
-            }
-            resolved.append(contentsOf: part)
-        }
-        var seen = Set<String>()
-        let ordered = resolved.sorted { $0.0 < $1.0 }.map(\.1).filter { seen.insert($0.id).inserted }
-        return Array(ordered.prefix(limit))
+        // PROVIDER rail: keep a tt-less India-regional title as `tmdb:<id>` when a tmdb: meta add-on makes it
+        // openable (else drop it, never a dead tile), retrying transient external-id lookups rather than
+        // downgrading. This is the exact shared resolve path the hub provider grids use (typed gate + retry).
+        return await resolveRowsDetailed(rows, key: key, limit: limit, providerFallback: true).items
     }
 
     // MARK: - Nested-collection Home rails (genres, Top New, Just New)
@@ -423,39 +394,109 @@ enum TMDBClient {
         return rows
     }
 
-    /// Resolve discover rows to engine-playable tt previews: over-fetch (some drop for a missing IMDb id),
-    /// resolve each tmdb id -> tt in CAPPED chunks (~6 in flight) so several rails don't burst hundreds of
+    /// Resolve discover rows to engine-playable previews: over-fetch (some drop for a missing IMDb id),
+    /// resolve each tmdb id in CAPPED chunks (~6 in flight) so several rails don't burst hundreds of
     /// concurrent requests at TMDB (429s silently thin rails), preserve order, de-dup, and cap at `limit`.
-    /// This is the exact resolve path `streamingProviderTitles` uses, factored out for the new rails.
+    /// Thin wrapper over `resolveRowsDetailed` for the callers that only need the items.
     private static func resolveRows(_ rows: [DiscoverRow], key: String, limit: Int, providerFallback: Bool = false) async -> [MetaPreview] {
+        await resolveRowsDetailed(rows, key: key, limit: limit, providerFallback: providerFallback).items
+    }
+
+    /// The resolved items PLUS why some rows dropped, so the honest empty-state can tell region-empty from a
+    /// 429 / offline / add-on-gated drop. Same batching and ordering as before; the difference is the per-row
+    /// id decision now goes through the TYPED resolver: a real IMDb id wins, a confirmed-none row keeps a
+    /// `tmdb:` id ONLY on a provider path with a `tmdb:` meta add-on installed (else it is dropped as add-on
+    /// gated so it never becomes a dead tile), and a row whose external-id lookup stays transient is dropped
+    /// rather than downgraded to a weaker `tmdb:` identity.
+    struct ResolveOutcome {
+        let items: [MetaPreview]
+        let rowsSeen: Int            // discover rows handed in (0 => discover returned nothing for this bucket)
+        let droppedAddonGated: Int   // tt-less provider rows dropped for want of a tmdb: meta add-on
+        let droppedTransient: Int    // rows dropped because external_ids stayed transient after the retry
+    }
+
+    /// The fate of one row inside `resolveRowsDetailed`, so the batch can tally WHY rows dropped.
+    private enum RowResult {
+        case kept(MetaPreview)
+        case droppedPosterless
+        case droppedFiltered      // confirmed no IMDb id on a non-provider (tt-only) grid
+        case droppedAddonGated    // confirmed no IMDb id, provider path, but no tmdb: meta add-on installed
+        case droppedTransient     // external-id lookup never resolved (still throttled/offline)
+    }
+
+    private static func resolveRowsDetailed(_ rows: [DiscoverRow], key: String, limit: Int, providerFallback: Bool) async -> ResolveOutcome {
+        // Read the tmdb:-meta gate ONCE for the whole page (a nonisolated UserDefaults read; see AddonMetaGate).
+        let tmdbMetaAddon = AddonMetaGate.tmdbMetaInstalled()
         let slice = Array(rows.prefix(limit * 2))
         var resolved: [(Int, MetaPreview)] = []
+        var addonGated = 0
+        var transientDropped = 0
         for start in stride(from: 0, to: slice.count, by: 6) {
             if resolved.count >= limit { break }
             let batch = Array(slice[start..<min(start + 6, slice.count)])
-            let part: [(Int, MetaPreview)] = await withTaskGroup(of: (Int, MetaPreview)?.self) { group in
+            let part: [(Int, RowResult)] = await withTaskGroup(of: (Int, RowResult).self) { group in
                 for (offset, row) in batch.enumerated() {
                     let i = start + offset
                     group.addTask {
-                        guard row.poster?.isEmpty == false else { return nil }
-                        // Resolve external_ids -> tt when TMDB has one; on a provider path keep a tt-less
-                        // India title as `tmdb:<id>` (still playable) instead of dropping it (see CatalogRowResolution).
-                        let ext = await get("/\(row.media)/\(row.tmdbID)/external_ids?api_key=\(key)")
-                        guard let id = CatalogRowResolution.playableID(imdbID: ext?["imdb_id"] as? String,
-                                                                       tmdbID: row.tmdbID, providerFallback: providerFallback) else { return nil }
-                        let type = row.media == "tv" ? "series" : "movie"
-                        return (i, MetaPreview(id: id, type: type, name: row.name, poster: row.poster, posterShape: nil, popularity: nil))
+                        guard row.poster?.isEmpty == false else { return (i, .droppedPosterless) }
+                        let resolution = await resolveExternalID(media: row.media, tmdbID: row.tmdbID, key: key)
+                        if let id = CatalogRowResolution.resolvedRowID(resolution, tmdbID: row.tmdbID,
+                                                                       providerFallback: providerFallback,
+                                                                       tmdbMetaAddonInstalled: tmdbMetaAddon) {
+                            let type = row.media == "tv" ? "series" : "movie"
+                            return (i, .kept(MetaPreview(id: id, type: type, name: row.name, poster: row.poster, posterShape: nil, popularity: nil)))
+                        }
+                        switch resolution {
+                        case .none:        return (i, providerFallback ? .droppedAddonGated : .droppedFiltered)
+                        case .unresolved:  return (i, .droppedTransient)
+                        case .imdb:        return (i, .droppedFiltered)   // unreachable: an .imdb always yields an id
+                        }
                     }
                 }
-                var out: [(Int, MetaPreview)] = []
-                for await r in group { if let r { out.append(r) } }
+                var out: [(Int, RowResult)] = []
+                for await r in group { out.append(r) }
                 return out
             }
-            resolved.append(contentsOf: part)
+            for (i, result) in part {
+                switch result {
+                case .kept(let meta):    resolved.append((i, meta))
+                case .droppedAddonGated: addonGated += 1
+                case .droppedTransient:  transientDropped += 1
+                case .droppedPosterless, .droppedFiltered: break
+                }
+            }
         }
         var seen = Set<String>()
         let ordered = resolved.sorted { $0.0 < $1.0 }.map(\.1).filter { seen.insert($0.id).inserted }
-        return Array(ordered.prefix(limit))
+        return ResolveOutcome(items: Array(ordered.prefix(limit)), rowsSeen: rows.count,
+                              droppedAddonGated: addonGated, droppedTransient: transientDropped)
+    }
+
+    /// Resolve one discover row's TMDB id to a TYPED external-id outcome, retrying a transient failure ONCE
+    /// (short backoff) so a 429 / transport blip never masquerades as "no IMDb id" and downgrades a real tt
+    /// title to a weaker `tmdb:` identity. `.imdb` on a confirmed tt, `.none` when TMDB confirms there is
+    /// none, `.unresolved` when it stays transient after the retry (unknown; the caller must NOT fall back).
+    private static func resolveExternalID(media: String, tmdbID: Int, key: String) async -> CatalogRowResolution.ExternalIDResolution {
+        let path = "/\(media)/\(tmdbID)/external_ids?api_key=\(key)"
+        for attempt in 0..<2 {
+            switch await getResult(path) {
+            case .ok(let obj):
+                if let imdb = obj["imdb_id"] as? String, imdb.hasPrefix("tt") { return .imdb(imdb) }
+                return .none
+            case .failure:
+                if attempt == 0 { try? await Task.sleep(nanoseconds: 250_000_000) }
+            }
+        }
+        return .unresolved
+    }
+
+    /// Map a typed fetch failure to the browse grid's empty-state cause.
+    private static func fetchCause(_ error: FetchError) -> CatalogRowResolution.CatalogEmptyCause {
+        switch error {
+        case .transport, .http: return .network
+        case .rateLimited:      return .rateLimited
+        case .parse:            return .parseFailure
+        }
     }
 
     /// A discover-result row, shared by the genre / recent / provider pages: (tmdb id, media, title, poster).
@@ -712,19 +753,51 @@ enum TMDBClient {
     /// previews. `path` is the endpoint without query, e.g. "/trending/movie/week", "/movie/popular",
     /// "/movie/now_playing", "/movie/upcoming". Paginated. Fails soft to [] with no key / nothing found.
     static func listTitles(path: String, region: String = deviceRegion, page: Int = 1, limit: Int = 40) async -> [MetaPreview] {
+        await listPage(path: path, region: region, page: page, limit: limit).items
+    }
+
+    /// `listTitles` with the typed empty-state cause alongside (region / network / 429 / parse / filtered),
+    /// for the hub grids that render an honest empty message. Native list endpoints are IMDb-keyed, so no
+    /// provider `tmdb:` fallback applies here.
+    static func listPage(path: String, region: String = deviceRegion, page: Int = 1, limit: Int = 40) async -> (items: [MetaPreview], cause: CatalogRowResolution.CatalogEmptyCause?) {
         let key = ApiKeys.effectiveTMDBKey()
+        guard !key.isEmpty else { return ([], .missingKey) }
         let media = path.contains("/tv") ? "tv" : "movie"
         let full = "\(path)?api_key=\(key)&language=en-US&page=\(page)&region=\(region)"
-        return await resolveRows(parseDiscover(await get(full), media: media), key: key, limit: limit)
+        return await resolveDiscoverResult(await getResult(full), media: media, key: key, limit: limit, providerFallback: false)
     }
 
     /// One TMDB /discover page with arbitrary extra params (with_watch_providers / with_genres / sort_by /
-    /// date windows), resolved to tt previews. `extra` is a pre-built query fragment (no leading `&`). The
+    /// date windows), resolved to previews. `extra` is a pre-built query fragment (no leading `&`). The
     /// sub-catalog grids (Movies / Shows / New / Top week-month-year / Trending) are built from this.
     static func discoverTitles(media: String, extra: String, region: String = deviceRegion, page: Int = 1, limit: Int = 40, providerFallback: Bool = false) async -> [MetaPreview] {
+        await discoverPage(media: media, extra: extra, region: region, page: page, limit: limit, providerFallback: providerFallback).items
+    }
+
+    /// `discoverTitles` with the typed empty-state cause alongside, so a service grid can say WHY it is empty
+    /// (region-empty vs a 429 / offline / parse failure vs rows that were all filtered / add-on gated) rather
+    /// than always blaming the region.
+    static func discoverPage(media: String, extra: String, region: String = deviceRegion, page: Int = 1, limit: Int = 40, providerFallback: Bool = false) async -> (items: [MetaPreview], cause: CatalogRowResolution.CatalogEmptyCause?) {
         let key = ApiKeys.effectiveTMDBKey()
+        guard !key.isEmpty else { return ([], .missingKey) }
         let full = "/discover/\(media)?api_key=\(key)&language=en-US&watch_region=\(region)&page=\(page)&\(extra)"
-        return await resolveRows(parseDiscover(await get(full), media: media), key: key, limit: limit, providerFallback: providerFallback)
+        return await resolveDiscoverResult(await getResult(full), media: media, key: key, limit: limit, providerFallback: providerFallback)
+    }
+
+    /// Turn a typed fetch result into (items, cause): a fetch failure maps straight to its cause; a 200 is
+    /// parsed and resolved, and its cause (nil when items survive) comes from the resolve tally.
+    private static func resolveDiscoverResult(_ result: FetchResult, media: String, key: String, limit: Int, providerFallback: Bool) async -> (items: [MetaPreview], cause: CatalogRowResolution.CatalogEmptyCause?) {
+        switch result {
+        case .failure(let error):
+            return ([], CatalogRowResolution.bucketEmptyCause(noUsableKey: false, fetchFailure: fetchCause(error),
+                                                              rowsSeen: 0, survivors: 0, droppedAddonGated: 0, droppedTransient: 0))
+        case .ok(let obj):
+            let outcome = await resolveRowsDetailed(parseDiscover(obj, media: media), key: key, limit: limit, providerFallback: providerFallback)
+            let cause = CatalogRowResolution.bucketEmptyCause(noUsableKey: false, fetchFailure: nil,
+                                                              rowsSeen: outcome.rowsSeen, survivors: outcome.items.count,
+                                                              droppedAddonGated: outcome.droppedAddonGated, droppedTransient: outcome.droppedTransient)
+            return (outcome.items, cause)
+        }
     }
 
     /// A representative 16:9 backdrop for a genre tile: the most popular in-region title in that genre's
@@ -1103,13 +1176,29 @@ enum TMDBClient {
     ///                          with the bundled key (the path still carries it) so the hub degrades, never
     ///                          dies. `path` is "/...?api_key=<effective>&...".
     private static func get(_ path: String) async -> [String: Any]? {
+        if case .ok(let obj) = await getResult(path) { return obj }
+        return nil
+    }
+
+    /// A single TMDB GET's TYPED outcome. `get` collapses everything to nil, which makes a 429/offline blip
+    /// indistinguishable from a genuine 200-with-nothing; callers that must tell those apart (the honest
+    /// empty-state, and the external-id resolve that must NOT downgrade a real tt title on a transient error)
+    /// use this instead.
+    enum FetchError: Equatable { case transport, rateLimited, http(Int), parse }
+    enum FetchResult { case ok([String: Any]); case failure(FetchError) }
+
+    /// Typed twin of `get`, same routing: user key -> TMDB direct; no key -> keyless edge, and on an edge
+    /// failure fall back to bundled-key direct (that direct attempt is the reported result, so a transient
+    /// error reflects the last word).
+    static func getResult(_ path: String) async -> FetchResult {
         if ApiKeys.tmdbKey() != nil {
-            return await fetchJSON(URL(string: host + path), sign: false)
+            return await fetchResult(URL(string: host + path), sign: false)
         }
-        if let edgeURL = edgeURL(forPath: path), let obj = await fetchJSON(edgeURL, sign: true) {
-            return obj
+        if let edgeURL = edgeURL(forPath: path) {
+            let edge = await fetchResult(edgeURL, sign: true)
+            if case .ok = edge { return edge }
         }
-        return await fetchJSON(URL(string: host + path), sign: false)   // edge down -> bundled-key direct
+        return await fetchResult(URL(string: host + path), sign: false)   // edge down -> bundled-key direct
     }
 
     /// Build the edge URL for a TMDB path: prefix /3 (already in `host` for direct calls) and DROP the
@@ -1124,14 +1213,26 @@ enum TMDBClient {
     /// GET + decode JSON. Signs the request via `VortXEdgeAuth` when `sign` (only our edge host is gated;
     /// the helper no-ops for any other host), so the same call is safe whether it targets TMDB or the edge.
     private static func fetchJSON(_ url: URL?, sign: Bool) async -> [String: Any]? {
-        guard let url else { return nil }
+        if case .ok(let obj) = await fetchResult(url, sign: sign) { return obj }
+        return nil
+    }
+
+    /// GET + decode JSON to a TYPED result: `.ok` on a 200 with a JSON object, else `.failure` classifying
+    /// WHY (a thrown request -> transport, HTTP 429 -> rateLimited, other non-200 -> http, a 200 whose body
+    /// is not a JSON object -> parse). Signs the edge host exactly like `fetchJSON`.
+    private static func fetchResult(_ url: URL?, sign: Bool) async -> FetchResult {
+        guard let url else { return .failure(.transport) }
         var req = URLRequest(url: url)
         if sign { VortXEdgeAuth.sign(&req) }
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
-            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        } catch { return nil }
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            guard code == 200 else { return .failure(code == 429 ? .rateLimited : .http(code)) }
+            guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                return .failure(.parse)
+            }
+            return .ok(obj)
+        } catch { return .failure(.transport) }
     }
 
     /// Resolve a catalog id to an IMDb `tt` id. A `tt` id passes straight through; a `tmdb:<n>` (or bare
