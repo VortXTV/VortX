@@ -930,10 +930,15 @@ struct SourceIndexTorrentContractTests {
                "serve reconstruction mirrors the worker floor (>=1), still dropping 0/absent, non-torrent, and noncanonical rows")
         expect(served.first?.url == nil && served.first?.nzbUrl == nil,
                "served torrent has no URL or NZB payload")
-        expect(served.first?.name == "Other · Singularity"
-               && served.first?.description == "Singularity source"
-               && !(served.first?.name ?? "").contains(privateURL),
-               "served presentation ignores malicious response quality size and seeder metadata")
+        // The served row now CARRIES the pool's display metadata (resolution/size/seeders) so it renders like
+        // any other source -- but every field is untrusted: `trusted` sets quality to a private URL and size to
+        // the Int64 MAX. The malicious quality must normalize AWAY (never echoed) and the adversarial MAX size
+        // must print a BOUNDED value, while the visible name stays the neutral "Singularity".
+        expect(served.first?.name == "Singularity"
+               && !(served.first?.name ?? "").contains(privateURL)
+               && !(served.first?.description ?? "").contains(privateURL)
+               && (served.first?.description ?? "").contains("100000.00 GB"),
+               "untrusted pooled quality is normalized away and an adversarial MAX size prints a bounded value")
         expect(SourceIndexClient.streams(from: Array(repeating: trusted, count: 101)).count == 100,
                "direct reconstruction cannot exceed the worker's 100-row serve maximum")
 
@@ -1061,15 +1066,17 @@ struct SourceIndexTorrentContractTests {
         )
         let allKindPool = [rdCachedTorrent, publicHTTPRow, credentialHTTPRow, publicUsenetRow, opaqueUsenetRow]
 
-        // A user with NO direct-http and NO usenet capability (the byte-unchanged torrent-only path) sees only
-        // the self-verifying torrent, built byte-identically to v1 (a bare "Other · Singularity" infohash row).
+        // A user with NO direct-http and NO usenet capability (the torrent-only path) sees only the
+        // self-verifying torrent. Its display now carries the pool's real resolution + seeders; the visible
+        // name stays the neutral "Singularity" (the pool's provider fact is NOT shown to a requester who has
+        // no debrid providers configured -- .torrentOnly carries an empty provider set).
         let torrentOnlyServed = SourceIndexClient.streams(from: allKindPool, capabilities: .torrentOnly)
         expect(torrentOnlyServed.count == 1
                && torrentOnlyServed.first?.infoHash == lower
                && torrentOnlyServed.first?.url == nil
                && torrentOnlyServed.first?.nzbUrl == nil
-               && torrentOnlyServed.first?.name == "Other · Singularity",
-               "a torrent-only requester sees only the self-verifying torrent, byte-identical to v1")
+               && torrentOnlyServed.first?.name == "Singularity",
+               "a torrent-only requester sees only the self-verifying torrent, with a neutral name")
 
         // A user who can play raw http but has NO usenet service: the torrent + the PUBLIC http link, never the
         // credential-bearing http row, never usenet.
@@ -1100,9 +1107,105 @@ struct SourceIndexTorrentContractTests {
         // The rd-tagged torrent is shown to EVERY requester (self-verifying); a tb-only user is never shown it
         // as a fabricated cached badge -- the pool's provider claim never becomes a played link on its own, the
         // requester's OWN cache-check is the authority (delivered by the existing debrid pipeline, not here).
-        expect(torrentOnlyServed.first?.description == "Singularity source"
+        expect(torrentOnlyServed.first?.description == "1080p 👤 1 Singularity source"
+               && !(torrentOnlyServed.first?.description ?? "").contains("RD")
                && httpCapable.first(where: { $0.infoHash == lower })?.url == nil,
-               "a provider-tagged torrent stays a plain self-verifying row; the tag never fabricates a played link")
+               "a provider-tagged torrent stays a plain self-verifying row; the tag never fabricates a played link or a cached badge for a requester without that provider")
+
+        // ---- FIX: served rows carry the pool's real display metadata (the "Other other other" bug) ----------
+        // The pooled quality/size/seeders must reach the built stream's parse text so a Singularity row renders
+        // with a resolution badge, size, and seeder-aware ranking like any other source, instead of a wall of
+        // undifferentiated "Other" rows.
+        let richPool = [
+            SourceIndexClient.PooledSource(kind: "torrent", id: lower, quality: "1080p",
+                                           sizeBytes: 2_684_354_560, seeders: 47, corroboration: 2),
+        ]
+        let richServed = SourceIndexClient.streams(from: richPool, capabilities: .torrentOnly)
+        let richDesc = richServed.first?.description ?? ""
+        expect(richServed.count == 1 && richServed.first?.infoHash == lower
+               && richServed.first?.name == "Singularity"
+               && richDesc.contains("1080p") && richDesc.contains("2.50 GB") && richDesc.contains("👤 47"),
+               "a pooled row maps its resolution, size, and seeders into the built stream's parse text")
+
+        // Pure metadata formatters: closed-vocabulary resolution, bounded size, clamped seeders.
+        expect(SourceIndexClient.pooledResolutionToken("2160p") == "4K"
+               && SourceIndexClient.pooledResolutionToken("1080p") == "1080p"
+               && SourceIndexClient.pooledResolutionToken("uhd") == "4K"
+               && SourceIndexClient.pooledResolutionToken("https://evil.example/x") == nil
+               && SourceIndexClient.pooledResolutionToken(nil) == nil,
+               "resolution maps through the closed vocabulary; unknown/hostile values collapse to no resolution")
+        expect(SourceIndexClient.pooledSizeText(2_684_354_560) == "2.50 GB"
+               && SourceIndexClient.pooledSizeText(524_288_000) == "500 MB"
+               && SourceIndexClient.pooledSizeText(1) == nil
+               && SourceIndexClient.pooledSizeText(0) == nil
+               && SourceIndexClient.pooledSizeText(nil) == nil
+               && SourceIndexClient.pooledSizeText(9_007_199_254_740_991) == "100000.00 GB",
+               "size prints a bounded human string StreamRanking reads back; an adversarial MAX clamps")
+        expect(SourceIndexClient.pooledSeedersText(kind: "torrent", seeders: 47) == "👤 47"
+               && SourceIndexClient.pooledSeedersText(kind: "torrent", seeders: 0) == nil
+               && SourceIndexClient.pooledSeedersText(kind: "torrent", seeders: nil) == nil
+               && SourceIndexClient.pooledSeedersText(kind: "http", seeders: 47) == nil
+               && SourceIndexClient.pooledSeedersText(kind: "torrent", seeders: 5_000_000) == "👤 1000000",
+               "seeders map to the ranker's token for torrents only, clamped at the parse boundary")
+
+        // Provider hint: only the intersection of the row's pooled providers with what THIS requester has
+        // configured, as neutral debrid SERVICE codes -- never an add-on name, never for an absent provider.
+        expect(SourceIndexClient.pooledProviderHint(providers: ["rd", "tb"], requester: ["rd"]) == "RD"
+               && SourceIndexClient.pooledProviderHint(providers: ["rd", "tb"], requester: ["rd", "tb"]) == "RD · TB"
+               && SourceIndexClient.pooledProviderHint(providers: ["tb"], requester: ["rd"]) == nil
+               && SourceIndexClient.pooledProviderHint(providers: ["rd"], requester: []) == nil
+               && SourceIndexClient.pooledProviderHint(providers: nil, requester: ["rd"]) == nil,
+               "the provider hint is gated to the requester's own configured debrid providers")
+        let rdRequester = SourceIndexClient.streams(
+            from: [rdCachedTorrent],
+            capabilities: SourceIndexClient.ServeCapabilities(canPlayDirectHTTP: false, hasUsenet: false,
+                                                              debridProviders: ["rd"])
+        )
+        expect(rdRequester.first?.name == "Singularity · RD",
+               "a requester WITH the pooled provider sees a neutral provider hint in the row name")
+
+        // Anonymous-tail bound: rows with NO usable metadata are capped so a metadata-poor pool cannot spam the
+        // list; rows WITH metadata are never capped.
+        let anonymousRow = SourceIndexClient.PooledSource(kind: "torrent", id: lower, quality: "Other",
+                                                          sizeBytes: 0, seeders: 0, corroboration: 2)
+        let hundredAnonymous = SourceIndexClient.streams(from: Array(repeating: anonymousRow, count: 100),
+                                                         capabilities: .torrentOnly)
+        expect(hundredAnonymous.count == SourceIndexContract.maxAnonymousServedSources,
+               "a metadata-poor pool is bounded to the anonymous-tail cap, not 100 undifferentiated rows")
+        let mixedTail = SourceIndexClient.streams(from: richPool + Array(repeating: anonymousRow, count: 100),
+                                                  capabilities: .torrentOnly)
+        expect(mixedTail.count == 1 + SourceIndexContract.maxAnonymousServedSources
+               && (mixedTail.first?.description ?? "").contains("1080p"),
+               "rich rows are kept in full; only the anonymous remainder is capped, and rich rows rank first")
+
+        // Dedupe/merge against the add-on list: a pooled torrent whose infohash an add-on already surfaced (any
+        // case) does NOT render a duplicate Singularity row; only add-on-unseen hashes become new rows.
+        let dedupePooled = SourceIndexClient.streams(from: [
+            SourceIndexClient.PooledSource(kind: "torrent", id: lower, quality: "1080p", sizeBytes: 0,
+                                           seeders: 1, corroboration: 2),
+            SourceIndexClient.PooledSource(kind: "torrent", id: secondHash, quality: "1080p", sizeBytes: 0,
+                                           seeders: 1, corroboration: 2),
+        ], capabilities: .torrentOnly)
+        let addonGroups = [CoreStreamSourceGroup(id: "addon-group", addon: "AnAddon",
+                                                 streams: [CoreStream(name: "1080p", infoHash: upper)])]  // == lower, upper-case
+        let dedupeMerged = SourceIndexServeSource.merge(dedupePooled, into: addonGroups)
+        let singularityGroup = dedupeMerged.first(where: { $0.id == SourceIndexClient.groupID })
+        expect(dedupeMerged.count == 2
+               && singularityGroup?.streams.count == 1
+               && singularityGroup?.streams.first?.infoHash == secondHash,
+               "a pooled torrent an add-on already surfaced merges away; only the add-on-unseen hash becomes a new row")
+        let noAddonMerged = SourceIndexServeSource.merge(dedupePooled, into: [])
+        expect(noAddonMerged.first(where: { $0.id == SourceIndexClient.groupID })?.streams.count == 2,
+               "with no add-on overlap both pooled torrents remain (pass-through unchanged)")
+
+        // The worker also serves an optional `source_tag`. It is decoded, sanitized, and folded ONLY into the
+        // parse text (never the visible name), and it is empty for every row current fleets contribute.
+        let taggedRow = SourceIndexClient.PooledSource(kind: "torrent", id: lower, quality: "Other", sizeBytes: 0,
+                                                       seeders: 0, corroboration: 2, sourceTag: "BluRay Remux")
+        let taggedServed = SourceIndexClient.streams(from: [taggedRow], capabilities: .torrentOnly)
+        expect(taggedServed.first?.name == "Singularity"
+               && (taggedServed.first?.description ?? "").contains("BluRay Remux"),
+               "a served source tag folds into the parse text but never becomes the visible row name")
 
         // ---- All-kind CONTRIBUTION shapes + client-side credential strip ----
         let contributionGroups = [CoreStreamSourceGroup(id: "g", addon: "addon", streams: [

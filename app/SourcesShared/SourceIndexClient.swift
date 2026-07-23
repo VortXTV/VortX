@@ -300,6 +300,11 @@ enum SourceIndexClient {
         let id: String?
         let quality: String?
         let sizeBytes: Int64?
+        /// An optional display tag the worker stores (`source_tag`). Sanitized, display-only, and empty for
+        /// every row current fleets contribute (the client Descriptor carries no tag). Decoded so a future
+        /// tag is not silently dropped and so `streams(from:)` can fold any quality token it carries into the
+        /// row's parse text. Never rendered as a visible name -- the row's shown label stays neutral.
+        let sourceTag: String?
         let seeders: Int?
         let corroboration: Int?   // number of distinct witnesses; the worker only returns >= its quarantine floor
         /// The debrid providers (rd/tb/pm/ad) confirmed to have this source cached. Used to boost/badge a row
@@ -307,11 +312,12 @@ enum SourceIndexClient {
         let providers: [String]?
 
         init(kind: String?, id: String?, quality: String?, sizeBytes: Int64?, seeders: Int?,
-             corroboration: Int?, providers: [String]? = nil) {
+             corroboration: Int?, providers: [String]? = nil, sourceTag: String? = nil) {
             self.kind = kind
             self.id = id
             self.quality = quality
             self.sizeBytes = sizeBytes
+            self.sourceTag = sourceTag
             self.seeders = seeders
             self.corroboration = corroboration
             self.providers = providers
@@ -937,45 +943,168 @@ enum SourceIndexClient {
     struct ServeCapabilities: Sendable {
         let canPlayDirectHTTP: Bool
         let hasUsenet: Bool
+        /// The debrid providers THIS requester has configured, in the pool's code space (rd/tb/pm/ad). Used
+        /// ONLY to surface a provider hint for a source the user can actually reach through their own account;
+        /// the pool's provider claim never fabricates a cached badge (the live own-key cache-check is the
+        /// authority). Empty by default so the torrent-only path stays byte-identical.
+        let debridProviders: Set<String>
+
+        init(canPlayDirectHTTP: Bool, hasUsenet: Bool, debridProviders: Set<String> = []) {
+            self.canPlayDirectHTTP = canPlayDirectHTTP
+            self.hasUsenet = hasUsenet
+            self.debridProviders = debridProviders
+        }
+
         /// The v1 behaviour: torrent-only. Kept as the default so pure-torrent reconstruction (and the
         /// deterministic contract tests) stay byte-identical to before this change.
         static let torrentOnly = ServeCapabilities(canPlayDirectHTTP: false, hasUsenet: false)
     }
 
-    /// Turn canonical pooled rows into playable `CoreStream`s, filtered by what the requester can consume.
-    /// Torrent rows are byte-identical to v1 (a lone `Other · Singularity` infohash stream). http rows become
+    /// Turn canonical pooled rows into playable `CoreStream`s, filtered by what the requester can consume, and
+    /// carrying the pool's real display metadata so a Singularity row renders like any other source (resolution
+    /// badge, size, seeders) through the SAME `StreamRanking` text parse the whole app uses. http rows become
     /// direct-link streams only when the requester can play raw http; usenet rows become nzb streams only when
     /// the requester has a usenet-capable service. Every row re-runs the client-side strip so a served link is
     /// re-verified as public before it enters the user's pipeline. Fail-soft.
+    ///
+    /// EVERY pooled field is UNTRUSTED contributor data. Quality is forced through the closed vocabulary, size
+    /// and seeders are clamped, the source tag is charset-stripped, and the provider hint is shown only for a
+    /// provider THIS requester has -- so an adversarial response can never inject arbitrary text into a row and
+    /// the pool's provider claim never fabricates a cached badge (the own-key cache-check stays the authority).
+    ///
+    /// ANONYMOUS-TAIL BOUND: rows that carry no usable metadata at all (legacy entries with no resolution, size,
+    /// seeders, provider fact, or tag) are the wall of undifferentiated "Other" rows the pool used to spam. They
+    /// rank last at the worker already; here their remainder is capped so a metadata-poor pool cannot fill the
+    /// list with anonymous duplicates. Rich rows are all kept.
     static func streams(from pooled: [PooledSource],
                         capabilities: ServeCapabilities = .torrentOnly) -> [CoreStream] {
-        let built: [CoreStream] = pooled.prefix(SourceIndexContract.maxServedSources).compactMap { src -> CoreStream? in
+        var rich: [CoreStream] = []
+        var anonymous: [CoreStream] = []
+        for src in pooled.prefix(SourceIndexContract.maxServedSources) {
             guard let kind = src.kind, let id = src.id, !id.isEmpty,
                   // MIRROR the worker's serve floor; never exceed it (the worker already applied its kind-aware
                   // floor before sending). Retained purely as defence against a malformed/absent count so real
                   // policy stays backend-tunable with no app release.
-                  (src.corroboration ?? 0) >= SourceIndexContract.minimumServedCorroboration else { return nil }
+                  (src.corroboration ?? 0) >= SourceIndexContract.minimumServedCorroboration else { continue }
+            let display = pooledDisplay(for: src, requesterProviders: capabilities.debridProviders)
+            let stream: CoreStream?
             switch kind {
             case Kind.torrent.rawValue:
-                // Name/desc both say "Singularity" so the source ROW is visibly a Singularity source. Shown to
-                // every requester; their OWN debrid cache-check badges + resolves it (a wrong provider tag from
-                // the pool never fabricates a cached badge -- the own-key check is the authority).
-                guard let hash = SourceIndexContract.canonicalStoredInfoHash(id) else { return nil }
-                return make(name: "Other · Singularity", description: "Singularity source", infoHash: hash)
+                // Shown to every requester; their OWN debrid cache-check badges + resolves it (a provider tag
+                // from the pool never fabricates a cached badge -- the own-key check is the authority).
+                guard let hash = SourceIndexContract.canonicalStoredInfoHash(id) else { continue }
+                stream = make(name: display.name, description: display.description, infoHash: hash)
             case Kind.http.rawValue:
                 guard capabilities.canPlayDirectHTTP,
-                      let link = SourceIndexContract.playableRemoteURL(kind: kind, id: id) else { return nil }
-                return make(name: "Other · Singularity", description: "Singularity source", url: link)
+                      let link = SourceIndexContract.playableRemoteURL(kind: kind, id: id) else { continue }
+                stream = make(name: display.name, description: display.description, url: link)
             case Kind.usenet.rawValue:
                 guard capabilities.hasUsenet,
-                      let link = SourceIndexContract.playableRemoteURL(kind: kind, id: id) else { return nil }
-                return make(name: "Other · Singularity", description: "Singularity source", nzbUrl: link)
+                      let link = SourceIndexContract.playableRemoteURL(kind: kind, id: id) else { continue }
+                stream = make(name: display.name, description: display.description, nzbUrl: link)
             default:
-                return nil
+                continue
             }
+            guard let stream else { continue }
+            if display.hasMetadata { rich.append(stream) } else { anonymous.append(stream) }
         }
+        let built = rich + anonymous.prefix(SourceIndexContract.maxAnonymousServedSources)
         diag(.streamsReconstruct, counts: [(.pooled, pooled.count), (.playable, built.count)])
         return built
+    }
+
+    /// One served row's DISPLAY, composed from normalized + bounded pooled metadata. Returns the parse text the
+    /// row renders through (`name` is the human title line, `description` carries the parse tokens), plus whether
+    /// the row carries any usable metadata (drives the anonymous-tail bound). All fields are untrusted:
+    ///   - resolution is `normalizeQuality`'d to the closed vocabulary, so an odd/hostile quality string (a link,
+    ///     free text) becomes "Other" and is simply omitted -- it is never echoed into the row,
+    ///   - size is clamped to the same ceiling `StreamRanking` itself applies and printed in a form its size
+    ///     parser reads back ("2.35 GB" / "850 MB"),
+    ///   - seeders (torrent only) are clamped and printed as the "👤 N" token the ranker parses,
+    ///   - the provider hint lists only debrid SERVICE codes (rd/tb/pm/ad -- never an add-on name) the requester
+    ///     actually has configured, so it can never claim a source the user cannot reach,
+    ///   - the source tag is charset-stripped, length-bounded, and folded ONLY into the parse text, never shown
+    ///     as a visible name (the row's shown label stays the neutral "Singularity").
+    static func pooledDisplay(for src: PooledSource,
+                              requesterProviders: Set<String>) -> (name: String, description: String, hasMetadata: Bool) {
+        let resolution = pooledResolutionToken(src.quality)
+        let size = pooledSizeText(src.sizeBytes)
+        let seeders = pooledSeedersText(kind: src.kind, seeders: src.seeders)
+        let providerHint = pooledProviderHint(providers: src.providers, requester: requesterProviders)
+        let tag = pooledSourceTag(src.sourceTag)
+
+        let hasMetadata = resolution != nil || size != nil || seeders != nil
+            || providerHint != nil || tag != nil
+
+        // Visible title line: neutral brand plus, when present, the requester-reachable provider hint. Never the
+        // untrusted tag or the raw pooled quality string.
+        let name = providerHint.map { "Singularity · \($0)" } ?? "Singularity"
+        // Parse-only text StreamRanking reads for the resolution badge, size line, and seeder-aware ranking. The
+        // sanitized tag is folded in here (parse layer only) so any quality token it carries still classifies.
+        let description = ([resolution, size, seeders, tag].compactMap { $0 } + ["Singularity source"])
+            .joined(separator: " ")
+        return (name, description, hasMetadata)
+    }
+
+    /// The closed-vocabulary resolution label for a pooled quality string, or nil when the pool carries no
+    /// recognizable resolution (so the row honestly shows no resolution rather than a fabricated one). Untrusted
+    /// input collapses to "Other" -> nil, so a hostile quality value is never echoed.
+    static func pooledResolutionToken(_ quality: String?) -> String? {
+        let normalized = SourceIndexContract.normalizeQuality(quality ?? "")
+        return normalized == "Other" ? nil : normalized
+    }
+
+    /// A bounded, human size string StreamRanking's own size parser reads back ("2.35 GB" / "850 MB"), or nil
+    /// when the size is absent or below a meaningful floor. The byte count is clamped to the SAME ceiling
+    /// `StreamRanking.sizeGB` applies (100000 GB), so an adversarial MAX size can only ever print a bounded value.
+    static func pooledSizeText(_ sizeBytes: Int64?) -> String? {
+        guard let raw = sizeBytes, raw > 0 else { return nil }
+        let bytes = Double(min(max(0, raw), SourceIndexContract.maxSafeSizeBytes))
+        let gb = min(bytes / 1_073_741_824, 100_000)          // 1024^3, clamped like StreamRanking
+        if gb >= 1 { return String(format: "%.2f GB", gb) }
+        let mb = bytes / 1_048_576                            // 1024^2
+        return mb >= 1 ? String(format: "%.0f MB", mb) : nil
+    }
+
+    /// The "👤 N" seeder token StreamRanking parses, for a TORRENT row with a positive advertised swarm, clamped
+    /// to the parse boundary. Absent/zero seeders yield nil (unknown, not an explicitly dead swarm).
+    static func pooledSeedersText(kind: String?, seeders: Int?) -> String? {
+        guard kind == Kind.torrent.rawValue, let s = seeders, s > 0 else { return nil }
+        return "👤 \(min(s, SourceIndexContract.maxSeeders))"
+    }
+
+    /// A neutral provider hint (uppercased debrid SERVICE codes: RD/TB/PM/AD) for the intersection of the row's
+    /// pooled provider facts with the providers THIS requester has configured. Empty intersection -> nil, so the
+    /// row never advertises a provider the user cannot reach, and no add-on name is ever surfaced.
+    static func pooledProviderHint(providers: [String]?, requester: Set<String>) -> String? {
+        guard let providers, !requester.isEmpty else { return nil }
+        let matched = Set(providers.compactMap { SourceIndexContract.normalizeProviderTag($0) })
+            .intersection(requester)
+        guard !matched.isEmpty else { return nil }
+        return matched.sorted().map { $0.uppercased() }.joined(separator: " · ")
+    }
+
+    /// A sanitized, length-bounded source tag, or nil when empty. Charset-stripped to the stored vocabulary the
+    /// worker uses, so no punctuation, emoji, or credential-shaped text survives into the parse layer.
+    static func pooledSourceTag(_ tag: String?) -> String? {
+        guard let trimmed = tag?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        let safe = trimmed
+            .replacingOccurrences(of: "[^A-Za-z0-9 ._-]", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        guard !safe.isEmpty else { return nil }
+        return String(safe.prefix(48))
+    }
+
+    /// The requester's configured debrid providers, mapped to the pool's provider codes (rd/tb/pm/ad). Used only
+    /// to surface a provider hint for a source THIS user can reach -- never to fabricate a cached badge.
+    @MainActor
+    static func configuredDebridProviders() -> Set<String> {
+        var set: Set<String> = []
+        if DebridKeys.shared.isConfigured(.realDebrid) { set.insert("rd") }
+        if DebridKeys.shared.isConfigured(.torBox) { set.insert("tb") }
+        if DebridKeys.shared.isConfigured(.premiumize) { set.insert("pm") }
+        if DebridKeys.shared.isConfigured(.allDebrid) { set.insert("ad") }
+        return set
     }
 
     /// Deterministic decode boundary used by the live GET path's contract tests. Invalid JSON is empty and a
@@ -1481,9 +1610,12 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
             // A public http(s) direct link is playable by anyone (no embedded server needed, plays on Lite
             // too), so http rows are shown to every requester. A usenet nzb needs a usenet-capable service, so
             // it is built only when the requester has TorBox configured (the one usenet backend among the four).
+            // The requester's configured debrid providers are snapshotted here so an off-main reconstruction can
+            // show a provider hint for a source THIS user can reach without touching main-actor state later.
             SourceIndexClient.ServeCapabilities(
                 canPlayDirectHTTP: true,
-                hasUsenet: DebridKeys.shared.isConfigured(.torBox)
+                hasUsenet: DebridKeys.shared.isConfigured(.torBox),
+                debridProviders: SourceIndexClient.configuredDebridProviders()
             )
         },
         coalescer: SourceIndexFetchCoalescer = .shared
@@ -1576,10 +1708,11 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
 
     /// Merge the community sources into `groups` as its OWN named source group, exactly like any other add-on.
     /// Singularity's corroborated sources appear under the "Singularity" label whenever the pool has any for this
-    /// title, EVEN when one of your own add-ons also returns the same release: add-ons are never deduped against
-    /// one another, so Singularity is not either (that is what made it invisible on titles your add-ons already
-    /// cover). We drop only internal duplicates within Singularity's own list, by infoHash. Empty pool (SERVE off
-    /// / not signed in / fleet-off / nothing corroborated) is a pure pass-through, so the list is unchanged.
+    /// title. A pooled TORRENT whose infohash is ALREADY surfaced by one of the user's own add-ons is dropped
+    /// here: it corroborates a row the list already shows (with that add-on's fuller metadata) rather than
+    /// rendering a second identical row, so only hashes the add-ons did NOT surface become new Singularity rows.
+    /// Internal duplicates within Singularity's own list are dropped too. Empty pool (SERVE off / not signed in /
+    /// fleet-off / nothing corroborated) is a pure pass-through, so the list is unchanged.
     func merged(into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         Self.merge(streams, into: groups)
     }
@@ -1594,14 +1727,26 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     /// `SourceListModel.rebuild`, once per coalesced rebuild, where its frequency is the metric.
     nonisolated static func merge(_ extra: [CoreStream], into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         guard !extra.isEmpty else { return groups }
+        // Torrent infohashes the user's OWN add-ons already surfaced (any case). A pooled torrent that matches
+        // one is corroboration of a row the list already shows, not a new source, so it is dropped below. The
+        // Singularity group itself is skipped so a re-merge of an already-merged list never eats its own rows.
+        var addonHashes: Set<String> = []
+        for group in groups where group.id != SourceIndexClient.groupID {
+            for s in group.streams {
+                if let hash = SourceIndexContract.normalizeInfoHash(s.infoHash) { addonHashes.insert(hash) }
+            }
+        }
         var seen: Set<String> = []
         var own: [CoreStream] = []
         for s in extra {
             // Each pooled source is keyed by its kind's natural id: torrent by canonical infohash, http by its
             // direct url, usenet by its nzb link. The rows were already screened + built by
-            // `streams(from:capabilities:)`, so this only drops duplicates WITHIN Singularity's own list.
+            // `streams(from:capabilities:)`.
             let key: String?
-            if let hash = SourceIndexContract.canonicalStoredInfoHash(s.infoHash) {
+            if let hash = SourceIndexContract.normalizeInfoHash(s.infoHash) {
+                // Dedupe/merge against the add-on list: a pooled torrent the add-ons already return does not get
+                // a duplicate Singularity row.
+                if addonHashes.contains(hash) { continue }
                 key = "t:" + hash
             } else if let url = s.url, !url.isEmpty {
                 key = "h:" + url
@@ -1613,9 +1758,6 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
             guard let key else { continue }
             if seen.insert(key).inserted { own.append(s) }
         }
-        // NOTE: `own` is deduped ONLY within Singularity's own list by torrent infohash. It is deliberately NOT
-        // deduped against the user's add-on groups, so a
-        // release your add-ons already return still appears under the Singularity label.
         guard !own.isEmpty else { return groups }
         return groups + [CoreStreamSourceGroup(id: SourceIndexClient.groupID, addon: SourceIndexClient.groupAddon, streams: own)]
     }
