@@ -109,8 +109,9 @@ verify_sha256() { # <file> <expected-hash> <label>
     # Windows fallback (Git Bash without coreutils): certutil prints the hash on line 2.
     actual="$(certutil -hashfile "$1" SHA256 | sed -n '2p' | tr -dc '0-9a-fA-F' | tr 'A-F' 'a-f')"
   else
-    echo "fetch-server-deps: no sha256 tool (sha256sum/shasum/openssl/certutil); skipping verify for $3" >&2
-    return 0
+    echo "fetch-server-deps: ERROR - cannot verify $3: no SHA-256 tool (sha256sum/shasum/openssl/certutil)" >&2
+    rm -f "$1"
+    exit 1
   fi
   if [ "${actual}" != "$2" ]; then
     echo "ERROR: $3 checksum mismatch" >&2
@@ -170,13 +171,17 @@ case "${uname_s}" in
     else
       # Pinned zhongfly release. Baseline x86-64 build (NOT the -v3/AVX2 build) for broad CPU
       # compatibility. The checksum is verified on the downloaded bytes.
-      MPV_WIN_TAG="2026-06-19-2d5dfb343a"
-      MPV_WIN_ASSET="mpv-x86_64-20260619-git-2d5dfb343a.7z"
-      MPV_WIN_SHA256="eaa0479b67270b5a1d3f0c6d9a5b6b5749322e5e8848bba544b921669d5d207a"
+      MPV_WIN_TAG="2026-07-20-94335ab87a"
+      MPV_WIN_ASSET="mpv-x86_64-20260720-git-94335ab87a.7z"
+      MPV_WIN_SHA256="a77cd53dc8d9e002b612d3bfaffa15be3ca2944713caab508b6f4f26a75400b3"
       MPV_WIN_URL="https://github.com/zhongfly/mpv-winbuild/releases/download/${MPV_WIN_TAG}/${MPV_WIN_ASSET}"
       echo "fetch-server-deps: downloading mpv (zhongfly ${MPV_WIN_TAG})..."
       TMP_MPV="$(mktemp -d)"
-      curl -fsSL "${MPV_WIN_URL}" -o "${TMP_MPV}/mpv.7z"
+      if ! curl -fsSL "${MPV_WIN_URL}" -o "${TMP_MPV}/mpv.7z"; then
+        echo "fetch-server-deps: ERROR - pinned Windows mpv artifact is unavailable: ${MPV_WIN_URL}" >&2
+        rm -rf "${TMP_MPV}"
+        exit 1
+      fi
       verify_sha256 "${TMP_MPV}/mpv.7z" "${MPV_WIN_SHA256}" "mpv windows ${MPV_WIN_TAG}"
       # 7-Zip ships on the GitHub windows runner; extract just mpv.exe (flat, ignore the rest).
       ( cd "${TMP_MPV}" && 7z e -y mpv.7z mpv.exe >/dev/null )
