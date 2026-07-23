@@ -9,9 +9,11 @@
 // #1 add-on is a localized meta provider sees that provider's metadata even though the engine lists the
 // protected English Cinemeta first.
 //
-// Run:
+// Run (compiles the REAL `AddonPriorityOrder` too, since `CoreMetaDetails.meta` now resolves its rank and
+// identity through the shared primitive - so this test exercises the exact shipped dedup + canonical rule):
 //
 //     xcrun swiftc -o /tmp/addon-reorder-meta-test \
+//       app/SourcesShared/AddonPriorityOrder.swift \
 //       app/SourcesShared/CoreModels.swift \
 //       app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //       app/Tests/AddonReorderMetaResolutionTests.swift && \
@@ -51,14 +53,10 @@ actor DebridCoordinator {
 
 enum StubError: Error { case unavailable }
 
-// The two symbols CoreMetaDetails.meta consults. `appliedAddonOrder` is settable so the test can supply an
-// explicit reorder; `normalize` is the real trim+lowercase contract (AddonTombstones.normalize).
+// The one symbol CoreMetaDetails.meta consults for the applied order. `appliedAddonOrder` is settable so the
+// test can supply an explicit reorder. The identity + dedup rule is the REAL `AddonPriorityOrder` (compiled
+// above), not a stub, so this asserts the shipped canonical / first-occurrence behavior directly.
 enum VortXSyncManager { static var appliedAddonOrder: [String] = [] }
-enum AddonTombstones {
-    static func normalize(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-}
 
 final class DebridKeys {
     static let shared = DebridKeys()
@@ -112,7 +110,8 @@ private struct AddonReorderMetaResolutionTests {
 
         // The user reorders their French provider to #1: the SHIPPED resolver must now answer French even
         // though the engine still lists English first (which is exactly the defect the reorder must drive).
-        VortXSyncManager.appliedAddonOrder = [AddonTombstones.normalize(french), AddonTombstones.normalize(english)]
+        // The applied order is written with the REAL shared canonical identity, the same rule meta reads by.
+        VortXSyncManager.appliedAddonOrder = [AddonPriorityOrder.canonical(french), AddonPriorityOrder.canonical(english)]
         check(details.meta?.name == "Synopsis en français",
               "META: after reorder, the detail meta resolves from the reordered #1 add-on (French), not engine-first")
 
@@ -121,6 +120,23 @@ private struct AddonReorderMetaResolutionTests {
         VortXSyncManager.appliedAddonOrder = ["https://unrelated.example/manifest.json"]
         check(details.meta?.name == "English synopsis",
               "META: an unrelated reorder falls back to engine order (no add-on placed for this title)")
+
+        // DEDUP (M2): a duplicated synced entry keeps the FIRST occurrence, the same policy the stream and
+        // catalog seams use. French listed twice then English still resolves French, and never traps/doubles.
+        VortXSyncManager.appliedAddonOrder = [AddonPriorityOrder.canonical(french),
+                                              AddonPriorityOrder.canonical(french),
+                                              AddonPriorityOrder.canonical(english)]
+        check(details.meta?.name == "Synopsis en français",
+              "META: a duplicated applied entry keeps first-occurrence (shared dedup policy), still resolves French")
+
+        // H3: the meta pick uses the shared canonical identity, so an applied entry differing only by PATH
+        // case does NOT match a provider (the old whole-string lowercasing would have collapsed them). Here
+        // the reorder names the French provider with an upper-cased PATH, so it fails to place and the pick
+        // falls back to engine-first English.
+        let frenchPathCased = french.replacingOccurrences(of: "manifest.json", with: "MANIFEST.json")
+        VortXSyncManager.appliedAddonOrder = [AddonPriorityOrder.canonical(frenchPathCased)]
+        check(details.meta?.name == "English synopsis",
+              "META: a path-case-only applied entry does not match the provider (canonical identity, H3)")
 
         print("")
         if failures == 0 {

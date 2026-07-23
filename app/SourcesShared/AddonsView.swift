@@ -159,11 +159,11 @@ struct AddonsView: View {
                             // tvOS: `.plain` left the system focus platter on over this settings-card row. See ChipButtonStyle.
                             .vortxCardButton()
                             // Reorder add-ons into the order you want. The order is the PRIORITY spine (which
-                            // add-on's catalogs and sources come first) and syncs to the dashboard + your
+                            // add-on's catalogs and sources appear first) and syncs to the dashboard + your
                             // other devices via doc.addonOrder, the same order the dashboard drag writes.
                             // iOS / Mac use a drag List (`AddonReorderView`); tvOS has no pointer drag, so it
                             // gets a focus-native move-up / move-down screen (`AddonReorderTVView`). Both
-                            // write the SAME `applyInAppAddonOrder`, so the resolution order is identical.
+                            // write the SAME `applyInAppAddonOrder`, so the displayed order is identical.
                             if core.addons.count > 1 {
                                 NavigationLink {
                                     #if os(tvOS)
@@ -515,9 +515,10 @@ struct AddonReorderView: View {
 #if os(tvOS)
 /// tvOS reorder: Apple TV has no pointer/touch drag, so the priority order is set with focus-native
 /// move-up / move-down buttons on each row instead of the iOS drag List. Each nudge writes the SAME
-/// `VortXSyncManager.applyInAppAddonOrder` the iOS drag and the web dashboard write, so a reordered add-on
-/// answers first for catalogs, sources and meta on tvOS exactly as on the other platforms, and the order
-/// syncs to every device via `doc.addonOrder`.
+/// `VortXSyncManager.applyInAppAddonOrder` the iOS drag and the web dashboard write, so a reordered add-on's
+/// catalogs, sources and meta APPEAR FIRST on tvOS exactly as on the other platforms, and the order syncs to
+/// every device via `doc.addonOrder`. (The reorder controls DISPLAY / grouping order; whether the auto-picked
+/// "Watch Now" source follows it is the separate `SourcePreferences.useAddonOrder` choice.)
 ///
 /// FOCUS: the two chevrons are ordinary focusable `Button`s inside the focusable ScrollView, so the remote
 /// steps onto them geometrically. They stay ENABLED at the list ends (a boundary press is a clamped no-op
@@ -537,7 +538,7 @@ struct AddonReorderTVView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: Theme.Space.sm) {
-                Text("Move an add-on up to make its catalogs and sources answer first.")
+                Text("Move an add-on up to make its catalogs and sources appear first.")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -600,10 +601,16 @@ struct AddonReorderTVView: View {
     }
 
     /// Move the row at `index` one step (`by` = -1 up, +1 down) and persist through the SAME canonical
-    /// path the iOS drag uses. Boundary presses are clamped no-ops (AddonPriorityOrder.moved), so nothing
-    /// is pushed and the order is unchanged. Focus is re-pinned to the moved add-on's same-direction button
-    /// so repeated presses keep walking the same add-on.
+    /// path the iOS drag uses. STALE-INDEX GUARD: a row's `index` is captured at render by the `ForEach`,
+    /// but `ordered` can be re-seeded under it (an install / remove elsewhere fires `reload()` on the
+    /// `core.addons.count` change, or a remote reorder re-seeds via the order observer). If the captured
+    /// index no longer addresses the list, treat the press as a no-op instead of indexing out of bounds.
+    /// Boundary presses are clamped no-ops (AddonPriorityOrder.moved), so nothing is pushed and the order is
+    /// unchanged. The persist is coalesced downstream (applyInAppAddonOrder debounces the sync push), so
+    /// walking one add-on several rows sends ONE push, not one per nudge. Focus is re-pinned to the moved
+    /// add-on's same-direction button so repeated presses keep walking the same add-on.
     private func nudge(_ index: Int, by delta: Int) {
+        guard ordered.indices.contains(index) else { return }   // stale captured index: the list changed under us
         let addon = ordered[index]
         let next = AddonPriorityOrder.moved(ordered, from: index, to: index + delta)
         guard next.map(\.transportUrl) != ordered.map(\.transportUrl) else { return }   // clamped no-op at an end

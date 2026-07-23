@@ -128,6 +128,50 @@ final class CoreBridge: ObservableObject {
         bootstrapAuth()
         seedInitialState()
         scheduleSessionRepair()   // runs on EVERY launch path: covers the force-close add-on-loss desync
+        // Home board rebuild consumer (H1). A reorder from ANY channel posts
+        // `VortXSyncManager.addonOrderChangedNote`: an in-app reorder (applyInAppAddonOrder), a remote pull
+        // that carried a newer order (syncDown), or an account transition (bindAddonOrderOwner). Re-sort and
+        // republish the ALREADY-published board rows so an open Home reflects the new order immediately, and
+        // widen the load window so a promoted add-on's off-window catalogs hydrate (H4). Without this the
+        // published Home rows kept the old order until an unrelated rebuild. queue:.main -> the block runs on
+        // the main thread, where boardRows is published. The open source list re-sorts through its OWN
+        // observer of the same note (SourceListModel, H2).
+        NotificationCenter.default.addObserver(forName: VortXSyncManager.addonOrderChangedNote,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.handleAddonOrderChanged()
+        }
+    }
+
+    /// React to an add-on order change (local reorder, remote pull, or account switch). Widens the board so a
+    /// promoted off-window catalog can appear at all (H4), then re-sorts and republishes the currently-loaded
+    /// rows now (H1). Idempotent and cheap when no order is applied.
+    private func handleAddonOrderChanged() {
+        ensureReorderedCatalogsLoaded()
+        rebuildBoardRows()
+    }
+
+    /// When the user has an applied add-on reorder, make sure the Home board's LoadRange window is wide enough
+    /// to cover EVERY installed catalog, so a promoted add-on whose catalogs sit at raw engine slot 31+ (past
+    /// the default 30-row initial window) actually hydrate and can then be sorted to the front by
+    /// `buildBoardRows`. Without this, `buildBoardRows` drops the promoted add-on's unloaded (empty) rows, so a
+    /// reordered add-on stays ABSENT (not merely "not first") until old-order infinite scroll happens to widen
+    /// the range (H4 / the raw-LoadRange window). Reuses the exact proven widen mechanism as
+    /// `ensureLiveCatalogsLoaded`. No-op when there is no applied order (the shipping default: zero extra
+    /// startup / network cost) or once the window already covers every catalog. ACCEPTED COST: an account WITH
+    /// a reorder loads its full catalog window up front instead of paginating it in; bounded (a real account
+    /// has a few dozen catalogs) and idempotent.
+    func ensureReorderedCatalogsLoaded() {
+        guard !VortXSyncManager.appliedAddonOrder.isEmpty else { return }
+        let needed = installedCatalogs(includeTombstoned: true, includeDisabled: true).count
+        if boardRows.isEmpty {
+            loadBoard(rows: max(needed, 30))
+            return
+        }
+        guard needed > boardRowsLoaded else { return }   // already wide enough
+        boardRowsLoaded = needed
+        dispatch(action: ["action": "CatalogsWithExtra",
+                          "args": ["action": "LoadRange", "args": ["start": 0, "end": needed]]],
+                 field: "board")
     }
 
     /// Pull state the engine populated at construction (e.g. `continue_watching_preview` from the
@@ -1003,14 +1047,17 @@ final class CoreBridge: ObservableObject {
                                                     streams: streams))
             }
         }
-        // SOURCE-RESOLUTION ORDER: the engine hands these groups back in raw `profile.addons` order (the
+        // SOURCE DISPLAY / GROUP ORDER: the engine hands these groups back in raw `profile.addons` order (the
         // `AggrRequest::AllOfResource` walk), which the add-on reorder never rewrites. Re-order them by the
-        // user's applied priority so a reordered add-on genuinely ANSWERS FIRST for streams. This is the
-        // single chokepoint feeding every stream consumer (the source list, StreamRanking.best's
-        // add-on-order first pick + rankedGroups' between-group order, and the tvOS auto-advance /
-        // Watch-Now paths in HomeView / DetailView / TVPlayerView), so ordering here moves all of them at
-        // once. Groups are keyed by `id` == the add-on transport base; an empty applied order is a no-op
-        // (engine order preserved), and add-ons the user has not placed keep their engine order at the end.
+        // user's applied priority so a reordered add-on's streams APPEAR FIRST in the source list. This is the
+        // single chokepoint feeding every stream consumer, so ordering here moves the DISPLAYED order of all
+        // of them at once. Whether the AUTO-SELECTED "Watch Now" source follows this order is a SEPARATE,
+        // explicit choice: `StreamRanking.best` honors this group order only when the user's
+        // `SourcePreferences.useAddonOrder` is on; on the shipping default it still scores globally for the
+        // best-quality source (see StreamRanking). So this controls which add-on appears first, not the
+        // engine's internal request priority (DIS-05, out of scope) and not the default auto-pick. Groups are
+        // keyed by `id` == the add-on transport base; an empty applied order is a no-op (engine order
+        // preserved), and add-ons the user has not placed keep their engine order at the end.
         return AddonPriorityOrder.order(groups, applied: VortXSyncManager.appliedAddonOrder, base: { $0.id })
     }
 
@@ -2307,26 +2354,24 @@ final class CoreBridge: ObservableObject {
             guard !items.isEmpty else { continue }
             let key = Self.catalogKey(base: request.base, type: request.path.type, id: request.path.id)
             if CatalogPrefsStore.isHidden(key) { continue }   // user hid this catalog row (catalog manager)
+            // Carry the TYPED add-on base (`request.base`) on the row, so the priority sort ranks by the real
+            // add-on identity instead of reverse-parsing it back out of the composite key string.
             rows.append(CoreBoardRow(id: key, title: titles[key] ?? request.path.id,
-                                     type: request.path.type, items: items, engineIndex: engineIndex))
+                                     type: request.path.type, items: items, engineIndex: engineIndex,
+                                     addonBase: request.base))
         }
         // Apply the user's order. The EXPLICIT per-catalog order (catalog manager, `CatalogPrefsStore.rank`)
         // still wins where set; among catalogs the user has not explicitly placed, the add-on PRIORITY order
-        // (the reorder) groups each add-on's catalogs together so a reordered add-on's catalogs come first on
+        // (the reorder) groups each add-on's catalogs together so a reordered add-on's catalogs appear first on
         // Home, not just in the list; the engine catalog index is the final stable tiebreak. Previously the
-        // fallback was raw engine order, so the reorder never touched Home at all.
+        // fallback was raw engine order, so the reorder never touched Home at all. Ranks by the row's TYPED
+        // `addonBase` (canonicalized inside orderCatalogRows), never a pipe-split of the composite key.
         return AddonPriorityOrder.orderCatalogRows(
             rows,
             applied: VortXSyncManager.appliedAddonOrder,
-            base: { Self.catalogBase(of: $0.id) },
+            base: { $0.addonBase },
             catalogRank: { CatalogPrefsStore.rank($0.id) },
             engineIndex: { $0.engineIndex })
-    }
-
-    /// The add-on transport base embedded in a catalog key (`base|type|id`), for priority-ordering the
-    /// Home board rows by their source add-on. Mirrors `CatalogPreferences`' own key split.
-    private static func catalogBase(of key: String) -> String {
-        key.components(separatedBy: "|").first ?? key
     }
 
     /// One catalog an installed add-on provides, for the catalog manager editor.
