@@ -760,8 +760,11 @@ struct TVPlayerView: View {
         let isDV = StreamRanking.isDolbyVision(sourceHint ?? "")
         // tvOS: DVDisplaySupport.isCapable is constant true (the Apple TV negotiates DV over HDMI), so the DV
         // mandate's remux lane engages for DV MKVs here too. Stable across renders (no engine flip mid-play).
+        // The live delivery flag gates rule (4b)'s Matroska half: with the HLS delivery lane rolled back a
+        // plain MKV stays on libmpv instead of attempting an AVPlayer mount the engine could not remux.
         let chosen = PlayerEngineRouter.engine(for: url, isTorrent: torrent || loopback, isDolbyVision: isDV,
-                                               dvDisplayCapable: DVDisplaySupport.isCapable)
+                                               dvDisplayCapable: DVDisplaySupport.isCapable,
+                                               plainRemuxDelivery: VortXRemuxHLSServer.deliveryEnabled)
         // [dv] routing probe: first line of the DV trail (route -> mount -> classify -> fallback -> demote).
         // With the engineLatch this fires only on the pre-onAppear renders plus the single seed, so the
         // exported log gets the route trail once per stream instead of once per body pass (#76 b163 flood).
