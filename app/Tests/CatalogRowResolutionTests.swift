@@ -16,7 +16,9 @@
 //      add-on is installed (else it is dropped, never a dead tile) - this is what keeps the India-regional
 //      provider grids/rails from thinning to empty while still never leaving an unopenable tile.
 //   4. A transient external-id failure is NOT downgraded to a weaker tmdb: identity (retry, do not degrade).
-//   5. The UK+India+US region union is order-stable and de-duplicated.
+//   5. Service region resolution puts the viewer's OWN region first, appends the SELECTED provider's carried
+//      regions bounded + de-duped, queries the user region ALONE for an empty or transiently-failed lookup, and
+//      preserves the transient lookup's typed cause (no hardcoded country list anywhere).
 //   6. The empty-state copy reflects the REAL cause (region / network / 429 / missing key / parse / filtered /
 //      add-on required), and every message is em-dash-free.
 import Foundation
@@ -82,15 +84,37 @@ struct CatalogRowResolutionTests {
         check("an empty-string prefix is ignored (never a false match)",
               R.metaHandlesTMDB(providesMeta: true, idPrefixes: [""]) == false)
 
-        // MARK: unionRegions (the UK+India+US multi-region union, item 1)
-        check("a GB viewer's service grid queries GB, then IN, then US",
-              R.unionRegions(base: "GB") == ["GB", "IN", "US"])
-        check("a viewer already in the union set is not duplicated",
-              R.unionRegions(base: "IN") == ["IN", "GB", "US"])
-        check("a viewer outside the union keeps their region first, then the union",
-              R.unionRegions(base: "DE") == ["DE", "GB", "IN", "US"])
-        check("the union is order-stable and de-duplicated (US viewer)",
-              R.unionRegions(base: "US") == ["US", "GB", "IN"])
+        // MARK: serviceRegions (viewer's own region PRIMARY + the SELECTED provider's carried regions, item 1)
+        // The viewer's OWN region is ALWAYS first (home relevance), ahead of any provider-carried region.
+        check("the viewer's own region is always first, then the provider's carried regions",
+              R.serviceRegions(base: "GB", lookup: .resolved(["IN", "US"])).regions == ["GB", "IN", "US"])
+        check("a viewer outside the provider's markets still keeps their own region first",
+              R.serviceRegions(base: "DE", lookup: .resolved(["IN", "AE"])).regions == ["DE", "IN", "AE"])
+        // Bounded: at most maxExtraRegions carried regions beyond the base, most-prominent first.
+        check("carried regions are capped at maxExtraRegions beyond the base (most-prominent kept)",
+              R.serviceRegions(base: "GB", lookup: .resolved(["IN", "US", "AE", "SA", "SG"]), maxExtraRegions: 3).regions
+                == ["GB", "IN", "US", "AE"])
+        check("the default cap keeps the base plus three carried regions",
+              R.serviceRegions(base: "GB", lookup: .resolved(["IN", "US", "AE", "SA", "SG"])).regions.count == 4)
+        // De-duped: the base appearing in the carried list is not repeated, nor is a repeated carried region.
+        check("the base region is not duplicated when the provider also lists it",
+              R.serviceRegions(base: "IN", lookup: .resolved(["IN", "AE", "GB"])).regions == ["IN", "AE", "GB"])
+        check("a repeated carried region is de-duplicated",
+              R.serviceRegions(base: "GB", lookup: .resolved(["IN", "IN", "US"])).regions == ["GB", "IN", "US"])
+        // An EMPTY carried-region list -> the user region ALONE, and no lookup cause (never a hardcoded union).
+        check("an empty carried-region list queries the user region alone",
+              R.serviceRegions(base: "GB", lookup: .resolved([])).regions == ["GB"])
+        check("an empty carried-region list contributes no lookup cause",
+              R.serviceRegions(base: "GB", lookup: .resolved([])).lookupCause == nil)
+        check("a resolved-but-empty lookup never invents a country union (US viewer)",
+              R.serviceRegions(base: "US", lookup: .resolved([])).regions == ["US"])
+        // A TRANSIENT provider-region lookup failure -> user region ALONE, and the typed cause carried forward.
+        check("a transient (rateLimited) provider-region failure queries the user region alone",
+              R.serviceRegions(base: "GB", lookup: .failed(.rateLimited)).regions == ["GB"])
+        check("a transient (rateLimited) provider-region failure preserves its typed cause",
+              R.serviceRegions(base: "GB", lookup: .failed(.rateLimited)).lookupCause == .rateLimited)
+        check("a network provider-region failure preserves its typed cause",
+              R.serviceRegions(base: "GB", lookup: .failed(.network)).lookupCause == .network)
 
         // MARK: bucketEmptyCause (per-bucket honest reason, item 2)
         check("survivors present -> not empty (nil cause)",

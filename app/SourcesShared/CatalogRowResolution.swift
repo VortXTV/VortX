@@ -79,16 +79,58 @@ enum CatalogRowResolution {
         return idPrefixes.contains { !$0.isEmpty && "tmdb:0".hasPrefix($0) }
     }
 
-    /// The watch_region set a SERVICE grid queries AT ONCE: the viewer's own region first (home relevance),
-    /// then the UK + India + US union, order-stably de-duplicated. Querying several regions simultaneously
-    /// (not the old "in-region, then US only if page 1 came back empty") is what surfaces an India-only
-    /// provider (JioHotstar 2336 / ZEE5 232) for a viewer under another storefront: TMDB scopes
-    /// with_watch_providers to the watch_region, so the provider returns nothing under GB but its real catalog
-    /// under IN. Pure so the union is unit-tested without network.
-    static func unionRegions(base: String, union: [String] = ["GB", "IN", "US"]) -> [String] {
-        var out = [base]
-        for region in union where !out.contains(region) { out.append(region) }
-        return out
+    // MARK: - Service region resolution (the viewer's own region + the selected provider's carried regions)
+
+    /// A selected streaming provider's carried-region lookup, reduced to what the pure resolver needs. The
+    /// impure `TMDBClient.providerRegions` builds it from TMDB's /watch/providers listing: each provider entry
+    /// carries a `display_priorities` map of region -> priority whose KEYS are exactly the regions the provider
+    /// is carried in.
+    ///   - `.resolved`  TMDB answered: these are the provider's carried regions, MOST-prominent first (may be
+    ///                  empty when TMDB carries the provider nowhere it knows of).
+    ///   - `.failed`    the listing lookup itself failed transiently (429 -> `.rateLimited`, offline / HTTP ->
+    ///                  `.network`); the carried regions are simply unknown right now, so we must NOT fabricate
+    ///                  a list, and the typed cause is carried forward for the empty-state.
+    enum ProviderRegionLookup: Equatable {
+        case resolved([String])
+        case failed(CatalogEmptyCause)
+    }
+
+    /// Cap on how many of a selected provider's carried regions are queried IN ADDITION to the viewer's own
+    /// region. Each extra region is a full movie + TV discover round-trip PER sub-catalog pill, so this bounds
+    /// request fan-out. Three keeps a service grid within the old fixed-union budget (base plus three) while
+    /// still reaching an out-of-region provider's home markets, since the carried regions arrive most-prominent
+    /// first (lowest TMDB display priority), so the cap keeps the ones that matter.
+    static let defaultMaxExtraRegions = 3
+
+    /// The watch_region set a SERVICE grid queries at once, plus any empty-state cause the region resolution
+    /// itself contributes. The decided model: the viewer's OWN region is PRIMARY, and a SELECTED provider that
+    /// is thin or absent there auto-reaches the regions it actually operates in. NO hardcoded country list and
+    /// NO user-facing secondary-region chooser:
+    ///   - the viewer's OWN region is ALWAYS first (home relevance) and is the only guaranteed entry;
+    ///   - when the selected provider RESOLVED to carried regions, up to `maxExtraRegions` of them (already
+    ///     ordered most-prominent-first) are appended after the base, with the base excluded from the tail and
+    ///     the tail de-duplicated, so an India-only provider (JioHotstar 2336 / ZEE5 232) a viewer OUTSIDE
+    ///     India selected still resolves its home catalog: TMDB scopes with_watch_providers to the watch_region,
+    ///     so the provider returns nothing under GB but its real catalog under IN;
+    ///   - an EMPTY carried-region list leaves the base region alone (nothing to add);
+    ///   - a TRANSIENT failure of the provider-region lookup ALSO leaves the base region alone, but carries its
+    ///     typed cause forward as `lookupCause` so an empty grid blames the throttle / outage instead of
+    ///     fabricating a region list or flatly claiming "not in your region".
+    /// Pure so the whole model is unit-tested without network.
+    static func serviceRegions(base: String, lookup: ProviderRegionLookup,
+                               maxExtraRegions: Int = defaultMaxExtraRegions)
+        -> (regions: [String], lookupCause: CatalogEmptyCause?) {
+        switch lookup {
+        case .failed(let cause):
+            return ([base], cause)
+        case .resolved(let providerRegions):
+            var out = [base]
+            for region in providerRegions {
+                guard out.count < maxExtraRegions + 1 else { break }
+                if region != base, !out.contains(region) { out.append(region) }
+            }
+            return (out, nil)
+        }
     }
 
     // MARK: - Empty-state cause (an honest reason, not always "region")

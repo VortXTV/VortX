@@ -749,6 +749,58 @@ enum TMDBClient {
         }
     }
 
+    /// The regions a SELECTED streaming provider is actually carried in, MOST-prominent first, for the service
+    /// grid's automatic region resolution. Read from TMDB's GLOBAL /watch/providers/{movie,tv} listing: each
+    /// provider entry carries a `display_priorities` map of region -> priority whose KEYS are exactly the regions
+    /// the provider is listed in. Queries the whole brand FAMILY (canonical + region aliases) so a region-alias
+    /// id resolves the same regions as its canonical, and UNIONS movie + TV (a provider can be carried in a
+    /// region for only one medium). Ordered by the BEST (lowest) display priority a region reaches across the
+    /// family and both media, so the provider's home markets come first and the pure `serviceRegions` cap keeps
+    /// the most relevant ones. The listing is the global one (no watch_region), which the keyless edge already
+    /// caches and which changes rarely, so this is one warm round-trip per medium; `ProviderRegionsCache` then
+    /// memoizes the POSITIVE result per canonical id for the session (a transient failure is NOT latched, so a
+    /// later load retries). `.failed` (typed transient cause) only when BOTH media listings fail to fetch, so a
+    /// real outage is surfaced honestly instead of read as an empty carried-region list.
+    static func providerRegions(providerID: Int) async -> CatalogRowResolution.ProviderRegionLookup {
+        await ProviderRegionsCache.shared.regions(for: canonicalProviderID(providerID))
+    }
+
+    /// Uncached family-wide provider-region resolve (the actor cache calls this on a miss). Movie + TV unioned;
+    /// a region's rank is the best (lowest) `display_priorities` value it reaches across the family and both
+    /// media. `.failed` only when BOTH listing fetches fail (a real transient outage).
+    fileprivate static func fetchProviderRegions(canonicalID: Int) async -> CatalogRowResolution.ProviderRegionLookup {
+        let key = ApiKeys.effectiveTMDBKey()
+        let family = Set(providerFamilyMembers(canonicalID))
+        async let movieFetch = getResult("/watch/providers/movie?api_key=\(key)")
+        async let tvFetch = getResult("/watch/providers/tv?api_key=\(key)")
+        let movieResult = await movieFetch, tvResult = await tvFetch
+        var bestPriority: [String: Int] = [:]
+        var anyOK = false
+        for result in [movieResult, tvResult] {
+            guard case .ok(let obj) = result, let providers = obj["results"] as? [[String: Any]] else { continue }
+            anyOK = true
+            for p in providers {
+                guard let id = p["provider_id"] as? Int, family.contains(id) else { continue }
+                let priorities = (p["display_priorities"] as? [String: Any]) ?? [:]
+                for (region, value) in priorities {
+                    guard let priority = value as? Int else { continue }
+                    if let existing = bestPriority[region], existing <= priority { continue }
+                    bestPriority[region] = priority
+                }
+            }
+        }
+        guard anyOK else {
+            // Both listings failed: report the real transient cause (429 / offline / HTTP) from the movie leg.
+            if case .failure(let e) = movieResult { return .failed(fetchCause(e)) }
+            if case .failure(let e) = tvResult { return .failed(fetchCause(e)) }
+            return .failed(.network)
+        }
+        let ordered = bestPriority
+            .sorted { $0.value != $1.value ? $0.value < $1.value : $0.key < $1.key }
+            .map(\.key)
+        return .resolved(ordered)
+    }
+
     /// One TMDB LIST endpoint (trending / popular / now_playing / upcoming) resolved to engine-playable tt
     /// previews. `path` is the endpoint without query, e.g. "/trending/movie/week", "/movie/popular",
     /// "/movie/now_playing", "/movie/upcoming". Paginated. Fails soft to [] with no key / nothing found.
@@ -1262,4 +1314,27 @@ enum TMDBClient {
         return nil
     }
 
+}
+
+/// Session cache for `TMDBClient.providerRegions`: a selected provider's carried regions change rarely, yet a
+/// service grid resolves them on EVERY sub-catalog pill load, so memoize the POSITIVE result per canonical
+/// provider id (with in-flight de-dup so N pills issue ONE listing fetch, not N). Mirrors LandscapeBackdropCache:
+/// a transient `.failed` is deliberately NOT cached, so a throttled / offline lookup retries on the next load
+/// instead of latching the grid to the user region alone for the whole session.
+private actor ProviderRegionsCache {
+    static let shared = ProviderRegionsCache()
+
+    private var cache: [Int: CatalogRowResolution.ProviderRegionLookup] = [:]
+    private var inflight: [Int: Task<CatalogRowResolution.ProviderRegionLookup, Never>] = [:]
+
+    func regions(for canonicalID: Int) async -> CatalogRowResolution.ProviderRegionLookup {
+        if let hit = cache[canonicalID] { return hit }
+        if let task = inflight[canonicalID] { return await task.value }
+        let task = Task { await TMDBClient.fetchProviderRegions(canonicalID: canonicalID) }
+        inflight[canonicalID] = task
+        let result = await task.value
+        if case .resolved = result { cache[canonicalID] = result }   // never latch a transient failure
+        inflight[canonicalID] = nil
+        return result
+    }
 }

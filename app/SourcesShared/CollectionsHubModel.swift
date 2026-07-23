@@ -203,7 +203,7 @@ enum CollectionsCatalog {
     static func subCatalogs(for target: HubTarget, region: String) -> [SubCatalog] {
         switch target {
         case .discover(let list): return discoverSubs(list, region: region)
-        case .service(let id, _): return scopedSubs(movieScope: providerScope(id), tvScope: providerScope(id), region: region, serviceFallback: true)
+        case .service(let id, _): return scopedSubs(movieScope: providerScope(id), tvScope: providerScope(id), region: region, serviceFallback: true, providerID: id)
         case .genre(let g):       return scopedSubs(movieScope: genreScope(g, media: "movie"), tvScope: genreScope(g, media: "tv"), region: region)
         case .decade(let d):      return decadeSubs(d, region: region)
         }
@@ -235,7 +235,7 @@ enum CollectionsCatalog {
 
     // MARK: the shared Movies/Shows/New/Top/Trending set (services + genres)
 
-    private static func scopedSubs(movieScope: String?, tvScope: String?, region: String, serviceFallback: Bool = false) -> [SubCatalog] {
+    private static func scopedSubs(movieScope: String?, tvScope: String?, region: String, serviceFallback: Bool = false, providerID: Int? = nil) -> [SubCatalog] {
         let today = TMDBClient.isoDate(daysAgo: 0)
         // `fresh` opts a POPULARITY window (Movies / Shows / Trending) into the per-app-open seeded page
         // rotation (CuratedFreshness). Date-sorted and Top-This-* rows keep their semantic order. When a
@@ -250,9 +250,9 @@ enum CollectionsCatalog {
                 let offset = fresh ? CuratedFreshness.pageOffset(key: "\(movie ?? "")|\(tv ?? "")") : 0
                 let rotated = await mergedDiscover(
                     movie: movie, tv: tv,
-                    region: region, page: page + offset, serviceRegionFallback: serviceFallback)
+                    region: region, page: page + offset, serviceRegionFallback: serviceFallback, providerID: providerID)
                 if offset > 0, page == 1, rotated.items.isEmpty {
-                    return await mergedDiscover(movie: movie, tv: tv, region: region, page: 1, serviceRegionFallback: serviceFallback)
+                    return await mergedDiscover(movie: movie, tv: tv, region: region, page: 1, serviceRegionFallback: serviceFallback, providerID: providerID)
                 }
                 return rotated
             })
@@ -345,17 +345,29 @@ enum CollectionsCatalog {
     // MARK: merge helper
 
     /// Fetch the movie + TV buckets (skipping a nil bucket) and interleave, de-duplicating by id. For a SERVICE
-    /// grid, query the UK+India+US region UNION (plus the viewer's own region) simultaneously and merge, so an
-    /// India-only provider under another storefront still surfaces its India titles. Genre / decade / Discover
-    /// grids stay on the single device region. Returns a `CatalogPage` so an empty result explains itself.
-    private static func mergedDiscover(movie: String?, tv: String?, region: String, page: Int, serviceRegionFallback: Bool = false) async -> CatalogPage {
+    /// grid, the viewer's OWN region is primary and the SELECTED provider's carried regions (auto-resolved from
+    /// TMDB, bounded) are queried alongside it, so a provider thin or absent in the viewer's region still
+    /// surfaces its home catalog with no hardcoded country list and no user-facing region chooser. Genre /
+    /// decade / Discover grids stay on the single device region. Returns a `CatalogPage` so an empty result
+    /// explains itself.
+    private static func mergedDiscover(movie: String?, tv: String?, region: String, page: Int, serviceRegionFallback: Bool = false, providerID: Int? = nil) async -> CatalogPage {
         // `serviceRegionFallback` is true for exactly the SERVICE grids (set by scopedSubs); reuse it as the
         // provider-fallback flag so a tt-less India title survives as `tmdb:<id>` (gated on a tmdb: meta add-on)
         // here, while genre/decade/Discover grids keep the strict tt-only gate.
         guard serviceRegionFallback else {
             return await mergeBuckets(movie: movie, tv: tv, region: region, page: page, providerFallback: false)
         }
-        let regions = CatalogRowResolution.unionRegions(base: region)
+        // Resolve the watch_region set: the viewer's OWN region first, then the SELECTED provider's carried
+        // regions (auto-fetched from TMDB, capped by CatalogRowResolution.defaultMaxExtraRegions). A transient
+        // provider-region lookup failure keeps the base region and carries its typed cause into the empty-state
+        // rather than fabricating a region list.
+        let lookup: CatalogRowResolution.ProviderRegionLookup
+        if let providerID {
+            lookup = await TMDBClient.providerRegions(providerID: providerID)
+        } else {
+            lookup = .resolved([])
+        }
+        let (regions, lookupCause) = CatalogRowResolution.serviceRegions(base: region, lookup: lookup)
         // Fetch every region's bucket-pair concurrently, then round-robin interleave across regions (so no one
         // region dominates the top of the grid) and de-dup by id. The empty-state cause merges across regions.
         let pages: [CatalogPage] = await withTaskGroup(of: (Int, CatalogPage).self) { group in
@@ -373,7 +385,12 @@ enum CollectionsCatalog {
                 out.append(p.items[i])
             }
         }
-        let cause = out.isEmpty ? CatalogRowResolution.mergeCauses(pages.map { $0.cause }) : nil
+        // When the merged grid is empty, fold the provider-region lookup's own transient cause (if any) into the
+        // per-region causes so a throttled / failed region resolve surfaces honestly instead of a flat
+        // region-empty; a nil lookupCause is dropped (never read as "that bucket had items").
+        var mergedCauses = pages.map { $0.cause }
+        if let lookupCause { mergedCauses.append(lookupCause) }
+        let cause = out.isEmpty ? CatalogRowResolution.mergeCauses(mergedCauses) : nil
         return CatalogPage(items: out, cause: cause)
     }
 
