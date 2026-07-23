@@ -4,6 +4,19 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 8 - 2026-07-23
+
+The same-day hotfix for Beta 7's field reports, every one reproduced before it was fixed. Dolby Vision plays again: the player rework shipped a thirty-six second startup requirement against a ten second watchdog, rejected the timestamps a resume produces, and killed its own stream when the memory spool filled a few seconds into 4K, so titles hung, failed instantly, or died mid-play and fell to HDR10; all of it is fixed and proven against a real pipeline harness, with fresh starts answering in about four seconds. The Dolby Vision player's audio and subtitle menus name their tracks instead of showing one Unknown entry. Community (Singularity) sources show their real resolution, size, and seeders, and merge with what your add-ons already found instead of stacking a wall of identical rows. Ratings show all four scores on cards, the detail page, and freshly baked posters, add-on posters that arrive pre-baked with their own scores pass through untouched, and turning on ERDB artwork can no longer blank your art. The diagnostic-log export shows its QR on the first open. In-place update, nothing resets.
+
+### Fixed
+
+- **Dolby Vision plays again, starts fast, resumes, and survives long plays.** Seven distinct causes, each matched to a field diagnostic and reproduced red-then-green against the real remux pipeline: a thirty-six second startup floor versus the ten second watchdog, segment cuts that rejected open-GOP HEVC and every resume landing on one, resume timestamps the muxer refused as non-monotonic, a memory spool that killed the stream when it filled, an advertised alternate track failure that took the whole session down, an audio playlist that advertised nothing for mixed-codec files, and silent failure paths that logged no reason. Every failure now logs its cause. Apple TV.
+- **The Dolby Vision audio menu names its tracks.** The muxed main track is properly named with honest channel and Atmos labeling, alternates appear, and built-in text subtitles keep their names. Apple TV.
+- **Community (Singularity) rows carry their real metadata and merge with add-on sources.** Resolution, size, seeders, a provider mark only when your own configured service was seen to have it cached, duplicates merged away, unlabeled legacy rows bounded. Apple TV, iPhone, iPad, and Mac.
+- **All four ratings everywhere, and add-on poster art is respected.** Cards, the detail page's primary rating line, and newly baked portrait posters carry IMDb, Rotten Tomatoes, Metacritic, and TMDB together; posters an add-on supplies pre-baked pass through untouched. Apple TV, iPhone, iPad, and Mac.
+- **ERDB artwork fails soft.** A miss now falls back to the art the app already had instead of blanking the slot. Apple TV, iPhone, iPad, and Mac.
+- **The diagnostic-log export shows its QR on first open.** A brief spinner covers the cold start of the one-time local link. Apple TV.
+
 ## 0.3.14 Beta 7 - 2026-07-23
 
 The big one. Signing in by QR works for the first time, the community (Singularity) source pool is collecting and serving again for every kind of source, Dolby Vision stops flickering and starts at the beginning, hi-res TrueHD titles keep true Dolby Vision, watched history flows in from Trakt and SIMKL the moment you switch them on, JioHotstar and ZEE5 catalogs fill, Picture-in-Picture works on ordinary files on iPhone and iPad, and a setting you change now stays changed. The diagnostic log you send us carries far less about you, and only you can fetch it.

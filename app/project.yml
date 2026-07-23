@@ -189,7 +189,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "189"
+        CURRENT_PROJECT_VERSION: "190"
         # Web-host target ONLY: this is the WKWebView app (ContentView/StremioWebView). The shared
         # NodeServer preload starts an 11471 reverse-proxy of web.stremio.com solely so that webview can
         # load the UI from a loopback origin. The native targets (VortXiOSNative, VortXTV) have no
@@ -305,7 +305,7 @@ targets:
         # cross-compile).
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "189"
+        CURRENT_PROJECT_VERSION: "190"
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
@@ -400,7 +400,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "189"
+        CURRENT_PROJECT_VERSION: "190"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
         # Base plist (merged under the generated keys) carrying the ATS arbitrary-loads exception +
@@ -516,7 +516,7 @@ targets:
         # condition set, the tvOS Settings toggle renders (VortxNativeServerFlag.isSupported).
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "189"
+        CURRENT_PROJECT_VERSION: "190"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
@@ -559,7 +559,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.topshelf
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "189"
+        CURRENT_PROJECT_VERSION: "190"
         # BASE plist carrying the NSExtension dict (the extension point + principal class), which has no
         # INFOPLIST_KEY_* equivalent and so cannot be expressed as build settings. Xcode merges its
         # GENERATED keys on top, exactly as ResourcesTV/Info-tvOS.plist does for the app: that merge is
@@ -640,7 +640,7 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_NO_EMBEDDED_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "189"
+        CURRENT_PROJECT_VERSION: "190"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
