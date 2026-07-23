@@ -1,4 +1,4 @@
-// BundledTMDBKeyAssemblyTests — a standalone, runnable proof that the MASKED bundled TMDB key
+// BundledTMDBKeyAssemblyTests: a standalone, runnable proof that the MASKED bundled TMDB key
 // reassembles to the exact original key.
 //
 // VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md),
@@ -13,7 +13,7 @@
 //   1. the reassembled string is exactly 32 lowercase-hex characters (a well-formed TMDB v3 read key), and
 //   2. SHA256(reassembled) equals the committed hash below.
 //
-// The committed hash — NOT the key — is what proves fidelity: the plaintext key never appears in this
+// The committed hash, NOT the key, is what proves fidelity: the plaintext key never appears in this
 // file or anywhere in git. If ApiKeys.swift's arrays or XOR ever drift, this test fails, which is the
 // guard that the masked form still decodes to the real key.
 //
