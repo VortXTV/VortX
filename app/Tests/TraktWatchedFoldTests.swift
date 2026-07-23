@@ -1,15 +1,16 @@
 // TraktWatchedFoldTests: a standalone, runnable verification of the Trakt watched-import identity fold
-// (SourcesShared/TraktWatchedFold.swift) - the issue #143 contract that a title watched on Trakt must match
-// its catalog cover by imdb AND by tmdb identity.
+// (SourcesShared/WatchedFold.swift, the shared fold reached here through its `TraktWatchedFold` typealias) -
+// the issue #143 contract that a title watched on Trakt must match its catalog cover by imdb AND by tmdb
+// identity.
 //
 // VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md), so this
 // follows the ExternalSyncToggleSyncTests / HouseholdCryptoTests convention: a self-contained executable run
-// with the system toolchain, compiling the REAL source in. TraktWatchedFold.swift is Foundation-only and has
+// with the system toolchain, compiling the REAL source in. WatchedFold.swift is Foundation-only and has
 // no app dependencies, so unlike TraktSyncEngine (which pulls in TraktAuth / TraktService / WatchedIndex and
 // cannot link standalone) it compiles directly, and it is what gets exercised here:
 //
 //     swiftc -o /tmp/traktfold \
-//       app/SourcesShared/TraktWatchedFold.swift \
+//       app/SourcesShared/WatchedFold.swift \
 //       app/Tests/TraktWatchedFoldTests.swift && /tmp/traktfold
 //
 // The load-bearing cases are the identity forms: capturing ONLY imdb is exactly what broke the watched
