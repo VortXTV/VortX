@@ -103,7 +103,16 @@ private struct TraktConnectCard: View {
                 Toggle("Add to watchlist when you add to Library", isOn: $watchlist).tint(Theme.Palette.accent)
                 Toggle("Show titles watched on Trakt as watched here", isOn: $importWatched)
                     .tint(Theme.Palette.accent)
-                    .onChange(of: importWatched) { _ in WatchedIndex.shared.externalShadowChanged() }
+                    .onChange(of: importWatched) { on in
+                        // Turning import ON must pull the Trakt watched history NOW. An earlier import-off
+                        // refresh already armed TraktSyncEngine's staleness throttle (it stamps on every
+                        // refresh, even the ones whose pull no-op'd while the toggle was off), so a plain
+                        // rebuild's refreshIfStale would early-return and the badges would not appear until an
+                        // unrelated engine event fired minutes later. refreshNow clears that throttle so the
+                        // just-enabled watched titles import immediately.
+                        if on { TraktSyncEngine.shared.refreshNow() }
+                        WatchedIndex.shared.externalShadowChanged()
+                    }
                 // Gates the detail page's rating chip AND its mirror. Turning it off never deletes a
                 // rating: they live in the local shadow, so turning it back on brings them all back.
                 Toggle("Rate titles and sync your ratings", isOn: $ratings)

@@ -56,6 +56,11 @@ final class TraktSyncEngine {
     private var lastActivityFingerprint: String?
     private var lastRefresh: Date?
     private var refreshing = false
+    /// Set by `refreshNow()` when a force arrives while a refresh is already in flight. The single-flight
+    /// guard would otherwise swallow the force, and this refresh's `defer` re-arms the very throttle the
+    /// force cleared, so the in-flight refresh honors it once on completion with one more pass. Guarded by
+    /// `lock`.
+    private var refreshAgain = false
     /// Bumped by `reset()` (disconnect / sign-out). An in-flight refresh captures it before its network
     /// awaits and refuses to write back if it changed meanwhile, so a pull/drain that started before a
     /// disconnect can never resurrect the wiped shadow cache or push queue into the next account.
@@ -87,7 +92,7 @@ final class TraktSyncEngine {
         guard ExternalSyncToggle.isOn(ExternalSyncToggle.traktImportWatched, default: false) else { return false }
         lock.lock(); defer { lock.unlock() }
         guard !watchedEpisodeKeys.isEmpty else { return false }
-        return watchedEpisodeKeys.contains(Self.episodeKey(showIdentity, season, episode))
+        return watchedEpisodeKeys.contains(TraktWatchedFold.episodeKey(showIdentity, season, episode))
     }
 
     /// True when the episode shadow holds anything at all. Lets a caller skip per-episode work entirely
@@ -96,12 +101,6 @@ final class TraktSyncEngine {
         guard ExternalSyncToggle.isOn(ExternalSyncToggle.traktImportWatched, default: false) else { return false }
         lock.lock(); defer { lock.unlock() }
         return !watchedEpisodeKeys.isEmpty
-    }
-
-    /// The one place the episode key shape is spelled, so the pull and the read can never drift apart.
-    /// `|` cannot appear in an imdb / `tmdb:<id>` identity, so the key is unambiguous.
-    private static func episodeKey(_ identity: String, _ season: Int, _ episode: Int) -> String {
-        "\(identity)|\(season)|\(episode)"
     }
 
     // MARK: - Disconnect
@@ -152,7 +151,13 @@ final class TraktSyncEngine {
                 // watched pull and queue drain. Leaving it nil on a stale generation lets the next call
                 // pull immediately.
                 if self.generation == gen { self.lastRefresh = Date() }
+                // A force (refreshNow) arrived mid-refresh and was swallowed by the single-flight guard;
+                // its throttle clear was then re-armed by the stamp above. Honor it now with one more pass
+                // so a just-enabled import is never deferred to the next unrelated engine event.
+                let force = self.refreshAgain
+                self.refreshAgain = false
                 self.lock.unlock()
+                if force { self.refreshNow() }
             }
             guard await TraktAuth.shared.isSignedIn else { return }
             await self.drainQueue()
@@ -163,6 +168,25 @@ final class TraktSyncEngine {
             // simply defer convergence to the next cycle. Correct either way, just a cycle slower.
             await self.pullRatings()
         }
+    }
+
+    /// Force an immediate refresh, bypassing the `refreshInterval` staleness throttle. Called when the user
+    /// just turned import ON. The subtlety it exists for: while the import toggle is OFF, `refreshIfStale`
+    /// still runs on every `WatchedIndex` rebuild (it drains the offline push queue and pulls ratings) and
+    /// STAMPS `lastRefresh`, even though its `pullWatched` no-op's on the toggle. So by the time the user
+    /// flips import on, the throttle is almost always armed, and a plain `refreshIfStale` would early-return
+    /// and defer the FIRST watched pull by up to `refreshInterval` - the just-enabled Trakt badges would not
+    /// appear until an unrelated engine event happened to fire minutes later (the "I turned it on and nothing
+    /// happened" report). Clearing the stamp lets the pull run now. If a refresh is already in flight, latch
+    /// `refreshAgain` so it re-runs on completion rather than being lost to the single-flight guard. Still
+    /// gated on config / sign-in / import-toggle downstream: this forces the SCHEDULE, never the gates.
+    func refreshNow() {
+        lock.lock()
+        lastRefresh = nil
+        let inFlight = refreshing
+        if inFlight { refreshAgain = true }
+        lock.unlock()
+        if !inFlight { refreshIfStale() }
     }
 
     /// Pull `GET /sync/ratings/{movies,shows}` and hand each leg to `TraktRatingsStore.merge`, which owns
@@ -223,20 +247,11 @@ final class TraktSyncEngine {
                 // any Trakt record that lacks an imdb id, so a title watched on Trakt showed as
                 // unwatched (issue #143). Same id-mismatch class the trickplay tmdb-identity fix killed.
                 //
-                // `identities` collects the same forms for the episode keys below, so a show's episodes are
-                // indexed under exactly the identities its title is, and the two grains can never disagree
-                // about how this show is named.
-                var identities: [String] = []
-                if let imdb = ids["imdb"] as? String, !imdb.isEmpty { next.insert(imdb); identities.append(imdb) }
-                // Trakt returns tmdb as a JSON number. Insert the canonical `tmdb:<id>` form the hub
-                // covers use, plus the typed `tmdb:movie:<id>` / `tmdb:tv:<id>` shape some metas carry,
-                // so either cover-id form matches. We know movie-vs-show from the endpoint we pulled.
-                if let tmdb = Self.intID(ids["tmdb"]) {
-                    next.insert("tmdb:\(tmdb)")
-                    next.insert(isSeries ? "tmdb:tv:\(tmdb)" : "tmdb:movie:\(tmdb)")
-                    identities.append("tmdb:\(tmdb)")
-                    if isSeries { identities.append("tmdb:tv:\(tmdb)") }
-                }
+                // `titleIdentities` is the ONE place that shape is spelled (see `TraktWatchedFold`), reused
+                // for the episode keys below so a show's episodes are indexed under exactly the identities
+                // its title is, and the two grains can never disagree about how this show is named.
+                let identities = TraktWatchedFold.titleIdentities(ids, isSeries: isSeries)
+                for identity in identities { next.insert(identity) }
                 // A title Trakt returns with NEITHER imdb nor tmdb cannot be matched to any cover, so it
                 // is simply absent from the set (no badge). We never guess an identity it did not give us.
                 // The same holds for its episodes: no identity means no episode key either, which is why
@@ -284,24 +299,14 @@ final class TraktSyncEngine {
     private static func foldEpisodes(_ seasons: Any?, identities: [String], into keys: inout Set<String>) {
         guard let seasons = seasons as? [[String: Any]] else { return }
         for season in seasons {
-            guard let seasonNumber = nonNegativeInt(season["number"]),
+            guard let seasonNumber = TraktWatchedFold.nonNegativeInt(season["number"]),
                   let episodes = season["episodes"] as? [[String: Any]] else { continue }
             for episode in episodes {
-                guard let episodeNumber = nonNegativeInt(episode["number"]) else { continue }
+                guard let episodeNumber = TraktWatchedFold.nonNegativeInt(episode["number"]) else { continue }
                 guard keys.count < episodeKeyCap else { return }
-                for identity in identities { keys.insert(episodeKey(identity, seasonNumber, episodeNumber)) }
+                for identity in identities { keys.insert(TraktWatchedFold.episodeKey(identity, seasonNumber, episodeNumber)) }
             }
         }
-    }
-
-    /// Coerce a season / episode NUMBER to a non-negative Int. Deliberately NOT `intID`, which demands a
-    /// POSITIVE value because it validates database ids: season 0 is the real, common specials season, and
-    /// `intID` would reject it, silently dropping every special's tick. Numbers and ids are different
-    /// domains with different valid ranges, so they get different coercions.
-    private static func nonNegativeInt(_ value: Any?) -> Int? {
-        if let n = value as? Int, n >= 0 { return n }
-        if let s = value as? String, let n = Int(s), n >= 0 { return n }
-        return nil
     }
 
     /// `<movies.watched_at>|<episodes.watched_at>` from GET /sync/last_activities, or nil on any failure.
@@ -315,14 +320,6 @@ final class TraktSyncEngine {
         let episodes = (json["episodes"] as? [String: Any])?["watched_at"] as? String
         guard movies != nil || episodes != nil else { return nil }
         return "\(movies ?? "-")|\(episodes ?? "-")"
-    }
-
-    /// Coerce a Trakt JSON id value (an NSNumber from JSONSerialization, or defensively a numeric
-    /// String) to a positive Int, or nil. Used to normalize the tmdb id into a `tmdb:<id>` shadow key.
-    private static func intID(_ value: Any?) -> Int? {
-        if let n = value as? Int, n > 0 { return n }
-        if let s = value as? String, let n = Int(s), n > 0 { return n }
-        return nil
     }
 
     /// Authenticated GET returning the raw JSON array, or nil on any failure.
