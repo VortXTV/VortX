@@ -797,6 +797,9 @@ jobs:
       - name: Verify the release tag points at the built commit (fail closed)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh runs in a job with NO repo checkout, so it cannot infer the repository from git;
+          # without this the upload dies with "fatal: not a git repository" (beta.7 attach failure).
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           set -euo pipefail
@@ -857,6 +860,9 @@ jobs:
       - name: Attach the CI builds to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh runs in a job with NO repo checkout, so it cannot infer the repository from git;
+          # without this the upload dies with "fatal: not a git repository" (beta.7 attach failure).
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           set -euo pipefail
