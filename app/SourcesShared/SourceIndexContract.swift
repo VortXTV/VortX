@@ -9,6 +9,12 @@ enum SourceIndexContract {
     /// Re-derive this value if the accepted row shape or row cap changes.
     static let maxResponseBodyBytes = 64 * 1024
     static let maxServedSources = 100
+    /// Bound on Singularity rows that carry NO usable display metadata (no resolution, size, seeders, provider
+    /// fact, or tag). Such rows are indistinguishable from one another, so a metadata-poor pool must not fill the
+    /// list with a wall of anonymous "Other" duplicates. Rows WITH metadata are never capped by this; only the
+    /// undifferentiated tail is. Well below `maxServedSources`; a handful is plenty to signal "the pool also has
+    /// these unlabelled sources" without spamming.
+    static let maxAnonymousServedSources = 12
     /// A FLOOR-OF-FLOORS sanity bound on a served row. It is deliberately the lowest value any worker policy
     /// could use, NOT a statement of the worker's current policy.
     ///
