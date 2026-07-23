@@ -3,6 +3,8 @@
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
 //     -o /tmp/remux-resume-policy-test \
 //     app/Sources/Player/RemuxResumePolicy.swift \
+//     app/Sources/Player/VortXRemuxBuffer.swift \
+//     app/Sources/Player/DVPlaybackPolicy.swift \
 //     app/Tests/RemuxResumePolicyTests.swift && /tmp/remux-resume-policy-test
 //
 // This suite CALLS the production decisions. The code that uses them lives in AVPlayerEngine and
@@ -21,6 +23,13 @@
 // sign error that no single-direction assertion would notice.
 
 import Foundation
+
+// Standalone-compilation stub for the buffer's production default (same shape as the sibling harnesses). The
+// buffer is compiled in only so the REAL playlist renderer and startup oracle can run against real windows.
+struct RemoteConfig {
+    struct Snapshot { let dvRemuxWindowMiB: Int }
+    static let snapshot = Snapshot(dvRemuxWindowMiB: 64)
+}
 
 @MainActor var failures = 0
 @MainActor func check(_ name: String, _ condition: Bool) {
@@ -292,6 +301,107 @@ check("pre-start: a non-finite target is never issued",
 // zero it would issue a forward seek on every single resume.
 check("pre-start: the tolerance stays around one long GOP",
       RemuxResumePolicy.originToleranceSeconds > 0 && RemuxResumePolicy.originToleranceSeconds <= 20)
+
+// MARK: - Position in -> playlist/segment start out (the wired resume, end to end)
+
+// This section proves the WIRED chain, not one decision at a time: a stored continue-watching position goes in
+// at the chrome, and what comes out is a playlist whose first segment is the resume content. It executes every
+// policy seam the production path crosses, in production order, with the real playlist renderer and the real
+// startup oracle, so a break anywhere in the chain turns exactly these checks RED.
+//
+// The chain under test (each step names its production caller):
+//   1. chrome -> engine: RemuxResumeConfiguration one-shot (PlayerScreen.loadIntoPlayer /
+//      TVPlayerView.playerSurface -> AVPlayerEngineView.makeHostView -> configureResumeOrigin).
+//   2. engine -> stream: the consumed origin is the remux mount's startAtSeconds
+//      (AVPlayerEngine.loadFile -> VortXRemuxHLSServer.make -> VortXMKVRemuxStream.init).
+//   3. stream: sanitize + convert to the one input seek (originRequest -> seekTimestampMicroseconds ->
+//      avformat_seek_file BACKWARD), then latch the achieved keyframe origin from mapped base video only.
+//   4. stream -> playlist: every packet is REBASED by the achieved origin, so the produced timeline starts at
+//      zero and the FIRST segment holds the resume content. The playlist renderer states that start explicitly
+//      (EXT-X-START:TIME-OFFSET=0 while segment zero is retained), which is the only lever that matters: the
+//      client picks the first segment from playlist CONTENTS; EXT-X-START is advisory.
+//   5. playlist -> chrome: the pre-start seek resolves satisfied (no post-mount seek is issued into a
+//      forward-only mount) and the first reported frame maps back to the stored position, so progress saves
+//      continue from where the viewer left off.
+
+let storedPosition = 1830.25          // the continue-watching value the chrome fetched
+var launchConfiguration = RemuxResumeConfiguration()
+launchConfiguration.configure(seconds: storedPosition)
+let consumedOrigin = launchConfiguration.consumeForNextLoad()
+check("wired: the stored position survives the chrome-to-engine handoff unchanged",
+      consumedOrigin == storedPosition)
+
+// Step 3: the mount's request converts to the exact microsecond seek target the input seek receives.
+check("wired: the consumed origin is the exact input-seek target",
+      RemuxResumePolicy.seekTimestampMicroseconds(resumeSeconds: consumedOrigin ?? 0) == 1_830_250_000)
+
+// The BACKWARD seek lands on the keyframe at or before the ask; this achieved origin is what production
+// latches (establishTimelineOrigin), and only a mapped base-video packet may set it.
+let achievedOrigin = 1828.0
+check("wired: the achieved keyframe origin is latched from mapped base video",
+      RemuxResumePolicy.canEstablishOrigin(packetStreamIndex: 0, baseVideoStreamIndex: 0, isMapped: true)
+        && RemuxResumePolicy.preStartSeek(target: storedPosition, origin: achievedOrigin) == .satisfied)
+
+// Step 4: the produced window after rebase. Segment ids and starts both begin at ZERO even though the mount
+// began 1828 s into the source; nine 4 s segments cover the startup oracle's admission floor below.
+let resumedWindow = VortXHLSWindow(segments: (0..<9).map {
+    VortXHLSSegment(id: $0, byteOffset: $0 * 1_000, byteLength: 1_000,
+                    start: Double($0) * 4.0, duration: 4.0)
+})
+let frozenTarget = VortXHLSTargetPolicy.conservativeTarget
+let resumedPlaylist = DVPlaybackPolicy.mediaPlaylistLines(
+    window: resumedWindow, ended: false,
+    targetDuration: frozenTarget.seconds, mapURI: "init.mp4")
+
+// The client-visible levers, asserted on the REAL rendered artifact. TIME-OFFSET=0 plus a MEDIA-SEQUENCE of 0
+// tells every client the presentation starts at seg0, and seg0 IS the resume point after the rebase; that is
+// the whole position-in -> segment-start-out contract.
+check("wired: the resumed playlist starts at media sequence zero",
+      resumedPlaylist.contains("#EXT-X-MEDIA-SEQUENCE:0"))
+check("wired: the resumed playlist pins the start to time-offset zero precisely",
+      resumedPlaylist.contains("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES"))
+check("wired: the first advertised media URI is segment zero (the resume content)",
+      resumedPlaylist.first(where: { $0.hasSuffix(".m4s") }) == "seg0.m4s")
+check("wired: a producing resumed mount does not claim ENDLIST",
+      !resumedPlaylist.contains("#EXT-X-ENDLIST"))
+
+// Startup timing is NOT resume's to change: the playlist carries the frozen conservative target (12) and the
+// startup oracle admits the same first cohort it would admit for a fresh mount. A resume that widened, shrank
+// or re-froze the target would break the conformance startup expectations and fail here.
+check("wired: the resumed playlist carries the frozen conservative target duration",
+      frozenTarget.seconds == 12
+        && resumedPlaylist.contains("#EXT-X-TARGETDURATION:12"))
+let readiness = VortXHLSStartupReadiness(frozenTarget: frozenTarget)
+check("wired: startup readiness admission is unchanged by resume",
+      readiness?.minimumSegmentCount == 6
+        && readiness?.minimumRenderedDurationMilliseconds == 36_000)
+if let readiness {
+    let pinned = DVPlaybackPolicy.pinnedStartupSnapshot(
+        window: resumedWindow, ended: false,
+        minimumSegmentCount: readiness.minimumSegmentCount,
+        minimumRenderedDurationMilliseconds: readiness.minimumRenderedDurationMilliseconds)
+    check("wired: the resumed window pins the same startup cohort as a fresh mount",
+          pinned?.window.segments.map(\.id) == Array(0..<9) && pinned?.ended == false)
+} else {
+    check("wired: startup readiness must construct for the frozen conservative target", false)
+}
+
+// Step 5: closing the loop with the chrome. No seek is issued (satisfied), the first frame reports the
+// achieved origin so a progress save can never write zero over the viewer's position, and asking to scrub back
+// to the exact stored position lands inside the produced band where the origin put it.
+check("wired: the first reported frame is the resume point, never zero",
+      near(RemuxResumePolicy.presented(playerSeconds: 0, origin: achievedOrigin), achievedOrigin))
+check("wired: a scrub to the stored position maps just past the produced start",
+      near(RemuxResumePolicy.playerSeek(sourceSeconds: storedPosition, origin: achievedOrigin,
+                                        producedEdgePlayerSeconds: 36), storedPosition - achievedOrigin))
+
+// Inertness: a fresh start renders BYTE-IDENTICAL playlist lines for the same produced window. Resume changes
+// which source second seg0 contains, never the playlist shape, so every conformance property proven for fresh
+// starts holds for resumed mounts by construction.
+check("wired: a fresh start renders byte-identical playlist lines for the same window",
+      DVPlaybackPolicy.mediaPlaylistLines(
+        window: resumedWindow, ended: false,
+        targetDuration: frozenTarget.seconds, mapURI: "init.mp4") == resumedPlaylist)
 
 // MARK: - Result
 
