@@ -4086,7 +4086,7 @@ private struct LandscapeArtiOS: View {
         let bakedPosterShown = !usedBackdrop && PosterArtwork.bakesRatings(forID: id)
         CardRatingBadge(id: id, type: type,
                         active: PosterArtwork.bakesRatings && !bakedPosterShown,
-                        glyphSize: 8, textSize: 10)
+                        glyphSize: 8, textSize: 10, maxScores: 2)
             .padding(6)
     }
 

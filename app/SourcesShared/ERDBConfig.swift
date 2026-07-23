@@ -48,6 +48,14 @@ enum ERDB {
                 u += "&fk=\(enc)"
             }
         }
+        // Carry the app's OWN art as `fb` so the renderer 302s back to it on ANY miss (an id it cannot map,
+        // or a type with no source art such as an episode thumbnail) instead of returning a tiny "not found"
+        // body that the image loader then tries to decode and shows nothing. This mirrors the poster
+        // service's fail-soft `fb` contract; without it, turning this provider on blanks the art it cannot
+        // render rather than leaving the add-on/metahub art in place.
+        if let fb = fallback, !fb.isEmpty, let enc = fb.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            u += (u.contains("?") ? "&" : "?") + "fb=\(enc)"
+        }
         return u
     }
 
@@ -128,9 +136,34 @@ enum PosterArtwork {
 
     /// Poster image URL for a title id. ERDB token wins, then VortX / XRDB, then the original poster.
     static func poster(id: String, fallback: String?) -> String? {
+        // Respect an add-on's OWN poster art. If the catalog item's poster URL is NOT one of the raw,
+        // id-derivable art forms we can safely re-render (the metahub / TMDB image CDNs), it is the add-on's
+        // own image and may already carry baked ratings from a poster-ratings service. Routing it through our
+        // baking service fetches our own base art and discards those scores, so pass it through untouched. We
+        // wrap only art we effectively source ourselves (or when the add-on supplied no poster at all).
+        if let fb = fallback, !fb.isEmpty, !isWrappableRawArt(fb) { return fb }
         if ERDB.isActive { return ERDB.imageURL("poster", id: id, fallback: fallback) }
         return XRDB.imageURL(id: id, fallback: fallback)
     }
+
+    /// Whether `url` is one of the raw, id-derivable art forms our baking service can safely re-render from:
+    /// the metahub poster CDN and the TMDB image CDN. Those are clean base images with no baked overlays, so
+    /// wrapping one only adds our rating. Any OTHER host is the add-on's own poster (often already baked by a
+    /// poster-ratings service), which we pass through untouched so its scores survive. A blank/nil URL is
+    /// treated as wrappable (there is nothing of the add-on's to preserve; we render from the id). NOTE: a
+    /// plain TMDB image URL is genuinely ambiguous -- an add-on could hand us clean TMDB art or, in theory, a
+    /// pre-baked one -- so we KEEP the current wrapping for TMDB/metahub and pass through only foreign hosts.
+    static func isWrappableRawArt(_ url: String?) -> Bool {
+        guard let raw = url, !raw.isEmpty else { return true }
+        guard let host = URL(string: raw)?.host?.lowercased() else { return false }
+        for h in wrappableArtHosts where host == h || host.hasSuffix("." + h) { return true }
+        return false
+    }
+
+    /// The raw-art CDN hosts (and their subdomains) our baking service re-renders from. Everything else is
+    /// treated as add-on-supplied art and passed through untouched. Kept deliberately small: these are the
+    /// only two clean, id-derivable poster sources the app itself resolves.
+    private static let wrappableArtHosts = ["metahub.space", "tmdb.org"]
 
     /// Backdrop image URL. ERDB when active (it bakes ratings/quality on backdrops too), else the original.
     static func backdrop(id: String, fallback: String?) -> String? {
