@@ -315,10 +315,19 @@ enum SettingsBackup {
     /// app owns is dotted (`stremiox.*`, `vortx.*`). So the write lands but no live view or store re-reads it.
     /// Callers MUST follow a successful restore with `reloadLiveStores()` on the main actor, or the restored
     /// values stay invisible until a relaunch AND the stale in-memory copies get flushed back over them.
+    ///
+    /// `skipping` is the LOCAL-WINS set (empty by default). The cross-device PULL path (VortXSyncManager.syncDown)
+    /// passes the account's locally-dirty settings keys here so a value the user just changed on THIS device but
+    /// has not yet pushed is NOT overwritten by the account's older value (`SettingsDirtyKeys`, and the "would not
+    /// stay" interplay at VortXSyncManager.swift:1175-1182). The set is compared in MIGRATED form (matching how
+    /// VortXSyncManager stamps its dirty set and its appliedSettingsBaseline), so it stays correct once the 0.4
+    /// rename seam opens. The user-facing backup-FILE import path passes nothing: an explicit "restore from file"
+    /// is a deliberate overwrite and honors every key. The count returned is of keys ACTUALLY applied.
     @discardableResult
     @MainActor
-    static func restore(from data: Data) throws -> Int {
+    static func restore(from data: Data, skipping dirtyKeys: Set<String> = []) throws -> Int {
         let pairs = try decodeDomain(from: data)
+            .filter { dirtyKeys.isEmpty || !dirtyKeys.contains(migratedKey($0.key)) }
         var restoredConsent: Bool?
         var restoredServe: Bool?
         for (key, value) in pairs {
