@@ -53,10 +53,17 @@ enum AddonPairingClient {
         var isExpired: Bool { Date() >= expiresAt }
     }
 
-    /// One TV install acknowledgement: the delivery id and its confirmed terminal status.
+    /// One TV install acknowledgement: the delivery id, its confirmed terminal status, the local install
+    /// `attempt` that produced it (H3 attempt authority — the worker rejects an ack from a superseded attempt),
+    /// the session `rev` the ack was computed against (H3 revision authority — a stale ack cannot overwrite a
+    /// newer worker attempt), and a unique `mutationId` NONCE (replay enforcement — the worker records the nonce
+    /// and rejects a replayed ack body).
     struct DeliveryAck: Equatable {
         let deliveryId: String
         let status: String   // "installed" | "failed"
+        let attempt: Int
+        let rev: Int
+        let mutationId: String
     }
 
     /// A poll outcome. `.gone` maps the relay's 404 (expired / unknown token) so the view can rotate
@@ -78,10 +85,29 @@ enum AddonPairingClient {
 
         guard let data = await performData(req),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let token = obj["token"] as? String, !token.isEmpty,
-              let pageUrl = obj["pageUrl"] as? String, !pageUrl.isEmpty,
+              let token = obj["token"] as? String, isStrictToken(token),
+              let pageUrl = obj["pageUrl"] as? String, isTrustedPageURL(pageUrl),
               let expiresAt = numeric(obj["expiresAt"]) else { return nil }
         return Session(token: token, pageUrl: pageUrl, expiresAtMs: expiresAt)
+    }
+
+    /// M4: a strict token alphabet. The token is spliced into the `/pair/<token>` route, so it must be a plain
+    /// opaque id (ASCII letters, digits, `-`, `_`) — reject anything with a slash, dot, or other char that could
+    /// alter the path (`../`, an extra segment) even after percent-encoding. Bounded length as a sanity cap.
+    static func isStrictToken(_ token: String) -> Bool {
+        guard (1...200).contains(token.count) else { return false }
+        return token.allSatisfy { c in
+            c.isASCII && (c.isLetter || c.isNumber || c == "-" || c == "_")
+        }
+    }
+
+    /// M4: only trust a pairing page URL that is HTTPS on our own relay host, so a tampered/injected `pageUrl`
+    /// in the create response is never rendered as a QR or shown on screen.
+    static func isTrustedPageURL(_ pageUrl: String) -> Bool {
+        guard let comps = URLComponents(string: pageUrl),
+              comps.scheme?.lowercased() == "https",
+              comps.host?.lowercased() == "add.vortx.tv" else { return false }
+        return true
     }
 
     // MARK: - GET /pair/<token>
@@ -113,7 +139,9 @@ enum AddonPairingClient {
             }
             let expiresAt = numeric(obj["expiresAt"]) ?? 0
             let closed = (obj["closed"] as? Bool) ?? false
-            let rev = Int(numeric(obj["rev"]) ?? 0)
+            // H11: a hostile / malformed remote `rev` (NaN, ±inf, a value past Int.max) must never crash the app.
+            // `safeRevision` clamps instead of trapping — `Int(numeric(...) ?? 0)` was the reproduced exit-133.
+            let rev = safeRevision(numeric(obj["rev"]))
             return .ok(Poll(manifests: manifests, expiresAtMs: expiresAt, closed: closed, rev: rev))
         } catch {
             return .failed
@@ -125,7 +153,9 @@ enum AddonPairingClient {
     /// Report CONFIRMED per-delivery install results back to the relay so the phone's Done can show the truth.
     /// Best-effort: a `.gone` (404, the session rotated / expired) or a transport error is not fatal to the
     /// install itself (the add-on is already in the engine); it just means the phone can no longer be updated.
-    /// Returns true only on a 2xx. Never logs the URL or token.
+    /// Returns true only on a 2xx (H2: the caller HONORS this Bool and retries on false). Never logs the URL or
+    /// token. The body carries per-delivery attempt + rev + a unique mutationId nonce (H3 / replay), and the
+    /// HMAC signature is BOUND TO THE BODY (H2) so the worker's enforced ack cannot be replayed or forged.
     @discardableResult
     static func ack(token: String, deliveries: [DeliveryAck]) async -> Bool {
         guard !deliveries.isEmpty else { return true }
@@ -135,11 +165,20 @@ enum AddonPairingClient {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "content-type")
         req.setValue("application/json", forHTTPHeaderField: "accept")
-        let body: [String: Any] = ["deliveries": deliveries.map { ["id": $0.deliveryId, "status": $0.status] }]
-        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        VortXEdgeAuth.sign(&req)   // gated host (add.vortx.tv /pair/<token>/ack POST): stamp X-VX-Ts / X-VX-Sig
+        let body: [String: Any] = ["deliveries": deliveries.map {
+            ["id": $0.deliveryId, "status": $0.status, "attempt": $0.attempt, "rev": $0.rev, "mid": $0.mutationId]
+        }]
+        // Canonical (sorted-keys) body so the exact bytes we sign are the exact bytes the worker verifies.
+        req.httpBody = (try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])) ?? Data()
+        // gated host (add.vortx.tv /pair/<token>/ack POST): sign method+path+ts+SHA256(body) so the signature
+        // covers the body (H2 body-binding). Body must be set BEFORE signing.
+        VortXEdgeAuth.signIncludingBody(&req)
         return await performData(req) != nil
     }
+
+    /// Mint a fresh replay nonce (mutation id) for an ack. UUID: unique per ack POST, so the worker can record
+    /// it and reject a byte-for-byte replay of the same signed body.
+    static func newMutationId() -> String { UUID().uuidString }
 
     // MARK: - Session persistence (resume across sheet opens)
 

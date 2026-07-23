@@ -120,6 +120,36 @@ enum VortXEdgeAuth {
         request.setValue(sig, forHTTPHeaderField: sigHeader)
     }
 
+    /// Header name carrying the SHA-256 of the request body, so a body-bound signature is self-describing on the
+    /// wire and the worker can recompute + compare it.
+    private static let bodyHeader = "X-VX-Body"
+
+    /// Sign `request` like `sign(_:)` but BIND THE BODY into the signature (H2): the message is
+    /// `METHOD\npath\nts\nSHA256(body)`, and `X-VX-Body` carries that lowercase-hex body hash. This lets the
+    /// enforced-ack worker reject a request whose body was altered or replayed with a signature the body did not
+    /// cover. The body must already be set on the request. No-op for a non-gated host, matching `sign(_:)`.
+    static func signIncludingBody(_ request: inout URLRequest) {
+        guard let url = request.url, let host = url.host, gatedHosts.contains(host) else { return }
+
+        let method = (request.httpMethod ?? "GET").uppercased()
+        let ts = String(Int(Date().timeIntervalSince1970))
+        let bodyHash = sha256Hex(request.httpBody ?? Data())
+        let message = "\(method)\n\(signedPath(of: url))\n\(ts)\n\(bodyHash)"
+        let key = SymmetricKey(data: Data(secret.utf8))
+        let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: key)
+        let sig = mac.map { String(format: "%02x", $0) }.joined()
+
+        request.setValue(ts, forHTTPHeaderField: tsHeader)
+        request.setValue(keyId, forHTTPHeaderField: kidHeader)
+        request.setValue(sig, forHTTPHeaderField: sigHeader)
+        request.setValue(bodyHash, forHTTPHeaderField: bodyHeader)
+    }
+
+    /// Lowercase-hex SHA-256 of arbitrary bytes (the ack body hash).
+    private static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
     /// Return a QUERY-signed copy of `url` for header-less asset loads: `AsyncImage(url:)` and other `<img>`/
     /// `<video>`-style GETs that cannot attach `X-VX-*` headers. Appends `vts` / `vkid` / `vsig`, where `vsig`
     /// is the SAME `HMAC-SHA256(key, METHOD\npath\nts)` the header path computes, so a worker verifies a
