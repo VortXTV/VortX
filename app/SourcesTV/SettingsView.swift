@@ -60,6 +60,7 @@ struct SettingsView: View {
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
+    @AppStorage(SubtitleStyle.Key.brightness) private var subBrightness = SubtitleStyle.defaultBrightness
     @AppStorage(SubtitleStyle.Key.background) private var subBackground = SubtitleStyle.defaultBackground
     @AppStorage(TrackPreferences.Key.forced) private var prefForced = TrackPreferences.ForcedPolicy.forced.rawValue
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
@@ -182,6 +183,7 @@ struct SettingsView: View {
         .onChange(of: subFont) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subSize) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subColor) { ProfileStore.shared.capturePlayback() }
+        .onChange(of: subBrightness) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subBackground) { ProfileStore.shared.capturePlayback() }
         // Source-ranking taste AND the 13 stream filters are per-profile, but they bind DIRECTLY to
         // the SourcePreferences singleton (no @AppStorage mirror), so without a capture a filter
@@ -1189,6 +1191,7 @@ struct SettingsView: View {
                        onMinus: { adjustSubScale(-1) },
                        onPlus: { adjustSubScale(1) })
             choiceRow(String(localized: "Color"), SubtitleStyle.colors.map { ($0.id, $0.label) }, selection: $subColor)
+            choiceRow(String(localized: "Brightness"), SubtitleStyle.brightnessLevels.map { ($0.id, $0.label) }, selection: $subBrightness)
             choiceRow("Background", SubtitleStyle.backgrounds.map { ($0.id, $0.label) }, selection: $subBackground)
             Text("Styles the built-in player's subtitles. Pick which subtitle track to show from the player while watching.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)

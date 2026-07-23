@@ -58,6 +58,7 @@ struct iOSSettingsView: View {
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
+    @AppStorage(SubtitleStyle.Key.brightness) private var subBrightness = SubtitleStyle.defaultBrightness
     @AppStorage(SubtitleStyle.Key.background) private var subBackground = SubtitleStyle.defaultBackground
     @AppStorage(TrackPreferences.Key.forced) private var prefForced = TrackPreferences.ForcedPolicy.forced.rawValue
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
@@ -310,6 +311,7 @@ struct iOSSettingsView: View {
             .onChange(of: subFont) { _ in ProfileStore.shared.capturePlayback() }
             .onChange(of: subSize) { _ in ProfileStore.shared.capturePlayback() }
             .onChange(of: subColor) { _ in ProfileStore.shared.capturePlayback() }
+            .onChange(of: subBrightness) { _ in ProfileStore.shared.capturePlayback() }
             .onChange(of: subBackground) { _ in ProfileStore.shared.capturePlayback() }
             // Source-ranking taste AND the 13 stream filters are per-profile, but they bind
             // DIRECTLY to the SourcePreferences singleton (no @AppStorage mirror), so without a
@@ -1517,6 +1519,10 @@ struct iOSSettingsView: View {
                 ForEach(SubtitleStyle.colors, id: \.id) { Text($0.label).tag($0.id) }
             }
             .tint(Theme.Palette.accent).id("subColor-\(theme.accentID)")
+            Picker("Brightness", selection: $subBrightness) {
+                ForEach(SubtitleStyle.brightnessLevels, id: \.id) { Text($0.label).tag($0.id) }
+            }
+            .tint(Theme.Palette.accent).id("subBrightness-\(theme.accentID)")
             Picker("Background", selection: $subBackground) {
                 ForEach(SubtitleStyle.backgrounds, id: \.id) { Text($0.label).tag($0.id) }
             }

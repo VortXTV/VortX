@@ -116,6 +116,7 @@ struct TVPlayerView: View {
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
+    @AppStorage(SubtitleStyle.Key.brightness) private var subBrightness = SubtitleStyle.defaultBrightness
     @AppStorage(SubtitleStyle.Key.background) private var subBackground = SubtitleStyle.defaultBackground
     @State private var optionRow = 0                   // highlighted row in the options panel
     // Skip-segment editor (tvOS): the inline iOS/Mac editor bar is unavailable here, so the editor
@@ -1821,6 +1822,8 @@ struct TVPlayerView: View {
             rows.append(OptionRow(label: String(localized: "Bigger  +"), detail: scalePct) { adjustSubScale(1) })
             rows.append(OptionRow(label: String(localized: "Colour"), isHeader: true))
             for c in SubtitleStyle.colors { rows.append(OptionRow(label: Self.l10n(c.label), isSelected: subColor == c.id) { setSubtitleColor(c.id) }) }
+            rows.append(OptionRow(label: String(localized: "Brightness"), isHeader: true))
+            for b in SubtitleStyle.brightnessLevels { rows.append(OptionRow(label: b.label, isSelected: subBrightness == b.id) { setSubtitleBrightness(b.id) }) }
             rows.append(OptionRow(label: String(localized: "Background"), isHeader: true))
             for b in SubtitleStyle.backgrounds { rows.append(OptionRow(label: Self.l10n(b.label), isSelected: subBackground == b.id) { setSubtitleBackground(b.id) }) }
             return rows
@@ -2628,6 +2631,9 @@ struct TVPlayerView: View {
     }
     private func setSubtitleColor(_ id: String) {
         subColor = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
+    }
+    private func setSubtitleBrightness(_ id: String) {
+        subBrightness = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
     }
     private func setSubtitleBackground(_ id: String) {
         subBackground = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()

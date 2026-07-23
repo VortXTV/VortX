@@ -14,12 +14,15 @@ enum SubtitleStyle {
         static let sizeScale = "stremiox.sub.sizeScale"
         static let color = "stremiox.sub.color"
         static let background = "stremiox.sub.background"
+        static let brightness = "stremiox.sub.brightness"
     }
 
     static let defaultFont = "modern"
     static let defaultSize = "m"
     static let defaultColor = "white"
     static let defaultBackground = "outline"
+    /// 100% = full brightness, the no-op default: an existing viewer's subtitles are unchanged.
+    static let defaultBrightness = "100"
 
     /// A fine +/- multiplier on top of the named size (Settings and the in-player stepper),
     /// so a viewer can nudge subtitles bigger or smaller without jumping a whole size step.
@@ -41,9 +44,21 @@ enum SubtitleStyle {
     ]
     static let colors: [(id: String, label: String, hex: String)] = [
         ("white", "White", "#FFFFFF"), ("yellow", "Yellow", "#FFFF00"), ("soft", "Soft", "#F2F2F2"),
+        // A genuinely OLED-friendly soft grey (~70% white). On HDR/Dolby Vision an all-white subtitle is
+        // driven near peak nits and blooms on an OLED panel; a grey base sits far below peak while staying
+        // clearly legible against the picture (#155).
+        ("grey", "Grey", "#B3B3B3"),
     ]
     static let backgrounds: [(id: String, label: String)] = [
         ("outline", "Outline only"), ("shaded", "Shaded"), ("box", "Solid box"),
+    ]
+
+    /// Subtitle brightness: a multiplier on the chosen colour's luminance, so ANY preset (white, yellow,
+    /// soft, grey) can be dimmed for OLED HDR/DV viewing without picking a different hue (#155). Discrete
+    /// levels mirror the Colour row on every surface (a menu Picker on iOS, a choiceRow on tvOS, option rows
+    /// in-player). The `id` is what's persisted; `factor` scales each RGB channel. 100% is the default no-op.
+    static let brightnessLevels: [(id: String, label: String, factor: Double)] = [
+        ("100", "100%", 1.0), ("80", "80%", 0.80), ("60", "60%", 0.60), ("40", "40%", 0.40),
     ]
 
     private static func current(_ key: String, _ fallback: String) -> String {
@@ -63,7 +78,37 @@ enum SubtitleStyle {
         let base = (sizes.first { $0.id == current(Key.size, defaultSize) } ?? sizes[1]).fontSize
         return Int((Double(base) * sizeScale).rounded())
     }
-    static var colorHex: String { (colors.first { $0.id == current(Key.color, defaultColor) } ?? colors[0]).hex }
+    static var brightnessId: String { current(Key.brightness, defaultBrightness) }
+
+    /// The luminance multiplier for the chosen brightness level (1.0 = full, the default). An unknown stored
+    /// id falls back to the first level (100%), so a bad value can never darken subtitles unexpectedly.
+    static var brightnessFactor: Double {
+        (brightnessLevels.first { $0.id == brightnessId } ?? brightnessLevels[0]).factor
+    }
+
+    /// The chosen preset colour AFTER the brightness multiplier, i.e. the exact `#RRGGBB` handed to every
+    /// renderer (mpv `sub-color`, the AVPlayer overlay label, and the AVPlayer-native `AVTextStyleRule`). This
+    /// is the ONE chokepoint the two engines share, so dimming applied here reaches both consistently. At 100%
+    /// this is the untouched preset hex, so existing viewers see no change.
+    static var colorHex: String {
+        let base = (colors.first { $0.id == current(Key.color, defaultColor) } ?? colors[0]).hex
+        return dimmedHex(base, factor: brightnessFactor)
+    }
+
+    /// Multiply each RGB channel of a `#RRGGBB` hex by `factor`, lowering luminance while preserving hue.
+    /// `factor` is clamped to 0...1 (so a bad level can neither brighten past the preset nor go negative); at
+    /// 1.0 the result equals the input colour. Malformed input (not exactly 6 hex digits) is returned
+    /// unchanged so a caller never renders an empty colour. Pure and side-effect free for direct testing.
+    static func dimmedHex(_ hex: String, factor: Double) -> String {
+        let f = min(max(factor, 0.0), 1.0)
+        var s = hex
+        if s.hasPrefix("#") { s.removeFirst() }
+        guard s.count == 6, let value = UInt32(s, radix: 16) else { return hex }
+        let r = UInt32((Double((value >> 16) & 0xFF) * f).rounded())
+        let g = UInt32((Double((value >> 8) & 0xFF) * f).rounded())
+        let b = UInt32((Double(value & 0xFF) * f).rounded())
+        return String(format: "#%02X%02X%02X", min(r, 255), min(g, 255), min(b, 255))
+    }
     static var backgroundId: String { current(Key.background, defaultBackground) }
 
     /// The mpv face name for the chosen style. BOTH styles name a BUNDLED face on purpose:

@@ -701,6 +701,7 @@ final class VortXSyncManager: ObservableObject {
                     "forced": pb.forcedPolicy, "subFont": pb.subFont, "subSize": pb.subSize,
                     "subColor": pb.subColor, "subBackground": pb.subBackground]
                 if let s = pb.subSizeScale { playback["subSizeScale"] = s }
+                if let b = pb.subBrightness { playback["subBrightness"] = b }
                 if let o = pb.sourceTypeOrder { playback["sourceTypeOrder"] = o }
                 if let u = pb.useAddonOrder { playback["useAddonOrder"] = u }
                 if let v = pb.safetyMode { playback["safetyMode"] = v }
