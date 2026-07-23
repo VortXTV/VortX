@@ -4211,7 +4211,7 @@ struct PosterCardiOS: View {
                         // When a poster service bakes the rating into the image (VortX/XRDB or ERDB), skip
                         // the native overlay to avoid a double badge. Also skipped on a watched card, whose
                         // topTrailing corner carries the check badge instead (mirror of tvOS PosterCard).
-                        if !isWatched, let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings {
+                        if !isWatched, let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings(forID: id) {
                             HStack(spacing: 2) {
                                 Image(systemName: "star.fill").font(.system(size: 8))
                                 Text(rating).font(.system(size: 10, weight: .semibold))

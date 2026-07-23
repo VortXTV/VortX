@@ -33,6 +33,11 @@ enum XRDB {
         return url
     }
 
+    /// True when the poster service can render (and therefore bake a rating onto) this id. Mirror of the
+    /// `renderableID` gate `imageURL` uses, exposed so a per-poster badge site can tell whether a baked
+    /// rating will arrive for this id (only `tt…` / `tmdb:` do).
+    static func canRender(id: String) -> Bool { renderableID(id) != nil }
+
     /// XRDB renders from IMDb (`tt…`) ids directly and from TMDB ids; other id schemes (`kitsu:`, custom
     /// add-on ids) cannot be rendered, so those keep their raw poster.
     private static func renderableID(_ id: String) -> String? {
