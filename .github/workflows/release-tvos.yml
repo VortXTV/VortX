@@ -102,7 +102,7 @@ jobs:
           # also sends its own links. PUSH GATE: this ref carries a path patch on stremio-core;
           # publish the patched stremio-core to the private mirror and swap the patch for a git
           # rev pin (see the engine repo's Cargo.toml note), then update this ref to that commit.
-          ref: 43463d08bbb8104f990ef657ddabaf5c64ae64e5
+          ref: 4d5ae6371cc9e4031f787cf1c7adf7a535474b0c
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false

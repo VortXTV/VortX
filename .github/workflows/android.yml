@@ -97,7 +97,7 @@ jobs:
           # Same engine ref as release-tvos.yml (fix/meta-imdb-link-preserve): keep both surfaces
           # on one engine. Same push gate applies: flip the stremio-core path patch to a git rev
           # pin on the private mirror before this ref can build in CI.
-          ref: 43463d08bbb8104f990ef657ddabaf5c64ae64e5
+          ref: 4d5ae6371cc9e4031f787cf1c7adf7a535474b0c
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false
