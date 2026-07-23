@@ -1277,27 +1277,39 @@ final class MPVMetalViewController: PlatformViewController {
     private static let pausedClampGraceSeconds: TimeInterval = 60
     private static let clampedCacheCap = "48MiB"
 
+    /// This file's CURRENT forward-cache budget in bytes: `activeReadAheadCap` as applied by loadFile,
+    /// permanently reduced by each memory-warning shed. Falls back to the floor when the stored spelling
+    /// is unparseable (never happens with the two spellings loadFile writes; defensive only).
+    private var currentReadAheadBudgetBytes: Int {
+        activeReadAheadCap.flatMap(VortXCacheShedPolicy.capBytes) ?? VortXCacheShedPolicy.floorBytes
+    }
+
     /// Main-thread mirror of mpv's pause property (posted from the event drain). Arms the paused clamp
     /// after the grace period, and restores the per-file cache cap on resume.
     private func pausedStateChanged(_ paused: Bool) {
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
         if paused {
-            // Live keeps its own tight buffers, and once a memory warning clamped this file the floor is
-            // already in force; nothing to arm in either case.
-            guard mpv != nil, !configuredLiveMode, !memoryCacheClamped, !pausedCacheClamped else { return }
+            // Live keeps its own tight buffers, and a budget already at the shed floor has nothing left to
+            // clamp. #148: a memory-warning shed no longer disarms this - after a first-warning step-down the
+            // file keeps a real (halved) budget, and a parked viewer must still drop to the paused floor.
+            guard mpv != nil, !configuredLiveMode, !pausedCacheClamped,
+                  currentReadAheadBudgetBytes > VortXCacheShedPolicy.floorBytes else { return }
             let work = DispatchWorkItem { [weak self] in self?.applyPausedCacheClamp() }
             pausedCacheClampWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.pausedClampGraceSeconds, execute: work)
         } else if pausedCacheClamped {
             pausedCacheClamped = false
-            guard mpv != nil, !memoryCacheClamped, let cap = activeReadAheadCap else { return }
+            // Restore the file's CURRENT budget: the loadFile cap, or the memory-warning-reduced budget
+            // (activeReadAheadCap tracks the shed, so a resume can never re-raise past what pressure allowed).
+            guard mpv != nil, let cap = activeReadAheadCap else { return }
             setString("demuxer-max-bytes", cap)
             mpvLog.log("resumed: paused cache clamp released, demuxer-max-bytes back to \(cap, privacy: .public)")
         }
     }
 
     private func applyPausedCacheClamp() {
-        guard mpv != nil, !pausedCacheClamped, !memoryCacheClamped else { return }
+        guard mpv != nil, !pausedCacheClamped,
+              currentReadAheadBudgetBytes > VortXCacheShedPolicy.floorBytes else { return }
         guard getFlag(MPVProperty.pause) else { return }   // belt-and-suspenders; resume cancels the work item
         pausedCacheClamped = true
         setString("demuxer-max-bytes", Self.clampedCacheCap)
@@ -1331,14 +1343,32 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     private func shedForMemoryPressure() {
-        guard mpv != nil, !memoryCacheClamped else { return }
+        guard mpv != nil else { return }
+        // #148 ("caches then stops caching ~40s in"): the old handler answered the FIRST warning by
+        // slamming the forward cap to the 48 MiB floor for the rest of the file. On the Apple TV the big
+        // read-ahead fills at link speed, so a warning arrived ~40s into every mpv mount (six in one field
+        // log) and caching visibly died for the whole film. The real relief is the buffer DROP below,
+        // which frees the resident bytes immediately either way; the refill budget only sets the next
+        // peak. So step DOWN instead of slamming: first warning halves the budget (768 -> 384 MiB,
+        // 256 -> 128 MiB; caching stays alive), any later warning floors it (the old terminal state).
+        // The reduced budget is written back to activeReadAheadCap so pause/resume and later warnings all
+        // key off it; loadFile still resets a NEW file to its full budget.
+        let newCapBytes = VortXCacheShedPolicy.forwardCapAfterWarning(
+            currentBytes: currentReadAheadBudgetBytes, previouslyShed: memoryCacheClamped)
         memoryCacheClamped = true
-        pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
-        setString("demuxer-max-bytes", Self.clampedCacheCap)
+        let newCap = String(newCapBytes)
+        activeReadAheadCap = newCap
+        if pausedCacheClamped {
+            // Parked at the paused floor already: keep the live cap there (raising it under pressure would
+            // be backwards); the shrunken budget takes over on resume via pausedStateChanged.
+        } else {
+            setString("demuxer-max-bytes", newCap)
+        }
         setString("demuxer-max-back-bytes", "8MiB")
         flushDemuxerCachePreservingPosition()   // NOT bare drop-buffers: that moves the play head (see above)
-        mpvLog.log("memory warning: demuxer cache clamped to \(Self.clampedCacheCap, privacy: .public) for the rest of this file")
-        DiagnosticsLog.log("player", "memory warning: mpv cache clamped to \(Self.clampedCacheCap) + buffers dropped")
+        let mib = newCapBytes >> 20
+        mpvLog.log("memory warning: demuxer cache stepped down to \(mib, privacy: .public)MiB for the rest of this file")
+        DiagnosticsLog.log("player", "memory warning: mpv cache stepped down to \(mib)MiB + buffers dropped")
     }
     #endif
 

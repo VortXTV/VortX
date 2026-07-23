@@ -72,8 +72,12 @@ final class VortXAudioTranscoder {
         let srcChannels = dctx.pointee.ch_layout.nb_channels > 0 ? dctx.pointee.ch_layout.nb_channels : 2
         // AAC tops out at 7.1; FFmpeg's eac3 encoder tops out at 5.1 (a 7.1 TrueHD source folds to 5.1 there).
         encChannels = min(max(srcChannels, 1), isEAC3 ? 6 : 8)
-        // EAC3 caps at 48 kHz; hi-res TrueHD/DTS-HD (96/192 kHz) resamples down. AAC keeps the source rate.
-        let encRate = isEAC3 ? min(srcRate, 48_000) : srcRate
+        // #148: snap the encoder rate to what the encoder actually opens with. The old "AAC keeps the
+        // source rate" passed 192/176.4 kHz hi-res TrueHD/DTS-HD straight to avcodec_open2, which rejects
+        // anything above 96 kHz (rc=-22), so init? failed and the whole DV session demoted to the libmpv
+        // HDR10 tone-map: the "TrueHD reverts to HDR" field report. The resampler below already converts
+        // whatever rate delta this produces (it always did for the EAC3 48 kHz cap).
+        let encRate = VortXAudioTranscodePolicy.encoderSampleRate(source: srcRate, isEAC3: isEAC3)
         ectx.pointee.sample_rate = encRate
         ectx.pointee.sample_fmt = AV_SAMPLE_FMT_FLTP          // both encoders' native planar-float input
         av_channel_layout_default(&ectx.pointee.ch_layout, encChannels)
