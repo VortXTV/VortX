@@ -169,6 +169,71 @@ final class VortXSyncManager: ObservableObject {
         get { Set(UserDefaults.standard.stringArray(forKey: settingsBaselineKey(for: account?.id)) ?? []) }
         set { UserDefaults.standard.set(Array(newValue), forKey: settingsBaselineKey(for: account?.id)) }
     }
+    /// LOCAL-WINS dirty set: syncable settings keys the user changed on THIS device that have NOT been confirmed
+    /// onto the account yet, as `key -> dirtyAt` (epoch). Keyed PER ACCOUNT exactly like the gates above and
+    /// under the `vortx.sync.` prefix so `SettingsBackup.deviceLocalKeyPrefixes` already keeps it out of every
+    /// synced blob and backup file. The PULL path (syncDown) skips these keys when applying the account's
+    /// settings blob, so a just-made local change is never clobbered by the account's older value before this
+    /// device pushes it; the mark clears only after a CONFIRMED push (see `clearPushedDirtySettings`). Per-account
+    /// keying is what satisfies "a device switching accounts must not carry another account's dirty set": account
+    /// B reads its own (empty) slot and applies B's values normally. Not reset on signOut (per-account keying
+    /// isolates accounts), matching lastSyncedVersion / appliedSettingsBaseline above; that also protects a
+    /// sign-out / re-login for the SAME account, whose reconcile pull would otherwise re-clobber the unpushed edit.
+    private func dirtySettingsKey(for accountId: String?) -> String { "vortx.sync.dirtySettings." + (accountId ?? "") }
+    private var dirtySettings: [String: Double] {
+        get { (UserDefaults.standard.dictionary(forKey: dirtySettingsKey(for: account?.id)) as? [String: Double]) ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: dirtySettingsKey(for: account?.id)) }
+    }
+    /// The last SYNCABLE defaults snapshot the differ reconciled. In-memory only: it tracks the physical
+    /// `UserDefaults` domain (account-independent), while the dirty SET above is per-account. Seeded at init and
+    /// re-baselined after every remote-apply / housekeeping window (so a suppressed non-user write is never
+    /// mis-attributed to a later user edit). There is no per-key UserDefaults change signal, so a change is
+    /// detected by diffing this shadow against the live domain in the global didChange observer.
+    private var settingsShadow: [String: Any] = [:]
+
+    /// The app's OWN syncable defaults right now (the exact set `SettingsBackup` pushes), used as both the
+    /// differ input and the shadow baseline. Mirrors `makeBackup` / `mergedSyncBlob`'s domain read.
+    private func currentSyncableDomain() -> [String: Any] {
+        let bundleID = Bundle.main.bundleIdentifier ?? "unknown"
+        return (UserDefaults.standard.persistentDomain(forName: bundleID) ?? [:])
+            .filter { SettingsBackup.isSyncable($0.key) }
+    }
+    /// Re-baseline the differ shadow to the live domain. Called after a remote apply / suppressed housekeeping
+    /// window so those non-user writes become the baseline, never a future user edit's phantom diff.
+    private func refreshSettingsShadow() { settingsShadow = currentSyncableDomain() }
+    /// A genuine LOCAL settings write landed (the global didChange observer, already gated on !isApplyingRemote,
+    /// so a remote-apply / housekeeping write never reaches here). Diff the live domain against the shadow, mark
+    /// any changed syncable key dirty, and re-baseline the shadow. No-op when signed out (nothing to protect).
+    private func noteLocalSettingsChange() {
+        guard isSignedIn else { return }
+        let current = currentSyncableDomain()
+        let changed = SettingsDirtyKeys.changedSyncableKeys(from: settingsShadow, to: current,
+                                                            isSyncable: SettingsBackup.isSyncable)
+        settingsShadow = current
+        guard !changed.isEmpty else { return }
+        var dirty = dirtySettings
+        SettingsDirtyKeys.mark(changed, at: Date().timeIntervalSince1970, into: &dirty)
+        dirtySettings = dirty
+    }
+    /// Clear the keys a CONFIRMED push carried up, guarded by the stamp `snapshot` taken when that push began so a
+    /// key re-edited mid-push stays protected (see `SettingsDirtyKeys.clearPushed`). Under the suppression window:
+    /// it is a `vortx.sync.` UserDefaults write and must not arm a self-echo push.
+    private func clearPushedDirtySettings(_ snapshot: [String: Double]) {
+        guard !snapshot.isEmpty else { return }
+        withRemoteApplySuppressed {
+            var dirty = dirtySettings
+            SettingsDirtyKeys.clearPushed(snapshot, from: &dirty)
+            dirtySettings = dirty
+        }
+    }
+    /// After a startup pull, a still-dirty settings key (a change made in a previous session whose debounced push
+    /// never landed) needs a push so the account and the rest of the fleet heal. syncUp reads local, so the dirty
+    /// value (local wins) rides up and the confirmed push clears the dirty mark. Debounced via requestSyncSoon so
+    /// it coalesces with any other pending change. No-op when there is nothing unpushed.
+    private func flushDirtySettingsIfNeeded() {
+        guard isSignedIn, !dirtySettings.isEmpty else { return }
+        requestSyncSoon()
+    }
     /// Last shared add-on ORDER applied from the account (Bug B). Persisted normalized transportUrls in the
     /// converged priority order. Read by ownedAddons(from:) as the ordering spine when a pulled doc does not
     /// itself carry addonOrder, so a device that hydrates after (but not during) an order change still lands
@@ -259,9 +324,17 @@ final class VortXSyncManager: ObservableObject {
         // the receiving device's syncDown re-arms hasPendingPush (self-echo) and starves its own pull guard,
         // so peer settings never apply (the Beta 8/9 settings-sync regression). The notification is delivered
         // on the main queue, so reading the @MainActor flag here is safe.
+        // Seed the LOCAL-WINS differ baseline from the current domain BEFORE the observer is armed, so the first
+        // real user edit diffs against a true snapshot rather than an empty one (which would mark every existing
+        // key dirty). Refreshed after every remote-apply / housekeeping window (see withRemoteApplySuppressed).
+        refreshSettingsShadow()
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
                 guard let self, !self.isApplyingRemote else { return }
+                // Record which syncable key(s) the user just changed (durable, per-key, survives a relaunch) so a
+                // later pull cannot clobber an unpushed local edit; THEN arm the debounced push. Both are gated on
+                // !isApplyingRemote, so a remote apply's writes never mark dirty or arm a push.
+                self.noteLocalSettingsChange()
                 self.requestSyncSoon()
             }
         }
@@ -967,12 +1040,19 @@ final class VortXSyncManager: ObservableObject {
                 return false
             }
         }
+        // Snapshot the LOCAL-WINS dirty stamps BEFORE building the push blob. mergeLocalIntoDoc reads the local
+        // domain (local wins), so every currently-dirty key's value rides up in this push. On a CONFIRMED push we
+        // clear exactly these keys (unless re-edited since: clearPushed guards on the stamp), so the dirty mark is
+        // released only once the value is safely on the account and a later pull may apply account values again.
+        let dirtyAtPushStart = dirtySettings
         // Build the merged doc from the current account base, then push with optimistic-concurrency
         // recovery: if a concurrent write wins the race, re-run this exact merge onto the winner's doc and
         // retry (bounded). The rebuild closure re-pulls a fresh base each attempt so the recovered push
         // never clobbers the winner; it returns nil on a failed pull so the retry aborts safely.
         guard let initial = await mergeLocalIntoDoc(base: nil) else { return false }
-        return await pushDerivedDoc(initial, rebuild: { await self.mergeLocalIntoDoc(base: nil) })
+        let pushed = await pushDerivedDoc(initial, rebuild: { await self.mergeLocalIntoDoc(base: nil) })
+        if pushed { clearPushedDirtySettings(dirtyAtPushStart) }
+        return pushed
     }
 
     /// Build the doc to push by MERGING this device's profiles + settings + keys + add-on order onto a
@@ -1233,7 +1313,13 @@ final class VortXSyncManager: ObservableObject {
             // a richer local profile (the data-loss bug). Restore, re-read the cloud roster, then UNION
             // the captured local roster back in so no local-only profile is ever dropped by this pull.
             let localRosterBefore = ProfileStore.shared.profiles
-            if ((try? SettingsBackup.restore(from: data)) ?? 0) > 0 {
+            // LOCAL-WINS: skip any syncable key the user changed on THIS device and has not pushed yet, so the
+            // account's OLDER value cannot overwrite a just-made local edit before this device's push carries it
+            // up (the durable, per-key successor to the in-memory hasPendingPush guard; see SettingsDirtyKeys and
+            // the "would not stay" interplay at :1175-1182). A restored/fresh device has an empty set, so a full
+            // restore is unchanged. The skipped keys keep their local value, which flushDirtySettingsIfNeeded then
+            // pushes so the account heals.
+            if ((try? SettingsBackup.restore(from: data, skipping: Set(dirtySettings.keys))) ?? 0) > 0 {
                 restored = true
                 // Stamp the applied-blob BASELINE (#145 resurrection fix): the syncable keys this pulled doc just
                 // wrote, in the SAME migrated form restore used. mergedSyncBlob reads it on the next push so a
@@ -2034,7 +2120,14 @@ final class VortXSyncManager: ObservableObject {
         body()
         // If we were already inside an outer suppression window, let the outer one clear it.
         guard !wasSuppressing else { return }
-        DispatchQueue.main.async { [weak self] in self?.isApplyingRemote = false }
+        DispatchQueue.main.async { [weak self] in
+            // Re-baseline the LOCAL-WINS differ shadow to the just-applied domain BEFORE clearing the flag, so
+            // none of the suppressed writes (a remote apply, or touch:false housekeeping) is ever mis-read as a
+            // user edit by the next real didChange diff. A key that was SKIPPED as dirty kept its local value, so
+            // the snapshot captures the user's value for it and it stays dirty until its own push confirms.
+            self?.refreshSettingsShadow()
+            self?.isApplyingRemote = false
+        }
     }
 
     /// ProfileStore entry point: wrap a touch:false housekeeping persist so its UserDefaults writes do not
@@ -2070,6 +2163,10 @@ final class VortXSyncManager: ObservableObject {
         Task {
             await self.restoreAccountDocIfNeeded()
             await self.syncDown()
+            // A settings change from a PREVIOUS session whose debounced push never landed (relaunch, offline, or a
+            // crash before the 2.5s push) is still marked dirty and survived the pull above untouched. Arm a push
+            // now so the account and the rest of the fleet converge on it. No-op when nothing is unpushed.
+            self.flushDirtySettingsIfNeeded()
         }
     }
 
