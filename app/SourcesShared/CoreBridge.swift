@@ -99,7 +99,10 @@ final class CoreBridge: ObservableObject {
     /// simply signed out of Stremio and takes the signed-out recovery path.
     private var importedAwayFromStremio: Bool {
         guard let token = Keychain.string(activeTokenAccount), !token.isEmpty else { return false }
-        return ProfileSync.libraryImportedFromStremio(authKey: token) && !ProfileSync.alsoSyncToStremio
+        return ProfileSync.libraryImportedFromStremio(
+            authKey: token,
+            scope: CredentialScopeSnapshotStore.shared.load().scope
+        ) && !ProfileSync.alsoSyncToStremio
     }
 
     private init() {}
@@ -472,18 +475,18 @@ final class CoreBridge: ObservableObject {
                 // session repair. Next launch has no token, so isLoggedIn() is false and this runs at most once;
                 // on an unreachable launch we keep the session and retry next launch (never an empty UI).
                 Task { @MainActor in
-                    if await VortXSyncManager.shared.accountDocReachable() {
+                    if let credentialStamp = await VortXSyncManager.shared.accountDocCredentialStamp(),
+                       self.unloadImportedSessionAndClearToken(credentialStamp: credentialStamp) {
                         NSLog("[CoreBridge] imported to VortX + opt-out: unloading the engine's Stremio session")
-                        self.logOut()   // Ctx Logout: kills the Stremio session server-side + resets the engine
-                        // The Logout invalidated the Stremio token server-side, so the retained Keychain token is
-                        // dead. Clear it: it is useless, and keeping it would keep scheduleSessionRepair trying to
-                        // re-auth a dead session. "Connect Stremio" / alsoSyncToStremio is a fresh sign-in.
-                        Keychain.set(nil, for: self.activeTokenAccount)
                         // Deterministic post-logout recovery: wait for the engine to actually process the Logout
                         // (isLoggedIn flips false and the library resets), then load that empty library and recover
                         // the owner library from doc.vortx at launch, not after the 14s repair.
-                        for _ in 0 ..< 30 where self.isLoggedIn() { try? await Task.sleep(nanoseconds: 100_000_000) }
+                        for _ in 0 ..< 30 where CredentialScopeAuthority.shared.isCurrent(credentialStamp) && self.isLoggedIn() {
+                            try? await Task.sleep(nanoseconds: 100_000_000)
+                        }
+                        guard CredentialScopeAuthority.shared.isCurrent(credentialStamp) else { return }
                         await self.loadLibraryAndAwait()
+                        guard CredentialScopeAuthority.shared.isCurrent(credentialStamp) else { return }
                         await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
                     } else {
                         NSLog("[CoreBridge] deferring engine Stremio-session unload: VortX doc unreachable this launch")
@@ -643,7 +646,29 @@ final class CoreBridge: ObservableObject {
 
     /// Log out of the engine (clears the persisted profile + library, and kills the session
     /// server-side) and the published UI state. For explicit sign-out, never for profile switching.
-    func logOut() {
+    @MainActor
+    @discardableResult
+    func logOut(credentialStamp suppliedStamp: CredentialCommitStamp? = nil) -> Bool {
+        let authority = CredentialScopeAuthority.shared
+        guard let stamp = suppliedStamp ?? authority.currentContextStamp() else { return false }
+        return authority.commitIfCurrent(stamp) {
+            performLogout()
+            return true
+        } ?? false
+    }
+
+    @MainActor
+    private func unloadImportedSessionAndClearToken(credentialStamp: CredentialCommitStamp) -> Bool {
+        guard let tokenAccount = credentialStamp.stremioSlot?.account else { return false }
+        return CredentialScopeAuthority.shared.commitIfCurrent(credentialStamp) {
+            performLogout()
+            Keychain.set(nil, for: tokenAccount)
+            return true
+        } ?? false
+    }
+
+    @MainActor
+    private func performLogout() {
         dispatchCtx(["action": "Logout"])
         clearUserState()
     }
@@ -1646,7 +1671,23 @@ final class CoreBridge: ObservableObject {
     /// on the next play. `@discardableResult` keeps fire-and-forget callers unchanged.
     @MainActor
     @discardableResult
-    func addCatalogItemToAccount(id: String, type: String, stampIntent: Bool = true) async -> Bool {
+    func addCatalogItemToAccount(
+        id: String,
+        type: String,
+        stampIntent: Bool = true,
+        credentialStamp suppliedStamp: CredentialCommitStamp? = nil
+    ) async -> Bool {
+        let authority = CredentialScopeAuthority.shared
+        let operation = authority.beginOperation(.coreCatalogMutation)
+        let baseStamp = suppliedStamp ?? authority.currentContextStamp()
+        guard let baseStamp else { return false }
+        let credentialStamp = CredentialCommitStamp(
+            scope: baseStamp.scope,
+            stremioSlot: baseStamp.stremioSlot,
+            document: baseStamp.document,
+            operation: operation
+        )
+        guard authority.isCurrent(credentialStamp) else { return false }
         let safeType = (type == "series") ? "series" : "movie"
         let safeId = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         guard let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(safeType)/\(safeId).json"),
@@ -1658,9 +1699,11 @@ final class CoreBridge: ObservableObject {
         // stampIntent: false: recovery is a machine re-add of account-owned titles, and stamping an addedAt
         // there could mint a machine timestamp that beats a real removal this device has not folded yet,
         // durably resurrecting a removed title.
-        if stampIntent { LibraryTombstones.forget(id) }
-        dispatchCtx(["action": "AddToLibrary", "args": meta])
-        return true
+        return authority.commitIfCurrent(credentialStamp) {
+            if stampIntent { LibraryTombstones.forget(id) }
+            dispatchCtx(["action": "AddToLibrary", "args": meta])
+            return true
+        } ?? false
     }
 
     /// Mark a catalog item watched / unwatched without opening its detail page first. `MetaItemMarkAsWatched`

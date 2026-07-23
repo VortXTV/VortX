@@ -620,7 +620,8 @@ struct CoreContinueWatchingRow: View {
             }
             Task { @MainActor in
                 let hashShort = (entry.infoHash?.prefix(8)).map(String.init) ?? "-"
-                let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
+                let homeResumeResult = await CWResume.resolvedURLVersioned(for: entry)
+                let (resolvedURL, refreshed) = homeResumeResult.value
                 let bridge = CoreBridge.shared   // this row has no `core` env-object; use the shared engine bridge
                 if hasEpisodicPhysicalIdentity, entry.torrent == true,
                    entry.fileIdx == nil, !refreshed {
@@ -629,35 +630,56 @@ struct CoreContinueWatchingRow: View {
                     )
                     return
                 }
+                guard DebridCredentialSnapshotStore.shared.compareAndPublish(
+                    revision: homeResumeResult.revision,
+                    mutation: {
+                        let requestType = usesSeriesLifecycle ? "series" : entry.type
+                        if refreshed
+                            || bridge.metaDetails?.meta?.id != item.id
+                            || bridge.streamGroups(forStreamId: entry.videoId).isEmpty
+                            || (usesSeriesLifecycle
+                                && (bridge.metaDetails?.meta?.videos?.isEmpty ?? true)) {
+                            bridge.loadMeta(
+                                type: requestType, id: item.id,
+                                streamType: requestType, streamId: entry.videoId
+                            )
+                        }
+                    }
+                ) else { return }
                 if refreshed, let service = entry.debridService.flatMap(DebridService.init(rawValue:)),
                    let hash = entry.infoHash, !hash.isEmpty {
                     // Fresh link for the SAME source: play it as an EXPLICIT pick (no silent hop) so the resume
                     // honors the user's chosen source, exactly as a manual source-row tap would. Carry the debrid
                     // provenance so the play-record re-stores it and the NEXT resume can reresolve again.
                     NSLog("[cw-probe] tv directResume: svc=%@ hash=%@ fileIdx=%@ reresolve=FRESH path=exact-source", service.rawValue, hashShort, entry.fileIdx.map(String.init) ?? "-")
-                    let requestType = usesSeriesLifecycle ? "series" : entry.type
-                    bridge.loadMeta(type: requestType, id: item.id,
-                                    streamType: requestType, streamId: entry.videoId)
                     let eps = await prefetchEpisodes(bridge, itemID: item.id,
                                                      usesSeriesLifecycle: usesSeriesLifecycle)
                     let groups = bridge.streamGroups(forStreamId: entry.videoId)
                     let source = resumeSource(entry: entry, url: resolvedURL, groups: groups,
                                               forceDirect: true)
-                    let engineVideoID = source.flatMap {
-                        bindResumeEngine(bridge, source: $0, entry: entry,
-                                         hasEpisodicPhysicalIdentity: hasEpisodicPhysicalIdentity,
-                                         groups: groups, resolvedURL: resolvedURL)
-                    }
                     let ref = DebridPlaybackRef(url: resolvedURL, service: service, infoHash: hash,
                                                 torrentId: entry.debridTorrentId, fileId: entry.debridFileId,
                                                 fileIdx: entry.fileIdx)
-                    presenter.request = PlaybackRequest(
-                        url: resolvedURL, title: entry.title, meta: meta, episodes: eps,
-                        sourceHint: entry.qualityText, torrent: false,
-                        bingeGroup: entry.bingeGroup, headers: entry.headers,
-                        debridRef: ref, sourceStream: source,
-                        enginePlayerVideoId: engineVideoID,
-                        wasExplicitPick: true, wasResume: true)
+                    guard DebridCredentialSnapshotStore.shared.compareAndPublish(
+                        revision: homeResumeResult.revision,
+                        mutation: {
+                            let engineVideoID = source.flatMap {
+                                bindResumeEngine(
+                                    bridge, source: $0, entry: entry,
+                                    hasEpisodicPhysicalIdentity: hasEpisodicPhysicalIdentity,
+                                    groups: groups, resolvedURL: resolvedURL
+                                )
+                            }
+                            presenter.request = PlaybackRequest(
+                                url: resolvedURL, title: entry.title, meta: meta, episodes: eps,
+                                sourceHint: entry.qualityText, torrent: false,
+                                bingeGroup: entry.bingeGroup, headers: entry.headers,
+                                debridRef: ref, sourceStream: source,
+                                enginePlayerVideoId: engineVideoID,
+                                wasExplicitPick: true, wasResume: true
+                            )
+                        }
+                    ) else { return }
                     return
                 }
                 // No fresh link (non-debrid entry, or the source is genuinely gone): replay the stored url as
@@ -667,28 +689,30 @@ struct CoreContinueWatchingRow: View {
                 // gives the resume-path community hoard (above) the groups it polls for (series was previously
                 // left unloaded here, so a series fallback resume seeded nothing).
                 NSLog("[cw-probe] tv directResume: svc=%@ hash=%@ fileIdx=%@ reresolve=NIL path=fallback-stored-url", entry.debridService ?? "-", hashShort, entry.fileIdx.map(String.init) ?? "-")
-                if bridge.metaDetails?.meta?.id != item.id
-                    || bridge.streamGroups(forStreamId: entry.videoId).isEmpty
-                    || (usesSeriesLifecycle && (bridge.metaDetails?.meta?.videos?.isEmpty ?? true)) {
-                    let requestType = usesSeriesLifecycle ? "series" : entry.type
-                    bridge.loadMeta(type: requestType, id: item.id,
-                                    streamType: requestType, streamId: entry.videoId)
-                }
                 let eps = await prefetchEpisodes(bridge, itemID: item.id,
                                                  usesSeriesLifecycle: usesSeriesLifecycle)
                 let groups = bridge.streamGroups(forStreamId: entry.videoId)
                 let source = resumeSource(entry: entry, url: resolvedURL, groups: groups)
-                let engineVideoID = source.flatMap {
-                    bindResumeEngine(bridge, source: $0, entry: entry,
-                                     hasEpisodicPhysicalIdentity: hasEpisodicPhysicalIdentity,
-                                     groups: groups, resolvedURL: nil)
-                }
-                if let source { tvPrimeTorrentStream(source) }
-                presenter.request = PlaybackRequest(
-                    url: resolvedURL, title: entry.title, meta: meta,
-                    episodes: eps, sourceHint: entry.qualityText, torrent: entry.torrent ?? false,
-                    headers: entry.headers, sourceStream: source,
-                    enginePlayerVideoId: engineVideoID, wasResume: true)
+                guard DebridCredentialSnapshotStore.shared.compareAndPublish(
+                    revision: homeResumeResult.revision,
+                    mutation: {
+                        let engineVideoID = source.flatMap {
+                            bindResumeEngine(
+                                bridge, source: $0, entry: entry,
+                                hasEpisodicPhysicalIdentity: hasEpisodicPhysicalIdentity,
+                                groups: groups, resolvedURL: nil
+                            )
+                        }
+                        if let source { tvPrimeTorrentStream(source) }
+                        presenter.request = PlaybackRequest(
+                            url: resolvedURL, title: entry.title, meta: meta,
+                            episodes: eps, sourceHint: entry.qualityText,
+                            torrent: entry.torrent ?? false,
+                            headers: entry.headers, sourceStream: source,
+                            enginePlayerVideoId: engineVideoID, wasResume: true
+                        )
+                    }
+                ) else { return }
             }
         }
     }

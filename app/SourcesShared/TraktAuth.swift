@@ -54,23 +54,32 @@ actor TraktAuth {
 
     // MARK: - Keychain accounts (token set lives here, nowhere else)
 
-    private let accessAccount = "vortx.trakt.accessToken"
-    private let refreshAccount = "vortx.trakt.refreshToken"
-    private let expiryAccount = "vortx.trakt.expiresAt"   // unix epoch seconds, stored as a string
+    private static let accessAccount = "vortx.trakt.accessToken"
+    private static let refreshAccount = "vortx.trakt.refreshToken"
+    private static let expiryAccount = "vortx.trakt.expiresAt"   // unix epoch seconds, stored as a string
     /// Unix epoch seconds when the token was ISSUED, stored as a string. Fourth slot: it lets
     /// `currentToken()` rebuild the token with its ORIGINAL lifetime so the 30-minute early-refresh
     /// leeway actually fires (see `TraktToken.defaultLeeway`). May be absent on installs whose token
     /// was stored before this slot existed; `currentToken()` degrades gracefully to hard-expiry-only.
-    private let createdAtAccount = "vortx.trakt.createdAt"
+    private static let createdAtAccount = "vortx.trakt.createdAt"
+    private static let migrationGroup = "trakt"
 
     private let session: URLSession
+    nonisolated private let tokenStorage: CredentialTokenStorage
+    private let onBeforeCommit: (@Sendable () async -> Void)?
 
     /// The single in-flight refresh, if one is running. Concurrent `validToken()` callers (scrobbleStart,
     /// TraktSyncEngine.pullWatched, a rail fetch) await THIS task instead of each firing their own refresh
     /// POST. Trakt rotates the refresh token on every refresh, so two independent refreshes would race:
     /// the loser 401s on an already-spent refresh token and would drop the whole session. Single-flight
     /// collapses them into one, so only one rotation happens and everyone gets the same fresh token.
-    private var inFlightRefresh: Task<TraktToken, Error>?
+    private struct RefreshFlight {
+        let id: UUID
+        let operation: CredentialOperationStamp
+        let task: Task<TraktToken, Error>
+    }
+    private var inFlightRefresh: RefreshFlight?
+    private var pendingDeviceOperations: [String: CredentialOperationStamp] = [:]
 
     /// Injected at app startup (by `VortXSyncManager`): returns the freshest cross-device Trakt token
     /// triple from the synced `doc.apiKeys` mirror, or nil. Lets the refresh-401 path re-adopt a token a
@@ -78,8 +87,14 @@ actor TraktAuth {
     /// so `TraktAuth` stays free of a `VortXSyncManager` dependency.
     private var syncedTokenProvider: (@Sendable () async -> (access: String, refresh: String, expiryUnix: Int)?)?
 
-    init(session: URLSession = .shared) {
+    init(
+        session: URLSession = .shared,
+        tokenStorage: CredentialTokenStorage = .keychain,
+        onBeforeCommit: (@Sendable () async -> Void)? = nil
+    ) {
         self.session = session
+        self.tokenStorage = tokenStorage
+        self.onBeforeCommit = onBeforeCommit
     }
 
     /// Wire the cross-device synced-token lookup used by the refresh-401 recovery path (T-2). Called once
@@ -91,14 +106,22 @@ actor TraktAuth {
     // MARK: - Public state
 
     /// True when a token set is stored (the user has connected Trakt). Does not check expiry.
-    var isSignedIn: Bool { Keychain.string(accessAccount)?.isEmpty == false }
+    var isSignedIn: Bool {
+        let scope = CredentialScopeSnapshotStore.shared.load().scope
+        return string(Self.accessAccount, scope: scope)?.isEmpty == false
+    }
 
     /// Drop all stored Trakt tokens (the user disconnected). Does not revoke server-side.
-    func signOut() {
-        Keychain.set(nil, for: accessAccount)
-        Keychain.set(nil, for: refreshAccount)
-        Keychain.set(nil, for: expiryAccount)
-        Keychain.set(nil, for: createdAtAccount)
+    func signOut() async {
+        let operation = await beginOperation(.traktDisconnect)
+        let committed = await commitIfCurrent(CredentialCommitStamp(operation: operation)) { scope in
+            self.clearTokens(scope: scope)
+        }
+        if committed {
+            inFlightRefresh?.task.cancel()
+            inFlightRefresh = nil
+            pendingDeviceOperations.removeAll(keepingCapacity: true)
+        }
     }
 
     /// Adopt a token set that arrived from ANOTHER device over the E2E `doc.apiKeys` sync channel, so
@@ -106,24 +129,39 @@ actor TraktAuth {
     /// slots directly (no network). `expiryUnix` is absolute unix-epoch seconds (what `store` persists
     /// and `syncUp` mirrors). Ignores an empty access/refresh pair so a partial doc never clears a live
     /// local session. Idempotent: adopting the same tokens twice is a harmless overwrite.
-    func adoptTokens(access: String, refresh: String, expiryUnix: Int) {
+    func adoptTokens(
+        access: String,
+        refresh: String,
+        expiryUnix: Int,
+        credentialStamp suppliedStamp: CredentialCommitStamp? = nil
+    ) async {
         guard !access.isEmpty, !refresh.isEmpty else { return }
-        Keychain.set(access, for: accessAccount)
-        Keychain.set(refresh, for: refreshAccount)
-        Keychain.set(String(expiryUnix), for: expiryAccount)
-        // The synced mirror carries no issue time, so stamp adoption time. The rebuilt "lifetime" is
-        // then the REMAINING lifetime at adoption, whose half-life leeway is always strictly less than
-        // the remaining time itself, so a just-adopted token is never instantly read as expired.
-        Keychain.set(String(Int(Date().timeIntervalSince1970)), for: createdAtAccount)
+        let stamp: CredentialCommitStamp
+        if let suppliedStamp {
+            stamp = suppliedStamp
+        } else {
+            stamp = await currentCommitStamp()
+        }
+        let adoptedAt = Int(Date().timeIntervalSince1970)
+        _ = await commitIfCurrent(stamp) { scope in
+            self.writeTokens(
+                access: access,
+                refresh: refresh,
+                expiryUnix: expiryUnix,
+                createdAt: adoptedAt,
+                scope: scope
+            )
+        }
     }
 
     /// The stored token triple for the sync PUSH side (access, refresh, absolute unix expiry), or nil
     /// when not signed in. Read-only mirror of `currentToken`; the sync manager sends these only when a
     /// local session exists and NEVER deletes them from the doc when absent (mirrors the debrid guard).
     func syncableTokens() -> (access: String, refresh: String, expiryUnix: Int)? {
-        guard let access = Keychain.string(accessAccount), !access.isEmpty,
-              let refresh = Keychain.string(refreshAccount), !refresh.isEmpty,
-              let expiryString = Keychain.string(expiryAccount), let expiry = Int(expiryString)
+        let scope = CredentialScopeSnapshotStore.shared.load().scope
+        guard let access = string(Self.accessAccount, scope: scope), !access.isEmpty,
+              let refresh = string(Self.refreshAccount, scope: scope), !refresh.isEmpty,
+              let expiryString = string(Self.expiryAccount, scope: scope), let expiry = Int(expiryString)
         else { return nil }
         return (access, refresh, expiry)
     }
@@ -133,6 +171,9 @@ actor TraktAuth {
     /// Begin the device flow. Returns the codes and polling schedule to drive the UI and step 2.
     func requestDeviceCode() async throws -> TraktDeviceCode {
         try ensureConfigured()
+        let operation = await beginOperation(.traktDevicePoll)
+        let stamp = CredentialCommitStamp(operation: operation)
+        guard await isCurrent(stamp) else { throw TraktAuthError.superseded }
         struct Body: Encodable { let client_id: String }
         let request = try makeRequest(
             path: "/oauth/device/code",
@@ -141,6 +182,7 @@ actor TraktAuth {
             authorized: false
         )
         let (data, status) = try await send(request)
+        guard await isCurrent(stamp) else { throw TraktAuthError.superseded }
         DiagnosticsLog.log("trakt-auth", "device/code -> HTTP \(status)")
         guard status == 200 else {
             // A 401 at the CODE step means the shipped client_id is not a valid Trakt app key. Surface it
@@ -148,7 +190,9 @@ actor TraktAuth {
             if status == 401 { throw TraktAuthError.invalidClient }
             throw TraktAuthError.server(status: status)
         }
-        return try decode(TraktDeviceCode.self, from: data)
+        let code = try decode(TraktDeviceCode.self, from: data)
+        pendingDeviceOperations[code.deviceCode] = operation
+        return code
     }
 
     // MARK: - Step 2: poll for the token
@@ -163,7 +207,23 @@ actor TraktAuth {
     }
 
     func poll(deviceCode: String) async throws -> PollResult {
+        let operation: CredentialOperationStamp
+        if let pending = pendingDeviceOperations[deviceCode] {
+            operation = pending
+        } else {
+            operation = await beginOperation(.traktDevicePoll)
+            pendingDeviceOperations[deviceCode] = operation
+        }
+        return try await poll(deviceCode: deviceCode, operation: operation)
+    }
+
+    private func poll(
+        deviceCode: String,
+        operation: CredentialOperationStamp
+    ) async throws -> PollResult {
         try ensureConfigured()
+        let stamp = CredentialCommitStamp(operation: operation)
+        guard await isCurrent(stamp) else { throw TraktAuthError.superseded }
         struct Body: Encodable { let code: String; let client_id: String; let client_secret: String }
         let request = try makeRequest(
             path: "/oauth/device/token",
@@ -172,10 +232,13 @@ actor TraktAuth {
             authorized: false
         )
         let (data, status) = try await send(request)
+        guard await isCurrent(stamp) else { throw TraktAuthError.superseded }
         switch status {
         case 200:
             let token = try decode(TraktToken.self, from: data)
-            store(token)
+            guard await store(token, credentialStamp: stamp) else {
+                throw TraktAuthError.superseded
+            }
             DiagnosticsLog.log("trakt-auth", "device/token -> 200 authorized")
             return .authorized(token)
         case 400:
@@ -216,6 +279,18 @@ actor TraktAuth {
     /// On success the token is already stored in the Keychain; the return value is the same token.
     @discardableResult
     func pollForToken(deviceCode: String, interval: Int, expiresIn: Int) async throws -> TraktToken {
+        let operation: CredentialOperationStamp
+        if let pending = pendingDeviceOperations[deviceCode] {
+            operation = pending
+        } else {
+            operation = await beginOperation(.traktDevicePoll)
+            pendingDeviceOperations[deviceCode] = operation
+        }
+        defer {
+            if pendingDeviceOperations[deviceCode] == operation {
+                pendingDeviceOperations.removeValue(forKey: deviceCode)
+            }
+        }
         let deadline = Date().addingTimeInterval(TimeInterval(expiresIn))
         let baseInterval = max(interval, 1)
         var waitSeconds = baseInterval
@@ -223,7 +298,7 @@ actor TraktAuth {
         while Date() < deadline {
             try await sleep(seconds: waitSeconds)
             try Task.checkCancellation()
-            switch try await poll(deviceCode: deviceCode) {
+            switch try await poll(deviceCode: deviceCode, operation: operation) {
             case .authorized(let token):
                 return token
             case .pending:
@@ -257,28 +332,66 @@ actor TraktAuth {
     /// second concurrent refresh would spend an already-rotated token and 401). Stores and returns the set.
     @discardableResult
     func refresh(using refreshToken: String) async throws -> TraktToken {
-        // Join an in-flight refresh rather than starting a competing one.
-        if let existing = inFlightRefresh {
-            return try await existing.value
+        while true {
+            if let flight = inFlightRefresh {
+                let current = await isCurrent(CredentialCommitStamp(operation: flight.operation))
+                if current, inFlightRefresh?.id == flight.id {
+                    return try await finish(flight)
+                }
+                if inFlightRefresh?.id == flight.id {
+                    flight.task.cancel()
+                    inFlightRefresh = nil
+                }
+                continue
+            }
+
+            let operation = await beginOperation(.traktRefresh)
+            let stamp = CredentialCommitStamp(operation: operation)
+
+            // A second caller can enter while beginOperation hops to MainActor.
+            // If it reserved the flight first, join that newest current flight.
+            if let flight = inFlightRefresh {
+                if await isCurrent(CredentialCommitStamp(operation: flight.operation)) {
+                    return try await finish(flight)
+                }
+                continue
+            }
+            guard await isCurrent(stamp) else { continue }
+
+            // A refresh that completed moments ago may have stored a fresh token.
+            // Read the owner captured by this operation, never the process's newer scope.
+            if let fresh = currentToken(scope: operation.scope.scope), !fresh.isExpired() {
+                return fresh
+            }
+
+            let id = UUID()
+            let task = Task<TraktToken, Error> { [weak self] in
+                guard let self else { throw TraktAuthError.notSignedIn }
+                return try await self.performRefresh(using: refreshToken, credentialStamp: stamp)
+            }
+            let flight = RefreshFlight(id: id, operation: operation, task: task)
+            inFlightRefresh = flight
+            return try await finish(flight)
         }
-        // A refresh that completed moments ago (whose defer already cleared `inFlightRefresh`) may have
-        // stored a fresh token. A caller that just missed the in-flight window must not refresh again with
-        // the now-rotated refresh token, so re-check synchronously (no await) before starting a new one.
-        if let fresh = currentToken(), !fresh.isExpired() {
-            return fresh
+    }
+
+    private func finish(_ flight: RefreshFlight) async throws -> TraktToken {
+        do {
+            let token = try await flight.task.value
+            if inFlightRefresh?.id == flight.id { inFlightRefresh = nil }
+            return token
+        } catch {
+            if inFlightRefresh?.id == flight.id { inFlightRefresh = nil }
+            throw error
         }
-        let task = Task<TraktToken, Error> { [weak self] in
-            guard let self else { throw TraktAuthError.notSignedIn }
-            return try await self.performRefresh(using: refreshToken)
-        }
-        inFlightRefresh = task
-        defer { inFlightRefresh = nil }
-        return try await task.value
     }
 
     /// The actual `POST /oauth/token` refresh network call. Only ever invoked from inside the single-flight
     /// `refresh(using:)`, so at most one runs at a time.
-    private func performRefresh(using refreshToken: String) async throws -> TraktToken {
+    private func performRefresh(
+        using refreshToken: String,
+        credentialStamp: CredentialCommitStamp
+    ) async throws -> TraktToken {
         try ensureConfigured()
         struct Body: Encodable {
             let refresh_token: String
@@ -298,13 +411,18 @@ actor TraktAuth {
             grant_type: "refresh_token"
         )
         let request = try makeRequest(path: "/oauth/token", method: "POST", body: body, authorized: false)
+        guard await isCurrent(credentialStamp) else { throw TraktAuthError.superseded }
         let (data, status) = try await send(request)
+        guard await isCurrent(credentialStamp) else { throw TraktAuthError.superseded }
         guard status == 200 else {
             // A rejected refresh token USUALLY means the session is dead, but a concurrent winner (this
             // device pre single-flight, or a SIBLING device over sync) may already have rotated a NEWER
             // token. Only sign out when no fresher token exists anywhere; otherwise adopt it and keep going.
             if status == 401 {
-                if let recovered = await recoverAfterRefreshFailure(deadRefreshToken: refreshToken) {
+                if let recovered = await recoverAfterRefreshFailure(
+                    deadRefreshToken: refreshToken,
+                    credentialStamp: credentialStamp
+                ) {
                     return recovered
                 }
                 // Terminal-wipe guard: the recovery path above SUSPENDS (it awaits the synced-token
@@ -314,15 +432,19 @@ actor TraktAuth {
                 // from the one this refresh just spent is that winner's live session, so return it
                 // instead of wiping. Only when the stored set still carries the exact spent refresh
                 // token (or nothing is stored) is the session truly dead.
-                if let stored = currentToken(), stored.refreshToken != refreshToken {
-                    return stored
-                }
-                signOut()
+                let terminal = await terminalRefreshFailure(
+                    deadRefreshToken: refreshToken,
+                    credentialStamp: credentialStamp
+                )
+                guard terminal.committed else { throw TraktAuthError.superseded }
+                if let stored = terminal.replacement { return stored }
             }
             throw TraktAuthError.server(status: status)
         }
         let token = try decode(TraktToken.self, from: data)
-        store(token)
+        guard await store(token, credentialStamp: credentialStamp) else {
+            throw TraktAuthError.superseded
+        }
         return token
     }
 
@@ -330,13 +452,18 @@ actor TraktAuth {
     /// minted: (T-1c) re-read the Keychain in case a local refresh rotated it, then (T-2) consult the
     /// cross-device synced mirror in case a SIBLING device rotated and pushed one. Returns the token to
     /// adopt, or nil when nothing fresher exists (the caller then signs out).
-    private func recoverAfterRefreshFailure(deadRefreshToken: String) async -> TraktToken? {
+    private func recoverAfterRefreshFailure(
+        deadRefreshToken: String,
+        credentialStamp: CredentialCommitStamp
+    ) async -> TraktToken? {
+        guard await isCurrent(credentialStamp) else { return nil }
+        let scope = credentialStamp.scope.scope
         // (T-1c) A local winner rotated the token while this refresh was in flight. A Trakt rotation always
         // changes the refresh token, so a stored refresh token different from the one we just spent means a
         // winner already stored a rotated set; adopt it REGARDLESS of the access token's age (even an aged
         // set carries a live refresh token the next `validToken()` will spend), rather than wiping the
         // session over a token that merely needs its own refresh.
-        if let local = currentToken(), local.refreshToken != deadRefreshToken {
+        if let local = currentToken(scope: scope), local.refreshToken != deadRefreshToken {
             return local
         }
         // (T-2) A sibling device rotated + pushed a newer token over the synced `doc.apiKeys` mirror. A
@@ -344,8 +471,18 @@ actor TraktAuth {
         // the Keychain and use it. Same-token or absent means nothing fresher exists remotely.
         if let synced = await syncedTokenProvider?(),
            !synced.access.isEmpty, !synced.refresh.isEmpty, synced.refresh != deadRefreshToken {
-            adoptTokens(access: synced.access, refresh: synced.refresh, expiryUnix: synced.expiryUnix)
-            return currentToken()
+            guard await isCurrent(credentialStamp) else { return nil }
+            let adoptedAt = Int(Date().timeIntervalSince1970)
+            guard await commitIfCurrent(credentialStamp, { scope in
+                self.writeTokens(
+                    access: synced.access,
+                    refresh: synced.refresh,
+                    expiryUnix: synced.expiryUnix,
+                    createdAt: adoptedAt,
+                    scope: scope
+                )
+            }) else { return nil }
+            return self.currentToken(scope: scope)
         }
         return nil
     }
@@ -354,15 +491,19 @@ actor TraktAuth {
 
     /// The stored token set, reconstructed from the Keychain entries, or nil if not signed in.
     private func currentToken() -> TraktToken? {
-        guard let access = Keychain.string(accessAccount), !access.isEmpty,
-              let refresh = Keychain.string(refreshAccount), !refresh.isEmpty,
-              let expiryString = Keychain.string(expiryAccount),
+        currentToken(scope: CredentialScopeSnapshotStore.shared.load().scope)
+    }
+
+    nonisolated private func currentToken(scope: CredentialScope) -> TraktToken? {
+        guard let access = string(Self.accessAccount, scope: scope), !access.isEmpty,
+              let refresh = string(Self.refreshAccount, scope: scope), !refresh.isEmpty,
+              let expiryString = string(Self.expiryAccount, scope: scope),
               let expiry = Int(expiryString) else { return nil }
         // Rebuild with the ORIGINAL issue time when the fourth slot has it, so `expiresIn` is the
         // original lifetime and `defaultLeeway` gives a real 30-minute early refresh. (A rebuild from
         // the REMAINING lifetime makes `remaining <= min(1800, remaining/2)` unsatisfiable, so the
         // early refresh silently never fires and a data call can carry a token that expires in flight.)
-        if let createdAtString = Keychain.string(createdAtAccount),
+        if let createdAtString = string(Self.createdAtAccount, scope: scope),
            let createdAt = Int(createdAtString), createdAt < expiry {
             return TraktToken(accessToken: access, refreshToken: refresh,
                               expiresIn: expiry - createdAt, createdAt: createdAt)
@@ -376,11 +517,87 @@ actor TraktAuth {
                           expiresIn: expiry - now, createdAt: now)
     }
 
-    private func store(_ token: TraktToken) {
-        Keychain.set(token.accessToken, for: accessAccount)
-        Keychain.set(token.refreshToken, for: refreshAccount)
-        Keychain.set(String(Int(token.expiresAt.timeIntervalSince1970)), for: expiryAccount)
-        Keychain.set(String(token.createdAt), for: createdAtAccount)
+    @discardableResult
+    private func store(
+        _ token: TraktToken,
+        credentialStamp: CredentialCommitStamp
+    ) async -> Bool {
+        await commitIfCurrent(credentialStamp) { scope in
+            self.writeTokens(
+                access: token.accessToken,
+                refresh: token.refreshToken,
+                expiryUnix: Int(token.expiresAt.timeIntervalSince1970),
+                createdAt: token.createdAt,
+                scope: scope
+            )
+        }
+    }
+
+    nonisolated private func string(_ account: String, scope: CredentialScope) -> String? {
+        tokenStorage.read(account, Self.migrationGroup, scope)
+    }
+
+    nonisolated private func writeTokens(
+        access: String,
+        refresh: String,
+        expiryUnix: Int,
+        createdAt: Int,
+        scope: CredentialScope
+    ) {
+        _ = tokenStorage.write(access, Self.accessAccount, scope)
+        _ = tokenStorage.write(refresh, Self.refreshAccount, scope)
+        _ = tokenStorage.write(String(expiryUnix), Self.expiryAccount, scope)
+        _ = tokenStorage.write(String(createdAt), Self.createdAtAccount, scope)
+    }
+
+    nonisolated private func clearTokens(scope: CredentialScope) {
+        _ = tokenStorage.write(nil, Self.accessAccount, scope)
+        _ = tokenStorage.write(nil, Self.refreshAccount, scope)
+        _ = tokenStorage.write(nil, Self.expiryAccount, scope)
+        _ = tokenStorage.write(nil, Self.createdAtAccount, scope)
+    }
+
+    private func beginOperation(_ domain: CredentialOperationDomain) async -> CredentialOperationStamp {
+        await MainActor.run { CredentialScopeAuthority.shared.beginOperation(domain) }
+    }
+
+    private func currentCommitStamp() async -> CredentialCommitStamp {
+        await MainActor.run { CredentialScopeAuthority.shared.commitStamp() }
+    }
+
+    private func isCurrent(_ stamp: CredentialCommitStamp) async -> Bool {
+        await MainActor.run { CredentialScopeAuthority.shared.isCurrent(stamp) }
+    }
+
+    @discardableResult
+    private func commitIfCurrent(
+        _ stamp: CredentialCommitStamp,
+        _ mutation: @escaping @Sendable (CredentialScope) -> Void
+    ) async -> Bool {
+        if let onBeforeCommit { await onBeforeCommit() }
+        return await MainActor.run {
+            CredentialScopeAuthority.shared.commitIfCurrent(stamp) {
+                mutation(stamp.scope.scope)
+                return true
+            } ?? false
+        }
+    }
+
+    private func terminalRefreshFailure(
+        deadRefreshToken: String,
+        credentialStamp: CredentialCommitStamp
+    ) async -> (committed: Bool, replacement: TraktToken?) {
+        await MainActor.run {
+            CredentialScopeAuthority.shared.commitIfCurrent(credentialStamp) {
+                let scope = credentialStamp.scope.scope
+                if let stored = self.currentToken(scope: scope),
+                   stored.refreshToken != deadRefreshToken {
+                    return (true, stored)
+                }
+                self.clearTokens(scope: scope)
+                return (true, nil)
+            } ?? (false, nil)
+        }
     }
 
     // MARK: - HTTP plumbing
@@ -439,6 +656,7 @@ enum TraktAuthError: LocalizedError, Sendable, Equatable {
     /// (HTTP 401). Distinct from a transient `.server` fault: it means the shipped credentials do not
     /// match a valid, enabled Trakt application, so retrying will not help until they are fixed.
     case invalidClient
+    case superseded
     case server(status: Int)
     case transport(String)
     case decoding
@@ -453,6 +671,7 @@ enum TraktAuthError: LocalizedError, Sendable, Equatable {
         case .expired: return "The Trakt sign-in code expired. Please try again."
         case .denied: return "Trakt access was denied."
         case .invalidClient: return "Trakt did not accept this app's credentials. Please report this if it continues."
+        case .superseded: return "A newer account or Trakt operation replaced this request."
         case .server(let status): return "Trakt returned an error (HTTP \(status))."
         case .transport(let message): return message
         case .decoding: return "Could not read the response from Trakt."

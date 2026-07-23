@@ -52,6 +52,7 @@ final class IPTVPlaylistStore: ObservableObject {
     private static let defaultsKey = "vortx.iptv.playlists"
     private static let removedKey = "vortx.iptv.removed"   // slug -> removal stamp (epoch ms), last-writer-wins
     private func credAccount(_ slug: String) -> String { "vortx.iptv.cred." + slug }
+    private static let migrationGroup = "iptv"
 
     private init() {
         load()
@@ -96,7 +97,10 @@ final class IPTVPlaylistStore: ObservableObject {
     /// Idempotent by slug (a re-add of the same slug replaces the existing entry).
     func add(_ playlist: IPTVPlaylist, credentials: IPTVCredentials) {
         if let data = try? JSONEncoder().encode(credentials) {
-            Keychain.set(String(data: data, encoding: .utf8), for: credAccount(playlist.id))
+            CredentialScopedKeychain.set(
+                String(data: data, encoding: .utf8),
+                for: credAccount(playlist.id)
+            )
         }
         clearRemovedTombstone(playlist.id)
         playlists.removeAll { $0.id == playlist.id }
@@ -107,7 +111,7 @@ final class IPTVPlaylistStore: ObservableObject {
     /// Forget a playlist locally: drop its Keychain credentials and its metadata. The caller is responsible for
     /// uninstalling the add-on from the engine and calling the worker's /revoke first.
     func remove(slug: String) {
-        Keychain.set(nil, for: credAccount(slug))
+        CredentialScopedKeychain.set(nil, for: credAccount(slug))
         playlists.removeAll { $0.id == slug }
         stampRemovedTombstone(slug)
         save()
@@ -136,8 +140,15 @@ final class IPTVPlaylistStore: ObservableObject {
     }
 
     /// The stored credentials for a slug, or nil when absent.
-    func credentials(for slug: String) -> IPTVCredentials? {
-        guard let s = Keychain.string(credAccount(slug)), let data = s.data(using: .utf8) else { return nil }
+    func credentials(
+        for slug: String,
+        scope: CredentialScope = CredentialScopeSnapshotStore.shared.load().scope
+    ) -> IPTVCredentials? {
+        guard let s = CredentialScopedKeychain.string(
+            credAccount(slug),
+            migrationGroup: Self.migrationGroup,
+            scope: scope
+        ), let data = s.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(IPTVCredentials.self, from: data)
     }
 
@@ -164,6 +175,7 @@ final class IPTVPlaylistStore: ObservableObject {
     /// UNAFFECTED: the ACCOUNT token itself stays Keychain-only and out of every backup. It is the key that
     /// opens this document, so it can never live inside it, and nothing here changes that.
     func syncBlob() -> String? {
+        let scope = CredentialScopeSnapshotStore.shared.load().scope
         let removed = Self.loadRemoved()
         guard !playlists.isEmpty || !removed.isEmpty else { return nil }
         var listJSON: [[String: Any]] = []
@@ -177,7 +189,7 @@ final class IPTVPlaylistStore: ObservableObject {
             ]
             // The credential JSON is carried as an opaque string, so a future field added to IPTVCredentials
             // rides along without a blob-schema change and an older client passes it through untouched.
-            if let c = credentials(for: p.id), let data = try? JSONEncoder().encode(c),
+            if let c = credentials(for: p.id, scope: scope), let data = try? JSONEncoder().encode(c),
                let s = String(data: data, encoding: .utf8) {
                 obj["cred"] = s
             }
@@ -199,7 +211,13 @@ final class IPTVPlaylistStore: ObservableObject {
     /// `doc.settings` also carries the playlist array (it is a `UserDefaults` key), and `syncDown` applies that
     /// first; this union then merges on top, so the two channels converge on the strictly better answer rather
     /// than fighting. `MediaServerStore` has the identical overlap by design.
-    func applySyncBlob(_ json: String) {
+    func applySyncBlob(_ json: String, credentialStamp: CredentialCommitStamp) {
+        _ = CredentialScopeAuthority.shared.commitIfCurrent(credentialStamp) {
+            applySyncBlobCurrent(json, scope: credentialStamp.scope.scope)
+        }
+    }
+
+    private func applySyncBlobCurrent(_ json: String, scope: CredentialScope) {
         guard let data = json.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         let remote = (root["playlists"] as? [[String: Any]]) ?? []
@@ -222,15 +240,15 @@ final class IPTVPlaylistStore: ObservableObject {
             if let stamp = localRemoved[slug], stamp > createdAt.timeIntervalSince1970 * 1000 {
                 if bySlug[slug] != nil {
                     bySlug[slug] = nil
-                    Keychain.set(nil, for: credAccount(slug))
+                    CredentialScopedKeychain.set(nil, for: credAccount(slug), scope: scope)
                     didChange = true
                 }
                 continue
             }
             // Credentials: adopt into the Keychain only when the local slot is empty (Keychain authoritative).
             // This is the leg that makes a reinstalled device's restored playlists live again.
-            if credentials(for: slug) == nil, let cred = obj["cred"] as? String, !cred.isEmpty {
-                Keychain.set(cred, for: credAccount(slug))
+            if credentials(for: slug, scope: scope) == nil, let cred = obj["cred"] as? String, !cred.isEmpty {
+                CredentialScopedKeychain.set(cred, for: credAccount(slug), scope: scope)
             }
             let record = IPTVPlaylist(id: slug, name: name, kind: kind, transportUrl: transportUrl, createdAt: createdAt)
             if bySlug[slug] != record { bySlug[slug] = record; didChange = true }

@@ -322,6 +322,9 @@ jobs:
       - name: Generate the Xcode project
         run: cd app && xcodegen generate
 
+      - name: Verify credential ownership integrity
+        run: app/Tests/run-credential-integrity.sh
+
       # Derive the masked edge secret and inject it into every app build.
       #
       # WHY THE APP GETS A MASKED BLOB WHILE THE WORKERS HOLD RAW HEX. The VortX edge workers

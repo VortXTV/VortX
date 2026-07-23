@@ -193,15 +193,15 @@ final class ProfileStore: ObservableObject {
     /// roster + overlay watch: VortX (doc.vortx.*) is authoritative. The import itself is a UNION / last
     /// writer wins fold, so it is idempotent; a re-run (for example after a reinstall clears this flag) can
     /// never lose a profile or a watch record, it only re-confirms what the account already holds.
-    private static func stremioImportKey(_ authKey: String) -> String {
+    private static func stremioImportKey(_ authKey: String, scope: CredentialScope) -> String {
         let digest = SHA256.hash(data: Data(authKey.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
-        return "vortx.profiles.stremioImportComplete.\(digest)"
+        return "vortx.profiles.stremioImportComplete.\(scope.storageNamespace).\(digest)"
     }
-    private static func stremioImportDone(authKey: String) -> Bool {
-        UserDefaults.standard.bool(forKey: stremioImportKey(authKey))
+    private static func stremioImportDone(authKey: String, scope: CredentialScope) -> Bool {
+        UserDefaults.standard.bool(forKey: stremioImportKey(authKey, scope: scope))
     }
-    private static func markStremioImportDone(authKey: String) {
-        UserDefaults.standard.set(true, forKey: stremioImportKey(authKey))
+    private static func markStremioImportDone(authKey: String, scope: CredentialScope) {
+        UserDefaults.standard.set(true, forKey: stremioImportKey(authKey, scope: scope))
     }
 
     /// Flat mirror of the ACTIVE profile's disabled add-on set, rewritten on every profile apply so
@@ -224,6 +224,26 @@ final class ProfileStore: ObservableObject {
 
     private var pushRosterTask: Task<Void, Never>?
     private var pushWatchTask: Task<Void, Never>?
+
+    private func primaryCredentialAccount() -> String {
+        let scope = CredentialScopeSnapshotStore.shared.load().scope
+        _ = CredentialScopedKeychain.string(
+            Self.primaryTokenAccount,
+            migrationGroup: "stremio." + Self.primaryTokenAccount,
+            scope: scope
+        )
+        return CredentialScopedKeychain.account(Self.primaryTokenAccount, scope: scope)
+    }
+
+    @MainActor
+    private func beginProfileSync(account: String) -> CredentialCommitStamp? {
+        let authority = CredentialScopeAuthority.shared
+        guard let slot = authority.currentStremioSlotStamp,
+              slot.account == account,
+              authority.isCurrent(slot) else { return nil }
+        let operation = authority.beginOperation(.profileSync)
+        return authority.commitStamp(stremioSlot: slot, operation: operation)
+    }
 
     /// Durable delete tombstones (profile id strings). Persisted in UserDefaults, emitted into
     /// doc.vortx.deletedProfiles by VortXSyncManager, and subtracted from every roster union so a
@@ -258,6 +278,7 @@ final class ProfileStore: ObservableObject {
             applyTheme(active)
             UserDefaults.standard.set(active.disabledAddons ?? [], forKey: Self.activeDisabledAddonsKey)
             UserDefaults.standard.set(active.isKids, forKey: Self.activeKidsKey)
+            bindCredentialSlot(for: active)
         }
         // One-time seed: pre-feature rosters share one flat set of playback preferences, so
         // copying it into every profile preserves today's behavior exactly; from then on each
@@ -280,16 +301,44 @@ final class ProfileStore: ObservableObject {
     /// The Keychain slot the rest of the app reads the session from right now. StremioAccount and
     /// CoreBridge resolve their token through this, so a profile switch re-points both at once.
     var activeKeychainAccount: String {
-        active.map(keychainAccount(for:)) ?? Self.primaryTokenAccount
+        if let active { return keychainAccount(for: active) }
+        let scope = CredentialScopeSnapshotStore.shared.load().scope
+        _ = CredentialScopedKeychain.string(
+            Self.primaryTokenAccount,
+            migrationGroup: "stremio." + Self.primaryTokenAccount,
+            scope: scope
+        )
+        return CredentialScopedKeychain.account(Self.primaryTokenAccount, scope: scope)
+    }
+
+    func tokenBaseAccount(for profile: UserProfile) -> String {
+        if profile.isOwner { return Self.primaryTokenAccount }
+        return profile.usesOwnAccount ? Self.primaryTokenAccount + "." + profile.id.uuidString
+                                      : Self.primaryTokenAccount
     }
 
     func keychainAccount(for profile: UserProfile) -> String {
         // The owner IS the primary account: it always reads the primary slot, no matter what the
         // usesOwnAccount flag says. (A synced roster once arrived with the flag flipped on the
         // owner, which pointed sign-in at an empty per-profile slot and "signed out" every device.)
-        if profile.isOwner { return Self.primaryTokenAccount }
-        return profile.usesOwnAccount ? Self.primaryTokenAccount + "." + profile.id.uuidString
-                                      : Self.primaryTokenAccount
+        let base = tokenBaseAccount(for: profile)
+        let scope = CredentialScopeSnapshotStore.shared.load().scope
+        _ = CredentialScopedKeychain.string(
+            base,
+            migrationGroup: "stremio." + base,
+            scope: scope
+        )
+        return CredentialScopedKeychain.account(base, scope: scope)
+    }
+
+    private func bindCredentialSlot(for profile: UserProfile) {
+        let account = keychainAccount(for: profile)
+        MainActor.assumeIsolated {
+            CredentialScopeAuthority.shared.bindStremioSlot(
+                profileID: profile.id,
+                account: account
+            )
+        }
     }
 
     /// What the account layer must do after a switch. `.switchAccount` carries the new profile's
@@ -312,6 +361,7 @@ final class ProfileStore: ObservableObject {
         capturePlayback()
         let beforeAccount = active.map(keychainAccount(for:))
         activeID = profile.id
+        bindCredentialSlot(for: profile)
         pickedThisLaunch = true
         persist(touch: false)   // selection is per-device, not a roster edit
         applyTheme(profile)
@@ -904,21 +954,28 @@ final class ProfileStore: ObservableObject {
     ///   3. Keeps the legacy two-way Stremio sync alive ONLY while the opt-in "also sync to Stremio" mirror
     ///      is on. By default the roster + overlays stay fresh through the VortX realtime syncDown / poll.
     func bootstrapSync() {
-        guard let key = Keychain.string(Self.primaryTokenAccount), !key.isEmpty else { return }
-        Task { [weak self] in
-            guard let self else { return }
-            let salvaged = await ProfileSync.prepare(authKey: key)
-            if !salvaged.isEmpty { await MainActor.run { self.migrateSalvagedWatch(salvaged) } }
-            guard ProfileSync.cloudAvailable == true else { return }   // Stremio custom collection unavailable
-            if !Self.stremioImportDone(authKey: key) {
-                await self.importProfilesFromStremio(authKey: key)
+        let account = primaryCredentialAccount()
+        guard let key = Keychain.string(account), !key.isEmpty else { return }
+        Task { @MainActor [weak self] in
+            guard let self, let stamp = self.beginProfileSync(account: account) else { return }
+            let salvaged = await ProfileSync.prepare(authKey: key, stamp: stamp)
+            guard CredentialScopeAuthority.shared.isCurrent(stamp) else { return }
+            if !salvaged.isEmpty {
+                _ = CredentialScopeAuthority.shared.commitIfCurrent(stamp) {
+                    self.migrateSalvagedWatch(salvaged)
+                }
+            }
+            guard ProfileSync.cloudAvailable(for: stamp) == true else { return }   // Stremio custom collection unavailable
+            if !Self.stremioImportDone(authKey: key, scope: stamp.scope.scope) {
+                await self.importProfilesFromStremio(authKey: key, stamp: stamp)
             }
             // Opt-in legacy Stremio mirror (default OFF): only when the user turns it on does the app keep
             // two-way syncing the roster + overlay watch with the Stremio datastore. Off by default because
             // VortX owns the data now, so there is nothing more to read from Stremio here.
-            if ProfileSync.alsoSyncToStremio {
-                await self.syncRosterWithStremio(authKey: key)
-                await MainActor.run { self.refreshWatchFromServer() }
+            if ProfileSync.alsoSyncToStremio,
+               CredentialScopeAuthority.shared.isCurrent(stamp) {
+                await self.syncRosterWithStremio(authKey: key, stamp: stamp)
+                await self.refreshWatchFromServer(stamp: stamp)
             }
         }
     }
@@ -931,7 +988,10 @@ final class ProfileStore: ObservableObject {
     /// to VortX and, only once the VortX copy is confirmed (or there is no VortX account to import into yet),
     /// stamps the per-account flag so it runs exactly once. The order is the data-safety rule: never mark the
     /// import done while the data still lives only in Stremio.
-    private func importProfilesFromStremio(authKey: String) async {
+    private func importProfilesFromStremio(
+        authKey: String,
+        stamp: CredentialCommitStamp
+    ) async {
         // ORDER AFTER A VORTX PULL FIRST. On a reinstall the local delete-tombstone set is empty until a pull
         // folds it, so pushing before folding could emit a doc that OMITS deletedProfiles and let a peer that
         // still holds a deleted profile re-seed it into the cloud roster (the sync-wound resurrection). Pull
@@ -939,8 +999,10 @@ final class ProfileStore: ObservableObject {
         // merge Stremio in and push. Plain (not forced) so a genuine local edit made in the first seconds
         // after launch, which arms a pending push, still defers this pull instead of being clobbered.
         await VortXSyncManager.shared.syncDown()
+        guard await MainActor.run(body: { CredentialScopeAuthority.shared.isCurrent(stamp) }) else { return }
         // Read the legacy Stremio roster (do not merge yet: the overlays are folded first, below).
-        let remoteRoster = await ProfileSync.fetchRoster(authKey: authKey)
+        let remoteRoster = await ProfileSync.fetchRoster(authKey: authKey, stamp: stamp)
+        guard await MainActor.run(body: { CredentialScopeAuthority.shared.isCurrent(stamp) }) else { return }
         // Per-profile overlay watch, folded BEFORE the roster merge (last writer wins per title). Two reasons
         // for the ordering: (1) collapseEmptyDuplicateSecondaries runs inside mergeInRoster and decides
         // "empty" by reading the watch cache, so folding overlays first means a just-imported same-name
@@ -950,9 +1012,13 @@ final class ProfileStore: ObservableObject {
         // roster's own flags avoids depending on whether the profile is merged locally yet.
         let overlayIDs = (remoteRoster?.profiles ?? []).filter { !$0.usesEngineHistory }.map(\.id)
         for id in overlayIDs {
-            guard let remote = await ProfileSync.fetchWatch(profileID: id, authKey: authKey),
+            guard let remote = await ProfileSync.fetchWatch(profileID: id, authKey: authKey, stamp: stamp),
                   !remote.isEmpty else { continue }
-            await MainActor.run { self.applyRemoteOverlay(profileID: id, entries: remote) }
+            await MainActor.run {
+                _ = CredentialScopeAuthority.shared.commitIfCurrent(stamp) {
+                    self.applyRemoteOverlay(profileID: id, entries: remote)
+                }
+            }
         }
         // Roster: ADDITIVE union (incomingModified: nil). VortX is authoritative, so a shared profile keeps
         // its VortX-owned fields (name, PIN, avatar, playback, isKids, disabledAddons) and Stremio only
@@ -960,38 +1026,68 @@ final class ProfileStore: ObservableObject {
         // record win a shared id wholesale and roll back a field the user changed on the new build, then
         // propagate that revert on push. This matches every other mergeInRoster caller (all pass nil).
         if let remoteRoster {
-            await MainActor.run { self.mergeInRoster(remoteRoster.profiles, incomingModified: nil) }
+            await MainActor.run {
+                _ = CredentialScopeAuthority.shared.commitIfCurrent(stamp) {
+                    self.mergeInRoster(remoteRoster.profiles, incomingModified: nil)
+                }
+            }
         }
         // Fold complete: push the merged roster + overlays into the VortX account so doc.vortx.* owns them.
         // pushThisDevice() is syncUp(): it read-merges onto a freshly pulled account base (never clobbers
         // another surface's keys, and vortxSummary unions the account's profile tombstones so the push can
         // never shrink them) and reports whether the write landed.
-        let pushed = await VortXSyncManager.shared.pushThisDevice()
+        guard await MainActor.run(body: { CredentialScopeAuthority.shared.isCurrent(stamp) }) else { return }
+        let pushed = await VortXSyncManager.shared.pushThisDevice(requiredCredentialStamp: stamp)
         // STAMP THE FLAG ONLY once the VortX copy is confirmed, so the import is never marked done while the
         // data lives only in Stremio. If there is no VortX account yet, there is nothing to confirm and
         // nothing to strand (the data is already folded into the LOCAL store, and a later VortX sign-in pushes
         // it up), so stamping is safe. A failed push while signed in leaves the flag unset, so the import
         // retries next launch (idempotent), never leaving the Stremio data un-migrated.
         let signedIntoVortx = await MainActor.run { VortXSyncManager.shared.isSignedIn }
-        if pushed || !signedIntoVortx {
-            Self.markStremioImportDone(authKey: authKey)
+        let completionStamp: CredentialCommitStamp
+        if signedIntoVortx {
+            guard pushed,
+                  let documentStamp = await VortXSyncManager.shared.accountDocCredentialStamp(),
+                  documentStamp.scope == stamp.scope,
+                  documentStamp.stremioSlot == stamp.stremioSlot,
+                  let document = documentStamp.document else { return }
+            completionStamp = CredentialCommitStamp(
+                scope: stamp.scope,
+                stremioSlot: stamp.stremioSlot,
+                document: document,
+                operation: stamp.operation
+            )
+        } else {
+            completionStamp = stamp
+        }
+        await MainActor.run {
+            _ = CredentialScopeAuthority.shared.commitIfCurrent(completionStamp) {
+                Self.markStremioImportDone(authKey: authKey, scope: completionStamp.scope.scope)
+            }
         }
     }
 
     /// OPT-IN legacy Stremio roster sync (two-way), reached only when the user turns on "also sync to
     /// Stremio". Mirrors the pre-independence behavior: adopt the account's roster when it is newer, else push
     /// this device's roster to the Stremio datastore so the two stay in step for a user who keeps the mirror on.
-    private func syncRosterWithStremio(authKey: String) async {
-        if let remote = await ProfileSync.fetchRoster(authKey: authKey) {
+    private func syncRosterWithStremio(
+        authKey: String,
+        stamp: CredentialCommitStamp
+    ) async {
+        if let remote = await ProfileSync.fetchRoster(authKey: authKey, stamp: stamp) {
             let localModified = Date(timeIntervalSince1970:
                 UserDefaults.standard.double(forKey: Self.modifiedKey))
             if remote.mtime > localModified {
-                await MainActor.run { self.adoptRemoteRoster(remote.profiles) }
+                await MainActor.run {
+                    _ = CredentialScopeAuthority.shared.commitIfCurrent(stamp) {
+                        self.adoptRemoteRoster(remote.profiles)
+                    }
+                }
             } else if localModified > remote.mtime {
-                await ProfileSync.pushRoster(self.profiles, authKey: authKey)
+                await ProfileSync.pushRoster(self.profiles, authKey: authKey, stamp: stamp)
             }
         } else if !profiles.isEmpty {
-            await ProfileSync.pushRoster(profiles, authKey: authKey)   // first device seeds the roster
+            await ProfileSync.pushRoster(profiles, authKey: authKey, stamp: stamp)   // first device seeds the roster
         }
     }
 
@@ -1243,12 +1339,15 @@ final class ProfileStore: ObservableObject {
         // write fires the sync manager's observer), which carries the roster in doc.settings + doc.vortx.profiles.
         // The legacy Stremio write is opt-in (default OFF), so it stays dormant unless the user turns on the mirror.
         guard ProfileSync.alsoSyncToStremio else { return }
-        guard let key = Keychain.string(Self.primaryTokenAccount), !key.isEmpty else { return }
+        let account = primaryCredentialAccount()
+        guard let key = Keychain.string(account), !key.isEmpty else { return }
         let snapshot = profiles
-        pushRosterTask = Task {
+        pushRosterTask = Task { @MainActor [weak self] in
+            guard let self, let stamp = self.beginProfileSync(account: account) else { return }
             try? await Task.sleep(for: .seconds(2))
-            guard !Task.isCancelled else { return }
-            await ProfileSync.pushRoster(snapshot, authKey: key)
+            guard !Task.isCancelled,
+                  CredentialScopeAuthority.shared.isCurrent(stamp) else { return }
+            await ProfileSync.pushRoster(snapshot, authKey: key, stamp: stamp)
         }
     }
 
@@ -1397,10 +1496,12 @@ final class ProfileStore: ObservableObject {
         guard let profile = active, !profile.usesEngineHistory,
               let key = Keychain.string(keychainAccount(for: profile)), !key.isEmpty else { return }
         let id = profile.id
-        Task { [weak self] in
-            guard let remote = await ProfileSync.fetchWatch(profileID: id, authKey: key) else { return }
-            await MainActor.run {
-                guard let self, self.activeID == id else { return }
+        let account = keychainAccount(for: profile)
+        Task { @MainActor [weak self] in
+            guard let self, let stamp = self.beginProfileSync(account: account),
+                  let remote = await ProfileSync.fetchWatch(profileID: id, authKey: key, stamp: stamp) else { return }
+            _ = CredentialScopeAuthority.shared.commitIfCurrent(stamp) {
+                guard self.activeID == id else { return }
                 // Merge by newest lastWatched per title, so a stale device can't roll back progress.
                 var merged = remote
                 for (metaId, local) in self.watch where (merged[metaId]?.lastWatched ?? "") < local.lastWatched {
@@ -1409,6 +1510,28 @@ final class ProfileStore: ObservableObject {
                 self.watch = merged
                 self.saveWatchCache()
             }
+        }
+    }
+
+    @MainActor
+    private func refreshWatchFromServer(stamp: CredentialCommitStamp) async {
+        guard ProfileSync.alsoSyncToStremio,
+              let profile = active, !profile.usesEngineHistory,
+              let key = Keychain.string(keychainAccount(for: profile)), !key.isEmpty,
+              CredentialScopeAuthority.shared.isCurrent(stamp),
+              let remote = await ProfileSync.fetchWatch(
+                profileID: profile.id,
+                authKey: key,
+                stamp: stamp
+              ) else { return }
+        _ = CredentialScopeAuthority.shared.commitIfCurrent(stamp) {
+            guard self.activeID == profile.id else { return }
+            var merged = remote
+            for (metaId, local) in self.watch where (merged[metaId]?.lastWatched ?? "") < local.lastWatched {
+                merged[metaId] = local
+            }
+            self.watch = merged
+            self.saveWatchCache()
         }
     }
 
@@ -1421,16 +1544,19 @@ final class ProfileStore: ObservableObject {
         // sync 3s after the last write. requestSyncSoon no-ops when not signed into a VortX account.
         let profile = active
         let snapshot = watch
-        pushWatchTask = Task { @MainActor in
+        let account = profile.map(keychainAccount(for:))
+        pushWatchTask = Task { @MainActor [weak self] in
+            guard let self, let account, let stamp = self.beginProfileSync(account: account) else { return }
             try? await Task.sleep(for: .seconds(3))
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  CredentialScopeAuthority.shared.isCurrent(stamp) else { return }
             // VortX authoritative: the overlay rides doc.vortx.byProfile, so always nudge the VortX sync.
             VortXSyncManager.shared.requestSyncSoon()
             // The legacy Stremio overlay write is opt-in (default OFF); it stays dormant unless the mirror is on.
             if ProfileSync.alsoSyncToStremio,
                let profile, !profile.usesEngineHistory,
                let key = Keychain.string(keychainAccount(for: profile)), !key.isEmpty {
-                await ProfileSync.pushWatch(snapshot, profileID: profile.id, authKey: key)
+                await ProfileSync.pushWatch(snapshot, profileID: profile.id, authKey: key, stamp: stamp)
             }
         }
     }

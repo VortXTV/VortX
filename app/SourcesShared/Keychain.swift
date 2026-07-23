@@ -45,7 +45,8 @@ enum Keychain {
         queue.sync { load()[account] }
     }
 
-    static func set(_ value: String?, for account: String) {
+    @discardableResult
+    static func set(_ value: String?, for account: String) -> Bool {
         queue.sync {
             var store = load()
             if let value {
@@ -53,7 +54,8 @@ enum Keychain {
             } else {
                 store.removeValue(forKey: account)   // delete = remove the key
             }
-            save(store)
+            guard save(store) else { return false }
+            return load()[account] == value
         }
     }
 
@@ -66,24 +68,31 @@ enum Keychain {
         return (decoded as? [String: String]) ?? [:]
     }
 
-    private static func save(_ store: [String: String]) {
+    private static func save(_ store: [String: String]) -> Bool {
         let fm = FileManager.default
         let dir = storeURL.deletingLastPathComponent()
         // Create the dir owner-only (0700) if missing.
         if !fm.fileExists(atPath: dir.path) {
-            try? fm.createDirectory(at: dir, withIntermediateDirectories: true,
-                                    attributes: [.posixPermissions: 0o700])
+            do {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true,
+                                       attributes: [.posixPermissions: 0o700])
+            } catch {
+                NSLog("%@", "[Keychain] failed to create credentials directory: \(error)")
+                return false
+            }
         }
 
         guard let data = try? PropertyListSerialization.data(fromPropertyList: store,
-                                                             format: .binary, options: 0) else { return }
+                                                             format: .binary, options: 0) else { return false }
         // Atomic write so a crash mid-write can't corrupt the store.
         do {
             try data.write(to: storeURL, options: [.atomic])
             // Atomic writes replace the inode, so re-assert owner-only perms (0600) afterwards.
-            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storeURL.path)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storeURL.path)
+            return true
         } catch {
             NSLog("%@", "[Keychain] failed to persist credentials file: \(error)")
+            return false
         }
     }
 #else
@@ -107,16 +116,20 @@ enum Keychain {
         return UserDefaults.standard.string(forKey: fallbackKey(account))
     }
 
-    static func set(_ value: String?, for account: String) {
+    @discardableResult
+    static func set(_ value: String?, for account: String) -> Bool {
         let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: account,
         ]
-        SecItemDelete(base as CFDictionary)   // replace any existing item
+        let deleteStatus = SecItemDelete(base as CFDictionary)   // replace any existing item
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            return false
+        }
 
         guard let value, let data = value.data(using: .utf8) else {
             UserDefaults.standard.removeObject(forKey: fallbackKey(account))   // clearing the token
-            return
+            return string(account) == nil
         }
 
         var add = base
@@ -130,6 +143,65 @@ enum Keychain {
             // Keychain unavailable (unsigned Simulator, entitlement mismatch) → keep it working.
             UserDefaults.standard.set(value, forKey: fallbackKey(account))
         }
+        return string(account) == value
     }
 #endif
+}
+
+/// Owner-qualified credential slots with one-time, first-owner migration from
+/// the pre-scoping account name. The migration marker contains only the typed
+/// owner namespace. The lock makes claiming the legacy slot and deleting it one
+/// process-local critical section, so two concurrent account switches cannot
+/// both inherit the same old credential.
+enum CredentialScopedKeychain {
+    private static let migrationLock = NSLock()
+
+    static func account(_ base: String, scope: CredentialScope) -> String {
+        base + "." + scope.storageNamespace
+    }
+
+    static func string(
+        _ base: String,
+        migrationGroup: String,
+        scope: CredentialScope = CredentialScopeSnapshotStore.shared.load().scope
+    ) -> String? {
+        let scopedAccount = account(base, scope: scope)
+        if let value = Keychain.string(scopedAccount) { return value }
+
+        migrationLock.lock()
+        defer { migrationLock.unlock() }
+        if let value = Keychain.string(scopedAccount) { return value }
+
+        let markerAccount = "vortx.credential.migration." + migrationGroup
+        let owner = scope.storageNamespace
+        if let claimedOwner = Keychain.string(markerAccount) {
+            guard claimedOwner == owner else { return nil }
+        } else {
+            guard Keychain.string(base) != nil,
+                  Keychain.set(owner, for: markerAccount),
+                  Keychain.string(markerAccount) == owner else { return nil }
+        }
+
+        // The legacy slot has no owner. Claim it permanently, then delete it
+        // before publishing into the chosen owner. If deletion or destination
+        // publication fails, fail closed and require reconnect rather than let
+        // a second owner inherit the same credential.
+        guard let legacy = Keychain.string(base),
+              Keychain.set(nil, for: base),
+              Keychain.string(base) == nil,
+              Keychain.set(legacy, for: scopedAccount),
+              Keychain.string(scopedAccount) == legacy else { return nil }
+        return legacy
+    }
+
+    @discardableResult
+    static func set(
+        _ value: String?,
+        for base: String,
+        scope: CredentialScope = CredentialScopeSnapshotStore.shared.load().scope
+    ) -> Bool {
+        let account = account(base, scope: scope)
+        guard Keychain.set(value, for: account) else { return false }
+        return Keychain.string(account) == value
+    }
 }

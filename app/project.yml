@@ -654,6 +654,24 @@ targets:
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
     # Build-time edge-signing secret (gitignored xcconfig; empty default; see project-level note).
+  VortXTests:
+    type: bundle.unit-test
+    platform: tvOS
+    sources:
+      - Tests/CredentialOwnerScopingRaceTests.swift
+    dependencies:
+      - target: VortXTV
+      - framework: Vendor/VortxEngine.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.credential-tests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/VortXTV.app/VortXTV"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
 schemes:
   VortX:
     build:
@@ -683,6 +701,10 @@ schemes:
     build:
       targets:
         VortXTV: all
+    test:
+      config: Debug
+      targets:
+        - VortXTests
     run:
       config: Debug
     archive:

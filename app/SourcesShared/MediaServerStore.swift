@@ -68,6 +68,7 @@ final class MediaServerStore: ObservableObject {
 
     private func tokenAccount(_ id: UUID) -> String { "vortx.mediaserver.\(id.uuidString).token" }
     static let plexAccountTokenAccount = "vortx.mediaserver.plexAccount.token"
+    private static let migrationGroup = "media-server"
 
     private init() {
         servers = Self.loadRecords()
@@ -108,23 +109,36 @@ final class MediaServerStore: ObservableObject {
 
     /// The access token for a server, or nil when absent (a synced-without-token server, or one that needs
     /// re-auth). Keychain-only, never UserDefaults.
-    func token(for id: UUID) -> String? {
-        Keychain.string(tokenAccount(id))
+    func token(
+        for id: UUID,
+        scope: CredentialScope = CredentialScopeSnapshotStore.shared.load().scope
+    ) -> String? {
+        CredentialScopedKeychain.string(
+            tokenAccount(id),
+            migrationGroup: Self.migrationGroup,
+            scope: scope
+        )
     }
 
     func hasToken(for id: UUID) -> Bool { !(token(for: id) ?? "").isEmpty }
 
     /// The Plex account token (kept only to re-run resource discovery), or nil.
-    var plexAccountToken: String? { Keychain.string(Self.plexAccountTokenAccount) }
+    var plexAccountToken: String? {
+        CredentialScopedKeychain.string(
+            Self.plexAccountTokenAccount,
+            migrationGroup: Self.migrationGroup
+        )
+    }
 
     // MARK: Mutations
 
     /// Record a freshly-connected server: stash its token in the Keychain, clear any old removal tombstone for
     /// this id, prepend the metadata, persist, rebuild the coordinator, and nudge sync. Idempotent by id.
     func add(_ record: MediaServerRecord, token: String, plexAccountToken: String? = nil) {
-        Keychain.set(token, for: tokenAccount(record.id))
+        let scope = CredentialScopeSnapshotStore.shared.load().scope
+        CredentialScopedKeychain.set(token, for: tokenAccount(record.id), scope: scope)
         if let plexAccountToken, !plexAccountToken.isEmpty {
-            Keychain.set(plexAccountToken, for: Self.plexAccountTokenAccount)
+            CredentialScopedKeychain.set(plexAccountToken, for: Self.plexAccountTokenAccount, scope: scope)
         }
         clearRemovedTombstone(record.id)
         var next = servers.filter { $0.id != record.id }
@@ -136,7 +150,8 @@ final class MediaServerStore: ObservableObject {
     /// Forget a server locally: drop its Keychain token, remove the metadata, stamp a removal tombstone (so a
     /// peer device drops it too), persist, rebuild the coordinator, nudge sync.
     func remove(id: UUID) {
-        Keychain.set(nil, for: tokenAccount(id))
+        let scope = CredentialScopeSnapshotStore.shared.load().scope
+        CredentialScopedKeychain.set(nil, for: tokenAccount(id), scope: scope)
         servers.removeAll { $0.id == id }
         stampRemovedTombstone(id)
         save()
@@ -165,8 +180,9 @@ final class MediaServerStore: ObservableObject {
     /// doomed request. One config per usable connection URL is NOT built here (the provider owns URL
     /// ordering); the primary URL is passed and the provider tries it.
     func configs() -> [MediaServerConfig] {
-        servers.compactMap { record in
-            guard let tok = token(for: record.id), !tok.isEmpty, let base = record.urls.first else { return nil }
+        let scope = CredentialScopeSnapshotStore.shared.load().scope
+        return servers.compactMap { record in
+            guard let tok = token(for: record.id, scope: scope), !tok.isEmpty, let base = record.urls.first else { return nil }
             return MediaServerConfig(kind: record.kind, baseURL: base, apiKey: tok, userId: record.userId,
                                      id: record.id, displayName: record.name, urls: record.urls)
         }
@@ -177,6 +193,11 @@ final class MediaServerStore: ObservableObject {
     private func reloadCoordinator() {
         let built = configs()
         Task { @MainActor in MediaServerCoordinator.shared.reload(configs: built) }
+    }
+
+    @MainActor
+    func credentialScopeDidChange() {
+        reloadCoordinator()
     }
 
     // MARK: Persistence
@@ -253,6 +274,7 @@ final class MediaServerStore: ObservableObject {
     /// thread-safe) so it is safe to call from the sync push path off the main actor without racing @Published.
     /// The token is included per server ONLY when the sync-logins toggle is ON.
     func syncBlob() -> String? {
+        let scope = CredentialScopeSnapshotStore.shared.load().scope
         let records = Self.loadRecords()
         let removed = Self.loadRemoved()
         guard !records.isEmpty || !removed.isEmpty else { return nil }
@@ -268,7 +290,7 @@ final class MediaServerStore: ObservableObject {
                 "addedAt": r.addedAt.timeIntervalSince1970 * 1000,
             ]
             if let m = r.machineId { obj["machineId"] = m }
-            if includeTokens, let tok = token(for: r.id), !tok.isEmpty { obj["token"] = tok }
+            if includeTokens, let tok = token(for: r.id, scope: scope), !tok.isEmpty { obj["token"] = tok }
             serversJSON.append(obj)
         }
         let blob: [String: Any] = ["v": 1, "servers": serversJSON, "removed": removed]
@@ -284,7 +306,14 @@ final class MediaServerStore: ObservableObject {
     /// remote simply lacks (asymmetric read-merge, exactly like the debrid guard). Runs its mutations on the
     /// main actor (it may be called from the sync apply path).
     @MainActor
-    func applySyncBlob(_ json: String) {
+    func applySyncBlob(_ json: String, credentialStamp: CredentialCommitStamp) {
+        _ = CredentialScopeAuthority.shared.commitIfCurrent(credentialStamp) {
+            applySyncBlobCurrent(json, scope: credentialStamp.scope.scope)
+        }
+    }
+
+    @MainActor
+    private func applySyncBlobCurrent(_ json: String, scope: CredentialScope) {
         guard let data = json.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         let remoteServers = (root["servers"] as? [[String: Any]]) ?? []
@@ -305,17 +334,21 @@ final class MediaServerStore: ObservableObject {
             let addedAt = (obj["addedAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) } ?? Date()
             // A removal newer than this server's add wins: drop it and do not resurrect.
             if let stamp = localRemoved[idStr], stamp > addedAt.timeIntervalSince1970 * 1000 {
-                if byId[id] != nil { byId[id] = nil; Keychain.set(nil, for: tokenAccount(id)); didChange = true }
+                if byId[id] != nil {
+                    byId[id] = nil
+                    CredentialScopedKeychain.set(nil, for: tokenAccount(id), scope: scope)
+                    didChange = true
+                }
                 continue
             }
             let userId = obj["userId"] as? String ?? ""
             let machineId = obj["machineId"] as? String
             // Token: adopt into the Keychain only when the local slot is empty (Keychain is authoritative).
-            let hadToken = hasToken(for: id)
+            let hadToken = !(token(for: id, scope: scope) ?? "").isEmpty
             if !hadToken, let tok = obj["token"] as? String, !tok.isEmpty {
-                Keychain.set(tok, for: tokenAccount(id))
+                CredentialScopedKeychain.set(tok, for: tokenAccount(id), scope: scope)
             }
-            let needsReauth = !hasToken(for: id)
+            let needsReauth = (token(for: id, scope: scope) ?? "").isEmpty
             let record = MediaServerRecord(id: id, name: name, kind: kind, urls: urls, userId: userId,
                                            machineId: machineId, addedAt: addedAt, needsReauth: needsReauth)
             if byId[id] != record { byId[id] = record; didChange = true }

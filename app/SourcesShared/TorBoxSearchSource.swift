@@ -20,6 +20,12 @@ import Foundation
 enum TorBoxSearch {
     private static let base = "https://search-api.torbox.app"
 
+    struct SearchResult: Sendable {
+        let streams: [CoreStream]
+        let rateLimited: Bool
+        let transportError: Bool
+    }
+
     /// One usenet result parsed from the search index into a playable `CoreStream` (nzb link + optional
     /// pick regex), plus torrent results (infoHash / magnet). Tolerant decoding: the index wraps items
     /// under `data.nzbs` / `data.torrents` (with fallbacks), and field names vary, so every field is
@@ -88,12 +94,38 @@ enum TorBoxSearch {
     /// caller backs off instead of re-firing on the next title and burning more of the quota. `transportError`
     /// is `true` when a leg's request never completed (offline, DNS/TLS failure, timeout), so the caller keeps
     /// the empty result OUT of the session cache and re-fetches for real once the network is back.
-    static func streams(imdbId: String, season: Int? = nil, episode: Int? = nil, apiKey: String) async -> (streams: [CoreStream], rateLimited: Bool, transportError: Bool) {
-        guard imdbId.hasPrefix("tt") else { return ([], false, false) }
-        async let usenet = fetch(kind: "usenet", imdbId: imdbId, season: season, episode: episode, apiKey: apiKey)
-        async let torrents = fetch(kind: "torrents", imdbId: imdbId, season: season, episode: episode, apiKey: apiKey)
+    static func streams(
+        imdbId: String,
+        season: Int? = nil,
+        episode: Int? = nil,
+        snapshot: DebridCredentialSnapshot,
+        credentialStore: DebridCredentialSnapshotStore = .shared
+    ) async -> DebridVersionedResult<SearchResult> {
+        let empty = SearchResult(streams: [], rateLimited: false, transportError: false)
+        guard imdbId.hasPrefix("tt"),
+              let apiKey = snapshot.keys[.torBox], !apiKey.isEmpty else {
+            return DebridVersionedResult(value: empty, revision: snapshot.revision)
+        }
+        let credentialToken = DebridCredentialRevisionToken(
+            revision: snapshot.revision, store: credentialStore
+        )
+        async let usenet = fetch(
+            kind: "usenet", imdbId: imdbId, season: season, episode: episode,
+            apiKey: apiKey, credentialToken: credentialToken
+        )
+        async let torrents = fetch(
+            kind: "torrents", imdbId: imdbId, season: season, episode: episode,
+            apiKey: apiKey, credentialToken: credentialToken
+        )
         let (u, t) = await (usenet, torrents)
-        return (u.streams + t.streams, u.rateLimited || t.rateLimited, u.transportError || t.transportError)
+        return DebridVersionedResult(
+            value: SearchResult(
+                streams: u.streams + t.streams,
+                rateLimited: u.rateLimited || t.rateLimited,
+                transportError: u.transportError || t.transportError
+            ),
+            revision: snapshot.revision
+        )
     }
 
     /// One `GET /{kind}/imdb_id:{id}` call, bounded and fail-soft. The id-type prefix must be `imdb_id:`
@@ -101,7 +133,14 @@ enum TorBoxSearch {
     /// come back empty. Auth is the Bearer header ONLY (the JSON endpoints take no `apikey` query param,
     /// and the key must not ride in URLs anyway); anonymous requests are hard-429'd by the index.
     /// `check_cache=true` asks the index to flag which results the user's own account already has cached.
-    private static func fetch(kind: String, imdbId: String, season: Int?, episode: Int?, apiKey: String) async -> (streams: [CoreStream], rateLimited: Bool, transportError: Bool) {
+    private static func fetch(
+        kind: String,
+        imdbId: String,
+        season: Int?,
+        episode: Int?,
+        apiKey: String,
+        credentialToken: DebridCredentialRevisionToken
+    ) async -> SearchResult {
         var comps = URLComponents(string: "\(base)/\(kind)/imdb_id:\(imdbId)")
         var query = [
             URLQueryItem(name: "metadata", value: "false"),
@@ -110,7 +149,9 @@ enum TorBoxSearch {
         if let season { query.append(URLQueryItem(name: "season", value: String(season))) }
         if let episode { query.append(URLQueryItem(name: "episode", value: String(episode))) }
         comps?.queryItems = query
-        guard let url = comps?.url else { return ([], false, false) }
+        guard let url = comps?.url else {
+            return SearchResult(streams: [], rateLimited: false, transportError: false)
+        }
         var req = URLRequest(url: url)
         req.timeoutInterval = 12
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -121,16 +162,27 @@ enum TorBoxSearch {
         // A request that never completed (offline, DNS/TLS failure, timeout) yields no HTTP response. Report it
         // as a distinct transportError so the caller does not cache the empty result as "no results" for the
         // session; that is what made an offline first open stick until the app was relaunched.
-        guard let (data, response) = try? await session.data(for: req),
-              let code = (response as? HTTPURLResponse)?.statusCode else { return ([], false, true) }
+        guard let (data, response) = try? await DebridAuthenticatedHTTP.data(
+            session, for: req, credentialToken: credentialToken
+        ), let code = (response as? HTTPURLResponse)?.statusCode else {
+            return SearchResult(streams: [], rateLimited: false, transportError: true)
+        }
         // 429 = over the TorBox scraper allowance (the account's daily search cooldown). The index returns
         // "Rate limit exceeded: 0 per 1 minute" for EVERY search until the cooldown resets (~24h), so surface
         // it as a distinct signal instead of an empty "no results" the caller can't tell apart.
-        if code == 429 { return ([], true, false) }
+        if code == 429 {
+            return SearchResult(streams: [], rateLimited: true, transportError: false)
+        }
         guard (200...299).contains(code),
-              let decoded = try? JSONDecoder().decode(Response.self, from: data) else { return ([], false, false) }
+              let decoded = try? JSONDecoder().decode(Response.self, from: data) else {
+            return SearchResult(streams: [], rateLimited: false, transportError: false)
+        }
         let items = (decoded.data?.nzbs ?? []) + (decoded.data?.torrents ?? [])
-        return (items.compactMap { stream(from: $0, imdbId: imdbId) }, false, false)
+        return SearchResult(
+            streams: items.compactMap { stream(from: $0, imdbId: imdbId) },
+            rateLimited: false,
+            transportError: false
+        )
     }
 
     /// Build a `CoreStream` from one search item. Usenet vs torrent is discriminated by the index's own
@@ -213,6 +265,9 @@ enum TorBoxSearch {
 /// of the same title does not re-hit the index.
 @MainActor
 final class TorBoxSearchSource: ObservableObject {
+    private let credentialStore: DebridCredentialSnapshotStore
+    private var credentialObserver: DebridCredentialNotificationToken?
+
     /// The extra streams from the search index, ready to merge. Empty until a fetch completes (and always
     /// with no TorBox key). One group so the source list shows a single "TorBox Search" section.
     @Published private(set) var streams: [CoreStream] = [] { didSet { epoch &+= 1 } }
@@ -227,9 +282,13 @@ final class TorBoxSearchSource: ObservableObject {
     /// The title currently shown (its fetch key). Switching titles resets `streams` so a previous title's
     /// results can never leak onto one we don't (or can't) fetch.
     private var shownKey: String?
+    /// The credential generation that owns all contributor state below. A revision change clears the old
+    /// cache, cooldown, in-flight request, and visible rows as one compare-and-publish mutation.
+    private var credentialRevision: UInt64?
     /// The fetch key currently in flight, so the paired `.onChange` + `.onAppear` for the same title issue
     /// exactly one network round trip instead of two.
     private var inFlightKey: String?
+    private var inFlightRevision: UInt64?
     /// Session cache of completed results, keyed by "imdb|season|episode". A hit re-publishes with no network,
     /// so browsing back and forth never re-hits the TorBox scraper. Re-hitting on every open is exactly what
     /// exhausts the account's small daily search allowance and trips its ~24h `cooldown_until`.
@@ -241,62 +300,130 @@ final class TorBoxSearchSource: ObservableObject {
     private var cooldownUntil: Date?
     private var task: Task<Void, Never>?
 
+    init(credentialStore: DebridCredentialSnapshotStore = .shared) {
+        self.credentialStore = credentialStore
+        credentialRevision = credentialStore.load().revision
+        credentialObserver = DebridCredentialNotificationToken(
+            NotificationCenter.default.addObserver(
+                forName: DebridCredentialSnapshotStore.didPublishNotification,
+                object: credentialStore,
+                queue: nil
+            ) { [weak self] _ in
+                // Snapshot publication is MainActor-isolated and NotificationCenter delivers a nil-queue
+                // observer synchronously on the posting executor. Keep invalidation inside publish(B)'s call.
+                MainActor.assumeIsolated { self?.adoptCurrentCredentialRevision() }
+            }
+        )
+    }
+
+    private func adoptCurrentCredentialRevision() {
+        _ = adoptCredentialRevision(credentialStore.load().revision)
+    }
+
     /// Fetch search results for `imdbId` if the user has a TorBox key. Fail-soft, session-cached, and backed
     /// off during a scraper cooldown. Safe to call on every meta change / `.onAppear`. Pass `season`/`episode`
     /// from an episode context so the index scopes usenet/torrent results to that episode (nil = movie level).
     func refresh(imdbId: String?, season: Int? = nil, episode: Int? = nil) {
+        let snapshot = credentialStore.load()
+        guard adoptCredentialRevision(snapshot.revision) else { return }
         // Re-validate through the SHARED module rather than trusting a `tt` prefix. Callers pass an id that a
         // screen resolved; the old prefix check also accepted the EPISODE form ("tt0903747:1:1"), so `imdb_id:`
         // below was keyed on an id no IMDb index can answer and the content id composed "tt0903747:1:1:3:5".
         // `imdbTitleID` yields a BARE tt id or nothing, which is exactly this path's contract: it is IMDb-keyed,
         // so a tmdb id here is wrong rather than weak.
         guard let imdbId = SourceIndexIdentity.imdbTitleID(imdbId) else {
-            clearResults(); return
+            clearResults(revision: snapshot.revision); return
         }
-        guard DebridKeys.shared.isConfigured(.torBox) else { clearResults(); return }   // gate: no TorBox key -> no-op
+        guard let key = snapshot.keys[.torBox], !key.isEmpty else {
+            clearResults(revision: snapshot.revision); return
+        }
         let fetchKey = "\(imdbId)|\(season ?? -1)|\(episode ?? -1)"
         // Tuple-exact, same rule as the pool key: a PARTIAL coordinate pair is not silently widened to the
         // show, because that publishes one episode's results under the show-wide token.
         guard let contentID = SourceIndexIdentity.contentKey(titleID: imdbId, season: season, episode: episode) else {
-            clearResults(); return
+            clearResults(revision: snapshot.revision); return
         }
-        // New title: publish its cached results (or clear), so the prior title's streams never linger.
-        if fetchKey != shownKey {
-            shownKey = fetchKey
-            publishedContentID = contentID
-            streams = cache[fetchKey] ?? []
-        }
-        if cache[fetchKey] != nil { return }              // cached: already published above, no round trip
-        if inFlightKey == fetchKey { return }             // the paired onChange/onAppear for this id: fetch once
-        if let until = cooldownUntil, until > Date() { return }   // in scraper cooldown: don't burn requests
-        task?.cancel()
-        inFlightKey = fetchKey
-        let key = DebridKeys.shared.key(for: .torBox)
         // H9 diagnostic (terminal-run repro): confirm refresh actually fires with a key. Logs the id + whether
         // a non-empty TorBox key is present (never the key itself). If this line never appears, the gate above
         // no-op'd; if it appears but the count line below is 0, the index returned nothing for the id.
         VXProbe.log("torbox-search", "refresh id=\(VXProbeRedaction.identityToken(imdbId)) s=\(season ?? -1) e=\(episode ?? -1) hasKey=\(key.isEmpty ? "no" : "yes")")
-        task = Task { [weak self] in
-            let result = await TorBoxSearch.streams(imdbId: imdbId, season: season, episode: episode, apiKey: key)
-            guard !Task.isCancelled, let self else { return }
+        let requestCredentialStore = credentialStore
+        _ = credentialStore.compareAndPublish(revision: snapshot.revision) {
+            // New title: publish its cached results (or clear), so the prior title's streams never linger.
+            if fetchKey != self.shownKey {
+                self.shownKey = fetchKey
+                self.publishedContentID = contentID
+                self.streams = self.cache[fetchKey] ?? []
+            }
+            if self.cache[fetchKey] != nil { return }
+            if self.inFlightKey == fetchKey, self.inFlightRevision == snapshot.revision { return }
+            if let until = self.cooldownUntil, until > Date() { return }
+
+            self.task?.cancel()
+            self.inFlightKey = fetchKey
+            self.inFlightRevision = snapshot.revision
+            self.task = Task { [weak self] in
+                let result = await TorBoxSearch.streams(
+                    imdbId: imdbId, season: season, episode: episode, snapshot: snapshot,
+                    credentialStore: requestCredentialStore
+                )
+                guard !Task.isCancelled, let self else { return }
+
+                enum AppliedResult {
+                    case rateLimited
+                    case transportError
+                    case fetched(Int)
+                }
+                var appliedResult: AppliedResult?
+                _ = self.credentialStore.compareAndPublish(revision: result.revision) {
+                    guard self.inFlightKey == fetchKey,
+                          self.inFlightRevision == result.revision else { return }
+                    self.inFlightKey = nil
+                    self.inFlightRevision = nil
+                    self.task = nil
+                    if result.value.rateLimited {
+                        // Keep an empty result out of the cache so the next allowed probe fetches for real.
+                        self.cooldownUntil = Date().addingTimeInterval(15 * 60)
+                        appliedResult = .rateLimited
+                    } else if result.value.transportError {
+                        appliedResult = .transportError
+                    } else {
+                        self.cooldownUntil = nil
+                        self.cache[fetchKey] = result.value.streams
+                        if self.shownKey == fetchKey { self.streams = result.value.streams }
+                        appliedResult = .fetched(result.value.streams.count)
+                    }
+                }
+
+                switch appliedResult {
+                case .rateLimited:
+                    VXProbe.log("torbox-search", "rate-limited (scraper cooldown) for id=\(VXProbeRedaction.identityToken(imdbId)), backing off ~15m")
+                case .transportError:
+                    VXProbe.log("torbox-search", "transport error for id=\(VXProbeRedaction.identityToken(imdbId)), not caching, will retry")
+                case .fetched(let count):
+                    VXProbe.log("torbox-search", "fetched \(count) stream(s) for id=\(VXProbeRedaction.identityToken(imdbId))")
+                case nil:
+                    break
+                }
+            }
+        }
+    }
+
+    /// Adopt one credential generation before reading or mutating contributor state. This also prevents a
+    /// completed request from one account from lending its cache or cooldown to the next account.
+    private func adoptCredentialRevision(_ revision: UInt64) -> Bool {
+        credentialStore.compareAndPublish(revision: revision) {
+            guard self.credentialRevision != revision else { return }
+            self.task?.cancel()
+            self.task = nil
+            self.credentialRevision = revision
             self.inFlightKey = nil
-            if result.rateLimited {
-                // Over the TorBox scraper allowance. Back off ~15 min before re-probing; do NOT cache the
-                // empty result, so it re-fetches for real once the cooldown lifts.
-                self.cooldownUntil = Date().addingTimeInterval(15 * 60)
-                VXProbe.log("torbox-search", "rate-limited (scraper cooldown) for id=\(VXProbeRedaction.identityToken(imdbId)), backing off ~15m")
-                return
-            }
-            if result.transportError {
-                // The request never completed (offline / network failure). Do NOT cache the empty result and do
-                // NOT set a cooldown, so the next meta change or reopen re-fetches for real once the network is
-                // back. Without this, an offline first open cached an empty list for the whole session.
-                VXProbe.log("torbox-search", "transport error for id=\(VXProbeRedaction.identityToken(imdbId)), not caching, will retry")
-                return
-            }
-            VXProbe.log("torbox-search", "fetched \(result.streams.count) stream(s) for id=\(VXProbeRedaction.identityToken(imdbId))")
-            self.cache[fetchKey] = result.streams
-            if self.shownKey == fetchKey { self.streams = result.streams }
+            self.inFlightRevision = nil
+            self.cache.removeAll()
+            self.cooldownUntil = nil
+            self.shownKey = nil
+            self.publishedContentID = nil
+            if !self.streams.isEmpty { self.streams = [] }
         }
     }
 
@@ -312,9 +439,17 @@ final class TorBoxSearchSource: ObservableObject {
     /// cooldown signal, while letting it finish only fills the session cache (the `shownKey` guard
     /// already blocks a stale publish).
     func clearResults() {
-        shownKey = nil
-        publishedContentID = nil
-        if !streams.isEmpty { streams = [] }
+        let snapshot = credentialStore.load()
+        guard adoptCredentialRevision(snapshot.revision) else { return }
+        clearResults(revision: snapshot.revision)
+    }
+
+    private func clearResults(revision: UInt64) {
+        _ = credentialStore.compareAndPublish(revision: revision) {
+            self.shownKey = nil
+            self.publishedContentID = nil
+            if !self.streams.isEmpty { self.streams = [] }
+        }
     }
 
     /// Merge the fetched search streams into `groups` as one extra group, deduped against the streams

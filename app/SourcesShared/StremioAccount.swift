@@ -145,12 +145,15 @@ final class StremioAccount: ObservableObject {
     /// The active profile's Keychain slot (shared profiles use the primary slot), so a profile
     /// switch re-points every token read and write at once.
     private var tokenKey: String { ProfileStore.shared.activeKeychainAccount }
+    private var tokenBaseKey: String {
+        guard let profile = ProfileStore.shared.active else { return ProfileStore.primaryTokenAccount }
+        return ProfileStore.shared.tokenBaseAccount(for: profile)
+    }
     private let emailKey = "stremiox.email"
     private let log = Logger(subsystem: "com.stremiox.app", category: "account")
 
     private var authKey: String? {
         get { Keychain.string(tokenKey) }
-        set { Keychain.set(newValue, for: tokenKey) }
     }
 
     init() {
@@ -161,6 +164,7 @@ final class StremioAccount: ObservableObject {
 
     /// Re-read the session for the newly active profile (called after a profile switch).
     func reloadForActiveProfile() {
+        _ = captureCredentialStamp()
         signInError = nil
         streamSources = []
         addons = []
@@ -182,10 +186,15 @@ final class StremioAccount: ObservableObject {
 
     /// Move a token saved by an older build (UserDefaults) into the Keychain, once.
     private func migrateTokenToKeychain() {
-        guard authKey == nil,
-              let legacy = UserDefaults.standard.string(forKey: tokenKey), !legacy.isEmpty else { return }
-        Keychain.set(legacy, for: tokenKey)
-        UserDefaults.standard.removeObject(forKey: tokenKey)
+        guard let stamp = captureCredentialStamp(),
+              let destination = stamp.stremioSlot?.account,
+              Keychain.string(destination) == nil,
+              let legacy = UserDefaults.standard.string(forKey: tokenBaseKey), !legacy.isEmpty else { return }
+        _ = CredentialScopeAuthority.shared.commitIfCurrent(stamp) {
+            guard Keychain.set(legacy, for: destination),
+                  Keychain.string(destination) == legacy else { return }
+            UserDefaults.standard.removeObject(forKey: tokenBaseKey)
+        }
     }
 
     func signIn(email rawEmail: String, password: String) async {
@@ -201,22 +210,29 @@ final class StremioAccount: ObservableObject {
         }
         struct ErrObj: Decodable { let message: String? }
         guard !email.isEmpty, !password.isEmpty else { signInError = "Enter your email and password."; return }
+        guard let credentialStamp = captureCredentialStamp(operation: .stremioSignIn) else { return }
         do {
             let res: Res = try await post("login", body: Req(email: email, password: password))
             guard let key = res.result?.authKey else {
                 let msg = res.error?.message ?? "Sign-in failed"
-                signInError = msg
-                log.error("signIn failed: \(msg, privacy: .public)")
+                _ = CredentialScopeAuthority.shared.commitIfCurrent(credentialStamp) {
+                    signInError = msg
+                    log.error("signIn failed: \(msg, privacy: .public)")
+                }
                 return
             }
-            authKey = key
-            setEmail(res.result?.user?.email ?? email)
-            if !isSignedIn { isSignedIn = true }   // guard the @Published write so true->true can't re-fire observers
+            guard commitTokenReplacement(
+                key,
+                email: res.result?.user?.email ?? email,
+                credentialStamp: credentialStamp
+            ) else { return }
             log.info("signed in ok")
             await loadAddons()
         } catch {
-            signInError = "Couldn't reach Stremio. Check your connection."
-            log.error("signIn network error: \(error.localizedDescription, privacy: .public)")
+            _ = CredentialScopeAuthority.shared.commitIfCurrent(credentialStamp) {
+                signInError = "Couldn't reach Stremio. Check your connection."
+                log.error("signIn network error: \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 
@@ -224,16 +240,66 @@ final class StremioAccount: ObservableObject {
         let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else { signInError = "Sign-in failed."; return }
         signInError = nil
-        authKey = token
-        await backfillEmail()
-        if !isSignedIn { isSignedIn = true }   // guard the @Published write so true->true can't re-fire observers
+        guard let credentialStamp = captureCredentialStamp(operation: .stremioSignIn),
+              commitTokenReplacement(token, email: nil, credentialStamp: credentialStamp) else { return }
+        let adoptedStamp = captureCredentialStamp()
+        await backfillEmail(credentialStamp: adoptedStamp)
         log.info("signed in with link ok")
         await loadAddons()
     }
 
     func signOut() {
-        authKey = nil; isSignedIn = false; streamSources = []; addons = []
-        setEmail(nil)
+        guard let stamp = captureCredentialStamp(operation: .stremioLogout),
+              let profile = ProfileStore.shared.active,
+              let account = stamp.stremioSlot?.account else { return }
+        _ = CredentialScopeAuthority.shared.commitIfCurrent(stamp) {
+            let cleared = Keychain.set(nil, for: account) && Keychain.string(account) == nil
+            CredentialScopeAuthority.shared.transitionStremioSlot(
+                profileID: profile.id,
+                account: account
+            )
+            if cleared {
+                isSignedIn = false
+                streamSources = []
+                addons = []
+                setEmail(nil)
+            }
+        }
+    }
+
+    private func captureCredentialStamp(
+        operation domain: CredentialOperationDomain? = nil
+    ) -> CredentialCommitStamp? {
+        guard let profile = ProfileStore.shared.active else { return nil }
+        let authority = CredentialScopeAuthority.shared
+        let account = ProfileStore.shared.keychainAccount(for: profile)
+        let slot = authority.bindStremioSlot(profileID: profile.id, account: account)
+        let operation = domain.map { authority.beginOperation($0) }
+        return CredentialCommitStamp(
+            scope: slot.scope,
+            stremioSlot: slot,
+            document: nil,
+            operation: operation
+        )
+    }
+
+    private func commitTokenReplacement(
+        _ token: String,
+        email: String?,
+        credentialStamp: CredentialCommitStamp
+    ) -> Bool {
+        guard let slot = credentialStamp.stremioSlot else { return false }
+        return CredentialScopeAuthority.shared.commitIfCurrent(credentialStamp) {
+            guard Keychain.set(token, for: slot.account),
+                  Keychain.string(slot.account) == token else { return false }
+            CredentialScopeAuthority.shared.transitionStremioSlot(
+                profileID: slot.profileID,
+                account: slot.account
+            )
+            if let email { setEmail(email) }
+            if !isSignedIn { isSignedIn = true }
+            return true
+        } ?? false
     }
 
     private func setEmail(_ value: String?) {
@@ -248,32 +314,41 @@ final class StremioAccount: ObservableObject {
     }
 
     func loadAddons() async {
-        guard let key = authKey else { return }
+        guard let credentialStamp = captureCredentialStamp(),
+              let account = credentialStamp.stremioSlot?.account,
+              let key = Keychain.string(account) else { return }
         struct Req: Encodable { let authKey: String; let update = true }
         struct Res: Decodable { struct R: Decodable { let addons: [AddonDescriptor] }; let result: R? }
         do {
             let res: Res = try await post("addonCollectionGet", body: Req(authKey: key))
             let addons = res.result?.addons ?? []
-            self.addons = addons
-            // Keep the user's addon order (addonCollectionGet = their Stremio order) so the sources
-            // and catalogs they prioritised come first. (A broken `.sorted` was scrambling it.)
-            streamSources = addons.filter { $0.providesStreams }
-                .map { StreamSource(base: $0.baseUrl, name: $0.manifest.name) }
-            log.info("loaded \(self.addons.count) addons, \(self.streamSources.count) stream addons")
-            if email == nil { await backfillEmail() }   // older sessions saved no email
+            let needsEmail = CredentialScopeAuthority.shared.commitIfCurrent(credentialStamp) {
+                self.addons = addons
+                // Keep the user's addon order (addonCollectionGet = their Stremio order) so the sources
+                // and catalogs they prioritised come first. (A broken `.sorted` was scrambling it.)
+                streamSources = addons.filter { $0.providesStreams }
+                    .map { StreamSource(base: $0.baseUrl, name: $0.manifest.name) }
+                log.info("loaded \(self.addons.count) addons, \(self.streamSources.count) stream addons")
+                return email == nil
+            } ?? false
+            if needsEmail { await backfillEmail(credentialStamp: credentialStamp) }
         } catch {
             // keep whatever we had, but surface why the refresh failed
-            log.error("loadAddons failed: \(error.localizedDescription, privacy: .public)")
+            _ = CredentialScopeAuthority.shared.commitIfCurrent(credentialStamp) {
+                log.error("loadAddons failed: \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 
     /// Backfill the account email (for sessions that predate email capture).
-    private func backfillEmail() async {
-        guard let key = authKey else { return }
+    private func backfillEmail(credentialStamp suppliedStamp: CredentialCommitStamp? = nil) async {
+        guard let credentialStamp = suppliedStamp ?? captureCredentialStamp(),
+              let account = credentialStamp.stremioSlot?.account,
+              let key = Keychain.string(account) else { return }
         struct Req: Encodable { let authKey: String }
         struct Res: Decodable { struct U: Decodable { let email: String? }; let result: U? }
         if let res: Res = try? await post("getUser", body: Req(authKey: key)), let e = res.result?.email {
-            setEmail(e)
+            _ = CredentialScopeAuthority.shared.commitIfCurrent(credentialStamp) { setEmail(e) }
         }
     }
 
@@ -294,8 +369,15 @@ final class StremioAccount: ObservableObject {
         // two-way mirror (default OFF).
         if let engine = CoreBridge.shared.engineResumeSecondsByLibraryId(for: meta) { return engine }
         guard ProfileSync.alsoSyncToStremio else { return 0 }
-        guard let key = authKey,
-              let item = await rawLibraryItem(id: meta.libraryId, authKey: key),
+        guard let credentialStamp = captureCredentialStamp(),
+              let account = credentialStamp.stremioSlot?.account,
+              let key = Keychain.string(account),
+              let item = await rawLibraryItem(
+                id: meta.libraryId,
+                authKey: key,
+                credentialStamp: credentialStamp
+              ),
+              CredentialScopeAuthority.shared.isCurrent(credentialStamp),
               let state = item["state"] as? [String: Any] else { return 0 }
         if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
             usesSeriesLifecycle: meta.usesSeriesLifecycle,
@@ -322,9 +404,17 @@ final class StremioAccount: ObservableObject {
         // on cold devices, so Continue Watching + resume survive with NO Stremio dependency. Do NOT write to the
         // Stremio account datastore by default; only ALSO write it when the user opted into two-way sync (OFF).
         guard ProfileSync.alsoSyncToStremio else { return }
-        guard let key = authKey, durationSeconds > 0, positionSeconds >= 0 else { return }
+        guard let credentialStamp = captureCredentialStamp(),
+              let account = credentialStamp.stremioSlot?.account,
+              let key = Keychain.string(account),
+              durationSeconds > 0, positionSeconds >= 0 else { return }
         let now = Self.isoNow()
-        var item = await rawLibraryItem(id: meta.libraryId, authKey: key) ?? Self.newLibraryItem(meta, now: now)
+        var item = await rawLibraryItem(
+            id: meta.libraryId,
+            authKey: key,
+            credentialStamp: credentialStamp
+        ) ?? Self.newLibraryItem(meta, now: now)
+        guard CredentialScopeAuthority.shared.isCurrent(credentialStamp) else { return }
         var state = (item["state"] as? [String: Any]) ?? [:]
         state["timeOffset"] = Int((positionSeconds * 1000).rounded())
         state["duration"] = Int((durationSeconds * 1000).rounded())
@@ -335,36 +425,55 @@ final class StremioAccount: ObservableObject {
         item["removed"] = false
         if item["name"] == nil { item["name"] = meta.name }
         if item["type"] == nil { item["type"] = meta.type }
-        await datastorePut(authKey: key, change: item)
+        await datastorePut(authKey: key, change: item, credentialStamp: credentialStamp)
     }
 
     /// Fetch a single library item as raw JSON so all its fields survive a progress update.
-    private func rawLibraryItem(id: String, authKey: String) async -> [String: Any]? {
+    private func rawLibraryItem(
+        id: String,
+        authKey: String,
+        credentialStamp: CredentialCommitStamp
+    ) async -> [String: Any]? {
         let body: [String: Any] = ["authKey": authKey, "collection": "libraryItem", "ids": [id], "all": false]
-        guard let data = try? await postRaw("datastoreGet", body: body),
+        guard let data = try? await postRaw("datastoreGet", body: body, credentialStamp: credentialStamp),
+              CredentialScopeAuthority.shared.isCurrent(credentialStamp),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let arr = obj["result"] as? [[String: Any]] else { return nil }
         return arr.first
     }
 
-    private func datastorePut(authKey: String, change: [String: Any]) async {
+    private func datastorePut(
+        authKey: String,
+        change: [String: Any],
+        credentialStamp: CredentialCommitStamp
+    ) async {
         let body: [String: Any] = ["authKey": authKey, "collection": "libraryItem", "changes": [change]]
         do {
-            _ = try await postRaw("datastorePut", body: body)
+            _ = try await postRaw("datastorePut", body: body, credentialStamp: credentialStamp)
         } catch {
+            guard CredentialScopeAuthority.shared.isCurrent(credentialStamp) else { return }
             // Progress saves are best-effort, but don't drop the failure silently: log it and retry once.
             log.error("datastorePut failed: \(error.localizedDescription, privacy: .public); retrying once")
             do {
-                _ = try await postRaw("datastorePut", body: body)
+                _ = try await postRaw("datastorePut", body: body, credentialStamp: credentialStamp)
             } catch {
-                log.error("datastorePut retry failed: \(error.localizedDescription, privacy: .public)")
+                if CredentialScopeAuthority.shared.isCurrent(credentialStamp) {
+                    log.error("datastorePut retry failed: \(error.localizedDescription, privacy: .public)")
+                }
             }
         }
     }
 
     /// Like `post`, but with an untyped JSON body/response, for library items whose full shape we
     /// deliberately don't model (we preserve unknown fields rather than round-trip through Codable).
-    private func postRaw(_ path: String, body: [String: Any]) async throws -> Data {
+    private func postRaw(
+        _ path: String,
+        body: [String: Any],
+        credentialStamp: CredentialCommitStamp
+    ) async throws -> Data {
+        guard CredentialScopeAuthority.shared.isCurrent(credentialStamp) else {
+            throw CancellationError()
+        }
         guard let url = URL(string: "\(api)/\(path)") else { throw URLError(.badURL) }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -372,6 +481,9 @@ final class StremioAccount: ObservableObject {
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         req.timeoutInterval = 20
         let (data, _) = try await URLSession.shared.data(for: req)
+        guard CredentialScopeAuthority.shared.isCurrent(credentialStamp) else {
+            throw CancellationError()
+        }
         return data
     }
 

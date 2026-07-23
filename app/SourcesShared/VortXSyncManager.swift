@@ -49,6 +49,7 @@ final class VortXSyncManager: ObservableObject {
 
     private let base = "https://api.vortx.tv"
     private let kcAccount = "vortx.sync.session.v1"
+    private let credentialAuthority = CredentialScopeAuthority.shared
     private var token: String?
     private var dataKey: Data?
     /// Newest doc version this device has pushed or applied. Persisted to UserDefaults per account (see
@@ -144,6 +145,7 @@ final class VortXSyncManager: ObservableObject {
     /// In-flight guaranteed restore, so the sign-in kick, the Keychain-restored relaunch kick, and a syncUp
     /// that is blocked by the gate all await ONE restore instead of racing several forced pulls at once.
     private var restoreTask: Task<Bool, Never>?
+    private var restoreTaskCredentialStamp: CredentialCommitStamp?
     /// LWW stamp of the last web profileEdits applied, keyed PER ACCOUNT (mirroring versionKey(for:)) so an
     /// account switch cannot skip the new account's dashboard edits against the previous account's high-water
     /// mark. Persisted to UserDefaults so a sign-out / re-login for the SAME account does not re-window an old
@@ -292,13 +294,18 @@ final class VortXSyncManager: ObservableObject {
     private func restore() {
         guard let str = Keychain.string(kcAccount), let data = str.data(using: .utf8),
               let p = try? JSONDecoder().decode(Persisted.self, from: data),
-              let dk = Data(base64Encoded: p.dataKey) else { return }
+              let dk = Data(base64Encoded: p.dataKey),
+              let scope = CredentialScope(canonicalRemoteAccountID: p.account.id) else { return }
+        credentialAuthority.transition(to: scope)
+        bindActiveStremioSlot()
+        ApiKeys.shared.reloadForCredentialScope()
+        MediaServerStore.shared.credentialScopeDidChange()
         SourceIndexLifecycleScope.shared.sessionWillMutate()
         token = p.token; account = p.account; dataKey = dk; isSignedIn = true
         // Point the debrid credential store at THIS account before anything can read a key. Restoring a
         // session is the earliest moment the device's real owner is known, and it is also where the one-time
         // adoption of the old unscoped entries happens, so an existing user keeps their keys without a re-paste.
-        DebridKeys.shared.bind(owner: p.account.id)
+        DebridKeys.shared.bind(owner: scope)
         reloadLastSyncStamp()   // show this account's persisted "last synced" immediately on relaunch
         // A Keychain-restored session (app relaunch / reinstall) sets isSignedIn WITHOUT going through
         // adopt(), so nothing would open the sync channel until the first scenePhase foreground transition.
@@ -312,6 +319,13 @@ final class VortXSyncManager: ObservableObject {
     }
 
     func signOut() {
+        restoreTask?.cancel()
+        restoreTask = nil
+        restoreTaskCredentialStamp = nil
+        credentialAuthority.transition(to: .signedOutDevice)
+        bindActiveStremioSlot()
+        ApiKeys.shared.reloadForCredentialScope()
+        MediaServerStore.shared.credentialScopeDidChange()
         SourceIndexLifecycleScope.shared.sessionWillMutate()
         stopRealtime()   // drop the SyncRoom socket + poll before clearing the token
         token = nil; account = nil; dataKey = nil; isSignedIn = false
@@ -321,7 +335,7 @@ final class VortXSyncManager: ObservableObject {
         // own Keychain scope and return if the same account signs back in. What must not happen is the next
         // account on this device inheriting them, which is exactly what used to happen when these entries were
         // global and sign-out left them behind.
-        DebridKeys.shared.bind(owner: DebridKeys.signedOutOwner)
+        DebridKeys.shared.bind(owner: .signedOutDevice)
         // The shared add-on ORDER is a global static with no account context, so a switched-in account would
         // otherwise inherit the previous account's order until its own pull lands. Clear it here so the next
         // account starts from the descriptor spine and converges on its own doc.addonOrder. The per-account
@@ -331,7 +345,20 @@ final class VortXSyncManager: ObservableObject {
 
     // MARK: - HTTP
 
-    private func request(_ method: String, _ path: String, body: [String: Any]? = nil, auth: Bool = false, bearer: String? = nil) async -> (Int, [String: Any]?) {
+    private func request(
+        _ method: String,
+        _ path: String,
+        body: [String: Any]? = nil,
+        auth: Bool = false,
+        bearer: String? = nil,
+        credentialStamp: CredentialCommitStamp? = nil,
+        debridCredentialToken: DebridCredentialRevisionToken? = nil
+    ) async -> (Int, [String: Any]?) {
+        if auth || bearer != nil {
+            guard let credentialStamp, credentialAuthority.isCurrent(credentialStamp) else {
+                return (0, nil)
+            }
+        }
         guard let url = URL(string: base + path) else { return (0, nil) }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -343,26 +370,67 @@ final class VortXSyncManager: ObservableObject {
         // token BEFORE it is adopted); otherwise `auth` uses the stored session token.
         if let t = bearer ?? (auth ? token : nil) { req.setValue("Bearer " + t, forHTTPHeaderField: "authorization") }
         do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let response: (Data, URLResponse)
+            if let debridCredentialToken {
+                response = try await DebridAuthenticatedHTTP.data(
+                    URLSession.shared,
+                    for: req,
+                    credentialToken: debridCredentialToken
+                )
+            } else {
+                response = try await URLSession.shared.data(for: req)
+            }
+            let (data, resp) = response
+            if let credentialStamp, !credentialAuthority.isCurrent(credentialStamp) {
+                return (0, nil)
+            }
+            if let debridCredentialToken, !debridCredentialToken.resultIsCurrent() {
+                return (0, nil)
+            }
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             return (code, json)
         } catch { return (0, nil) }
     }
 
-    private func adopt(token: String, account acct: [String: Any], dataKey: Data) {
-        SourceIndexLifecycleScope.shared.sessionWillMutate()
-        self.token = token
-        self.dataKey = dataKey
-        self.account = Account(
-            id: acct["id"] as? String ?? "",
-            email: acct["email"] as? String ?? "",
-            username: acct["username"] as? String ?? "",
-            twoFactorEnabled: acct["twoFactorEnabled"] as? Bool ?? false)
-        self.isSignedIn = true
+    @discardableResult
+    private func adopt(
+        token: String,
+        account acct: [String: Any],
+        dataKey: Data,
+        operation: CredentialOperationStamp
+    ) -> Bool {
+        guard
+            let rawAccountID = acct["id"] as? String,
+            let scope = CredentialScope(canonicalRemoteAccountID: rawAccountID)
+        else {
+            return false
+        }
+        let committed = credentialAuthority.commitIfCurrent(
+            credentialAuthority.commitStamp(operation: operation)
+        ) {
+            restoreTask?.cancel()
+            restoreTask = nil
+            restoreTaskCredentialStamp = nil
+            credentialAuthority.transition(to: scope)
+            bindActiveStremioSlot()
+            ApiKeys.shared.reloadForCredentialScope()
+            MediaServerStore.shared.credentialScopeDidChange()
+            DebridKeys.shared.bind(owner: scope)
+            SourceIndexLifecycleScope.shared.sessionWillMutate()
+            self.token = token
+            self.dataKey = dataKey
+            self.account = Account(
+                id: rawAccountID,
+                email: acct["email"] as? String ?? "",
+                username: acct["username"] as? String ?? "",
+                twoFactorEnabled: acct["twoFactorEnabled"] as? Bool ?? false)
+            self.isSignedIn = true
+            return true
+        } ?? false
+        guard committed else { return false }
         // Rebind debrid credentials to the account that just signed in. Without this a switched-in account
         // would keep reading the previous owner's keys out of memory even though the Keychain is now scoped.
-        DebridKeys.shared.bind(owner: self.account?.id ?? DebridKeys.signedOutOwner)
         reloadLastSyncStamp()   // a re-sign-in to a known account restores its persisted "last synced"
         persist()
         // A fresh sign-in is a foreground action, so open the real-time channel immediately (if the app
@@ -389,6 +457,15 @@ final class VortXSyncManager: ObservableObject {
         }
         // Reconciliation is decided by the UI after sign-in (reconcileAfterSignIn), so a sign-in never
         // blindly overwrites either side. A new account just gets seeded.
+        return true
+    }
+
+    private func bindActiveStremioSlot() {
+        guard let profile = ProfileStore.shared.active else { return }
+        credentialAuthority.bindStremioSlot(
+            profileID: profile.id,
+            account: ProfileStore.shared.keychainAccount(for: profile)
+        )
     }
 
     enum AuthResult: Equatable { case ok, totpRequired, failed(String) }
@@ -396,6 +473,7 @@ final class VortXSyncManager: ObservableObject {
     // MARK: - Flows
 
     func register(email: String, username: String, password: String) async -> (result: AuthResult, recoveryCode: String?) {
+        let operation = credentialAuthority.beginOperation(.vortxRegister)
         let kdfSalt = VortXSyncCrypto.randomBytes(16)
         let iters = VortXSyncCrypto.defaultIters
         let masterKey = VortXSyncCrypto.masterKey(password: password, kdfSalt: kdfSalt, iters: iters)
@@ -419,7 +497,9 @@ final class VortXSyncManager: ObservableObject {
         ]
         let (code, json) = await request("POST", "/v1/auth/register", body: body)
         if code == 200, let token = json?["token"] as? String, let acct = json?["account"] as? [String: Any] {
-            adopt(token: token, account: acct, dataKey: dataKey)
+            guard adopt(token: token, account: acct, dataKey: dataKey, operation: operation) else {
+                return (.failed("A newer sign-in replaced this request."), nil)
+            }
             return (.ok, recoveryCode)
         }
         switch json?["error"] as? String {
@@ -430,7 +510,11 @@ final class VortXSyncManager: ObservableObject {
     }
 
     func signIn(login: String, password: String, totp: String? = nil) async -> AuthResult {
+        let operation = credentialAuthority.beginOperation(.vortxSignIn)
         let (_, pre) = await request("POST", "/v1/auth/prelogin", body: ["login": login])
+        guard credentialAuthority.isCurrent(operation) else {
+            return .failed("A newer sign-in replaced this request.")
+        }
         guard let saltStr = pre?["kdfSalt"] as? String, let salt = Data(base64Encoded: saltStr),
               let iters = pre?["kdfIters"] as? Int else { return .failed("Could not reach VortX. Try again.") }
         // Reject a downgraded work factor from the UNAUTHENTICATED prelogin response before deriving the key.
@@ -445,13 +529,19 @@ final class VortXSyncManager: ObservableObject {
               let dk = VortXSyncCrypto.open(key: masterKey, wrappedPw) else {
             return .failed(code == 401 ? "Wrong login or password." : "Could not sign in.")
         }
-        adopt(token: token, account: acct, dataKey: dk)
+        guard adopt(token: token, account: acct, dataKey: dk, operation: operation) else {
+            return .failed("A newer sign-in replaced this request.")
+        }
         return .ok
     }
 
     func recover(email: String, recoveryCode: String, newPassword: String) async -> AuthResult {
+        let operation = credentialAuthority.beginOperation(.vortxRecovery)
         let trimmed = recoveryCode.trimmingCharacters(in: .whitespacesAndNewlines)
         let (_, start) = await request("POST", "/v1/auth/recover-start", body: ["email": email])
+        guard credentialAuthority.isCurrent(operation) else {
+            return .failed("A newer sign-in replaced this request.")
+        }
         guard let saltStr = start?["kdfSalt"] as? String, let salt = Data(base64Encoded: saltStr),
               let iters = start?["kdfIters"] as? Int, let wrappedRec = start?["wrappedKeyRecovery"] as? String else {
             return .failed("No recovery is set up for that email.")
@@ -471,7 +561,9 @@ final class VortXSyncManager: ObservableObject {
         ]
         let (code, json) = await request("POST", "/v1/auth/recover-complete", body: body)
         if code == 200, let token = json?["token"] as? String, let acct = json?["account"] as? [String: Any] {
-            adopt(token: token, account: acct, dataKey: dk)
+            guard adopt(token: token, account: acct, dataKey: dk, operation: operation) else {
+                return .failed("A newer sign-in replaced this request.")
+            }
             return .ok
         }
         return .failed("Recovery failed.")
@@ -509,7 +601,10 @@ final class VortXSyncManager: ObservableObject {
     @available(*, deprecated, message: "nil conflates 'no backup yet' with 'pull failed'; use pullSyncDocResult() (or a tri-state wrapper like accountHasSyncData/rosterConflictWithAccount) so a network blip is never misread as an empty account")
     func pullSyncDoc() async -> [String: Any]? {
         guard dataKey != nil else { return nil }
-        let (code, json) = await request("GET", "/v1/backup", auth: true)
+        let stamp = credentialAuthority.commitStamp()
+        let (code, json) = await request(
+            "GET", "/v1/backup", auth: true, credentialStamp: stamp
+        )
         guard code == 200, let doc = json?["document"] as? String,
               let pt = openSyncDocument(doc, version: (json?["version"] as? Int) ?? 0) else { return nil }
         return (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any]
@@ -519,9 +614,14 @@ final class VortXSyncManager: ObservableObject {
     /// (safe to start from an empty doc) from "the pull failed" (must NOT push, or it clobbers the
     /// account's existing document). A non-200/non-404 response or an undecryptable document is a failure.
     private enum SyncDocPull { case doc([String: Any]); case empty; case failed }
-    private func pullSyncDocResult() async -> SyncDocPull {
+    private func pullSyncDocResult(
+        credentialStamp suppliedStamp: CredentialCommitStamp? = nil
+    ) async -> SyncDocPull {
         guard dataKey != nil else { return .failed }
-        let (code, json) = await request("GET", "/v1/backup", auth: true)
+        let stamp = suppliedStamp ?? credentialAuthority.commitStamp()
+        let (code, json) = await request(
+            "GET", "/v1/backup", auth: true, credentialStamp: stamp
+        )
         if code == 404 { return .empty }                 // no backup yet
         guard code == 200 else { return .failed }        // network/server error: do not clobber
         guard let docStr = json?["document"] as? String, !docStr.isEmpty else { return .empty } // 200, no document
@@ -548,10 +648,18 @@ final class VortXSyncManager: ObservableObject {
     ///  - .failed: we did NOT read the account. `retryable` separates a transient transport/server fault (worth
     ///             another attempt) from a deterministic decrypt/parse refusal (retrying re-fails identically).
     ///             Either way the caller must NOT treat this as an empty account.
-    private enum VersionedPull { case doc(doc: [String: Any], version: Int); case empty; case failed(retryable: Bool) }
-    private func pullDocVersionedResult() async -> VersionedPull {
+    private enum VersionedPull {
+        case doc(doc: [String: Any], version: Int, ciphertext: String)
+        case empty
+        case failed(retryable: Bool)
+    }
+    private func pullDocVersionedResult(
+        credentialStamp: CredentialCommitStamp
+    ) async -> VersionedPull {
         guard dataKey != nil else { return .failed(retryable: false) }
-        let (code, json) = await request("GET", "/v1/backup", auth: true)
+        let (code, json) = await request(
+            "GET", "/v1/backup", auth: true, credentialStamp: credentialStamp
+        )
         if code == 404 { return .empty }                                  // no backup yet
         // request() returns code 0 for a thrown URLSession error (offline / DNS / TLS / timeout) and 5xx is a
         // server fault: both are transient, and both are exactly the "silently returns false" case of #145.
@@ -565,7 +673,7 @@ final class VortXSyncManager: ObservableObject {
         // reads as "nothing there") is what keeps a decrypt-miss / ratchet refusal from being pushed over.
         guard let pt = openSyncDocument(docStr, version: version),
               let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return .failed(retryable: false) }
-        return .doc(doc: obj, version: version)
+        return .doc(doc: obj, version: version, ciphertext: docStr)
     }
 
     /// pullDocVersionedResult with a bounded retry on TRANSIENT faults only (#145 M1). The reinstall restore was
@@ -574,10 +682,16 @@ final class VortXSyncManager: ObservableObject {
     /// retried because the retry re-fails identically; they stay .failed so the caller stays blocked rather than
     /// seeding over a doc it never read. Bounded and short (~1.2s worst case) so the 10s while-active poll and
     /// the foreground pull never stack up behind it.
-    private func pullDocVersionedRetrying(attempts: Int = 3) async -> VersionedPull {
+    private func pullDocVersionedRetrying(
+        attempts: Int = 3,
+        credentialStamp: CredentialCommitStamp
+    ) async -> VersionedPull {
         var delayNanos: UInt64 = 400_000_000
         for attempt in 0..<max(1, attempts) {
-            let result = await pullDocVersionedResult()
+            guard credentialAuthority.isCurrent(credentialStamp) else {
+                return .failed(retryable: false)
+            }
+            let result = await pullDocVersionedResult(credentialStamp: credentialStamp)
             switch result {
             case .doc, .empty: return result
             case .failed(let retryable):
@@ -596,20 +710,74 @@ final class VortXSyncManager: ObservableObject {
     /// accepted==true: advancing it on a rejected write (the old bug) suppressed the recovery pull, so a
     /// write that LOST the race was silently dropped and the device stayed diverged.
     private enum PushOutcome { case accepted(version: Int); case rejected(storedVersion: Int?); case error }
-    private func pushSyncDocAt(_ obj: [String: Any], version: Int) async -> PushOutcome {
+
+    /// A derived sync document is inseparable from the exact debrid revision whose keys it embedded. The
+    /// revision is checked at the actual PUT issuance point, so a stale document can never publish old keys
+    /// after a newer credential envelope is visible.
+    private struct DerivedSyncDocument {
+        let object: [String: Any]
+        let debridRevision: UInt64
+    }
+
+    private func credentialAuthorityIsCurrent(
+        _ scopeStamp: CredentialCommitStamp,
+        requiring requiredStamp: CredentialCommitStamp?
+    ) -> Bool {
+        credentialAuthority.isCurrent(scopeStamp)
+            && requiredStamp.map { credentialAuthority.isCurrent($0) } != false
+    }
+
+    private func pushSyncDocAt(
+        _ obj: [String: Any],
+        version: Int,
+        credentialStamp: CredentialCommitStamp,
+        debridRevision: UInt64,
+        requiredCredentialStamp: CredentialCommitStamp? = nil
+    ) async -> PushOutcome {
+        guard credentialAuthorityIsCurrent(
+            credentialStamp,
+            requiring: requiredCredentialStamp
+        ) else { return .error }
+        guard DebridCredentialSnapshotStore.shared.isCurrent(revision: debridRevision) else {
+            return .error
+        }
         guard let dataKey, let pt = try? JSONSerialization.data(withJSONObject: obj),
               let ct = VortXSyncCrypto.sealDocument(dataKey: dataKey, plaintext: pt, accountId: account?.id ?? "", version: version, writeV2: Self.writeSyncDocV2) else { return .error }
-        let (code, json) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true)
+        let credentialToken = DebridCredentialRevisionToken(
+            revision: debridRevision,
+            store: DebridCredentialSnapshotStore.shared
+        )
+        // No suspension between this combined authority check and request issuance. A newer profile import can
+        // therefore stop the stale derived document before the credential-bearing PUT leaves the MainActor.
+        guard credentialAuthorityIsCurrent(
+            credentialStamp,
+            requiring: requiredCredentialStamp
+        ) else { return .error }
+        let (code, json) = await request(
+            "PUT",
+            "/v1/backup",
+            body: ["document": ct, "version": version],
+            auth: true,
+            credentialStamp: credentialStamp,
+            debridCredentialToken: credentialToken
+        )
+        guard credentialAuthorityIsCurrent(
+            credentialStamp,
+            requiring: requiredCredentialStamp
+        ) else { return .error }
         guard code == 200 else { return .error }
         // accepted defaults to true so an older worker without the field (which stored the write) still
         // advances the version, matching the website's `accepted !== false` read.
         let accepted = (json?["accepted"] as? Bool) ?? true
         if accepted {
-            lastSyncedVersion = max(lastSyncedVersion, version)
-            persistLastSyncedVersion()   // survive relaunch so the version guard stays consistent
-            if Self.writeSyncDocV2 { Self.markSawDocV2(account?.id ?? "") }  // H-1: account's stored doc is now v2
-            stampSyncSuccess()           // the account now holds this device's doc: "last synced" = now
-            return .accepted(version: version)
+            guard requiredCredentialStamp.map({ credentialAuthority.isCurrent($0) }) != false else { return .error }
+            return credentialAuthority.commitIfCurrent(credentialStamp) {
+                lastSyncedVersion = max(lastSyncedVersion, version)
+                persistLastSyncedVersion()   // survive relaunch so the version guard stays consistent
+                if Self.writeSyncDocV2 { Self.markSawDocV2(account?.id ?? "") }  // H-1: account's stored doc is now v2
+                stampSyncSuccess()           // the account now holds this device's doc: "last synced" = now
+                return .accepted(version: version)
+            } ?? .error
         }
         // Rejected (a concurrent write won). The worker echoes the current stored version so we can retry
         // deterministically at stored+1 instead of racing epoch-ms again. Do NOT advance lastSyncedVersion.
@@ -617,48 +785,32 @@ final class VortXSyncManager: ObservableObject {
         return .rejected(storedVersion: stored)
     }
 
-    /// Blind single-shot push of a fully-formed doc the caller does not re-derive (it holds no local pending
-    /// changes to re-merge, so on a rejection it just re-pushes the SAME doc above the winner). The version is
-    /// `max(storedVersion+1, epochMs)` so a device whose wall clock has skewed BACKWARD (a lower epoch-ms than
-    /// the stored version) can never lock itself out: it retries strictly above the stored version instead of
-    /// racing a permanently-lower epoch-ms. A rejection is retried once at storedVersion+1 (same as
-    /// pushDerivedDoc); a lost second race or a .error leaves lastSyncedVersion unadvanced so the next pull
-    /// reconciles.
-    @discardableResult
-    func pushSyncDoc(_ obj: [String: Any]) async -> Bool {
-        var version = Int(Date().timeIntervalSince1970 * 1000)
-        for attempt in 0..<2 {
-            switch await pushSyncDocAt(obj, version: version) {
-            case .accepted:
-                return true
-            case .error:
-                return false
-            case .rejected(let storedVersion):
-                // A concurrent write won. Retry strictly above the winner's echoed version (falling back to a
-                // fresh epoch-ms if the worker did not echo one). max(stored+1, epochMs) guarantees a backward
-                // clock still produces a higher version than the stored one, so the device is never locked out.
-                guard attempt < 1 else { return false }
-                if let stored = storedVersion {
-                    version = max(stored + 1, Int(Date().timeIntervalSince1970 * 1000))
-                } else {
-                    version = Int(Date().timeIntervalSince1970 * 1000)
-                }
-            }
-        }
-        return false
-    }
-
     /// Push a doc that is DERIVED from a pulled base, with optimistic-concurrency recovery. `rebuild`
     /// re-runs the caller's exact merge onto a freshly pulled base, so a lost race is recovered by
     /// re-merging the local pending changes onto the winner's doc and retrying at storedVersion+1 (up to
     /// `maxRetries`). This preserves the caller's merge semantics (LWW, never clobber libraryItem) on every
     /// attempt. On exhaustion lastSyncedVersion is left unadvanced so the next natural pull reconciles.
-    private func pushDerivedDoc(_ initial: [String: Any], rebuild: () async -> [String: Any]?) async -> Bool {
+    private func pushDerivedDoc(
+        _ initial: DerivedSyncDocument,
+        credentialStamp: CredentialCommitStamp,
+        requiredCredentialStamp: CredentialCommitStamp? = nil,
+        rebuild: () async -> DerivedSyncDocument?
+    ) async -> Bool {
         let maxRetries = 3
         var doc = initial
         var version = Int(Date().timeIntervalSince1970 * 1000)
         for attempt in 0..<maxRetries {
-            switch await pushSyncDocAt(doc, version: version) {
+            guard credentialAuthorityIsCurrent(
+                credentialStamp,
+                requiring: requiredCredentialStamp
+            ) else { return false }
+            switch await pushSyncDocAt(
+                doc.object,
+                version: version,
+                credentialStamp: credentialStamp,
+                debridRevision: doc.debridRevision,
+                requiredCredentialStamp: requiredCredentialStamp
+            ) {
             case .accepted:
                 return true
             case .error:
@@ -669,6 +821,10 @@ final class VortXSyncManager: ObservableObject {
                 // longer produce a doc (e.g. the account pull now fails), abort WITHOUT advancing so the next
                 // pull reconciles rather than clobbering the winner.
                 guard attempt < maxRetries - 1, let rebuilt = await rebuild() else { return false }
+                guard credentialAuthorityIsCurrent(
+                    credentialStamp,
+                    requiring: requiredCredentialStamp
+                ) else { return false }
                 doc = rebuilt
                 // storedVersion+1 beats the winner deterministically; fall back to a fresh epoch-ms if the
                 // worker did not echo a version (the row-vanished race), still strictly increasing.
@@ -948,8 +1104,16 @@ final class VortXSyncManager: ObservableObject {
     /// chose to overwrite it. Never pass true from an automatic or engine-driven path: #145 is precisely what
     /// happens when an unattended push decides on the user's behalf.
     @discardableResult
-    func syncUp(afterUserChoseThisDevice: Bool = false) async -> Bool {
+    func syncUp(
+        afterUserChoseThisDevice: Bool = false,
+        requiredCredentialStamp: CredentialCommitStamp? = nil
+    ) async -> Bool {
         guard isSignedIn else { return false }
+        let credentialStamp = credentialAuthority.commitStamp()
+        guard credentialAuthorityIsCurrent(
+            credentialStamp,
+            requiring: requiredCredentialStamp
+        ) else { return false }
         // #145 M1, THE ORDERING RULE: A DEVICE THAT HAS NOT YET APPLIED THE ACCOUNT'S DOC MUST NOT PUSH OVER IT.
         // Restore first, then push. Every destructive-push path in the bug funnels through here (the debounced
         // observer push, the engine-driven pushThisDevice calls, the background push), so this one gate closes
@@ -962,7 +1126,10 @@ final class VortXSyncManager: ObservableObject {
             // this is what turns "push over the account" into "restore, then push". Single-flight, so several
             // blocked pushes plus the sign-in kick await ONE restore instead of stampeding the endpoint.
             await restoreAccountDocIfNeeded()
-            guard hasAppliedAccountDoc else {
+            guard credentialAuthorityIsCurrent(
+                credentialStamp,
+                requiring: requiredCredentialStamp
+            ), hasAppliedAccountDoc else {
                 NSLog("[sync] push refused: this device has not applied the account's doc yet (#145 gate)")
                 return false
             }
@@ -971,8 +1138,25 @@ final class VortXSyncManager: ObservableObject {
         // recovery: if a concurrent write wins the race, re-run this exact merge onto the winner's doc and
         // retry (bounded). The rebuild closure re-pulls a fresh base each attempt so the recovered push
         // never clobbers the winner; it returns nil on a failed pull so the retry aborts safely.
-        guard let initial = await mergeLocalIntoDoc(base: nil) else { return false }
-        return await pushDerivedDoc(initial, rebuild: { await self.mergeLocalIntoDoc(base: nil) })
+        guard let initial = await mergeLocalIntoDoc(
+            base: nil,
+            credentialStamp: credentialStamp,
+            requiredCredentialStamp: requiredCredentialStamp
+        ), credentialAuthorityIsCurrent(
+            credentialStamp,
+            requiring: requiredCredentialStamp
+        ) else { return false }
+        return await pushDerivedDoc(
+            initial,
+            credentialStamp: credentialStamp,
+            requiredCredentialStamp: requiredCredentialStamp,
+            rebuild: {
+            await self.mergeLocalIntoDoc(
+                base: nil,
+                credentialStamp: credentialStamp,
+                requiredCredentialStamp: requiredCredentialStamp
+            )
+        })
     }
 
     /// Build the doc to push by MERGING this device's profiles + settings + keys + add-on order onto a
@@ -982,13 +1166,25 @@ final class VortXSyncManager: ObservableObject {
     /// unused today (each call re-pulls) but kept so a caller could pass a known base to avoid a re-pull.
     /// Returns nil on a FAILED pull (network error / undecryptable doc): a failed pull must NEVER overwrite
     /// the account's existing document, or it wipes keys other surfaces wrote.
-    private func mergeLocalIntoDoc(base: [String: Any]?) async -> [String: Any]? {
+    private func mergeLocalIntoDoc(
+        base: [String: Any]?,
+        credentialStamp: CredentialCommitStamp,
+        requiredCredentialStamp: CredentialCommitStamp? = nil
+    ) async -> DerivedSyncDocument? {
+        guard credentialAuthorityIsCurrent(
+            credentialStamp,
+            requiring: requiredCredentialStamp
+        ) else { return nil }
         var doc: [String: Any]
-        switch await pullSyncDocResult() {
+        switch await pullSyncDocResult(credentialStamp: credentialStamp) {
         case .failed: return nil
         case .empty: doc = [:]
         case .doc(let existing): doc = existing
         }
+        guard credentialAuthorityIsCurrent(
+            credentialStamp,
+            requiring: requiredCredentialStamp
+        ) else { return nil }
         // Read-merge the pulled doc's tombstone stamps into the local stores BEFORE vortxSummary rebuilds them
         // from local state, so a push that raced a peer's fresh re-add stamp adopts that stamp instead of
         // overwriting the doc with a local-only view; this also re-seeds the maps after a b171 peer push that
@@ -1040,22 +1236,32 @@ final class VortXSyncManager: ObservableObject {
         // Debrid keys ride the same encrypted apiKeys channel so they follow the account across devices
         // (they live in the Keychain, which SettingsBackup deliberately excludes, so they need this mirror).
         // Set only when configured locally; do NOT remove a key absent locally (another device authored it).
-        let debrid = DebridKeys.shared
-        if debrid.isConfigured(.realDebrid) { keys["realDebrid"] = debrid.key(for: .realDebrid) }
-        if debrid.isConfigured(.allDebrid)  { keys["allDebrid"]  = debrid.key(for: .allDebrid) }
-        if debrid.isConfigured(.premiumize) { keys["premiumize"] = debrid.key(for: .premiumize) }
-        if debrid.isConfigured(.torBox)     { keys["torBox"]     = debrid.key(for: .torBox) }
+        let debridSnapshot = DebridCredentialSnapshotStore.shared.load()
+        if let value = debridSnapshot.keys[.realDebrid] { keys["realDebrid"] = value }
+        if let value = debridSnapshot.keys[.allDebrid] { keys["allDebrid"] = value }
+        if let value = debridSnapshot.keys[.premiumize] { keys["premiumize"] = value }
+        if let value = debridSnapshot.keys[.torBox] { keys["torBox"] = value }
         // External sync provider tokens (Trakt Lane C, SIMKL Lane D) ride the SAME encrypted apiKeys
         // channel so a connection made on one device follows the account. They live in the Keychain, which
         // SettingsBackup deliberately excludes, so this mirror is the only carrier. Set only when connected
         // locally; NEVER remove a key that is absent locally (another device authored it) - the same
         // asymmetric read-merge guard as the debrid keys above.
-        if let t = await TraktAuth.shared.syncableTokens() {
+        let traktTokens = await TraktAuth.shared.syncableTokens()
+        guard credentialAuthorityIsCurrent(
+            credentialStamp,
+            requiring: requiredCredentialStamp
+        ) else { return nil }
+        if let t = traktTokens {
             keys["traktAccess"] = t.access
             keys["traktRefresh"] = t.refresh
             keys["traktExpiry"] = String(t.expiryUnix)
         }
-        if let s = await SIMKLAuth.shared.syncableTokens() {
+        let simklTokens = await SIMKLAuth.shared.syncableTokens()
+        guard credentialAuthorityIsCurrent(
+            credentialStamp,
+            requiring: requiredCredentialStamp
+        ) else { return nil }
+        if let s = simklTokens {
             keys["simklAccess"] = s.access
             keys["simklExpiry"] = String(s.expiryUnix)
         }
@@ -1087,7 +1293,13 @@ final class VortXSyncManager: ObservableObject {
         let defaultTerms = SearchHistoryStore.allTerms(for: nil)
         if !defaultTerms.isEmpty { searches["default"] = defaultTerms }
         if searches.isEmpty { doc.removeValue(forKey: "searches") } else { doc["searches"] = searches }
-        return doc
+        guard credentialAuthorityIsCurrent(
+            credentialStamp,
+            requiring: requiredCredentialStamp
+        ), DebridCredentialSnapshotStore.shared.isCurrent(
+            revision: debridSnapshot.revision
+        ) else { return nil }
+        return DerivedSyncDocument(object: doc, debridRevision: debridSnapshot.revision)
     }
 
     /// The current add-on order this device holds, as normalized transportUrls in the engine's true
@@ -1138,17 +1350,30 @@ final class VortXSyncManager: ObservableObject {
     @discardableResult
     func restoreAccountDocIfNeeded() async -> Bool {
         guard isSignedIn else { return false }
+        let credentialStamp = credentialAuthority.commitStamp()
         if hasAppliedAccountDoc { return true }
         // Single-flight: adopt(), startRealtime(), and any blocked syncUp can all arrive at once. Assigning
         // restoreTask before the first await means concurrent callers join this task rather than starting their
         // own forced pulls. Safe on the main actor: the Task body cannot begin until this function suspends.
-        if let inFlight = restoreTask { return await inFlight.value }
+        if restoreTaskCredentialStamp == credentialStamp, let inFlight = restoreTask {
+            return await inFlight.value
+        }
+        restoreTask?.cancel()
+        restoreTask = nil
+        restoreTaskCredentialStamp = nil
         let task = Task { @MainActor [weak self] () -> Bool in
             guard let self else { return false }
-            defer { self.restoreTask = nil }
+            defer {
+                if self.restoreTaskCredentialStamp == credentialStamp {
+                    self.restoreTask = nil
+                    self.restoreTaskCredentialStamp = nil
+                }
+            }
             var delayNanos: UInt64 = 1_000_000_000
             for attempt in 0..<5 {
+                guard self.credentialAuthority.isCurrent(credentialStamp) else { return false }
                 await self.syncDown(force: true)
+                guard self.credentialAuthority.isCurrent(credentialStamp) else { return false }
                 if self.hasAppliedAccountDoc { return true }
                 guard attempt < 4 else { break }
                 try? await Task.sleep(nanoseconds: delayNanos)
@@ -1160,6 +1385,7 @@ final class VortXSyncManager: ObservableObject {
             return self.hasAppliedAccountDoc
         }
         restoreTask = task
+        restoreTaskCredentialStamp = credentialStamp
         return await task.value
     }
 
@@ -1172,6 +1398,7 @@ final class VortXSyncManager: ObservableObject {
     @discardableResult
     func syncDown(force: Bool = false) async -> Bool {
         guard isSignedIn else { return false }
+        let scopeStamp = credentialAuthority.commitStamp()
         // PENDING-EDIT GUARD. When a GENUINE local edit is queued (a settings toggle, a profile delete: the
         // observer armed hasPendingPush), defer this pull until that edit's debounced push lands. Without it an
         // interleaved pull re-applies the account's pre-edit value and the change the user just made flips back
@@ -1191,22 +1418,25 @@ final class VortXSyncManager: ObservableObject {
         let mustRestore = !hasAppliedAccountDoc
         let effectiveForce = force || mustRestore
         if !effectiveForce, hasPendingPush { return false }
-        let pulled: (doc: [String: Any], version: Int)
-        switch await pullDocVersionedRetrying() {
-        case .doc(let doc, let version):
-            pulled = (doc, version)
+        let pulled: (doc: [String: Any], version: Int, ciphertext: String)
+        switch await pullDocVersionedRetrying(credentialStamp: scopeStamp) {
+        case .doc(let doc, let version, let ciphertext):
+            pulled = (doc, version, ciphertext)
         case .empty:
             // The account definitively HAS no document. Nothing to restore, and nothing this device could push
             // over, so open the gate: a genuinely fresh account must still be seedable (reconcileAfterSignIn's
             // .seededFromDevice path pushes through syncUp). Stamped inside the suppression window because it is
             // a UserDefaults write, and an unsuppressed write here would arm the very push we are ordering.
-            withRemoteApplySuppressed { hasAppliedAccountDoc = true }
+            _ = credentialAuthority.commitIfCurrent(scopeStamp) {
+                withRemoteApplySuppressed { hasAppliedAccountDoc = true }
+            }
             return false
         case .failed:
             // We did NOT read the account (transient fault already retried, or an undecryptable doc). Leave the
             // gate shut: syncUp stays blocked, so a failed read can never become a destructive push.
             return false
         }
+        guard credentialAuthority.isCurrent(scopeStamp) else { return false }
         // VERSION-WINS: once no local edit is pending, apply only a STRICTLY NEWER remote; a stale or equal pull
         // is a no-op. lastSyncedVersion is persisted per account (versionKey(for:)) so this holds across relaunches.
         //
@@ -1218,7 +1448,12 @@ final class VortXSyncManager: ObservableObject {
         // of on the version is what breaks that: the version can lie about whether we restored, the flag cannot.
         if !effectiveForce, pulled.version <= lastSyncedVersion { return false }
         let doc = pulled.doc
+        let documentStamp = credentialAuthority.observePulledDocument(
+            ciphertext: pulled.ciphertext,
+            version: pulled.version
+        )
         var restored = false
+        var debridGenerationApplied = true
         // SUPPRESS THE OBSERVER for the whole apply region. SettingsBackup.restore + the apiKeys/overlay/
         // tombstone/profileEdits writes below all hit UserDefaults; without suppression each fires the
         // global didChangeNotification observer, which calls requestSyncSoon() -> re-arms hasPendingPush and
@@ -1226,6 +1461,7 @@ final class VortXSyncManager: ObservableObject {
         // receiving device permanently inside the hasPendingPush window, so its next syncDown bails at the
         // guard and the peer's settings are never applied. The body is fully synchronous (no awaits), so the
         // coalesced notifications drain on the next main-queue turn while the flag is still set.
+        guard credentialAuthority.commitIfCurrent(CredentialCommitStamp(document: documentStamp), {
         withRemoteApplySuppressed {
         if let b64 = doc["settings"] as? String, let data = Data(base64Encoded: b64) {
             // Capture the LIVE roster BEFORE restore: SettingsBackup.restore overwrites the roster key
@@ -1263,39 +1499,51 @@ final class VortXSyncManager: ObservableObject {
             if let f = keys["fanart"] { ApiKeys.shared.fanart = f }
             // Debrid keys: apply only when present so a doc without them never clears a locally-entered key.
             let debrid = DebridKeys.shared
-            if let v = keys["realDebrid"], v != debrid.key(for: .realDebrid) { debrid.setKey(v, for: .realDebrid) }
-            if let v = keys["allDebrid"],  v != debrid.key(for: .allDebrid)  { debrid.setKey(v, for: .allDebrid) }
-            if let v = keys["premiumize"], v != debrid.key(for: .premiumize) { debrid.setKey(v, for: .premiumize) }
-            if let v = keys["torBox"],     v != debrid.key(for: .torBox)     { debrid.setKey(v, for: .torBox) }
-            // A key that ARRIVED from another device must take effect here too: rebuild the resolvers so
-            // the changed/new key is live (setKey already nudges this on a local edit; this covers the pull
-            // path explicitly). DebridCoordinator is now an `actor`, so the reload hops onto it off-main.
-            // We are on the main actor here, so capture the fully-applied key snapshot NOW and hand the
-            // immutable value to the actor: the actor must never read DebridKeys' @Published dictionary
-            // itself (that would race these main-actor setKey writes).
-            // No withRemoteApplySuppressed wrapper is needed: reload(keys:) only rebuilds resolver instances
-            // from the passed-in key snapshot and writes no sync-doc / @Published state, so it can never
-            // re-arm a self-echo push.
-            let debridSnapshot = debrid.snapshot
-            Task { await DebridCoordinator.shared.reload(keys: debridSnapshot) }
+            var remoteDebrid: [DebridService: String] = [:]
+            if let value = keys["realDebrid"] { remoteDebrid[.realDebrid] = value }
+            if let value = keys["allDebrid"] { remoteDebrid[.allDebrid] = value }
+            if let value = keys["premiumize"] { remoteDebrid[.premiumize] = value }
+            if let value = keys["torBox"] { remoteDebrid[.torBox] = value }
+            // Persist and publish the complete remote envelope atomically. A partial durable failure means the
+            // document was not applied, so leave every version/success stamp untouched and retry this version.
+            guard debrid.applyRemoteKeys(remoteDebrid) else {
+                debridGenerationApplied = false
+                return
+            }
             // External sync provider tokens (Trakt Lane C, SIMKL Lane D): adopt a connection authored on
             // another device. Apply only when present so a doc without them never clears a locally-connected
             // session (mirrors the debrid guard just above; never delete on absence). adoptTokens writes the
             // Keychain via an actor, so it hops out of this synchronous suppressed region in a Task.
             if let a = keys["traktAccess"], let r = keys["traktRefresh"], !a.isEmpty, !r.isEmpty {
                 let expiry = Int(keys["traktExpiry"] ?? "") ?? 0
-                Task { await TraktAuth.shared.adoptTokens(access: a, refresh: r, expiryUnix: expiry) }
+                Task {
+                    await TraktAuth.shared.adoptTokens(
+                        access: a,
+                        refresh: r,
+                        expiryUnix: expiry,
+                        credentialStamp: CredentialCommitStamp(document: documentStamp)
+                    )
+                }
             }
             if let a = keys["simklAccess"], !a.isEmpty {
                 let expiry = Int(keys["simklExpiry"] ?? "") ?? 0
-                Task { await SIMKLAuth.shared.adoptTokens(access: a, expiryUnix: expiry) }
+                Task {
+                    await SIMKLAuth.shared.adoptTokens(
+                        access: a,
+                        expiryUnix: expiry,
+                        credentialStamp: CredentialCommitStamp(document: documentStamp)
+                    )
+                }
             }
             // Media servers (lane E): adopt a server connected on another device. applySyncBlob union-merges by
             // id, honors removal tombstones, and writes a synced token to the Keychain only when the local slot
             // is empty (Keychain stays authoritative). Apply only when present so a doc without it never clears
             // a locally-connected server (the same never-delete-on-absence guard as the tokens above).
             if let blob = keys["vortx.mediaServers"] {
-                Task { @MainActor in MediaServerStore.shared.applySyncBlob(blob) }
+                MediaServerStore.shared.applySyncBlob(
+                    blob,
+                    credentialStamp: CredentialCommitStamp(document: documentStamp)
+                )
             }
             // IPTV playlists (Live TV): adopt a playlist registered on another device, and re-seed the Keychain
             // credentials a reinstall dropped, which is what makes a restored playlist live again instead of a
@@ -1304,7 +1552,12 @@ final class VortXSyncManager: ObservableObject {
             // so a doc without it never clears a locally-added playlist. Called SYNCHRONOUSLY (unlike the media
             // servers above): the store is @MainActor and so is this region, so its UserDefaults writes stay
             // inside the suppression window and cannot arm a self-echo push.
-            if let blob = keys["vortx.iptv"] { IPTVPlaylistStore.shared.applySyncBlob(blob) }
+            if let blob = keys["vortx.iptv"] {
+                IPTVPlaylistStore.shared.applySyncBlob(
+                    blob,
+                    credentialStamp: CredentialCommitStamp(document: documentStamp)
+                )
+            }
             restored = true
         }
         if let searches = doc["searches"] as? [String: [String]] {
@@ -1418,7 +1671,10 @@ final class VortXSyncManager: ObservableObject {
                 Self.appliedAddonOrder = normalized
                 restored = true
                 // A remote reorder landed: refresh any live add-on list on the main thread.
-                DispatchQueue.main.async { NotificationCenter.default.post(name: Self.addonOrderChangedNote, object: nil) }
+                DispatchQueue.main.async {
+                    guard Self.shared.credentialAuthority.isCurrent(documentStamp) else { return }
+                    NotificationCenter.default.post(name: Self.addonOrderChangedNote, object: nil)
+                }
             }
         }
         let removedAddonSet = AddonTombstones.all()
@@ -1427,6 +1683,7 @@ final class VortXSyncManager: ObservableObject {
             // uninstall loop in its own suppression: uninstallAddon writes UserDefaults, which would otherwise
             // fire the observer and re-arm a self-echo push of the just-applied removal.
             Task { @MainActor in
+                guard Self.shared.credentialAuthority.isCurrent(documentStamp) else { return }
                 Self.shared.withRemoteApplySuppressed {
                     for addon in CoreBridge.shared.addons
                     where removedAddonSet.contains(AddonTombstones.normalize(addon.transportUrl))
@@ -1487,6 +1744,9 @@ final class VortXSyncManager: ObservableObject {
         // spurious push of the just-applied doc (the same self-echo class this region exists to prevent).
         stampSyncSuccess()
         }   // end withRemoteApplySuppressed
+        return true
+        }) == true else { return false }
+        guard debridGenerationApplied else { return false }
         return restored
     }
 
@@ -1506,13 +1766,18 @@ final class VortXSyncManager: ObservableObject {
     /// "engine account library empty AND the account owns one" so it runs at most once per fresh install.
     func hydrateEngineFromOwnedAddons() async {
         guard isSignedIn else { return }
-        guard case let .doc(doc) = await pullSyncDocResult() else { return }   // .failed/.empty: do nothing
+        let credentialStamp = credentialAuthority.commitStamp()
+        guard case let .doc(doc) = await pullSyncDocResult(credentialStamp: credentialStamp),
+              credentialAuthority.isCurrent(credentialStamp) else { return }
         // Fold the doc's tombstone stamps into the local stores BEFORE computing the hydrate + recovery sets,
         // so a cold launch (no prior syncDown) honors the removals the doc already carries: ownedAddons(from:)
         // reads AddonTombstones.all() and recoverOwnerLibraryIfEmpty reads LibraryTombstones.all(), both of
         // which would otherwise be stale on a fresh device. Suppressed so these UserDefaults writes do not
         // self-arm a push.
-        withRemoteApplySuppressed { foldDocTombstones(doc) }
+        guard credentialAuthority.commitIfCurrent(credentialStamp, {
+            withRemoteApplySuppressed { foldDocTombstones(doc) }
+            return true
+        }) == true else { return }
         let owned = Self.ownedAddons(from: doc)
         if !owned.isEmpty {
             CoreBridge.shared.hydrateAddonsFromAccount(owned)
@@ -1520,7 +1785,8 @@ final class VortXSyncManager: ObservableObject {
         // The engine now holds the hydrated add-ons, so baseline-stamp them once (a no-op once syncDown or a
         // prior hydrate already did it, or while the installed set is still empty).
         baselineInstalledAddonsOnce()
-        await recoverOwnerLibraryIfEmpty(from: doc)
+        await recoverOwnerLibraryIfEmpty(from: doc, credentialStamp: credentialStamp)
+        guard credentialAuthority.isCurrent(credentialStamp) else { return }
         // recoverOwnerLibraryIfEmpty just refreshed OwnerResumeStore (and, on a cold device, re-added the owner
         // library at time 0). Paint Continue Watching once here from the engine preview UNION those cached
         // offsets, so the rail fills immediately on a cold / migrated launch (#149) even for a warm device that
@@ -1583,7 +1849,10 @@ final class VortXSyncManager: ObservableObject {
     /// `AddToLibrary`/`addCatalogItemToAccount` path (real Cinemeta meta = schema-safe). NEVER writes app
     /// data into a libraryItem doc (the poisoned-account incident). Owner-profile semantics only: items
     /// land in the account library, which is the owner profile's history.
-    private func recoverOwnerLibraryIfEmpty(from doc: [String: Any]) async {
+    private func recoverOwnerLibraryIfEmpty(
+        from doc: [String: Any],
+        credentialStamp: CredentialCommitStamp
+    ) async {
         guard let vortx = doc["vortx"] as? [String: Any] else { return }
         // doc.vortx.library is the owner library; fall back to doc.library (web Stremio import) if present.
         let ownedLibrary = (vortx["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
@@ -1612,12 +1881,19 @@ final class VortXSyncManager: ObservableObject {
         // resurrecting a removed title.
         var recovered = 0
         for item in ownedLibrary {
+            guard credentialAuthority.isCurrent(credentialStamp) else { break }
             guard let id = item["id"] as? String, !id.isEmpty,
                   !removedLibrary.contains(LibraryTombstones.normalize(id)),
                   // Real catalog ids only (tt… / tmdb…); never a synthetic id, or it poisons account sync.
                   id.hasPrefix("tt") || id.hasPrefix("tmdb") else { continue }
             let type = (item["type"] as? String) == "series" ? "series" : "movie"
-            await CoreBridge.shared.addCatalogItemToAccount(id: id, type: type, stampIntent: false)
+            await CoreBridge.shared.addCatalogItemToAccount(
+                id: id,
+                type: type,
+                stampIntent: false,
+                credentialStamp: credentialStamp
+            )
+            guard credentialAuthority.isCurrent(credentialStamp) else { break }
             recovered += 1
         }
         if recovered > 0 {
@@ -1691,10 +1967,12 @@ final class VortXSyncManager: ObservableObject {
     /// are handled by vortxSummary's read-side guard; this just forces a push so the snapshot lands.
     func snapshotOwnedFromEngine() async {
         guard isSignedIn else { return }
+        let credentialStamp = credentialAuthority.commitStamp()
         guard !CoreBridge.shared.addons.isEmpty else { return }   // never-zero: nothing to anchor
         // Confirm the account doc is reachable before pushing (a .failed pull means a degraded network:
         // syncUp's own guard would already abort, but checking here avoids a wasted makeBackup).
-        if case .failed = await pullSyncDocResult() { return }
+        if case .failed = await pullSyncDocResult(credentialStamp: credentialStamp) { return }
+        guard credentialAuthority.isCurrent(credentialStamp) else { return }
         await syncUp()   // vortxSummary unions the engine descriptors into doc.vortx.addons + sets addonsOwnedAt
     }
 
@@ -1713,20 +1991,52 @@ final class VortXSyncManager: ObservableObject {
     func importOwnerLibraryFromStremioOnce(stremioToken: String) async {
         guard !stremioToken.isEmpty else { return }
         guard isSignedIn else { return }                                             // need a VortX account to import INTO
-        guard !ProfileSync.libraryImportedFromStremio(authKey: stremioToken) else { return }   // already migrated
+        guard let slot = credentialAuthority.currentStremioSlotStamp,
+              credentialAuthority.isCurrent(slot) else { return }
+        let operation = credentialAuthority.beginOperation(.profileSync)
+        let credentialStamp = credentialAuthority.commitStamp(
+            stremioSlot: slot,
+            operation: operation
+        )
+        guard !ProfileSync.libraryImportedFromStremio(
+            authKey: stremioToken,
+            scope: credentialStamp.scope.scope
+        ) else { return }   // already migrated
         // Make the engine load its account library into the readable `library` field so `vortxSummary` captures
         // the FULL set (the engine persists its bucket locally, so this reflects the Stremio-pulled library).
         await CoreBridge.shared.loadLibraryAndAwait()
+        guard credentialAuthority.isCurrent(credentialStamp) else { return }
         // Require the engine to have POSITIVELY reported a library (`library != nil`): a nil library is "still
         // loading / unknown", not "empty", so we never confirm the import against an unknown state. Retry next launch.
         guard CoreBridge.shared.library != nil else { return }
         // Confirm the VortX account doc is reachable (a `.failed`/`.empty` pull means a degraded network: retry
         // next launch rather than mark imported while unreachable), then push the FLOOR union.
-        guard case .doc = await pullSyncDocResult() else { return }
-        guard await syncUp() else { return }   // push failed: do NOT record the import
+        guard case .doc = await pullSyncDocResult(credentialStamp: credentialStamp) else { return }
+        guard credentialAuthority.isCurrent(credentialStamp) else { return }
+        guard await syncUp(requiredCredentialStamp: credentialStamp) else { return }   // push failed: do NOT record the import
+        guard credentialAuthority.isCurrent(credentialStamp) else { return }
+        // Re-read the document after the accepted push and bind its exact ciphertext/version to the completion.
+        // The import flag is a credential mutation: it must never be stamped from reachability alone or from a
+        // document that belonged to the pre-push owner/slot.
+        guard let documentContext = await accountDocCredentialStamp(),
+              documentContext.scope == credentialStamp.scope,
+              documentContext.stremioSlot == credentialStamp.stremioSlot,
+              let document = documentContext.document else { return }
+        let completionStamp = CredentialCommitStamp(
+            scope: credentialStamp.scope,
+            stremioSlot: credentialStamp.stremioSlot,
+            document: document,
+            operation: credentialStamp.operation
+        )
         // The VortX copy is confirmed on the server. Record it so the next launch can stop loading the Stremio
         // token. The Keychain token is left intact (opt-in reconnect / two-way sync).
-        ProfileSync.markLibraryImportedFromStremio(authKey: stremioToken)
+        guard credentialAuthority.commitIfCurrent(completionStamp, {
+            ProfileSync.markLibraryImportedFromStremio(
+                authKey: stremioToken,
+                scope: completionStamp.scope.scope
+            )
+            return true
+        }) == true else { return }
         DiagnosticsLog.log("sync", "imported the Stremio-owned library into the VortX account (one-time); the engine can now run local")
     }
 
@@ -1739,13 +2049,24 @@ final class VortXSyncManager: ObservableObject {
         return 0
     }
 
-    /// True when the VortX account doc is currently pullable (a decryptable `.doc`). Used as a pre-flight gate
-    /// before the post-import engine Logout so we NEVER unload the engine's Stremio session (which resets the
-    /// engine profile, wiping its local library) unless we can immediately rebuild the owner library from the
-    /// account doc this launch. On an unreachable launch we keep the session and retry next launch: no empty UI.
-    func accountDocReachable() async -> Bool {
-        if case .doc = await pullSyncDocResult() { return true }
-        return false
+    /// Capture immutable authority for the destructive post-import Stremio logout. The returned stamp binds
+    /// the VortX owner generation, active Stremio token slot, and the exact pulled document ciphertext/version.
+    /// Callers must commit the logout and token clear through this stamp in one MainActor turn.
+    func accountDocCredentialStamp() async -> CredentialCommitStamp? {
+        guard let startingStamp = credentialAuthority.currentContextStamp() else { return nil }
+        switch await pullDocVersionedRetrying(credentialStamp: startingStamp) {
+        case .doc(_, let version, let ciphertext):
+            guard credentialAuthority.isCurrent(startingStamp) else { return nil }
+            let document = credentialAuthority.observePulledDocument(
+                ciphertext: ciphertext,
+                version: version,
+                stremioSlot: startingStamp.stremioSlot
+            )
+            let stamp = CredentialCommitStamp(document: document)
+            return credentialAuthority.isCurrent(stamp) ? stamp : nil
+        case .empty, .failed:
+            return nil
+        }
     }
 
     /// Wave 4: refresh the local owner-resume cache (`OwnerResumeStore`) from a pulled doc's owner library.
@@ -1822,7 +2143,10 @@ final class VortXSyncManager: ObservableObject {
     /// pushes in CoreBridge, the in-app add-on reorder, "Sync now" once rosterConflictWithAccount reports no
     /// conflict), so on a reinstall this restores first and then pushes, which is the intended order. The
     /// deliberate "Keep this device" button calls keepThisDeviceOverridingAccount() instead.
-    @discardableResult func pushThisDevice() async -> Bool { await syncUp() }
+    @discardableResult
+    func pushThisDevice(requiredCredentialStamp: CredentialCommitStamp? = nil) async -> Bool {
+        await syncUp(requiredCredentialStamp: requiredCredentialStamp)
+    }
 
     /// The user saw the three-way conflict prompt (shown only after accountHasSyncData() positively READ the
     /// account's doc and reported .hasData) and explicitly chose to overwrite the account with this device.
@@ -1887,12 +2211,17 @@ final class VortXSyncManager: ObservableObject {
     /// of the account is not stuck at whatever sign-in returned (Bug 1).
     func refreshAccount() async {
         guard isSignedIn, var a = account else { return }
-        let (code, json) = await request("GET", "/v1/auth/me", auth: true)
+        let credentialStamp = credentialAuthority.commitStamp()
+        let (code, json) = await request(
+            "GET", "/v1/auth/me", auth: true, credentialStamp: credentialStamp
+        )
         guard code == 200, let acct = json?["account"] as? [String: Any] else { return }
-        a.username = acct["username"] as? String ?? a.username
-        a.twoFactorEnabled = acct["twoFactorEnabled"] as? Bool ?? a.twoFactorEnabled
-        account = a
-        persist()
+        _ = credentialAuthority.commitIfCurrent(credentialStamp) {
+            a.username = acct["username"] as? String ?? a.username
+            a.twoFactorEnabled = acct["twoFactorEnabled"] as? Bool ?? a.twoFactorEnabled
+            account = a
+            persist()
+        }
     }
 
     // MARK: - VortX-account QR sign-in (device pairing)
@@ -1919,24 +2248,35 @@ final class VortXSyncManager: ObservableObject {
         let code: String
         let devicePublicKey: String
         let ephemeral: Curve25519.KeyAgreement.PrivateKey
+        let credentialOperation: CredentialOperationStamp
     }
 
     enum QrJoinResult: Equatable { case pending, expired, failed, signedIn(email: String) }
 
     /// JOINER (TV): open a pairing. Returns the session to poll, or nil on a transport failure.
     func qrStart() async -> QrJoinSession? {
+        let operation = credentialAuthority.beginOperation(.vortxQR)
         let eph = PairingCrypto.newEphemeral()
         let pub = eph.publicKeyBase64URL
         let (code, json) = await request("POST", "/v1/qr/start", body: ["devicePublicKey": pub])
+        guard credentialAuthority.isCurrent(operation) else { return nil }
         guard code == 200, let id = json?["pairingID"] as? String, let human = json?["code"] as? String else { return nil }
-        return QrJoinSession(pairingID: id, code: human, devicePublicKey: pub, ephemeral: eph.privateKey)
+        return QrJoinSession(
+            pairingID: id,
+            code: human,
+            devicePublicKey: pub,
+            ephemeral: eph.privateKey,
+            credentialOperation: operation
+        )
     }
 
     /// JOINER (TV): poll once. On approval, unwrap the data key, fetch the account via /me with the freshly
     /// issued token, and adopt. Security: the token is DISCARDED (never adopted) if the unwrap fails, so a
     /// session with no decryptable data key can never leave a half-signed-in device.
     func qrPoll(_ session: QrJoinSession) async -> QrJoinResult {
+        guard credentialAuthority.isCurrent(session.credentialOperation) else { return .failed }
         let (code, json) = await request("GET", "/v1/qr/status?id=\(session.pairingID)")
+        guard credentialAuthority.isCurrent(session.credentialOperation) else { return .failed }
         if code == 404 || code == 410 { return .expired }
         guard code == 200 else { return .pending }
         if json?["pending"] as? Bool == true { return .pending }
@@ -1948,9 +2288,19 @@ final class VortXSyncManager: ObservableObject {
               let dk = PairingCrypto.unwrapDataKey(wrapped: wrapped, holderPublicKey: claim, using: session.ephemeral)
         else { return .failed }
         // Fetch the account this session belongs to, authing with the freshly issued token (not yet adopted).
-        let (mc, mj) = await request("GET", "/v1/auth/me", bearer: token)
+        let (mc, mj) = await request(
+            "GET",
+            "/v1/auth/me",
+            bearer: token,
+            credentialStamp: CredentialCommitStamp(operation: session.credentialOperation)
+        )
         guard mc == 200, let acct = mj?["account"] as? [String: Any] else { return .failed }
-        adopt(token: token, account: acct, dataKey: dk)
+        guard adopt(
+            token: token,
+            account: acct,
+            dataKey: dk,
+            operation: session.credentialOperation
+        ) else { return .failed }
         return .signedIn(email: acct["email"] as? String ?? "")
     }
 
@@ -1959,12 +2309,14 @@ final class VortXSyncManager: ObservableObject {
     /// false if we are not signed in (no data key), the wrap fails, or the relay rejects it.
     func qrApprove(code: String, devicePublicKey: String) async -> Bool {
         guard let dataKey else { return false }
+        let credentialStamp = credentialAuthority.commitStamp()
         guard let (claim, wrapped) = PairingCrypto.wrapDataKey(dataKey, toJoinerPublicKey: devicePublicKey),
               let envData = try? JSONSerialization.data(withJSONObject: ["claim": claim, "wrapped": wrapped]),
               let envelope = String(data: envData, encoding: .utf8) else { return false }
         let (c, _) = await request("POST", "/v1/qr/authorize",
             body: ["code": code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(), "wrappedPayload": envelope],
-            auth: true)
+            auth: true,
+            credentialStamp: credentialStamp)
         return c == 200
     }
 

@@ -360,38 +360,41 @@ final class BatchDownloadCoordinator: ObservableObject {
                 season >= 0 && episode >= 0 ? DebridEpisode(season: season, episode: episode) : nil
             }
         }
-        let resolved: URL?
-        if best.url == nil, ep == nil {
-            resolved = nil
-        } else {
-            resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: best, episode: ep)
+        func queueResolved(_ resolved: URL?) -> Outcome {
+            guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
+                isUsenet: best.isUsenet, resolvedURL: resolved,
+                fallbackURL: best.playableURL(isEpisode: true)
+            ) else { return .noSource }
+            if resolved == nil, best.isTorrent { _ = prepareTorrentStream(best) }
+            let pm = PlaybackMeta(
+                libraryId: job.seriesId, videoId: job.video.id, type: "series",
+                name: job.seriesName, poster: job.video.thumbnail ?? job.fallbackPoster,
+                season: job.video.season, episode: job.video.episode
+            )
+            let record = DownloadManager.shared.download(
+                stream: best, meta: pm, resolvedURL: url,
+                sourceName: best.name, qualityText: StreamRanking.signature(best)
+            )
+            if DownloadStore.shared.record(id: record.id)?.state == .failed { return .noSource }
+            let candidates = StreamRanking.rankedCandidates(
+                groups, continuity: job.continuity, pin: job.pin,
+                debridCachedHashes: job.cachedHashes
+            )
+            if let alternate = candidates.first(where: { !sameSource($0, best) }) {
+                retryPlans[record.id] = RetryPlan(alternate: alternate, pm: pm, episode: ep)
+            }
+            return .queued
         }
+        if best.url == nil, ep == nil { return queueResolved(nil) }
+        let batchJobResult = await DebridCoordinator.shared
+            .resolvedPlaybackURLVersioned(for: best, episode: ep)
         if Task.isCancelled { return .cancelled }
-        guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
-            isUsenet: best.isUsenet, resolvedURL: resolved,
-            fallbackURL: best.playableURL(isEpisode: true)
+        var outcome: Outcome = .noSource
+        guard DebridCredentialSnapshotStore.shared.compareAndPublish(
+            revision: batchJobResult.revision,
+            mutation: { outcome = queueResolved(batchJobResult.value) }
         ) else { return .noSource }
-        // Raw torrent: the loopback server must be told to /create it first (#21). Fire-and-forget:
-        // the prime's retry loop is self-terminating (~15s max), same as the CW-resume prime.
-        if resolved == nil, best.isTorrent { _ = prepareTorrentStream(best) }
-        let pm = PlaybackMeta(libraryId: job.seriesId, videoId: job.video.id, type: "series",
-                              name: job.seriesName, poster: job.video.thumbnail ?? job.fallbackPoster,
-                              season: job.video.season, episode: job.video.episode)
-        let record = DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: url,
-                                                     sourceName: best.name,
-                                                     qualityText: StreamRanking.signature(best))
-        // download() can refuse synchronously (an HLS source on a device that can't save HLS, a storage
-        // shortfall): that episode was NOT queued, so report it as skipped, not as a success.
-        if DownloadStore.shared.record(id: record.id)?.state == .failed { return .noSource }
-        // #119 remainder: arm ONE auto-swap to the next-best DISTINCT source if this download later fails its
-        // byte transfer. Same ranking the batch just used (rankedCandidates mirrors best()); a nil alternate
-        // (nothing else playable) arms no plan, so that episode simply fails honestly as before.
-        let candidates = StreamRanking.rankedCandidates(groups, continuity: job.continuity, pin: job.pin,
-                                                        debridCachedHashes: job.cachedHashes)
-        if let alternate = candidates.first(where: { !sameSource($0, best) }) {
-            retryPlans[record.id] = RetryPlan(alternate: alternate, pm: pm, episode: ep)
-        }
-        return .queued
+        return outcome
     }
 
     private func sameSource(_ lhs: CoreStream, _ rhs: CoreStream) -> Bool {
@@ -430,31 +433,36 @@ final class BatchDownloadCoordinator: ObservableObject {
         guard retryPlans.removeValue(forKey: id) != nil else { return }   // already swapped: one swap per episode
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let resolved: URL?
             if plan.alternate.url == nil, plan.episode == nil {
-                resolved = nil
+                queueRetrySwap(resolved: nil, failedRecordID: id, plan: plan)
             } else {
-                resolved = await DebridCoordinator.shared.resolvedPlaybackURL(
+                let batchRetryResult = await DebridCoordinator.shared.resolvedPlaybackURLVersioned(
                     for: plan.alternate, episode: plan.episode
                 )
+                guard DebridCredentialSnapshotStore.shared.compareAndPublish(
+                    revision: batchRetryResult.revision,
+                    mutation: {
+                        queueRetrySwap(resolved: batchRetryResult.value, failedRecordID: id, plan: plan)
+                    }
+                ) else { return }
             }
-            if resolved == nil, plan.alternate.isTorrent { _ = prepareTorrentStream(plan.alternate) }
-            guard let fallback = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
-                isUsenet: plan.alternate.isUsenet, resolvedURL: resolved,
-                fallbackURL: plan.alternate.playableURL(isEpisode: true)
-            ) else { return }   // no URL: keep the failed row, do not orphan the episode
-            let record = DownloadManager.shared.download(stream: plan.alternate, meta: plan.pm,
-                                                         resolvedURL: fallback,
-                                                         sourceName: plan.alternate.name,
-                                                         qualityText: StreamRanking.signature(plan.alternate))
-            // Replacement is queued: now drop the failed download via the canonical DownloadManager path
-            // (cancels the live task, clears taskForRecord / resumeData / cannotCreateFileRetries / the HLS
-            // asset-task map, then removes the record + file). DownloadStore.remove would leak that bookkeeping.
-            DownloadManager.shared.cancel(id: id)
-            // Honest per-episode note (shown in the DownloadsView row) so the swap is never silent.
-            DownloadStore.shared.update(id: record.id) {
-                $0.retryNote = String(localized: "Retried with next-best source (first source failed)")
-            }
+        }
+    }
+
+    private func queueRetrySwap(resolved: URL?, failedRecordID id: UUID, plan: RetryPlan) {
+        if resolved == nil, plan.alternate.isTorrent { _ = prepareTorrentStream(plan.alternate) }
+        guard let fallback = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
+            isUsenet: plan.alternate.isUsenet, resolvedURL: resolved,
+            fallbackURL: plan.alternate.playableURL(isEpisode: true)
+        ) else { return }
+        let record = DownloadManager.shared.download(
+            stream: plan.alternate, meta: plan.pm, resolvedURL: fallback,
+            sourceName: plan.alternate.name,
+            qualityText: StreamRanking.signature(plan.alternate)
+        )
+        DownloadManager.shared.cancel(id: id)
+        DownloadStore.shared.update(id: record.id) {
+            $0.retryNote = String(localized: "Retried with next-best source (first source failed)")
         }
     }
 

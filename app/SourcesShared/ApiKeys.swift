@@ -7,31 +7,54 @@ import SwiftUI
 final class ApiKeys: ObservableObject {
     static let shared = ApiKeys()
 
-    private let tmdbAccount = "vortx.apikey.tmdb"
-    private let mdblistAccount = "vortx.apikey.mdblist"
-    private let fanartAccount = "vortx.apikey.fanart"
-    private let skipdbAccount = "vortx.apikey.skipdb"
-    private let customSkipURLAccount = "vortx.skip.customurl"
-    private let customSkipKeyAccount = "vortx.apikey.customskip"
+    private static let tmdbAccount = "vortx.apikey.tmdb"
+    private static let mdblistAccount = "vortx.apikey.mdblist"
+    private static let fanartAccount = "vortx.apikey.fanart"
+    private static let skipdbAccount = "vortx.apikey.skipdb"
+    private static let customSkipURLAccount = "vortx.skip.customurl"
+    private static let customSkipKeyAccount = "vortx.apikey.customskip"
+    private static let migrationGroup = "api-keys"
+    private var isReloadingScope = false
 
-    @Published var tmdb: String { didSet { Keychain.set(tmdb.isEmpty ? nil : tmdb, for: tmdbAccount); VortXSyncManager.shared.requestSyncSoon() } }
-    @Published var mdblist: String { didSet { Keychain.set(mdblist.isEmpty ? nil : mdblist, for: mdblistAccount); VortXSyncManager.shared.requestSyncSoon() } }
-    @Published var fanart: String { didSet { Keychain.set(fanart.isEmpty ? nil : fanart, for: fanartAccount); VortXSyncManager.shared.requestSyncSoon() } }
-    @Published var skipdb: String { didSet { Keychain.set(skipdb.isEmpty ? nil : skipdb, for: skipdbAccount); VortXSyncManager.shared.requestSyncSoon() } }
+    @Published var tmdb: String { didSet { persist(tmdb, for: Self.tmdbAccount) } }
+    @Published var mdblist: String { didSet { persist(mdblist, for: Self.mdblistAccount) } }
+    @Published var fanart: String { didSet { persist(fanart, for: Self.fanartAccount) } }
+    @Published var skipdb: String { didSet { persist(skipdb, for: Self.skipdbAccount) } }
 
     /// An ADDITIONAL user-configured SkipDB-compatible provider: the base URL of a self-hosted mirror
     /// (e.g. https://my-mirror.example), plus an optional API key for it. When set, a submit fans out to
     /// it alongside skip.vortx.tv and skipdb.tv, and reads query it too. Both stay in the Keychain.
-    @Published var customSkipURL: String { didSet { Keychain.set(customSkipURL.isEmpty ? nil : customSkipURL, for: customSkipURLAccount); VortXSyncManager.shared.requestSyncSoon() } }
-    @Published var customSkipKey: String { didSet { Keychain.set(customSkipKey.isEmpty ? nil : customSkipKey, for: customSkipKeyAccount); VortXSyncManager.shared.requestSyncSoon() } }
+    @Published var customSkipURL: String { didSet { persist(customSkipURL, for: Self.customSkipURLAccount) } }
+    @Published var customSkipKey: String { didSet { persist(customSkipKey, for: Self.customSkipKeyAccount) } }
 
     private init() {
-        tmdb = Keychain.string(tmdbAccount) ?? ""
-        mdblist = Keychain.string(mdblistAccount) ?? ""
-        fanart = Keychain.string(fanartAccount) ?? ""
-        skipdb = Keychain.string(skipdbAccount) ?? ""
-        customSkipURL = Keychain.string(customSkipURLAccount) ?? ""
-        customSkipKey = Keychain.string(customSkipKeyAccount) ?? ""
+        tmdb = Self.read(Self.tmdbAccount) ?? ""
+        mdblist = Self.read(Self.mdblistAccount) ?? ""
+        fanart = Self.read(Self.fanartAccount) ?? ""
+        skipdb = Self.read(Self.skipdbAccount) ?? ""
+        customSkipURL = Self.read(Self.customSkipURLAccount) ?? ""
+        customSkipKey = Self.read(Self.customSkipKeyAccount) ?? ""
+    }
+
+    func reloadForCredentialScope() {
+        isReloadingScope = true
+        tmdb = Self.read(Self.tmdbAccount) ?? ""
+        mdblist = Self.read(Self.mdblistAccount) ?? ""
+        fanart = Self.read(Self.fanartAccount) ?? ""
+        skipdb = Self.read(Self.skipdbAccount) ?? ""
+        customSkipURL = Self.read(Self.customSkipURLAccount) ?? ""
+        customSkipKey = Self.read(Self.customSkipKeyAccount) ?? ""
+        isReloadingScope = false
+    }
+
+    private func persist(_ value: String, for account: String) {
+        guard !isReloadingScope else { return }
+        CredentialScopedKeychain.set(value.isEmpty ? nil : value, for: account)
+        VortXSyncManager.shared.requestSyncSoon()
+    }
+
+    nonisolated private static func read(_ account: String) -> String? {
+        CredentialScopedKeychain.string(account, migrationGroup: migrationGroup)
     }
 
     var hasTMDB: Bool { !tmdb.isEmpty }
@@ -42,7 +65,7 @@ final class ApiKeys: ObservableObject {
 
     /// Read the keys off the main actor (for use inside async network code).
     nonisolated static func tmdbKey() -> String? {
-        let k = Keychain.string("vortx.apikey.tmdb"); return (k?.isEmpty == false) ? k : nil
+        let k = read(tmdbAccount); return (k?.isEmpty == false) ? k : nil
     }
 
     /// VortX's own TMDB read key, used ONLY as the last-resort fallback when the keyless edge
@@ -55,20 +78,20 @@ final class ApiKeys: ObservableObject {
     /// (a real user key -> TMDB direct; no user key -> the keyless edge, which injects its own key).
     nonisolated static func effectiveTMDBKey() -> String { tmdbKey() ?? bundledTMDBKey }
     nonisolated static func mdblistKey() -> String? {
-        let k = Keychain.string("vortx.apikey.mdblist"); return (k?.isEmpty == false) ? k : nil
+        let k = read(mdblistAccount); return (k?.isEmpty == false) ? k : nil
     }
     nonisolated static func fanartKey() -> String? {
-        let k = Keychain.string("vortx.apikey.fanart"); return (k?.isEmpty == false) ? k : nil
+        let k = read(fanartAccount); return (k?.isEmpty == false) ? k : nil
     }
     nonisolated static func skipDBKey() -> String? {
-        let k = Keychain.string("vortx.apikey.skipdb"); return (k?.isEmpty == false) ? k : nil
+        let k = read(skipdbAccount); return (k?.isEmpty == false) ? k : nil
     }
     /// Base URL of the user's optional custom SkipDB-compatible provider (nil when unset).
     nonisolated static func customSkipURL() -> String? {
-        let k = Keychain.string("vortx.skip.customurl"); return (k?.isEmpty == false) ? k : nil
+        let k = read(customSkipURLAccount); return (k?.isEmpty == false) ? k : nil
     }
     /// Optional API key for the custom provider (nil when unset; some mirrors are keyless).
     nonisolated static func customSkipKey() -> String? {
-        let k = Keychain.string("vortx.apikey.customskip"); return (k?.isEmpty == false) ? k : nil
+        let k = read(customSkipKeyAccount); return (k?.isEmpty == false) ? k : nil
     }
 }
