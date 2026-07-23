@@ -1,9 +1,80 @@
 import SwiftUI
 
+// CREDENTIAL_OWNER_IDENTITY_BEGIN
+/// Validates the identity used to scope credentials and account-local sync state.
+///
+/// `deviceOwnerID` is deliberately valid only through `explicitOwnerID`: it is the real local scope used
+/// while signed out. A remote account response may never claim that reserved scope, and an absent account id
+/// never becomes an empty or local namespace by fallback.
+enum CredentialOwnerIdentity {
+    static let deviceOwnerID = "local"
+    private static let maximumUTF8Count = 512
+
+    static func explicitOwnerID(_ raw: String?) -> String? {
+        guard let raw,
+              !raw.isEmpty,
+              raw.utf8.count <= maximumUTF8Count,
+              raw == raw.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else { return nil }
+        return raw
+    }
+
+    static func remoteAccountID(_ raw: String?) -> String? {
+        guard let owner = explicitOwnerID(raw), owner != deviceOwnerID else { return nil }
+        return owner
+    }
+
+    static func accountNamespace(prefix: String, accountID: String?) -> String? {
+        guard let owner = remoteAccountID(accountID) else { return nil }
+        return prefix + owner
+    }
+}
+// CREDENTIAL_OWNER_IDENTITY_END
+
+// CREDENTIAL_RELOAD_FENCE_BEGIN
+/// One serialized application point for owner-bound coordinator state.
+///
+/// Generations are issued synchronously by the credential store. Tasks may arrive here out of order, so a
+/// request older than the newest observed generation is discarded. If generation A is already applying when B
+/// arrives, actor reentrancy only replaces `pending`; B cannot apply concurrently and is drained immediately
+/// after A. Thus a late A never applies, and an in-flight A can never become the final coordinator state after B.
+actor LatestCredentialReload<Value: Sendable> {
+    private struct Request: Sendable {
+        let generation: UInt64
+        let value: Value
+        let apply: @Sendable (Value) async -> Void
+    }
+
+    private var newestGeneration: UInt64 = 0
+    private var pending: Request?
+    private var isDraining = false
+
+    func submit(
+        generation: UInt64,
+        value: Value,
+        apply: @escaping @Sendable (Value) async -> Void
+    ) async {
+        guard generation > newestGeneration else { return }
+        newestGeneration = generation
+        pending = Request(generation: generation, value: value, apply: apply)
+        guard !isDraining else { return }
+
+        isDraining = true
+        defer { isDraining = false }
+        while let candidate = pending {
+            pending = nil
+            guard candidate.generation == newestGeneration else { continue }
+            await candidate.apply(candidate.value)
+        }
+    }
+}
+// CREDENTIAL_RELOAD_FENCE_END
+
 /// A debrid service VortX can hold an API key for. A debrid key turns cached torrents into instant
 /// direct links; the roadmap's "in-app debrid" means the user pastes the key ONCE here, with no separate
 /// add-on configuration site.
-enum DebridService: String, CaseIterable, Identifiable {
+enum DebridService: String, CaseIterable, Identifiable, Sendable {
     case realDebrid, allDebrid, premiumize, torBox
 
     var id: String { rawValue }
@@ -53,11 +124,17 @@ final class DebridKeys: ObservableObject {
 
     /// Owner scope for a device with nobody signed in. Its keys are real and usable (debrid does not require a
     /// VortX account), they simply belong to the signed-out device rather than to any account.
-    static let signedOutOwner = "local"
+    static let signedOutOwner = CredentialOwnerIdentity.deviceOwnerID
 
     /// The account these in-memory keys belong to. Every Keychain read and write goes through it, so a stale
     /// value cannot leak one account's credentials to another.
     private(set) var owner: String = DebridKeys.signedOutOwner
+
+    /// Resolver reload requests are issued from the same serialized UI/sync writer as `keys`. The generation
+    /// records that mutation order before an unstructured Task can be scheduled out of order; the actor then
+    /// drops any late stale task and serializes an already-running predecessor ahead of the newest snapshot.
+    private let reloadFence = LatestCredentialReload<[DebridService: String]>()
+    private var reloadGeneration: UInt64 = 0
 
     /// Legacy adoption happens exactly once, at the FIRST binding, and never again. Deliberately not at init:
     /// at init the signed-in account is not yet restored, so adopting then would file an existing user's keys
@@ -76,14 +153,15 @@ final class DebridKeys: ObservableObject {
     /// Point the store at an account (or at `signedOutOwner`). Call on sign-in, sign-out and account switch.
     /// Republishes and rebuilds the resolvers, so a switched-in account never keeps the previous one's keys
     /// in memory either.
-    func bind(owner newOwner: String) {
-        let resolved = newOwner.isEmpty ? Self.signedOutOwner : newOwner
-        guard resolved != owner || !hasConsideredLegacy else { return }
+    @discardableResult
+    func bind(owner newOwner: String) -> Bool {
+        guard let resolved = CredentialOwnerIdentity.explicitOwnerID(newOwner) else { return false }
+        guard resolved != owner || !hasConsideredLegacy else { return true }
         owner = resolved
         adoptLegacyIfNeeded()
         loadScope()
-        let snapshot = self.snapshot
-        Task { await DebridCoordinator.shared.reload(keys: snapshot) }
+        scheduleResolverReload(snapshot)
+        return true
     }
 
     /// Move the pre-scoping global entries into the CURRENT owner's scope, once per process, and only where
@@ -149,8 +227,7 @@ final class DebridKeys: ObservableObject {
         // Capture the fresh key snapshot HERE, synchronously on this writer's context (serialized with the
         // `keys` mutation just above), then hand the immutable value to the actor: the actor never reads the
         // `@Published` dictionary itself (that would race the main-actor writers).
-        let snapshot = self.snapshot
-        Task { await DebridCoordinator.shared.reload(keys: snapshot) }
+        scheduleResolverReload(snapshot)
         // Nudge the E2E sync SEPARATELY, not chained behind the actor hop. Keeping it a distinct main-actor
         // task preserves the old enqueue timing: on the sync-apply path the nudge lands while
         // `withRemoteApplySuppressed` is still active, so `requestSyncSoon`'s guard swallows the self-echo.
@@ -171,6 +248,23 @@ final class DebridKeys: ObservableObject {
     /// The first configured service + key, for the single-debrid resolve path the resolver layer uses.
     var primary: (service: DebridService, key: String)? {
         configuredServices.first.map { ($0, key(for: $0)) }
+    }
+
+    /// Rebuild from the current owner-bound snapshot through the same ordered fence as every mutation.
+    /// Callers must not invoke the coordinator directly or they can bypass owner-switch ordering.
+    func reloadResolvers() {
+        scheduleResolverReload(snapshot)
+    }
+
+    private func scheduleResolverReload(_ snapshot: [DebridService: String]) {
+        reloadGeneration &+= 1
+        let generation = reloadGeneration
+        let fence = reloadFence
+        Task {
+            await fence.submit(generation: generation, value: snapshot) { keys in
+                await DebridCoordinator.shared.reload(keys: keys)
+            }
+        }
     }
 }
 
