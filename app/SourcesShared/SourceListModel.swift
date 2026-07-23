@@ -145,6 +145,12 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             singularity.$streams.map { _ in () }.eraseToAnyPublisher(),    // Singularity pool results replaced
             mediaServers.$groups.map { _ in () }.eraseToAnyPublisher(),    // media-server direct-play groups replaced
             debridCache.$cachedHashes.map { _ in () }.eraseToAnyPublisher(), // cache awareness re-ranks
+            // Add-on PRIORITY order changed (H2): a reorder (local, remote pull, or account switch) bumps
+            // AddonOrderObserver.revision. Without this the open source list never re-snapshots on a reorder,
+            // because none of the epochs / hashed inputs above move, so its published groups + best keep the
+            // OLD add-on order. The applied order is also folded into the rebuild signature below, so the
+            // rebuild is not skipped as a no-op when only the order changed.
+            AddonOrderObserver.shared.$revision.map { _ in () }.eraseToAnyPublisher(),
             trigger.eraseToAnyPublisher(),                                 // context change / manual nudge
         ]
         Publishers.MergeMany(events)
@@ -218,6 +224,11 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         hasher.combine(ctx.disabledAddons)
         hasher.combine(cachedHashes)
         hasher.combine(tombstones)
+        // Add-on PRIORITY order (H2): the raw stream groups are sorted by this at the CoreBridge seam
+        // (assembleStreamGroups), so a reorder with no other input change must still invalidate the published
+        // output. Folding the applied order in makes an order-only change a real signature change, so rebuild()
+        // re-snapshots (through core.streamGroups(), which re-applies the new order) instead of early-returning.
+        hasher.combine(VortXSyncManager.appliedAddonOrder)
         let signature = Signature(streamsEpoch: core.streamsEpoch,
                                   torboxEpoch: torbox.epoch,
                                   singularityEpoch: singularity.epoch,

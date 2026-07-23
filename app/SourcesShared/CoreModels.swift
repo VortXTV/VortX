@@ -410,6 +410,11 @@ struct CoreBoardRow: Identifiable {
     /// `LoadNextPage(engineIndex)` for its own horizontal infinite scroll (#95). Stable across page
     /// loads and board widening; `buildBoardRows` captures it before the display filter/sort.
     let engineIndex: Int
+    /// The source add-on's transport base, carried TYPED from the catalog's `request.base` at build time,
+    /// so the add-on-priority sort (the reorder) ranks a row by its real add-on identity instead of
+    /// reverse-parsing it back out of the composite `id` string ("base|type|id") at the first pipe. A URL
+    /// never contains a pipe, but a typed carrier removes that fragility outright.
+    let addonBase: String
 }
 
 /// The content types Stremio treats as Live TV (the same set tvOS uses for its live-tuned player
@@ -468,12 +473,15 @@ struct CoreMetaDetails: Decodable {
         guard let first = ready.first else { return nil }
         let order = VortXSyncManager.appliedAddonOrder
         guard !order.isEmpty else { return first.meta }   // no user order -> engine order, unchanged
-        var rank: [String: Int] = [:]
-        for (i, url) in order.enumerated() { rank[url] = i }
+        // ONE identity + ONE dedup policy shared with the stream and catalog seams: the FIRST-occurrence rank
+        // map keyed by the shared QR-safe canonical identity (M2 + H3). Previously this built a LAST-occurrence
+        // map keyed by whole-string lowercasing, so a duplicated synced entry or a case-sensitive path could
+        // rank the detail meta differently from the list / board.
+        let rank = AddonPriorityOrder.rankMap(order)
         // Earliest applied-order add-on wins; add-ons not in the order sort AFTER the ordered ones and keep
         // engine order among themselves (a stable min: equal ranks fall back to the first ready seen).
         let best = ready.min { a, b in
-            switch (rank[AddonTombstones.normalize(a.base)], rank[AddonTombstones.normalize(b.base)]) {
+            switch (rank[AddonPriorityOrder.canonical(a.base)], rank[AddonPriorityOrder.canonical(b.base)]) {
             case let (x?, y?): return x < y
             case (_?, nil):    return true
             case (nil, _?):    return false

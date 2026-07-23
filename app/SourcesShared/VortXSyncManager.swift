@@ -173,18 +173,55 @@ final class VortXSyncManager: ObservableObject {
     /// converged priority order. Read by ownedAddons(from:) as the ordering spine when a pulled doc does not
     /// itself carry addonOrder, so a device that hydrates after (but not during) an order change still lands
     /// the converged order. Empty means "no shared order yet" (fall back to the descriptor spine).
-    private static let kAddonOrderKey = "vortx.sync.appliedAddonOrder"
+    /// Legacy PRE-account-scope global key (`vortx.sync.appliedAddonOrder`), kept only as a historical
+    /// reference. It is NO LONGER read or written: a single global order leaked across account transitions
+    /// (C0), so a switched-in account B could apply account A's order. The order is now ACCOUNT-SCOPED under
+    /// `kAddonOrderKeyPrefix + owner` (below). The orphaned legacy value is deliberately NOT migrated into any
+    /// account scope (that would REINTRODUCE the leak); each account re-derives its own order from its own
+    /// `doc.addonOrder` sync on the next pull, and a signed-out device from its own reorder.
+    private static let kAddonOrderKeyPrefix = "vortx.sync.appliedAddonOrder."
+    /// Owner-identity cache for the nonisolated `appliedAddonOrder` static. `account` is a `@MainActor`
+    /// instance property, but `appliedAddonOrder` must stay `nonisolated` (read off-main by
+    /// `CoreMetaDetails.meta`); this thread-safe `UserDefaults` cache carries the current owner id so the
+    /// nonisolated accessor can scope its key without an actor hop. Rebound on EVERY account transition
+    /// (restore / sign-in / adopt / sign-out) via `bindAddonOrderOwner`, alongside `DebridKeys.bind(owner:)`,
+    /// which is the same per-account isolation model the credential lane uses.
+    private static let kAddonOrderOwnerKey = "vortx.sync.appliedAddonOrder.owner"
+    /// The signed-out namespace: the logged-out device's own order lives under this owner.
+    static let signedOutAddonOrderOwner = ""
     /// Upper bound on the persisted order length. A real account has a few dozen add-ons; this only exists so a
     /// malicious/garbage synced `doc.addonOrder` can't balloon UserDefaults. Applied in the setter, which is the
     /// single chokepoint for both the in-app reorder and the syncDown apply.
     private static let maxAddonOrderEntries = 1024
+
+    /// Bind the account whose add-on order `appliedAddonOrder` reads/writes. Called at every account
+    /// transition (a mutation channel), so account A's order can never apply under account B: A's order lives
+    /// under A's owner id and B reads its own (initially empty) scope. On a real change of owner it also
+    /// republishes `addonOrderChangedNote` so live Home / source-list / add-on-list consumers re-sort to the
+    /// new account's order (or the empty signed-out order) instead of the prior account's. Nonisolated +
+    /// thread-safe (UserDefaults only), callable from the main-actor transition sites.
+    nonisolated static func bindAddonOrderOwner(_ ownerId: String?) {
+        let owner = ownerId ?? signedOutAddonOrderOwner
+        let prev = UserDefaults.standard.string(forKey: kAddonOrderOwnerKey) ?? signedOutAddonOrderOwner
+        UserDefaults.standard.set(owner, forKey: kAddonOrderOwnerKey)
+        guard owner != prev else { return }
+        DispatchQueue.main.async { NotificationCenter.default.post(name: addonOrderChangedNote, object: nil) }
+    }
+
+    /// The account-scoped UserDefaults key for the currently-bound owner.
+    private nonisolated static func addonOrderKey() -> String {
+        let owner = UserDefaults.standard.string(forKey: kAddonOrderOwnerKey) ?? signedOutAddonOrderOwner
+        return kAddonOrderKeyPrefix + owner
+    }
+
     /// `nonisolated`: it only touches thread-safe `UserDefaults` (and Sendable `let` backing constants), so
     /// nonisolated read sites like `CoreMetaDetails.meta` (the #144 detail-language pick, a plain Decodable
     /// evaluated off the main actor) can consult the shared order without an actor hop. All existing
-    /// main-actor callers keep working (nonisolated members are callable from any context).
+    /// main-actor callers keep working (nonisolated members are callable from any context). ACCOUNT-SCOPED:
+    /// the key is derived from the owner bound by `bindAddonOrderOwner`, so this never leaks across accounts.
     nonisolated static var appliedAddonOrder: [String] {
-        get { UserDefaults.standard.stringArray(forKey: kAddonOrderKey) ?? [] }
-        set { UserDefaults.standard.set(Array(newValue.prefix(maxAddonOrderEntries)), forKey: kAddonOrderKey) }
+        get { UserDefaults.standard.stringArray(forKey: addonOrderKey()) ?? [] }
+        set { UserDefaults.standard.set(Array(newValue.prefix(maxAddonOrderEntries)), forKey: addonOrderKey()) }
     }
     /// Posted (main thread) whenever the shared add-on order changes: an in-app Reorder drag or a remote
     /// pull that carried a newer order. Views showing the add-on list observe it to re-sort live, since
@@ -206,15 +243,35 @@ final class VortXSyncManager: ObservableObject {
     /// so the dashboard and the user's other devices converge, mirroring the dashboard's doc.addonOrder write.
     /// The immediate push avoids the debounce-starvation that delayed removals (see uninstallAddon).
     func applyInAppAddonOrder(_ transportUrls: [String]) {
-        let normalized = transportUrls.map { AddonTombstones.normalize($0) }
+        // Canonicalize with the ONE shared QR-safe identity rule (scheme/host case-folded, path/query
+        // preserved, fragment dropped): the read side (`AddonPriorityOrder`) canonicalizes the live add-on
+        // base with the same rule, so both sides agree and a case-sensitive path/query no longer collapses two
+        // add-ons to one rank (H3).
+        let normalized = transportUrls.map { AddonPriorityOrder.canonical($0) }
         guard normalized != Self.appliedAddonOrder else { return }
         Self.appliedAddonOrder = normalized
         // Refresh any live add-on list NOW: appliedAddonOrder is a plain UserDefaults static, not @Published,
         // so views showing the list have no other signal to re-run orderedByApplied on their current body.
         NotificationCenter.default.post(name: Self.addonOrderChangedNote, object: nil)
-        Task {
-            let ok = await pushThisDevice()
-            NSLog("[addon] in-app reorder pushed to sync (%d add-ons, ok=%@)", normalized.count, ok ? "yes" : "no")
+        // COALESCED push: the tvOS move-up / move-down screen calls this once PER nudge, so a user walking one
+        // add-on several rows would otherwise launch a burst of overlapping `pushThisDevice()` tasks (each a
+        // full seal + POST). Cancel any in-flight push and schedule ONE trailing push ~400 ms after the last
+        // nudge, so a burst converges to a single network write carrying the final order. The local
+        // appliedAddonOrder + note are applied synchronously above, so the UI is never delayed by the debounce.
+        scheduleAddonOrderPush(count: normalized.count)
+    }
+
+    /// Trailing-coalesced push of the applied add-on order. Replaces any pending push so only the LAST order
+    /// in a burst of nudges reaches the network.
+    private var addonOrderPushTask: Task<Void, Never>?
+    private static let addonOrderPushDebounceNanos: UInt64 = 400_000_000   // 400 ms trailing window
+    private func scheduleAddonOrderPush(count: Int) {
+        addonOrderPushTask?.cancel()
+        addonOrderPushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.addonOrderPushDebounceNanos)
+            guard !Task.isCancelled, let self else { return }
+            let ok = await self.pushThisDevice()
+            NSLog("[addon] in-app reorder pushed to sync (%d add-ons, ok=%@)", count, ok ? "yes" : "no")
         }
     }
     private var hasPendingPush = false  // a debounced syncUp is queued; don't pull over it
@@ -289,6 +346,10 @@ final class VortXSyncManager: ObservableObject {
         // session is the earliest moment the device's real owner is known, and it is also where the one-time
         // adoption of the old unscoped entries happens, so an existing user keeps their keys without a re-paste.
         DebridKeys.shared.bind(owner: p.account.id)
+        // Scope the add-on order to this account too (same per-account isolation model as the debrid keys),
+        // so the restored account reads its OWN order, never a prior account's (C0). Binds before syncDown so
+        // the pull's `doc.addonOrder` apply writes into this account's scope.
+        Self.bindAddonOrderOwner(p.account.id)
         reloadLastSyncStamp()   // show this account's persisted "last synced" immediately on relaunch
         // A Keychain-restored session (app relaunch / reinstall) sets isSignedIn WITHOUT going through
         // adopt(), so nothing would open the sync channel until the first scenePhase foreground transition.
@@ -312,11 +373,12 @@ final class VortXSyncManager: ObservableObject {
         // account on this device inheriting them, which is exactly what used to happen when these entries were
         // global and sign-out left them behind.
         DebridKeys.shared.bind(owner: DebridKeys.signedOutOwner)
-        // The shared add-on ORDER is a global static with no account context, so a switched-in account would
-        // otherwise inherit the previous account's order until its own pull lands. Clear it here so the next
-        // account starts from the descriptor spine and converges on its own doc.addonOrder. The per-account
-        // version and edits high-water marks are deliberately NOT reset (they are keyed by account id).
-        Self.appliedAddonOrder = []
+        // Rebind the add-on order to the SIGNED-OUT namespace. The order is now account-scoped (keyed by
+        // owner), so the previous account's order stays safe under its own key and can never apply to the
+        // signed-out device or a switched-in account (C0). This replaces the old blanket clear, which only
+        // masked the leak on a clean sign-out and left the window open on account adoption / a no-key remote
+        // doc. The per-account version and edits high-water marks stay untouched (they are keyed by account id).
+        Self.bindAddonOrderOwner(nil)
     }
 
     // MARK: - HTTP
@@ -353,6 +415,10 @@ final class VortXSyncManager: ObservableObject {
         // Rebind debrid credentials to the account that just signed in. Without this a switched-in account
         // would keep reading the previous owner's keys out of memory even though the Keychain is now scoped.
         DebridKeys.shared.bind(owner: self.account?.id ?? DebridKeys.signedOutOwner)
+        // Scope the add-on order to the account that just signed in, so its own order (not the previously
+        // signed-in / signed-out order) is the one that applies (C0). Binds before the first pull applies
+        // `doc.addonOrder`, and republishes so a live Home / source list re-sorts to this account's order.
+        Self.bindAddonOrderOwner(self.account?.id)
         reloadLastSyncStamp()   // a re-sign-in to a known account restores its persisted "last synced"
         persist()
         // A fresh sign-in is a foreground action, so open the real-time channel immediately (if the app
@@ -1080,19 +1146,23 @@ final class VortXSyncManager: ObservableObject {
         return doc
     }
 
-    /// The current add-on order this device holds, as normalized transportUrls in the engine's true
-    /// priority order (the same `rawAddonDescriptorsOrdered` spine `vortxSummary` uses). Removed add-ons
-    /// (tombstoned) are excluded so the shared order never re-lists a removed add-on. Normalized on the
-    /// same trim+lowercase as the tombstone + doc.addonOrder read side so cross-surface comparison holds.
+    /// The current add-on order this device holds, as canonical transportUrls in the engine's true priority
+    /// order (the same `rawAddonDescriptorsOrdered` spine `vortxSummary` uses). Removed add-ons (tombstoned)
+    /// are excluded so the shared order never re-lists a removed add-on. The emitted / compared identity is
+    /// the SHARED QR-safe `AddonPriorityOrder.canonical` (scheme/host case-folded, path/query preserved), the
+    /// exact rule the stored `appliedAddonOrder` and the `doc.addonOrder` read side (syncDown) use, so the
+    /// intersection below and the pushed order can never disagree with the applied order over path/query case
+    /// (H3). The TOMBSTONE check stays on `AddonTombstones.normalize` because that set is keyed by it.
     static func currentAddonOrder() -> [String] {
         let removed = AddonTombstones.all()
         var seen = Set<String>()
         var live: [String] = []
         for raw in CoreBridge.shared.rawAddonDescriptorsOrdered() {
             guard let url = raw["transportUrl"] as? String, !url.isEmpty else { continue }
-            let normalized = AddonTombstones.normalize(url)
-            guard !removed.contains(normalized), seen.insert(normalized).inserted else { continue }
-            live.append(normalized)
+            guard !removed.contains(AddonTombstones.normalize(url)) else { continue }   // removed-add-on identity
+            let canonical = AddonPriorityOrder.canonical(url)                            // order identity
+            guard seen.insert(canonical).inserted else { continue }
+            live.append(canonical)
         }
         // Prefer the user's shared order (in-app Reorder screen or the dashboard drag): take the applied
         // order intersected with the LIVE set (so an uninstalled/removed add-on drops out), then append any
@@ -1403,11 +1473,16 @@ final class VortXSyncManager: ObservableObject {
         // sync can never scramble the order. Reordering the ALREADY-hydrated live engine Vec needs a
         // CoreBridge action (out of scope here); the persisted order takes effect on the next hydrate.
         if let addonOrder = doc["addonOrder"] as? [String] {
-            let normalized = addonOrder.map { AddonTombstones.normalize($0) }
+            // Canonicalize with the SAME shared QR-safe identity rule the write side and the read side use, so
+            // a dashboard-authored order and the local live add-on bases compare on one stable identity (H3).
+            // Writes into THIS account's scope (bindAddonOrderOwner ran at restore/adopt before this pull).
+            let normalized = addonOrder.map { AddonPriorityOrder.canonical($0) }
             if normalized != Self.appliedAddonOrder {
                 Self.appliedAddonOrder = normalized
                 restored = true
-                // A remote reorder landed: refresh any live add-on list on the main thread.
+                // A remote reorder landed: refresh any live add-on list on the main thread. The Home board and
+                // the open source list re-sort through their own observers of this note (CoreBridge +
+                // SourceListModel), so a remote reorder republishes them too, not just the add-on list.
                 DispatchQueue.main.async { NotificationCenter.default.post(name: Self.addonOrderChangedNote, object: nil) }
             }
         }
@@ -1548,17 +1623,20 @@ final class VortXSyncManager: ObservableObject {
         }
         // Apply the shared cross-surface add-on ORDER (Bug B) as the ordering spine when the doc carries
         // one: a reorder made on any surface (app or web dashboard) converges here so a fresh/cold device
-        // hydrates add-ons in the user's chosen priority. Compared on the same normalized transportUrl the
-        // order is stored under. Any owned add-on NOT named in the order (newly installed elsewhere,
-        // pre-order docs) keeps its existing relative slot AFTER the ordered ones, so nothing is dropped.
+        // hydrates add-ons in the user's chosen priority. Compared on the SHARED QR-safe canonical identity
+        // (`AddonPriorityOrder.canonical`), the same rule the stored order and the read side use, so a
+        // case-sensitive path/query no longer collapses two add-ons to one slot (H3). Any owned add-on NOT
+        // named in the order (newly installed elsewhere, pre-order docs) keeps its existing relative slot
+        // AFTER the ordered ones, so nothing is dropped.
         let addonOrder = (doc["addonOrder"] as? [String]).flatMap { $0.isEmpty ? nil : $0 } ?? appliedAddonOrder
         if !addonOrder.isEmpty {
-            var normalizedToUrl: [String: String] = [:]
-            for url in order { normalizedToUrl[AddonTombstones.normalize(url)] = url }
+            var canonicalToUrl: [String: String] = [:]
+            for url in order { canonicalToUrl[AddonPriorityOrder.canonical(url)] = url }
             var ordered: [String] = []
             var placed = Set<String>()
-            for normalized in addonOrder {
-                guard let url = normalizedToUrl[normalized], byUrl[url] != nil, placed.insert(url).inserted
+            for entry in addonOrder {
+                guard let url = canonicalToUrl[AddonPriorityOrder.canonical(entry)], byUrl[url] != nil,
+                      placed.insert(url).inserted
                 else { continue }
                 ordered.append(url)
             }
