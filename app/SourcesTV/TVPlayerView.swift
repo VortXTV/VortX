@@ -1713,7 +1713,7 @@ struct TVPlayerView: View {
             // Reached only on libmpv (the drill-in above is hidden on AVPlayer); guard anyway so a stale
             // navigation never shows inert controls.
             if isAVPlayerActive {
-                return [OptionRow(label: String(localized: "Audio is managed automatically"), isHeader: true)]
+                return [OptionRow(label: String(localized: "Audio sync isn't available on the Dolby Vision player"), isHeader: true)]
             }
             let now = String(format: "%+.1fs", audioDelay)
             var rows = [OptionRow(label: String(localized: "Sync"), isHeader: true),

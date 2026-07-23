@@ -182,14 +182,18 @@ enum PlayerEngineRouter {
         return .mpv
     }
 
-    /// Platform gate for rule (4b): the non-DV AVPlayer default flip ships on iOS/tvOS only; macOS keeps its
-    /// existing routing (the same carve-out rule 4 makes with its `#if`). A stored per-platform constant
-    /// consumed as a parameter default, rather than an `#if` around the rule, so the standalone router
-    /// harness (which compiles as a macOS binary) can execute the REAL rule by passing true explicitly.
-    #if os(macOS)
-    static let nonDVAVPlayerDefaultPlatform = false
-    #else
+    /// Platform gate for rule (4b): the non-DV AVPlayer default flip ships on iOS ONLY for this cut. PiP and
+    /// native AirPlay, the whole point of the flip, exist on iPhone/iPad; tvOS has neither, so flipping the
+    /// Apple TV's default MKV engine would change the primary platform's playback path in the same build the
+    /// beta cohort is device-verifying the DV fixes, for zero PiP benefit. tvOS joins after a soak (or via
+    /// the avPlayerDefault fleet flag, which can turn the rule on remotely without an app update). macOS
+    /// keeps its existing routing (the same carve-out rule 4 makes with its `#if`). A stored per-platform
+    /// constant consumed as a parameter default, rather than an `#if` around the rule, so the standalone
+    /// router harness (which compiles as a macOS binary) can execute the REAL rule by passing true explicitly.
+    #if os(iOS)
     static let nonDVAVPlayerDefaultPlatform = true
+    #else
+    static let nonDVAVPlayerDefaultPlatform = false
     #endif
 
     /// True for an adaptive HLS playlist URL. Mirrors the rule `HLSPlayerView.handles` uses today.

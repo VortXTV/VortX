@@ -4787,7 +4787,7 @@ struct PlayerScreen: View {
             // AVPlayer manages audio delay + output routing itself: setAudioDelay / setAudioOutputMode are
             // no-ops on that engine, so hide the inert controls rather than show rows that do nothing (#76).
             if isAVPlayerActive {
-                return [Row(label: String(localized: "Audio is managed automatically"), isHeader: true)]
+                return [Row(label: String(localized: "Audio sync isn't available on the Dolby Vision player"), isHeader: true)]
             }
             let now = String(format: "%+.1fs", audioDelay)
             var rs = [Row(label: String(localized: "Sync"), isHeader: true),
