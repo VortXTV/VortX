@@ -3354,22 +3354,13 @@ struct PlayerScreen: View {
                 }
             }
             #if !os(tvOS)
-            // Skip-segment editor: any tt####### title qualifies. Submission is keyless via our
-            // skip.vortx.tv worker, so no third-party key is required to open or use it.
-            if let m = curMeta,
-               m.libraryId.range(of: #"^tt\d{7,8}$"#, options: .regularExpression) != nil {
+            // Skip-segment editor: offered for any tt####### VOD via the shared SkipEditPolicy gate (CONTENT
+            // liveness, never player duration/seekability, so the DV-remux / AVPlayer lane keeps it).
+            // Submission is keyless via our skip.vortx.tv worker: no third-party key to open or use it.
+            if let m = curMeta, SkipEditPolicy.canEdit(isLiveContent: isLive, contentId: m.libraryId) {
                 iconButton(showSkipDBEdit ? "checkmark.bubble.fill" : "checkmark.bubble",
                            label: showSkipDBEdit ? "Close skip editor" : "Edit skip segments") {
-                    if !showSkipDBEdit {
-                        let snapped = (currentTime * 2).rounded() / 2
-                        skipDBEditStart = max(0, snapped)
-                        skipDBEditEnd = min(snapped + 30, duration > 0 ? duration : snapped + 60)
-                        skipDBEditType = .intro
-                        skipDBShowEndTime = true
-                        skipDBSubmitResult = nil
-                        skipDBSubmitError = nil
-                        skipDBPreviewing = false
-                    }
+                    if !showSkipDBEdit { seedSkipDBEditor() }
                     showSkipDBEdit.toggle()
                 }
             }
@@ -3675,6 +3666,32 @@ struct PlayerScreen: View {
     #if !os(tvOS)
     // MARK: - Skip segment edit bar (iOS/Mac)
 
+    /// Seed the skip editor bar from the current playhead + emit one values-free visibility diagnostic.
+    /// Shared by the top-bar icon and the overflow "Contribute" row so both open the editor identically.
+    private func seedSkipDBEditor() {
+        DiagnosticsLog.log("skip", SkipEditPolicy.visibilityDiagnostic(
+            canEdit: true, isLiveContent: isLive,
+            hasSubmittableId: (curMeta.map { SkipEditPolicy.isSubmittableContentId($0.libraryId) } ?? false),
+            engine: (coordinator.player is AVPlayerEngineController) ? "avplayer" : "libmpv"))
+        let snapped = (currentTime * 2).rounded() / 2
+        skipDBEditStart = max(0, snapped)
+        skipDBEditEnd = min(snapped + 30, duration > 0 ? duration : snapped + 60)
+        skipDBEditType = .intro
+        skipDBShowEndTime = true
+        skipDBSubmitResult = nil
+        skipDBSubmitError = nil
+        skipDBPreviewing = false
+    }
+
+    /// The SYNTHESIZED runtime (source seconds) for a submission when the engine has not emitted a finite
+    /// `duration` (the DV-remux INDEFINITE edge). Reuses the loaded meta's human runtime, the same value the
+    /// provisional trickplay key uses, and only when it is THIS title's meta. nil when unknown.
+    private var skipSubmissionFallbackRuntimeSeconds: Double? {
+        guard let m = curMeta, let loaded = core.metaDetails?.meta, loaded.id == m.libraryId,
+              let secs = loaded.runtimeSeconds, secs > 0 else { return nil }
+        return secs
+    }
+
     @ViewBuilder private func skipDBEditBar(meta: PlaybackMeta) -> some View {
         let submittedKey = "\(meta.libraryId):\(meta.season ?? 0):\(meta.episode ?? 0):\(skipDBEditType.rawValue)"
         let alreadySubmitted = skipDBSubmittedKeys.contains(submittedKey)
@@ -3976,7 +3993,9 @@ struct PlayerScreen: View {
             segment_type: skipDBEditType.rawValue,
             start_ms: Int(skipDBEditStart * 1000),
             end_ms: Int(effectiveEnd * 1000),
-            duration_ms: duration > 0 ? Int(duration * 1000) : nil
+            duration_ms: SkipEditPolicy.submissionDurationMs(
+                playerDurationSeconds: duration,
+                fallbackRuntimeSeconds: skipSubmissionFallbackRuntimeSeconds)
         )
         do {
             try await SkipDBClient.submit(req)
@@ -4892,21 +4911,11 @@ struct PlayerScreen: View {
             // Skip-segment submit (G): a discoverable overflow entry to the in-player editor, pre-filled with
             // the current position, so a user who wants to contribute an intro/outro timestamp finds it without
             // hunting the top-bar icon. Any tt####### title qualifies (keyless submit via skip.vortx.tv).
-            if let m = curMeta,
-               m.libraryId.range(of: #"^tt\d{7,8}$"#, options: .regularExpression) != nil {
+            if let m = curMeta, SkipEditPolicy.canEdit(isLiveContent: isLive, contentId: m.libraryId) {
                 rows.append(Row(label: "Contribute", isHeader: true))
                 rows.append(Row(label: showSkipDBEdit ? "Close skip editor" : "Submit skip segment",
                                 detail: showSkipDBEdit ? "" : "at \(timeString(currentTime))") {
-                    if !showSkipDBEdit {
-                        let snapped = (currentTime * 2).rounded() / 2
-                        skipDBEditStart = max(0, snapped)
-                        skipDBEditEnd = min(snapped + 30, duration > 0 ? duration : snapped + 60)
-                        skipDBEditType = .intro
-                        skipDBShowEndTime = true
-                        skipDBSubmitResult = nil
-                        skipDBSubmitError = nil
-                        skipDBPreviewing = false
-                    }
+                    if !showSkipDBEdit { seedSkipDBEditor() }
                     showSkipDBEdit.toggle()
                     panel = nil   // close the settings sheet so the editor bar is visible over the video
                 })
