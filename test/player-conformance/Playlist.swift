@@ -20,6 +20,7 @@ enum Playlist {
         let targetDuration: Int?
         let mapURI: String?
         let hasPlaylistTypeEvent: Bool
+        let hasPreciseZeroStart: Bool
         let errors: [String]
 
         var count: Int { segments.count }
@@ -48,7 +49,7 @@ enum Playlist {
 
         var isValidAdvertisedWindow: Bool {
             errors.isEmpty && !segments.isEmpty && mediaSequence != nil && targetDuration != nil
-                && mapURI != nil
+                && mapURI != nil && (mediaSequence != 0 || hasPreciseZeroStart)
                 && advertisedRange != nil && hasContiguousAbsoluteIDs
         }
     }
@@ -61,30 +62,27 @@ enum Playlist {
 
     /// Read one rendered EXTINF as integer milliseconds without a Double.
     static func msFromExtinf(_ line: String) -> Int? {
-        guard let colon = line.firstIndex(of: ":") else { return nil }
-        var value = String(line[line.index(after: colon)...])
-        if let comma = value.firstIndex(of: ",") { value = String(value[..<comma]) }
-        return msFromSecondsText(value.trimmingCharacters(in: .whitespaces))
+        let prefix = "#EXTINF:"
+        guard line.hasPrefix(prefix), line.hasSuffix(",") else { return nil }
+        let value = String(line.dropFirst(prefix.count).dropLast())
+        return msFromSecondsText(value)
     }
 
     static func msFromSecondsText(_ text: String) -> Int? {
-        let sign = text.hasPrefix("-") ? -1 : 1
-        let unsigned = text.hasPrefix("-") || text.hasPrefix("+") ? String(text.dropFirst()) : text
-        guard !unsigned.isEmpty,
-              unsigned.filter({ $0 == "." }).count <= 1,
-              unsigned.allSatisfy({ $0.isNumber || $0 == "." }) else { return nil }
-        let parts = unsigned.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+        guard !text.isEmpty,
+              text.filter({ $0 == "." }).count <= 1,
+              text.allSatisfy({ $0.isNumber || $0 == "." }) else { return nil }
+        let parts = text.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
         guard !parts[0].isEmpty, let seconds = Int(parts[0]) else { return nil }
         let (whole, multiplyOverflow) = seconds.multipliedReportingOverflow(by: 1_000)
         guard !multiplyOverflow else { return nil }
         var fraction = parts.count > 1 ? String(parts[1]) : ""
-        guard fraction.allSatisfy(\.isNumber) else { return nil }
+        guard fraction.count <= 3, fraction.allSatisfy(\.isNumber) else { return nil }
         if fraction.count < 3 { fraction += String(repeating: "0", count: 3 - fraction.count) }
-        if fraction.count > 3 { fraction = String(fraction.prefix(3)) }
         guard let fractionMs = Int(fraction.isEmpty ? "0" : fraction) else { return nil }
         let (milliseconds, addOverflow) = whole.addingReportingOverflow(fractionMs)
         guard !addOverflow else { return nil }
-        return sign * milliseconds
+        return milliseconds
     }
 
     static func parseMedia(_ body: String) -> Parsed {
@@ -95,41 +93,73 @@ enum Playlist {
         var targetDuration: Int?
         var mapURI: String?
         var sawMap = false
+        var sawHeader = false
+        var version: Int?
+        var sawStart = false
         var hasEvent = false
         var errors: [String] = []
         var observedKind: String?
+        var ended = false
 
-        for raw in body.split(separator: "\n", omittingEmptySubsequences: false) {
+        let lines = body.split(separator: "\n", omittingEmptySubsequences: false)
+        for (index, raw) in lines.enumerated() {
             let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.hasPrefix("#EXTINF:") {
+            if line.isEmpty {
+                if index != lines.indices.last { errors.append("empty line before playlist end") }
+                continue
+            }
+            if !sawHeader {
+                sawHeader = true
+                if line != "#EXTM3U" { errors.append("missing leading EXTM3U") }
+                continue
+            }
+            if ended {
+                errors.append("content after ENDLIST")
+                continue
+            }
+            if line == "#EXTM3U" {
+                errors.append("duplicate EXTM3U")
+            } else if line.hasPrefix("#EXT-X-VERSION:") {
+                let parsed = strictNonnegativeInt(String(line.dropFirst("#EXT-X-VERSION:".count)))
+                if version != nil { errors.append("duplicate VERSION") }
+                version = parsed
+                if parsed != 7 { errors.append("VERSION must be 7") }
+            } else if line.hasPrefix("#EXTINF:") {
                 if pendingMs != nil { errors.append("EXTINF without a segment URI") }
                 pendingMs = msFromExtinf(line)
                 if pendingMs == nil { errors.append("invalid EXTINF: \(line)") }
             } else if line == "#EXT-X-ENDLIST" {
+                if pendingMs != nil { errors.append("ENDLIST before segment URI") }
                 endlist = true
+                ended = true
             } else if line == "#EXT-X-PLAYLIST-TYPE:EVENT" {
                 hasEvent = true
+                errors.append("EVENT playlists are forbidden")
+            } else if line == "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES"
+                        || line == "#EXT-X-START:TIME-OFFSET=0.0,PRECISE=YES" {
+                if sawStart { errors.append("duplicate EXT-X-START") }
+                sawStart = true
             } else if line.hasPrefix("#EXT-X-MEDIA-SEQUENCE:") {
-                let parsed = Int(line.dropFirst("#EXT-X-MEDIA-SEQUENCE:".count))
+                let parsed = strictNonnegativeInt(String(line.dropFirst("#EXT-X-MEDIA-SEQUENCE:".count)))
                 if mediaSequence != nil { errors.append("duplicate MEDIA-SEQUENCE") }
                 mediaSequence = parsed
-                if parsed == nil || parsed! < 0 { errors.append("invalid MEDIA-SEQUENCE") }
+                if parsed == nil { errors.append("invalid MEDIA-SEQUENCE") }
             } else if line.hasPrefix("#EXT-X-TARGETDURATION:") {
-                let parsed = Int(line.dropFirst("#EXT-X-TARGETDURATION:".count))
+                let parsed = strictNonnegativeInt(String(line.dropFirst("#EXT-X-TARGETDURATION:".count)))
                 if targetDuration != nil { errors.append("duplicate TARGETDURATION") }
                 targetDuration = parsed
-                if parsed == nil || parsed! <= 0 { errors.append("invalid TARGETDURATION") }
-            } else if line.hasPrefix("#EXT-X-MAP:URI=\"") {
+                if parsed == nil || parsed == 0 { errors.append("invalid TARGETDURATION") }
+            } else if line.hasPrefix("#EXT-X-MAP:") {
                 if sawMap { errors.append("duplicate EXT-X-MAP") }
                 sawMap = true
-                let rest = line.dropFirst("#EXT-X-MAP:URI=\"".count)
-                if let quote = rest.firstIndex(of: "\"") {
-                    let parsed = String(rest[..<quote])
-                    if parsed.isEmpty { errors.append("empty EXT-X-MAP URI") }
-                    else { mapURI = parsed }
-                } else {
+                let prefix = "#EXT-X-MAP:URI=\""
+                guard line.hasPrefix(prefix), line.hasSuffix("\"") else {
                     errors.append("invalid EXT-X-MAP")
+                    continue
                 }
+                let parsed = String(line.dropFirst(prefix.count).dropLast())
+                if parsed.isEmpty || parsed.contains("\"") { errors.append("invalid EXT-X-MAP URI") }
+                else { mapURI = parsed }
             } else if !line.isEmpty, !line.hasPrefix("#") {
                 guard let milliseconds = pendingMs else {
                     errors.append("segment URI without EXTINF: \(line)")
@@ -152,9 +182,13 @@ enum Playlist {
                     ms: milliseconds,
                     uri: line,
                     renditionID: identity.renditionID))
+            } else {
+                errors.append("unknown or malformed tag: \(line)")
             }
         }
         if pendingMs != nil { errors.append("final EXTINF without a segment URI") }
+        if !sawHeader { errors.append("empty playlist") }
+        if version == nil { errors.append("missing VERSION") }
 
         var durationTotal = 0
         for segment in segments {
@@ -167,6 +201,7 @@ enum Playlist {
         }
 
         if let sequence = mediaSequence {
+            if sequence != 0 && sawStart { errors.append("EXT-X-START is valid only at sequence zero") }
             for (offset, segment) in segments.enumerated() {
                 let (expected, overflow) = sequence.addingReportingOverflow(offset)
                 if overflow || segment.id != expected {
@@ -187,6 +222,7 @@ enum Playlist {
             targetDuration: targetDuration,
             mapURI: mapURI,
             hasPlaylistTypeEvent: hasEvent,
+            hasPreciseZeroStart: sawStart,
             errors: errors)
     }
 
@@ -215,12 +251,28 @@ enum Playlist {
     }
 
     private static func nonnegativeInt(_ text: String) -> Int? {
-        guard !text.isEmpty, text.allSatisfy(\.isNumber), let value = Int(text), value >= 0 else { return nil }
+        strictNonnegativeInt(text)
+    }
+
+    private static func strictNonnegativeInt(_ text: String) -> Int? {
+        guard !text.isEmpty, text.allSatisfy({ $0 >= "0" && $0 <= "9" }),
+              let value = Int(text) else { return nil }
         return value
     }
 
     static func cohortReady(count: Int, totalMs: Int) -> Bool {
         count >= Contract.minStartupSegments && totalMs >= Contract.minStartupMs
+    }
+
+    static func isMinimalStartupCohort(_ playlist: Parsed) -> Bool {
+        guard playlist.isValidAdvertisedWindow,
+              playlist.mediaSequence == 0,
+              !playlist.endlist,
+              cohortReady(count: playlist.count, totalMs: playlist.totalMs),
+              let final = playlist.segments.last else { return false }
+        return !cohortReady(
+            count: playlist.count - 1,
+            totalMs: playlist.totalMs - final.ms)
     }
 
     static func startupDisposition(count: Int, totalMs: Int, ended: Bool) -> StartupDisposition {

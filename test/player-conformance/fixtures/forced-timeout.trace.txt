@@ -6,3 +6,4 @@
 2026-07-22 05:00:30.000 [dv] hls_startup_cohort_timeout waitedMs=30000 requiredCount=6 requiredDurationMs=36000 actualCount=1 actualDuration=6000
 2026-07-22 05:00:30.001 [dv] hls 404 /master.m3u8
 2026-07-22 05:00:30.002 [dv] hls_mount_to_ready_timeout count=1 waitedMs=30000 -> fail-soft
+[harness] complete-http path=/master.m3u8 status=404 bytes=0 curl_rc=0

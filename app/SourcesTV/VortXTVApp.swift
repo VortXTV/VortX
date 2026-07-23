@@ -81,7 +81,12 @@ struct VortXTVApp: App {
             // `directResume`) lifted into a shared helper. That is a refactor of the app's most
             // bug-historied path and does not belong inside a new feature's diff, so it is left as a
             // deliberate follow-up rather than duplicated out here where the two copies would drift.
-            .onOpenURL { DeepLinkRouter.shared.handle($0) }
+            .onOpenURL { url in
+                #if DEBUG
+                if DebugPlaybackHook.handleDeepLink(url, presenter: presenter) { return }
+                #endif
+                DeepLinkRouter.shared.handle(url)
+            }
             .onChange(of: scenePhase) { _, phase in
                 // Distinguishes "the system suspended us" (an unhandled menu press)
                 // from "we crashed" when a device report says the app vanished.
@@ -145,6 +150,9 @@ struct VortXTVApp: App {
                 }
             }
             .onAppear {
+                #if DEBUG
+                DebugPlaybackHook.fireFromEnvironmentIfRequested(presenter: presenter)
+                #endif
                 // Cold-launch pull: on a fresh process the initial scenePhase == .active does NOT fire
                 // .onChange(of: scenePhase), so nothing opens the sync channel on launch. On Apple TV the
                 // first real foreground transition is the screensaver dismissal (minutes away), so a reinstall

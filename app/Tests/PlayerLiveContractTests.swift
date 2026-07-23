@@ -141,6 +141,23 @@ private final class ManualSegmentSender {
 @MainActor @main
 enum PlayerLiveContractTests {
     static func main() {
+        let arguments = Array(CommandLine.arguments.dropFirst())
+        if arguments == ["--spool-only"] {
+            testSessionSpoolAdmissionAndFailures()
+            finish()
+            return
+        }
+        if arguments == ["--multi-audio-tolerance-only"] {
+            testMultiAudioInclusiveTolerance()
+            finish()
+            return
+        }
+        if !arguments.isEmpty {
+            check("runner: unknown selection fails closed", false)
+            finish()
+            return
+        }
+
         testInitialMountPinsStartupBytes()
         testResidentSlidingPlaylistAndAbsoluteRequests()
         testReadLeaseLifecycle()
@@ -153,8 +170,13 @@ enum PlayerLiveContractTests {
         testDisplayRequestLifecycle()
         testSelectionRefreshLifecycle()
         testBoundaryKeyAgreement()
+        testMultiAudioInclusiveTolerance()
         testProductionWiring()
 
+        finish()
+    }
+
+    private static func finish() {
         print("")
         if failures == 0 {
             print("ALL PASS")
@@ -162,6 +184,24 @@ enum PlayerLiveContractTests {
         }
         print("\(failures) FAILED")
         exit(1)
+    }
+
+    private static func testMultiAudioInclusiveTolerance() {
+        let first = MultiAudioPolicy.AudioPacketTiming(decodeStart: 0.149, duration: 0.021)
+
+        var oneTickState = MultiAudioPolicy.AudioCoverageState()
+        let acceptedFirst = oneTickState.accept(first)
+        let acceptedOneTick = oneTickState.accept(
+            MultiAudioPolicy.AudioPacketTiming(decodeStart: 0.171, duration: 0.021))
+        check("multi-audio tolerance: inclusive one-tick Matroska residue is accepted",
+              acceptedFirst && acceptedOneTick)
+
+        var discontinuousState = MultiAudioPolicy.AudioCoverageState()
+        let acceptedControl = discontinuousState.accept(first)
+        let acceptedDiscontinuity = discontinuousState.accept(
+            MultiAudioPolicy.AudioPacketTiming(decodeStart: 0.1711, duration: 0.021))
+        check("multi-audio tolerance: a genuine 1.1 ms discontinuity is rejected",
+              acceptedControl && !acceptedDiscontinuity)
     }
 
     private static func testInitialMountPinsStartupBytes() {

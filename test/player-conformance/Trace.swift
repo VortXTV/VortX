@@ -39,6 +39,14 @@ struct TraceSession {
         let segmentID: Int
     }
 
+    struct HTTPReceipt: Equatable {
+        let ordinal: Int
+        let path: String
+        let status: Int
+        let bytes: Int
+        let curlRC: Int
+    }
+
     var lines: [(t: Date?, raw: String)] = []
     var port: Int?
     var mountAt: Date?
@@ -53,6 +61,8 @@ struct TraceSession {
     var master404Ordinals: [Int] = []
     var timeoutEventOrdinals: [Int] = []
     var timeoutEvents: [TimeoutEvent] = []
+    var completeHTTPReceipts: [HTTPReceipt] = []
+    var parseErrors: [String] = []
     var sawEventPlaylist = false
 
     var firstMediaResponse: MediaResponse? { mediaResponses.first }
@@ -102,8 +112,8 @@ enum Trace {
 
     private static func build(_ raw: [String]) -> TraceSession {
         var session = TraceSession()
-        var videoRange: Range<Int>?
-        var audioRanges: [Int: Range<Int>] = [:]
+        var videoRanges: [Range<Int>] = []
+        var audioRanges: [Int: [Range<Int>]] = [:]
 
         for (ordinal, line) in raw.enumerated() {
             session.lines.append((timestamp(line), line))
@@ -120,24 +130,28 @@ enum Trace {
             if line.contains("#EXT-X-PLAYLIST-TYPE:EVENT") { session.sawEventPlaylist = true }
 
             if let match = firstMatch(
-                #"hls media segment (\d+) published .*\([0-9]+B, ([0-9]+\.[0-9]+)s media\)"#,
+                #"hls media segment (\d+) published .*\([0-9]+B, ([0-9]+\.[0-9]+)s media\)$"#,
                 line),
                let id = Int(match[1]),
                let milliseconds = Playlist.msFromSecondsText(match[2]) {
                 session.publishedDurationsMs[id] = milliseconds
+            } else if line.contains("hls media segment ") && line.contains(" published ") {
+                session.parseErrors.append("malformed segment publication at ordinal \(ordinal)")
             }
 
             if let match = firstMatch(
-                #"hls resp /media\.m3u8 seq=(\d+) segs=(\d+) ended=(true|false)"#,
+                #"hls resp /media\.m3u8 seq=(\d+) segs=(\d+) ended=(true|false) ([0-9]+)B$"#,
                 line),
                let sequence = Int(match[1]), let count = Int(match[2]) {
                 let response = TraceSession.MediaResponse(
                     sequence: sequence, segmentCount: count, ended: match[3] == "true")
                 session.mediaResponses.append(response)
-                videoRange = response.advertisedRange
+                if let range = response.advertisedRange { videoRanges.append(range) }
+            } else if line.contains("hls resp /media.m3u8") {
+                session.parseErrors.append("malformed media response at ordinal \(ordinal)")
             }
             if let match = firstMatch(
-                #"hls resp /audio(\d+)\.m3u8 seq=(\d+) segs=(\d+)"#,
+                #"hls resp /audio(\d+)\.m3u8 seq=(\d+) segs=(\d+)$"#,
                 line),
                let rendition = Int(match[1]),
                let sequence = Int(match[2]),
@@ -145,32 +159,60 @@ enum Trace {
                 let response = TraceSession.AudioResponse(
                     renditionID: rendition, sequence: sequence, segmentCount: count)
                 session.audioResponses.append(response)
-                audioRanges[rendition] = response.advertisedRange
+                if let range = response.advertisedRange {
+                    audioRanges[rendition, default: []].append(range)
+                }
+            } else if line.contains("hls resp /audio") && line.contains(".m3u8") {
+                session.parseErrors.append("malformed audio response at ordinal \(ordinal)")
             }
 
-            if let match = firstMatch(#"hls req /seg(\d+)\.m4s"#, line),
-               let id = Int(match[1]), session.firstVideoSegReq == nil {
-                session.firstVideoSegReq = id
+            if let match = firstMatch(#"hls req /seg(\d+)\.m4s$"#, line),
+               let id = Int(match[1]) {
+                if session.firstVideoSegReq == nil { session.firstVideoSegReq = id }
+            } else if line.contains("hls req /seg") {
+                session.parseErrors.append("malformed video segment request at ordinal \(ordinal)")
             }
-            if let match = firstMatch(#"hls req /audio(\d+)-seg(\d+)\.m4s"#, line),
+            if let match = firstMatch(#"hls req /audio(\d+)-seg(\d+)\.m4s$"#, line),
                let rendition = Int(match[1]), let id = Int(match[2]) {
                 session.audioSegReqs.append(.init(renditionID: rendition, segmentID: id))
+            } else if line.contains("hls req /audio") && line.contains("-seg") {
+                session.parseErrors.append("malformed audio segment request at ordinal \(ordinal)")
             }
 
-            if line.contains("hls req /master.m3u8") { session.masterRequestOrdinals.append(ordinal) }
-            if line.contains("hls 404 /master.m3u8") { session.master404Ordinals.append(ordinal) }
+            if line.hasSuffix("hls req /master.m3u8") { session.masterRequestOrdinals.append(ordinal) }
+            else if line.contains("hls req /master.m3u8") {
+                session.parseErrors.append("malformed master request at ordinal \(ordinal)")
+            }
+            if line.hasSuffix("hls 404 /master.m3u8") { session.master404Ordinals.append(ordinal) }
+            else if line.contains("hls 404 /master.m3u8") {
+                session.parseErrors.append("malformed master 404 at ordinal \(ordinal)")
+            }
             if line.contains(Contract.cohortTimeoutEvent) {
                 session.timeoutEventOrdinals.append(ordinal)
             }
 
-            if let match = firstMatch(#"hls 404 /seg(\d+)\.m4s"#, line),
-               let id = Int(match[1]), videoRange?.contains(id) == true {
+            if let match = firstMatch(#"hls 404 /seg(\d+)\.m4s$"#, line),
+               let id = Int(match[1]), videoRanges.contains(where: { $0.contains(id) }) {
                 session.advertisedFailures.append("/seg\(id).m4s")
+            } else if line.contains("hls 404 /seg") {
+                session.parseErrors.append("malformed video segment 404 at ordinal \(ordinal)")
             }
-            if let match = firstMatch(#"hls 404 /audio(\d+)-seg(\d+)\.m4s"#, line),
+            if let match = firstMatch(#"hls 404 /audio(\d+)-seg(\d+)\.m4s$"#, line),
                let rendition = Int(match[1]), let id = Int(match[2]),
-               audioRanges[rendition]?.contains(id) == true {
+               audioRanges[rendition]?.contains(where: { $0.contains(id) }) == true {
                 session.advertisedFailures.append("/audio\(rendition)-seg\(id).m4s")
+            } else if line.contains("hls 404 /audio") && line.contains("-seg") {
+                session.parseErrors.append("malformed audio segment 404 at ordinal \(ordinal)")
+            }
+
+            if let match = firstMatch(
+                #"^\[harness\] complete-http path=(/[^ ]+) status=(\d{3}) bytes=(\d+) curl_rc=(\d+)$"#,
+                line),
+               let status = Int(match[2]), let bytes = Int(match[3]), let curlRC = Int(match[4]) {
+                session.completeHTTPReceipts.append(.init(
+                    ordinal: ordinal, path: match[1], status: status, bytes: bytes, curlRC: curlRC))
+            } else if line.contains("[harness] complete-http") {
+                session.parseErrors.append("malformed complete HTTP receipt at ordinal \(ordinal)")
             }
 
             if let match = firstMatch(
@@ -211,7 +253,7 @@ enum Trace {
     static func failSoftTimeoutFinding(_ session: TraceSession) -> Finding {
         let events = session.timeoutEvents
         var evidence = [
-            "timeout events=\(events.count), master requests=\(session.masterRequestCount), /master 404s=\(session.master404Ordinals.count), ready=\(session.readyAt != nil)"
+            "timeout events=\(events.count), master requests=\(session.masterRequestCount), /master 404s=\(session.master404Ordinals.count), complete receipts=\(session.completeHTTPReceipts.count), ready=\(session.readyAt != nil)"
         ]
         guard events.count == 1,
               session.timeoutEventOrdinals.count == 1,
@@ -228,12 +270,21 @@ enum Trace {
             "event waitedMs=\(event.waitedMs) requiredCount=\(event.requiredCount) requiredDurationMs=\(event.requiredDurationMs) actualCount=\(event.actualCount) actualDuration=\(event.actualDurationMs)")
         let masterRequestBeforeEvent = session.masterRequestOrdinals.contains { $0 < event.ordinal }
         let master404AfterEvent = session.master404Ordinals.contains { $0 > event.ordinal }
+        let complete404s = session.completeHTTPReceipts.filter {
+            $0.path == "/master.m3u8" && $0.status == 404 && $0.bytes == 0
+                && $0.curlRC == 0 && $0.ordinal > event.ordinal
+        }
         if !masterRequestBeforeEvent { evidence.append("no startup /master.m3u8 request before the timeout event") }
         if !master404AfterEvent { evidence.append("no /master.m3u8 404 after the timeout event") }
+        if complete404s.count != 1 {
+            evidence.append("expected one complete bounded /master.m3u8 HTTP 404 receipt after the event")
+        }
+        if !session.parseErrors.isEmpty { evidence.append("parse errors=\(session.parseErrors)") }
         if session.readyAt != nil { evidence.append("readyToPlay appeared on the timeout path") }
         return Finding(
             point: .failSoftCounted,
             verdict: fieldsMatch && masterRequestBeforeEvent && master404AfterEvent
+                && complete404s.count == 1 && session.parseErrors.isEmpty
                 && session.readyAt == nil ? .green : .red,
             evidence: evidence)
     }
@@ -324,6 +375,14 @@ enum Trace {
         } else {
             output.append(Finding(point: .failSoftCounted, verdict: .indeterminate,
                                   evidence: ["neither success nor timeout terminal tuple is present"]))
+        }
+        guard session.parseErrors.isEmpty else {
+            return output.map {
+                Finding(
+                    point: $0.point,
+                    verdict: .red,
+                    evidence: $0.evidence + ["trace parse errors=\(session.parseErrors)"])
+            }
         }
         return output
     }

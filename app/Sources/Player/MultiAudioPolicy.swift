@@ -423,7 +423,7 @@ enum MultiAudioPolicy {
                       packetDuration: resource.trailingPacketDuration,
                       videoFrameDuration: videoFrameDuration) else { return nil }
             if let previousDecodeEnd,
-               abs(resource.decodeStart - previousDecodeEnd) > alignmentTolerance {
+               !isWithinAlignmentTolerance(resource.decodeStart, previousDecodeEnd) {
                 return nil
             }
             aligned.append(VortXHLSSegment(
@@ -463,10 +463,18 @@ enum MultiAudioPolicy {
 
     private static let alignmentTolerance = 0.001
 
+    /// Keeps the one-millisecond media tolerance inclusive when binary floating-point arithmetic leaves a
+    /// few representational ULPs above the exact decimal boundary. This is not additional media tolerance:
+    /// the slack scales only with the compared timestamps and remains microscopic at playback time scales.
+    private static func isWithinAlignmentTolerance(_ lhs: Double, _ rhs: Double) -> Bool {
+        let scale = max(1.0, max(abs(lhs), abs(rhs)))
+        return abs(lhs - rhs) <= alignmentTolerance + scale.ulp * 4
+    }
+
     private static func boundaryDriftIsValid(_ drift: Double,
                                              packetDuration: Double,
                                              videoFrameDuration: Double) -> Bool {
-        if abs(drift) <= alignmentTolerance { return true }
+        if isWithinAlignmentTolerance(drift, 0) { return true }
         guard packetDuration > 0 else { return false }
         return abs(drift) <= packetDuration / 2 + alignmentTolerance
             && abs(drift) < videoFrameDuration
@@ -800,7 +808,7 @@ enum MultiAudioPolicy {
             }
 
             if let expected = openEnd ?? previousDecodeEnd,
-               abs(timing.decodeStart - expected) > MultiAudioPolicy.alignmentTolerance {
+               !MultiAudioPolicy.isWithinAlignmentTolerance(timing.decodeStart, expected) {
                 isValid = false
                 return false
             }
@@ -830,14 +838,15 @@ enum MultiAudioPolicy {
                   let lastDecodeStart = openLastStart,
                   let lastDuration = openLastDuration,
                   chosenCut.isFinite,
-                  lastDecodeStart <= chosenCut + MultiAudioPolicy.alignmentTolerance,
-                  abs(decodeEnd - chosenCut) <= MultiAudioPolicy.alignmentTolerance else {
+                  lastDecodeStart <= chosenCut
+                      || MultiAudioPolicy.isWithinAlignmentTolerance(lastDecodeStart, chosenCut),
+                  MultiAudioPolicy.isWithinAlignmentTolerance(decodeEnd, chosenCut) else {
                 isValid = false
                 return nil
             }
             let cutQuantum = selectionFrameDuration ?? lastDuration
             let videoDrift = chosenCut - boundary.end
-            if abs(videoDrift) > MultiAudioPolicy.alignmentTolerance {
+            if !MultiAudioPolicy.isWithinAlignmentTolerance(chosenCut, boundary.end) {
                 guard cutQuantum.isFinite,
                       cutQuantum > 0,
                       abs(videoDrift) <= cutQuantum / 2 + MultiAudioPolicy.alignmentTolerance else {
@@ -846,13 +855,13 @@ enum MultiAudioPolicy {
                 }
             }
             if let previousBoundaryEnd {
-                guard abs(boundary.start - previousBoundaryEnd) <= MultiAudioPolicy.alignmentTolerance else {
+                guard MultiAudioPolicy.isWithinAlignmentTolerance(boundary.start, previousBoundaryEnd) else {
                     isValid = false
                     return nil
                 }
             } else {
                 let startDrift = decodeStart - boundary.start
-                if abs(startDrift) > MultiAudioPolicy.alignmentTolerance,
+                if !MultiAudioPolicy.isWithinAlignmentTolerance(decodeStart, boundary.start),
                    abs(startDrift) > firstDuration / 2 + MultiAudioPolicy.alignmentTolerance {
                     isValid = false
                     return nil

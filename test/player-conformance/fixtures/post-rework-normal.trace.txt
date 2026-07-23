@@ -4,6 +4,10 @@
 2026-07-22 04:00:00.100 [dv] hls req /master.m3u8
 2026-07-22 04:00:00.300 [dv] hls media segment 0 published +0.3s after mount (600000B, 6.00s media)
 2026-07-22 04:00:00.600 [dv] hls media segment 1 published +0.6s after mount (600000B, 6.00s media)
+2026-07-22 04:00:00.900 [dv] hls media segment 2 published +0.9s after mount (600000B, 6.00s media)
+2026-07-22 04:00:01.200 [dv] hls media segment 3 published +1.2s after mount (600000B, 6.00s media)
+2026-07-22 04:00:01.500 [dv] hls media segment 4 published +1.5s after mount (600000B, 6.00s media)
+2026-07-22 04:00:01.700 [dv] hls media segment 5 published +1.7s after mount (600000B, 6.00s media)
 2026-07-22 04:00:01.800 [dv] hls resp /master.m3u8 variants=1 audio=1 subs=0 410B
 2026-07-22 04:00:01.850 [dv] hls req /media.m3u8
 2026-07-22 04:00:01.851 [dv] hls resp /media.m3u8 seq=0 segs=6 ended=false 420B

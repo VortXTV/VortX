@@ -10,8 +10,13 @@ import Foundation
 //   trace <log> [--index N] [--only-point7]
 //                                     Evaluate a captured production trace.
 //   fixture-assert <normal> <timeout> Assert only fixture-observable facts.
+//   capture-startup --port N --output DIR
+//                                     Save one coherent immutable startup publication.
+//   verify-captured --port N --capture DIR --receipt FILE
+//                                     Re-fetch every URI from the retained publication.
 //   live  --container <dir>          Full battery over loopback + filesystem while
-//         [--port N] [--log <file>]  a plain-remux playback is LIVE.
+//         [--port N] [--log <file>] [--startup DIR] [--retained-receipt FILE]
+//                                     a plain-remux playback is LIVE.
 //   spool --container <dir> [--expect-active|--expect-empty]
 //
 // Exit code for trace/live is the GATE: 0 only when every point is GREEN/EXEMPT.
@@ -86,6 +91,7 @@ private func protocolResponse(_ request: URLRequest, status: Int, length: Int) -
 
 enum HarnessMutation: String {
     case startupReadinessOr = "startup-readiness-or"
+    case startupMinimalityDisabled = "startup-minimality-disabled"
 }
 
 func runSelfTest(
@@ -131,6 +137,18 @@ func runSelfTest(
     expect("6 segments at 35999 ms stay CLOSED by 1 ms", b == (6, 35999, false))
     let c = cohort(Array(repeating: 6.000, count: 6))
     expect("6 segments at exactly 36000 ms OPEN", c == (6, 36000, true))
+    let minimalSeven = Playlist.parseMedia(Playlist.buildMediaBodyLikeServer(
+        durations: [5.920] + Array(repeating: 6.000, count: 6), ended: false))
+    let nonminimalEight = Playlist.parseMedia(Playlist.buildMediaBodyLikeServer(
+        durations: [5.920] + Array(repeating: 6.000, count: 7), ended: false))
+    let sevenIsMinimal = harnessMutation == .startupMinimalityDisabled
+        ? Playlist.cohortReady(count: minimalSeven.count, totalMs: minimalSeven.totalMs)
+        : Playlist.isMinimalStartupCohort(minimalSeven)
+    let eightIsMinimal = harnessMutation == .startupMinimalityDisabled
+        ? Playlist.cohortReady(count: nonminimalEight.count, totalMs: nonminimalEight.totalMs)
+        : Playlist.isMinimalStartupCohort(nonminimalEight)
+    expect("5.92s first segment yields a valid minimal seven-segment startup", sevenIsMinimal)
+    expect("one removable segment makes an eight-segment startup nonminimal", !eightIsMinimal)
     expect("production gate rejects 5 segments even above 36000 ms",
            productionStartup(Array(repeating: 8.000, count: 5)) == nil)
     expect("production gate rejects the 35999 ms boundary",
@@ -211,10 +229,27 @@ func runSelfTest(
         of: "#EXT-X-MAP:URI=\"init.mp4\"",
         with: "#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-MAP:URI=\"init.mp4\""))
     expect("duplicate EXT-X-MAP fails closed", !duplicateMap.isValidAdvertisedWindow)
+    expect("media playlist without EXTM3U fails closed",
+           !Playlist.parseMedia(body.replacingOccurrences(of: "#EXTM3U\n", with: "")).isValidAdvertisedWindow)
+    expect("media playlist without VERSION fails closed",
+           !Playlist.parseMedia(body.replacingOccurrences(of: "#EXT-X-VERSION:7\n", with: "")).isValidAdvertisedWindow)
+    expect("media playlist rejects trailing MAP attributes",
+           !Playlist.parseMedia(body.replacingOccurrences(
+               of: "#EXT-X-MAP:URI=\"init.mp4\"",
+               with: "#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"1@0\""))
+               .isValidAdvertisedWindow)
+    expect("media playlist rejects unknown tags",
+           !Playlist.parseMedia(body.replacingOccurrences(
+               of: "#EXT-X-MAP:URI=\"init.mp4\"",
+               with: "#EXT-X-UNKNOWN:1\n#EXT-X-MAP:URI=\"init.mp4\""))
+               .isValidAdvertisedWindow)
     let validMaster = """
     #EXTM3U
+    #EXT-X-VERSION:7
     #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",LANGUAGE="eng",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2"
     #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Spanish",LANGUAGE="spa",DEFAULT=NO,AUTOSELECT=YES,CHANNELS="2",URI="audio0.m3u8"
+    #EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS="avc1.64001F,mp4a.40.2",AUDIO="audio"
+    media.m3u8
     """
     expect("master requires one in-band primary and one exact alternate playlist URI",
            Live.audioRenditionURI(validMaster) == "audio0.m3u8")
@@ -222,6 +257,22 @@ func runSelfTest(
            Live.audioRenditionURI(validMaster.replacingOccurrences(of: "LANGUAGE=\"spa\"", with: "LANGUAGE=\"eng\"")) == nil)
     expect("master rejects unknown-language topology",
            Live.audioRenditionURI(validMaster.replacingOccurrences(of: "LANGUAGE=\"spa\"", with: "LANGUAGE=\"und\"")) == nil)
+    expect("master rejects unknown AUDIO attributes",
+           Live.audioRenditionURI(validMaster.replacingOccurrences(
+               of: "CHANNELS=\"2\",URI=\"audio0.m3u8\"",
+               with: "CHANNELS=\"2\",X-UNKNOWN=\"1\",URI=\"audio0.m3u8\"")) == nil)
+    expect("master rejects unknown STREAM-INF attributes",
+           Live.audioRenditionURI(validMaster.replacingOccurrences(
+               of: ",AUDIO=\"audio\"", with: ",AUDIO=\"audio\",X-UNKNOWN=1")) == nil)
+    expect("master rejects an audio-only CODECS claim",
+           Live.audioRenditionURI(validMaster.replacingOccurrences(
+               of: "avc1.64001F,mp4a.40.2", with: "mp4a.40.2,mp4a.40.2")) == nil)
+    expect("master rejects trailing attribute syntax",
+           Live.audioRenditionURI(validMaster.replacingOccurrences(
+               of: ",AUDIO=\"audio\"", with: ",AUDIO=\"audio\",")) == nil)
+    expect("master rejects unbalanced attribute syntax",
+           Live.audioRenditionURI(validMaster.replacingOccurrences(
+               of: "AUDIO=\"audio\"", with: "AUDIO=\"audio")) == nil)
 
     var timeout = TraceSession()
     timeout.masterRequestOrdinals = [0]
@@ -230,8 +281,14 @@ func runSelfTest(
     timeout.timeoutEvents = [.init(
         ordinal: 1, waitedMs: 30_000, requiredCount: 6, requiredDurationMs: 36_000,
         actualCount: 1, actualDurationMs: 6_000)]
+    timeout.completeHTTPReceipts = [.init(
+        ordinal: 3, path: "/master.m3u8", status: 404, bytes: 0, curlRC: 0)]
     expect("point7 accepts exactly one current event then /master 404 and no ready",
            Trace.failSoftTimeoutFinding(timeout).verdict == .green)
+    var missingCompleteReceipt = timeout
+    missingCompleteReceipt.completeHTTPReceipts = []
+    expect("point7 rejects a log-only 404 without a complete HTTP receipt",
+           Trace.failSoftTimeoutFinding(missingCompleteReceipt).verdict == .red)
     var wrongPath = timeout
     wrongPath.master404Ordinals = []
     wrongPath.advertisedFailures = ["/seg0.m4s"]
@@ -262,6 +319,24 @@ func runSelfTest(
     expect("point7 rejects readyToPlay on the timeout path",
            Trace.failSoftTimeoutFinding(reachedReady).verdict == .red)
 
+    let traceFixture = FileManager.default.temporaryDirectory
+        .appendingPathComponent("player-conformance-trace-\(UUID().uuidString).log")
+    defer { try? FileManager.default.removeItem(at: traceFixture) }
+    let strictTraceText = """
+    2026-07-22 04:00:00.000 [dv] hls server listening on 127.0.0.1:59999
+    2026-07-22 04:00:00.100 [dv] hls resp /media.m3u8 seq=0 segs=6 ended=false 420B
+    2026-07-22 04:00:01.100 [dv] hls resp /media.m3u8 seq=8 segs=6 ended=false 420B
+    2026-07-22 04:00:02.100 [dv] hls 404 /seg0.m4s
+    2026-07-22 04:00:03.100 [dv] hls req /seg8.m4s trailing
+    """
+    try? Data(strictTraceText.utf8).write(to: traceFixture, options: .atomic)
+    let strictTrace = Trace.session(inFileAt: traceFixture.path)
+    expect("trace retains every advertised window when classifying later 404s",
+           strictTrace?.advertisedFailures == ["/seg0.m4s"])
+    expect("trace rejects trailing syntax on a load-bearing request",
+           strictTrace?.parseErrors.count == 1
+               && Trace.findings(strictTrace ?? TraceSession()).allSatisfy { $0.verdict == .red })
+
     expect("512 MiB exact admission boundary is accepted",
            SpoolLayout.withinAdmissionCeiling(512 * 1024 * 1024))
     expect("512 MiB plus one byte is rejected",
@@ -270,24 +345,35 @@ func runSelfTest(
     let layoutRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("player-conformance-layout-\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: layoutRoot) }
+    let firstLaunch = "launch-\(UUID().uuidString)"
+    let firstSession = "session-\(UUID().uuidString)"
     let sessionDirectory = layoutRoot.appendingPathComponent(
-        "Library/Caches/VortXHLS/launch-A/session-A", isDirectory: true)
+        "Library/Caches/VortXHLS/\(firstLaunch)/\(firstSession)", isDirectory: true)
     try? FileManager.default.createDirectory(at: sessionDirectory, withIntermediateDirectories: true)
     try? Data([0x01]).write(to: sessionDirectory.appendingPathComponent("video-0.m4s"))
     let oneSession = SpoolLayout.inspect(containerPath: layoutRoot.path)
     expect("whole-root discovery accepts exactly one launch and session",
            oneSession.hasOneActiveLaunchAndSession && oneSession.bytes == 1)
     let secondSession = layoutRoot.appendingPathComponent(
-        "Library/Caches/VortXHLS/launch-B/session-B", isDirectory: true)
+        "Library/Caches/VortXHLS/launch-\(UUID().uuidString)/session-\(UUID().uuidString)",
+        isDirectory: true)
     try? FileManager.default.createDirectory(at: secondSession, withIntermediateDirectories: true)
     expect("whole-root discovery rejects multiple active launches",
            !SpoolLayout.inspect(containerPath: layoutRoot.path).hasOneActiveLaunchAndSession)
     try? FileManager.default.removeItem(at: secondSession.deletingLastPathComponent())
     let siblingSession = sessionDirectory.deletingLastPathComponent()
-        .appendingPathComponent("session-B", isDirectory: true)
+        .appendingPathComponent("session-\(UUID().uuidString)", isDirectory: true)
     try? FileManager.default.createDirectory(at: siblingSession, withIntermediateDirectories: true)
     expect("whole-root discovery rejects multiple active sessions in one launch",
            !SpoolLayout.inspect(containerPath: layoutRoot.path).hasOneActiveLaunchAndSession)
+    expect("root grammar rejects non-UUID launch and session names",
+           !SpoolLayout.isCanonicalUUIDDirectory("launch-A", prefix: "launch-")
+               && !SpoolLayout.isCanonicalUUIDDirectory("session-A", prefix: "session-"))
+    expect("root grammar rejects the zero UUID",
+           !SpoolLayout.isCanonicalUUIDDirectory(
+                "launch-00000000-0000-0000-0000-000000000000", prefix: "launch-")
+               && !SpoolLayout.isCanonicalUUIDDirectory(
+                "session-00000000-0000-0000-0000-000000000000", prefix: "session-"))
 
     var edge = TraceSession()
     edge.mountAt = Date(timeIntervalSince1970: 0)
@@ -570,8 +656,8 @@ func runFixtureAssert(normalPath: String, timeoutPath: String) -> Bool {
     if let normal, let first = normal.firstMediaResponse {
         expect("normal first response is absolute zero with six-segment cardinality",
                first.sequence == 0 && first.segmentCount == 6 && first.advertisedRange == 0..<6)
-        expect("normal fixture keeps duration proof scoped to live playlist bytes",
-               Trace.startupRenderedMilliseconds(normal, response: first) == nil)
+        expect("normal first response proves exactly six segments and 36000 rendered ms",
+               Trace.startupRenderedMilliseconds(normal, response: first) == Contract.minStartupMs)
         expect("normal fixture proves a valid nonzero sliding response",
                normal.mediaResponses.dropFirst().contains {
                    $0.sequence > 0 && $0.advertisedRange != nil
@@ -634,7 +720,10 @@ case "selftest":
             mutation = nil
             harnessMutation = parsed
         } else {
-            let names = (FMP4.Mutation.allCases.map(\.rawValue) + [HarnessMutation.startupReadinessOr.rawValue])
+            let names = (FMP4.Mutation.allCases.map(\.rawValue) + [
+                HarnessMutation.startupReadinessOr.rawValue,
+                HarnessMutation.startupMinimalityDisabled.rawValue,
+            ])
                 .joined(separator: " | ")
             FileHandle.standardError.write(Data("unknown mutant \(name); use \(names)\n".utf8)); exit(2)
         }
@@ -665,6 +754,29 @@ case "fixture-assert":
         FileHandle.standardError.write(Data("usage: fixture-assert <normal.trace> <timeout.trace>\n".utf8)); exit(2)
     }
     exit(runFixtureAssert(normalPath: paths[0], timeoutPath: paths[1]) ? 0 : 1)
+
+case "capture-startup":
+    guard let portText = value("--port", args), let port = Int(portText), port > 0,
+          let output = value("--output", args) else {
+        FileHandle.standardError.write(Data("usage: capture-startup --port N --output DIR\n".utf8))
+        exit(2)
+    }
+    let capture = Live.captureStartup(port: port, directoryPath: output)
+    capture.evidence.forEach { print("[capture] \($0)") }
+    exit(capture.passed ? 0 : 1)
+
+case "verify-captured":
+    guard let portText = value("--port", args), let port = Int(portText), port > 0,
+          let capturePath = value("--capture", args),
+          let receipt = value("--receipt", args) else {
+        FileHandle.standardError.write(
+            Data("usage: verify-captured --port N --capture DIR --receipt FILE\n".utf8))
+        exit(2)
+    }
+    let verification = Live.verifyCapturedResources(
+        port: port, directoryPath: capturePath, receiptPath: receipt)
+    verification.evidence.forEach { print("[retention] \($0)") }
+    exit(verification.passed ? 0 : 1)
 
 case "live":
     guard let container = value("--container", args) else {
@@ -699,7 +811,12 @@ case "live":
         exit(3)
     }
 
-    let outcome = Live.evaluate(port: port, trace: s, containerPath: container)
+    let outcome = Live.evaluate(
+        port: port,
+        trace: s,
+        containerPath: container,
+        startupDirectoryPath: value("--startup", args),
+        retainedReceiptPath: value("--retained-receipt", args))
     if let infra = outcome.infra {
         // Print whatever WAS observed, explicitly marked as not a verdict, then exit 3.
         if !outcome.findings.isEmpty {
@@ -732,6 +849,7 @@ case "spool":
     exit(0)
 
 default:
-    FileHandle.standardError.write(Data("unknown command \(cmd); use selftest | fixture-assert | trace | live | spool\n".utf8))
+    FileHandle.standardError.write(Data(
+        "unknown command \(cmd); use selftest | fixture-assert | capture-startup | verify-captured | trace | live | spool\n".utf8))
     exit(2)
 }
