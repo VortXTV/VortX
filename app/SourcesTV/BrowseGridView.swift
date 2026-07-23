@@ -381,6 +381,9 @@ struct TVCategoryBrowse: View {
     @State private var page = 1
     @State private var loading = false
     @State private var done = false
+    /// Why the grid is empty once `done`, so the empty-state tells the truth (region / offline / 429 / add-on)
+    /// instead of always blaming the region. Set from the first empty page's `CatalogPage.cause`.
+    @State private var emptyCause: CatalogRowResolution.CatalogEmptyCause?
     @State private var loadTask: Task<Void, Never>?
     /// Bumped on every pill switch. A load captures it before its await and drops every post-await mutation
     /// when the token has moved on, so an in-flight (or pagination) load for the OLD pill can never clear the
@@ -432,7 +435,9 @@ struct TVCategoryBrowse: View {
     @ViewBuilder private var grid: some View {
         if items.isEmpty {
             if done {
-                Text("Nothing here yet.").font(Theme.Typography.label)
+                Text(LocalizedStringKey(CatalogRowResolution.emptyGridMessage(cause: emptyCause ?? .region, isServiceTarget: target.isService)))
+                    .font(Theme.Typography.label)
+                    .multilineTextAlignment(.center)
                     .foregroundStyle(Theme.Palette.textSecondary).padding(Theme.Space.xxl).frame(maxWidth: .infinity)
             } else {
                 BigSpinner().padding(Theme.Space.xxl).frame(maxWidth: .infinity)
@@ -459,7 +464,7 @@ struct TVCategoryBrowse: View {
         // Reset `loading` too: an in-flight load leaves it true, and without this the next loadNext() bails on
         // its `guard !loading` and the grid stays stuck on the spinner. Bump the generation so any stale load
         // (the cancelled loadTask AND any onAppear pagination load) drops its result.
-        items = []; seen = []; page = 1; done = false; loading = false
+        items = []; seen = []; page = 1; done = false; loading = false; emptyCause = nil
         loadGen += 1
         loadTask?.cancel()
         loadTask = Task { await loadNext() }
@@ -474,9 +479,9 @@ struct TVCategoryBrowse: View {
         // WITHOUT touching loading (clearing it here would clobber the new pill's in-flight state).
         guard gen == loadGen else { return }
         loading = false
-        if next.isEmpty { done = true; return }
+        if next.items.isEmpty { emptyCause = next.cause; done = true; return }
         page += 1
-        let fresh = next.filter { seen.insert($0.id).inserted }
+        let fresh = next.items.filter { seen.insert($0.id).inserted }
         items.append(contentsOf: fresh)
         if focusModel.hero == nil, let first = items.first { focusModel.seedIfEmpty(hero(for: first)) }
     }
