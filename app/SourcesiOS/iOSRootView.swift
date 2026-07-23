@@ -4073,7 +4073,21 @@ private struct LandscapeArtiOS: View {
                 Theme.Palette.surface1
             }
         }
+        .overlay(alignment: .topLeading) { ratingBadge }
         .task(id: id) { await load() }
+    }
+
+    /// The clean 16:9 backdrop carries NO baked rating (unlike the portrait poster the service bakes), so
+    /// when "Show ratings on posters" is on, surface it as a client badge fed by the keyless VortX ratings
+    /// service. Suppressed only when a genuinely BAKED poster is on screen (the rare no-backdrop fallback for
+    /// a renderable id), so a rating is never double-drawn. Top-LEADING to clear the watched checkmark (which
+    /// owns top-trailing) and the outer PosterCardiOS portrait rating badge (also top-trailing).
+    @ViewBuilder private var ratingBadge: some View {
+        let bakedPosterShown = !usedBackdrop && PosterArtwork.bakesRatings(forID: id)
+        CardRatingBadge(id: id, type: type,
+                        active: PosterArtwork.bakesRatings && !bakedPosterShown,
+                        glyphSize: 8, textSize: 10)
+            .padding(6)
     }
 
     /// The title ON the backdrop: the clean TMDB clearlogo when one resolves, else styled text, over a

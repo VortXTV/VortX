@@ -571,7 +571,24 @@ struct LandscapeArt: View {
         }
         .frame(width: width, height: height)
         .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        .overlay(alignment: .topLeading) { ratingBadge }
         .task(id: id ?? poster ?? "") { await load() }
+    }
+
+    /// The clean 16:9 backdrop these cards show carries NO baked rating (unlike the portrait poster the
+    /// service bakes), so when "Show ratings on posters" is on, surface the rating as a client badge fed by
+    /// the keyless VortX ratings service. Suppressed only when a genuinely BAKED poster is on screen (the
+    /// rare no-backdrop fallback for a renderable id), so a rating is never double-drawn. Top-LEADING to
+    /// clear the watched checkmark, which owns the top-trailing corner. Placed in `PosterCard` at the same
+    /// corner would work too, but `id` and `usedBackdrop` live here.
+    @ViewBuilder private var ratingBadge: some View {
+        if let id {
+            let bakedPosterShown = !usedBackdrop && PosterArtwork.bakesRatings(forID: id)
+            CardRatingBadge(id: id, type: type,
+                            active: PosterArtwork.bakesRatings && !bakedPosterShown,
+                            glyphSize: 12, textSize: 15)
+                .padding(Theme.Space.sm)
+        }
     }
 
     /// The title ON the cinematic backdrop: the title's clean TMDB clearlogo when one resolves, else the
