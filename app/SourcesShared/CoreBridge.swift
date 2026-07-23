@@ -42,8 +42,12 @@ final class CoreBridge: ObservableObject {
     /// different (or transiently failing) response than the one the user confirmed, so the row could flip
     /// ready -> failed on install for no real reason. Consume-once, short TTL; a miss just fetches fresh. Only
     /// touched on the main actor (preview + install are `@MainActor`).
-    private var manifestPreviewCache: [String: (manifest: [String: Any], fetchedAt: Date)] = [:]
+    /// Value also carries the guarded FINAL (post-redirect) canonical identity so the following install reuses
+    /// the exact identity the preview validated (H4). M3: the map is BOUNDED — capped entry count with
+    /// TTL-first eviction — so a stream of unique preview URLs cannot grow it without limit.
+    private var manifestPreviewCache: [String: (manifest: [String: Any], canonicalURL: String, fetchedAt: Date)] = [:]
     private static let manifestCacheTTL: TimeInterval = 60
+    private static let manifestCacheCap = 64
     private var started = false
     /// Coalesces the Home-board rebuild. The engine emits a BURST of `board` events during launch and while a
     /// catalog page lands (one per catalog settling), and each event used to trigger a full `buildBoardRows()`
@@ -300,13 +304,11 @@ final class CoreBridge: ObservableObject {
     /// so AddonsView can detect an already-installed URL and offer to UPDATE it instead of erroring.
     /// Nil if it is not a valid http(s) URL.
     func normalizedAddonURL(_ urlString: String) -> String? {
-        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard var url = URL(string: trimmed), let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else { return nil }
-        if !url.absoluteString.lowercased().hasSuffix("manifest.json") {
-            url = url.appendingPathComponent("manifest.json")
-        }
-        return url.absoluteString
+        // H4: ONE shared, query/fragment-safe canonical rule (`canonicalAddonIdentity`, also used by the reorder
+        // path). It suffixes `/manifest.json` on the PATH (not the whole string), so a query-bearing URL is not
+        // corrupted into `.../manifest.json/manifest.json?…` and a `?next=manifest.json` decoy is not mistaken
+        // for an already-manifest path, and it drops the fragment.
+        canonicalAddonIdentity(urlString)
     }
 
     /// Back-compat facade for the non-pairing install callers (paste-a-URL, batch imports, the store). Maps the
@@ -334,71 +336,124 @@ final class CoreBridge: ObservableObject {
         guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else {
             return .failed(retryable: false, message: "Enter a valid add-on URL (https://…/manifest.json).")
         }
-        let alreadyInstalled = addons.contains(where: { $0.transportUrl == normalized })
-        if alreadyInstalled, !replacingExisting { return .alreadyInstalled }
+        if addons.contains(where: { $0.transportUrl == normalized }), !replacingExisting { return .alreadyInstalled }
 
         // Reuse the manifest a just-preceding preview fetched + validated for this URL (single-fetch), else fetch
         // now. SSRF guard: AddonURLGuard validates the host + every RESOLVED address (and each redirect hop)
         // against the private/loopback/link-local/CGNAT/ULA ranges. A pasted or QR-relayed URL can never point
         // the fetch at 127.0.0.1 / a LAN service / a cloud metadata endpoint. A reused preview manifest already
         // passed that exact gate moments ago.
+        //
+        // H4: the identity we install/tombstone/confirm against is the GUARDED FINAL (post-redirect) URL, not the
+        // pre-fetch string — a public URL that 3xx-redirects to its real manifest host installs under the host it
+        // actually served, canonicalized query/fragment-safe.
         let manifest: [String: Any]
+        let identity: String
         if let cached = takeCachedManifest(normalized) {
-            manifest = cached
+            manifest = cached.manifest
+            identity = cached.canonicalURL
         } else {
             switch await AddonURLGuard.fetch(url) {
             case .failure(let rejection):
                 return .failed(retryable: Self.isRetryable(rejection), message: rejection.message)
-            case .success(let (data, _)):
+            case .success(let (data, finalURL)):
+                // M5: id AND name must be NON-EMPTY, not merely non-nil (a `{"id":"","name":""}` is not a valid
+                // add-on).
                 guard let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                      parsed["id"] != nil, parsed["name"] != nil else {
+                      Self.hasNonEmptyIdentity(parsed) else {
                     return .failed(retryable: false, message: "That URL did not return a valid add-on manifest.")
                 }
                 manifest = parsed
+                identity = normalizedAddonURL(finalURL.absoluteString) ?? normalized
             }
         }
+        guard let identityURL = URL(string: identity) else {
+            return .failed(retryable: false, message: "That URL did not return a valid add-on manifest.")
+        }
+
+        // Re-evaluate against the FINAL identity: a redirect may land on an already-installed add-on.
+        let replacing = addons.contains(where: { $0.transportUrl == identity })
+        if replacing, !replacingExisting { return .alreadyInstalled }
 
         // Update in place: drop the existing descriptor ONLY now that the new manifest is validated, so a flaky
         // fetch / bad manifest can never leave the user with NEITHER the old nor the new add-on. The engine
-        // processes Uninstall before Install, so the freshly-fetched manifest replaces the old one.
-        if alreadyInstalled, let existing = rawAddonsByUrl[normalized] {
+        // processes Uninstall before Install, so the freshly-fetched manifest replaces the old one. Snapshot the
+        // old manifest FIRST so the confirmation can prove the replacement actually landed (H6).
+        let previousManifest: [String: Any]? = replacing
+            ? (rawAddonsByUrl[identity]?["manifest"] as? [String: Any]) : nil
+        if replacing, let existing = rawAddonsByUrl[identity] {
             dispatchCtx(["action": "UninstallAddon", "args": existing])
         }
-        // An EXPLICIT install supersedes any prior removal tombstone for this URL: clear it so the freshly
-        // installed add-on is not instantly re-uninstalled by refreshAddons' tombstone enforcement, and so the
-        // next sync push stops carrying the stale removal. A genuine fresh install of a previously-deleted add-on
-        // therefore works on every device.
-        AddonTombstones.forget(url.absoluteString)
         let descriptor: [String: Any] = [
-            "transportUrl": url.absoluteString,
+            "transportUrl": identityURL.absoluteString,
             "manifest": manifest,
             "flags": ["official": false, "protected": false],
         ]
         dispatchCtx(["action": "InstallAddon", "args": descriptor])
         // CONFIRM the install: the engine applies InstallAddon asynchronously and emits a ctx event that
-        // refreshAddons folds into `addons`. Wait for the add-on to actually appear before reporting success, so
-        // the UI never shows "Installed" for a dispatch the engine silently dropped. A timeout is a RETRYABLE
-        // failure (dispatched but unconfirmed), not a false success.
-        if await awaitAddonInstalled(normalized) {
-            return .installed
+        // refreshAddons folds into `addons`. Wait for the add-on to actually appear (and, for a replace, for the
+        // NEW manifest to actually land — H6: never fast-pass on the still-published old row) before reporting
+        // success, so the UI never shows "Installed"/"Updated" for a dispatch the engine dropped or has not yet
+        // applied. A timeout is a RETRYABLE failure (dispatched but unconfirmed), not a false success.
+        guard await awaitAddonInstalled(identity, replacingManifest: previousManifest, expectedManifest: manifest) else {
+            return .failed(retryable: true, message: "Install did not confirm. Check your connection and try again.")
         }
-        return .failed(retryable: true, message: "Install did not confirm. Check your connection and try again.")
+        // H5: only NOW — after the engine has CONFIRMED the add-on on the live roster — forget any prior removal
+        // tombstone for this URL, so a failed / unconfirmed dispatch never mutates durable cross-device sync
+        // authority. Clearing it lets the freshly installed add-on survive refreshAddons' tombstone enforcement
+        // and stops the next sync push from carrying the stale removal.
+        AddonTombstones.forget(identityURL.absoluteString)
+        return .installed
     }
 
-    /// Poll the published `addons` set until it holds `normalizedURL` (the engine has applied the install) or a
-    /// bounded timeout elapses. Fast path returns immediately when it is already present.
+    /// True when a manifest dictionary carries a NON-EMPTY string `id` and a NON-EMPTY string `name` (M5). The
+    /// engine keys everything off `id`, and an empty name renders as a blank row, so both must be real.
+    private static func hasNonEmptyIdentity(_ manifest: [String: Any]) -> Bool {
+        guard let id = manifest["id"] as? String, !id.isEmpty,
+              let name = manifest["name"] as? String, !name.isEmpty else { return false }
+        return true
+    }
+
+    /// Poll the published `addons` set until the install is CONFIRMED, or a bounded timeout elapses.
+    ///  - Fresh install: confirmed once `identity` appears in `addons`.
+    ///  - Replace (H6): a same-URL replace keeps `identity` present the whole time, so mere presence proves
+    ///    nothing. It is confirmed only once the PUBLISHED manifest for `identity` equals the new `expectedManifest`
+    ///    (the replacement landed). If the new manifest already equals the currently-published one, the replace is
+    ///    a content no-op and is confirmed immediately (it IS up to date) — this avoids a false timeout.
     @MainActor
-    private func awaitAddonInstalled(_ normalizedURL: String, timeout: TimeInterval = 6) async -> Bool {
-        if addons.contains(where: { $0.transportUrl == normalizedURL }) { return true }
+    private func awaitAddonInstalled(_ identity: String,
+                                    replacingManifest: [String: Any]? = nil,
+                                    expectedManifest: [String: Any]? = nil,
+                                    timeout: TimeInterval = 6) async -> Bool {
+        if confirmedInstalled(identity, replacingManifest: replacingManifest, expectedManifest: expectedManifest) {
+            return true
+        }
         let stepNanos: UInt64 = 100_000_000            // 0.1s poll cadence
         let deadlineNanos = UInt64(timeout * 1_000_000_000)
         var elapsed: UInt64 = 0
         while elapsed < deadlineNanos {
             try? await Task.sleep(nanoseconds: stepNanos)
-            if addons.contains(where: { $0.transportUrl == normalizedURL }) { return true }
+            if confirmedInstalled(identity, replacingManifest: replacingManifest, expectedManifest: expectedManifest) {
+                return true
+            }
             elapsed += stepNanos
         }
-        return addons.contains(where: { $0.transportUrl == normalizedURL })
+        return confirmedInstalled(identity, replacingManifest: replacingManifest, expectedManifest: expectedManifest)
+    }
+
+    /// The confirmation predicate for `awaitAddonInstalled`. For a fresh install, presence on the roster is
+    /// enough. For a replace, the published manifest must equal the new one (H6: do not confirm on the old row).
+    @MainActor
+    private func confirmedInstalled(_ identity: String,
+                                    replacingManifest: [String: Any]?,
+                                    expectedManifest: [String: Any]?) -> Bool {
+        guard addons.contains(where: { $0.transportUrl == identity }) else { return false }
+        guard replacingManifest != nil, let expected = expectedManifest else { return true }
+        // Replace: confirmed once the engine holds the NEW manifest for this URL. NSDictionary equality compares
+        // the manifest content, so an unchanged replace (new == published) confirms at once and a real change
+        // confirms only after the new content lands.
+        guard let published = rawAddonsByUrl[identity]?["manifest"] as? [String: Any] else { return false }
+        return NSDictionary(dictionary: published).isEqual(to: expected)
     }
 
     /// Map an `AddonURLGuard.Rejection` to whether the install is worth retrying. Only a transport / DNS blip
@@ -412,13 +467,27 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Consume the cached preview manifest for `normalizedURL` if it is still fresh. Consume-once so a stale
-    /// entry can never be reused twice.
+    /// entry can never be reused twice. Returns the manifest AND the guarded final canonical identity the preview
+    /// validated (H4).
     @MainActor
-    private func takeCachedManifest(_ normalizedURL: String) -> [String: Any]? {
+    private func takeCachedManifest(_ normalizedURL: String) -> (manifest: [String: Any], canonicalURL: String)? {
         guard let cached = manifestPreviewCache[normalizedURL] else { return nil }
         manifestPreviewCache[normalizedURL] = nil
         guard Date().timeIntervalSince(cached.fetchedAt) < Self.manifestCacheTTL else { return nil }
-        return cached.manifest
+        return (cached.manifest, cached.canonicalURL)
+    }
+
+    /// Store a validated preview manifest, keeping the cache BOUNDED (M3): evict expired entries first, then, if
+    /// still at the cap, drop the oldest, so a stream of unique preview URLs cannot grow the map without limit.
+    @MainActor
+    private func storeCachedManifest(_ normalizedURL: String, manifest: [String: Any], canonicalURL: String) {
+        let now = Date()
+        manifestPreviewCache = manifestPreviewCache.filter { now.timeIntervalSince($0.value.fetchedAt) < Self.manifestCacheTTL }
+        if manifestPreviewCache.count >= Self.manifestCacheCap,
+           let oldest = manifestPreviewCache.min(by: { $0.value.fetchedAt < $1.value.fetchedAt })?.key {
+            manifestPreviewCache[oldest] = nil
+        }
+        manifestPreviewCache[normalizedURL] = (manifest, canonicalURL, now)
     }
 
     /// Fetch + validate a manifest URL the way `installAddonConfirmed` does, WITHOUT installing, returning a typed
@@ -430,19 +499,24 @@ final class CoreBridge: ObservableObject {
         guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else {
             return .rejected(retryable: false, message: "Enter a valid add-on URL (https://…/manifest.json).")
         }
-        let alreadyInstalled = addons.contains(where: { $0.transportUrl == normalized })
         // SSRF guard: the same private-address gate the install uses, so a manifest URL pointing at a
         // private/loopback/LAN address never even previews.
         switch await AddonURLGuard.fetch(url) {
         case .failure(let rejection):
             return .rejected(retryable: Self.isRetryable(rejection), message: rejection.message)
-        case .success(let (data, _)):
+        case .success(let (data, finalURL)):
+            // M5: id AND name must be NON-EMPTY (not merely non-nil).
             guard let manifest = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  manifest["id"] != nil,
+                  let id = manifest["id"] as? String, !id.isEmpty,
                   let name = manifest["name"] as? String, !name.isEmpty else {
                 return .rejected(retryable: false, message: "That URL did not return a valid add-on manifest.")
             }
-            manifestPreviewCache[normalized] = (manifest, Date())
+            // H4: identity is the guarded FINAL (post-redirect) canonical URL; cache under the pre-fetch key so
+            // the install reuses this exact fetch + identity (single-fetch), and check already-installed against
+            // the final identity too (a redirect can land on an installed add-on).
+            let identity = normalizedAddonURL(finalURL.absoluteString) ?? normalized
+            storeCachedManifest(normalized, manifest: manifest, canonicalURL: identity)
+            let alreadyInstalled = addons.contains { $0.transportUrl == normalized || $0.transportUrl == identity }
             return alreadyInstalled ? .alreadyInstalled(name: name) : .ready(name: name)
         }
     }

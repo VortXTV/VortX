@@ -51,6 +51,11 @@ enum AddonURLGuard {
     /// couple; a chain longer than this is treated as abuse and refused.
     private static let maxRedirects = 5
 
+    /// Upper bound on a manifest response body (H9). A real add-on manifest is small JSON; a multi-megabyte body
+    /// is either abuse or not a manifest, so we stream-read up to this and refuse anything larger instead of
+    /// buffering an unbounded response into memory.
+    private static let maxManifestBytes = 2 * 1024 * 1024
+
     // MARK: - Public validation
 
     /// Validate a URL's SCHEME + HOST before any fetch: reject a non-http(s) scheme, a literal-IP host in a
@@ -72,10 +77,19 @@ enum AddonURLGuard {
         }
 
         // Otherwise resolve the hostname and check EVERY address it maps to. Any blocked address fails closed.
-        let resolved = resolve(host: bareHost)
+        // H10: `getaddrinfo` is a BLOCKING syscall that can take seconds on slow/hostile DNS, so it runs on a
+        // detached background task and never on the caller's actor (a MainActor resolve froze the tvOS UI).
+        let resolved = await resolveOffActor(host: bareHost)
         guard !resolved.isEmpty else { return .unresolvable }
         if resolved.contains(where: { $0.isBlocked }) { return .privateAddress }
         return nil
+    }
+
+    /// Run the blocking `getaddrinfo` OFF the caller's actor (H10). A detached task guarantees the synchronous
+    /// resolve executes on the cooperative pool, not the MainActor, regardless of the async caller's isolation,
+    /// so a slow DNS answer can never stall the UI.
+    private static func resolveOffActor(host: String) async -> [IPAddress] {
+        await Task.detached(priority: .userInitiated) { resolve(host: host) }.value
     }
 
     /// Fetch a validated manifest URL with MANUAL redirect handling, re-validating each hop so a public URL
@@ -94,14 +108,29 @@ enum AddonURLGuard {
             defer { session.finishTasksAndInvalidate() }
 
             do {
-                let (data, response) = try await session.data(for: request)
+                // Stream the response so the body is BOUNDED (H9): headers arrive first (so a 3xx redirect is
+                // handled without reading any body), and the body is read incrementally and aborted the instant
+                // it exceeds `maxManifestBytes`, so a hostile host can never make us buffer an unbounded body.
+                let (byteStream, response) = try await session.bytes(for: request)
                 guard let http = response as? HTTPURLResponse else { return .failure(.unresolvable) }
-                // 3xx with a Location: re-validate the target host before following it.
+                // 3xx with a Location: re-validate the target host before following it. Do not read the body.
                 if (300...399).contains(http.statusCode),
                    let location = http.value(forHTTPHeaderField: "Location"),
                    let next = URL(string: location, relativeTo: current)?.absoluteURL {
                     current = next
                     continue
+                }
+                // H9: only a 2xx carries a manifest. Any other non-redirect status (a manifest-shaped 404 body, a
+                // 500, an auth wall) is NOT a valid manifest and is refused rather than parsed.
+                guard (200...299).contains(http.statusCode) else { return .failure(.unresolvable) }
+                // Fast reject on a declared oversize body, then enforce the real bound while streaming (a
+                // Content-Length can lie).
+                if http.expectedContentLength > Int64(maxManifestBytes) { return .failure(.unresolvable) }
+                var data = Data()
+                data.reserveCapacity(min(maxManifestBytes, 64 * 1024))
+                for try await byte in byteStream {
+                    data.append(byte)
+                    if data.count > maxManifestBytes { return .failure(.unresolvable) }
                 }
                 // Re-validate the URL URLSession actually connected to (its own resolution, not ours). This
                 // narrows the resolve-then-connect DNS-rebinding window: a host that answered a public address
@@ -153,8 +182,8 @@ enum AddonURLGuard {
 
 /// A resolved or literal IP address, reduced to the bytes we test against the blocked ranges. Kept private to
 /// the guard; the only question it answers is `isBlocked`.
-private struct IPAddress {
-    enum Kind { case v4([UInt8]), v6([UInt8]) }
+private struct IPAddress: Sendable {
+    enum Kind: Sendable { case v4([UInt8]), v6([UInt8]) }
     let kind: Kind
 
     init(v4 addr: in_addr) {

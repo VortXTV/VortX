@@ -38,7 +38,26 @@ struct AddonPairingView: View {
     // Long-lived tasks: one creates + rotates the session, one polls it.
     @State private var pollTask: Task<Void, Never>?
 
+    // H4 fence: a monotonic generation bumped on a full session RESET (onAppear / Retry) and on teardown
+    // (onDisappear). Every resolve / install / ack side-effect Task captures the generation it started under and
+    // refuses to mutate the reducer or keep retrying once the view has been reset or dismissed, so an untracked
+    // task can never resurrect a torn-down view or hammer the relay forever. NOTE: minting a fresh QR while the
+    // view stays open (rotation inside the poll loop) does NOT bump the generation, so an install dispatched on
+    // the old token still completes and lands — the outliving-coordinator guarantee (a dispatched-unconfirmed
+    // install survives session close / rotation) is preserved.
+    @State private var generation = 0
+    // All in-flight side-effect Tasks, tracked so teardown cancels them (bounded: finished tasks are pruned on
+    // each spawn, so this never grows without limit — M3 collection bound).
+    @State private var sideEffectTasks: [Task<Void, Never>] = []
+    // The latest session revision seen from the relay, attached to every ack so a stale ack cannot overwrite a
+    // newer worker attempt (H3 revision authority).
+    @State private var latestRev = 0
+
     private static let pollInterval: Duration = .seconds(2)
+    // H2: bounded ack retry. A confirmed install must be reported to the relay so the phone's Done shows truth;
+    // a transient failure is retried a few times with backoff before giving up (the add-on is already installed
+    // locally either way, so this is best-effort — but it no longer drops the ack after a single failed POST).
+    private static let ackMaxAttempts = 4
 
     // Ten-foot tvOS gets a large QR + panel; phone / Mac are arm's-length, so size down (mirrors
     // LinkLoginView's platform split).
@@ -184,12 +203,17 @@ struct AddonPairingView: View {
 
     private func incomingRow(_ row: AddonRow) -> some View {
         HStack(alignment: .top, spacing: Theme.Space.md) {
+            // M6: the status icon is DECORATIVE — the status text below states the same thing — so hide it from
+            // VoiceOver to remove the redundant accessibility element. The focusable Install/Retry button stays.
             Image(systemName: iconName(for: row.state))
                 .font(.system(size: 28))
                 .foregroundStyle(iconColor(for: row.state))
                 .frame(width: 40)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 6) {
-                Text(row.name ?? row.delivery.rawURL)
+                // M2: before the name resolves, fall back to the HOST ONLY — never the raw manifest URL, whose
+                // query/path can embed a debrid/config credential that would then sit on a shared TV screen.
+                Text(row.name ?? Self.credentialSafeHost(row.delivery.rawURL))
                     .font(Theme.Typography.cardTitle)
                     .foregroundStyle(Theme.Palette.textPrimary)
                     .lineLimit(2)
@@ -235,10 +259,12 @@ struct AddonPairingView: View {
 
     private func startSession() {
         stop()
+        generation += 1   // H4: a fresh session lifecycle; results from the prior generation are now stale.
         creating = true
         createFailed = false
         qrImage = nil
         session = nil
+        latestRev = 0
 
         pollTask = Task { @MainActor in
             await createAndPollLoop()
@@ -318,16 +344,30 @@ struct AddonPairingView: View {
     }
 
     private func stop() {
+        generation += 1   // H4: invalidate every side-effect task started under the current generation.
         pollTask?.cancel()
         pollTask = nil
+        // Cancel every tracked resolve / install / ack task so none outlives the dismissed view (H4).
+        for task in sideEffectTasks { task.cancel() }
+        sideEffectTasks = []
         // The session is deliberately LEFT ALIVE on the relay (it self-expires): a manifest the phone
         // adds after this sheet closes is picked up by the persisted-session resume on the next open.
+    }
+
+    /// Track a spawned side-effect task so teardown can cancel it, pruning already-finished entries so the list
+    /// stays bounded (M3).
+    private func track(_ task: Task<Void, Never>) {
+        sideEffectTasks.removeAll { $0.isCancelled }
+        sideEffectTasks.append(task)
     }
 
     // MARK: - Reducer wiring
 
     /// Fold the relay's live delivery list into the reducer, then run whatever effects it returns.
     private func merge(_ poll: AddonPairingClient.Poll, token: String) {
+        // H3: track the newest session revision so every ack we send carries it (a stale ack cannot overwrite a
+        // newer worker attempt). Never move it backwards.
+        latestRev = max(latestRev, poll.rev)
         let deliveries = poll.manifests.map { m in
             AddonDelivery(
                 id: m.deliveryId,
@@ -348,8 +388,8 @@ struct AddonPairingView: View {
                 resolve(delivery)
             case .install(let delivery, let attempt):
                 performInstall(delivery, attempt: attempt)
-            case .ack(let delivery, let status):
-                sendAck(delivery, status: status)
+            case .ack(let delivery, let status, let attempt):
+                sendAck(delivery, status: status, attempt: attempt)
             case .releaseToken:
                 // The poll loop rotates via `reducer.isInFlight`; nothing extra to do on release.
                 break
@@ -361,30 +401,59 @@ struct AddonPairingView: View {
     /// install path uses; it also caches the manifest so the following install reuses that fetch) to get its name
     /// and installable / already-installed / rejected state.
     private func resolve(_ delivery: AddonDelivery) {
-        Task { @MainActor in
+        let gen = generation
+        let task = Task { @MainActor in
             let outcome = await core.previewAddonManifest(urlString: delivery.rawURL)
+            // H4 fence: drop the result if the view was reset / dismissed while the preview was in flight.
+            guard gen == generation, !Task.isCancelled else { return }
             apply(reducer.resolved(id: delivery.id, outcome: outcome))
         }
+        track(task)
     }
 
     /// Install through the app's ONE hardened, CONFIRMED installer, then feed the typed outcome back to the
     /// reducer (which marks `.installed` only on confirmation and acks the relay).
     private func performInstall(_ delivery: AddonDelivery, attempt: Int) {
-        Task { @MainActor in
+        let gen = generation
+        let task = Task { @MainActor in
             let outcome = await core.installAddonConfirmed(urlString: delivery.rawURL)
+            // H4 fence: a reset / dismissed view drops the reducer re-entry. The reducer's attempt authority
+            // additionally ignores a stale attempt, so a late confirm can never double-apply.
+            guard gen == generation, !Task.isCancelled else { return }
             apply(reducer.installed(id: delivery.id, attempt: attempt, outcome: outcome))
         }
+        track(task)
     }
 
-    /// Report a confirmed terminal status back to the relay so the phone's Done can show the truth. Best-effort;
-    /// a rotated / expired session (404) is harmless: the add-on is already in the engine.
-    private func sendAck(_ delivery: AddonDelivery, status: AddonAckStatus) {
-        Task {
-            await AddonPairingClient.ack(
-                token: delivery.token,
-                deliveries: [AddonPairingClient.DeliveryAck(deliveryId: delivery.id, status: status.rawValue)]
-            )
+    /// Report a confirmed terminal status back to the relay so the phone's Done can show the truth (H2). Unlike
+    /// the old fire-and-forget POST, this HONORS the returned Bool and RETRIES with backoff until the relay
+    /// durably accepts it or the attempts are exhausted, so a single dropped POST no longer leaves the engine
+    /// installed while the phone never learns it. Each ack carries the install `attempt`, the latest session
+    /// `rev`, and a fresh mutation-id NONCE (H3 authority + replay enforcement); the client binds all of that
+    /// into the HMAC body signature. The retry loop is fenced by generation so a dismissed view stops retrying.
+    private func sendAck(_ delivery: AddonDelivery, status: AddonAckStatus, attempt: Int) {
+        let gen = generation
+        let rev = latestRev
+        let task = Task { @MainActor in
+            var backoff: Duration = .milliseconds(400)
+            for tryIndex in 0..<Self.ackMaxAttempts {
+                if gen != generation || Task.isCancelled { return }
+                let ack = AddonPairingClient.DeliveryAck(
+                    deliveryId: delivery.id,
+                    status: status.rawValue,
+                    attempt: attempt,
+                    rev: rev,
+                    mutationId: AddonPairingClient.newMutationId()
+                )
+                let ok = await AddonPairingClient.ack(token: delivery.token, deliveries: [ack])
+                if ok { return }                       // durably accepted
+                if tryIndex < Self.ackMaxAttempts - 1 {
+                    try? await Task.sleep(for: backoff)
+                    backoff *= 2
+                }
+            }
         }
+        track(task)
     }
 
     // MARK: - Row presentation
@@ -408,11 +477,20 @@ struct AddonPairingView: View {
     private func statusText(for row: AddonRow) -> String {
         switch row.state {
         case .resolving:                    return String(localized: "Checking add-on…")
-        case .ready:                        return row.delivery.rawURL
+        // M2: never render the raw manifest URL (credential-bearing). A `.ready` row is transient under
+        // auto-install anyway; show the credential-safe host.
+        case .ready:                        return Self.credentialSafeHost(row.delivery.rawURL)
         case .installing:                   return String(localized: "Installing…")
         case .installed:                    return String(localized: "Installed")
         case .failed(_, let message):       return message
         }
+    }
+
+    /// The credential-SAFE display for an add-on URL: its host only, never the query or path, either of which can
+    /// carry a debrid/config token that must not be shown on a shared TV (M2). Falls back to a generic label if
+    /// the string has no parseable host.
+    private static func credentialSafeHost(_ raw: String) -> String {
+        URLComponents(string: raw)?.host ?? String(localized: "Add-on")
     }
 
     private func statusColor(for state: AddonRowState) -> Color {
