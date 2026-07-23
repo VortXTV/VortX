@@ -1324,12 +1324,24 @@ struct TVPlayerView: View {
         }
     }
 
-    /// True for an IMDb tt####### title, the same gate the iOS control-bar uses to offer the skip
-    /// editor. Live streams and non-tt ids (e.g. add-on/Kitsu ids) are excluded: the SkipDB worker keys
-    /// off imdb:S:E, so a non-tt id has nothing to submit against.
+    /// True for an IMDb tt####### title, the same gate the iOS control-bar uses to offer the skip editor.
+    /// The decision lives in `SkipEditPolicy` so BOTH chromes share it and it is unit-tested: it keys on
+    /// CONTENT liveness (`isCurrentLiveStream`, meta type), never on the player's duration/seekability, so a
+    /// Dolby-Vision remux (which reports an indefinite/non-seekable HLS to AVPlayer) still offers the editor.
+    /// Live streams and non-tt ids (e.g. add-on/Kitsu ids) are excluded: the worker keys off imdb:S:E, so a
+    /// non-tt id has nothing to submit against.
     private var canEditSkip: Bool {
-        guard !isCurrentLiveStream, let m = curMeta else { return false }
-        return m.libraryId.range(of: #"^tt\d{7,8}$"#, options: .regularExpression) != nil
+        guard let m = curMeta else { return false }
+        return SkipEditPolicy.canEdit(isLiveContent: isCurrentLiveStream, contentId: m.libraryId)
+    }
+
+    /// The SYNTHESIZED runtime (source seconds) for a skip submission when the engine has not emitted a
+    /// finite `duration` (the DV-remux INDEFINITE edge). Reuses the loaded meta's human runtime, the same
+    /// value the provisional trickplay key uses, and only when it is THIS title's meta. nil when unknown.
+    private var skipSubmissionFallbackRuntimeSeconds: Double? {
+        guard let m = curMeta, let loaded = core.metaDetails?.meta, loaded.id == m.libraryId,
+              let secs = loaded.runtimeSeconds, secs > 0 else { return nil }
+        return secs
     }
 
     /// The bottom transport row in remote left/right order. `.close` (top bar) and `.scrub` (the seek
@@ -1422,6 +1434,10 @@ struct TVPlayerView: View {
     /// Seed the skip editor from the current playhead and open its panel. Reset on every open so a fresh
     /// segment never inherits stale times / type / result from a prior submission, matching the iOS bar.
     private func openSkipEditor() {
+        DiagnosticsLog.log("skip", SkipEditPolicy.visibilityDiagnostic(
+            canEdit: canEditSkip, isLiveContent: isCurrentLiveStream,
+            hasSubmittableId: (curMeta.map { SkipEditPolicy.isSubmittableContentId($0.libraryId) } ?? false),
+            engine: isAVPlayerActive ? "avplayer" : "libmpv"))
         let snapped = (currentTime * 2).rounded() / 2
         skipEditStart = max(0, snapped)
         skipEditEnd = min(snapped + 30, duration > 0 ? duration : snapped + 60)
@@ -2011,7 +2027,9 @@ struct TVPlayerView: View {
             segment_type: skipEditType.rawValue,
             start_ms: Int(skipEditStart * 1000),
             end_ms: Int(skipEditEnd * 1000),
-            duration_ms: duration > 0 ? Int(duration * 1000) : nil
+            duration_ms: SkipEditPolicy.submissionDurationMs(
+                playerDurationSeconds: duration,
+                fallbackRuntimeSeconds: skipSubmissionFallbackRuntimeSeconds)
         )
         let key = skipSubmitKey(meta, type: skipEditType)
         Task { @MainActor in
