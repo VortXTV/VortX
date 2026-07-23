@@ -17,6 +17,17 @@ enum DebridService: String, CaseIterable, Identifiable {
         }
     }
 
+    /// The Singularity pool provider tag for this service (the closed rd/tb/pm/ad enum the source-index worker
+    /// validates). Used to contribute the FACT "this provider had the source cached" alongside a torrent hash.
+    var poolProviderTag: String {
+        switch self {
+        case .realDebrid: return "rd"
+        case .allDebrid:  return "ad"
+        case .premiumize: return "pm"
+        case .torBox:     return "tb"
+        }
+    }
+
     /// Where to get the key, shown as a hint under the field.
     var hint: String {
         switch self {

@@ -2171,7 +2171,8 @@ struct iOSDetailView: View {
         sourceContentID ?? "meta:\(id)"
     }
 
-    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
+    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil,
+                                    providerByHash: [String: String] = [:]) {
         let contentID = sourceContentID
         sourceIndex.refresh(contentID: contentID, isSignedIn: VortXSyncManager.shared.isSignedIn)
         guard let contentID else { return }
@@ -2179,9 +2180,10 @@ struct iOSDetailView: View {
         // torrents even when the user hides them locally). Includes the TorBox search sources. No user data.
         // Pool-EXCLUDED: the caller's torbox-base when it already merged one, else self-merge. NEVER the
         // Singularity-pool-inclusive set: hoarding the pool's own results back into itself would be wrong.
+        // `providerByHash` tags each cached torrent with the provider the user's OWN cache-check confirmed.
         let groups = torboxMerged ?? torboxSearch.merged(into: core.streamGroups())
         guard !groups.isEmpty else { return }
-        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
+        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups, providerByHash: providerByHash) }
     }
 
     /// Trailing-debounced driver for the movie/live add-on load storm: the raw `.onChange` fired per add-on
@@ -2196,7 +2198,8 @@ struct iOSDetailView: View {
             guard !Task.isCancelled else { return }
             let torboxBase = torboxSearch.merged(into: core.streamGroups())   // pool-EXCLUDED (hoard set)
             debridCache.refresh(from: sourceIndex.merged(into: torboxBase))   // pool-INCLUDED (debrid set)
-            refreshSourceIndex(torboxMerged: torboxBase)                      // reuse the same base; no second merge
+            refreshSourceIndex(torboxMerged: torboxBase,
+                               providerByHash: debridCache.cachedProviderByHash) // reuse the base; tag cached facts
         }
     }
 
@@ -4236,15 +4239,17 @@ struct iOSEpisodeStreams: View {
     /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
-    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
+    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil,
+                                    providerByHash: [String: String] = [:]) {
         let contentID = episodeContentID
         sourceIndex.refresh(contentID: contentID, isSignedIn: VortXSyncManager.shared.isSignedIn)
         guard let contentID else { return }
         // Pool-EXCLUDED hoard set: the caller's episode-scoped torbox-base when it merged one, else self-merge.
         // NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into itself is wrong.
+        // `providerByHash` tags each cached torrent with the provider the user's OWN cache-check confirmed.
         let groups = torboxMerged ?? torboxSearch.merged(into: core.streamGroups(forStreamId: shownVideo.id))
         guard !groups.isEmpty else { return }
-        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
+        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups, providerByHash: providerByHash) }
     }
 
     /// Trailing-debounced driver for THIS episode's add-on load storm: the raw `.onChange` fired per add-on
@@ -4259,7 +4264,8 @@ struct iOSEpisodeStreams: View {
             guard !Task.isCancelled else { return }
             let torboxBase = torboxSearch.merged(into: core.streamGroups(forStreamId: shownVideo.id))   // pool-EXCLUDED
             debridCache.refresh(from: sourceIndex.merged(into: torboxBase))   // pool-INCLUDED (debrid set)
-            refreshSourceIndex(torboxMerged: torboxBase)                      // reuse the same base; no second merge
+            refreshSourceIndex(torboxMerged: torboxBase,
+                               providerByHash: debridCache.cachedProviderByHash) // reuse the base; tag cached facts
         }
     }
 

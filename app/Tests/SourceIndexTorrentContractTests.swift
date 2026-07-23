@@ -88,6 +88,19 @@ enum MoatConsent {
     nonisolated(unsafe) static var contributeAndConsume = true
 }
 
+/// Minimal stand-in for the app's debrid service enum + key store, referenced by the SERVE source's default
+/// capability closure (usenet is gated on a configured TorBox key). The serve-filter tests below drive
+/// capabilities EXPLICITLY through `SourceIndexClient.streams(from:capabilities:)`, so the store's only job
+/// here is to let the default closure compile; it defaults to nothing configured.
+enum DebridService: String, CaseIterable { case realDebrid, allDebrid, premiumize, torBox }
+final class DebridKeys: @unchecked Sendable {
+    static let shared = DebridKeys()
+    private let lock = NSLock()
+    private var configured: Set<DebridService> = []
+    func isConfigured(_ service: DebridService) -> Bool { lock.withLock { configured.contains(service) } }
+    func setConfigured(_ set: Set<DebridService>) { lock.withLock { configured = set } }
+}
+
 /// Mirrors the members of the real `ResolvedConfig` that `SourceIndexClient` reads. Every value here MUST equal the
 /// baked default in `RemoteConfigDefaults`, so this harness exercises the same behaviour the app ships with an absent
 /// remote block. A member added to the real snapshot and not added here does not fail a test: it stops the whole
@@ -692,8 +705,12 @@ struct SourceIndexTorrentContractTests {
         // type, so a tmdb key merges two unrelated titles into one pool bucket in both directions.
         expect(SourceIndexClient.serveURL(contentID: "tmdb:123:1:2") == nil,
                "serve boundary REFUSES a tmdb key: pool keys are IMDb-only")
-        expect(SourceIndexClient.serveURL(contentID: "tt1234567:1:2")?.absoluteString.contains("kind=torrent") == true,
-               "serve boundary builds only the torrent query for a canonical IMDb episode")
+        // DEC-260723-D1: the serve request now asks for ALL kinds (torrent / http / usenet) and filters
+        // client-side by the requester's configured services, so the URL carries content_id and NO kind param.
+        expect(SourceIndexClient.serveURL(contentID: "tt1234567:1:2")?.absoluteString.contains("content_id=tt1234567") == true,
+               "serve boundary builds the content_id query for a canonical IMDb episode")
+        expect(SourceIndexClient.serveURL(contentID: "tt1234567:1:2")?.absoluteString.contains("kind=") == false,
+               "serve boundary requests ALL kinds (no kind filter) so http and usenet come back too")
         let exactOrigin = "https://sources.vortx.tv"
         let hostileOrigins = [
             "http://sources.vortx.tv",
@@ -1009,14 +1026,131 @@ struct SourceIndexTorrentContractTests {
         expect(postResponseResult.isEmpty && postResponseTransportCount == 1,
                "GET gate closing after response prevents decoded rows from escaping")
 
+        // CONTRACT CHANGED (DEC-260723-D1): merge is now a pure combine/dedup over ALREADY-SCREENED streams
+        // (the credential strip + capability gate live in `streams(from:capabilities:)`, exercised below), so
+        // merge admits torrent / http / usenet rows and only drops duplicates WITHIN Singularity's own list.
+        let publicHTTP = "https://cdn.example.com/movie.mkv"
+        let publicNZB = "https://indexer.example.com/file.nzb"
         let merged = SourceIndexServeSource.merge(
-            served + [CoreStream(name: "direct", url: privateURL), CoreStream(name: "nzb", nzbUrl: privateNZB)],
+            served + [CoreStream(name: "direct", url: publicHTTP), CoreStream(name: "nzb", nzbUrl: publicNZB),
+                      CoreStream(name: "direct-dup", url: publicHTTP)],
             into: []
         )
-        // Count follows `served`, which is now 2 under the corrected worker-mirrored floor (>=1). The INTENT is
-        // unchanged and still enforced: the appended direct and nzb rows must NOT appear in the merged output.
-        expect(merged.count == 1 && merged.first?.streams.count == 2,
-               "merge admits only canonical torrent streams (direct/nzb rows excluded)")
+        // served (2 torrents) + one http + one usenet, with the duplicate http collapsed by its url key.
+        expect(merged.count == 1 && merged.first?.streams.count == 4,
+               "merge admits torrent + http + usenet streams and dedups within its own list by kind-natural id")
+
+        // ---- Per-requester SERVE filtering (DEC-260723-D1): torrent/http/usenet built by what the requester
+        // can consume. The credential strip + playable-URL screen run here, so the privacy boundary that used
+        // to be asserted on merge now lives on streams(from:capabilities:).
+        let rdCachedTorrent = SourceIndexClient.PooledSource(
+            kind: "torrent", id: lower, quality: "1080p", sizeBytes: 1, seeders: 1, corroboration: 2,
+            providers: ["rd"]
+        )
+        let publicHTTPRow = SourceIndexClient.PooledSource(
+            kind: "http", id: publicHTTP, quality: "1080p", sizeBytes: 1, seeders: nil, corroboration: 2
+        )
+        let credentialHTTPRow = SourceIndexClient.PooledSource(
+            kind: "http", id: privateURL, quality: "1080p", sizeBytes: 1, seeders: nil, corroboration: 2
+        )
+        let publicUsenetRow = SourceIndexClient.PooledSource(
+            kind: "usenet", id: publicNZB, quality: "1080p", sizeBytes: 1, seeders: nil, corroboration: 2
+        )
+        let opaqueUsenetRow = SourceIndexClient.PooledSource(
+            kind: "usenet", id: "opaque-nzb-id.123", quality: "1080p", sizeBytes: 1, seeders: nil, corroboration: 2
+        )
+        let allKindPool = [rdCachedTorrent, publicHTTPRow, credentialHTTPRow, publicUsenetRow, opaqueUsenetRow]
+
+        // A user with NO direct-http and NO usenet capability (the byte-unchanged torrent-only path) sees only
+        // the self-verifying torrent, built byte-identically to v1 (a bare "Other · Singularity" infohash row).
+        let torrentOnlyServed = SourceIndexClient.streams(from: allKindPool, capabilities: .torrentOnly)
+        expect(torrentOnlyServed.count == 1
+               && torrentOnlyServed.first?.infoHash == lower
+               && torrentOnlyServed.first?.url == nil
+               && torrentOnlyServed.first?.nzbUrl == nil
+               && torrentOnlyServed.first?.name == "Other · Singularity",
+               "a torrent-only requester sees only the self-verifying torrent, byte-identical to v1")
+
+        // A user who can play raw http but has NO usenet service: the torrent + the PUBLIC http link, never the
+        // credential-bearing http row, never usenet.
+        let httpCapable = SourceIndexClient.streams(
+            from: allKindPool,
+            capabilities: SourceIndexClient.ServeCapabilities(canPlayDirectHTTP: true, hasUsenet: false)
+        )
+        expect(httpCapable.count == 2
+               && httpCapable.contains(where: { $0.infoHash == lower })
+               && httpCapable.contains(where: { $0.url == publicHTTP })
+               && !httpCapable.contains(where: { $0.url == privateURL })
+               && !httpCapable.contains(where: { $0.nzbUrl != nil }),
+               "an http-capable requester sees torrent + public http, never the credential http or any usenet row")
+
+        // A user WITH a usenet-capable service: also the public usenet nzb, but never the opaque (unplayable)
+        // usenet id and never the credential http.
+        let usenetCapable = SourceIndexClient.streams(
+            from: allKindPool,
+            capabilities: SourceIndexClient.ServeCapabilities(canPlayDirectHTTP: true, hasUsenet: true)
+        )
+        expect(usenetCapable.count == 3
+               && usenetCapable.contains(where: { $0.infoHash == lower })
+               && usenetCapable.contains(where: { $0.url == publicHTTP })
+               && usenetCapable.contains(where: { $0.nzbUrl == publicNZB })
+               && !usenetCapable.contains(where: { $0.nzbUrl == "opaque-nzb-id.123" }),
+               "a usenet-capable requester also sees the public nzb, but never an opaque/unplayable usenet id")
+
+        // The rd-tagged torrent is shown to EVERY requester (self-verifying); a tb-only user is never shown it
+        // as a fabricated cached badge -- the pool's provider claim never becomes a played link on its own, the
+        // requester's OWN cache-check is the authority (delivered by the existing debrid pipeline, not here).
+        expect(torrentOnlyServed.first?.description == "Singularity source"
+               && httpCapable.first(where: { $0.infoHash == lower })?.url == nil,
+               "a provider-tagged torrent stays a plain self-verifying row; the tag never fabricates a played link")
+
+        // ---- All-kind CONTRIBUTION shapes + client-side credential strip ----
+        let contributionGroups = [CoreStreamSourceGroup(id: "g", addon: "addon", streams: [
+            CoreStream(name: "1080p", infoHash: lower),                                   // raw torrent
+            CoreStream(name: "1080p", url: publicHTTP),                                   // public direct http
+            CoreStream(name: "1080p", url: privateURL),                                   // credential http -> dropped
+            CoreStream(name: "1080p", nzbUrl: publicNZB),                                 // public usenet
+            CoreStream(name: "1080p", nzbUrl: privateNZB),                                // credential usenet -> dropped
+            CoreStream(name: "1080p", url: "https://cdn.debrid.example/dl/x/f.mkv",       // debrid-from-hash:
+                       sources: ["dht:" + secondHash]),                                   //   contribute HASH, not CDN url
+        ])]
+        let allKindDescriptors = SourceIndexClient.descriptors(
+            from: contributionGroups, providerByHash: [lower: "rd", secondHash: "tb"]
+        )
+        let byKind = Dictionary(grouping: allKindDescriptors, by: { $0.kind })
+        expect((byKind["torrent"]?.count ?? 0) == 2
+               && byKind["torrent"]?.contains(where: { $0.id == lower && $0.provider == "rd" }) == true
+               && byKind["torrent"]?.contains(where: { $0.id == secondHash && $0.provider == "tb" }) == true,
+               "torrents are contributed with the provider fact from the user's own cache-check")
+        expect(byKind["http"]?.count == 1 && byKind["http"]?.first?.id == publicHTTP,
+               "a public http link is contributed; a credential-bearing one is dropped before the boundary")
+        expect(byKind["usenet"]?.count == 1 && byKind["usenet"]?.first?.id == publicNZB,
+               "a public usenet nzb link is contributed; a credential-bearing one is dropped before the boundary")
+        let contributedIDs = Set(allKindDescriptors.map { $0.id })
+        expect(!contributedIDs.contains(privateURL) && !contributedIDs.contains(privateNZB)
+               && !contributedIDs.contains("https://cdn.debrid.example/dl/x/f.mkv"),
+               "no credential link and no personal debrid CDN link ever crosses the contribution boundary")
+
+        // The upload boundary re-runs each kind's canonicalizer + provider validation on hand-built descriptors.
+        let handBuilt: [SourceIndexClient.Descriptor] = [
+            .init(kind: "http", id: publicHTTP, quality: "4K", sizeBytes: 1, seeders: nil, provider: "rd"),
+            .init(kind: "usenet", id: privateNZB, quality: "4K", sizeBytes: 1, seeders: nil),
+            .init(kind: "torrent", id: upper, quality: "1080p", sizeBytes: 0, seeders: 5, provider: "realdebrid"),
+        ]
+        let uploadableAllKind = SourceIndexClient.uploadableDescriptors(handBuilt)
+        expect(uploadableAllKind.count == 2
+               && uploadableAllKind.contains(where: { $0.kind == "http" && $0.id == publicHTTP && $0.provider == "rd" })
+               && uploadableAllKind.contains(where: { $0.kind == "torrent" && $0.id == lower && $0.provider == nil }),
+               "upload boundary keeps public http (valid provider) + normalized torrent (unknown provider -> nil), drops credential usenet")
+        let allKindWire = String(
+            data: SourceIndexClient.contributionBody(contentID: "tt1234567", descriptors: handBuilt) ?? Data(),
+            encoding: .utf8
+        ) ?? ""
+        // JSONEncoder escapes '/' as '\/' and does not preserve key order, so assert on slash-free substrings.
+        expect(allKindWire.contains("cdn.example.com") && allKindWire.contains("movie.mkv")
+               && allKindWire.contains(lower) && allKindWire.contains("\"provider\":\"rd\"")
+               && !allKindWire.contains("indexer.example") && !allKindWire.contains("apikey"),
+               "the wire body carries public http + torrent + a validated provider tag, never a credential link")
 
         let rotated = SourceIndexClient.PooledSource(
             kind: "torrent", id: secondHash, quality: "Other", sizeBytes: 0,

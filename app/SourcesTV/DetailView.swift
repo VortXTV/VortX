@@ -2500,17 +2500,19 @@ struct CoreStreamList: View {
     /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
-    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
+    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil,
+                                    providerByHash: [String: String] = [:]) {
         let contentID = sourceContentID
         let vortxSignedIn = VortXSyncManager.shared.isSignedIn
         sourceIndex.refresh(contentID: contentID, isSignedIn: vortxSignedIn)
         guard let contentID else { return }
         // Pool-EXCLUDED hoard set: the caller's torbox-base when it already merged one (avoids a second walk),
         // else self-merge. NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into
-        // itself would be wrong.
+        // itself would be wrong. `providerByHash` tags each cached torrent with the provider the user's OWN
+        // cache-check confirmed.
         let groups = torboxMerged ?? torboxSearch.merged(into: targetCoreGroups)
         guard !groups.isEmpty else { return }
-        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
+        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups, providerByHash: providerByHash) }
     }
 
     /// Trailing-debounced driver for the add-on load storm: the raw `.onChange` fired per add-on completion,
@@ -2526,7 +2528,8 @@ struct CoreStreamList: View {
             // filter would drop, plus Singularity's torrent-only pool sources. Torrents resolve through debrid;
             // TorBox-search NZBs resolve through TorBox. This remains orthogonal to the display filter.
             debridCache.refresh(from: sourceIndex.merged(into: torboxBase))
-            refreshSourceIndex(torboxMerged: torboxBase)   // reuse the same base; no second merge walk
+            refreshSourceIndex(torboxMerged: torboxBase,
+                               providerByHash: debridCache.cachedProviderByHash) // reuse the base; tag cached facts
         }
     }
 
