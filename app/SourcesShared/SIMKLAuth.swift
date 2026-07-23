@@ -1,5 +1,44 @@
 import Foundation
 
+// CREDENTIAL_SIMKL_SLOTS_BEGIN
+/// Owner-scoped Keychain slot names for the SIMKL token pair (M3, INS-260722-06R v2: PER-ACCOUNT scope).
+/// Mirrors `TraktTokenSlots`: nonisolated so both the `SIMKLAuth` actor and the @MainActor synchronous
+/// sync-adoption path (H2) derive the same names without an actor hop. The pre-scoping global names remain
+/// only as a one-owner claim source (REQ-23 delete-source-first); they are never written again.
+enum SIMKLTokenSlots {
+    static let legacyAccess = "vortx.simkl.accessToken"
+    static let legacyExpiry = "vortx.simkl.expiresAt"
+    /// One-owner claim marker for the legacy global token pair (no credential value inside).
+    static let claimMarker = "vortx.simkl.migration.global.owner"
+
+    static func access(_ ns: String) -> String { legacyAccess + "." + ns }
+    static func expiry(_ ns: String) -> String { legacyExpiry + "." + ns }
+
+    /// Claim the unowned global legacy token pair for `ns` (first explicit bind wins, permanently),
+    /// delete-source-first. Synchronous; called from the main-actor scope bind in `VortXSyncManager`.
+    static func claimLegacyGlobal(ownerNamespace ns: String) {
+        CredentialLegacyClaim.claimGlobalSlotSet(
+            slots: [
+                (source: legacyAccess, destination: access(ns)),
+                (source: legacyExpiry, destination: expiry(ns)),
+            ],
+            claimMarkerAccount: claimMarker,
+            ownerNamespace: ns,
+            provenanceTag: "simkl-token-pair"
+        )
+    }
+
+    /// H2 (INS-260722-06R v2): adopt a synced SIMKL token with ALL Keychain writes in ONE synchronous
+    /// closure, no await between the caller's session validation and these writes (see
+    /// `TraktTokenSlots.adoptSyncedTokens`). Writes target the CALLER-CAPTURED owner namespace.
+    static func adoptSyncedTokens(access: String, expiryUnix: Int, ownerNamespace ns: String) {
+        guard !access.isEmpty else { return }
+        Keychain.set(access, for: Self.access(ns))
+        Keychain.set(String(expiryUnix), for: Self.expiry(ns))
+    }
+}
+// CREDENTIAL_SIMKL_SLOTS_END
+
 /// SIMKL PIN/device auth plus Keychain-backed token storage. Mirrors `TraktAuth`'s shape but for
 /// SIMKL's simpler model: a PIN flow (request a code, poll until the user authorizes) that yields a
 /// LONG-LIVED access token with NO refresh rotation. A missing/zero expiry is therefore treated as
@@ -8,6 +47,9 @@ import Foundation
 /// Credentials come from the same build-time seam as Trakt: the Info.plist `SIMKLClientId` /
 /// `SIMKLClientSecret` keys, substituted from `$(SIMKL_CLIENT_ID)` / `$(SIMKL_CLIENT_SECRET)` (empty
 /// default). `isConfigured` gates the whole feature so the app ships safely with the values blank.
+///
+/// OWNER CAPTURE RULE (M3): every public entry point captures the CURRENT owner namespace once, before
+/// its first suspension; every Keychain slot it touches derives from that capture (see `TraktAuth`).
 actor SIMKLAuth {
     static let shared = SIMKLAuth()
 
@@ -49,32 +91,38 @@ actor SIMKLAuth {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - Keychain accounts (token lives here, nowhere else)
-
-    private let accessAccount = "vortx.simkl.accessToken"
-    private let expiryAccount = "vortx.simkl.expiresAt"   // unix epoch seconds, or "0" for a non-expiring token
-
     private let session: URLSession
 
     init(session: URLSession = .shared) { self.session = session }
 
-    // MARK: - Public state
-
-    /// True when an access token is stored (the user has connected SIMKL).
-    var isSignedIn: Bool { Keychain.string(accessAccount)?.isEmpty == false }
-
-    /// Drop the stored token (the user disconnected). Does not revoke server-side.
-    func signOut() {
-        Keychain.set(nil, for: accessAccount)
-        Keychain.set(nil, for: expiryAccount)
+    /// The owner namespace captured at operation entry (see the OWNER CAPTURE RULE above).
+    private nonisolated func currentOwnerNamespace() -> String {
+        CredentialScopeRegistry.shared.currentNamespace()
     }
 
-    /// A live access token, or throws `.notSignedIn`. SIMKL tokens are long-lived and do not refresh, so
-    /// a stored token is returned as-is; a recorded expiry in the past (rare, only if a future SIMKL
-    /// change adds one) throws so the UI can re-prompt.
+    // MARK: - Public state
+
+    /// True when an access token is stored for the CURRENT owner (the user has connected SIMKL).
+    var isSignedIn: Bool {
+        Keychain.string(SIMKLTokenSlots.access(currentOwnerNamespace()))?.isEmpty == false
+    }
+
+    /// Drop the CURRENT owner's stored token (the user disconnected). Does not revoke server-side.
+    /// H5: the token clear records provenance at commit time, in the same synchronous run as the writes.
+    func signOut() {
+        let ns = currentOwnerNamespace()
+        Keychain.set(nil, for: SIMKLTokenSlots.access(ns))
+        Keychain.set(nil, for: SIMKLTokenSlots.expiry(ns))
+        CredentialProvenance.record(event: "token-clear.simkl", ownerNamespace: ns)
+    }
+
+    /// A live access token for the CURRENT owner, or throws `.notSignedIn`. SIMKL tokens are long-lived
+    /// and do not refresh, so a stored token is returned as-is; a recorded expiry in the past (rare, only
+    /// if a future SIMKL change adds one) throws so the UI can re-prompt.
     func validToken() throws -> String {
-        guard let token = Keychain.string(accessAccount), !token.isEmpty else { throw SIMKLError.notSignedIn }
-        if let expiryString = Keychain.string(expiryAccount), let expiry = Int(expiryString), expiry > 0,
+        let ns = currentOwnerNamespace()
+        guard let token = Keychain.string(SIMKLTokenSlots.access(ns)), !token.isEmpty else { throw SIMKLError.notSignedIn }
+        if let expiryString = Keychain.string(SIMKLTokenSlots.expiry(ns)), let expiry = Int(expiryString), expiry > 0,
            Date().timeIntervalSince1970 >= Double(expiry) {
             throw SIMKLError.notSignedIn
         }
@@ -83,20 +131,13 @@ actor SIMKLAuth {
 
     // MARK: - Cross-device adoption / sync mirror
 
-    /// Adopt a token that arrived from ANOTHER device over the E2E `doc.apiKeys` sync channel. Writes the
-    /// Keychain directly (no network). Ignores an empty token so a partial doc never clears a live session.
-    func adoptTokens(access: String, expiryUnix: Int) {
-        guard !access.isEmpty else { return }
-        Keychain.set(access, for: accessAccount)
-        Keychain.set(String(expiryUnix), for: expiryAccount)
-    }
-
     /// The stored token for the sync PUSH side (access, absolute unix expiry or 0), or nil when not
-    /// signed in. Read-only; the sync manager sends these only when a local session exists and NEVER
-    /// deletes them from the doc when absent (mirrors the debrid guard).
-    func syncableTokens() -> (access: String, expiryUnix: Int)? {
-        guard let access = Keychain.string(accessAccount), !access.isEmpty else { return nil }
-        let expiry = Int(Keychain.string(expiryAccount) ?? "0") ?? 0
+    /// signed in, read from the CALLER-CAPTURED owner scope (see `TraktAuth.syncableTokens`). Read-only;
+    /// the sync manager sends these only when a local session exists and NEVER deletes them from the doc
+    /// when absent (mirrors the debrid guard).
+    nonisolated static func syncableTokens(ownerNamespace ns: String) -> (access: String, expiryUnix: Int)? {
+        guard let access = Keychain.string(SIMKLTokenSlots.access(ns)), !access.isEmpty else { return nil }
+        let expiry = Int(Keychain.string(SIMKLTokenSlots.expiry(ns)) ?? "0") ?? 0
         return (access, expiry)
     }
 
@@ -122,6 +163,10 @@ actor SIMKLAuth {
 
     /// One poll of `GET /oauth/pin/{user_code}`.
     func poll(userCode: String) async throws -> PollResult {
+        try await poll(userCode: userCode, ownerNamespace: currentOwnerNamespace())
+    }
+
+    private func poll(userCode: String, ownerNamespace ns: String) async throws -> PollResult {
         try ensureConfigured()
         guard var components = URLComponents(string: Self.apiBase + "/oauth/pin/\(userCode)") else { throw SIMKLError.badURL }
         components.queryItems = Self.requiredQueryItems
@@ -130,32 +175,34 @@ actor SIMKLAuth {
         guard status == 200 else { throw SIMKLError.server(status: status) }
         let poll = try decode(SIMKLPinPoll.self, from: data)
         if poll.result.uppercased() == "OK", let token = poll.accessToken, !token.isEmpty {
-            store(accessToken: token)
+            store(accessToken: token, ownerNamespace: ns)
             return .authorized(token)
         }
         return .pending
     }
 
     /// Run the full polling loop until the user authorizes or the code expires. On success the token is
-    /// already stored; the return value is the same token.
+    /// already stored; the return value is the same token. The owner is captured ONCE, at entry: the
+    /// connection belongs to the owner who initiated it, even if the VortX session changes mid-poll.
     @discardableResult
     func pollForToken(userCode: String, interval: Int, expiresIn: Int) async throws -> String {
+        let ns = currentOwnerNamespace()
         let deadline = Date().addingTimeInterval(TimeInterval(expiresIn))
         let waitSeconds = max(interval, 1)
         while Date() < deadline {
             try await sleep(seconds: waitSeconds)
             try Task.checkCancellation()
-            if case .authorized(let token) = try await poll(userCode: userCode) { return token }
+            if case .authorized(let token) = try await poll(userCode: userCode, ownerNamespace: ns) { return token }
         }
         throw SIMKLError.expired
     }
 
     // MARK: - Persistence + HTTP plumbing
 
-    /// Store a fresh access token. SIMKL tokens do not expire, so the expiry slot is "0" (non-expiring).
-    private func store(accessToken: String) {
-        Keychain.set(accessToken, for: accessAccount)
-        Keychain.set("0", for: expiryAccount)
+    /// Store a fresh access token under an owner. SIMKL tokens do not expire, so the expiry slot is "0".
+    private func store(accessToken: String, ownerNamespace ns: String) {
+        Keychain.set(accessToken, for: SIMKLTokenSlots.access(ns))
+        Keychain.set("0", for: SIMKLTokenSlots.expiry(ns))
     }
 
     private func ensureConfigured() throws {

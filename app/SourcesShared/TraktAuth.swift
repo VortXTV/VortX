@@ -1,5 +1,60 @@
 import Foundation
 
+// CREDENTIAL_TRAKT_SLOTS_BEGIN
+/// Owner-scoped Keychain slot names for the Trakt token set (M3, INS-260722-06R v2: PER-ACCOUNT scope).
+///
+/// Nonisolated on purpose: BOTH the `TraktAuth` actor (device flow, refresh) and the @MainActor synchronous
+/// sync-adoption path (`adoptSyncedTokens`, the H2 fix) write these slots, so the names must be derivable
+/// without an actor hop. The pre-scoping global names remain only as a one-owner claim source (REQ-23
+/// delete-source-first, via `CredentialLegacyClaim`); they are never written again.
+enum TraktTokenSlots {
+    static let legacyAccess = "vortx.trakt.accessToken"
+    static let legacyRefresh = "vortx.trakt.refreshToken"
+    static let legacyExpiry = "vortx.trakt.expiresAt"
+    static let legacyCreatedAt = "vortx.trakt.createdAt"
+    /// One-owner claim marker for the legacy global token set (no credential value inside).
+    static let claimMarker = "vortx.trakt.migration.global.owner"
+
+    static func access(_ ns: String) -> String { legacyAccess + "." + ns }
+    static func refresh(_ ns: String) -> String { legacyRefresh + "." + ns }
+    static func expiry(_ ns: String) -> String { legacyExpiry + "." + ns }
+    static func createdAt(_ ns: String) -> String { legacyCreatedAt + "." + ns }
+
+    /// Claim the unowned global legacy token set for `ns` (first explicit bind wins, permanently), moving
+    /// it into the owner's scoped slots delete-source-first. Synchronous; called from the main-actor scope
+    /// bind in `VortXSyncManager`.
+    static func claimLegacyGlobal(ownerNamespace ns: String) {
+        CredentialLegacyClaim.claimGlobalSlotSet(
+            slots: [
+                (source: legacyAccess, destination: access(ns)),
+                (source: legacyRefresh, destination: refresh(ns)),
+                (source: legacyExpiry, destination: expiry(ns)),
+                (source: legacyCreatedAt, destination: createdAt(ns)),
+            ],
+            claimMarkerAccount: claimMarker,
+            ownerNamespace: ns,
+            provenanceTag: "trakt-token-set"
+        )
+    }
+
+    /// H2 (INS-260722-06R v2): adopt a synced Trakt token set with ALL Keychain writes in ONE synchronous
+    /// closure, no await between the caller's session validation and these writes. The caller (`syncDown`'s
+    /// apply region) is @MainActor and validates the credential session in the SAME turn; the actor hop the
+    /// old `adoptTokens` await performed is exactly the guard-to-Keychain gap this replaces. Writes target
+    /// the CALLER-CAPTURED owner namespace, never "whatever is current at write time".
+    static func adoptSyncedTokens(access: String, refresh: String, expiryUnix: Int, ownerNamespace ns: String) {
+        guard !access.isEmpty, !refresh.isEmpty else { return }
+        Keychain.set(access, for: Self.access(ns))
+        Keychain.set(refresh, for: Self.refresh(ns))
+        Keychain.set(String(expiryUnix), for: Self.expiry(ns))
+        // The synced mirror carries no issue time, so stamp adoption time. The rebuilt "lifetime" is
+        // then the REMAINING lifetime at adoption, whose half-life leeway is always strictly less than
+        // the remaining time itself, so a just-adopted token is never instantly read as expired.
+        Keychain.set(String(Int(Date().timeIntervalSince1970)), for: Self.createdAt(ns))
+    }
+}
+// CREDENTIAL_TRAKT_SLOTS_END
+
 /// Trakt.tv OAuth device-code flow plus Keychain-backed token storage.
 ///
 /// The flow is the standard Trakt device path (https://trakt.docs.apiary.io/reference/authentication-devices):
@@ -7,13 +62,14 @@ import Foundation
 ///   1. `requestDeviceCode()` -> show `userCode` + `verificationURL` to the user.
 ///   2. `pollForToken(deviceCode:)` -> loop on `POST /oauth/device/token` at the server-given
 ///      `interval` until the user authorizes (200), denies (418), or the codes expire (410).
-///   3. Tokens are stored in the Keychain via `Keychain.swift` (never UserDefaults, never backups).
+///   3. Tokens are stored in the Keychain via `Keychain.swift` (never UserDefaults, never backups),
+///      SCOPED TO THE OWNER (VortX account or the signed-out device) that started the operation.
 ///   4. `validToken()` returns a live access token, transparently refreshing when near expiry.
 ///
-/// The config constants `clientID` / `clientSecret` are placeholders. A Trakt app must be registered
-/// at https://trakt.tv/oauth/applications and the values filled in (or, preferably, injected from a
-/// build-time secret) before the flow can run. `isConfigured` gates the whole feature so the app
-/// ships safely with the values blank.
+/// OWNER CAPTURE RULE (M3): every public entry point captures the CURRENT owner namespace ONCE, before its
+/// first suspension, and every Keychain slot it touches is derived from that capture. A VortX account switch
+/// mid-operation therefore files results under the owner that STARTED the operation (whose scope they belong
+/// to) and can never write into the switched-in owner's scope.
 actor TraktAuth {
     static let shared = TraktAuth()
 
@@ -52,30 +108,22 @@ actor TraktAuth {
     /// True once a non-empty client id/secret pair is present. Everything no-ops until then.
     static var isConfigured: Bool { !clientID.isEmpty && !clientSecret.isEmpty }
 
-    // MARK: - Keychain accounts (token set lives here, nowhere else)
-
-    private let accessAccount = "vortx.trakt.accessToken"
-    private let refreshAccount = "vortx.trakt.refreshToken"
-    private let expiryAccount = "vortx.trakt.expiresAt"   // unix epoch seconds, stored as a string
-    /// Unix epoch seconds when the token was ISSUED, stored as a string. Fourth slot: it lets
-    /// `currentToken()` rebuild the token with its ORIGINAL lifetime so the 30-minute early-refresh
-    /// leeway actually fires (see `TraktToken.defaultLeeway`). May be absent on installs whose token
-    /// was stored before this slot existed; `currentToken()` degrades gracefully to hard-expiry-only.
-    private let createdAtAccount = "vortx.trakt.createdAt"
-
     private let session: URLSession
 
-    /// The single in-flight refresh, if one is running. Concurrent `validToken()` callers (scrobbleStart,
-    /// TraktSyncEngine.pullWatched, a rail fetch) await THIS task instead of each firing their own refresh
-    /// POST. Trakt rotates the refresh token on every refresh, so two independent refreshes would race:
-    /// the loser 401s on an already-spent refresh token and would drop the whole session. Single-flight
-    /// collapses them into one, so only one rotation happens and everyone gets the same fresh token.
-    private var inFlightRefresh: Task<TraktToken, Error>?
+    /// The single in-flight refresh for ONE owner namespace, if one is running. Concurrent `validToken()`
+    /// callers under the same owner await THIS task instead of each firing their own refresh POST. Trakt
+    /// rotates the refresh token on every refresh, so two independent refreshes would race: the loser 401s
+    /// on an already-spent refresh token and would drop the whole session. Single-flight collapses them into
+    /// one. Keyed by the owner namespace so a caller under a DIFFERENT owner never joins (and never
+    /// receives) another owner's refresh.
+    private var inFlightRefresh: (ns: String, task: Task<TraktToken, Error>)?
 
     /// Injected at app startup (by `VortXSyncManager`): returns the freshest cross-device Trakt token
     /// triple from the synced `doc.apiKeys` mirror, or nil. Lets the refresh-401 path re-adopt a token a
     /// SIBLING device rotated and pushed, instead of signing this device out. A seam (not a direct import)
-    /// so `TraktAuth` stays free of a `VortXSyncManager` dependency.
+    /// so `TraktAuth` stays free of a `VortXSyncManager` dependency. The provider validates ITS OWN
+    /// credential session across its pull, so a mid-pull account switch yields nil, never another
+    /// account's mirror.
     private var syncedTokenProvider: (@Sendable () async -> (access: String, refresh: String, expiryUnix: Int)?)?
 
     init(session: URLSession = .shared) {
@@ -88,42 +136,39 @@ actor TraktAuth {
         syncedTokenProvider = provider
     }
 
-    // MARK: - Public state
-
-    /// True when a token set is stored (the user has connected Trakt). Does not check expiry.
-    var isSignedIn: Bool { Keychain.string(accessAccount)?.isEmpty == false }
-
-    /// Drop all stored Trakt tokens (the user disconnected). Does not revoke server-side.
-    func signOut() {
-        Keychain.set(nil, for: accessAccount)
-        Keychain.set(nil, for: refreshAccount)
-        Keychain.set(nil, for: expiryAccount)
-        Keychain.set(nil, for: createdAtAccount)
+    /// The owner namespace captured at operation entry (see the OWNER CAPTURE RULE above).
+    private nonisolated func currentOwnerNamespace() -> String {
+        CredentialScopeRegistry.shared.currentNamespace()
     }
 
-    /// Adopt a token set that arrived from ANOTHER device over the E2E `doc.apiKeys` sync channel, so
-    /// a Trakt connection made on one device follows the account to the rest. Writes the Keychain
-    /// slots directly (no network). `expiryUnix` is absolute unix-epoch seconds (what `store` persists
-    /// and `syncUp` mirrors). Ignores an empty access/refresh pair so a partial doc never clears a live
-    /// local session. Idempotent: adopting the same tokens twice is a harmless overwrite.
-    func adoptTokens(access: String, refresh: String, expiryUnix: Int) {
-        guard !access.isEmpty, !refresh.isEmpty else { return }
-        Keychain.set(access, for: accessAccount)
-        Keychain.set(refresh, for: refreshAccount)
-        Keychain.set(String(expiryUnix), for: expiryAccount)
-        // The synced mirror carries no issue time, so stamp adoption time. The rebuilt "lifetime" is
-        // then the REMAINING lifetime at adoption, whose half-life leeway is always strictly less than
-        // the remaining time itself, so a just-adopted token is never instantly read as expired.
-        Keychain.set(String(Int(Date().timeIntervalSince1970)), for: createdAtAccount)
+    // MARK: - Public state
+
+    /// True when a token set is stored for the CURRENT owner (the user has connected Trakt). Does not
+    /// check expiry.
+    var isSignedIn: Bool {
+        Keychain.string(TraktTokenSlots.access(currentOwnerNamespace()))?.isEmpty == false
+    }
+
+    /// Drop the CURRENT owner's stored Trakt tokens (the user disconnected). Does not revoke server-side.
+    /// H5: the token clear records provenance at commit time, in the same synchronous run as the writes.
+    func signOut() {
+        let ns = currentOwnerNamespace()
+        Keychain.set(nil, for: TraktTokenSlots.access(ns))
+        Keychain.set(nil, for: TraktTokenSlots.refresh(ns))
+        Keychain.set(nil, for: TraktTokenSlots.expiry(ns))
+        Keychain.set(nil, for: TraktTokenSlots.createdAt(ns))
+        CredentialProvenance.record(event: "token-clear.trakt", ownerNamespace: ns)
     }
 
     /// The stored token triple for the sync PUSH side (access, refresh, absolute unix expiry), or nil
-    /// when not signed in. Read-only mirror of `currentToken`; the sync manager sends these only when a
-    /// local session exists and NEVER deletes them from the doc when absent (mirrors the debrid guard).
-    func syncableTokens() -> (access: String, refresh: String, expiryUnix: Int)? {
-        guard let access = Keychain.string(accessAccount), !access.isEmpty,
-              let refresh = Keychain.string(refreshAccount), !refresh.isEmpty,
-              let expiryString = Keychain.string(expiryAccount), let expiry = Int(expiryString)
+    /// when not signed in, read from the CALLER-CAPTURED owner scope so a mid-merge account switch can
+    /// never mirror the previous owner's connection into the next owner's doc. The sync manager sends
+    /// these only when a local session exists and NEVER deletes them from the doc when absent (mirrors
+    /// the debrid guard).
+    nonisolated static func syncableTokens(ownerNamespace ns: String) -> (access: String, refresh: String, expiryUnix: Int)? {
+        guard let access = Keychain.string(TraktTokenSlots.access(ns)), !access.isEmpty,
+              let refresh = Keychain.string(TraktTokenSlots.refresh(ns)), !refresh.isEmpty,
+              let expiryString = Keychain.string(TraktTokenSlots.expiry(ns)), let expiry = Int(expiryString)
         else { return nil }
         return (access, refresh, expiry)
     }
@@ -163,6 +208,10 @@ actor TraktAuth {
     }
 
     func poll(deviceCode: String) async throws -> PollResult {
+        try await poll(deviceCode: deviceCode, ownerNamespace: currentOwnerNamespace())
+    }
+
+    private func poll(deviceCode: String, ownerNamespace ns: String) async throws -> PollResult {
         try ensureConfigured()
         struct Body: Encodable { let code: String; let client_id: String; let client_secret: String }
         let request = try makeRequest(
@@ -175,7 +224,7 @@ actor TraktAuth {
         switch status {
         case 200:
             let token = try decode(TraktToken.self, from: data)
-            store(token)
+            store(token, ownerNamespace: ns)
             DiagnosticsLog.log("trakt-auth", "device/token -> 200 authorized")
             return .authorized(token)
         case 400:
@@ -214,8 +263,11 @@ actor TraktAuth {
     /// Run the full polling loop until the user authorizes, denies, or the codes expire. Honors the
     /// server `interval`, backs off an extra second on a 429, and stops once `expiresIn` elapses.
     /// On success the token is already stored in the Keychain; the return value is the same token.
+    /// The owner is captured ONCE, at entry: the connection the user initiated belongs to the owner who
+    /// initiated it, even if the VortX session changes while the poll loop runs.
     @discardableResult
     func pollForToken(deviceCode: String, interval: Int, expiresIn: Int) async throws -> TraktToken {
+        let ns = currentOwnerNamespace()
         let deadline = Date().addingTimeInterval(TimeInterval(expiresIn))
         let baseInterval = max(interval, 1)
         var waitSeconds = baseInterval
@@ -223,7 +275,7 @@ actor TraktAuth {
         while Date() < deadline {
             try await sleep(seconds: waitSeconds)
             try Task.checkCancellation()
-            switch try await poll(deviceCode: deviceCode) {
+            switch try await poll(deviceCode: deviceCode, ownerNamespace: ns) {
             case .authorized(let token):
                 return token
             case .pending:
@@ -242,43 +294,50 @@ actor TraktAuth {
 
     // MARK: - Token access + refresh
 
-    /// A live access token, refreshing first if the stored one is near expiry. Throws
-    /// `.notSignedIn` when no token is stored.
+    /// A live access token for the CURRENT owner, refreshing first if the stored one is near expiry.
+    /// Throws `.notSignedIn` when no token is stored. The owner is captured once, before any suspension.
     func validToken() async throws -> String {
-        guard let token = currentToken() else { throw TraktAuthError.notSignedIn }
+        let ns = currentOwnerNamespace()
+        guard let token = currentToken(ownerNamespace: ns) else { throw TraktAuthError.notSignedIn }
         if token.isExpired() {
-            return try await refresh(using: token.refreshToken).accessToken
+            return try await refresh(using: token.refreshToken, ownerNamespace: ns).accessToken
         }
         return token.accessToken
     }
 
-    /// Exchange the refresh token for a fresh set via `POST /oauth/token`, SINGLE-FLIGHT: if a refresh is
-    /// already running, await it instead of starting a second one (Trakt rotates the refresh token, so a
-    /// second concurrent refresh would spend an already-rotated token and 401). Stores and returns the set.
+    /// Exchange the refresh token for a fresh set via `POST /oauth/token`, SINGLE-FLIGHT per owner: if a
+    /// refresh for the SAME owner is already running, await it instead of starting a second one (Trakt
+    /// rotates the refresh token, so a second concurrent refresh would spend an already-rotated token and
+    /// 401). Stores and returns the set.
     @discardableResult
     func refresh(using refreshToken: String) async throws -> TraktToken {
-        // Join an in-flight refresh rather than starting a competing one.
-        if let existing = inFlightRefresh {
-            return try await existing.value
+        try await refresh(using: refreshToken, ownerNamespace: currentOwnerNamespace())
+    }
+
+    private func refresh(using refreshToken: String, ownerNamespace ns: String) async throws -> TraktToken {
+        // Join an in-flight refresh rather than starting a competing one, but ONLY within the same owner:
+        // another owner's refresh is another owner's token set.
+        if let existing = inFlightRefresh, existing.ns == ns {
+            return try await existing.task.value
         }
         // A refresh that completed moments ago (whose defer already cleared `inFlightRefresh`) may have
         // stored a fresh token. A caller that just missed the in-flight window must not refresh again with
         // the now-rotated refresh token, so re-check synchronously (no await) before starting a new one.
-        if let fresh = currentToken(), !fresh.isExpired() {
+        if let fresh = currentToken(ownerNamespace: ns), !fresh.isExpired() {
             return fresh
         }
         let task = Task<TraktToken, Error> { [weak self] in
             guard let self else { throw TraktAuthError.notSignedIn }
-            return try await self.performRefresh(using: refreshToken)
+            return try await self.performRefresh(using: refreshToken, ownerNamespace: ns)
         }
-        inFlightRefresh = task
+        inFlightRefresh = (ns, task)
         defer { inFlightRefresh = nil }
         return try await task.value
     }
 
     /// The actual `POST /oauth/token` refresh network call. Only ever invoked from inside the single-flight
-    /// `refresh(using:)`, so at most one runs at a time.
-    private func performRefresh(using refreshToken: String) async throws -> TraktToken {
+    /// `refresh(using:ownerNamespace:)`, so at most one runs at a time.
+    private func performRefresh(using refreshToken: String, ownerNamespace ns: String) async throws -> TraktToken {
         try ensureConfigured()
         struct Body: Encodable {
             let refresh_token: String
@@ -304,25 +363,30 @@ actor TraktAuth {
             // device pre single-flight, or a SIBLING device over sync) may already have rotated a NEWER
             // token. Only sign out when no fresher token exists anywhere; otherwise adopt it and keep going.
             if status == 401 {
-                if let recovered = await recoverAfterRefreshFailure(deadRefreshToken: refreshToken) {
+                if let recovered = await recoverAfterRefreshFailure(deadRefreshToken: refreshToken, ownerNamespace: ns) {
                     return recovered
                 }
                 // Terminal-wipe guard: the recovery path above SUSPENDS (it awaits the synced-token
-                // provider), so another actor turn (a syncDown `adoptTokens`, a device-code poll storing
+                // provider), so another actor turn (a syncDown adoption, a device-code poll storing
                 // a brand-new set) may have landed a live token during that await. Re-check the Keychain
                 // with NO suspension between this read and the wipe: a stored refresh token DIFFERENT
                 // from the one this refresh just spent is that winner's live session, so return it
                 // instead of wiping. Only when the stored set still carries the exact spent refresh
-                // token (or nothing is stored) is the session truly dead.
-                if let stored = currentToken(), stored.refreshToken != refreshToken {
+                // token (or nothing is stored) is the session truly dead. The wipe targets ONLY the
+                // captured owner's scope.
+                if let stored = currentToken(ownerNamespace: ns), stored.refreshToken != refreshToken {
                     return stored
                 }
-                signOut()
+                Keychain.set(nil, for: TraktTokenSlots.access(ns))
+                Keychain.set(nil, for: TraktTokenSlots.refresh(ns))
+                Keychain.set(nil, for: TraktTokenSlots.expiry(ns))
+                Keychain.set(nil, for: TraktTokenSlots.createdAt(ns))
+                CredentialProvenance.record(event: "token-clear.trakt.refresh-401", ownerNamespace: ns)
             }
             throw TraktAuthError.server(status: status)
         }
         let token = try decode(TraktToken.self, from: data)
-        store(token)
+        store(token, ownerNamespace: ns)
         return token
     }
 
@@ -330,39 +394,48 @@ actor TraktAuth {
     /// minted: (T-1c) re-read the Keychain in case a local refresh rotated it, then (T-2) consult the
     /// cross-device synced mirror in case a SIBLING device rotated and pushed one. Returns the token to
     /// adopt, or nil when nothing fresher exists (the caller then signs out).
-    private func recoverAfterRefreshFailure(deadRefreshToken: String) async -> TraktToken? {
+    private func recoverAfterRefreshFailure(deadRefreshToken: String, ownerNamespace ns: String) async -> TraktToken? {
         // (T-1c) A local winner rotated the token while this refresh was in flight. A Trakt rotation always
         // changes the refresh token, so a stored refresh token different from the one we just spent means a
         // winner already stored a rotated set; adopt it REGARDLESS of the access token's age (even an aged
         // set carries a live refresh token the next `validToken()` will spend), rather than wiping the
         // session over a token that merely needs its own refresh.
-        if let local = currentToken(), local.refreshToken != deadRefreshToken {
+        if let local = currentToken(ownerNamespace: ns), local.refreshToken != deadRefreshToken {
             return local
         }
         // (T-2) A sibling device rotated + pushed a newer token over the synced `doc.apiKeys` mirror. A
         // synced refresh token different from the one we spent is that sibling's fresher set; adopt it into
         // the Keychain and use it. Same-token or absent means nothing fresher exists remotely.
+        //
+        // OWNER RE-CHECK (M3): the provider suspends, and its result is the CURRENT VortX account's doc.
+        // Adopt it only when the owner that started this refresh is still the current owner (the provider
+        // additionally discards its own pull on a mid-pull session change), so one owner's synced mirror
+        // can never be filed under another owner's scope.
         if let synced = await syncedTokenProvider?(),
-           !synced.access.isEmpty, !synced.refresh.isEmpty, synced.refresh != deadRefreshToken {
-            adoptTokens(access: synced.access, refresh: synced.refresh, expiryUnix: synced.expiryUnix)
-            return currentToken()
+           !synced.access.isEmpty, !synced.refresh.isEmpty, synced.refresh != deadRefreshToken,
+           currentOwnerNamespace() == ns {
+            TraktTokenSlots.adoptSyncedTokens(
+                access: synced.access, refresh: synced.refresh, expiryUnix: synced.expiryUnix,
+                ownerNamespace: ns
+            )
+            return currentToken(ownerNamespace: ns)
         }
         return nil
     }
 
     // MARK: - Keychain persistence
 
-    /// The stored token set, reconstructed from the Keychain entries, or nil if not signed in.
-    private func currentToken() -> TraktToken? {
-        guard let access = Keychain.string(accessAccount), !access.isEmpty,
-              let refresh = Keychain.string(refreshAccount), !refresh.isEmpty,
-              let expiryString = Keychain.string(expiryAccount),
+    /// The stored token set for an owner, reconstructed from the Keychain entries, or nil if not signed in.
+    private func currentToken(ownerNamespace ns: String) -> TraktToken? {
+        guard let access = Keychain.string(TraktTokenSlots.access(ns)), !access.isEmpty,
+              let refresh = Keychain.string(TraktTokenSlots.refresh(ns)), !refresh.isEmpty,
+              let expiryString = Keychain.string(TraktTokenSlots.expiry(ns)),
               let expiry = Int(expiryString) else { return nil }
         // Rebuild with the ORIGINAL issue time when the fourth slot has it, so `expiresIn` is the
         // original lifetime and `defaultLeeway` gives a real 30-minute early refresh. (A rebuild from
         // the REMAINING lifetime makes `remaining <= min(1800, remaining/2)` unsatisfiable, so the
         // early refresh silently never fires and a data call can carry a token that expires in flight.)
-        if let createdAtString = Keychain.string(createdAtAccount),
+        if let createdAtString = Keychain.string(TraktTokenSlots.createdAt(ns)),
            let createdAt = Int(createdAtString), createdAt < expiry {
             return TraktToken(accessToken: access, refreshToken: refresh,
                               expiresIn: expiry - createdAt, createdAt: createdAt)
@@ -376,11 +449,11 @@ actor TraktAuth {
                           expiresIn: expiry - now, createdAt: now)
     }
 
-    private func store(_ token: TraktToken) {
-        Keychain.set(token.accessToken, for: accessAccount)
-        Keychain.set(token.refreshToken, for: refreshAccount)
-        Keychain.set(String(Int(token.expiresAt.timeIntervalSince1970)), for: expiryAccount)
-        Keychain.set(String(token.createdAt), for: createdAtAccount)
+    private func store(_ token: TraktToken, ownerNamespace ns: String) {
+        Keychain.set(token.accessToken, for: TraktTokenSlots.access(ns))
+        Keychain.set(token.refreshToken, for: TraktTokenSlots.refresh(ns))
+        Keychain.set(String(Int(token.expiresAt.timeIntervalSince1970)), for: TraktTokenSlots.expiry(ns))
+        Keychain.set(String(token.createdAt), for: TraktTokenSlots.createdAt(ns))
     }
 
     // MARK: - HTTP plumbing
