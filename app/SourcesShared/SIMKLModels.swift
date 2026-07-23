@@ -219,6 +219,124 @@ struct SIMKLListEntry: Sendable, Equatable {
     let addedAt: String?
 }
 
+// MARK: - Ratings (`POST /sync/ratings`, `/sync/ratings/remove`, and the `/sync/ratings/{type}` read-back)
+//
+// The SIMKL peer of the Trakt ratings wire types. SIMKL rates WHOLE TITLES only ("You cannot rate the seasons
+// or episodes right now"), so this stays movie / show level exactly like `TraktRatedMovie` / `TraktRatedShow`
+// and like `SIMKLProvider.titleItems`. Anime are `shows` on every SIMKL write path, so an anime rating rides
+// the `shows` array; the read-back keeps anime in its own array (see `SIMKLRatingsResponse`) and both fold as
+// series. Dedicated rated types (not a `rating` bolted onto `SIMKLMovie`/`SIMKLShow`) keep the history /
+// watchlist encode untouched, mirroring how Trakt separates its rated types from its plain ones.
+
+/// The `rated_at` timestamp shape SIMKL uses. The add path documents whole-second UTC (`2014-09-01T09:10:11Z`)
+/// and the add RESPONSE echoes the fractional form (`...11.000Z`), while the read-back sends whole-second
+/// (`user_rated_at: "2021-06-23T13:19:05Z"`). Both forms are parsed (a `withFractionalSeconds` formatter
+/// returns nil on a whole-second string and vice-versa), so a rating whose stamp fails to parse never silently
+/// falls back to `.distantPast` and loses a newer-wins comparison. Mirrors `TraktRatedAt`.
+enum SIMKLRatedAt {
+    private static let fractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    private static let whole: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    /// Format a date the way SIMKL accepts on a ratings write (whole-second UTC, its documented shape).
+    static func string(from date: Date) -> String { whole.string(from: date) }
+
+    /// Parse a SIMKL `rated_at` / `user_rated_at`, tolerating either the whole-second or fractional form.
+    static func date(from string: String) -> Date? {
+        whole.date(from: string) ?? fractional.date(from: string)
+    }
+}
+
+/// A movie carrying a rating, for `POST /sync/ratings`. `rating` is 1...10; optional because the remove path
+/// (`/sync/ratings/remove`) takes the same shape with the value omitted (the ids identify what to un-rate).
+struct SIMKLRatedMovie: Codable, Sendable, Equatable {
+    var ids: SIMKLIDs
+    var title: String?
+    var year: Int?
+    var rating: Int?
+    var ratedAt: String?
+
+    init(ids: SIMKLIDs, title: String? = nil, year: Int? = nil, rating: Int? = nil, ratedAt: String? = nil) {
+        self.ids = ids
+        self.title = title
+        self.year = year
+        self.rating = rating
+        self.ratedAt = ratedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ids, title, year, rating
+        case ratedAt = "rated_at"
+    }
+}
+
+/// A show (or anime) carrying a rating, for `POST /sync/ratings`. Title-level, matching the detail page's
+/// rating control and `SIMKLProvider.watchlistItems`. Anime ride this `shows` array on the write path.
+struct SIMKLRatedShow: Codable, Sendable, Equatable {
+    var ids: SIMKLIDs
+    var title: String?
+    var year: Int?
+    var rating: Int?
+    var ratedAt: String?
+
+    init(ids: SIMKLIDs, title: String? = nil, year: Int? = nil, rating: Int? = nil, ratedAt: String? = nil) {
+        self.ids = ids
+        self.title = title
+        self.year = year
+        self.rating = rating
+        self.ratedAt = ratedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ids, title, year, rating
+        case ratedAt = "rated_at"
+    }
+}
+
+/// Body for `POST /sync/ratings` and `POST /sync/ratings/remove`. Omit the array you are not using.
+struct SIMKLRatingItems: Codable, Sendable, Equatable {
+    var movies: [SIMKLRatedMovie]?
+    var shows: [SIMKLRatedShow]?
+
+    init(movies: [SIMKLRatedMovie]? = nil, shows: [SIMKLRatedShow]? = nil) {
+        self.movies = movies
+        self.shows = shows
+    }
+}
+
+/// One row from the ratings read-back (`POST /sync/ratings/{type}`): the score the user gave, when, and the
+/// title it is on. SIMKL nests the title under `movie` for the movies array and under `show` for BOTH the
+/// shows and anime arrays, so this one row type covers all three. Only `ids` are read off the nested title
+/// (the rating value + timestamp live at the row level as `user_rating` / `user_rated_at`).
+struct SIMKLRatingEntry: Decodable, Sendable {
+    let userRating: Int
+    let userRatedAt: String?
+    let movie: SIMKLMovie?
+    let show: SIMKLShow?
+
+    enum CodingKeys: String, CodingKey {
+        case movie, show
+        case userRating = "user_rating"
+        case userRatedAt = "user_rated_at"
+    }
+}
+
+/// Envelope for the ratings read-back. SIMKL splits ANIME out of `shows` here exactly as it does on the
+/// all-items read, so all three arrays must be consumed or a SIMKL user's anime ratings would be dropped.
+struct SIMKLRatingsResponse: Decodable, Sendable {
+    let movies: [SIMKLRatingEntry]?
+    let shows: [SIMKLRatingEntry]?
+    let anime: [SIMKLRatingEntry]?
+}
+
 /// Typed errors for the SIMKL calls.
 enum SIMKLError: LocalizedError, Sendable, Equatable {
     case notConfigured

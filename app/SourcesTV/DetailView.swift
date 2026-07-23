@@ -218,6 +218,9 @@ struct DetailView: View {
     /// credential-less build. Series rate at the SHOW level, matching the title-level watchlist writes.
     @ViewBuilder private var ratingChip: some View {
         TraktRatingChip(imdb: ratingsImdbID, tmdb: ratingTMDBID, isSeries: effectiveType == "series")
+        // SIMKL's own rating chip (SourcesShared/SIMKLRatingControl.swift), each gated on its own service, so a
+        // SIMKL-only user finally gets a rating control and a both-connected user sees each score. Self-hiding.
+        SIMKLRatingChip(imdb: ratingsImdbID, tmdb: ratingTMDBID, isSeries: effectiveType == "series")
     }
 
     /// The pool `content_key` for this title (P1). Movies/series key on the imdb id (no season/episode here,
@@ -1871,6 +1874,10 @@ struct CoreStreamList: View {
     /// parameter labelled `imdb`.
     @ViewBuilder private var ratingChip: some View {
         TraktRatingChip(imdb: titleIdentity.titleID, tmdb: ratingTMDBID,
+                        isSeries: (meta?.type ?? "") == "series")
+        // SIMKL's own rating chip (SourcesShared/SIMKLRatingControl.swift), so the episode/sources row rates on
+        // SIMKL too while bingeing. Each chip is gated on its own service and self-hides otherwise.
+        SIMKLRatingChip(imdb: titleIdentity.titleID, tmdb: ratingTMDBID,
                         isSeries: (meta?.type ?? "") == "series")
     }
 

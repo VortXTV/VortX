@@ -112,6 +112,12 @@ enum ExternalSyncToggle {
     /// Turning this OFF never deletes anything: the ratings live in `TraktRatingsStore`'s local shadow,
     /// so switching it back on restores every rating the user already gave.
     static let traktRatings = "vortx.trakt.ratings"
+    /// Rate titles from the detail page, and mirror those ratings to SIMKL (`POST /sync/ratings`). The SIMKL
+    /// peer of `traktRatings`: same purpose, same default ON, same "the control only appears once SIMKL is
+    /// CONNECTED and only moves on a deliberate action" reasoning. App-local (deliberately NOT in the synced
+    /// toggle carriage, exactly like `traktRatings`). Turning it OFF never deletes anything: the ratings live in
+    /// `SIMKLRatingsStore`'s local shadow, so switching it back on restores every rating the user already gave.
+    static let simklRatings = "vortx.simkl.ratings"
     /// Offer a one-tap "Resume from <time>" chip before playback when Trakt holds a position from another
     /// device that is ahead of this device's own. Default OFF for the same reason as `traktImportWatched`:
     /// reading another service's state into a VortX surface is opt-in. It is a SUGGESTION only. VortX stays

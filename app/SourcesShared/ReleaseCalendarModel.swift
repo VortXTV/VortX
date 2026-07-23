@@ -98,7 +98,7 @@ final class ReleaseCalendarModel: ObservableObject {
 
     /// Cancel any in-flight sweep when the owning Home view is torn down, so a slow fetch can't keep the
     /// model (and its captured state) alive for up to the per-series timeout after the view disappears.
-    deinit { loadTask?.cancel(); movieLoadTask?.cancel() }
+    deinit { loadTask?.cancel(); movieLoadTask?.cancel(); simklSeedTask?.cancel() }
 
     /// Build the rail from the series library + installed meta add-on bases, derived by the caller the SAME
     /// way `NewEpisodeNotifications.sweepLibrary`'s caller does (series-typed library ids + names, and the
@@ -135,9 +135,10 @@ final class ReleaseCalendarModel: ObservableObject {
 
     /// Clear when the library empties or the meta add-ons go away.
     func clear() {
-        loadTask?.cancel(); movieLoadTask?.cancel()
+        loadTask?.cancel(); movieLoadTask?.cancel(); simklSeedTask?.cancel()
         upcoming = []; upcomingMovies = []
         lastSignature = nil; lastMovieSignature = nil
+        simklSeeds = []; lastSIMKLSeedRefresh = nil; lastUpcomingInputs = nil
     }
 
     /// Walk each series' meta off the main thread (reusing the shared `SeriesMetaFetcher` that also backs
@@ -264,9 +265,101 @@ final class ReleaseCalendarModel: ObservableObject {
             if moviePosters[entry.id] == nil, let p = entry.poster, !p.isEmpty { moviePosters[entry.id] = p }
         }
 
-        refresh(seriesIDs: seriesIDs, seriesNames: seriesNames, metaBases: metaBases, reference: reference)
-        refreshMovies(movieIDs: movieIDs, movieNames: movieNames, moviePosters: moviePosters,
-                      metaBases: metaBases, reference: reference)
+        // Remember the base (library + local watchlist) seeds so a later SIMKL plan-to-watch resolve can re-fold
+        // and rebuild without the host re-deriving anything, then kick that throttled SIMKL fetch.
+        lastUpcomingInputs = UpcomingInputs(seriesIDs: seriesIDs, seriesNames: seriesNames, movieIDs: movieIDs,
+                                            movieNames: movieNames, moviePosters: moviePosters,
+                                            metaBases: metaBases, reference: reference)
+        buildUpcoming(from: lastUpcomingInputs!)
+        refreshSIMKLSeeds()
+    }
+
+    // MARK: - SIMKL plan-to-watch fold (air dates for the shows a SIMKL user follows)
+
+    /// The base seeds of the last `refreshUpcoming`, so a SIMKL resolve that lands later can re-fold + rebuild.
+    private struct UpcomingInputs {
+        let seriesIDs: [String]
+        let seriesNames: [String: String]
+        let movieIDs: [String]
+        let movieNames: [String: String]
+        let moviePosters: [String: String]
+        let metaBases: [String]
+        let reference: Date
+    }
+
+    private var lastUpcomingInputs: UpcomingInputs?
+    /// SIMKL plan-to-watch titles resolved to catalog tt ids, cached between refreshes. Folded into every build.
+    private var simklSeeds: [SIMKLUpcomingSeeds.Seed] = []
+    private var lastSIMKLSeedRefresh: Date?
+    private var simklSeedTask: Task<Void, Never>?
+    /// Matches the plan-to-watch rail's own interval, so a connected user does at most a few SIMKL GETs per
+    /// interval across the rail, the watched shadow, and this fold combined.
+    private static let simklRefreshInterval: TimeInterval = 5 * 60
+
+    /// Build both rails from the base seeds folded with whatever SIMKL seeds are currently cached.
+    private func buildUpcoming(from inputs: UpcomingInputs) {
+        let folded = SIMKLUpcomingSeeds.fold(baseSeriesIDs: inputs.seriesIDs, baseSeriesNames: inputs.seriesNames,
+                                             baseMovieIDs: inputs.movieIDs, baseMovieNames: inputs.movieNames,
+                                             simkl: simklSeeds)
+        refresh(seriesIDs: folded.seriesIDs, seriesNames: folded.seriesNames,
+                metaBases: inputs.metaBases, reference: inputs.reference)
+        refreshMovies(movieIDs: folded.movieIDs, movieNames: folded.movieNames, moviePosters: inputs.moviePosters,
+                      metaBases: inputs.metaBases, reference: inputs.reference)
+    }
+
+    /// Pull the SIMKL plan-to-watch list, resolve each entry to a tt id (reusing the proven, persistently cached
+    /// `CommunityTrickplay.resolveIMDbID`, exactly as `SIMKLRailsModel` does), and if the seed set changed,
+    /// re-fold + rebuild. Throttled to `simklRefreshInterval`. Fully fail-soft: unconfigured / not-signed-in /
+    /// flaky network clears the seeds (dropping SIMKL titles from Upcoming) or leaves the last set, never errors.
+    private func refreshSIMKLSeeds() {
+        guard SIMKLAuth.isConfigured else {
+            if !simklSeeds.isEmpty { simklSeeds = []; rebuildAfterSIMKLChange() }
+            return
+        }
+        if let last = lastSIMKLSeedRefresh, Date().timeIntervalSince(last) < Self.simklRefreshInterval { return }
+        guard simklSeedTask == nil else { return }
+        lastSIMKLSeedRefresh = Date()
+        simklSeedTask = Task { [weak self] in
+            defer { self?.simklSeedTask = nil }
+            let resolved = await Self.resolveSIMKLSeeds()
+            guard let self, !Task.isCancelled else { return }
+            guard resolved != self.simklSeeds else { return }
+            self.simklSeeds = resolved
+            self.rebuildAfterSIMKLChange()
+        }
+    }
+
+    /// Re-run the last build with the updated SIMKL seeds (a no-op when no `refreshUpcoming` has run yet).
+    private func rebuildAfterSIMKLChange() {
+        guard let inputs = lastUpcomingInputs else { return }
+        buildUpcoming(from: inputs)
+    }
+
+    /// Off-main: fetch the plan-to-watch list and resolve every entry to a tt id. A signed-out account yields an
+    /// empty set (so SIMKL titles drop out of Upcoming on disconnect). Mirrors `SIMKLRailsModel.fetch`'s resolve.
+    private static func resolveSIMKLSeeds() async -> [SIMKLUpcomingSeeds.Seed] {
+        guard await SIMKLAuth.shared.isSignedIn,
+              let entries = try? await SIMKLService.shared.planToWatch() else { return [] }
+        let resolved: [(Int, SIMKLUpcomingSeeds.Seed)] = await withTaskGroup(of: (Int, SIMKLUpcomingSeeds.Seed?).self) { group in
+            for (index, entry) in entries.enumerated() {
+                group.addTask {
+                    if let imdb = entry.imdb, !imdb.isEmpty {
+                        return (index, SIMKLUpcomingSeeds.Seed(id: imdb, type: entry.type, name: entry.title))
+                    }
+                    guard let tmdb = entry.tmdb,
+                          let tt = await CommunityTrickplay.resolveIMDbID(rawId: "tmdb:\(tmdb)",
+                                                                          seriesHint: entry.type == "series")
+                    else { return (index, nil) }
+                    return (index, SIMKLUpcomingSeeds.Seed(id: tt, type: entry.type, name: entry.title))
+                }
+            }
+            var out: [(Int, SIMKLUpcomingSeeds.Seed)] = []
+            for await (i, seed) in group { if let seed { out.append((i, seed)) } }
+            return out
+        }
+        // Restore list order and de-duplicate on the resolved tt (two entries can resolve to one title).
+        var seen = Set<String>()
+        return resolved.sorted { $0.0 < $1.0 }.compactMap { seen.insert($0.1.id).inserted ? $0.1 : nil }
     }
 }
 
