@@ -278,6 +278,8 @@ enum TMDBClient {
         .init(providerID: 15, name: "Hulu"),
         .init(providerID: 386, name: "Peacock"),
         .init(providerID: 283, name: "Crunchyroll"),
+        .init(providerID: 2336, name: String(localized: "JioHotstar")),
+        .init(providerID: 232, name: String(localized: "ZEE5")),
     ]
 
     /// Titles available on a streaming service in the region (TMDB /discover with_watch_providers, streaming
@@ -287,45 +289,18 @@ enum TMDBClient {
     /// add-on). Name + poster come from the discover row itself, so this is one discover call + one
     /// external_ids call per title (capped), not a full meta fetch per card.
     static func streamingProviderTitles(providerID: Int, region: String = deviceRegion, limit: Int = 18) async -> [MetaPreview] {
-        let key = ApiKeys.effectiveTMDBKey()
-        async let movieRows = discoverProviderPage(media: "movie", providerID: providerID, region: region, key: key)
-        async let tvRows = discoverProviderPage(media: "tv", providerID: providerID, region: region, key: key)
-        let movies = await movieRows, series = await tvRows
-        // Interleave movie + tv (each already popularity-ordered) so a rail blends both.
-        var rows: [(tmdbID: Int, media: String, name: String, poster: String?)] = []
-        for i in 0..<max(movies.count, series.count) {
-            if i < movies.count { rows.append(movies[i]) }
-            if i < series.count { rows.append(series[i]) }
-        }
-        // Over-fetch (some drop for a missing IMDb id), resolve each TMDB id -> tt concurrently, preserve order.
-        let slice = Array(rows.prefix(limit * 2))
-        // Resolve external_ids in CAPPED chunks (~6 in flight) instead of spawning all ~36 at once, so the
-        // 9 rails together never burst hundreds of concurrent requests at TMDB (429s silently thin the rails)
-        // and the in-flight count tracks URLSession's per-host socket budget. Order preserved by row index.
-        var resolved: [(Int, MetaPreview)] = []
-        for start in stride(from: 0, to: slice.count, by: 6) {
-            if resolved.count >= limit { break }   // enough resolved; stop the over-fetch early
-            let batch = Array(slice[start..<min(start + 6, slice.count)])
-            let part: [(Int, MetaPreview)] = await withTaskGroup(of: (Int, MetaPreview)?.self) { group in
-                for (offset, row) in batch.enumerated() {
-                    let i = start + offset
-                    group.addTask {
-                        guard let ext = await get("/\(row.media)/\(row.tmdbID)/external_ids?api_key=\(key)"),
-                              let imdb = ext["imdb_id"] as? String, imdb.hasPrefix("tt"),
-                              row.poster?.isEmpty == false else { return nil }
-                        let type = row.media == "tv" ? "series" : "movie"
-                        return (i, MetaPreview(id: imdb, type: type, name: row.name, poster: row.poster, posterShape: nil, popularity: nil))
-                    }
-                }
-                var out: [(Int, MetaPreview)] = []
-                for await r in group { if let r { out.append(r) } }
-                return out
-            }
-            resolved.append(contentsOf: part)
-        }
-        var seen = Set<String>()
-        let ordered = resolved.sorted { $0.0 < $1.0 }.map(\.1).filter { seen.insert($0.id).inserted }
-        return Array(ordered.prefix(limit))
+        await streamingProviderTitles(providerID: providerID,
+                                      regions: CatalogPrefsStore.orderedCatalogRegions(primary: region),
+                                      limit: limit)
+    }
+
+    static func streamingProviderTitles(providerID: Int, regions: [String], limit: Int = 18) async -> [MetaPreview] {
+        let canonical = canonicalProviderID(providerID)
+        let family = providerFamilyMembers(canonical).map(String.init).joined(separator: "%7C")
+        let scope = "with_watch_providers=\(family)&with_watch_monetization_types=\(streamingMonetizationTypes)&sort_by=popularity.desc"
+        let result = await catalogPage(movieExtra: scope, tvExtra: scope, regions: regions, page: 1,
+                                       providerID: canonical)
+        return Array(result.previews.prefix(limit))
     }
 
     // MARK: - Nested-collection Home rails (genres, Top New, Just New)
@@ -521,6 +496,15 @@ enum TMDBClient {
         let providerID: Int
         let name: String
         let logoPath: String?
+        let regions: [String]
+
+        init(providerID: Int, name: String, logoPath: String?, regions: [String] = []) {
+            self.providerID = providerID
+            self.name = name
+            self.logoPath = logoPath
+            self.regions = CatalogServicePipeline.normalizedRegions(regions)
+        }
+
         var id: Int { providerID }
         var logoURL: String? { logoPath.map { "https://image.tmdb.org/t/p/w300\($0)" } }
     }
@@ -617,8 +601,51 @@ enum TMDBClient {
             let canonical = Self.canonicalProviderID(entry.tile.providerID)
             return ProviderTile(providerID: canonical,
                                 name: Self.canonicalDisplayName[canonical] ?? entry.tile.name,
-                                logoPath: entry.tile.logoPath)
+                                logoPath: entry.tile.logoPath,
+                                regions: [region])
         }
+    }
+
+    /// Ordered simultaneous provider union used by the mounted CollectionsHubModel. Fetches at most three
+    /// regions at once, keeps the first configured region's tile order, appends new families from later regions,
+    /// and merges ordered region provenance onto duplicates.
+    static func regionProviders(regions: [String], limit: Int = 50) async -> [ProviderTile] {
+        let regions = CatalogServicePipeline.normalizedRegions(regions)
+        var indexed: [(Int, [ProviderTile])] = []
+        for start in stride(from: 0, to: regions.count, by: CatalogServicePipeline.maximumConcurrentRegionFetches) {
+            let batch = Array(regions[start..<min(start + CatalogServicePipeline.maximumConcurrentRegionFetches, regions.count)])
+            let part: [(Int, [ProviderTile])] = await withTaskGroup(of: (Int, [ProviderTile]).self) { group in
+                for (offset, region) in batch.enumerated() {
+                    let index = start + offset
+                    group.addTask { (index, await regionProviders(region: region, limit: limit)) }
+                }
+                var values: [(Int, [ProviderTile])] = []
+                for await value in group { values.append(value) }
+                return values
+            }
+            indexed.append(contentsOf: part)
+        }
+        var ordered: [ProviderTile] = []
+        var position: [Int: Int] = [:]
+        for (_, tiles) in indexed.sorted(by: { $0.0 < $1.0 }) {
+            for tile in tiles {
+                let canonical = canonicalProviderID(tile.providerID)
+                if let index = position[canonical] {
+                    var provenance = ordered[index].regions
+                    for region in tile.regions where !provenance.contains(region) { provenance.append(region) }
+                    let current = ordered[index]
+                    ordered[index] = ProviderTile(providerID: canonical, name: current.name,
+                                                  logoPath: current.logoPath ?? tile.logoPath,
+                                                  regions: provenance)
+                } else {
+                    position[canonical] = ordered.count
+                    ordered.append(ProviderTile(providerID: canonical,
+                                                name: canonicalDisplayName[canonical] ?? tile.name,
+                                                logoPath: tile.logoPath, regions: tile.regions))
+                }
+            }
+        }
+        return ordered
     }
 
     /// Some brands appear under several TMDB provider ids; map every alias to the canonical (kept) id so each
@@ -655,7 +682,11 @@ enum TMDBClient {
 
     /// The corrected display name for a canonical brand whose TMDB entry name is stale after a merge (Paramount+
     /// absorbed Showtime; JioHotstar merged Disney+ Hotstar and JioCinema). Absent -> keep TMDB's own name.
-    private static let canonicalDisplayName: [Int: String] = [531: "Paramount+", 2336: "JioHotstar"]
+    private static let canonicalDisplayName: [Int: String] = [
+        531: "Paramount+",
+        2336: String(localized: "JioHotstar"),
+        232: String(localized: "ZEE5"),
+    ]
 
     private static func providerPage(media: String, region: String?) async -> [(tile: ProviderTile, priority: Int)] {
         let key = ApiKeys.effectiveTMDBKey()
@@ -697,7 +728,8 @@ enum TMDBClient {
             let canonical = Self.canonicalProviderID(entry.tile.providerID)
             return ProviderTile(providerID: canonical,
                                 name: Self.canonicalDisplayName[canonical] ?? entry.tile.name,
-                                logoPath: entry.tile.logoPath)
+                                logoPath: entry.tile.logoPath,
+                                regions: [])
         }
     }
 
@@ -718,6 +750,177 @@ enum TMDBClient {
         let key = ApiKeys.effectiveTMDBKey()
         let full = "/discover/\(media)?api_key=\(key)&language=en-US&watch_region=\(region)&page=\(page)&\(extra)"
         return await resolveRows(parseDiscover(await get(full), media: media), key: key, limit: limit)
+    }
+
+    // MARK: Typed catalog successor transport
+
+    private enum CatalogFamilyOutcome: Sendable {
+        case skipped
+        case success(candidates: [CatalogCandidate], totalPages: Int)
+        case failure(CatalogFailure)
+    }
+
+    /// Production adapter used by CollectionsCatalog and the streaming Home rails. The pure pipeline owns
+    /// ordering, dedupe, retry, and publication; this adapter owns TMDB request and decode semantics.
+    static func catalogPage(
+        movieExtra: String?,
+        tvExtra: String?,
+        regions: [String],
+        page: Int,
+        providerID: Int? = nil,
+        excludingIMDbIDs: Set<String> = []
+    ) async -> CatalogPageResult {
+        let pipeline = CatalogServicePipeline()
+        return await pipeline.loadPage(
+            regions: regions,
+            page: page,
+            excludingIMDbIDs: excludingIMDbIDs,
+            fetch: { region, requestedPage in
+                await catalogRegionPage(movieExtra: movieExtra, tvExtra: tvExtra, region: region,
+                                        page: requestedPage, providerID: providerID)
+            },
+            resolveExternalID: { candidate in
+                await catalogExternalIMDbID(candidate)
+            }
+        )
+    }
+
+    /// Typed list endpoint counterpart for Trending/Popular/Latest/Upcoming category routes.
+    static func catalogListPage(
+        path: String,
+        region: String,
+        page: Int,
+        excludingIMDbIDs: Set<String> = []
+    ) async -> CatalogPageResult {
+        let media = path.contains("/tv") ? "tv" : "movie"
+        let pipeline = CatalogServicePipeline()
+        return await pipeline.loadPage(
+            regions: [region],
+            page: page,
+            excludingIMDbIDs: excludingIMDbIDs,
+            fetch: { requestedRegion, requestedPage in
+                let key = ApiKeys.effectiveTMDBKey()
+                let full = "\(path)?api_key=\(key)&language=en-US&page=\(requestedPage)&region=\(requestedRegion)"
+                switch await getOutcome(full) {
+                case .failure(let failure):
+                    return .failure(region: requestedRegion, failure: failure)
+                case .success(let object):
+                    switch decodeCatalogCandidates(object, media: media, providerID: nil) {
+                    case .failure(let failure):
+                        return .failure(region: requestedRegion, failure: failure)
+                    case .success(let decoded):
+                        return .success(CatalogRegionPage(region: requestedRegion, page: requestedPage,
+                                                          totalPages: decoded.totalPages,
+                                                          candidates: decoded.candidates, failures: []))
+                    }
+                }
+            },
+            resolveExternalID: { candidate in await catalogExternalIMDbID(candidate) }
+        )
+    }
+
+    private static func catalogRegionPage(
+        movieExtra: String?,
+        tvExtra: String?,
+        region: String,
+        page: Int,
+        providerID: Int?
+    ) async -> CatalogRegionPageOutcome {
+        async let movie = catalogFamilyPage(media: "movie", extra: movieExtra, region: region,
+                                            page: page, providerID: providerID)
+        async let tv = catalogFamilyPage(media: "tv", extra: tvExtra, region: region,
+                                         page: page, providerID: providerID)
+        let families = [await movie, await tv]
+        var successful: [[CatalogCandidate]] = []
+        var totalPages = page
+        var failures: [CatalogFailure] = []
+        for family in families {
+            switch family {
+            case .skipped:
+                break
+            case .failure(let failure):
+                failures.append(failure)
+            case .success(let candidates, let upstreamTotalPages):
+                successful.append(candidates)
+                totalPages = max(totalPages, upstreamTotalPages)
+            }
+        }
+        guard !successful.isEmpty else {
+            return .failure(region: region, failure: preferredCatalogFailure(failures))
+        }
+        let movies = successful.first(where: { $0.first?.media == "movie" }) ?? []
+        let shows = successful.first(where: { $0.first?.media == "tv" }) ?? []
+        var interleaved: [CatalogCandidate] = []
+        for index in 0..<max(movies.count, shows.count) {
+            if index < movies.count { interleaved.append(movies[index]) }
+            if index < shows.count { interleaved.append(shows[index]) }
+        }
+        // An empty successful family has no first row, so the media lookup above cannot identify it. That is
+        // harmless for rows, but a non-empty sibling must still be retained.
+        if interleaved.isEmpty { interleaved = successful.flatMap { $0 } }
+        return .success(CatalogRegionPage(region: region, page: page, totalPages: totalPages,
+                                          candidates: interleaved, failures: failures))
+    }
+
+    private static func catalogFamilyPage(
+        media: String,
+        extra: String?,
+        region: String,
+        page: Int,
+        providerID: Int?
+    ) async -> CatalogFamilyOutcome {
+        guard let extra else { return .skipped }
+        let key = ApiKeys.effectiveTMDBKey()
+        let full = "/discover/\(media)?api_key=\(key)&language=en-US&watch_region=\(region)&page=\(page)&\(extra)"
+        switch await getOutcome(full) {
+        case .failure(let failure):
+            return .failure(failure)
+        case .success(let object):
+            switch decodeCatalogCandidates(object, media: media, providerID: providerID) {
+            case .failure(let failure): return .failure(failure)
+            case .success(let decoded): return .success(candidates: decoded.candidates, totalPages: decoded.totalPages)
+            }
+        }
+    }
+
+    private static func decodeCatalogCandidates(
+        _ object: [String: Any],
+        media: String,
+        providerID: Int?
+    ) -> CatalogTransportOutcome<(candidates: [CatalogCandidate], totalPages: Int)> {
+        guard let results = object["results"] as? [[String: Any]] else {
+            return .failure(CatalogFailure(.decoding))
+        }
+        let totalPages = max(1, object["total_pages"] as? Int ?? 1)
+        let canonicalProvider = providerID.map(canonicalProviderID)
+        let family = canonicalProvider.map(providerFamilyMembers) ?? []
+        let candidates = results.compactMap { row -> CatalogCandidate? in
+            guard let id = row["id"] as? Int else { return nil }
+            let name = (row["title"] as? String) ?? (row["name"] as? String) ?? ""
+            let poster = (row["poster_path"] as? String).map { "https://image.tmdb.org/t/p/w342\($0)" }
+            return CatalogCandidate(tmdbID: id, media: media, name: name, poster: poster,
+                                    providerID: canonicalProvider, providerFamily: family)
+        }
+        return .success((candidates, totalPages))
+    }
+
+    private static func catalogExternalIMDbID(_ candidate: CatalogCandidate) async -> CatalogExternalIDOutcome {
+        let key = ApiKeys.effectiveTMDBKey()
+        switch await getOutcome("/\(candidate.media)/\(candidate.tmdbID)/external_ids?api_key=\(key)") {
+        case .failure(let failure):
+            return .failure(failure)
+        case .success(let object):
+            guard let imdbID = object["imdb_id"] as? String, !imdbID.isEmpty else { return .absent }
+            return .resolved(imdbID)
+        }
+    }
+
+    private static func preferredCatalogFailure(_ failures: [CatalogFailure]) -> CatalogFailure {
+        let priority: [CatalogFailureKind] = [.authentication, .rateLimited, .transport, .decoding, .unavailable]
+        for kind in priority {
+            if let failure = failures.first(where: { $0.kind == kind }) { return failure }
+        }
+        return CatalogFailure(.unavailable)
     }
 
     /// A representative 16:9 backdrop for a genre tile: the most popular in-region title in that genre's
@@ -1096,13 +1299,25 @@ enum TMDBClient {
     ///                          with the bundled key (the path still carries it) so the hub degrades, never
     ///                          dies. `path` is "/...?api_key=<effective>&...".
     private static func get(_ path: String) async -> [String: Any]? {
+        switch await getOutcome(path) {
+        case .success(let object): return object
+        case .failure: return nil
+        }
+    }
+
+    /// Typed counterpart to `get`. Existing enrichment callers keep their fail-soft optional wrapper above,
+    /// while the catalog successor carries the exact failure kind through to its production UI.
+    private static func getOutcome(_ path: String) async -> CatalogTransportOutcome<[String: Any]> {
         if ApiKeys.tmdbKey() != nil {
-            return await fetchJSON(URL(string: host + path), sign: false)
+            return await fetchJSONOutcome(URL(string: host + path), sign: false)
         }
-        if let edgeURL = edgeURL(forPath: path), let obj = await fetchJSON(edgeURL, sign: true) {
-            return obj
+        if let edgeURL = edgeURL(forPath: path) {
+            let edge = await fetchJSONOutcome(edgeURL, sign: true)
+            if case .success = edge { return edge }
         }
-        return await fetchJSON(URL(string: host + path), sign: false)   // edge down -> bundled-key direct
+        // The bundled direct route is the established edge failover. Its failure is the final user-visible
+        // outcome because it is the last route actually attempted.
+        return await fetchJSONOutcome(URL(string: host + path), sign: false)
     }
 
     /// Build the edge URL for a TMDB path: prefix /3 (already in `host` for direct calls) and DROP the
@@ -1116,15 +1331,40 @@ enum TMDBClient {
 
     /// GET + decode JSON. Signs the request via `VortXEdgeAuth` when `sign` (only our edge host is gated;
     /// the helper no-ops for any other host), so the same call is safe whether it targets TMDB or the edge.
-    private static func fetchJSON(_ url: URL?, sign: Bool) async -> [String: Any]? {
-        guard let url else { return nil }
+    static func catalogFailure(statusCode: Int) -> CatalogFailure? {
+        switch statusCode {
+        case 200..<300: return nil
+        case 401, 403: return CatalogFailure(.authentication, statusCode: statusCode)
+        case 429: return CatalogFailure(.rateLimited, statusCode: statusCode)
+        default: return CatalogFailure(.unavailable, statusCode: statusCode)
+        }
+    }
+
+    static func catalogFailure(for error: Error) -> CatalogFailure {
+        CatalogFailure(.transport, statusCode: nil)
+    }
+
+    static func catalogDecodedJSON(data: Data, statusCode: Int) -> CatalogTransportOutcome<[String: Any]> {
+        if let failure = catalogFailure(statusCode: statusCode) { return .failure(failure) }
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return .failure(CatalogFailure(.decoding, statusCode: statusCode))
+        }
+        return .success(object)
+    }
+
+    private static func fetchJSONOutcome(_ url: URL?, sign: Bool) async -> CatalogTransportOutcome<[String: Any]> {
+        guard let url else { return .failure(CatalogFailure(.unavailable)) }
         var req = URLRequest(url: url)
         if sign { VortXEdgeAuth.sign(&req) }
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
-            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        } catch { return nil }
+            guard let statusCode = (resp as? HTTPURLResponse)?.statusCode else {
+                return .failure(CatalogFailure(.transport))
+            }
+            return catalogDecodedJSON(data: data, statusCode: statusCode)
+        } catch {
+            return .failure(catalogFailure(for: error))
+        }
     }
 
     /// Resolve a catalog id to an IMDb `tt` id. A `tt` id passes straight through; a `tmdb:<n>` (or bare

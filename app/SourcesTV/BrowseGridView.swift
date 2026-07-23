@@ -41,8 +41,8 @@ struct TVCollectionsHub: View {
             }
             if showStreaming, !model.providers.isEmpty {
                 section(title: String(localized: "Streaming Services"), eyebrow: String(localized: "Browse by service")) {
-                    ForEach(model.providers) { p in
-                        NavigationLink { TVCategoryBrowse(target: .service(id: p.providerID, name: p.name)) } label: { TVServiceTile(provider: p) }
+                    ForEach(CollectionsHubMount.serviceRoutes(from: model.providers)) { route in
+                        NavigationLink { TVCategoryBrowse(target: route.target) } label: { TVServiceTile(provider: route.provider) }
                             .buttonStyle(CardFocusStyle())
                     }
                 }
@@ -381,6 +381,7 @@ struct TVCategoryBrowse: View {
     @State private var page = 1
     @State private var loading = false
     @State private var done = false
+    @State private var pageState: CatalogPageState?
     @State private var loadTask: Task<Void, Never>?
     /// Bumped on every pill switch. A load captures it before its await and drops every post-await mutation
     /// when the token has moved on, so an in-flight (or pagination) load for the OLD pill can never clear the
@@ -405,6 +406,11 @@ struct TVCategoryBrowse: View {
                 VStack(alignment: .leading, spacing: Theme.Space.md) {
                     Text(LocalizedStringKey(target.title)).screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
                     pills
+                    if !items.isEmpty, let message = pageState?.localizedMessage {
+                        Text(message).font(Theme.Typography.label)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                            .padding(.horizontal, Theme.Space.screenEdge)
+                    }
                     grid
                 }
                 .padding(.top, Theme.Space.sm)
@@ -432,7 +438,8 @@ struct TVCategoryBrowse: View {
     @ViewBuilder private var grid: some View {
         if items.isEmpty {
             if done {
-                Text("Nothing here yet.").font(Theme.Typography.label)
+                Text(pageState?.localizedMessage ?? String(localized: "Nothing here yet."))
+                    .font(Theme.Typography.label)
                     .foregroundStyle(Theme.Palette.textSecondary).padding(Theme.Space.xxl).frame(maxWidth: .infinity)
             } else {
                 BigSpinner().padding(Theme.Space.xxl).frame(maxWidth: .infinity)
@@ -459,7 +466,7 @@ struct TVCategoryBrowse: View {
         // Reset `loading` too: an in-flight load leaves it true, and without this the next loadNext() bails on
         // its `guard !loading` and the grid stays stuck on the spinner. Bump the generation so any stale load
         // (the cancelled loadTask AND any onAppear pagination load) drops its result.
-        items = []; seen = []; page = 1; done = false; loading = false
+        items = []; seen = []; page = 1; done = false; loading = false; pageState = nil
         loadGen += 1
         loadTask?.cancel()
         loadTask = Task { await loadNext() }
@@ -469,16 +476,18 @@ struct TVCategoryBrowse: View {
         guard !loading, !done, let sub = subs.first(where: { $0.id == selectedID }) else { return }
         loading = true
         let gen = loadGen
-        let next = await sub.load(page)
+        let result = await sub.load(page, seen)
         // A pill switched mid-fetch: a newer select() already reset `loading` and owns the new load, so return
         // WITHOUT touching loading (clearing it here would clobber the new pill's in-flight state).
         guard gen == loadGen else { return }
         loading = false
-        if next.isEmpty { done = true; return }
+        pageState = result.state
         page += 1
-        let fresh = next.filter { seen.insert($0.id).inserted }
+        done = !result.hasMore
+        let fresh = result.previews.filter { seen.insert($0.id).inserted }
         items.append(contentsOf: fresh)
         if focusModel.hero == nil, let first = items.first { focusModel.seedIfEmpty(hero(for: first)) }
+        if fresh.isEmpty, result.hasMore { Task { await loadNext() } }
     }
 
     private func hero(for item: MetaPreview) -> FocusedHero {

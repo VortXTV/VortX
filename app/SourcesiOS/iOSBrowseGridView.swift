@@ -50,7 +50,9 @@ struct iOSCollectionsHub: View {
     /// The streaming tiles with TMDB's split brand entries collapsed to one per brand (H1: the owner saw
     /// TWO Apple TV+ tiles - id 2 "Apple TV" store and id 350 "Apple TV+" are separate TMDB entries; also
     /// Prime / Max / Discovery+ alias pairs). View-layer dedup so the shared model stays untouched.
-    private var streamingProviders: [TMDBClient.ProviderTile] { ProviderBrandMap.dedupeProviders(model.providers) }
+    private var streamingRoutes: [CollectionsMountedServiceRoute] {
+        CollectionsHubMount.serviceRoutes(from: model.providers)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.lg) {
@@ -63,10 +65,10 @@ struct iOSCollectionsHub: View {
                     }
                 }
             }
-            if showStreaming, !streamingProviders.isEmpty {
+            if showStreaming, !streamingRoutes.isEmpty {
                 hubSection(title: "Streaming Services") {
-                    ForEach(streamingProviders) { p in
-                        NavigationLink(value: HubTarget.service(id: p.providerID, name: p.name)) { iOSServiceTile(provider: p, width: tileWidth) }.buttonStyle(.plain)
+                    ForEach(streamingRoutes) { route in
+                        NavigationLink(value: route.target) { iOSServiceTile(provider: route.provider, width: tileWidth) }.buttonStyle(.plain)
                     }
                 }
             }
@@ -394,16 +396,14 @@ struct iOSCategoryBrowse: View {
     @State private var page = 1
     @State private var loading = false
     @State private var done = false
+    @State private var pageState: CatalogPageState?
     @State private var loadTask: Task<Void, Never>?
     /// Push debounce: a sticky Bool reset in onAppear died when pop-back did not re-fire onAppear in
     /// the 7-tab opacity-ZStack architecture, eating every tap after the first (owner report). Time-based
     /// so it can never wedge shut.
     @State private var lastPush = Date.distantPast
-    /// In-flight guard for the async tmdb:->tt resolve so a slow (>0.6s) resolve cannot be pushed twice.
-    @State private var resolving = false
-    /// The async tmdb:->tt resolve task, held so onDisappear can cancel it: a slow resolve otherwise appends
-    /// to the NavigationPath after the user has already left, force-pushing a detail page behind them.
-    @State private var resolveTask: Task<Void, Never>?
+    /// Bumped on each pill switch so a cancelled older request cannot publish into the new selection.
+    @State private var loadGen = 0
 
     /// The persistent cinematic hero at the top of the browse screen - the same ambient billboard Home /
     /// Discover use, seeded from the selected pill's top items. tvOS's TVCategoryBrowse already has a hero
@@ -420,9 +420,15 @@ struct iOSCategoryBrowse: View {
                     FeaturedHeroView(model: hero, onOpen: openHero)
                 }
                 pills
+                if !items.isEmpty, let message = pageState?.localizedMessage {
+                    Text(message).font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .padding(.horizontal, Theme.Space.md)
+                }
                 if items.isEmpty {
                     if done {
-                        Text("Nothing here yet.").font(Theme.Typography.label)
+                        Text(pageState?.localizedMessage ?? String(localized: "Nothing here yet."))
+                            .font(Theme.Typography.label)
                             .foregroundStyle(Theme.Palette.textSecondary).frame(maxWidth: .infinity).padding(Theme.Space.xxl)
                     } else {
                         ProgressView().frame(maxWidth: .infinity).padding(Theme.Space.xxl)
@@ -444,7 +450,7 @@ struct iOSCategoryBrowse: View {
         .onAppear { if selectedID.isEmpty, let first = subs.first { select(first.id) } }
         // Stop the hero's rotation/wake tasks and cancel the resolve so a popped browse leaves nothing looping
         // in the background and never pushes a detail page after the user has left.
-        .onDisappear { loadTask?.cancel(); resolveTask?.cancel(); hero.stop() }
+        .onDisappear { loadTask?.cancel(); hero.stop() }
     }
 
     private var pills: some View {
@@ -472,26 +478,11 @@ struct iOSCategoryBrowse: View {
         pushResolvingHubID(item)
     }
 
-    /// Hub catalogs (Discover/Trending/genres/streaming tiles) deliver `tmdb:` ids, which Cinemeta meta,
-    /// stream add-ons and the ratings service cannot key on - so on iOS/Mac the detail hero art, ratings and
-    /// the Play button all stayed dark for hub items (tvOS already works because its stream path never gated on
-    /// meta). Resolve tmdb:->tt BEFORE pushing so the pushed item carries a tt id. A non-tmdb id pushes
-    /// immediately; the resolve is fail-soft (push the unresolved item so detail still opens with seed art +
-    /// the de-gated Play button). external_ids is edge-cached, so a warm title resolves in a few ms.
+    /// Successor publication is strict IMDb-only. The route boundary repeats that invariant so a future caller
+    /// cannot reintroduce a raw TMDB id as a playable detail destination.
     private func pushResolvingHubID(_ item: FeaturedHeroItem) {
-        guard item.id.hasPrefix("tmdb:") else { path.append(item); return }
-        // The 0.6s lastPush window can reopen before a cold-cache external_ids resolve returns (>0.6s),
-        // letting a second tap push the same detail twice. Gate the async path on a dedicated in-flight flag.
-        guard !resolving else { return }
-        resolving = true
-        resolveTask = Task { @MainActor in
-            let tt = await TMDBClient.imdbID(forCatalogID: item.id, type: item.type)
-            resolving = false
-            // The user may have popped this screen during a cold-cache resolve; don't append a detail page
-            // behind them (onDisappear cancels this task).
-            guard !Task.isCancelled else { return }
-            path.append(tt.map { item.withResolvedIMDbID($0) } ?? item)
-        }
+        guard CatalogServicePipeline.routeID(for: item.id) != nil else { return }
+        path.append(item)
     }
 
     private func select(_ id: String) {
@@ -501,7 +492,8 @@ struct iOSCategoryBrowse: View {
         // `await sub.load(page)` with loading==true when the new task starts. Without this reset the new task
         // hits `guard !loading` and bails, and when the old task finally resumes it only sets loading=false and
         // returns (id mismatch) - leaving items empty, no task running, and a PERMANENT spinner on the new pill.
-        items = []; seen = []; page = 1; done = false; loading = false
+        items = []; seen = []; page = 1; done = false; loading = false; pageState = nil
+        loadGen += 1
         loadTask?.cancel()
         loadTask = Task { await loadNext() }
     }
@@ -509,14 +501,15 @@ struct iOSCategoryBrowse: View {
     private func loadNext() async {
         guard !loading, !done, let sub = subs.first(where: { $0.id == selectedID }) else { return }
         loading = true
-        let requested = selectedID
-        let metas = await sub.load(page)
-        guard requested == selectedID else { loading = false; return }
+        let generation = loadGen
+        let result = await sub.load(page, seen)
+        guard generation == loadGen else { return }
         loading = false
-        if metas.isEmpty { done = true; return }
+        pageState = result.state
         page += 1
+        done = !result.hasMore
         let firstPage = (page == 2)   // page was 1 before this increment -> these are the pill's top items
-        let fresh = metas.filter { seen.insert($0.id).inserted }
+        let fresh = result.previews.filter { seen.insert($0.id).inserted }
             .map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
         items.append(contentsOf: fresh)
         // Seed (and on a pill switch, re-seed) the hero from the top of the freshly loaded catalog so the
@@ -524,6 +517,7 @@ struct iOSCategoryBrowse: View {
         if firstPage {
             hero.seed(Array(items.prefix(6)).map(FeaturedHeroItem.from(rail:)), reduceMotion: reduceMotion)
         }
+        if fresh.isEmpty, result.hasMore { Task { await loadNext() } }
     }
 }
 

@@ -52,19 +52,31 @@ final class HomeGroupsModel: ObservableObject {
     /// new watch rebuilds while a routine re-emit does not. Folding the seed signature in keeps the
     /// personalized "Because You Watched" group fresh without refetching the region-only groups needlessly.
     private var loadedKey: String?
+    private var requestKey: String?
     private var loadTask: Task<Void, Never>?
+    private var loadGeneration = 0
 
     /// Build the groups for the region (default: device region). `cw`/`library` (default empty) seed the
     /// personalized "Because You Watched" group and are READ ONLY. Idempotent: a second call for the same
     /// region + same recent watches while loaded (or in flight) is a no-op, so it is safe to call from
     /// `onAppear` and every Home re-emit. The whole section hides cleanly (stays empty) when nothing resolves.
     func load(region: String = TMDBClient.deviceRegion, cw: [CoreCWItem] = [], library: [CoreCWItem] = []) {
-        let key = region + "|" + BecauseYouWatchedModel.seedSignature(cw: cw, library: library)
-        guard loadTask == nil, loadedKey != key else { return }
+        let regions = CatalogPrefsStore.orderedCatalogRegions(primary: region)
+        let key = CatalogCacheIdentity.key(namespace: "home-groups", regions: regions)
+            + "|" + BecauseYouWatchedModel.seedSignature(cw: cw, library: library)
+        if loadTask != nil, requestKey == key { return }
+        if loadTask != nil { loadTask?.cancel(); loadTask = nil; loadGeneration += 1 }
+        guard loadedKey != key else { return }
+        loadGeneration += 1
+        requestKey = key
+        let stamp = CatalogRequestStamp(generation: loadGeneration, cacheIdentity: key)
         loadTask = Task { [weak self] in
-            let built = await Self.buildAll(region: region, cw: cw, library: library)
+            let built = await Self.buildAll(region: region, catalogRegions: regions, cw: cw, library: library)
             guard let self, !Task.isCancelled else { return }
+            guard stamp.isCurrent(generation: self.loadGeneration,
+                                  cacheIdentity: self.requestKey ?? "") else { return }
             self.loadTask = nil
+            self.requestKey = nil
             // Keep whatever we had on a fully empty build (flaky network / no key) rather than blanking a
             // populated section; leave `loadedKey` nil so the next Home appearance retries.
             if built.isEmpty { return }
@@ -77,14 +89,21 @@ final class HomeGroupsModel: ObservableObject {
     func clear() {
         loadTask?.cancel()
         loadTask = nil
+        loadGeneration += 1
+        requestKey = nil
         groups = []
         loadedKey = nil
     }
 
     /// Build all groups in parallel, preserving display order, dropping any group with no rails.
-    private static func buildAll(region: String, cw: [CoreCWItem], library: [CoreCWItem]) async -> [CollectionGroup] {
+    private static func buildAll(
+        region: String,
+        catalogRegions: [String],
+        cw: [CoreCWItem],
+        library: [CoreCWItem]
+    ) async -> [CollectionGroup] {
         async let because = buildBecauseYouWatchedGroup(cw: cw, library: library)
-        async let streaming = buildStreamingGroup(region: region)
+        async let streaming = buildStreamingGroup(regions: catalogRegions)
         async let genres = buildGenresGroup(region: region)
         async let topNew = buildTopNewGroup(region: region)
         async let new = buildNewGroup(region: region)
@@ -112,8 +131,8 @@ final class HomeGroupsModel: ObservableObject {
     /// Group 1 "Streaming": the streaming-service rails (Netflix, Disney+, …), reusing the exact same
     /// `StreamingRailsModel` fetch path as the flat streaming section so the data + drop-empty behaviour
     /// match. Needs a TMDB key; with none it resolves to no rails and the group is dropped.
-    private static func buildStreamingGroup(region: String) async -> CollectionGroup? {
-        let rails = await StreamingRailsModel.streamingCollections(region: region)
+    private static func buildStreamingGroup(regions: [String]) async -> CollectionGroup? {
+        let rails = await StreamingRailsModel.streamingCollections(regions: regions)
         guard !rails.isEmpty else { return nil }
         return CollectionGroup(id: "group.streaming", title: String(localized: "Streaming"),
                                eyebrow: String(localized: "Browse by service"), rails: rails)

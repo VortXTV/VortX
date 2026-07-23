@@ -17,25 +17,36 @@ final class StreamingRailsModel: ObservableObject {
     /// capped. A service that resolved to nothing in-region is omitted. Empty hides the whole section.
     @Published private(set) var collections: [CuratedCollection] = []
 
-    /// The region the current rails were built for, so a locale change rebuilds and a routine re-emit does not.
-    private var loadedRegion: String?
+    /// The ordered region set the current rails were built for, so order changes invalidate stale results too.
+    private var loadedIdentity: String?
+    private var requestIdentity: String?
     private var loadTask: Task<Void, Never>?
+    private var loadGeneration = 0
 
     /// Build the streaming-service rails for the region (default: device region). Idempotent: a second call
     /// for the same region while loaded (or in flight) is a no-op, so it is safe to call from `onAppear` and
-    /// every Home re-emit. Hides cleanly (stays empty) when no TMDB key is set.
+    /// every Home re-emit. Hides cleanly when no catalog route returns playable titles.
     func load(region: String = TMDBClient.deviceRegion) {
-        guard ApiKeys.tmdbKey() != nil else { collections = []; loadedRegion = nil; return }
-        guard loadTask == nil, loadedRegion != region else { return }
+        let regions = CatalogPrefsStore.orderedCatalogRegions(primary: region)
+        let identity = CatalogCacheIdentity.key(namespace: "streaming-rails", regions: regions)
+        if loadTask != nil, requestIdentity == identity { return }
+        if loadTask != nil { loadTask?.cancel(); loadTask = nil; loadGeneration += 1 }
+        guard loadedIdentity != identity else { return }
+        loadGeneration += 1
+        requestIdentity = identity
+        let stamp = CatalogRequestStamp(generation: loadGeneration, cacheIdentity: identity)
         loadTask = Task { [weak self] in
-            let built = await Self.streamingCollections(region: region)
+            let built = await Self.streamingCollections(regions: regions)
             guard let self, !Task.isCancelled else { return }
+            guard stamp.isCurrent(generation: self.loadGeneration,
+                                  cacheIdentity: self.requestIdentity ?? "") else { return }
             self.loadTask = nil
+            self.requestIdentity = nil
             // Keep whatever we had on a fully empty fetch (flaky network) rather than blanking a populated
             // section; leave `loadedRegion` nil so the next Home appearance retries.
             if built.isEmpty { return }
             self.collections = built
-            self.loadedRegion = region
+            self.loadedIdentity = identity
         }
     }
 
@@ -43,16 +54,21 @@ final class StreamingRailsModel: ObservableObject {
     func clear() {
         loadTask?.cancel()
         loadTask = nil
+        loadGeneration += 1
+        requestIdentity = nil
         collections = []
-        loadedRegion = nil
+        loadedIdentity = nil
     }
 
     /// Fetch every streaming-service rail in parallel, preserving `majorStreamingServices` order, dropping
     /// any service with nothing available in-region. Runs off the main actor. Shared with the nested
     /// "Streaming" collection group (`HomeGroupsModel`) so the streaming rails are fetched the same way
-    /// whether they render as the flat section or as a group's child rails. Returns [] with no TMDB key.
+    /// whether they render as the flat section or as a group's child rails. Returns [] when every service is empty.
     static func streamingCollections(region: String) async -> [CuratedCollection] {
-        guard ApiKeys.tmdbKey() != nil else { return [] }
+        await streamingCollections(regions: CatalogPrefsStore.orderedCatalogRegions(primary: region))
+    }
+
+    static func streamingCollections(regions: [String]) async -> [CuratedCollection] {
         let services = TMDBClient.majorStreamingServices
         // Resolve services in small concurrent batches (3 at a time), so the rails don't all fan out their
         // TMDB requests at once on first Home load (each service itself caps its in-flight external_ids).
@@ -63,7 +79,8 @@ final class StreamingRailsModel: ObservableObject {
                 for (offset, service) in batch.enumerated() {
                     let index = start + offset
                     group.addTask {
-                        let items = await TMDBClient.streamingProviderTitles(providerID: service.providerID, region: region)
+                        let items = await TMDBClient.streamingProviderTitles(providerID: service.providerID,
+                                                                             regions: regions)
                         guard !items.isEmpty else { return (index, nil) }
                         return (index, CuratedCollection(id: "streaming.\(service.providerID)", title: service.name, items: items))
                     }

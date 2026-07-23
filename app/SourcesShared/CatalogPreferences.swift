@@ -159,6 +159,7 @@ enum CatalogPrefsStore {
     static let hideLabelsKey = "stremiox.catalog.hidePosterLabels"
     static let hiddenCategoriesKey = "vortx.discover.hiddenCategories"
     static let regionKey = "vortx.discover.regionPreference"   // "" / absent = follow the device region
+    static let regionsV2Key = "vortx.discover.regions.v2"
     static let homeLayoutKey = "vortx.home.layout"   // tvOS Home: "rails" (default) | "wall" (#105)
     static let filtersKey = "vortx.discover.filters"   // advanced Discover filter set (JSON, absent = none)
 
@@ -182,8 +183,46 @@ enum CatalogPrefsStore {
         return v.isEmpty ? nil : v.uppercased()
     }
     static func setRegionOverride(_ code: String?) {
-        if let code, !code.isEmpty { UserDefaults.standard.set(code.uppercased(), forKey: regionKey) }
+        let previous = regionOverride()
+        let selected = code.flatMap { CatalogServicePipeline.normalizedRegions([$0]).first }
+        if let selected { UserDefaults.standard.set(selected, forKey: regionKey) }
         else { UserDefaults.standard.removeObject(forKey: regionKey) }
+        var stored = UserDefaults.standard.stringArray(forKey: regionsV2Key) ?? []
+        if let previous { stored.removeAll { $0.caseInsensitiveCompare(previous) == .orderedSame } }
+        let device = Locale.current.region?.identifier ?? "US"
+        let primary = selected ?? device
+        let migrated = migratedCatalogRegions(storedRegions: [primary] + stored,
+                                              legacyRegion: primary, deviceRegion: device)
+        UserDefaults.standard.set(migrated, forKey: regionsV2Key)
+    }
+
+    /// The Beta 7 union always includes GB, IN, and US. A legacy or device-selected region stays first, so an
+    /// existing fourth region is preserved rather than silently replaced during migration.
+    static let mandatoryCatalogRegions = ["GB", "IN", "US"]
+
+    static func migratedCatalogRegions(
+        storedRegions: [String]?,
+        legacyRegion: String?,
+        deviceRegion: String
+    ) -> [String] {
+        let primary = legacyRegion ?? deviceRegion
+        let seed = (storedRegions?.isEmpty == false ? storedRegions! : [primary]) + mandatoryCatalogRegions
+        return CatalogServicePipeline.normalizedRegions(seed)
+    }
+
+    /// Ordered v2 region set used by every provider catalog and its cache identity. Reading performs the
+    /// one-time legacy migration into a normal UserDefaults value, which the existing backup and cloud writers
+    /// already carry without any writer changes.
+    static func orderedCatalogRegions(primary: String? = nil) -> [String] {
+        let device = Locale.current.region?.identifier ?? "US"
+        let legacy = primary ?? regionOverride() ?? device
+        var stored = UserDefaults.standard.stringArray(forKey: regionsV2Key)
+        if primary != nil {
+            stored = [legacy] + (stored ?? []).filter { $0.caseInsensitiveCompare(legacy) != .orderedSame }
+        }
+        let migrated = migratedCatalogRegions(storedRegions: stored, legacyRegion: legacy, deviceRegion: device)
+        if stored != migrated { UserDefaults.standard.set(migrated, forKey: regionsV2Key) }
+        return migrated
     }
 
     /// The user's advanced Discover filter set (genre include/exclude, year window, age rating, runtime,
@@ -286,10 +325,12 @@ final class CatalogPreferences: ObservableObject {
         didSet {
             guard oldValue != regionOverride else { return }
             CatalogPrefsStore.setRegionOverride(regionOverride)
+            orderedRegions = CatalogPrefsStore.orderedCatalogRegions(primary: regionOverride)
             // Region changed: reload the hub (providers/backdrops are region-keyed) so tiles reflect it.
             CollectionsHubModel.shared.load()
         }
     }
+    @Published private(set) var orderedRegions: [String] = CatalogPrefsStore.orderedCatalogRegions()
     /// The user's advanced Discover filters, applied client-side over the loaded Discover previews. Empty by
     /// default so Discover is unchanged until a filter is set. Two-way bound by the Discover filter panel;
     /// persists on change (an empty set clears the stored key).
@@ -332,6 +373,8 @@ final class CatalogPreferences: ObservableObject {
         if homeLayout != savedLayout { homeLayout = savedLayout }
         let savedRegion = CatalogPrefsStore.regionOverride()
         if regionOverride != savedRegion { regionOverride = savedRegion }
+        let savedRegions = CatalogPrefsStore.orderedCatalogRegions(primary: savedRegion)
+        if orderedRegions != savedRegions { orderedRegions = savedRegions }
         let savedFilters = CatalogPrefsStore.discoverFilters()
         if discoverFilters != savedFilters { discoverFilters = savedFilters }
     }

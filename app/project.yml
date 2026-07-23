@@ -654,6 +654,42 @@ targets:
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
     # Build-time edge-signing secret (gitignored xcconfig; empty default; see project-level note).
+  CatalogSuccessorTestsIOS:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests/CatalogSuccessorTests.swift
+    dependencies:
+      - target: VortXiOSNative
+      - framework: Vendor/VortxEngine.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.catalog-successor-tests.ios
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/VortXiOSNative.app/VortXiOSNative"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+  CatalogSuccessorTestsTVOS:
+    type: bundle.unit-test
+    platform: tvOS
+    sources:
+      - Tests/CatalogSuccessorTests.swift
+    dependencies:
+      - target: VortXTV
+      - framework: Vendor/VortxEngine.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.catalog-successor-tests.tvos
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/VortXTV.app/VortXTV"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
 schemes:
   VortX:
     build:
@@ -667,6 +703,11 @@ schemes:
     build:
       targets:
         VortXiOSNative: all
+        CatalogSuccessorTestsIOS: [test]
+    test:
+      config: Debug
+      targets:
+        - CatalogSuccessorTestsIOS
     run:
       config: Debug
     archive:
@@ -683,6 +724,11 @@ schemes:
     build:
       targets:
         VortXTV: all
+        CatalogSuccessorTestsTVOS: [test]
+    test:
+      config: Debug
+      targets:
+        - CatalogSuccessorTestsTVOS
     run:
       config: Debug
     archive:
