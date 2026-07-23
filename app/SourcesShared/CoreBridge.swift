@@ -208,12 +208,16 @@ final class CoreBridge: ObservableObject {
                     }
                 }
             }
+            // Publish the tmdb:-meta gate from the FINAL surviving set (thread-safe UserDefaults write, no
+            // self needed) so the off-main catalog resolvers gate the tmdb: fallback on real installed state.
+            AddonMetaGate.publish(survivingTyped.contains { $0.providesTMDBMeta })
             DispatchQueue.main.async { [weak self] in
                 self?.addons = survivingTyped
                 self?.rawAddonsByUrl = publishedRaw
             }
             return
         }
+        AddonMetaGate.publish(typed.contains { $0.providesTMDBMeta })
         DispatchQueue.main.async { [weak self] in
             self?.addons = typed
             self?.rawAddonsByUrl = raw
