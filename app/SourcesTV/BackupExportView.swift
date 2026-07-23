@@ -28,7 +28,9 @@ struct BackupExportView: View {
     private enum Status: Equatable { case starting, waiting, saving, backedUp, failed }
 
     private static let qrSize: CGFloat = 320
-    private static let approveBase = "https://vortx.tv/approve"
+    // Hash route, not a real path: the web approver is a hash-routed SPA, so a path URL never renders the
+    // approve view and the TV waits forever. Same defect + fix as the sign-in joiner (see #153).
+    private static let approveBase = "https://vortx.tv/#/approve"
     private static let pollInterval: UInt64 = 2_000_000_000   // 2s
 
     var body: some View {
@@ -118,8 +120,8 @@ struct BackupExportView: View {
             try? await Task.sleep(nanoseconds: Self.pollInterval)
             if Task.isCancelled { return }
             switch await VortXSyncManager.shared.qrPoll(s) {
-            case .pending:
-                continue
+            case .pending, .transportError:
+                continue                             // reachable-but-idle, or a retriable relay blip; keep polling
             case .expired:
                 start(); return                      // the code aged out; mint a fresh one
             case .failed:
