@@ -690,7 +690,6 @@ struct DetailView: View {
                         VStack(alignment: .leading, spacing: Theme.Space.sm) {
                             titleOrLogo(m)
                             metaRow(m)
-                            ratingsRow()
                             financialsRow()
                             releaseDatesRow()
                             if let d = m.description, !d.isEmpty {
@@ -918,7 +917,6 @@ struct DetailView: View {
                     .lineLimit(2).minimumScaleFactor(0.6)
                     .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
                 metaRow(m)
-                ratingsRow()
                 financialsRow()
                 releaseDatesRow()
                 if let d = m.description, !d.isEmpty {
@@ -1163,12 +1161,7 @@ struct DetailView: View {
 
     private func metaRow(_ m: CoreMetaItem) -> some View {
         HStack(spacing: Theme.Space.md) {
-            if let imdb = m.imdbRating {
-                HStack(spacing: 6) {
-                    Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
-                    Text(imdb)
-                }
-            }
+            primaryRatings(m)
             if let r = m.releaseInfo { Text(r) }
             if let rt = m.runtime { Text(rt) }
             let genres = m.genres
@@ -1178,26 +1171,31 @@ struct DetailView: View {
         .foregroundStyle(Theme.Palette.textSecondary)
     }
 
-    /// Compact cross-provider ratings row ("IMDb 8.5  ·  RT 92%  ·  MC 81  ·  TMDB 78%"), fed by the VortX
-    /// ratings service (no user key needed), with the user's MDBList key filling any gap. Shown only when
-    /// ratings came back; renders nothing otherwise (no error UI). Non-focusable, same typography as metaRow
-    /// so it reads as a second fact line under the title and never disturbs the first-screen focus chain.
-    @ViewBuilder private func ratingsRow() -> some View {
-        if let text = mdbRatings.flatMap(Self.ratingsText), !text.isEmpty {
-            Text(text)
-                .font(Theme.Typography.label)
-                .foregroundStyle(Theme.Palette.textSecondary)
+    /// The PRIMARY rating position on the tvOS hero. VortX hosts the ratings backend, so this shows the FULL
+    /// cross-provider set (IMDb star + RT / MC / TMDB, formatted once in `RatingsFormat`) once the keyless
+    /// VortX ratings service resolves, and the engine metadata's IMDb rating INSTANTLY until then so the row
+    /// never blanks. Both branches lead with the same accent star, so the extra scores fade in beside it with
+    /// no reflow. Per-score fail-soft: a title with only IMDb keeps showing only IMDb.
+    @ViewBuilder private func primaryRatings(_ m: CoreMetaItem) -> some View {
+        if let r = mdbRatings, case let tokens = RatingsFormat.tokens(r), !tokens.isEmpty {
+            HStack(spacing: Theme.Space.md) {
+                ForEach(Array(tokens.enumerated()), id: \.offset) { _, token in
+                    HStack(spacing: 5) {
+                        if token.isIMDb {
+                            Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
+                        } else {
+                            Text(token.label).foregroundStyle(Theme.Palette.textTertiary)
+                        }
+                        Text(token.value).foregroundStyle(Theme.Palette.textPrimary)
+                    }
+                }
+            }
+        } else if let imdb = m.imdbRating {
+            HStack(spacing: 6) {
+                Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
+                Text(imdb).foregroundStyle(Theme.Palette.textPrimary)
+            }
         }
-    }
-
-    /// Build the joined ratings string from the decoded model, or nil when nothing is present.
-    private static func ratingsText(_ r: MDBListRatings) -> String? {
-        var parts: [String] = []
-        if let v = r.imdb { parts.append("IMDb \(imdbFmt.string(from: NSNumber(value: v)) ?? String(v))") }
-        if let v = r.rottenTomatoes { parts.append("RT \(v)%") }
-        if let v = r.metacritic { parts.append("MC \(v)") }
-        if let v = r.tmdb { parts.append("TMDB \(v)%") }
-        return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
     }
 
     /// Movie budget + box office (+ profit multiple), a third fact line under the ratings. Opt-out via the
@@ -1236,14 +1234,6 @@ struct DetailView: View {
         if let g = d.digital { parts.append("Digital \(g)") }
         return parts.joined(separator: "  ·  ")
     }
-
-    /// One-decimal IMDb formatter (8.5, not 8.50). `static let` to avoid per-row allocation.
-    private static let imdbFmt: NumberFormatter = {
-        let f = NumberFormatter()
-        f.minimumFractionDigits = 1
-        f.maximumFractionDigits = 1
-        return f
-    }()
 
     /// The season of the episode the viewer was LAST on (from the resume videoId), decoupled from the
     /// watched-gate seriesPrimaryEpisode applies. Opening Details from Continue Watching should land on the

@@ -960,7 +960,6 @@ struct iOSDetailView: View {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 titleOrLogo
                 metaRow
-                ratingsRow
                 financialsRow
                 releaseDatesRow
                 // #9: a clamped synopsis reads WITH the ratings block on the hero art; the full
@@ -1407,11 +1406,8 @@ struct iOSDetailView: View {
         if let rt = m?.runtime { facts.append(rt) }
         let genres = m?.genres ?? []
         if !genres.isEmpty { facts.append(genres.prefix(3).joined(separator: " · ")) }
-        return HStack(spacing: 6) {
-            if let imdb = m?.imdbRating {
-                Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
-                Text(imdb)
-            }
+        return HStack(spacing: 8) {
+            primaryRatings
             // Facts collapse into ONE truncating line. A row of separate non-truncating Texts had a
             // minimum width near the iPhone's portrait width, so it forced the hero wider than the screen
             // and the right edge clipped even with the GeometryReader cap. A single tail-truncating Text
@@ -1423,6 +1419,34 @@ struct iOSDetailView: View {
         .font(Theme.Typography.label)
         .foregroundStyle(Theme.Palette.textSecondary)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The PRIMARY rating position. Since VortX hosts the ratings backend itself, this shows the FULL
+    /// cross-provider set (IMDb star + RT / MC / TMDB, formatted once in `RatingsFormat`) as soon as the
+    /// keyless VortX ratings service resolves. Until then it shows the engine metadata's IMDb rating
+    /// INSTANTLY so the row never blanks; both branches lead with the same accent star, so when the full set
+    /// arrives the star stays put and the extra scores simply appear beside it (no vertical reflow / jank).
+    /// Per-score fail-soft: a title carrying only IMDb keeps showing only IMDb.
+    @ViewBuilder private var primaryRatings: some View {
+        if let r = mdbRatings, case let tokens = RatingsFormat.tokens(r), !tokens.isEmpty {
+            HStack(spacing: 8) {
+                ForEach(Array(tokens.enumerated()), id: \.offset) { _, token in
+                    HStack(spacing: 3) {
+                        if token.isIMDb {
+                            Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
+                        } else {
+                            Text(token.label).foregroundStyle(Theme.Palette.textTertiary)
+                        }
+                        Text(token.value).foregroundStyle(Theme.Palette.textPrimary)
+                    }
+                }
+            }
+        } else if let imdb = meta?.imdbRating {
+            HStack(spacing: 6) {
+                Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
+                Text(imdb).foregroundStyle(Theme.Palette.textPrimary)
+            }
+        }
     }
 
     /// Cast & Crew under the synopsis: a horizontally scrollable rail of EVERY cast member with photo +
@@ -2225,29 +2249,6 @@ struct iOSDetailView: View {
         }
     }
 
-    /// Compact cross-provider ratings row ("IMDb 8.5  ·  RT 92%  ·  TMDB 78%"), fed by the VortX ratings
-    /// service (no user key needed), with the user's MDBList key filling any gap. Shown only when ratings
-    /// came back; renders nothing otherwise (no error UI). Same typography as metaRow.
-    @ViewBuilder private var ratingsRow: some View {
-        if let text = mdbRatings.flatMap(Self.mdbRatingsText), !text.isEmpty {
-            Text(text)
-                .font(Theme.Typography.label)
-                .foregroundStyle(Theme.Palette.textSecondary)
-                .lineLimit(1).truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    /// Build the joined ratings string from the decoded model, or nil when nothing is present.
-    private static func mdbRatingsText(_ r: MDBListRatings) -> String? {
-        var parts: [String] = []
-        if let v = r.imdb { parts.append("IMDb \(mdbImdbFmt.string(from: NSNumber(value: v)) ?? String(v))") }
-        if let v = r.rottenTomatoes { parts.append("RT \(v)%") }
-        if let v = r.metacritic { parts.append("MC \(v)") }
-        if let v = r.tmdb { parts.append("TMDB \(v)%") }
-        return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
-    }
-
     /// Fetch the movie budget + box office (no-op for series / no key / no imdb id). Fail-soft; the row hides on a miss.
     private func loadFinancials() {
         guard showFinancials, type != "series", let imdb = ratingsImdbID, financials == nil else { return }
@@ -2342,14 +2343,6 @@ struct iOSDetailView: View {
         if let g = d.digital { parts.append("Digital \(g)") }
         return parts.joined(separator: "  ·  ")
     }
-
-    /// One-decimal IMDb formatter (8.5, not 8.50). `static let` to avoid per-row allocation.
-    private static let mdbImdbFmt: NumberFormatter = {
-        let f = NumberFormatter()
-        f.minimumFractionDigits = 1
-        f.maximumFractionDigits = 1
-        return f
-    }()
 
     /// Apply the Direct-links-only filter (drop every torrent source) so a user with the setting on
     /// never sees or auto-plays a torrent — the exact `displayGroups` the tvOS `CoreStreamList` uses.
