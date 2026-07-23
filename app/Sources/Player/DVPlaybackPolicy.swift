@@ -361,9 +361,16 @@ enum DVPlaybackPolicy {
     }
 }
 
-/// Exact access-unit classifier for the two video codecs the remux lane can publish. FFmpeg's KEY flag also
-/// covers HEVC CRA/BLA pictures; Apple segment independence requires IDR, so production passes the packet bytes
-/// through this parser before asking the boundary policy to open or cut a segment.
+/// Exact access-unit classifier for the two video codecs the remux lane can publish. A segment may open only
+/// at a picture from which decode can begin independently. For HEVC that is any IRAP with a defined
+/// random-access contract: IDR (19/20), CRA (21) and BLA (16-18). CRA/BLA are MP4 sync samples and legal HLS
+/// segment starts (their RASL leading pictures are discarded by a decoder that tunes in at the IRAP); the
+/// field regression that motivated this widening was IDR-only classification killing every open-GOP HEVC
+/// source: such encodes carry CRA keyframes for long stretches (and a resume seek lands on one), so the
+/// boundary policy could never cut (fresh play died at the frozen-target cap) or never open (resume died on
+/// its first packet) and the whole DV mount 404'd into the libmpv HDR10 demote. Build 187 cut on FFmpeg's
+/// KEY flag, which covers exactly these IRAP types, and shipped that behavior for months. H.264 stays
+/// IDR-only: its open-GOP recovery points are SEI-signaled and not provable from one NAL header.
 enum VortXVideoIDRClassifier {
     enum Codec: Equatable, Sendable { case hevc, h264 }
     enum PacketFormat: Equatable, Sendable {
@@ -469,7 +476,8 @@ enum VortXVideoIDRClassifier {
                   bytes[1] & 0x07 != 0 else { return .malformed }
             let type = (bytes[0] >> 1) & 0x3f
             guard type <= 31 else { return .nonVCL }
-            return type == 19 || type == 20 ? .idrVCL : .otherVCL
+            // IRAP with a random-access contract: BLA_W_LP(16) ... CRA_NUT(21). See the type doc above.
+            return (16...21).contains(type) ? .idrVCL : .otherVCL
         case .h264:
             guard length >= 1, bytes[0] & 0x80 == 0 else { return .malformed }
             let type = bytes[0] & 0x1f
@@ -963,16 +971,25 @@ struct VortXHLSStartupReadiness: Equatable, Sendable {
     let minimumSegmentCount: Int
     let minimumRenderedDurationMilliseconds: Int
 
-    init?(frozenTarget: VortXHLSFrozenTarget, minimumSegmentCount: Int = 6) {
+    /// Startup floor: TWO segments and FOUR seconds of rendered media. This is deliberately a flat wall-clock
+    /// budget, NOT a multiple of the frozen target. The build 189 field regression: the floor was
+    /// 6 segments AND 3x the conservative 12s target (36 SECONDS of media), so a UHD DV mount held its master
+    /// until ~380 MB had been produced - 12-15s on a fast debrid link - while the chrome's start watchdog
+    /// demotes at 10s. Every DV title "hung ~10s then fell to HDR10". The same floor sized the live window
+    /// (36 segments), whose RFC 8216 retention arithmetic (segment + longest-playlist duration) then pushed
+    /// resident spool bytes past the 512 MiB admission ceiling ~25s in and killed the healthy remux mid-play.
+    /// Build 187 shipped a TWO-segment startup window for months (field-proven on the same device/player);
+    /// EXT-X-START:TIME-OFFSET=0,PRECISE=YES pins the start point, so the 3-target live-edge heuristic of
+    /// RFC 8216 6.3.3 does not apply to this server's fixed-offset startup.
+    static let startupFloorMilliseconds = 4_000
+
+    init?(frozenTarget: VortXHLSFrozenTarget, minimumSegmentCount: Int = 2) {
         guard frozenTarget.seconds >= VortXHLSTargetPolicy.minimumSeconds,
               frozenTarget.seconds <= VortXHLSTargetPolicy.conservativeSeconds,
               minimumSegmentCount > 0 else { return nil }
-        let (threeTargets, targetOverflow) = frozenTarget.seconds.multipliedReportingOverflow(by: 3)
-        let (milliseconds, millisecondsOverflow) = threeTargets.multipliedReportingOverflow(by: 1_000)
-        guard !targetOverflow, !millisecondsOverflow else { return nil }
         self.frozenTarget = frozenTarget
         self.minimumSegmentCount = minimumSegmentCount
-        self.minimumRenderedDurationMilliseconds = milliseconds
+        self.minimumRenderedDurationMilliseconds = Self.startupFloorMilliseconds
     }
 }
 

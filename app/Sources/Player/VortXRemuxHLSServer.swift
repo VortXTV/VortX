@@ -69,6 +69,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private var startupMediaList: (window: VortXHLSWindow, ended: Bool)?
     private var publishedVideoWindow: VortXHLSWindow?
     private var advertisedAudioPlan: MultiAudioPolicy.RenditionPlan?
+    private var advertisedPrimaryAudioTag: String?
+    /// Last aligned alternate-audio window + init actually published, retained so an ADVERTISED alternate
+    /// that later fails can freeze at this terminal window (ENDLIST) instead of killing the whole session.
+    private var lastPublishedAudioWindow: VortXHLSWindow?
+    private var advertisedAudioInitData: Data?
     private var advertisedSubtitles: [SubtitleRenditionPolicy.Rendition] = []
     private var advertisedDolbyVision = false
     private var engineReady = false
@@ -86,10 +91,14 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         let audioPlan: MultiAudioPolicy.RenditionPlan?
         let subtitles: [SubtitleRenditionPolicy.Rendition]
         let ended: Bool
+        /// The advertised alternate failed after publication; its route serves the frozen terminal window.
+        let audioTerminated: Bool
     }
 
     private struct MasterPublication {
         let audioPlan: MultiAudioPolicy.RenditionPlan?
+        /// URI-less in-band primary label, used ONLY when `audioPlan` is nil (see HLSWindowSnapshot).
+        let primaryAudioTag: String?
         let subtitles: [SubtitleRenditionPolicy.Rendition]
     }
 
@@ -547,8 +556,18 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         }
 
         let audioPlan = publication.audioPlan
-        let audioTags = MultiAudioPolicy.mediaTags(audioPlan)
-        let audioAttribute = MultiAudioPolicy.streamInfAttribute(plan: audioPlan)
+        // With a qualified alternate the two-rendition tags render exactly as before. Without one, the muxed
+        // primary still gets a NAMED URI-less row so AVPlayer's audio menu shows the real language instead of
+        // "Unknown" (build 189 field regression on every multi-language mixed-codec file).
+        let audioTags: [String]
+        if audioPlan != nil {
+            audioTags = MultiAudioPolicy.mediaTags(audioPlan)
+        } else if let primaryTag = publication.primaryAudioTag {
+            audioTags = [primaryTag]
+        } else {
+            audioTags = []
+        }
+        let audioAttribute = audioTags.isEmpty ? "" : ",AUDIO=\"audio\""
         let subtitleRenditions = publication.subtitles
         let subtitleTags = subtitleRenditions.map(SubtitleRenditionPolicy.mediaTag)
         let subtitleAttribute = SubtitleRenditionPolicy.streamInfAttribute(
@@ -567,7 +586,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             input: input,
             mediaTags: audioTags + subtitleTags,
             streamInfAttributes: audioAttribute + subtitleAttribute)
-        DiagnosticsLog.log("dv", "hls resp /master.m3u8 variants=\(sig.dolbyVision ? 2 : 1) audio=\(audioPlan == nil ? 0 : 1) subs=\(subtitleRenditions.count) \(body.count)B")
+        DiagnosticsLog.log("dv", "hls resp /master.m3u8 variants=\(sig.dolbyVision ? 2 : 1) audio=\(audioPlan == nil ? 0 : 1) audioTags=\(audioTags.count) subs=\(subtitleRenditions.count) \(body.count)B")
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
     }
 
@@ -582,6 +601,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             guard topologyMatches(snapshot) else { return nil }
             return MasterPublication(
                 audioPlan: advertisedAudioPlan,
+                primaryAudioTag: advertisedPrimaryAudioTag,
                 subtitles: advertisedSubtitles)
         }
 
@@ -659,9 +679,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         startupMediaList = (finalVideoWindow, ended)
         publishedVideoWindow = finalVideoWindow
         advertisedAudioPlan = audioPlan
+        advertisedPrimaryAudioTag = audioPlan == nil ? snapshot.primaryAudioTag : nil
+        advertisedAudioInitData = audioPlan == nil ? nil : snapshot.audioInitData
+        lastPublishedAudioWindow = finalAudioWindow
         advertisedSubtitles = subtitles
         advertisedDolbyVision = snapshot.signaling?.dolbyVision == true
-        return MasterPublication(audioPlan: audioPlan, subtitles: subtitles)
+        return MasterPublication(
+            audioPlan: audioPlan,
+            primaryAudioTag: advertisedPrimaryAudioTag,
+            subtitles: subtitles)
     }
 
     private func logStartupCohortTimeout() {
@@ -709,6 +735,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             return nil
         }
 
+        let audioTerminated = audioDegraded(snapshot)
         let selectedVideo: VortXHLSWindow
         let ended: Bool
         if !engineReady {
@@ -716,7 +743,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             ended = startup.ended
         } else {
             var requiredWindows = [snapshot.window]
-            if advertisedAudioPlan != nil {
+            if advertisedAudioPlan != nil, !audioTerminated {
                 guard let audioWindow = snapshot.audioWindow else { return nil }
                 requiredWindows.append(audioWindow)
             }
@@ -772,9 +799,17 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         }
 
         let ids = selectedVideo.segments.map(\.id)
-        let selectedAudio = advertisedAudioPlan == nil
-            ? nil : snapshot.audioWindow.flatMap { exactWindow($0, ids: ids) }
-        guard advertisedAudioPlan == nil || selectedAudio != nil else { return nil }
+        let selectedAudio: VortXHLSWindow?
+        if advertisedAudioPlan == nil {
+            selectedAudio = nil
+        } else if audioTerminated {
+            // Degraded: the alternate's route freezes at the last window it actually published.
+            selectedAudio = lastPublishedAudioWindow
+        } else {
+            selectedAudio = snapshot.audioWindow.flatMap { exactWindow($0, ids: ids) }
+            guard selectedAudio != nil else { return nil }
+            lastPublishedAudioWindow = selectedAudio
+        }
         let selectedSubtitles = advertisedSubtitles.isEmpty
             ? nil : snapshot.subtitleWindow.flatMap { exactWindow($0, ids: ids) }
         guard advertisedSubtitles.isEmpty || selectedSubtitles != nil else { return nil }
@@ -791,21 +826,34 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             subtitleWindow: selectedSubtitles,
             audioPlan: advertisedAudioPlan,
             subtitles: advertisedSubtitles,
-            ended: ended)
+            ended: ended,
+            audioTerminated: audioTerminated)
     }
 
     private func topologyMatches(_ snapshot: VortXMKVRemuxStream.HLSWindowSnapshot) -> Bool {
         guard snapshot.frozenTarget == startupReadiness.frozenTarget else { return false }
         guard snapshot.signaling?.dolbyVision == advertisedDolbyVision else { return false }
         if let advertisedAudioPlan {
-            guard snapshot.audioPlan == advertisedAudioPlan,
-                  snapshot.audioInitData != nil else { return false }
+            // An advertised alternate that FAILED after publication is a DEGRADED topology, not a dead one:
+            // the alternate route freezes at its last published window (ENDLIST) while video/subtitles play
+            // on. Build 189 fail-closed here ("advertised HLS rendition topology became unavailable"), which
+            // 404'd every playlist and demoted a healthy mid-play session to libmpv HDR10 the moment the
+            // OPTIONAL rendition hit any snag.
+            guard audioDegraded(snapshot)
+                || (snapshot.audioPlan == advertisedAudioPlan && snapshot.audioInitData != nil) else {
+                return false
+            }
         }
         guard snapshot.subtitleFailureReason == nil || advertisedSubtitles.isEmpty,
               advertisedSubtitles.allSatisfy({ snapshot.subtitleRenditions.contains($0) }) else {
             return false
         }
         return true
+    }
+
+    /// True when an advertised alternate has failed after publication (the degraded, freeze-and-continue state).
+    private func audioDegraded(_ snapshot: VortXMKVRemuxStream.HLSWindowSnapshot) -> Bool {
+        advertisedAudioPlan != nil && snapshot.audioState == .failed
     }
 
     private func windowConformsToFrozenTarget(_ window: VortXHLSWindow) -> Bool {
@@ -958,20 +1006,22 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         let lines = MultiAudioPolicy.mediaPlaylist(
             renditionID: renditionID,
             window: window,
-            ended: publication.ended,
+            ended: publication.ended || publication.audioTerminated,
             targetDuration: startupReadiness.frozenTarget.seconds)
         let body = Data(lines.joined(separator: "\n").utf8)
-        DiagnosticsLog.log("dv", "hls resp /audio\(renditionID).m3u8 seq=\(window.mediaSequence) segs=\(window.segments.count)")
+        DiagnosticsLog.log("dv", "hls resp /audio\(renditionID).m3u8 seq=\(window.mediaSequence) segs=\(window.segments.count)\(publication.audioTerminated ? " [terminated]" : "")")
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
     }
 
     private func serveAudioInit(_ connection: NWConnection, renditionID: Int) {
         publicationLock.lock()
         let advertised = advertisedAudioPlan?.alternate.id == renditionID
+        let retainedInit = advertisedAudioInitData
         publicationLock.unlock()
         let snapshot = stream.hlsWindowSnapshot()
-        guard advertised, snapshot.audioPlan?.alternate.id == renditionID,
-              let data = snapshot.audioInitData else {
+        // The retained copy keeps the init servable in the degraded (terminated) state, where the failed
+        // alternate's stream-side snapshot no longer carries it.
+        guard advertised, let data = snapshot.audioInitData ?? retainedInit else {
             close(connection, status: "404 Not Found")
             return
         }

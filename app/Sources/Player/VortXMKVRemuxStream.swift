@@ -213,6 +213,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var _alternateAudioPlan: MultiAudioPolicy.RenditionPlan?
     private var _alternateAudioCandidatePlan: MultiAudioPolicy.RenditionPlan?
     private var _alternateAudioState: MultiAudioPolicy.StartupState = .failed
+    /// Metadata of the ONE stream-copied (in-band) audio track, published at classify so the master can label
+    /// the muxed primary with a URI-less EXT-X-MEDIA row when no separately-muxed alternate qualifies.
+    private var _primaryAudioLabel: (languageRaw: String, title: String,
+                                     channels: Int, usesDec3: Bool)?
     private var _alternateAudioResources: [MultiAudioPolicy.AudioResource] = []
     private var _alternateAudioMuxer: VortXAlternateAudioMuxer?
     private var _subtitleRenditions: [SubtitleRenditionPolicy.Rendition] = []
@@ -331,6 +335,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let audioWindow: VortXHLSWindow?
         let audioState: MultiAudioPolicy.StartupState
         let audioBuffer: VortXRemuxBuffer?
+        /// URI-less EXT-X-MEDIA row labeling the muxed in-band primary; the master emits it ONLY when no
+        /// separately-muxed alternate is advertised (`audioPlan == nil`). nil when the source names nothing.
+        let primaryAudioTag: String?
         let subtitleRenditions: [SubtitleRenditionPolicy.Rendition]
         let subtitleCues: [[SubtitleRenditionPolicy.Cue]]
         let subtitleWindow: VortXHLSWindow?
@@ -391,6 +398,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let subtitleWindow = _subtitleSettlement.settledWindow(videoWindow: videoWindow)
         let subtitleValid = _subtitleSettlement.isValid
         let audioPublished = _alternateAudioState == .ready && _alternateAudioPlan != nil
+        let primaryAudioTag = _primaryAudioLabel.flatMap {
+            MultiAudioPolicy.inBandPrimaryTag(
+                languageRaw: $0.languageRaw,
+                title: $0.title,
+                physicalChannels: $0.channels,
+                usesDec3: $0.usesDec3,
+                dec3: _primaryDec3Observation)
+        }
         return HLSWindowSnapshot(
             initData: _hlsInitData,
             initDataHDR: _hlsInitDataHDR,
@@ -402,6 +417,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             audioWindow: audioPublished ? audioWindow : nil,
             audioState: _alternateAudioState,
             audioBuffer: audioPublished ? audioMuxer?.buffer : nil,
+            primaryAudioTag: primaryAudioTag,
             subtitleRenditions: subtitleValid ? _subtitleRenditions : [],
             subtitleCues: subtitleValid ? _subtitleCues : [],
             subtitleWindow: subtitleWindow,
@@ -574,16 +590,49 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 packetStreamIndex: packetStreamIndex,
                 baseVideoStreamIndex: baseVideoStreamIndex,
                 isMapped: isMapped) else { return }
-        let timestamp = packet.pointee.dts != AV_NOPTS_VALUE_CONST
-            ? packet.pointee.dts : packet.pointee.pts
-        guard timestamp != AV_NOPTS_VALUE_CONST else { return }
+        // Latch from the DTS-TIMELINE FLOOR, not the landing IRAP's pts. After a Matroska seek the demuxer
+        // leaves the first (reordered) base-video packets with NO dts, and the real dts timeline resumes a
+        // reorder-depth BELOW the IRAP's presentation time. An origin latched at that pts made every later
+        // real dts NEGATIVE on the rebased output timeline, which movenc rejects as non-monotonic against
+        // the auto-filled leading dts ("invalid, non monotonically increasing dts", rc=-22) - the build 189
+        // resume death. Holding for the first dts-carrying base-video packet reproduces the exact shape a
+        // from-the-head mux sees (dts from zero, pts at or above it). The first pts-only packet is kept as a
+        // FALLBACK origin for sources that never deliver a dts inside the bounded pre-scan.
+        if packet.pointee.dts != AV_NOPTS_VALUE_CONST {
+            latchOrigin(timestamp: packet.pointee.dts, timeBase: timeBase, basis: "dts")
+        } else if packet.pointee.pts != AV_NOPTS_VALUE_CONST, originPtsFallbackUsec == nil {
+            originPtsFallbackUsec = max(0, av_rescale_q(packet.pointee.pts, timeBase, Self.avTimeBaseQ))
+        }
+    }
+
+    /// First pts-only origin candidate observed while waiting for a dts-carrying base-video packet.
+    private var originPtsFallbackUsec: Int64?
+
+    private func latchOrigin(timestamp: Int64, timeBase: AVRational, basis: String) {
         originShiftUsec = max(0, av_rescale_q(timestamp, timeBase, Self.avTimeBaseQ))
         originShiftLatched = true
         let origin = Double(originShiftUsec) / Double(Self.avTimeBase)
         hlsLock.lock(); _timelineOriginSeconds = origin; hlsLock.unlock()
         VXProbe.log(
             "dv",
-            "resume: base-video timeline origin \(String(format: "%.3f", origin))s (asked \(Int(requestedOriginSeconds))s)")
+            "resume: base-video timeline origin \(String(format: "%.3f", origin))s [\(basis)] (asked \(Int(requestedOriginSeconds))s)")
+    }
+
+    /// End-of-pre-scan fallback: no dts-carrying base-video packet arrived inside the bounded scan, so the
+    /// first pts-only candidate becomes the origin (the pre-fix behavior, correct for containers that carry
+    /// no reordering). Returns whether ANY origin could be latched.
+    private func latchOriginFromFallbackIfNeeded() -> Bool {
+        guard originSeekApplied else { return true }
+        if originShiftLatched { return true }
+        guard let fallback = originPtsFallbackUsec else { return false }
+        originShiftUsec = fallback
+        originShiftLatched = true
+        let origin = Double(originShiftUsec) / Double(Self.avTimeBase)
+        hlsLock.lock(); _timelineOriginSeconds = origin; hlsLock.unlock()
+        VXProbe.log(
+            "dv",
+            "resume: base-video timeline origin \(String(format: "%.3f", origin))s [pts fallback] (asked \(Int(requestedOriginSeconds))s)")
+        return true
     }
 
     /// Shift one packet by the already-established base-video origin. This runs before subtitle settlement,
@@ -934,6 +983,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             let profile = p.pointee.profile
             let joc = p.pointee.codec_id == AV_CODEC_ID_EAC3 && profile == Self.eac3AtmosProfile
             mappedAudioName = "\(Self.codecName(p.pointee.codec_id))/\(p.pointee.ch_layout.nb_channels)ch profile=\(profile) joc=\(joc)"
+            // Publish the in-band primary's labeling metadata for the master's URI-less EXT-X-MEDIA row
+            // (see MultiAudioPolicy.inBandPrimaryTag). Written once, before any master can serve.
+            let primaryLabel = (languageRaw: Self.streamLanguage(s),
+                                title: Self.streamMetadata(s, key: "title"),
+                                channels: Int(p.pointee.ch_layout.nb_channels),
+                                usesDec3: p.pointee.codec_id == AV_CODEC_ID_EAC3)
+            hlsLock.lock()
+            _primaryAudioLabel = primaryLabel
+            hlsLock.unlock()
             // Arm the one-time dec3 verification scan for a stream-copied E-AC3 track: the produced init
             // segment's dec3 box must carry the JOC extension for tvOS to light Atmos, and the log proves in
             // one diagnostics export whether the muxer wrote it (see scanForDec3). Message-only, fail-soft.
@@ -1056,9 +1114,45 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 }
             }
         }
-        if originSeekApplied, !originShiftLatched {
+        if !latchOriginFromFallbackIfNeeded() {
             buffer.fail("resume input seek produced no timestamped base-video packet")
             return
+        }
+        // RESUME LEADING-DTS REPAIR: after the seek, the demuxer's per-stream dts generation restarts, so the
+        // landing IRAP and its leading pictures (up to video_delay packets) arrive with NO dts while the first
+        // real dts resumes a reorder-depth BELOW the IRAP's pts. libavformat's muxer-side auto-fill derives a
+        // dts from those packets' PTS values, which exceed the first real dts, and movenc kills the session
+        // with "non monotonically increasing dts" (rc=-22) - the build 189 field death on EVERY open-GOP
+        // resume. Repair at the source: give the dts-less head packets a synthetic, monotonic dts ramp ENDING
+        // one frame below the first real dts, and lower the session origin to that ramp's floor so the
+        // rebased output timeline still starts at zero. From-the-head mounts never enter this path.
+        if originSeekApplied, originShiftLatched, baseVideoIn >= 0,
+           let baseStream = inCtx.pointee.streams[baseVideoIn] {
+            var dtsLess: [UnsafeMutablePointer<AVPacket>] = []
+            var firstRealDts: Int64?
+            for p in prebuffered where Int(p.pointee.stream_index) == baseVideoIn {
+                if p.pointee.dts == AV_NOPTS_VALUE_CONST {
+                    if firstRealDts == nil { dtsLess.append(p) }
+                } else {
+                    firstRealDts = p.pointee.dts
+                    break
+                }
+            }
+            if let firstRealDts, !dtsLess.isEmpty {
+                let tb = baseStream.pointee.time_base
+                let rate = baseStream.pointee.avg_frame_rate
+                var frameTicks: Int64 = 1
+                if rate.num > 0, rate.den > 0, tb.num > 0, tb.den > 0 {
+                    frameTicks = max(1, av_rescale_q(
+                        1, AVRational(num: rate.den, den: rate.num), tb))
+                }
+                for (index, packet) in dtsLess.enumerated() {
+                    packet.pointee.dts = firstRealDts
+                        - Int64(dtsLess.count - index) * frameTicks
+                }
+                let floorTicks = firstRealDts - Int64(dtsLess.count) * frameTicks
+                latchOrigin(timestamp: floorTicks, timeBase: tb, basis: "dts-ramp floor k=\(dtsLess.count)")
+            }
         }
 
         let convertP7 = (mode == .dolbyVision && info.dvProfile == 7)
@@ -2107,7 +2201,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         return _alternateAudioState
     }
 
-    private func markAlternateAudioFailed(_ category: MultiAudioPolicy.AlternateFailureCategory) {
+    private func markAlternateAudioFailed(_ category: MultiAudioPolicy.AlternateFailureCategory,
+                                          line: Int = #line) {
         hlsLock.lock()
         let wasActive = _alternateAudioState != .failed
         _alternateAudioState = .failed
@@ -2117,7 +2212,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         muxer?.abort()
         _ = updateHLSAuxiliaryBytes(alternateAudioInit: 0)
         if wasActive {
-            DiagnosticsLog.log("dv", "multi-audio omitted category=\(category.rawValue)")
+            // `line` is the CALL SITE (Swift default arguments evaluate there); shared categories were not
+            // enough to tell WHICH stage omitted the rendition in a device export (build 189 field lesson).
+            DiagnosticsLog.log("dv", "multi-audio omitted category=\(category.rawValue) site=\(line)")
         }
     }
 
@@ -2438,7 +2535,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 return HLSVideoStep(
                     seconds: sec,
                     boundary: nil,
-                    failure: "first HLS video segment lacked matching IDR NAL and AV_PKT_FLAG_KEY evidence")
+                    failure: "first HLS video segment lacked matching sync-IRAP NAL and AV_PKT_FLAG_KEY evidence (sec=\(String(format: "%.3f", sec)) irap=\(isIDR) key=\(hasKeyFlag))")
             }
             hlsSegmentStartSec = sec
             hlsSegmentStartPacketProven = true
@@ -2472,6 +2569,23 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // keeps T=3 alive when T=6 arrives and prevents either key from replacing the other.
         let logicalStart = hlsPendingBoundaries.logicalSegmentStartSeconds ?? publishedStart
         let elapsed = sec - logicalStart
+        // HEVC LEADING PICTURES (RASL/RADL): after a segment opens or cuts at an IRAP, the IRAP's leading
+        // pictures follow in DECODE order with PRESENTATION times behind the IRAP - and Matroska carries no
+        // DTS, so `sec` is their pts and the interval goes NEGATIVE. They belong to the open segment; this is
+        // not a stall and must not fail the mount. Build 189 field regression (diag 8): every RESUME seek
+        // lands on an IRAP, its first leading picture produced elapsed=-0.083, the strict `elapsed >= 0`
+        // boundary guard fail-softed, and the whole DV mount died silently into the instant master-404 ->
+        // AVPlayer item .failed -> libmpv HDR10 demote. A regression deeper than one frozen target is still a
+        // genuinely broken timeline and keeps the hard failure.
+        if elapsed < 0 {
+            guard elapsed > -Double(hlsTarget.seconds) else {
+                return HLSVideoStep(
+                    seconds: sec,
+                    boundary: nil,
+                    failure: "HLS video timestamp regressed beyond one frozen target (sec=\(String(format: "%.3f", sec)) logicalStart=\(String(format: "%.3f", logicalStart)))")
+            }
+            return HLSVideoStep(seconds: sec, boundary: nil, failure: nil)
+        }
         let decision = VortXHLSBoundaryPolicy.decision(
             hasOpenSegment: true,
             incomingIsIDR: isIDR,
@@ -2488,7 +2602,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             return HLSVideoStep(
                 seconds: sec,
                 boundary: nil,
-                failure: "HLS newest segment interval exceeded frozen target duration")
+                failure: "HLS newest segment interval exceeded frozen target duration (sec=\(String(format: "%.3f", sec)) logicalStart=\(String(format: "%.3f", logicalStart)) elapsed=\(String(format: "%.3f", elapsed)) irap=\(isIDR) key=\(hasKeyFlag))")
         case .cut:
             break
         }

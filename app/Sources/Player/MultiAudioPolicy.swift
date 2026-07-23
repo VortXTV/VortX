@@ -338,6 +338,70 @@ enum MultiAudioPolicy {
             .replacingOccurrences(of: "\n", with: " ")
     }
 
+    /// English names for common audio language tags (ISO 639-2/B + 639-1). Same deliberate duplication rule as
+    /// `languageKey`: this file and SubtitleRenditionPolicy are both dependency-free on purpose, so the table
+    /// is repeated rather than shared. Anything unlisted falls back to the uppercased tag, which is honest
+    /// about what the file said.
+    private static let languageNames: [String: String] = [
+        "eng": "English", "en": "English", "spa": "Spanish", "es": "Spanish",
+        "fre": "French", "fra": "French", "fr": "French",
+        "ger": "German", "deu": "German", "de": "German", "ita": "Italian", "it": "Italian",
+        "por": "Portuguese", "pt": "Portuguese", "rus": "Russian", "ru": "Russian",
+        "jpn": "Japanese", "ja": "Japanese", "kor": "Korean", "ko": "Korean",
+        "chi": "Chinese", "zho": "Chinese", "zh": "Chinese", "ara": "Arabic", "ar": "Arabic",
+        "hin": "Hindi", "hi": "Hindi", "dut": "Dutch", "nld": "Dutch", "nl": "Dutch",
+        "swe": "Swedish", "sv": "Swedish", "nor": "Norwegian", "no": "Norwegian",
+        "dan": "Danish", "da": "Danish", "fin": "Finnish", "fi": "Finnish",
+        "pol": "Polish", "pl": "Polish", "tur": "Turkish", "tr": "Turkish",
+        "heb": "Hebrew", "he": "Hebrew", "tha": "Thai", "th": "Thai",
+        "vie": "Vietnamese", "vi": "Vietnamese", "ces": "Czech", "cze": "Czech", "cs": "Czech",
+        "gre": "Greek", "ell": "Greek", "el": "Greek", "ukr": "Ukrainian", "uk": "Ukrainian",
+        "ind": "Indonesian", "id": "Indonesian", "hun": "Hungarian", "hu": "Hungarian",
+        "ron": "Romanian", "rum": "Romanian", "ro": "Romanian",
+    ]
+
+    /// One `EXT-X-MEDIA` line labeling the IN-BAND (muxed) primary audio when NO separately-muxed alternate
+    /// qualifies. An EXT-X-MEDIA row without URI names the rendition carried inside the variant stream itself
+    /// (RFC 8216 4.3.4.1), so AVPlayer's audio menu shows the real language/title instead of the synthesized
+    /// "Unknown" entry the build 189 field build showed for every multi-language file whose tracks were all
+    /// different codecs (the same-codec alternate rule qualifies nothing there, so the master carried no audio
+    /// group at all). Returns nil when the source names nothing displayable - an unnamed unknown-language
+    /// track cannot be labeled better than AVPlayer's own entry, and the master then keeps its pre-feature
+    /// bytes exactly.
+    ///
+    /// CHANNELS follows the same dec3 honesty rule as the two-rendition path: an E-AC-3 primary states JOC
+    /// complexity only from a structured mux receipt, a proven non-JOC dec3 states the physical count, and a
+    /// missing/malformed receipt omits the attribute rather than guessing.
+    static func inBandPrimaryTag(languageRaw: String,
+                                 title: String,
+                                 physicalChannels: Int,
+                                 usesDec3: Bool,
+                                 dec3: Dec3Observation?) -> String? {
+        let key = languageKey(languageRaw)
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty || !isUnknownLanguage(key) else { return nil }
+        let name = trimmedTitle.isEmpty
+            ? (languageNames[key] ?? key.uppercased())
+            : trimmedTitle
+        var tag = "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"\(quoteSafe(name))\""
+        if !isUnknownLanguage(key) { tag += ",LANGUAGE=\"\(quoteSafe(key))\"" }
+        tag += ",DEFAULT=YES,AUTOSELECT=YES"
+        let channels: String?
+        if usesDec3 {
+            if let complexity = dec3?.jocComplexityIndex {
+                channels = "\(complexity)/JOC"
+            } else if dec3 != nil {
+                channels = String(max(1, physicalChannels))
+            } else {
+                channels = nil
+            }
+        } else {
+            channels = String(max(1, physicalChannels))
+        }
+        if let channels { tag += ",CHANNELS=\"\(channels)\"" }
+        return tag
+    }
+
     static func mediaTags(_ plan: RenditionPlan?) -> [String] {
         guard let plan,
               let primaryChannels = plan.primary.channelSignaling.attribute,
