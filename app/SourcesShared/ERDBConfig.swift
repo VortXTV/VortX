@@ -51,6 +51,10 @@ enum ERDB {
         return u
     }
 
+    /// True when ERDB can render (and therefore bake a rating onto) this id. Mirror of the `renderableID`
+    /// gate `imageURL` uses, exposed so a per-poster badge site can tell whether a baked rating will arrive.
+    static func canRender(id: String) -> Bool { renderableID(id) != nil }
+
     /// ERDB resolves IMDb, TMDB, TVDB, and the anime id schemes. A custom add-on id it cannot map keeps its
     /// original artwork (return nil so the caller uses the fallback).
     private static func renderableID(_ id: String) -> String? {
@@ -105,8 +109,22 @@ enum Fanart {
 /// original add-on artwork. Keeps the three poster call sites and the two logo slots from each re-deciding.
 enum PosterArtwork {
     /// True when an art provider bakes ratings onto the image, so the app must NOT also draw its own rating
-    /// badge (avoids a double badge).
+    /// badge (avoids a double badge). This is the PROVIDER-LEVEL flag: it says a baking provider is switched
+    /// on, NOT that it can render any given id. Prefer `bakesRatings(forID:)` at a per-poster badge site.
     static var bakesRatings: Bool { ERDB.isActive || XRDB.isEnabled }
+
+    /// Whether the active art provider will ACTUALLY bake a rating onto THIS id's poster. Mirrors the
+    /// `poster(id:fallback:)` precedence exactly: when ERDB is active it must be able to render the id, else
+    /// the VortX/XRDB service must. A non-renderable id (a custom add-on scheme like `hive:…` that neither
+    /// service maps) yields false, so the caller draws its OWN rating badge instead of suppressing it for a
+    /// baked rating that never arrives -- the bug where an add-on catalog card showed no rating at all because
+    /// the global flag assumed a bake the unrenderable id could not produce.
+    static func bakesRatings(forID id: String?) -> Bool {
+        guard let id else { return bakesRatings }
+        if ERDB.isActive { return ERDB.canRender(id: id) }
+        if XRDB.isEnabled { return XRDB.canRender(id: id) }
+        return false
+    }
 
     /// Poster image URL for a title id. ERDB token wins, then VortX / XRDB, then the original poster.
     static func poster(id: String, fallback: String?) -> String? {
