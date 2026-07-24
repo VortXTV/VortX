@@ -47,6 +47,22 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         return RemoteConfig.snapshot.isFeatureOn("dvRemuxHLS", default: true)
     }
 
+    /// Fleet escape hatch for the WINDOW-ADVANCEMENT policy (standing requirement after build 190). ON, the
+    /// default: the published media window slides only behind the client's demonstrated consumption frontier
+    /// (the Beta 6 field-proven contract, ported onto the Beta 7 structure), with the pre-ready tail growing
+    /// so CoreMedia's readiness negotiation is never starved. OFF: the build 190 behavior (frozen pre-ready
+    /// startup window + production-driven minimum-suffix slide), kept remotely flippable so any unforeseen
+    /// field regression in the new windowing can be reverted without shipping a build. An explicit
+    /// UserDefaults value wins for local testing; else the RemoteConfig feature decides. Captured once per
+    /// server so a mid-play fleet flip cannot mix the two policies inside one session.
+    static let consumptionAnchorKey = "stremiox.dvWindowConsumptionAnchor"
+    static var consumptionAnchorEnabled: Bool {
+        if UserDefaults.standard.object(forKey: consumptionAnchorKey) != nil {
+            return UserDefaults.standard.bool(forKey: consumptionAnchorKey)
+        }
+        return RemoteConfig.snapshot.isFeatureOn("dvWindowConsumptionAnchor", default: true)
+    }
+
     // MARK: - Lifecycle
 
     private let stream: VortXMKVRemuxStream
@@ -74,6 +90,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// that later fails can freeze at this terminal window (ENDLIST) instead of killing the whole session.
     private var lastPublishedAudioWindow: VortXHLSWindow?
     private var advertisedAudioInitData: Data?
+    /// The client's demonstrated CONSUMPTION frontier: the highest video segment id it has requested.
+    /// -1 until the first fetch, which keeps the startup window pinned at its first sequence. Guarded by
+    /// `publicationLock`.
+    private var highestServedVideoSegmentID = -1
+    /// Session-captured window-advancement policy (see `consumptionAnchorEnabled`).
+    private let consumptionAnchored = VortXRemuxHLSServer.consumptionAnchorEnabled
+    /// Fully-consumed segments retained in the published window behind the consumption frontier, so the
+    /// playhead (which trails the fetch frontier) and an immediate small back-seek stay inside the window.
+    private static let keepBehindSegments = 2
     private var advertisedSubtitles: [SubtitleRenditionPolicy.Rendition] = []
     private var advertisedDolbyVision = false
     private var engineReady = false
@@ -738,7 +763,14 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         let audioTerminated = audioDegraded(snapshot)
         let selectedVideo: VortXHLSWindow
         let ended: Bool
-        if !engineReady {
+        // Pre-ready and post-ready share ONE window rule now (the 187 EVENT-playlist shape): the START is
+        // pinned until the client's own consumption advances it, and the TAIL always grows with production.
+        // The old pre-ready branch froze the whole startup window until markEngineReady; CoreMedia can hold
+        // readyToPlay until the live playlist offers more than the minimum cohort, so a frozen pre-ready
+        // window deadlocks startup (the engine's readyToPlay is exactly what would have unfrozen it). The
+        // consumption floor already pins the start at the startup sequence while nothing has been fetched.
+        if !engineReady, startup.ended || !consumptionAnchored {
+            // `!consumptionAnchored` is the fleet escape hatch: the exact build 190 frozen pre-ready window.
             selectedVideo = startup.window
             ended = startup.ended
         } else {
@@ -785,6 +817,20 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                     < startupReadiness.minimumRenderedDurationMilliseconds) {
                 selectedVideo = common
             } else {
+                // CONSUMPTION-ANCHORED SLIDE (the field-proven Beta 6 / build 187 contract, restored).
+                // The pre-rework server never advanced MEDIA-SEQUENCE past the client at all (EVENT playlist,
+                // entries only appended) and bounded memory BEHIND THE READER via the byte window. The rework
+                // slid the published window to `minimumConformingSuffix` of everything PRODUCED on every
+                // reload; with the small startup floor, production outran playback ~20 sequences per reload
+                // (build 190 field log: seq=0 -> 29 -> 49 -> 59 at ~6s intervals, segs=4), AVPlayer's next
+                // fetch fell off the window's tail-end, and every DV play skipped/stalled into the HDR10
+                // demote. The playlist start may now advance ONLY behind the client's demonstrated
+                // consumption frontier (the highest video segment it has actually fetched, minus a small
+                // keep-behind), and never past the furthest slide the minimum floors would allow. Before the
+                // client fetches anything, the startup window stays PINNED at its first sequence. Memory
+                // stays bounded exactly as before: segments the window drops enter their RFC retention
+                // deadlines, and the producer parks on the spool ceiling (backpressure) instead of running
+                // unbounded ahead.
                 guard let suffix = DVPlaybackPolicy.minimumConformingSuffix(
                     window: common,
                     minimumSegmentCount: startupReadiness.minimumSegmentCount,
@@ -792,7 +838,18 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                         startupReadiness.minimumRenderedDurationMilliseconds) else {
                     return nil
                 }
-                selectedVideo = suffix
+                let suffixStartID = suffix.segments.first?.id ?? current.mediaSequence
+                if consumptionAnchored {
+                    let consumptionFloorID = highestServedVideoSegmentID < 0
+                        ? current.mediaSequence
+                        : highestServedVideoSegmentID - Self.keepBehindSegments
+                    let newStartID = max(current.mediaSequence, min(suffixStartID, consumptionFloorID))
+                    let slid = common.segments.drop { $0.id < newStartID }
+                    selectedVideo = slid.isEmpty ? common : VortXHLSWindow(segments: Array(slid))
+                } else {
+                    // Escape hatch OFF-path: the build 190 production-driven minimum suffix, verbatim.
+                    selectedVideo = suffix
+                }
             }
             publishedVideoWindow = selectedVideo
             ended = commonReachedEOF
@@ -984,6 +1041,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// Resource lookup is independent of the current playlist window. A URI removed from a later generation
     /// stays openable through its receipt-derived deadline, and the lease is acquired before any 200 bytes.
     private func serveSegment(_ connection: NWConnection, index: Int) {
+        // A video segment REQUEST is the client's consumption receipt: requesting seg N proves its playlist
+        // coverage reaches N, so the published window may slide up to N minus the keep-behind (and no
+        // further). This is the anchor the consumption-bounded slide in `currentPublication` keys on.
+        publicationLock.lock()
+        if index > highestServedVideoSegmentID { highestServedVideoSegmentID = index }
+        publicationLock.unlock()
         serveSpoolResource(
             connection,
             key: .video(segmentID: index),

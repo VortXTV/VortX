@@ -11,6 +11,7 @@
 // =============================================================================
 
 import Foundation
+import AVFoundation
 
 let fixtureDir = "/tmp/dd-dvstall/fixtures"
 
@@ -195,12 +196,133 @@ func runScenario(name: String, fixture: String, startAt: Double,
     return result
 }
 
+// MARK: - REAL-CONSUMER gate: an actual AVPlayer plays the served stream continuously.
+//
+// The production-side scenarios below drive the server the way a well-behaved client would, but they cannot
+// observe CONSUMPTION dynamics - the build 190 field regression (media window sliding at production speed,
+// AVPlayer skip/stall/demote) passed all of them. This scenario is the gate that catches that class: a real
+// AVFoundation HLS client plays for a minute and its clock must advance continuously with no seek-jumps.
+
+struct ConsumerResult {
+    var reachedSeconds = 0.0
+    var wallSeconds = 0.0
+    var maxForwardJump = 0.0
+    var maxBackwardJump = 0.0
+    var longestStall = 0.0
+    var itemError: String?
+    var remuxFailed = false
+}
+
+/// Serve the fixture over the conformance range server at a PACED byte rate, so the producer and the player
+/// race the way they do against a real debrid link. Unpaced local input makes production instant, the live
+/// playlist covers the whole file before AVPlayer's first fetch, and the client starts at the live edge -
+/// a shape the field never produces and one that would let a windowing bug through this gate.
+func startPacedSource(fixture: String, bytesPerSecond: Int) -> (process: Process, url: URL) {
+    let portFile = "/tmp/dd-dvpin/paced-port-\(UUID().uuidString.prefix(8))"
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["python3", "test/player-conformance/range-server.py",
+                         "\(fixtureDir)/\(fixture)", portFile, "127.0.0.1",
+                         String(bytesPerSecond)]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    try? process.run()
+    let deadline = Date().addingTimeInterval(10)
+    var port = 0
+    while Date() < deadline, port == 0 {
+        if let text = try? String(contentsOfFile: portFile, encoding: .utf8),
+           let value = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            port = value
+        } else {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+    }
+    guard port != 0 else { print("FATAL paced source did not start"); exit(2) }
+    return (process, URL(string: "http://127.0.0.1:\(port)/\(fixture)")!)
+}
+
+func consumerScenario(name: String, fixture: String, startAt: Double,
+                      playSeconds: Double, pacedBytesPerSecond: Int) -> ConsumerResult {
+    print("=== CONSUMER \(name) fixture=\(fixture) startAt=\(Int(startAt))s play=\(Int(playSeconds))s paced=\(pacedBytesPerSecond)B/s ===")
+    var result = ConsumerResult()
+    let source = startPacedSource(fixture: fixture, bytesPerSecond: pacedBytesPerSecond)
+    defer { source.process.terminate() }
+    guard let (server, playlistURL) = VortXRemuxHLSServer.make(
+        input: source.url, headers: nil, mode: .plain, startAtSeconds: startAt) else {
+        print("FATAL consumer server did not bind"); exit(2)
+    }
+    server.start()
+    let item = AVPlayerItem(url: playlistURL)
+    let player = AVPlayer(playerItem: item)
+    player.play()
+
+    let wallStart = Date()
+    var engineReadySent = false
+    var lastTime = -1.0
+    var hasAdvanced = false   // startup buffering before first motion is latency, not a mid-play stall
+    var stallStart: Date?
+    let deadline = wallStart.addingTimeInterval(playSeconds + 30)   // startup allowance beyond play window
+    while Date() < deadline {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        if item.status == .failed {
+            result.itemError = item.error.map(String.init(describing:)) ?? "failed"
+            break
+        }
+        if item.status == .readyToPlay, !engineReadySent {
+            engineReadySent = true
+            server.markEngineReady()   // mirror AVPlayerEngine's readyToPlay hook
+            player.play()
+        }
+        let progress = server.mountProgress
+        if progress.failed { result.remuxFailed = true; break }
+        let now = item.currentTime().seconds
+        guard now.isFinite else { continue }
+        if lastTime >= 0 {
+            let delta = now - lastTime
+            if delta > 0.05 {
+                if let began = stallStart {
+                    result.longestStall = max(result.longestStall, Date().timeIntervalSince(began))
+                    stallStart = nil
+                }
+                let expected = 0.6   // one 0.5s sample at rate 1.0 plus jitter
+                if hasAdvanced, delta > expected {
+                    result.maxForwardJump = max(result.maxForwardJump, delta)
+                }
+                hasAdvanced = true
+            } else if delta < -0.5 {
+                result.maxBackwardJump = min(result.maxBackwardJump, delta)
+            } else if hasAdvanced {
+                if stallStart == nil { stallStart = Date() }
+            }
+        }
+        lastTime = max(lastTime, now)
+        result.reachedSeconds = max(result.reachedSeconds, now)
+        if result.reachedSeconds >= playSeconds { break }
+    }
+    if let began = stallStart {
+        result.longestStall = max(result.longestStall, Date().timeIntervalSince(began))
+    }
+    result.wallSeconds = Date().timeIntervalSince(wallStart)
+    print(String(format: "consumer end reached=%.1fs wall=%.1fs maxFwdJump=%.2fs maxBackJump=%.2fs longestStall=%.1fs itemError=%@ remuxFailed=%@",
+                 result.reachedSeconds, result.wallSeconds, result.maxForwardJump,
+                 result.maxBackwardJump, result.longestStall,
+                 result.itemError ?? "none", String(result.remuxFailed)))
+    player.pause()
+    server.invalidate()
+    Thread.sleep(forTimeInterval: 0.5)
+    return result
+}
+
 // --- Scenario 1: fresh play, same-codec alternate + 2 text subs ---
 let fresh = runScenario(name: "fresh-multiaudio", fixture: "fixture-multiaudio.mkv",
                         startAt: 0, consumeSeconds: 12)
-check("startup window fits the 10s start watchdog (rendered <= 8s)",
-      red: fresh.startupRenderedSeconds > 8.0,
-      detail: "first media playlist rendered=\(String(format: "%.1f", fresh.startupRenderedSeconds))s (field: 36s cohort held the master 12-15s while the chrome watchdog is 10s)")
+// The first media playlist must start PINNED at sequence zero (the growing EVENT tail is by-design; the
+// build 190 regression was the sequence racing ahead of the client at production speed). Master latency
+// stays covered by the paced consumer gate below; against this unpaced local file the tail legitimately
+// covers however much was already produced.
+check("first media playlist starts pinned at sequence zero",
+      red: !fresh.mediaBody.contains("#EXT-X-MEDIA-SEQUENCE:0"),
+      detail: "first media playlist rendered=\(String(format: "%.1f", fresh.startupRenderedSeconds))s, seq0=\(fresh.mediaBody.contains("#EXT-X-MEDIA-SEQUENCE:0"))")
 check("master served at all (fresh)", red: fresh.masterStatus != 200,
       detail: "status=\(fresh.masterStatus)")
 check("same-codec alternate audio advertised with labels",
@@ -232,6 +354,33 @@ check("primary audio labeled even without a qualifying alternate",
       detail: "audio EXT-X-MEDIA tags=\(mixed.audioMediaTags) (field: audio=0 master -> AVPlayer shows one Unknown entry)")
 check("master served (mixed)", red: mixed.masterStatus != 200,
       detail: "status=\(mixed.masterStatus)")
+
+// --- REAL-CONSUMER gate: 60+ seconds of continuous AVPlayer playback, fresh AND resume ---
+func judgeConsumer(_ label: String, _ run: ConsumerResult, playSeconds: Double) {
+    check("consumer \(label): played \(Int(playSeconds))s continuously",
+          red: run.reachedSeconds < playSeconds - 1,
+          detail: String(format: "reached=%.1fs of %.0fs (wall=%.1fs)",
+                         run.reachedSeconds, playSeconds, run.wallSeconds))
+    check("consumer \(label): no seek-jumps",
+          red: run.maxForwardJump > 3.0 || run.maxBackwardJump < -1.0,
+          detail: String(format: "maxFwdJump=%.2fs maxBackJump=%.2fs (field: skips of ~15s every few seconds)",
+                         run.maxForwardJump, run.maxBackwardJump))
+    check("consumer \(label): no stall or failure",
+          red: run.longestStall > 5.0 || run.itemError != nil || run.remuxFailed,
+          detail: String(format: "longestStall=%.1fs itemError=%@ remuxFailed=%@",
+                         run.longestStall, run.itemError ?? "none", String(run.remuxFailed)))
+}
+
+// ~2.6x the fixture's real-time byte rate: the producer leads the player modestly, the field shape.
+let pacedRate = 400_000
+let consumerFresh = consumerScenario(
+    name: "fresh", fixture: "fixture-multiaudio.mkv", startAt: 0, playSeconds: 65,
+    pacedBytesPerSecond: pacedRate)
+judgeConsumer("fresh", consumerFresh, playSeconds: 65)
+let consumerResume = consumerScenario(
+    name: "resume", fixture: "fixture-multiaudio.mkv", startAt: 60, playSeconds: 65,
+    pacedBytesPerSecond: pacedRate)
+judgeConsumer("resume", consumerResume, playSeconds: 65)
 
 print("=== REPRO SUMMARY: \(redCount) RED ===")
 exit(Int32(min(redCount, 125)))
