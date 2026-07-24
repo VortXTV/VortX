@@ -38,17 +38,24 @@ struct CardRatingBadge: View {
     var body: some View {
         ZStack {
             if active, let ratings, case let tokens = RatingsFormat.tokens(ratings, limit: maxScores), !tokens.isEmpty {
-                HStack(spacing: 6) {
-                    ForEach(Array(tokens.enumerated()), id: \.offset) { _, token in
+                HStack(spacing: groupSpacing) {
+                    ForEach(Array(tokens.enumerated()), id: \.offset) { index, token in
+                        // A hairline sets the IMDb anchor apart from the quieter aggregator scores, so the badge
+                        // reads as "your star rating, then the rest" instead of one flat run of numbers. Only
+                        // when IMDb actually leads (a title missing IMDb has no anchor to divide from).
+                        if index == 1, tokens.first?.isIMDb == true {
+                            Capsule(style: .continuous)
+                                .fill(Theme.Palette.textPrimary.opacity(0.22))
+                                .frame(width: 1, height: glyphSize + 3)
+                        }
                         scoreView(token)
                     }
                 }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 5).padding(.vertical, 2)
-                // Same on-art badge glass the portrait poster's native rating badge uses (iOS PosterCardiOS
-                // and the tvOS resume timecode): a dark scrim plate so the white label holds contrast over any
-                // backdrop. `.scrim` because it sits ON the artwork; on tvOS this drops to a cheap opaque warm
-                // capsule automatically (see GlassStyle).
+                .padding(.horizontal, hInset).padding(.vertical, vInset)
+                // The same on-art badge glass the portrait poster's rating badge and the resume timecode use:
+                // a warm near-black SCRIM plate (`badgeFillAlpha`) at the pill radius so the label holds
+                // contrast over any backdrop. `.scrim` because it sits ON the artwork; on tvOS this drops to a
+                // cheap opaque warm capsule automatically (see GlassStyle).
                 .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.badgeFillAlpha, shadow: .flat, tone: .scrim)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(accessibilityText(tokens))
@@ -62,19 +69,42 @@ struct CardRatingBadge: View {
         }
     }
 
-    /// One score: the IMDb token leads with the accent-free white star (the on-art plate carries the color),
-    /// the others print a small dimmed provider label ("RT") beside the value ("84%"). Same content the
-    /// detail row prints, just glyph-led for IMDb so it stays compact on a card.
+    /// One score. The IMDb token is the ANCHOR: the app's single ember accent on the star (per DESIGN.md's
+    /// one-accent rule) with the value bright in `textPrimary`, the exact lead the detail page's rating row
+    /// uses, so a card and the detail page read as one system. Every other provider prints a quieter, a-notch
+    /// smaller label + value (muted `textTertiary` / `textSecondary`) so they support the anchor rather than
+    /// crowd it. Digits are monospaced so a scrolling rail of badges does not jitter as values change width.
     @ViewBuilder private func scoreView(_ token: RatingsFormat.Token) -> some View {
-        HStack(spacing: 2) {
-            if token.isIMDb {
-                Image(systemName: "star.fill").font(.system(size: glyphSize))
-            } else {
-                Text(token.label).font(.system(size: textSize - 2, weight: .semibold)).opacity(0.72)
+        if token.isIMDb {
+            HStack(spacing: 3) {
+                Image(systemName: "star.fill")
+                    .font(.system(size: glyphSize, weight: .semibold))
+                    .foregroundStyle(Theme.Palette.accent)
+                Text(token.value)
+                    .font(.system(size: textSize, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(Theme.Palette.textPrimary)
             }
-            Text(token.value).font(.system(size: textSize, weight: .semibold))
+        } else {
+            HStack(spacing: 2) {
+                Text(token.label)
+                    .font(.system(size: secondarySize, weight: .semibold))
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                Text(token.value)
+                    .font(.system(size: secondarySize, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
         }
     }
+
+    // MARK: Layout (tracks the card's own text size, so ONE badge scales from an iOS tile to a tvOS card)
+
+    /// Aggregator scores sit a couple of points below the IMDb value so the anchor stays dominant.
+    private var secondarySize: CGFloat { max(textSize - 2, 9) }
+    /// Gap between score groups, and the pill's insets, tracked to the text size so the badge stays tight on a
+    /// small iOS tile and breathes on a 10-foot tvOS card without a magic constant per platform.
+    private var groupSpacing: CGFloat { (textSize * 0.5).rounded() }
+    private var hInset: CGFloat { (textSize * 0.62).rounded() }
+    private var vInset: CGFloat { (textSize * 0.3).rounded() }
 
     private func accessibilityText(_ tokens: [RatingsFormat.Token]) -> String {
         "Rating " + tokens.map { "\($0.label) \($0.value)" }.joined(separator: ", ")
