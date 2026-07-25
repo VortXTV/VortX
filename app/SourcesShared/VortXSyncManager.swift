@@ -296,7 +296,7 @@ final class VortXSyncManager: ObservableObject {
     /// Set while syncDown is applying a remote pull (the SettingsBackup.restore + apiKeys + overlays +
     /// tombstones region) and while ProfileStore is doing touch:false launch housekeeping. The global
     /// UserDefaults.didChangeNotification observer early-returns while this is true, so applying a pull
-    /// (which rewrites every stremiox.* key) no longer self-echoes into requestSyncSoon() — which would
+    /// (which rewrites every stremiox.* key) no longer self-echoes into requestSyncSoon(), which would
     /// re-arm hasPendingPush and push the just-applied peer values straight back, starving syncDown's
     /// guard at line ~471 so a receiving device never applies a peer's settings. A genuine user edit
     /// (touch:true) is NEVER wrapped in this, so real settings toggles still push and sync.
@@ -1629,7 +1629,7 @@ final class VortXSyncManager: ObservableObject {
     /// zero (the "post-update: 0 sources / 0 add-ons" fix). This is the load-bearing new capability.
     ///
     /// NEVER-ZERO INVARIANT: a `.failed` or `.empty` account pull does NOTHING (we never hydrate-then-
-    /// empty). Only a real `.doc` triggers hydration. Not gated by the mirror toggles — the VortX-owned
+    /// empty). Only a real `.doc` triggers hydration. Not gated by the mirror toggles; the VortX-owned
     /// set always hydrates when the engine is empty/degraded; the toggles only control the snapshot
     /// DIRECTION (Stremio -> VortX), not the floor.
     ///
@@ -2042,7 +2042,7 @@ final class VortXSyncManager: ObservableObject {
     // public key travels with the sealed key: {"claim": <b64url holder pubkey>, "wrapped": <b64url iv‖ct‖tag>}.
     // Both the app holder (qrApprove) and the web holder (vortx-site vault.ts qrApprove) MUST emit this exact
     // envelope, and both joiners MUST parse it. Crypto contract: PairingCrypto (salt vortx-pairing-salt-v1,
-    // info vortx-pairing-v1, base64url, iv‖ct‖tag) — identical across app + web.
+    // info vortx-pairing-v1, base64url, iv‖ct‖tag), identical across app + web.
 
     /// A live joiner pairing: the id to poll, the human code to show, and our ephemeral key kept in memory
     /// only (never persisted) until the handoff completes. `devicePublicKey` is embedded in the shown QR.

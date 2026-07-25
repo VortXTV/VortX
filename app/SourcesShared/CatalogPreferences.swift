@@ -46,7 +46,7 @@ enum PosterWidthPreset: String, CaseIterable, Identifiable {
     }
 
     /// The card/track width in points on a REGULAR width class (iPad / Mac), tuned so `.balanced` equals
-    /// today's `iOSPillMetrics.cardWidth` (224) — the shipping look. The compact-iPhone widths are derived
+    /// today's `iOSPillMetrics.cardWidth` (224), the shipping look. The compact-iPhone widths are derived
     /// separately (`compactWidth`) so a phone still fits ~3 across at the default.
     var regularWidth: CGFloat {
         switch self {

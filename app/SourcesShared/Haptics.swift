@@ -9,9 +9,9 @@ import UIKit
 /// Apple target.
 ///
 /// Keep the vocabulary deliberately small and the intent obvious at the call site:
-/// - `tap()`     — a light confirmation for a discrete action (toggle, copy, pick).
-/// - `success()` — a positive "that worked" notification (accepted a skip, finished a flow).
-/// - `warning()` — a soft "heads up" notification (a recoverable miss, a no-op the user tried).
+/// - `tap()`:      a light confirmation for a discrete action (toggle, copy, pick).
+/// - `success()`:  a positive "that worked" notification (accepted a skip, finished a flow).
+/// - `warning()`:  a soft "heads up" notification (a recoverable miss, a no-op the user tried).
 ///
 /// Use these sparingly. Haptics should punctuate intent, not narrate every state change.
 enum Haptics {

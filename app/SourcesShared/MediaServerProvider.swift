@@ -8,12 +8,12 @@ import Foundation
 /// `MediaServerCoordinator`, built the same way so it slots into the play path later without reshaping.
 ///
 /// UNWIRED GROUNDWORK. This file is the resolver ENGINE only: it takes an IMDb id / title and returns a
-/// matched item with a playable URL. NOTHING calls it yet — exactly like `DebridResolver` was built and
+/// matched item with a playable URL. NOTHING calls it yet, exactly like `DebridResolver` was built and
 /// left inert before the source-list/play-path wiring. Two deferred, owner-steered pieces are out of scope
 /// here on purpose:
 ///   1. The play/`streamGroups()` integration. `streamGroups()` is SYNCHRONOUS and has 14+ callers;
 ///      surfacing async media-server hits in the unified stream list means making that path async across
-///      all of them — a one-way-door refactor that must be owner-approved, not slipped in under this groundwork.
+///      all of them, a one-way-door refactor that must be owner-approved, not slipped in under this groundwork.
 ///   2. A Settings + Keychain credential surface (mirroring `DebridKeys`/`DebridKeysView`). Until that
 ///      lands, configs are passed in by the caller; `MediaServerCoordinator.reload(configs:)` is the seam.
 ///
@@ -144,7 +144,7 @@ enum MediaServerResolve {
 /// series we resolve the SERIES by its IMDb id, then query its episodes (`ParentId` + `IncludeItemTypes=Episode`)
 /// and pick the SxEy child by `ParentIndexNumber`/`IndexNumber`.
 ///
-/// Stream URL: `GET /Videos/{itemId}/stream?static=true&mediaSourceId={id}&container={ext}&api_key={key}` — the
+/// Stream URL: `GET /Videos/{itemId}/stream?static=true&mediaSourceId={id}&container={ext}&api_key={key}`, the
 /// static direct-play endpoint (original file, no transcode). Resolution/container come from the item's first
 /// `MediaSources` entry. NOTE: spec-derived + compile-verified, NOT live-verified (needs a real Jellyfin server);
 /// inert until the play-path wiring calls it.
@@ -338,7 +338,7 @@ actor JellyfinProvider: MediaServerProviding {
                               serverId: serverId, serverName: serverName, sizeBytes: source?.size, fileName: fileName)
     }
 
-    /// `GET /Videos/{itemId}/stream?static=true[&mediaSourceId=][&container=]&api_key=` — static direct play.
+    /// `GET /Videos/{itemId}/stream?static=true[&mediaSourceId=][&container=]&api_key=`, static direct play.
     private func streamURL(itemId: String, mediaSourceId: String?, container: String?) -> URL? {
         guard var comps = URLComponents(string: "\(base)/Videos/\(itemId)/stream") else { return nil }
         var q = [URLQueryItem(name: "static", value: "true")]

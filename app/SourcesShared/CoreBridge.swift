@@ -424,7 +424,7 @@ final class CoreBridge: ObservableObject {
     /// logged-out / degraded Stremio session show the account's add-ons + sources instead of zero.
     ///
     /// Uses the EXACT `InstallAddon` descriptor shape `installAddon` sends (`{transportUrl, manifest,
-    /// flags}`, camelCase) — the engine mutates `ctx.profile.addons` LOCALLY with no api.strem.io call.
+    /// flags}`, camelCase), the engine mutates `ctx.profile.addons` LOCALLY with no api.strem.io call.
     /// A lowercase-key mismatch silently no-ops in the engine, so `VortXOwnedAddon.installDescriptor`
     /// keeps the keys aligned with `installAddon`. Targets the account/engine add-on set ONLY; it never
     /// touches a per-profile overlay and never `disabledAddons` (which stays a render-layer filter).
@@ -530,8 +530,8 @@ final class CoreBridge: ObservableObject {
                 self.loadBoard()
             }
             // Still surface the default addons' catalogs (Cinemeta et al. ship in the engine's default
-            // profile) so a signed-out Home is a real, browsable landing screen — backdrop hero + rails
-            // — not an empty "please sign in" page. Discover already loads signed-out; Home should too.
+            // profile) so a signed-out Home is a real, browsable landing screen (backdrop hero + rails),
+            // not an empty "please sign in" page. Discover already loads signed-out; Home should too.
             loadBoard()
             return
         }
@@ -552,7 +552,7 @@ final class CoreBridge: ObservableObject {
     ///    add-on, so every title reports "no sources" until a manual logout/login. This is the
     ///    user-reported "force close → lost all my addons but still shows logged in" bug.
     /// If, a while after launch, the stored token says we're signed in but the engine has no account
-    /// data OR no stream add-on, re-establish the session from the token — the engine then pulls
+    /// data OR no stream add-on, re-establish the session from the token; the engine then pulls
     /// add-ons + the full library fresh. Runs once per launch and never fights an in-flight auth/switch.
     private func scheduleSessionRepair() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
@@ -577,10 +577,10 @@ final class CoreBridge: ObservableObject {
                 // In that case (or when genuinely logged out), the VortX doc hydration above is the whole recovery.
                 // Never call switchAccount with an empty token.
                 if hasStremioToken, let key, !self.importedAwayFromStremio {
-                    NSLog("%@", "[CoreBridge] degraded session (\(noStreamAddon ? "no stream add-on" : "no account data")) with a stored token — hydrated account add-ons, now re-authenticating to reconcile from Stremio")
+                    NSLog("%@", "[CoreBridge] degraded session (\(noStreamAddon ? "no stream add-on" : "no account data")) with a stored token; hydrated account add-ons, now re-authenticating to reconcile from Stremio")
                     self.switchAccount(token: key)
                 } else {
-                    NSLog("[CoreBridge] degraded session with no Stremio token — recovered from the VortX account doc")
+                    NSLog("[CoreBridge] degraded session with no Stremio token; recovered from the VortX account doc")
                     self.loadBoard()
                 }
             }
@@ -595,7 +595,7 @@ final class CoreBridge: ObservableObject {
 
     /// Reconcile the engine's library copy with api.strem.io NOW. The tvOS player writes watch progress
     /// directly to the account API (StremioAccount.saveProgress), which the engine cannot see until its
-    /// next library sync — and nothing scheduled one after playback, so the Home dashboard's Continue
+    /// next library sync, and nothing scheduled one after playback, so the Home dashboard's Continue
     /// Watching card kept the pre-playback timestamp (and fed a stale resume) until a detail-page load
     /// happened to trigger a sync (the "have to long-press → Details to refresh the timestamp" report).
     /// Called by the player's exit path AFTER its final save has landed on the API, so the pull can
@@ -822,7 +822,7 @@ final class CoreBridge: ObservableObject {
 
     /// Load the next page of the current Discover catalog (infinite scroll). The engine appends the
     /// page to `discover.catalog` and clears `next_page` at the end. No-op at the end or while a page
-    /// is already in flight. Previously missing entirely — the catalog stopped at its first page, which
+    /// is already in flight. Previously missing entirely, the catalog stopped at its first page, which
     /// add-on authors saw as "next page / next catalog not loading."
     func loadDiscoverNextPage() {
         guard discoverHasNextPage, !discoverPageInFlight else { return }
@@ -1132,7 +1132,7 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Flatten stremio-core's `ResourceError` / `EnvError` JSON into a short human string. Returns nil
-    /// for `EmptyContent` (the add-on returned an empty list — not an error). Tagged-enum shapes:
+    /// for `EmptyContent` (the add-on returned an empty list, not an error). Tagged-enum shapes:
     /// `{"type":"Fetch","content":"…"}`, `{"type":"Env","content":{"type":"Fetch","content":"…"}}`, or a bare string.
     private static func describeResourceError(_ content: Any?) -> String? {
         if let s = content as? String { return s }
@@ -1812,7 +1812,7 @@ final class CoreBridge: ObservableObject {
             streamRequest = firstReadyRequest
         }
         guard let rawStream, let streamRequest, let metaRequest else {
-            DiagnosticsLog.log("cw", "loadEnginePlayer no-op (meta_details/stream/metaRequest missing) — CW + progress will not track for this item")
+            DiagnosticsLog.log("cw", "loadEnginePlayer no-op (meta_details/stream/metaRequest missing); CW + progress will not track for this item")
             return
         }
         let selected: [String: Any] = [

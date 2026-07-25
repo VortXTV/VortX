@@ -3,13 +3,13 @@ import SwiftUI
 /// Nested collections (grouped Home rails): a SECOND tier above the flat add-on/editorial rails, where
 /// related rails are gathered under a big group header. The owner's structure, in this exact order, is:
 ///
-///   0. "For You"    — a single personalized "Because you watched <title>" rail seeded from the active
+///   0. "For You":     a single personalized "Because you watched <title>" rail seeded from the active
 ///                     profile's recent watches (see `BecauseYouWatchedModel`); FIRST so it sits near the
 ///                     top of the section. Read-only over watch history; dropped when there's no history.
-///   1. "Streaming"  — the streaming-service rails (Netflix, Disney+, …) from `StreamingRailsModel`.
-///   2. "Genres"     — a handful of top genres (Action, Comedy, Drama, …) from TMDB /discover-by-genre.
-///   3. "Top New"    — the most popular movies + shows released in the last few months (TMDB popularity).
-///   4. "New"        — the freshest movies + shows by release / air date (TMDB date-desc).
+///   1. "Streaming":   the streaming-service rails (Netflix, Disney+, …) from `StreamingRailsModel`.
+///   2. "Genres":      a handful of top genres (Action, Comedy, Drama, …) from TMDB /discover-by-genre.
+///   3. "Top New":     the most popular movies + shows released in the last few months (TMDB popularity).
+///   4. "New":         the freshest movies + shows by release / air date (TMDB date-desc).
 ///
 /// This is purely ADDITIVE and empty-state safe. The whole grouped section renders BELOW the existing
 /// flat Home rails (Continue Watching, Top Picks, Upcoming Episodes, the engine board rows, the editorial
@@ -20,7 +20,7 @@ import SwiftUI
 /// unchanged from before.
 ///
 /// Every card is a `MetaPreview` carrying a resolved Cinemeta `tt` id, so a tap routes to `DetailView` and
-/// plays through the engine exactly like every other rail card — no new card type, no new routing.
+/// plays through the engine exactly like every other rail card, no new card type, no new routing.
 
 // MARK: - Model
 
@@ -94,7 +94,7 @@ final class HomeGroupsModel: ObservableObject {
         return [await because, await streaming, await genres, await topNew, await new].compactMap { $0 }
     }
 
-    // MARK: Group 0 — Because You Watched (personalized)
+    // MARK: Group 0: Because You Watched (personalized)
 
     /// Group 0 "Because You Watched": a single personalized rail of TMDB recommendations seeded from the
     /// active profile's most recent watches (see `BecauseYouWatchedModel`). READ ONLY over the CW +
@@ -107,7 +107,7 @@ final class HomeGroupsModel: ObservableObject {
                                eyebrow: String(localized: "Because you keep watching"), rails: [rail])
     }
 
-    // MARK: Group 1 — Streaming
+    // MARK: Group 1: Streaming
 
     /// Group 1 "Streaming": the streaming-service rails (Netflix, Disney+, …), reusing the exact same
     /// `StreamingRailsModel` fetch path as the flat streaming section so the data + drop-empty behaviour
@@ -119,7 +119,7 @@ final class HomeGroupsModel: ObservableObject {
                                eyebrow: String(localized: "Browse by service"), rails: rails)
     }
 
-    // MARK: Group 2 — Genres
+    // MARK: Group 2: Genres
 
     /// Group 2 "Genres": one rail per top genre. Prefers TMDB /discover-by-genre (movie + TV merged);
     /// when there's no TMDB key (or a genre came back empty), it FALLS BACK to the keyless Cinemeta genre
@@ -165,7 +165,7 @@ final class HomeGroupsModel: ObservableObject {
         return merged
     }
 
-    // MARK: Group 3 — Top New
+    // MARK: Group 3: Top New
 
     /// Group 3 "Top New": one rail of the most popular recent movies + shows. TMDB-only (no keyless
     /// fallback), so the group is dropped when there's no key / nothing resolves.
@@ -178,7 +178,7 @@ final class HomeGroupsModel: ObservableObject {
                                eyebrow: String(localized: "Hot right now"), rails: [rail])
     }
 
-    // MARK: Group 4 — New
+    // MARK: Group 4: New
 
     /// Group 4 "New": one rail of the freshest releases by date. TMDB-only, dropped when nothing resolves.
     private static func buildNewGroup(region: String) async -> CollectionGroup? {

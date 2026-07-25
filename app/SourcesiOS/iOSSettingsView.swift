@@ -968,7 +968,7 @@ struct iOSSettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        // Reorder controls follow the accent (#49), dimmed when disabled at an end —
+                        // Reorder controls follow the accent (#49), dimmed when disabled at an end,
                         // the touch twin of tvOS's accent reorder chips.
                         Button {
                             sourcePrefs.moveType(at: index, direction: -1)
@@ -1320,7 +1320,7 @@ struct iOSSettingsView: View {
             // The full "Upcoming" calendar (next air / release dates of library + watchlisted titles).
             NavigationLink("Upcoming") { iOSUpcomingScreen() }
             // Fold Search into Discover (one combined surface with a search field above the browse) so the
-            // tab bar is less cluttered on mobile. Default OFF, fully reversible — Search returns as its own tab.
+            // tab bar is less cluttered on mobile. Default OFF, fully reversible; Search returns as its own tab.
             Toggle("Combine Discover & Search", isOn: $mergeDiscoverSearch)
             Toggle("Budget & box office", isOn: $showFinancials)
             // Spoiler-safe mode: veils an unwatched episode's art AND synopsis (supersets the old thumbnail-only
@@ -1889,8 +1889,8 @@ enum NewEpisodeNotifications {
     /// One series' full meta, fetched directly over the add-on protocol from the first meta add-on that
     /// answers. Never touches the engine. nil if none decode.
     /// The implementation moved to the OS-agnostic `SeriesMetaFetcher` (SourcesShared) so the shared
-    /// `ReleaseCalendarModel` reuses the EXACT same fetch and the tvOS targets — which don't compile this
-    /// SourcesiOS file — can reach it. This thin shim keeps the existing callers unchanged; behavior is identical.
+    /// `ReleaseCalendarModel` reuses the EXACT same fetch and the tvOS targets, which don't compile this
+    /// SourcesiOS file, can reach it. This thin shim keeps the existing callers unchanged; behavior is identical.
     static func fetchSeriesMeta(id: String, bases: [String]) async -> CoreMetaItem? {
         await SeriesMetaFetcher.fetch(id: id, bases: bases)
     }

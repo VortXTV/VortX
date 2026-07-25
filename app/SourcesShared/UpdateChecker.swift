@@ -14,7 +14,7 @@ final class UpdateChecker: ObservableObject {
 
     struct Release: Equatable, Identifiable {
         let version: String      // marketing, e.g. "0.3.8"
-        let build: Int           // CFBundleVersion, e.g. 116 — the real beta discriminator
+        let build: Int           // CFBundleVersion, e.g. 116 (the real beta discriminator)
         let name: String         // release title, e.g. "Beta 4"
         let notes: String        // what's new (shown in the update sheet)
         let ipa: String?         // direct signed-IPA URL (a GitHub release asset)

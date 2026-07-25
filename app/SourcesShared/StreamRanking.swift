@@ -261,7 +261,7 @@ enum StreamRanking {
     private static func computeScore(_ s: CoreStream, debridCachedHashes: Set<String> = []) -> Int {
         let text = qualityText(s)
         var score = resolution(text)
-        // Source ladder: STRICT and the dominant WITHIN-resolution key (issue #68 — a remux must beat
+        // Source ladder: STRICT and the dominant WITHIN-resolution key (issue #68, a remux must beat
         // a bigger WEB-DL). The gaps (remux->bluray 80, bluray->web 75) both exceed the most a lower
         // source can earn from features + size (56 + 12 = 68), so source type strictly outranks them.
         // remux > bluray > web-dl > webrip > hdtv > dvdrip > tv captures.
@@ -836,7 +836,7 @@ enum StreamRanking {
         return playablePairs(groups).max { (score($0.stream, debridCachedHashes: debridCachedHashes) + pinBonus($0.stream, addon: $0.addon, pin: pin)) < (score($1.stream, debridCachedHashes: debridCachedHashes) + pinBonus($1.stream, addon: $1.addon, pin: pin)) }?.stream
     }
 
-    /// The best playable stream for each distinct resolution (4K, 1080p, …), best-first — feeds the
+    /// The best playable stream for each distinct resolution (4K, 1080p, …), best-first; feeds the
     /// "Watch in 4K" button's resolution dropdown.
     static func resolutionOptions(_ groups: [CoreStreamSourceGroup]) -> [(label: String, stream: CoreStream)] {
         let playable = groups.flatMap { $0.streams }.filter { $0.playableURL != nil && !$0.isYouTubeTrailer }
@@ -981,7 +981,7 @@ enum StreamRanking {
     /// (resolution, remux/web class, DV/HDR, audio, codec, cached) and the file
     /// size when the add-on includes one.
     /// The flavour tags WITHOUT the resolution label: Remux · HDR · Atmos · HEVC · Cached (+ a junk
-    /// class when the source ranks at the bottom). For rows that show the resolution *separately* —
+    /// class when the source ranks at the bottom). For rows that show the resolution *separately*,
     /// the iOS/Mac source row renders it as a prominent badge, so repeating it in the tag line read
     /// as a doubled "4K · 4K · HDR". The in-player lists, which have no badge, use `sourceDetail`.
     static func flavorTags(_ s: CoreStream) -> [String] {
@@ -992,7 +992,7 @@ enum StreamRanking {
         else if t.contains("bluray") || t.contains("blu-ray") { tags.append("BluRay") }
         else if t.contains("web") { tags.append("WEB") }
         // HDR formats are layered (Dolby Vision often sits over an HDR10 base), so they're additive
-        // rather than exclusive — mirrors Stremio's "HDR10 | DV | HDR" line.
+        // rather than exclusive, mirrors Stremio's "HDR10 | DV | HDR" line.
         if t.contains("dolby vision") || t.contains("dolbyvision") || t.contains("dovi")
             || matches(t, #"\bdv\b"#) { tags.append("DV") }
         if t.contains("hdr10+") || t.contains("hdr10plus") { tags.append("HDR10+") }
@@ -1160,7 +1160,7 @@ enum StreamRanking {
         return text
     }
 
-    /// Remove add-on template blobs — any `{ ... }` run — from stream text before it is classified (H6). A
+    /// Remove add-on template blobs, any `{ ... }` run, from stream text before it is classified (H6). A
     /// broken add-on template (AIOStreams stream-expressions and similar) can emit a raw, unevaluated
     /// expression such as `{cannot_apply_modifier_to_null(replace('2160p','4k'))}`; left in place its literal
     /// resolution tokens poison `resolution` / `qualityLabel`. Non-greedy per-blob removal, up to a small cap

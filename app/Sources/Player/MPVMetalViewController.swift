@@ -94,7 +94,7 @@ final class MPVMetalViewController: PlatformViewController {
     private var pausedCacheClampWork: DispatchWorkItem?
     /// True while the paused clamp holds `demuxer-max-bytes` at the small floor (restored on resume).
     private var pausedCacheClamped = false
-    /// True once a system memory warning forced the cache floor for the REST of this file — a resume must
+    /// True once a system memory warning forced the cache floor for the REST of this file; a resume must
     /// not re-raise the cap, because the pressure that fired the warning is usually still there. Reset on
     /// the next loadFile (a new file starts with its buffers freed and gets its normal budget back).
     private var memoryCacheClamped = false
@@ -120,7 +120,7 @@ final class MPVMetalViewController: PlatformViewController {
         metalLayer.frame = view.bounds
         metalLayer.framebufferOnly = false  // must be false for MoltenVK internal blits (e.g. format resolve)
         // Insurance against render-thread/main-thread deadlocks: the drawable present must never wait
-        // on the main run loop's CATransaction commit (presentsWithTransaction = false, the default —
+        // on the main run loop's CATransaction commit (presentsWithTransaction = false, the default,
         // made explicit), and nextDrawable() must be able to time out instead of blocking the vo thread
         // forever if drawables can't be recycled while the main thread is busy.
         metalLayer.presentsWithTransaction = false
@@ -493,7 +493,7 @@ final class MPVMetalViewController: PlatformViewController {
 
         // Do NOT apply mpv's "fast" profile by default. It overrides gpu-next/libplacebo's sharp default
         // upscaler (lanczos) with bilinear and disables debanding/dither, which made upscaled video look
-        // soft/blurry — the "player size/quality is pathetic vs the 0.1.6 IPA" report. v0.1.6 left this
+        // soft/blurry, the "player size/quality is pathetic vs the 0.1.6 IPA" report. v0.1.6 left this
         // OFF and looked sharp. Apple-Silicon's gpu-next + VideoToolbox defaults are already performant;
         // re-enable per-device ONLY if a constrained GPU stutters on 4K (the original reason it was added).
         // checkError(mpv_set_option_string(mpv, "profile", "fast"))
@@ -604,12 +604,12 @@ final class MPVMetalViewController: PlatformViewController {
         // big forward buffer is backed by a Caches subdirectory instead of RAM, so a viewer can pick a
         // large cache (seek minutes ahead with no re-buffer, pre-cache) WITHOUT spending the jetsam-bound
         // in-process RAM budget. The actual byte budget is the clamped `demuxer-max-bytes` applied per
-        // file in loadFile (DiskCacheSetting.resolvedMaxBytes — always bounded by free disk, never
+        // file in loadFile (DiskCacheSetting.resolvedMaxBytes, always bounded by free disk, never
         // unlimited). The hero-preview (#44) is a tiny silent loop, so it stays on the in-memory cache.
         //
         // `cache-on-disk` is a stable libmpv option (mpv 0.30+, present in MPVKit 0.41); if a future
         // build ever drops it, these lines no-op and mpv falls back to the in-memory cache that the same
-        // clamped `demuxer-max-bytes` already bounds — so the safety guarantee holds either way.
+        // clamped `demuxer-max-bytes` already bounds, so the safety guarantee holds either way.
         if !startMuted, DiskCacheSetting.diskCacheEnabled, let cacheDir = DiskCacheSetting.ensureCacheDirectory() {
             checkError(mpv_set_option_string(mpv, "cache-on-disk", "yes"))
             checkError(mpv_set_option_string(mpv, "cache-dir", cacheDir))
@@ -620,7 +620,7 @@ final class MPVMetalViewController: PlatformViewController {
         // Post-seek/track-change smoothing for the tvOS avfoundation AO. Every scrub commit empties the
         // forward cache and every audio/subtitle track change triggers a demuxer refresh-seek that
         // discards + re-reads it; playback then resumed instantly on a near-empty cache while the refill
-        // burst saturated the network + demuxer + decoder — so the audio output underran repeatedly,
+        // burst saturated the network + demuxer + decoder, so the audio output underran repeatedly,
         // heard as several seconds of crackly/distorted audio with video lagging until the cache caught
         // up. The avfoundation AO is also known upstream to drop 30+ frames each time it resumes from an
         // underrun (mpv-player/mpv#16346), which compounds the visible lag. Only the deeper `audio-buffer`
@@ -640,7 +640,7 @@ final class MPVMetalViewController: PlatformViewController {
 
         // HLS: pick the HIGHEST-bandwidth variant of an adaptive master playlist. mpv's documented
         // default is already `max`, but add-ons that serve a single adaptive master (e.g. KhmerHub's
-        // OK.ru streams) were starting at the lowest rendition — the "144p instead of 720p" report —
+        // OK.ru streams) were starting at the lowest rendition (the "144p instead of 720p" report),
         // so set it explicitly and unambiguously before init. (If a stream is proxied through the
         // embedded server, the playlist rewrite must preserve all variants for this to take effect.)
         checkError(mpv_set_option_string(mpv, "hls-bitrate", "max"))
@@ -1032,7 +1032,7 @@ final class MPVMetalViewController: PlatformViewController {
         guard mpv != nil else { return issuedToken }
         // Re-arm HDR detection for THIS file. appliedDynamicRange otherwise persists from the previous
         // file, so an in-place episode / source switch left it stale and the guard SKIPPED re-applying the
-        // colorspace — the new (HDR) episode then kept rendering in the previous SDR output (dull) until a
+        // colorspace; the new (HDR) episode then kept rendering in the previous SDR output (dull) until a
         // full replay rebuilt the player. Resetting to the nil SENTINEL (not .sdr) means the next
         // re-evaluation ALWAYS applies the new file's true range (nil != any real range), so an HDR->HDR,
         // HDR->SDR, or SDR->HDR switch all re-tag correctly. The re-evaluation no longer depends on the
@@ -1169,7 +1169,7 @@ final class MPVMetalViewController: PlatformViewController {
             #else
             // iOS/tvOS run the streaming server IN-PROCESS and are jetsam-bound. Crucially, on iOS the node
             // server's reported RSS INCLUDES this mpv demuxer cache (same process), so a big read-ahead is
-            // counted twice toward the jetsam ceiling AND grows even on DEBRID (direct CDN) playback — which
+            // counted twice toward the jetsam ceiling AND grows even on DEBRID (direct CDN) playback, which
             // is why the server "dies" on debrid, not just torrents. A 128 MiB read-ahead (down from 256)
             // is still ample for a fast debrid link and shaves ~128 MiB off the peak; the Mac (out-of-process
             // server + swap) keeps the larger buffer for slow-CDN resilience.
@@ -1317,10 +1317,10 @@ final class MPVMetalViewController: PlatformViewController {
     // starts a stream and immediately pauses parks the app at its peak cache footprint (256 MiB default
     // remote; up to 768 MiB with the Streaming-cache setting) for the whole pause. On tvOS the pause also
     // re-enables the idle timer, so a few minutes in the SCREENSAVER (its own 4K video pipeline) starts on
-    // top — exactly when this app is at its fattest — and jetsam reaps the app: the "start a video, pause
+    // top, exactly when this app is at its fattest, and jetsam reaps the app: the "start a video, pause
     // for some minutes, app is suddenly gone" crash. Two defenses, both engine-local and reset per load:
     //  1. Paused clamp: after `pausedClampGraceSeconds` of continuous pause, drop the forward cap to a
-    //     small floor and FREE the already-buffered read-ahead (`drop-buffers` — shrinking the cap alone
+    //     small floor and FREE the already-buffered read-ahead (`drop-buffers`, shrinking the cap alone
     //     stops growth but releases nothing). Restored on resume; a healthy link refills in seconds.
     //  2. Memory warning: the system's last call before jetsam. Clamp to the floor immediately and keep
     //     it there for the rest of this file; playback survives fine on the small rolling buffer.
@@ -1372,11 +1372,11 @@ final class MPVMetalViewController: PlatformViewController {
     /// Free the demuxer cache WITHOUT moving the play head. `drop-buffers` alone is the wrong tool on a
     /// seekable stream: it discards the cached packets but leaves the demuxer's READ position at the
     /// buffered edge (it exists for live streams, where skipping to the edge is the point), so playback
-    /// silently continued from minutes ahead of where the viewer paused — the "jumps forward after a
+    /// silently continued from minutes ahead of where the viewer paused, the "jumps forward after a
     /// minute of pause" regression reported on the first cut of this clamp. Drop, then EXACT-seek back
     /// to the recorded play head: the RAM is freed and demuxing re-anchors at the right byte offset,
     /// with the refill bounded by the (already lowered) cap. The exact flag re-decodes to the same
-    /// frame, so the paused picture does not visibly move. Seekable streams only — a non-seekable
+    /// frame, so the paused picture does not visibly move. Seekable streams only, a non-seekable
     /// stream cannot re-read, so it keeps its buffers rather than corrupting playback; and a not-yet
     /// known position (time-pos <= 0) skips too rather than risk re-anchoring at 0.
     private func flushDemuxerCachePreservingPosition() {
@@ -1983,7 +1983,7 @@ final class MPVMetalViewController: PlatformViewController {
     private(set) var videoSizeMode = UserDefaults.standard.string(forKey: "stremiox.videoSize") ?? MPVMetalViewController.defaultVideoSizeMode
 
     /// Default sizing per device. iPhone fills the screen (crop) so a 16:9 stream doesn't leave thick side
-    /// bars on a tall phone in landscape — the "thick bezels, fill it like this" report. iPad / Mac / Apple
+    /// bars on a tall phone in landscape, the "thick bezels, fill it like this" report. iPad / Mac / Apple
     /// TV keep "original" (whole frame, letterboxed): their larger screens make bars fine, and cropping a
     /// 2.39:1 film on a TV would lose too much of the picture. The user can still change it in the player's
     /// Aspect control, which persists the override.
@@ -2051,7 +2051,7 @@ final class MPVMetalViewController: PlatformViewController {
 
     /// Switch the audio output policy (Auto / Stereo / Surround / Passthrough) on the playing file.
     /// Persists the choice, then re-applies the channel layout and the spdif bitstream list live so it
-    /// takes effect without a reload — mpv re-opens the audio output when these properties change.
+    /// takes effect without a reload; mpv re-opens the audio output when these properties change.
     /// `channelPolicy` reads `AudioOutputMode.current`, so persisting first makes it reflect `mode`.
     /// Setting `audio-spdif` to "" (when leaving Passthrough) tells mpv to decode to PCM again.
     func setAudioOutputMode(_ mode: AudioOutputMode) {
@@ -2166,7 +2166,7 @@ final class MPVMetalViewController: PlatformViewController {
 
     func captureFrameJPEGData(maxWidth: CGFloat, completion: @escaping (Data?) -> Void) {
         guard mpv != nil else { completion(nil); return }
-        // Build or rebuild the pipeline lazily — at VIDEO_RECONFIG time the device/drawableSize may
+        // Build or rebuild the pipeline lazily; at VIDEO_RECONFIG time the device/drawableSize may
         // not be set yet (especially on tvOS); calling here retries until everything is ready.
         // updateCapturePipeline is a no-op once the pipeline matches the current resolution/format.
         updateCapturePipeline()
@@ -2177,7 +2177,7 @@ final class MPVMetalViewController: PlatformViewController {
             guard let self, let texture else { completion(nil); return }
             self.captureQueue.async {
                 // CIImage(mtlTexture:) wraps the texture lazily. Metal textures have (0,0) at
-                // top-left; CIImage has (0,0) at bottom-left — flip y while scaling to 480px wide.
+                // top-left; CIImage has (0,0) at bottom-left; flip y while scaling to 480px wide.
                 guard let raw = CIImage(mtlTexture: texture,
                                         options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]) else {
                     completion(nil); return
@@ -2389,7 +2389,7 @@ final class MPVMetalViewController: PlatformViewController {
                 case MPV_EVENT_VIDEO_RECONFIG:
                     // The video output was (re)configured for the now-current file/params. This EVENT is
                     // not value-coalesced like the sig-peak property observer, so it fires reliably on
-                    // every in-place episode switch even when two HDR episodes share a mastering peak —
+                    // every in-place episode switch even when two HDR episodes share a mastering peak,
                     // exactly the case that left ~2 of 3 switches dull. Re-derive + re-apply HDR from the
                     // freshly settled params (the nil sentinel set in loadFile guarantees it isn't swallowed).
                     guard let loadToken = self.callbackLoadToken() else { break }

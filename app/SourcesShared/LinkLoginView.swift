@@ -66,7 +66,7 @@ struct LinkLoginView: View {
                     .frame(width: Self.qrSize, height: Self.qrSize)
             } else if busy {
                 // BigSpinner lives in SourcesTV (not compiled into iOS/macOS); inline its identical
-                // body — ProgressView at 1.5x with the accent tint — for the non-tvOS targets.
+                // body (ProgressView at 1.5x with the accent tint) for the non-tvOS targets.
                 #if os(tvOS)
                 BigSpinner()
                 #else
@@ -144,7 +144,7 @@ struct LinkLoginView: View {
 
                 let deadline = Date().addingTimeInterval(Self.timeout)
                 // A single network blip must not kill the flow, but a persistent failure (server
-                // down, DNS gone, the link service erroring) must NOT spin silently forever — after
+                // down, DNS gone, the link service erroring) must NOT spin silently forever, after
                 // a short run of consecutive failures we surface the last error so the user can act.
                 var consecutiveFailures = 0
                 while !Task.isCancelled {
@@ -162,7 +162,7 @@ struct LinkLoginView: View {
                                 status = "Signing in…"
                                 errorMessage = nil
                             }
-                            // `read` only proves the link service handed back a key — NOT that the
+                            // `read` only proves the link service handed back a key, NOT that the
                             // main account API still honours it. A rejected/expired token is gated
                             // here: validate against api.strem.io first, and only commit to a
                             // signed-in state once the session is confirmed. On failure we surface
@@ -230,7 +230,7 @@ struct LinkLoginView: View {
         filter.setValue("M", forKey: "inputCorrectionLevel")
         guard let output = filter.outputImage else { return nil }
         let scaled = output.transformed(by: CGAffineTransform(scaleX: 12, y: 12))
-        // CIContext yields a CGImage directly — cross-platform, no UIImage/NSImage wrap needed.
+        // CIContext yields a CGImage directly, cross-platform, no UIImage/NSImage wrap needed.
         return CIContext().createCGImage(scaled, from: scaled.extent)
     }
 }

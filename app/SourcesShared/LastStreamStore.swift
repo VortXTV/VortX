@@ -26,7 +26,7 @@ enum LastStreamStore {
         /// header-gated stream is rejected by its CDN. Optional, so old entries decode.
         var headers: [String: String]? = nil
         /// Debrid provenance of a NATIVELY-resolved link (via the user's own key), so a Continue-Watching
-        /// resume can regenerate a FRESH link straight from the provider when the stored one has expired —
+        /// resume can regenerate a FRESH link straight from the provider when the stored one has expired,
         /// skipping the slow full add-on re-resolve. All optional so old entries decode and a non-debrid
         /// (torrent / plain-direct) resume path is unchanged. Same privacy class as `url`: a device-local,
         /// per-profile playback hint. NEVER written into `libraryItem` or any account-parsed doc.

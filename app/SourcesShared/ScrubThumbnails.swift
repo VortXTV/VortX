@@ -417,7 +417,7 @@ private final class LocalTrickplayFrameCache {
     private let maxDiskBytes: Int64 = 256 * 1024 * 1024
     private let ioQueue = DispatchQueue(label: "com.stremiox.trickplay.localcache", qos: .utility)
     /// Bounded in-memory layer of decoded thumbnails. NSCache caps the resident count AND auto-evicts
-    /// under memory pressure (it observes the system memory warning) — important on iOS, where this runs
+    /// under memory pressure (it observes the system memory warning), important on iOS, where this runs
     /// in-process alongside the embedded streaming server and mpv's 4K decode buffers, so an UNBOUNDED
     /// frame map (the original [String:[Int:ScrubImage]], which neither store nor image(for:) ever pruned)
     /// would add straight onto the jetsam pressure. Anything evicted stays on disk and re-decodes on demand.

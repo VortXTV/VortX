@@ -579,7 +579,7 @@ struct TVReorderServicesView: View {
     }
 }
 
-// MARK: - Discover personalization (region + category on/off) — tvOS
+// MARK: - Discover personalization (region + category on/off), tvOS
 
 /// tvOS Settings screen for the Discover pack: a REGION picker (device region default, overridable) plus
 /// per-category / per-section show-hide rows for the Discover cards, the Streaming-Services section, and each

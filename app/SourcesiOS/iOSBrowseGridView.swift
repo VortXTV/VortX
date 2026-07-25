@@ -656,7 +656,7 @@ struct iOSReorderServicesView: View {
 // MARK: - Discover personalization (region + category on/off)
 
 /// Settings screen (iOS / iPad / Mac) for the Discover pack: a REGION picker (device region by default,
-/// overridable — orders + scopes hub content to a chosen country) plus per-category / per-section show/hide
+/// overridable, orders + scopes hub content to a chosen country) plus per-category / per-section show/hide
 /// toggles for the Discover cards, the Streaming-Services section, and each genre tile. Everything binds to
 /// the shared `CatalogPreferences`, persists per-profile via UserDefaults, and republishes so the live hub
 /// re-lays out immediately. Defaults reproduce today's behavior (device region, nothing hidden).

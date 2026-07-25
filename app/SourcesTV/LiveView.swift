@@ -7,7 +7,7 @@ import SwiftUI
 /// tile feeds the same `BrowseHeroBackdrop` / `FocusedItemModel` that Home and Discover use; selecting one
 /// pushes the standard `DetailView`, which has a Live branch (backdrop + name + LIVE badge + source list,
 /// no VOD chrome) and plays through the player's live-tuned path. The screen reuses the engine + player
-/// wholesale — no EPG, no M3U import.
+/// wholesale: no EPG, no M3U import.
 ///
 /// Empty state: when no installed add-on exposes a live catalog there are no live rows, so the screen
 /// nudges the user to the Add-ons tab rather than showing a blank surface.
@@ -80,7 +80,7 @@ struct LiveView: View {
 }
 
 /// One Live row from the engine board: a titled, horizontally-scrolling band of square `ChannelTile`s.
-/// The Live twin of `CoreCatalogRowView` — same header + spacing language, but square channel tiles
+/// The Live twin of `CoreCatalogRowView`, same header + spacing language, but square channel tiles
 /// instead of 2:3 poster cards, and it feeds the focus model just like the poster rails do.
 struct CoreChannelRowView: View {
     let row: CoreBoardRow
@@ -108,7 +108,7 @@ struct CoreChannelRowView: View {
 }
 
 /// A focusable square (1:1) channel tile: the channel's logo (preferred) or poster, fit on a neutral
-/// surface card so logos with transparency / odd aspect ratios read cleanly — channels rarely have
+/// surface card so logos with transparency / odd aspect ratios read cleanly, channels rarely have
 /// box-art, so a `fit` on a surface beats a `fill` crop. Navigates to the standard `DetailView`, which
 /// engages the Live branch via the channel's `type`; crafted focus (scale + ember glow + lift) comes from
 /// `CardFocusStyle`, the same component the poster cards use, so the row matches the rest of the app.
@@ -118,7 +118,7 @@ struct ChannelTile: View {
 
     private let side: CGFloat = kPosterWidth   // square, matching the poster column width
 
-    /// Logo first (the channel mark), else poster — both are channel-identifying art.
+    /// Logo first (the channel mark), else poster; both are channel-identifying art.
     private var artURL: URL? { URL(string: meta.logo ?? meta.poster ?? "") }
 
     var body: some View {

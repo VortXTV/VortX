@@ -4,10 +4,10 @@ import SwiftUI
 //
 // ProfilesView now lives in SourcesShared, so it compiles into the iOS, macOS and tvOS targets.
 // A few modifiers it uses are not available everywhere:
-//   • `.focusSection()`        — tvOS / macOS 13+ / iOS 17+. The iOS target deploys to 16, so it
+//   • `.focusSection()`:         tvOS / macOS 13+ / iOS 17+. The iOS target deploys to 16, so it
 //                                 must be gated. On tvOS it shapes directional-focus traversal;
 //                                 on iOS/macOS there is no remote focus engine, so it is a no-op.
-//   • `.fullScreenCover(...)`  — iOS / tvOS only. macOS has no full-screen cover, so it falls back
+//   • `.fullScreenCover(...)`:   iOS / tvOS only. macOS has no full-screen cover, so it falls back
 //                                 to a sheet there.
 // These helpers keep the tvOS behaviour byte-for-byte identical while letting the file build on
 // iOS and macOS. `PlatformModifiers.swift` has equivalents but lives in SourcesiOS (not compiled

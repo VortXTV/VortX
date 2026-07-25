@@ -78,7 +78,7 @@ struct CoreCWItem: Decodable, Identifiable {
     }
 
     /// The engine's own "has been watched" predicate (upstream `LibraryItem::watched()`:
-    /// `times_watched > 0`), driving the Library poster badge (DESIGN.md "PosterCard —
+    /// `times_watched > 0`), driving the Library poster badge (DESIGN.md "PosterCard:
     /// Watched state"). `LibraryItemMarkAsWatched` and every finished play/episode bump
     /// `timesWatched`; unmark resets it to 0. `flaggedWatched` is deliberately NOT consulted:
     /// upstream documents it as a per-video "watched event sent" latch, not the indicator.
@@ -249,7 +249,7 @@ enum CoreLoadable<T: Decodable>: Decodable {
         // terminal (.err, which streamLoadProgress already counts as settled) and log the
         // surprise so an engine tag rename is visible instead of silent.
         default:
-            NSLog("%@", "[core] CoreLoadable unknown tag '\(tag)' — treating as terminal (.err)")
+            NSLog("%@", "[core] CoreLoadable unknown tag '\(tag)'; treating as terminal (.err)")
             self = .err
         }
     }
@@ -264,7 +264,7 @@ struct CoreMeta: Decodable, Identifiable {
     let name: String
     let poster: String?
     let posterShape: String?
-    /// The channel mark on live (tv/channel/events) catalog previews — channels publish a `logo`
+    /// The channel mark on live (tv/channel/events) catalog previews; channels publish a `logo`
     /// instead of box-art, so the Live surface's `ChannelTile` prefers it over `poster`. Optional;
     /// VOD previews omit it and decode fine.
     let logo: String?
@@ -277,7 +277,7 @@ struct CoreMeta: Decodable, Identifiable {
     /// carries the rating in its name; category "Genres" carries each genre), NOT as top-level fields.
     /// The engine never emits a top-level `imdbRating`/`genres` for a preview, so the old stored
     /// properties decoded nil every time and the featured hero never showed a rating. Read them from
-    /// `links` instead — the same place CoreMetaItem (the full detail meta) reads them.
+    /// `links` instead, the same place CoreMetaItem (the full detail meta) reads them.
     let links: [CoreLink]?
 
     var imdbRating: String? {
@@ -629,7 +629,7 @@ struct CoreMetaItem: Decodable {
         return trailerLink.flatMap { Self.youTubeID(from: $0.name) }
     }
 
-    /// All episodes ordered (season, then episode, then id) across EVERY season — the list handed to the
+    /// All episodes ordered (season, then episode, then id) across EVERY season, the list handed to the
     /// player so in-player Next / auto-advance rolls past the season boundary into the next season's first
     /// episode (was per-season, so it dead-ended at the last episode of a season).
     var orderedEpisodes: [CoreVideo] { (videos ?? []).orderedBySeasonEpisode }
@@ -737,7 +737,7 @@ struct CoreVideo: Decodable, Identifiable {
         return "Episode \(episode ?? 0)"
     }
 
-    /// The `released` string parsed as a `Date` (non-breaking — display still uses the raw string).
+    /// The `released` string parsed as a `Date` (non-breaking; display still uses the raw string).
     /// Live/EPG schedules carry an ISO-8601 UTC timestamp here; try the plain form first, then the
     /// fractional-seconds variant some add-ons emit. Returns nil when absent or unparseable.
     var releasedDate: Date? {
@@ -763,7 +763,7 @@ extension Array where Element == CoreVideo {
 }
 
 extension ISO8601DateFormatter {
-    /// Shared formatters for parsing `CoreVideo.released` — `static let` so the EPG now/next pass
+    /// Shared formatters for parsing `CoreVideo.released`, `static let` so the EPG now/next pass
     /// reuses one instance per form instead of allocating a formatter per video (they're costly).
     static let epg = ISO8601DateFormatter()
     static let epgFractional: ISO8601DateFormatter = {
@@ -1177,7 +1177,7 @@ struct CoreStream: Decodable, Identifiable, Equatable {
     /// Native Stremio USENET source fields (part of the stream spec, alongside url / ytId / infoHash):
     /// `nzbUrl` is an http(s) link to an `.nzb`, and `fileMustInclude` is an optional regex that picks the
     /// video inside the (potentially multi-file) usenet download. A stream with a non-nil `nzbUrl` is a
-    /// USENET stream — it resolves through the user's own usenet-capable debrid account (TorBox), never a
+    /// USENET stream; it resolves through the user's own usenet-capable debrid account (TorBox), never a
     /// torrent swarm. All optional so a stream without them (every torrent/direct/YouTube source) still
     /// decodes byte-identically to before.
     let nzbUrl: String?
@@ -1194,14 +1194,14 @@ struct CoreStream: Decodable, Identifiable, Equatable {
     var isTorrent: Bool { url == nil && infoHash != nil && nzbUrl == nil }
 
     /// A USENET stream: no direct `url` yet, but an `.nzb` link to resolve through a usenet-capable debrid
-    /// account. Like a raw torrent, it needs resolution before it is playable — the usenet analogue of
+    /// account. Like a raw torrent, it needs resolution before it is playable, the usenet analogue of
     /// `isTorrent`. Kept mutually exclusive from `isTorrent` (which now also checks `nzbUrl == nil`) so a
     /// stream is classified as exactly one of torrent / usenet / direct.
     var isUsenet: Bool { url == nil && (nzbUrl.map { !$0.isEmpty } ?? false) }
 
     /// A bare YouTube source (`ytId`, no direct `url`): a trailer/clip from a trailer add-on like
     /// Streailer, not a full feature stream. Playable (via the `/yt` route in `playableURL`) so the
-    /// user can tap it, but excluded from quality RANKING and the one-press auto-pick — otherwise an
+    /// user can tap it, but excluded from quality RANKING and the one-press auto-pick; otherwise an
     /// unscored "🎬 Trailer" row could become `StreamRanking.best` and play the trailer in place of
     /// the movie (and a trailer must never be recorded as Continue Watching).
     var isYouTubeTrailer: Bool { url == nil && infoHash == nil && (ytId.map { !$0.isEmpty } ?? false) }
@@ -1210,7 +1210,7 @@ struct CoreStream: Decodable, Identifiable, Equatable {
     ///
     /// A `ytId`-only stream is a YouTube source (e.g. a trailer add-on like Streailer returns
     /// `{ "ytId": "…" }` streams, no `url`/`infoHash`): play it through the remote resolver's
-    /// `/yt/{id}` route — the same path the Trailer button uses (`TrailerRequest`). The remote
+    /// `/yt/{id}` route, the same path the Trailer button uses (`TrailerRequest`). The remote
     /// resolver needs no embedded server, so this is playable on every scheme including Lite.
     /// Without this, every Streailer stream rendered as an inert lock-icon row.
     var playableURL: URL? { playableURL(isEpisode: false) }
@@ -1373,8 +1373,8 @@ struct CoreLibSort: Decodable, Identifiable {
     var label: String {
         switch sort {
         case "lastwatched": return "Recent"
-        case "name": return "Name A–Z"
-        case "namereverse": return "Name Z–A"
+        case "name": return "Name A-Z"
+        case "namereverse": return "Name Z-A"
         case "timeswatched": return "Most watched"
         case "watched": return "Watched"
         case "notwatched": return "Unwatched"

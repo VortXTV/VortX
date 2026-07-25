@@ -105,7 +105,7 @@ enum VortXSyncCrypto {
         pbkdf2(password, salt: kdfSalt, iterations: iters)
     }
 
-    /// base64(PBKDF2(masterKey, salt=utf8(password), 1)) — the value sent to register/login.
+    /// base64(PBKDF2(masterKey, salt=utf8(password), 1)), the value sent to register/login.
     static func authVerifier(masterKey: Data, password: String) -> String {
         pbkdf2(masterKey, salt: Data(password.utf8), iterations: 1).base64EncodedString()
     }

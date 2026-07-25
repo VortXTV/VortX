@@ -2,7 +2,7 @@ import SwiftUI
 
 /// Client-side type segmentation for the Library (Movies / TV / Anime). The engine's own type filter
 /// only knows movie vs. series and cannot surface Anime, so the type row is derived here from each saved
-/// title's meta type — a pure presentation grouping that leaves the engine's SORT chips and every
+/// title's meta type, a pure presentation grouping that leaves the engine's SORT chips and every
 /// per-item action (open / remove / watched) untouched.
 private enum LibrarySegment: String, CaseIterable, Identifiable {
     case all, movies, tv, anime
@@ -177,7 +177,7 @@ struct LibraryView: View {
 
     /// The client-side type segment chips (All / Movies / TV / Anime), rendered with the shared
     /// `ChipButtonStyle` so they carry the same glass + focus treatment as every other filter chip.
-    /// Shown only when the library actually spans two or more buckets — a single-type library keeps the
+    /// Shown only when the library actually spans two or more buckets, a single-type library keeps the
     /// flat grid with no redundant control.
     @ViewBuilder private func segmentBar(_ items: [CoreCWItem]) -> some View {
         let segs = availableSegments(items)
@@ -299,7 +299,7 @@ struct LibraryView: View {
     /// metaId itself, episode finishes record episode ids), never the account's state.
     private func isWatched(_ item: CoreCWItem) -> Bool {
         // A series fully watched by its aired, regular-season episodes badges even when the engine's
-        // `times_watched` never got bumped (marked, not played) — WatchedIndex holds that derived set,
+        // `times_watched` never got bumped (marked, not played), WatchedIndex holds that derived set,
         // per profile, alongside the engine bucket / overlay signal (issue #143).
         if watchedIndex.ids.contains(item.id) { return true }
         return profiles.activeUsesEngineHistory

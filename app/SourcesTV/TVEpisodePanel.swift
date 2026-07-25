@@ -5,7 +5,7 @@ import UIKit
 /// The in-player episode list for the bare tvOS AVPlayer (#46). It is hosted inside
 /// `AVPlayerViewController.customInfoViewControllers`, the Info-panel tab AVKit reveals when the viewer
 /// swipes down on the Siri remote. AVKit owns the focus engine for that panel, so this focusable list never
-/// competes with the remote the way a custom overlay would — which is exactly why the tvOS HLS / Dolby-Vision
+/// competes with the remote the way a custom overlay would, which is exactly why the tvOS HLS / Dolby-Vision
 /// path stays a bare `AVPlayerViewController` instead of routing through `TVPlayerView` (the focus invariant).
 ///
 /// This delivers the "Prefer AVPlayer + in-player episode list" experience the redditors asked for: pick any
@@ -77,7 +77,7 @@ struct TVPlayerEpisodePanel: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
 
-        /// "S2E5" / "E5" — numeric, not localized (episode numbering is universal).
+        /// "S2E5" / "E5", numeric, not localized (episode numbering is universal).
         private var label: String {
             if let season = episode.season, season > 0 { return "S\(season)E\(episode.episodeNumber)" }
             return "E\(episode.episodeNumber)"
@@ -235,7 +235,7 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
 }
 
 /// Tell the embedded server to create the torrent engine (POST /{hash}/create) before the player opens its
-/// loopback URL — a self-contained copy of `TVPlayerView.prepareTorrent`, since the re-present path resolves
+/// loopback URL, a self-contained copy of `TVPlayerView.prepareTorrent`, since the re-present path resolves
 /// the episode/source outside any player view. Stateless and fire-and-forget; a no-op for direct / debrid
 /// streams. File-internal (not private) so the Sources-panel switch in RootTabView can prime too.
 func tvPrimeTorrentStream(_ stream: CoreStream) {

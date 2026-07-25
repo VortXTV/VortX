@@ -156,7 +156,7 @@ enum DiskCacheSetting {
     /// Also gated by the RemoteConfig fleet kill-switch `features.diskCache`: a remote `false` FORCES the
     /// cache off fleet-wide (an escape hatch if the disk cache regresses on some devices). Baked default is
     /// true, so an absent / null remote field is behaviorally identical to shipping; the user's own Off/On
-    /// selection still governs — this only ANDs in the fleet gate.
+    /// selection still governs; this only ANDs in the fleet gate.
     static var diskCacheEnabled: Bool {
         !isOff && RemoteConfig.snapshot.isFeatureOn("diskCache", default: true)
     }
@@ -170,7 +170,7 @@ enum DiskCacheSetting {
         guard let url = cacheDirectoryURL else { return }
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) else {
-            // Directory may not exist yet (never played) — nothing to clear.
+            // Directory may not exist yet (never played), nothing to clear.
             return
         }
         var cleared = 0

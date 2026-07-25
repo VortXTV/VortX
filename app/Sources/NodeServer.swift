@@ -185,12 +185,12 @@ enum NodeServer {
         setenv("UV_THREADPOOL_SIZE", "16", 1)
         // CRITICAL (regression fix, #56): the in-process nodejs-mobile runtime CANNOT spawn child
         // processes in the iOS/tvOS sandbox, so the server's :12470 HTTPS endpoint and its HLSv2
-        // transcoder (which shells out to ffmpeg via child_process.spawn) MUST be disabled — exactly
+        // transcoder (which shells out to ffmpeg via child_process.spawn) MUST be disabled, exactly
         // what official Stremio's own mobile build does (server.js force-sets both under IOS_APP).
         // Without them the boot-time hwAccel profiler fires a /hlsv2 probe that spawns ffmpeg, the spawn
         // is denied, and the node runtime dies ~10s after launch (the "server goes Offline" report).
         // A prior commit removed these on the mistaken theory that the death was only the 11471
-        // web-proxy's EADDRINUSE — but that proxy is gated to the web-host target and never runs here,
+        // web-proxy's EADDRINUSE, but that proxy is gated to the web-host target and never runs here,
         // so removing them just re-exposed the native apps to the iOS-incompatible HTTPS/HLS/spawn paths.
         // Do NOT set IOS_APP itself: server.js would then call a native apple_bridge binding that isn't
         // linked in this app and would throw. These two discrete flags are the correct substitute.
@@ -199,7 +199,7 @@ enum NodeServer {
         #if VORTX_WEB_HOST
         // Only the WKWebView web-host target needs the 11471 reverse-proxy of web.stremio.com (so the
         // webview can load the UI from a loopback origin). The native iOS/tvOS apps have no webview, so
-        // the preload skips that idle HTTP server + its per-request https buffers there — more footprint
+        // the preload skips that idle HTTP server + its per-request https buffers there, more footprint
         // shed on the 2 GB Apple TV HD (issue #56). See the gated block in the preload below.
         setenv("NEEDS_WEB_PROXY", "1", 1)
         #endif
