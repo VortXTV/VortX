@@ -1365,6 +1365,17 @@ final class CoreBridge: ObservableObject {
     /// device re-adds owner titles at time 0 because stremio-core exposes no action to inject a saved offset,
     /// so this cache is what restores cross-device resume. Series: only when the cached episode matches. Returns
     /// nil (not 0) when there is no positive cached offset, so a genuine "start from 0" is never overridden.
+    private func vortxOwnedResumeSeconds(for meta: PlaybackMeta) -> Double? {
+        guard ProfileStore.shared.activeUsesEngineHistory else { return nil }
+        guard let entry = OwnerResumeStore.entry(forId: meta.libraryId), entry.t > 0 else { return nil }
+        if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
+            usesSeriesLifecycle: meta.usesSeriesLifecycle,
+            savedVideoID: entry.v,
+            requestedVideoID: meta.videoId
+        ) { return nil }
+        return entry.t
+    }
+
     /// Apply the Continue Watching FLOOR to a POSITIVE engine-held resume position.
     ///
     /// With a live Stremio session and "Mirror Continue Watching from Stremio" OFF, the engine's offset may have
@@ -1378,17 +1389,6 @@ final class CoreBridge: ObservableObject {
               !LocalRewindLog.contains(meta.libraryId),
               let owned = vortxOwnedResumeSeconds(for: meta), owned > engine else { return engine }
         return owned
-    }
-
-    private func vortxOwnedResumeSeconds(for meta: PlaybackMeta) -> Double? {
-        guard ProfileStore.shared.activeUsesEngineHistory else { return nil }
-        guard let entry = OwnerResumeStore.entry(forId: meta.libraryId), entry.t > 0 else { return nil }
-        if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
-            usesSeriesLifecycle: meta.usesSeriesLifecycle,
-            savedVideoID: entry.v,
-            requestedVideoID: meta.videoId
-        ) { return nil }
-        return entry.t
     }
 
     // MARK: Library / Continue Watching mutations (Ctx actions; CW + library refresh live via events)
