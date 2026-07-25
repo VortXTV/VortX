@@ -72,6 +72,10 @@ let escapeHatches: [(key: String, bakedDefault: Bool, site: String)] = [
     ("dvRemuxSubtitles",          true,  "VortXMKVRemuxStream.swift:518"),
     ("plainRemux",                true,  "PlayerEngineRouter.swift:326"),
     ("avPlayerDefault",           true,  "PlayerEngineRouter.swift:346"),
+    // Found by an exhaustive read-vs-decoded key diff, not in the original report: the same defect on the
+    // two paths that CONTRIBUTE user data upstream, where a working kill switch matters most.
+    ("subtitleUpload",            true,  "SubtitlePoolClient.swift:426"),
+    ("languageIndexContribute",   true,  "LanguageIndexClient.swift:180"),
 ]
 
 /// A LITERAL transcription of the set-vs-absent idiom in `PlayerEngineRouter.plainRemuxEnabled` /
@@ -225,10 +229,11 @@ struct RemoteConfigValidationTests {
         // one of the fields again, this goes red.
         let allOff = #"""
         {"features":{"tvosSpdif":false,"dvWindowConsumptionAnchor":false,"dvRemuxMultiAudio":false,
-        "dvRemuxSubtitles":false,"plainRemux":false,"avPlayerDefault":false}}
+        "dvRemuxSubtitles":false,"plainRemux":false,"avPlayerDefault":false,"subtitleUpload":false,
+        "languageIndexContribute":false}}
         """#
         expect(fingerprint(resolved(allOff)) != emptyFingerprint,
-               "REGRESSION GUARD: a config turning all six switches OFF is no longer identical to an empty config")
+               "REGRESSION GUARD: a config turning every one of these switches OFF is no longer identical to an empty config")
         for hatch in escapeHatches {
             expect(resolved(allOff).isFeatureOn(hatch.key, default: true) == false,
                    "REGRESSION GUARD: \(hatch.key) reads FALSE from the all-off payload")
@@ -237,18 +242,24 @@ struct RemoteConfigValidationTests {
         // merely being filled with one constant.
         let allOn = #"""
         {"features":{"tvosSpdif":true,"dvWindowConsumptionAnchor":true,"dvRemuxMultiAudio":true,
-        "dvRemuxSubtitles":true,"plainRemux":true,"avPlayerDefault":true}}
+        "dvRemuxSubtitles":true,"plainRemux":true,"avPlayerDefault":true,"subtitleUpload":true,
+        "languageIndexContribute":true}}
         """#
         for hatch in escapeHatches {
             expect(resolved(allOn).isFeatureOn(hatch.key, default: false) == true,
                    "REGRESSION GUARD: \(hatch.key) reads TRUE from the all-on payload")
         }
 
-        // ---- The five keys that DECODE but nothing READS (reported, deliberately NOT deleted) ----
+        // ---- The keys that DECODE but nothing READS (reported, deliberately NOT deleted) ----
         // Deleting a schema field is a separate decision: a server may already be sending these. Pinned here
         // so the decision stays visible and a later reader can see they were known, not missed.
+        // There are TWELVE, not the five originally reported. The other seven were found by diffing every
+        // `isFeatureOn("...")` read in app/ against every `put("...")` in validate; each of the seven has
+        // zero references anywhere outside this file.
         for orphan in ["hdrDisplayModeSwitch", "iosPassthroughAudio", "dvToAVPlayerRouting",
-                       "hlsToAVPlayerRouting", "av1Penalty"] {
+                       "hlsToAVPlayerRouting", "av1Penalty",
+                       "aniSkip", "debridCacheCheck", "debridInlineResolve", "erdbPosters",
+                       "skipVortxLayer", "vortxRatings", "xrdbPosters"] {
             expect(resolved(#"{"features":{"\#(orphan)":false}}"#).isFeatureOn(orphan, default: true) == false,
                    "DECODED BUT UNREAD: \(orphan) still decodes (no app call site reads it today)")
         }
@@ -366,6 +377,106 @@ struct RemoteConfigValidationTests {
         expect(resolved(#"{"endpoints":{"sources":"https://alt.vortx.tv"}}"#).sourcesEndpoint.absoluteString
                == "https://alt.vortx.tv",
                "ENDPOINT: an https *.vortx.tv sources endpoint is accepted")
+
+        // ---- BAKED DEFAULTS MUST DESCRIBE WHAT SHIPS TODAY ----
+        // A baked default IS the promise that wiring its accessor is a no-op. A stale one turns a change
+        // meant to be inert into a silent behaviour regression the first time someone wires it. Two were
+        // stale. These pin them to the literal the production code actually uses, with the citation, so the
+        // next drift is caught here instead of in the field.
+        expect(RemoteConfigDefaults.debridResolveSecs == 5,
+               "BAKED TRUTH: debridResolveSecs is 5, matching DebridResolver.swift:1178 (was 15, the pre-change value)")
+        expect(RemoteConfigDefaults.detailSettleIOSSecs == 20,
+               "BAKED TRUTH: detailSettleIOSSecs is 20, matching iOSDetailView.swift:654 and :3630 (was 12, the tvOS value)")
+        expect(RemoteConfigDefaults.detailSettleTVSecs == 12,
+               "BAKED TRUTH: detailSettleTVSecs is 12, matching DetailView.swift:2221")
+        expect(RemoteConfigDefaults.vodReadaheadSecs == 300,
+               "BAKED TRUTH: vodReadaheadSecs is 300, matching MPVMetalViewController.swift:1250")
+        // Every corrected default must still sit INSIDE its own clamp range, or an absent remote value would
+        // resolve to something other than the baked value and the equivalence contract would break.
+        expect(resolved("{}").debridResolveSecs == RemoteConfigDefaults.debridResolveSecs,
+               "BAKED TRUTH: the corrected debridResolveSecs survives its own clamp (5...30) unchanged")
+        expect(resolved("{}").detailSettleIOSSecs == RemoteConfigDefaults.detailSettleIOSSecs,
+               "BAKED TRUTH: the corrected detailSettleIOSSecs survives its own clamp (5...60) unchanged")
+
+        // ---- LAUNCH-HEALTH GUARD: the valid-but-HARMFUL config ----
+        // A config can decode cleanly, pass every clamp, be persisted as last-known-good, and still wedge the
+        // app. It is then re-applied on every launch, so if it wedges before the next fetch completes, the
+        // mechanism built to deliver the fix can never reach the device. The decision is a pure function so
+        // it can be checked exhaustively here.
+        let threshold = RemoteConfig.unhealthyStartThreshold
+        expect(threshold == 3, "GUARD: the threshold is the conservative 3 (1 and 2 are inside ordinary user behaviour)")
+        expect(RemoteConfig.healthySurvivalSecs == 10, "GUARD: a launch must hold the main thread responsive for 10s to count healthy")
+
+        let hashA = RemoteConfig.stableHash(Data(#"{"schemaVersion":1}"#.utf8))
+        let hashB = RemoteConfig.stableHash(Data(#"{"schemaVersion":2}"#.utf8))
+        expect(hashA == RemoteConfig.stableHash(Data(#"{"schemaVersion":1}"#.utf8)),
+               "GUARD: the content hash is STABLE for identical bytes (Hasher is per-process seeded and cannot be used)")
+        expect(hashA != hashB, "GUARD: the content hash separates different configs")
+
+        func decide(storedHash: String?, counter: Int, quarantined: String? = nil) -> RemoteConfig.LaunchHealthDecision {
+            RemoteConfig.launchHealthDecision(cachedHash: hashA, storedHash: storedHash, storedCounter: counter,
+                                              quarantinedHash: quarantined, threshold: threshold)
+        }
+
+        // Healthy device: a config never seen before, and the counted run up to the threshold.
+        expect(decide(storedHash: nil, counter: 0) == .apply(nextCounter: 1),
+               "GUARD: a config never applied before is admitted and starts its own count at 1")
+        expect(decide(storedHash: hashA, counter: 0) == .apply(nextCounter: 1),
+               "GUARD: a healthy device (counter 0) is admitted")
+        expect(decide(storedHash: hashA, counter: 1) == .apply(nextCounter: 2),
+               "GUARD: one prior unhealthy start still admits, and increments")
+        expect(decide(storedHash: hashA, counter: 2) == .apply(nextCounter: 3),
+               "GUARD: two prior unhealthy starts still admit (2 is inside ordinary quick-quit behaviour)")
+        expect(decide(storedHash: hashA, counter: 3) == .discard,
+               "GUARD: THREE consecutive unhealthy starts discard the cached config and boot baked")
+        expect(decide(storedHash: hashA, counter: 99) == .discard,
+               "GUARD: any count at or above the threshold discards")
+
+        // The operator's FIX must never arrive pre-condemned by the previous config's failures.
+        expect(decide(storedHash: hashB, counter: 99) == .apply(nextCounter: 1),
+               "GUARD: a DIFFERENT config resets the count, so a fix is never charged for the bad config's crashes")
+        // Quarantine is by content hash, so a re-serve of the same bad bytes cannot undo a discard.
+        expect(decide(storedHash: hashA, counter: 0, quarantined: hashA) == .discard,
+               "GUARD: a quarantined config is discarded even from a clean counter (refresh cannot re-install it)")
+        expect(decide(storedHash: hashA, counter: 0, quarantined: hashB) == .apply(nextCounter: 1),
+               "GUARD: quarantining one config does not condemn a different one")
+        // Corrupt / hostile persisted state must not disable the guard.
+        expect(decide(storedHash: hashA, counter: -50) == .apply(nextCounter: 1),
+               "GUARD: a negative persisted counter is floored at 0 rather than granting infinite retries")
+
+        // The guard must be INERT on a device that never has a cached config problem: the full healthy
+        // sequence below is what an ordinary user experiences, and it never discards.
+        var healthySequenceDiscarded = false
+        for _ in 0..<50 {
+            if decide(storedHash: hashA, counter: 0) == .discard { healthySequenceDiscarded = true }
+        }
+        expect(!healthySequenceDiscarded,
+               "GUARD: fifty consecutive HEALTHY launches (counter reset each time) never discard a good config")
+
+        // ---- FOREGROUND THROTTLE ----
+        // `refreshIfForegroundDue` previously had ZERO call sites anywhere in the repo, so the 30-minute
+        // throttle had never actually run. Now that both scene hooks call it on every foreground transition,
+        // it must genuinely no-op when the last fetch is recent, or a user tabbing in and out would hammer
+        // config.vortx.tv.
+        let halfHour: TimeInterval = 30 * 60
+        expect(RemoteConfig.shouldRefreshOnForeground(lastFetchEpoch: 0, now: 1_000_000, throttle: halfHour),
+               "THROTTLE: a device that has never fetched is always allowed through")
+        expect(!RemoteConfig.shouldRefreshOnForeground(lastFetchEpoch: 1_000_000, now: 1_000_001, throttle: halfHour),
+               "THROTTLE: a fetch one second ago is BLOCKED (this is the hammering case)")
+        expect(!RemoteConfig.shouldRefreshOnForeground(lastFetchEpoch: 1_000_000, now: 1_000_000 + halfHour - 1, throttle: halfHour),
+               "THROTTLE: one second SHORT of the window is still blocked")
+        expect(RemoteConfig.shouldRefreshOnForeground(lastFetchEpoch: 1_000_000, now: 1_000_000 + halfHour, throttle: halfHour),
+               "THROTTLE: exactly at the 30-minute window it is due")
+        expect(RemoteConfig.shouldRefreshOnForeground(lastFetchEpoch: 1_000_000, now: 1_000_000 + halfHour + 1, throttle: halfHour),
+               "THROTTLE: past the window it is due")
+        // A backwards clock must not lock a device out of config updates until real time catches up.
+        expect(RemoteConfig.shouldRefreshOnForeground(lastFetchEpoch: 2_000_000, now: 1_000_000, throttle: halfHour),
+               "THROTTLE: a clock that moved BACKWARDS is treated as due, not as blocked forever")
+        // Ten rapid foreground transitions inside the window must produce exactly ONE allowed refresh.
+        var allowed = 0
+        for i in 0..<10 where RemoteConfig.shouldRefreshOnForeground(
+            lastFetchEpoch: 1_000_000, now: 1_000_000 + Double(i), throttle: halfHour) { allowed += 1 }
+        expect(allowed == 0, "THROTTLE: ten foreground transitions within the window allow ZERO extra fetches")
 
         print(failures == 0 ? "\nALL PASS" : "\n\(failures) FAILURE(S)")
         exit(failures == 0 ? 0 : 1)

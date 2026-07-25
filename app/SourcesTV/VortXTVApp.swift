@@ -126,6 +126,14 @@ struct VortXTVApp: App {
                 DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
                 if phase == .active {
                     UpdateChecker.shared.checkIfStale()
+                    // RemoteConfig had NO foreground pull: `refreshIfForegroundDue` existed with zero call
+                    // sites anywhere in the repo, so the only refreshes were the cold-launch fetch and the
+                    // 6-hourly periodic Task. That Task's sleep does not advance while tvOS has the process
+                    // suspended, and an Apple TV app is often never fully quit, so a device could hold a
+                    // stale config (and therefore a stale KILL SWITCH) for a very long time. Throttled to
+                    // once per 30 minutes inside the actor, detached so it cannot delay this hook, and
+                    // fail-soft by construction (refresh never throws and keeps last-good on any error).
+                    Task.detached(priority: .utility) { await RemoteConfig.shared.refreshIfForegroundDue() }
                     #if !VORTX_NO_EMBEDDED_SERVER
                     // #130: after a suspension (Home, app switch, screensaver exit) tvOS can tear down the
                     // server's bound listener while node keeps ticking, so the server reads Offline until a
