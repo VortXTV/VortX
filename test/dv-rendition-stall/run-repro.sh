@@ -268,6 +268,8 @@ xcrun swiftc -sdk "$SDK_PATH" \
   app/Sources/Player/AudioTranscodePolicy.swift \
   app/Sources/Player/VortXAudioTranscoder.swift \
   app/Sources/Player/VortXMKVRemuxStream.swift \
+  app/SourcesShared/VortXEngineHostPolicy.swift \
+  app/Sources/Player/VortXHostedResponse.swift \
   app/Sources/Player/VortXRemuxHLSServer.swift \
   test/dv-rendition-stall/main.swift
 
