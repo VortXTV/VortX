@@ -167,6 +167,19 @@ enum Live {
         var probeInfra: String?
         var audioFetchInfra: String?
 
+        // ANTI-ROT GATE. The server wrote media responses this build's parser could not
+        // read. That is harness drift against the product's log vocabulary, and it is
+        // exactly how this gate went blind before: points 1, 4, 6 and 7 all stand on
+        // parsed trace facts, so an unparsed line silently becomes "cannot observe"
+        // rather than "the harness is out of date". Report it as INFRA, never as a verdict.
+        if trace.mediaResponseLines > trace.mediaResponses.count {
+            probeInfra = "HARNESS DRIFT: the session log contains \(trace.mediaResponseLines)"
+                + " `hls resp /media.m3u8` lines but this build's parser understood only"
+                + " \(trace.mediaResponses.count). The product's log vocabulary has moved ahead"
+                + " of Trace.swift. Re-read VortXRemuxHLSServer's DiagnosticsLog lines and update"
+                + " the patterns before trusting any verdict below."
+        }
+
         let master = get(port: port, path: "/master.m3u8", session: session)
         let masterText = String(data: master.body, encoding: .utf8) ?? ""
         let media = get(port: port, path: "/media.m3u8", session: session)
@@ -403,7 +416,7 @@ enum Live {
                 ev.append("DIAGNOSTIC trace: advertised segments logged as 404 during playback: \(w.observed404s)")
             }
             if w.avgSegmentBytes > 0 {
-                ev.append("DIAGNOSTIC prediction: resident window ~= \(Contract.windowFloorMiB) MiB / \(w.avgSegmentBytes) B ≈ \(w.residentSegments) segments; playlist advertised up to \(w.advertisedMax) (MEDIA-SEQUENCE stays 0)")
+                ev.append("DIAGNOSTIC prediction: resident window ~= \(Contract.windowFloorMiB) MiB / \(w.avgSegmentBytes) B ≈ \(w.residentSegments) segments; playlist advertised up to absolute id \(w.advertisedMax), MEDIA-SEQUENCE reached \(trace.maxMediaSequence) (the window SLIDES)")
                 if let evictedUpTo = w.evictedUpTo {
                     ev.append("DIAGNOSTIC prediction only: segment 0..\(evictedUpTo) may no longer be resident; this does not decide the verdict")
                 }

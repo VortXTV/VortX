@@ -8,8 +8,67 @@ and turns GREEN when the rework is correct. It exercises **real runtime behaviou
 overnight run used) and, while a plain-remux MKV is playing, fetches playlists and
 segment bytes over the simulator's shared loopback. It never asserts on source text.
 The plain and Dolby Vision lanes share the startup gate and the playlist builder
-(`DVPlaybackPolicy.mediaPlaylistHeader` + `VortXRemuxHLSServer.buildMediaBody`), so
+(`DVPlaybackPolicy.mediaPlaylistLines` + `VortXRemuxHLSServer.buildMediaBody`), so
 every point is observable with a plain MKV - which is all this machine has.
+
+## PRODUCT SYMBOL DEPENDENCIES (read this before changing either side)
+
+This harness compiles **real product source** and calls **real product symbols**. That
+is deliberate: a gate that re-implements what it grades proves nothing. The cost is that
+the harness can drift behind the product, and it did - it sat unbuildable, and therefore
+unavailable, while its numbers were a whole windowing generation stale. The list below is
+the contract between the two. **If you change any of these in the product, this harness is
+part of the change.**
+
+Product files compiled into the harness (`build_harness` in `run-conformance.sh`):
+
+| File | Why |
+|---|---|
+| `app/Sources/Player/DVPlaybackPolicy.swift` | the playlist renderer, the startup floor, the boundary decision |
+| `app/Sources/Player/VortXRemuxBuffer.swift` | `VortXHLSWindow` / `VortXHLSSegment`, which the renderer's signatures take |
+| `test/player-conformance/Stubs.swift` | the only two app singletons those two files read |
+
+Exact symbols the harness calls or mirrors:
+
+| Product symbol | Used by | Shipped value / shape |
+|---|---|---|
+| `DVPlaybackPolicy.mediaPlaylistLines(window:ended:targetDuration:mapURI:)` | `Playlist.buildMediaBodyLikeServer` | renders header **and** entries; the server joins its lines with `\n` |
+| `VortXHLSWindow` / `VortXHLSSegment` | `Playlist.buildMediaBodyLikeServer` | absolute segment ids; `mediaSequence` = first id |
+| `VortXHLSStartupReadiness.startupFloorMilliseconds` | `Contract.minStartupMs` | `4_000` |
+| `VortXHLSStartupReadiness.minimumSegmentCount` (default `2`) | `Contract.minStartupSegments` | `2` |
+| `VortXHLSTargetPolicy.conservativeSeconds` | `Contract.hlsTargetDuration`, `Contract.segmentFailSoftSecs` | `12` |
+| `VortXHLSBoundaryPolicy.decision(...)` | `Contract.segmentCutFloorSecs` and the point-2 structural check | cuts only on a confirmed IDR at/past `1.0 s`; fails soft past the frozen target; **no non-keyframe hard cut** |
+| `RemoteConfigDefaults.dvRemuxWindowMiB` | `Contract.windowFloorMiB` (diagnostic only) | `64` |
+
+Log lines the trace channel parses (all from `VortXRemuxHLSServer` / `VortXMKVRemuxStream` /
+`AVPlayerEngine`). These are a **format contract**; changing the text changes the gate:
+
+- `hls server listening on 127.0.0.1:<port>` - session boundary
+- `dv-remux mount host=...` - mount time for point 6
+- `readyToPlay -> play()` - ready time for point 6
+- `hls resp /media.m3u8 seq=<N> segs=<N> ended=<bool> <N>B` - points 1 and 4
+- `hls media segment <id> published +<s>s after mount (<N>B, <s>s media)` - **logged for ids 0 and 1 only**
+- `hls req|resp|404 /seg<id>.m4s`, `hls req /audio<rendition>-seg<id>.m4s`
+- `hls_startup_cohort_timeout ...` - point 7
+
+Two guards exist so this cannot rot silently again:
+
+1. **`Contract.driftAgainstProduct()`**, run first by `selftest`, compares every mirrored
+   number against the shipped symbol and names the symbol on any mismatch. It also proves
+   behaviourally that the retired non-keyframe hard cut stays retired.
+2. **A build failure is INFRA, not RED.** `build_harness` no longer lets `swiftc`'s exit
+   code escape as `1` (which is indistinguishable from "a contract point is RED"). It
+   prints the compiler output and exits `3`, pointing back at this section.
+
+### Windowing note (current, not the old model)
+
+The published media window is **consumption-anchored**: `VortXRemuxHLSServer` publishes
+behind the client's demonstrated fetch frontier, `EXT-X-MEDIA-SEQUENCE` **slides**, and
+entries the server can no longer serve are removed from the playlist. The RemoteConfig
+flag `dvWindowConsumptionAnchor` (default ON, `VortXRemuxHLSServer.swift:58-64`) restores
+the build-190 windowing when OFF. A `404` for an id the playlist has already dropped is
+therefore correct behaviour, and point 4 scores only a `404` for an id that is **still**
+advertised.
 
 ## Re-run when the rework lands
 
@@ -58,11 +117,25 @@ path if you need to regenerate a trace from a fresh binary. The gate exits `0` o
 when **every** point is GREEN/EXEMPT; against beta it exits non-zero. Subcommands
 also run directly: `/tmp/dd-harness/bin/player-conformance {selftest|trace <log>|live --container <dir>|spool <dir>}`.
 
-## What each point needs, and current beta status
+## What each point needs, and current status
 
-| # | Point | Channel | Beta now |
+**The "Beta now" column below is a HISTORICAL SNAPSHOT taken against the pre-consumption-anchor
+server, and row 1 is the clearest possible illustration of why a stale harness is worse than
+no harness.** It records the server serving its first `/media.m3u8` at `segs=2` and scores that
+**RED** - against a 6-segment floor the product had already retired. Two segments is now the
+*correct, shipped* startup cohort (`VortXHLSStartupReadiness`, 2 segments / 4 000 ms), so that
+RED was the harness being wrong about the product, not the product being wrong. The constants
+have been corrected and `Contract.driftAgainstProduct()` now guards them; re-run the gate to
+replace this column with live results.
+
+`live-auto` additionally requires the product-side DEBUG headless playback hook
+(`app/SourcesTV/DebugPlaybackHook.swift`, `VORTX_DEBUG_PLAY_URL`). On a line that does not
+carry it, preflight exits `3` and says so directly instead of sending you off to rebuild.
+`selftest`, `mutants`, `trace` and the manual `live` channel do not need it.
+
+| # | Point | Channel | Historical snapshot (stale, see above) |
 |---|-------|---------|----------|
-| 1 | Startup cohort ≥6 segs AND ≥15000 ms (integer-ms from EXTINF text) | trace + live | **RED** - first `/media.m3u8` served at `segs=2`, ~8000 ms |
+| 1 | Startup cohort (now ≥2 segs AND ≥4000 ms, integer-ms from EXTINF text) | trace + live | **RED, and the RED was the harness's fault** - first `/media.m3u8` served at `segs=2`, which the shipped floor accepts |
 | 2 | Every published segment starts on an IDR frame | live (init + fMP4 parse) | **RED** - the sampled first video access units fail the combined MP4-sync and AVC/HEVC-IDR test |
 | 3 | First video seg id == 0 AND first alt-audio seg id == 0 | trace + live | **RED** - video half is 0; no alternate-audio rendition exists (audio muxed) |
 | 4 | No advertised-segment 404 through the RFC 8216 §6.2.2 window | trace diagnostics + live complete-response probes | **RED, proven** - playlist advertised 116 while ~34 are resident; 16 advertised ids probed, all returned complete `HTTP 404` responses |
@@ -115,38 +188,43 @@ of these numbers is derived from a constant the harness already owns, never pick
 `Contract.swift` stays the single source of truth; do not replace any of them with a
 literal.
 
-### GOP 6.000 s, deliberately LONGER than the 4 s hard cut (point 2)
+### GOP 6.000 s (point 2) - and why its ORIGINAL rationale is now history
 
-This is the difference between a fixture that TESTS point 2 and one that FAKES it. The
-segmenter's entire cut rule is one predicate, `VortXMKVRemuxStream.swift:2030-2032`:
+**Read this before "fixing" the GOP.** The 6 s interval was chosen to exceed a 4 s
+non-keyframe hard cut. **That hard cut no longer exists**, so the paragraphs that used to
+live here described a mechanism the product retired. They are replaced rather than
+deleted, because deleting them would invite someone to re-derive the old number.
+
+The segmenter's cut rule is now one shipped, executable decision,
+`VortXHLSBoundaryPolicy.decision` (`DVPlaybackPolicy.swift:1123-1141`), called from
+`VortXMKVRemuxStream.swift:2589-2595`:
 
 ```swift
-guard (isKey && elapsed >= Self.hlsTargetSegmentSecs)   // 1.0 s
-        || elapsed >= Self.hlsMaxSegmentSecs            // 4.0 s
-        || openBytes >= Self.hlsMaxSegmentBytes else { return }
+let hasConfirmedStart = incomingIsIDR && incomingHasKeyFlag
+guard hasOpenSegment else { return hasConfirmedStart ? .open : .failSoft }
+guard elapsed <= frozenTargetSeconds else { return .failSoft }   // 12 s
+if hasConfirmedStart, elapsed >= targetSeconds { return .cut }   // 1 s
+return .continueOpen
 ```
 
-Cut on the first KEYFRAME past 1 s, else hard-cut at 4 s on whatever frame is current.
-Only that hard cut lacks an `isKey` guard, so only the hard cut can begin a segment
-mid-GOP, and that is the entire hazard point 2 exists to catch. At any keyframe interval
-of 4 s **or less** the keyframe branch always fires first, every cut lands IDR-aligned,
-and point 2 scores a **false GREEN** with the defect completely untouched.
+Neither `.open` nor `.cut` is reachable without `incomingIsIDR && incomingHasKeyFlag`.
+There is no byte cut and no time cut on an arbitrary frame; an open segment that runs past
+the frozen target **fails the remux soft** instead of cutting mid-GOP. The mid-GOP hazard
+recorded as MIS-260722-07 is therefore closed *structurally*, not statistically, and no
+fixture GOP can reproduce it. `Contract.driftAgainstProduct()` asserts exactly that
+property on the shipped function, so if a hard cut ever comes back the selftest says so by
+name instead of the gate quietly depending on a fixture parameter.
 
-This is not the same rule as "a GOP that does not divide evenly into 4 s". A 3 s GOP
-satisfies that and still hides the hazard: measured, it produced 2.92 s / 3.00 s
-segments, zero hard cuts, and point 2 GREEN with zero offenders. **The interval must
-exceed 4 s.** At 6 s the cuts are periodic and half of them are mid-GOP by construction:
+What point 2 still tests, and why the fixture still matters: the harness fetches real
+published segments and proves each one's first video access unit carries **both** MP4 sync
+metadata **and** a real AVC/HEVC IDR NAL. That is a check on what the muxer actually
+emitted, independent of what the boundary policy intended.
 
-```
-seg0   0.0 -> 4.0   hard cut at 4 s              (starts on the t=0 keyframe: IDR)
-seg1   4.0 -> 6.0   keyframe cut, elapsed 2.0 s  (STARTS MID-GOP: non-IDR)
-seg2   6.0 -> 10.0  hard cut                     (starts on the t=6 keyframe: IDR)
-seg3  10.0 -> 12.0  keyframe cut                 (STARTS MID-GOP: non-IDR)
-```
-
-6 s also leaves the post-cut remainder at 2.0 s, comfortably clear of the 1 s target
-floor, so the following keyframe cut is unambiguous rather than a floating-point coin
-toss (a 5 s GOP puts that remainder on exactly 1.000 s).
+The 6 s interval is kept because it remains a good fixture: it is comfortably under the
+12 s fail-soft ceiling, it is well clear of the 1 s cut floor so segment lengths are
+unambiguous rather than a floating-point coin toss (a 5 s GOP lands the post-cut remainder
+on exactly 1.000 s), and with the shipped 2-segment / 4 000 ms startup floor it fills the
+cohort in exactly two segments of 6 s.
 
 ### Delivery paced at 4x the fixture's own bitrate (point 1)
 
@@ -351,8 +429,8 @@ deliver and provably cannot fill before any startup deadline. Both constants are
 of `Contract.swift`. The runner logs the derivation:
 
 ```
-[starve] starving pace 80223 B/s. Derivation: the contract's cohort floor is
-[starve]   6 segments AND 15000 ms; delivering 15000 ms of media
+[starve] starving pace 21392 B/s. Derivation: the contract's cohort floor is
+[starve]   2 segments AND 4000 ms; delivering 4000 ms of media
 [starve]   at this rate takes 120s, i.e. 4x the 30000 ms
 [starve]   mount->ready SLO, so the cohort provably cannot fill before any startup deadline.
 ```
@@ -407,9 +485,17 @@ If the fixture server does die, its stderr is preserved at
 Two synthetic golden traces (no real user data) show the harness flips per behaviour:
 
 ```bash
-/tmp/dd-harness/bin/player-conformance trace fixtures/post-rework-normal.trace.txt  # points 1,3,4,6 -> GREEN
+/tmp/dd-harness/bin/player-conformance trace fixtures/post-rework-normal.trace.txt  # points 1,3,6 -> GREEN
 /tmp/dd-harness/bin/player-conformance trace fixtures/forced-timeout.trace.txt      # point 7 -> GREEN
 ```
+
+**These two files are HAND-WRITTEN, not captured**, so they are only as truthful as whoever
+last edited them - and that is a rot surface of its own. They previously carried line shapes
+the server does not emit (`hls resp /media.m3u8 segs=N` with no `seq=`, `plain-remux mount`,
+`/aseg0.m4s`), which is precisely how the trace channel's parser was tuned to a product that
+did not exist. They now mirror the shipped vocabulary listed under **PRODUCT SYMBOL
+DEPENDENCIES** above. Point 4 is deliberately INDETERMINATE on the normal fixture: the trace
+channel never lets resident-window arithmetic alone decide availability.
 
 The real overnight beta trace makes points 1, 3, 4 RED; feeding the same harness a
 trace with a filled cohort, a `seg0`/`aseg0` first request, a bounded advertised
