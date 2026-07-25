@@ -643,6 +643,7 @@ struct TVPlayerView: View {
             // (first-writer-wins, background, gated; no-op if the community already had a set). Both engines
             // capture frames now (AVPlayer via AVPlayerItemVideoOutput). Independent of the engine-teardown rules below.
             scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
+            NowPlayingCenter.clear()   // #157: drop the system Now Playing card + its transport targets on close
             saveProgress(at: currentTime, thenSyncEngine: true)   // exit flush: save, THEN pull the engine's library fresh (no-op for live)
             // R9: same floor guard the periodic (:562) and saveProgress paths use. A suppressed DV-remux resume
             // restarted playback at 0, so this final flush must not regress the ENGINE resume point below where
@@ -873,6 +874,10 @@ struct TVPlayerView: View {
             if let b = data as? Bool {
                 isPaused = b
                 UIApplication.shared.isIdleTimerDisabled = !b   // hold the TV awake while playing; let it sleep when paused
+                // #157: reflect play/pause on the system card AT ONCE. The play head stops ticking while
+                // paused, so without this the published rate would stay at "playing" and the Control Center
+                // clock would keep running against a frozen picture.
+                refreshNowPlaying(force: true)
                 // External sync (Trakt) live scrobble pause/resume, ADDED ALONGSIDE the existing persistence
                 // below (which is unchanged). Fail-soft + gated inside the coordinator; a no-op with empty
                 // creds. SIMKL has no live scrobble, so it is skipped by capability.
@@ -989,6 +994,21 @@ struct TVPlayerView: View {
                     // creds. Duration is often still 0 at first frame, so this starts at 0% and the stop carries
                     // the real percentage.
                     if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStarted(m, position: d, duration: duration, sessionToken: playbackSessionID) }
+                    // #157: register this playback with the system. Until this landed the Apple TV held an
+                    // active .playback audio session while telling the OS nothing was playing, so the Control
+                    // Center Now Playing card was empty and no system-level transport reached the player.
+                    // Wired ONCE per playback at first frame (the same moment iOS wires it); the position and
+                    // state then ride the ordinary tick / pause handlers below. Seeks go through the engine
+                    // RELATIVE/ABSOLUTE calls so they always act on the LIVE position, never a captured one.
+                    NowPlayingCenter.wireCommands(
+                        play: { coordinator.player?.play() },
+                        pause: { coordinator.player?.pause() },
+                        togglePause: { coordinator.player?.togglePause() },
+                        seekBy: { delta in coordinator.player?.seek(by: delta) },
+                        seekTo: { position in coordinator.player?.seek(to: position) },
+                        stepSeconds: seekStepSeconds,
+                        canScrub: NowPlayingPolicy.allowsScrubbing(duration: duration, isLive: isCurrentLiveStream))
+                    refreshNowPlaying(force: true)   // publish the card immediately, not on the next tick
                     fetchPooledSubtitles()          // community-subtitle pool (P2/P3), fail-soft + gated
                     uploadEmbeddedSubtitlesIfNeeded()   // best-effort pooling of the file's own text tracks (P4)
                     // Add-on subtitles were fetched only from the `duration` event, which a debrid direct-HTTP
@@ -1023,6 +1043,13 @@ struct TVPlayerView: View {
                     handleProperty(MPVProperty.duration, engineDur, loadToken: event.loadToken)
                 }
                 updateCurrentSkip(at: d)
+                // #157: keep the system Now Playing card's clock honest. Self-throttling, so this is a couple
+                // of pushes a second at most, not one per 4 Hz tick (the system extrapolates the play head
+                // from the last elapsed+rate pair it was given). A duration that only lands mid-playback
+                // (durationless debrid MKVs) also turns the system's position controls on at that moment.
+                refreshNowPlaying()
+                NowPlayingCenter.setScrubbingEnabled(
+                    NowPlayingPolicy.allowsScrubbing(duration: duration, isLive: isCurrentLiveStream))
                 // Ensure the community key is provisioned off meta.runtime the moment the behind-playback
                 // meta lands (idempotent; no-op once keyed), so capture starts even without a duration event.
                 configureCommunityTrickplayProvisional()
@@ -4094,6 +4121,41 @@ struct TVPlayerView: View {
 
     private var isCurrentLiveStream: Bool { curIsLive && !isTorrentPlayback }
     private var initialLiveMode: Bool { !torrent && isLiveMeta(meta) }
+
+    // MARK: - System Now Playing (#157)
+
+    /// What the Apple TV Control Center card / system transport should show for what is playing RIGHT NOW.
+    /// Built from the LIVE identity (`curTitle` / `curMeta`), never the immutable launch props, so a binge
+    /// advance or an in-player source hop re-publishes the new episode instead of leaving the card on the
+    /// outgoing one. Series carry the show name + season/episode separately; a movie leaves them nil.
+    private var nowPlayingItem: NowPlayingItem {
+        let m = curMeta ?? meta
+        let isSeries = m?.usesSeriesLifecycle == true
+        let displayTitle = curTitle.isEmpty ? (m?.name ?? title) : curTitle
+        return NowPlayingItem(title: displayTitle,
+                              showName: isSeries ? m?.name : nil,
+                              season: isSeries ? m?.season : nil,
+                              episode: isSeries ? m?.episode : nil,
+                              artworkURL: m?.poster,
+                              isLive: isCurrentLiveStream)
+    }
+
+    /// Push the current position / state to the system Now Playing surface. Cheap and self-throttling
+    /// (`NowPlayingPolicy.refreshInterval`), so it is safe on the 4 Hz tick; `force` is for the moments the
+    /// system cannot extrapolate, i.e. right after a committed seek.
+    ///
+    /// Engine-agnostic by construction: it reads only the chrome's own `currentTime` / `duration` /
+    /// `isPaused`, which BOTH engines drive through the same property stream, so libmpv and AVPlayer (incl.
+    /// the Dolby Vision remux lane) publish identically with no engine branch here.
+    private func refreshNowPlaying(force: Bool = false) {
+        guard hasStartedPlaying else { return }
+        NowPlayingCenter.update(item: nowPlayingItem,
+                                elapsed: currentTime,
+                                duration: duration,
+                                paused: isPaused,
+                                speed: playSpeed,
+                                force: force)
+    }
 
     /// The first load's URL/headers, proxied through the embedded server when the launch stream
     /// declares request headers (same routing as loadIntoPlayer, applied to the initial play).
