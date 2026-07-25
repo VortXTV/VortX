@@ -124,6 +124,43 @@ struct PlayerScreen: View {
         return hasStartedPlaying && !isSeekable
     }
 
+    // MARK: - System Now Playing (#157)
+
+    /// What the Lock Screen / Control Center / Mac menu-bar card should show for what is playing RIGHT NOW.
+    /// Built from the LIVE identity (`curTitle` / `curMeta`), never the immutable launch props, so a binge
+    /// advance or an in-player source hop re-publishes the new episode. Series carry the show name +
+    /// season/episode separately; a movie leaves them nil.
+    private var nowPlayingItem: NowPlayingItem {
+        let m = curMeta   // already falls back to the launch meta
+        let isSeries = m?.usesSeriesLifecycle == true
+        let displayTitle = curTitle.isEmpty ? (m?.name ?? title) : curTitle
+        return NowPlayingItem(title: displayTitle,
+                              showName: isSeries ? m?.name : nil,
+                              season: isSeries ? m?.season : nil,
+                              episode: isSeries ? m?.episode : nil,
+                              artworkURL: m?.poster,
+                              isLive: effectivelyLive)
+    }
+
+    /// Push the current position / state to the system Now Playing surface. Self-throttling, so it is safe on
+    /// the 4 Hz tick; `force` is for the moments the system cannot extrapolate (first frame, play/pause).
+    /// Engine-agnostic: it reads only the chrome's own state, which BOTH engines drive through the same
+    /// property stream.
+    ///
+    /// `at` overrides the published position for the ONE caller that runs before `currentTime` has been
+    /// assigned this tick's value: the first-frame publish. Without it a resumed title publishes 0 and is
+    /// only corrected on the next tick, so the card would briefly show the start of a film resumed at 40
+    /// minutes.
+    private func updateNowPlaying(at elapsed: Double? = nil, force: Bool = false) {
+        guard hasStartedPlaying else { return }
+        NowPlayingCenter.update(item: nowPlayingItem,
+                                elapsed: elapsed ?? currentTime,
+                                duration: duration,
+                                paused: isPaused,
+                                speed: speed,
+                                force: force)
+    }
+
     // MARK: Panels
 
     private enum Panel: Identifiable, Equatable {
@@ -1176,12 +1213,20 @@ struct PlayerScreen: View {
                     // is often still 0 at first frame, so this starts at 0% and later ticks / the stop carry
                     // the real percentage.
                     if let m = curMeta, !effectivelyLive { ScrobbleCoordinator.shared.playbackStarted(m, position: d, duration: duration, sessionToken: playbackSessionID) }
-                    // Lock Screen / Control Center transport. Relative mpv seek so the skip always works off
-                    // the LIVE position (a captured currentTime would be stale in these long-lived targets).
+                    // Lock Screen / Control Center / media-key transport. Relative mpv seek so the skip always
+                    // works off the LIVE position (a captured currentTime would be stale in these long-lived
+                    // targets); the absolute seek is the system progress bar's own drag. play/pause are
+                    // DISTINCT from the toggle now: the system sends the command it wants, so routing an
+                    // explicit "play" into a toggle paused a playing film (#157).
                     NowPlayingCenter.wireCommands(
+                        play: { coordinator.player?.play() },
+                        pause: { coordinator.player?.pause() },
                         togglePause: { coordinator.player?.togglePause() },
-                        seek: { delta in coordinator.player?.seek(by: delta) },
-                        stepSeconds: seekStepSeconds)
+                        seekBy: { delta in coordinator.player?.seek(by: delta) },
+                        seekTo: { position in coordinator.player?.seek(to: position) },
+                        stepSeconds: seekStepSeconds,
+                        canScrub: NowPlayingPolicy.allowsScrubbing(duration: duration, isLive: effectivelyLive))
+                    updateNowPlaying(at: d, force: true)   // publish the card immediately, not on the next tick
                     fetchPooledSubtitles()          // community-subtitle pool (P2/P3), fail-soft + gated
                     uploadEmbeddedSubtitlesIfNeeded()   // best-effort pooling of the file's own text tracks (P4)
                     applyPersistedVolume()          // restore the saved in-player volume + mute (D5)
@@ -1207,7 +1252,9 @@ struct PlayerScreen: View {
                     }
                     #endif
                     updateCurrentSkip(at: d)
-                    NowPlayingCenter.update(title: curTitle, elapsed: d, duration: duration, paused: isPaused)
+                    updateNowPlaying()
+                    NowPlayingCenter.setScrubbingEnabled(
+                        NowPlayingPolicy.allowsScrubbing(duration: duration, isLive: effectivelyLive))
                     // Provision the community key off meta.runtime the moment the behind-playback meta lands
                     // (idempotent; no-op once keyed), so capture starts even without a duration event.
                     configureCommunityTrickplayProvisional()
@@ -1312,7 +1359,7 @@ struct PlayerScreen: View {
                 isPaused = b
                 // Reflect the play/pause state on the Lock Screen immediately (timePos stops ticking while
                 // paused, so without this the now-playing rate would stay stuck at "playing").
-                NowPlayingCenter.update(title: curTitle, elapsed: currentTime, duration: duration, paused: b)
+                updateNowPlaying(force: true)
                 // External sync (Trakt) live scrobble pause/resume. Scrobble ONLY: this handler persists
                 // nothing else (no resume-point write). Additive + fail-soft + gated inside the coordinator;
                 // a no-op with empty creds. Live content is excluded (parity with the start/stop hooks).
