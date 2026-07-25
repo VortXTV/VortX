@@ -1685,6 +1685,17 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             guard player.currentItem === item else { return }   // a newer file loaded meanwhile
             audioGroup = ag
             subGroup = sg
+            // VortX owns track selection from here on (TrackSelector runs on the first track-list publication
+            // and the picker drives every later change), so stop AVFoundation re-applying its OWN automatic
+            // criteria on top. Apple's contract for `select(_:in:)` is exactly this: an app that selects
+            // explicitly must clear this flag, otherwise the framework re-asserts its automatic choice at the
+            // next selection opportunity and silently reverts the app's pick. Left at its default `true`,
+            // that is a live fight on the remux lane, whose master carries DEFAULT=YES / AUTOSELECT rows:
+            // an explicit deselect could come back on (subtitles rendering while the picker says Off) and an
+            // explicit pick could be undone right after the rendition finished buffering ("I click it, the
+            // stream buffers and nothing changes"). Clearing the flag deselects nothing, so whatever is
+            // already playing keeps playing; it only stops future automatic overrides.
+            item.appliesMediaSelectionCriteriaAutomatically = false
             // A selection notification may arrive before the groups finish loading and publish an empty
             // snapshot. Force the newly available option topology to publish once even when both are Off.
             selectionRefreshState.reset()
