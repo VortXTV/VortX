@@ -149,11 +149,25 @@ extension MirrorSettings {
 enum LocalRewindLog {
     private static let key = "vortx.cw.localRewinds.v1"
 
+    /// Hard bound, in the shape `AddonTombstones` uses for its durable sets. The log is normally near-empty
+    /// (an id lives here only between a local finish and the account doc absorbing its zero), so the cap is
+    /// only a floor under a pathological device that somehow never pushes: the OLDEST stamps are dropped, and
+    /// dropping one only costs that title the exemption, which restores the pre-toggle behaviour for it.
+    private static let maxEntries = 500
+
+    /// All ids currently stamped. Read fresh from UserDefaults so the write side (`CoreBridge.finishedWatching`)
+    /// and the retire side (`VortXSyncManager.vortxSummary`) always see the same authority.
+    static func all() -> [String] {
+        UserDefaults.standard.stringArray(forKey: key) ?? []
+    }
+
     static func stamp(_ id: String) {
         guard !id.isEmpty else { return }
-        var ids = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
-        guard ids.insert(id).inserted else { return }
-        UserDefaults.standard.set(Array(ids), forKey: key)
+        var ids = all()
+        guard !ids.contains(id) else { return }
+        ids.append(id)
+        if ids.count > maxEntries { ids.removeFirst(ids.count - maxEntries) }
+        UserDefaults.standard.set(ids, forKey: key)
     }
 
     static func contains(_ id: String) -> Bool {

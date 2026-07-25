@@ -227,6 +227,22 @@ func testLocalRewindLog() {
     expect(LocalRewindLog.contains("tt200"), "forgetting an absent id is a no-op")
     LocalRewindLog.stamp("")
     expect(LocalRewindLog.contains("") == false, "an empty id is never stamped")
+
+    // `all()` is what vortxSummary sweeps, so it must report exactly what is held.
+    UserDefaults.standard.removeObject(forKey: "vortx.cw.localRewinds.v1")
+    LocalRewindLog.stamp("tt1")
+    LocalRewindLog.stamp("tt2")
+    expect(Set(LocalRewindLog.all()) == Set(["tt1", "tt2"]), "all() reports every stamped id")
+    LocalRewindLog.forget("tt1")
+    expect(LocalRewindLog.all() == ["tt2"], "all() drops a forgotten id")
+
+    // Bounded, so a device that somehow never absorbs its zeros cannot grow the log without limit. Dropping
+    // the oldest stamp only costs that one title its exemption, which is the pre-toggle behaviour for it.
+    UserDefaults.standard.removeObject(forKey: "vortx.cw.localRewinds.v1")
+    for n in 0 ..< 600 { LocalRewindLog.stamp("tt\(n)") }
+    expect(LocalRewindLog.all().count == 500, "the log is capped at 500 entries")
+    expect(LocalRewindLog.contains("tt599"), "the cap keeps the NEWEST stamps")
+    expect(LocalRewindLog.contains("tt0") == false, "the cap evicts the oldest stamps")
     UserDefaults.standard.removeObject(forKey: "vortx.cw.localRewinds.v1")
 }
 

@@ -1525,16 +1525,20 @@ final class CoreBridge: ObservableObject {
         guard !mayReplace else { return items }
         return items.map { item in
             let owned = OwnerResumeStore.entry(forId: item.id)
+            let enginePosition = MirrorSettings.CWPosition(t: item.state.timeOffset / 1000,
+                                                          d: item.state.duration / 1000,
+                                                          v: item.state.videoId)
             let resolved = MirrorSettings.resolveContinueWatching(
-                engine: MirrorSettings.CWPosition(t: item.state.timeOffset / 1000,
-                                                  d: item.state.duration / 1000,
-                                                  v: item.state.videoId),
+                engine: enginePosition,
                 owned: owned.map { MirrorSettings.CWPosition(t: $0.t, d: $0.d, v: $0.v) },
                 mayReplace: false,
                 locallyRewound: LocalRewindLog.contains(item.id))
             // Unchanged position: hand back the ORIGINAL item so the engine's watched bookkeeping
-            // (flaggedWatched / timesWatched, which `pruneFinished` reads) is preserved untouched.
-            guard resolved.t != item.state.timeOffset / 1000 || resolved.v != item.state.videoId else { return item }
+            // (flaggedWatched / timesWatched, which `pruneFinished` reads) is preserved untouched. Compared
+            // against the NORMALIZED engine position, not the raw fields: `CWPosition` folds an empty video id
+            // to nil, so comparing raw would read "changed" for every item the engine spells with `""` and
+            // would silently strip the watched counters off titles the floor never touched.
+            guard resolved != enginePosition else { return item }
             // Floored: the VortX position won, so the title is in progress by VortX's own truth and must not
             // carry the engine's Stremio-sourced watched flags into `pruneFinished`.
             let state = CoreLibState(timeOffset: resolved.t * 1000, duration: resolved.d * 1000, videoId: resolved.v)

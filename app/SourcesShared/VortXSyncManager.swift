@@ -853,6 +853,15 @@ final class VortXSyncManager: ObservableObject {
         }
         let stremioMayReplaceCW = MirrorSettings.stremioMayReplaceContinueWatching(
             stremioSessionLive: CoreBridge.shared.isLoggedIn())
+        // Retire local-rewind exemptions the account doc has already absorbed. An id is stamped by
+        // `CoreBridge.finishedWatching` and is only needed until the doc carries its zero; once the doc says
+        // t == 0 (or has no entry for the title at all, in which case the floor cannot engage for it anyway)
+        // the stamp is dead weight. UNCONDITIONAL, deliberately: a device that never has a live Stremio session
+        // never enters the floor branch below, so a retire that only ran there would let the log grow by one id
+        // per finished title forever.
+        for id in LocalRewindLog.all() where Self.libSeconds(priorPositions[id]?["t"]) == 0 {
+            LocalRewindLog.forget(id)
+        }
         for entry in engineLibrary {
             guard let id = entry["id"] as? String else { continue }
             // Wave 4 clobber guard (Finding 1): do NOT let a bare, progress-less engine item (t == 0 AND d == 0,
@@ -889,9 +898,6 @@ final class VortXSyncManager: ObservableObject {
                 var merged = entry     // keep the engine's fresh name / poster / type; only the position is floored
                 merged["t"] = Int(resolved.t); merged["d"] = Int(resolved.d); merged["v"] = resolved.v ?? ""
                 libraryByID[id] = merged
-                // Self-clear the local-rewind exemption once the account doc already carries the zero: the finish
-                // has landed, so the id no longer needs to bypass the floor.
-                if locallyRewound, Self.libSeconds(prior["t"]) == 0 { LocalRewindLog.forget(id) }
                 continue
             }
             libraryByID[id] = entry
