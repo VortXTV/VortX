@@ -2,7 +2,7 @@
 #
 # Points this clone's git hooks at the tracked .githooks/ directory.
 #
-# Run by scripts/fetch-server-deps.sh, which CLAUDE.md documents as the first command
+# Run by scripts/fetch-server-deps.sh, which the README documents as the first command
 # after cloning, so a fresh clone is guarded without anyone having to be told. Safe and
 # silent to re-run; it only prints when it changes something or finds a problem.
 #

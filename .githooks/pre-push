@@ -110,13 +110,19 @@ case $? in
     *) say "PUSH BLOCKED  engine leak guard: path probe failed, refusing to guess"; exit 1 ;;
 esac
 
-# Marker sweep reads blob contents, so it runs over the deduplicated TREES of the refs
-# being pushed rather than over every commit. A relocated or renamed engine tree is
-# visible at a tip by definition; scanning full history for it would cost minutes.
-for tree in $(printf '%s\n' "$tip_shas" | while read -r s; do
-                  [ -n "$s" ] && git rev-parse --quiet --verify "$s^{tree}" 2>/dev/null
-              done | sort -u); do
-    out="$("$SCANNER" markers "$tree")"
+# Marker sweep reads blob contents, so it runs once per distinct TREE among the refs being
+# pushed rather than once per commit: pushing 90 tags off one branch is one sweep, not 90.
+# It is reported against the commit, not the tree, because a commit is what an operator can
+# actually go and look at. Tips only: a relocated or renamed engine tree is visible at a tip
+# by definition, and sweeping full history for it would cost minutes instead of a second.
+seen_trees=" "
+for sha in $tip_shas; do
+    tree="$(git rev-parse --quiet --verify "$sha^{tree}" 2>/dev/null)" || continue
+    [ -n "$tree" ] || continue
+    case "$seen_trees" in *" $tree "*) continue ;; esac
+    seen_trees="$seen_trees$tree "
+
+    out="$("$SCANNER" markers "$sha")"
     case $? in
         0) : ;;
         1) findings="$findings$out"$'\n' ;;

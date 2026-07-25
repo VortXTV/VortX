@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # --- git hooks -------------------------------------------------------------------------
-# Installed here because CLAUDE.md documents this script as the first command after
+# Installed here because the README documents this script as the first command after
 # cloning, so the pre-push engine leak guard is live before anyone can push. Idempotent
 # and silent once installed. Non-fatal on failure (a source export is not a git clone),
 # but loud, because an uninstalled guard is an unguarded clone.

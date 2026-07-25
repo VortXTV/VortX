@@ -24,8 +24,13 @@
 #   scan-proprietary-engine.sh markers <commit-ish>    # content-marker sweep of one tree
 #
 # OUTPUT  one violation per line, on stdout:
-#   PATH    <commit> <top-level-path>
+#   PATH    <commit> <top-level-path> <tree-oid>
 #   MARKER  <commit> <file>
+#
+# The trailing tree OID names the engine SNAPSHOT, not the commit that happens to carry
+# it. 1258 commits in this repo's history carry only 143 distinct snapshots, so the OID is
+# what CI's baseline is keyed on: it distinguishes "content that is already public" from
+# "content that has just leaked", which a commit id cannot do.
 #
 # EXIT    0 clean   1 violations found   2 internal error (callers MUST treat as unsafe)
 
@@ -58,25 +63,44 @@ die() { printf 'scan-proprietary-engine: %s\n' "$*" >&2; exit 2; }
 # repo: 1703 commits x 2 paths in 0.22s. Cheap enough that nobody is tempted to skip it,
 # which was an explicit design constraint: a guard people route around protects nothing.
 probe_paths() {
-    local commits path commit rc
+    local commits path commit expected st
     commits="$(cat)"
-    [ -n "$commits" ] || return 0
+    commits="$(printf '%s\n' "$commits" | awk 'NF')"
 
-    # `--batch-check='%(objecttype) %(rest)'` prints "tree <label>" when the path resolves
-    # and "<input> missing" when it does not, so a leading "tree"/"blob" is a hit and the
-    # label carries the commit and path back out.
+    # An empty list is an ERROR, not a clean result. Callers only invoke this when they
+    # have refs to check, so "nothing arrived" means the pipe, the shell, or git broke.
+    # Reading that as "clean" is precisely how a guard fails open.
+    [ -n "$commits" ] || die "no commit-ish arrived on stdin"
+    expected=$(printf '%s\n' "$commits" | wc -l | tr -d ' ')
+
+    # Two kinds of probe go through one `git cat-file` pass:
+    #   "<c> <c> :self:"        proves the commit is actually readable here
+    #   "<c>:<path> <c> <path>" asks whether the proprietary tree is in it
+    # `--batch-check='%(objectname) %(objecttype) %(rest)'` answers "<oid> <type> <label>"
+    # on a hit and "<input> missing" otherwise. A missing :self: line means we could not
+    # see the commit at all, so its silence proves nothing and the scan must be failed.
     {
+        printf '%s\n' "$commits" | while IFS= read -r commit; do
+            printf '%s %s :self:\n' "$commit" "$commit"
+        done
         for path in $PROPRIETARY_PATHS; do
             printf '%s\n' "$commits" | while IFS= read -r commit; do
-                [ -n "$commit" ] || continue
                 printf '%s:%s %s %s\n' "$commit" "$path" "$commit" "$path"
             done
         done
-    } | git cat-file --batch-check='%(objecttype) %(rest)' 2>/dev/null \
-      | awk '$1 == "tree" || $1 == "blob" { print "PATH   ", $2, $3 }'
+    } | git cat-file --batch-check='%(objectname) %(objecttype) %(rest)' 2>/dev/null \
+      | awk -v expected="$expected" '
+            $2 == "tree" || $2 == "blob"      { print "PATH   ", $3, $4, $1; next }
+            $2 == "commit" || $2 == "tag"     { seen++; next }
+            # "<token> missing": a token with a colon is a path that is simply absent
+            # (the good case); a token without one is a commit we could not resolve.
+            $2 == "missing" && index($1,":")==0 { print "unresolvable commit-ish: " $1 > "/dev/stderr"; bad++ }
+            END { if (bad > 0 || seen != expected) exit 3 }
+        '
 
-    rc=${PIPESTATUS[1]:-0}
-    [ "$rc" -le 1 ] || die "git cat-file failed (rc=$rc)"
+    st=("${PIPESTATUS[@]}")
+    [ "${st[1]}" -eq 0 ] || die "git cat-file failed (rc=${st[1]})"
+    [ "${st[2]}" -eq 0 ] || die "could not read every commit being pushed, refusing to report clean"
 }
 
 # Sweep one tree for the content markers.

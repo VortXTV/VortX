@@ -73,9 +73,15 @@ jobs:
 
           found=""
           rc=0
-          "$scanner" paths - < commits.txt || rc=$?
+          "$scanner" paths - < commits.txt > hits.txt || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::path probe failed (rc=$rc)"; exit 1; }
-          [ "$rc" -eq 0 ] || found=1
+
+          # Same baseline the nightly sweep uses, for the same reason: a branch cut from an
+          # old point inherits engine snapshots that were public long before this push, and
+          # alarming on those trains everyone to ignore the alarm.
+          grep -E '^[0-9a-f]{40}$' .github/engine-leak-baseline.txt | sort -u > known.txt
+          awk 'NR == FNR { known[$1] = 1; next } !($4 in known)' known.txt hits.txt > new.txt
+          if [ -s new.txt ]; then cat new.txt; found=1; fi
 
           rc=0
           "$scanner" markers "$AFTER" || rc=$?
@@ -100,32 +106,52 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
-      - name: Probe every branch and tag
+      - name: Probe every commit reachable from every branch and tag
         run: |
           set -uo pipefail
           scanner=scripts/scan-proprietary-engine.sh
+          baseline=.github/engine-leak-baseline.txt
           [ -x "$scanner" ] || { echo "::error::$scanner missing on the default branch"; exit 1; }
+          [ -r "$baseline" ] || { echo "::error::$baseline missing; refusing to sweep without it"; exit 1; }
 
           git for-each-ref --format='%(objectname) %(refname)' \
               refs/remotes/origin refs/tags > refs.txt
-          echo "refs on this repository: $(wc -l < refs.txt)"
+          awk '{print $1}' refs.txt | sort -u > tips.txt
+
+          # Full history, not just ref tips. A push that bypassed the hook can easily have
+          # a clean tip and the engine three commits back, and walking every reachable
+          # commit costs about a second here (3231 commits in 0.6s when this was written).
+          git rev-list --stdin < tips.txt 2>/dev/null | sort -u > commits.txt
+          echo "refs: $(wc -l < refs.txt)   reachable commits: $(wc -l < commits.txt)"
 
           rc=0
-          awk '{print $1}' refs.txt | sort -u | "$scanner" paths - > hits.txt || rc=$?
+          "$scanner" paths - < commits.txt > hits.txt || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::path probe failed (rc=$rc)"; exit 1; }
 
-          if [ "$rc" -eq 1 ]; then
-            echo "Proprietary engine trees found:"
-            cat hits.txt
+          # Drop snapshots that were already public before the guard existed. Keyed on the
+          # tree OID, so a genuinely new engine snapshot is never hidden by an old one.
+          grep -E '^[0-9a-f]{40}$' "$baseline" | sort -u > known.txt
+          awk 'NR == FNR { known[$1] = 1; next } !($4 in known)' known.txt hits.txt > new.txt
+
+          echo "engine-bearing commits: $(wc -l < hits.txt) across $(awk '{print $4}' hits.txt | sort -u | wc -l) snapshots"
+          echo "already-public snapshots baselined: $(wc -l < known.txt)"
+
+          if [ -s new.txt ]; then
+            echo "Engine snapshots that are NOT in the baseline:"
+            awk '{print $4}' new.txt | sort -u
             echo
-            echo "Refs pointing at them:"
-            while read -r sha ref; do
-              grep -q " $sha " hits.txt && echo "  $ref"
-            done < refs.txt
-            echo "::error::Proprietary engine source is reachable on this PUBLIC repository. Deleting the ref does not unpublish the objects; treat this as a disclosure, not a typo."
+            echo "Commits carrying them:"
+            sort -u new.txt
+            echo
+            echo "Refs that reach them (first few commits shown):"
+            awk '{print $2}' new.txt | sort -u | head -5 | while read -r c; do
+              printf '  %s is reachable from:\n' "$c"
+              git for-each-ref --contains "$c" --format='    %(refname)' refs/remotes/origin refs/tags
+            done
+            echo "::error::New proprietary engine material is public on this repository. Deleting the ref does not unpublish the objects: treat this as a disclosure, not a typo. Rotate what needs rotating, then decide deliberately whether the snapshot joins .github/engine-leak-baseline.txt."
             exit 1
           fi
-          echo "clean: no proprietary engine trees on any ref"
+          echo "clean: every engine snapshot present here was already public before the guard existed"
 
       - name: Marker sweep of the default branch
         run: |
