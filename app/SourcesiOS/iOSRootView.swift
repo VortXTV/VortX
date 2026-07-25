@@ -113,7 +113,7 @@ struct iOSRootView: View {
     @ObservedObject private var updates = UpdateChecker.shared
     #if !os(tvOS)
     /// Offline downloads (#30), observed so the Library tab can carry a live count badge of in-flight
-    /// downloads — the persistent "downloads are running, find them here" signal away from the detail page.
+    /// downloads, the persistent "downloads are running, find them here" signal away from the detail page.
     @ObservedObject private var downloads = DownloadStore.shared
     #endif
     /// Live connectivity (#120): drives the quiet "You're offline" strip and the one-shot offline
@@ -191,7 +191,7 @@ struct iOSRootView: View {
             ZStack {
                 // `isActive` gates each browse screen's `.principal` wordmark: on macOS a principal
                 // toolbar item is hoisted into the shared window titlebar, and every mounted
-                // NavigationStack would otherwise stamp its own — tiling "StremioX" once per screen.
+                // NavigationStack would otherwise stamp its own, tiling "StremioX" once per screen.
                 // Only the visible tab contributes its wordmark (#46 regression).
                 iOSHomeView(isActive: tab == .home).opacity(tab == .home ? 1 : 0)
                 // Hidden tabs UNMOUNT, mirroring Live's long-standing gate (#117): a tab hidden in
@@ -447,7 +447,7 @@ struct iOSRootView: View {
     /// MAC NAV MOVE (CEO greenlit): the macOS navigation shell, restructured from the old bottom bar
     /// into a top-center floating glass pill (the Mac mockup): the VortX mark, then the SAME tab items
     /// as the bar (`tabButton`, `visibleTabs`), so tab identity / selection / scroll-to-top / the
-    /// macOS keyboard focus-ring wiring carry over UNCHANGED — only the pill's position and the
+    /// macOS keyboard focus-ring wiring carry over UNCHANGED; only the pill's position and the
     /// wordmark move. Structural on macOS ONLY (see the `#if os(macOS)` gate around this whole
     /// extension and around its call site in `body`); iOS/iPadOS keep `customTabBar` at the bottom.
     private var macNavPill: some View {
@@ -761,7 +761,7 @@ private extension View {
 /// engine, under the interactive featured hero. Signed-out shows a sign-in prompt; the rails populate
 /// as the engine hydrates.
 struct iOSHomeView: View {
-    /// True only when this is the visible tab — gates the macOS window-titlebar wordmark (#46).
+    /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
@@ -897,7 +897,7 @@ struct iOSHomeView: View {
     /// catalog row, capped by the model. These are the titles a Home visitor sees first.
     private var heroCandidates: [FeaturedHeroItem] {
         // A Continue-Watching entry carries only name + poster (no rating / year / genres), so a
-        // CW-sourced hero is bare until the slow background HTTP enrichment lands — and when that fetch
+        // CW-sourced hero is bare until the slow background HTTP enrichment lands, and when that fetch
         // is unreliable, the hero's meta row stays empty (the reported "no metadata on the backdrop").
         // If the same title is ALSO in a loaded catalog row, seed from that CoreMeta instead: it carries
         // the links-derived rating/year/genres (and a synopsis), so the hero shows its meta immediately,
@@ -921,7 +921,7 @@ struct iOSHomeView: View {
             // The hero is the first scrolling element (an ambient billboard header), not a
             // behind-the-scroll backdrop: that keeps its Play / Trailer buttons + the tappable poster
             // cards reachable (a ScrollView layered over a hero would otherwise eat the hero's taps).
-            // Its bottom fades cleanly into canvas with a small gap before the first rail (#52) — the
+            // Its bottom fades cleanly into canvas with a small gap before the first rail (#52), the
             // old negative-overlap tuck made the hero bleed into Continue Watching.
             ScrollView {
                 // In-flow hero: the band is the FIRST scrolling child of the column (not a pinned section
@@ -978,7 +978,7 @@ struct iOSHomeView: View {
                 }
                 .padding(.bottom, Theme.Space.md)
             }
-            // A scroll gesture quiets the ambient hero rotation (resumes after inactivity) — the
+            // A scroll gesture quiets the ambient hero rotation (resumes after inactivity), the
             // billboard never yanks the page while the user is browsing (#53).
             .scrollDismissesHeroRotation(model: hero)
             // Re-tapping the active Home tab scrolls back to the top anchor above the hero.
@@ -1078,7 +1078,7 @@ struct iOSHomeView: View {
         // by routine engine re-emits.
         .onAppear {
             // Populate the board on appear (mirrors Discover/Library) so the default Cinemeta catalogs
-            // fill Home even when SIGNED OUT — the landing screen shows a real backdrop hero + rails
+            // fill Home even when SIGNED OUT; the landing screen shows a real backdrop hero + rails
             // instead of a bare empty state. The Sign In button stays in the toolbar. Guarded on empty
             // so a signed-in session (board already loaded at bootstrap) isn't re-fetched.
             if core.boardRows.isEmpty { core.loadBoard() }
@@ -1138,7 +1138,7 @@ struct iOSHomeView: View {
         // catalogs I can't remove from Home" report). The render + hero pool are gated on the same flag.
         .onChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: the render is already gated on showCollectionsHub, and clear() blanked the shared hub for the OTHER surface (Home vs Discover)
-        // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
+        // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
         // installed meta add-on, and rebuild Upcoming Episodes (its sweep also needs the meta add-ons).
@@ -1316,7 +1316,7 @@ struct iOSHomeView: View {
         #endif
     }
 
-    /// Tapping a poster opens that title's detail through normal navigation — it does NOT "feature" it
+    /// Tapping a poster opens that title's detail through normal navigation; it does NOT "feature" it
     /// in the hero. The hero is a decoupled ambient billboard (#53); the only side effect of a tap is
     /// quieting its rotation for a beat.
     private func handleTap(_ item: RailItem) {
@@ -1336,7 +1336,7 @@ struct iOSHomeView: View {
         mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none
     }
 
-    /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases — derived
+    /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases, derived
     /// EXACTLY like the new-episode notification sweep (series-typed library ids + names, `providesMeta`
     /// add-on base URLs). The model no-ops when the series set is unchanged, so this is cheap to re-call.
     private func refreshReleaseCalendar() {
@@ -1373,7 +1373,7 @@ struct iOSHomeView: View {
 
     @ViewBuilder private var emptyState: some View {
         // Route through the shared compat empty state for one consistent layout (#44). Signed-out gets
-        // a primary Sign In CTA (the in-house PrimaryActionStyle, not the stock .borderedProminent — #42);
+        // a primary Sign In CTA (the in-house PrimaryActionStyle, not the stock .borderedProminent, #42);
         // signed-in is the bare loading line while catalogs hydrate.
         if account.isSignedIn || vortxSync.isSignedIn {
             ContentUnavailableViewCompat(title: "Loading your catalogs…", systemImage: "popcorn",
@@ -1467,7 +1467,7 @@ struct HomeRailEditorView: View {
 
 /// Client-side type segmentation for the Library (Movies / TV / Anime). The engine's own type filter
 /// only knows movie vs. series and cannot surface Anime, so the type row is derived here from each saved
-/// title's meta type — a pure presentation grouping that leaves the engine's SORT chips and every
+/// title's meta type, a pure presentation grouping that leaves the engine's SORT chips and every
 /// per-item action (open / remove / watched) untouched.
 private enum LibrarySegment: String, CaseIterable, Identifiable {
     case all, movies, tv, anime
@@ -1534,7 +1534,7 @@ private enum LibrarySmartFilter: String, CaseIterable, Identifiable {
 /// hero. Refreshes as the library changes; reloads while empty since it syncs asynchronously after
 /// sign-in.
 struct iOSLibraryView: View {
-    /// True only when this is the visible tab — gates the macOS window-titlebar wordmark (#46).
+    /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
@@ -1581,7 +1581,7 @@ struct iOSLibraryView: View {
         }
     }
 
-    /// True when there is at least one offline download — keeps the empty-Library placeholder from
+    /// True when there is at least one offline download; keeps the empty-Library placeholder from
     /// showing when a user has downloads but no saved titles. Always false on tvOS (downloads deferred).
     private var hasDownloads: Bool {
         #if os(tvOS)
@@ -1653,7 +1653,7 @@ struct iOSLibraryView: View {
                     // can report an over-wide ideal that the LazyVStack adopts, shifting the column left.
                     .frame(maxWidth: .infinity, alignment: .leading)
                 } else if !hasDownloads {
-                    // Only show the "Library empty" placeholder when there are ALSO no downloads — a user
+                    // Only show the "Library empty" placeholder when there are ALSO no downloads, a user
                     // with downloads but no saved titles still sees their offline section above.
                     ContentUnavailableViewCompat(title: "Library", systemImage: "books.vertical",
                         message: "Titles you add to your library in Stremio show up here.")
@@ -1715,7 +1715,7 @@ struct iOSLibraryView: View {
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
         }
         .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
-        // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
+        // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
         // installed meta add-on. tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
@@ -1736,7 +1736,7 @@ struct iOSLibraryView: View {
     @ViewBuilder private func sortChips(_ selectable: CoreLibrarySelectable) -> some View {
         // Route through the shared ChipButtonStyle (like Search's link button): a selected chip is a
         // soft-accent pill with accent ink, so on-chip text follows onAccent and stays legible on
-        // light accents (#39) — the old solid-accent + hardcoded-white chip went invisible.
+        // light accents (#39); the old solid-accent + hardcoded-white chip went invisible.
         chipScroll { ForEach(selectable.sorts) { s in
             Button(AddonTerms.localize(s.label)) { core.selectLibrary(s.request) }
                 .buttonStyle(ChipButtonStyle(selected: s.selected)) } }
@@ -1744,7 +1744,7 @@ struct iOSLibraryView: View {
 
     /// The client-side type segment chips (All / Movies / TV / Anime), rendered with the shared
     /// `ChipButtonStyle` so they match every other filter chip. Shown only when the library actually
-    /// spans two or more buckets — a single-type library keeps the flat grid with no redundant control.
+    /// spans two or more buckets, a single-type library keeps the flat grid with no redundant control.
     @ViewBuilder private func segmentBar(_ items: [RailItem]) -> some View {
         let segs = availableSegments(items)
         if !segs.isEmpty {
@@ -2079,7 +2079,7 @@ struct DownloadsView: View {
     /// Play a completed download from its LOCAL file. Rebuilds the engine `PlaybackMeta` so progress /
     /// Continue Watching record exactly as for a streamed source; `isTorrent: false` because a finished
     /// file plays directly (never back through the loopback torrent server). Fail-soft if the file is
-    /// missing (purged out from under us) — drop the row.
+    /// missing (purged out from under us); drop the row.
     private func play(_ record: DownloadRecord) {
         guard record.state == .completed, store.fileExists(for: record) else {
             if record.state == .completed { manager.cancel(id: record.id) }   // file gone → clean up the stale row
@@ -2197,7 +2197,7 @@ struct iOSDownloadsScreen: View {
 /// engine's `CoreBridge.search` hard-gates at 2 chars, so a single-char query would otherwise read as
 /// a misleading empty state).
 struct iOSSearchView: View {
-    /// True only when this is the visible tab — gates the macOS window-titlebar wordmark (#46).
+    /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount   // passed to the lifted paste-a-link player
@@ -2343,7 +2343,7 @@ struct iOSSearchView: View {
         }
     }
 
-    /// Group results into Movies / Series / Other, dropping empty sections — the tvOS `resultSections`.
+    /// Group results into Movies / Series / Other, dropping empty sections, the tvOS `resultSections`.
     private var resultSections: [(title: String, items: [CoreMeta])] {
         let movies = core.searchResults.filter { $0.type == "movie" }
         let series = core.searchResults.filter { $0.type == "series" }
@@ -2353,7 +2353,7 @@ struct iOSSearchView: View {
 
     private var suggestionTitles: [String] { core.searchSuggestionTitles(for: query) }
 
-    /// Recent searches (per profile, sync-backed) shown when the field is empty — the touch/Mac twin of
+    /// Recent searches (per profile, sync-backed) shown when the field is empty, the touch/Mac twin of
     /// the tvOS SearchView history row (#90). Tap a chip to re-run it; Clear wipes the list.
     private var historySection: some View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
@@ -2415,10 +2415,10 @@ struct iOSSearchView: View {
 }
 
 /// Discover, driven by the stremio-core engine (CatalogWithFilters): type, catalog, and genre
-/// chips carrying the engine's own request, dispatched back on tap, over a poster grid — under the
+/// chips carrying the engine's own request, dispatched back on tap, over a poster grid, under the
 /// interactive featured hero (shown once a catalog has loaded).
 struct iOSDiscoverView: View {
-    /// True only when this is the visible tab — gates the macOS window-titlebar wordmark (#46).
+    /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
@@ -2457,11 +2457,11 @@ struct iOSDiscoverView: View {
         NavigationStack(path: $path) {
             ScrollView {
                 // LazyVStack (not VStack): a vertical ScrollView proposes the viewport width, but a
-                // plain VStack sizes to its WIDEST child — and the nested horizontal chip ScrollViews
+                // plain VStack sizes to its WIDEST child, and the nested horizontal chip ScrollViews
                 // below let it adopt their (wider-than-screen) content width, pushing the whole column
                 // off-axis so the hero + chips + grid render shifted-left and clipped on both edges
                 // (the intermittent beta7 "weird viewport" on Discover/Library). LazyVStack is greedy
-                // on the cross axis — it always takes the full viewport width — so it can't overflow.
+                // on the cross axis; it always takes the full viewport width, so it can't overflow.
                 // Home already uses LazyVStack and never exhibited the shift.
                 // S4: Discover stacks its rails at lg (32) so its vertical rhythm matches Home / Library /
                 // Search; it was the lone surface at md (20), reading as a tighter, inconsistent column.
@@ -2471,7 +2471,7 @@ struct iOSDiscoverView: View {
                     // pinned section header: pinning put it on top on macOS and ate every tap.
                     Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Discover tab -> scroll here
                     // Merged mode: an inline search field sits above the Discover browse so the two surfaces
-                    // share one tab (owner: less clutter on mobile). Fail-soft — the flag defaults OFF, so the
+                    // share one tab (owner: less clutter on mobile). Fail-soft; the flag defaults OFF, so the
                     // field is absent and Discover is byte-for-byte unchanged unless the user opts in.
                     if mergeDiscoverSearch { mergedSearchField }
                     if mergeDiscoverSearch, hasSearchQuery {
@@ -2516,7 +2516,7 @@ struct iOSDiscoverView: View {
                 .padding(.bottom, Theme.Space.md)
                 // Pin the column to the viewport width. The adaptive PosterGrid can report an over-wide
                 // ideal that the LazyVStack adopts (LazyVStack is NOT inherently viewport-pinned as the
-                // note above assumed), shifting the hero/chips/grid off the left edge — the Discover
+                // note above assumed), shifting the hero/chips/grid off the left edge, the Discover
                 // clipping report. Home has only self-bounding horizontal rails, so it never needed this.
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -2568,10 +2568,10 @@ struct iOSDiscoverView: View {
             if showCollectionsHub { collectionsHub.load() }
         }
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: the render is already gated on showCollectionsHub, and clear() blanked the shared hub for the OTHER surface (Home vs Discover)
-        // The grid changes whenever a different type/catalog/genre is selected, which bumps revision —
+        // The grid changes whenever a different type/catalog/genre is selected, which bumps revision;
         // reseed so the hero pool tracks the visible catalog.
         .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
-        // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
+        // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
         // installed meta add-on. tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
@@ -2958,7 +2958,7 @@ struct iOSDiscoverFilterPanel: View {
 
 /// One catalog row's tappable poster. Beyond the poster + progress the card needs, it carries the
 /// catalog preview fields (`background`, `description`, `releaseInfo`, `imdbRating`, `genres`) so the
-/// detail route opened on tap arrives with rich seed data — they're present on `CoreMeta` but were
+/// detail route opened on tap arrives with rich seed data; they're present on `CoreMeta` but were
 /// previously dropped at the `.map`. Continue Watching / Library entries lack a `background`, so the
 /// hero derives 16:9 art from metahub-by-IMDB-id (see `FeaturedHeroItem.from`).
 /// Keep the first occurrence of each meta id, dropping later duplicates. Paginated catalogs can repeat a
@@ -3087,7 +3087,7 @@ extension View {
 }
 
 /// Resume the EXACT link a Continue-Watching title last played, straight into the player, instead of
-/// routing through the detail page and re-resolving sources — the touch/Mac twin of the tvOS
+/// routing through the detail page and re-resolving sources, the touch/Mac twin of the tvOS
 /// `CoreContinueWatchingRow.directResume`. Returns nil (caller then opens detail) when no remembered
 /// link fits: never played on this device, the link is a torrent while torrents are disabled, or the
 /// engine moved the series on to a different episode than the one we remembered.
@@ -3174,7 +3174,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                             name: entry.name, poster: entry.poster,
                             season: entry.season, episode: entry.episode)
     // Resume where the user left off, not 0:00 (#11). The iOS PlayerScreen seeks ONLY to the passed
-    // `resume`, so the offset must be computed here — mirroring iOSDetailView.resume(_:):
+    // `resume`, so the offset must be computed here, mirroring iOSDetailView.resume(_:):
     // the engine's own offset for engine-history profiles, else the account/overlay offset.
     let resume: Double
     if let engine = core.engineResumeSeconds(for: meta) {
@@ -3202,7 +3202,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     if usesSeriesLifecycle {
         // Load the series meta (for the episode list) AND the CURRENT episode's streams, so the in-player
         // Sources button has this episode's alternates. Loading meta-only here had wiped the resident
-        // episode streams the Sources list relied on — the "Sources button gone from CW resume" regression.
+        // episode streams the Sources list relied on, the "Sources button gone from CW resume" regression.
         // Both stream surfaces count as resident: an episode whose sources are meta-embedded (metaStreams,
         // the HTTP/HLS add-on shape, #122) must not force a redundant re-dispatch here.
         let hasEpStreams = core.metaDetails?.allStreamGroups.contains { $0.request.path.id == entry.videoId } ?? false
@@ -3288,7 +3288,7 @@ private func iOSRawTorrentStream(infoHash: String, fileIdx: Int, name: String) -
     return try? JSONDecoder().decode(CoreStream.self, from: data)
 }
 
-/// Stremio's "paste a link" feature on touch / Mac (#16) — the twin of the tvOS `OpenLinkView`. Plays
+/// Stremio's "paste a link" feature on touch / Mac (#16), the twin of the tvOS `OpenLinkView`. Plays
 /// a direct video URL or a magnet: magnets ride the embedded torrent engine (the `/create` call blocks
 /// until the torrent's metadata arrives, then the largest video file plays). The tvOS `OpenLinkView`
 /// and its `LinkOpener` live in the tvOS-only target (they depend on `PlayerPresenter`), so this brings
@@ -3722,11 +3722,11 @@ private enum OpenLinkMagnet {
 
 /// A poster grid (Library, Search, Discover) of tappable cards. Cards are `Button`s wired to an
 /// `onTap(item)` router (instead of pushing a `NavigationLink` directly), so the SCREEN decides what a
-/// tap means — across all three surfaces it now opens the title's detail (the hero is a decoupled
+/// tap means: across all three surfaces it now opens the title's detail (the hero is a decoupled
 /// ambient billboard, #53), so there is no featured ring here.
 ///
 /// Centering (#47): the adaptive columns are CENTER-aligned and the grid is constrained to the same
-/// row width that gives even, balanced columns — a `.leading`-aligned adaptive grid bunched cards to
+/// row width that gives even, balanced columns; a `.leading`-aligned adaptive grid bunched cards to
 /// the left and left a ragged right gutter, which read as "left-aligned". Centering the columns and
 /// the trailing remainder keeps the grid even across the width at every breakpoint (iPhone → Mac).
 struct PosterGrid: View {
@@ -4325,7 +4325,7 @@ private struct PosterContextMenu: ViewModifier {
     let menu: iOSPosterMenu
     /// Opens the title's detail page. On a Continue Watching card a tap RESUMES the remembered stream,
     /// so the menu offers "Details" to reach the detail page instead (to pick a different episode or
-    /// source) — the touch/Mac twin of what the user expects from a long-press on the tvOS row.
+    /// source), the touch/Mac twin of what the user expects from a long-press on the tvOS row.
     var onDetails: (() -> Void)? = nil
 
     func body(content: Content) -> some View {
@@ -4390,8 +4390,8 @@ private struct PosterContextMenu: ViewModifier {
 // MARK: - Browse-screen chrome helpers (#46 wordmark, #53 scroll quiets the ambient hero)
 
 extension View {
-    /// The accent-tinted brand wordmark in the navigation bar's principal slot — warm-white "Stremio"
-    /// with an ember "X", in the serif wordmark face — replacing the plain stock `.navigationTitle`
+    /// The accent-tinted brand wordmark in the navigation bar's principal slot, warm-white "Stremio"
+    /// with an ember "X", in the serif wordmark face, replacing the plain stock `.navigationTitle`
     /// that fell back to flat white in dark mode (#46). Mirrors the tvOS `HomeView.header` wordmark.
     /// The `pageTitle` is kept only as the bar's inline accessibility identity (and back-button
     /// context); the visible principal item is always the wordmark, applied across Home / Discover /
@@ -4399,7 +4399,7 @@ extension View {
     /// `isActive` is the macOS guard: a `.principal` item is hoisted into the shared window titlebar,
     /// and all seven tab screens stay mounted at once (opacity-switched to preserve state), so without
     /// this gate every browse screen stamps its own wordmark and they tile ("StremioX"×4). The
-    /// conditional lives *inside* `@ToolbarContentBuilder` — branching the whole view instead would
+    /// conditional lives *inside* `@ToolbarContentBuilder`, branching the whole view instead would
     /// change the NavigationStack's structural identity and reset its scroll/path on every tab switch.
     @ViewBuilder
     func stremioWordmarkTitle(_ pageTitle: String, isActive: Bool = true) -> some View {

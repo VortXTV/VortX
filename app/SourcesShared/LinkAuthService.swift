@@ -13,7 +13,7 @@ enum LinkAuthService {
 
     /// The link `read` endpoint answers HTTP 200 with `{"error":{"code":101,...}}` for the entire
     /// window before the user finishes the browser/QR step. That is the *pending* signal, not a
-    /// failure — only this code may be polled past. Any other error (or a transport fault) is real
+    /// failure; only this code may be polled past. Any other error (or a transport fault) is real
     /// and must be surfaced, otherwise the panel spins on "Waiting for sign-in…" forever.
     private static let pendingErrorCode = 101
 
@@ -26,7 +26,7 @@ enum LinkAuthService {
     /// The main account API (api.strem.io). `link.stremio.com` only hands back a session key; it is
     /// the main API that actually owns the session, so a key must be validated against it before the
     /// app commits to a signed-in state. A revoked/expired token answers HTTP 200 with
-    /// `{"error":{"code":1,"message":"Session does not exist"}}`, NOT a transport failure — so the
+    /// `{"error":{"code":1,"message":"Session does not exist"}}`, NOT a transport failure, so the
     /// JSON error must be inspected, not just the status code.
     private static let accountAPI = "https://api.strem.io/api"
 

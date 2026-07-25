@@ -1,4 +1,4 @@
-// HouseholdCryptoTests — a standalone, runnable verification of the household key-wrapping crypto.
+// HouseholdCryptoTests: a standalone, runnable verification of the household key-wrapping crypto.
 //
 // VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md),
 // so this is written as a self-contained Swift executable that runs directly with the system toolchain:
@@ -6,7 +6,7 @@
 //     swift app/Tests/HouseholdCryptoTests.swift
 //
 // It re-implements the EXACT primitives HouseholdCrypto.swift uses (BackupCrypto.seal/open framing,
-// base64URL, the household HKDF salt/info, and — for the cross-replay test — the PairingCrypto HKDF
+// base64URL, the household HKDF salt/info, and, for the cross-replay test, the PairingCrypto HKDF
 // salt/info) so the two security-critical properties are actually asserted against real CryptoKit:
 //
 //   1. wrapHHKey -> unwrapHHKey round-trips and recovers the SAME 32 bytes.
@@ -79,7 +79,7 @@ enum TestHouseholdCrypto {
     }
 }
 
-// MARK: - Mirror of the PairingCrypto HKDF (DIFFERENT salt/info — used only to prove isolation)
+// MARK: - Mirror of the PairingCrypto HKDF (DIFFERENT salt/info: used only to prove isolation)
 
 enum TestPairingCrypto {
     static let salt = Data("vortx-pairing-salt-v1".utf8)

@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// A floating "back to top" button for long browse screens (Home, Discover). It fades in once you have
-/// scrolled the top of the screen out of view and, when tapped, bumps the tab's scroll-to-top signal —
+/// scrolled the top of the screen out of view and, when tapped, bumps the tab's scroll-to-top signal,
 /// reusing the exact path a re-tap of the active tab already drives (see [[TabScrollToTop]]). So it shares
 /// the same anchor and animation as re-tap-to-top; it is just a second, always-reachable way to get there.
 ///

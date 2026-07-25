@@ -11,7 +11,7 @@ enum PlaybackSettings {
     /// Video upscaling / quality preset. Picks the libmpv (gpu-next / libplacebo) scaler and debanding
     /// baseline applied during player setup. Default is hardware-aware: the memory-constrained Apple TV HD
     /// (A8) gets `.performance` so a 4K stream doesn't stutter, every other device gets `.standard` (today's
-    /// sharp libplacebo default). A change takes effect on the next played file — the player is recreated
+    /// sharp libplacebo default). A change takes effect on the next played file; the player is recreated
     /// per session, the same lifetime as `customMpvOptions`.
     static var videoUpscaling: VideoUpscaling {
         get {

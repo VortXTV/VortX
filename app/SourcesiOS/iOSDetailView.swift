@@ -29,7 +29,7 @@ func prepareTorrentStream(_ stream: CoreStream) -> Task<Void, Never>? {
     request.timeoutInterval = 5
     // Retry the prime a few times: the embedded server can still be cold-starting (notably the macOS
     // child `node` process), and a single fire-and-forget POST sent before it's listening is silently
-    // dropped — leaving the torrent un-primed and the player hanging on a peerless swarm. A round-trip
+    // dropped, leaving the torrent un-primed and the player hanging on a peerless swarm. A round-trip
     // that doesn't throw means the server received the create; connection-refused retries with backoff.
     // The Task is returned so the owning view can cancel it on disappear / new selection.
     return Task {
@@ -56,7 +56,7 @@ private func warmFetchEpisodeStreams(base: String, addon: String, id: String) as
     return CoreStreamSourceGroup(id: base, addon: addon, streams: streams)
 }
 
-/// Direct-links-only filter (drop torrent sources) — the free twin of the per-view displayGroups,
+/// Direct-links-only filter (drop torrent sources), the free twin of the per-view displayGroups,
 /// shared by the Continue-Watching resume so it ranks the same set the detail page would.
 func iOSDisplayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
     guard PlaybackSettings.directLinksOnly else { return groups }
@@ -93,7 +93,7 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
         if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
         // Settle gate (see StreamRanking.resolveSettled): for a resume, hold out until the SAME quality the
         // user last played has loaded (and, unless they rank torrents on top, a non-torrent one), because
-        // torrents answer in ~4s while the user's debrid of that quality lands ~10-12s later — a flat 4s
+        // torrents answer in ~4s while the user's debrid of that quality lands ~10-12s later, a flat 4s
         // cutoff auto-picked the fast torrent, so the CW resume "tried a torrent first".
         let progress = core.streamLoadProgress(forStreamId: v.id)
         let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
@@ -172,7 +172,7 @@ struct FlowLayout: Layout {
 }
 
 /// Touch / Mac detail page. Loads meta through the shared engine, then presents the same cinematic
-/// composition the tvOS `DetailView` uses — a full-bleed backdrop from `meta.background` with a dark
+/// composition the tvOS `DetailView` uses, a full-bleed backdrop from `meta.background` with a dark
 /// gradient scrim, the hero (logo or title, year · runtime · genres · rating, synopsis) over it, a
 /// Play / Watch action, and the source list styled as surface cards. Series show a season selector and
 /// an episode list; tapping an episode pushes its own per-episode source-list screen (`iOSEpisodeStreams`)
@@ -251,7 +251,7 @@ struct iOSDetailView: View {
 
     // A SINGLE presentation slot drives every full-screen cover (player OR trailer). On macOS the
     // `platformFullScreenPlayerCover(item:)` calls become a `.sheet(item:)`, and two sheets attached to
-    // the same view shadow each other — so tapping Watch could fail to present the player at all.
+    // the same view shadow each other, so tapping Watch could fail to present the player at all.
     // Driving both from one enum-typed item guarantees exactly one cover is ever attached, so Watch
     // always presents reliably. The player-cover variant sizes its content to fill the macOS window.
     @State private var presentation: Presentation?
@@ -477,7 +477,7 @@ struct iOSDetailView: View {
 
     var body: some View {
         // A GeometryReader gives us the EXACT viewport width to HARD-cap the content column with
-        // `.frame(width:)`. `maxWidth: .infinity` only sets an upper bound — it does not stop a child
+        // `.frame(width:)`. `maxWidth: .infinity` only sets an upper bound; it does not stop a child
         // whose intrinsic width exceeds the screen (the hero's single-line metaRow / action button row on
         // a narrow iPhone) from stretching the ZStack wider than the viewport, which then renders with a
         // negative leading origin and clipped every hero element off the left edge. A concrete width can't
@@ -618,7 +618,7 @@ struct iOSDetailView: View {
         // catalog id: a TMDB/Kitsu catalog gives the meta a tmdb:/kitsu: id, and imdb-keyed stream add-ons
         // (idPrefixes ["tt"]) are silently dropped from the plan for a non-imdb id (so only AIOStreams-style
         // broad add-ons answer). The imdb id lives in the meta's behaviorHints.defaultVideoId, known only
-        // AFTER the meta loads — so dispatch the streams here, once the meta arrives. (movieStreamId).
+        // AFTER the meta loads, so dispatch the streams here, once the meta arrives. (movieStreamId).
         // Re-dispatch streams under the AUTHORITATIVE meta.type once it arrives (Collections-hub fix): if the
         // hub's TMDB guess was wrong, meta.type now corrects it and the stream request re-fires under the type
         // the add-ons actually index the title under. The hasStreams guard keys on the effective streamId, so
@@ -643,7 +643,7 @@ struct iOSDetailView: View {
             refreshLanguageChips()
         }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS
-        // detail page's onDisappear AFTER the episode page has already loaded its streams — so calling
+        // detail page's onDisappear AFTER the episode page has already loaded its streams, so calling
         // unloadMeta would wipe `metaDetails` out from under the episode page (~0.3s later), leaving its
         // source list empty ("No stream add-ons responded"). That race is why SERIES found no streams on
         // iOS while MOVIES (no child push) and macOS (different onDisappear timing) worked. The next
@@ -1159,7 +1159,7 @@ struct iOSDetailView: View {
         // The backdrop is the ZStack's WIDTH ANCHOR: it greedily takes the full viewport width and
         // pins to the leading edge, so the ZStack's leading edge is the screen's leading edge. Before
         // this, the oversized serif hero title made the ZStack wider than the screen and `.bottomLeading`
-        // pushed the whole block to a negative x — clipping the title / Watch / synopsis off the left.
+        // pushed the whole block to a negative x, clipping the title / Watch / synopsis off the left.
         .frame(maxWidth: .infinity, alignment: .leading)
         .clipped()
         // A smoother multi-stop vertical fade: the art stays crisp up top and dissolves cleanly into the
@@ -1388,7 +1388,7 @@ struct iOSDetailView: View {
         // and forcing the text to its intrinsic size made the ZStack (which sizes to its WIDEST child)
         // wider than the viewport, which `.bottomLeading` then pushed off the left edge. Clamping to
         // `maxWidth: .infinity, alignment: .leading` lets the title WRAP/scale within the available
-        // width instead — so the title can never make the ZStack exceed the screen. Mirrors tvOS,
+        // width instead, so the title can never make the ZStack exceed the screen. Mirrors tvOS,
         // whose hero title wraps inside a width-bounded VStack with no horizontal fixedSize.
         Text(l10n.title(for: id) ?? meta?.name ?? title)
             .font(Theme.Typography.hero).tracking(-1)
@@ -1526,7 +1526,7 @@ struct iOSDetailView: View {
                             #if os(macOS)
                             // macOS: a destination-builder NavigationLink inside this lazy horizontal stack
                             // does not reliably activate (the lazy container defers / loses the destination
-                            // builder — the same #25 fragility documented at iOSRootView). Route by VALUE
+                            // builder, the same #25 fragility documented at iOSRootView). Route by VALUE
                             // instead (registered via `.navigationDestination` in `body`), which fires
                             // reliably from a LazyHStack on Mac, and give the whole 92pt tile a hit shape so
                             // the gaps between headshots are clickable too, not just opaque photo pixels.
@@ -1607,10 +1607,10 @@ struct iOSDetailView: View {
         }
     }
 
-    // MARK: Series — hero Resume/Play affordance (mirrors tvOS DetailView.seriesPrimaryEpisode)
+    // MARK: Series hero Resume/Play affordance (mirrors tvOS DetailView.seriesPrimaryEpisode)
 
     /// VortX's OWN watched episode-id set for the open series: the engine's computed set for
-    /// engine-history profiles, the profile overlay's set otherwise — the exact same
+    /// engine-history profiles, the profile overlay's set otherwise, the exact same
     /// invariant tvOS uses for its ticks, dimming, and primary-episode pick.
     ///
     /// This is the AUTHORITATIVE set. Use it for any decision about the user's own place in the show
@@ -1645,7 +1645,7 @@ struct iOSDetailView: View {
     }
 
     /// Series hero: a primary "Resume S#E#" / "Play S#E#" button (with a progress stripe when the
-    /// resume episode is partially watched), then the trailer + library chips — the touch/Mac twin
+    /// resume episode is partially watched), then the trailer + library chips, the touch/Mac twin
     /// of the tvOS series hero. Tapping it pushes that episode's source list (the same screen an
     /// episode-row tap opens), so the user still picks the source.
     @ViewBuilder private var seriesHeroActions: some View {
@@ -1677,7 +1677,7 @@ struct iOSDetailView: View {
             // overflow onto the next line under the hero's hard width cap (prevents "Tr / ail / er" slivers).
             FlowLayout(spacing: Theme.Space.sm) {
                 #if !os(tvOS)
-                // Offline (#30): open the pre-download quality picker for the primary episode — the series twin
+                // Offline (#30): open the pre-download quality picker for the primary episode, the series twin
                 // of the movie Download chip. Gated on the primary episode resolving; the chip reflects state.
                 if let primary {
                     downloadChip(videoId: primary.video.id, ready: true) {
@@ -1700,7 +1700,7 @@ struct iOSDetailView: View {
     }
 
     /// Resume position (the saved episode, if not yet watched) vs the first unwatched episode,
-    /// vs the first episode — a straight port of the tvOS `seriesPrimaryEpisode`.
+    /// vs the first episode, a straight port of the tvOS `seriesPrimaryEpisode`.
     /// The season of the episode the viewer was last on (from the resume videoId), decoupled from the
     /// watched-gate seriesPrimaryEpisode applies, so opening a series from Continue Watching lands on the season
     /// you were last in even after that episode is marked watched. nil when there is no resume position. Mirrors
@@ -1849,9 +1849,9 @@ struct iOSDetailView: View {
         #endif
     }
 
-    // MARK: Movie — Watch Now + sources
+    // MARK: Movie Watch Now + sources
 
-    /// The movie hero action row — the touch/Mac twin of the tvOS detail action set: a **Watch**
+    /// The movie hero action row, the touch/Mac twin of the tvOS detail action set: a **Watch**
     /// button (best ranked source), a **Quality** picker (resolution tier → flavour variants), a
     /// **Sources** button (scrolls to the grouped per-add-on list below), and **Add to Library**,
     /// plus the trailer chip when one exists. Wraps onto a second line on a narrow phone.
@@ -2012,7 +2012,7 @@ struct iOSDetailView: View {
         .padding(.horizontal, Theme.Space.md)
     }
 
-    /// The per-row offline-download handler passed to the movie source list — present on iPhone/iPad/Mac,
+    /// The per-row offline-download handler passed to the movie source list, present on iPhone/iPad/Mac,
     /// nil on tvOS (downloads are deferred there), so the list renders no Download affordance on tvOS.
     private var movieDownloadHandler: ((CoreStream, URL) -> Void)? {
         #if os(tvOS)
@@ -2112,7 +2112,7 @@ struct iOSDetailView: View {
 
     /// The pool `content_key` for this title (P1). Movies key on the imdb id; a series detail keys on the
     /// show id (no season/episode here, since the detail page lists all sources across episodes). nil when
-    /// no imdb id is known — the whole language-chip feature then no-ops.
+    /// no imdb id is known; the whole language-chip feature then no-ops.
     private var languageContentKey: String? {
         SubtitleReleaseFingerprint.contentKey(imdbId: ratingsImdbID)
     }
@@ -2345,12 +2345,12 @@ struct iOSDetailView: View {
     }
 
     /// Apply the Direct-links-only filter (drop every torrent source) so a user with the setting on
-    /// never sees or auto-plays a torrent — the exact `displayGroups` the tvOS `CoreStreamList` uses.
+    /// never sees or auto-plays a torrent, the exact `displayGroups` the tvOS `CoreStreamList` uses.
     private func displayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         // Merge the TorBox search sources FIRST (no-op with no TorBox key / no results), then the community
         // source-index sources (no-op unless the Singularity toggle is on + signed in), then apply the
         // Direct-links-only filter so a search/community torrent source is filtered on the same rule as an
-        // add-on's — keeps the filter contract intact.
+        // add-on's (keeps the filter contract intact).
         let withSearch = sourceIndex.merged(into: torboxSearch.merged(into: groups))
         guard PlaybackSettings.directLinksOnly else { return withSearch }
         return withSearch.compactMap { group in
@@ -2361,7 +2361,7 @@ struct iOSDetailView: View {
     }
 
     /// The quality signature this title last played in (per profile), so reopening it auto-picks the
-    /// remembered quality with same-release-group biasing — the tvOS `LastStreamStore` continuity hint.
+    /// remembered quality with same-release-group biasing, the tvOS `LastStreamStore` continuity hint.
     private var rememberedQuality: String? {
         guard let m = meta else { return nil }
         return LastStreamStore.entry(for: m.id, profileID: ProfileStore.shared.activeID)?.qualityText
@@ -2407,7 +2407,7 @@ struct iOSDetailView: View {
     }
 
     /// Watch-Now arms once a best stream has resolved and sources have settled. A4b: this is NO LONGER gated
-    /// on `meta != nil` — a hub-opened title whose Cinemeta meta is nil/mismatched (a tt at TMDB not yet in
+    /// on `meta != nil`, a hub-opened title whose Cinemeta meta is nil/mismatched (a tt at TMDB not yet in
     /// Cinemeta) still assembles its `streamGroups` (the sources LIST renders from them unconditionally), so
     /// Play must arm off the SAME groups the list shows, not a meta-gated path, or the button would sit
     /// disabled forever while the sources below are fully playable. Playback identity falls back to the seed
@@ -2501,7 +2501,7 @@ struct iOSDetailView: View {
     }
 
     private func playMovie(fromStart: Bool = false, startAt: Double? = nil) async {
-        // A4b: no longer gated on `meta != nil` — a hub-opened title with nil/mismatched Cinemeta meta still
+        // A4b: no longer gated on `meta != nil`, a hub-opened title with nil/mismatched Cinemeta meta still
         // has a resolved best stream (off the same groups the list renders) and plays off its seed identity.
         guard !preparing, let stream = movieBest else { return }
         preparing = true; defer { preparing = false }
@@ -2539,7 +2539,7 @@ struct iOSDetailView: View {
         // today's (primePlayback → engine + torrent prime), so the no-key path is byte-identical.
         //
         // AUTO-PICK PARALLELISM: this is the top-cached "Watch" path, so race the top few CACHED candidates
-        // (StreamRanking order preserved) concurrently and play the FIRST that resolves — the user reaches a
+        // (StreamRanking order preserved) concurrently and play the FIRST that resolves; the user reaches a
         // genuinely-cached source in ~2-4s instead of committing to `movieBest` alone when it is a
         // false-cached row. Fail-soft: a nil race result falls straight through to the single-resolve on
         // `movieBest` below, so the no-key / no-cache path is byte-identical. (A manual source-row tap uses
@@ -2598,7 +2598,7 @@ struct iOSDetailView: View {
 
     /// Play an arbitrary chosen movie source (a tapped source-list row). `url` is the source's
     /// `playableURL`; a cached-debrid raw torrent overrides it with the direct link (fail-soft, no-key
-    /// byte-identical — see `DebridCoordinator.resolvedPlaybackURL`).
+    /// byte-identical; see `DebridCoordinator.resolvedPlaybackURL`).
     private func playStream(_ stream: CoreStream, url: URL) async {
         // #95: a tapped TRAILER row (a Streailer/YouTube `ytId` source) is NOT a content stream. Route it to
         // the trailer player (isTrailer:true, no meta) so a dead trailer shows "Trailer unavailable" and STOPS
@@ -2607,7 +2607,7 @@ struct iOSDetailView: View {
             await playTrailerStream(stream)
             return
         }
-        // A4b: no longer gated on `meta != nil` — a hub-opened title with nil meta still plays a tapped source
+        // A4b: no longer gated on `meta != nil`, a hub-opened title with nil meta still plays a tapped source
         // row off its seed identity (the source list itself renders without meta, so its rows must be playable).
         guard !preparing else { return }
         preparing = true; defer { preparing = false }
@@ -2674,7 +2674,7 @@ struct iOSDetailView: View {
             continuity: rememberedQuality, pin: sourcePin, cachedHashes: debridCache.cachedHashes)
     }
 
-    /// Present the pre-download quality picker for a SERIES' primary episode (#30 follow-up) — the series twin
+    /// Present the pre-download quality picker for a SERIES' primary episode (#30 follow-up), the series twin
     /// of the movie Download chip. A series detail loads meta only, so this first loads + settles THAT
     /// episode's streams (mirroring the episode page's resolve gate), then hands the picker the SAME
     /// display-filtered groups + remembered-quality continuity + source pin + confirmed cached-debrid hashes
@@ -2711,10 +2711,10 @@ struct iOSDetailView: View {
     }
     #endif
 
-    // MARK: Live — backdrop + LIVE badge + source list (no VOD chrome)
+    // MARK: Live backdrop + LIVE badge + source list (no VOD chrome)
 
     /// The Live channel page: the same cinematic backdrop + title block as a movie, but stripped of
-    /// VOD chrome — no trailer chip, no movie-style synopsis paragraph, no skip/chapter UI. A "LIVE"
+    /// VOD chrome: no trailer chip, no movie-style synopsis paragraph, no skip/chapter UI. A "LIVE"
     /// badge sits beside the title, then a now/next EPG strip (when the channel carries a schedule),
     /// and the full channel source list lets the user pick a stream.
     @ViewBuilder private var livePage: some View {
@@ -2742,7 +2742,7 @@ struct iOSDetailView: View {
     }
 
     /// Now/Next EPG strip for a live channel. The schedule already rides in the meta JSON
-    /// (`behaviorHints.hasScheduledVideos` + dated `videos[]`) — no XMLTV/networking on the client.
+    /// (`behaviorHints.hasScheduledVideos` + dated `videos[]`); no XMLTV/networking on the client.
     /// When `EPGSchedule` resolves, show a NOW row (program title + "until <next start>") and a NEXT
     /// row (title + start time). Otherwise, if the meta has a description, show it (lower-fidelity
     /// add-ons that only put Now/Next text in `description`). Times format with the device LOCALE
@@ -2841,7 +2841,7 @@ struct iOSDetailView: View {
 
     /// Play a chosen live channel source. Mirrors `playStream`, but the `PlaybackMeta.type` is the
     /// channel's own live type (tv / channel / events), which the player reads via `LiveTypes` to
-    /// engage live tuning and to NO-OP resume/progress. No resume offset is requested or recorded —
+    /// engage live tuning and to NO-OP resume/progress. No resume offset is requested or recorded;
     /// a live stream has no meaningful position to restore.
     private func playLiveStream(_ stream: CoreStream, url: URL) async {
         guard !preparing, let m = meta else { return }
@@ -2856,7 +2856,7 @@ struct iOSDetailView: View {
                                             isTorrent: stream.isTorrent, sourceStream: stream))
     }
 
-    // MARK: Series — season selector + episode cards
+    // MARK: Series season selector + episode cards
 
     @ViewBuilder private var episodeList: some View {
         if let videos = meta?.videos, !videos.isEmpty {
@@ -2925,7 +2925,7 @@ struct iOSDetailView: View {
             }
             .padding(.horizontal, Theme.Space.md)
             // Initial season = the season you were LAST watching (Continue Watching), else first-unwatched,
-            // else the first non-special, else 1 — matching the tvOS rule. Re-applies when a large series'
+            // else the first non-special, else 1, matching the tvOS rule. Re-applies when a large series'
             // episodes stream in after the list first appears (onChange videos.count), guarded so a manual tap
             // is never overridden.
             .onAppear { applyEpisodeSeason(seasons); publishSeriesWatchRollup() }
@@ -2957,7 +2957,7 @@ struct iOSDetailView: View {
     }
 
     /// Tapping an episode now PUSHES its own source-list screen (the full ranked sources + Quality
-    /// picker) instead of silently auto-playing the best source — mirroring the tvOS `CoreEpisodeStreams`
+    /// picker) instead of silently auto-playing the best source, mirroring the tvOS `CoreEpisodeStreams`
     /// flow. The user sees every source for that episode and picks one, which plays via the primed path.
     /// Spoiler-safe veil for one episode on the detail list: mode ON, the episode is NOT watched, and it has
     /// not yet been revealed this session. Read-only against `watchedSet` (never a write), so it honours the
@@ -3422,7 +3422,7 @@ struct iOSDetailView: View {
 
     // MARK: Shared
 
-    /// Prime a picked stream for playback BEFORE the player launches — exactly what the tvOS `play()`
+    /// Prime a picked stream for playback BEFORE the player launches, exactly what the tvOS `play()`
     /// does. Wires the engine Player (so progress records against the right library item) and, for
     /// torrents, asks the embedded server to start fetching peers. Without this, iOS/Mac launched the
     /// player against a torrent the server had never been told to create, so the stream never played.
@@ -3449,11 +3449,11 @@ struct iOSDetailView: View {
 
 // MARK: - Per-episode source list (mirrors tvOS CoreEpisodeStreams)
 
-/// The screen pushed when a series episode is tapped — the touch/Mac twin of the tvOS
+/// The screen pushed when a series episode is tapped, the touch/Mac twin of the tvOS
 /// `CoreEpisodeStreams`. It shows the episode's own backdrop, title, and overview, then the FULL
 /// ranked source list (with the Quality picker) via the shared `iOSSourceList`, fed with that
 /// episode's streamId. Picking a source primes playback (engine Player + torrent /create) and
-/// presents the native player — exactly like the movie path. This replaces the old behaviour where
+/// presents the native player, exactly like the movie path. This replaces the old behaviour where
 /// tapping an episode silently auto-played the best source and showed no sources / no quality picker.
 struct iOSEpisodeStreams: View {
     let meta: CoreMetaItem
@@ -3601,7 +3601,7 @@ struct iOSEpisodeStreams: View {
         .inlineNavigationTitle()
         #endif
         .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
-        // The engine loads per-episode streams on demand; trigger that load for THIS episode — but only
+        // The engine loads per-episode streams on demand; trigger that load for THIS episode, but only
         // when the resident streams aren't already this episode's, so a back/forward revisit doesn't churn.
         .onAppear {
             // Wire the source-list model to this episode's sources (idempotent; see SourceListModel).
@@ -3735,7 +3735,7 @@ struct iOSEpisodeStreams: View {
     /// the tvOS `CoreEpisodeStreams` header block.
     private func hero(width: CGFloat) -> some View {
         // Fixed backdrop banner (show eyebrow + episode title + meta overlaid) with the overview flowing
-        // below on the canvas — same structure as iOSDetailView.hero, so a long episode synopsis can't push
+        // below on the canvas, same structure as iOSDetailView.hero, so a long episode synopsis can't push
         // the backdrop down behind the text.
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             ZStack(alignment: .bottomLeading) {
@@ -3886,7 +3886,7 @@ struct iOSEpisodeStreams: View {
             }
         }
         .frame(height: height)
-        // Width anchor for the episode hero ZStack — full viewport width, pinned leading (see iOSDetailView.backdrop).
+        // Width anchor for the episode hero ZStack, full viewport width, pinned leading (see iOSDetailView.backdrop).
         .frame(maxWidth: .infinity, alignment: .leading)
         .clipped()
         .overlay(
@@ -4170,7 +4170,7 @@ struct iOSEpisodeStreams: View {
     }
 
     /// Direct-links-only: drop every torrent source so a user with the setting on never sees or
-    /// auto-plays one — the same `displayGroups` filter the tvOS `CoreStreamList` applies. Merges the
+    /// auto-plays one, the same `displayGroups` filter the tvOS `CoreStreamList` applies. Merges the
     /// TorBox search sources first (no-op with no TorBox key / no results).
     private func displayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         let withSearch = sourceIndex.merged(into: torboxSearch.merged(into: groups))
@@ -4263,7 +4263,7 @@ struct iOSEpisodeStreams: View {
     }
 
     /// The quality this series last played in (per profile), so the episode's Watch-in pick keeps the
-    /// same quality across episodes — the tvOS `LastStreamStore` continuity hint, keyed on the series id.
+    /// same quality across episodes, the tvOS `LastStreamStore` continuity hint, keyed on the series id.
     private var rememberedQuality: String? {
         LastStreamStore.entry(for: meta.id, profileID: ProfileStore.shared.activeID)?.qualityText
     }
@@ -4402,7 +4402,7 @@ private struct iOSProgressStripe: View {
     }
 }
 
-/// The grouped, filterable source list for the touch / Mac detail page — the twin of tvOS
+/// The grouped, filterable source list for the touch / Mac detail page, the twin of tvOS
 /// `CoreStreamList`. Instead of a flat list of potentially thousands of streams, it offers:
 ///   • a **Watch in <quality>** primary button (best ranked source) + a **Quality** picker
 ///     (resolution tier → flavour variants, the same two-level model tvOS uses),
@@ -4443,7 +4443,7 @@ struct iOSSourceList: View {
     /// When false, the primary Watch / Quality / All-sources control bar is hidden and the grouped list is
     /// shown directly. The MOVIE detail page passes false because its hero already shows Watch + Quality +
     /// a "Sources" scroll button (rendering both looked like duplicate controls). The episode + live pages
-    /// keep the default true — there the control bar is the only primary action.
+    /// keep the default true; there the control bar is the only primary action.
     var showsPrimaryControls = true
     let play: (CoreStream, URL) -> Void
     /// AUTO single-resolve for the primary "Watch in <quality>" button's FALLBACK (used only when
@@ -4455,7 +4455,7 @@ struct iOSSourceList: View {
     /// candidate list (best first) so it can race the top few CACHED sources in parallel and play the first
     /// that resolves, reaching a genuinely-cached link fast instead of committing to `best` alone. Optional:
     /// when nil, the Watch button falls back to the single-resolve `play(best, url)` (byte-identical to
-    /// before). The per-row taps and the Quality picker NEVER use this — a user choosing a specific row still
+    /// before). The per-row taps and the Quality picker NEVER use this; a user choosing a specific row still
     /// resolves exactly that row through `play`.
     var playBest: (([CoreStream], CoreStream) -> Void)? = nil
     /// Ranked best playable stream, computed once off-main by SourceListModel; the control bar's Watch pick.
@@ -4518,7 +4518,7 @@ struct iOSSourceList: View {
     }
 
     private var streamCount: Int { groups.reduce(0) { $0 + $1.streams.count } }
-    // Still loading unless every add-on answered — OR the settle timeout fired, which flips a hung
+    // Still loading unless every add-on answered, OR the settle timeout fired, which flips a hung
     // resolution to the real "No sources found" state instead of an endless spinner.
     private var loading: Bool { !settleTimedOut && (progress.total == 0 || progress.loaded < progress.total) }
     private var visibleGroups: [CoreStreamSourceGroup] {
@@ -4557,13 +4557,13 @@ struct iOSSourceList: View {
     }
 
     /// Empty result, told apart by CAUSE. If one or more add-ons actually ERRORED (fetch / timeout /
-    /// TLS), name them and show the reason instead of the misleading generic "returned nothing" — this
+    /// TLS), name them and show the reason instead of the misleading generic "returned nothing"; this
     /// is what surfaces, on-device, WHY a title finds no links (e.g. an iOS-only stream-fetch failure).
     @ViewBuilder private var emptyState: some View {
         let errored = states.filter { $0.error != nil }
         // Stream add-ons that ANSWERED (not still loading) without an error: either genuinely had
         // nothing (ready == 0) or returned streams that the current filter (e.g. direct-links-only)
-        // removed. Naming them tells the user the add-ons WERE queried and came back empty — which is
+        // removed. Naming them tells the user the add-ons WERE queried and came back empty, which is
         // the actionable case (add-on offline / config expired) vs StremioX not asking at all.
         let answeredEmpty = states.filter { $0.error == nil && !$0.loading }
         if !errored.isEmpty {
@@ -4584,7 +4584,7 @@ struct iOSSourceList: View {
                     .padding(.horizontal, Theme.Space.md)
             }
         } else {
-            // Reached "no sources" with NO add-on having produced any stream state — so no STREAM add-on
+            // Reached "no sources" with NO add-on having produced any stream state, so no STREAM add-on
             // was even queried (only catalog/metadata add-ons are active). This is the real "no links"
             // cause: a stream add-on is missing, or the engine dropped it (e.g. lost after a force-quit).
             VStack(alignment: .leading, spacing: Theme.Space.xs) {
@@ -4607,9 +4607,9 @@ struct iOSSourceList: View {
             .padding(.horizontal, Theme.Space.md)
     }
 
-    /// Add-ons whose stream request FAILED (fetch/timeout/TLS/ATS) — the actionable transport failures.
+    /// Add-ons whose stream request FAILED (fetch/timeout/TLS/ATS), the actionable transport failures.
     private var erroredAddons: [CoreBridge.StreamAddonState] { states.filter { $0.error != nil } }
-    /// Add-ons that answered with no streams (queried, genuinely empty) — distinct from "not queried".
+    /// Add-ons that answered with no streams (queried, genuinely empty), distinct from "not queried".
     private var emptyAddons: [CoreBridge.StreamAddonState] {
         states.filter { $0.error == nil && !$0.loading && $0.ready == 0 }
     }
@@ -4671,7 +4671,7 @@ struct iOSSourceList: View {
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
                 }
                 // Reveal the grouped list on demand (All-sources toggle) OR always when the control bar is
-                // hidden — otherwise the movie rail would be empty, since the toggle lives in that bar.
+                // hidden; otherwise the movie rail would be empty, since the toggle lives in that bar.
                 if showAllSources || !showsPrimaryControls {
                     if groups.count > 1 { filterBar }
                     sortBar
@@ -4693,11 +4693,11 @@ struct iOSSourceList: View {
         // The flow layout (HStack that wraps) is simulated with two rows so it stays tidy on a phone.
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
             // Watch-in pick honors the remembered-quality continuity hint, so reopening a title lands
-            // on the same quality it last played (same-release-group biased) — matching tvOS.
+            // on the same quality it last played (same-release-group biased), matching tvOS.
             if let best = bestStream, let url = best.playableURL(isEpisode: isEpisode) {
                 HStack(spacing: Theme.Space.sm) {
                     // Watch-Now waits until every add-on has answered (or the settle timeout fired), so one
-                    // press plays the best of ALL sources, not the best of whoever replied first — the tvOS
+                    // press plays the best of ALL sources, not the best of whoever replied first, the tvOS
                     // gate. The Quality picker stays live so a manual pick is always available immediately.
                     // AUTO-PICK: race the top cached candidates in parallel via `playBest` when the caller
                     // wired it (best first, ranking order preserved), else the single-resolve `play(best)`.
@@ -4795,7 +4795,7 @@ struct iOSSourceList: View {
 
     // MARK: Grouped, collapsible streams
 
-    /// One collapsible section per add-on. LazyVStack so only on-screen rows are built — a popular
+    /// One collapsible section per add-on. LazyVStack so only on-screen rows are built, a popular
     /// title can return thousands of sources, and instantiating them all at once OOM-crashed on tvOS.
     private var groupedList: some View {
         let plan = windowedPlan
@@ -4974,7 +4974,7 @@ extension iOSSourceList: Equatable {
 /// add-on's raw verbose blurb (e.g. "Stream Expression (308) / Included Reasons / Removal Reasons /
 /// digitalRelease Bypass"). It shows: a leading play/torrent icon, a quality badge (4K / 1080p / …)
 /// next to the add-on + TORRENT badges, the parsed flavour tags (Remux · HDR · Atmos · HEVC · Cached)
-/// + file size, and a single trimmed title line for human context — built from `StreamRanking.sourceDetail`
+/// + file size, and a single trimmed title line for human context, built from `StreamRanking.sourceDetail`
 /// and `StreamRanking.qualityLabel`, the same parse that powers the Watch / Quality affordances.
 private struct iOSStreamLabel: View {
     let addon: String
@@ -5031,7 +5031,7 @@ private struct iOSStreamLabel: View {
                         if cached { badge("⚡ CACHED", prominent: true) }
                     }
                 }
-                // Parsed flavour tags + size — the clean line tvOS shows, minus the resolution (it is
+                // Parsed flavour tags + size, the clean line tvOS shows, minus the resolution (it is
                 // the prominent badge above), so the row never reads as a doubled "4K · 4K · HDR".
                 if !flavors.isEmpty || size != nil {
                     HStack(spacing: 8) {
@@ -5051,7 +5051,7 @@ private struct iOSStreamLabel: View {
                 }
                 // The release title for human context. Allowed two lines so the fuller release name
                 // shows (people want the detail) while a verbose multi-line add-on blurb still can't
-                // run away — `cleanTitle` already keeps only the first line of the add-on's name.
+                // run away; `cleanTitle` already keeps only the first line of the add-on's name.
                 // Compact rows (#117) drop this line entirely: the parsed badges + tags + size above
                 // are the whole row.
                 if !compactLabels, let title = cleanTitle {
@@ -5067,7 +5067,7 @@ private struct iOSStreamLabel: View {
         .opacity(enabled ? 1 : 0.55)
     }
 
-    /// A single trimmed context line: the actual RELEASE NAME. Prefer behaviorHints.filename — it is the
+    /// A single trimmed context line: the actual RELEASE NAME. Prefer behaviorHints.filename; it is the
     /// only field that distinguishes "...Deathly.Hallows.Part.1..." from "Part.2", which a short add-on
     /// label / quality blurb in `name` drops. Fall back to the stream `name`, then the first line of
     /// `description`. Newlines collapse to the first line and a trailing container extension is stripped;
@@ -5142,7 +5142,7 @@ private struct iOSEmptyRow: View {
     }
 }
 
-/// Add / remove the open title from the engine library — the touch/Mac twin of the tvOS LibraryChip.
+/// Add / remove the open title from the engine library, the touch/Mac twin of the tvOS LibraryChip.
 private struct iOSLibraryChip: View {
     @EnvironmentObject private var core: CoreBridge
 
@@ -5162,7 +5162,7 @@ private struct iOSLibraryChip: View {
     }
 }
 
-/// Add / remove the open title from the local "want to watch" watchlist (`LibraryAutoAdd`) — a pure app-side
+/// Add / remove the open title from the local "want to watch" watchlist (`LibraryAutoAdd`), a pure app-side
 /// bookmark separate from the engine Library, engine-safe ids only (tt / tmdb). Reads the open title from the
 /// engine detail meta exactly like `iOSLibraryChip` reads `core.detailInLibrary`, so it needs no call-site
 /// plumbing; a synthetic magnet / paste-a-link title (no tt / tmdb id) hides the chip since it can't be

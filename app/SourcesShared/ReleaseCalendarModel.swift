@@ -3,7 +3,7 @@ import SwiftUI
 /// One series' full meta, fetched directly over the add-on protocol from the first meta add-on that
 /// answers. Never touches the engine, so the open detail page's engine meta slot is untouched. nil if
 /// none decode. OS-agnostic (pure URLSession + Codable) so it lives in SourcesShared and is reachable by
-/// EVERY target — both the iOS new-episode notification sweep (`NewEpisodeNotifications.fetchSeriesMeta`,
+/// EVERY target, both the iOS new-episode notification sweep (`NewEpisodeNotifications.fetchSeriesMeta`,
 /// a thin shim over this) and the shared `ReleaseCalendarModel`, including the tvOS targets that don't
 /// compile the SourcesiOS notifications file. Single implementation, identical behavior on both surfaces.
 enum SeriesMetaFetcher {
@@ -58,7 +58,7 @@ enum MovieMetaFetcher {
 /// "Upcoming Episodes": a Home rail of the next-airing episode of each SERIES in the user's library that
 /// drops within the next 45 days, soonest first. It reuses the SAME meta fetch the new-episode
 /// notification sweep runs (`SeriesMetaFetcher.fetch`), so a show you follow surfaces its next episode
-/// here whether or not you ever reopen its page — no engine call, the meta comes straight off the
+/// here whether or not you ever reopen its page; no engine call, the meta comes straight off the
 /// installed meta add-ons (never `CoreBridge`, so the open detail page's meta slot is untouched).
 ///
 /// Everything fails soft: an empty library, no meta add-ons, or a flaky network all leave `upcoming`
@@ -143,14 +143,14 @@ final class ReleaseCalendarModel: ObservableObject {
 
     /// Walk each series' meta off the main thread (reusing the shared `SeriesMetaFetcher` that also backs
     /// the notification sweep), take the SOONEST not-yet-aired episode within the horizon, and return them
-    /// sorted by air date. Pure transform + network, no main-actor state — runs entirely off the caller's actor.
+    /// sorted by air date. Pure transform + network, no main-actor state, runs entirely off the caller's actor.
     private static func build(seriesIDs: [String], seriesNames: [String: String],
                               metaBases: [String], reference: Date) async -> [UpcomingEpisode] {
         let horizon = reference.addingTimeInterval(Self.horizonDays * 86_400)
         var out: [UpcomingEpisode] = []
         for id in seriesIDs {
             guard let meta = await SeriesMetaFetcher.fetch(id: id, bases: metaBases) else { continue }
-            // The SOONEST not-yet-aired dated episode within the 45-day horizon — the exact filter the
+            // The SOONEST not-yet-aired dated episode within the 45-day horizon, the exact filter the
             // notification sweep uses (`releasedDate > now && < now + 45d`, earliest wins).
             let next = (meta.videos ?? [])
                 .compactMap { v -> (CoreVideo, Date)? in v.releasedDate.map { (v, $0) } }

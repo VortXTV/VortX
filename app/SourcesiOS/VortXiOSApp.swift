@@ -21,10 +21,10 @@ struct VortXiOSApp: App {
     @State private var splashDone = false
 
     // macOS only: the embedded streaming server runs as a `node` CHILD PROCESS (MacNodeServer),
-    // and Foundation does NOT kill that child when the app quits — it would be reparented to
+    // and Foundation does NOT kill that child when the app quits; it would be reparented to
     // launchd and keep holding port 11470, accumulating orphans across launches. An app-delegate
     // gives us the one reliable "the app is really quitting" hook (applicationWillTerminate),
-    // which scenePhase .background/.inactive does NOT provide on macOS — those fire on ordinary
+    // which scenePhase .background/.inactive does NOT provide on macOS; those fire on ordinary
     // window/focus changes, so killing the server there would wrongly stop it mid-use.
     #if os(macOS) && !VORTX_NO_EMBEDDED_SERVER
     @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
@@ -85,7 +85,7 @@ struct VortXiOSApp: App {
         // blank + the app is laggy on open" report (constant re-fetch through the tiny shared cache).
         PosterImageLoader.configureSharedCache()
         // Safety sweep: clear any leftover libmpv on-disk streaming cache from a previous run. The
-        // player wipes it on a genuine exit, but a crash mid-playback could leave bytes behind — this
+        // player wipes it on a genuine exit, but a crash mid-playback could leave bytes behind; this
         // guarantees a fresh, bounded start so the configurable cache can never accumulate unbounded.
         // Detached so the directory scan + delete (multi-GB after a crash) never blocks launch.
         Task.detached(priority: .utility) { DiskCacheSetting.clearCache() }
@@ -205,8 +205,8 @@ struct VortXiOSApp: App {
                     await NewEpisodeNotifications.sweepLibrary(seriesIDs: series.map(\.id), seriesNames: names, metaBases: bases)
                 }
                 // macOS: present the player full-window at the scene ROOT (above the dimmed app), not as a
-                // separate floating window. The overlay is applied HERE — INSIDE the environmentObjects
-                // below — so those objects wrap the overlay's ZStack and the hoisted player (a sibling of
+                // separate floating window. The overlay is applied HERE, INSIDE the environmentObjects
+                // below, so those objects wrap the overlay's ZStack and the hoisted player (a sibling of
                 // the root content, fed through MacPlayerHost) inherits CoreBridge / StremioAccount /
                 // ThemeManager. Injecting them deeper than the overlay crashed the player the instant it
                 // launched: the hoisted AnyView read an @EnvironmentObject that was not one of its
@@ -222,7 +222,7 @@ struct VortXiOSApp: App {
                 .modifier(MacRootProfileCoverOverlay())
                 #endif
                 // Brand launch splash on top of everything (incl. the macOS player overlay) until its
-                // animation finishes — the iPhone/iPad/Mac twin of the tvOS RootTabView splash.
+                // animation finishes, the iPhone/iPad/Mac twin of the tvOS RootTabView splash.
                 .overlay {
                     if !splashDone {
                         SplashView { splashDone = true }
@@ -241,7 +241,7 @@ struct VortXiOSApp: App {
                 .tint(Theme.Palette.accent)
                 // Without a min frame the macOS WindowGroup adopts the root's tiny intrinsic size and
                 // opens as a postage-stamp window; pin a sensible minimum so it can't collapse. (iOS /
-                // iPadOS ignore this — their windows are managed by the system, not content size.)
+                // iPadOS ignore this; their windows are managed by the system, not content size.)
                 #if os(macOS)
                 .frame(minWidth: 900, minHeight: 600)
                 // Resolve the single shared NSToolbar as hidden so updateLocations has nothing to
@@ -257,7 +257,7 @@ struct VortXiOSApp: App {
                 #endif
         }
         // macOS opens the window at a real default size (the deployment target is macOS 14, so
-        // .defaultSize / .windowResizability — macOS 13+ — are available), and .contentMinSize lets
+        // .defaultSize / .windowResizability, macOS 13+, are available), and .contentMinSize lets
         // the user shrink it only down to the root's min frame above, never to nothing.
         #if os(macOS)
         .defaultSize(width: 1280, height: 820)
@@ -298,7 +298,7 @@ struct VortXiOSApp: App {
 }
 
 /// macOS menu-bar command bridge. The menu commands live at the SwiftUI `Scene` level, outside the
-/// view tree, so they cannot touch iOSRootView's `@State tab` directly — they post a notification the
+/// view tree, so they cannot touch iOSRootView's `@State tab` directly; they post a notification the
 /// root view observes and maps to its tab selection. Tiny and platform-neutral so it compiles on every
 /// SourcesiOS target even though only macOS builds a menu bar.
 enum MacCommands {
@@ -438,7 +438,7 @@ private struct MacWindowChrome: NSViewRepresentable {
                 while let v = node, v !== window.contentView?.superview {
                     v.isHidden = false
                     // SwiftUI's hidden-toolbar resolution FADES NSTitlebarContainerView to alpha 0
-                    // rather than hiding it (field-verified: hidden=false, alpha=0.0) — restore alpha
+                    // rather than hiding it (field-verified: hidden=false, alpha=0.0), restore alpha
                     // or the unhidden buttons still never draw.
                     if v.alphaValue < 1 { v.alphaValue = 1 }
                     if v.frame.height < 1 {
@@ -459,7 +459,7 @@ import AppKit
 
 /// macOS app delegate whose sole job is to kill the embedded node streaming server when the app
 /// actually quits. `applicationWillTerminate(_:)` is the reliable "app is exiting" signal on macOS
-/// (Cmd-Q, menu Quit, logout/shutdown) — unlike scenePhase `.background`/`.inactive`, which fire on
+/// (Cmd-Q, menu Quit, logout/shutdown), unlike scenePhase `.background`/`.inactive`, which fire on
 /// routine window/focus changes and must NOT tear the server down. Without this the `node` child is
 /// reparented to launchd and keeps holding port 11470 (the orphaned-process leak this fixes).
 final class MacAppDelegate: NSObject, NSApplicationDelegate {
@@ -479,7 +479,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
 
     /// Closing the only window must QUIT the app (a single-window media app, not a document app).
     /// Without this, the red close button / Cmd-W left the app running headless with the node server
-    /// still holding port 11470 and no way to get the window back — and applicationWillTerminate above
+    /// still holding port 11470 and no way to get the window back, and applicationWillTerminate above
     /// never fired, so the server was only reaped on an explicit Quit.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }

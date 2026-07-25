@@ -12,7 +12,7 @@ import UIKit
 ///    transfer continues while the app is suspended / backgrounded.
 ///  * **torrent-to-disk** (`isTorrent == true`): the playable URL IS the loopback streaming-server URL
 ///    (`127.0.0.1:11470/{infoHash}/{fileIdx}`). The in-app node server fetches pieces as we read, so the
-///    server MUST stay alive — a background `URLSession` can't keep it running. So torrents download over
+///    server MUST stay alive; a background `URLSession` can't keep it running. So torrents download over
 ///    a `.default` session while the app is ACTIVE, wrapped in a `UIApplication` background-task assertion
 ///    that buys a grace window if the user backgrounds the app. If the server dies the transfer simply
 ///    fails (fail-soft) and the record goes to `.failed` with resume data kept where the OS provides it.
@@ -107,7 +107,7 @@ final class DownloadManager: NSObject, ObservableObject {
 
     /// `taskIdentifier -> final destination file URL`, captured at task-creation time and read from the
     /// `didFinishDownloadingTo` delegate callback. That callback runs on the session's BACKGROUND
-    /// delegate queue, where the temp file must be moved synchronously before it's deleted — so the
+    /// delegate queue, where the temp file must be moved synchronously before it's deleted, so the
     /// destination must be resolvable WITHOUT hopping to the main actor. The box is its own thread-safe
     /// (`NSLock`-guarded) `Sendable` type, so it's safe to read from either thread.
     nonisolated let destinations = DownloadDestinationMap()
@@ -129,7 +129,7 @@ final class DownloadManager: NSObject, ObservableObject {
     /// Register for device-unlock so a download parked after a -3000 save failure auto-resumes instead of
     /// dead-ending. Three triggers, all routed to `retryDownloadsAwaitingUnlock` (which no-ops when nothing
     /// is parked or the device is still locked): `protectedDataDidBecomeAvailable` (the unlock itself),
-    /// `didBecomeActive`, and `willEnterForeground` — the last two are belt-and-braces flushes for an unlock
+    /// `didBecomeActive`, and `willEnterForeground`; the last two are belt-and-braces flushes for an unlock
     /// that happened while the app was suspended (that notification would have been missed) AND for the
     /// unlocked-but-parked fallback below, which recovers on the next foreground. The singleton lives for the
     /// process, so the observers never need removing.
@@ -171,7 +171,7 @@ final class DownloadManager: NSObject, ObservableObject {
 
     // MARK: Sessions
 
-    /// Survives app suspension — debrid / direct / HTTP.
+    /// Survives app suspension: debrid / direct / HTTP.
     private lazy var backgroundSession: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: "tv.vortx.downloads.background")
         config.isDiscretionary = false
@@ -180,7 +180,7 @@ final class DownloadManager: NSObject, ObservableObject {
         return URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }()
 
-    /// Active-app only — the loopback torrent URL (server must stay alive).
+    /// Active-app only: the loopback torrent URL (server must stay alive).
     private lazy var foregroundSession: URLSession = {
         let config = URLSessionConfiguration.default
         config.allowsCellularAccess = true
@@ -190,7 +190,7 @@ final class DownloadManager: NSObject, ObservableObject {
     #if os(iOS)
     /// Offline HLS (.m3u8) downloads: AVFoundation fetches the media into a system-managed `.movpkg` bundle we
     /// play back through AVPlayer (libmpv can't open a `.movpkg`). Background config so it survives suspension.
-    /// iOS only — `AVAssetDownloadURLSession` is unavailable on tvOS and native macOS (there the source fails soft).
+    /// iOS only: `AVAssetDownloadURLSession` is unavailable on tvOS and native macOS (there the source fails soft).
     private lazy var hlsAssetSession: AVAssetDownloadURLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: "tv.vortx.downloads.hls")
         config.allowsCellularAccess = true
@@ -209,7 +209,7 @@ final class DownloadManager: NSObject, ObservableObject {
     // MARK: Public API
 
     /// Begin downloading `stream` for `meta`, fetching the already-resolved `resolvedURL` (the SAME URL
-    /// the player would have used — debrid/direct https, or the loopback torrent URL). Returns the new
+    /// the player would have used, debrid/direct https, or the loopback torrent URL). Returns the new
     /// record. No-ops to the existing record if this exact video is already downloaded / downloading.
     @discardableResult
     func download(stream: CoreStream, meta: PlaybackMeta, resolvedURL: URL,
@@ -655,11 +655,11 @@ final class DownloadManager: NSObject, ObservableObject {
     /// a download shows as `.downloading` yet pause/cancel find no live task and silently no-op. So here we:
     ///
     ///  1. Re-CREATE each background session with its SAME identifier + delegate (a background session must be
-    ///     recreated in the new process to receive its running tasks) — done by touching the lazy sessions.
+    ///     recreated in the new process to receive its running tasks), done by touching the lazy sessions.
     ///  2. `getAllTasks` and RECONCILE: map each live task back to its record (persisted `taskIdentifier`
     ///     first, then the filename/uuid we serialized on `taskDescription`), so its pause/cancel controls
     ///     drive the real task again. An ORPHAN task with no matching store record is cancelled. Any store
-    ///     record still marked `.downloading` with NO live task is reconciled to `.paused` (resumable) —
+    ///     record still marked `.downloading` with NO live task is reconciled to `.paused` (resumable),
     ///     never deleted, since its bytes-on-disk / partial asset are intact.
     ///
     /// Idempotent + fail-soft: safe to call at launch AND from the background-relaunch handler; a
@@ -743,7 +743,7 @@ final class DownloadManager: NSObject, ObservableObject {
     /// Any record still marked `.downloading` after reconnection but with NO reconnected live task is
     /// stranded (its session/task did not survive, e.g. a torrent foreground transfer whose server died
     /// while suspended, or a task the OS dropped). Reconcile it to `.paused` so its controls make sense and
-    /// the user can resume — never delete it, the partial bytes / asset are still on disk. `hlsOnly` scopes
+    /// the user can resume; never delete it, the partial bytes / asset are still on disk. `hlsOnly` scopes
     /// the sweep to the matching transport so the byte pass doesn't touch HLS records still awaiting the
     /// asset-session callback and vice-versa.
     private func reconcileStuckDownloading(excluding adopted: Set<UUID>, hlsOnly: Bool) {
@@ -755,7 +755,7 @@ final class DownloadManager: NSObject, ObservableObject {
             let recordIsHLS = false
             #endif
             if hlsOnly != recordIsHLS { continue }
-            // Still has a live task from THIS process (never lost) — leave it alone.
+            // Still has a live task from THIS process (never lost); leave it alone.
             if taskForRecord[record.id] != nil { continue }
             #if os(iOS)
             if assetTaskForRecord[record.id] != nil { continue }
@@ -907,15 +907,15 @@ final class DownloadManager: NSObject, ObservableObject {
 
     /// Opt-in storage reclaim (DEFAULT OFF): when a downloaded title has become fully finished-watched,
     /// delete its on-disk file and drop its record. Driven by the `WatchedIndex.ids` signal wired in
-    /// `init`. Read-only w.r.t. watch state — it only READS the finished-watched signal and calls the local
+    /// `init`. Read-only w.r.t. watch state; it only READS the finished-watched signal and calls the local
     /// delete path (`DownloadStore.remove`, which unlinks the file and removes the row); it never marks,
     /// unmarks, or otherwise mutates watch/progress/library state.
     ///
     /// SAFETY GUARDS: only a `.completed` record with NO live transfer is ever eligible, so a still
     /// downloading, queued, paused, or failed item is never touched, and a partially-watched title is never
-    /// deleted (the watched signals we read are "finished" signals — `WatchedIndex.ids` holds only
+    /// deleted (the watched signals we read are "finished" signals; `WatchedIndex.ids` holds only
     /// watched/marked metas + fully-watched series, and an overlay's `watchedVideoIds` holds only finished
-    /// videos — so neither can report a partial watch). Fail-soft: `store.remove` swallows a missing/locked
+    /// videos, so neither can report a partial watch). Fail-soft: `store.remove` swallows a missing/locked
     /// file, and we snapshot the ids BEFORE deleting since `remove` mutates `store.records`.
     private func autoDeleteFinishedWatchedIfEnabled() {
         guard UserDefaults.standard.bool(forKey: Self.autoDeleteWatchedDefaultsKey) else { return }
@@ -941,7 +941,7 @@ final class DownloadManager: NSObject, ObservableObject {
     /// Read-only, and it honors the per-profile watch-history invariant exactly as `WatchedIndex` does:
     ///  - OWNER profile (`activeUsesEngineHistory`): the engine-derived `WatchedIndex.ids`. A movie matches
     ///    on its own id; an episode is reclaimed only once its WHOLE series is finished (per-episode engine
-    ///    ticks are not exposed here, so this stays conservative — it never deletes a partly-watched show).
+    ///    ticks are not exposed here, so this stays conservative; it never deletes a partly-watched show).
     ///  - OVERLAY profile: that profile's PRIVATE overlay only (never the account/engine set). Per-episode
     ///    exact (`watchedVideoIds` holds each finished episode id), and a finished movie records its own id.
     private func isFinishedWatched(_ record: DownloadRecord) -> Bool {
@@ -950,7 +950,7 @@ final class DownloadManager: NSObject, ObservableObject {
         if profiles.activeUsesEngineHistory {
             let watched = WatchedIndex.shared.ids
             // Movie: contentId == videoId == metaId; either matches. Episode: only the series-completion
-            // rollup (contentId) counts — an episode id is not carried in the engine watched set.
+            // rollup (contentId) counts; an episode id is not carried in the engine watched set.
             return watched.contains(record.contentId) || (!isEpisode && watched.contains(record.videoId))
         }
         let overlay = profiles.watchedVideoIds(forMeta: record.contentId)
@@ -983,10 +983,10 @@ extension DownloadManager: URLSessionDownloadDelegate {
         }
     }
 
-    /// Finished — the temp file is only valid for the duration of THIS synchronous callback (the OS
+    /// Finished: the temp file is only valid for the duration of THIS synchronous callback (the OS
     /// deletes it on return), so move it now, on this (background) delegate-queue thread, into the
     /// Downloads dir. Media files are gigabytes, so a `FileManager.moveItem` (an inode relink within the
-    /// same container) is the only safe option — never read the bytes into memory. The destination was
+    /// same container) is the only safe option; never read the bytes into memory. The destination was
     /// captured at task-creation time into a lock-guarded map, so it's resolvable here without hopping to
     /// the main actor (which `assumeIsolated` would crash on, since this runs off-main).
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,

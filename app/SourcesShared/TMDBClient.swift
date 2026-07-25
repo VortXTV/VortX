@@ -100,7 +100,7 @@ enum TMDBClient {
     /// whose language matches the user's preferred language, then the title's ORIGINAL language, then English,
     /// then the first/most-popular official Trailer. Within each language band an official Trailer beats a
     /// non-official one, which beats a Teaser/Clip. Pass `[]` (the default) to keep the old
-    /// language-agnostic pick — the AMBIENT muted hero clip does not use this, so its behavior is unchanged.
+    /// language-agnostic pick; the AMBIENT muted hero clip does not use this, so its behavior is unchanged.
     static func trailerYouTubeID(metaID: String, type: String, preferredLanguages: [String] = []) async -> String? {
         let key = ApiKeys.effectiveTMDBKey()
         let media = (type == "series") ? "tv" : "movie"

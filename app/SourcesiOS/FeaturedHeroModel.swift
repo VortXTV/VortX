@@ -1,13 +1,13 @@
 import SwiftUI
 
-/// The ambient billboard hero's per-screen model — the touch/Mac analogue of the tvOS
+/// The ambient billboard hero's per-screen model, the touch/Mac analogue of the tvOS
 /// `FocusedItemModel`, adapted for a focus-less platform. Where tvOS tracks the *focused* card, touch
 /// has no pointer to follow, so the hero is a SELF-DRIVEN ambient billboard (Netflix/Disney+ style):
 ///
 ///   - A small randomized pool of candidates (the top items of the screen) cross-fades every
 ///     `heroRotateInterval`, as a still backdrop with the Play + detail overlay.
 ///   - The hero is fully DECOUPLED from the catalog grid/rails: it does NOT auto-select, focus, or
-///     ring any poster, and tapping a poster opens that title's detail through normal navigation —
+///     ring any poster, and tapping a poster opens that title's detail through normal navigation;
 ///     it never "features" the tapped title in the hero.
 ///   - Rotation STOPS the moment the user interacts (scroll / hover / select) and resumes only after
 ///     a spell of inactivity (`heroResumeAfter`). Reduce Motion disables rotation entirely.
@@ -22,7 +22,7 @@ final class FeaturedHeroModel: ObservableObject {
     /// The item currently filling the hero (seed-grade until enrichment lands, then upgraded in place).
     @Published private(set) var hero: FeaturedHeroItem?
 
-    /// The number of items in the rotating pool, and which one is showing — published so the hero view can
+    /// The number of items in the rotating pool, and which one is showing, published so the hero view can
     /// render pager dots. `page` tracks the ambient rotation index; a specifically-featured item (macOS
     /// keyboard browse) is not in the pool so `page` simply holds its last rotation value (dots stay valid).
     @Published private(set) var pageCount = 0
@@ -37,7 +37,7 @@ final class FeaturedHeroModel: ObservableObject {
     /// How many candidates the rotating pool holds at most.
     static let heroPoolCap = 5
     /// After the user interacts (scroll / hover / select), rotation pauses and only resumes once this
-    /// much time has passed with no further interaction — so the billboard never yanks the page out
+    /// much time has passed with no further interaction, so the billboard never yanks the page out
     /// from under someone who is reading or browsing.
     static let heroResumeAfter: Duration = .seconds(12)
     /// Coalescing window for changed-content re-seeds. At app open the engine emits one revision per
@@ -52,7 +52,7 @@ final class FeaturedHeroModel: ObservableObject {
     private var rotationTask: Task<Void, Never>?
 
     /// The candidate ids of the last APPLIED seed, in CALLER order. The idempotence check compares
-    /// against this — never against the (shuffled) `pool` order: comparing caller-order ids to the
+    /// against this, never against the (shuffled) `pool` order: comparing caller-order ids to the
     /// shuffled pool made an IDENTICAL re-seed look like new content almost every time (a 5-item shuffle
     /// is the identity 1 in 120 tries), so every routine engine re-emit reshuffled + re-showed the hero.
     private var seededIds: [String] = []
@@ -123,7 +123,7 @@ final class FeaturedHeroModel: ObservableObject {
         motionEnabled = !reduceMotion
         let capped = Array(candidates.prefix(Self.heroPoolCap))
         // An empty pool means the screen has no content (e.g. after sign-out clears the rows). Clear
-        // the hero and halt rotation so a stale featured title — with a working Play button — can't
+        // the hero and halt rotation so a stale featured title, with a working Play button, can't
         // linger. Home renders the hero unconditionally, so without this it would keep cycling
         // stale data; Discover/Library already gate on content but benefit from the cleanup too.
         guard !capped.isEmpty else {
@@ -144,7 +144,7 @@ final class FeaturedHeroModel: ObservableObject {
             // not rotating like Mac" report). Re-arm the timer if it isn't running.
             if rotationTask == nil { startRotation() }
             // This identical-content emit supersedes any changed-content seed still waiting out the
-            // debounce — a stale pending pool must not land later.
+            // debounce; a stale pending pool must not land later.
             pendingSeedTask?.cancel(); pendingSeedTask = nil; pendingSeed = nil
             return
         }
@@ -197,7 +197,7 @@ final class FeaturedHeroModel: ObservableObject {
         }
         startRotation()
         // Eagerly enrich the WHOLE pool now, not just the visible item. Continue-Watching seeds carry
-        // only a name + poster, so a CW hero (e.g. Game of Thrones) showed bare — its enrichment used to
+        // only a name + poster, so a CW hero (e.g. Game of Thrones) showed bare; its enrichment used to
         // start only when it rotated in and often lost the apply-race against the ~7s rotation. Pre-fetching
         // every pool item means each is already cached (rating/year/genres/synopsis/logo) by the time it
         // appears, so the meta row is there on first show. The cache + in-flight guards de-dup the work.
@@ -268,7 +268,7 @@ final class FeaturedHeroModel: ObservableObject {
     /// The user touched the screen (scroll / hover / select). Pause the ambient rotation immediately
     /// and (re)start the inactivity timer; rotation resumes only once `heroResumeAfter` passes with no
     /// further interaction. No-op when motion is disabled. Decoupled from selection: this never pins,
-    /// rings, or opens any poster — it only quiets the billboard while the user is busy (issue #53).
+    /// rings, or opens any poster; it only quiets the billboard while the user is busy (issue #53).
     func noteInteraction() {
         guard motionEnabled else { return }
         interactionHeld = true
@@ -302,14 +302,14 @@ final class FeaturedHeroModel: ObservableObject {
 
     /// Fill in logo / trailer / synopsis / rating / year / runtime / genres (and better 16:9 art) for
     /// a seed-grade item by fetching its meta from Cinemeta + the installed meta add-ons. This is what
-    /// gives Continue-Watching heroes — which carry only a name + poster — a real meta row and synopsis
+    /// gives Continue-Watching heroes (which carry only a name + poster) a real meta row and synopsis
     /// (issue #54). Cached to the session cache; applied live only if the title is still the one on
     /// screen. Self-contained (no dependency on the tvOS `FocusedItemModel`), so tvOS is untouched.
     private func enrichIfNeeded(_ item: FeaturedHeroItem) {
         guard Self.enrichmentCache[item.id] == nil, !enriching.contains(item.id) else { return }
         let candidates = Self.metaURLs(for: item)
         guard !candidates.isEmpty else {
-            NSLog("%@", "[Hero] no meta candidates for \(item.name) (id=\(item.id), type=\(item.type)) — id scheme not covered by Cinemeta or any installed meta add-on")
+            NSLog("%@", "[Hero] no meta candidates for \(item.name) (id=\(item.id), type=\(item.type)); id scheme not covered by Cinemeta or any installed meta add-on")
             return
         }
         enriching.insert(item.id)
@@ -335,9 +335,9 @@ final class FeaturedHeroModel: ObservableObject {
                 }
                 return
             }
-            // No candidate resolved (every fetch failed / timed out / returned an empty meta) — free the
+            // No candidate resolved (every fetch failed / timed out / returned an empty meta), free the
             // id to retry later, and log it so a persistently-bare hero is diagnosable on-device.
-            NSLog("%@", "[Hero] enrich FAILED for \(item.name) (id=\(item.id)) — all \(candidates.count) candidate fetch(es) failed/empty")
+            NSLog("%@", "[Hero] enrich FAILED for \(item.name) (id=\(item.id)); all \(candidates.count) candidate fetch(es) failed/empty")
             await MainActor.run { self?.enriching.remove(item.id) }
         }
     }
@@ -515,7 +515,7 @@ struct FeaturedHeroItem: Identifiable, Equatable, Hashable {
 
 // MARK: - The Stremio add-on meta response
 
-/// The add-on protocol's meta response — the fields the hero uses. Self-contained copy (the tvOS one
+/// The add-on protocol's meta response, the fields the hero uses. Self-contained copy (the tvOS one
 /// in SharedUI.swift is tvOS-only + private), extended with `logo` + `trailerStreams` so the touch
 /// hero can surface the editorial logo and the Trailer chip. Same JSON shape for Cinemeta and every
 /// catalog add-on.
@@ -550,7 +550,7 @@ struct AddonMetaResponse: Decodable {
         let ytId: String?
     }
 
-    /// Meta-level `behaviorHints` — only `defaultVideoId` (the imdb id for a tmdb:/kitsu: title) is read.
+    /// Meta-level `behaviorHints`, only `defaultVideoId` (the imdb id for a tmdb:/kitsu: title) is read.
     struct BehaviorHints: Decodable {
         let defaultVideoId: String?
     }

@@ -7,7 +7,7 @@ import Foundation
 /// Hard invariant (see SavedLinksStore + ProfileSync.swift): a raw magnet has no catalog meta id, and
 /// injecting a synthetic item into the stremio-core library corrupts account-wide sync for the official
 /// Stremio clients. So we ONLY ever add a *resolved* item (a real `tt…` / `tmdb:…` id from Cinemeta). If
-/// nothing matches, we add nothing here — the raw link still lives in SavedLinksStore. Per-profile
+/// nothing matches, we add nothing here; the raw link still lives in SavedLinksStore. Per-profile
 /// invariant is honoured: the main profile goes through the engine (account library); overlay profiles
 /// go to their private ProfileStore overlay and never touch the account library.
 @MainActor

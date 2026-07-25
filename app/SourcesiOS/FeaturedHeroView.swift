@@ -5,7 +5,7 @@ import UIKit   // UIScreen / UIDevice for the screen-proportional hero band heig
 import AppKit  // NSApplication / NSScreen for the window-proportional macOS hero band height
 #endif
 
-/// The ambient featured hero shown at the top of Home, Library, and Discover — the touch/Mac twin of
+/// The ambient featured hero shown at the top of Home, Library, and Discover, the touch/Mac twin of
 /// the tvOS browse hero. It mirrors the `iOSDetailView` hero's visual language: a full-bleed
 /// `meta.background` STILL backdrop with the same dual-gradient scrim, a logo-or-serif-title, the
 /// ★rating · year · runtime · genres meta row, a 3-line synopsis, and a Play + Trailer action row.
@@ -16,7 +16,7 @@ import AppKit  // NSApplication / NSScreen for the window-proportional macOS her
 /// navigation rather than "featuring" it here (issue #53). When the featured item has a trailer whose
 /// `playableURL` resolves and motion is allowed, a muted, looping clip plays as the hero backdrop (#44)
 /// through the native libmpv player over the embedded server's `/yt` route (`InHeroTrailerView`), the
-/// SAME path tvOS uses — no YouTube web embed (which YouTube's July-2025 Referer enforcement broke). The
+/// SAME path tvOS uses, no YouTube web embed (which YouTube's July-2025 Referer enforcement broke). The
 /// still backdrop underneath is the permanent fallback, so a missing / slow / blocked clip never occludes
 /// the art. The Play button opens the title's detail and the Trailer chip plays the trailer in-app in a
 /// full-screen native player cover. The cross-fade, rotation, and the hero clip honour
@@ -61,7 +61,7 @@ struct FeaturedHeroView: View {
 
 
     /// Hero band height. iPhone: the billboard must command MORE THAN HALF the screen (owner ask), so the
-    /// band is a fraction of the device screen height — 0.58 lands 55-60% visible even with the notch /
+    /// band is a fraction of the device screen height; 0.58 lands 55-60% visible even with the notch /
     /// home-indicator safe areas inside the bounds. The content row is bottom-anchored, so the extra
     /// height shows more backdrop above it. iPad's much taller canvas gets a gentler fraction with a cap
     /// so the hero stays a billboard, not a full page. macOS: taller than the old 460 but a FIXED cap, so
@@ -114,7 +114,7 @@ struct FeaturedHeroView: View {
         ZStack(alignment: .bottomLeading) {
             // The still backdrop image is the base art layer and the permanent fallback: the muted clip
             // (#44) only paints OVER it when a trailer id resolves, so a missing / slow / blocked embed
-            // never leaves the band black — the artwork always shows through. Reduce-motion skips the
+            // never leaves the band black; the artwork always shows through. Reduce-motion skips the
             // clip entirely.
             backdrop
             heroClip
@@ -158,8 +158,8 @@ struct FeaturedHeroView: View {
             }
         }
         // The LazyVStack host has no horizontal padding (each rail insets itself), so the band is
-        // already edge-to-edge — a fixed-height ambient scroll-header.
-        // Animate the swap on the hero id — the model already wraps content changes in the matching
+        // already edge-to-edge, a fixed-height ambient scroll-header.
+        // Animate the swap on the hero id; the model already wraps content changes in the matching
         // cross-fade, but keying the container guarantees art + overlay move as one.
         .animation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade),
                    value: model.hero?.id)
@@ -193,7 +193,7 @@ struct FeaturedHeroView: View {
     /// allowed and the featured item's trailer resolves a PLAYABLE url (nil on the Lite build, so it
     /// no-ops to the still backdrop there). Keyed on the URL so it reloads per item and tears down the
     /// moment the hero rotates to another title; the still backdrop underneath is the fallback when no
-    /// clip plays. Decorative — the title / meta read first for VoiceOver.
+    /// clip plays. Decorative; the title / meta read first for VoiceOver.
     @ViewBuilder private var heroClip: some View {
         // Also gated by the RemoteConfig fleet kill-switch `features.trailers` (baked default true, so an
         // absent/null remote is identical to shipping): a remote `false` force-disables ambient hero trailers
@@ -240,7 +240,7 @@ struct FeaturedHeroView: View {
         // GeometryReader pins BOTH art layers to the EXACT band size so `scaledToFill` always covers the
         // whole band at any window width. Without it, the AsyncImage sat unframed inside the ZStack (the
         // frame was on the ZStack, not the image), so it sized to the loaded image's natural width and the
-        // rest of the wide macOS band stayed bare scrim — the "backdrop only fills part of the band" report.
+        // rest of the wide macOS band stayed bare scrim, the "backdrop only fills part of the band" report.
         // (On the narrow iPhone the image width happened to exceed the band, so the gap never showed.)
         GeometryReader { geo in
             KenBurnsArt {
@@ -250,14 +250,14 @@ struct FeaturedHeroView: View {
                 // above misses). nil = today's flat canvas, the graceful fallback.
                 (heroTint ?? Theme.Palette.canvas)
                 // Poster fallback layer: a slow or failed backdrop request must never leave a flat black
-                // band (the iPhone "no backdrop" report — AsyncImage fell straight to the black canvas on
+                // band (the iPhone "no backdrop" report; AsyncImage fell straight to the black canvas on
                 // a load miss while the iPad had it cached). The poster is the catalog art the screen
                 // already loaded, so it's almost always available; the backdrop paints over it on success.
                 posterFallback
                 AsyncImage(url: URL(string: model.hero?.backdrop ?? "")) { phase in
                     switch phase {
                     case .success(let img):
-                        // ONE fill image clipped to the band — the same clean approach as
+                        // ONE fill image clipped to the band, the same clean approach as
                         // iOSDetailView.backdrop. The earlier dual layer (a blurred band-filling copy under a
                         // fit copy of the SAME photo) painted the image twice and read as "two overlapping
                         // images". A single scaledToFill covers the band with no second copy and no side gaps.
@@ -293,7 +293,7 @@ struct FeaturedHeroView: View {
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.5), .clear],
                            startPoint: .leading, endPoint: .center)
         )
-        // Purely decorative art + scrims — hide from VoiceOver so the title/meta read first.
+        // Purely decorative art + scrims; hide from VoiceOver so the title/meta read first.
         .accessibilityHidden(true)
     }
 
@@ -309,7 +309,7 @@ struct FeaturedHeroView: View {
                     (heroTint ?? Theme.Palette.canvas)
                 }
             }
-            // Decorative backdrop filler — never announced by VoiceOver.
+            // Decorative backdrop filler, never announced by VoiceOver.
             .accessibilityHidden(true)
         } else {
             (heroTint ?? Theme.Palette.canvas)
@@ -347,7 +347,7 @@ struct FeaturedHeroView: View {
         }
     }
 
-    /// Pager dots reflecting which of the rotating pool items is showing — the ambient-billboard cue the
+    /// Pager dots reflecting which of the rotating pool items is showing, the ambient-billboard cue the
     /// reference design uses. Hidden for a single-item pool (nothing to page). The active dot is the ember
     /// accent; the rest are a dim capsule. Decorative, so hidden from VoiceOver.
     @ViewBuilder private var pagerDots: some View {
@@ -366,7 +366,7 @@ struct FeaturedHeroView: View {
     }
 
     /// The add-on logo when enrichment surfaced one (the editorial signature), else the serif hero
-    /// type — mirrors `iOSDetailView.titleOrLogo`.
+    /// type, mirrors `iOSDetailView.titleOrLogo`.
     @ViewBuilder private func titleOrLogo(_ hero: FeaturedHeroItem) -> some View {
         // fanart.tv clearlogo first (when enabled), else the ERDB-aware add-on/metahub logo, else serif text.
         // The shared component is used by tvOS + the detail pages too, so the logo behaves identically everywhere.
@@ -423,7 +423,7 @@ struct FeaturedHeroView: View {
     private func actionRow(_ hero: FeaturedHeroItem) -> some View {
         HStack(spacing: Theme.Space.sm) {
             // A rounded "View Details" pill: tapping the hero opens the title's detail page (where Play
-            // lives), so the label states what the tap does. Ember fill, big radius — the reference pill.
+            // lives), so the label states what the tap does. Ember fill, big radius (the reference pill).
             Button { onOpen(hero) } label: {
                 // The tap opens the detail page (where Play lives), not playback, so the glyph is an
                 // info/detail cue rather than a play triangle: a filled play icon here reads as "start
@@ -455,7 +455,7 @@ struct FeaturedHeroView: View {
         .padding(.top, Theme.Space.xs)
     }
 
-    /// The Trailer chip — shown only when the enriched hero carries a trailer whose `playableURL`
+    /// The Trailer chip, shown only when the enriched hero carries a trailer whose `playableURL`
     /// resolves (so the Lite build, with no proxy, auto-hides it the same way the detail page does).
     /// Tapping it opens an explicit full-screen IN-APP player cover; it never autoplays inline.
     @ViewBuilder private func trailerButton(_ hero: FeaturedHeroItem) -> some View {
@@ -546,7 +546,7 @@ struct FeaturedHeroView: View {
 /// the parent's per-title `.id` on the backdrop means each new featured title restarts the pan from
 /// neutral. Fully gated off under Reduce Motion. The host frame + `.clipped()` keep the drift inside the
 /// band (scale >= 1.05 so the offset never bares an edge). Compositor-only (transform/opacity) per the
-/// motion rules — never animates layout.
+/// motion rules, never animates layout.
 private struct KenBurnsArt<Content: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var active = false

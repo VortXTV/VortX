@@ -6,14 +6,14 @@ import Security
 /// Small-secret store for the Stremio auth token.
 ///
 /// On iOS/tvOS this prefers the Keychain (generic password, readable after first unlock, not
-/// iCloud-synced). If the Keychain is unavailable — which happens on the unsigned Simulator and can
-/// happen on a re-signed sideload where the keychain-access-group does not match — it falls back to
+/// iCloud-synced). If the Keychain is unavailable, which happens on the unsigned Simulator and can
+/// happen on a re-signed sideload where the keychain-access-group does not match, it falls back to
 /// UserDefaults so the token is never silently lost. On a normally signed device the Keychain path is
 /// used and nothing is mirrored to UserDefaults.
 ///
 /// On macOS the app is ad-hoc signed (no Developer ID), so every `SecItem` access against the LOGIN
 /// keychain pops the "StremioX wants to use confidential information stored in '…' in your keychain"
-/// password prompt — the item's ACL can never match a stable signing identity. To avoid that prompt
+/// password prompt; the item's ACL can never match a stable signing identity. To avoid that prompt
 /// entirely, macOS stores the SAME accounts in an owner-only file under Application Support instead of
 /// the system keychain. The public API is identical across platforms, so no caller changes.
 enum Keychain {
@@ -27,7 +27,7 @@ enum Keychain {
     static let fallbackKeyPrefix = "kcfallback."
 
 #if os(macOS)
-    // MARK: macOS — file-backed store (no system keychain, no password prompt)
+    // MARK: macOS file-backed store (no system keychain, no password prompt)
 
     /// `~/Library/Application Support/StremioX/credentials.plist`, a `[String: String]` map keyed by
     /// the same account names the Keychain path uses (e.g. "stremiox.authKey",
@@ -87,7 +87,7 @@ enum Keychain {
         }
     }
 #else
-    // MARK: iOS / tvOS — system Keychain with UserDefaults fallback (unchanged)
+    // MARK: iOS / tvOS system Keychain with UserDefaults fallback (unchanged)
 
     private static func fallbackKey(_ account: String) -> String { fallbackKeyPrefix + account }
 

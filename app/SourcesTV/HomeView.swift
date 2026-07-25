@@ -141,8 +141,8 @@ struct HomeView: View {
     /// Second pass: the release-calendar / meta-source triggers and the focus-settled hero trailer.
     private var homeChangeHandlers: some View {
         homeSeedHandlers
-        // Rebuild "Upcoming Episodes" when the library changes (a new follow) or the meta add-ons hydrate
-        // — the same two inputs the model sweeps over. The bases come from `account.addons`, which loads
+        // Rebuild "Upcoming Episodes" when the library changes (a new follow) or the meta add-ons hydrate,
+        // the same two inputs the model sweeps over. The bases come from `account.addons`, which loads
         // async after sign-in, so key on its count too (matching the notification sweep's input set).
         .onChange(of: core.library?.catalog.count ?? 0) { refreshReleaseCalendar() }
         .onChange(of: account.addons.count) { refreshReleaseCalendar() }
@@ -168,7 +168,7 @@ struct HomeView: View {
         mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none
     }
 
-    /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases — derived
+    /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases, derived
     /// EXACTLY like the new-episode notification sweep (series-typed library ids + names, `providesMeta`
     /// add-on base URLs). The model no-ops when the series set is unchanged, so this is cheap to re-call.
     private func refreshReleaseCalendar() {
@@ -485,7 +485,7 @@ struct RailHeader: View {
 }
 
 /// The BIG header for a nested collection GROUP (Streaming / Genres / Top New / New): reuses `RailHeader`'s
-/// eyebrow + title styling but a visual tier UP — the screen-title font with an accent rule beneath — so a
+/// eyebrow + title styling but a visual tier UP, the screen-title font with an accent rule beneath, so a
 /// group reads as a section ABOVE its child rails, distinct from an individual rail's `RailHeader`.
 struct GroupHeader: View {
     var eyebrow: String? = nil
@@ -968,7 +968,7 @@ struct StreamingRow: View {
 }
 
 /// "Upcoming Episodes": the next-airing episode of each series in the library within the next 45 days,
-/// soonest first (see `ReleaseCalendarModel`). Mirrors `TopPicksRow`/`StreamingRow` — each card is the
+/// soonest first (see `ReleaseCalendarModel`). Mirrors `TopPicksRow`/`StreamingRow`, each card is the
 /// series' `PosterCard` (so it routes to the series `DetailView` like any catalog card and resolves its
 /// poster through `PosterArtwork`), with a small "S2E5 · Jun 30" caption under it. Series-only.
 struct UpcomingEpisodesRow: View {

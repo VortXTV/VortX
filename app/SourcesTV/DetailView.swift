@@ -2953,7 +2953,7 @@ struct LibraryChip: View {
     }
 }
 
-/// Add / remove the open title from the local "want to watch" watchlist (`LibraryAutoAdd`) — a pure app-side
+/// Add / remove the open title from the local "want to watch" watchlist (`LibraryAutoAdd`), a pure app-side
 /// bookmark separate from the engine Library, engine-safe ids only (tt / tmdb). Reads the open title from the
 /// engine detail meta exactly like `LibraryChip` reads `core.detailInLibrary`, so it needs no call-site
 /// plumbing; a synthetic magnet / paste-a-link title (no tt / tmdb id) hides the chip since it can't be

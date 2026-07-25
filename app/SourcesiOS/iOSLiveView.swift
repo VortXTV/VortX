@@ -5,7 +5,7 @@ import SwiftUI
 /// art is a logo on a neutral card, not box-art, so a dedicated `ChannelTile` (not a forked poster
 /// card) carries the right shape. Tapping a channel pushes the standard `iOSDetailView`, which now has
 /// a Live branch (backdrop + name + source list + LIVE badge, no VOD chrome) and plays through the
-/// player's live-tuned path. The screen reuses the engine + player wholesale — no EPG, no M3U import.
+/// player's live-tuned path. The screen reuses the engine + player wholesale: no EPG, no M3U import.
 ///
 /// Empty state: when no installed add-on exposes a live catalog there are no live rows, so the screen
 /// nudges the user to the Add-ons tab rather than showing a blank surface.
@@ -75,7 +75,7 @@ struct iOSLiveView: View {
 }
 
 /// One Live row: a titled, horizontally-scrolling band of square `ChannelTile`s. The twin of
-/// `PosterRail` for live content — same header + spacing language, but square tiles instead of
+/// `PosterRail` for live content, same header + spacing language, but square tiles instead of
 /// 2:3 poster cards.
 private struct ChannelRail: View {
     let title: String
@@ -100,7 +100,7 @@ private struct ChannelRail: View {
 }
 
 /// A square (1:1) channel tile: the channel's logo (preferred) or poster, fit on a neutral surface
-/// card so logos with transparency / odd aspect ratios read cleanly — channels rarely have box-art,
+/// card so logos with transparency / odd aspect ratios read cleanly, channels rarely have box-art,
 /// so a `fit` on a surface beats a `fill` crop. A square shape (`posterShape == "square"`) fits the
 /// logo on the card; any other live item without square art falls back to the same logo-on-surface
 /// tile so the row stays uniform. The channel name sits below, like a poster card.
@@ -110,7 +110,7 @@ private struct ChannelTile: View {
 
     private let side: CGFloat = 132
 
-    /// Logo first (the channel mark), else poster — both are channel-identifying art.
+    /// Logo first (the channel mark), else poster; both are channel-identifying art.
     private var artURL: URL? { URL(string: meta.logo ?? meta.poster ?? "") }
 
     var body: some View {

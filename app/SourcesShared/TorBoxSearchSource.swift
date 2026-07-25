@@ -3,13 +3,13 @@ import Foundation
 /// TorBox SEARCH-as-a-source: a lightweight client for `search-api.torbox.app` (a PUBLIC, IP-rate-limited
 /// search index, SEPARATE from the account API `api.torbox.app`). For the current title's imdb id it pulls
 /// both usenet and torrent results and turns them into extra `CoreStream`s that MERGE into the source list
-/// the user sees — so a user with a TorBox key gets usenet AND torrent sources with NO usenet/torrent
+/// the user sees, so a user with a TorBox key gets usenet AND torrent sources with NO usenet/torrent
 /// add-on installed.
 ///
 /// GATED on a TorBox key (`DebridKeys.isConfigured(.torBox)`): with no key the whole feature no-ops (no
 /// fetch, no extra sources). The key is passed to lift the rate limits where the API accepts it. FAIL-SOFT:
 /// any error/timeout yields no extra sources and no user-visible failure. It never blocks the normal add-on
-/// stream load — a detail view fetches it in parallel and appends the result when it arrives (the same
+/// stream load; a detail view fetches it in parallel and appends the result when it arrives (the same
 /// async-contribution shape as `DebridCacheAwareness`).
 ///
 /// NO referral / partnership code: these are the user's own search results against the public index, not a
@@ -193,7 +193,7 @@ enum TorBoxSearch {
     }
 
     /// Build a `CoreStream` via JSON decode so it tracks the struct's own (all-optional) field set with no
-    /// manual memberwise init — the same technique `CoreMetaItem.placeholder` uses.
+    /// manual memberwise init, the same technique `CoreMetaItem.placeholder` uses.
     private static func make(name: String, description: String, nzbUrl: String? = nil,
                              infoHash: String? = nil, sources: [String]? = nil) -> CoreStream? {
         var json: [String: Any] = ["name": name, "description": description]
@@ -319,7 +319,7 @@ final class TorBoxSearchSource: ObservableObject {
 
     /// Merge the fetched search streams into `groups` as one extra group, deduped against the streams
     /// already present (by infoHash for torrents, nzbUrl for usenet, url otherwise). Returns `groups`
-    /// unchanged when there is nothing to add — so a no-key / empty-result path is a pure pass-through.
+    /// unchanged when there is nothing to add, so a no-key / empty-result path is a pure pass-through.
     func merged(into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         Self.merge(streams, into: groups)
     }

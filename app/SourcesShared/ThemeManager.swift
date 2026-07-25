@@ -34,7 +34,7 @@ final class ThemeManager: ObservableObject {
     /// The setter explicitly fans `objectWillChange` out FIRST and clamps in one place, so a write
     /// from any path (the iOS Stepper's `$theme.textScale` binding, the tvOS +/- buttons via
     /// `adjustTextScale`, a profile switch via `applyTheme`) invalidates observers deterministically.
-    /// Reading `textScale` through `Theme.Typography` alone does NOT subscribe a view — a view must
+    /// Reading `textScale` through `Theme.Typography` alone does NOT subscribe a view; a view must
     /// observe ThemeManager (`@EnvironmentObject theme`) for its fonts to repaint on change.
     @Published var textScale: Double {
         didSet {
@@ -115,9 +115,9 @@ final class ThemeManager: ObservableObject {
     var accent: Color { option.base }
     var accentBright: Color { option.bright }
 
-    /// Ink that sits ON the accent fill — primary-button labels (Watch/Play/Save/Sign In), on-accent
+    /// Ink that sits ON the accent fill, primary-button labels (Watch/Play/Save/Sign In), on-accent
     /// spinners, the profile "current" check. It was a hardcoded warm-brown literal, so it kept an
-    /// orange cast on top of ANY accent — the "still looks orange after switching to pink" report.
+    /// orange cast on top of ANY accent, the "still looks orange after switching to pink" report.
     /// Now derived from the accent's luminance: Ember keeps its signature warm-brown; every other
     /// accent gets a neutral near-black on light/mid fills or near-white on dark fills (max contrast,
     /// no stale hue). Re-reads live when the accent changes, like `accent` itself.
@@ -141,7 +141,7 @@ final class ThemeManager: ObservableObject {
         return 0.2126 * Double(r) + 0.7152 * Double(g) + 0.0722 * Double(b)
     }
 
-    // Chrome: a dark near-black tinted toward the accent's hue (so "Warm" now follows the accent —
+    // Chrome: a dark near-black tinted toward the accent's hue (so "Warm" now follows the accent:
     // Ocean reads cool, Forest green, Mono near-neutral), or true black for OLED / AMOLED panels.
     var canvas: Color   { oled ? themeRGB(0, 0, 0)             : tintedDark(0.085) }
     var surface1: Color { oled ? themeRGB(0.055, 0.055, 0.057) : tintedDark(0.130) }

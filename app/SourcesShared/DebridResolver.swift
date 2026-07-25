@@ -19,7 +19,7 @@ enum DebridProbe {
 /// HTTPS URL through the user's own debrid account, so cached torrents play instantly without a debrid
 /// add-on. The keys live in `DebridKeys.shared`; this is the resolver layer that finally USES them
 /// (task #12). Provider-agnostic via `DebridResolving`; TorBox is implemented first (most popular, the
-/// only one of the four that also does usenet, and — unlike Real-Debrid — it kept its instant cache-check).
+/// only one of the four that also does usenet, and, unlike Real-Debrid, it kept its instant cache-check).
 ///
 /// This file is the resolver ENGINE only: it takes hashes/magnets and returns files/URLs. Wiring it into
 /// the source list (badge + rank cached results to the top) and the play path (cached -> instant direct
@@ -469,7 +469,7 @@ private extension Array {
 /// (base `https://api.torbox.app/v1/api/usenet`, same Bearer auth). A usenet stream carries an `.nzb`
 /// link (`CoreStream.nzbUrl`) instead of an infohash; the resolver adds the nzb, waits until TorBox has
 /// it present, picks the video file, and mints a direct HTTPS URL the player opens as a plain direct
-/// stream (NOT a torrent — no `/create`, no warm-up, no torrent teardown). The identifier is the md5 of
+/// stream (NOT a torrent, no `/create`, no warm-up, no torrent teardown). The identifier is the md5 of
 /// the nzb link (TorBox's usenet cache key). Fail-soft: any failure throws a `DebridError`, which the
 /// coordinator's bounded resolve collapses to `nil`.
 actor TorBoxUsenetResolver {
@@ -704,7 +704,7 @@ actor RealDebridResolver: DebridResolving {
         // Pick the ONE target file (DebridFile.id = RD's own file id) by the episode/size heuristic over the
         // full list, then select ONLY it. This is the verified-against-live-API path: RD packs a MULTI-file
         // selection into a single RAR link (unstreamable), and selectFiles is a no-op once the torrent has
-        // downloaded — so selecting the wanted file alone, before download, is the only way to get one
+        // downloaded, so selecting the wanted file alone, before download, is the only way to get one
         // streamable link. `links.first` is then that file's restricted link.
         let dfiles = fileList.map { f -> DebridFile in
             DebridFile(id: f.id, name: f.path, shortName: (f.path as NSString).lastPathComponent, size: f.bytes, mimetype: nil)
@@ -982,7 +982,7 @@ enum DebridForm {
 
 enum DebridHTTP {
     /// Send a request and decode JSON, mapping 401/403 to `.invalidKey`, other non-2xx to `.providerError`,
-    /// and decode failures to `.providerError` — the same contract `TorBoxResolver.send` uses.
+    /// and decode failures to `.providerError`, the same contract `TorBoxResolver.send` uses.
     static func decode<T: Decodable>(_ session: URLSession, _ req: URLRequest) async throws -> T {
         let (data, response) = try await session.data(for: req)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -1179,7 +1179,7 @@ extension DebridCoordinator {
 
     /// The single bridge from a tapped/auto-picked RAW TORRENT to a debrid DIRECT link for playback.
     ///
-    /// Returns a remote HTTPS URL the player can open as a plain direct stream (NOT a torrent — it does not
+    /// Returns a remote HTTPS URL the player can open as a plain direct stream (NOT a torrent; it does not
     /// match the `{server}:11470/{40-hex}/{idx}` shape the player keys torrent behaviour off, so it gets no
     /// `/create`, no warm-up, and no `closeTorrent` teardown), or `nil` when the caller should use today's
     /// path unchanged. It is FAIL-SOFT by construction: every non-success (no key, not a raw torrent, any
@@ -1326,7 +1326,7 @@ extension DebridCoordinator {
     /// Ordering IS the caller's ranking: `candidates` must arrive already StreamRanking-ordered (continuity /
     /// binge / pin preserved), and the first `max` that are resolvable-cached are raced. A candidate is
     /// resolvable-cached when it is a raw torrent whose lowercased infoHash is in `cachedHashes`, OR a usenet
-    /// stream whose nzb link is in `cachedUsenetURLs` — i.e. the same account-confirmed sets the source list
+    /// stream whose nzb link is in `cachedUsenetURLs`, i.e. the same account-confirmed sets the source list
     /// badges. A stream already carrying a direct `url` is skipped (nothing to resolve; the caller plays it
     /// directly). Anything not confirmed cached is left out so we never kick off an uncached add-then-download.
     ///
@@ -1336,7 +1336,7 @@ extension DebridCoordinator {
     /// `resolveTimeout` per leg, and settles as soon as ONE leg wins.
     ///
     /// FAIL-SOFT: returns `nil` when nothing is confirmed-cached to race (e.g. no key, or no cached row) or
-    /// when every raced leg fails — the caller then falls back to today's single-resolve / local-engine path,
+    /// when every raced leg fails, the caller then falls back to today's single-resolve / local-engine path,
     /// so behaviour with no debrid key is byte-identical (this returns `nil` before any `await`).
     ///
     /// - Parameters:

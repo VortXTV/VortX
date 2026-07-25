@@ -11,7 +11,7 @@ class MetalLayer: CAMetalLayer {
 
     // Trickplay capture: when a capture is requested, the next nextDrawable() call blits the
     // newly acquired drawable's texture into captureTexture before returning the drawable to mpv.
-    // The newly acquired drawable holds the frame from 2+ renders ago — valid and not in transition,
+    // The newly acquired drawable holds the frame from 2+ renders ago, valid and not in transition,
     // unlike the previous drawable which MoltenVK may recycle inside super.nextDrawable().
     // All fields protected by captureLock (VO thread vs main thread).
     private let captureLock = NSLock()

@@ -306,8 +306,8 @@ struct RootTabView: View {
                 DiscoverView().id(resetTokens[1])
                     .tabItem { Label("Discover", systemImage: "safari.fill") }.tag(1)
             }
-            // Live TV sits after Discover. Tags 0–5 were already taken (Search uses 4, Add-ons 3),
-            // so Live takes the next free tag 6 and reset slot 6 — the selection-reset .onChange
+            // Live TV sits after Discover. Tags 0-5 were already taken (Search uses 4, Add-ons 3),
+            // so Live takes the next free tag 6 and reset slot 6, the selection-reset .onChange
             // below stays in bounds against the resized 7-slot array.
             if !hideLiveTab {
                 LiveView().id(resetTokens[6])

@@ -47,7 +47,7 @@ extension View {
     }
 
     /// Like `platformFullScreenCover`, but on macOS the presented content is sized to fill the screen
-    /// so the player / trailer reads as a large, window-filling, in-app surface — NOT the tiny floating
+    /// so the player / trailer reads as a large, window-filling, in-app surface, NOT the tiny floating
     /// sheet a `.sheet` collapses to around full-bleed (`Color.black.ignoresSafeArea`) content with no
     /// intrinsic size. On iOS / iPadOS this is identical to `platformFullScreenCover` (the system
     /// already presents `fullScreenCover` edge-to-edge). Use this ONLY for media covers (player /
@@ -92,7 +92,7 @@ final class MacPlayerHost: ObservableObject {
     @Published var content: AnyView?
     /// Identity of the cover bridge currently presenting. Several call sites (Search, the detail page,
     /// Continue-Watching resume) each attach a bridge and all feed THIS one host, so a bridge must only
-    /// ever clear the player IT put up — never one another bridge owns — and a bridge being torn down
+    /// ever clear the player IT put up, never one another bridge owns, and a bridge being torn down
     /// (e.g. its detail page popped while the player was up) must be able to clean up after itself.
     private var ownerID: UUID?
     private init() {}
@@ -118,7 +118,7 @@ private struct MacPlayerCoverBridge<Item: Identifiable, C: View>: View {
     @Binding var item: Item?
     @ViewBuilder let content: (Item) -> C
     /// Stable per-instance identity (persisted across re-renders by @State) so the host knows which bridge
-    /// owns the on-screen player and a torn-down bridge clears only its own — see MacPlayerHost.ownerID.
+    /// owns the on-screen player and a torn-down bridge clears only its own; see MacPlayerHost.ownerID.
     @State private var ownerID = UUID()
     var body: some View {
         Color.clear
@@ -177,7 +177,7 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
         let c = context.coordinator
         // The window isn't attached yet, so defer one runloop turn to find + mutate it. If the view is
         // dismantled BEFORE this runs (rapid present-then-dismiss in the same cycle), `c.cancelled` is
-        // already set, so we bail without hiding the titlebar — otherwise we'd hide it with nothing left
+        // already set, so we bail without hiding the titlebar; otherwise we'd hide it with nothing left
         // to restore it and the window would lose its titlebar permanently.
         DispatchQueue.main.async { [weak view] in
             guard !c.cancelled, let host = view?.window else { return }
@@ -247,13 +247,13 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
         var titlebarObserver: NSObjectProtocol?
 
         /// Hide the whole titlebar chain from the traffic-light buttons up to (but not including) the theme
-        /// frame — exactly the chain MacWindowChrome.apply force-resurrects — reversing it. Only `isHidden`
+        /// frame, exactly the chain MacWindowChrome.apply force-resurrects, reversing it. Only `isHidden`
         /// is touched (never styleMask or frame height): hiding a view cannot resize the window, and the grey
         /// band is the NSTitlebarContainerView's NSVisualEffectView material, which stops drawing once the
         /// container is hidden. Each node's prior state is recorded ONCE so dismantle restores it; a fresh
         /// fullscreen container seen on a later re-assert is recorded fresh and harmlessly restored too.
         /// (Hiding the container also hides the traffic lights during playback, which is the correct full-bleed
-        /// behavior — the player exposes its own close/chevron control.)
+        /// behavior; the player exposes its own close/chevron control.)
         func collapseTitlebar(_ window: NSWindow) {
             let stop = window.contentView?.superview
             for kind: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
