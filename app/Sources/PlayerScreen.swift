@@ -146,10 +146,15 @@ struct PlayerScreen: View {
     /// the 4 Hz tick; `force` is for the moments the system cannot extrapolate (first frame, play/pause).
     /// Engine-agnostic: it reads only the chrome's own state, which BOTH engines drive through the same
     /// property stream.
-    private func updateNowPlaying(force: Bool = false) {
+    ///
+    /// `at` overrides the published position for the ONE caller that runs before `currentTime` has been
+    /// assigned this tick's value: the first-frame publish. Without it a resumed title publishes 0 and is
+    /// only corrected on the next tick, so the card would briefly show the start of a film resumed at 40
+    /// minutes.
+    private func updateNowPlaying(at elapsed: Double? = nil, force: Bool = false) {
         guard hasStartedPlaying else { return }
         NowPlayingCenter.update(item: nowPlayingItem,
-                                elapsed: currentTime,
+                                elapsed: elapsed ?? currentTime,
                                 duration: duration,
                                 paused: isPaused,
                                 speed: speed,
@@ -1221,7 +1226,7 @@ struct PlayerScreen: View {
                         seekTo: { position in coordinator.player?.seek(to: position) },
                         stepSeconds: seekStepSeconds,
                         canScrub: NowPlayingPolicy.allowsScrubbing(duration: duration, isLive: effectivelyLive))
-                    updateNowPlaying(force: true)   // publish the card immediately, not on the next tick
+                    updateNowPlaying(at: d, force: true)   // publish the card immediately, not on the next tick
                     fetchPooledSubtitles()          // community-subtitle pool (P2/P3), fail-soft + gated
                     uploadEmbeddedSubtitlesIfNeeded()   // best-effort pooling of the file's own text tracks (P4)
                     applyPersistedVolume()          // restore the saved in-player volume + mute (D5)

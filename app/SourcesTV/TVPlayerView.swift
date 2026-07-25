@@ -1008,7 +1008,7 @@ struct TVPlayerView: View {
                         seekTo: { position in coordinator.player?.seek(to: position) },
                         stepSeconds: seekStepSeconds,
                         canScrub: NowPlayingPolicy.allowsScrubbing(duration: duration, isLive: isCurrentLiveStream))
-                    refreshNowPlaying(force: true)   // publish the card immediately, not on the next tick
+                    refreshNowPlaying(at: d, force: true)   // publish the card immediately, not on the next tick
                     fetchPooledSubtitles()          // community-subtitle pool (P2/P3), fail-soft + gated
                     uploadEmbeddedSubtitlesIfNeeded()   // best-effort pooling of the file's own text tracks (P4)
                     // Add-on subtitles were fetched only from the `duration` event, which a debrid direct-HTTP
@@ -4147,10 +4147,15 @@ struct TVPlayerView: View {
     /// Engine-agnostic by construction: it reads only the chrome's own `currentTime` / `duration` /
     /// `isPaused`, which BOTH engines drive through the same property stream, so libmpv and AVPlayer (incl.
     /// the Dolby Vision remux lane) publish identically with no engine branch here.
-    private func refreshNowPlaying(force: Bool = false) {
+    ///
+    /// `at` overrides the published position for the ONE caller that runs before `currentTime` has been
+    /// assigned this tick's value: the first-frame publish. Without it a resumed title publishes 0 and is
+    /// only corrected on the next tick, so the card would briefly show the start of a film resumed at 40
+    /// minutes.
+    private func refreshNowPlaying(at elapsed: Double? = nil, force: Bool = false) {
         guard hasStartedPlaying else { return }
         NowPlayingCenter.update(item: nowPlayingItem,
-                                elapsed: currentTime,
+                                elapsed: elapsed ?? currentTime,
                                 duration: duration,
                                 paused: isPaused,
                                 speed: playSpeed,
