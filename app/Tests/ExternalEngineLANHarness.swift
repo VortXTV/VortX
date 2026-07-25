@@ -22,12 +22,14 @@
 // Vision negotiation against a LAN HLS origin, which needs an actual Apple TV and an actual DV source. That
 // remains the one thing only a device soak can settle.
 //
-// BUILD AND RUN:
+// BUILD AND RUN. Swift only permits top-level code in a file literally named `main.swift`, so the harness is
+// copied to that name in a scratch directory rather than being restructured around an @main type, which would
+// have added a layer of indirection for no benefit to a script:
 //   cd /Users/daksh/vortx-extengine/app
-//   xcrun swiftc -O -o /tmp/vortx-lan-harness \
-//     SourcesShared/VortXEngineHostPolicy.swift \
-//     Tests/ExternalEngineLANHarness.swift
-//   /tmp/vortx-lan-harness
+//   mkdir -p /tmp/vortx-lan && cp Tests/ExternalEngineLANHarness.swift /tmp/vortx-lan/main.swift
+//   xcrun swiftc -O -o /tmp/vortx-lan/harness \
+//     SourcesShared/VortXEngineHostPolicy.swift /tmp/vortx-lan/main.swift
+//   /tmp/vortx-lan/harness
 //
 // Requires ffmpeg on PATH to synthesize the test asset (any recent build; it only needs libx264 and the
 // fragmented-MP4 HLS muxer).
@@ -80,7 +82,7 @@ func lanAddress() -> String? {
                 }
             }
         }
-        pointer = interface.pointee.ifa_next
+        pointer = interface.ifa_next
     }
     return best
 }

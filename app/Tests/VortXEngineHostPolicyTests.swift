@@ -14,9 +14,10 @@
 // answered. Section 1 below (`defaultOff*`) pins that equivalence; everything after it is the strict HTTP layer
 // that only ever activates for a LAN-hosted session with a real capability.
 //
-// A genuine bug was found in `normalizeHost` while writing this suite (see the "BUG" comment in section 4): the
-// unbracketed `host:port` split is dead code, so a typed port is silently ignored in favour of the default. The
-// source was left untouched per instructions; the tests below assert the ACTUAL behaviour and are annotated with
+// A genuine bug was found in `normalizeHost` while writing this suite and has since been FIXED: the unbracketed
+// `host:port` split was dead code (its guard dropped one character from the front of the whole string rather
+// than everything up to the colon), so a typed port was silently ignored in favour of the default and every
+// port-validation guard was unreachable. Section 4 now pins the corrected behaviour, including
 // what the doc comment / an unbracketed caller would reasonably have expected instead.
 
 import Foundation
@@ -227,21 +228,18 @@ check("range: a guarded route carries the parsed Range through",
 
 check("host: a bare IP normalizes with the default port",
       hostsEqual(P.normalizeHost("192.168.1.33"), (host: "192.168.1.33", port: 11471)))
-// BUG: expected (host: "192.168.1.33", port: 9000) per the doc comment; the port is dropped and swallowed into
-// the (unsplit) host string instead. See the BUG note above.
-check("host: BUG - an unbracketed host:port does NOT split out the port",
-      hostsEqual(P.normalizeHost("192.168.1.33:9000"), (host: "192.168.1.33:9000", port: 11471)))
-// BUG: same root cause once the scheme and trailing slash are correctly stripped.
-check("host: BUG - a scheme+port URL strips scheme/slash but still keeps host:port fused",
-      hostsEqual(P.normalizeHost("http://192.168.1.33:9000/"), (host: "192.168.1.33:9000", port: 11471)))
+check("host: an unbracketed host:port splits out the port",
+      hostsEqual(P.normalizeHost("192.168.1.33:9000"), (host: "192.168.1.33", port: 9000)))
+check("host: a scheme and trailing slash are stripped before the port is split",
+      hostsEqual(P.normalizeHost("http://192.168.1.33:9000/"), (host: "192.168.1.33", port: 9000)))
 check("host: surrounding whitespace is trimmed",
       hostsEqual(P.normalizeHost("  mac.local  "), (host: "mac.local", port: 11471)))
 check("host: a bracketed IPv6 literal with a port splits correctly",
       hostsEqual(P.normalizeHost("[fe80::1]:9000"), (host: "fe80::1", port: 9000)))
 check("host: a bracketed IPv6 literal with no port uses the default",
       hostsEqual(P.normalizeHost("[fe80::1]"), (host: "fe80::1", port: 11471)))
-// This one happens to match the doc comment's stated intent ("not mangled"), but only as a side effect of the
-// same dead branch above, not because of deliberate multi-colon detection.
+// Deliberate multi-colon detection: more than one colon with no brackets is a bare IPv6 literal, so the last
+// group must not be mistaken for a port.
 check("host: a bare (unbracketed) IPv6 literal is kept whole, not mangled",
       hostsEqual(P.normalizeHost("fe80::1:2:3"), (host: "fe80::1:2:3", port: 11471)))
 check("host: nil input normalizes to nil",
@@ -250,16 +248,12 @@ check("host: empty input normalizes to nil",
       P.normalizeHost("") == nil)
 check("host: whitespace-only input normalizes to nil",
       P.normalizeHost("   ") == nil)
-// BUG: expected nil (an unparseable port should be refused); actual is a "valid" tuple because the port half is
-// never even reached, per the BUG note above.
-check("host: BUG - an unparseable port string is NOT rejected, it passes through as the whole host",
-      hostsEqual(P.normalizeHost("host:notaport"), (host: "host:notaport", port: 11471)))
-// BUG: expected nil (`port > 0` should refuse 0); actual is the same pass-through.
-check("host: BUG - a zero port is NOT rejected, it passes through as the whole host",
-      hostsEqual(P.normalizeHost("host:0"), (host: "host:0", port: 11471)))
-// BUG: expected nil (`port <= 65535` should refuse an out-of-range port); actual is the same pass-through.
-check("host: BUG - an out-of-range port is NOT rejected, it passes through as the whole host",
-      hostsEqual(P.normalizeHost("host:70000"), (host: "host:70000", port: 11471)))
+check("host: an unparseable port string is rejected",
+      P.normalizeHost("host:notaport") == nil)
+check("host: a zero port is rejected",
+      P.normalizeHost("host:0") == nil)
+check("host: an out-of-range port is rejected",
+      P.normalizeHost("host:70000") == nil)
 
 // MARK: - 5. Mount plan (the default-off gate)
 //
@@ -299,13 +293,13 @@ check("failover: a nil report above the threshold fails over",
 check("failover: a healthy report with no accumulated failures keeps the remote mount",
       P.failover(consecutiveControlFailures: 0, hostReportsHealthy: true) == .keepRemote)
 
-// The documented behaviour, matched precisely rather than invented: `failover` does NOT itself reset the
-// failure counter on a healthy report. "Fail-open on true" (per the source's own doc comment) is a property of
-// the CALLER's contract — the caller resets its counter to 0 on a successful report before the next call. If a
-// caller passes `hostReportsHealthy: true` while the counter is still at or above the threshold (i.e. it has not
-// yet honoured that contract), the function still fails over, because the second guard alone is sufficient.
-check("failover: a healthy report does NOT itself override an already-high failure count",
-      P.failover(consecutiveControlFailures: 999, hostReportsHealthy: true) == .failOverToDevice)
+// A healthy report is positive evidence that arrived over a control request which COMPLETED, so it wins
+// outright rather than falling through to the failure threshold. In normal operation the caller has already
+// reset its counter on that success and this case is unreachable; asserting it anyway pins the function as
+// self-consistent read in isolation, instead of depending on a caller convention to avoid contradicting its own
+// documentation.
+check("failover: a healthy report wins outright over a stale failure count",
+      P.failover(consecutiveControlFailures: 999, hostReportsHealthy: true) == .keepRemote)
 
 // MARK: - 7. mountPath
 
