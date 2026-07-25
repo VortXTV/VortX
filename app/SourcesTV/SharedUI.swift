@@ -645,7 +645,7 @@ struct PosterCard: View {
     /// (alongside the progress stripe) so Continue Watching cards say where playback resumes. Nil on
     /// every non-CW card, so their tiles are unchanged.
     var resumeSeconds: Double? = nil
-    /// Watched state (DESIGN.md "PosterCard, Watched state: 55% opacity plus a check badge").
+    /// Watched state (docs/DESIGN-SYSTEM.md section 3, "Poster card": dim plus a check badge; 55% opacity is our value for "dim").
     /// Mirrors the DetailView episode-thumbnail treatment. Data-bearing callers pass it: the
     /// Library grid (its own per-profile helper) and, since #111, the Home catalog rails and
     /// category grids (via the shared per-profile `WatchedIndex` set). The default keeps every

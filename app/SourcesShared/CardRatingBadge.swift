@@ -66,8 +66,8 @@ struct CardRatingBadge: View {
 /// poster art -- so a landscape card and a portrait poster in the same rail are one idea rendered twice,
 /// not two badges that happen to show the same numbers.
 ///
-/// Inside, hierarchy is carried by SIZE, TRACKING, CASE and INK, never by a second colour (DESIGN.md's
-/// one-accent law: the accent star is the only coloured thing here):
+/// Inside, hierarchy is carried by SIZE, TRACKING, CASE and INK, never by a second colour (the
+/// one-accent law in docs/DESIGN-SYSTEM.md: the accent star is the only coloured thing here):
 ///   * the IMDb value is the ANCHOR, set a third larger, in `textPrimary`, with its DECIMAL dropped to
 ///     ~76% and into `textSecondary`, so the number reads as one considered figure rather than three even
 ///     digits;

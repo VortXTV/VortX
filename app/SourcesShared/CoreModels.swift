@@ -78,8 +78,8 @@ struct CoreCWItem: Decodable, Identifiable {
     }
 
     /// The engine's own "has been watched" predicate (upstream `LibraryItem::watched()`:
-    /// `times_watched > 0`), driving the Library poster badge (DESIGN.md "PosterCard —
-    /// Watched state"). `LibraryItemMarkAsWatched` and every finished play/episode bump
+    /// `times_watched > 0`), driving the Library poster badge (docs/DESIGN-SYSTEM.md section 3,
+    /// "Poster card": watched is dim plus a check badge). `LibraryItemMarkAsWatched` and every finished play/episode bump
     /// `timesWatched`; unmark resets it to 0. `flaggedWatched` is deliberately NOT consulted:
     /// upstream documents it as a per-video "watched event sent" latch, not the indicator.
     /// Distinct from `isFinished`, which answers the Continue-Watching prune question.

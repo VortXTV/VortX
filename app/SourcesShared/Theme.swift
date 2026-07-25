@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// StremioX design system. One source of truth for color, type, spacing, motion, and the focus
-/// treatment, so every tvOS screen reads as one product at ten feet. See DESIGN.md for the rationale.
+/// treatment, so every tvOS screen reads as one product at ten feet. See docs/DESIGN-SYSTEM.md for the rationale.
 /// Direction: editorial cinema. Warm near-black chrome so poster art is the only color on screen,
 /// one ember accent that means focus / selection / primary / progress, nothing decorative colored.
 enum Theme {
