@@ -142,11 +142,22 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         /// free because every playlist URI the server emits is relative.
         let capability: String
 
-        init?(capability: String) {
+        /// Ask the session to retain its ENTIRE produced timeline rather than sliding a window, which is what
+        /// lets the client seek backwards anywhere into what has been produced. Only a host has the disk for
+        /// this. The request may be DOWNGRADED at construction when the machine cannot support it, so read
+        /// `VortXRemuxHLSServer.retainsFullTimeline` for what was actually granted.
+        let retainFullTimeline: Bool
+
+        init?(capability: String, retainFullTimeline: Bool = false) {
             guard VortXEngineHostPolicy.isWellFormedCapability(capability) else { return nil }
             self.capability = capability
+            self.retainFullTimeline = retainFullTimeline
         }
     }
+
+    /// Whether this session ACTUALLY retains its whole timeline. False for every on-device mount, and false for
+    /// a hosted mount on a machine that turned out not to have the disk.
+    var retainsFullTimeline: Bool { stream.retainsFullTimeline }
 
     private let hosting: HostingConfig?
 
@@ -181,7 +192,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             headers: headers,
             indexForHLS: true,
             mode: mode,
-            startAtSeconds: startAtSeconds)
+            startAtSeconds: startAtSeconds,
+            retainFullTimeline: hosting?.retainFullTimeline ?? false)
         guard let server = VortXRemuxHLSServer(
             stream: stream,
             hosting: hosting,
@@ -269,6 +281,17 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     /// Monotonic mount-progress counters for the chrome's progress-aware start watchdog. Thread-safe passthrough.
     var mountProgress: VortXMKVRemuxStream.MountProgress { stream.mountProgress() }
+
+    /// The furthest SOURCE second a closed segment has been published for.
+    ///
+    /// On-device this is inferable from AVPlayer's own seekable ranges, so nothing reads it. A remote client
+    /// cannot infer it (its AVPlayer only knows what the playlist currently advertises, and on a retaining
+    /// session that is the whole timeline regardless of production), so a host reports it explicitly and the
+    /// client clamps forward seeks against it exactly as the on-device lane does.
+    var producedEdgeSeconds: Double {
+        guard let last = stream.hlsWindowSnapshot().window.segments.last else { return 0 }
+        return timelineOriginSeconds + last.end
+    }
 
     /// Stop everything: the remux thread, the listener, and every open connection. Idempotent.
     func invalidate() {
@@ -886,7 +909,24 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                     || common.segments.last?.id == snapshot.audioWindow?.segments.last?.id)
                 && (snapshot.subtitleWindow == nil
                     || common.segments.last?.id == snapshot.subtitleWindow?.segments.last?.id)
-            if commonReachedEOF,
+            if retainsFullTimeline {
+                // FULL-TIMELINE RETENTION (hosted sessions only). The window START never advances: the playlist
+                // always begins at the first segment and only grows at the tail, which is exactly the EVENT
+                // promise the renderers make below and is what entitles AVPlayer to treat the whole produced
+                // timeline as seekable. Backward seek stops being a demote and becomes an ordinary seek.
+                //
+                // Nothing has to be taught not to evict. Spool retention is playlist-receipt driven: a deadline
+                // is armed only for a key that was in the PREVIOUS generation and is absent from this one, so a
+                // playlist that never drops an entry never arms a deadline and nothing is ever collected. The
+                // only real obstacle was the 512 MiB admission ceiling, raised for a retaining spool.
+                //
+                // Skipping `minimumConformingSuffix` here is not an optimisation, it is a requirement. That
+                // function walks every suffix of the window and re-renders each one's duration through
+                // `String(format:)`, which is O(n squared) formatted-string round trips per reload; at the 3600
+                // to 7200 segments of a two-hour title that is seconds of CPU on every playlist fetch. With a
+                // pinned start there is nothing to slide, so its entire purpose is void anyway.
+                selectedVideo = common
+            } else if commonReachedEOF,
                (common.segments.count < startupReadiness.minimumSegmentCount
                 || (DVPlaybackPolicy.renderedDurationMilliseconds(of: common) ?? 0)
                     < startupReadiness.minimumRenderedDurationMilliseconds) {
@@ -1091,7 +1131,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// Pure rendering of the exact immutable storage window used for request lookup.
     private func buildMediaBody(window: VortXHLSWindow, ended: Bool, mapURI: String) -> Data {
         let lines = DVPlaybackPolicy.mediaPlaylistLines(window: window, ended: ended,
-            targetDuration: startupReadiness.frozenTarget.seconds, mapURI: mapURI)
+            targetDuration: startupReadiness.frozenTarget.seconds, mapURI: mapURI,
+            isEvent: retainsFullTimeline)
         return Data(lines.joined(separator: "\n").utf8)
     }
 
@@ -1147,7 +1188,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             renditionID: renditionID,
             window: window,
             ended: publication.ended || publication.audioTerminated,
-            targetDuration: startupReadiness.frozenTarget.seconds)
+            targetDuration: startupReadiness.frozenTarget.seconds,
+            isEvent: retainsFullTimeline)
         let body = Data(lines.joined(separator: "\n").utf8)
         DiagnosticsLog.log("dv", "hls resp /audio\(renditionID).m3u8 seq=\(window.mediaSequence) segs=\(window.segments.count)\(publication.audioTerminated ? " [terminated]" : "")")
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl", delivery: delivery)
@@ -1203,7 +1245,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             renditionID: renditionID,
             window: window,
             ended: publication.ended,
-            targetDuration: startupReadiness.frozenTarget.seconds)
+            targetDuration: startupReadiness.frozenTarget.seconds,
+            isEvent: retainsFullTimeline)
         respond(connection,
                 body: Data(lines.joined(separator: "\n").utf8),
                 contentType: "application/vnd.apple.mpegurl",

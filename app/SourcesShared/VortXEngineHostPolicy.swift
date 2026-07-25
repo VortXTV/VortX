@@ -124,9 +124,15 @@ enum VortXEngineHostPolicy {
             } else if !rest.isEmpty {
                 return nil
             }
-        } else if let colon = text.lastIndex(of: ":"), !text.dropFirst().contains(":") {
-            // A single colon is host:port. Two or more with no brackets is a bare IPv6 literal, which we take
-            // whole and give the default port rather than mangling its last group into a port number.
+        } else if text.filter({ $0 == ":" }).count == 1, let colon = text.firstIndex(of: ":") {
+            // EXACTLY ONE colon is host:port. Two or more with no brackets is a bare IPv6 literal, which we
+            // take whole and give the default port rather than mangling its last group into a port number.
+            //
+            // The count is the whole check and it has to be. An earlier form of this line asked
+            // `!text.dropFirst().contains(":")`, which reads like "no colon after the first character" but
+            // actually drops one character from the front of the WHOLE string, so the colon in `host:9000`
+            // survives and the branch never ran. The visible effect was that a user typing `192.168.1.33:9000`
+            // was silently sent to the default port, and every port-validation guard below was dead code.
             guard let parsed = Int(text[text.index(after: colon)...]) else { return nil }
             host = String(text[..<colon])
             port = parsed
@@ -284,10 +290,14 @@ enum VortXEngineHostPolicy {
     /// - a nil report is a request that did not complete (host asleep, Wi-Fi dropped, process gone). That is
     ///   ambiguous, so it is counted, and only a run of them fails over.
     ///
-    /// Fail-open on `true`: a healthy report resets nothing here (the caller resets its counter on success),
-    /// it simply keeps the remote mount.
+    /// - `hostReportsHealthy == true` is positive evidence that arrived over a control request that COMPLETED,
+    ///   so it wins outright. In normal operation the caller has already reset its counter on that success and
+    ///   this case is unreachable; making it explicit rather than falling through to the threshold means the
+    ///   function is self-consistent read in isolation, instead of depending on a caller convention to avoid
+    ///   contradicting its own documentation.
     static func failover(consecutiveControlFailures: Int, hostReportsHealthy: Bool?) -> Failover {
         if hostReportsHealthy == false { return .failOverToDevice }
+        if hostReportsHealthy == true { return .keepRemote }
         if consecutiveControlFailures >= controlFailureThreshold { return .failOverToDevice }
         return .keepRemote
     }

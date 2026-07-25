@@ -561,10 +561,14 @@ enum MultiAudioPolicy {
         return matches[0].byteOffset
     }
 
+    /// `isEvent` defaults false so every existing caller renders byte-for-byte what it always has. It is set
+    /// only by an engine host retaining its whole timeline, where the EVENT promise (entries are appended, never
+    /// removed) is actually true. See the note on `DVPlaybackPolicy.mediaPlaylistLines`.
     static func mediaPlaylist(renditionID: Int,
                               window: VortXHLSWindow,
                               ended: Bool,
-                              targetDuration: Int) -> [String] {
+                              targetDuration: Int,
+                              isEvent: Bool = false) -> [String] {
         guard renditionID >= 0, !window.segments.isEmpty else { return [] }
         var lines = [
             "#EXTM3U",
@@ -573,6 +577,7 @@ enum MultiAudioPolicy {
             "#EXT-X-MEDIA-SEQUENCE:\(window.mediaSequence)",
             "#EXT-X-MAP:URI=\"audio\(renditionID)-init.mp4\"",
         ]
+        if isEvent { lines.append("#EXT-X-PLAYLIST-TYPE:EVENT") }
         if window.mediaSequence == 0 {
             lines.append("#EXT-X-START:TIME-OFFSET=0.0,PRECISE=YES")
         }

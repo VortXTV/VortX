@@ -300,14 +300,19 @@ enum SubtitleRenditionPolicy {
     /// eviction, durations are inherited from video, and a sliding active playlist is never falsely EVENT.
     ///
     /// There is deliberately no `EXT-X-MAP`: WebVTT segments are self-contained documents with no init.
+    /// `isEvent` defaults false so a sliding active playlist is never falsely EVENT, which is the invariant the
+    /// paragraph above states. An engine host retaining its whole timeline sets it, because there the promise is
+    /// true. See the note on `DVPlaybackPolicy.mediaPlaylistLines`.
     static func mediaPlaylist(renditionID: Int, window: VortXHLSWindow,
-                              ended: Bool, targetDuration: Int) -> [String] {
+                              ended: Bool, targetDuration: Int,
+                              isEvent: Bool = false) -> [String] {
         var lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:7",
             "#EXT-X-TARGETDURATION:\(max(1, targetDuration))",
             "#EXT-X-MEDIA-SEQUENCE:\(window.mediaSequence)",
         ]
+        if isEvent { lines.append("#EXT-X-PLAYLIST-TYPE:EVENT") }
         if window.mediaSequence == 0 {
             lines.append("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES")
         }

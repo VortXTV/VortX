@@ -164,5 +164,9 @@
 		<string>zh-Hant</string>
 		<string>zu</string>
 	</array>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_vortx-engine._tcp</string>
+	</array>
 </dict>
 </plist>

@@ -978,6 +978,47 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     static let defaultCapacityBytes = 512 * 1024 * 1024
     static let defaultChunkBytes = 512 * 1024
 
+    // MARK: - Hosted full-timeline retention (external engine mode)
+
+    /// Free space left untouched for the user. The spool must never be the reason a boot volume fills up.
+    static let hostedReservedFreeBytes = 20 * 1024 * 1024 * 1024
+
+    /// Hard ceiling regardless of how much disk exists. A 2-hour UHD Dolby Vision remux is 40 to 70 GB, so
+    /// 256 GiB covers several concurrent sessions with room to spare, and having ANY finite cap keeps the
+    /// accounting arithmetic meaningful (see `retentionCapacity`).
+    static let hostedMaximumCapacityBytes = 256 * 1024 * 1024 * 1024
+
+    /// The byte ceiling for a session that retains its ENTIRE produced timeline instead of sliding a window.
+    ///
+    /// This is what makes seek-anywhere possible. The on-device lane slides because it is bounded by a jetsam
+    /// ceiling; a host is bounded by a disk, so it can simply keep everything and let the client seek back into
+    /// any of it. Retention itself needs no eviction change: the spool's retention is playlist-receipt driven,
+    /// so a playlist that never drops a segment never arms a deadline and nothing is ever collected. The only
+    /// thing standing in the way is this admission ceiling, which at 512 MiB is roughly 60 to 90 seconds of UHD
+    /// media, after which every append is refused and the mount dies on the 120s backpressure limit.
+    ///
+    /// NOT `Int.max`, deliberately. `Accounting.admittedBytes` saturates to `Int.max` on overflow, so an
+    /// unbounded ceiling would let `physical <= capacityBytes` pass with a meaningless total. Worse, it would
+    /// convert a clean and recoverable "park and fail" into a filesystem ENOSPC raised deep inside the muxer,
+    /// which poisons the stage. A large finite ceiling derived from real free space keeps the admission gate
+    /// working as the safety valve it was designed to be.
+    ///
+    /// Returns nil when there is not enough disk to be worth doing, in which case the caller keeps the ordinary
+    /// sliding spool rather than failing: a host short of space should still be able to serve, just without
+    /// seek-anywhere.
+    static func retentionCapacity(parentDirectory: URL) -> Int? {
+        var probe = parentDirectory
+        while !FileManager.default.fileExists(atPath: probe.path), probe.pathComponents.count > 1 {
+            probe = probe.deletingLastPathComponent()
+        }
+        guard let values = try? probe.resourceValues(
+                forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+              let available = values.volumeAvailableCapacityForImportantUsage else { return nil }
+        let usable = Int(available) - hostedReservedFreeBytes
+        guard usable > defaultCapacityBytes else { return nil }
+        return min(usable, hostedMaximumCapacityBytes)
+    }
+
     enum ResourceKey: Hashable, Sendable {
         case video(segmentID: Int)
         case audio(renditionID: Int, segmentID: Int)
@@ -2151,12 +2192,31 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         }
     }
 
+    /// The ordinary session spool: a sliding window under Caches, 512 MiB, exactly as shipped.
     static func makeDefault() -> VortXHLSSessionSpool? {
         guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
             return nil
         }
         return VortXHLSSessionSpool(
             parentDirectory: caches.appendingPathComponent("VortXHLS", isDirectory: true))
+    }
+
+    /// A spool for a HOSTED session that retains its whole timeline, or nil when this machine cannot support
+    /// one (no Application Support directory, not enough free disk, or the spool would not initialise). The
+    /// caller falls back to `makeDefault()` rather than failing.
+    ///
+    /// It lives under Application Support, NOT Caches, and that is not a detail. macOS is entitled to purge
+    /// Caches under disk pressure, and a purged segment does not merely disappear quietly: the window snapshot
+    /// silently drops it, the publication frontier notices a previously advertised segment is gone, and the
+    /// whole session fails. Today that exposure is a handful of segments; under full retention it would be
+    /// every segment of a two-hour film, held for the entire session. Caches is the wrong place for bytes we
+    /// have promised a client are still there.
+    static func makeRetaining() -> VortXHLSSessionSpool? {
+        guard let support = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        let parent = support.appendingPathComponent("VortXHLS", isDirectory: true)
+        guard let capacity = retentionCapacity(parentDirectory: parent) else { return nil }
+        return VortXHLSSessionSpool(parentDirectory: parent, capacityBytes: capacity)
     }
 
     deinit {

@@ -143,6 +143,10 @@ struct RemoteConfigData: Decodable {
         let communityTrickplay: Bool?
         let dvRemux: Bool?
         let dvRemuxHLS: Bool?   // b166: local-HLS delivery of the DV remux (kill-switch back to the loader path)
+        // External engine mode: hosting the remux on a Mac for another device. FLEET KILL SWITCH ONLY.
+        // Baked true means "not disabled"; it can never turn the feature ON for anyone, because the user
+        // default is off and `VortXExternalEngine.mountPlan` also requires a paired, configured host.
+        let externalEngine: Bool?
         let diskCache: Bool?
         let trailers: Bool?
         let vortxRatings: Bool?
@@ -803,6 +807,7 @@ actor RemoteConfig {
             put("communityTrickplay", f.communityTrickplay)
             put("dvRemux", f.dvRemux)
             put("dvRemuxHLS", f.dvRemuxHLS)
+            put("externalEngine", f.externalEngine)
             put("diskCache", f.diskCache)
             put("trailers", f.trailers)
             put("vortxRatings", f.vortxRatings)
