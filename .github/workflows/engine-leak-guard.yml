@@ -1,0 +1,137 @@
+name: Engine Leak Guard
+
+# Fails if any ref on this PUBLIC repository carries proprietary VortX engine source.
+#
+# This is layer 2. Layer 1 is .githooks/pre-push, which prevents the push in the first
+# place. A hook is local: it is absent on a fresh clone until scripts/install-git-hooks.sh
+# has run, absent on a teammate's machine, and absent for anything pushed through the web
+# UI or the API. So the hook cannot be the only defence, and this job is what notices when
+# the hook was not there.
+#
+# Detection lives in scripts/scan-proprietary-engine.sh, shared verbatim with the hook so
+# the two layers cannot drift into disagreeing about what "proprietary" means.
+#
+# WHY BOTH A PUSH TRIGGER AND A SCHEDULE
+#   push      Immediate. But a push-triggered workflow runs the workflow file as it exists
+#             ON THE PUSHED REF. Every ref that leaked in the 2026-07-25 incident was a
+#             rescue branch cut long before this file existed, so the push trigger would
+#             have stayed silent for all 56 of them. Useful, but structurally incomplete.
+#   schedule  Load-bearing. A scheduled run uses the DEFAULT branch's copy of this file and
+#             of the scanner, and sweeps every ref the repository has, including refs that
+#             predate the guard, refs pushed with the hook uninstalled, and refs pushed by
+#             someone who neutered their own copy of the scanner. This is the layer that
+#             would actually have caught the incident.
+# Daily rather than hourly: leaked objects are not made less public by being noticed 23
+# hours sooner, and the sweep is an O(1) tree probe per ref, not something worth burning
+# 24x the minutes on.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["**"]
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pushed-ref:
+    name: Pushed ref
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Scan the ref that was just pushed
+        # Ref names reach this step as data in the environment, never interpolated into
+        # the script body: git permits '$' and '`' in ref names, so a branch called
+        # `foo$(...)` would otherwise be executed rather than reported.
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          PUSHED_REF: ${{ github.ref }}
+        run: |
+          set -uo pipefail
+          scanner=scripts/scan-proprietary-engine.sh
+          if [ ! -x "$scanner" ]; then
+            echo "::error::$scanner is missing or not executable on this ref."
+            echo "A ref that carries the workflow but not the detector cannot be checked."
+            exit 1
+          fi
+
+          # The tip, plus every commit this push added when the previous tip is known.
+          # (github.event.before is all-zeros when the ref is brand new, in which case the
+          # tip probe plus the nightly all-refs sweep are the coverage.)
+          printf '%s\n' "$AFTER" > commits.txt
+          case "$BEFORE" in
+            *[!0]*) git rev-list "$AFTER" "^$BEFORE" 2>/dev/null >> commits.txt || true ;;
+          esac
+
+          found=""
+          rc=0
+          "$scanner" paths - < commits.txt || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::path probe failed (rc=$rc)"; exit 1; }
+          [ "$rc" -eq 0 ] || found=1
+
+          rc=0
+          "$scanner" markers "$AFTER" || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::marker sweep failed (rc=$rc)"; exit 1; }
+          [ "$rc" -eq 0 ] || found=1
+
+          if [ -n "$found" ]; then
+            echo "::error::Proprietary engine material is present on $PUSHED_REF of this PUBLIC repository. See the findings above. Engine source belongs on the private engine remote."
+            exit 1
+          fi
+          printf 'clean: no proprietary engine material on %s\n' "$PUSHED_REF"
+
+  all-refs:
+    name: All refs
+    if: github.event_name != 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    steps:
+      # Deliberately the default branch rather than the triggering ref: the sweep must use
+      # a copy of the detector that no individual pushed ref can have altered.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Probe every branch and tag
+        run: |
+          set -uo pipefail
+          scanner=scripts/scan-proprietary-engine.sh
+          [ -x "$scanner" ] || { echo "::error::$scanner missing on the default branch"; exit 1; }
+
+          git for-each-ref --format='%(objectname) %(refname)' \
+              refs/remotes/origin refs/tags > refs.txt
+          echo "refs on this repository: $(wc -l < refs.txt)"
+
+          rc=0
+          awk '{print $1}' refs.txt | sort -u | "$scanner" paths - > hits.txt || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::path probe failed (rc=$rc)"; exit 1; }
+
+          if [ "$rc" -eq 1 ]; then
+            echo "Proprietary engine trees found:"
+            cat hits.txt
+            echo
+            echo "Refs pointing at them:"
+            while read -r sha ref; do
+              grep -q " $sha " hits.txt && echo "  $ref"
+            done < refs.txt
+            echo "::error::Proprietary engine source is reachable on this PUBLIC repository. Deleting the ref does not unpublish the objects; treat this as a disclosure, not a typo."
+            exit 1
+          fi
+          echo "clean: no proprietary engine trees on any ref"
+
+      - name: Marker sweep of the default branch
+        run: |
+          set -uo pipefail
+          rc=0
+          scripts/scan-proprietary-engine.sh markers HEAD || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::marker sweep failed (rc=$rc)"; exit 1; }
+          [ "$rc" -eq 0 ] || { echo "::error::Files declaring the proprietary licence or closed-source header are present on the default branch."; exit 1; }
+          echo "clean: no proprietary content markers"

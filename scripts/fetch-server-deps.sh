@@ -5,6 +5,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# --- git hooks -------------------------------------------------------------------------
+# Installed here because CLAUDE.md documents this script as the first command after
+# cloning, so the pre-push engine leak guard is live before anyone can push. Idempotent
+# and silent once installed. Non-fatal on failure (a source export is not a git clone),
+# but loud, because an uninstalled guard is an unguarded clone.
+if ! ./scripts/install-git-hooks.sh; then
+    echo "WARNING: could not install git hooks. This clone has NO protection against" >&2
+    echo "         pushing proprietary engine source to a public remote." >&2
+fi
+
 # Pinned SHA256s for everything downloaded below. These binaries ship inside the
 # IPA, so verify them instead of trusting the transport. When replacing a vendor
 # asset, recompute the matching hash (shasum -a 256 <file>).

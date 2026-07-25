@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+#
+# Blocks proprietary VortX engine source from reaching a public remote.
+#
+# WHY THIS IS A HOOK AND NOT A BRIEFING
+# On 2026-07-25 one lane was told "engine material never goes to the public remote" and
+# correctly refused 22 branches. A later lane, briefed about other things but not that,
+# tagged the same commits and pushed ~90 tags to the public repo; 56 carried the closed
+# vortx-core/ tree. The rule was never wrong, it was just stored in a person. Everything
+# here assumes the operator has never heard of the rule and will not be told.
+#
+# WHAT IT CHECKS   the tree of every commit being pushed, never the ref name. Names were
+#                  exactly what failed. See scripts/scan-proprietary-engine.sh.
+# WHEN IT BLOCKS   destination is public (or its visibility cannot be established) AND
+#                  proprietary material is present.
+# HOW TO PROCEED   push engine work to the private engine remote instead.
+#
+# git calls this with:  $1 = remote name (or URL)   $2 = remote URL
+# stdin, one line per ref:  <local ref> <local sha> <remote ref> <remote sha>
+
+set -uo pipefail
+
+ZERO="0000000000000000000000000000000000000000"
+OVERRIDE_VAR="VORTX_ALLOW_PROPRIETARY_ENGINE_PUSH_TO_PUBLIC"
+
+# Push targets that are known-private engine repositories, keyed on the resolved
+# OWNER/REPO of the push URL rather than on the local remote's nickname. A nickname is
+# operator-chosen and can point anywhere; the URL is what actually receives the objects.
+PRIVATE_ENGINE_REPOS="VortXTV/vortx-core VortXTV/stremiox-core"
+
+remote_name="${1:-}"
+remote_url="${2:-}"
+
+say() { printf '%s\n' "$*" >&2; }
+
+# The scanner is resolved from the HOOK's own location, not from the working directory.
+# core.hooksPath points every worktree at one checkout, so the guard still runs when the
+# branch being pushed is older than the guard itself and has no scripts/ copy of it.
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCANNER="$HOOK_DIR/../scripts/scan-proprietary-engine.sh"
+
+if [ ! -x "$SCANNER" ]; then
+    say ""
+    say "PUSH BLOCKED  engine leak guard cannot run"
+    say ""
+    say "  Expected the detector at:"
+    say "    $SCANNER"
+    say ""
+    say "  A missing detector is treated as unsafe, never as permission. Restore it, or"
+    say "  re-run scripts/install-git-hooks.sh from a current checkout."
+    say ""
+    exit 1
+fi
+
+# --- 1. free short circuit: is this a known private engine remote? ---------------------
+slug=""
+case "$remote_url" in
+    *github.com[:/]*)
+        slug="${remote_url#*github.com}"
+        slug="${slug#:}"
+        slug="${slug#/}"
+        slug="${slug%.git}"
+        slug="${slug%/}"
+        ;;
+esac
+
+for repo in $PRIVATE_ENGINE_REPOS; do
+    if [ "$slug" = "$repo" ]; then
+        exit 0
+    fi
+done
+
+# --- 2. collect what is actually being pushed -----------------------------------------
+tips=""
+commits=""
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -n "${local_sha:-}" ] || continue
+    # Deleting a remote ref transfers no objects and cannot leak anything.
+    [ "$local_sha" != "$ZERO" ] || continue
+
+    tips="$tips$local_sha $local_ref"$'\n'
+
+    # Commits the destination does not already have. Anything it already has is already
+    # exposed and is the containment lane's problem, not a reason to block today's push;
+    # scoping to new objects is also what keeps this guard from firing on every single
+    # push, since 913 commits of already-published beta history carry a vortx-core tree.
+    if [ "${remote_sha:-$ZERO}" != "$ZERO" ]; then
+        new="$(git rev-list "$local_sha" "^$remote_sha" --not --remotes="$remote_name" 2>/dev/null)"
+    else
+        new="$(git rev-list "$local_sha" --not --remotes="$remote_name" 2>/dev/null)"
+    fi
+    [ -z "$new" ] || commits="$commits$new"$'\n'
+done
+
+if [ -z "$tips" ]; then
+    exit 0
+fi
+
+# --- 3. scan (local, no network) ------------------------------------------------------
+tip_shas="$(printf '%s' "$tips" | awk 'NF {print $1}')"
+scan_input="$(printf '%s\n%s\n' "$tip_shas" "$commits" | awk 'NF' | sort -u)"
+
+findings=""
+
+out="$(printf '%s\n' "$scan_input" | "$SCANNER" paths -)"
+case $? in
+    0) : ;;
+    1) findings="$findings$out"$'\n' ;;
+    *) say "PUSH BLOCKED  engine leak guard: path probe failed, refusing to guess"; exit 1 ;;
+esac
+
+# Marker sweep reads blob contents, so it runs over the deduplicated TREES of the refs
+# being pushed rather than over every commit. A relocated or renamed engine tree is
+# visible at a tip by definition; scanning full history for it would cost minutes.
+for tree in $(printf '%s\n' "$tip_shas" | while read -r s; do
+                  [ -n "$s" ] && git rev-parse --quiet --verify "$s^{tree}" 2>/dev/null
+              done | sort -u); do
+    out="$("$SCANNER" markers "$tree")"
+    case $? in
+        0) : ;;
+        1) findings="$findings$out"$'\n' ;;
+        *) say "PUSH BLOCKED  engine leak guard: marker sweep failed, refusing to guess"; exit 1 ;;
+    esac
+done
+
+findings="$(printf '%s' "$findings" | awk 'NF')"
+if [ -z "$findings" ]; then
+    exit 0
+fi
+
+# --- 4. only now does destination visibility matter -----------------------------------
+# Deferring the network call to here means a clean push never touches the network and
+# never waits on GitHub. A guard that adds latency to ordinary work gets switched off.
+visibility="public"
+reason="could not determine visibility"
+
+if [ -z "$slug" ]; then
+    reason="push URL is not a GitHub repository ($remote_url)"
+elif ! command -v gh >/dev/null 2>&1; then
+    reason="the gh CLI is not installed, so visibility cannot be confirmed"
+else
+    api="$(gh api "repos/$slug" --jq .private 2>/dev/null)"
+    if [ "$api" = "true" ]; then
+        visibility="private"
+    elif [ "$api" = "false" ]; then
+        reason="github.com/$slug is a public repository"
+    else
+        reason="the GitHub API did not answer for $slug (offline, unauthenticated, or no access)"
+    fi
+fi
+
+if [ "$visibility" = "private" ]; then
+    say "engine leak guard: proprietary material present, destination github.com/$slug is private. Allowed."
+    exit 0
+fi
+
+# --- 5. refuse, and say exactly why ---------------------------------------------------
+say ""
+say "================================================================================"
+say " PUSH BLOCKED  proprietary VortX engine source would become public"
+say "================================================================================"
+say ""
+say "  Destination : $remote_name  ->  $remote_url"
+say "  Treated as  : PUBLIC  ($reason)"
+say ""
+say "  Refs in this push:"
+printf '%s' "$tips" | awk 'NF {printf "    %s  %s\n", substr($1,1,12), $2}' >&2
+say ""
+say "  Proprietary material found (commit, then what tripped it):"
+printf '%s\n' "$findings" | awk '{ printf "    %-7s %s  %s\n", $1, substr($2,1,12), $3 }' >&2
+say ""
+say "  HOW TO PROCEED"
+say "    Engine work belongs on the private engine remote, not here:"
+say "      git push vortx-core-private <ref>"
+say "    If these refs are app code that merely inherited an old engine tree, rebase or"
+say "    filter the engine out and push the cleaned refs."
+say ""
+say "  This guard reads the trees of the commits being pushed. It does not look at branch"
+say "  or tag names, because names are what failed last time."
+say ""
+
+if [ "${!OVERRIDE_VAR:-}" = "1" ]; then
+    say "********************************************************************************"
+    say "*  OVERRIDE ACTIVE  $OVERRIDE_VAR=1"
+    say "*"
+    say "*  You are knowingly publishing the proprietary engine material listed above to"
+    say "*  a remote this guard could not confirm is private. This is not reversible:"
+    say "*  once the objects are on a public remote they can be fetched by anyone, and"
+    say "*  deleting the ref afterwards does not unpublish them."
+    say "*"
+    say "*  Proceeding in 5 seconds. Ctrl-C now if this was not deliberate."
+    say "********************************************************************************"
+    sleep 5
+    say "*  OVERRIDE: push allowed."
+    exit 0
+fi
+
+say "  If this is genuinely intended, re-run with:"
+say "    $OVERRIDE_VAR=1 git push ..."
+say ""
+exit 1
