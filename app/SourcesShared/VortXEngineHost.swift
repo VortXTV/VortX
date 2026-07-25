@@ -551,6 +551,7 @@ final class VortXEngineHost: @unchecked Sendable {
         }
         if markReady { _ = session.server.markEngineReady() }
         let progress = session.server.mountProgress
+        let signalling = session.server.signaling
         reply(connection, status: "200 OK", body: VortXEngineProtocol.SessionStatus(
             healthy: session.server.isMountHealthy,
             durationSeconds: session.server.sourceDurationSeconds,
@@ -562,6 +563,10 @@ final class VortXEngineHost: @unchecked Sendable {
             producedSegments: progress.segmentCount,
             producedBytes: progress.producedBytes,
             ended: progress.ended,
+            signalingPublished: progress.signalingPublished,
+            dolbyVision: signalling?.dolbyVision ?? false,
+            width: signalling?.width ?? 0,
+            height: signalling?.height ?? 0,
             producedEdgeSeconds: session.server.producedEdgeSeconds))
     }
 

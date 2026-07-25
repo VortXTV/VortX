@@ -279,6 +279,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         stream.hlsSnapshot().initData != nil && stream.buffer.status().failure == nil
     }
 
+    /// The classifier's published signalling, or nil before classify finishes.
+    ///
+    /// Exposed for one reason: a HOSTED session's client has to fire its own Dolby Vision panel switch. The
+    /// switch inside `serveMaster` is `#if os(tvOS)` and a host is a Mac, so it is compiled out there and a
+    /// hosted session would otherwise present true DV to a panel nobody switched.
+    var signaling: VortXMKVRemuxStream.HLSSignaling? { stream.hlsSnapshot().signaling }
+
     /// Monotonic mount-progress counters for the chrome's progress-aware start watchdog. Thread-safe passthrough.
     var mountProgress: VortXMKVRemuxStream.MountProgress { stream.mountProgress() }
 

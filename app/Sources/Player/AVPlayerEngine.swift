@@ -149,6 +149,21 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     // delivery AVFoundation supports for a growing fMP4 (the progressive loader path above never framed on
     // device). Held for the whole session; torn down in stop()/loadFile().
     private var remuxHLSServer: VortXRemuxHLSServer?
+    /// EXTERNAL ENGINE MODE: the same remux, produced on ANOTHER machine and mounted over the LAN.
+    ///
+    /// A separate optional rather than a protocol over the local server, deliberately. The local type is at the
+    /// centre of a lane that took two field regressions to stabilise, and the engine already reads its mount
+    /// through a two-lane `??` chain (`remuxHLSServer?.x ?? remuxLoader?.x`) for the legacy delivery. Extending
+    /// that chain by one arm leaves every existing local expression untouched and makes default-off provably
+    /// byte-identical: with external mode off this is always nil and every `??` short-circuits before reaching
+    /// it. A protocol refactor would have touched the local path at ten sites to buy nothing a user can see.
+    private var remuxRemoteMount: VortXRemoteRemuxMount?
+    /// One-shot: forces the NEXT loadFile to skip external engine mode and mount on-device. Consumed inside
+    /// loadFile, exactly like `forceRemux` and `forcePlainRemux`. Set when a host refuses or dies, so the retry
+    /// takes the ordinary local lane instead of asking the same dead host again.
+    private var bypassExternalEngine = false
+    /// The in-flight external mount preflight, cancelled by the next load exactly as `nativePreAttachTask` is.
+    private var externalMountTask: Task<Void, Never>?
     /// One-shot resume request configured by the chrome before `loadFile`. `currentLoadResumeOrigin` retains
     /// the request only for same-token internal remounts (plain-remux and hvc1 repair); a new logical load with
     /// no configuration resets it to zero. `remuxTimelineOrigin` is the achieved base-video timestamp reported
@@ -158,7 +173,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     private var remuxTimelineOrigin: Double = 0
     /// Whether the forward-only remux is mounted for the CURRENT item (either delivery). A mounted origin can
     /// begin part-way through the source, but later seeks remain bounded to the bytes produced from that point.
-    var isRemuxMounted: Bool { remuxLoader != nil || remuxHLSServer != nil }
+    var isRemuxMounted: Bool { remuxLoader != nil || remuxHLSServer != nil || remuxRemoteMount != nil }
 
     /// Progress counters for the mounted DV remux (either delivery), or nil when no remux is mounted. The
     /// chrome's PROGRESS-AWARE start watchdog polls this ~1 Hz to tell a slow-but-alive 4K source (counters
@@ -166,6 +181,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// -> demote to libmpv). Cheap: two lock hops per read, no allocation beyond the tiny struct.
     var remuxMountProgress: VortXMKVRemuxStream.MountProgress? {
         if let server = remuxHLSServer { return server.mountProgress }
+        if let remote = remuxRemoteMount { return remote.mountProgress }
         if let loader = remuxLoader { return loader.mountProgress }
         return nil
     }
@@ -176,6 +192,14 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// (the HLS sliding playlist advertises produced media there); fall back to the loaded (player-buffered)
     /// edge for the legacy loader delivery. 0 means "unknown / no produced edge yet" (callers do not clamp).
     var producedEdgeSeconds: Double {
+        // EXTERNAL ENGINE with full-timeline retention: AVPlayer's seekable range now advertises the WHOLE
+        // timeline, which is exactly the point (it is what makes a backward seek an ordinary seek instead of a
+        // demote), but it therefore can no longer stand in for the PRODUCED edge. The host reports that
+        // separately and it is the only trustworthy forward bound here. Converted from source seconds to player
+        // seconds through the achieved origin, which is the space this property is read in.
+        if let remote = remuxRemoteMount, remote.retainsFullTimeline {
+            return max(0, remote.producedEdgeSeconds - remuxTimelineOrigin)
+        }
         guard let item else { return 0 }
         var edge = 0.0
         for value in item.seekableTimeRanges {
@@ -245,6 +269,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // The new logical request becomes active before any mount failure or observer can emit.
         invalidateLoadToken()
         activeLoadToken = issuedToken
+        externalMountTask?.cancel()
+        externalMountTask = nil
         #if os(tvOS)
         nativePreAttachTask?.cancel()
         nativePreAttachTask = nil
@@ -309,6 +335,32 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             && (forcePlainRemux || PlayerEngineRouter.shouldPlainRemux(url: url))
         forcePlainRemux = false
         let wantsRemux = wantsDVRemux || wantsPlainRemux
+        // EXTERNAL ENGINE MODE. When the user has paired a Mac and turned this on, the remux is produced THERE
+        // and mounted over the LAN, so this device spends its whole chip decoding instead of demuxing, rewriting
+        // the Dolby Vision RPU, muxing and spooling. The stream is a copy either way: nothing is re-encoded, so
+        // the picture and the RPU are identical to the on-device lane's.
+        //
+        // Opening a session is a network round trip, so it cannot happen inline on this main-actor path. It
+        // follows the SAME pattern the tvOS native-DV preflight already uses in this function: the old item has
+        // already been retired above, an async task does the work, and `attachPreparedItem` is still the only
+        // place a replacement mounts. If anything at all goes wrong (host asleep, refused, unreachable, no
+        // signalling) the task sets `bypassExternalEngine` and re-enters this function on the same token, which
+        // takes the ordinary local branch below. There is no state in which a bad host is worse than no host.
+        let externalConsumed = bypassExternalEngine
+        bypassExternalEngine = false
+        if wantsRemux, VortXRemuxHLSServer.deliveryEnabled, !externalConsumed,
+           case .external = VortXExternalEngine.shared.mountPlan {
+            beginExternalEngineMount(
+                url: url,
+                headers: headers,
+                wantsPlainRemux: wantsPlainRemux,
+                startAtSeconds: requestedRemuxOrigin,
+                live: live,
+                audioSidecar: audioSidecar,
+                loadToken: issuedToken,
+                generation: issuedGeneration)
+            return issuedToken
+        }
         if wantsRemux, VortXRemuxHLSServer.deliveryEnabled,
            let mounted = VortXRemuxHLSServer.make(input: url, headers: headers,
                                                   mode: wantsPlainRemux ? .plain : .dolbyVision,
@@ -514,6 +566,142 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     }
     #endif
 
+    // MARK: - External engine mode
+
+    /// Open a hosted remux session, wait for its signalling, switch the panel, then attach.
+    ///
+    /// Modelled directly on `beginNativeDVPreAttach`: the retired item is already detached by the time this is
+    /// called, the async work is cancellable, every side effect rechecks token and generation, and
+    /// `attachPreparedItem` remains the only place a replacement mounts. The chrome's existing start watchdog is
+    /// still the outer bound on a slow load, so nothing new can hang playback.
+    private func beginExternalEngineMount(url: URL,
+                                          headers: [String: String]?,
+                                          wantsPlainRemux: Bool,
+                                          startAtSeconds: Double,
+                                          live: Bool,
+                                          audioSidecar: URL?,
+                                          loadToken: PlayerLoadToken,
+                                          generation: UInt64) {
+        externalMountTask?.cancel()
+        let mode: VortXEngineProtocol.RemuxMode = wantsPlainRemux ? .plain : .dolbyVision
+        DiagnosticsLog.log("engine", "external engine mount requested mode=\(mode.rawValue) generation=\(generation)")
+        externalMountTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let mount = await VortXRemoteRemuxMount.open(
+                input: url, headers: headers, mode: mode, startAtSeconds: startAtSeconds,
+                onLost: { [weak self] in
+                    Task { @MainActor [weak self] in self?.handleExternalEngineLost(loadToken: loadToken) }
+                })
+            guard !Task.isCancelled,
+                  self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation) else {
+                mount?.invalidate()
+                return
+            }
+            guard let mount else {
+                // The host refused, is asleep, or is unreachable. Re-enter loadFile on the SAME token with the
+                // external lane bypassed, which is the ordinary on-device mount and therefore the shipped
+                // behaviour exactly. The user sees a slightly slower start, never a failure.
+                DiagnosticsLog.log("engine", "external engine unavailable -> on-device remux mount")
+                self.bypassExternalEngine = true
+                _ = self.loadFile(url, headers: headers, live: live,
+                                  audioSidecar: audioSidecar, reusing: loadToken)
+                return
+            }
+            mount.start()
+            // Wait for classify, bounded. A hosted session's client must fire the Dolby Vision panel switch
+            // itself: the switch inside the remux server is tvOS-only and a host is a Mac, so nobody else will.
+            let signalling = await mount.awaitSignalling()
+            guard !Task.isCancelled,
+                  self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation) else {
+                mount.invalidate()
+                return
+            }
+            guard let signalling, signalling.healthy else {
+                DiagnosticsLog.log("engine", "external engine produced no signalling -> on-device remux mount")
+                mount.invalidate()
+                self.bypassExternalEngine = true
+                _ = self.loadFile(url, headers: headers, live: live,
+                                  audioSidecar: audioSidecar, reusing: loadToken)
+                return
+            }
+            self.attachRemoteRemux(mount, signalling: signalling,
+                                   wantsPlainRemux: wantsPlainRemux,
+                                   loadToken: loadToken, generation: generation)
+        }
+    }
+
+    /// Build and attach the item for a hosted mount.
+    ///
+    /// This deliberately does NOT share the local branch's tail. The two differ in the one place that matters:
+    /// on-device the panel switch is deferred to the remux server and fires when it serves the master, while
+    /// here it fires BEFORE the item exists, which is the ordering Apple Tech Talk 503 actually asks for and
+    /// which only a client that already knows the signalling can achieve. Folding them together would mean a
+    /// conditional inside the shipped local path, which is the one path that must not move.
+    private func attachRemoteRemux(_ mount: VortXRemoteRemuxMount,
+                                   signalling: VortXEngineProtocol.SessionStatus,
+                                   wantsPlainRemux: Bool,
+                                   loadToken: PlayerLoadToken,
+                                   generation: UInt64) {
+        guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation) else {
+            mount.invalidate()
+            return
+        }
+        remuxRemoteMount = mount
+        let newItem = AVPlayerItem(asset: AVURLAsset(url: mount.playlistURL))
+        // The 30s cap on the local lane exists to stop AVPlayer sizing its own forward buffer at hundreds of MB
+        // inside the SAME jetsam-bound process as node and mpv. On a hosted mount that memory pressure moved to
+        // the Mac, and the risk that replaces it is the opposite one: a LAN hiccup starving a thin cushion. So
+        // the remote case buffers more. It is the cheapest quality win in the whole feature.
+        newItem.preferredForwardBufferDuration = VortXEngineHostPolicy.forwardBufferSeconds(remote: true)
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+        ])
+        newItem.add(output)
+        #if os(tvOS)
+        if !wantsPlainRemux, signalling.dolbyVision, signalling.frameRate > 0,
+           signalling.width > 0, signalling.height > 0 {
+            HDRDisplayMode.request(.dolbyVision, fps: signalling.frameRate,
+                                   width: signalling.width, height: signalling.height, in: nil)
+            DiagnosticsLog.log(
+                "dv",
+                "hosted remux confirmed DV -> requested Dolby Vision display mode pre-attach (fps=\(String(format: "%.3f", signalling.frameRate)) \(signalling.width)x\(signalling.height))")
+        } else if !signalling.dolbyVision {
+            // A hosted PLAIN or non-DV session must clear a previous title's criteria, exactly as the local
+            // lane's else-branch does. Idempotent.
+            HDRDisplayMode.reset(in: nil)
+        }
+        #endif
+        player.automaticallyWaitsToMinimizeStalling = false
+        player.allowsExternalPlayback = true
+        DiagnosticsLog.log(
+            "avplayer",
+            "external-remux mount host=\(mount.playlistURL.host ?? "?") retainsTimeline=\(mount.retainsFullTimeline) generation=\(generation)")
+        VXProbe.log("dv", "remux mounted on an EXTERNAL engine host=\(mount.playlistURL.host ?? "?") seekAnywhere=\(mount.retainsFullTimeline)")
+        attachPreparedItem(newItem, output: output, loadToken: loadToken, generation: generation)
+    }
+
+    /// The Mac went away mid-playback: lid closed, slept, quit, or dropped off Wi-Fi.
+    ///
+    /// Degrade to an on-device mount AT THE CURRENT POSITION rather than stalling. This reuses the resume-origin
+    /// machinery the chrome already owns instead of inventing anything: `configureResumeOrigin` is the one-shot
+    /// handoff a fresh remux reads to start part-way in. The user sees a rebuffer, which is the correct and
+    /// honest outcome, and playback continues on the lane that never needed a Mac.
+    private func handleExternalEngineLost(loadToken: PlayerLoadToken) {
+        guard activeLoadToken == loadToken, let mount = remuxRemoteMount, let url = lastLoadURL else { return }
+        let resumeAt = playbackPositionSeconds
+        DiagnosticsLog.log(
+            "engine",
+            "external engine lost mid-playback -> on-device remount at \(String(format: "%.1f", resumeAt))s")
+        remuxRemoteMount = nil
+        mount.invalidate()
+        configureResumeOrigin(seconds: resumeAt)
+        bypassExternalEngine = true
+        // A NEW logical load, not a same-token remount: the source is being re-opened from scratch on a
+        // different lane, and the resume origin above is what carries the position across.
+        _ = loadFile(url, headers: lastLoadHeaders, live: lastLoadLive,
+                     audioSidecar: nil, reusing: nil)
+    }
+
     /// #147 reactive-net gate: should this item failure be retried through the PLAIN remux lane instead of
     /// demoting to libmpv? True only when ALL hold:
     ///  - the mount never produced playback (`!didStart`) and is a RAW mount (`!isRemuxMounted`: a failure on
@@ -591,7 +779,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // against AVPlayer's duration and the produced edge. Non-remux items keep the original expression.
         let clamped: Double
         if isRemuxMounted {
-            let sourceDuration = remuxHLSServer?.sourceDurationSeconds ?? remuxLoader?.sourceDurationSeconds
+            let sourceDuration = remuxHLSServer?.sourceDurationSeconds
+                ?? remuxRemoteMount?.sourceDurationSeconds ?? remuxLoader?.sourceDurationSeconds
             clamped = RemuxResumePolicy.playerSeek(
                 sourceSeconds: seconds,
                 origin: remuxTimelineOrigin,
@@ -679,6 +868,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         remuxLoader = nil
         remuxHLSServer?.invalidate()
         remuxHLSServer = nil
+        remuxRemoteMount?.invalidate()
+        remuxRemoteMount = nil
     }
 
     // MARK: Video sizing
@@ -997,7 +1188,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // source MKV's libav chapter list at open (same window as the source duration, which is already ready
         // here). Pull those directly; `loadChapterMetadataGroups` on the local HLS playlist would return none.
         if isRemuxMounted {
-            let remuxChapters = remuxHLSServer?.chapters ?? remuxLoader?.chapters ?? []
+            let remuxChapters = remuxHLSServer?.chapters
+                ?? remuxRemoteMount?.chapters ?? remuxLoader?.chapters ?? []
             if !remuxChapters.isEmpty {
                 loadedChapters = remuxChapters
                     .map { MPVChapter(title: $0.title, start: $0.start) }
@@ -1289,6 +1481,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         guard owns(item, loadToken: loadToken) else { return }
         switch item.status {
         case .readyToPlay:
+            remuxRemoteMount?.markEngineReady()
             if let server = remuxHLSServer, !server.markEngineReady() {
                 return
             }
@@ -1300,7 +1493,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             // Latch the achieved base-video origin before reporting any position or resolving a pending seek.
             // The input seek may land on an earlier keyframe, so this authoritative value can differ slightly
             // from the requested origin. Zero keeps the entire mapping path an identity for ordinary loads.
-            if let origin = remuxHLSServer?.timelineOriginSeconds, origin > 0 {
+            if let origin = remuxHLSServer?.timelineOriginSeconds
+                ?? remuxRemoteMount?.timelineOriginSeconds, origin > 0 {
                 remuxTimelineOrigin = origin
                 DiagnosticsLog.log(
                     "dv",
@@ -1315,6 +1509,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             // add the achieved origin to recover a source-timeline duration. Non-remux values remain untouched.
             if isRemuxMounted {
                 let authoritativeDuration = remuxHLSServer?.sourceDurationSeconds
+                    ?? remuxRemoteMount?.sourceDurationSeconds
                     ?? remuxLoader?.sourceDurationSeconds
                 emittedDuration = RemuxResumePolicy.reportedDuration(
                     playerDurationSeconds: dur,
@@ -1388,7 +1583,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                     let assetFPS = Double(item.tracks.first {
                         $0.assetTrack?.mediaType == .video
                     }?.assetTrack?.nominalFrameRate ?? 0)
-                    let classifiedFPS = remuxHLSServer?.authoritativeFrameRate ?? 0
+                    let classifiedFPS = remuxHLSServer?.authoritativeFrameRate
+                        ?? remuxRemoteMount?.authoritativeFrameRate ?? 0
                     if let fps = DVPlaybackPolicy.frameRate(
                         classified: classifiedFPS, assetTrack: assetFPS) {
                         HDRDisplayMode.request(.dolbyVision, fps: fps,

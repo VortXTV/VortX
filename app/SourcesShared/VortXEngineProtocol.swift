@@ -204,6 +204,22 @@ enum VortXEngineProtocol {
         let producedBytes: Int
         /// The remux reached end of source.
         let ended: Bool
+        /// Whether classify has published signalling yet. Until it has, the fields below are meaningless.
+        let signalingPublished: Bool
+        /// Whether this session is genuinely Dolby Vision, plus the geometry needed to request the panel switch.
+        ///
+        /// THESE EXIST FOR ONE REASON AND IT IS THE WHOLE POINT OF THE FEATURE. On device, the Dolby Vision panel
+        /// switch is fired from inside the remux server, when it serves the master playlist. A host is a Mac, and
+        /// that code is compiled out on macOS, so a hosted session would never switch the client's panel and the
+        /// Apple TV would present a true DV stream on an HDR10 panel. The client therefore fires the switch
+        /// ITSELF, and these three fields are what it needs to do so: the display criteria wants a real frame
+        /// rate and real dimensions, and an invented 60Hz is explicitly not acceptable.
+        ///
+        /// The client can also fire it EARLIER than the on-device lane does, before the item is ever attached,
+        /// which is the ordering Apple Tech Talk 503 actually asks for.
+        let dolbyVision: Bool
+        let width: Int
+        let height: Int
         /// The furthest source second produced so far. On a full-timeline session everything from
         /// `timelineOriginSeconds` to here is seekable; without it, only the sliding window is.
         let producedEdgeSeconds: Double

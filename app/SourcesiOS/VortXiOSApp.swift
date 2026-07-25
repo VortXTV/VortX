@@ -37,6 +37,22 @@ struct VortXiOSApp: App {
     @UIApplicationDelegateAdaptor(OrientationAppDelegate.self) private var orientationDelegate
     #endif
 
+    /// STANDALONE ENGINE SERVER. Evaluated before `init()` runs, because a stored property's initializer is the
+    /// earliest point this app can act. With `--engine-daemon` on the command line (or VORTX_ENGINE_DAEMON=1 in
+    /// the environment) this starts the engine host, drops the dock icon, and then NEVER RETURNS: the process
+    /// serves the network from the main dispatch queue and no interface is ever built. That is what makes it
+    /// launchd-able as a background service rather than an app somebody has to remember to open.
+    ///
+    /// Not returning is the mechanism, and it is not a shortcut. SwiftUI's `SceneBuilder` has no support for
+    /// conditionals, so there is no way to express "build no scene today" in `body`. Blocking here instead means
+    /// AppKit's own run loop is simply never started, which for a headless service is the correct outcome: what
+    /// the listener and the signal sources actually need is a serviced main queue, not an NSApplication.
+    ///
+    /// In every ordinary launch this is one string comparison that returns false.
+    #if os(macOS)
+    private let runningAsEngineDaemon = VortXEngineDaemon.bootIfRequested()
+    #endif
+
     init() {
         // Self-capture crashes into the exportable diagnostic log FIRST, before anything else can fault.
         // The owner cannot easily pull .ips reports off a sideloaded device, so the app writes its own: a

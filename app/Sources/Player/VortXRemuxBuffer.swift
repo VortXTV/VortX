@@ -1006,7 +1006,13 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     /// Returns nil when there is not enough disk to be worth doing, in which case the caller keeps the ordinary
     /// sliding spool rather than failing: a host short of space should still be able to serve, just without
     /// seek-anywhere.
+    /// macOS ONLY, and the guard is a correctness boundary rather than a portability nicety.
+    /// `volumeAvailableCapacityForImportantUsage` does not exist on tvOS or iOS at all, and neither does the
+    /// premise: retention is something a HOST does, and only a Mac is ever a host. An Apple TV asking this
+    /// question would be asking whether to fill a device that gets killed by jetsam at ~900 MB, and the answer
+    /// there is always no. Returning nil off macOS makes that the type's answer rather than a caller's promise.
     static func retentionCapacity(parentDirectory: URL) -> Int? {
+        #if os(macOS)
         var probe = parentDirectory
         while !FileManager.default.fileExists(atPath: probe.path), probe.pathComponents.count > 1 {
             probe = probe.deletingLastPathComponent()
@@ -1017,6 +1023,9 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         let usable = Int(available) - hostedReservedFreeBytes
         guard usable > defaultCapacityBytes else { return nil }
         return min(usable, hostedMaximumCapacityBytes)
+        #else
+        return nil
+        #endif
     }
 
     enum ResourceKey: Hashable, Sendable {
