@@ -45,21 +45,41 @@ enum RemoteConfigDefaults {
     static let macCeilingMiB = 1024          // macOS ceiling (was `1_024 * 1024 * 1024`)
     static let offFloorMiB = 64              // hard floor: no ceiling may drop below this
     static let vodReadaheadSecs = 300        // demuxer-readahead-secs for VOD (configureLiveMode else-branch)
-    static let dvRemuxWindowMiB = 64         // Re-read floor, in MiB. MUST stay >= two full HLS segments
-                                             // (2 x hlsMaxSegmentBytes = 2 x 32 MiB = 64), the worst-case
-                                             // concurrent two-segment read skew. A floor below that can evict a
-                                             // range still being served on an open connection: the reader's next
-                                             // request falls below the window, the HLS connection is cut, and
-                                             // AVPlayer demotes DV to HDR10. (It is NOT a startup guard;
+    static let dvRemuxWindowMiB = 64         // Re-read floor, in MiB. THE 64 IS EMPIRICAL, not derived.
+                                             // It used to be justified here as "2 x hlsMaxSegmentBytes = 2 x 32
+                                             // MiB", the worst-case concurrent two-segment read skew. That
+                                             // derivation is dead: there is no `hlsMaxSegmentBytes` anywhere in
+                                             // the app any more, and VortXRemuxBuffer calls 32 MiB "the retired
+                                             // 32 MiB threshold" (VortXRemuxBuffer.swift:318-323) because legal
+                                             // GOPs may exceed it, so the window is not a segment multiple at all.
+                                             // The eviction-under-an-open-response hazard the old text described
+                                             // is now held by ACTIVE READ LEASES (VortXRemuxBuffer.activeReadRanges),
+                                             // which block eviction beneath any in-flight response independently
+                                             // of this floor. What the floor still buys is keeping ordinary
+                                             // near-frontier re-reads from churning. (It is NOT a startup guard;
                                              // producerLeadBytes supplies startup headroom independently.) 64 is
-                                             // both the design minimum and the shipped value, so the clamp and
-                                             // VortXRemuxBuffer.windowFloorMinMiB agree. Widening (never lowering)
-                                             // is trialable on the fleet via the RemoteConfig dial without a build.
+                                             // simply the shipped value, and VortXRemuxBuffer.windowFloorMinMiB is
+                                             // the same 64, so the clamp is a fleet no-op today. Widening (never
+                                             // lowering) is trialable on the fleet via the RemoteConfig dial
+                                             // without a build.
 
     // Timeouts (detail settle / debrid resolve). Present for future wiring; clamped in validate.
-    static let detailSettleIOSSecs = 12
-    static let detailSettleTVSecs = 12
-    static let debridResolveSecs = 15
+    //
+    // NONE of these three is wired to a call site yet: no code outside this file reads
+    // `detailSettleSecs(tv:)` or `debridResolveSecs`. That is exactly why two of them had gone STALE, and why
+    // that staleness was a landmine rather than a cosmetic error. A baked default is the promise that wiring
+    // the accessor is a NO-OP; a stale one converts a change meant to be inert into a silent behaviour
+    // regression on first wiring. Corrected below to the values the code actually uses today. Runtime
+    // behaviour is unchanged by these edits precisely because nothing reads them yet.
+    static let detailSettleIOSSecs = 20      // iOSDetailView.swift:654 and :3630, both `.seconds(20)`.
+                                             // WAS 12, which is the tvOS value (DetailView.swift:2221); the
+                                             // iOS twin is 20 and was never separately checked.
+    static let detailSettleTVSecs = 12       // DetailView.swift:2221, `.seconds(12)`. Correct as-is.
+    static let debridResolveSecs = 5         // DebridResolver.swift:1178, `resolveTimeout = .seconds(5)`.
+                                             // WAS 15, and that file's own comment says "Kept tight (was
+                                             // 15s)", so this constant had frozen the PRE-change value.
+                                             // Wiring it at 15 would have TRIPLED the play-action resolve
+                                             // budget for every user.
 
     // Trickplay capture params.
     static let captureIntervalSecs = 10      // ScrubThumbnails.captureInterval
@@ -143,6 +163,9 @@ struct RemoteConfigData: Decodable {
         let communityTrickplay: Bool?
         let dvRemux: Bool?
         let dvRemuxHLS: Bool?   // b166: local-HLS delivery of the DV remux (kill-switch back to the loader path)
+        let dvRemuxMultiAudio: Bool?           // VortXMKVRemuxStream.multiAudioEnabled (baked ON)
+        let dvRemuxSubtitles: Bool?            // VortXMKVRemuxStream.subtitleRenditionsEnabled (baked ON)
+        let dvWindowConsumptionAnchor: Bool?   // VortXRemuxHLSServer.consumptionAnchorEnabled (baked ON)
         let diskCache: Bool?
         let trailers: Bool?
         let vortxRatings: Bool?
@@ -156,12 +179,17 @@ struct RemoteConfigData: Decodable {
         let debridInlineResolve: Bool?
         let hdrDisplayModeSwitch: Bool?
         let iosPassthroughAudio: Bool?
+        let tvosSpdif: Bool?           // AudioOutputMode.tvosSpdifExperimentEnabled (baked OFF)
         let dvToAVPlayerRouting: Bool?
         let hlsToAVPlayerRouting: Bool?
+        let plainRemux: Bool?          // PlayerEngineRouter.plainRemuxEnabled (baked ON, two-probe read)
+        let avPlayerDefault: Bool?     // PlayerEngineRouter.avPlayerDefaultEnabled (baked ON, two-probe read)
         let av1Penalty: Bool?
         let communitySubtitles: Bool?
         let subtitleSync: Bool?
+        let subtitleUpload: Bool?           // SubtitlePoolClient.swift:426 (baked ON)
         let languageIndex: Bool?
+        let languageIndexContribute: Bool?  // LanguageIndexClient.swift:180 (baked ON)
         let localizedMetadata: Bool?
         let sourceIndex: Bool?
     }
@@ -585,7 +613,12 @@ actor RemoteConfig {
     /// (1) Synchronously load the last-good cached JSON from Application Support and build the snapshot (else
     /// all-baked). (2) Kick a background refresh. Never throws.
     func bootstrap() async {
-        if let cached = Self.loadCachedJSON(), let decoded = try? JSONDecoder().decode(RemoteConfigData.self, from: cached) {
+        // The launch-health guard sits BETWEEN loading the cache and applying it: a cached config that has
+        // already failed `unhealthyStartThreshold` consecutive launches is dropped here and never reaches
+        // `validate`. See `admitCachedConfig` for why "abnormal" is deliberately imprecise.
+        if let cached = Self.loadCachedJSON(),
+           Self.admitCachedConfig(hash: Self.stableHash(cached)),
+           let decoded = try? JSONDecoder().decode(RemoteConfigData.self, from: cached) {
             currentRaw = cached
             await installAndAnnounce(Self.validate(decoded))   // clamp once at swap time
         } else {
@@ -593,6 +626,7 @@ actor RemoteConfig {
             await installAndAnnounce(.baked)
         }
         startPeriodicIfNeeded()
+        Self.scheduleLaunchHealthMark()
         Task { await refresh() }
     }
 
@@ -625,6 +659,17 @@ actor RemoteConfig {
             }
             guard http.statusCode == 200 else { return }                // any other status: keep last-good
 
+            // A config the launch-health guard already condemned is not re-installed just because the server
+            // still serves it: without this, a boot-time discard would be silently undone by this refresh
+            // moments later and the device would wedge again on the next launch. Stamp the fetch time so the
+            // throttle still applies, but do NOT persist it. A genuinely new config hashes differently and is
+            // therefore never caught here, so an operator's fix installs normally.
+            if Self.isQuarantined(Self.stableHash(data)) {
+                await installAndAnnounce(.baked)
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
+                return
+            }
+
             let decoded = try JSONDecoder().decode(RemoteConfigData.self, from: data)
 
             // master.remoteConfigEnabled == false => discard fetched config to baked (kill switch for the
@@ -649,8 +694,22 @@ actor RemoteConfig {
     /// phase; it cheaply no-ops when the last fetch is recent.
     func refreshIfForegroundDue() async {
         let last = UserDefaults.standard.double(forKey: Self.lastFetchKey)
-        if last > 0, Date().timeIntervalSince1970 - last < Self.foregroundThrottle { return }
+        guard Self.shouldRefreshOnForeground(lastFetchEpoch: last,
+                                             now: Date().timeIntervalSince1970,
+                                             throttle: Self.foregroundThrottle) else { return }
         await refresh()
+    }
+
+    /// The throttle decision, pure so it can be tested without a clock, a network, or UserDefaults. Called on
+    /// every foreground transition now that the scene hooks are wired, so "it cheaply no-ops when the last
+    /// fetch is recent" is a claim that has to be checkable rather than asserted in a comment.
+    static func shouldRefreshOnForeground(lastFetchEpoch: Double, now: Double, throttle: TimeInterval) -> Bool {
+        guard lastFetchEpoch > 0 else { return true }   // never fetched: always allowed
+        // A clock that moved BACKWARDS (timezone edit, NTP correction, a restored backup) must not lock the
+        // device out of refreshing until real time catches up, so a negative age is treated as due.
+        let age = now - lastFetchEpoch
+        if age < 0 { return true }
+        return age >= throttle
     }
 
     // MARK: Periodic loop.
@@ -684,13 +743,14 @@ actor RemoteConfig {
         let reduced = max(floor, clamp(data.player?.readAhead?.reducedCeilingMiB, RemoteConfigDefaults.reducedCeilingMiB, 64, 192))
         let mac = max(floor, clamp(data.player?.readAhead?.macCeilingMiB, RemoteConfigDefaults.macCeilingMiB, 128, 1536))
         let vodSecs = clamp(data.player?.vodReadaheadSecs, RemoteConfigDefaults.vodReadaheadSecs, 30, 600)
-        // DV-remux buffer window floor: keep at least 64 MiB (two full HLS segments, matching
-        // VortXRemuxBuffer.windowFloorMinMiB) and cap at 512 MiB. The lower bound is the design invariant, not a
-        // convenience: a floor below the two-segment skew can evict a range still being served on an open
-        // connection (reader request drops below storageBase -> HLS connection cut -> AVPlayer demotes DV to
-        // HDR10). It is NOT a startup-starvation guard; producerLeadBytes supplies the startup headroom
-        // independently. The upper cap keeps a widened re-read floor from approaching the whole-movie RAM this
-        // window replaced.
+        // DV-remux buffer window floor: keep at least 64 MiB (matching VortXRemuxBuffer.windowFloorMinMiB) and
+        // cap at 512 MiB. The lower bound is EMPIRICAL, not a two-segment derivation: see the note on
+        // RemoteConfigDefaults.dvRemuxWindowMiB for why that derivation is dead (no hlsMaxSegmentBytes exists,
+        // and 32 MiB is a retired threshold). Eviction beneath a range still being served is held by
+        // VortXRemuxBuffer's active read leases, not by this floor; the floor keeps ordinary near-frontier
+        // re-reads from churning. It is NOT a startup-starvation guard; producerLeadBytes supplies the startup
+        // headroom independently. The upper cap keeps a widened re-read floor from approaching the whole-movie
+        // RAM this window replaced.
         let dvWindow = clamp(data.player?.readAhead?.dvRemuxWindowMiB, RemoteConfigDefaults.dvRemuxWindowMiB, 64, 512)
 
         // --- Timeouts. ---
@@ -803,6 +863,9 @@ actor RemoteConfig {
             put("communityTrickplay", f.communityTrickplay)
             put("dvRemux", f.dvRemux)
             put("dvRemuxHLS", f.dvRemuxHLS)
+            put("dvRemuxMultiAudio", f.dvRemuxMultiAudio)
+            put("dvRemuxSubtitles", f.dvRemuxSubtitles)
+            put("dvWindowConsumptionAnchor", f.dvWindowConsumptionAnchor)
             put("diskCache", f.diskCache)
             put("trailers", f.trailers)
             put("vortxRatings", f.vortxRatings)
@@ -816,12 +879,17 @@ actor RemoteConfig {
             put("debridInlineResolve", f.debridInlineResolve)
             put("hdrDisplayModeSwitch", f.hdrDisplayModeSwitch)
             put("iosPassthroughAudio", f.iosPassthroughAudio)
+            put("tvosSpdif", f.tvosSpdif)
             put("dvToAVPlayerRouting", f.dvToAVPlayerRouting)
             put("hlsToAVPlayerRouting", f.hlsToAVPlayerRouting)
+            put("plainRemux", f.plainRemux)
+            put("avPlayerDefault", f.avPlayerDefault)
             put("av1Penalty", f.av1Penalty)
             put("communitySubtitles", f.communitySubtitles)
             put("subtitleSync", f.subtitleSync)
+            put("subtitleUpload", f.subtitleUpload)
             put("languageIndex", f.languageIndex)
+            put("languageIndexContribute", f.languageIndexContribute)
             put("localizedMetadata", f.localizedMetadata)
             put("sourceIndex", f.sourceIndex)
         }
@@ -907,6 +975,146 @@ actor RemoteConfig {
     private static func persist(json: Data, etag: String?) {
         if let file = cacheFile() { try? json.write(to: file, options: .atomic) }
         if let etag, !etag.isEmpty { UserDefaults.standard.set(etag, forKey: etagKey) }
+    }
+
+    // MARK: - Launch-health guard: the valid-but-HARMFUL config
+
+    /// MALFORMED config is already handled well (corrupt / undecodable / out-of-range => absent => baked).
+    /// This guards the OTHER case, and it is the only one that can brick the fleet PERMANENTLY: a config that
+    /// decodes cleanly, passes every clamp, is persisted as last-known-good, and then wedges the app. It is
+    /// re-applied on every launch, so if it wedges the app before the next fetch completes, the very
+    /// mechanism built to deliver the fix can never reach the device.
+    ///
+    /// THE GUARD: count launches that applied a given cached config and did not survive to a responsive main
+    /// thread. `unhealthyStartThreshold` consecutive such launches discard that config, quarantine it by
+    /// content hash, and boot baked.
+    ///
+    /// WHAT "ABNORMAL" CAN AND CANNOT MEAN HERE, stated plainly. We cannot distinguish a crash from a jetsam
+    /// kill, a force-quit, or a fast Home press: all four look identical, in that the healthy mark never ran.
+    /// That imprecision is ACCEPTED because the two error directions are wildly asymmetric. A false NEGATIVE
+    /// strands a user forever. A false POSITIVE boots them on baked defaults, which is byte-identical to the
+    /// shipping build, and the next good fetch restores remote behavior. So this is deliberately tuned to
+    /// tolerate false positives and never to tolerate a false negative.
+    ///
+    /// SCOPE, also stated plainly: this protects the LAUNCH path, which is the unrecoverable case. A config
+    /// that only misbehaves later (during playback, say) still lets the app start and fetch, so the fleet
+    /// stays reachable and does not need this guard.
+    ///
+    /// Consecutive unhealthy starts before a cached config is discarded. THREE, deliberately: 1 would throw
+    /// away good config on any single unrelated crash or a quick quit; 2 is still ordinary user behavior
+    /// (open the app and immediately background it, twice); 3 consecutive launches that each failed to keep
+    /// the main thread responsive for `healthySurvivalSecs` is a strong signal, and it costs a genuinely
+    /// affected user at most three bad launches before the device self-heals.
+    static let unhealthyStartThreshold = 3
+    /// How long a launch must keep the MAIN thread responsive to count as healthy. Scheduled on the MAIN
+    /// queue on purpose: a hang, not only a crash, must fail to mark healthy, and a main-queue block that
+    /// never runs is exactly the signature of a wedged app.
+    static let healthySurvivalSecs: TimeInterval = 10
+
+    private static let healthCounterKey = "vortx.remoteConfig.unhealthyStarts"
+    private static let healthHashKey = "vortx.remoteConfig.healthConfigHash"
+    private static let quarantineHashKey = "vortx.remoteConfig.quarantinedHash"
+    private static let lastDiscardKey = "vortx.remoteConfig.lastDiscardEpoch"
+    private static let discardCountKey = "vortx.remoteConfig.discardCount"
+
+    /// FNV-1a over the raw config bytes. Hand-rolled because `Hasher` is randomly seeded PER PROCESS, so its
+    /// output cannot be compared across launches, which is the only thing this hash is for.
+    static func stableHash(_ data: Data) -> String {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100_0000_01b3
+        }
+        return String(hash, radix: 16)
+    }
+
+    enum LaunchHealthDecision: Equatable {
+        /// Apply the cached config. `nextCounter` is persisted BEFORE applying, so a wedge during apply is
+        /// still counted on the next launch.
+        case apply(nextCounter: Int)
+        /// Discard the cached config and boot baked.
+        case discard
+    }
+
+    /// The whole decision, as a PURE function of persisted state, so it can be exhaustively tested without
+    /// UserDefaults, a filesystem, or an app lifecycle.
+    static func launchHealthDecision(cachedHash: String,
+                                     storedHash: String?,
+                                     storedCounter: Int,
+                                     quarantinedHash: String?,
+                                     threshold: Int) -> LaunchHealthDecision {
+        if let quarantinedHash, quarantinedHash == cachedHash { return .discard }
+        // A config this device has not applied before starts its own count. Unhealthy starts charged against
+        // a PREVIOUS config must never be inherited by a new one, or an operator's fix would arrive
+        // pre-condemned.
+        let counter = (storedHash == cachedHash) ? max(0, storedCounter) : 0
+        if counter >= threshold { return .discard }
+        return .apply(nextCounter: counter + 1)
+    }
+
+    /// Record this launch's attempt against `cachedHash`. Returns true when the cached config may be applied,
+    /// false when it must be discarded (in which case it is quarantined and the on-disk cache is dropped).
+    private static func admitCachedConfig(hash cachedHash: String) -> Bool {
+        let defaults = UserDefaults.standard
+        let decision = launchHealthDecision(
+            cachedHash: cachedHash,
+            storedHash: defaults.string(forKey: healthHashKey),
+            storedCounter: defaults.integer(forKey: healthCounterKey),
+            quarantinedHash: defaults.string(forKey: quarantineHashKey),
+            threshold: unhealthyStartThreshold)
+
+        switch decision {
+        case .discard:
+            // Quarantine by CONTENT hash so `refresh` cannot re-install the same bytes minutes later and undo
+            // this. Drop the cache file and the ETag together: keeping the ETag would make the next GET 304
+            // into a cache that no longer exists.
+            defaults.set(cachedHash, forKey: quarantineHashKey)
+            defaults.set(Date().timeIntervalSince1970, forKey: lastDiscardKey)
+            defaults.set(defaults.integer(forKey: discardCountKey) + 1, forKey: discardCountKey)
+            defaults.set(0, forKey: healthCounterKey)
+            defaults.removeObject(forKey: healthHashKey)
+            defaults.removeObject(forKey: etagKey)
+            if let file = cacheFile() { try? FileManager.default.removeItem(at: file) }
+            return false
+        case .apply(let next):
+            defaults.set(cachedHash, forKey: healthHashKey)
+            defaults.set(next, forKey: healthCounterKey)
+            return true
+        }
+    }
+
+    static func isQuarantined(_ hash: String) -> Bool {
+        UserDefaults.standard.string(forKey: quarantineHashKey) == hash
+    }
+
+    /// Called once per launch on the MAIN queue, `healthySurvivalSecs` after bootstrap. Reaching it proves the
+    /// process started AND the main thread is servicing work, which is what "healthy" must mean for the guard
+    /// to catch hangs rather than only crashes.
+    static func markLaunchHealthy() {
+        UserDefaults.standard.set(0, forKey: healthCounterKey)
+    }
+
+    private static func scheduleLaunchHealthMark() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + healthySurvivalSecs) { markLaunchHealthy() }
+    }
+
+    /// Read-only diagnostics for the guard, so a discard is visible after the fact rather than silent.
+    struct LaunchHealthState {
+        let unhealthyStarts: Int
+        let trackedConfigHash: String?
+        let quarantinedHash: String?
+        let lastDiscardEpoch: Double
+        let discardCount: Int
+    }
+
+    static var launchHealth: LaunchHealthState {
+        let defaults = UserDefaults.standard
+        return LaunchHealthState(
+            unhealthyStarts: defaults.integer(forKey: healthCounterKey),
+            trackedConfigHash: defaults.string(forKey: healthHashKey),
+            quarantinedHash: defaults.string(forKey: quarantineHashKey),
+            lastDiscardEpoch: defaults.double(forKey: lastDiscardKey),
+            discardCount: defaults.integer(forKey: discardCountKey))
     }
 }
 

@@ -83,6 +83,14 @@ struct VortXiOSApp: App {
                 .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
                     if phase == .active {
                         UpdateChecker.shared.checkIfStale()
+                        // RemoteConfig had NO foreground pull: `refreshIfForegroundDue` existed with zero
+                        // call sites anywhere in the repo, so the only refreshes were the cold-launch fetch
+                        // and the 6-hourly periodic Task, whose sleep does not advance while the process is
+                        // suspended. Users routinely never fully quit the app, so a device could hold a
+                        // stale config (and therefore a stale KILL SWITCH) indefinitely. Throttled to once
+                        // per 30 minutes inside the actor, detached so it cannot delay this hook, and
+                        // fail-soft by construction (refresh never throws and keeps last-good on any error).
+                        Task.detached(priority: .utility) { await RemoteConfig.shared.refreshIfForegroundDue() }
                         #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
                         // #130: after a long suspension iOS can tear down the server's bound listener while
                         // node keeps ticking, so the server reads Offline until a manual restart.
