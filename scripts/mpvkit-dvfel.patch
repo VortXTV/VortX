@@ -1,5 +1,5 @@
 diff --git a/Sources/BuildScripts/XCFrameworkBuild/main.swift b/Sources/BuildScripts/XCFrameworkBuild/main.swift
-index e5f872c..d678e75 100644
+index e5f872c..b46a86f 100644
 --- a/Sources/BuildScripts/XCFrameworkBuild/main.swift
 +++ b/Sources/BuildScripts/XCFrameworkBuild/main.swift
 @@ -45,10 +45,25 @@ do {
@@ -83,7 +83,29 @@ index e5f872c..d678e75 100644
          ]
          if BaseBuild.options.enableGPL {
              array.append("-Dgpl=true")
-@@ -778,10 +815,87 @@ private class BuildLuaJIT: ZipBaseBuild {
+@@ -681,6 +718,21 @@ private class BuildFFMPEG: BaseBuild {
+         "--enable-encoder=aac", "--enable-encoder=alac", "--enable-encoder=flac", "--enable-encoder=pcm*",
+         "--enable-encoder=movtext", "--enable-encoder=mpeg4", "--enable-encoder=h264_videotoolbox",
+         "--enable-encoder=hevc_videotoolbox", "--enable-encoder=prores", "--enable-encoder=prores_videotoolbox",
++
++        // SPIKE: E-AC-3 encoder for the Dolby Vision remux lane. VortXAudioTranscoder.swift asks for
++        // AV_CODEC_ID_EAC3 first and falls back to AAC, and upstream MPVKit ships neither an eac3 nor
++        // an ac3 encoder, so that fallback ALWAYS fired: a TrueHD or DTS-HD MA source reached the
++        // receiver as AAC instead of Dolby Digital Plus. Verified by symbol scan of our own artifact
++        // (nm on every Libavcodec slice: 49 encoders, zero _ff_ac3_encoder / _ff_eac3_encoder).
++        //
++        // Native FFmpeg encoder, so no external library and no licence change: configure has
++        // `eac3_encoder_select="ac3_encoder"` and `ac3_encoder_select="ac3dsp audiodsp me_cmp"`, all
++        // internal, and neither carries a gpl or nonfree marker at n8.1.2. ac3_encoder therefore
++        // appears in the build too, as a selected dependency rather than a separate choice.
++        // The mov/mp4 sink already supports it: movenc maps EAC3 to the 'ec-3' tag and writes the
++        // dec3 atom, and mov_muxer_select already pulls in ac3_parser, which is what parses the
++        // frames for that atom.
++        "--enable-encoder=eac3",
+         // ./configure --list-protocols
+         "--enable-protocols",
+         // ./configure --list-demuxers
+@@ -778,10 +830,87 @@ private class BuildLuaJIT: ZipBaseBuild {
  }
  
  

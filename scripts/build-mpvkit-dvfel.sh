@@ -20,16 +20,35 @@
 #   libplacebo 4c426e466814536def653cb23f1d1c287ea7a7f5  master, 2026-07-24, PL_API_VER 371
 #   FFmpeg     n8.1.2                                    UNCHANGED, deliberately
 #
-# FFmpeg stays put because VortXMKVRemuxStream.swift calls libavformat/libavcodec directly and
-# master's libavutil 60 -> 61 deprecation removals are a much bigger risk than this feature is
-# worth. The bounded cost: dual-track P7 MKV (separate BL + EL video tracks) works; single-track
+# FFmpeg stays put for now, but NOT for the reason first recorded here. The original claim was that
+# VortXMKVRemuxStream.swift calls libavformat/libavcodec directly, so libavutil 60 -> 61 deprecation
+# removals made a bump too risky. A source-level audit REFUTED that, and the refutation is the point
+# of this paragraph: of the 67 distinct FFmpeg functions VortX calls, ZERO were removed or changed
+# signature between n8.1.2 and master, and every FF_API_* removal in the range lands on APIs we do
+# not touch. The version jump is in fact WIDER than was recorded (762b94e672 moves libavformat and
+# libavcodec 62 -> 63 in the same change, and we link both directly) and it is still clean.
+# libavutil/dovi_meta.h has a ZERO-byte diff across the range, so the synthetic Dolby Vision record
+# built at VortXMKVRemuxStream.swift:3612-3640 is untouched. Audit: vortx-ffmpeg-harvest.md.
+#
+# So our Swift call sites are NOT the blocker. What actually gates the bump is (a) the DV
+# conformance harness being repaired, and (b) one genuinely UNMEASURED cost: whether MPVKit's own
+# FFmpeg patches rebase onto FFmpeg release/9.0. Nobody has attempted that rebase yet, and it is the
+# only thing here that could turn a small job into a long one. Do not re-derive the Swift-API fear.
+#
+# The bounded cost of staying put: dual-track P7 MKV (separate BL + EL video tracks) works; single-track
 # INTERLEAVED P7 does not, because mpv's splitter needs FFmpeg's `dovi_split` bitstream filter
 # (upstream 6026988b75, 2026-05-16) which n8.1.2 does not ship. mpv handles its absence by
 # returning NULL, so those files degrade to exactly today's behaviour with no crash.
 #
-# Our delta to MPVKit is ONE file (Sources/BuildScripts/XCFrameworkBuild/main.swift), carried as
-# scripts/mpvkit-dvfel.patch. Everything not listed above still comes from upstream MPVKit's own
-# prebuilt zips at the versions the 0.41.0-n8.1.2 pin already used.
+# Our delta to MPVKit is TWO files, and they are deliberately kept apart:
+#   scripts/mpvkit-dvfel.patch        patches MPVKit's own Sources/BuildScripts/XCFrameworkBuild/main.swift
+#                                     (the pins above, the libplacebo source build, and the FFmpeg
+#                                     --enable-encoder=eac3 the Dolby Vision audio transcoder needs).
+#   scripts/mpv-moltenvk-resize.patch patches MPV itself. Installed below as patch 0004 next to
+#                                     MPVKit's own 0001-0003, because it edits the file MPVKit's 0001
+#                                     creates and so must be applied after it.
+# Everything not listed above still comes from upstream MPVKit's own prebuilt zips at the versions
+# the 0.41.0-n8.1.2 pin already used.
 #
 # Cost: a full clean run builds 9 slices (ios, isimulator x2, tvos x2, tvsimulator x2, macos x2)
 # of FFmpeg, libplacebo and mpv from source. Budget hours, not minutes, and ~20 GB of scratch.
@@ -54,6 +73,15 @@ git fetch --all --quiet
 git checkout --quiet "$MPVKIT_REF"
 git checkout --quiet -- .
 git apply "$REPO/scripts/mpvkit-dvfel.patch"
+
+# Install our mpv-side patch alongside MPVKit's own libmpv patches. SpikeGit.applyPatches (added by
+# mpvkit-dvfel.patch) applies that directory in sorted order, so the 0004 prefix guarantees it runs
+# after MPVKit's 0001, which is what creates video/out/vulkan/context_moltenvk.m in the first place.
+# Copied rather than committed into the patch-of-a-patch above so the mpv diff stays readable and
+# reviewable on its own. `git checkout -- .` above does not remove untracked files, so an existing
+# copy from a previous run is simply overwritten.
+cp "$REPO/scripts/mpv-moltenvk-resize.patch" \
+   "$WORK/MPVKit/Sources/BuildScripts/patch/libmpv/0004-moltenvk-context-check-events-resize.patch"
 
 # GPL variant: VortX consumes the MPVKit-GPL product (libsmbclient + -Dgpl=true).
 swift run --build-path ./.build --package-path Sources/BuildScripts \

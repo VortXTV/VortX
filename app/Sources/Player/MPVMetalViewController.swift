@@ -247,17 +247,48 @@ final class MPVMetalViewController: PlatformViewController {
             didBuildInitialVideoOutput = true
             reconfigureVideoOutput()
         } else if didResize {
-            // libmpv sets the video output up for whatever size it STARTS at but doesn't refill the
-            // surface after a live resize (the video ends up tiny in a corner after rotating). Rebuild
-            // the video output (vid no -> auto) at the new size.
-            reconfigureVideoOutput()
+            // A live resize (rotation, macOS window drag) no longer needs the VO rebuilt. Our mpv
+            // build carries scripts/mpv-moltenvk-resize.patch, which makes the moltenvk render
+            // context answer VOCTRL_CHECK_EVENTS by re-reading the layer's drawableSize, resizing
+            // its own swapchain and raising VO_EVENT_RESIZE. mpv therefore refills the surface by
+            // itself, and the old `vid=no` then `vid=auto` teardown (which threw away the decoder
+            // and the whole video chain on every single rotation) is gone.
+            applyVideoSize { self.setString($0, $1) }
+            wakeVideoOutputThread()
         }
     }
 
+    /// Kick mpv's video-output thread so it polls the layer size NOW rather than whenever it next
+    /// happens to run. That thread's loop checks events once per iteration and then parks for a very
+    /// long time whenever it has nothing to render (video/out/vo.c), so a rotation performed while
+    /// PAUSED would otherwise not be picked up until playback resumed, leaving the last frame
+    /// stretched to the new bounds. Measured, not assumed: test/moltenvk-resize probes a paused
+    /// rotation with no follow-up, with the size properties re-applied, and with this call.
+    ///
+    /// Re-applying the size properties is NOT sufficient on its own. mpv only notifies option
+    /// listeners when a value actually changes (options/m_config_core.c), and `keepaspect` and
+    /// `panscan` do not change across a rotation, so those writes are inert.
+    ///
+    /// `display-names` is read purely for the dispatch: its getter is one of the few property reads
+    /// that goes through vo_control(), which hands work to the video-output thread and therefore
+    /// wakes it. The value is discarded, and this lane answers VO_NOTIMPL anyway. Async so nothing
+    /// on the calling thread can ever block on the video-output thread finishing a frame; this runs
+    /// from a layout callback on the main thread, and that thread must never wait on the renderer
+    /// (see the MetalLayer EDR note for what that costs when it goes wrong).
+    private func wakeVideoOutputThread() {
+        guard mpv != nil else { return }
+        mpv_get_property_async(mpv, 0, "display-names", MPV_FORMAT_STRING)
+    }
+
+    /// One-shot VO rebuild for the zero-size-at-init case only (see didBuildInitialVideoOutput). Live
+    /// resizes no longer come through here: mpv's own render context now notices a layer resize, so
+    /// layoutDrawable just re-applies the size mode. This remains because a VO that was configured
+    /// against a surface with NO size never built a presentable context at all, which no amount of
+    /// resizing after the fact can repair.
     private func reconfigureVideoOutput() {
         guard mpv != nil else { return }
-        // Runtime rebuild after a live resize/rotation: `vid` must be set as a PROPERTY. mpv_set_option_string
-        // is a silent no-op after mpv_initialize, so the option-string form never actually rebuilt the VO.
+        // `vid` must be set as a PROPERTY. mpv_set_option_string is a silent no-op after
+        // mpv_initialize, so the option-string form never actually rebuilt the VO.
         checkError(mpv_set_property_string(mpv, "vid", "no"))
         DispatchQueue.main.async { [weak self] in
             guard let self, self.mpv != nil else { return }
@@ -2405,6 +2436,11 @@ final class MPVMetalViewController: PlatformViewController {
                         // so keep the message body private; prefix + level stay public for log filtering.
                         if !text.isEmpty { self.mpvLog.log("[\(prefix, privacy: .public)/\(level, privacy: .public)] \(text, privacy: .private)") }
                     }
+                case MPV_EVENT_GET_PROPERTY_REPLY:
+                    // wakeVideoOutputThread reads a property purely to hand work to the
+                    // video-output thread. The reply carries nothing anyone wants; swallow it here
+                    // so a rotation does not print a puzzling event line in debug builds.
+                    break
                 default:
                     #if DEBUG
                     let eventName = mpv_event_name(event!.pointee.event_id)
