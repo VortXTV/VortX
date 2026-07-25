@@ -441,6 +441,10 @@ func selectionScenario(name: String, fixture: String, playSeconds: Double,
 
     let audioGroup = loadGroup(item.asset, .audible)
     let subGroup = loadGroup(item.asset, .legible)
+    // Mirror AVPlayerEngine.loadSelectionGroups: the app owns selection from here on, so the framework must
+    // stop re-applying its own automatic criteria over an explicit pick. Set at the same point in the
+    // sequence, so this gate exercises the configuration that actually ships.
+    player.appliesMediaSelectionCriteriaAutomatically = false
     result.audioOptions = audioGroup?.options.map(\.displayName) ?? []
     result.subtitleOptions = subGroup?.options.map(\.displayName) ?? []
     print("selection groups: audio=\(result.audioOptions) subtitles=\(result.subtitleOptions)")

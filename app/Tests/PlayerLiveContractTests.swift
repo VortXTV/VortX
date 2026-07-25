@@ -2740,7 +2740,7 @@ enum PlayerLiveContractTests {
         // choice at the next selection opportunity and silently reverts the pick. The remux master carries
         // DEFAULT=YES / AUTOSELECT rows, so leaving it set is a live fight with every explicit selection.
         check("wiring: VortX owns selection, so automatic media-selection criteria are cleared",
-              groupLoad?.contains("item.appliesMediaSelectionCriteriaAutomatically = false") == true)
+              groupLoad?.contains("player.appliesMediaSelectionCriteriaAutomatically = false") == true)
         check("release: Beta 7 is the first parseable changelog version",
               changelog?.range(of: "## 0.3.14 Beta 7")?.lowerBound
                   == changelog?.range(of: "## ")?.lowerBound)

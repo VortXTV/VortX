@@ -1694,8 +1694,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             // an explicit deselect could come back on (subtitles rendering while the picker says Off) and an
             // explicit pick could be undone right after the rendition finished buffering ("I click it, the
             // stream buffers and nothing changes"). Clearing the flag deselects nothing, so whatever is
-            // already playing keeps playing; it only stops future automatic overrides.
-            item.appliesMediaSelectionCriteriaAutomatically = false
+            // already playing keeps playing; it only stops future automatic overrides. Applied HERE rather
+            // than before the item mounts on purpose: the framework's initial automatic pick still happens, so
+            // a source whose TrackSelector run picks no audio keeps the audible track it has today.
+            player.appliesMediaSelectionCriteriaAutomatically = false
             // A selection notification may arrive before the groups finish loading and publish an empty
             // snapshot. Force the newly available option topology to publish once even when both are Off.
             selectionRefreshState.reset()
