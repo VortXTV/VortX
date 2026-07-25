@@ -827,9 +827,9 @@ final class VortXSyncManager: ObservableObject {
             }
         // FLOOR vs MIRROR for the owner library, per the "Mirror library from Stremio" toggle. FLOOR (OFF,
         // default) = UNION the account's already-owned `doc.vortx.library` with the engine library, so a
-        // Stremio removal never removes from VortX and an empty/degraded engine can never SHRINK it. The
-        // `mirror CW` toggle, when OFF, is what keeps a prior in-progress item's t/d from being zeroed by a
-        // Stremio drop (the union preserves it). MIRROR (ON) = REPLACE: the live Stremio set is authoritative
+        // Stremio removal never removes from VortX and an empty/degraded engine can never SHRINK it. This
+        // toggle governs MEMBERSHIP; the per-item resume POSITION (t / d / v) is governed separately by the
+        // "Mirror Continue Watching" floor below. MIRROR (ON) = REPLACE: the live Stremio set is authoritative
         // so removals propagate - but ONLY with a live Stremio session AND a non-empty engine library, so a
         // logged-out / mid-pull shrunken set can never propagate the shrink to every device (the add-on
         // guard's clobber fix; the library has no official-defaults concept, so no `!engineIsDefaultOnly`).
@@ -837,6 +837,30 @@ final class VortXSyncManager: ObservableObject {
         let mirrorReplaceLibrary = MirrorSettings.mirrorLibrary && !engineLibrary.isEmpty && CoreBridge.shared.isLoggedIn()
         if !mirrorReplaceLibrary, let prior = (existingVortx?["library"] as? [[String: Any]]) {
             for entry in prior { if let id = entry["id"] as? String, !id.isEmpty { libraryByID[id] = entry } }
+        }
+        // FLOOR vs MIRROR for the owner's RESUME POSITIONS, per the "Mirror Continue Watching from Stremio"
+        // toggle. Read the prior doc positions into their OWN map rather than reusing `libraryByID`, because the
+        // two toggles are independent categories: with "Mirror library" ON the membership map is deliberately
+        // empty (REPLACE), and the CW floor must still be able to compare against VortX's owned position. This
+        // map is used for POSITIONS ONLY and never re-adds prior-only membership.
+        //
+        // The gate is inert without a live Stremio session (see ContinueWatchingMirror.swift): the engine's
+        // library bucket carries this device's own playback as well as a Stremio pull, so with no session there
+        // is nothing to floor and every entry below takes the engine value exactly as it does today.
+        var priorPositions: [String: [String: Any]] = [:]
+        for entry in (existingVortx?["library"] as? [[String: Any]]) ?? [] {
+            if let id = entry["id"] as? String, !id.isEmpty { priorPositions[id] = entry }
+        }
+        let stremioMayReplaceCW = MirrorSettings.stremioMayReplaceContinueWatching(
+            stremioSessionLive: CoreBridge.shared.isLoggedIn())
+        // Retire local-rewind exemptions the account doc has already absorbed. An id is stamped by
+        // `CoreBridge.finishedWatching` and is only needed until the doc carries its zero; once the doc says
+        // t == 0 (or has no entry for the title at all, in which case the floor cannot engage for it anyway)
+        // the stamp is dead weight. UNCONDITIONAL, deliberately: a device that never has a live Stremio session
+        // never enters the floor branch below, so a retire that only ran there would let the log grow by one id
+        // per finished title forever.
+        for id in LocalRewindLog.all() where Self.libSeconds(priorPositions[id]?["t"]) == 0 {
+            LocalRewindLog.forget(id)
         }
         for entry in engineLibrary {
             guard let id = entry["id"] as? String else { continue }
@@ -852,6 +876,27 @@ final class VortXSyncManager: ObservableObject {
                (Self.libSeconds(prior["t"]) > 0 || Self.libSeconds(prior["d"]) > 0) {
                 var merged = entry
                 merged["t"] = prior["t"]; merged["d"] = prior["d"]; merged["v"] = prior["v"]
+                libraryByID[id] = merged
+                continue
+            }
+            // The Continue Watching FLOOR. Only engages with a live Stremio session and the toggle OFF, and even
+            // then only when the engine's position moves BACKWARDS from the VortX-owned one (a stale Stremio
+            // copy, a title finished on an official Stremio client, a Stremio rewind). Local playback always
+            // moves the position forward, so it passes through untouched; a local FINISH also zeroes it, so
+            // `finishedWatching` stamps `LocalRewindLog` and the resolver lets that zero through.
+            if !stremioMayReplaceCW, let prior = priorPositions[id] {
+                let locallyRewound = LocalRewindLog.contains(id)
+                let resolved = MirrorSettings.resolveContinueWatching(
+                    engine: MirrorSettings.CWPosition(t: Double(Self.libSeconds(entry["t"])),
+                                                      d: Double(Self.libSeconds(entry["d"])),
+                                                      v: entry["v"] as? String),
+                    owned: MirrorSettings.CWPosition(t: Double(Self.libSeconds(prior["t"])),
+                                                     d: Double(Self.libSeconds(prior["d"])),
+                                                     v: prior["v"] as? String),
+                    mayReplace: false,
+                    locallyRewound: locallyRewound)
+                var merged = entry     // keep the engine's fresh name / poster / type; only the position is floored
+                merged["t"] = Int(resolved.t); merged["d"] = Int(resolved.d); merged["v"] = resolved.v ?? ""
                 libraryByID[id] = merged
                 continue
             }

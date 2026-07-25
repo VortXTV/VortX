@@ -593,7 +593,7 @@ struct iOSSettingsView: View {
         } header: {
             Text("Stremio mirror")
         } footer: {
-            Text("Off (recommended) is one-way: VortX pulls in your Stremio add-ons but never edits your Stremio account, so removing an add-on in VortX hides it here only and leaves your Stremio account untouched. On is two-way: adding or removing an add-on in VortX also adds or removes it in your Stremio account. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
+            Text("Off (recommended) is one-way: VortX pulls your Stremio add-ons, library, and Continue Watching in, but never lets Stremio take them back out. Removing an add-on in VortX hides it here only and leaves your Stremio account untouched, your library keeps titles Stremio no longer has, and a resume position never rolls back to an older or finished Stremio copy. On makes VortX track Stremio for that category, so a removal, a rewind, or a finish there applies here too. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
         }
     }
 

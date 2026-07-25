@@ -1313,7 +1313,7 @@ final class CoreBridge: ObservableObject {
             return vortxOwnedResumeSeconds(for: meta) ?? 0
         }
         let engine = max(0, item.state.timeOffset / 1000.0)
-        if engine > 0 { return engine }                                    // freshest local play wins
+        if engine > 0 { return flooredResumeSeconds(engine: engine, for: meta) }   // freshest local play wins
         // engine reports 0: only fall back to the VortX cache for the BARE re-add signature (timeOffset == 0 AND
         // duration == 0, a recovered item the engine could not be given an offset). A genuine finished / rewound
         // 0 keeps duration > 0 and is REAL, so trust it and never offer a stale resume for a just-finished title.
@@ -1352,7 +1352,7 @@ final class CoreBridge: ObservableObject {
             return vortxOwnedResumeSeconds(for: meta) ?? 0
         }
         let engine = max(0, item.state.timeOffset / 1000.0)
-        if engine > 0 { return engine }                                    // freshest local play wins
+        if engine > 0 { return flooredResumeSeconds(engine: engine, for: meta) }   // freshest local play wins
         // Engine reports 0: only fall back to the VortX cache for the BARE re-add signature (timeOffset == 0 AND
         // duration == 0). A genuine finished / rewound 0 keeps duration > 0 and is REAL, so trust it.
         if item.state.duration == 0 { return vortxOwnedResumeSeconds(for: meta) ?? 0 }
@@ -1374,6 +1374,21 @@ final class CoreBridge: ObservableObject {
             requestedVideoID: meta.videoId
         ) { return nil }
         return entry.t
+    }
+
+    /// Apply the Continue Watching FLOOR to a POSITIVE engine-held resume position.
+    ///
+    /// With a live Stremio session and "Mirror Continue Watching from Stremio" OFF, the engine's offset may have
+    /// been authored by an official Stremio client, so a copy that sits BEHIND VortX's own saved position must
+    /// not drag the resume point backwards. Returns the engine value untouched in every other case: mirror ON,
+    /// no live Stremio session (the default and every VortX-only device), a locally-finished title, an overlay
+    /// profile, or no cached VortX position that is actually ahead. `vortxOwnedResumeSeconds` does the owner
+    /// gate and the episode-identity match, so a series never resumes another episode's position through here.
+    private func flooredResumeSeconds(engine: Double, for meta: PlaybackMeta) -> Double {
+        guard !MirrorSettings.stremioMayReplaceContinueWatching(stremioSessionLive: isLoggedIn()),
+              !LocalRewindLog.contains(meta.libraryId),
+              let owned = vortxOwnedResumeSeconds(for: meta), owned > engine else { return engine }
+        return owned
     }
 
     // MARK: Library / Continue Watching mutations (Ctx actions; CW + library refresh live via events)
@@ -1477,15 +1492,58 @@ final class CoreBridge: ObservableObject {
     /// the caller's thread (the Rust worker thread on the event path) to keep the JSON parse off main, then
     /// synthesizes + publishes on main.
     func rebuildContinueWatching() {
-        let engine = Self.pruneFinished(decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? [])
+        // "Mirror Continue Watching from Stremio": with a live Stremio session and the toggle OFF, a
+        // Stremio-sourced position must not drag the RAIL backwards either, not just the account doc. Resolved
+        // here off-main (a UserDefaults read plus the ctx auth probe, both thread-safe) and applied BEFORE
+        // `pruneFinished`, because a title Stremio reports as finished would otherwise be pruned away before
+        // the floor could restore VortX's own in-progress position.
+        let mayReplaceCW = MirrorSettings.stremioMayReplaceContinueWatching(stremioSessionLive: isLoggedIn())
+        let preview = decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
         let library = decode(CoreLibrary.self, field: "library")?.catalog ?? []
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            let items = ProfileStore.shared.activeUsesEngineHistory
+            // Owner profile only: the floor and the union are both owner-library concepts, and an overlay
+            // profile rides `profiles.cwItems` and ignores this published value entirely.
+            let ownerProfile = ProfileStore.shared.activeUsesEngineHistory
+            let engine = Self.pruneFinished(ownerProfile
+                ? Self.applyOwnedContinueWatchingFloor(preview, mayReplace: mayReplaceCW)
+                : preview)
+            let items = ownerProfile
                 ? Self.unionOwnerContinueWatching(engine: engine, library: library)
                 : engine
             VXProbe.log("engine", "continueWatching rebuilt n=\(items.count) (engine=\(engine.count))")
             self.continueWatching = items
+        }
+    }
+
+    /// FLOOR each engine Continue Watching item against the VortX-owned position cached in `OwnerResumeStore`.
+    ///
+    /// A pass-through when `mayReplace` (mirror ON, or no live Stremio session), which is the default path for
+    /// every VortX-only / imported-away device, so this changes nothing for them. Owner-profile only; the caller
+    /// gates. The decision itself is pure and lives in `MirrorSettings.resolveContinueWatching`.
+    static func applyOwnedContinueWatchingFloor(_ items: [CoreCWItem], mayReplace: Bool) -> [CoreCWItem] {
+        guard !mayReplace else { return items }
+        return items.map { item in
+            let owned = OwnerResumeStore.entry(forId: item.id)
+            let enginePosition = MirrorSettings.CWPosition(t: item.state.timeOffset / 1000,
+                                                          d: item.state.duration / 1000,
+                                                          v: item.state.videoId)
+            let resolved = MirrorSettings.resolveContinueWatching(
+                engine: enginePosition,
+                owned: owned.map { MirrorSettings.CWPosition(t: $0.t, d: $0.d, v: $0.v) },
+                mayReplace: false,
+                locallyRewound: LocalRewindLog.contains(item.id))
+            // Unchanged position: hand back the ORIGINAL item so the engine's watched bookkeeping
+            // (flaggedWatched / timesWatched, which `pruneFinished` reads) is preserved untouched. Compared
+            // against the NORMALIZED engine position, not the raw fields: `CWPosition` folds an empty video id
+            // to nil, so comparing raw would read "changed" for every item the engine spells with `""` and
+            // would silently strip the watched counters off titles the floor never touched.
+            guard resolved != enginePosition else { return item }
+            // Floored: the VortX position won, so the title is in progress by VortX's own truth and must not
+            // carry the engine's Stremio-sourced watched flags into `pruneFinished`.
+            let state = CoreLibState(timeOffset: resolved.t * 1000, duration: resolved.d * 1000, videoId: resolved.v)
+            return CoreCWItem(id: item.id, type: item.type, name: item.name, poster: item.poster, state: state,
+                              removed: item.removed, temp: item.temp)
         }
     }
 
@@ -1529,6 +1587,12 @@ final class CoreBridge: ObservableObject {
             ProfileStore.shared.finishedWatching(metaId: libraryId)   // overlay profile
             return
         }
+        // Stamp the LOCAL rewind before the dispatch. This is the app's single `RewindLibraryItem` site, and a
+        // finish is indistinguishable by value from a Stremio rollback (t drops to 0), so the Continue Watching
+        // FLOOR would otherwise refuse this device's own finish and pin the title in the rail whenever a Stremio
+        // session is live and "Mirror Continue Watching from Stremio" is OFF. `vortxSummary` clears the stamp as
+        // soon as the account doc carries the zero, which the immediate push below normally makes the next round.
+        LocalRewindLog.stamp(libraryId)
         dispatchCtx(["action": "RewindLibraryItem", "args": libraryId])
         // A rewind is NOT a removal (the library entry stays), so no tombstone applies; but its pushed
         // t/d=0 must survive an imminent sideload-update process kill, or the title comes back with stale
