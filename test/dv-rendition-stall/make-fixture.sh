@@ -35,6 +35,9 @@ srt() { # srt <path> <label> <duration>
 
 srt "$OUT/sub-eng.srt" "English" "$DUR"
 srt "$OUT/sub-fre.srt" "French" "$DUR"
+srt "$OUT/sub-ger.srt" "German" "$DUR"
+srt "$OUT/sub-spa.srt" "Spanish" "$DUR"
+srt "$OUT/sub-ita.srt" "Italian" "$DUR"
 
 if [ ! -f "$OUT/fixture-multiaudio.mkv" ]; then
   "$FFMPEG" -y -hide_banner -loglevel error \
@@ -65,6 +68,35 @@ if [ ! -f "$OUT/fixture-mixedcodec.mkv" ]; then
     -c:a:1 ac3  -ar:a:1 48000 -ac:a:1 6 -b:a:1 256k -metadata:s:a:1 language=fre -metadata:s:a:1 title="French 5.1" \
     -c:s srt -metadata:s:s:0 language=eng \
     "$OUT/fixture-mixedcodec.mkv"
+fi
+
+# Fixture C (fixture-manyaudio.mkv): the CEO's build 191 field shape - FIVE decodable audio tracks in
+# FOUR different codecs, one language each (so the pre-fix same-codec alternate rule qualifies NOTHING and
+# the master carries exactly one URI-less audio row: "audio says the language name but no options"), plus
+# FIVE text subtitle tracks. This is the fixture the real-AVPlayer selection gate drives.
+if [ ! -f "$OUT/fixture-manyaudio.mkv" ]; then
+  "$FFMPEG" -y -hide_banner -loglevel error \
+    -f lavfi -i "testsrc2=size=640x360:rate=24:duration=$DUR" \
+    -f lavfi -i "sine=frequency=440:duration=$DUR" \
+    -f lavfi -i "sine=frequency=550:duration=$DUR" \
+    -f lavfi -i "sine=frequency=660:duration=$DUR" \
+    -f lavfi -i "sine=frequency=770:duration=$DUR" \
+    -f lavfi -i "sine=frequency=880:duration=$DUR" \
+    -i "$OUT/sub-eng.srt" -i "$OUT/sub-fre.srt" -i "$OUT/sub-ger.srt" \
+    -i "$OUT/sub-spa.srt" -i "$OUT/sub-ita.srt" \
+    -map 0:v -map 1:a -map 2:a -map 3:a -map 4:a -map 5:a \
+    -map 6:s -map 7:s -map 8:s -map 9:s -map 10:s \
+    -c:v libx265 -preset ultrafast -tag:v hvc1 -x265-params "keyint=24:min-keyint=24:scenecut=0:log-level=error" -pix_fmt yuv420p \
+    -c:a:0 eac3 -ar:a:0 48000 -ac:a:0 6 -b:a:0 256k -metadata:s:a:0 language=eng -metadata:s:a:0 title="English 5.1" \
+    -c:a:1 ac3  -ar:a:1 48000 -ac:a:1 6 -b:a:1 448k -metadata:s:a:1 language=fre -metadata:s:a:1 title="French 5.1" \
+    -c:a:2 aac  -ar:a:2 48000 -ac:a:2 2 -b:a:2 128k -metadata:s:a:2 language=ger -metadata:s:a:2 title="German 2.0" \
+    -c:a:3 ac3  -ar:a:3 48000 -ac:a:3 2 -b:a:3 192k -metadata:s:a:3 language=spa -metadata:s:a:3 title="Spanish 2.0" \
+    -c:a:4 aac  -ar:a:4 48000 -ac:a:4 2 -b:a:4 128k -metadata:s:a:4 language=ita -metadata:s:a:4 title="Italian 2.0" \
+    -c:s srt \
+    -metadata:s:s:0 language=eng -metadata:s:s:1 language=fre -metadata:s:s:2 language=ger \
+    -metadata:s:s:3 language=spa -metadata:s:s:4 language=ita \
+    -disposition:s:0 default \
+    "$OUT/fixture-manyaudio.mkv"
 fi
 
 ls -la "$OUT"

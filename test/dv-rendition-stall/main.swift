@@ -313,6 +313,244 @@ func consumerScenario(name: String, fixture: String, startAt: Double,
     return result
 }
 
+// MARK: - REAL-CONSUMER SELECTION gate (build 191 field defect: renditions advertised, selection dead).
+//
+// The consumer gate above proves the stream PLAYS. It cannot prove a viewer can CHANGE anything: the field
+// report on build 191 was that audio showed one name with no options, subtitles showed Off while built-in
+// subs rendered, and picking a row buffered without switching. This gate drives a REAL AVPlayer, waits for
+// steady playback, then SELECTS an alternate audio rendition and an alternate subtitle rendition mid-play
+// and requires three things per switch:
+//   1. AVPlayerItem.currentMediaSelection reports the option we asked for (the selection BOUND),
+//   2. the server actually SERVED that rendition's own resources afterwards (the switch reached the wire),
+//   3. playback continued for 20s+ with no stall, no error and a monotonically advancing clock.
+
+struct SwitchOutcome {
+    var requested = ""
+    var observed = ""
+    var servedRenditionResources = false
+    var secondsPlayedAfter = 0.0
+    var longestStallAfter = 0.0
+    var errorAfter: String?
+    var attempted = false
+    /// Wall seconds between `item.select(_:in:)` returning and `currentMediaSelection` reporting the pick.
+    /// The chrome re-reads the engine's track list 0.25s after a tap, so a settle slower than that is what
+    /// makes a viewer's checkmark jump back with the stream buffering behind it.
+    var settleSeconds = -1.0
+}
+
+struct SelectionResult {
+    var audioOptions: [String] = []
+    var subtitleOptions: [String] = []
+    var audio = SwitchOutcome()
+    var subtitles = SwitchOutcome()
+    var itemError: String?
+    var remuxFailed = false
+    var reachedSecondsBeforeSwitch = 0.0
+}
+
+/// Pump the main run loop until `ready()` returns true or `seconds` elapse. Returns whether it went true.
+@discardableResult
+func pump(seconds: Double, until ready: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline {
+        if ready() { return true }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+    }
+    return ready()
+}
+
+func loadGroup(_ asset: AVAsset, _ characteristic: AVMediaCharacteristic) -> AVMediaSelectionGroup? {
+    nonisolated(unsafe) var group: AVMediaSelectionGroup?
+    nonisolated(unsafe) var done = false
+    Task {
+        group = try? await asset.loadMediaSelectionGroup(for: characteristic)
+        done = true
+    }
+    pump(seconds: 20) { done }
+    return group
+}
+
+/// Play for `seconds`, reporting how far the clock advanced and the longest mid-play stall. Any item error
+/// is captured. Mirrors the continuity rules of `consumerScenario` so a switch cannot hide a stall.
+func observePlayback(item: AVPlayerItem, seconds: Double) -> (played: Double, longestStall: Double, error: String?) {
+    let start = item.currentTime().seconds
+    var last = start
+    var stallStart: Date?
+    var longestStall = 0.0
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        if item.status == .failed {
+            return (max(0, last - start), longestStall,
+                    item.error.map(String.init(describing:)) ?? "failed")
+        }
+        let now = item.currentTime().seconds
+        guard now.isFinite else { continue }
+        if now - last > 0.05 {
+            if let began = stallStart {
+                longestStall = max(longestStall, Date().timeIntervalSince(began))
+                stallStart = nil
+            }
+            last = now
+        } else if stallStart == nil {
+            stallStart = Date()
+        }
+    }
+    if let began = stallStart { longestStall = max(longestStall, Date().timeIntervalSince(began)) }
+    return (max(0, last - start), longestStall, nil)
+}
+
+/// Did the server serve any resource whose logged path matches `marker` after log index `since`?
+func servedSince(_ since: Int, marker: String) -> Bool {
+    DiagnosticsLog.capturedLines().dropFirst(since)
+        .contains { $0.contains("hls resp") && $0.contains(marker) }
+}
+
+func selectionScenario(name: String, fixture: String, playSeconds: Double,
+                       holdSeconds: Double, pacedBytesPerSecond: Int) -> SelectionResult {
+    print("=== SELECTION \(name) fixture=\(fixture) ===")
+    var result = SelectionResult()
+    let source = startPacedSource(fixture: fixture, bytesPerSecond: pacedBytesPerSecond)
+    defer { source.process.terminate() }
+    guard let (server, playlistURL) = VortXRemuxHLSServer.make(
+        input: source.url, headers: nil, mode: .plain, startAtSeconds: 0) else {
+        print("FATAL selection server did not bind"); exit(2)
+    }
+    server.start()
+    let item = AVPlayerItem(url: playlistURL)
+    let player = AVPlayer(playerItem: item)
+    player.play()
+
+    guard pump(seconds: 60, until: { item.status == .readyToPlay || item.status == .failed }) ,
+          item.status == .readyToPlay else {
+        result.itemError = item.error.map(String.init(describing:)) ?? "never became readyToPlay"
+        print("selection: item never readyToPlay (\(result.itemError!))")
+        server.invalidate()
+        return result
+    }
+    server.markEngineReady()
+    player.play()
+
+    // Steady playback first: a selection made before the stream is genuinely rolling proves nothing.
+    let warm = observePlayback(item: item, seconds: playSeconds)
+    result.reachedSecondsBeforeSwitch = item.currentTime().seconds
+    result.itemError = warm.error
+    if server.mountProgress.failed { result.remuxFailed = true }
+    print(String(format: "selection warm-up: clock=%.1fs advanced=%.1fs stall=%.1fs",
+                 result.reachedSecondsBeforeSwitch, warm.played, warm.longestStall))
+
+    let audioGroup = loadGroup(item.asset, .audible)
+    let subGroup = loadGroup(item.asset, .legible)
+    // Mirror AVPlayerEngine.loadSelectionGroups: the app owns selection from here on, so the framework must
+    // stop re-applying its own automatic criteria over an explicit pick. Set at the same point in the
+    // sequence, so this gate exercises the configuration that actually ships.
+    player.appliesMediaSelectionCriteriaAutomatically = false
+    result.audioOptions = audioGroup?.options.map(\.displayName) ?? []
+    result.subtitleOptions = subGroup?.options.map(\.displayName) ?? []
+    print("selection groups: audio=\(result.audioOptions) subtitles=\(result.subtitleOptions)")
+    // What AVFoundation picked on its own, BEFORE anything asked it to. A legible rendition auto-selected
+    // here renders subtitles the viewer never asked for, and any chrome that reports "Off" while this is
+    // non-nil is lying about the state (the build 191 "built-in subs show but settings say off" report).
+    let initialAudio = audioGroup
+        .flatMap { item.currentMediaSelection.selectedMediaOption(in: $0)?.displayName } ?? "none"
+    let initialSubtitle = subGroup
+        .flatMap { item.currentMediaSelection.selectedMediaOption(in: $0)?.displayName } ?? "none"
+    print("selection at mount (AVFoundation's own automatic pick): audio=\(initialAudio) subtitle=\(initialSubtitle)")
+
+    // --- audio switch ---
+    if let group = audioGroup {
+        let current = item.currentMediaSelection.selectedMediaOption(in: group)
+        if let target = group.options.first(where: { $0 != current }) {
+            result.audio.attempted = true
+            result.audio.requested = target.displayName
+            let mark = DiagnosticsLog.capturedLines().count
+            let selectAt = Date()
+            item.select(target, in: group)
+            // AVFoundation may settle an HLS rendition switch asynchronously; give it a bounded window and
+            // record how long it took, because the chrome re-reads at 0.25s.
+            if pump(seconds: 10, until: {
+                item.currentMediaSelection.selectedMediaOption(in: group) == target
+            }) { result.audio.settleSeconds = Date().timeIntervalSince(selectAt) }
+            result.audio.observed = item.currentMediaSelection
+                .selectedMediaOption(in: group)?.displayName ?? "nil"
+            let after = observePlayback(item: item, seconds: holdSeconds)
+            result.audio.secondsPlayedAfter = after.played
+            result.audio.longestStallAfter = after.longestStall
+            result.audio.errorAfter = after.error
+            // A URI-bearing alternate proves itself by its OWN media resources reaching the wire.
+            result.audio.servedRenditionResources = servedSince(mark, marker: "/audio")
+            print(String(format: "audio switch: requested=%@ observed=%@ settle=%.2fs served=%@ played=%.1fs stall=%.1fs",
+                         result.audio.requested, result.audio.observed, result.audio.settleSeconds,
+                         String(result.audio.servedRenditionResources),
+                         result.audio.secondsPlayedAfter, result.audio.longestStallAfter))
+        } else {
+            print("audio switch: NO alternate option exists (options=\(result.audioOptions.count))")
+        }
+    }
+
+    // --- subtitle switch ---
+    if let group = subGroup, !group.options.isEmpty {
+        let current = item.currentMediaSelection.selectedMediaOption(in: group)
+        if let target = group.options.first(where: { $0 != current }) {
+            result.subtitles.attempted = true
+            result.subtitles.requested = target.displayName
+            let mark = DiagnosticsLog.capturedLines().count
+            let selectAt = Date()
+            item.select(target, in: group)
+            if pump(seconds: 10, until: {
+                item.currentMediaSelection.selectedMediaOption(in: group) == target
+            }) { result.subtitles.settleSeconds = Date().timeIntervalSince(selectAt) }
+            result.subtitles.observed = item.currentMediaSelection
+                .selectedMediaOption(in: group)?.displayName ?? "nil"
+            let after = observePlayback(item: item, seconds: holdSeconds)
+            result.subtitles.secondsPlayedAfter = after.played
+            result.subtitles.longestStallAfter = after.longestStall
+            result.subtitles.errorAfter = after.error
+            result.subtitles.servedRenditionResources = servedSince(mark, marker: "subs")
+            print(String(format: "subtitle switch: requested=%@ observed=%@ settle=%.2fs served=%@ played=%.1fs stall=%.1fs",
+                         result.subtitles.requested, result.subtitles.observed, result.subtitles.settleSeconds,
+                         String(result.subtitles.servedRenditionResources),
+                         result.subtitles.secondsPlayedAfter, result.subtitles.longestStallAfter))
+        } else {
+            print("subtitle switch: NO alternate option exists (options=\(result.subtitleOptions.count))")
+        }
+    }
+
+    if server.mountProgress.failed { result.remuxFailed = true }
+    player.pause()
+    server.invalidate()
+    Thread.sleep(forTimeInterval: 0.5)
+    return result
+}
+
+func judgeSwitch(_ label: String, _ outcome: SwitchOutcome, holdSeconds: Double, optionCount: Int) {
+    check("selection \(label): an alternate rendition is offered at all",
+          red: optionCount < 2,
+          detail: "options=\(optionCount) (field: the audio menu showed one name and no choices)")
+    guard optionCount >= 2 else { return }
+    check("selection \(label): selection BINDS (currentMediaSelection reports the pick)",
+          red: !outcome.attempted || outcome.observed != outcome.requested,
+          detail: String(format: "requested=%@ observed=%@ settled in %.2fs",
+                         outcome.requested, outcome.observed, outcome.settleSeconds))
+    check("selection \(label): the picked rendition is actually SERVED",
+          red: !outcome.servedRenditionResources,
+          detail: "served=\(outcome.servedRenditionResources) (field: the stream buffered and nothing changed)")
+    check("selection \(label): playback continues \(Int(holdSeconds))s after the switch",
+          red: outcome.secondsPlayedAfter < holdSeconds - 6
+              || outcome.longestStallAfter > 5.0 || outcome.errorAfter != nil,
+          detail: String(format: "played=%.1fs of %.0fs stall=%.1fs error=%@",
+                         outcome.secondsPlayedAfter, holdSeconds, outcome.longestStallAfter,
+                         outcome.errorAfter ?? "none"))
+}
+
+// Iteration affordance ONLY: `ONLY_SELECTION=1` runs just the selection gate while that gate is being
+// developed. Every reported run is a full run (the variable is unset), and the summary states which it was.
+let onlySelection = ProcessInfo.processInfo.environment["ONLY_SELECTION"] == "1"
+// ~2.6x the fixture's real-time byte rate: the producer leads the player modestly, the field shape.
+let pacedRate = 400_000
+
+if !onlySelection {
+
 // --- Scenario 1: fresh play, same-codec alternate + 2 text subs ---
 let fresh = runScenario(name: "fresh-multiaudio", fixture: "fixture-multiaudio.mkv",
                         startAt: 0, consumeSeconds: 12)
@@ -371,8 +609,6 @@ func judgeConsumer(_ label: String, _ run: ConsumerResult, playSeconds: Double) 
                          run.longestStall, run.itemError ?? "none", String(run.remuxFailed)))
 }
 
-// ~2.6x the fixture's real-time byte rate: the producer leads the player modestly, the field shape.
-let pacedRate = 400_000
 let consumerFresh = consumerScenario(
     name: "fresh", fixture: "fixture-multiaudio.mkv", startAt: 0, playSeconds: 65,
     pacedBytesPerSecond: pacedRate)
@@ -382,5 +618,23 @@ let consumerResume = consumerScenario(
     pacedBytesPerSecond: pacedRate)
 judgeConsumer("resume", consumerResume, playSeconds: 65)
 
-print("=== REPRO SUMMARY: \(redCount) RED ===")
+}   // end !onlySelection
+
+// --- REAL-CONSUMER SELECTION gate: the CEO's build 191 field shape (5 mixed-codec dubs, 5 text subs) ---
+let selectionHold = 22.0
+let selection = selectionScenario(
+    name: "manyaudio", fixture: "fixture-manyaudio.mkv", playSeconds: 12,
+    holdSeconds: selectionHold, pacedBytesPerSecond: pacedRate)
+check("selection: every text subtitle track is offered",
+      red: selection.subtitleOptions.count < 5,
+      detail: "subtitle options=\(selection.subtitleOptions.count) \(selection.subtitleOptions) (fixture carries 5)")
+judgeSwitch("audio", selection.audio, holdSeconds: selectionHold,
+            optionCount: selection.audioOptions.count)
+judgeSwitch("subtitle", selection.subtitles, holdSeconds: selectionHold,
+            optionCount: selection.subtitleOptions.count)
+check("selection: the session survived both switches",
+      red: selection.remuxFailed || selection.itemError != nil,
+      detail: "remuxFailed=\(selection.remuxFailed) itemError=\(selection.itemError ?? "none")")
+
+print("=== REPRO SUMMARY: \(redCount) RED\(onlySelection ? " (SELECTION GATE ONLY)" : " (full run)") ===")
 exit(Int32(min(redCount, 125)))

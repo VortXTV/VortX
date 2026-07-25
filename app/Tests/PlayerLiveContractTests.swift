@@ -2213,7 +2213,20 @@ enum PlayerLiveContractTests {
             engine,
             from: "private func handleStatus(_ item: AVPlayerItem",
             to: "private func logDVVideoTrackDiagnostics(")
-        let manualSelection = sourceSection(engine, from: "private func select(", to: "/// The overlay host")
+        let manualSelection = sourceSection(engine, from: "private func select(", to: "/// Re-read AVPlayer's")
+        let externalSubtitleRow = sourceSection(
+            engine, from: "private func externalSubtitleTracks()", to: "func setAudioTrack(")
+        let externalSubtitleSelection = sourceSection(
+            engine, from: "func setSubtitleTrack(_ id: Int) {", to: "/// Select option `id`")
+        let externalSubtitleLoad = sourceSection(
+            engine, from: "func addExternalSubtitle(url: String",
+            to: "/// Stop rendering the external overlay subtitle")
+        let selectionRefresh = sourceSection(
+            engine, from: "private func refreshSelectionTracks(for item: AVPlayerItem)",
+            to: "/// Force one track-list publication")
+        let externalSubtitleDisable = sourceSection(
+            engine, from: "private func disableExternalSubtitle(discardingCues: Bool = false)",
+            to: "/// AVFoundation cannot time-shift native")
         let groupLoad = sourceSection(engine, from: "private func loadSelectionGroups()",
                                       to: "/// Rebuild cached selected flags")
         let subtitlePlaylist = sourceSection(
@@ -2682,11 +2695,52 @@ enum PlayerLiveContractTests {
                   && display?.contains("preferredDisplayCriteria === criteria") == false)
         check("wiring: manual selection immediately refreshes cached flags",
               manualSelection?.contains("refreshSelectionTracks(for: item)") == true)
+        // Build 191 field defect: an HLS rendition switch AVFoundation settles asynchronously left the cached
+        // rows carrying their old flags, so the chrome's re-read a quarter second after the tap reverted the
+        // viewer's checkmark with the stream buffering behind it. The refresh must come BEFORE any settled
+        // check, and an unsettled selection must schedule a bounded re-read rather than return silently.
+        check("wiring: an unsettled selection still publishes and schedules a settle re-read",
+              sourceContainsInOrder(manualSelection, [
+                "item.select(requested, in: group)",
+                "refreshSelectionTracks(for: item)",
+                "selectedMediaOption(in: group) != requested",
+                "scheduleSelectionSettleRead(for: item)",
+              ]))
+        // The VortX-owned external overlay subtitle (add-on / community-pooled) must be a REAL row of the
+        // track list, not an invisible renderer: both chromes tick "Off" from `subtitleTracks.allSatisfy {
+        // !$0.selected }` and hide an added add-on row expecting it to reappear in the ordinary list, so an
+        // unpublished external sub showed Off while rendering and made the tapped row vanish with no tick.
+        check("wiring: the external overlay subtitle is published as a selectable track row",
+              engine?.contains("static let externalSubtitleTrackID = 100_000") == true
+                  && engine?.contains("case \"sub\":   return subTracks + externalSubtitleTracks()") == true
+                  && externalSubtitleRow?.contains("selected: externalSubActive") == true)
+        check("wiring: an external subtitle load and its re-selection both republish the track list",
+              externalSubtitleSelection?.contains("publishSelectionTracks()") == true
+                  && externalSubtitleLoad?.contains("self.externalSubLabel = (title: title, lang: lang)") == true
+                  && externalSubtitleLoad?.contains("self.publishSelectionTracks()") == true)
+        check("wiring: the ticked-row identity includes the external subtitle",
+              selectionRefresh?.contains(
+                "let subtitleID = externalSubActive ? Self.externalSubtitleTrackID : nativeSubtitleID") == true)
+        // Turning subtitles Off must not DESTROY the external subtitle: the chrome has already hidden that
+        // add-on's own row on the promise that the subtitle lives in the ordinary track list, so discarding
+        // the cues here would make it unreachable for the rest of the session. Only a title change or a full
+        // teardown discards.
+        check("wiring: only a title change or teardown discards the external subtitle's cues",
+              externalSubtitleSelection?.contains("disableExternalSubtitle()") == true
+                  && externalSubtitleSelection?.contains("discardingCues: true") == false
+                  && engine?.components(separatedBy: "disableExternalSubtitle(discardingCues: true)")
+                      .count == 3
+                  && externalSubtitleDisable?.contains("guard discardingCues else { return }") == true)
         check("wiring: system media-selection changes are observed",
               engine?.contains("AVPlayerItem.mediaSelectionDidChangeNotification") == true)
         check("wiring: loaded groups force their initial track-list publication",
               groupLoad?.contains("selectionRefreshState.reset()") == true
                   && groupLoad?.contains("refreshSelectionTracks(for: item)") == true)
+        // An app that calls select(_:in:) must clear this flag or AVFoundation re-asserts its own automatic
+        // choice at the next selection opportunity and silently reverts the pick. The remux master carries
+        // DEFAULT=YES / AUTOSELECT rows, so leaving it set is a live fight with every explicit selection.
+        check("wiring: VortX owns selection, so automatic media-selection criteria are cleared",
+              groupLoad?.contains("player.appliesMediaSelectionCriteriaAutomatically = false") == true)
         check("release: Beta 7 is the first parseable changelog version",
               changelog?.range(of: "## 0.3.14 Beta 7")?.lowerBound
                   == changelog?.range(of: "## ")?.lowerBound)
