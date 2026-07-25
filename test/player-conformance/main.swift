@@ -104,23 +104,33 @@ func runSelfTest(mutation: FMP4.Mutation? = nil) -> Bool {
     var checks: [(String, Bool)] = []
     func expect(_ name: String, _ cond: Bool) { checks.append((name, cond)) }
 
-    // Cohort boundary cases, built through the REAL server format and measured as
-    // integer ms from the resulting EXTINF text.
+    // ANTI-ROT CHECK, FIRST. Every mirrored number in Contract.swift is compared against
+    // the shipped symbol it mirrors before a single behavioural case runs, so a product
+    // floor change is reported as "the harness is stale, here is the symbol" instead of
+    // being graded as a player regression. See Contract.driftAgainstProduct().
+    let drift = Contract.driftAgainstProduct()
+    expect("Contract mirrors the SHIPPED product values (no harness drift)", drift.isEmpty)
+    for line in drift { expect("DRIFT: \(line)", false) }
+
+    // Cohort boundary cases, built through the REAL server renderer and measured as
+    // integer ms from the resulting EXTINF text. The numbers below are the SHIPPED
+    // startup floor (2 segments AND 4 000 ms); they were 6 segments AND 15 000 ms, a
+    // floor the server retired after the build-189 field regression.
     func cohort(_ durs: [Double], ended: Bool = false) -> (Int, Int, Bool) {
         let body = Playlist.buildMediaBodyLikeServer(durations: durs, ended: ended)
         let p = Playlist.parseMedia(body)
         return (p.count, p.totalMs, Playlist.cohortReady(count: p.count, totalMs: p.totalMs))
     }
-    let a = cohort(Array(repeating: 4.000, count: 5))
-    expect("5x4.000s stays CLOSED (count 5<6)", a == (5, 20000, false))
-    let b = cohort(Array(repeating: 3.000, count: 6))
-    expect("6x3.000s OPENS (6 segs, 18000 ms)", b == (6, 18000, true))
-    let c = cohort(Array(repeating: 1.000, count: 15))
-    expect("15x1.000s OPENS (15 segs, 15000 ms)", c == (15, 15000, true))
-    let d = cohort([2.500, 2.500, 2.500, 2.500, 2.500, 2.499])
-    expect("14.999s (6 segs) stays CLOSED (14999<15000, 1 ms)", d == (6, 14999, false))
-    let e = cohort([2.500, 2.500, 2.500, 2.500, 2.500, 2.500])
-    expect("15.000s (6 segs) OPENS (integer >= 15000)", e == (6, 15000, true))
+    let a = cohort([6.000])
+    expect("1x6.000s stays CLOSED (count 1<2, duration alone never opens)", a == (1, 6000, false))
+    let b = cohort(Array(repeating: 3.000, count: 2))
+    expect("2x3.000s OPENS (2 segs, 6000 ms)", b == (2, 6000, true))
+    let c = cohort(Array(repeating: 1.000, count: 4))
+    expect("4x1.000s OPENS (4 segs, 4000 ms exactly)", c == (4, 4000, true))
+    let d = cohort([2.000, 1.999])
+    expect("3.999s (2 segs) stays CLOSED (3999<4000, 1 ms)", d == (2, 3999, false))
+    let e = cohort([2.000, 2.000])
+    expect("4.000s (2 segs) OPENS (integer >= 4000)", e == (2, 4000, true))
 
     // EXTINF text -> integer ms, no float.
     expect("EXTINF 4.000 -> 4000 ms", Playlist.msFromExtinf("#EXTINF:4.000,") == 4000)
@@ -129,14 +139,28 @@ func runSelfTest(mutation: FMP4.Mutation? = nil) -> Bool {
     expect("EXTINF 15 -> 15000 ms", Playlist.msFromExtinf("#EXTINF:15,") == 15000)
     expect("EXTINF 1.5 -> 1500 ms", Playlist.msFromExtinf("#EXTINF:1.5,") == 1500)
 
-    // The real DVPlaybackPolicy header is compiled in and used by the builder.
+    // The real DVPlaybackPolicy renderer is compiled in and used by the builder.
     let body = Playlist.buildMediaBodyLikeServer(durations: [4.0, 4.0, 4.0], ended: true)
-    expect("builder emits TARGETDURATION 5", body.contains("#EXT-X-TARGETDURATION:5"))
+    expect("builder emits the SHIPPED TARGETDURATION \(Contract.hlsTargetDuration)",
+           body.contains("#EXT-X-TARGETDURATION:\(Contract.hlsTargetDuration)"))
+    expect("builder emits MEDIA-SEQUENCE 0 for a window starting at segment 0",
+           body.contains("#EXT-X-MEDIA-SEQUENCE:0"))
     expect("builder emits the load-bearing EXT-X-START", body.contains("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES"))
     expect("builder emits EXT-X-MAP init.mp4", body.contains("#EXT-X-MAP:URI=\"init.mp4\""))
     let rp = Playlist.parseMedia(body)
     expect("round-trip recovers 3 segments ids 0..2", rp.segments.map(\.id) == [0, 1, 2])
     expect("round-trip sees ENDLIST", rp.endlist)
+
+    // The window SLIDES. A body whose first absolute id is nonzero must carry that id as
+    // MEDIA-SEQUENCE and must NOT re-assert the zero-start preference, which is only
+    // valid while segment zero is still the start of the session
+    // (DVPlaybackPolicy.swift:184-196). The old harness could not express this case at
+    // all, because it built every body from a hardcoded `seg\(i).m4s` running index.
+    let slid = Playlist.buildMediaBodyLikeServer(durations: [4.0, 4.0], ended: false, firstSegmentID: 7)
+    expect("slid window emits MEDIA-SEQUENCE 7", slid.contains("#EXT-X-MEDIA-SEQUENCE:7"))
+    expect("slid window drops EXT-X-START (segment zero is gone)",
+           !slid.contains("#EXT-X-START"))
+    expect("slid window round-trips ids 7..8", Playlist.parseMedia(slid).segments.map(\.id) == [7, 8])
 
     var predictedOnlyTrace = TraceSession()
     predictedOnlyTrace.advertisedMax = 100
