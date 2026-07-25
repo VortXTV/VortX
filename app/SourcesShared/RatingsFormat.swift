@@ -6,6 +6,18 @@ import Foundation
 /// `buildSvg`). Change the labels/order/number format here and every Apple surface moves together, so the
 /// card, the detail row, and the baked poster never disagree about how a score reads.
 ///
+/// The numbers cannot drift because every surface reaches them the same way: `VortXRatings.swift` and
+/// `MDBListClient.swift` both land the aggregators with `Int($0.rounded())`, which is exactly what the
+/// worker's `Math.round` does, and both read the same service keys (imdb / rt / metacritic / tmdb). The
+/// worker's own unit test asserts the printed runs in this order, so a change on that side is caught; a
+/// change on THIS side has no test behind it, so anything edited here must be mirrored by hand.
+///
+/// What DOES differ, deliberately, is the arrangement. The card draws these tokens as the JEWEL capsule
+/// (a glass plate, lettermark beside its value) because it floats in a corner over unpredictable artwork;
+/// the baked portrait poster draws them as the MARQUEE block (type straight on the art, lettermark stacked
+/// above its value under a rule) because it owns a tall canvas with room for a real composition. That is a
+/// design decision, not drift: do not "reunify" the two compositions. Only the tokens are shared.
+///
 /// The model is `MDBListRatings` (the shared decode target for both the keyless VortX ratings service and a
 /// user's own MDBList key): IMDb on its native 0-10 scale, Rotten Tomatoes / TMDB as 0-100 percentages, and
 /// Metacritic as a 0-100 metascore (no percent sign, matching how the score is conventionally printed).
