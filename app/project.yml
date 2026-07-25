@@ -148,9 +148,17 @@ packages:
   # So we build libplacebo from source too. Pinned refs, never a moving master:
   #   mpv        8c67647b50059406c5c0444903597281b81516cf  (master, 2026-07-24)
   #   libplacebo 4c426e466814536def653cb23f1d1c287ea7a7f5  (master, 2026-07-24, PL_API_VER 371)
-  # FFmpeg deliberately STAYS at n8.1.2: our own VortXMKVRemuxStream calls libavformat/libavcodec
-  # directly, and master's libavutil 60 -> 61 deprecation removals are a far bigger risk than this
-  # feature is worth. The cost of that choice is honest and bounded: dual-track Profile 7 MKV (a
+  # FFmpeg STAYS at n8.1.2 for now, but not for the reason originally recorded here. That reason was
+  # that VortXMKVRemuxStream calls libavformat/libavcodec directly, so libavutil 60 -> 61 deprecation
+  # removals made a bump too risky. A source-level audit REFUTED it: of the 67 distinct FFmpeg
+  # functions VortX calls, ZERO were removed or changed signature between n8.1.2 and master, every
+  # FF_API_* removal in the range lands on APIs we do not touch, and libavutil/dovi_meta.h has a
+  # ZERO-byte diff (so the synthetic DV record at VortXMKVRemuxStream.swift:3612-3640 is untouched).
+  # The jump is also wider than was recorded, 762b94e672 moves libavformat and libavcodec 62 -> 63
+  # as well and we link both, and it is still clean. Audit: vortx-ffmpeg-harvest.md.
+  # What actually gates the bump: the DV conformance harness being repaired, and the one unmeasured
+  # cost, whether MPVKit's own FFmpeg patches rebase onto FFmpeg release/9.0. Not our call sites.
+  # The cost of staying put is honest and bounded: dual-track Profile 7 MKV (a
   # separate BL + EL video track, i.e. ~every UHD-BluRay DV rip) works; single-track INTERLEAVED
   # Profile 7 does not, because it needs FFmpeg's `dovi_split` bitstream filter which n8.1.2 does
   # not ship, and it degrades to exactly today's behaviour (base layer only, no crash).
