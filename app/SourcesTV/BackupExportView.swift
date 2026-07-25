@@ -28,9 +28,9 @@ struct BackupExportView: View {
     private enum Status: Equatable { case starting, waiting, saving, backedUp, failed }
 
     private static let qrSize: CGFloat = 320
-    // Hash route, not a real path: the web approver is a hash-routed SPA, so a path URL never renders the
-    // approve view and the TV waits forever. Same defect + fix as the sign-in joiner (see #153).
-    private static let approveBase = "https://vortx.tv/#/approve"
+    // A real page on the account site (vortx-site, src/pages/approve.astro), which reads `c` and `k` out of
+    // location.search. Kept identical to the sign-in joiner's approveBase; see the long note there (#153).
+    private static let approveBase = "https://vortx.tv/approve"
     private static let pollInterval: UInt64 = 2_000_000_000   // 2s
 
     var body: some View {
