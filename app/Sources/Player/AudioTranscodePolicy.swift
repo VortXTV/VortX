@@ -22,9 +22,10 @@ enum VortXAudioTranscodePolicy {
         24_000, 22_050, 16_000, 12_000, 11_025, 8_000, 7_350,
     ]
 
-    /// FFmpeg's eac3 encoder accepts only the AC-3 rates. Unreachable with today's bundled binaries
-    /// (no eac3 encoder is compiled in), but the day one ships this keeps its open from failing on a
-    /// low-rate source the same way the AAC lane failed on a hi-res one.
+    /// FFmpeg's eac3 encoder accepts only the AC-3 rates. This IS the live path now: our own MPVKit
+    /// build configures FFmpeg with `--enable-encoder=eac3`, so the transcoder's EAC3-first choice
+    /// finally resolves, and this keeps its open from failing on a low-rate source the same way the
+    /// AAC lane failed on a hi-res one. Proven end to end by test/eac3-transcode.
     static let eac3SupportedRates: [Int32] = [48_000, 44_100, 32_000]
 
     /// The sample rate the encoder context is opened with for a source of rate `source`.

@@ -8,11 +8,12 @@ import Libswresample
 /// to an AVPlayer-decodable codec inside the Dolby Vision fMP4 remux, so the AVPlayer DV lane no longer bails
 /// to libmpv (HDR10) just because AVPlayer cannot decode the source audio codec.
 ///
-/// CODEC-AGNOSTIC BY DESIGN: the encoder is picked EAC3-first, else AAC. Today's bundled FFmpeg (MPVKit
-/// `--enable-encoder=aac`, no ac3/eac3 encoder) resolves that to AAC 5.1/7.1, which AVPlayer decodes natively
-/// and the system routes to the receiver as multichannel PCM. The day a rebuilt MPVKit with
-/// `--enable-encoder=eac3` lands, the same line resolves to EAC3 and AVPlayer BITSTREAMS Dolby Digital Plus to
-/// the receiver, with zero app-code change.
+/// CODEC-AGNOSTIC BY DESIGN: the encoder is picked EAC3-first, else AAC. That fallback used to fire every
+/// single time, because upstream MPVKit's FFmpeg allowlist contained neither an eac3 nor an ac3 encoder, so
+/// a TrueHD or DTS-HD MA source reached the receiver as AAC (decoded to multichannel PCM, no Dolby badge).
+/// Our own MPVKit build adds `--enable-encoder=eac3`, so the same line now resolves to EAC3 and AVPlayer
+/// BITSTREAMS Dolby Digital Plus to the receiver, with zero app-code change. AAC remains the honest fallback
+/// for any build that lacks the encoder. Proven end to end by test/eac3-transcode.
 ///
 /// WHY TRANSCODE AT ALL: pre-tvOS-26 the platform cannot bitstream lossless TrueHD / DTS-HD MA to a receiver
 /// (the reference players all decode these to PCM too), so decoded multichannel is the real ceiling. A DV file
@@ -61,8 +62,8 @@ final class VortXAudioTranscoder {
         dctx.pointee.pkt_timebase = sourceTimeBase   // parameters_to_context may reset it; re-assert
         guard avcodec_open2(dctx, decoder, nil) >= 0 else { encoderName = "?"; cleanup(); return nil }
 
-        // EAC3-first, else AAC. With today's bundled binaries this resolves to AAC; a rebuilt MPVKit with
-        // `--enable-encoder=eac3` flips the receiver badge to Dolby Digital Plus with no app-code change.
+        // EAC3-first, else AAC. With our own MPVKit build (`--enable-encoder=eac3`) this resolves to EAC3
+        // and the receiver badge reads Dolby Digital Plus; AAC stays as the fallback for a build without it.
         guard let encoder = avcodec_find_encoder(AV_CODEC_ID_EAC3) ?? avcodec_find_encoder(AV_CODEC_ID_AAC),
               let ectx = avcodec_alloc_context3(encoder) else { encoderName = "?"; cleanup(); return nil }
         self.enc = ectx

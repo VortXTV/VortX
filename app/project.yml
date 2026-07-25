@@ -121,9 +121,51 @@ options:
     - zh-Hant
     - zu
 packages:
+  # MPVKit, built BY US from pinned upstream refs, for Dolby Vision Profile 7 enhancement-layer
+  # (FEL) support. Was: url https://github.com/mpvkit/MPVKit, exactVersion "0.41.0-n8.1.2".
+  #
+  # LICENSING (fixed by this change). The old 0.41.0-n8.1.2 pin passed `--enable-nonfree` in
+  # MPVKit's common FFmpeg configure array (its main.swift:652 at that tag), so the FFmpeg we
+  # shipped self-reported "libavutil license: nonfree and unredistributable" while README.md and
+  # THIRD-PARTY-NOTICES.md both declare this project GPL-3.0. Upstream removed the flag in
+  # MPVKit 5e94d4a9 "Remove nonfree FFmpeg configure flag (#78)" on 2026-07-11, which POSTDATES
+  # that pin, so we never got it. The previous comment here claimed the opposite: it credited #78
+  # as an "Atmos/eARC fix" and cited a PR #101 that does not exist, which is most likely why the
+  # defect went unnoticed. Our fork bases on MPVKit 2103893 (post-#78), so the flag is gone and
+  # the built artifacts now report "libavutil license: GPL version 3 or later". The flag-array
+  # diff between the two revisions is exactly one line removed (`--enable-nonfree`) and nothing
+  # else, so no codec we rely on was dropped.
+  #
+  # For the record, the tvOS avfoundation AO that the old comment was reaching for is MPVKit
+  # PR #73, and it is carried here by patch 0003-enable-avfoundation-ao-tvos.patch, which we
+  # verified still applies cleanly at the pinned mpv master SHA.
+  #
+  # Why a local package and not a version bump: the FEL feature needs BOTH mpv master and a
+  # libplacebo newer than any release. mpv gates every line of its FEL code behind
+  # `#if PL_API_VER >= 367`, and upstream MPVKit links a PREBUILT libplacebo 7.360.1, which is
+  # PL_API_VER 360. Bumping only mpv would compile the whole feature out SILENTLY, with a green
+  # build, and would be a straight regression (the EL decoder runs, its output is discarded).
+  # So we build libplacebo from source too. Pinned refs, never a moving master:
+  #   mpv        8c67647b50059406c5c0444903597281b81516cf  (master, 2026-07-24)
+  #   libplacebo 4c426e466814536def653cb23f1d1c287ea7a7f5  (master, 2026-07-24, PL_API_VER 371)
+  # FFmpeg STAYS at n8.1.2 for now, but not for the reason originally recorded here. That reason was
+  # that VortXMKVRemuxStream calls libavformat/libavcodec directly, so libavutil 60 -> 61 deprecation
+  # removals made a bump too risky. A source-level audit REFUTED it: of the 67 distinct FFmpeg
+  # functions VortX calls, ZERO were removed or changed signature between n8.1.2 and master, every
+  # FF_API_* removal in the range lands on APIs we do not touch, and libavutil/dovi_meta.h has a
+  # ZERO-byte diff (so the synthetic DV record at VortXMKVRemuxStream.swift:3612-3640 is untouched).
+  # The jump is also wider than was recorded, 762b94e672 moves libavformat and libavcodec 62 -> 63
+  # as well and we link both, and it is still clean. Audit: vortx-ffmpeg-harvest.md.
+  # What actually gates the bump: the DV conformance harness being repaired, and the one unmeasured
+  # cost, whether MPVKit's own FFmpeg patches rebase onto FFmpeg release/9.0. Not our call sites.
+  # The cost of staying put is honest and bounded: dual-track Profile 7 MKV (a
+  # separate BL + EL video track, i.e. ~every UHD-BluRay DV rip) works; single-track INTERLEAVED
+  # Profile 7 does not, because it needs FFmpeg's `dovi_split` bitstream filter which n8.1.2 does
+  # not ship, and it degrades to exactly today's behaviour (base layer only, no crash).
+  #
+  # `artifacts/` is gitignored build output. Regenerate with scripts/build-mpvkit-dvfel.sh.
   MPVKit:
-    url: https://github.com/mpvkit/MPVKit
-    exactVersion: "0.41.0-n8.1.2"   # n8.1.2 includes MPVKit PR #73 (avfoundation AO built for tvOS) - the #78/#101 Atmos/eARC fix
+    path: Vendor/MPVKit-DVFEL
 # Project-wide defaults. VORTX_EDGE_SECRET is the build-time HMAC key for the hardened VortX edge
 # workers; it is EMPTY here so the build never fails when the gitignored Config/VortXEdge.xcconfig
 # is absent (e.g. a fresh clone, or CI before the secret is injected). When that xcconfig is present

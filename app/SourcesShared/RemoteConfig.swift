@@ -192,6 +192,10 @@ struct RemoteConfigData: Decodable {
         let languageIndexContribute: Bool?  // LanguageIndexClient.swift:180 (baked ON)
         let localizedMetadata: Bool?
         let sourceIndex: Bool?
+        // Dolby Vision Profile 7 enhancement-layer (FEL) compositing on the libmpv lane. Baked ON.
+        // Setting this false remotely makes libmpv discard the EL and render the base layer alone,
+        // i.e. exactly the pre-FEL behaviour, without shipping a build.
+        let dvEnhancementLayer: Bool?
     }
     struct Player: Decodable {
         struct ReadAhead: Decodable {
@@ -892,6 +896,7 @@ actor RemoteConfig {
             put("languageIndexContribute", f.languageIndexContribute)
             put("localizedMetadata", f.localizedMetadata)
             put("sourceIndex", f.sourceIndex)
+            put("dvEnhancementLayer", f.dvEnhancementLayer)
         }
 
         return ResolvedConfig(

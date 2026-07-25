@@ -247,17 +247,48 @@ final class MPVMetalViewController: PlatformViewController {
             didBuildInitialVideoOutput = true
             reconfigureVideoOutput()
         } else if didResize {
-            // libmpv sets the video output up for whatever size it STARTS at but doesn't refill the
-            // surface after a live resize (the video ends up tiny in a corner after rotating). Rebuild
-            // the video output (vid no -> auto) at the new size.
-            reconfigureVideoOutput()
+            // A live resize (rotation, macOS window drag) no longer needs the VO rebuilt. Our mpv
+            // build carries scripts/mpv-moltenvk-resize.patch, which makes the moltenvk render
+            // context answer VOCTRL_CHECK_EVENTS by re-reading the layer's drawableSize, resizing
+            // its own swapchain and raising VO_EVENT_RESIZE. mpv therefore refills the surface by
+            // itself, and the old `vid=no` then `vid=auto` teardown (which threw away the decoder
+            // and the whole video chain on every single rotation) is gone.
+            applyVideoSize { self.setString($0, $1) }
+            wakeVideoOutputThread()
         }
     }
 
+    /// Kick mpv's video-output thread so it polls the layer size NOW rather than whenever it next
+    /// happens to run. That thread's loop checks events once per iteration and then parks for a very
+    /// long time whenever it has nothing to render (video/out/vo.c), so a rotation performed while
+    /// PAUSED would otherwise not be picked up until playback resumed, leaving the last frame
+    /// stretched to the new bounds. Measured, not assumed: test/moltenvk-resize probes a paused
+    /// rotation with no follow-up, with the size properties re-applied, and with this call.
+    ///
+    /// Re-applying the size properties is NOT sufficient on its own. mpv only notifies option
+    /// listeners when a value actually changes (options/m_config_core.c), and `keepaspect` and
+    /// `panscan` do not change across a rotation, so those writes are inert.
+    ///
+    /// `display-names` is read purely for the dispatch: its getter is one of the few property reads
+    /// that goes through vo_control(), which hands work to the video-output thread and therefore
+    /// wakes it. The value is discarded, and this lane answers VO_NOTIMPL anyway. Async so nothing
+    /// on the calling thread can ever block on the video-output thread finishing a frame; this runs
+    /// from a layout callback on the main thread, and that thread must never wait on the renderer
+    /// (see the MetalLayer EDR note for what that costs when it goes wrong).
+    private func wakeVideoOutputThread() {
+        guard mpv != nil else { return }
+        mpv_get_property_async(mpv, 0, "display-names", MPV_FORMAT_STRING)
+    }
+
+    /// One-shot VO rebuild for the zero-size-at-init case only (see didBuildInitialVideoOutput). Live
+    /// resizes no longer come through here: mpv's own render context now notices a layer resize, so
+    /// layoutDrawable just re-applies the size mode. This remains because a VO that was configured
+    /// against a surface with NO size never built a presentable context at all, which no amount of
+    /// resizing after the fact can repair.
     private func reconfigureVideoOutput() {
         guard mpv != nil else { return }
-        // Runtime rebuild after a live resize/rotation: `vid` must be set as a PROPERTY. mpv_set_option_string
-        // is a silent no-op after mpv_initialize, so the option-string form never actually rebuilt the VO.
+        // `vid` must be set as a PROPERTY. mpv_set_option_string is a silent no-op after
+        // mpv_initialize, so the option-string form never actually rebuilt the VO.
         checkError(mpv_set_property_string(mpv, "vid", "no"))
         DispatchQueue.main.async { [weak self] in
             guard let self, self.mpv != nil else { return }
@@ -514,6 +545,26 @@ final class MPVMetalViewController: PlatformViewController {
         // HDR compatibility toggle forces SDR output for displays that show DV P7
         // remuxes as green/purple garbage). Harmless for native SDR content.
         checkError(mpv_set_option_string(mpv, "tone-mapping", "bt.2446a"))
+        // Dolby Vision Profile 7 enhancement layer (FEL). For a dual-track P7 MKV (a separate base and
+        // enhancement video track, i.e. ~every UHD-BluRay DV rip), libmpv now pairs the two tracks and
+        // libplacebo composites the EL's residual detail onto the base layer, instead of us decoding the
+        // base alone and throwing the enhancement layer away. It also means such a title finally carries
+        // real DV metadata rather than none. This engages AUTOMATICALLY once the pairing succeeds, so the
+        // only control we need is the OFF switch: `enhancement-layer=no` makes the format filter discard
+        // the paired EL frame, which is exactly the pre-FEL behaviour. Baked ON, fleet-flippable, so a
+        // field problem is a same-day remote revert instead of an emergency build. `vf` is set nowhere
+        // else in the app, so owning the whole chain here is safe.
+        if !RemoteConfig.snapshot.isFeatureOn("dvEnhancementLayer", default: true) {
+            checkError(mpv_set_option_string(mpv, "vf", "format=enhancement-layer=no"))
+            mpvLog.log("dv enhancement layer DISABLED by remote config")
+        }
+        // Keep the enhancement-layer track VISIBLE in `track-list`. Upstream hides dependent tracks by
+        // default, which would make the FEL diagnostic below a permanent false negative: it could never
+        // tell "paired and compositing" from "never found, base layer only", and that silent no-op is
+        // the exact failure this feature is prone to. `tracks(ofType:)` re-hides them, so the user-facing
+        // audio/subtitle pickers are byte-for-byte unchanged, and mpv's own track-preference comparator
+        // ranks non-dependent tracks first, so the base layer still wins auto-selection.
+        checkError(mpv_set_option_string(mpv, "show-dependent-tracks", "yes"))
         // Apply the saved video-size mode up front so the first frame is sized correctly + uniformly.
         applyVideoSize { self.checkError(mpv_set_option_string(self.mpv, $0, $1)) }
 
@@ -1630,6 +1681,36 @@ final class MPVMetalViewController: PlatformViewController {
         mpv_set_property_string(mpv, name, value)
     }
 
+    /// Positive evidence that Dolby Vision Profile 7 FEL pairing actually engaged.
+    ///
+    /// This exists because upstream mpv logs NOTHING on the success path: `f_output_chain` only warns
+    /// when pairing FAILS, so "no warning" is indistinguishable from "the enhancement layer was never
+    /// found and we silently rendered the base layer alone". `track-list/N/dependent` is the one
+    /// property that proves the demuxer paired a base and enhancement video track, so we read it and
+    /// state the outcome plainly in the probe trail.
+    ///
+    /// Note this reports the DEMUXER pairing, which is the step that can silently no-op on our stack
+    /// (single-track interleaved P7 needs FFmpeg's `dovi_split` BSF, which our pinned n8.1.2 does not
+    /// ship). A "paired" line plus no "Failed to set up enhancement-layer" warning from mpv means the
+    /// EL decoder came up and libplacebo is compositing it.
+    private func probeEnhancementLayer() {
+        guard mpv != nil else { return }
+        let count = getInt("track-list/count")
+        guard count > 0 else { return }
+        var videoTracks = 0
+        var dependentIDs: [Int] = []
+        for i in 0..<count where (getString("track-list/\(i)/type") ?? "") == "video" {
+            videoTracks += 1
+            if getFlag("track-list/\(i)/dependent") { dependentIDs.append(getInt("track-list/\(i)/id")) }
+        }
+        guard videoTracks > 1 || !dependentIDs.isEmpty else { return }   // ordinary single-layer source
+        if dependentIDs.isEmpty {
+            VXProbe.log("dv", "FEL not paired: \(videoTracks) video tracks, none marked dependent (EL discarded, base layer only)")
+        } else {
+            VXProbe.log("dv", "FEL paired: enhancement-layer track(s) \(dependentIDs) of \(videoTracks) video tracks")
+        }
+    }
+
     /// Read the current audio/subtitle/video tracks from mpv's `track-list`.
     func tracks(ofType type: String) -> [MPVTrack] {
         guard mpv != nil else { return [] }
@@ -1637,6 +1718,12 @@ final class MPVMetalViewController: PlatformViewController {
         guard count > 0 else { return [] }
         var result: [MPVTrack] = []
         for i in 0..<count where (getString("track-list/\(i)/type") ?? "") == type {
+            // We ask mpv for `--show-dependent-tracks=yes` so the DV enhancement-layer track stays
+            // observable for the FEL diagnostic. Dependent tracks are not independently decodable and
+            // upstream hides them from `track-list` for exactly that reason, so re-hide them here and
+            // keep the pickers identical to stock behaviour. Today this only ever matches a video EL
+            // (never listed anyway), but it also pre-empts things like IAMF audio element layers.
+            if getFlag("track-list/\(i)/dependent") { continue }
             result.append(MPVTrack(
                 id: getInt("track-list/\(i)/id"),
                 type: type,
@@ -2284,6 +2371,7 @@ final class MPVMetalViewController: PlatformViewController {
                         ?? self.playUrl?.host ?? "?"
                     VXProbeState.shared.setPlayer(state: "playing", source: loadedHost, engine: "mpv")
                     VXProbe.event("player", "loaded \(loadedHost)")
+                    self.probeEnhancementLayer()
                     // One-shot audio-negotiation diagnostic: what mpv DECODED vs what the AO actually OPENED
                     // (the negotiated output layout, e.g. 5.1 vs a silent stereo downmix). Delayed so the AO
                     // has opened; libmpv property reads are thread-safe and the handle is guarded on main.
@@ -2348,6 +2436,11 @@ final class MPVMetalViewController: PlatformViewController {
                         // so keep the message body private; prefix + level stay public for log filtering.
                         if !text.isEmpty { self.mpvLog.log("[\(prefix, privacy: .public)/\(level, privacy: .public)] \(text, privacy: .private)") }
                     }
+                case MPV_EVENT_GET_PROPERTY_REPLY:
+                    // wakeVideoOutputThread reads a property purely to hand work to the
+                    // video-output thread. The reply carries nothing anyone wants; swallow it here
+                    // so a rotation does not print a puzzling event line in debug builds.
+                    break
                 default:
                     #if DEBUG
                     let eventName = mpv_event_name(event!.pointee.event_id)

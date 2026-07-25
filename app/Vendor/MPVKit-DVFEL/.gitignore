@@ -1,0 +1,3 @@
+# Build OUTPUT (hundreds of MB), reproducible from the pinned refs via
+# scripts/build-mpvkit-dvfel.sh. Must never enter git history.
+artifacts/
