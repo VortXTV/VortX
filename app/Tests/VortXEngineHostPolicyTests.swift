@@ -9,7 +9,7 @@
 // Foundation with no other dependencies, so it compiles standalone with no stubs required.
 //
 // The single property that matters more than any other, per the source's own TOP INVARIANT comment: **with
-// external mode off (no capability), every decision must reduce to today's shipping behaviour exactly** —
+// external mode off (no capability), every decision must reduce to today's shipping behaviour exactly** ,
 // method-blind, Range-blind, path-exact, and it must NEVER reject a request that today's server would have
 // answered. Section 1 below (`defaultOff*`) pins that equivalence; everything after it is the strict HTTP layer
 // that only ever activates for a LAN-hosted session with a real capability.
@@ -51,7 +51,7 @@ typealias P = VortXEngineHostPolicy
 // MARK: - 1. Default-off equivalence (THE most important group)
 //
 // Every case here passes `capability: nil`, which is the shape of every session today: no engine host
-// configured, loopback only. `route` must reduce to the shipping parse — method-blind, Range-blind, path-exact —
+// configured, loopback only. `route` must reduce to the shipping parse , method-blind, Range-blind, path-exact ,
 // for every one of these, and the malformed-request-line case must still fail exactly as it does today (a 400,
 // not a new rejection shape).
 
@@ -208,23 +208,20 @@ check("range: a guarded route carries the parsed Range through",
 
 // MARK: - 4. Host normalization
 //
-// BUG FOUND (documented, not fixed — source left untouched per instructions): the unbracketed "single colon is
-// host:port" branch is dead code. It is guarded by `!text.dropFirst().contains(":")`, which drops exactly one
-// CHARACTER from the front of the whole host string, not everything up to and including the colon. For any
-// realistic "host:port" string the colon still appears after dropping one character, so the condition is false
-// and the branch never runs — the port is silently left at `defaultControlPort` and the full "host:port" text is
-// kept as the host verbatim. Only the bracketed IPv6 form (`[fe80::1]:9000`) actually splits a custom port,
-// because that path does not go through the broken condition at all.
+// A REAL BUG WAS FOUND HERE AND HAS SINCE BEEN FIXED. Recorded rather than deleted, because the shape of the
+// mistake is worth keeping: the unbracketed "single colon is host:port" branch was dead code, guarded by
+// `!text.dropFirst().contains(":")`. That reads like "no colon after the first character", but `dropFirst()`
+// drops one character from the front of the WHOLE string, not everything up to the colon, so for any realistic
+// "host:9000" the colon survived, the condition was false, and the branch never ran.
 //
-// Practical impact: a user typing `192.168.1.33:9000` into the engine host field gets silently routed to port
-// 11471 (the default) against host string `"192.168.1.33:9000"` instead of port 9000 against `"192.168.1.33"`.
-// The malformed-port guards (`host:notaport`, `host:0`, `host:70000`) are unreachable for the same reason: since
-// the split never happens, `Int(...)` parsing of the port half never runs, so these strings pass through as a
-// "valid" (wrong) host with the default port instead of being rejected as the code intends.
+// Two consequences, neither of them visible from reading the function's documentation. A user typing
+// `192.168.1.33:9000` was silently routed to the default port against the host string "192.168.1.33:9000". And
+// every port-validation guard below the split (`Int(...)` parsing, `port > 0`, `port <= 65535`) was unreachable,
+// so `host:notaport`, `host:0` and `host:70000` all passed through as "valid" instead of being rejected.
 //
-// The assertions below pin the ACTUAL shipped behaviour (verified by direct compilation against the real
-// function before writing this suite), each annotated with what a reader of the doc comment would otherwise
-// expect.
+// The guard is now a colon COUNT, which is the property actually being tested for: exactly one means host:port,
+// more than one with no brackets means a bare IPv6 literal whose last group must not be mistaken for a port. The
+// assertions below pin the corrected behaviour, including the three rejections that used to be unreachable.
 
 check("host: a bare IP normalizes with the default port",
       hostsEqual(P.normalizeHost("192.168.1.33"), (host: "192.168.1.33", port: 11471)))
