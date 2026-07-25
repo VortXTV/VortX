@@ -281,7 +281,9 @@ You'll need macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen),
 ```bash
 # 1) Streaming-server deps: NodeMobile (tvOS-enabled build from this repo's vendor
 #    release), server.js (from a local Stremio.app if present, otherwise the
-#    public CDN), and the bundled subtitle fallback fonts.
+#    public CDN), and the bundled subtitle fallback fonts. Also installs the git
+#    hooks, whose pre-push guard blocks proprietary engine source from reaching
+#    this public repo (scripts/install-git-hooks.sh, safe to re-run on its own).
 ./scripts/fetch-server-deps.sh
 
 # 2) Build the engine into an xcframework (needs Rust nightly + rust-src AND access to the

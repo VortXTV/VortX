@@ -1,0 +1,132 @@
+# Engine snapshots that were ALREADY PUBLIC on github.com/VortXTV/VortX before the guard
+# existed. This is a record of an incident, not permission for a new one.
+#
+# WHAT THESE ARE
+# Each line is the git tree OID of a vortx-core/ snapshot that is reachable from a branch
+# or tag on the public repository. They are listed by snapshot rather than by commit
+# because 1139 commits carry only these 100 distinct trees: the tree is the content that
+# leaked, the commit is just one of many places it appears.
+#
+# WHY THE FILE EXISTS
+# .github/workflows/engine-leak-guard.yml sweeps every ref for engine material. Without
+# this list it would fail on day one and keep failing, because the engine is reachable
+# from 913 commits in the default branch's own history. A check that is permanently red
+# gets muted, and a muted check is not a check. Baselining what already leaked is what
+# lets the sweep report the only thing it can still act on: something NEW leaking.
+#
+# WHAT IT DOES NOT DO
+# It does not unpublish anything, and the pre-push hook deliberately ignores it. The hook
+# blocks engine material reaching a public remote whether or not that exact snapshot has
+# leaked before. Only the after-the-fact CI sweep consults this list.
+#
+# THIS FILE SHOULD SHRINK, NEVER GROW.
+# A new entry means something leaked. Adding one is an incident record and needs the same
+# scrutiny as the leak itself. Removing one means history was genuinely rewritten.
+#
+# Regenerate the current exposure (does not write this file):
+#   git ls-remote --heads --tags <public-remote> | awk '{print $1}' | sort -u \
+#     | git rev-list --stdin | sort -u \
+#     | scripts/scan-proprietary-engine.sh paths - | awk '{print $4}' | sort -u
+#
+# Captured 2026-07-25 from 294 live public refs, 2769 reachable commits, 1139 carrying an engine tree.
+
+02f580935ece3526a8e7e7f3d4164950b5fddfab
+060754b79ba0fe7bcf32e9b2326abfd2d9e4eff8
+0afaa34827218c9600adeb2120bc10f8b78e03c0
+0d30433cf8e4d784a7cf35b20c84d105191e62ac
+13d5ca2c2fd00e810d1ff78e77b8ece0885734aa
+17e8e0e413daca0cdf01db7615c5c9925ae9922c
+189ff217f21ce6e465cef96007e300333d70a269
+1a6df6d4582ff99d1d2a0608f37735849cb4aff5
+1bfcb5a8e8ed2d96af5d41abc582465fc53f0d85
+21bcf7d50cd683d0a29b187a0ca5d642e82f0499
+227fdf932ccb0b075594425a81e38e4b16931382
+297ed2809e927b4a15ee873c91586f53046e0da2
+2cf6cafdf302ed319c48f335defd21ad4bbc01d7
+2d7c08d59e201dcbda2271f803951d5f6f3072e1
+2e0d0a168a1f8998bd82e8eb25250e2ee875a7e5
+334e27a05947d05ca9586babbbf691cabf91eb97
+33ab0b5b4e5794231fd41298e40041b52acb0ffb
+33e32bf05897de1f2476e84cf8dcad25cb9d846e
+3427c69afa6d67e3cb6f548576e44de0dfe17e62
+37da7cc4f45c36b2db85c509a934ba2fe9f4024c
+38be9a51dc27f39edd1f6a45b7433d50a3d4ebe4
+39366dc3658fb07509c5cc27352a2d2b0663e233
+39eeeaf5407d9000d8ff047287f443b87389ab68
+41cee4f46a8302f2f45232813178184358457fca
+44a20ee951cd932a15ac4cfa6afa8815a0eb68cf
+44d7805e16ec7fd5599b2663fb24f95cafe64886
+45b3a920487fcd6f4a704fff7b6b683f4c595a2e
+47a3166939995a93707d341ff8c147c91dc4879e
+47fe1f56cdd51236414bbff0b59bce9f48830b01
+4940f66cafbadae887cb7952657407f6e0ed370f
+49c4ce41b3ed90a8238da9d9dc206602bc36f770
+49e7ba5d4c46fce45ded16a353a1a98e39e4fa0c
+5210a85c5f5f406ca6cd791860fc94f659b3451b
+5319fa2086cbe4fa0a8e8a09b25c7e5245791574
+574c2b7c2c70cb07bac10c2ac040c2b049c4c4f8
+5af55deb151ec022ebd19f10bb27b3058f304e08
+5e2ebc94cdd60adceddea544eef7f6baa96723d2
+5fd40bbbf2e8a3b6211ed2a8b42d2d6e4a796704
+605e9a6c9f16f086988a61a1e926696ab2bac5ea
+62745a59e7dde6b63b02f4025e416888a8205ff6
+634c6fbb8072b6133297829ba8186571dc05a272
+64417c35c194992ba7d37e4eca74493c1473a1ce
+6590383693a1e7134b66ddcbc9d7383444260a2b
+685202de09b45e488dd522ff23cc11271b6ec7f3
+6bf329d195b02dfe8b4646e5a513204422df7f51
+753730e5c42c40e8658fcb3efa2052b1cfbe26f6
+76a7a0856784c6024f1a07de61bc6e8094b6c593
+7ab0d1d2f39835238c0e42f1c6093db25b40a95c
+7b672d691bcac57325cb6433eb066e5fd9113362
+7d8eab62d18382eefa92d29c8a4aaae21611053b
+8314e2841f0d68ed36d6fb4ac6b39dda3670672c
+84352ce8f545d73da5dc6f36a14526edbf50fd11
+844663ac4dacc5d9a286bb621f82d8a59798f74b
+868be5cc4cdefc8eb169c819ad444ff9adf72dd4
+89b452008e5be09ae4df002e74ad51289df4d17c
+8a82821f4a964ddc9d6242e10d5da9ede78c928c
+8d33e8d7fefe198af50dc40dbe1116d6258b08b8
+95ca082a0d5339eb28aa63ddae120b8724f86b5d
+99b5b1c784982d0ffb020d66a30791f659db4ef1
+a07dfbe07f234f58212189596aa1d21565d9a184
+a0a2d0e8ede6c1b5180861af2cb869f8943c4b08
+a10850c217973e1a5205c18e907e82b7b815e4e7
+a3bf34ce09cc5f845dc2d4053cce87aff1e62669
+a412c898dbff1daf6ffaa72de68c9f94854d6872
+ab8e64a1b6593bc04f789876a89f90dcaf183a58
+aeee0629edd2d710a5f90611e4428e63faa2a8ad
+afa1946f5633fc7e8b05cb1b2abc1671a23cc647
+b029d5a708fc6da15fb22c827928bdf37c0f1013
+b1f395a179eedcd07c0b62f8f38501f7aee9878e
+b2c80da4821c7b24ae1c4e331cadbbc637e43a60
+b2ec34030729402bceff099347d21564b820d047
+b3d14b2ba6cf6fdf21e2938e71afeff7763c42c6
+b61e868e7ec646b28c1f43372f2b6b53c275d20e
+bbec45bfae885d3bff8ec6ab605a6b24627ecf81
+bde89f24be8c499fcdc10dcb343a067d321170ec
+c0c78bbcb6c694de1ccb02ddc4735e11ae99984e
+c8ce63510e0a14f756b7c0262a139a62c5863e28
+cb781f6b7a87ba87b2ee4b630082a996b03b9413
+cde3291b42da24a5764568db8c40f31759e923eb
+cf22f7b1fa6dbb59e26df7c991d24c6bf9c8de71
+d02388cdb9c232104351235d48482de30b10feac
+d2914e2041d840e44469918e9cf4c04d9ea338bc
+d5f08c0bf9cab9b1be9f65285de067e22d91d1e6
+d9bffe6f6c3a4f034c0baa0fdad831c436e2414b
+da28d6c87e6a2823f4eb6e7bd7b4e51807b4e07a
+dc91a1c53a2327cf2d5ed5115c75eff22881d73f
+de1e5dc5dbb58aad25e55857c2715f853d42ed1d
+e041109679b535cda7b599de89cbed568380344d
+e361026bc5f3f68840e47a2f8e6b026626e335db
+e4cfa6f7fc271a31fb5c23b5f36bafb227adb3de
+e4fc3e9b191d791c26d16ceb2c5120e436a7a37f
+e7d507c17d603bd1902e2a5aa47f2a3c909bf4c4
+ea8b163ea7ac3654e69bc9912d7885e8124b2777
+ec6abdaafe409ed1cfc7db4779e29afb4ef48ed3
+f0a1b15f80fc5ca8fb2e2ec9d0829f8526799135
+f275fa73cbd8acae0f0bebac7482472a1c5b266c
+f6d76f955bd49408b3c602dfe5ff2f596ea2b45c
+f774844d695cb8e86dd86ca1b4ed806235593bc6
+fdb7ec09a224aca5e8e8d1d9b17c4701a322894f
+ff7d43f69dd87d2d020106aa81d70795d03b65cd

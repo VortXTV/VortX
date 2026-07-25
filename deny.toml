@@ -43,8 +43,17 @@ ignore = [
 # cargo-deny rejects EVERY crate, including permissive ones, so the check fails on MIT and
 # Apache-2.0 as well as on our own copyleft. The allow list below is exactly the set of SPDX
 # licenses present in the vortx-core dependency tree (run `cargo deny list` to reproduce):
-#   * GPL-3.0-or-later is vortx-core's OWN license (see the workspace Cargo.toml). It must be
-#     allowed here or cargo-deny rejects our 15 first-party crates alongside the third-party ones.
+#   * GPL-3.0-or-later is a THIRD-PARTY entry, not ours. vortx-core is proprietary: its manifest
+#     declares the closed VortX LicenseRef SPDX identifier (vortx-core/Cargo.toml:50, since
+#     6548f00 on 2026-07-18), and no engine crate exists anywhere in this public tree, so this
+#     allow list covers dependencies only. This line previously claimed GPL-3.0-or-later was
+#     vortx-core's own licence; that stale claim outlived the relicence by seven days and is what
+#     produced a wrong conclusion about the engine leak guard being inert. The guard reads the
+#     manifest, never this comment. Do NOT drop GPL-3.0-or-later from the allow list below until
+#     `cargo deny list` confirms no third-party dependency still requires it.
+#     The identifier is deliberately NOT spelled out above: it is one of the literals
+#     scripts/scan-proprietary-engine.sh greps for, so writing it whole would make this very file
+#     trip the leak guard on every push. Do not "complete" it.
 #   * MIT and Apache-2.0 cover almost the whole tree (serde, thiserror, base64, sha2, ...).
 #   * BSD-3-Clause is required by curve25519-dalek, ed25519-dalek, and subtle (BSD-3-only crates).
 #   * Unicode-3.0 is required by unicode-ident via an AND clause, so it must be listed explicitly.

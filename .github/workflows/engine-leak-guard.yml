@@ -1,0 +1,188 @@
+name: Engine Leak Guard
+
+# Fails if any ref on this PUBLIC repository carries proprietary VortX engine source.
+#
+# This is layer 2. Layer 1 is .githooks/pre-push, which prevents the push in the first
+# place. A hook is local: it is absent on a fresh clone until scripts/install-git-hooks.sh
+# has run, absent on a teammate's machine, and absent for anything pushed through the web
+# UI or the API. So the hook cannot be the only defence, and this job is what notices when
+# the hook was not there.
+#
+# Detection lives in scripts/scan-proprietary-engine.sh, shared verbatim with the hook so
+# the two layers cannot drift into disagreeing about what "proprietary" means.
+#
+# WHY BOTH A PUSH TRIGGER AND A SCHEDULE
+#   push      Immediate. But a push-triggered workflow runs the workflow file as it exists
+#             ON THE PUSHED REF. Every ref that leaked in the 2026-07-25 incident was a
+#             rescue branch cut long before this file existed, so the push trigger would
+#             have stayed silent for all 56 engine-bearing refs, and for the 16 of those 56
+#             that carried snapshots which were not already public. (56 is the exposure
+#             surface, 16 is the disclosure; the two numbers are not interchangeable.)
+#             Useful, but structurally incomplete.
+#   schedule  Load-bearing. A scheduled run uses the DEFAULT branch's copy of this file and
+#             of the scanner, and sweeps every ref the repository has, including refs that
+#             predate the guard, refs pushed with the hook uninstalled, and refs pushed by
+#             someone who neutered their own copy of the scanner. This is the layer that
+#             would actually have caught the incident.
+# Daily rather than hourly: leaked objects are not made less public by being noticed 23
+# hours sooner, and the sweep is an O(1) tree probe per ref, not something worth burning
+# 24x the minutes on.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["**"]
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard-liveness:
+    name: Guard liveness
+    # Layer 1 is a LOCAL hook, which means its normal failure mode is silent absence: it
+    # stops running and every push succeeds at exit 0 with no output. Presence checks do
+    # not catch that, because a hook that exists can still be unreachable, non-executable,
+    # or overridden by core.hooksPath. Only a push that is actually refused proves the
+    # mechanism works, so this job builds a throwaway repository and refuses one. It is
+    # what converts a future silent absence into a red build.
+    # No `if:` on purpose: this must run on every trigger, including the schedule, because
+    # a push-triggered job is exactly the thing that goes quiet when nobody is pushing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install the guard the way a fresh clone does
+        # Proves the installer itself works, on a clone that has never had it. The
+        # verifier's config-hygiene assertion then checks what this step produced.
+        run: scripts/install-git-hooks.sh
+
+      - name: Assert an engine push is actually refused
+        run: scripts/verify-engine-leak-guard.sh
+
+  pushed-ref:
+    name: Pushed ref
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Scan the ref that was just pushed
+        # Ref names reach this step as data in the environment, never interpolated into
+        # the script body: git permits '$' and '`' in ref names, so a branch called
+        # `foo$(...)` would otherwise be executed rather than reported.
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          PUSHED_REF: ${{ github.ref }}
+        run: |
+          set -uo pipefail
+          scanner=scripts/scan-proprietary-engine.sh
+          if [ ! -x "$scanner" ]; then
+            echo "::error::$scanner is missing or not executable on this ref."
+            echo "A ref that carries the workflow but not the detector cannot be checked."
+            exit 1
+          fi
+
+          # The tip, plus every commit this push added when the previous tip is known.
+          # (github.event.before is all-zeros when the ref is brand new, in which case the
+          # tip probe plus the nightly all-refs sweep are the coverage.)
+          printf '%s\n' "$AFTER" > commits.txt
+          case "$BEFORE" in
+            *[!0]*) git rev-list "$AFTER" "^$BEFORE" 2>/dev/null >> commits.txt || true ;;
+          esac
+
+          found=""
+          rc=0
+          "$scanner" paths - < commits.txt > hits.txt || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::path probe failed (rc=$rc)"; exit 1; }
+
+          # Same baseline the nightly sweep uses, for the same reason: a branch cut from an
+          # old point inherits engine snapshots that were public long before this push, and
+          # alarming on those trains everyone to ignore the alarm.
+          grep -E '^[0-9a-f]{40}$' .github/engine-leak-baseline.txt | sort -u > known.txt
+          awk 'NR == FNR { known[$1] = 1; next } !($4 in known)' known.txt hits.txt > new.txt
+          if [ -s new.txt ]; then cat new.txt; found=1; fi
+
+          rc=0
+          "$scanner" markers "$AFTER" || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::marker sweep failed (rc=$rc)"; exit 1; }
+          [ "$rc" -eq 0 ] || found=1
+
+          if [ -n "$found" ]; then
+            echo "::error::Proprietary engine material is present on $PUSHED_REF of this PUBLIC repository. See the findings above. Engine source belongs on the private engine remote."
+            exit 1
+          fi
+          printf 'clean: no proprietary engine material on %s\n' "$PUSHED_REF"
+
+  all-refs:
+    name: All refs
+    if: github.event_name != 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    steps:
+      # Deliberately the default branch rather than the triggering ref: the sweep must use
+      # a copy of the detector that no individual pushed ref can have altered.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Probe every commit reachable from every branch and tag
+        run: |
+          set -uo pipefail
+          scanner=scripts/scan-proprietary-engine.sh
+          baseline=.github/engine-leak-baseline.txt
+          [ -x "$scanner" ] || { echo "::error::$scanner missing on the default branch"; exit 1; }
+          [ -r "$baseline" ] || { echo "::error::$baseline missing; refusing to sweep without it"; exit 1; }
+
+          git for-each-ref --format='%(objectname) %(refname)' \
+              refs/remotes/origin refs/tags > refs.txt
+          awk '{print $1}' refs.txt | sort -u > tips.txt
+
+          # Full history, not just ref tips. A push that bypassed the hook can easily have
+          # a clean tip and the engine three commits back, and walking every reachable
+          # commit costs about a second here (3231 commits in 0.6s when this was written).
+          git rev-list --stdin < tips.txt 2>/dev/null | sort -u > commits.txt
+          echo "refs: $(wc -l < refs.txt)   reachable commits: $(wc -l < commits.txt)"
+
+          rc=0
+          "$scanner" paths - < commits.txt > hits.txt || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::path probe failed (rc=$rc)"; exit 1; }
+
+          # Drop snapshots that were already public before the guard existed. Keyed on the
+          # tree OID, so a genuinely new engine snapshot is never hidden by an old one.
+          grep -E '^[0-9a-f]{40}$' "$baseline" | sort -u > known.txt
+          awk 'NR == FNR { known[$1] = 1; next } !($4 in known)' known.txt hits.txt > new.txt
+
+          echo "engine-bearing commits: $(wc -l < hits.txt) across $(awk '{print $4}' hits.txt | sort -u | wc -l) snapshots"
+          echo "already-public snapshots baselined: $(wc -l < known.txt)"
+
+          if [ -s new.txt ]; then
+            echo "Engine snapshots that are NOT in the baseline:"
+            awk '{print $4}' new.txt | sort -u
+            echo
+            echo "Commits carrying them:"
+            sort -u new.txt
+            echo
+            echo "Refs that reach them (first few commits shown):"
+            awk '{print $2}' new.txt | sort -u | head -5 | while read -r c; do
+              printf '  %s is reachable from:\n' "$c"
+              git for-each-ref --contains "$c" --format='    %(refname)' refs/remotes/origin refs/tags
+            done
+            echo "::error::New proprietary engine material is public on this repository. Deleting the ref does not unpublish the objects: treat this as a disclosure, not a typo. Rotate what needs rotating, then decide deliberately whether the snapshot joins .github/engine-leak-baseline.txt."
+            exit 1
+          fi
+          echo "clean: every engine snapshot present here was already public before the guard existed"
+
+      - name: Marker sweep of the default branch
+        run: |
+          set -uo pipefail
+          rc=0
+          scripts/scan-proprietary-engine.sh markers HEAD || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::marker sweep failed (rc=$rc)"; exit 1; }
+          [ "$rc" -eq 0 ] || { echo "::error::Files declaring the proprietary licence or closed-source header are present on the default branch."; exit 1; }
+          echo "clean: no proprietary content markers"
