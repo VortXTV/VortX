@@ -99,20 +99,40 @@ enum Playlist {
 
     // MARK: - Server-faithful body build (exercises the REAL header builder)
 
-    /// Rebuild a media body EXACTLY as `VortXRemuxHLSServer.buildMediaBody` does:
-    /// the header from the real, dependency-free `DVPlaybackPolicy.mediaPlaylistHeader`
-    /// (compiled into this harness), then one `#EXTINF:%.3f,` + `segN.m4s` per
-    /// segment, then optional ENDLIST. Used by the self-test to prove the round
+    /// Rebuild a media body EXACTLY as `VortXRemuxHLSServer.buildMediaBody` does
+    /// (VortXRemuxHLSServer.swift:1017-1021): hand a real `VortXHLSWindow` to the real,
+    /// dependency-free `DVPlaybackPolicy.mediaPlaylistLines` (compiled into this
+    /// harness) and join its lines with "\n". Used by the self-test to prove the round
     /// trip (build -> parse -> measure) matches, so the measurement is validated
     /// against the shipping format rather than a guess of it.
-    static func buildMediaBodyLikeServer(durations: [Double], ended: Bool, mapURI: String = "init.mp4") -> String {
-        var lines = DVPlaybackPolicy.mediaPlaylistHeader(targetDuration: Contract.hlsTargetDuration, mapURI: mapURI)
-        for (i, d) in durations.enumerated() {
-            lines.append(String(format: "#EXTINF:%.3f,", d))
-            lines.append("seg\(i).m4s")
+    ///
+    /// DRIFT NOTE (fixed here): this used to call `DVPlaybackPolicy.mediaPlaylistHeader`
+    /// and then emit the `#EXTINF:` / `segN.m4s` pairs ITSELF. That function no longer
+    /// exists - the product renders header AND entries in one call - so the harness
+    /// could not compile, and while it did compile it was re-implementing half of the
+    /// very format it claimed to validate. Calling the whole renderer means the EXTINF
+    /// text under test is now literally the server's own (`%.3f` on an explicit
+    /// en_US_POSIX locale, DVPlaybackPolicy.swift:180-182), not a lookalike.
+    static func buildMediaBodyLikeServer(durations: [Double],
+                                         ended: Bool,
+                                         mapURI: String = "init.mp4",
+                                         firstSegmentID: Int = 0) -> String {
+        var segments: [VortXHLSSegment] = []
+        var start = 0.0
+        for (offset, duration) in durations.enumerated() {
+            segments.append(VortXHLSSegment(
+                id: firstSegmentID + offset,
+                byteOffset: 0,
+                byteLength: 1,
+                start: start,
+                duration: duration))
+            start += duration
         }
-        if ended { lines.append("#EXT-X-ENDLIST") }
-        lines.append("")
+        let lines = DVPlaybackPolicy.mediaPlaylistLines(
+            window: VortXHLSWindow(segments: segments),
+            ended: ended,
+            targetDuration: Contract.hlsTargetDuration,
+            mapURI: mapURI)
         return lines.joined(separator: "\n")
     }
 }

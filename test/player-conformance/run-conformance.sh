@@ -63,7 +63,14 @@ BIN="$DD/bin/player-conformance"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
+# PRODUCT FILES COMPILED INTO THE HARNESS. These are the real shipping decision files,
+# not copies: the gate calls what the server calls. `VortXRemuxBuffer.swift` is required
+# because `DVPlaybackPolicy`'s own signatures take `VortXHLSWindow` / `VortXHLSSegment`,
+# which live there - omitting it is what turned the `mediaPlaylistHeader` drift into a
+# second, hidden "cannot find type in scope" failure. See README.md,
+# "PRODUCT SYMBOL DEPENDENCIES".
 POLICY="$REPO/app/Sources/Player/DVPlaybackPolicy.swift"
+BUFFER="$REPO/app/Sources/Player/VortXRemuxBuffer.swift"
 
 # --- live-auto fixture parameters -------------------------------------------
 #
@@ -122,8 +129,8 @@ contract_str() {   # $1 = string constant name in Contract.swift
   sed -n "s/.*static let $1 = \"\([^\"]*\)\".*/\1/p" "$HERE/Contract.swift" | head -1
 }
 WINDOW_FLOOR_MIB="$(contract_int windowFloorMiB)"        # 64: VortXRemuxBuffer re-read floor
-MIN_STARTUP_MS="$(contract_int minStartupMs)"            # 15000: point 1 duration floor
-MIN_STARTUP_SEGS="$(contract_int minStartupSegments)"    # 6: point 1 segment floor
+MIN_STARTUP_MS="$(contract_int minStartupMs)"            # 4000: point 1 duration floor
+MIN_STARTUP_SEGS="$(contract_int minStartupSegments)"    # 2: point 1 segment floor
 SLO_MOUNT_READY_MS="$(contract_int sloMountToReadyMs)"   # 30000: point 6 SLO
 
 # How far past the window floor the READ HEAD must travel before we trust point 4.
@@ -207,9 +214,33 @@ STARVE_TIMEOUT="${VORTX_STARVE_TIMEOUT:-180}"
 build_harness() {
   mkdir -p "$DD/bin"
   echo "[build] swiftc -> $BIN"
+  local log rc
+  log="$DD/bin/build.log"
+  # NOTE the `set +e`: under `set -e` a swiftc failure aborted the whole script with
+  # swiftc's own exit code 1, which is INDISTINGUISHABLE from "the gate ran and a point
+  # is RED" - the product signal. That is exactly how this gate rotted silently: the
+  # harness stopped compiling against the product it guards, CI read the 1 as a
+  # player regression or as noise, and nobody learned that the gate was unavailable.
+  # A harness that cannot be built has not OBSERVED anything, so it is INFRA (exit 3).
+  set +e
   swiftc -O -o "$BIN" \
     "$HERE/Contract.swift" "$HERE/Playlist.swift" "$HERE/FMP4.swift" "$HERE/FMP4Fixtures.swift" \
-    "$HERE/Trace.swift" "$HERE/Live.swift" "$HERE/main.swift" "$POLICY"
+    "$HERE/Trace.swift" "$HERE/Live.swift" "$HERE/main.swift" \
+    "$HERE/Stubs.swift" "$BUFFER" "$POLICY" >"$log" 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" != "0" ]; then
+    cat "$log" >&2
+    echo "" >&2
+    echo "[INFRA] the conformance harness FAILED TO COMPILE against the product (swiftc exit $rc)." >&2
+    echo "[INFRA] The compiler output is above; the harness build log is $log." >&2
+    echo "[INFRA] This means the harness has DRIFTED against the code it guards. It is NOT" >&2
+    echo "[INFRA] a player regression, and no gate verdict exists for this run." >&2
+    echo "[INFRA] The product symbols this harness compiles against are listed under" >&2
+    echo "[INFRA] 'PRODUCT SYMBOL DEPENDENCIES' in $HERE/README.md - start there." >&2
+    exit 3
+  fi
+  rm -f "$log"
 }
 
 run_mutants() {
@@ -553,10 +584,30 @@ preflight() {
     pkill -f "$HERE/range-server.py" || true
     sleep 1
   fi
-  # The 4th precondition - "the installed Debug build carries the DEBUG playback
-  # hook" - cannot be checked cheaply before launch without inspecting the binary.
-  # It is checked HONESTLY after launch instead: if no [debughook] marker of any
-  # kind appears, the wait reports exactly that. See wait_for_ready.
+  # The 4th precondition is the PRODUCT-SIDE headless playback hook. There are two
+  # distinct ways it can be missing, and telling a caller the wrong one costs a whole
+  # rebuild:
+  #
+  #   (a) the hook EXISTS in the tree but the INSTALLED build is Release. Rebuilding a
+  #       Debug build fixes it. That is checked after launch, in wait_for_ready.
+  #   (b) the hook is NOT IN THIS TREE AT ALL. No rebuild can conjure it, and telling
+  #       someone to "rebuild + install a Debug build" sends them off for ten minutes to
+  #       arrive at the identical failure. Check it here, cheaply, before generating a
+  #       420-second fixture and launching anything.
+  #
+  # Case (b) is real: `live-auto` depends on a product source file that is not on every
+  # line, so the gate can be unavailable for a reason that has nothing to do with the
+  # harness or the player.
+  if ! grep -rqs "VORTX_DEBUG_PLAY_URL" "$REPO/app"; then
+    infra "the DEBUG headless playback hook is NOT PRESENT IN THIS TREE.
+        Nothing under $REPO/app references VORTX_DEBUG_PLAY_URL, so no Debug build of
+        this checkout can carry it and 'app-build' will NOT help. live-auto drives
+        playback exclusively through that hook (see DEBUG-PLAYBACK-HOOK.md), so the
+        unattended channel cannot stand up a session on this line at all.
+        Options: land the hook on this line, or drive playback by hand and use
+        './run-conformance.sh live' instead, which needs no hook.
+        The offline channels are unaffected: selftest, mutants and trace all run here."
+  fi
 }
 
 make_fixture() {

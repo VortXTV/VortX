@@ -32,6 +32,14 @@ struct TraceSession {
     var sawAny404 = false
     var cohortTimeoutEvents = 0
     var mediaResponses: [(segs: Int, ended: Bool)] = []
+    /// Highest EXT-X-MEDIA-SEQUENCE the server reported on a media response. The window
+    /// is consumption-anchored and SLIDES, so a nonzero value here is normal, expected
+    /// behaviour and not evidence of anything going wrong.
+    var maxMediaSequence: Int = 0
+    /// Raw `hls resp /media.m3u8` lines seen, whether or not this parser understood them.
+    /// The gap between this and `mediaResponses.count` is PARSER DRIFT, not product
+    /// behaviour, and is reported as INFRA rather than folded into a verdict.
+    var mediaResponseLines: Int = 0
 }
 
 enum Trace {
@@ -89,25 +97,50 @@ enum Trace {
             if s.port == nil, let m = firstMatch(#"hls server listening on 127\.0\.0\.1:(\d+)"#, line) {
                 s.port = Int(m[1])
             }
-            if s.mountAt == nil, line.contains("plain-remux mount") { s.mountAt = timestamp(line) }
+            // The mount marker the shipped engine writes is `dv-remux mount host=...`
+            // (AVPlayerEngine.swift:339, category `avplayer`). `plain-remux mount` is kept
+            // only so older captured traces still parse; it is NOT a shipped shape.
+            if s.mountAt == nil,
+               line.contains("dv-remux mount") || line.contains("plain-remux mount") {
+                s.mountAt = timestamp(line)
+            }
             if s.readyAt == nil, line.contains("readyToPlay -> play") { s.readyAt = timestamp(line) }
 
             if let m = firstMatch(#"hls media segment (\d+) published .*\((\d+)B, ([0-9]+\.[0-9]+)s media\)"#, line) {
                 if let idx = Int(m[1]), let d = Double(m[3]) { s.publishedDurations[idx] = d }
             }
-            if let m = firstMatch(#"hls resp /media\.m3u8 segs=(\d+) ended=(true|false)"#, line) {
-                let segs = Int(m[1]) ?? 0
-                let ended = m[2] == "true"
+            // DRIFT FIXED: this pattern had no `seq=(\d+) ` between the path and `segs=`,
+            // but the server has emitted the media sequence in that exact position since
+            // the window became consumption-anchored (VortXRemuxHLSServer.swift:1012). The
+            // regex therefore matched NOTHING on a real trace: `firstMediaSegs` stayed nil,
+            // point 1 was permanently INDETERMINATE and point 4's `advertisedMax` stayed 0.
+            // A blind check that reports "cannot observe" looks identical to a check that
+            // is merely unlucky, which is how this survived.
+            if let m = firstMatch(#"hls resp /media\.m3u8 seq=(\d+) segs=(\d+) ended=(true|false)"#, line) {
+                let seq = Int(m[1]) ?? 0
+                let segs = Int(m[2]) ?? 0
+                let ended = m[3] == "true"
                 s.mediaResponses.append((segs, ended))
-                s.advertisedMax = max(s.advertisedMax, segs)
+                s.maxMediaSequence = max(s.maxMediaSequence, seq)
+                s.advertisedMax = max(s.advertisedMax, seq + segs)
                 if s.firstMediaSegs == nil { s.firstMediaSegs = segs; s.firstMediaEnded = ended }
             }
+            if line.contains("hls resp /media.m3u8") { s.mediaResponseLines += 1 }
             if let m = firstMatch(#"hls req /seg(\d+)\.m4s"#, line), let idx = Int(m[1]) {
                 if s.firstVideoSegReq == nil { s.firstVideoSegReq = idx }
             }
-            // Alternate-audio rendition segment request (rework-introduced). Match a
-            // few plausible shapes so the check works whatever the rework names it.
-            if let m = firstMatch(#"hls req /(?:aseg|audio-?seg|aud)(\d+)\.(?:m4s|aac|mp4)"#, line), let idx = Int(m[1]) {
+            // Alternate-audio rendition segment request. The shipped URI is
+            // `/audio<renditionID>-seg<segmentID>.m4s` (VortXRemuxHLSServer.swift:1107);
+            // the legacy `aseg<N>.m4s` shape is kept only for older captured traces.
+            //
+            // DRIFT FIXED: the old pattern (`aseg|audio-?seg|aud` followed immediately by
+            // digits) cannot match `/audio0-seg3.m4s`, because the rendition id sits
+            // between `audio` and `-seg`. Every alternate-audio request in a real trace was
+            // invisible, so the trace channel's point 3 always concluded "beta muxes audio
+            // inline" and scored RED no matter what the server served.
+            if let m = firstMatch(#"hls req /audio\d+-seg(\d+)\.m4s"#, line), let idx = Int(m[1]) {
+                s.audioSegReqs.append(idx)
+            } else if let m = firstMatch(#"hls req /aseg(\d+)\.m4s"#, line), let idx = Int(m[1]) {
                 s.audioSegReqs.append(idx)
             }
             if let m = firstMatch(#"hls resp /seg(\d+)\.m4s (\d+)B"#, line), let idx = Int(m[1]), let b = Int(m[2]) {
@@ -115,8 +148,19 @@ enum Trace {
             }
             if line.contains("hls 404") { s.sawAny404 = true }
             if let m = firstMatch(#"hls 404 /seg(\d+)\.m4s"#, line), let idx = Int(m[1]) {
-                // Advertised at the time iff below the max the playlist ever grew to.
-                if idx < s.advertisedMax { s.advertised404s.append(idx) }
+                // Advertised at the time iff inside the window the playlist actually
+                // published: at or above the highest MEDIA-SEQUENCE reached, and below the
+                // highest absolute id advertised.
+                //
+                // DRIFT FIXED: this was `idx < s.advertisedMax` alone, which treats every
+                // low id as permanently advertised. That was true of the old EVENT-shaped
+                // playlist whose MEDIA-SEQUENCE never moved; the shipped playlist SLIDES
+                // (DVPlaybackPolicy.swift:184-196 renders `window.mediaSequence`, and the
+                // window is anchored behind the client's demonstrated fetch frontier). A
+                // 404 for an id the playlist has already dropped is the server behaving
+                // correctly, and scoring it RED would have manufactured a product
+                // regression out of the current windowing.
+                if idx >= s.maxMediaSequence, idx < s.advertisedMax { s.advertised404s.append(idx) }
             }
             if line.contains(Contract.cohortTimeoutEvent) { s.cohortTimeoutEvents += 1 }
         }
@@ -168,34 +212,61 @@ enum Trace {
 
         // (1) Startup cohort - count is authoritative from the trace; startup ms is
         // the sum of the cohort segments' published durations (2-dp log precision,
-        // which is ample to decide the 15 000 ms floor). `ended` short clips exempt.
+        // which is ample to decide the 4 000 ms floor). `ended` short clips exempt.
+        //
+        // The product logs the "published +Xs after mount" breadcrumb ONLY for segments
+        // 0 and 1 (VortXMKVRemuxStream.swift:2882, `if idx <= 1`). Summing missing ids as
+        // zero would fabricate a duration shortfall, so the ms strand is reported only
+        // when EVERY id in the cohort actually has a logged duration.
         do {
             let segs = s.firstMediaSegs ?? -1
             let ended = s.firstMediaEnded ?? false
-            var approxMs = 0
-            if segs > 0 { for i in 0..<segs { approxMs += Int(((s.publishedDurations[i] ?? 0) * 1000).rounded()) } }
-            let ev = [
-                "first /media.m3u8 response: segs=\(segs) ended=\(ended)",
-                "cohort startup duration ~= \(approxMs) ms (sum of \(max(segs,0)) published segment durations, 2-dp log)",
-                "floors: segments >= \(Contract.minStartupSegments) AND duration >= \(Contract.minStartupMs) ms",
-            ]
+            var approxMs: Int?
+            if segs > 0 {
+                let ids = Array(0..<segs)
+                if ids.allSatisfy({ s.publishedDurations[$0] != nil }) {
+                    approxMs = ids.reduce(0) { $0 + Int(((s.publishedDurations[$1] ?? 0) * 1000).rounded()) }
+                }
+            }
+            var ev = ["first /media.m3u8 response: segs=\(segs) ended=\(ended)"]
+            if let approxMs {
+                ev.append("cohort startup duration ~= \(approxMs) ms (sum of \(segs) published segment durations, 2-dp log)")
+            } else if segs > 0 {
+                ev.append("cohort duration NOT measurable from this trace: the product logs the published"
+                    + " breadcrumb only for segments 0 and 1, and this cohort is \(segs) segments."
+                    + " The count strand decides; the live channel measures exact ms from EXTINF text.")
+            }
+            ev.append("floors: segments >= \(Contract.minStartupSegments) AND duration >= \(Contract.minStartupMs) ms")
             if segs < 0 {
-                out.append(Finding(point: .startupCohort, verdict: .indeterminate, evidence: ["no /media.m3u8 response in session"]))
+                out.append(Finding(point: .startupCohort, verdict: .indeterminate,
+                                   evidence: ["no /media.m3u8 response in session"]))
             } else if ended && segs < Contract.minStartupSegments {
                 out.append(Finding(point: .startupCohort, verdict: .exempt,
                                    evidence: ev + ["source ENDED before the cohort could fill; short-clip exemption"]))
             } else {
-                let ok = segs >= Contract.minStartupSegments && approxMs >= Contract.minStartupMs
-                out.append(Finding(point: .startupCohort, verdict: ok ? .green : .red, evidence: ev))
+                let countOK = segs >= Contract.minStartupSegments
+                let durationOK = approxMs.map { $0 >= Contract.minStartupMs } ?? true
+                out.append(Finding(point: .startupCohort,
+                                   verdict: (countOK && durationOK) ? .green : .red, evidence: ev))
             }
         }
 
-        // (2) IDR-start - not decidable from a trace. Heuristic note only.
+        // (2) IDR-start - not decidable from a trace, and no longer even guessable.
+        //
+        // DRIFT FIXED: this used to flag segments whose duration equalled the 4 s
+        // non-keyframe HARD CUT and predict that the following segment started mid-GOP.
+        // That cut no longer exists: `VortXHLSBoundaryPolicy.decision` only ever returns
+        // `.open` or `.cut` when `incomingIsIDR && incomingHasKeyFlag`, and fails soft
+        // past the frozen target instead of cutting on an arbitrary frame
+        // (DVPlaybackPolicy.swift:1136-1140). Keeping the heuristic would have printed a
+        // confident mid-GOP accusation about a mechanism the product retired.
         do {
-            let hardCut = s.publishedDurations.filter { abs($0.value - Contract.hardCutSecs) < 0.005 }.keys.sorted()
             var ev = ["segment bytes are not in the trace; the IDR check needs the live channel (fMP4 parse)"]
-            if !hardCut.isEmpty {
-                ev.append("heuristic: segments \(hardCut) are exactly \(Contract.hardCutSecs)s (the hard cut) -> the FOLLOWING segment likely starts mid-GOP (non-IDR)")
+            let longRun = s.publishedDurations
+                .filter { $0.value >= Double(Contract.segmentFailSoftSecs) }.keys.sorted()
+            if !longRun.isEmpty {
+                ev.append("note: segments \(longRun) reached the \(Contract.segmentFailSoftSecs)s fail-soft ceiling;"
+                    + " the product fails the remux soft there rather than cutting mid-GOP")
             }
             out.append(Finding(point: .idrStart, verdict: .indeterminate, evidence: ev))
         }
@@ -232,13 +303,21 @@ enum Trace {
             } else {
                 ev.append("no advertised-segment 404 fired during this forward-only playback")
             }
-            // Latent EVENT-window eviction: MEDIA-SEQUENCE stays 0, so the playlist keeps
-            // advertising low segments after the resident window has slid past them.
+            // Resident-window arithmetic, DIAGNOSTIC ONLY.
+            //
+            // DRIFT FIXED: this block used to turn a purely arithmetic prediction into a
+            // RED verdict, on the premise that "MEDIA-SEQUENCE stays 0, so the playlist
+            // keeps advertising low segments after the resident window has slid past
+            // them". The shipped playlist slides its MEDIA-SEQUENCE and drops the entries
+            // it can no longer serve, and the window is anchored behind the client's
+            // demonstrated fetch frontier, so the premise is simply no longer true. Only a
+            // real 404 for a still-advertised id decides this point.
             if w.avgSegmentBytes > 0 {
-                ev.append("resident window ~= \(Contract.windowFloorMiB) MiB / \(w.avgSegmentBytes) B ≈ \(w.residentSegments) segments; playlist advertised up to \(w.advertisedMax) (MEDIA-SEQUENCE stays 0)")
+                ev.append("DIAGNOSTIC: resident window ~= \(Contract.windowFloorMiB) MiB / \(w.avgSegmentBytes) B ≈ \(w.residentSegments) segments;"
+                    + " playlist advertised up to absolute id \(w.advertisedMax) with MEDIA-SEQUENCE reaching \(s.maxMediaSequence)")
                 if let evictedUpTo = w.evictedUpTo {
-                    ev.append("LATENT: segment 0..\(evictedUpTo) advertised but evicted -> a client that re-requests one (RFC 8216 s6.2.2 window) gets a 404")
-                    verdict = .red
+                    ev.append("DIAGNOSTIC prediction only: ids 0..\(evictedUpTo) may no longer be resident."
+                        + " With a sliding MEDIA-SEQUENCE this is the EXPECTED steady state, not a violation.")
                 }
             }
             out.append(Finding(point: .noAdvertised404, verdict: verdict, evidence: ev))
