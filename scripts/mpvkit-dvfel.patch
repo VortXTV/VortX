@@ -1,0 +1,174 @@
+diff --git a/Sources/BuildScripts/XCFrameworkBuild/main.swift b/Sources/BuildScripts/XCFrameworkBuild/main.swift
+index e5f872c..d678e75 100644
+--- a/Sources/BuildScripts/XCFrameworkBuild/main.swift
++++ b/Sources/BuildScripts/XCFrameworkBuild/main.swift
+@@ -45,10 +45,25 @@ do {
+ 
+ enum Library: String, CaseIterable {
+     case libmpv, FFmpeg, libshaderc, vulkan, lcms2, libdovi, openssl, libunibreak, libfreetype, libfribidi, libharfbuzz, libass, libsmbclient, libplacebo, libdav1d, gmp, nettle, gnutls, libuchardet, libbluray, libluajit, libuavs3d
++
++    // SPIKE PINS (Dolby Vision Profile 7 BL+EL). Exact SHAs so the build is reproducible
++    // rather than tracking a moving master.
++    //   mpv        8c67647b5005 (master, 2026-07-24) - carries 998c20af6 dovi_split,
++    //              f53e8f3fe demux_mkv EL+BL grouping, 6c4480cbf mp_image.enhancement_layer,
++    //              0480011ac vf=format=enhancement-layer, 81037dae3 no_enhancement_layer.
++    //   libplacebo 4c426e466814 (master, 2026-07-24) - carries 801b6812 FEL merging,
++    //              187b1bd1 pl_frame.enhancement_layer, dbf8dd89 nlq_active/nlq,
++    //              6e66d6d5 libav NLQ mapping. PL_API_VER 371 (>= 367 required by mpv).
++    static let mpvPinnedSHA = "8c67647b50059406c5c0444903597281b81516cf"
++    static let placeboPinnedSHA = "4c426e466814536def653cb23f1d1c287ea7a7f5"
++
+     var version: String {
+         switch self {
+         case .libmpv:
+-            return "v0.41.0"
++            // SPIKE: mpv master pinned to a SHA carrying the Dolby Vision Profile 7
++            // BL+EL work (dovi_split, demux_mkv EL/BL grouping, mp_image.enhancement_layer,
++            // vf=format=enhancement-layer). Cloned by BuildMPV.beforeBuild, not by --branch.
++            return "master-\(Library.mpvPinnedSHA.prefix(8))"
+         case .FFmpeg:
+             return "n8.1.2"
+         case .openssl:
+@@ -76,7 +91,10 @@ enum Library: String, CaseIterable {
+         case .lcms2:
+             return "2.17.0"
+         case .libplacebo:
+-            return "7.360.1"
++            // SPIKE: built FROM SOURCE off libplacebo master (PL_API_VER 371) instead of the
++            // prebuilt 7.360.1 zip (PL_API_VER 360). mpv's FEL code is behind PL_API_VER >= 367,
++            // so the released zip would silently compile the whole feature out.
++            return "master-\(Library.placeboPinnedSHA.prefix(8))"
+         case .libdovi:
+             return "3.3.2"
+         case .vulkan:
+@@ -123,7 +141,8 @@ enum Library: String, CaseIterable {
+         case .lcms2:
+             return "https://github.com/mpvkit/lcms2-build/releases/download/\(self.version)/lcms2-all.zip"
+         case .libplacebo:
+-            return "https://github.com/mpvkit/libplacebo-build/releases/download/\(self.version)/libplacebo-all.zip"
++            // SPIKE: source build off upstream git (was: prebuilt libplacebo-all.zip).
++            return "https://code.videolan.org/videolan/libplacebo.git"
+         case .libdav1d:
+             return "https://github.com/mpvkit/libdav1d-build/releases/download/\(self.version)/libdav1d-all.zip"
+         case .libdovi:
+@@ -372,6 +391,16 @@ private class BuildMPV: BaseBuild {
+         super.init(library: .libmpv)
+     }
+ 
++    // SPIKE: pinned master SHA rather than the v0.41.0 tag. All three MPVKit patches
++    // (moltenvk context, swift-frontend revert, tvOS avfoundation AO) were verified to
++    // apply cleanly at this commit.
++    override func beforeBuild() throws {
++        try SpikeGit.clonePinned(url: library.url,
++                                 sha: Library.mpvPinnedSHA,
++                                 into: directoryURL)
++        try SpikeGit.applyPatches(for: library, in: directoryURL)
++    }
++
+     override func flagsDependencelibrarys() -> [Library] {
+         if BaseBuild.options.enableGPL {
+             return [.gmp, .libsmbclient]
+@@ -396,6 +425,14 @@ private class BuildMPV: BaseBuild {
+             "-Djpeg=disabled",
+             "-Dvapoursynth=disabled",
+             "-Drubberband=disabled",
++
++            // NEW in mpv master (absent at v0.41.0), both `value: 'auto'`. MPVKit appends the HOST
++            // pkg-config path to PKG_CONFIG_PATH, so meson happily "finds" the Mac's system
++            // libcurl 8.7.1 and enables stream/stream_curl.c, which then fails the tvOS/iOS
++            // cross-compile with "'curl/curl.h' file not found". Pin both off explicitly rather
++            // than relying on auto-detection that leaks from the build host.
++            "-Dlibcurl=disabled",
++            "-Dsubrandr=disabled",
+         ]
+         if BaseBuild.options.enableGPL {
+             array.append("-Dgpl=true")
+@@ -778,10 +815,87 @@ private class BuildLuaJIT: ZipBaseBuild {
+ }
+ 
+ 
+-private class BuildPlacebo: ZipBaseBuild {
++// SPIKE: build libplacebo FROM SOURCE at a pinned master SHA so PL_API_VER >= 367 and
++// mpv's Dolby Vision FEL merging path actually compiles in. Upstream MPVKit downloads a
++// prebuilt 7.360.1 zip (PL_API_VER 360), which compiles the whole feature out silently.
++// Meson flags mirror mpvkit/libplacebo-build so the resulting library is a drop-in.
++private class BuildPlacebo: BaseBuild {
+     init() {
+         super.init(library: .libplacebo)
+     }
++
++    override func beforeBuild() throws {
++        try SpikeGit.clonePinned(url: library.url,
++                                 sha: Library.placeboPinnedSHA,
++                                 into: directoryURL)
++        try SpikeGit.applyPatches(for: library, in: directoryURL)
++    }
++
++    // ONLY libdovi, matching mpvkit/libplacebo-build. Do NOT add lcms2/libshaderc/vulkan here:
++    // BaseBuild.ldFlags turns each entry into `-l<name>`, and MoltenVK ships no `libvulkan.a`,
++    // so `-lvulkan` makes every meson link probe fail. That surfaces as the very misleading
++    // "C shared or static library 'atomic' not found". Those three resolve via PKG_CONFIG_PATH.
++    override func flagsDependencelibrarys() -> [Library] {
++        [.libdovi]
++    }
++
++    override func arguments(platform: PlatformType, arch: ArchType) -> [String] {
++        var args = [
++            "-Dopengl=enabled",
++            "-Dvulkan=enabled",
++            "-Dshaderc=enabled",
++            "-Dlcms=enabled",
++
++            "-Dxxhash=disabled",
++            "-Dunwind=disabled",
++            "-Dglslang=disabled",
++            "-Dd3d11=disabled",
++            "-Ddemos=false",
++            "-Dtests=false",
++        ]
++        let doviPath = URL.currentDirectory + [Library.libdovi.rawValue, platform.rawValue, "thin", arch.rawValue]
++        if FileManager.default.fileExists(atPath: doviPath.path) {
++            args += ["-Ddovi=enabled", "-Dlibdovi=enabled"]
++        } else {
++            args += ["-Ddovi=disabled", "-Dlibdovi=disabled"]
++        }
++        return args
++    }
++}
++
++// SPIKE: shared helpers for cloning a dependency at an exact commit. BaseBuild.beforeBuild
++// can only clone a tag/branch via `--branch`, which cannot express a SHA.
++enum SpikeGit {
++    static func clonePinned(url: String, sha: String, into directoryURL: URL) throws {
++        if FileManager.default.fileExists(atPath: directoryURL.path) {
++            return
++        }
++        // Shallow-clone the default branch deep enough to contain the pin, then detach onto it.
++        try! Utility.launch(path: "/usr/bin/git",
++                            arguments: ["-c", "advice.detachedHead=false", "clone",
++                                        "--depth", "150", url, directoryURL.path])
++        try! Utility.launch(path: "/usr/bin/git",
++                            arguments: ["-c", "advice.detachedHead=false", "checkout", sha],
++                            currentDirectoryURL: directoryURL)
++        try! Utility.launch(path: "/usr/bin/git",
++                            arguments: ["submodule", "update", "--init", "--recursive", "--depth", "1"],
++                            currentDirectoryURL: directoryURL)
++    }
++
++    static func applyPatches(for library: Library, in directoryURL: URL) throws {
++        let patch = URL.currentDirectory + "../Sources/BuildScripts/patch/\(library.rawValue)"
++        guard FileManager.default.fileExists(atPath: patch.path) else { return }
++        let fileNames = try! FileManager.default.contentsOfDirectory(atPath: patch.path).sorted()
++        for fileName in fileNames where fileName.hasSuffix(".patch") {
++            // Idempotent: skip anything already in the tree (re-runs reuse the clone).
++            let check = Utility.shell("git apply --reverse --check \"\((patch + fileName).path)\"",
++                                      currentDirectoryURL: directoryURL)
++            if check != nil { continue }
++            try! Utility.launch(path: "/usr/bin/git",
++                                arguments: ["apply", (patch + fileName).path],
++                                currentDirectoryURL: directoryURL)
++        }
++    }
+ }
+ 
+ private class BuildOpenSSL: ZipBaseBuild {
