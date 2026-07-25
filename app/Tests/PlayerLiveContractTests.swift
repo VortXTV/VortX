@@ -2220,10 +2220,13 @@ enum PlayerLiveContractTests {
             engine, from: "func setSubtitleTrack(_ id: Int) {", to: "/// Select option `id`")
         let externalSubtitleLoad = sourceSection(
             engine, from: "func addExternalSubtitle(url: String",
-            to: "/// Turn off the external overlay subtitle")
+            to: "/// Stop rendering the external overlay subtitle")
         let selectionRefresh = sourceSection(
             engine, from: "private func refreshSelectionTracks(for item: AVPlayerItem)",
             to: "/// Force one track-list publication")
+        let externalSubtitleDisable = sourceSection(
+            engine, from: "private func disableExternalSubtitle(discardingCues: Bool = false)",
+            to: "/// AVFoundation cannot time-shift native")
         let groupLoad = sourceSection(engine, from: "private func loadSelectionGroups()",
                                       to: "/// Rebuild cached selected flags")
         let subtitlePlaylist = sourceSection(
@@ -2718,6 +2721,16 @@ enum PlayerLiveContractTests {
         check("wiring: the ticked-row identity includes the external subtitle",
               selectionRefresh?.contains(
                 "let subtitleID = externalSubActive ? Self.externalSubtitleTrackID : nativeSubtitleID") == true)
+        // Turning subtitles Off must not DESTROY the external subtitle: the chrome has already hidden that
+        // add-on's own row on the promise that the subtitle lives in the ordinary track list, so discarding
+        // the cues here would make it unreachable for the rest of the session. Only a title change or a full
+        // teardown discards.
+        check("wiring: only a title change or teardown discards the external subtitle's cues",
+              externalSubtitleSelection?.contains("disableExternalSubtitle()") == true
+                  && externalSubtitleSelection?.contains("discardingCues: true") == false
+                  && engine?.components(separatedBy: "disableExternalSubtitle(discardingCues: true)")
+                      .count == 3
+                  && externalSubtitleDisable?.contains("guard discardingCues else { return }") == true)
         check("wiring: system media-selection changes are observed",
               engine?.contains("AVPlayerItem.mediaSelectionDidChangeNotification") == true)
         check("wiring: loaded groups force their initial track-list publication",

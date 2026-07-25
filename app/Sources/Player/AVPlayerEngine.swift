@@ -265,7 +265,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         videoFrameEverProduced = false; audioOverBlackSince = 0; audioOverBlackFired = false
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []; loadedChapters = []; containerFPS = 0
         selectionRefreshState.reset()
-        disableExternalSubtitle()   // a new title starts with no external overlay sub
+        disableExternalSubtitle(discardingCues: true)   // a new title starts with no external overlay sub
         // Claim .playback before play so PiP and locked-screen audio work, and advertise multichannel so the
         // system passes through Atmos (#78) and applies AirPods Spatial Audio (#88). Idempotent with the
         // libmpv path since only one engine is live at a time. macOS has no AVAudioSession (the system routes
@@ -662,7 +662,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // was not DV; only this lane sets DV criteria, and one engine is live at a time).
         HDRDisplayMode.reset(in: nil)
         #endif
-        disableExternalSubtitle()
+        disableExternalSubtitle(discardingCues: true)   // full teardown: nothing survives the session
         player.pause()
         player.replaceCurrentItem(with: nil)
         pipController?.delegate = nil
@@ -750,8 +750,12 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             publishSelectionTracks()
             return
         }
-        if externalSubActive { disableExternalSubtitle() }
+        let wasExternal = externalSubActive
+        if wasExternal { disableExternalSubtitle() }
         select(id, in: subGroup)
+        // A source with no legible renditions has no group, so `select` returns before publishing. Turning the
+        // overlay off there still changed which row is ticked, so publish it directly.
+        if wasExternal, subGroup == nil { publishSelectionTracks() }
     }
 
     /// Select option `id` (its index in the group) on the current item, or deselect for mpv's -1 = off.
@@ -842,14 +846,20 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         }
     }
 
-    /// Turn off the external overlay subtitle (clear cues + hide the overlay). Native track selection is
-    /// untouched, so the caller can then select an embedded track or leave subtitles Off. The published row
-    /// disappears with the cues, so the picker never offers a row that has nothing behind it.
-    private func disableExternalSubtitle() {
+    /// Stop rendering the external overlay subtitle. Native track selection is untouched, so the caller can
+    /// then select an embedded track or leave subtitles Off.
+    ///
+    /// `discardingCues: false` (the selection path) KEEPS the parsed cues and the published row, exactly as
+    /// libmpv keeps a sub-added file in its track list after you switch to Off: the viewer can come back to it
+    /// from the picker. Dropping the row here instead would make an add-on subtitle a one-way door, because
+    /// the chrome has already hidden that add-on's own row (it lives in `addedSubURLs`) on the promise that
+    /// the subtitle re-appears in the ordinary track list. `discardingCues: true` is the title-change reset.
+    private func disableExternalSubtitle(discardingCues: Bool = false) {
         externalSubActive = false
+        subtitleOverlay?.setText(nil)
+        guard discardingCues else { return }
         externalSubLabel = nil
         subtitleRenderer.clear()
-        subtitleOverlay?.setText(nil)
     }
 
     /// AVFoundation cannot time-shift native embedded/HLS legible renditions. Only the VortX-owned external
