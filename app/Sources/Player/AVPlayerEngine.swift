@@ -125,6 +125,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     private let subtitleRenderer = SubtitleCueRenderer()
     private weak var subtitleOverlay: SubtitleOverlayView?
     private var externalSubActive = false
+    /// Label of the loaded external overlay subtitle, so it can be published as a REAL row of `tracks(ofType:
+    /// "sub")` instead of being invisible to the chrome. Build 191 field defect: on this engine an add-on /
+    /// pooled subtitle rendered over the video while the picker showed "Off" ticked and the row the viewer
+    /// tapped vanished from the add-on section (the chrome hides an added row because on libmpv the same
+    /// subtitle re-appears in the ordinary track list - a promise this engine never kept). Non-nil exactly
+    /// while `externalSubActive` is true, so a load / disable can never leave a phantom row behind.
+    private var externalSubLabel: (title: String, lang: String)?
     // Asset chapter markers, loaded async once the item is ready (empty when the asset carries none).
     private var loadedChapters: [MPVChapter] = []
     // Container frame rate for the subtitle release fingerprint (Gap 8), loaded async at readyToPlay from the
@@ -702,22 +709,60 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
 
     // MARK: Tracks / subtitles (embedded tracks via AVMediaSelection; external subs are a later step)
 
+    /// Track id of the VortX-owned external overlay subtitle. Far above any AVMediaSelectionGroup option
+    /// index (a group has a handful of options; the subtitle rendition cap is 8), so the two id spaces cannot
+    /// collide and an id from either space routes unambiguously in `setSubtitleTrack`.
+    static let externalSubtitleTrackID = 100_000
+
     func tracks(ofType type: String) -> [MPVTrack] {
         switch type {
         case "audio": return audioTracks
-        case "sub":   return subTracks
+        case "sub":   return subTracks + externalSubtitleTracks()
         default:      return []
         }
     }
+
+    /// The external overlay subtitle as a normal, selectable, tickable row - the same shape libmpv publishes
+    /// once it has sub-added a file. Empty when no external subtitle is loaded, so a source with none keeps
+    /// exactly its previous list.
+    private func externalSubtitleTracks() -> [MPVTrack] {
+        guard let label = externalSubLabel else { return [] }
+        return [MPVTrack(id: Self.externalSubtitleTrackID, type: "sub",
+                         title: label.title, lang: label.lang,
+                         selected: externalSubActive, forced: false)]
+    }
+
     func setAudioTrack(_ id: Int) { select(id, in: audioGroup) }
     /// Selecting an embedded/HLS legible track (or turning subtitles Off) also turns OFF any external overlay
     /// sub, so the two never fight or double up. `id < 0` = Off, which the caller uses for the "Off" row.
+    /// `externalSubtitleTrackID` re-selects the already-loaded external overlay (its cues stay parsed across a
+    /// detour through an embedded track or Off), which is what makes the external row behave like every other
+    /// row in the picker instead of being a one-way door.
     func setSubtitleTrack(_ id: Int) {
+        if id == Self.externalSubtitleTrackID {
+            guard externalSubLabel != nil, subtitleRenderer.hasCues else { return }
+            if let group = subGroup, let item = player.currentItem {
+                item.select(nil, in: group)   // never render an embedded track under the overlay
+            }
+            externalSubActive = true
+            subtitleOverlay?.applyStyle()
+            updateSubtitleOverlay(atClock: player.currentTime().seconds)
+            publishSelectionTracks()
+            return
+        }
         if externalSubActive { disableExternalSubtitle() }
         select(id, in: subGroup)
     }
 
     /// Select option `id` (its index in the group) on the current item, or deselect for mpv's -1 = off.
+    ///
+    /// The cached track views are refreshed on EVERY call, settled or not. AVFoundation applies an HLS
+    /// rendition switch asynchronously (the item refetches the rendition's playlist first), so
+    /// `currentMediaSelection` can still report the previous option on return; the pre-fix early return then
+    /// left the cached rows carrying their OLD selected flags, and the chrome's re-read a quarter second later
+    /// silently reverted the viewer's tick with the stream buffering behind it - the field report "I click it,
+    /// the stream buffers and nothing changes". A short re-read publishes the settled state when it lands, and
+    /// the system's own selection-change notification remains the authoritative backstop.
     private func select(_ id: Int, in group: AVMediaSelectionGroup?) {
         guard let group, let item = player.currentItem else { return }
         let requested: AVMediaSelectionOption?
@@ -728,8 +773,24 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             requested = group.options[id]
         }
         item.select(requested, in: group)
-        guard item.currentMediaSelection.selectedMediaOption(in: group) == requested else { return }
         refreshSelectionTracks(for: item)
+        guard item.currentMediaSelection.selectedMediaOption(in: group) != requested else { return }
+        DiagnosticsLog.log(
+            "player",
+            "media selection not settled synchronously (group=\(group.options.count) options, requested=\(requested?.displayName ?? "off")); re-reading")
+        scheduleSelectionSettleRead(for: item)
+    }
+
+    /// Re-read AVPlayer's authoritative selection a few times over the next couple of seconds, so a rendition
+    /// switch that settles after `select` returns still reaches the chrome even if the system notification is
+    /// coalesced away. Cheap and bounded; each read publishes only on a real change.
+    private func scheduleSelectionSettleRead(for item: AVPlayerItem) {
+        for delay in [0.3, 0.8, 1.6, 3.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak item] in
+                guard let self, let item, self.player.currentItem === item else { return }
+                self.refreshSelectionTracks(for: item)
+            }
+        }
     }
 
     /// The overlay host (in `AVPlayerEngineView`) installs its subtitle overlay here so the engine can push the
@@ -766,24 +827,27 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 }
                 self.subtitleRenderer.load(cues: cues)
                 self.externalSubActive = true
+                self.externalSubLabel = (title: title, lang: lang)
                 // Turn off any embedded/HLS legible track so we don't render two subtitle streams at once.
                 if let group = self.subGroup, let item = self.player.currentItem {
                     item.select(nil, in: group)
-                    if item.currentMediaSelection.selectedMediaOption(in: group) == nil {
-                        self.refreshSelectionTracks(for: item)
-                    }
                 }
                 self.subtitleOverlay?.applyStyle()
                 self.updateSubtitleOverlay(atClock: self.player.currentTime().seconds)
+                // Publish unconditionally: the external row is now part of the track list, so the picker must
+                // learn about it whether or not the native deselect changed a group index.
+                self.publishSelectionTracks()
                 finish(true)
             }
         }
     }
 
     /// Turn off the external overlay subtitle (clear cues + hide the overlay). Native track selection is
-    /// untouched, so the caller can then select an embedded track or leave subtitles Off.
+    /// untouched, so the caller can then select an embedded track or leave subtitles Off. The published row
+    /// disappears with the cues, so the picker never offers a row that has nothing behind it.
     private func disableExternalSubtitle() {
         externalSubActive = false
+        externalSubLabel = nil
         subtitleRenderer.clear()
         subtitleOverlay?.setText(nil)
     }
@@ -1619,17 +1683,32 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         }
     }
 
-    /// Rebuild cached selected flags from AVPlayer's authoritative currentMediaSelection. Called after a
-    /// successful explicit selection and from AVPlayer's system-driven selection-change notification.
+    /// Rebuild cached selected flags from AVPlayer's authoritative currentMediaSelection. Called after every
+    /// explicit selection, from the bounded settle re-read, and from AVPlayer's system-driven
+    /// selection-change notification.
+    ///
+    /// The VortX-owned external overlay subtitle participates in the SAME "which row is ticked" identity, so
+    /// turning it on or off publishes a new track list even when no AVMediaSelectionGroup index moved. Without
+    /// that, an add-on subtitle could start rendering while the picker still showed Off ticked (the build 191
+    /// field report) because nothing in the group had changed.
     private func refreshSelectionTracks(for item: AVPlayerItem) {
         guard player.currentItem === item else { return }
         let audioID = audioGroup.flatMap { Self.selectedIndex(in: $0, item: item) }
-        let subtitleID = subGroup.flatMap { Self.selectedIndex(in: $0, item: item) }
+        let nativeSubtitleID = subGroup.flatMap { Self.selectedIndex(in: $0, item: item) }
+        let subtitleID = externalSubActive ? Self.externalSubtitleTrackID : nativeSubtitleID
         audioTracks = audioGroup.map { Self.mpvTracks(from: $0, type: "audio", item: item) } ?? []
         subTracks = subGroup.map { Self.mpvTracks(from: $0, type: "sub", item: item) } ?? []
         if selectionRefreshState.update(audio: audioID, subtitle: subtitleID) {
             emit(MPVProperty.trackList, nil)
         }
+    }
+
+    /// Force one track-list publication from the engine's current state. Used by the external-subtitle paths,
+    /// whose change is invisible to the group-index snapshot the incremental refresh compares against.
+    private func publishSelectionTracks() {
+        guard let item = player.currentItem else { return }
+        selectionRefreshState.reset()
+        refreshSelectionTracks(for: item)
     }
 
     private static func selectedIndex(in group: AVMediaSelectionGroup, item: AVPlayerItem) -> Int? {

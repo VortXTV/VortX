@@ -70,22 +70,34 @@ enum MultiAudioPolicy {
     }
 
     /// Selects the one metadata-qualified alternate without treating stream metadata as packet proof.
+    ///
+    /// CODEC RULE (build 191 field defect, "audio says the language name but shows no options"): the caller
+    /// hands over only tracks it already proved AVPlayer-decodable and stream-copyable, and the alternate is
+    /// muxed into its OWN independent audio-only fMP4 sink whose stream parameters are copied from that
+    /// track - nothing about that sink requires the primary's codec. The pre-fix rule additionally demanded
+    /// `codecID == primary.codecID`, which qualifies NOTHING on the ordinary UHD remux shape (one codec per
+    /// language: TrueHD/E-AC-3/DTS/AC-3), so those files advertised a single URI-less row and the audio menu
+    /// had exactly one entry and no alternative to pick. A SAME-codec alternate is still preferred first, so
+    /// every file that qualified before keeps its exact previous rendition; a different-codec alternate is
+    /// taken only when no same-codec one exists, which is precisely the case that used to yield nothing.
     static func alternateCandidate(from tracks: [AudioTrack], primaryIndex: Int) -> AudioTrack? {
         guard let primaryTrack = tracks.first(where: { $0.index == primaryIndex }) else { return nil }
         let primaryLanguage = languageKey(primaryTrack.language)
         guard !isUnknownLanguage(primaryLanguage) else { return nil }
 
-        return tracks
-            .filter { track in
-                guard track.index != primaryIndex,
-                      track.codecID == primaryTrack.codecID else { return false }
-                let candidateLanguage = languageKey(track.language)
-                return !isUnknownLanguage(candidateLanguage) && candidateLanguage != primaryLanguage
-            }
-            .min { lhs, rhs in
-                if lhs.channels != rhs.channels { return lhs.channels > rhs.channels }
-                return lhs.index < rhs.index
-            }
+        let eligible = tracks.filter { track in
+            guard track.index != primaryIndex else { return false }
+            let candidateLanguage = languageKey(track.language)
+            return !isUnknownLanguage(candidateLanguage) && candidateLanguage != primaryLanguage
+        }
+        let ordered: (AudioTrack, AudioTrack) -> Bool = { lhs, rhs in
+            let lhsSameCodec = lhs.codecID == primaryTrack.codecID
+            let rhsSameCodec = rhs.codecID == primaryTrack.codecID
+            if lhsSameCodec != rhsSameCodec { return lhsSameCodec }
+            if lhs.channels != rhs.channels { return lhs.channels > rhs.channels }
+            return lhs.index < rhs.index
+        }
+        return eligible.min(by: ordered)
     }
 
     /// Builds the only supported Beta 7 topology: the selected primary remains in the video fMP4 and one
