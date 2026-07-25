@@ -127,15 +127,64 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         let subtitles: [SubtitleRenditionPolicy.Rendition]
     }
 
+    // MARK: - Hosting (external engine mode)
+
+    /// Turns this session from a private loopback mount into one HOSTED for another device on the network.
+    ///
+    /// Presence of this config is the ONE switch that changes the server's posture, deliberately: the bind
+    /// host, the strict HTTP layer and the session path prefix are all derived from it rather than from
+    /// independent flags, so "listening on 0.0.0.0 with no credential" is unrepresentable rather than merely
+    /// discouraged. `nil` (the default, and what every on-device caller passes) leaves the server byte-identical
+    /// to what shipped: loopback bind, method-blind parse, no path prefix, no Range handling.
+    struct HostingConfig: Equatable {
+        /// 128 bits of CSPRNG material, minted per session by `VortXEngineHostPolicy.makeCapability()`. Every
+        /// resource of this session hangs under `/r/<capability>/`, which authenticates every child fetch for
+        /// free because every playlist URI the server emits is relative.
+        let capability: String
+
+        /// Ask the session to retain its ENTIRE produced timeline rather than sliding a window, which is what
+        /// lets the client seek backwards anywhere into what has been produced. Only a host has the disk for
+        /// this. The request may be DOWNGRADED at construction when the machine cannot support it, so read
+        /// `VortXRemuxHLSServer.retainsFullTimeline` for what was actually granted.
+        let retainFullTimeline: Bool
+
+        init?(capability: String, retainFullTimeline: Bool = false) {
+            guard VortXEngineHostPolicy.isWellFormedCapability(capability) else { return nil }
+            self.capability = capability
+            self.retainFullTimeline = retainFullTimeline
+        }
+    }
+
+    /// Whether this session ACTUALLY retains its whole timeline. False for every on-device mount, and false for
+    /// a hosted mount on a machine that turned out not to have the disk.
+    var retainsFullTimeline: Bool { stream.retainsFullTimeline }
+
+    private let hosting: HostingConfig?
+
+    /// True when this session is serving another device rather than this process's own AVPlayer.
+    var isHosted: Bool { hosting != nil }
+
+    /// The absolute path the master playlist answers on. `/master.m3u8` for a loopback session (unchanged);
+    /// `/r/<capability>/master.m3u8` for a hosted one. The engine host hands this plus `port` to the client,
+    /// which builds the URL against the address it already dialled, so the server never has to guess which of
+    /// its own interfaces the client can reach (this is what makes Tailscale and mDNS work for free).
+    var mountResourcePath: String {
+        guard let hosting else { return "/master.m3u8" }
+        return VortXEngineHostPolicy.mountPath(capability: hosting.capability, resource: "master.m3u8")
+    }
+
     /// Build the remux stream + local server for an MKV URL. Returns nil when the listener cannot bind
     /// (the caller fails soft to libmpv). The caller must `start()` the returned server to begin remuxing.
     /// `mode` (#147): `.dolbyVision` (the default, the original lane) or `.plain` for a non-DV MKV kept on
     /// AVPlayer for Picture in Picture; the mode flows into classify + signaling (see VortXMKVRemuxStream.Mode).
     /// `startAtSeconds` is a sanitized source-timeline origin consumed by AVPlayer before this mount exists.
     /// The stream seeks once before muxing, then publishes the base-video timestamp it actually reached.
+    /// `hosting` is nil for every on-device mount and non-nil only for a session an engine host is serving to
+    /// another device; see `HostingConfig`.
     static func make(input: URL, headers: [String: String]?,
                      mode: VortXMKVRemuxStream.Mode = .dolbyVision,
                      startAtSeconds: Double = 0,
+                     hosting: HostingConfig? = nil,
                      onStartupTimeout: @escaping @Sendable (VortXRemuxHLSServer) -> Void = { _ in })
         -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
         let stream = VortXMKVRemuxStream(
@@ -143,9 +192,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             headers: headers,
             indexForHLS: true,
             mode: mode,
-            startAtSeconds: startAtSeconds)
+            startAtSeconds: startAtSeconds,
+            retainFullTimeline: hosting?.retainFullTimeline ?? false)
         guard let server = VortXRemuxHLSServer(
             stream: stream,
+            hosting: hosting,
             onStartupTimeout: onStartupTimeout) else {
             stream.cancel()
             stream.listenerDidRetire()
@@ -156,16 +207,18 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         comps.scheme = "http"
         comps.host = "127.0.0.1"
         comps.port = Int(server.port)
-        comps.path = "/master.m3u8"
+        comps.path = server.mountResourcePath
         guard let url = comps.url else { server.invalidate(); return nil }
         return (server, url)
     }
 
     private init?(stream: VortXMKVRemuxStream,
+                  hosting: HostingConfig?,
                   onStartupTimeout: @escaping @Sendable (VortXRemuxHLSServer) -> Void) {
         guard let startupReadiness = VortXHLSStartupReadiness(
             frozenTarget: stream.frozenHLSTarget) else { return nil }
         self.stream = stream
+        self.hosting = hosting
         self.startupReadiness = startupReadiness
         self.onStartupTimeout = onStartupTimeout
     }
@@ -226,8 +279,26 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         stream.hlsSnapshot().initData != nil && stream.buffer.status().failure == nil
     }
 
+    /// The classifier's published signalling, or nil before classify finishes.
+    ///
+    /// Exposed for one reason: a HOSTED session's client has to fire its own Dolby Vision panel switch. The
+    /// switch inside `serveMaster` is `#if os(tvOS)` and a host is a Mac, so it is compiled out there and a
+    /// hosted session would otherwise present true DV to a panel nobody switched.
+    var signaling: VortXMKVRemuxStream.HLSSignaling? { stream.hlsSnapshot().signaling }
+
     /// Monotonic mount-progress counters for the chrome's progress-aware start watchdog. Thread-safe passthrough.
     var mountProgress: VortXMKVRemuxStream.MountProgress { stream.mountProgress() }
+
+    /// The furthest SOURCE second a closed segment has been published for.
+    ///
+    /// On-device this is inferable from AVPlayer's own seekable ranges, so nothing reads it. A remote client
+    /// cannot infer it (its AVPlayer only knows what the playlist currently advertises, and on a retaining
+    /// session that is the whole timeline regardless of production), so a host reports it explicitly and the
+    /// client clamps forward seeks against it exactly as the on-device lane does.
+    var producedEdgeSeconds: Double {
+        guard let last = stream.hlsWindowSnapshot().window.segments.last else { return 0 }
+        return timelineOriginSeconds + last.end
+    }
 
     /// Stop everything: the remux thread, the listener, and every open connection. Idempotent.
     func invalidate() {
@@ -255,12 +326,18 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         return invalidated
     }
 
-    /// Start the loopback listener synchronously (the VXTrailerProxy pattern) and record its port.
+    /// Start the listener synchronously (the VXTrailerProxy pattern) and record its port.
+    ///
+    /// The bind host is DERIVED from the hosting credential, never configured separately: no capability means
+    /// loopback, which is the shipped invariant ("never reachable off-device"). `VXDiagExport.swift:154-163` is
+    /// the working precedent for the `0.0.0.0` bind with these same `NWParameters`.
     private func listen() -> Bool {
         do {
+            let bind = VortXEngineHostPolicy.bindHost(capability: hosting?.capability)
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
-            params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .any)
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(bind.hostString), port: .any)
             let newListener = try NWListener(using: params)
             newListener.newConnectionHandler = { [weak self] connection in
                 self?.accept(connection)
@@ -290,7 +367,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             }
             listener = newListener
             port = bound
-            DiagnosticsLog.log("dv", "hls server listening on 127.0.0.1:\(bound)")
+            DiagnosticsLog.log("dv", "hls server listening on \(bind.hostString):\(bound)\(hosting == nil ? "" : " [hosted]")")
             return true
         } catch {
             DiagnosticsLog.log("dv", "hls server listener start failed: \(error)")
@@ -361,47 +438,75 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         }
     }
 
-    /// Parse "GET /path HTTP/1.1" and dispatch to the four resources.
+    /// How one request's response is shaped. `.legacy` is the shipped behaviour and the only value a loopback
+    /// session ever produces: treat everything as a body-bearing GET, ignore `Range`. A hosted session may
+    /// additionally see HEAD (a probe) and Range (a recovery-path partial fetch), which loopback CoreMedia has
+    /// never sent and which we therefore do not start answering differently on the on-device lane.
+    struct Delivery: Equatable {
+        let method: VortXEngineHostPolicy.Method
+        let range: VortXEngineHostPolicy.RangeSpec?
+        static let legacy = Delivery(method: .get, range: nil)
+        var wantsBody: Bool { method == .get }
+    }
+
+    /// Parse the request and dispatch to the resources.
+    ///
+    /// The parse itself lives in `VortXEngineHostPolicy.route`, which is pure and therefore provable. For a
+    /// loopback session it returns `.legacy` and reproduces the shipped parse exactly (method-blind,
+    /// Range-blind); for a hosted session it enforces the capability, the method and the path prefix BEFORE a
+    /// byte is written. A failed capability check closes with no reply at all, so a scanner on the LAN learns
+    /// nothing it could not already learn from the open port.
     private func route(_ connection: NWConnection, header: Data) {
-        guard !isInvalidated,
-              let text = String(data: header, encoding: .utf8),
-              let requestLine = text.components(separatedBy: "\r\n").first else {
+        guard !isInvalidated, let text = String(data: header, encoding: .utf8) else {
             close(connection, status: "400 Bad Request")
             return
         }
-        let parts = requestLine.components(separatedBy: " ")
-        guard parts.count >= 2 else {
-            close(connection, status: "400 Bad Request")
-            return
+        switch VortXEngineHostPolicy.route(header: text, capability: hosting?.capability) {
+        case .legacy(let path):
+            DiagnosticsLog.log("dv", "hls req \(path)")
+            dispatch(connection, path: path, delivery: .legacy)
+        case .guarded(let method, let path, let range):
+            DiagnosticsLog.log("dv", "hls req \(path) [hosted \(method.rawValue)\(range == nil ? "" : " ranged")]")
+            dispatch(connection, path: path, delivery: Delivery(method: method, range: range))
+        case .reject(let status):
+            if let status {
+                close(connection, status: status)
+            } else {
+                // No reply at all. See `VortXEngineHostPolicy.Route.reject`.
+                connection.cancel()
+            }
         }
-        let path = parts[1].components(separatedBy: "?").first ?? parts[1]
-        DiagnosticsLog.log("dv", "hls req \(path)")
+    }
+
+    private func dispatch(_ connection: NWConnection, path: String, delivery: Delivery) {
         switch path {
-        case "/master.m3u8":    serveMaster(connection)
-        case "/media.m3u8":     serveMedia(connection, hdr: false)
-        case "/media-hdr.m3u8": serveMedia(connection, hdr: true)
-        case "/init.mp4":       serveInit(connection, hdr: false)
-        case "/init-hdr.mp4":   serveInit(connection, hdr: true)
+        case "/master.m3u8":    serveMaster(connection, delivery: delivery)
+        case "/media.m3u8":     serveMedia(connection, hdr: false, delivery: delivery)
+        case "/media-hdr.m3u8": serveMedia(connection, hdr: true, delivery: delivery)
+        case "/init.mp4":       serveInit(connection, hdr: false, delivery: delivery)
+        case "/init-hdr.mp4":   serveInit(connection, hdr: true, delivery: delivery)
         default:
             if let audioRequest = MultiAudioPolicy.parseRequest(path: path) {
                 switch audioRequest {
                 case .playlist(let renditionID):
-                    serveAudioPlaylist(connection, renditionID: renditionID)
+                    serveAudioPlaylist(connection, renditionID: renditionID, delivery: delivery)
                 case .initialization(let renditionID):
-                    serveAudioInit(connection, renditionID: renditionID)
+                    serveAudioInit(connection, renditionID: renditionID, delivery: delivery)
                 case .segment(let renditionID, let segmentID):
-                    serveAudioSegment(connection, renditionID: renditionID, segmentID: segmentID)
+                    serveAudioSegment(connection, renditionID: renditionID, segmentID: segmentID,
+                                      delivery: delivery)
                 }
             } else if let subtitleRequest = SubtitleRenditionPolicy.parseRequest(path: path) {
                 switch subtitleRequest {
                 case .playlist(let renditionID):
-                    serveSubtitlePlaylist(connection, renditionID: renditionID)
+                    serveSubtitlePlaylist(connection, renditionID: renditionID, delivery: delivery)
                 case .segment(let renditionID, let segmentID):
-                    serveSubtitleSegment(connection, renditionID: renditionID, segmentID: segmentID)
+                    serveSubtitleSegment(connection, renditionID: renditionID, segmentID: segmentID,
+                                         delivery: delivery)
                 }
             } else if path.hasPrefix("/seg"), path.hasSuffix(".m4s"),
                let index = Int(path.dropFirst(4).dropLast(4)) {
-                serveSegment(connection, index: index)
+                serveSegment(connection, index: index, delivery: delivery)
             } else {
                 DiagnosticsLog.log("dv", "hls 404 \(path)")
                 close(connection, status: "404 Not Found")
@@ -495,7 +600,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// Master playlist: TWO variants (DV -> media.m3u8, lifeboat -> media-hdr.m3u8, #143). Held until the
     /// remux has classified the source
     /// and written its header (the signaling exists from then on).
-    private func serveMaster(_ connection: NWConnection) {
+    private func serveMaster(_ connection: NWConnection, delivery: Delivery = .legacy) {
         guard let sig = waitForMount({ stream.hlsSnapshot().signaling }) else {
             DiagnosticsLog.log("dv", "hls 404 /master.m3u8")
             close(connection, status: "404 Not Found")
@@ -612,7 +717,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             mediaTags: audioTags + subtitleTags,
             streamInfAttributes: audioAttribute + subtitleAttribute)
         DiagnosticsLog.log("dv", "hls resp /master.m3u8 variants=\(sig.dolbyVision ? 2 : 1) audio=\(audioPlan == nil ? 0 : 1) audioTags=\(audioTags.count) subs=\(subtitleRenditions.count) \(body.count)B")
-        respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
+        respond(connection, body: body, contentType: "application/vnd.apple.mpegurl", delivery: delivery)
     }
 
     /// Freeze the shortest absolute-zero cohort that satisfies every rendition's rendered-duration floor.
@@ -811,7 +916,24 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                     || common.segments.last?.id == snapshot.audioWindow?.segments.last?.id)
                 && (snapshot.subtitleWindow == nil
                     || common.segments.last?.id == snapshot.subtitleWindow?.segments.last?.id)
-            if commonReachedEOF,
+            if retainsFullTimeline {
+                // FULL-TIMELINE RETENTION (hosted sessions only). The window START never advances: the playlist
+                // always begins at the first segment and only grows at the tail, which is exactly the EVENT
+                // promise the renderers make below and is what entitles AVPlayer to treat the whole produced
+                // timeline as seekable. Backward seek stops being a demote and becomes an ordinary seek.
+                //
+                // Nothing has to be taught not to evict. Spool retention is playlist-receipt driven: a deadline
+                // is armed only for a key that was in the PREVIOUS generation and is absent from this one, so a
+                // playlist that never drops an entry never arms a deadline and nothing is ever collected. The
+                // only real obstacle was the 512 MiB admission ceiling, raised for a retaining spool.
+                //
+                // Skipping `minimumConformingSuffix` here is not an optimisation, it is a requirement. That
+                // function walks every suffix of the window and re-renders each one's duration through
+                // `String(format:)`, which is O(n squared) formatted-string round trips per reload; at the 3600
+                // to 7200 segments of a two-hour title that is seconds of CPU on every playlist fetch. With a
+                // pinned start there is nothing to slide, so its entire purpose is void anyway.
+                selectedVideo = common
+            } else if commonReachedEOF,
                (common.segments.count < startupReadiness.minimumSegmentCount
                 || (DVPlaybackPolicy.renderedDurationMilliseconds(of: common) ?? 0)
                     < startupReadiness.minimumRenderedDurationMilliseconds) {
@@ -987,7 +1109,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     }
 
     /// Both video variants render the exact same coordinator-owned absolute-ID frontier.
-    private func serveMedia(_ connection: NWConnection, hdr: Bool) {
+    private func serveMedia(_ connection: NWConnection, hdr: Bool, delivery: Delivery = .legacy) {
         let path = hdr ? "/media-hdr.m3u8" : "/media.m3u8"
         publicationLock.lock()
         let hdrAdvertised = advertisedDolbyVision
@@ -1010,20 +1132,21 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             ended: publication.ended,
             mapURI: hdr ? "init-hdr.mp4" : "init.mp4")
         DiagnosticsLog.log("dv", "hls resp \(path) seq=\(publication.videoWindow.mediaSequence) segs=\(publication.videoWindow.segments.count) ended=\(publication.ended) \(body.count)B")
-        respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
+        respond(connection, body: body, contentType: "application/vnd.apple.mpegurl", delivery: delivery)
     }
 
     /// Pure rendering of the exact immutable storage window used for request lookup.
     private func buildMediaBody(window: VortXHLSWindow, ended: Bool, mapURI: String) -> Data {
         let lines = DVPlaybackPolicy.mediaPlaylistLines(window: window, ended: ended,
-            targetDuration: startupReadiness.frozenTarget.seconds, mapURI: mapURI)
+            targetDuration: startupReadiness.frozenTarget.seconds, mapURI: mapURI,
+            isEvent: retainsFullTimeline)
         return Data(lines.joined(separator: "\n").utf8)
     }
 
     /// The ftyp+moov init segment, retained in memory for the whole session (immune to window eviction).
     /// `hdr` serves the lifeboat's dvvC-stripped copy (#143); both publish in the same lock write, so
     /// whichever exists implies both do (the nil-coalesce is a belt-and-braces fallback, not a lane).
-    private func serveInit(_ connection: NWConnection, hdr: Bool) {
+    private func serveInit(_ connection: NWConnection, hdr: Bool, delivery: Delivery = .legacy) {
         let path = hdr ? "/init-hdr.mp4" : "/init.mp4"
         let initData = waitForResource(seconds: Self.resourceWaitSeconds) { () -> Data? in
             let snap = stream.hlsSnapshot()
@@ -1035,12 +1158,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             return
         }
         DiagnosticsLog.log("dv", "hls resp \(path) \(initData.count)B")
-        respond(connection, body: initData, contentType: "video/mp4")
+        respond(connection, body: initData, contentType: "video/mp4", delivery: delivery)
     }
 
     /// Resource lookup is independent of the current playlist window. A URI removed from a later generation
     /// stays openable through its receipt-derived deadline, and the lease is acquired before any 200 bytes.
-    private func serveSegment(_ connection: NWConnection, index: Int) {
+    private func serveSegment(_ connection: NWConnection, index: Int, delivery: Delivery = .legacy) {
         // A video segment REQUEST is the client's consumption receipt: requesting seg N proves its playlist
         // coverage reaches N, so the published window may slide up to N minus the keep-behind (and no
         // further). This is the anchor the consumption-bounded slide in `currentPublication` keys on.
@@ -1051,14 +1174,16 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             connection,
             key: .video(segmentID: index),
             path: "/seg\(index).m4s",
-            contentType: "video/mp4")
+            contentType: "video/mp4",
+            delivery: delivery)
     }
 
     private static let segmentChunk = 512 * 1024
 
     // MARK: - Optional aligned audio rendition
 
-    private func serveAudioPlaylist(_ connection: NWConnection, renditionID: Int) {
+    private func serveAudioPlaylist(_ connection: NWConnection, renditionID: Int,
+                                    delivery: Delivery = .legacy) {
         guard let publication = waitForResource(seconds: Self.resourceWaitSeconds, {
             self.currentPublication()
         }), publication.audioPlan?.alternate.id == renditionID,
@@ -1070,13 +1195,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             renditionID: renditionID,
             window: window,
             ended: publication.ended || publication.audioTerminated,
-            targetDuration: startupReadiness.frozenTarget.seconds)
+            targetDuration: startupReadiness.frozenTarget.seconds,
+            isEvent: retainsFullTimeline)
         let body = Data(lines.joined(separator: "\n").utf8)
         DiagnosticsLog.log("dv", "hls resp /audio\(renditionID).m3u8 seq=\(window.mediaSequence) segs=\(window.segments.count)\(publication.audioTerminated ? " [terminated]" : "")")
-        respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
+        respond(connection, body: body, contentType: "application/vnd.apple.mpegurl", delivery: delivery)
     }
 
-    private func serveAudioInit(_ connection: NWConnection, renditionID: Int) {
+    private func serveAudioInit(_ connection: NWConnection, renditionID: Int,
+                                delivery: Delivery = .legacy) {
         publicationLock.lock()
         let advertised = advertisedAudioPlan?.alternate.id == renditionID
         let retainedInit = advertisedAudioInitData
@@ -1088,12 +1215,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
-        respond(connection, body: data, contentType: "audio/mp4")
+        respond(connection, body: data, contentType: "audio/mp4", delivery: delivery)
     }
 
     private func serveAudioSegment(_ connection: NWConnection,
                                    renditionID: Int,
-                                   segmentID: Int) {
+                                   segmentID: Int,
+                                   delivery: Delivery = .legacy) {
         publicationLock.lock()
         let advertised = advertisedAudioPlan?.alternate.id == renditionID
         publicationLock.unlock()
@@ -1105,12 +1233,14 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             connection,
             key: .audio(renditionID: renditionID, segmentID: segmentID),
             path: "/audio\(renditionID)-seg\(segmentID).m4s",
-            contentType: "audio/mp4")
+            contentType: "audio/mp4",
+            delivery: delivery)
     }
 
     // MARK: - Optional settled subtitle renditions
 
-    private func serveSubtitlePlaylist(_ connection: NWConnection, renditionID: Int) {
+    private func serveSubtitlePlaylist(_ connection: NWConnection, renditionID: Int,
+                                       delivery: Delivery = .legacy) {
         guard let publication = waitForResource(seconds: Self.resourceWaitSeconds, {
             self.currentPublication()
         }), publication.subtitles.contains(where: { $0.id == renditionID }),
@@ -1122,15 +1252,18 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             renditionID: renditionID,
             window: window,
             ended: publication.ended,
-            targetDuration: startupReadiness.frozenTarget.seconds)
+            targetDuration: startupReadiness.frozenTarget.seconds,
+            isEvent: retainsFullTimeline)
         respond(connection,
                 body: Data(lines.joined(separator: "\n").utf8),
-                contentType: "application/vnd.apple.mpegurl")
+                contentType: "application/vnd.apple.mpegurl",
+                delivery: delivery)
     }
 
     private func serveSubtitleSegment(_ connection: NWConnection,
                                       renditionID: Int,
-                                      segmentID: Int) {
+                                      segmentID: Int,
+                                      delivery: Delivery = .legacy) {
         publicationLock.lock()
         let advertised = advertisedSubtitles.contains(where: { $0.id == renditionID })
         publicationLock.unlock()
@@ -1143,13 +1276,69 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             key: .subtitle(renditionID: renditionID, segmentID: segmentID),
             path: SubtitleRenditionPolicy.segmentURI(
                 renditionID: renditionID, segmentID: segmentID),
-            contentType: "text/vtt")
+            contentType: "text/vtt",
+            delivery: delivery)
     }
 
     private func serveSpoolResource(_ connection: NWConnection,
                                     key: VortXHLSSessionSpool.ResourceKey,
                                     path: String,
-                                    contentType: String) {
+                                    contentType: String,
+                                    delivery: Delivery = .legacy) {
+        // HOSTED-ONLY BRANCHES FIRST, and they are only reachable for a hosted session because `Delivery` is
+        // always `.legacy` on the loopback lane (see `route`). Everything after this block is the shipped code
+        // path, unchanged, which is what keeps external-mode-off byte-identical.
+        if delivery != .legacy {
+            if !delivery.wantsBody {
+                // HEAD: answer the headers a GET would have produced, without opening a response pump. Used by
+                // a client probing whether a resource exists before committing to a fetch.
+                guard let lease = stream.openHLSResource(key) else {
+                    close(connection, status: "404 Not Found")
+                    return
+                }
+                let length = lease.length
+                lease.close()
+                DiagnosticsLog.log("dv", "hls head \(path) \(length)B")
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: \(contentType)\r\nContent-Length: \(length)\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in
+                    connection.cancel()
+                })
+                return
+            }
+            if let spec = delivery.range {
+                guard let lease = stream.openHLSResource(key) else {
+                    DiagnosticsLog.log("dv", "hls 404 \(path)")
+                    close(connection, status: "404 Not Found")
+                    return
+                }
+                let total = lease.length
+                guard let resolved = VortXEngineHostPolicy.resolve(spec, length: total) else {
+                    lease.close()
+                    DiagnosticsLog.log("dv", "hls 416 \(path) len=\(total)")
+                    close(connection, status: "416 Range Not Satisfiable")
+                    return
+                }
+                guard let response = VortXRangedSpoolPump(
+                    lease: lease, chunkSize: Self.segmentChunk, range: resolved) else {
+                    DiagnosticsLog.log("dv", "hls 404 \(path) (range pump)")
+                    close(connection, status: "404 Not Found")
+                    return
+                }
+                DiagnosticsLog.log(
+                    "dv", "hls resp \(path) 206 \(resolved.lowerBound)-\(resolved.upperBound)/\(total)")
+                let head = "HTTP/1.1 206 Partial Content\r\nContent-Type: \(contentType)\r\nContent-Length: \(resolved.count)\r\nContent-Range: bytes \(resolved.lowerBound)-\(resolved.upperBound)/\(total)\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                response.start(
+                    header: Data(head.utf8),
+                    cancelled: { [weak self] in self?.isInvalidated ?? true },
+                    send: { content, completion in
+                        connection.send(content: content, completion: .contentProcessed { error in
+                            completion(error == nil)
+                        })
+                    },
+                    terminal: { _ in connection.cancel() })
+                return
+            }
+        }
         guard let lease = stream.openHLSResource(key),
               let response = VortXSpoolResponsePump(
                   lease: lease,
@@ -1159,7 +1348,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             return
         }
         DiagnosticsLog.log("dv", "hls resp \(path) \(lease.length)B")
-        let head = "HTTP/1.1 200 OK\r\nContent-Type: \(contentType)\r\nContent-Length: \(lease.length)\r\nConnection: close\r\n\r\n"
+        // `Accept-Ranges` is advertised only on a hosted session. Adding a header to the loopback response
+        // would be a behaviour change on the lane that must not move, and CoreMedia over loopback has never
+        // asked for one.
+        let acceptRanges = hosting == nil ? "" : "Accept-Ranges: bytes\r\n"
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: \(contentType)\r\nContent-Length: \(lease.length)\r\n\(acceptRanges)Connection: close\r\n\r\n"
         response.start(
             header: Data(head.utf8),
             cancelled: { [weak self] in self?.isInvalidated ?? true },
@@ -1173,10 +1366,16 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     // MARK: - Response helpers
 
-    private func respond(_ connection: NWConnection, body: Data, contentType: String) {
+    /// Answer a small in-memory resource (a playlist, an init segment).
+    ///
+    /// A `Range` on one of these is deliberately ignored and answered whole with a 200: a playlist is a few KB,
+    /// an init segment a few hundred bytes, and no HLS client partial-fetches either. HEAD is honoured because
+    /// it costs one branch and a hosted client may legitimately probe.
+    private func respond(_ connection: NWConnection, body: Data, contentType: String,
+                         delivery: Delivery = .legacy) {
         let head = "HTTP/1.1 200 OK\r\nContent-Type: \(contentType)\r\nCache-Control: no-cache\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
         var payload = Data(head.utf8)
-        payload.append(body)
+        if delivery.wantsBody { payload.append(body) }
         connection.send(content: payload, completion: .contentProcessed { _ in
             connection.cancel()
         })

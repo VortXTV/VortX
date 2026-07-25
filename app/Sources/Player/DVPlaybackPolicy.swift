@@ -184,14 +184,22 @@ enum DVPlaybackPolicy {
     /// Render exactly one immutable resident window. A sliding playlist cannot declare EVENT because an EVENT
     /// playlist may not remove earlier entries. The precise zero-start preference is valid only while segment zero
     /// is still the start of the session; after eviction MEDIA-SEQUENCE advances to the first retained absolute id.
+    ///
+    /// `isEvent` is the exception, and it defaults false so every existing caller renders byte-for-byte what it
+    /// always has. An engine host that RETAINS its whole timeline never removes an entry, which is exactly the
+    /// promise RFC 8216 4.3.3.5 defines EVENT as, and making that promise explicit is what entitles a client to
+    /// treat the whole timeline as seekable instead of assuming the start may move out from under it. Declaring
+    /// EVENT on a sliding playlist would be a lie that clients are allowed to act on, hence the default.
     static func mediaPlaylistLines(window: VortXHLSWindow, ended: Bool,
-                                   targetDuration: Int, mapURI: String) -> [String] {
+                                   targetDuration: Int, mapURI: String,
+                                   isEvent: Bool = false) -> [String] {
         var lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:7",
             "#EXT-X-TARGETDURATION:\(targetDuration)",
             "#EXT-X-MEDIA-SEQUENCE:\(window.mediaSequence)",
         ]
+        if isEvent { lines.append("#EXT-X-PLAYLIST-TYPE:EVENT") }
         if window.mediaSequence == 0 {
             lines.append("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES")
         }

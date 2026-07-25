@@ -1,0 +1,322 @@
+// Executable harness for the EXTERNAL ENGINE MODE routing/auth/failover decisions.
+//
+//   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
+//     -o /tmp/vortx-engine-host-policy-test \
+//     app/SourcesShared/VortXEngineHostPolicy.swift \
+//     app/Tests/VortXEngineHostPolicyTests.swift && /tmp/vortx-engine-host-policy-test
+//
+// This suite CALLS the production decisions (the RemuxResumePolicyTests pattern). VortXEngineHostPolicy is pure
+// Foundation with no other dependencies, so it compiles standalone with no stubs required.
+//
+// The single property that matters more than any other, per the source's own TOP INVARIANT comment: **with
+// external mode off (no capability), every decision must reduce to today's shipping behaviour exactly** ,
+// method-blind, Range-blind, path-exact, and it must NEVER reject a request that today's server would have
+// answered. Section 1 below (`defaultOff*`) pins that equivalence; everything after it is the strict HTTP layer
+// that only ever activates for a LAN-hosted session with a real capability.
+//
+// A genuine bug was found in `normalizeHost` while writing this suite and has since been FIXED: the unbracketed
+// `host:port` split was dead code (its guard dropped one character from the front of the whole string rather
+// than everything up to the colon), so a typed port was silently ignored in favour of the default and every
+// port-validation guard was unreachable. Section 4 now pins the corrected behaviour, including
+// what the doc comment / an unbracketed caller would reasonably have expected instead.
+
+import Foundation
+
+@MainActor var failures = 0
+@MainActor func check(_ name: String, _ condition: Bool) {
+    if condition { print("PASS  \(name)") } else { failures += 1; print("FAIL  \(name)") }
+}
+
+/// `(host:port)?` is a tuple type, which cannot conform to `Equatable`, so `Optional<(String, Int)>` has no `==`
+/// overload (proven by direct compilation before writing this suite). This local comparator is the tuple
+/// counterpart to `RemuxResumePolicyTests.near` for floating point: a tiny helper standing in for an operator
+/// the standard library does not provide here.
+func hostsEqual(_ a: (host: String, port: Int)?, _ b: (host: String, port: Int)?) -> Bool {
+    switch (a, b) {
+    case (nil, nil): return true
+    case let (l?, r?): return l.host == r.host && l.port == r.port
+    default: return false
+    }
+}
+
+@MainActor @main
+enum VortXEngineHostPolicyTests {
+    static func main() { run() }
+}
+
+@MainActor func run() {
+
+typealias P = VortXEngineHostPolicy
+
+// MARK: - 1. Default-off equivalence (THE most important group)
+//
+// Every case here passes `capability: nil`, which is the shape of every session today: no engine host
+// configured, loopback only. `route` must reduce to the shipping parse , method-blind, Range-blind, path-exact ,
+// for every one of these, and the malformed-request-line case must still fail exactly as it does today (a 400,
+// not a new rejection shape).
+
+check("default-off: a normal GET routes to legacy with the exact path",
+      P.route(header: "GET /master.m3u8 HTTP/1.1", capability: nil) == .legacy(path: "/master.m3u8"))
+
+check("default-off: a query string is stripped from the legacy path",
+      P.route(header: "GET /seg7.m4s?x=1 HTTP/1.1", capability: nil) == .legacy(path: "/seg7.m4s"))
+
+// The byte-identical promise in one assertion: an utterly unrecognised method must still be served, never
+// rejected, because today's server has never once looked at the method.
+check("default-off: an unusual method still routes to legacy, never rejected",
+      P.route(header: "WOMBAT /master.m3u8 HTTP/1.1", capability: nil) == .legacy(path: "/master.m3u8"))
+
+// Range-blind: a Range header must not change the outcome or be surfaced anywhere in a legacy route.
+check("default-off: a Range header is present but ignored",
+      P.route(header: "GET /master.m3u8 HTTP/1.1\r\nRange: bytes=0-99", capability: nil)
+        == .legacy(path: "/master.m3u8"))
+
+// The one case a loopback session DOES reject today: a request line that does not even have a path.
+check("default-off: fewer than 2 space-separated parts on the request line is 400",
+      P.route(header: "GET", capability: nil) == .reject(status: "400 Bad Request"))
+
+check("default-off: bindHost with no capability is loopback",
+      P.bindHost(capability: nil) == .loopback)
+
+// A weak credential must never open the LAN. Each of these is well-formed enough to *look* like a real
+// capability at a glance but fails `isWellFormedCapability`, so both the bind and the route must degrade to
+// exactly the loopback/legacy behaviour above rather than half-authenticating.
+let weakCapabilities: [(String, String)] = [
+    ("malformed (contains a non-hex character)", String(repeating: "g", count: 32)),
+    ("short (31 chars)", String(repeating: "a", count: 31)),
+    ("uppercase hex (32 chars)", String(repeating: "A", count: 32)),
+]
+for (label, weak) in weakCapabilities {
+    check("default-off: bindHost with a \(label) capability is loopback",
+          P.bindHost(capability: weak) == .loopback)
+    check("default-off: route with a \(label) capability still routes to legacy",
+          P.route(header: "GET /master.m3u8 HTTP/1.1", capability: weak) == .legacy(path: "/master.m3u8"))
+}
+
+// MARK: - 2. Capability auth
+
+let capA = P.makeCapability()
+let capB = P.makeCapability()
+
+check("capability: makeCapability produces 32 lowercase hex characters",
+      capA.count == 32 && capA.allSatisfy { $0.isHexDigit && !$0.isUppercase })
+check("capability: two mints differ",
+      capA != capB)
+
+check("capability: a minted capability is well-formed",
+      P.isWellFormedCapability(capA))
+check("capability: an empty string is not well-formed",
+      !P.isWellFormedCapability(""))
+check("capability: 31 characters is not well-formed",
+      !P.isWellFormedCapability(String(repeating: "a", count: 31)))
+check("capability: 33 characters is not well-formed",
+      !P.isWellFormedCapability(String(repeating: "a", count: 33)))
+check("capability: uppercase hex is not well-formed",
+      !P.isWellFormedCapability(String(repeating: "A", count: 32)))
+check("capability: a non-hex character is not well-formed",
+      !P.isWellFormedCapability(String(repeating: "g", count: 32)))
+
+check("capability: bindHost is allInterfaces only for a well-formed capability",
+      P.bindHost(capability: capA) == .allInterfaces)
+
+// The authenticated happy path: the capability prefix is stripped so the resource switch sees the same path it
+// always has. Checked for both methods the guarded lane accepts.
+let goodPath = "/r/\(capA)/seg3.m4s"
+check("capability: a correctly prefixed GET routes to guarded with the prefix stripped",
+      P.route(header: "GET \(goodPath) HTTP/1.1", capability: capA)
+        == .guarded(method: .get, path: "/seg3.m4s", range: nil))
+check("capability: a correctly prefixed HEAD routes to guarded with the prefix stripped",
+      P.route(header: "HEAD \(goodPath) HTTP/1.1", capability: capA)
+        == .guarded(method: .head, path: "/seg3.m4s", range: nil))
+
+// Silent close, no body, for every way a peer can fail to present the right credential. `status: nil` is the
+// contract: an unauthorised LAN peer learns nothing beyond "a TCP port is open".
+check("capability: a wrong capability in the path is a silent reject",
+      P.route(header: "GET /r/wrongcapabilityvaluenotevenhex/seg3.m4s HTTP/1.1", capability: capA)
+        == .reject(status: nil))
+check("capability: a missing prefix is a silent reject",
+      P.route(header: "GET /seg3.m4s HTTP/1.1", capability: capA) == .reject(status: nil))
+check("capability: a truncated prefix is a silent reject",
+      P.route(header: "GET /r/\(capA.dropLast(5))/seg3.m4s HTTP/1.1", capability: capA) == .reject(status: nil))
+check("capability: a prefix belonging to a different (well-formed) session is a silent reject",
+      P.route(header: "GET /r/\(capB)/seg3.m4s HTTP/1.1", capability: capA) == .reject(status: nil))
+
+// Defensive traversal rejection, even though the resource switch never touches a filesystem.
+check("capability: a resource containing .. after the prefix is a silent reject",
+      P.route(header: "GET /r/\(capA)/../etc/passwd HTTP/1.1", capability: capA) == .reject(status: nil))
+check("capability: a resource containing // after the prefix is a silent reject",
+      P.route(header: "GET /r/\(capA)//seg3.m4s HTTP/1.1", capability: capA) == .reject(status: nil))
+
+check("capability: a method that is not GET/HEAD is 405",
+      P.route(header: "DELETE \(goodPath) HTTP/1.1", capability: capA)
+        == .reject(status: "405 Method Not Allowed"))
+
+let overLongPath = "/r/\(capA)/" + String(repeating: "a", count: 3000)
+let overLongLine = "GET \(overLongPath) HTTP/1.1"
+check("capability: an over-long request line is rejected before it is even measured",
+      overLongLine.utf8.count > P.maxRequestLineBytes
+        && P.route(header: overLongLine, capability: capA) == .reject(status: "400 Bad Request"))
+
+// MARK: - 3. Range parsing and resolution
+
+check("range: bytes=0-99 parses to fromTo",
+      P.parseRangeValue("bytes=0-99") == .fromTo(0, 99))
+check("range: bytes=100- parses to from",
+      P.parseRangeValue("bytes=100-") == .from(100))
+check("range: bytes=-50 parses to suffix",
+      P.parseRangeValue("bytes=-50") == .suffix(50))
+check("range: bytes=abc has no dash and is rejected",
+      P.parseRangeValue("bytes=abc") == nil)
+check("range: a value with no bytes= prefix is rejected",
+      P.parseRangeValue("100-200") == nil)
+check("range: a multi-range value is deliberately unsupported",
+      P.parseRangeValue("bytes=0-9,20-29") == nil)
+check("range: an inverted range (end before start) is rejected",
+      P.parseRangeValue("bytes=200-100") == nil)
+
+// Case-insensitive header discovery, and nil when the header is simply absent.
+check("range: a lowercase range: header is found",
+      P.parseRange(header: ["GET / HTTP/1.1", "range: bytes=0-9"]) == .fromTo(0, 9))
+check("range: a title-case Range: header is found",
+      P.parseRange(header: ["GET / HTTP/1.1", "Range: bytes=0-9"]) == .fromTo(0, 9))
+check("range: an uppercase RANGE: header is found",
+      P.parseRange(header: ["GET / HTTP/1.1", "RANGE: bytes=0-9"]) == .fromTo(0, 9))
+check("range: no Range header at all returns nil",
+      P.parseRange(header: ["GET / HTTP/1.1"]) == nil)
+
+// resolve() against a known resource length.
+check("range: fromTo(0,99) on length 1000 is 0...99",
+      P.resolve(.fromTo(0, 99), length: 1000) == 0...99)
+check("range: fromTo(0,5000) on length 1000 clamps to 0...999",
+      P.resolve(.fromTo(0, 5000), length: 1000) == 0...999)
+check("range: from(990) on length 1000 is 990...999",
+      P.resolve(.from(990), length: 1000) == 990...999)
+check("range: from(1000) on length 1000 is unsatisfiable",
+      P.resolve(.from(1000), length: 1000) == nil)
+check("range: suffix(50) on length 1000 is 950...999",
+      P.resolve(.suffix(50), length: 1000) == 950...999)
+check("range: suffix(5000) on length 1000 clamps to the whole resource",
+      P.resolve(.suffix(5000), length: 1000) == 0...999)
+check("range: any spec on a zero-length resource is unsatisfiable",
+      P.resolve(.fromTo(0, 10), length: 0) == nil)
+
+// A guarded route must carry the parsed range through unchanged, so the connection handler can resolve it
+// against the resource it is about to serve.
+check("range: a guarded route carries the parsed Range through",
+      P.route(header: "GET \(goodPath) HTTP/1.1\r\nRange: bytes=0-99", capability: capA)
+        == .guarded(method: .get, path: "/seg3.m4s", range: .fromTo(0, 99)))
+
+// MARK: - 4. Host normalization
+//
+// A REAL BUG WAS FOUND HERE AND HAS SINCE BEEN FIXED. Recorded rather than deleted, because the shape of the
+// mistake is worth keeping: the unbracketed "single colon is host:port" branch was dead code, guarded by
+// `!text.dropFirst().contains(":")`. That reads like "no colon after the first character", but `dropFirst()`
+// drops one character from the front of the WHOLE string, not everything up to the colon, so for any realistic
+// "host:9000" the colon survived, the condition was false, and the branch never ran.
+//
+// Two consequences, neither of them visible from reading the function's documentation. A user typing
+// `192.168.1.33:9000` was silently routed to the default port against the host string "192.168.1.33:9000". And
+// every port-validation guard below the split (`Int(...)` parsing, `port > 0`, `port <= 65535`) was unreachable,
+// so `host:notaport`, `host:0` and `host:70000` all passed through as "valid" instead of being rejected.
+//
+// The guard is now a colon COUNT, which is the property actually being tested for: exactly one means host:port,
+// more than one with no brackets means a bare IPv6 literal whose last group must not be mistaken for a port. The
+// assertions below pin the corrected behaviour, including the three rejections that used to be unreachable.
+
+check("host: a bare IP normalizes with the default port",
+      hostsEqual(P.normalizeHost("192.168.1.33"), (host: "192.168.1.33", port: 11471)))
+check("host: an unbracketed host:port splits out the port",
+      hostsEqual(P.normalizeHost("192.168.1.33:9000"), (host: "192.168.1.33", port: 9000)))
+check("host: a scheme and trailing slash are stripped before the port is split",
+      hostsEqual(P.normalizeHost("http://192.168.1.33:9000/"), (host: "192.168.1.33", port: 9000)))
+check("host: surrounding whitespace is trimmed",
+      hostsEqual(P.normalizeHost("  mac.local  "), (host: "mac.local", port: 11471)))
+check("host: a bracketed IPv6 literal with a port splits correctly",
+      hostsEqual(P.normalizeHost("[fe80::1]:9000"), (host: "fe80::1", port: 9000)))
+check("host: a bracketed IPv6 literal with no port uses the default",
+      hostsEqual(P.normalizeHost("[fe80::1]"), (host: "fe80::1", port: 11471)))
+// Deliberate multi-colon detection: more than one colon with no brackets is a bare IPv6 literal, so the last
+// group must not be mistaken for a port.
+check("host: a bare (unbracketed) IPv6 literal is kept whole, not mangled",
+      hostsEqual(P.normalizeHost("fe80::1:2:3"), (host: "fe80::1:2:3", port: 11471)))
+check("host: nil input normalizes to nil",
+      P.normalizeHost(nil) == nil)
+check("host: empty input normalizes to nil",
+      P.normalizeHost("") == nil)
+check("host: whitespace-only input normalizes to nil",
+      P.normalizeHost("   ") == nil)
+check("host: an unparseable port string is rejected",
+      P.normalizeHost("host:notaport") == nil)
+check("host: a zero port is rejected",
+      P.normalizeHost("host:0") == nil)
+check("host: an out-of-range port is rejected",
+      P.normalizeHost("host:70000") == nil)
+
+// MARK: - 5. Mount plan (the default-off gate)
+//
+// All three of userEnabled, killSwitchOn, and a valid host must hold, or the client stays on-device. Each is
+// tested false individually against the other two true, plus the all-true case.
+
+check("mountplan: userEnabled false alone forces onDevice",
+      P.mountPlan(userEnabled: false, killSwitchOn: true, host: "192.168.1.33") == .onDevice)
+check("mountplan: killSwitchOn false alone forces onDevice",
+      P.mountPlan(userEnabled: true, killSwitchOn: false, host: "192.168.1.33") == .onDevice)
+check("mountplan: an unusable host alone forces onDevice",
+      P.mountPlan(userEnabled: true, killSwitchOn: true, host: nil) == .onDevice)
+check("mountplan: all three true yields an external mount",
+      P.mountPlan(userEnabled: true, killSwitchOn: true, host: "192.168.1.33")
+        == .external(host: "192.168.1.33", port: P.defaultControlPort))
+
+// MARK: - 6. Failover
+
+// The host's own diagnosis is authoritative and final: one unhealthy report fails over immediately, even at
+// zero accumulated control-plane failures.
+check("failover: hostReportsHealthy == false fails over immediately, even at 0 failures",
+      P.failover(consecutiveControlFailures: 0, hostReportsHealthy: false) == .failOverToDevice)
+
+// A nil report (request did not complete) is ambiguous, so it is counted against the threshold rather than
+// trusted immediately.
+check("failover: a nil report below the threshold keeps the remote mount",
+      P.failover(consecutiveControlFailures: P.controlFailureThreshold - 1, hostReportsHealthy: nil)
+        == .keepRemote)
+check("failover: a nil report exactly at the threshold fails over",
+      P.failover(consecutiveControlFailures: P.controlFailureThreshold, hostReportsHealthy: nil)
+        == .failOverToDevice)
+check("failover: a nil report above the threshold fails over",
+      P.failover(consecutiveControlFailures: P.controlFailureThreshold + 5, hostReportsHealthy: nil)
+        == .failOverToDevice)
+
+// A healthy report with zero accumulated failures is the ordinary steady state.
+check("failover: a healthy report with no accumulated failures keeps the remote mount",
+      P.failover(consecutiveControlFailures: 0, hostReportsHealthy: true) == .keepRemote)
+
+// A healthy report is positive evidence that arrived over a control request which COMPLETED, so it wins
+// outright rather than falling through to the failure threshold. In normal operation the caller has already
+// reset its counter on that success and this case is unreachable; asserting it anyway pins the function as
+// self-consistent read in isolation, instead of depending on a caller convention to avoid contradicting its own
+// documentation.
+check("failover: a healthy report wins outright over a stale failure count",
+      P.failover(consecutiveControlFailures: 999, hostReportsHealthy: true) == .keepRemote)
+
+// MARK: - 7. mountPath
+
+check("mountpath: a bare resource name is mounted under /r/<capability>/",
+      P.mountPath(capability: capA, resource: "master.m3u8") == "/r/\(capA)/master.m3u8")
+check("mountpath: a leading-slash resource name mounts identically",
+      P.mountPath(capability: capA, resource: "/master.m3u8") == "/r/\(capA)/master.m3u8")
+check("mountpath: round-trips through route back to the bare resource path",
+      P.route(header: "GET \(P.mountPath(capability: capA, resource: "master.m3u8")) HTTP/1.1", capability: capA)
+        == .guarded(method: .get, path: "/master.m3u8", range: nil))
+
+// MARK: - 8. Forward buffer
+
+check("buffer: local (loopback) origin uses the shipping 30s value",
+      P.forwardBufferSeconds(remote: false) == 30)
+check("buffer: a remote origin buffers more than local",
+      P.forwardBufferSeconds(remote: true) > P.forwardBufferSeconds(remote: false))
+
+// MARK: - Result
+
+print("")
+if failures == 0 { print("ALL PASS"); exit(0) } else { print("\(failures) FAILED"); exit(1) }
+}

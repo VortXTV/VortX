@@ -166,6 +166,10 @@ struct RemoteConfigData: Decodable {
         let dvRemuxMultiAudio: Bool?           // VortXMKVRemuxStream.multiAudioEnabled (baked ON)
         let dvRemuxSubtitles: Bool?            // VortXMKVRemuxStream.subtitleRenditionsEnabled (baked ON)
         let dvWindowConsumptionAnchor: Bool?   // VortXRemuxHLSServer.consumptionAnchorEnabled (baked ON)
+        // External engine mode: hosting the remux on a Mac for another device. FLEET KILL SWITCH ONLY.
+        // Baked true means "not disabled"; it can never turn the feature ON for anyone, because the user
+        // default is off and `VortXExternalEngine.mountPlan` also requires a paired, configured host.
+        let externalEngine: Bool?
         let diskCache: Bool?
         let trailers: Bool?
         let vortxRatings: Bool?
@@ -870,6 +874,7 @@ actor RemoteConfig {
             put("dvRemuxMultiAudio", f.dvRemuxMultiAudio)
             put("dvRemuxSubtitles", f.dvRemuxSubtitles)
             put("dvWindowConsumptionAnchor", f.dvWindowConsumptionAnchor)
+            put("externalEngine", f.externalEngine)
             put("diskCache", f.diskCache)
             put("trailers", f.trailers)
             put("vortxRatings", f.vortxRatings)

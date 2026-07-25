@@ -126,10 +126,24 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// write/seek callbacks synchronously on it), so it needs no lock.
     private var avioWriteCursor: Int = 0
 
+    /// True when this session's spool retains its ENTIRE produced timeline instead of sliding a window, which is
+    /// what lets a client seek backwards anywhere into what has been produced. Only ever requested by an engine
+    /// host, and only granted when the machine actually has the disk, so a caller must READ this rather than
+    /// assume its request was honoured.
+    private let hlsRetainsFullTimeline: Bool
+    var retainsFullTimeline: Bool { hlsRetainsFullTimeline }
+
+    /// `retainFullTimeline` is requested only by a host serving another device. It is silently downgraded to
+    /// the ordinary sliding spool when the machine cannot support it, because a host short of disk should still
+    /// serve, just without seek-anywhere.
     init(input: String, headers: [String: String]?, indexForHLS: Bool = false,
-         mode: Mode = .dolbyVision, startAtSeconds: Double = 0) {
+         mode: Mode = .dolbyVision, startAtSeconds: Double = 0,
+         retainFullTimeline: Bool = false) {
         let primaryBuffer = VortXRemuxBuffer()
-        let spool = indexForHLS ? VortXHLSSessionSpool.makeDefault() : nil
+        let retaining = (indexForHLS && retainFullTimeline)
+            ? VortXHLSSessionSpool.makeRetaining() : nil
+        let spool = retaining ?? (indexForHLS ? VortXHLSSessionSpool.makeDefault() : nil)
+        self.hlsRetainsFullTimeline = retaining != nil
         self.buffer = primaryBuffer
         self.input = input
         self.headers = headers

@@ -41,6 +41,21 @@ struct iOSSettingsView: View {
     /// NodeServer.sharedOnLAN, which persists + restarts the node process when it flips.
     @State private var shareOnLAN = NodeServer.sharedOnLAN
     @State private var didCopyLAN = false
+    // EXTERNAL ENGINE MODE, host side (macOS only). VortXEngineHost is a headless service with no SwiftUI
+    // in it by design (see its own file header: "a service that reaches into the UI layer cannot become
+    // [a standalone daemon]"), so it publishes nothing and these mirrors are how the screen stays live.
+    // They are refreshed on a one-second poll while this screen is visible, and every write goes THROUGH
+    // the service, never around it.
+    @State private var engineHostOn = VortXEngineHost.shared.isEnabled
+    @State private var engineHostRetainsTimeline = VortXEngineHost.shared.retainsFullTimeline
+    @State private var engineHostRunning = false
+    @State private var engineHostSessions = 0
+    /// The live pairing code and its countdown, nil when no window is open.
+    @State private var enginePairingCode: String?
+    @State private var enginePairingRemaining: TimeInterval = 0
+    @State private var enginePairedDevices: [VortXPairedDevice] = []
+    @State private var didCopyEngineAddress = false
+    @State private var showEngineRevokeAllConfirm = false
     #endif
     #if !os(macOS)
     /// Phase 8: the in-process engine streaming-server flag (default OFF, CEO/device-gated flip).
@@ -633,6 +648,13 @@ struct iOSSettingsView: View {
                 .tint(Theme.Palette.accent)
             Text("Plays Dolby Vision .mkv from debrid via an in-app remux. Experimental; falls back automatically if it fails.")
                 .font(.caption).foregroundStyle(.secondary)
+            // EXTERNAL ENGINE MODE, client side. Sits next to the in-app remux row because it is the same
+            // job moved off this device. Default OFF, and this link is the only way to configure it: the
+            // screen behind it owns the pairing, the host choice and the master switch, so nothing here can
+            // turn it on by accident.
+            NavigationLink("Use a Mac as the engine") { ExternalEngineSettingsView() }
+            Text("Let a Mac on your network unpack and prepare the stream for this device. Off until you pair one.")
+                .font(.caption).foregroundStyle(.secondary)
             #endif
             Picker("Skip step", selection: $seekStep) {
                 ForEach(["10", "15", "30"], id: \.self) { Text("\($0)s").tag($0) }
@@ -1188,6 +1210,19 @@ struct iOSSettingsView: View {
                 }
                 #endif
             }
+
+            #if os(macOS)
+            // EXTERNAL ENGINE MODE, host side. Sits in this section because it is the other thing this Mac
+            // can be on the network, next to the LAN-sharing toggle it reads like.
+            //
+            // Deliberately OUTSIDE the two gates that wrap the rows above. `!effectiveDirectLinksOnly` gates
+            // the TORRENT server, and an engine host never touches it: it fetches a debrid or direct URL and
+            // remuxes it, which is exactly what a Direct Links Only build does all day. `!StremioServer.isCustom`
+            // gates rows that configure the embedded node child, and this Mac can host an engine while pointing
+            // its own playback at somebody else's server. Nesting inside either would hide a feature that works
+            // fine in that state, which is worse than an extra row.
+            engineHostControls
+            #endif
         } header: {
             Text("Streaming Server")
         } footer: {
@@ -1250,6 +1285,268 @@ struct iOSSettingsView: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    // MARK: External engine mode (host side, macOS only)
+
+    /// EXTERNAL ENGINE MODE, the HOST half: this Mac offering itself as the engine for the other VortX
+    /// devices in the house.
+    ///
+    /// WHAT THE USER IS ACTUALLY TURNING ON. With this on, an Apple TV on the same network can ask this Mac
+    /// to unpack an MKV, rewrite its Dolby Vision layer from Profile 7 to 8.1, cut it into segments and hold
+    /// the whole thing on this Mac's disk, then fetch it as one clean stream. The TV still decodes and still
+    /// drives the panel (that part is physically fixed by the HDMI chain), so nothing is re-encoded and the
+    /// picture is identical. What moves is the container work and the disk, which is precisely the work the
+    /// TV gets killed for doing.
+    ///
+    /// DEFAULT OFF AND NOTHING BELOW RUNS UNTIL IT IS ON. The toggle writes `VortXEngineHost.isEnabled`,
+    /// whose setter starts or stops the listener, so the switch IS the service's lifecycle rather than a
+    /// preference the service consults later. Off means no bound socket, no Bonjour advertisement, and no
+    /// route for anything on the network to reach.
+    ///
+    /// EVERY LIVE NUMBER ON THIS SCREEN IS POLLED. `VortXEngineHost` imports Foundation and Network and
+    /// nothing else, on purpose: it has to be able to become a launchd daemon, and a service that publishes
+    /// SwiftUI state cannot. So it exposes plain properties and this view reads them once a second while it
+    /// is on screen. `refreshEngineHostStatus` compares before assigning so an idle Mac is not invalidating
+    /// the whole Settings form every second for no change.
+    @ViewBuilder private var engineHostControls: some View {
+        Toggle(isOn: Binding(
+            get: { engineHostOn },
+            set: { newValue in
+                engineHostOn = newValue
+                // The setter starts or stops the listener. Fail-soft: a port that will not bind leaves the
+                // service disabled and `isRunning` false, which the status row below reports honestly rather
+                // than showing a switch that says on over a service that is not.
+                VortXEngineHost.shared.isEnabled = newValue
+                // Turning the host off must also close any pairing window: a code left live over a stopped
+                // listener is a code the owner believes is doing something.
+                if !newValue { VortXEngineHost.shared.closePairing() }
+                refreshEngineHostStatus()
+            }
+        )) {
+            Label("Act as the engine for this network", systemImage: "bolt.horizontal.circle")
+        }
+        .tint(Theme.Palette.accent)
+        // One poll for the whole block, tied to this row's lifetime. Cancelled automatically when Settings
+        // closes or when the search field filters this section away. One second is fast enough for a
+        // countdown that ticks in whole seconds and for a session count that changes when somebody presses
+        // play in another room, and cheap enough to be free (two lock acquisitions and an array copy).
+        .task {
+            while !Task.isCancelled {
+                refreshEngineHostStatus()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+
+        if engineHostOn {
+            engineHostStatusRows
+            engineHostPairingRows
+            engineHostDeviceRows
+            engineHostTimelineRows
+            engineHostSecurityNote
+        } else {
+            Text("Off. Other VortX devices on this network will keep doing their own work, exactly as they do today.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    /// Name, port, address, and whether the service is actually up.
+    @ViewBuilder private var engineHostStatusRows: some View {
+        HStack(spacing: Theme.Space.sm) {
+            Circle()
+                .fill(engineHostRunning ? Theme.Palette.ok : Theme.Palette.danger)
+                .frame(width: 10, height: 10)
+            Text(engineHostStatusText)
+                .font(.footnote)
+            Spacer()
+        }
+        LabeledContent("Name on the network", value: VortXEngineHost.shared.displayName)
+        LabeledContent("Control port", value: String(engineHostPort))
+
+        // The address to type on a device that cannot find this Mac by itself. `NodeServer.lanIP` is this
+        // Mac's own primary non-loopback IPv4, independent of whether the streaming server is being shared,
+        // and `host:port` is exactly the shape `VortXEngineHostPolicy.normalizeHost` parses back on the
+        // client, so what is copied here is what the other device's address field wants.
+        if let ip = NodeServer.lanIP {
+            Button {
+                let pb = NSPasteboard.general
+                pb.clearContents(); pb.setString("\(ip):\(engineHostPort)", forType: .string)
+                didCopyEngineAddress = true
+            } label: {
+                HStack {
+                    Label("\(ip):\(engineHostPort)", systemImage: "link")
+                        .font(.system(.footnote, design: .monospaced))
+                    Spacer()
+                    Image(systemName: didCopyEngineAddress ? "checkmark" : "doc.on.doc")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+            Text("Most devices find this Mac on their own. Type this address on one that cannot, over a VPN or across VLANs.")
+                .font(.caption).foregroundStyle(.secondary)
+        } else {
+            Label("Connect to Wi-Fi or Ethernet for other devices to reach this Mac",
+                  systemImage: "wifi.slash")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
+    /// The pairing window: open it, show the code big, count it down, close it.
+    @ViewBuilder private var engineHostPairingRows: some View {
+        if let code = enginePairingCode {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(code)
+                    .font(.system(size: 44, weight: .bold, design: .monospaced))
+                    .tracking(10)
+                    .foregroundStyle(Theme.Palette.accent)
+                    .textSelection(.enabled)
+                Text("Type this on the other device. \(enginePairingCountdown) left.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 4)
+            Button {
+                VortXEngineHost.shared.closePairing()
+                refreshEngineHostStatus()
+            } label: {
+                Label("Stop pairing", systemImage: "xmark.circle")
+            }
+        } else {
+            Button {
+                // Opening REPLACES any previous code and resets the attempt count, so an owner who closes
+                // and reopens this is never handed a window an attacker already spent guesses against.
+                _ = VortXEngineHost.shared.openPairing()
+                refreshEngineHostStatus()
+            } label: {
+                Label("Pair a device", systemImage: "person.badge.key")
+            }
+            .disabled(!engineHostRunning)
+            Text("Opens a six-digit code for five minutes. Enter it on the Apple TV, iPhone, iPad or Mac you want to let use this engine.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    /// The paired-device index, with per-device and bulk revoke.
+    ///
+    /// Revoking is the ONLY way to take access away from a device that is not in the room, because
+    /// `VortXExternalEngine.unpair` on the client is local-only by design (a device being unpaired may well
+    /// be unable to reach this Mac). The list is the owner's control surface for that, so it lives in front
+    /// of them rather than behind a disclosure.
+    @ViewBuilder private var engineHostDeviceRows: some View {
+        if enginePairedDevices.isEmpty {
+            Text("No devices paired yet.")
+                .font(.caption).foregroundStyle(.secondary)
+        } else {
+            ForEach(enginePairedDevices, id: \.clientID) { device in
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(device.clientName)
+                        Text(engineDeviceDetail(device))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button(role: .destructive) {
+                        VortXEngineHost.shared.pairingRegistry.revoke(clientID: device.clientID)
+                        refreshEngineHostStatus()
+                    } label: {
+                        Label("Revoke", systemImage: "minus.circle")
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+            Button(role: .destructive) { showEngineRevokeAllConfirm = true } label: {
+                Label("Revoke all devices", systemImage: "trash")
+            }
+            .confirmationDialog("Revoke every paired device?",
+                                isPresented: $showEngineRevokeAllConfirm,
+                                titleVisibility: .visible) {
+                Button("Revoke All", role: .destructive) {
+                    VortXEngineHost.shared.pairingRegistry.revokeAll()
+                    refreshEngineHostStatus()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Every device loses access immediately and has to pair again with a new code.")
+            }
+        }
+    }
+
+    /// Full-timeline retention, which is what "seek anywhere" is made of.
+    @ViewBuilder private var engineHostTimelineRows: some View {
+        Toggle(isOn: Binding(
+            get: { engineHostRetainsTimeline },
+            set: { newValue in
+                engineHostRetainsTimeline = newValue
+                VortXEngineHost.shared.retainsFullTimeline = newValue
+            }
+        )) {
+            Label("Let paired devices seek anywhere", systemImage: "arrow.left.and.right")
+        }
+        .tint(Theme.Palette.accent)
+        Text("Keeps everything this Mac has produced for a playing device on disk instead of a rolling window, so that device can jump back to any point it has already reached. It costs about as much disk as the part of the file that has played, and it is freed when playback ends. Turn it off if this Mac is short on space; devices still play, they just cannot seek back past the window. Applies to playbacks started from now on.")
+            .font(.caption).foregroundStyle(.secondary)
+    }
+
+    /// The transport note. `VortXEngineProtocol` requires it in these words: the token and the per-session
+    /// capability "are NOT transport security and the UI must not imply otherwise". So this says what is
+    /// true, which is that pairing is an access gate and not encryption.
+    @ViewBuilder private var engineHostSecurityNote: some View {
+        Label("Video leaves this Mac as plain, unencrypted HTTP on your own network. Pairing is what stops other devices on the same Wi-Fi from fetching it, and it is not encryption. Pair only devices you own, and revoke any you no longer use.",
+              systemImage: "lock.open")
+            .font(.footnote).foregroundStyle(.secondary)
+    }
+
+    /// The port to show and to copy: the one actually bound when the listener is up, the configured one
+    /// otherwise. They differ only while the service is stopped or failed to bind, which is exactly when
+    /// showing the configured value is the more useful of the two.
+    private var engineHostPort: Int {
+        let bound = VortXEngineHost.shared.boundPort
+        return bound == 0 ? VortXEngineHost.shared.controlPort : Int(bound)
+    }
+
+    private var engineHostStatusText: String {
+        guard engineHostRunning else {
+            return String(localized: "Not running. Another program may already be using port \(String(engineHostPort)).")
+        }
+        switch engineHostSessions {
+        case 0: return String(localized: "Ready. No device is playing through this Mac.")
+        case 1: return String(localized: "Serving 1 device.")
+        default: return String(localized: "Serving \(engineHostSessions) devices.")
+        }
+    }
+
+    /// Remaining pairing time as m:ss. Whole seconds only, because the poll below ticks once a second and a
+    /// finer readout would just jitter.
+    private var enginePairingCountdown: String {
+        let total = max(0, Int(enginePairingRemaining))
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    private func engineDeviceDetail(_ device: VortXPairedDevice) -> String {
+        let paired = Date(timeIntervalSince1970: device.pairedAt)
+            .formatted(date: .abbreviated, time: .shortened)
+        return String(localized: "Paired \(paired)")
+    }
+
+    /// Re-read the service. Every assignment is guarded by an inequality check: a bare assignment to
+    /// @State invalidates the view whether or not the value changed, and this runs once a second inside a
+    /// Form with a hundred other rows in it.
+    private func refreshEngineHostStatus() {
+        let host = VortXEngineHost.shared
+        if engineHostOn != host.isEnabled { engineHostOn = host.isEnabled }
+        if engineHostRetainsTimeline != host.retainsFullTimeline {
+            engineHostRetainsTimeline = host.retainsFullTimeline
+        }
+        if engineHostRunning != host.isRunning { engineHostRunning = host.isRunning }
+        if engineHostSessions != host.activeSessionCount { engineHostSessions = host.activeSessionCount }
+
+        let window = host.pairingWindow
+        if enginePairingCode != window?.code { enginePairingCode = window?.code }
+        // Rounded to whole seconds so the guard above actually holds the view still between ticks.
+        let remaining = (window?.remaining ?? 0).rounded()
+        if enginePairingRemaining != remaining { enginePairingRemaining = remaining }
+
+        let devices = host.pairingRegistry.pairedDevices
+        if enginePairedDevices != devices { enginePairedDevices = devices }
     }
     #endif
 
@@ -1692,14 +1989,17 @@ private enum SettingsSearchSection: CaseIterable {
                                 "credits", "skip timestamps", "skip database", "seek bar", "community scrub previews",
                                 "trickplay", "autoplay trailers", "trailer language", "default volume",
                                 "auto-add watched", "landscape", "background playback", "keep playing", "play in",
-                                "external player"]
+                                "external player", "external engine", "use a mac", "mac as engine",
+                                "engine host", "seek anywhere", "pair a mac"]
         case .downloads: return ["downloads", "auto-delete", "delete watched", "offline", "storage", "reclaim space"]
         case .notifications: return ["new episode alerts", "episode", "notification"]
         case .streams: return ["quality preset", "smart source selection", "add-on ranking", "source type",
                                "safety filter", "regex", "max quality", "minimum quality", "max file size",
                                "compact source rows", "pinned sources", "resolution"]
         case .community: return ["contribute", "anonymized data", "singularity", "privacy"]
-        case .server: return ["server", "configure server", "server log", "restart", "embedded", "node", "lan", "share"]
+        case .server: return ["server", "configure server", "server log", "restart", "embedded", "node", "lan", "share",
+                              "engine", "external engine", "act as the engine", "engine host", "pair a device",
+                              "paired devices", "revoke", "seek anywhere"]
         case .tabBar: return ["tab", "discover tab", "live tv tab", "library tab", "search tab"]
         case .appearance: return ["editorial home rows", "collections on home", "collections on discover",
                                   "refresh collections", "streaming services", "discover & region",
