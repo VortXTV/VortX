@@ -40,14 +40,17 @@ struct VortXAccountJoinerView: View {
     private static let checkFontSize: CGFloat = 46
     private static let captionMaxWidth: CGFloat = 420
     #endif
-    // The web approver (webapp/, web.vortx.tv) is a HASH-routed SPA: its router reads location.hash and the
-    // approve view reads its params out of the hash query (router.ts / views/approve.ts). So the approval
-    // link MUST carry the code + device key in the HASH route (#/approve?c=..&k=..). A real-path URL
-    // (vortx.tv/approve?c=..&k=..) boots the SPA on its default Home route with an empty hash, so the approve
-    // view never renders and the joining device waits forever; that was issue #153. beta.7 emits the hash
-    // form below (works against the already-deployed web); the webapp also normalizes the legacy path form so
-    // devices already in the field, and a hand-typed vortx.tv/approve, still resolve to the approve view.
-    private static let approveBase = "https://vortx.tv/#/approve"
+    // The approver is vortx.tv/approve: a REAL PAGE on the account site (vortx-site, src/pages/approve.astro),
+    // which reads `c` and `k` from location.search. That is also where the VortX account itself lives (login,
+    // dashboard), and it is the address this screen's own caption tells the user to type. It is NOT the
+    // hash-routed web player at web.vortx.tv, which is a separate origin with a separate signed-in session.
+    //
+    // beta.7 through beta.9 pointed this at "https://vortx.tv/#/approve", which put the params behind a hash
+    // on the marketing site's home route: the browser landed on the home page and the approve page never ran.
+    // That was a regression, not the original #153 defect (the original was the approve page's dead-end
+    // sign-in link, which dropped `c` and `k` on the way to /login). Both are fixed; the site also folds a
+    // stray "#/approve?..." hash back onto /approve so beta.7-9 codes already in the field still resolve.
+    private static let approveBase = "https://vortx.tv/approve"
     private static let pollInterval: UInt64 = 2_000_000_000   // 2s
 
     var body: some View {
@@ -109,9 +112,9 @@ struct VortXAccountJoinerView: View {
             guard let s = await VortXSyncManager.shared.qrStart() else { status = .failed; return }
             session = s
             codeMintedAt = Date()
-            // The QR opens the approve link carrying the code plus this TV's ephemeral public key, so the
-            // approving device can wrap the data key to us. Both values are URL-safe (base64url / A-Z2-9);
-            // approveBase is the hash route the web approver reads (see the note above, #153).
+            // The QR opens vortx.tv/approve carrying the code plus this device's ephemeral public key, so the
+            // approving device can wrap the data key to us. Both values are URL-safe (base64url / A-Z2-9), so
+            // they need no escaping in the query string (see the approveBase note above, #153).
             qrImage = QRCodeImage.make("\(Self.approveBase)?c=\(s.code)&k=\(s.devicePublicKey)")
             status = .waiting
             await pollLoop(s)
