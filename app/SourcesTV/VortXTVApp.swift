@@ -1,5 +1,43 @@
 import SwiftUI
 
+/// The clip the built-in playback selftests play (`-tv-selftest` mounts the player directly,
+/// `-tv-playertest` exercises the root-replacement path). Both read it from here so a dead default
+/// can never rot in two places again, which is exactly what happened: the previous default,
+/// Blender's `BigBuckBunny_320x180.mp4`, started returning 404 and every selftest run landed on the
+/// "source never started" screen instead of playing, making the smoke check useless.
+///
+/// Override it to point a run at a local HTTP server (an offline machine, or to exercise a specific
+/// container) with either:
+///   -tv-selftest-url https://host/clip.mp4     launch argument, wins
+///   defaults write <bundle-id> tv.selftest.url https://host/clip.mp4
+/// A malformed or non-http(s) override is ignored in favour of the default, so a typo degrades to a
+/// working selftest rather than the failure screen the override was meant to diagnose.
+enum SelftestSource {
+    /// Verified 2026-07-25: HTTP 200, no redirects, H.264 640x360, 10s, 0.94 MB. Kept deliberately
+    /// small so a cold simulator start reaches first frame quickly.
+    static let defaultURLString = "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4"
+    static let argumentName = "-tv-selftest-url"
+    static let defaultsKey = "tv.selftest.url"
+
+    static var url: URL { resolve(override: overrideString) ?? URL(string: defaultURLString)! }
+
+    /// The raw override from the launch argument (preferred) or the defaults key, whichever is present.
+    static var overrideString: String? {
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: argumentName), i + 1 < args.count { return args[i + 1] }
+        return UserDefaults.standard.string(forKey: defaultsKey)
+    }
+
+    /// Accept only a well-formed http(s) URL; anything else falls back to the default. Pure, so the
+    /// rule is testable without launching the app.
+    static func resolve(override: String?) -> URL? {
+        guard let raw = override?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+              let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https", url.host?.isEmpty == false else { return nil }
+        return url
+    }
+}
+
 @main
 struct VortXTVApp: App {
     @StateObject private var account = StremioAccount()
@@ -58,7 +96,7 @@ struct VortXTVApp: App {
         WindowGroup {
             Group {
                 if ProcessInfo.processInfo.arguments.contains("-tv-selftest") {
-                    TVPlayerView(url: URL(string: "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4")!, title: "Player Test, Oceans")
+                    TVPlayerView(url: SelftestSource.url, title: "Player Test, Oceans")
                 } else {
                     RootView()   // player OR shell, never both, the only reliable tvOS focus isolation
                 }
@@ -175,8 +213,7 @@ struct VortXTVApp: App {
                 // DIAGNOSTIC (-tv-playertest): exercise the real root-replacement path without an account.
                 guard ProcessInfo.processInfo.arguments.contains("-tv-playertest") else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    presenter.request = PlaybackRequest(
-                        url: URL(string: "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4")!, title: "Player Test")
+                    presenter.request = PlaybackRequest(url: SelftestSource.url, title: "Player Test")
                 }
             }
         }
