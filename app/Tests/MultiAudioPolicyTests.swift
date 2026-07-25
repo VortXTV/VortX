@@ -90,12 +90,34 @@ enum MultiAudioPolicyTests {
                 from: [primary, japanese],
                 primaryIndex: primary.index,
                 provenPacketStreamIndices: []) == nil)
-        check("plan: a different codec does not qualify",
+        // CODEC RULE (build 191). A different-codec alternate DOES qualify: it is muxed into its own
+        // independent audio-only fMP4 sink built from that track's own parameters, so the primary's codec is
+        // not a constraint on it. The pre-fix same-codec-only rule qualified nothing on the ordinary UHD
+        // remux shape (one codec per language), which is why those files advertised a single URI-less row and
+        // the audio menu had a name and no alternative to pick.
+        check("plan: a proven different-codec different-language alternate qualifies",
               MultiAudioPolicy.renditionPlan(
                 from: [primary, Track(index: 2, codecID: ac3, channels: 6,
                                       language: "jpn", title: "Japanese")],
                 primaryIndex: primary.index,
-                provenPacketStreamIndices: [2]) == nil)
+                provenPacketStreamIndices: [2])?.alternate.sourceIndex == 2)
+        // ...but a SAME-codec alternate still wins when both exist, so every source that qualified before
+        // this change keeps the exact rendition it had, even when the different-codec track has more channels.
+        check("plan: a same-codec alternate is preferred over a higher-channel different-codec one",
+              MultiAudioPolicy.renditionPlan(
+                from: [primary,
+                       Track(index: 2, codecID: ac3, channels: 8, language: "jpn", title: "Japanese 7.1"),
+                       Track(index: 3, codecID: eac3, channels: 6, language: "fre", title: "French 5.1")],
+                primaryIndex: primary.index,
+                provenPacketStreamIndices: [2, 3])?.alternate.sourceIndex == 3)
+        // Within one codec class the existing channel-then-file-order ranking is untouched.
+        check("plan: among different-codec candidates the most channels still wins",
+              MultiAudioPolicy.renditionPlan(
+                from: [primary,
+                       Track(index: 2, codecID: ac3, channels: 2, language: "jpn", title: "Japanese 2.0"),
+                       Track(index: 3, codecID: ac3, channels: 6, language: "fre", title: "French 5.1")],
+                primaryIndex: primary.index,
+                provenPacketStreamIndices: [2, 3])?.alternate.sourceIndex == 3)
         check("plan: the same language does not qualify",
               MultiAudioPolicy.renditionPlan(
                 from: [primary, Track(index: 2, codecID: eac3, channels: 8,

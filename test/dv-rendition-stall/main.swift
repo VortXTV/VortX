@@ -444,6 +444,14 @@ func selectionScenario(name: String, fixture: String, playSeconds: Double,
     result.audioOptions = audioGroup?.options.map(\.displayName) ?? []
     result.subtitleOptions = subGroup?.options.map(\.displayName) ?? []
     print("selection groups: audio=\(result.audioOptions) subtitles=\(result.subtitleOptions)")
+    // What AVFoundation picked on its own, BEFORE anything asked it to. A legible rendition auto-selected
+    // here renders subtitles the viewer never asked for, and any chrome that reports "Off" while this is
+    // non-nil is lying about the state (the build 191 "built-in subs show but settings say off" report).
+    let initialAudio = audioGroup
+        .flatMap { item.currentMediaSelection.selectedMediaOption(in: $0)?.displayName } ?? "none"
+    let initialSubtitle = subGroup
+        .flatMap { item.currentMediaSelection.selectedMediaOption(in: $0)?.displayName } ?? "none"
+    print("selection at mount (AVFoundation's own automatic pick): audio=\(initialAudio) subtitle=\(initialSubtitle)")
 
     // --- audio switch ---
     if let group = audioGroup {

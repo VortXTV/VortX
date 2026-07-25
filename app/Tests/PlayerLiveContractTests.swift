@@ -2213,7 +2213,17 @@ enum PlayerLiveContractTests {
             engine,
             from: "private func handleStatus(_ item: AVPlayerItem",
             to: "private func logDVVideoTrackDiagnostics(")
-        let manualSelection = sourceSection(engine, from: "private func select(", to: "/// The overlay host")
+        let manualSelection = sourceSection(engine, from: "private func select(", to: "/// Re-read AVPlayer's")
+        let externalSubtitleRow = sourceSection(
+            engine, from: "private func externalSubtitleTracks()", to: "func setAudioTrack(")
+        let externalSubtitleSelection = sourceSection(
+            engine, from: "func setSubtitleTrack(_ id: Int) {", to: "/// Select option `id`")
+        let externalSubtitleLoad = sourceSection(
+            engine, from: "func addExternalSubtitle(url: String",
+            to: "/// Turn off the external overlay subtitle")
+        let selectionRefresh = sourceSection(
+            engine, from: "private func refreshSelectionTracks(for item: AVPlayerItem)",
+            to: "/// Force one track-list publication")
         let groupLoad = sourceSection(engine, from: "private func loadSelectionGroups()",
                                       to: "/// Rebuild cached selected flags")
         let subtitlePlaylist = sourceSection(
@@ -2682,6 +2692,32 @@ enum PlayerLiveContractTests {
                   && display?.contains("preferredDisplayCriteria === criteria") == false)
         check("wiring: manual selection immediately refreshes cached flags",
               manualSelection?.contains("refreshSelectionTracks(for: item)") == true)
+        // Build 191 field defect: an HLS rendition switch AVFoundation settles asynchronously left the cached
+        // rows carrying their old flags, so the chrome's re-read a quarter second after the tap reverted the
+        // viewer's checkmark with the stream buffering behind it. The refresh must come BEFORE any settled
+        // check, and an unsettled selection must schedule a bounded re-read rather than return silently.
+        check("wiring: an unsettled selection still publishes and schedules a settle re-read",
+              sourceContainsInOrder(manualSelection, [
+                "item.select(requested, in: group)",
+                "refreshSelectionTracks(for: item)",
+                "selectedMediaOption(in: group) != requested",
+                "scheduleSelectionSettleRead(for: item)",
+              ]))
+        // The VortX-owned external overlay subtitle (add-on / community-pooled) must be a REAL row of the
+        // track list, not an invisible renderer: both chromes tick "Off" from `subtitleTracks.allSatisfy {
+        // !$0.selected }` and hide an added add-on row expecting it to reappear in the ordinary list, so an
+        // unpublished external sub showed Off while rendering and made the tapped row vanish with no tick.
+        check("wiring: the external overlay subtitle is published as a selectable track row",
+              engine?.contains("static let externalSubtitleTrackID = 100_000") == true
+                  && engine?.contains("case \"sub\":   return subTracks + externalSubtitleTracks()") == true
+                  && externalSubtitleRow?.contains("selected: externalSubActive") == true)
+        check("wiring: an external subtitle load and its re-selection both republish the track list",
+              externalSubtitleSelection?.contains("publishSelectionTracks()") == true
+                  && externalSubtitleLoad?.contains("self.externalSubLabel = (title: title, lang: lang)") == true
+                  && externalSubtitleLoad?.contains("self.publishSelectionTracks()") == true)
+        check("wiring: the ticked-row identity includes the external subtitle",
+              selectionRefresh?.contains(
+                "let subtitleID = externalSubActive ? Self.externalSubtitleTrackID : nativeSubtitleID") == true)
         check("wiring: system media-selection changes are observed",
               engine?.contains("AVPlayerItem.mediaSelectionDidChangeNotification") == true)
         check("wiring: loaded groups force their initial track-list publication",
