@@ -7,11 +7,13 @@
 #   .github/workflows/engine-leak-guard.yml   (remote, alarms on what got through)
 #
 # WHY THIS EXISTS
-# On 2026-07-25 a lane pushed ~90 tags to the public repo; 56 of them pointed at commits
-# carrying the closed vortx-core/ tree. An earlier lane had correctly refused the same
-# material. The difference was not competence, it was that the rule lived in a human
-# briefing instead of in the tooling. Everything here is therefore designed to fire for
-# an operator who has never heard of the rule.
+# On 2026-07-25 a lane pushed roughly 90 tags to the public repo. 56 of them pointed at
+# commits carrying the closed vortx-core/ tree, and 16 of those 56 carried snapshots that
+# were not already public (15 distinct tree OIDs). The 56 is the exposure surface; the 16
+# is the disclosure, and it is what containment preserved and deleted. An earlier lane had
+# correctly refused the same material. The difference was not competence, it was that the
+# rule lived in a human briefing instead of in the tooling. Everything here is therefore
+# designed to fire for an operator who has never heard of the rule.
 #
 # THE RULE IS CONTENT, NOT NAMES
 # Nothing below looks at a branch or tag name. Names are exactly what failed: the refs
@@ -24,8 +26,9 @@
 #   scan-proprietary-engine.sh markers <commit-ish>    # content-marker sweep of one tree
 #
 # OUTPUT  one violation per line, on stdout:
-#   PATH    <commit> <top-level-path> <tree-oid>
-#   MARKER  <commit> <file>
+#   PATH     <commit> <top-level-path> <tree-oid>
+#   MARKER   <commit> <file>
+#   MANIFEST <commit> <file>
 #
 # The trailing tree OID names the engine SNAPSHOT, not the commit that happens to carry
 # it. 1258 commits in this repo's history carry only 143 distinct snapshots, so the OID is
@@ -53,6 +56,21 @@ PROPRIETARY_PATHS="vortx-core stremiox-core"
 #    would match its own scan and the guard would flag itself on every push.
 MARKER_SPDX="LicenseRef-VortX""-Proprietary"
 MARKER_HEADER="VortX-Proprietary:"" CLOSED SOURCE"
+
+# 3. Crate manifest names, scoped to *Cargo.toml. Closes the partial-copy gap: someone
+#    vendors crates/ranking/ alone, so there is no vortx-core/ top-level entry for probe 1
+#    and the copied files carry no licence marker for probe 2. All 29 engine crate
+#    manifests declare name = "vortx-<crate>", and the manifest always travels with the
+#    crate, so one literal covers every crate with no per-crate convention to decay.
+#
+#    THE PATHSPEC IS WHAT MAKES THIS SAFE. Unscoped, this literal matches 4 legitimate
+#    public files (SubtitlePoolClient.swift, SubtitlePoolConsentContractTests.swift, and
+#    two wrangler.toml). Scoped to *Cargo.toml it matches 0 public files and 30 at engine
+#    HEAD, measured 2026-07-25. Do NOT add the stremiox- equivalent in any form:
+#    desktop/src-tauri/Cargo.toml legitimately declares name = "stremiox-desktop". If a
+#    stremiox-core ever becomes real, list its crate names explicitly instead.
+MARKER_MANIFEST="name = \"vortx""-"
+MANIFEST_PATHSPEC='*Cargo.toml'
 
 die() { printf 'scan-proprietary-engine: %s\n' "$*" >&2; exit 2; }
 
@@ -110,14 +128,27 @@ probe_paths() {
 # lookup, and a renamed or relocated engine is visible at the tip by definition. Measured
 # on the VortX repo: 0.17s for the whole tree.
 probe_markers() {
-    local commit="$1" rc out
+    local commit="$1" rc out hits=""
+
     out="$(git grep -l -F -e "$MARKER_SPDX" -e "$MARKER_HEADER" "$commit" -- . 2>/dev/null)"
     rc=$?
     case "$rc" in
-        0) printf '%s\n' "$out" | sed 's/^\([^:]*\):/MARKER  \1 /' ;;
+        0) hits="$hits$(printf '%s\n' "$out" | sed 's/^\([^:]*\):/MARKER   \1 /')"$'\n' ;;
         1) : ;;                       # git grep: no matches, tree is clean
         *) die "git grep failed on $commit (rc=$rc)" ;;
     esac
+
+    # Second pass rather than another -e on the first: this literal is only safe under the
+    # manifest pathspec, and a shared invocation would silently unscope it.
+    out="$(git grep -l -F -e "$MARKER_MANIFEST" "$commit" -- "$MANIFEST_PATHSPEC" 2>/dev/null)"
+    rc=$?
+    case "$rc" in
+        0) hits="$hits$(printf '%s\n' "$out" | sed 's/^\([^:]*\):/MANIFEST \1 /')"$'\n' ;;
+        1) : ;;
+        *) die "git grep failed on $commit (rc=$rc, manifest probe)" ;;
+    esac
+
+    printf '%s' "$hits" | awk 'NF'
 }
 
 mode="${1:-}"

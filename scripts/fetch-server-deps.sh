@@ -10,9 +10,16 @@ cd "$(dirname "$0")/.."
 # cloning, so the pre-push engine leak guard is live before anyone can push. Idempotent
 # and silent once installed. Non-fatal on failure (a source export is not a git clone),
 # but loud, because an uninstalled guard is an unguarded clone.
+#
+# The install now also enforces hygiene, not just presence: it deletes core.hooksPath in
+# every scope it can write (any value there overrides the installed hook, so it is a bypass)
+# and it refuses to report success if the installed hook or scanner has drifted from the
+# tracked sources. So a failure here can mean "not installed" OR "installed but tampered
+# with" OR "overridden by config", and all three leave this clone unguarded.
 if ! ./scripts/install-git-hooks.sh; then
-    echo "WARNING: could not install git hooks. This clone has NO protection against" >&2
-    echo "         pushing proprietary engine source to a public remote." >&2
+    echo "WARNING: could not install the git hooks, or the installed guard failed its" >&2
+    echo "         config-scope and content checks. This clone has NO reliable protection" >&2
+    echo "         against pushing proprietary engine source to a public remote." >&2
 fi
 
 # Pinned SHA256s for everything downloaded below. These binaries ship inside the

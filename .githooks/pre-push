@@ -5,8 +5,10 @@
 # WHY THIS IS A HOOK AND NOT A BRIEFING
 # On 2026-07-25 one lane was told "engine material never goes to the public remote" and
 # correctly refused 22 branches. A later lane, briefed about other things but not that,
-# tagged the same commits and pushed ~90 tags to the public repo; 56 carried the closed
-# vortx-core/ tree. The rule was never wrong, it was just stored in a person. Everything
+# tagged the same commits and pushed roughly 90 tags to the public repo. 56 of them carried
+# the closed vortx-core/ tree, and 16 of those 56 carried snapshots that were not already
+# public. The 56 is the exposure surface, the 16 is the actual disclosure, and they are not
+# the same number. The rule was never wrong, it was just stored in a person. Everything
 # here assumes the operator has never heard of the rule and will not be told.
 #
 # WHAT IT CHECKS   the tree of every commit being pushed, never the ref name. Names were
@@ -34,8 +36,10 @@ remote_url="${2:-}"
 say() { printf '%s\n' "$*" >&2; }
 
 # The scanner is resolved from the HOOK's own location, not from the working directory.
-# core.hooksPath points every worktree at one checkout, so the guard still runs when the
-# branch being pushed is older than the guard itself and has no scripts/ copy of it.
+# scripts/install-git-hooks.sh puts this hook at <common-dir>/hooks/pre-push and the scanner
+# at <common-dir>/scripts/, so this resolves to the installed copy no matter which worktree
+# is pushing and no matter what is checked out there. That is what keeps the guard alive on
+# the branches that predate it, which have no scripts/ copy of their own.
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCANNER="$HOOK_DIR/../scripts/scan-proprietary-engine.sh"
 
@@ -174,7 +178,7 @@ say "  Refs in this push:"
 printf '%s' "$tips" | awk 'NF {printf "    %s  %s\n", substr($1,1,12), $2}' >&2
 say ""
 say "  Proprietary material found (commit, then what tripped it):"
-printf '%s\n' "$findings" | awk '{ printf "    %-7s %s  %s\n", $1, substr($2,1,12), $3 }' >&2
+printf '%s\n' "$findings" | awk '{ printf "    %-8s %s  %s\n", $1, substr($2,1,12), $3 }' >&2
 say ""
 say "  HOW TO PROCEED"
 say "    Engine work belongs on the private engine remote, not here:"

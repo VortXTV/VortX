@@ -15,7 +15,10 @@ name: Engine Leak Guard
 #   push      Immediate. But a push-triggered workflow runs the workflow file as it exists
 #             ON THE PUSHED REF. Every ref that leaked in the 2026-07-25 incident was a
 #             rescue branch cut long before this file existed, so the push trigger would
-#             have stayed silent for all 56 of them. Useful, but structurally incomplete.
+#             have stayed silent for all 56 engine-bearing refs, and for the 16 of those 56
+#             that carried snapshots which were not already public. (56 is the exposure
+#             surface, 16 is the disclosure; the two numbers are not interchangeable.)
+#             Useful, but structurally incomplete.
 #   schedule  Load-bearing. A scheduled run uses the DEFAULT branch's copy of this file and
 #             of the scanner, and sweeps every ref the repository has, including refs that
 #             predate the guard, refs pushed with the hook uninstalled, and refs pushed by
@@ -37,6 +40,28 @@ permissions:
   contents: read
 
 jobs:
+  guard-liveness:
+    name: Guard liveness
+    # Layer 1 is a LOCAL hook, which means its normal failure mode is silent absence: it
+    # stops running and every push succeeds at exit 0 with no output. Presence checks do
+    # not catch that, because a hook that exists can still be unreachable, non-executable,
+    # or overridden by core.hooksPath. Only a push that is actually refused proves the
+    # mechanism works, so this job builds a throwaway repository and refuses one. It is
+    # what converts a future silent absence into a red build.
+    # No `if:` on purpose: this must run on every trigger, including the schedule, because
+    # a push-triggered job is exactly the thing that goes quiet when nobody is pushing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install the guard the way a fresh clone does
+        # Proves the installer itself works, on a clone that has never had it. The
+        # verifier's config-hygiene assertion then checks what this step produced.
+        run: scripts/install-git-hooks.sh
+
+      - name: Assert an engine push is actually refused
+        run: scripts/verify-engine-leak-guard.sh
+
   pushed-ref:
     name: Pushed ref
     if: github.event_name == 'push'
