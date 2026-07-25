@@ -60,10 +60,36 @@ func resolved(_ json: String) -> ResolvedConfig {
     return RemoteConfig.validate(decoded)
 }
 
+/// The six feature keys a PLAYER call site reads. Each was decoded by nothing at all: `RemoteConfigData.Features`
+/// had no matching field, so `features[key]` was always absent, the call site's `default:` always won, and the
+/// switch could never be flipped from the server. These are the escape hatches for the Dolby Vision work, so an
+/// inert one means a bad DV build cannot be turned off remotely, which is the exact scenario they exist for.
+/// Paired with the baked default its call site passes, and the site that passes it.
+let escapeHatches: [(key: String, bakedDefault: Bool, site: String)] = [
+    ("tvosSpdif",                 false, "AudioOutputMode.swift:53"),
+    ("dvWindowConsumptionAnchor", true,  "VortXRemuxHLSServer.swift:63"),
+    ("dvRemuxMultiAudio",         true,  "VortXMKVRemuxStream.swift:510"),
+    ("dvRemuxSubtitles",          true,  "VortXMKVRemuxStream.swift:518"),
+    ("plainRemux",                true,  "PlayerEngineRouter.swift:326"),
+    ("avPlayerDefault",           true,  "PlayerEngineRouter.swift:346"),
+]
+
+/// A LITERAL transcription of the set-vs-absent idiom in `PlayerEngineRouter.plainRemuxEnabled` /
+/// `avPlayerDefaultEnabled` (PlayerEngineRouter.swift:330-336 and 350-356). Those functions cannot be linked
+/// into this standalone harness (they pull in the whole player), so the idiom is mirrored here and applied to
+/// a REAL `ResolvedConfig`. The primitive it rests on, `isFeatureOn`, is production code either way, and that
+/// primitive is what the six assertions below exercise directly.
+func twoProbeResolve(_ c: ResolvedConfig, _ key: String, baked: Bool) -> Bool {
+    let onWhenAbsentTrue = c.isFeatureOn(key, default: true)
+    let onWhenAbsentFalse = c.isFeatureOn(key, default: false)
+    if onWhenAbsentTrue == onWhenAbsentFalse { return onWhenAbsentTrue }
+    return baked
+}
+
 /// Every field a call site can read, as one comparable tuple-ish description. Used for the baked-equivalence
 /// contract: `.baked` and `validate({})` must agree on ALL of them, not on the handful someone remembered.
 func fingerprint(_ c: ResolvedConfig) -> [String: String] {
-    [
+    var out: [String: String] = [
         "remoteConfigEnabled": "\(c.remoteConfigEnabled)",
         "rankingConfigEnabled": "\(c.rankingConfigEnabled)",
         "debridCeilingMiB": "\(c.debridCeilingMiB)",
@@ -99,6 +125,15 @@ func fingerprint(_ c: ResolvedConfig) -> [String: String] {
         "featureSourceIndexDefaultTrue": "\(c.isFeatureOn("sourceIndex", default: true))",
         "featureSourceIndexDefaultFalse": "\(c.isFeatureOn("sourceIndex", default: false))",
     ]
+    // BOTH probes for each escape hatch, so an ABSENT key is pinned in BOTH directions. The pair
+    // (true, false) is the signature of "not in the map", which is exactly what lets the call site's own
+    // `default:` win. If a decode change ever made one of these present-by-default, the pair would collapse
+    // to (x, x) and the baked-equivalence assertion in `main` would go red.
+    for hatch in escapeHatches {
+        out["feature_\(hatch.key)_defaultTrue"] = "\(c.isFeatureOn(hatch.key, default: true))"
+        out["feature_\(hatch.key)_defaultFalse"] = "\(c.isFeatureOn(hatch.key, default: false))"
+    }
+    return out
 }
 
 /// One clamp bound, asserted at both edges and one step outside each. A range moved by one in either
@@ -138,6 +173,85 @@ struct RemoteConfigValidationTests {
                "MISSING BLOCK: an empty sourceIndex block resolves identically to no block at all")
         expect(fingerprint(resolved(#"{"master":{},"player":{},"trickplay":{},"endpoints":{}}"#)) == emptyFingerprint,
                "MISSING BLOCK: empty sibling blocks resolve identically to no blocks at all")
+
+        // ---- THE FIX: six keys the player READS that `Features` never DECODED ----
+        // All three states are asserted for each key. PRESENT-FALSE is the one that matters operationally (it
+        // is the kill switch), ABSENT is the one that matters for safety (it must be indistinguishable from
+        // the shipped build, so a server that omits the key cannot change behaviour in the field).
+        for hatch in escapeHatches {
+            func present(_ v: Bool) -> ResolvedConfig {
+                resolved(#"{"features":{"\#(hatch.key)":\#(v)}}"#)
+            }
+
+            expect(present(true).isFeatureOn(hatch.key, default: false) == true,
+                   "\(hatch.key): PRESENT true decodes and WINS over a false call-site default (\(hatch.site))")
+            expect(present(true).isFeatureOn(hatch.key, default: true) == true,
+                   "\(hatch.key): PRESENT true resolves true whatever the call-site default is")
+            expect(present(false).isFeatureOn(hatch.key, default: true) == false,
+                   "\(hatch.key): PRESENT false OVERRIDES a true call-site default -- this is the kill switch, and it was inert")
+            expect(present(false).isFeatureOn(hatch.key, default: false) == false,
+                   "\(hatch.key): PRESENT false resolves false whatever the call-site default is")
+
+            // ABSENT must be byte-identical to today's shipped behaviour, on both snapshots a reader can see.
+            expect(resolved("{}").isFeatureOn(hatch.key, default: hatch.bakedDefault) == hatch.bakedDefault,
+                   "\(hatch.key): ABSENT yields the baked \(hatch.bakedDefault), so a server omitting the key changes NOTHING")
+            expect(ResolvedConfig.baked.isFeatureOn(hatch.key, default: hatch.bakedDefault) == hatch.bakedDefault,
+                   "\(hatch.key): the all-baked snapshot also yields \(hatch.bakedDefault)")
+            // An explicit null must be ABSENT, not false. A null resolving to false would silently kill a
+            // default-ON DV lane across the whole fleet.
+            expect(resolved(#"{"features":{"\#(hatch.key)":null}}"#)
+                    .isFeatureOn(hatch.key, default: hatch.bakedDefault) == hatch.bakedDefault,
+                   "\(hatch.key): an explicit null is treated as ABSENT, not as false")
+        }
+
+        // ---- The PlayerEngineRouter two-probe idiom, across all three states ----
+        // It distinguishes an explicitly-set false from an absent key by comparing two probes. That idiom is
+        // correct and had to keep working once the keys began decoding: before the fix its "present" branch
+        // was unreachable for these two keys.
+        for hatch in escapeHatches where hatch.key == "plainRemux" || hatch.key == "avPlayerDefault" {
+            expect(twoProbeResolve(resolved(#"{"features":{"\#(hatch.key)":true}}"#), hatch.key, baked: true) == true,
+                   "\(hatch.key) two-probe: PRESENT true -> probes AGREE -> true")
+            expect(twoProbeResolve(resolved(#"{"features":{"\#(hatch.key)":false}}"#), hatch.key, baked: true) == false,
+                   "\(hatch.key) two-probe: PRESENT false -> probes AGREE -> false (the fleet kill switch now reaches the router)")
+            expect(twoProbeResolve(resolved("{}"), hatch.key, baked: true) == true,
+                   "\(hatch.key) two-probe: ABSENT -> probes DISAGREE -> the baked ON default, exactly as shipped")
+            expect(twoProbeResolve(ResolvedConfig.baked, hatch.key, baked: true) == true,
+                   "\(hatch.key) two-probe: the all-baked snapshot resolves ON, identical to today")
+        }
+
+        // ---- The regression itself, stated as one assertion ----
+        // Before the fix `Features` had no field for any of these six, so this payload decoded to an EMPTY
+        // feature map and was indistinguishable from `{}`. That equality WAS the bug. If a future edit drops
+        // one of the fields again, this goes red.
+        let allOff = #"""
+        {"features":{"tvosSpdif":false,"dvWindowConsumptionAnchor":false,"dvRemuxMultiAudio":false,
+        "dvRemuxSubtitles":false,"plainRemux":false,"avPlayerDefault":false}}
+        """#
+        expect(fingerprint(resolved(allOff)) != emptyFingerprint,
+               "REGRESSION GUARD: a config turning all six switches OFF is no longer identical to an empty config")
+        for hatch in escapeHatches {
+            expect(resolved(allOff).isFeatureOn(hatch.key, default: true) == false,
+                   "REGRESSION GUARD: \(hatch.key) reads FALSE from the all-off payload")
+        }
+        // And the mirror image: a payload turning all six ON is likewise distinguishable, so the map is not
+        // merely being filled with one constant.
+        let allOn = #"""
+        {"features":{"tvosSpdif":true,"dvWindowConsumptionAnchor":true,"dvRemuxMultiAudio":true,
+        "dvRemuxSubtitles":true,"plainRemux":true,"avPlayerDefault":true}}
+        """#
+        for hatch in escapeHatches {
+            expect(resolved(allOn).isFeatureOn(hatch.key, default: false) == true,
+                   "REGRESSION GUARD: \(hatch.key) reads TRUE from the all-on payload")
+        }
+
+        // ---- The five keys that DECODE but nothing READS (reported, deliberately NOT deleted) ----
+        // Deleting a schema field is a separate decision: a server may already be sending these. Pinned here
+        // so the decision stays visible and a later reader can see they were known, not missed.
+        for orphan in ["hdrDisplayModeSwitch", "iosPassthroughAudio", "dvToAVPlayerRouting",
+                       "hlsToAVPlayerRouting", "av1Penalty"] {
+            expect(resolved(#"{"features":{"\#(orphan)":false}}"#).isFeatureOn(orphan, default: true) == false,
+                   "DECODED BUT UNREAD: \(orphan) still decodes (no app call site reads it today)")
+        }
 
         // ---- The Singularity ranges, each at both edges and one step outside ----
         assertRange("interBatchDelayMs", lo: 1100, hi: 30000, baked: 1100,

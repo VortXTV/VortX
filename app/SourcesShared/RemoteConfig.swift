@@ -45,16 +45,23 @@ enum RemoteConfigDefaults {
     static let macCeilingMiB = 1024          // macOS ceiling (was `1_024 * 1024 * 1024`)
     static let offFloorMiB = 64              // hard floor: no ceiling may drop below this
     static let vodReadaheadSecs = 300        // demuxer-readahead-secs for VOD (configureLiveMode else-branch)
-    static let dvRemuxWindowMiB = 64         // Re-read floor, in MiB. MUST stay >= two full HLS segments
-                                             // (2 x hlsMaxSegmentBytes = 2 x 32 MiB = 64), the worst-case
-                                             // concurrent two-segment read skew. A floor below that can evict a
-                                             // range still being served on an open connection: the reader's next
-                                             // request falls below the window, the HLS connection is cut, and
-                                             // AVPlayer demotes DV to HDR10. (It is NOT a startup guard;
+    static let dvRemuxWindowMiB = 64         // Re-read floor, in MiB. THE 64 IS EMPIRICAL, not derived.
+                                             // It used to be justified here as "2 x hlsMaxSegmentBytes = 2 x 32
+                                             // MiB", the worst-case concurrent two-segment read skew. That
+                                             // derivation is dead: there is no `hlsMaxSegmentBytes` anywhere in
+                                             // the app any more, and VortXRemuxBuffer calls 32 MiB "the retired
+                                             // 32 MiB threshold" (VortXRemuxBuffer.swift:318-323) because legal
+                                             // GOPs may exceed it, so the window is not a segment multiple at all.
+                                             // The eviction-under-an-open-response hazard the old text described
+                                             // is now held by ACTIVE READ LEASES (VortXRemuxBuffer.activeReadRanges),
+                                             // which block eviction beneath any in-flight response independently
+                                             // of this floor. What the floor still buys is keeping ordinary
+                                             // near-frontier re-reads from churning. (It is NOT a startup guard;
                                              // producerLeadBytes supplies startup headroom independently.) 64 is
-                                             // both the design minimum and the shipped value, so the clamp and
-                                             // VortXRemuxBuffer.windowFloorMinMiB agree. Widening (never lowering)
-                                             // is trialable on the fleet via the RemoteConfig dial without a build.
+                                             // simply the shipped value, and VortXRemuxBuffer.windowFloorMinMiB is
+                                             // the same 64, so the clamp is a fleet no-op today. Widening (never
+                                             // lowering) is trialable on the fleet via the RemoteConfig dial
+                                             // without a build.
 
     // Timeouts (detail settle / debrid resolve). Present for future wiring; clamped in validate.
     static let detailSettleIOSSecs = 12
@@ -143,6 +150,9 @@ struct RemoteConfigData: Decodable {
         let communityTrickplay: Bool?
         let dvRemux: Bool?
         let dvRemuxHLS: Bool?   // b166: local-HLS delivery of the DV remux (kill-switch back to the loader path)
+        let dvRemuxMultiAudio: Bool?           // VortXMKVRemuxStream.multiAudioEnabled (baked ON)
+        let dvRemuxSubtitles: Bool?            // VortXMKVRemuxStream.subtitleRenditionsEnabled (baked ON)
+        let dvWindowConsumptionAnchor: Bool?   // VortXRemuxHLSServer.consumptionAnchorEnabled (baked ON)
         let diskCache: Bool?
         let trailers: Bool?
         let vortxRatings: Bool?
@@ -156,8 +166,11 @@ struct RemoteConfigData: Decodable {
         let debridInlineResolve: Bool?
         let hdrDisplayModeSwitch: Bool?
         let iosPassthroughAudio: Bool?
+        let tvosSpdif: Bool?           // AudioOutputMode.tvosSpdifExperimentEnabled (baked OFF)
         let dvToAVPlayerRouting: Bool?
         let hlsToAVPlayerRouting: Bool?
+        let plainRemux: Bool?          // PlayerEngineRouter.plainRemuxEnabled (baked ON, two-probe read)
+        let avPlayerDefault: Bool?     // PlayerEngineRouter.avPlayerDefaultEnabled (baked ON, two-probe read)
         let av1Penalty: Bool?
         let communitySubtitles: Bool?
         let subtitleSync: Bool?
@@ -684,13 +697,14 @@ actor RemoteConfig {
         let reduced = max(floor, clamp(data.player?.readAhead?.reducedCeilingMiB, RemoteConfigDefaults.reducedCeilingMiB, 64, 192))
         let mac = max(floor, clamp(data.player?.readAhead?.macCeilingMiB, RemoteConfigDefaults.macCeilingMiB, 128, 1536))
         let vodSecs = clamp(data.player?.vodReadaheadSecs, RemoteConfigDefaults.vodReadaheadSecs, 30, 600)
-        // DV-remux buffer window floor: keep at least 64 MiB (two full HLS segments, matching
-        // VortXRemuxBuffer.windowFloorMinMiB) and cap at 512 MiB. The lower bound is the design invariant, not a
-        // convenience: a floor below the two-segment skew can evict a range still being served on an open
-        // connection (reader request drops below storageBase -> HLS connection cut -> AVPlayer demotes DV to
-        // HDR10). It is NOT a startup-starvation guard; producerLeadBytes supplies the startup headroom
-        // independently. The upper cap keeps a widened re-read floor from approaching the whole-movie RAM this
-        // window replaced.
+        // DV-remux buffer window floor: keep at least 64 MiB (matching VortXRemuxBuffer.windowFloorMinMiB) and
+        // cap at 512 MiB. The lower bound is EMPIRICAL, not a two-segment derivation: see the note on
+        // RemoteConfigDefaults.dvRemuxWindowMiB for why that derivation is dead (no hlsMaxSegmentBytes exists,
+        // and 32 MiB is a retired threshold). Eviction beneath a range still being served is held by
+        // VortXRemuxBuffer's active read leases, not by this floor; the floor keeps ordinary near-frontier
+        // re-reads from churning. It is NOT a startup-starvation guard; producerLeadBytes supplies the startup
+        // headroom independently. The upper cap keeps a widened re-read floor from approaching the whole-movie
+        // RAM this window replaced.
         let dvWindow = clamp(data.player?.readAhead?.dvRemuxWindowMiB, RemoteConfigDefaults.dvRemuxWindowMiB, 64, 512)
 
         // --- Timeouts. ---
@@ -803,6 +817,9 @@ actor RemoteConfig {
             put("communityTrickplay", f.communityTrickplay)
             put("dvRemux", f.dvRemux)
             put("dvRemuxHLS", f.dvRemuxHLS)
+            put("dvRemuxMultiAudio", f.dvRemuxMultiAudio)
+            put("dvRemuxSubtitles", f.dvRemuxSubtitles)
+            put("dvWindowConsumptionAnchor", f.dvWindowConsumptionAnchor)
             put("diskCache", f.diskCache)
             put("trailers", f.trailers)
             put("vortxRatings", f.vortxRatings)
@@ -816,8 +833,11 @@ actor RemoteConfig {
             put("debridInlineResolve", f.debridInlineResolve)
             put("hdrDisplayModeSwitch", f.hdrDisplayModeSwitch)
             put("iosPassthroughAudio", f.iosPassthroughAudio)
+            put("tvosSpdif", f.tvosSpdif)
             put("dvToAVPlayerRouting", f.dvToAVPlayerRouting)
             put("hlsToAVPlayerRouting", f.hlsToAVPlayerRouting)
+            put("plainRemux", f.plainRemux)
+            put("avPlayerDefault", f.avPlayerDefault)
             put("av1Penalty", f.av1Penalty)
             put("communitySubtitles", f.communitySubtitles)
             put("subtitleSync", f.subtitleSync)
