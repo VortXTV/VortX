@@ -6,7 +6,13 @@
 set -euo pipefail
 # stremiox-core is proprietary + lives in a PRIVATE repo. Resolve its checkout: STREMIOX_CORE_DIR env,
 # else a sibling ../../stremiox-core clone, else the legacy in-repo ../core (removed from the public repo).
-_SD="$(dirname "$0")"
+_SD="$(cd "$(dirname "$0")" && pwd)"
+# Capture the repo root BEFORE the `cd "$CORE_DIR"` below. OUT used to be relative ("../app/Vendor"),
+# which was only ever correct for the legacy in-repo ./core layout, where ../app/Vendor happened to be
+# the repo's own Vendor dir. With the core in a SIBLING checkout it resolved to <sibling-parent>/app/
+# Vendor, i.e. outside the repo, so the build wrote the fresh xcframework somewhere nothing links and
+# the app silently kept linking a stale one. Absolute against the repo root is correct for BOTH layouts.
+REPO_ROOT="$(cd "$_SD/.." && pwd)"
 CORE_DIR="${STREMIOX_CORE_DIR:-}"
 if [ -z "$CORE_DIR" ]; then
   for c in "$_SD/../../stremiox-core" "$_SD/../core"; do
@@ -17,6 +23,8 @@ if [ -z "$CORE_DIR" ] || [ ! -f "$CORE_DIR/Cargo.toml" ]; then
   echo "ERROR: stremiox-core crate not found. Set STREMIOX_CORE_DIR or clone VortXTV/stremiox-core to ../../stremiox-core." >&2
   exit 1
 fi
+CORE_DIR="$(cd "$CORE_DIR" && pwd)"   # absolute, so logs and any later use do not depend on the CWD
+echo "core workspace: $CORE_DIR"
 cd "$CORE_DIR"
 source "$HOME/.cargo/env" 2>/dev/null || true
 
@@ -25,7 +33,7 @@ BUILDSTD="-Z build-std=std,panic_abort"
 # resolution FAILS the build here instead of silently linking a different graph than CI proved.
 LOCKED="--locked"
 LIB="libstremiox_core.a"
-OUT="../app/Vendor/StremioXCore.xcframework"   # Vendor/ is gitignored; produced by this script
+OUT="$REPO_ROOT/app/Vendor/StremioXCore.xcframework"   # Vendor/ is gitignored; produced by this script
 
 rustup +nightly-2026-07-19 target add aarch64-apple-ios aarch64-apple-ios-sim 2>/dev/null || true
 
