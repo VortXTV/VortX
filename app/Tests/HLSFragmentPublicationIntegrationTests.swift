@@ -1,17 +1,22 @@
 // Production-linked fragmented-MP4 publication harness.
 //
+// DO NOT hand-roll the framework search below from a bare MPV_ROOT. This comment used to read
+//
 //   MPV_ROOT=/path/to/DerivedData/VortX-*/SourcePackages/artifacts/mpvkit
-//   FRAMEWORK_KEYS=(Libavformat-GPL Libavcodec-GPL Libavutil-GPL Libavdevice-GPL Libavfilter-GPL
-//     Libswresample-GPL Libswscale-GPL Libssl Libcrypto Libass Libfreetype Libfribidi Libharfbuzz
-//     Libshaderc_combined lcms2 Libplacebo Libdovi Libunibreak Libsmbclient gmp nettle hogweed gnutls
-//     Libdav1d Libuavs3d)
-//   LINK_FLAGS=()
-//   for key in "${FRAMEWORK_KEYS[@]}"; do
-//     slice=$(find "$MPV_ROOT/$key" -type d -name macos-arm64_x86_64 | head -n 1)
-//     framework_dir=$(find "$slice" -maxdepth 1 -name '*.framework' -type d | head -n 1)
-//     LINK_FLAGS+=( -F "${framework_dir:h}" -framework "${framework_dir:t:r}" )
-//   done
-//   MOLTEN_ARCHIVE=$(find "$MPV_ROOT/MoltenVK" -path '*macos-arm64_x86_64/libMoltenVK.a' | head -n 1)
+//   for key in "${FRAMEWORK_KEYS[@]}"; do slice=$(find "$MPV_ROOT/$key" ...
+//
+// which always resolves UPSTREAM MPVKit out of the SPM download cache. On a branch whose
+// app/project.yml points the MPVKit package at a LOCAL path (`path: Vendor/MPVKit-DVFEL`), the
+// shipped libavformat / libavcodec / libavutil / libswscale / libplacebo are built in-tree and are
+// BYTE-DIFFERENT from that cache, so the recipe above linked binaries the product does not ship
+// and any result it produced was about the wrong FFmpeg.
+//
+// test/dv-rendition-stall/run-repro.sh now resolves this correctly: it reads app/project.yml to
+// learn whether MPVKit is local or upstream, reads a local package's Package.swift to learn which
+// binaryTargets are built in-tree, takes those from the local artifacts/ and the rest from the SPM
+// cache, prints every path and SHA-256, and exits INFRA rather than guessing. Take LINK_FLAGS and
+// MOLTEN_ARCHIVE from that script (or just run it) instead of rebuilding the search here.
+//
 //   SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
 //   xcrun swiftc -sdk "$SDK_PATH" -strict-concurrency=complete -warnings-as-errors \
 //     "${LINK_FLAGS[@]}" "$MOLTEN_ARCHIVE" \
