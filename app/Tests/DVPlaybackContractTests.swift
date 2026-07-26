@@ -817,16 +817,40 @@ check("artifact: optional tags precede the single video variant",
 let hdrRecoveryArtifact = Data("""
 #EXTM3U
 #EXT-X-VERSION:7
-#EXT-X-STREAM-INF:BANDWIDTH=20000000,RESOLUTION=3840x2160,CODECS="hvc1.2.4.L153.B0,ec-3",FRAME-RATE=23.976
+#EXT-X-STREAM-INF:BANDWIDTH=20000000,RESOLUTION=3840x2160,CODECS="hvc1.2.4.L153.B0,ec-3",VIDEO-RANGE=PQ,FRAME-RATE=23.976
 media-hdr.m3u8
 
 """.utf8)
-check("artifact: explicit HDR recovery is a separate single-variant master",
+check("artifact: Profile 8.1 recovery is a separate exact-PQ single-variant master",
       DVPlaybackPolicy.masterPlaylistData(
         input: dvMasterInput,
         mediaTags: [],
         streamInfAttributes: "",
         videoVariant: .hdrFallback) == hdrRecoveryArtifact)
+
+let p84MasterInput = DVPlaybackPolicy.MasterPlaylistInput(
+    videoCodec: "hvc1.2.4.L153.B0",
+    supplementalCodec: "dvh1.08.06/db4h",
+    videoRange: "HLG",
+    audioCodec: "ec-3",
+    width: 3840,
+    height: 2160,
+    bandwidth: 20_000_000,
+    fps: 23.976,
+    dolbyVision: true)
+let p84RecoveryArtifact = Data("""
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-STREAM-INF:BANDWIDTH=20000000,RESOLUTION=3840x2160,CODECS="hvc1.2.4.L153.B0,ec-3",VIDEO-RANGE=HLG,FRAME-RATE=23.976
+media-hdr.m3u8
+
+""".utf8)
+check("artifact: Profile 8.4 recovery is a separate exact-HLG single-variant master",
+      DVPlaybackPolicy.masterPlaylistData(
+        input: p84MasterInput,
+        mediaTags: [],
+        streamInfAttributes: "",
+        videoVariant: .hdrFallback) == p84RecoveryArtifact)
 
 check("HDR recovery: exact healthy DV CoreMedia -12927 failure gets one explicit fallback",
       DVPlaybackPolicy.shouldAttemptHDRFallback(
@@ -864,6 +888,26 @@ check("HDR recovery: unrelated failures keep their existing fail-soft path",
         alreadyAttempted: false,
         errorDomain: "AVFoundationErrorDomain",
         errorCode: -11828))
+check("HDR recovery: a pre-ready replacement may cross the mount ready edge itself",
+      DVPlaybackPolicy.acceptsRemuxReady(
+        transitionAccepted: true,
+        mountAlreadyReady: true,
+        recoveryItem: true))
+check("HDR recovery: an already-ready mount may accept its replacement item",
+      DVPlaybackPolicy.acceptsRemuxReady(
+        transitionAccepted: false,
+        mountAlreadyReady: true,
+        recoveryItem: true))
+check("HDR recovery: an expired pre-ready mount cannot look already ready",
+      !DVPlaybackPolicy.acceptsRemuxReady(
+        transitionAccepted: false,
+        mountAlreadyReady: false,
+        recoveryItem: true))
+check("HDR recovery: an ordinary duplicate ready callback remains rejected",
+      !DVPlaybackPolicy.acceptsRemuxReady(
+        transitionAccepted: false,
+        mountAlreadyReady: true,
+        recoveryItem: false))
 check("HDR recovery: local master URL rewrites only the terminal resource",
       DVPlaybackPolicy.hdrFallbackMasterURL(
         from: URL(string: "http://127.0.0.1:4321/master.m3u8")!)?.absoluteString
@@ -880,6 +924,127 @@ check("HDR recovery: Profile 8.4 base layer requests HLG",
 check("HDR recovery: PQ and unknown base layers request HDR10",
       DVPlaybackPolicy.hdrFallbackDisplayRange(videoRange: "PQ") == .hdr10
         && DVPlaybackPolicy.hdrFallbackDisplayRange(videoRange: nil) == .hdr10)
+check("HDR recovery: capability stays closed before surgery settles",
+      !DVPlaybackPolicy.supportsHDRFallback(
+        dolbyVision: true,
+        videoCodec: "hvc1.2.4.L153.B0",
+        surgerySettled: false,
+        recoveryInitAvailable: true))
+check("HDR recovery: capability stays closed when surgery produced no init",
+      !DVPlaybackPolicy.supportsHDRFallback(
+        dolbyVision: true,
+        videoCodec: "hvc1.2.4.L153.B0",
+        surgerySettled: true,
+        recoveryInitAvailable: false))
+check("HDR recovery: Profile 5 stays closed even if impossible recovery bytes appear",
+      !DVPlaybackPolicy.supportsHDRFallback(
+        dolbyVision: true,
+        videoCodec: "dvh1.05.06",
+        surgerySettled: true,
+        recoveryInitAvailable: true))
+check("HDR recovery: compatible DV plus settled valid init opens the capability",
+      DVPlaybackPolicy.supportsHDRFallback(
+        dolbyVision: true,
+        videoCodec: "hvc1.2.4.L153.B0",
+        surgerySettled: true,
+        recoveryInitAvailable: true))
+
+var recoverySeek = DVPlaybackPolicy.HDRRecoverySeekState()
+recoverySeek.stageReplacement(
+    playerSeconds: 42,
+    queuedUserSourceSeconds: nil)
+check("HDR recovery seek: automatic retry restores the old player clock",
+      recoverySeek.consume(sourceToPlayer: { $0 - 3_600 }) == 42
+        && recoverySeek.automaticPlayerSeconds == nil
+        && recoverySeek.userSourceSeconds == nil)
+recoverySeek.stageReplacement(
+    playerSeconds: 42,
+    queuedUserSourceSeconds: 3_700)
+check("HDR recovery seek: a pre-ready queued user intent atomically beats the automatic clock",
+      recoverySeek.consume(sourceToPlayer: { $0 - 3_600 }) == 100
+        && recoverySeek.automaticPlayerSeconds == nil
+        && recoverySeek.userSourceSeconds == nil)
+check("HDR recovery seek: consumed state cannot replay on a later callback",
+      recoverySeek.consume(sourceToPlayer: { $0 }) == nil)
+recoverySeek.stageReplacement(
+    playerSeconds: 42,
+    queuedUserSourceSeconds: nil)
+check("HDR recovery failover: old player clock maps through the live origin before remount",
+      recoverySeek.failoverSourceSeconds(
+        currentSourceSeconds: 3_600,
+        playerToSource: { 3_600 + $0 }) == 3_642)
+recoverySeek.supersedeWithUser(sourceSeconds: 3_700)
+check("HDR recovery failover: newest user source intent supersedes automatic restoration",
+      recoverySeek.failoverSourceSeconds(
+        currentSourceSeconds: 3_600,
+        playerToSource: { 3_600 + $0 }) == 3_700)
+check("host failover: a seek queued during capability refresh beats every staged clock",
+      recoverySeek.failoverSourceSeconds(
+        pendingUserSourceSeconds: 3_800,
+        currentSourceSeconds: 3_600,
+        playerToSource: { 3_600 + $0 }) == 3_800)
+
+var recoverySelection = DVPlaybackPolicy.HDRRecoverySelectionState(
+    audioSelectionKnown: true,
+    audioIndex: 1,
+    subtitleSelectionKnown: true,
+    subtitleIndex: 2,
+    externalSubtitleActive: false)
+recoverySelection.selectAudio(5)
+recoverySelection.selectAudio(-1)
+recoverySelection.selectSubtitle(7, externalTrackID: 100_000)
+recoverySelection.selectSubtitle(100_000, externalTrackID: 100_000)
+check("HDR recovery selection: newest replacement-time audio and subtitle intent wins",
+      recoverySelection.audioSelectionKnown
+        && recoverySelection.audioIndex == nil
+        && recoverySelection.subtitleSelectionKnown
+        && recoverySelection.subtitleIndex == nil
+        && recoverySelection.externalSubtitleActive)
+
+let staleMountedSelection = DVPlaybackPolicy.HDRRecoverySelectionState(
+    audioSelectionKnown: true,
+    audioIndex: 1,
+    subtitleSelectionKnown: true,
+    subtitleIndex: 2,
+    externalSubtitleActive: false)
+let newestPendingSelection = DVPlaybackPolicy.HDRRecoverySelectionState(
+    audioSelectionKnown: true,
+    audioIndex: 5,
+    subtitleSelectionKnown: true,
+    subtitleIndex: nil,
+    externalSubtitleActive: true)
+let remountSelection = DVPlaybackPolicy.selectionForFreshRemount(
+    pendingReplacement: newestPendingSelection,
+    current: staleMountedSelection)
+check("host failover selection: pending replacement intent beats stale mounted groups",
+      remountSelection.audioIndex == 5)
+check("host failover selection: discarded external cues fail closed to subtitle Off",
+      remountSelection.subtitleSelectionKnown
+        && remountSelection.subtitleIndex == nil
+        && !remountSelection.externalSubtitleActive)
+
+check("DV bitrate pin: only the authoritatively signaled primary DV remux qualifies",
+      DVPlaybackPolicy.shouldPinPreferredPeakBitRate(
+        isRemuxMounted: true,
+        usingHDRFallbackItem: false,
+        contentIsDolbyVision: true,
+        signalingDolbyVision: true))
+check("DV bitrate pin: plain remux, HDR recovery, and route-only guesses stay unpinned",
+      !DVPlaybackPolicy.shouldPinPreferredPeakBitRate(
+        isRemuxMounted: true,
+        usingHDRFallbackItem: false,
+        contentIsDolbyVision: false,
+        signalingDolbyVision: false)
+        && !DVPlaybackPolicy.shouldPinPreferredPeakBitRate(
+            isRemuxMounted: true,
+            usingHDRFallbackItem: true,
+            contentIsDolbyVision: true,
+            signalingDolbyVision: true)
+        && !DVPlaybackPolicy.shouldPinPreferredPeakBitRate(
+            isRemuxMounted: true,
+            usingHDRFallbackItem: false,
+            contentIsDolbyVision: true,
+            signalingDolbyVision: false))
 
 // MARK: - Display switch de-duplication (the flicker)
 

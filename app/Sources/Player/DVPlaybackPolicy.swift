@@ -249,12 +249,13 @@ enum DVPlaybackPolicy {
         var codecs = input.videoCodec
         if let audio = input.audioCodec { codecs += ",\(audio)" }
 
-        func commonInf(bandwidth: Int) -> String {
+        func commonInf(bandwidth: Int, videoRange: String? = nil) -> String {
             var inf = "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth)"
             if input.width > 0, input.height > 0 {
                 inf += ",RESOLUTION=\(input.width)x\(input.height)"
             }
             inf += ",CODECS=\"\(codecs)\""
+            if let videoRange { inf += ",VIDEO-RANGE=\(videoRange)" }
             if input.fps > 0 { inf += String(format: ",FRAME-RATE=%.3f", input.fps) }
             return inf
         }
@@ -265,7 +266,11 @@ enum DVPlaybackPolicy {
         }
 
         if videoVariant == .hdrFallback {
-            let inf = commonInf(bandwidth: input.bandwidth) + streamInfAttributes
+            let fallbackRange = hdrFallbackDisplayRange(videoRange: input.videoRange) == .hlg
+                ? "HLG" : "PQ"
+            let inf = commonInf(
+                bandwidth: input.bandwidth,
+                videoRange: fallbackRange) + streamInfAttributes
             return Data("\(head)\n\(inf)\nmedia-hdr.m3u8\n".utf8)
         }
 
@@ -302,12 +307,135 @@ enum DVPlaybackPolicy {
             && errorCode == -12927
     }
 
+    /// A recovery capability exists only after byte surgery settled successfully. Profile 5 remains excluded
+    /// even if malformed state somehow supplied bytes, because its IPT-only base is not independently playable.
+    static func supportsHDRFallback(
+        dolbyVision: Bool,
+        videoCodec: String,
+        surgerySettled: Bool,
+        recoveryInitAvailable: Bool
+    ) -> Bool {
+        dolbyVision
+            && !videoCodec.lowercased().hasPrefix("dvh1.05")
+            && surgerySettled
+            && recoveryInitAvailable
+    }
+
     /// A recovery item may share a mount whose one ready transition already happened. It may also be the item
     /// that crosses that transition after a pre-ready primary failure. Every other false transition is terminal.
     static func acceptsRemuxReady(transitionAccepted: Bool,
                                   mountAlreadyReady: Bool,
                                   recoveryItem: Bool) -> Bool {
         transitionAccepted || (recoveryItem && mountAlreadyReady)
+    }
+
+    /// One-shot replacement seek state that keeps player-clock restoration separate from user source-clock
+    /// intent. A user action arriving during replacement supersedes the automatic value, and `consume` clears
+    /// both domains atomically so no later callback can replay either seek.
+    struct HDRRecoverySeekState: Equatable, Sendable {
+        private(set) var automaticPlayerSeconds: Double?
+        private(set) var userSourceSeconds: Double?
+
+        /// Begin one replacement atomically. A resume or seek queued before the failed item became ready is
+        /// already user source-time intent, so it must be installed in the same write that stages the fallback
+        /// player clock. This prevents replacement setup from clearing the queued intent between two calls.
+        mutating func stageReplacement(
+            playerSeconds: Double,
+            queuedUserSourceSeconds: Double?
+        ) {
+            automaticPlayerSeconds = playerSeconds
+            userSourceSeconds = queuedUserSourceSeconds
+        }
+
+        mutating func supersedeWithUser(sourceSeconds: Double) {
+            userSourceSeconds = sourceSeconds
+        }
+
+        mutating func consume(sourceToPlayer: (Double) -> Double) -> Double? {
+            let target = userSourceSeconds.map(sourceToPlayer) ?? automaticPlayerSeconds
+            automaticPlayerSeconds = nil
+            userSourceSeconds = nil
+            return target
+        }
+
+        mutating func reset() {
+            automaticPlayerSeconds = nil
+            userSourceSeconds = nil
+        }
+
+        /// Choose the source-time resume point if a hosted engine disappears during replacement. A staged user
+        /// source seek is already in the required domain. Otherwise map the old item's staged player clock
+        /// through the live mount origin; the replacement item's current clock may still be zero. A seek queued
+        /// before replacement staging, such as one received during the hosted capability refresh, is newer than
+        /// both staged values and therefore wins first.
+        func failoverSourceSeconds(
+            pendingUserSourceSeconds: Double? = nil,
+            currentSourceSeconds: Double,
+            playerToSource: (Double) -> Double
+        ) -> Double {
+            if let pendingUserSourceSeconds { return pendingUserSourceSeconds }
+            if let userSourceSeconds { return userSourceSeconds }
+            if let automaticPlayerSeconds { return playerToSource(automaticPlayerSeconds) }
+            return currentSourceSeconds
+        }
+    }
+
+    /// Media-selection snapshot for an HDR replacement item. User actions received while AVFoundation is still
+    /// loading the new groups mutate this snapshot, so the newest intent wins when the groups become available.
+    struct HDRRecoverySelectionState: Equatable, Sendable {
+        var audioSelectionKnown: Bool
+        var audioIndex: Int?
+        var subtitleSelectionKnown: Bool
+        var subtitleIndex: Int?
+        var externalSubtitleActive: Bool
+
+        mutating func selectAudio(_ id: Int) {
+            audioSelectionKnown = true
+            audioIndex = id >= 0 ? id : nil
+        }
+
+        mutating func selectSubtitle(_ id: Int, externalTrackID: Int) {
+            subtitleSelectionKnown = true
+            if id == externalTrackID {
+                subtitleIndex = nil
+                externalSubtitleActive = true
+            } else {
+                subtitleIndex = id >= 0 ? id : nil
+                externalSubtitleActive = false
+            }
+        }
+    }
+
+    /// Choose the newest selection intent for a fresh remount. A replacement-time snapshot is newer than the
+    /// failed item's groups and therefore wins. External overlay cues are deliberately not preserved because
+    /// `loadFile` discards their parsed payload; retaining only the active flag would advertise a row that can
+    /// no longer render. Embedded selections remain stable and an invalid external selection becomes Off.
+    static func selectionForFreshRemount(
+        pendingReplacement: HDRRecoverySelectionState?,
+        current: HDRRecoverySelectionState
+    ) -> HDRRecoverySelectionState {
+        var selected = pendingReplacement ?? current
+        if selected.externalSubtitleActive {
+            selected.subtitleSelectionKnown = true
+            selected.subtitleIndex = nil
+            selected.externalSubtitleActive = false
+        }
+        return selected
+    }
+
+    /// The post-first-frame bitrate pin is valid only for an authoritatively signaled primary DV remux item.
+    /// Route intent alone is insufficient because a plain remux can share the same controller and bandwidth
+    /// field, and the HDR recovery item deliberately no longer carries Dolby Vision.
+    static func shouldPinPreferredPeakBitRate(
+        isRemuxMounted: Bool,
+        usingHDRFallbackItem: Bool,
+        contentIsDolbyVision: Bool,
+        signalingDolbyVision: Bool
+    ) -> Bool {
+        isRemuxMounted
+            && !usingHDRFallbackItem
+            && contentIsDolbyVision
+            && signalingDolbyVision
     }
 
     /// Preserve the origin, capability prefix and query while replacing only the primary master resource.

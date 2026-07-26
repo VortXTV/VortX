@@ -32,7 +32,7 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
 
     private let session: VortXExternalEngine.OpenedSession
     private let engine: VortXExternalEngine
-    private let onLost: @Sendable () -> Void
+    private let onLost: @Sendable (VortXRemoteRemuxMount) -> Void
 
     private let lock = NSLock()
     private var latest: VortXEngineProtocol.SessionStatus?
@@ -43,7 +43,7 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
 
     private init(session: VortXExternalEngine.OpenedSession,
                  engine: VortXExternalEngine,
-                 onLost: @escaping @Sendable () -> Void) {
+                 onLost: @escaping @Sendable (VortXRemoteRemuxMount) -> Void) {
         self.session = session
         self.engine = engine
         self.playlistURL = session.playlistURL
@@ -59,7 +59,8 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
                      mode: VortXEngineProtocol.RemuxMode,
                      startAtSeconds: Double,
                      engine: VortXExternalEngine = .shared,
-                     onLost: @escaping @Sendable () -> Void) async -> VortXRemoteRemuxMount? {
+                     onLost: @escaping @Sendable (VortXRemoteRemuxMount) -> Void) async
+        -> VortXRemoteRemuxMount? {
         guard let opened = await engine.openSession(
             input: input, headers: headers, mode: mode,
             startAtSeconds: max(0, startAtSeconds)) else { return nil }
@@ -87,6 +88,13 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
         return invalidated
     }
 
+    private func cacheSuccessfulStatus(_ status: VortXEngineProtocol.SessionStatus) {
+        lock.lock()
+        latest = status
+        consecutiveFailures = 0
+        lock.unlock()
+    }
+
     private func pollOnce() async {
         let status = await engine.status(session)
         lock.lock()
@@ -109,7 +117,7 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
             "host session lost (failures=\(failures) reportedHealthy=\(String(describing: status?.healthy))) -> falling back on-device")
         VXProbe.log("dv", "external engine mount lost -> on-device remount at current position")
         invalidate()
-        onLost()
+        onLost(self)
     }
 
     /// Wait, bounded, for the host to publish classify signalling.
@@ -122,13 +130,30 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while Date() < deadline, !isInvalidated {
             if let status = await engine.status(session) {
-                lock.lock(); latest = status; consecutiveFailures = 0; lock.unlock()
+                cacheSuccessfulStatus(status)
                 if status.signalingPublished { return status }
                 if !status.healthy { return nil }
             }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
         return nil
+    }
+
+    /// Refresh the host's HDR recovery capability at the exact failure boundary. The background poll can cache
+    /// `false` before init surgery settles, so a CoreMedia rejection performs its own bounded status read rather
+    /// than treating that young value as final. Only an explicit `true` succeeds; timeout, an unhealthy host,
+    /// invalidation, cancellation and an older host's nil field all fail closed.
+    func awaitHDRFallbackCapability(timeoutSeconds: Double = 3) async -> Bool {
+        let deadline = Date().addingTimeInterval(max(0, timeoutSeconds))
+        while Date() < deadline, !isInvalidated, !Task.isCancelled {
+            if let status = await engine.status(session) {
+                cacheSuccessfulStatus(status)
+                if status.supportsHDRFallback == true { return true }
+                if !status.healthy { return false }
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return false
     }
 
     // MARK: - The seven answers

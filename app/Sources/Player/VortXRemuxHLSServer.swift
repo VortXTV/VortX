@@ -285,10 +285,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     }
 
     /// Profile 5 carries IPT-only Dolby Vision and has no honest HDR base layer. Profile 8 and converted
-    /// Profile 7 use hvc1 plus DV supplemental signalling, so their stripped-DV init is a valid recovery asset.
+    /// Profile 7 are eligible only after the stream has explicitly produced a validated stripped-DV init.
     var supportsHDRFallback: Bool {
-        guard let signaling = stream.hlsSnapshot().signaling, signaling.dolbyVision else { return false }
-        return !signaling.videoCodec.lowercased().hasPrefix("dvh1.05")
+        let snapshot = stream.hlsSnapshot()
+        guard let signaling = snapshot.signaling else { return false }
+        return DVPlaybackPolicy.supportsHDRFallback(
+            dolbyVision: signaling.dolbyVision,
+            videoCodec: signaling.videoCodec,
+            surgerySettled: snapshot.hdrRecoveryInitSettled,
+            recoveryInitAvailable: snapshot.initDataHDR != nil)
     }
 
     /// The classifier's published signalling, or nil before classify finishes.
@@ -621,10 +626,24 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
-        if videoVariant == .hdrFallback, !supportsHDRFallback {
-            DiagnosticsLog.log("dv", "hls 404 /master-hdr.m3u8: source has no compatible HDR base layer")
-            close(connection, status: "404 Not Found")
-            return
+        if videoVariant == .hdrFallback {
+            let recoveryAvailable = waitForMount { () -> Bool? in
+                let snapshot = self.stream.hlsSnapshot()
+                guard snapshot.hdrRecoveryInitSettled else { return nil }
+                guard let signaling = snapshot.signaling else { return false }
+                return DVPlaybackPolicy.supportsHDRFallback(
+                    dolbyVision: signaling.dolbyVision,
+                    videoCodec: signaling.videoCodec,
+                    surgerySettled: snapshot.hdrRecoveryInitSettled,
+                    recoveryInitAvailable: snapshot.initDataHDR != nil)
+            }
+            guard recoveryAvailable == true else {
+                DiagnosticsLog.log(
+                    "dv",
+                    "hls 404 /master-hdr.m3u8: validated HDR recovery init unavailable")
+                close(connection, status: "404 Not Found")
+                return
+            }
         }
         #if os(tvOS)
         // #147: the panel switch below is DV-lane only. A PLAIN (non-DV) remux mount must never touch the
@@ -670,10 +689,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         }   // end sig.dolbyVision (#147)
         #endif
         // Hold the master until any in-flight HDR display-mode switch settles. AVFoundation's multivariant
-        // selector drops the explicit-PQ DV variant whenever it parses the master before the output pipeline
-        // is provably HDR, and that choice is session-persistent, so a master fetched mid-switch can pin the
-        // lifeboat (HDR10 output) for the whole title. Bounded and fail-OPEN: on timeout the lifeboat still
-        // guarantees a playable variant. HDRDisplayMode.isSwitchSettled is always true on iOS/macOS and
+        // selector can reject an explicit-range item whenever it parses the master before the output pipeline
+        // is provably HDR, and that choice is session-persistent. HDRDisplayMode.isSwitchSettled is always true on iOS/macOS and
         // whenever Match Dynamic Range never started a switch, so this is a no-op except on the tvOS DV path.
         _ = waitForMount(maximumStageSeconds: 6) {
             HDRDisplayMode.isSwitchSettled ? true : nil
@@ -1174,13 +1191,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     }
 
     /// The ftyp+moov init segment, retained in memory for the whole session (immune to window eviction).
-    /// `hdr` serves the lifeboat's dvvC-stripped copy (#143); both publish in the same lock write, so
-    /// whichever exists implies both do (the nil-coalesce is a belt-and-braces fallback, not a lane).
+    /// `hdr` serves only the validated dvvC/dvcC plus dby1-stripped copy. A missing recovery init is a 404,
+    /// never a request to substitute the primary bytes that still declare Dolby Vision.
     private func serveInit(_ connection: NWConnection, hdr: Bool, delivery: Delivery = .legacy) {
         let path = hdr ? "/init-hdr.mp4" : "/init.mp4"
         let initData = waitForResource(seconds: Self.resourceWaitSeconds) { () -> Data? in
             let snap = stream.hlsSnapshot()
-            return hdr ? (snap.initDataHDR ?? snap.initData) : snap.initData
+            return hdr ? snap.initDataHDR : snap.initData
         }
         guard let initData else {
             DiagnosticsLog.log("dv", "hls 404 \(path)")

@@ -69,17 +69,14 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     private var hdrFallbackRetried = false
     /// True only while the current item is the explicit HDR-only recovery item.
     private var usingHDRFallbackItem = false
-    private struct HDRRecoverySelection {
-        let audioSelectionKnown: Bool
-        let audioIndex: Int?
-        let subtitleSelectionKnown: Bool
-        let subtitleIndex: Int?
-        let externalSubtitleActive: Bool
-    }
-    /// Player-clock time on the same live mount. This is intentionally not source time: both items share the
-    /// same remux timeline origin, so restoring the old item clock preserves the exact source position.
-    private var pendingHDRRecoveryPlayerSeconds: Double?
-    private var pendingHDRRecoverySelection: HDRRecoverySelection?
+    /// The automatic retry value is in player time. A user seek arriving while the replacement is pending is
+    /// in source time and supersedes it through the one-shot policy state instead of mixing the two domains.
+    private var hdrRecoverySeekState = DVPlaybackPolicy.HDRRecoverySeekState()
+    private var pendingHDRRecoverySelection: DVPlaybackPolicy.HDRRecoverySelectionState?
+    /// A hosted status poll may lag the init-surgery publication that makes HDR recovery possible. Exactly one
+    /// bounded refresh owns that uncertainty for the current failed item; duplicate KVO and notification
+    /// callbacks observe this task and wait for its single retry or fatal completion.
+    private var hdrFallbackCapabilityRefreshTask: Task<Void, Never>?
     /// #147 reactive net, one-shot: a RAW (non-remux) mount that failed container-unsupported ("Cannot Open" -
     /// AVFoundation has no Matroska demuxer) gets ONE retry through the PLAIN remux lane before the libmpv
     /// demote (which would lose Picture in Picture). Loop-safe even though loadFile resets it: the retry
@@ -178,6 +175,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// byte-identical: with external mode off this is always nil and every `??` short-circuits before reaching
     /// it. A protocol refactor would have touched the local path at ten sites to buy nothing a user can see.
     private var remuxRemoteMount: VortXRemoteRemuxMount?
+    /// Generations owned by `remuxRemoteMount`. The opening generation identifies the asynchronous mount
+    /// request; the item generation advances when the same mount receives its one HDR recovery item.
+    private var remuxRemoteOpeningGeneration: UInt64?
+    private var remuxRemoteItemGeneration: UInt64?
     /// One-shot: forces the NEXT loadFile to skip external engine mode and mount on-device. Consumed inside
     /// loadFile, exactly like `forceRemux` and `forcePlainRemux`. Set when a host refuses or dies, so the retry
     /// takes the ordinary local lane instead of asking the same dead host again.
@@ -291,6 +292,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         activeLoadToken = issuedToken
         externalMountTask?.cancel()
         externalMountTask = nil
+        hdrFallbackCapabilityRefreshTask?.cancel()
+        hdrFallbackCapabilityRefreshTask = nil
         #if os(tvOS)
         nativePreAttachTask?.cancel()
         nativePreAttachTask = nil
@@ -308,7 +311,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
         playbackRequested = true
         hdrFallbackRetried = false; usingHDRFallbackItem = false
-        pendingHDRRecoveryPlayerSeconds = nil; pendingHDRRecoverySelection = nil
+        hdrRecoverySeekState.reset(); pendingHDRRecoverySelection = nil
         incompatibleEntryHandled = false; plainRemuxRetried = false
         lastLoadURL = url; lastLoadHeaders = headers; lastLoadLive = live
         videoFrameEverProduced = false; preferredPeakBitRatePinned = false
@@ -613,8 +616,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             guard let self else { return }
             let mount = await VortXRemoteRemuxMount.open(
                 input: url, headers: headers, mode: mode, startAtSeconds: startAtSeconds,
-                onLost: { [weak self] in
-                    Task { @MainActor [weak self] in self?.handleExternalEngineLost(loadToken: loadToken) }
+                onLost: { [weak self] emittingMount in
+                    Task { @MainActor [weak self] in
+                        self?.handleExternalEngineLost(
+                            loadToken: loadToken,
+                            openingGeneration: generation,
+                            emittingMount: emittingMount)
+                    }
                 })
             guard !Task.isCancelled,
                   self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation) else {
@@ -671,6 +679,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             return
         }
         remuxRemoteMount = mount
+        remuxRemoteOpeningGeneration = generation
+        remuxRemoteItemGeneration = generation
         let newItem = AVPlayerItem(asset: AVURLAsset(url: mount.playlistURL))
         // The 30s cap on the local lane exists to stop AVPlayer sizing its own forward buffer at hundreds of MB
         // inside the SAME jetsam-bound process as node and mpv. On a hosted mount that memory pressure moved to
@@ -710,20 +720,61 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// machinery the chrome already owns instead of inventing anything: `configureResumeOrigin` is the one-shot
     /// handoff a fresh remux reads to start part-way in. The user sees a rebuffer, which is the correct and
     /// honest outcome, and playback continues on the lane that never needed a Mac.
-    private func handleExternalEngineLost(loadToken: PlayerLoadToken) {
-        guard activeLoadToken == loadToken, let mount = remuxRemoteMount, let url = lastLoadURL else { return }
-        let resumeAt = playbackPositionSeconds
+    private func handleExternalEngineLost(
+        loadToken: PlayerLoadToken,
+        openingGeneration: UInt64,
+        emittingMount: VortXRemoteRemuxMount
+    ) {
+        guard activeLoadToken == loadToken,
+              remuxRemoteOpeningGeneration == openingGeneration,
+              remuxRemoteItemGeneration == itemGeneration,
+              let mount = remuxRemoteMount,
+              mount === emittingMount,
+              let url = lastLoadURL else { return }
+        let currentSourceSeconds = playbackPositionSeconds
+        let origin = remuxTimelineOrigin
+        let requestedPlayback = playbackRequested
+        let currentItem = item
+        let currentSelection = DVPlaybackPolicy.HDRRecoverySelectionState(
+            audioSelectionKnown: audioGroup != nil && currentItem != nil,
+            audioIndex: currentItem.flatMap { mountedItem in
+                audioGroup.flatMap { Self.selectedIndex(in: $0, item: mountedItem) }
+            },
+            subtitleSelectionKnown: subGroup != nil && currentItem != nil,
+            subtitleIndex: currentItem.flatMap { mountedItem in
+                subGroup.flatMap { Self.selectedIndex(in: $0, item: mountedItem) }
+            },
+            externalSubtitleActive: externalSubActive)
+        let remountSelection = DVPlaybackPolicy.selectionForFreshRemount(
+            pendingReplacement: pendingHDRRecoverySelection,
+            current: currentSelection)
+        let resumeAt = hdrRecoverySeekState.failoverSourceSeconds(
+            pendingUserSourceSeconds: pendingSeek,
+            currentSourceSeconds: currentSourceSeconds,
+            playerToSource: { playerSeconds in
+                RemuxResumePolicy.presented(playerSeconds: playerSeconds, origin: origin)
+            })
         DiagnosticsLog.log(
             "engine",
             "external engine lost mid-playback -> on-device remount at \(String(format: "%.1f", resumeAt))s")
         remuxRemoteMount = nil
+        remuxRemoteOpeningGeneration = nil
+        remuxRemoteItemGeneration = nil
         mount.invalidate()
         configureResumeOrigin(seconds: resumeAt)
         bypassExternalEngine = true
         // A NEW logical load, not a same-token remount: the source is being re-opened from scratch on a
         // different lane, and the resume origin above is what carries the position across.
-        _ = loadFile(url, headers: lastLoadHeaders, live: lastLoadLive,
-                     audioSidecar: nil, reusing: nil)
+        let replacementToken = loadFile(
+            url, headers: lastLoadHeaders, live: lastLoadLive,
+            audioSidecar: nil, reusing: nil)
+        guard activeLoadToken == replacementToken else { return }
+        playbackRequested = requestedPlayback
+        pendingHDRRecoverySelection = remountSelection
+        if !requestedPlayback { player.pause() }
+        DiagnosticsLog.log(
+            "engine",
+            "on-device remount restored transport=\(requestedPlayback ? "play" : "pause") and newest valid media-selection intent")
     }
 
     /// #147 reactive-net gate: should this item failure be retried through the PLAIN remux lane instead of
@@ -759,7 +810,12 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// Replace a rejected DV item with one explicit HDR-only item on the same healthy remux mount. The logical
     /// load token and remux stay alive; exact-item generation advances so late callbacks from the DV item are
     /// ignored. The playhead, requested rate and current media selections are restored on the replacement.
-    private func retryFreshHDRItemOnHealthyMount(error: NSError?) -> Bool {
+    private func retryFreshHDRItemOnHealthyMount(
+        error: NSError?,
+        allowRemoteCapabilityRefresh: Bool = true,
+        onUnavailable: @escaping @MainActor () -> Void
+    ) -> Bool {
+        guard !fatalErrorEmitted else { return false }
         let trigger = Self.hdrFallbackTriggerError(error)
         let mountHealthy = remuxHLSServer?.isMountHealthy
             ?? remuxRemoteMount?.isMountHealthy ?? false
@@ -769,19 +825,69 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             dolbyVision: contentIsDolbyVision,
             remuxMounted: isRemuxMounted,
             mountHealthy: mountHealthy,
-            fallbackAvailable: fallbackAvailable,
+            // Validate every immutable gate first. A hosted capability may still be absent only because the
+            // client's cached status predates init surgery, which is resolved below by one authoritative poll.
+            fallbackAvailable: true,
             alreadyAttempted: hdrFallbackRetried,
             errorDomain: trigger?.domain,
             errorCode: trigger?.code ?? 0
-        ), let currentItem = item,
+        ) else { return false }
+
+        if !fallbackAvailable {
+            guard allowRemoteCapabilityRefresh, let remote = remuxRemoteMount else { return false }
+            if hdrFallbackCapabilityRefreshTask != nil { return true }
+            guard let failedItem = item,
+                  player.currentItem === failedItem,
+                  let loadToken = activeLoadToken else { return false }
+            let failedGeneration = itemGeneration
+            DiagnosticsLog.log(
+                "dv",
+                "hosted HDR recovery capability was stale or unavailable at -12927 -> bounded authoritative refresh")
+            hdrFallbackCapabilityRefreshTask = Task { @MainActor [weak self] in
+                let becameAvailable = await remote.awaitHDRFallbackCapability()
+                guard let self, !Task.isCancelled,
+                      self.pendingLoadIsCurrent(
+                        loadToken: loadToken,
+                        generation: failedGeneration),
+                      self.item === failedItem,
+                      self.player.currentItem === failedItem,
+                      self.remuxRemoteMount === remote else { return }
+                self.hdrFallbackCapabilityRefreshTask = nil
+                guard !self.hdrFallbackRetried,
+                      !self.fatalErrorEmitted else { return }
+                guard becameAvailable else {
+                    DiagnosticsLog.log(
+                        "dv",
+                        "hosted HDR recovery capability did not become authoritative -> original fatal path")
+                    onUnavailable()
+                    return
+                }
+                guard self.retryFreshHDRItemOnHealthyMount(
+                    error: error,
+                    allowRemoteCapabilityRefresh: false,
+                    onUnavailable: onUnavailable) else {
+                    DiagnosticsLog.log(
+                        "dv",
+                        "hosted HDR recovery capability refreshed but retry identity no longer qualified -> original fatal path")
+                    onUnavailable()
+                    return
+                }
+            }
+            return true
+        }
+
+        hdrFallbackCapabilityRefreshTask?.cancel()
+        hdrFallbackCapabilityRefreshTask = nil
+        guard let currentItem = item,
            let primaryURL = (currentItem.asset as? AVURLAsset)?.url,
            let fallbackURL = DVPlaybackPolicy.hdrFallbackMasterURL(from: primaryURL),
            let loadToken = activeLoadToken else { return false }
 
         let currentPlayerSeconds = player.currentTime().seconds
-        pendingHDRRecoveryPlayerSeconds = currentPlayerSeconds.isFinite
-            ? max(0, currentPlayerSeconds) : 0
-        pendingHDRRecoverySelection = HDRRecoverySelection(
+        hdrRecoverySeekState.stageReplacement(
+            playerSeconds: currentPlayerSeconds.isFinite ? max(0, currentPlayerSeconds) : 0,
+            queuedUserSourceSeconds: pendingSeek)
+        pendingHDRRecoverySelection = DVPlaybackPolicy.HDRRecoverySelectionState(
             audioSelectionKnown: audioGroup != nil,
             audioIndex: audioGroup.flatMap { Self.selectedIndex(in: $0, item: currentItem) },
             subtitleSelectionKnown: subGroup != nil,
@@ -791,7 +897,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         usingHDRFallbackItem = true
         DiagnosticsLog.log(
             "dv",
-            "healthy DV item rejected CoreMedia -12927 -> one fresh HDR-only item at \(fallbackURL.lastPathComponent), playerTime=\(String(format: "%.3f", pendingHDRRecoveryPlayerSeconds ?? 0))s")
+            "healthy DV item rejected CoreMedia -12927 -> one fresh HDR-only item at \(fallbackURL.lastPathComponent), playerTime=\(String(format: "%.3f", hdrRecoverySeekState.automaticPlayerSeconds ?? 0))s")
         VXProbe.log(
             "dv",
             "DV item -12927 on healthy mount -> ONE explicit HDR-only recovery item before demote")
@@ -806,6 +912,9 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
 
         let freshItem = AVPlayerItem(asset: AVURLAsset(url: fallbackURL))
         itemGeneration &+= 1
+        if remuxRemoteMount != nil {
+            remuxRemoteItemGeneration = itemGeneration
+        }
         item = freshItem
         freshItem.preferredForwardBufferDuration = remuxRemoteMount == nil
             ? 30 : VortXEngineHostPolicy.forwardBufferSeconds(remote: true)
@@ -848,9 +957,23 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     func togglePause() { playbackRequested ? pause() : play() }
 
     func seek(to seconds: Double) {
+        // A hosted -12927 capability refresh intentionally keeps the failed item mounted for a bounded interval.
+        // AVPlayer cannot honor a seek on that failed item, so preserve the newest source-time intent for the
+        // replacement setup rather than sending it into a dead clock.
+        if hdrFallbackCapabilityRefreshTask != nil {
+            pendingSeek = seconds
+            return
+        }
         // Before the item is playable, remember the target and apply it on ready (covers the chrome's
         // resume seek issued right after loadFile, which AVPlayer would otherwise drop).
-        guard isReady else { pendingSeek = seconds; return }
+        guard isReady else {
+            if usingHDRFallbackItem {
+                hdrRecoverySeekState.supersedeWithUser(sourceSeconds: seconds)
+            } else {
+                pendingSeek = seconds
+            }
+            return
+        }
         let dur = item?.duration.seconds ?? 0
         // FORWARD-ONLY REMUX (P2, #76): cap the target at the produced edge at the ONE engine chokepoint, so
         // EVERY seek surface is covered (scrubber, hiddenSeek right-nudge, the fwd transport button, Lock Screen
@@ -927,6 +1050,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         nativePreAttachTask = nil
         nativeDisplayCriteria = nil
         #endif
+        hdrFallbackCapabilityRefreshTask?.cancel()
+        hdrFallbackCapabilityRefreshTask = nil
         teardownObservers()
         teardownRemux()
         #if os(tvOS)
@@ -943,7 +1068,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         item = nil
         playbackRequested = false
         usingHDRFallbackItem = false
-        pendingHDRRecoveryPlayerSeconds = nil
+        hdrRecoverySeekState.reset()
         pendingHDRRecoverySelection = nil
     }
 
@@ -957,6 +1082,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         remuxHLSServer = nil
         remuxRemoteMount?.invalidate()
         remuxRemoteMount = nil
+        remuxRemoteOpeningGeneration = nil
+        remuxRemoteItemGeneration = nil
     }
 
     // MARK: Video sizing
@@ -1010,13 +1137,46 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                          selected: externalSubActive, forced: false)]
     }
 
-    func setAudioTrack(_ id: Int) { select(id, in: audioGroup) }
+    func setAudioTrack(_ id: Int) {
+        if audioGroup == nil,
+           var pending = pendingHDRRecoverySelection {
+            pending.selectAudio(id)
+            pendingHDRRecoverySelection = pending
+            DiagnosticsLog.log(
+                "dv",
+                "replacement queued newest audio intent=\(id >= 0 ? String(id) : "off") until groups load")
+            return
+        }
+        select(id, in: audioGroup)
+    }
     /// Selecting an embedded/HLS legible track (or turning subtitles Off) also turns OFF any external overlay
     /// sub, so the two never fight or double up. `id < 0` = Off, which the caller uses for the "Off" row.
     /// `externalSubtitleTrackID` re-selects the already-loaded external overlay (its cues stay parsed across a
     /// detour through an embedded track or Off), which is what makes the external row behave like every other
     /// row in the picker instead of being a one-way door.
     func setSubtitleTrack(_ id: Int) {
+        if subGroup == nil,
+           var pending = pendingHDRRecoverySelection {
+            if id == Self.externalSubtitleTrackID {
+                guard externalSubLabel != nil, subtitleRenderer.hasCues else { return }
+            }
+            pending.selectSubtitle(id, externalTrackID: Self.externalSubtitleTrackID)
+            pendingHDRRecoverySelection = pending
+            if id == Self.externalSubtitleTrackID {
+                externalSubActive = true
+                subtitleOverlay?.applyStyle()
+                updateSubtitleOverlay(atClock: player.currentTime().seconds)
+                publishSelectionTracks()
+            } else {
+                let wasExternal = externalSubActive
+                if wasExternal { disableExternalSubtitle() }
+                if wasExternal { publishSelectionTracks() }
+            }
+            DiagnosticsLog.log(
+                "dv",
+                "replacement queued newest subtitle intent=\(id == Self.externalSubtitleTrackID ? "external" : (id >= 0 ? String(id) : "off")) until groups load")
+            return
+        }
         if id == Self.externalSubtitleTrackID {
             guard externalSubLabel != nil, subtitleRenderer.hasCues else { return }
             if let group = subGroup, let item = player.currentItem {
@@ -1631,15 +1791,36 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             loadChapters()                     // async; re-emits track-list if the asset has chapter markers
             emitDynamicRange(item)             // Gap 7: light the chrome's HDR chip for DV / HDR10 / HLG content
             loadContainerFrameRate(item)       // Gap 8: cache the video track fps for the subtitle fingerprint
-            if let target = pendingHDRRecoveryPlayerSeconds {
-                pendingHDRRecoveryPlayerSeconds = nil
+            let recoveryUserSeek = hdrRecoverySeekState.userSourceSeconds
+            let recoveryOrigin = remuxTimelineOrigin
+            let recoverySourceDuration = remuxHLSServer?.sourceDurationSeconds
+                ?? remuxRemoteMount?.sourceDurationSeconds
+                ?? remuxLoader?.sourceDurationSeconds
+            let recoveryProducedEdge = producedEdgeSeconds
+            let recoveryTarget: Double? = usingHDRFallbackItem
+                ? hdrRecoverySeekState.consume { sourceSeconds in
+                    return RemuxResumePolicy.playerSeek(
+                        sourceSeconds: sourceSeconds,
+                        origin: recoveryOrigin,
+                        authoritativeSourceDurationSeconds: recoverySourceDuration,
+                        playerDurationSeconds: dur,
+                        producedEdgePlayerSeconds: recoveryProducedEdge)
+                }
+                : nil
+            if let target = recoveryTarget {
                 player.seek(
                     to: CMTime(seconds: max(target, 0), preferredTimescale: 600),
                     toleranceBefore: .zero,
                     toleranceAfter: .zero)
-                DiagnosticsLog.log(
-                    "dv",
-                    "HDR recovery restored player clock to \(String(format: "%.3f", target))s on the same remux origin")
+                if let recoveryUserSeek {
+                    DiagnosticsLog.log(
+                        "dv",
+                        "HDR recovery user seek source=\(String(format: "%.3f", recoveryUserSeek))s superseded stale restore -> player=\(String(format: "%.3f", target))s origin=\(String(format: "%.3f", remuxTimelineOrigin))s")
+                } else {
+                    DiagnosticsLog.log(
+                        "dv",
+                        "HDR recovery restored player clock to \(String(format: "%.3f", target))s on the same remux origin")
+                }
             } else if let target = pendingSeek, seekable {
                 pendingSeek = nil
                 // A remux resume is fulfilled by opening the INPUT at its origin, not by seeking AVPlayer into
@@ -1763,20 +1944,28 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 )
                 return
             }
-            if retryFreshHDRItemOnHealthyMount(error: ns) {
+            let finishFailure: @MainActor () -> Void = { [weak self, weak item] in
+                guard let self, let item,
+                      self.owns(item, loadToken: loadToken),
+                      !self.fatalErrorEmitted else { return }
+                // [dv] the demotion edge: the AVPlayer item failed and the chrome will fall back to libmpv
+                // HDR10. For a DV source this is the tail of the [dv] trail.
+                VXProbe.log(
+                    "dv",
+                    "AVPlayer item .failed -> demoting to libmpv HDR10: \(ns?.localizedDescription ?? "?")")
+                self.fatalErrorEmitted = true
+                self.emit(
+                    MPVProperty.endFileError,
+                    item.error?.localizedDescription ?? "Playback failed",
+                    loadToken: loadToken
+                )
+            }
+            if retryFreshHDRItemOnHealthyMount(
+                error: ns,
+                onUnavailable: finishFailure) {
                 return
             }
-            // [dv] the demotion edge: the AVPlayer item failed and the chrome will fall back to libmpv HDR10.
-            // For a DV source this is the tail of the [dv] trail (a remux fail-soft usually preceded it), so
-            // grepping [dv] shows route -> mount -> classify/fallback-reason -> this demotion in order.
-            VXProbe.log("dv", "AVPlayer item .failed -> demoting to libmpv HDR10: \(ns?.localizedDescription ?? "?")")
-            guard !fatalErrorEmitted else { break }
-            fatalErrorEmitted = true
-            emit(
-                MPVProperty.endFileError,
-                item.error?.localizedDescription ?? "Playback failed",
-                loadToken: loadToken
-            )
+            finishFailure()
         default:
             break
         }
@@ -1960,9 +2149,19 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// against a later selector reinterpretation. Hosted mounts receive the same value over the optional status
     /// field, while older hosts safely leave the preference unset.
     private func pinPreferredPeakBitRateAfterFirstFrame(_ item: AVPlayerItem, atClock seconds: Double) {
+        let signalingDolbyVision: Bool
+        if let localSignaling = remuxHLSServer?.signaling {
+            signalingDolbyVision = localSignaling.dolbyVision
+        } else {
+            // A hosted DV session always reports PQ or HLG. Plain remux status intentionally carries nil.
+            signalingDolbyVision = remuxRemoteMount?.videoRange != nil
+        }
         guard !preferredPeakBitRatePinned,
-              isRemuxMounted,
-              !usingHDRFallbackItem,
+              DVPlaybackPolicy.shouldPinPreferredPeakBitRate(
+                  isRemuxMounted: isRemuxMounted,
+                  usingHDRFallbackItem: usingHDRFallbackItem,
+                  contentIsDolbyVision: contentIsDolbyVision,
+                  signalingDolbyVision: signalingDolbyVision),
               hasProducedPicture(atClock: seconds) else { return }
         let declared = remuxHLSServer?.signaling?.bandwidth
             ?? remuxRemoteMount?.declaredBandwidth ?? 0
@@ -1987,16 +2186,26 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
               let loadToken = activeLoadToken,
               owns(failedItem, loadToken: loadToken) else { return }
         let err = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+        let message = err?.localizedDescription ?? "Playback failed"
+        let eventMessage = err?.localizedDescription ?? "?"
+        let finishFailure: @MainActor () -> Void = { [weak self, weak failedItem] in
+            guard let self, let failedItem,
+                  self.owns(failedItem, loadToken: loadToken),
+                  !self.fatalErrorEmitted else { return }
+            self.fatalErrorEmitted = true
+            VXProbe.event("player", "endfile error \(eventMessage)")
+            self.emit(
+                MPVProperty.endFileError,
+                message,
+                loadToken: loadToken
+            )
+        }
         if retryFreshHDRItemOnHealthyMount(
-            error: (err as NSError?) ?? (failedItem.error as NSError?)) {
+            error: (err as NSError?) ?? (failedItem.error as NSError?),
+            onUnavailable: finishFailure) {
             return
         }
-        fatalErrorEmitted = true
-        VXProbe.event("player", "endfile error \(err?.localizedDescription ?? "?")")
-        emit(
-            MPVProperty.endFileError, err?.localizedDescription ?? "Playback failed",
-            loadToken: loadToken
-        )
+        finishFailure()
     }
 
     private func emit(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
@@ -2060,7 +2269,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 pendingHDRRecoverySelection = nil
                 DiagnosticsLog.log(
                     "dv",
-                    "HDR recovery restored audio=\(restore.audioIndex.map { String($0) } ?? (restore.audioSelectionKnown ? "off" : "default")) subtitle=\(restore.externalSubtitleActive ? "external" : (restore.subtitleIndex.map { String($0) } ?? (restore.subtitleSelectionKnown ? "off" : "default")))")
+                    "replacement restored audio=\(restore.audioIndex.map { String($0) } ?? (restore.audioSelectionKnown ? "off" : "default")) subtitle=\(restore.externalSubtitleActive ? "external" : (restore.subtitleIndex.map { String($0) } ?? (restore.subtitleSelectionKnown ? "off" : "default")))")
             }
             // A selection notification may arrive before the groups finish loading and publish an empty
             // snapshot. Force the newly available option topology to publish once even when both are Off.

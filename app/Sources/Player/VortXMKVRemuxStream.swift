@@ -211,12 +211,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         return _timelineOriginSeconds
     }
     private var _hlsInitData: Data?
-    /// The lifeboat variant's init segment (#143): the same ftyp+moov with the dvcC/dvvC box surgically
-    /// removed, so the variant that deliberately declares NO Dolby Vision (no SUPPLEMENTAL-CODECS, no
-    /// VIDEO-RANGE - the b170 filter-survivor) never serves content that DECLARES Dolby Vision. Falls back
-    /// to the exact `_hlsInitData` bytes when the strip is not applicable (P5) or the moov shape is
-    /// unexpected. Published atomically with `_hlsInitData`.
+    /// The recovery variant's init segment: the same ftyp+moov with every dvcC/dvvC declaration and the dby1
+    /// compatibility brand surgically removed. nil means there is no proven HDR recovery asset and must never
+    /// be replaced with `_hlsInitData`, because those primary bytes still declare Dolby Vision.
     private var _hlsInitDataHDR: Data?
+    /// Distinguishes "surgery has not run yet" from "surgery ran and failed". The HLS route waits for this edge
+    /// before returning either the recovery master or a definitive 404.
+    private var _hlsInitHDRRecoverySettled = false
     private var _hlsSegments: [HLSSegment] = []
     private var _hlsEnded = false
     private var _hlsSignaling: HLSSignaling?
@@ -261,11 +262,25 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// The source MKV chapter markers (start seconds + title, start-sorted; empty when none). Thread-safe.
     var chapters: [(start: Double, title: String)] { hlsLock.lock(); defer { hlsLock.unlock() }; return _chapters }
 
-    /// Consistent snapshot of the published HLS index for the local server. `initDataHDR` is the lifeboat
-    /// variant's DV-stripped init (#143); non-nil exactly when `initData` is.
-    func hlsSnapshot() -> (initData: Data?, initDataHDR: Data?, segments: [HLSSegment], ended: Bool, signaling: HLSSignaling?) {
+    /// Consistent snapshot of the published HLS index for the local server. `initDataHDR` is non-nil only when
+    /// the DV-config plus dby1 surgery produced a validated recovery init. `hdrRecoveryInitSettled` makes a
+    /// failed surgery distinguishable from a still-pending init.
+    func hlsSnapshot() -> (
+        initData: Data?,
+        initDataHDR: Data?,
+        hdrRecoveryInitSettled: Bool,
+        segments: [HLSSegment],
+        ended: Bool,
+        signaling: HLSSignaling?
+    ) {
         hlsLock.lock(); defer { hlsLock.unlock() }
-        return (_hlsInitData, _hlsInitDataHDR, _hlsSegments, _hlsEnded, _hlsSignaling)
+        return (
+            _hlsInitData,
+            _hlsInitDataHDR,
+            _hlsInitHDRRecoverySettled,
+            _hlsSegments,
+            _hlsEnded,
+            _hlsSignaling)
     }
 
     func openHLSResource(_ key: VortXHLSSessionSpool.ResourceKey,
@@ -1983,8 +1998,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
         var servedDV = initData
         var dvNote = "brand n/a"
-        var servedHDR = initData   // fallback: byte-identical to the source init (pre-#143 behavior)
-        var hdrNote = "same as dv"
+        var servedHDR: Data?
+        var hdrNote = "unavailable"
         if let brand = declaredBrand {
             // DV-declared lane (P8.1/8.4, incl. converted P7): brand the DV init, strip the lifeboat's.
             if let branded = Self.appendFtypCompatibleBrand(initData, brand: brand) {
@@ -1993,20 +2008,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             } else {
                 dvNote = "\(brand) NOT appended (unexpected ftyp shape)"
             }
-            if let stripped = Self.stripDoViConfigBox(initData),   // from the ORIGINAL bytes: no db1p here
-               let debranded = Self.removeFtypCompatibleBrand(stripped, brand: "dby1") {
-                servedHDR = debranded
+            if let recovered = Self.makeHDRRecoveryInit(initData) {
+                servedHDR = recovered
                 hdrNote = "dovi + dby1 stripped"
             } else {
-                hdrNote = "strip failed, original bytes"
+                hdrNote = "surgery failed closed"
             }
         } else if sig?.videoCodec.hasPrefix("hvc1") == true,
-                  let stripped = Self.stripDoViConfigBox(initData),
-                  let debranded = Self.removeFtypCompatibleBrand(stripped, brand: "dby1") {
+                  let recovered = Self.makeHDRRecoveryInit(initData) {
             // P8 with an unknown compat id: the master deliberately declares plain HEVC HDR on BOTH variants,
             // so neither may serve a dvvC-bearing init (same undeclared-DV mismatch, same -12927 exposure).
-            servedDV = debranded
-            servedHDR = debranded
+            servedDV = recovered
+            servedHDR = recovered
             dvNote = "dovi + dby1 stripped (undeclared P8)"
             hdrNote = "same as dv"
         }
@@ -2019,7 +2032,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         } else {
             dec3Receipt = "absent or malformed"
         }
-        let (servedInitBytes, servedInitOverflow) = servedDV.count.addingReportingOverflow(servedHDR.count)
+        let (servedInitBytes, servedInitOverflow) = servedDV.count.addingReportingOverflow(
+            servedHDR?.count ?? 0)
         guard !servedInitOverflow,
               armPrimaryOpenStage(base: initLen, primaryInitBytes: servedInitBytes) else {
             hlsAbortInitScan("served init copies exceeded HLS session admission")
@@ -2028,6 +2042,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         hlsLock.lock()
         _hlsInitData = servedDV
         _hlsInitDataHDR = servedHDR
+        _hlsInitHDRRecoverySettled = true
         _primaryDec3Observation = primaryDec3
         hlsLock.unlock()
         hlsVideoTrackID = videoTrackID
@@ -2035,7 +2050,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         hlsSegmentStartByte = initLen   // segment 0 starts right after the init (BUFFER offsets: original length)
         hlsInitState.publish(); hlsHeadBuf = []
         DiagnosticsLog.log("dv", "dec3 structured mux receipt: \(dec3Receipt)")
-        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B, \(Self.describeInitDoVi(initData))) served dv=\(servedDV.count)B [\(dvNote)] hdr=\(servedHDR.count)B [\(hdrNote)]" + String(format: " +%.1fs after mount", Date().timeIntervalSince(mountedAt)))
+        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B, \(Self.describeInitDoVi(initData))) served dv=\(servedDV.count)B [\(dvNote)] hdr=\(servedHDR?.count ?? 0)B [\(hdrNote)]" + String(format: " +%.1fs after mount", Date().timeIntervalSince(mountedAt)))
     }
 
     // MARK: - #143 served-init byte surgery (pure, fail-soft: nil keeps the original bytes)
@@ -2150,6 +2165,35 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         for off in ancestors { putBE32(&b, off, be32(b, off) - hit.size) }
         b.removeSubrange(hit.start ..< hit.start + hit.size)
         return Data(b)
+    }
+
+    /// Build the only init bytes the HDR recovery route may publish. Both transformations must succeed, the
+    /// resulting ftyp must contain no dby1 compatibility brand, and no dvcC/dvvC marker may remain anywhere in
+    /// the init. Any uncertainty returns nil so the route fails closed instead of serving the primary DV init
+    /// under an HDR-only playlist.
+    static func makeHDRRecoveryInit(_ data: Data) -> Data? {
+        guard let stripped = stripDoViConfigBox(data),
+              let recovered = removeFtypCompatibleBrand(stripped, brand: "dby1") else {
+            return nil
+        }
+        let bytes = [UInt8](recovered)
+        guard bytes.count >= 24 else { return nil }
+        let ftypSize = be32(bytes, 0)
+        guard ftypSize >= 16, ftypSize % 4 == 0, ftypSize + 8 <= bytes.count,
+              fourccAt(bytes, 4) == "ftyp",
+              fourccAt(bytes, ftypSize + 4) == "moov" else {
+            return nil
+        }
+        var brandOffset = 16
+        while brandOffset + 4 <= ftypSize {
+            guard fourccAt(bytes, brandOffset) != "dby1" else { return nil }
+            brandOffset += 4
+        }
+        guard recovered.range(of: Data("dvcC".utf8)) == nil,
+              recovered.range(of: Data("dvvC".utf8)) == nil else {
+            return nil
+        }
+        return recovered
     }
 
     /// Decode the DV carriage straight out of the SERVED init bytes (not the codecpar we handed the muxer) so

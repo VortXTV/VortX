@@ -14,8 +14,8 @@
 // HOW IT TESTS THE REAL CODE (not a mirror). VortX's Apple app has no Xcode unit-test bundle, and
 // the remux file imports Libavformat, which a bare toolchain cannot link. But the two functions
 // under test are pure Foundation byte surgery, so this script EXTRACTS THEIR REAL SOURCE TEXT from
-// app/Sources/Player/VortXMKVRemuxStream.swift (brace-matched, all five members: be32, putBE32,
-// fourccAt, appendFtypCompatibleBrand, removeFtypCompatibleBrand, stripDoViConfigBox), wraps them
+// app/Sources/Player/VortXMKVRemuxStream.swift (brace-matched: be32, putBE32, fourccAt,
+// appendFtypCompatibleBrand, removeFtypCompatibleBrand, stripDoViConfigBox, makeHDRRecoveryInit), wraps them
 // in an enum, and runs them
 // with the system toolchain against REAL CAPTURED FIXTURES. Any edit to the shipped functions is
 // therefore what gets tested. If extraction fails (rename / move), this test FAILS loudly; update
@@ -85,6 +85,7 @@ let signatures = [
     "static func appendFtypCompatibleBrand(",
     "static func removeFtypCompatibleBrand(",
     "static func stripDoViConfigBox(",
+    "static func makeHDRRecoveryInit(",
 ]
 var extracted: [String] = []
 for sig in signatures {
@@ -218,7 +219,21 @@ if RealSurgery.removeFtypCompatibleBrand(stripped, brand: "toolong") != nil {
 }
 print("PASS C9: removal is idempotent and malformed input / brand returns nil")
 
-print("ALL PASS: the served DV init carries the declared brand and the lifeboat carries no DV declaration")
+// C10: the production recovery constructor returns the exact validated bytes and fails closed if either
+// declaration-removal step cannot be proven. In particular, an already-stripped init is not silently accepted:
+// the constructor requires evidence that it removed the source's DV config itself.
+guard RealSurgery.makeHDRRecoveryInit(rawInit) == debranded else {
+    fail("C10 recovery constructor did not return the exact validated bytes")
+}
+if RealSurgery.makeHDRRecoveryInit(stripped) != nil {
+    fail("C10 an init with no removable DV config must fail closed")
+}
+if RealSurgery.makeHDRRecoveryInit(Data(count: 8)) != nil {
+    fail("C10 malformed init must fail closed")
+}
+print("PASS C10: validated recovery bytes are exact; missing surgery evidence fails closed")
+
+print("ALL PASS: the served DV init carries the declared brand and HDR recovery cannot carry a DV declaration")
 """
 
 let tmpDir = FileManager.default.temporaryDirectory
