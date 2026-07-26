@@ -8,14 +8,12 @@ import Network
 /// without ever producing a frame. HLS is the one delivery AVFoundation documents for a live fMP4 stream,
 /// and the one Apple's authoring spec defines for Dolby Vision 8.1 (CODECS + SUPPLEMENTAL-CODECS +
 /// VIDEO-RANGE), so this server presents the remux as:
-///   - `/master.m3u8`: two EXT-X-STREAM-INF variants - the DV variant (CODECS + SUPPLEMENTAL-CODECS +
-///     VIDEO-RANGE -> media.m3u8) plus a range-unlabeled "lifeboat" variant (-> media-hdr.m3u8), so
-///     AVFoundation's variant filter (which drops an explicit PQ/HLG variant when the pipeline is not
-///     provably HDR at parse time) always leaves one playable variant instead of zero -> -1002 (the b170
-///     fix). Since #143 the two variants have DISTINCT playlists/inits so each variant's media agrees with
-///     its declarations (the on-device -12927 rejections matched a declaration/content cross-check failing
-///     right after /init.mp4): the DV variant's init carries the declared db1p/db4h compatibility brand,
-///     the lifeboat's init has the dvvC stripped (it declares no Dolby Vision, so it serves none).
+///   - `/master.m3u8`: exactly one DV EXT-X-STREAM-INF (CODECS + SUPPLEMENTAL-CODECS + VIDEO-RANGE ->
+///     media.m3u8). A DV and stripped-HDR representation must never share one adaptive set: AVPlayer switched
+///     between them and rejected `/init-hdr.mp4` with CoreMedia -12927 on an otherwise healthy mount.
+///   - `/master-hdr.m3u8`: a separate, one-variant recovery master for a base-layer-compatible DV source. A
+///     fresh AVPlayerItem mounts it only after the DV item fails. Profile 5 has no HDR base layer and this route
+///     fails closed for it.
 ///   - `/media.m3u8`: a sliding playlist of closed, durably staged segments, with an
 ///     absolute MEDIA-SEQUENCE and EXT-X-ENDLIST once the trailer is written. The first answer is held until
 ///     a small startup window exists, and those startup bytes remain pinned until AVPlayer is ready.
@@ -78,8 +76,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private var listenerRetired = false
     private var connections: [ObjectIdentifier: NWConnection] = [:]
     /// One cross-rendition publication coordinator. It freezes the exact common startup cohort before the
-    /// master advertises any rendition, then advances both video variants and every advertised audio/subtitle
-    /// route through one shared absolute-ID frontier. Disk work and playlist receipts happen while this lock is
+    /// master advertises any rendition, then advances the DV and recovery video resources plus every advertised
+    /// audio/subtitle route through one shared absolute-ID frontier. Disk work and playlist receipts happen while this lock is
     /// held, so no concurrent request can expose half of a generation.
     private let publicationLock = NSLock()
     private var startupMediaList: (window: VortXHLSWindow, ended: Bool)?
@@ -256,6 +254,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         return true
     }
 
+    /// True only after this mount accepted its one ready transition. Recovery items use this to distinguish an
+    /// already-ready mount from a mount whose deadline expired before either item became playable.
+    var hasMarkedEngineReady: Bool {
+        publicationLock.lock(); defer { publicationLock.unlock() }
+        return engineReady
+    }
+
     /// The source MKV runtime in seconds (0 until parsed / when unknown). The engine reads it at readyToPlay
     /// to synthesize a finite VOD duration, since the live HLS delivery keeps AVPlayerItem.duration INDEFINITE.
     var sourceDurationSeconds: Double { stream.sourceDurationSeconds }
@@ -277,6 +282,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// mount" (retry a fresh item) from "the remux itself died" (demote). Same two signals serveMedia gates on.
     var isMountHealthy: Bool {
         stream.hlsSnapshot().initData != nil && stream.buffer.status().failure == nil
+    }
+
+    /// Profile 5 carries IPT-only Dolby Vision and has no honest HDR base layer. Profile 8 and converted
+    /// Profile 7 use hvc1 plus DV supplemental signalling, so their stripped-DV init is a valid recovery asset.
+    var supportsHDRFallback: Bool {
+        guard let signaling = stream.hlsSnapshot().signaling, signaling.dolbyVision else { return false }
+        return !signaling.videoCodec.lowercased().hasPrefix("dvh1.05")
     }
 
     /// The classifier's published signalling, or nil before classify finishes.
@@ -480,7 +492,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     private func dispatch(_ connection: NWConnection, path: String, delivery: Delivery) {
         switch path {
-        case "/master.m3u8":    serveMaster(connection, delivery: delivery)
+        case "/master.m3u8":    serveMaster(connection, videoVariant: .primary, delivery: delivery)
+        case "/master-hdr.m3u8": serveMaster(connection, videoVariant: .hdrFallback, delivery: delivery)
         case "/media.m3u8":     serveMedia(connection, hdr: false, delivery: delivery)
         case "/media-hdr.m3u8": serveMedia(connection, hdr: true, delivery: delivery)
         case "/init.mp4":       serveInit(connection, hdr: false, delivery: delivery)
@@ -597,12 +610,19 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     // MARK: - Resources
 
-    /// Master playlist: TWO variants (DV -> media.m3u8, lifeboat -> media-hdr.m3u8, #143). Held until the
-    /// remux has classified the source
-    /// and written its header (the signaling exists from then on).
-    private func serveMaster(_ connection: NWConnection, delivery: Delivery = .legacy) {
+    /// Master playlist: exactly one video variant per AVPlayerItem. The primary item receives DV; a later
+    /// explicit recovery item may receive the stripped-HDR base layer. Held until the remux has classified the
+    /// source and written its header.
+    private func serveMaster(_ connection: NWConnection,
+                             videoVariant: DVPlaybackPolicy.MasterVideoVariant = .primary,
+                             delivery: Delivery = .legacy) {
         guard let sig = waitForMount({ stream.hlsSnapshot().signaling }) else {
             DiagnosticsLog.log("dv", "hls 404 /master.m3u8")
+            close(connection, status: "404 Not Found")
+            return
+        }
+        if videoVariant == .hdrFallback, !supportsHDRFallback {
+            DiagnosticsLog.log("dv", "hls 404 /master-hdr.m3u8: source has no compatible HDR base layer")
             close(connection, status: "404 Not Found")
             return
         }
@@ -625,6 +645,10 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         // master-parse race that wait exists for.
         let switched = DispatchSemaphore(value: 0)
         let dvFps = sig.fps, dvWidth = sig.width, dvHeight = sig.height
+        let recoveryRange = DVPlaybackPolicy.hdrFallbackDisplayRange(videoRange: sig.videoRange)
+        let requestedRange: ContentDynamicRange = videoVariant == .primary
+            ? .dolbyVision
+            : (recoveryRange == .hlg ? .hlg : .hdr10)
         DispatchQueue.main.async { [weak self] in
             defer { switched.signal() }   // signal on EVERY exit so the serve task never eats the full timeout
             // Teardown race (#76 rework): if the user exited in this instant, invalidate() + stop()'s
@@ -633,9 +657,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             // switches the panel.
             guard let self, !self.isInvalidated else { return }
             MainActor.assumeIsolated {   // request() is @MainActor; this closure runs on the main queue
-                HDRDisplayMode.request(.dolbyVision, fps: dvFps, width: dvWidth, height: dvHeight, in: nil)
+                HDRDisplayMode.request(requestedRange, fps: dvFps, width: dvWidth, height: dvHeight, in: nil)
             }
-            DiagnosticsLog.log("dv", "remux classify confirmed DV -> requested Dolby Vision display mode before mount (fps=\(String(format: "%.3f", dvFps)) \(dvWidth)x\(dvHeight))")
+            DiagnosticsLog.log(
+                "dv",
+                "remux classify confirmed DV -> requested \(requestedRange.rawValue) display mode before \(videoVariant == .primary ? "DV" : "HDR recovery") mount (fps=\(String(format: "%.3f", dvFps)) \(dvWidth)x\(dvHeight))")
         }
         let switchBudget = min(2, remainingMountBudget())
         if switchBudget <= 0 || switched.wait(timeout: .now() + switchBudget) == .timedOut {
@@ -715,8 +741,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         let body = DVPlaybackPolicy.masterPlaylistData(
             input: input,
             mediaTags: audioTags + subtitleTags,
-            streamInfAttributes: audioAttribute + subtitleAttribute)
-        DiagnosticsLog.log("dv", "hls resp /master.m3u8 variants=\(sig.dolbyVision ? 2 : 1) audio=\(audioPlan == nil ? 0 : 1) audioTags=\(audioTags.count) subs=\(subtitleRenditions.count) \(body.count)B")
+            streamInfAttributes: audioAttribute + subtitleAttribute,
+            videoVariant: videoVariant)
+        let masterPath = videoVariant == .primary ? "/master.m3u8" : "/master-hdr.m3u8"
+        DiagnosticsLog.log(
+            "dv",
+            "hls resp \(masterPath) variants=1 mode=\(videoVariant == .primary ? "primary" : "hdr-recovery") audio=\(audioPlan == nil ? 0 : 1) audioTags=\(audioTags.count) subs=\(subtitleRenditions.count) \(body.count)B")
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl", delivery: delivery)
     }
 

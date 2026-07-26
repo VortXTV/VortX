@@ -158,6 +158,11 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
     var sourceDurationSeconds: Double { cached?.durationSeconds ?? 0 }
     var timelineOriginSeconds: Double { cached?.timelineOriginSeconds ?? 0 }
     var authoritativeFrameRate: Double { cached?.frameRate ?? 0 }
+    var videoWidth: Int { cached?.width ?? 0 }
+    var videoHeight: Int { cached?.height ?? 0 }
+    var declaredBandwidth: Int { cached?.bandwidth ?? 0 }
+    var videoRange: String? { cached?.videoRange }
+    var supportsHDRFallback: Bool { cached?.supportsHDRFallback ?? false }
 
     var chapters: [(start: Double, title: String)] {
         (cached?.chapters ?? []).map { ($0.start, $0.title) }

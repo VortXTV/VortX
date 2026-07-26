@@ -220,6 +220,13 @@ enum VortXEngineProtocol {
         let dolbyVision: Bool
         let width: Int
         let height: Int
+        /// Declared primary-variant bandwidth. Optional so a newer client can still decode an older host.
+        let bandwidth: Int?
+        /// Optional for wire compatibility with a host built before explicit HDR-only recovery existed.
+        /// "HLG" identifies a Profile 8.4 base layer; "PQ" and nil-compatible sources recover as HDR10.
+        let videoRange: String?
+        /// Whether the source has an honest non-DV base layer. Nil means an older host and fails closed.
+        let supportsHDRFallback: Bool?
         /// The furthest source second produced so far. On a full-timeline session everything from
         /// `timelineOriginSeconds` to here is seekable; without it, only the sliding window is.
         let producedEdgeSeconds: Double

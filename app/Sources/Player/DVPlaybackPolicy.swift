@@ -228,12 +228,23 @@ enum DVPlaybackPolicy {
         let dolbyVision: Bool
     }
 
+    enum MasterVideoVariant: Equatable, Sendable {
+        case primary
+        case hdrFallback
+    }
+
+    enum HDRFallbackDisplayRange: Equatable, Sendable {
+        case hdr10
+        case hlg
+    }
+
     /// Render the exact master artifact. With no optional tags or attributes this preserves the established
     /// plain and Dolby Vision bytes; feature-on media rows precede the variants and every variant receives the
     /// same group attributes.
     static func masterPlaylistData(input: MasterPlaylistInput,
                                    mediaTags: [String],
-                                   streamInfAttributes: String) -> Data {
+                                   streamInfAttributes: String,
+                                   videoVariant: MasterVideoVariant = .primary) -> Data {
         let head = (["#EXTM3U", "#EXT-X-VERSION:7"] + mediaTags).joined(separator: "\n")
         var codecs = input.videoCodec
         if let audio = input.audioCodec { codecs += ",\(audio)" }
@@ -253,6 +264,11 @@ enum DVPlaybackPolicy {
             return Data("\(head)\n\(inf)\nmedia.m3u8\n".utf8)
         }
 
+        if videoVariant == .hdrFallback {
+            let inf = commonInf(bandwidth: input.bandwidth) + streamInfAttributes
+            return Data("\(head)\n\(inf)\nmedia-hdr.m3u8\n".utf8)
+        }
+
         var dvInf = "#EXT-X-STREAM-INF:BANDWIDTH=\(input.bandwidth)"
         if input.width > 0, input.height > 0 {
             dvInf += ",RESOLUTION=\(input.width)x\(input.height)"
@@ -265,9 +281,50 @@ enum DVPlaybackPolicy {
         if input.fps > 0 { dvInf += String(format: ",FRAME-RATE=%.3f", input.fps) }
         dvInf += streamInfAttributes
 
-        let fallbackBandwidth = max(input.bandwidth - 100_000, 1)
-        let fallbackInf = commonInf(bandwidth: fallbackBandwidth) + streamInfAttributes
-        return Data("\(head)\n\(dvInf)\nmedia.m3u8\n\(fallbackInf)\nmedia-hdr.m3u8\n".utf8)
+        return Data("\(head)\n\(dvInf)\nmedia.m3u8\n".utf8)
+    }
+
+    /// A CoreMedia rejection of a healthy DV item gets one explicit HDR-only item, never an in-item variant
+    /// switch. A source with no compatible base layer, such as Profile 5, cannot truthfully enter this path.
+    static func shouldAttemptHDRFallback(dolbyVision: Bool,
+                                         remuxMounted: Bool,
+                                         mountHealthy: Bool,
+                                         fallbackAvailable: Bool,
+                                         alreadyAttempted: Bool,
+                                         errorDomain: String?,
+                                         errorCode: Int) -> Bool {
+        dolbyVision
+            && remuxMounted
+            && mountHealthy
+            && fallbackAvailable
+            && !alreadyAttempted
+            && errorDomain == "CoreMediaErrorDomain"
+            && errorCode == -12927
+    }
+
+    /// A recovery item may share a mount whose one ready transition already happened. It may also be the item
+    /// that crosses that transition after a pre-ready primary failure. Every other false transition is terminal.
+    static func acceptsRemuxReady(transitionAccepted: Bool,
+                                  mountAlreadyReady: Bool,
+                                  recoveryItem: Bool) -> Bool {
+        transitionAccepted || (recoveryItem && mountAlreadyReady)
+    }
+
+    /// Preserve the origin, capability prefix and query while replacing only the primary master resource.
+    /// A different terminal resource is not a remux master and fails closed.
+    static func hdrFallbackMasterURL(from primaryURL: URL) -> URL? {
+        guard var components = URLComponents(url: primaryURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        let suffix = "/master.m3u8"
+        guard components.path.hasSuffix(suffix) else { return nil }
+        components.path = String(components.path.dropLast(suffix.count)) + "/master-hdr.m3u8"
+        return components.url
+    }
+
+    /// Profile 8.4 carries an HLG-compatible base layer. Other compatible recovery assets use HDR10/PQ.
+    static func hdrFallbackDisplayRange(videoRange: String?) -> HDRFallbackDisplayRange {
+        videoRange?.uppercased() == "HLG" ? .hlg : .hdr10
     }
 
     // MARK: - Display switch de-duplication

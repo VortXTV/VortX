@@ -1993,18 +1993,21 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             } else {
                 dvNote = "\(brand) NOT appended (unexpected ftyp shape)"
             }
-            if let stripped = Self.stripDoViConfigBox(initData) {   // from the ORIGINAL bytes: no db1p here
-                servedHDR = stripped
-                hdrNote = "dovi stripped"
+            if let stripped = Self.stripDoViConfigBox(initData),   // from the ORIGINAL bytes: no db1p here
+               let debranded = Self.removeFtypCompatibleBrand(stripped, brand: "dby1") {
+                servedHDR = debranded
+                hdrNote = "dovi + dby1 stripped"
             } else {
                 hdrNote = "strip failed, original bytes"
             }
-        } else if sig?.videoCodec.hasPrefix("hvc1") == true, let stripped = Self.stripDoViConfigBox(initData) {
+        } else if sig?.videoCodec.hasPrefix("hvc1") == true,
+                  let stripped = Self.stripDoViConfigBox(initData),
+                  let debranded = Self.removeFtypCompatibleBrand(stripped, brand: "dby1") {
             // P8 with an unknown compat id: the master deliberately declares plain HEVC HDR on BOTH variants,
             // so neither may serve a dvvC-bearing init (same undeclared-DV mismatch, same -12927 exposure).
-            servedDV = stripped
-            servedHDR = stripped
-            dvNote = "dovi stripped (undeclared P8)"
+            servedDV = debranded
+            servedHDR = debranded
+            dvNote = "dovi + dby1 stripped (undeclared P8)"
             hdrNote = "same as dv"
         }
         let primaryDec3 = MultiAudioPolicy.dec3Observation(in: initData)
@@ -2073,6 +2076,31 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         b.insert(contentsOf: brandBytes, at: ftypSize)
         putBE32(&b, 0, ftypSize + 4)
         return Data(b)
+    }
+
+    /// Remove one compatibility brand from the ftyp compatible-brands list without changing the major brand
+    /// or any following box. A missing brand returns the original bytes, making the transform idempotent.
+    /// Malformed input returns nil so callers can fail soft.
+    static func removeFtypCompatibleBrand(_ data: Data, brand: String) -> Data? {
+        let brandBytes = Array(brand.utf8)
+        guard brandBytes.count == 4 else { return nil }
+        var b = [UInt8](data)
+        let n = b.count
+        guard n >= 24 else { return nil }
+        let ftypSize = be32(b, 0)
+        guard ftypSize >= 16, ftypSize % 4 == 0, ftypSize + 8 <= n,
+              fourccAt(b, 4) == "ftyp", fourccAt(b, ftypSize + 4) == "moov" else { return nil }
+        var off = 16
+        while off + 4 <= ftypSize {
+            if b[off] == brandBytes[0], b[off + 1] == brandBytes[1],
+               b[off + 2] == brandBytes[2], b[off + 3] == brandBytes[3] {
+                b.removeSubrange(off ..< off + 4)
+                putBE32(&b, 0, ftypSize - 4)
+                return Data(b)
+            }
+            off += 4
+        }
+        return data
     }
 
     /// Remove the dvcC/dvvC box from a captured ftyp+moov init segment, fixing the size of every enclosing

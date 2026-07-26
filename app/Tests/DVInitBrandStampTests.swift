@@ -7,14 +7,16 @@
 // CoreMediaErrorDomain -12927 (54 occurrences in one b182 reporter log), silently degrading DV to
 // HDR10. The #143 fix rewrites the SERVED copies in VortXMKVRemuxStream.hlsFinalizeInit:
 //   - /init.mp4     (DV variant):      appendFtypCompatibleBrand stamps the declared brand into ftyp
-//   - /init-hdr.mp4 (lifeboat variant): stripDoViConfigBox removes the dvvC/dvcC the variant denies
+//   - /init-hdr.mp4 (lifeboat variant): stripDoViConfigBox removes the dvvC/dvcC the variant denies,
+//     then removeFtypCompatibleBrand removes movenc's generic dby1 declaration
 // This test pins BOTH transforms byte-for-byte so the fix can never regress silently again.
 //
 // HOW IT TESTS THE REAL CODE (not a mirror). VortX's Apple app has no Xcode unit-test bundle, and
 // the remux file imports Libavformat, which a bare toolchain cannot link. But the two functions
 // under test are pure Foundation byte surgery, so this script EXTRACTS THEIR REAL SOURCE TEXT from
 // app/Sources/Player/VortXMKVRemuxStream.swift (brace-matched, all five members: be32, putBE32,
-// fourccAt, appendFtypCompatibleBrand, stripDoViConfigBox), wraps them in an enum, and runs them
+// fourccAt, appendFtypCompatibleBrand, removeFtypCompatibleBrand, stripDoViConfigBox), wraps them
+// in an enum, and runs them
 // with the system toolchain against REAL CAPTURED FIXTURES. Any edit to the shipped functions is
 // therefore what gets tested. If extraction fails (rename / move), this test FAILS loudly; update
 // the signatures list below, never weaken it to a skip.
@@ -25,7 +27,8 @@
 // configuration record (profile 8, bl compat id 1; x265 Main10 PQ video + AC3 audio).
 //   rawInit   = movenc's untouched ftyp+moov output (what the pre-fix code served, ftyp 32B, no db1p)
 //   servedDV  = the published /init.mp4 bytes  (ftyp 36B, db1p appended, size field patched)
-//   servedHDR = the published /init-hdr.mp4 bytes (dvvC stripped, ancestor sizes fixed)
+//   servedHDR = the legacy published /init-hdr.mp4 bytes (dvvC stripped, ancestor sizes fixed,
+//               but still carrying dby1). The corrected result removes exactly that four-byte brand.
 // The raw fixture is self-checked against the documented movenc shape before any assertion.
 //
 // RUN:              swift app/Tests/DVInitBrandStampTests.swift
@@ -80,6 +83,7 @@ let signatures = [
     "private static func putBE32(",
     "private static func fourccAt(",
     "static func appendFtypCompatibleBrand(",
+    "static func removeFtypCompatibleBrand(",
     "static func stripDoViConfigBox(",
 ]
 var extracted: [String] = []
@@ -183,7 +187,38 @@ let hdrMoov = be32([UInt8](stripped), 32)
 if rawMoov - hdrMoov != 32 { fail("C7 moov size delta \\(rawMoov - hdrMoov), expected 32") }
 print("PASS C7: moov size \\(rawMoov) -> \\(hdrMoov) (-32, the dvvC box)")
 
-print("ALL PASS: the served DV init carries the declared brand and the lifeboat carries no DV box")
+// C8: the corrected lifeboat removes the generic DV brand as well as the DV config box.
+guard let debranded = RealSurgery.removeFtypCompatibleBrand(stripped, brand: "dby1") else {
+    fail("C8 removeFtypCompatibleBrand returned nil on the real movenc init")
+}
+guard let hdr = brands(debranded), hdr.size == 28, hdr.major == "iso5",
+      hdr.list == ["iso5", "iso6", "mp41"],
+      fourcc([UInt8](debranded), hdr.size + 4) == "moov"
+else { fail("C8 corrected ftyp not the expected 28B [iso5, iso6, mp41] + moov shape") }
+if debranded.count != stripped.count - 4 {
+    fail("C8 corrected init size delta \\(stripped.count - debranded.count), expected 4")
+}
+if containsBox(debranded, "dvvC") || containsBox(debranded, "dvcC") || containsBox(debranded, "dby1") {
+    fail("C8 corrected lifeboat still declares Dolby Vision")
+}
+let oldMoov = [UInt8](stripped)[32...]
+let newMoov = [UInt8](debranded)[28...]
+if !oldMoov.elementsEqual(newMoov) { fail("C8 removing dby1 changed bytes outside ftyp") }
+print("PASS C8: lifeboat ftyp = 28B compatible=\\(hdr.list), dby1 removed, moov byte-identical")
+
+// C9: removal is idempotent and malformed inputs fail soft.
+guard RealSurgery.removeFtypCompatibleBrand(debranded, brand: "dby1") == debranded else {
+    fail("C9 removing an absent brand must preserve the input")
+}
+if RealSurgery.removeFtypCompatibleBrand(Data(count: 8), brand: "dby1") != nil {
+    fail("C9 short data must return nil")
+}
+if RealSurgery.removeFtypCompatibleBrand(stripped, brand: "toolong") != nil {
+    fail("C9 non-4-char brand must return nil")
+}
+print("PASS C9: removal is idempotent and malformed input / brand returns nil")
+
+print("ALL PASS: the served DV init carries the declared brand and the lifeboat carries no DV declaration")
 """
 
 let tmpDir = FileManager.default.temporaryDirectory

@@ -1188,16 +1188,9 @@ struct TVPlayerView: View {
                 // re-renders `playerSurface` to the mpv surface on the SAME view, which re-loads the stream.
                 // This is the true last resort the owner asked for, replacing the heavyweight forceMPV window
                 // rebuild for the common case. Genuine mpv failures fall through to the existing recovery.
-                // #76: before demoting, give a HEALTHY DV remux mount ONE fresh AVPlayerItem. Field logs show a
-                // served /media.m3u8 + fetched /init.mp4, then the item fails ~5ms later on a mount whose remux
-                // is still healthy (init published, buffer not failed): a CoreMedia loopback startup hiccup, not
-                // a dead stream. The engine re-attaches a fresh item on the SAME mount (one-shot per mount); if
-                // that fails too the next endFileError falls through here and demotes normally.
-                if (coordinator.player as? AVPlayerEngineController)?.retryFreshItemOnHealthyMount() == true {
-                    pendingAdvance?.terminal = false
-                    uncommittedIdentityBlocked = false
-                    return
-                }
+                // The engine consumes one exact CoreMedia -12927 on a healthy DV mount and mounts its explicit
+                // HDR-only recovery item before it emits endFileError. Reaching this chrome edge therefore
+                // means recovery was unavailable or already failed, so demotion is final and loop-free.
                 if demoteAVPlayerToMPV() { return }
                 handleLoadFailure((data as? String) ?? "")
             } else if isAVPlayerActive {

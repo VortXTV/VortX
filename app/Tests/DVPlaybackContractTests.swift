@@ -800,20 +800,86 @@ let dvFlagOffArtifact = Data("""
 #EXT-X-VERSION:7
 #EXT-X-STREAM-INF:BANDWIDTH=20000000,RESOLUTION=3840x2160,CODECS="hvc1.2.4.L153.B0,ec-3",SUPPLEMENTAL-CODECS="dvh1.08.06/db1p",VIDEO-RANGE=PQ,FRAME-RATE=23.976
 media.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=19900000,RESOLUTION=3840x2160,CODECS="hvc1.2.4.L153.B0,ec-3",FRAME-RATE=23.976
-media-hdr.m3u8
 
 """.utf8)
-check("artifact: DV flag-off master is byte-identical to the pre-feature body",
+check("artifact: DV master advertises exactly one DV video variant",
       DVPlaybackPolicy.masterPlaylistData(
         input: dvMasterInput, mediaTags: [], streamInfAttributes: "") == dvFlagOffArtifact)
 let decorated = String(decoding: DVPlaybackPolicy.masterPlaylistData(
     input: dvMasterInput,
     mediaTags: [#"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Primary""#],
     streamInfAttributes: #",AUDIO="audio",SUBTITLES="subs""#), as: UTF8.self)
-check("artifact: optional tags precede variants and every variant receives the same attributes",
+check("artifact: optional tags precede the single video variant",
       decorated.contains("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Primary\"\n#EXT-X-STREAM-INF")
-        && decorated.components(separatedBy: #",AUDIO="audio",SUBTITLES="subs""#).count == 3)
+        && decorated.components(separatedBy: #",AUDIO="audio",SUBTITLES="subs""#).count == 2
+        && !decorated.contains("media-hdr.m3u8"))
+
+let hdrRecoveryArtifact = Data("""
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-STREAM-INF:BANDWIDTH=20000000,RESOLUTION=3840x2160,CODECS="hvc1.2.4.L153.B0,ec-3",FRAME-RATE=23.976
+media-hdr.m3u8
+
+""".utf8)
+check("artifact: explicit HDR recovery is a separate single-variant master",
+      DVPlaybackPolicy.masterPlaylistData(
+        input: dvMasterInput,
+        mediaTags: [],
+        streamInfAttributes: "",
+        videoVariant: .hdrFallback) == hdrRecoveryArtifact)
+
+check("HDR recovery: exact healthy DV CoreMedia -12927 failure gets one explicit fallback",
+      DVPlaybackPolicy.shouldAttemptHDRFallback(
+        dolbyVision: true,
+        remuxMounted: true,
+        mountHealthy: true,
+        fallbackAvailable: true,
+        alreadyAttempted: false,
+        errorDomain: "CoreMediaErrorDomain",
+        errorCode: -12927))
+check("HDR recovery: an already attempted fallback cannot loop",
+      !DVPlaybackPolicy.shouldAttemptHDRFallback(
+        dolbyVision: true,
+        remuxMounted: true,
+        mountHealthy: true,
+        fallbackAvailable: true,
+        alreadyAttempted: true,
+        errorDomain: "CoreMediaErrorDomain",
+        errorCode: -12927))
+check("HDR recovery: Profile 5 or another no-base-layer source cannot claim HDR recovery",
+      !DVPlaybackPolicy.shouldAttemptHDRFallback(
+        dolbyVision: true,
+        remuxMounted: true,
+        mountHealthy: true,
+        fallbackAvailable: false,
+        alreadyAttempted: false,
+        errorDomain: "CoreMediaErrorDomain",
+        errorCode: -12927))
+check("HDR recovery: unrelated failures keep their existing fail-soft path",
+      !DVPlaybackPolicy.shouldAttemptHDRFallback(
+        dolbyVision: true,
+        remuxMounted: true,
+        mountHealthy: true,
+        fallbackAvailable: true,
+        alreadyAttempted: false,
+        errorDomain: "AVFoundationErrorDomain",
+        errorCode: -11828))
+check("HDR recovery: local master URL rewrites only the terminal resource",
+      DVPlaybackPolicy.hdrFallbackMasterURL(
+        from: URL(string: "http://127.0.0.1:4321/master.m3u8")!)?.absoluteString
+        == "http://127.0.0.1:4321/master-hdr.m3u8")
+check("HDR recovery: hosted capability prefix and query survive the rewrite",
+      DVPlaybackPolicy.hdrFallbackMasterURL(
+        from: URL(string: "http://host:4321/r/capability/master.m3u8?session=one")!)?.absoluteString
+        == "http://host:4321/r/capability/master-hdr.m3u8?session=one")
+check("HDR recovery: a non-master URL cannot be rewritten into a claim",
+      DVPlaybackPolicy.hdrFallbackMasterURL(
+        from: URL(string: "http://host:4321/r/capability/media.m3u8")!) == nil)
+check("HDR recovery: Profile 8.4 base layer requests HLG",
+      DVPlaybackPolicy.hdrFallbackDisplayRange(videoRange: "HLG") == .hlg)
+check("HDR recovery: PQ and unknown base layers request HDR10",
+      DVPlaybackPolicy.hdrFallbackDisplayRange(videoRange: "PQ") == .hdr10
+        && DVPlaybackPolicy.hdrFallbackDisplayRange(videoRange: nil) == .hdr10)
 
 // MARK: - Display switch de-duplication (the flicker)
 

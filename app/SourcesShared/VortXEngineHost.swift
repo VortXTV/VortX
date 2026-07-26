@@ -567,6 +567,9 @@ final class VortXEngineHost: @unchecked Sendable {
             dolbyVision: signalling?.dolbyVision ?? false,
             width: signalling?.width ?? 0,
             height: signalling?.height ?? 0,
+            bandwidth: signalling?.bandwidth,
+            videoRange: signalling?.videoRange,
+            supportsHDRFallback: session.server.supportsHDRFallback,
             producedEdgeSeconds: session.server.producedEdgeSeconds))
     }
 
