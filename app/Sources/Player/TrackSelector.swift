@@ -37,22 +37,27 @@ enum TrackSelector {
     /// First track whose language matches the priority list and whose title isn't rejected.
     private static func firstMatch(_ tracks: [MPVTrack], languages: [String], reject: [String]) -> MPVTrack? {
         for lang in languages {
-            if let t = tracks.first(where: { matches($0.lang, lang) && !isRejected($0, reject) }) { return t }
+            if let t = tracks.first(where: {
+                $0.isSelectable
+                    && matches($0.lang, lang)
+                    && !isRejected($0, reject)
+            }) { return t }
         }
         return nil
     }
 
     private static func selectSubtitle(_ subs: [MPVTrack], preferences p: TrackPreferences, gotPreferredAudio: Bool) -> Int? {
-        guard !subs.isEmpty else { return -1 }
+        let selectable = subs.filter(\.isSelectable)
+        guard !selectable.isEmpty else { return -1 }
         // Foreign-language content (no preferred audio matched): show full subtitles so you can follow.
         if !gotPreferredAudio {
-            return firstMatch(subs, languages: p.subtitleLanguages, reject: p.rejectTerms)?.id ?? -1
+            return firstMatch(selectable, languages: p.subtitleLanguages, reject: p.rejectTerms)?.id ?? -1
         }
         switch p.forcedPolicy {
         case .off:
             return -1
         case .always:
-            return firstMatch(subs, languages: p.subtitleLanguages, reject: p.rejectTerms)?.id ?? -1
+            return firstMatch(selectable, languages: p.subtitleLanguages, reject: p.rejectTerms)?.id ?? -1
         case .forced:
             // Match by the container's FORCED disposition flag FIRST: real forced tracks are flagged
             // (AV_DISPOSITION_FORCED / mpv track-list forced), not labelled "forced" in the title, so the old
@@ -61,15 +66,15 @@ enum TrackSelector {
             // of language), then fall back to the legacy title-contains-"forced" heuristic for the rare
             // container that only labels forced in its title. Off if nothing qualifies.
             for lang in p.subtitleLanguages {
-                if let t = subs.first(where: { $0.forced && matches($0.lang, lang) && !isRejected($0, p.rejectTerms) }) {
+                if let t = selectable.first(where: { $0.forced && matches($0.lang, lang) && !isRejected($0, p.rejectTerms) }) {
                     return t.id
                 }
             }
-            if let t = subs.first(where: { $0.forced && !isRejected($0, p.rejectTerms) }) {
+            if let t = selectable.first(where: { $0.forced && !isRejected($0, p.rejectTerms) }) {
                 return t.id
             }
             for lang in p.subtitleLanguages {
-                if let t = subs.first(where: { matches($0.lang, lang) && $0.title.lowercased().contains("forced") && !isRejected($0, p.rejectTerms) }) {
+                if let t = selectable.first(where: { matches($0.lang, lang) && $0.title.lowercased().contains("forced") && !isRejected($0, p.rejectTerms) }) {
                     return t.id
                 }
             }

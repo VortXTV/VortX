@@ -28,8 +28,9 @@ import Network
 ///
 /// FAIL-SOFT GUARANTEE: a listener that will not start makes the factory return nil (the engine then emits
 /// endFileError and the chrome demotes to libmpv HDR10); a remux failure 404s the next playlist reload so
-/// AVPlayer errors into the same demotion; an evicted-segment request 404s the same way; and the chrome's
-/// start watchdog covers a mount that never frames. Nothing here can hang playback.
+/// AVPlayer errors into the same demotion while the engine retains the exact producer reason; an
+/// evicted-segment request 404s the same way; and the chrome's start watchdog covers a mount that never frames.
+/// Nothing here can hang playback.
 final class VortXRemuxHLSServer: @unchecked Sendable {
 
     // MARK: - Delivery flag (rollback switch)
@@ -107,6 +108,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private var mountDeadline = VortXHLSMountDeadlineState()
     private var mountDeadlineWorkItem: DispatchWorkItem?
 
+    /// The remux producer's first terminal reason. The AVPlayer error surface reads this instead of reducing a
+    /// typed source or storage failure to CoreMedia's generic "URL not found" string.
+    var terminalFailureReason: String? {
+        stream.buffer.status().failure
+    }
+
     private struct Publication {
         let videoWindow: VortXHLSWindow
         let audioWindow: VortXHLSWindow?
@@ -182,6 +189,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     static func make(input: URL, headers: [String: String]?,
                      mode: VortXMKVRemuxStream.Mode = .dolbyVision,
                      startAtSeconds: Double = 0,
+                     selectedAudioStreamIndex: Int? = nil,
                      hosting: HostingConfig? = nil,
                      onStartupTimeout: @escaping @Sendable (VortXRemuxHLSServer) -> Void = { _ in })
         -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
@@ -191,7 +199,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             indexForHLS: true,
             mode: mode,
             startAtSeconds: startAtSeconds,
-            retainFullTimeline: hosting?.retainFullTimeline ?? false)
+            retainFullTimeline: hosting?.retainFullTimeline ?? false,
+            selectedAudioStreamIndex: selectedAudioStreamIndex)
         guard let server = VortXRemuxHLSServer(
             stream: stream,
             hosting: hosting,
@@ -276,6 +285,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// The source MKV chapter markers (start seconds + title). The engine reads these for the Chapters panel /
     /// scrubber ticks on the DV remux lane, since the local HLS delivery carries no chapter metadata (Gap 3).
     var chapters: [(start: Double, title: String)] { stream.chapters }
+
+    /// Stable source-container identities available to the remount-based audio picker.
+    var sourceAudioTracks: [VortXEngineProtocol.AudioTrack] { stream.sourceAudioTracks }
+
+    /// The source identity actually mapped into the primary output after validation and fallback.
+    var selectedSourceAudioIndex: Int? { stream.selectedSourceAudioIndex }
+
+    /// Stable source subtitle identities, including honest unavailable bitmap rows.
+    var sourceSubtitleTracks: [VortXEngineProtocol.SubtitleTrack] { stream.sourceSubtitleTracks }
 
     /// Whether the mount is still HEALTHY: the init segment has published AND the remux buffer has not failed.
     /// The engine's one-shot healthy-mount retry (#76) reads this to tell "a CoreMedia startup hiccup on a live
@@ -1169,8 +1187,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
-        if stream.buffer.status().failure != nil, !publication.ended {
-            DiagnosticsLog.log("dv", "hls 404 \(path) (remux failed)")
+        if let failure = stream.buffer.status().failure, !publication.ended {
+            DiagnosticsLog.log("dv", "hls 404 \(path) (remux failed: \(failure))")
             close(connection, status: "404 Not Found")
             return
         }

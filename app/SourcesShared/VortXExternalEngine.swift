@@ -128,10 +128,16 @@ final class VortXExternalEngine: @unchecked Sendable {
 
     // MARK: - Transport
 
+    /// Upper bounds for one control-channel request and its whole resource load. The remote-remux attach
+    /// watchdog derives its deadline from the resource bound because session creation must finish before the
+    /// client can begin its separate signalling wait.
+    static let controlRequestTimeoutSeconds: TimeInterval = 8
+    static let controlResourceTimeoutSeconds: TimeInterval = 15
+
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 8
-        config.timeoutIntervalForResource = 15
+        config.timeoutIntervalForRequest = controlRequestTimeoutSeconds
+        config.timeoutIntervalForResource = controlResourceTimeoutSeconds
         config.waitsForConnectivity = false
         // No cookies, no cache, no credential storage: this is a LAN control channel, not a browser.
         config.httpShouldSetCookies = false
@@ -251,7 +257,8 @@ final class VortXExternalEngine: @unchecked Sendable {
     func openSession(input: URL,
                      headers: [String: String]?,
                      mode: VortXEngineProtocol.RemuxMode,
-                     startAtSeconds: Double) async -> OpenedSession? {
+                     startAtSeconds: Double,
+                     selectedAudioStreamIndex: Int? = nil) async -> OpenedSession? {
         guard case .external(let hostString, let port) = mountPlan,
               let url = controlURL(host: hostString, port: port,
                                    path: VortXEngineProtocol.Path.session) else { return nil }
@@ -260,7 +267,8 @@ final class VortXExternalEngine: @unchecked Sendable {
             headers: headers,
             mode: mode,
             startAtSeconds: startAtSeconds,
-            requestFullTimeline: wantsFullTimeline)
+            requestFullTimeline: wantsFullTimeline,
+            selectedAudioStreamIndex: selectedAudioStreamIndex)
         guard let body = try? JSONEncoder().encode(payload),
               let opened = await send(request(url, method: "POST", body: body, authorized: true),
                                       as: VortXEngineProtocol.SessionResponse.self) else {
@@ -283,11 +291,17 @@ final class VortXExternalEngine: @unchecked Sendable {
                              port: port)
     }
 
-    func status(_ session: OpenedSession) async -> VortXEngineProtocol.SessionStatus? {
+    func status(
+        _ session: OpenedSession,
+        timeoutSeconds: TimeInterval? = nil
+    ) async -> VortXEngineProtocol.SessionStatus? {
         guard let url = controlURL(host: session.host, port: session.port,
                                    path: VortXEngineProtocol.Path.status(session.sessionID)) else { return nil }
-        return await send(request(url, method: "GET", body: nil, authorized: true),
-                          as: VortXEngineProtocol.SessionStatus.self)
+        var statusRequest = request(url, method: "GET", body: nil, authorized: true)
+        if let timeoutSeconds {
+            statusRequest.timeoutInterval = max(0.1, timeoutSeconds)
+        }
+        return await send(statusRequest, as: VortXEngineProtocol.SessionStatus.self)
     }
 
     /// Tell the host our player reached first frame, which widens the producer's lead exactly as the on-device

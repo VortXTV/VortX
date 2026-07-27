@@ -112,6 +112,21 @@ check("timestamp: an above-maximum or huge finite value is rejected before Int64
         && RemuxResumePolicy.seekTimestampMicroseconds(
           resumeSeconds: Double.greatestFiniteMagnitude) == nil)
 
+// MARK: - input seek result
+
+check("input seek: the precise range seek wins without consulting a fallback",
+      RemuxResumePolicy.inputSeekOutcome(
+        seekable: true, primaryResult: 0, fallbackResult: nil) == .primary)
+check("input seek: a failed range seek accepts a successful keyframe fallback",
+      RemuxResumePolicy.inputSeekOutcome(
+        seekable: true, primaryResult: -1, fallbackResult: 0) == .fallback)
+check("input seek: two failed attempts cannot silently restart a requested resume at zero",
+      RemuxResumePolicy.inputSeekOutcome(
+        seekable: true, primaryResult: -1, fallbackResult: -2) == .unavailable)
+check("input seek: a non-seekable source cannot claim that a resume was applied",
+      RemuxResumePolicy.inputSeekOutcome(
+        seekable: false, primaryResult: nil, fallbackResult: nil) == .unavailable)
+
 // MARK: - origin latch source
 
 check("origin latch: only a mapped base-video packet may establish the timeline origin",

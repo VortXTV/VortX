@@ -64,6 +64,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private let input: String
     private let headers: [String: String]?
     private let mode: Mode
+    /// Optional immutable source-container audio identity requested for this mount. Validation happens after
+    /// libav has enumerated the source; an absent or incompatible index falls back to the existing ranking.
+    private let requestedAudioStreamIndex: Int?
     /// Frozen once during construction. Current production deliberately has no validated complete index, so
     /// every mount uses the conservative 12-second authority for its whole lifetime.
     private let hlsTarget: VortXHLSFrozenTarget
@@ -138,7 +141,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// serve, just without seek-anywhere.
     init(input: String, headers: [String: String]?, indexForHLS: Bool = false,
          mode: Mode = .dolbyVision, startAtSeconds: Double = 0,
-         retainFullTimeline: Bool = false) {
+         retainFullTimeline: Bool = false, selectedAudioStreamIndex: Int? = nil) {
         let primaryBuffer = VortXRemuxBuffer()
         let retaining = (indexForHLS && retainFullTimeline)
             ? VortXHLSSessionSpool.makeRetaining() : nil
@@ -149,6 +152,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         self.headers = headers
         self.hlsIndexingEnabled = indexForHLS
         self.mode = mode
+        self.requestedAudioStreamIndex = selectedAudioStreamIndex
         self.hlsTarget = VortXHLSTargetPolicy.conservativeTarget
         self.requestedOriginSeconds = RemuxResumePolicy.isEnabledByDefault
             ? RemuxResumePolicy.originRequest(resumeSeconds: startAtSeconds)
@@ -222,6 +226,27 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var _hlsEnded = false
     private var _hlsSignaling: HLSSignaling?
     private var _primaryDec3Observation: MultiAudioPolicy.Dec3Observation?
+    /// Every source audio track the remux can deliver, plus the one actually mapped into the primary output.
+    /// Source indices are stable across remounts and are the picker IDs. Stream-copy and decode-only rows are
+    /// both present; delivery metadata tells the UI which path the selected remount will take.
+    private var _sourceAudioTracks: [VortXEngineProtocol.AudioTrack] = []
+    private var _selectedSourceAudioIndex: Int?
+    private var _sourceSubtitleTracks: [VortXEngineProtocol.SubtitleTrack] = []
+
+    var sourceAudioTracks: [VortXEngineProtocol.AudioTrack] {
+        hlsLock.lock(); defer { hlsLock.unlock() }
+        return _sourceAudioTracks
+    }
+
+    var selectedSourceAudioIndex: Int? {
+        hlsLock.lock(); defer { hlsLock.unlock() }
+        return _selectedSourceAudioIndex
+    }
+
+    var sourceSubtitleTracks: [VortXEngineProtocol.SubtitleTrack] {
+        hlsLock.lock(); defer { hlsLock.unlock() }
+        return _sourceSubtitleTracks
+    }
 
     // Optional rendition state. Every field is published under hlsLock, and every feature starts empty so the
     // flag-off master/media bytes follow the exact pre-feature rendering path.
@@ -860,7 +885,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // that must be transcoded (TrueHD/DTS/... - the b160 lane).
         var decodableAudio: [(index: Int, channels: Int32, rank: Int, lang: String,
                               title: String, atmos: Bool, codecID: UInt32)] = []
-        var transcodableAudio: [(index: Int, channels: Int32, lang: String)] = []
+        var transcodableAudio: [(index: Int, channels: Int32, lang: String,
+                                 title: String, codecID: UInt32)] = []
         // The audio track AVPlayer canNOT decode but the bundled FFmpeg CAN (TrueHD/MLP/DTS/Opus/Vorbis/PCM...,
         // a generic decoder check, no allowlist). Used ONLY when the scan finds no stream-copyable track:
         // stream-copy always beats a transcode. Chosen (below) as the highest-channel transcodable track.
@@ -871,6 +897,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // stream, so this is a no-op for them. `baseVideoIn` also tells the mux loop which packets to convert.
         var baseVideoIn = -1
         var subtitleTracks: [SubtitleRenditionPolicy.SourceTrack] = []
+        var subtitleMetadata: [(index: Int, codec: String, language: String, title: String,
+                                forced: Bool, textFormat: SubtitleRenditionPolicy.TextFormat?)] = []
         for i in 0..<nb {
             guard let inStream = inCtx.pointee.streams[i], let par = inStream.pointee.codecpar else { continue }
             switch par.pointee.codec_type {
@@ -905,19 +933,28 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                                            audioLang, Self.streamMetadata(inStream, key: "title"),
                                            isAtmosJOC, par.pointee.codec_id.rawValue))
                 } else if avcodec_find_decoder(par.pointee.codec_id) != nil {
-                    transcodableAudio.append((i, audioChannels, audioLang))
+                    transcodableAudio.append(
+                        (i, audioChannels, audioLang,
+                         Self.streamMetadata(inStream, key: "title"),
+                         par.pointee.codec_id.rawValue))
                 }
             case AVMEDIA_TYPE_SUBTITLE:
-                guard Self.subtitleRenditionsEnabled, hlsIndexingEnabled,
-                      let format = Self.textSubtitleFormat(par.pointee.codec_id) else { break }
                 let disposition = inStream.pointee.disposition
-                subtitleTracks.append(SubtitleRenditionPolicy.SourceTrack(
-                    index: i,
-                    format: format,
-                    language: Self.streamLanguage(inStream),
-                    title: Self.streamMetadata(inStream, key: "title"),
-                    isDefault: (disposition & Self.avDispositionDefault) != 0,
-                    isForced: (disposition & Self.avDispositionForced) != 0))
+                let format = Self.textSubtitleFormat(par.pointee.codec_id)
+                let language = Self.streamLanguage(inStream)
+                let title = Self.streamMetadata(inStream, key: "title")
+                let forced = (disposition & Self.avDispositionForced) != 0
+                subtitleMetadata.append(
+                    (i, Self.codecName(par.pointee.codec_id), language, title, forced, format))
+                if Self.subtitleRenditionsEnabled, hlsIndexingEnabled, let format {
+                    subtitleTracks.append(SubtitleRenditionPolicy.SourceTrack(
+                        index: i,
+                        format: format,
+                        language: language,
+                        title: title,
+                        isDefault: (disposition & Self.avDispositionDefault) != 0,
+                        isForced: forced))
+                }
             default:
                 break   // data/attachments are never mapped
             }
@@ -934,6 +971,26 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             }
             DiagnosticsLog.log("dv", "subtitles: text-renditions-ready count=\(renditions.count)")
         }
+        let renditionBySource = Dictionary(
+            uniqueKeysWithValues: SubtitleRenditionPolicy.renditions(from: subtitleTracks).map {
+                ($0.sourceIndex, $0.id)
+            })
+        let sourceSubtitleTracks = subtitleMetadata.map { metadata in
+            let renditionIndex = renditionBySource[metadata.index]
+            return VortXEngineProtocol.SubtitleTrack(
+                sourceIndex: metadata.index,
+                codec: metadata.codec,
+                language: metadata.language,
+                title: metadata.title,
+                isForced: metadata.forced,
+                delivery: renditionIndex == nil ? .bitmapUnavailable : .webVTT,
+                renditionIndex: renditionIndex,
+                unavailableReason: renditionIndex == nil
+                    ? "Image subtitle is not available in AVPlayer" : nil)
+        }
+        hlsLock.lock()
+        _sourceSubtitleTracks = sourceSubtitleTracks
+        hlsLock.unlock()
         // The target language each pick keeps to: the language of the FIRST track of its OWN kind in scan order,
         // which is exactly the track the old first-decodable / first-transcodable code played. Keeping to it
         // means the new channel/EAC3 ordering reorders only WITHIN that language and can never swap in a
@@ -942,6 +999,26 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // channel/codec order, exactly as intended.
         let decodableTargetLang = decodableAudio.first?.lang ?? ""
         let transcodeTargetLang = transcodableAudio.first?.lang ?? ""
+        let copyablePolicyAudioTracks = MultiAudioPolicy.selectableSourceTracks(from: decodableAudio.map {
+            MultiAudioPolicy.AudioTrack(
+                index: $0.index,
+                codecID: $0.codecID,
+                channels: Int($0.channels),
+                language: $0.lang,
+                title: $0.title,
+                isJOC: $0.atmos,
+                usesDec3: $0.codecID == AV_CODEC_ID_EAC3.rawValue)
+        })
+        let transcodablePolicyAudioTracks = MultiAudioPolicy.selectableSourceTracks(from: transcodableAudio.map {
+            MultiAudioPolicy.AudioTrack(
+                index: $0.index,
+                codecID: $0.codecID,
+                channels: Int($0.channels),
+                language: $0.lang,
+                title: $0.title)
+        })
+        let policyAudioTracks = MultiAudioPolicy.selectableSourceTracks(
+            from: copyablePolicyAudioTracks + transcodablePolicyAudioTracks)
         // Audio pick: keep to the TARGET LANGUAGE first (the original / main-program language), so a
         // higher-channel FOREIGN dub never displaces the original-language track - a Japanese 2.0 original must
         // beat an English 5.1 dub for a sub-watcher, and the remux maps only ONE track so there is no in-player
@@ -951,47 +1028,75 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // bed is never masked by a 1-2ch stereo downmix or commentary ordered ahead of it (the "Atmos plays as
         // stereo" report), then EAC3 (beating AC3, then lossy), then file order.
         var mappedAudioIn = -1
-        if let best = decodableAudio.min(by: { a, b in
+        let requestedAudio = MultiAudioPolicy.selectedSourceTrack(
+            from: policyAudioTracks,
+            requestedSourceIndex: requestedAudioStreamIndex)
+        let requestedCopyable = requestedAudio.flatMap { requested in
+            decodableAudio.first { $0.index == requested.index }
+        }
+        let defaultCopyable = decodableAudio.min(by: { a, b in
             let am = a.lang == decodableTargetLang, bm = b.lang == decodableTargetLang
             if am != bm { return am }
             if a.atmos != b.atmos { return a.atmos }
             if a.channels != b.channels { return a.channels > b.channels }
             if a.rank != b.rank { return a.rank < b.rank }
             return a.index < b.index
-        }) {
+        })
+        if requestedAudio == nil || requestedCopyable != nil,
+           let best = requestedCopyable ?? defaultCopyable {
             hasDecodableAudio = true
             mappedAudioIn = best.index
             mappable.insert(best.index)
         }
+        let publishedAudioTracks: [VortXEngineProtocol.AudioTrack] = policyAudioTracks.compactMap { track in
+            guard let source = inCtx.pointee.streams[track.index],
+                  let parameters = source.pointee.codecpar else { return nil }
+            let delivery: VortXEngineProtocol.AudioDelivery =
+                Self.avPlayerDecodableAudio.contains(parameters.pointee.codec_id.rawValue)
+                    ? .streamCopy : .transcode
+            return VortXEngineProtocol.AudioTrack(
+                sourceIndex: track.index,
+                codec: Self.codecName(parameters.pointee.codec_id),
+                channels: track.channels,
+                language: track.language,
+                title: track.title,
+                // JOC becomes true only after hlsFinalizeInit parses the selected output's real dec3 box.
+                isAtmosJOC: false,
+                delivery: delivery)
+        }
         // The transcode candidate follows the same target-language-then-highest-channel order (a 5.1 DTS bed in
         // the original language over a 2.0 DTS commentary or a foreign dub), used ONLY when nothing is
         // stream-copyable.
-        transcodeAudioIn = transcodableAudio.min(by: { a, b in
+        let requestedTranscodable = requestedAudio.flatMap { requested in
+            transcodableAudio.first { $0.index == requested.index }
+        }
+        let defaultTranscodable = transcodableAudio.min(by: { a, b in
             let am = a.lang == transcodeTargetLang, bm = b.lang == transcodeTargetLang
             if am != bm { return am }
             if a.channels != b.channels { return a.channels > b.channels }
             return a.index < b.index
-        })?.index ?? -1
-        // Insert the transcode candidate into the map ONLY when nothing stream-copyable exists (stream-copy is
-        // always preferred over a transcode). `transcodeActive` is the single switch the setup + mux loops key on.
-        let transcodeActive = !hasDecodableAudio && transcodeAudioIn >= 0
+        })
+        if requestedAudio != nil {
+            transcodeAudioIn = requestedTranscodable?.index ?? -1
+        } else if !hasDecodableAudio {
+            transcodeAudioIn = defaultTranscodable?.index ?? -1
+        }
+        // A decode-only picker row deliberately selects the existing bounded transcoder even when another
+        // stream-copyable source track exists. The default remains stream-copy-first.
+        let transcodeActive = transcodeAudioIn >= 0
         if transcodeActive { mappable.insert(transcodeAudioIn) }
+        hlsLock.lock()
+        _sourceAudioTracks = publishedAudioTracks
+        _selectedSourceAudioIndex = mappedAudioIn >= 0
+            ? mappedAudioIn : (transcodeActive ? transcodeAudioIn : nil)
+        hlsLock.unlock()
 
         // Select but do not advertise one alternate. Its first real packet must still prove the track and
         // initialize the separate muxer; pending state merely tells the master request to apply its <=2s wait.
         var alternateAudioTracks: [MultiAudioPolicy.AudioTrack] = []
         var alternateAudioIn = -1
         if Self.multiAudioEnabled, hlsIndexingEnabled, !transcodeActive, mappedAudioIn >= 0 {
-            alternateAudioTracks = decodableAudio.map {
-                MultiAudioPolicy.AudioTrack(
-                    index: $0.index,
-                    codecID: $0.codecID,
-                    channels: Int($0.channels),
-                    language: $0.lang,
-                    title: $0.title,
-                    isJOC: $0.atmos,
-                    usesDec3: $0.codecID == AV_CODEC_ID_EAC3.rawValue)
-            }
+            alternateAudioTracks = copyablePolicyAudioTracks
             if let candidate = MultiAudioPolicy.alternateCandidate(
                 from: alternateAudioTracks, primaryIndex: mappedAudioIn) {
                 alternateAudioIn = candidate.index
@@ -1060,21 +1165,51 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             if !seekable {
                 VXProbe.log(
                     "dv",
-                    "resume: source is not seekable, starting from beginning (asked \(Int(requestedOriginSeconds))s)")
+                    "resume: source is not seekable, refusing zero restart (asked \(Int(requestedOriginSeconds))s)")
+                buffer.fail(
+                    "resume input is not seekable at \(Int(requestedOriginSeconds)) seconds")
+                return
             } else {
                 // stream_index -1 makes min/target/max AV_TIME_BASE timestamps. BACKWARD lands at or before
                 // the request so the first produced base-video packet is independently decodable.
-                let result = avformat_seek_file(
+                let primaryResult = avformat_seek_file(
                     inCtx, -1, Int64.min, target, target, Self.avseekFlagBackward)
-                if result < 0 {
-                    VXProbe.log(
-                        "dv",
-                        "resume: input seek to \(Int(requestedOriginSeconds))s failed rc=\(result), starting from beginning")
-                } else {
+                var fallbackResult: Int32?
+                if primaryResult < 0 {
+                    // Some Matroska/HTTP demuxers reject avformat_seek_file's exact min/target/max window while
+                    // still supporting the simpler keyframe seek. Flush the failed attempt's buffered parser
+                    // state before the one fallback so a successful resume cannot inherit stale packets.
+                    avformat_flush(inCtx)
+                    fallbackResult = av_seek_frame(
+                        inCtx, -1, target, Self.avseekFlagBackward)
+                }
+                switch RemuxResumePolicy.inputSeekOutcome(
+                    seekable: true,
+                    primaryResult: primaryResult,
+                    fallbackResult: fallbackResult
+                ) {
+                case .primary:
                     originSeekApplied = true
                     VXProbe.log(
                         "dv",
-                        "resume: input seek requested \(Int(requestedOriginSeconds))s (awaiting base-video origin)")
+                        "resume: input range seek requested \(Int(requestedOriginSeconds))s "
+                            + "(awaiting base-video origin)")
+                case .fallback:
+                    originSeekApplied = true
+                    VXProbe.log(
+                        "dv",
+                        "resume: input range seek rc=\(primaryResult), keyframe fallback accepted "
+                            + "\(Int(requestedOriginSeconds))s (awaiting base-video origin)")
+                case .unavailable:
+                    let fallback = fallbackResult.map { String($0) } ?? "not-attempted"
+                    VXProbe.log(
+                        "dv",
+                        "resume: both input seeks failed primary=\(primaryResult) fallback=\(fallback), "
+                            + "refusing zero restart")
+                    buffer.fail(
+                        "resume input seek failed at \(Int(requestedOriginSeconds)) seconds "
+                            + "(primary \(primaryResult), fallback \(fallback))")
+                    return
                 }
             }
         }
@@ -1142,6 +1277,17 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     if !originSeekApplied || originShiftLatched { break }
                 }
             }
+        }
+        if let mismatch = DVPlaybackPolicy.sourceCapabilityMismatch(
+            requiresDolbyVision: mode == .dolbyVision,
+            width: info.width,
+            height: info.height,
+            dolbyVisionProfile: info.dvProfile,
+            audioTrackCount: audioSeen.count
+        ) {
+            VXProbe.log("dv", "HDR10 FALLBACK: \(mismatch)")
+            buffer.fail(mismatch)
+            return
         }
         if !latchOriginFromFallbackIfNeeded() {
             buffer.fail("resume input seek produced no timestamped base-video packet")
@@ -2044,6 +2190,26 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         _hlsInitDataHDR = servedHDR
         _hlsInitHDRRecoverySettled = true
         _primaryDec3Observation = primaryDec3
+        if let selectedSourceAudioIndex = _selectedSourceAudioIndex,
+           let selected = _sourceAudioTracks.firstIndex(where: {
+               $0.sourceIndex == selectedSourceAudioIndex
+           }),
+           _sourceAudioTracks[selected].delivery != .transcode {
+            let track = _sourceAudioTracks[selected]
+            _sourceAudioTracks[selected] = VortXEngineProtocol.AudioTrack(
+                sourceIndex: track.sourceIndex,
+                codec: track.codec,
+                channels: track.channels,
+                language: track.language,
+                title: track.title,
+                // The structured output receipt is the only authority. A source profile hint never reaches
+                // the picker, and transcoded audio can never inherit an Atmos label from its source.
+                isAtmosJOC: MultiAudioPolicy.verifiedJOC(
+                    isStreamCopy: track.delivery != .transcode,
+                    usesDec3: track.codec.lowercased() == "eac3",
+                    observation: primaryDec3),
+                delivery: track.delivery)
+        }
         hlsLock.unlock()
         hlsVideoTrackID = videoTrackID
         hlsOutputVideoFormat = outputVideoFormat

@@ -11,6 +11,35 @@ import Foundation
 /// and a semantic break fails it.
 enum DVPlaybackPolicy {
 
+    /// Prefix carried unchanged from remux classification to the player source-failover edge. Keeping one
+    /// typed prefix prevents a mislabeled preview asset from being reduced to a generic AVPlayer URL error.
+    static let sourceCapabilityMismatchPrefix = "source capability mismatch:"
+
+    /// A source ranked and routed as Dolby Vision can still resolve to a short 720p preview or trailer. The
+    /// diagnostic signature is deliberately strict: low-resolution video, no audio track, and no Dolby Vision
+    /// configuration after both container and bounded in-band inspection. Any partial match keeps the ordinary
+    /// codec/profile path because a valid unusual source must never be skipped by inference.
+    static func sourceCapabilityMismatch(
+        requiresDolbyVision: Bool,
+        width: Int,
+        height: Int,
+        dolbyVisionProfile: Int,
+        audioTrackCount: Int
+    ) -> String? {
+        guard requiresDolbyVision,
+              width > 0, height > 0,
+              max(width, height) <= 1280,
+              min(width, height) <= 720,
+              dolbyVisionProfile < 0,
+              audioTrackCount == 0 else { return nil }
+        return "\(sourceCapabilityMismatchPrefix) routed Dolby Vision but resolved "
+            + "\(width)x\(height), no audio, and no Dolby Vision configuration"
+    }
+
+    static func isSourceCapabilityMismatch(_ message: String) -> Bool {
+        message.hasPrefix(sourceCapabilityMismatchPrefix)
+    }
+
     enum NativePreAttachOutcome: Equatable, Sendable {
         case stale
         case attachedWithLoadedCriteria

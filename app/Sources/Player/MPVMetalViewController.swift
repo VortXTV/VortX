@@ -1188,17 +1188,14 @@ final class MPVMetalViewController: PlatformViewController {
         // own disk cache, and live owns its tight buffers, so those keep the RAM-safe read-ahead above.)
         let appliedCap: String
         if DiskCacheSetting.diskCacheEnabled, !live, !isLocalStream {
-            // DEVICE-SOAK ITEM: the prior flat 256 MiB ceiling masked the Settings slider and starved the
-            // read-ahead to ~25-30s on debrid (the owner had 120-200s before). The ATV 4K (4 GB + memory
-            // entitlement) holds ~75-90s at 4K within 768 MiB, ~3x runway, which also resolves the lag and
-            // ~7 dropped frames (the buffer was draining on CDN dips). 768 MiB is deliberately BELOW the
-            // ~700 MB+ unclamped level that jetsam-killed the device; keep ATV HD (reduced) tight at 128 MiB;
-            // the Mac (out-of-process server + swap) gets the generous 1 GiB ceiling.
-            // The player-teardown straddle that caused the earlier whole-device hang is fixed separately, so
-            // this is the buffer's first real restore. If it jetsams on soak, step 768 -> 512 MiB.
+            // DIAG-12 RECEIPT: restoring the tvOS ceiling to 768 MiB was not device-safe. The embedded
+            // Node heartbeat rose from about 422 MiB to 1.2 GiB immediately after libmpv opened a debrid
+            // stream while the JS heap stayed at 26 MiB. That native RSS delta matches the 768 MiB cap.
+            // Keep iOS/tvOS at the previously stable 256 MiB hard ceiling, reduced devices at 128 MiB,
+            // and macOS at 1 GiB because its server and swap model are different.
             //
             // THE RECURRING JETSAM KNOB: these ceilings are now the RemoteConfig `player.readAhead.*` dials
-            // (debrid 64..900, reduced 64..192, mac 128..1536, floor fixed 64). Baked fallbacks (768/128/1024)
+            // (debrid 64..256, reduced 64..192, mac 128..1536, floor fixed 64). Baked fallbacks (256/128/1024)
             // equal the shipping literals, so a null / absent remote config is behaviorally identical to today;
             // a bad value clamps to the baked default and can never breach the jetsam-safe range.
             #if os(macOS)
@@ -1315,7 +1312,7 @@ final class MPVMetalViewController: PlatformViewController {
     //
     // mpv keeps FILLING the forward demuxer cache to `demuxer-max-bytes` while PAUSED, so a viewer who
     // starts a stream and immediately pauses parks the app at its peak cache footprint (256 MiB default
-    // remote; up to 768 MiB with the Streaming-cache setting) for the whole pause. On tvOS the pause also
+    // remote; up to 256 MiB with the Streaming-cache setting) for the whole pause. On tvOS the pause also
     // re-enables the idle timer, so a few minutes in the SCREENSAVER (its own 4K video pipeline) starts on
     // top, exactly when this app is at its fattest, and jetsam reaps the app: the "start a video, pause
     // for some minutes, app is suddenly gone" crash. Two defenses, both engine-local and reset per load:
@@ -1400,8 +1397,8 @@ final class MPVMetalViewController: PlatformViewController {
         // read-ahead fills at link speed, so a warning arrived ~40s into every mpv mount (six in one field
         // log) and caching visibly died for the whole film. The real relief is the buffer DROP below,
         // which frees the resident bytes immediately either way; the refill budget only sets the next
-        // peak. So step DOWN instead of slamming: first warning halves the budget (768 -> 384 MiB,
-        // 256 -> 128 MiB; caching stays alive), any later warning floors it (the old terminal state).
+        // peak. So step DOWN instead of slamming: first warning halves the budget (256 -> 128 MiB;
+        // caching stays alive), any later warning floors it (the old terminal state).
         // The reduced budget is written back to activeReadAheadCap so pause/resume and later warnings all
         // key off it; loadFile still resets a NEW file to its full budget.
         let newCapBytes = VortXCacheShedPolicy.forwardCapAfterWarning(

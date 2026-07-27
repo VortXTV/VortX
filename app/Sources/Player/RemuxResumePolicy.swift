@@ -81,6 +81,27 @@ enum RemuxResumePolicy {
         return Int64(microseconds.rounded())
     }
 
+    enum InputSeekOutcome: Equatable, Sendable {
+        case primary
+        case fallback
+        case unavailable
+    }
+
+    /// Resolve the two FFmpeg input-seek attempts without ever treating a requested resume as "start at zero."
+    /// A failed precise range seek may fall back to av_seek_frame after the demuxer is flushed. If neither
+    /// succeeds, the remux must terminate so the existing libmpv recovery can reopen the same source at the
+    /// preserved resume point.
+    static func inputSeekOutcome(
+        seekable: Bool,
+        primaryResult: Int32?,
+        fallbackResult: Int32?
+    ) -> InputSeekOutcome {
+        guard seekable, let primaryResult else { return .unavailable }
+        if primaryResult >= 0 { return .primary }
+        if let fallbackResult, fallbackResult >= 0 { return .fallback }
+        return .unavailable
+    }
+
     /// The output timeline origin belongs to mapped base video. Audio, subtitles, data streams and unmapped
     /// packets may arrive first after a seek, but none may establish the clock used by every video segment.
     static func canEstablishOrigin(packetStreamIndex: Int,

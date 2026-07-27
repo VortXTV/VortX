@@ -112,13 +112,16 @@ let mixed = [
 ]
 let picked = Policy.renditions(from: mixed)
 check("renditions: source order is kept",
-      picked.map(\.sourceIndex) == [3, 4, 6, 7])
+      picked.map(\.sourceIndex) == [3, 4, 5, 6, 7])
 check("renditions: ids are the serving ordinals",
-      picked.map(\.id) == [0, 1, 2, 3])
+      picked.map(\.id) == [0, 1, 2, 3, 4])
 check("renditions: a second source default is published as NOT default",
       picked.first(where: { $0.sourceIndex == 7 })?.isDefault == false)
-check("renditions: an indistinguishable duplicate is dropped",
-      picked.filter { $0.name == "English" }.count == 1)
+check("renditions: indistinguishable source tracks remain independently selectable",
+      picked.contains(where: { $0.sourceIndex == 3 })
+          && picked.contains(where: { $0.sourceIndex == 5 }))
+check("renditions: duplicate labels carry deterministic source identity",
+      picked.first(where: { $0.sourceIndex == 5 })?.name.contains("Source 5") == true)
 check("renditions: a track differing only by forced is NOT a duplicate",
       picked.contains { $0.isForced && $0.language == "eng" })
 check("renditions: exactly one DEFAULT survives",
@@ -142,11 +145,10 @@ check("renditions: no tracks yields no renditions", Policy.renditions(from: []).
 let many = (0..<20).map {
     Track(index: $0, format: .subRip, language: "l\($0)", title: "T\($0)", isDefault: false, isForced: false)
 }
-check("renditions: the cap holds", Policy.renditions(from: many).count == Policy.maxRenditions)
-check("renditions: one under the cap is not capped",
-      Policy.renditions(from: Array(many.prefix(Policy.maxRenditions - 1))).count == Policy.maxRenditions - 1)
-check("renditions: exactly the cap is not truncated further",
-      Policy.renditions(from: Array(many.prefix(Policy.maxRenditions))).count == Policy.maxRenditions)
+check("renditions: twenty text tracks are not capped",
+      Policy.renditions(from: many).count == 20)
+check("renditions: all immutable source identities survive",
+      Policy.renditions(from: many).map(\.sourceIndex) == Array(0..<20))
 
 let collidingMetadata = Policy.renditions(from: [
     Track(index: 10, format: .subRip, language: "eng", title: "Main", isDefault: false, isForced: false),

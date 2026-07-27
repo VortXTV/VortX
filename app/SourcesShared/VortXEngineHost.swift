@@ -513,6 +513,7 @@ final class VortXEngineHost: @unchecked Sendable {
             headers: request.headers,
             mode: request.mode == .plain ? .plain : .dolbyVision,
             startAtSeconds: max(0, request.startAtSeconds),
+            selectedAudioStreamIndex: request.selectedAudioStreamIndex,
             hosting: hosting) else {
             reply(connection, status: "500 Internal Server Error",
                   body: VortXEngineProtocol.ErrorBody(error: "mount_failed",
@@ -563,6 +564,8 @@ final class VortXEngineHost: @unchecked Sendable {
             producedSegments: progress.segmentCount,
             producedBytes: progress.producedBytes,
             ended: progress.ended,
+            initPublished: progress.initPublished,
+            failed: progress.failed,
             signalingPublished: progress.signalingPublished,
             dolbyVision: signalling?.dolbyVision ?? false,
             width: signalling?.width ?? 0,
@@ -570,6 +573,9 @@ final class VortXEngineHost: @unchecked Sendable {
             bandwidth: signalling?.bandwidth,
             videoRange: signalling?.videoRange,
             supportsHDRFallback: session.server.supportsHDRFallback,
+            audioTracks: session.server.sourceAudioTracks,
+            selectedAudioStreamIndex: session.server.selectedSourceAudioIndex,
+            subtitleTracks: session.server.sourceSubtitleTracks,
             producedEdgeSeconds: session.server.producedEdgeSeconds))
     }
 

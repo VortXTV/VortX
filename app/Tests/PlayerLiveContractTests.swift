@@ -237,6 +237,33 @@ enum PlayerLiveContractTests {
         let ended = DVPlaybackPolicy.mediaPlaylistLines(
             window: window, ended: true, targetDuration: 5, mapURI: "init.mp4")
         check("playlist: completed resident window carries ENDLIST", ended.contains("#EXT-X-ENDLIST"))
+        let mismatch = DVPlaybackPolicy.sourceCapabilityMismatch(
+            requiresDolbyVision: true,
+            width: 1280,
+            height: 720,
+            dolbyVisionProfile: -1,
+            audioTrackCount: 0)
+        check("source capability: a low-resolution audio-less non-DV asset is typed as a mismatch",
+              mismatch.map(DVPlaybackPolicy.isSourceCapabilityMismatch) == true)
+        check("source capability: real DV, audio, or UHD evidence prevents a mismatch inference",
+              DVPlaybackPolicy.sourceCapabilityMismatch(
+                  requiresDolbyVision: true,
+                  width: 1280,
+                  height: 720,
+                  dolbyVisionProfile: 8,
+                  audioTrackCount: 0) == nil
+                  && DVPlaybackPolicy.sourceCapabilityMismatch(
+                      requiresDolbyVision: true,
+                      width: 1280,
+                      height: 720,
+                      dolbyVisionProfile: -1,
+                      audioTrackCount: 1) == nil
+                  && DVPlaybackPolicy.sourceCapabilityMismatch(
+                      requiresDolbyVision: true,
+                      width: 3840,
+                      height: 2160,
+                      dolbyVisionProfile: -1,
+                      audioTrackCount: 0) == nil)
     }
 
     private static func testReadLeaseLifecycle() {
@@ -984,37 +1011,46 @@ enum PlayerLiveContractTests {
             check("open stage RAM physical cap: fixture is creatable", false)
         }
 
-        let ramRejectRoot = scratchDirectory("open-stage-ram-transient-reject")
-        defer { try? FileManager.default.removeItem(at: ramRejectRoot) }
-        let ramRejectBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 32)
-        if let ramRejectSpool = VortXHLSSessionSpool(
-            parentDirectory: ramRejectRoot,
-            capacityBytes: 16,
+        let ramBackpressureRoot = scratchDirectory("open-stage-ram-close-backpressure")
+        defer { try? FileManager.default.removeItem(at: ramBackpressureRoot) }
+        let ramBackpressureBuffer = VortXRemuxBuffer(windowFloorBytes: 1, producerLeadBytes: 32)
+        if let ramBackpressureSpool = VortXHLSSessionSpool(
+            parentDirectory: ramBackpressureRoot,
+            capacityBytes: 35,
             chunkSize: 2,
             scavengeStaleSessions: false),
-           let ramRejectStage = ramRejectSpool.attachOpenStage(to: ramRejectBuffer) {
-            append([0, 1, 2, 3], to: ramRejectBuffer)
-            _ = ramRejectStage.arm(base: 4)
-            append([10, 11, 12, 13, 14, 15], to: ramRejectBuffer)
-            if let claim = ramRejectStage.claim() {
-                let rejected = !ramRejectStage.closePrefix(
+           ramBackpressureSpool.spill([.init(
+               key: .video(segmentID: 20),
+               data: Data(repeating: 7, count: 8),
+               durationMilliseconds: 1_000)]),
+           ramBackpressureSpool.recordPlaylistGeneration(
+               playlistID: "video", resourceKeys: [.video(segmentID: 20)], now: 0) != nil,
+           ramBackpressureSpool.recordPlaylistGeneration(
+               playlistID: "video", resourceKeys: [], now: 0) != nil,
+           let ramBackpressureStage = ramBackpressureSpool.attachOpenStage(
+               to: ramBackpressureBuffer) {
+            append([0, 1, 2, 3], to: ramBackpressureBuffer)
+            _ = ramBackpressureStage.arm(base: 4)
+            append([10, 11, 12, 13, 14, 15], to: ramBackpressureBuffer)
+            if let claim = ramBackpressureStage.claim() {
+                let closed = ramBackpressureStage.closePrefix(
                     claim,
                     endOffset: 7,
                     key: .video(segmentID: 22),
                     durationMilliseconds: 3_000,
                     additionalResources: [])
-                check("open stage RAM physical cap: no transient headroom rejects before any artifact",
-                      rejected
-                          && ramRejectSpool.accounting.openBytes == 6
-                          && ramRejectSpool.accounting.reservedBytes == 0
-                          && ramRejectSpool.accounting.transientCopyBytes == 0
-                          && ramRejectSpool.fileNamesOnDisk.isEmpty
-                          && ramRejectBuffer.status().failure != nil)
+                check("open stage RAM close backpressure: expired playlist bytes are reclaimed and the exact claim closes",
+                      closed
+                          && !ramBackpressureSpool.contains(.video(segmentID: 20))
+                          && ramBackpressureSpool.contains(.video(segmentID: 22))
+                          && ramBackpressureSpool.accounting.reservedBytes == 0
+                          && ramBackpressureSpool.accounting.transientCopyBytes == 0
+                          && ramBackpressureBuffer.status().failure == nil)
             } else {
-                check("open stage RAM physical cap rejection: exact claim is available", false)
+                check("open stage RAM close backpressure: exact claim is available", false)
             }
         } else {
-            check("open stage RAM physical cap rejection: fixture is creatable", false)
+            check("open stage RAM close backpressure: fixture is creatable", false)
         }
 
         let retainedInitRoot = scratchDirectory("open-stage-retained-init-cap")
@@ -2193,6 +2229,11 @@ enum PlayerLiveContractTests {
             .appendingPathComponent("Sources/PlayerScreen.swift"), encoding: .utf8)
         let tvPlayer = try? String(contentsOf: testsURL.deletingLastPathComponent()
             .appendingPathComponent("SourcesTV/TVPlayerView.swift"), encoding: .utf8)
+        let externalEngine = try? String(contentsOf: testsURL.deletingLastPathComponent()
+            .appendingPathComponent("SourcesShared/VortXExternalEngine.swift"), encoding: .utf8)
+        let remoteMount = try? String(
+            contentsOf: playerURL.appendingPathComponent("VortXRemoteRemuxMount.swift"),
+            encoding: .utf8)
         let initialAVMount = sourceSection(
             avPlayerView,
             from: "private func makeHostView()",
@@ -2209,10 +2250,25 @@ enum PlayerLiveContractTests {
             engine,
             from: "func seek(to seconds: Double)",
             to: "func seek(by seconds: Double)")
+        let playControl = sourceSection(engine, from: "func play() {", to: "func pause() {")
+        let pauseControl = sourceSection(engine, from: "func pause() {", to: "func togglePause()")
+        let speedControl = sourceSection(engine, from: "func setSpeed(_ speed: Double)", to: "/// Live playback position")
+        let playbackIntentCapture = sourceSection(
+            engine,
+            from: "private func capturePlaybackIntent(",
+            to: "private func sourceAudioMPVTracks()")
+        let externalEngineLoss = sourceSection(
+            engine,
+            from: "private func handleExternalEngineLost(",
+            to: "/// #147 reactive-net gate")
         let remuxDurationMapping = sourceSection(
             engine,
             from: "private func handleStatus(_ item: AVPlayerItem",
             to: "private func logDVVideoTrackDiagnostics(")
+        let initialTrackPublication = sourceSection(
+            remuxDurationMapping,
+            from: "refreshRemuxSourceAudioTracks()",
+            to: "loadSelectionGroups()")
         let manualSelection = sourceSection(engine, from: "private func select(", to: "/// Re-read AVPlayer's")
         let externalSubtitleRow = sourceSection(
             engine, from: "private func externalSubtitleTracks()", to: "func setAudioTrack(")
@@ -2229,6 +2285,34 @@ enum PlayerLiveContractTests {
             to: "/// AVFoundation cannot time-shift native")
         let groupLoad = sourceSection(engine, from: "private func loadSelectionGroups()",
                                       to: "/// Rebuild cached selected flags")
+        let sourceAudioAlignment = sourceSection(
+            engine,
+            from: "private func selectionContextIsCurrent(",
+            to: "/// Load the audio + subtitle selection groups")
+        let trackListGate = sourceSection(
+            engine,
+            from: "private func publishTrackListIfTopologyReady()",
+            to: "/// Force one track-list publication")
+        let chapterLoad = sourceSection(
+            engine,
+            from: "private func loadChapters()",
+            to: "private func logDVVideoTrackDiagnostics(")
+        let mediaSelectionNotification = sourceSection(
+            engine,
+            from: "@objc private func mediaSelectionDidChange",
+            to: "private func teardownObservers()")
+        let sourceSubtitleRows = sourceSection(
+            engine,
+            from: "private func sourceSubtitleMPVTracks(item: AVPlayerItem)",
+            to: "private func nativeSubtitleIndex")
+        let playerGroupedTracks = sourceSection(
+            playerScreen,
+            from: "private func groupedTrackRows(_ tracks: [MPVTrack]",
+            to: "private func langName")
+        let tvGroupedTracks = sourceSection(
+            tvPlayer,
+            from: "private func groupedTrackRows(_ tracks: [MPVTrack]",
+            to: "private func langName")
         let subtitlePlaylist = sourceSection(
             server,
             from: "private func serveSubtitlePlaylist(",
@@ -2253,6 +2337,10 @@ enum PlayerLiveContractTests {
             server,
             from: "private func currentPublication()",
             to: "private func topologyMatches(")
+        let mediaPublication = sourceSection(
+            server,
+            from: "private func serveMedia(",
+            to: "/// Pure rendering")
         let publicationReceipt = sourceSection(
             server,
             from: "private func recordPublication(",
@@ -2404,6 +2492,15 @@ enum PlayerLiveContractTests {
                   && publicationReceipt?.contains("/media-hdr.m3u8") == true
                   && publicationReceipt?.contains("/audio\\(plan.alternate.id).m3u8") == true
                   && publicationReceipt?.contains("/sub\\(rendition.id).m3u8") == true)
+        check("wiring: producer failure remains a fatal transport edge rather than natural ENDLIST",
+              sourceContainsInOrder(mediaPublication, [
+                "if let failure = stream.buffer.status().failure, !publication.ended",
+                "hls 404",
+                "close(connection, status: \"404 Not Found\")",
+                "return",
+                "buildMediaBody(",
+              ])
+                  && mediaPublication?.contains("shouldEndPublishedPlaylist") == false)
         check("wiring: alternate audio owns a separate muxer and cloned packet references",
               stream?.contains("private final class VortXAlternateAudioMuxer") == true
                   && stream?.contains("av_packet_clone(packet)") == true
@@ -2561,8 +2658,12 @@ enum PlayerLiveContractTests {
                   && mountWaits?.contains(
                       "guard let accepted = result.value, !isInvalidated else") == true
                   && mountWaits?.contains("Date().addingTimeInterval") == false
-                  && engine?.contains(
-                      "if let server = remuxHLSServer, !server.markEngineReady()") == true)
+                  && sourceContainsInOrder(engine, [
+                      "let accepted = server.markEngineReady()",
+                      "DVPlaybackPolicy.acceptsRemuxReady(",
+                      "transitionAccepted: accepted",
+                      "mountAlreadyReady: server.hasMarkedEngineReady",
+                  ]))
         check("wiring: timeout callback is generation-safe and emits one fatal chrome event",
               engine?.contains("onStartupTimeout: { [weak self] timedOutServer in") == true
                   && engine?.contains("remuxHLSServer === timedOutServer") == true
@@ -2680,11 +2781,47 @@ enum PlayerLiveContractTests {
               ]))
         check("wiring: resume seek, base-video origin latch and packet rebase are all live",
               stream?.contains("avformat_seek_file(") == true
+                  && stream?.contains("avformat_flush(inCtx)") == true
+                  && stream?.contains("av_seek_frame(") == true
+                  && stream?.contains("refusing zero restart") == true
                   && stream?.contains("RemuxResumePolicy.canEstablishOrigin(") == true
                   && stream?.contains("rebaseFromOrigin(p, timeBase:") == true
                   && stream?.contains("rebaseFromOrigin(pkt, timeBase:") == true
                   && engine?.contains("remuxHLSServer?.timelineOriginSeconds") == true
                   && resumePolicy?.contains("static let isEnabledByDefault = true") == true)
+        check("wiring: mislabeled tiny DV sources keep their typed reason through automatic failover",
+              stream?.contains("DVPlaybackPolicy.sourceCapabilityMismatch(") == true
+                  && engine?.contains("remuxHLSServer?.terminalFailureReason") == true
+                  && tvPlayer?.contains(
+                      "DVPlaybackPolicy.isSourceCapabilityMismatch(failureMessage)") == true
+                  && tvPlayer?.contains(
+                      "if DVPlaybackPolicy.isSourceCapabilityMismatch(msg)") == true)
+        check("wiring: first-frame proof and start timers are owned by the current logical load",
+              tvPlayer?.contains(".hasProducedPlayableVideoFrame == true") == true
+                  && tvPlayer?.contains(
+                      "TVPlaybackStartPolicy.loadTimeoutOwnerIsCurrent(") == true
+                  && tvPlayer?.contains(
+                      "capturedEpisodeGeneration: capturedEpisodeGeneration") == true
+                  && tvPlayer?.contains(
+                      "capturedLoadToken: capturedLoadToken") == true)
+        check("wiring: generic source timeout cannot outrun a progressing remux watchdog",
+              tvPlayer?.contains(
+                  "TVPlaybackStartPolicy.genericLoadTimeoutDefersToRemuxWatchdog(") == true
+                  && tvPlayer?.contains(
+                      "remuxPendingOrMounted: avController?.remuxStartupSignal.pendingOrMounted == true") == true
+                  && tvPlayer?.contains(
+                      "generic load timeout deferred to exact-owner progress-aware remux watchdog") == true)
+        check("wiring: remote attach watchdog covers the named resource and signalling budgets",
+              externalEngine?.contains(
+                  "config.timeoutIntervalForRequest = controlRequestTimeoutSeconds") == true
+                  && externalEngine?.contains(
+                  "config.timeoutIntervalForResource = controlResourceTimeoutSeconds") == true
+                  && remoteMount?.contains(
+                      "timeoutSeconds: Double = VortXRemoteRemuxMount.signallingTimeoutSeconds") == true
+                  && tvPlayer?.contains(
+                      "controlResourceTimeout: VortXExternalEngine.controlResourceTimeoutSeconds") == true
+                  && tvPlayer?.contains(
+                      "signallingTimeout: VortXRemoteRemuxMount.signallingTimeoutSeconds") == true)
         check("wiring: display manager uses the success-aware request ledger",
               display?.contains("displayRequestLedger.begin") == true
                   && display?.contains("displayRequestLedger.complete") == true
@@ -2719,17 +2856,168 @@ enum PlayerLiveContractTests {
                   && externalSubtitleLoad?.contains("self.externalSubLabel = (title: title, lang: lang)") == true
                   && externalSubtitleLoad?.contains("self.publishSelectionTracks()") == true)
         check("wiring: the ticked-row identity includes the external subtitle",
-              selectionRefresh?.contains(
-                "let subtitleID = externalSubActive ? Self.externalSubtitleTrackID : nativeSubtitleID") == true)
+              sourceContainsInOrder(selectionRefresh, [
+                  "let nativeSubtitleID =",
+                  "let sourceSubtitleID =",
+                  "let subtitleID = externalSubActive",
+                  "? Self.externalSubtitleTrackID",
+                  ": (sourceSubtitleID ?? nativeSubtitleID)",
+              ]))
+        check("wiring: every user transport action refreshes the pending remount intent",
+              playControl?.contains("refreshPendingIntentTransport()") == true
+                  && pauseControl?.contains("refreshPendingIntentTransport()") == true
+                  && speedControl?.contains("refreshPendingIntentTransport()") == true
+                  && sourceContainsInOrder(remuxSeekMapping, [
+                      "if var intent = pendingPlaybackIntent",
+                      "intent.updateSourceSeconds(seconds)",
+                      "pendingPlaybackIntent = intent",
+                  ]))
+        check("wiring: passive intent capture cannot overwrite an explicit pending seek",
+              sourceContainsInOrder(playbackIntentCapture, [
+                  "if let intent = pendingPlaybackIntent",
+                  "return intent",
+                  "let subtitle:",
+              ])
+                  && playbackIntentCapture?.contains(
+                      "if var intent = pendingPlaybackIntent") == false
+                  && playbackIntentCapture?.contains(
+                      "intent.updateSourceSeconds(playbackPositionSeconds)") == false
+                  && playbackIntentCapture?.contains(
+                      "intent.updateTransport(") == false)
+        check("wiring: host loss preserves an existing pending seek before either remount branch",
+              playbackIntentCapture?.contains(
+                  "sourceSeconds: playbackPositionSeconds") == true
+                  && sourceContainsInOrder(externalEngineLoss, [
+                      "let intent = capturePlaybackIntent(from: item)",
+                      "pendingPlaybackIntent = intent",
+                      "let resumeAt = intent.sourceSeconds",
+                      "switch PlaybackIntentPolicy.hostLossAction(",
+                      "case .remountAudioReplacement:",
+                  ])
+                  && externalEngineLoss?.contains(
+                      "intent.updateSourceSeconds(playbackPositionSeconds)") == false)
+        check("wiring: source audio alignment is bounded and exact-item owned",
+              sourceAudioAlignment?.contains("player.currentItem === item") == true
+                  && sourceAudioAlignment?.contains("self.item === item") == true
+                  && sourceAudioAlignment?.contains("itemGeneration == generation") == true
+                  && sourceAudioAlignment?.contains(
+                      "playbackMountIdentity == mountIdentity") == true
+                  && sourceAudioAlignment?.contains(".milliseconds(200)") == true
+                  && sourceAudioAlignment?.contains(".milliseconds(800)") == true
+                  && sourceAudioAlignment?.contains(".seconds(2)") == true
+                  && sourceContainsInOrder(sourceAudioAlignment, [
+                      "try? await Task.sleep(for: delay)",
+                      "guard !Task.isCancelled",
+                      "selectionContextIsCurrent(",
+                      "selectedMediaOption(in: group) == primary",
+                  ]))
+        check("wiring: audio replacement becomes ready only after exact primary alignment",
+              initialTrackPublication?.contains(
+                  "audioReplacement?.markReady") == false
+                  && sourceContainsInOrder(groupLoad, [
+                      "primaryAligned = await alignSourceBackedPrimaryAudio(",
+                      "if audioReplacement != nil",
+                      "if primaryAligned",
+                      "audioReplacement?.markReady(generation: selectionGeneration)",
+                      "let intentSnapshot = pendingPlaybackIntent",
+                      "let replacementReady = audioReplacement.map",
+                      "ownedIntent?.consume(",
+                  ]))
+        check("wiring: replacement alignment failure rolls back once or terminates as an owned error",
+              sourceContainsInOrder(groupLoad, [
+                  "if audioReplacement != nil",
+                  "if primaryAligned",
+                  "} else {",
+                  "recoverAudioReplacementIfNeeded(",
+                  "generation: selectionGeneration",
+                  "guard owns(item, loadToken: selectionLoadToken)",
+                  "selectionContextIsCurrent(",
+                  "!fatalErrorEmitted",
+                  "fatalErrorEmitted = true",
+                  "emit(",
+                  "MPVProperty.endFileError",
+                  "loadToken: selectionLoadToken",
+                  "return",
+                  "} else if sourceBackedAudio && !primaryAligned",
+                  "remuxSourceAudioTracks = []",
+                  "selectedRemuxAudioSourceIndex = nil",
+              ]))
+        check("wiring: selection restore guards group suspension then clamps without a second suspension",
+              sourceContainsInOrder(groupLoad, [
+                  "let selectionGeneration = itemGeneration",
+                  "let selectionMountIdentity = playbackMountIdentity",
+                  "loadMediaSelectionGroup(for: .audible)",
+                  "itemGeneration == selectionGeneration",
+                  "playbackMountIdentity == selectionMountIdentity",
+                  "loadMediaSelectionGroup(for: .legible)",
+                  "itemGeneration == selectionGeneration",
+                  "playbackMountIdentity == selectionMountIdentity",
+                  "await alignSourceBackedPrimaryAudio(",
+                  "guard selectionContextIsCurrent(",
+                  "} else if sourceBackedAudio && !primaryAligned",
+                  "remuxSourceAudioTracks = []",
+                  "selectedRemuxAudioSourceIndex = nil",
+                  "let intentSnapshot = pendingPlaybackIntent",
+                  "RemuxResumePolicy.playerSeek(",
+                  "producedEdgePlayerSeconds: producedEdgeSeconds",
+                  "player.seek(",
+                  "pendingPlaybackIntent = nil",
+              ])
+                  && groupLoad?.contains("await player.seek(") == false
+                  && groupLoad?.components(
+                      separatedBy: "let intentSnapshot = pendingPlaybackIntent"
+                  ).last?.contains("await ") == false)
+        check("wiring: initial track publication waits for both audio and subtitle groups",
+              initialTrackPublication?.contains("emit(MPVProperty.trackList") == false
+                  && engine?.components(separatedBy: "emit(MPVProperty.trackList").count == 2
+                  && sourceContainsInOrder(groupLoad, [
+                      "selectionTopologyGeneration = selectionGeneration",
+                      "selectionRefreshState.reset()",
+                      "refreshSelectionTracks(for: item)",
+                  ])
+                  && trackListGate?.contains(
+                      "guard selectionTopologyGeneration == itemGeneration else { return }") == true
+                  && chapterLoad?.contains("publishTrackListIfTopologyReady()") == true
+                  && mediaSelectionNotification?.contains(
+                      "selectionTopologyGeneration == itemGeneration") == true)
+        check("wiring: remux initial audio explicitly matches the selected in-band source",
+              sourceContainsInOrder(groupLoad, [
+                  "let inBandPrimary = group.defaultOption ?? group.options.first",
+                  "await alignSourceBackedPrimaryAudio(",
+                  "} else if sourceBackedAudio && !primaryAligned",
+                  "remuxSourceAudioTracks = []",
+                  "selectedRemuxAudioSourceIndex = nil",
+              ])
+                  && sourceContainsInOrder(selectionRefresh, [
+                      "let audioID = remuxSourceAudioTracks.isEmpty",
+                      "audioGroup.flatMap",
+                      ": selectedRemuxAudioSourceIndex",
+                      "audioTracks = remuxSourceAudioTracks.isEmpty",
+                      "audioGroup.map { Self.mpvTracks(",
+                      ": sourceAudioMPVTracks()",
+                  ]))
+        check("wiring: unavailable source subtitles are never selected by nil equality",
+              sourceContainsInOrder(sourceSubtitleRows, [
+                  "source.renditionIndex != nil",
+                  "source.renditionIndex == selectedRendition",
+              ]))
+        check("wiring: both Apple pickers show and disable unavailable subtitle rows",
+              playerGroupedTracks?.contains("detail: t.unavailableReason ?? \"\"") == true
+                  && playerGroupedTracks?.contains("isEnabled: t.isSelectable") == true
+                  && tvGroupedTracks?.contains("detail: t.unavailableReason ?? \"\"") == true
+                  && tvGroupedTracks?.contains("isEnabled: t.isSelectable") == true
+                  && tvPlayer?.contains("!rows[$0].isHeader && rows[$0].isEnabled") == true)
         // Turning subtitles Off must not DESTROY the external subtitle: the chrome has already hidden that
         // add-on's own row on the promise that the subtitle lives in the ordinary track list, so discarding
         // the cues here would make it unreachable for the rest of the session. Only a title change or a full
         // teardown discards.
-        check("wiring: only a title change or teardown discards the external subtitle's cues",
+        check("wiring: audio replacement preserves cues while title change or teardown discards them",
               externalSubtitleSelection?.contains("disableExternalSubtitle()") == true
                   && externalSubtitleSelection?.contains("discardingCues: true") == false
+                  && engine?.contains(
+                      "disableExternalSubtitle(discardingCues: !isIntentRemount)") == true
                   && engine?.components(separatedBy: "disableExternalSubtitle(discardingCues: true)")
-                      .count == 3
+                      .count == 2
                   && externalSubtitleDisable?.contains("guard discardingCues else { return }") == true)
         check("wiring: system media-selection changes are observed",
               engine?.contains("AVPlayerItem.mediaSelectionDidChangeNotification") == true)

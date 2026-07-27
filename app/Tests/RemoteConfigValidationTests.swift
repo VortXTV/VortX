@@ -280,6 +280,12 @@ struct RemoteConfigValidationTests {
         assertRange("requestTimeoutSecs", lo: 3, hi: 8, baked: 8,
                     { $0.sourceIndexRequestTimeoutSecs },
                     { #"{"sourceIndex":{"requestTimeoutSecs":\#($0)}}"# })
+        assertRange("debridCeilingMiB", lo: 64, hi: 256, baked: 256,
+                    { $0.debridCeilingMiB },
+                    { #"{"player":{"readAhead":{"debridCeilingMiB":\#($0)}}}"# })
+        expect(ResolvedConfig.baked.readAheadDebridCeilingBytes(reduced: false, isMac: false)
+               == 256 * 1024 * 1024,
+               "device debrid read-ahead resolves to the 256 MiB hard ceiling")
 
         // ---- The one-directional RELATIONS, asserted as relations rather than as literals ----
         // Each of these is the property the range exists for; a range widened on its risk side breaks the

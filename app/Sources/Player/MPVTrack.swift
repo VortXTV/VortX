@@ -11,12 +11,23 @@ struct MPVTrack: Identifiable {
     /// subtitle tracks are flagged here, NOT by the word "forced" in the title, so forced-subtitle auto-select
     /// must key off this, not the title text. Defaults false so a track built without the flag is "not forced".
     var forced: Bool = false
+    /// Non-nil keeps a real source row visible while making the reason it cannot be selected explicit.
+    /// Today this is used for image-based subtitles on AVPlayer, which cannot be converted to WebVTT.
+    var unavailableReason: String? = nil
+    var isSelectable: Bool { unavailableReason == nil }
 
     var label: String {
-        if !title.isEmpty && !lang.isEmpty { return "\(title) (\(lang.uppercased()))" }
-        if !title.isEmpty { return title }
-        if !lang.isEmpty { return lang.uppercased() }
-        return "Track \(id)"
+        let base: String
+        if !title.isEmpty && !lang.isEmpty {
+            base = "\(title) (\(lang.uppercased()))"
+        } else if !title.isEmpty {
+            base = title
+        } else if !lang.isEmpty {
+            base = lang.uppercased()
+        } else {
+            base = "Track \(id)"
+        }
+        return unavailableReason.map { "\(base) | \($0)" } ?? base
     }
 }
 

@@ -412,7 +412,7 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// How long the stage-append producer may PARK on a full session spool before the mount is declared dead.
     /// Retention deadlines are seconds-to-a-minute (segment + longest-playlist duration), so a healthy playing
     /// session reclaims space well inside this bound; only a genuinely wedged spool exhausts it.
-    private static let stageBackpressureLimitSeconds: TimeInterval = 120
+    fileprivate static let stageBackpressureLimitSeconds: TimeInterval = 120
 
     /// HLS-only append path. Stage admission and any filesystem write happen with the buffer condition unlocked;
     /// the producer then advances the buffer head. A memory stage materializes the bytes in RAM. An active stage
@@ -1706,7 +1706,10 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
                 additionalResources: additionalResources)
             if !result {
                 releaseClaim(id: claim.id)
-                buffer?.fail("HLS mutable open-stage close failed")
+                let status = buffer?.status()
+                if status?.failure == nil, status?.finished != true {
+                    buffer?.fail("HLS mutable open-stage close failed without a classified reason")
+                }
             }
             return result
         }
@@ -2694,39 +2697,86 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         durationMilliseconds: Int,
         additionalResources: [SpillResource]
     ) -> Bool {
+        guard let buffer = stage.buffer else { return false }
         guard durationMilliseconds > 0,
-              endOffset > claimedBase, endOffset <= claimedEnd,
-              let buffer = stage.buffer,
-              let stageState = stage.closeSnapshot(
-                  claimID: claimID, base: claimedBase, end: claimedEnd) else { return false }
+              endOffset > claimedBase, endOffset <= claimedEnd else {
+            buffer.fail("HLS mutable open-stage close rejected an invalid parser boundary")
+            return false
+        }
+        guard let stageState = stage.closeSnapshot(
+            claimID: claimID, base: claimedBase, end: claimedEnd) else {
+            buffer.fail("HLS mutable open-stage close lost its exact parser claim")
+            return false
+        }
         let prefixBytes = endOffset - claimedBase
         let suffixBytes = claimedEnd - endOffset
         let additionalBytes = validate(resources: additionalResources) ?? (additionalResources.isEmpty ? 0 : -1)
-        guard additionalBytes >= 0 else { return false }
+        guard additionalBytes >= 0 else {
+            buffer.fail("HLS mutable open-stage close rejected an invalid companion resource")
+            return false
+        }
         let keys = [key] + additionalResources.map(\.key)
-        guard Set(keys).count == keys.count else { return false }
+        guard Set(keys).count == keys.count else {
+            buffer.fail("HLS mutable open-stage close rejected duplicate resource keys")
+            return false
+        }
         let reservationID = UUID()
         let reclaimedBackingCapacity = stageState.storage == .memory
             ? buffer.projectedBackingCapacityAfterReclaim(before: endOffset) : nil
-        guard stageState.storage != .memory || reclaimedBackingCapacity != nil else { return false }
+        guard stageState.storage != .memory || reclaimedBackingCapacity != nil else {
+            buffer.fail("HLS mutable open-stage close could not project resident backing")
+            return false
+        }
         let transientBytes: Int
         if stageState.storage == .active {
             transientBytes = suffixBytes
         } else {
             let (combined, overflow) = prefixBytes.addingReportingOverflow(
                 reclaimedBackingCapacity ?? 0)
-            guard !overflow else { return false }
+            guard !overflow else {
+                buffer.fail("HLS mutable open-stage close transient accounting overflow")
+                return false
+            }
             transientBytes = combined
         }
-        guard reserveOpenClose(
-            id: reservationID, keys: keys,
-            uncoveredBytes: additionalBytes, transientBytes: transientBytes) else { return false }
+        let closeAdmissionDeadline = Date().addingTimeInterval(
+            VortXRemuxBuffer.stageBackpressureLimitSeconds)
+        admissionLoop: while true {
+            switch reserveOpenClose(
+                id: reservationID,
+                keys: keys,
+                uncoveredBytes: additionalBytes,
+                transientBytes: transientBytes
+            ) {
+            case .reserved:
+                break admissionLoop
+            case .full:
+                // A close briefly duplicates the still-open suffix. At the physical ceiling this is the
+                // same backpressure condition as a forward append, not a corrupt parser claim. Let client
+                // consumption expire older playlist receipts, reclaim them, and retry without publishing or
+                // discarding the claimed boundary.
+                if Date() >= closeAdmissionDeadline {
+                    buffer.fail(
+                        "HLS mutable open-stage close stayed full for "
+                            + "\(Int(VortXRemuxBuffer.stageBackpressureLimitSeconds))s "
+                            + "(backpressure limit)")
+                    return false
+                }
+                collectExpired(now: ProcessInfo.processInfo.systemUptime)
+                if buffer.status().finished { return false }
+                Thread.sleep(forTimeInterval: 0.25)
+            case .rejected:
+                buffer.fail("HLS mutable open-stage close reservation state was rejected")
+                return false
+            }
+        }
 
         var sourceLeases: [VortXRemuxBuffer.ReadLease] = []
         if stageState.storage == .memory {
             guard let lease = buffer.beginReadLease(offset: claimedBase, length: prefixBytes) else {
                 releaseOpenClose(
                     id: reservationID, keys: keys)
+                buffer.fail("HLS mutable open-stage close lost its resident prefix lease")
                 return false
             }
             sourceLeases.append(lease)
@@ -2736,6 +2786,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
                 guard let lease = source.beginReadLease(offset: offset, length: length) else {
                     releaseOpenClose(
                         id: reservationID, keys: keys)
+                    buffer.fail("HLS mutable open-stage close lost a companion resource lease")
                     return false
                 }
                 sourceLeases.append(lease)
@@ -2744,6 +2795,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
 
         guard beginStageOperation() else {
             releaseOpenClose(id: reservationID, keys: keys)
+            buffer.fail("HLS mutable open-stage close lost session ownership")
             return false
         }
         defer { endStageOperation() }
@@ -2955,23 +3007,32 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
                 stage.poisonAndFail("HLS open-stage promotion failed")
             }
             withExtendedLifetime(sourceLeases) {}
+            buffer.fail("HLS mutable open-stage close transaction failed: \(error)")
             return false
         }
     }
 
+    private enum OpenCloseReservationResult {
+        case reserved
+        case full
+        case rejected
+    }
+
     private func reserveOpenClose(id: UUID, keys: [ResourceKey],
-                                  uncoveredBytes: Int, transientBytes: Int) -> Bool {
+                                  uncoveredBytes: Int,
+                                  transientBytes: Int) -> OpenCloseReservationResult {
         lock.lock(); defer { lock.unlock() }
         let keySet = Set(keys)
-        guard let physical = currentAccounting.checkedPhysicalBytes(),
-              !invalidated, reservations[id] == nil,
+        guard !invalidated, reservations[id] == nil,
               transientCopyReservations[id] == nil,
               keySet.isDisjoint(with: pendingKeys),
               keySet.allSatisfy({ entries[$0] == nil }),
               uncoveredBytes >= 0, transientBytes >= 0,
-              physical <= capacityBytes,
+              let physical = currentAccounting.checkedPhysicalBytes(),
+              physical <= capacityBytes else { return .rejected }
+        guard
               uncoveredBytes <= capacityBytes - physical,
-              transientBytes <= capacityBytes - physical - uncoveredBytes else { return false }
+              transientBytes <= capacityBytes - physical - uncoveredBytes else { return .full }
         reservations[id] = uncoveredBytes
         transientCopyReservations[id] = transientBytes
         pendingKeys.formUnion(keySet)
@@ -2981,7 +3042,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
             currentAccounting.peakReservedBytes, currentAccounting.reservedBytes)
         currentAccounting.peakTransientCopyBytes = max(
             currentAccounting.peakTransientCopyBytes, currentAccounting.transientCopyBytes)
-        return true
+        return .reserved
     }
 
     private func commitOpenClose(id: UUID,

@@ -151,6 +151,9 @@ enum VortXEngineProtocol {
         /// may decline (returning `retainsFullTimeline: false`) if it lacks the disk; the client must read the
         /// response rather than assume its request was honoured.
         let requestFullTimeline: Bool
+        /// Stable source-container stream index to make primary for this remux. Nil preserves the host's
+        /// preference-ranked default. This is a source identity, never an HLS option index.
+        let selectedAudioStreamIndex: Int?
     }
 
     struct SessionResponse: Codable, Sendable, Equatable {
@@ -177,6 +180,64 @@ enum VortXEngineProtocol {
         let title: String
     }
 
+    enum AudioDelivery: String, Codable, Sendable {
+        /// The source packet bytes are copied into the remux unchanged.
+        case streamCopy
+        /// The source codec is decoded and encoded to an AVPlayer-compatible codec by the existing bounded
+        /// one-track transcoder. This describes delivery, never the source codec shown beside the row.
+        case transcode
+    }
+
+    /// One source-container audio identity that the AVPlayer remux can deliver.
+    ///
+    /// The list is metadata, not an HLS rendition promise. A client selects one source index, then opens a
+    /// replacement remux at the same source playhead with that track as the in-band primary. This keeps every
+    /// deliverable source track visible without multiplying live muxers and buffers.
+    struct AudioTrack: Codable, Sendable, Equatable {
+        let sourceIndex: Int
+        let codec: String
+        let channels: Int
+        let language: String
+        let title: String
+        /// True only after the selected stream-copy output's structured `dec3` receipt proved JOC. Source
+        /// profile metadata alone is not sufficient, and a transcoded row is always false.
+        let isAtmosJOC: Bool
+        /// Optional so a client can still decode status from an older host. Nil has the legacy meaning:
+        /// stream-copyable, because older hosts published only that subset.
+        let delivery: AudioDelivery?
+
+        init(sourceIndex: Int, codec: String, channels: Int, language: String, title: String,
+             isAtmosJOC: Bool, delivery: AudioDelivery? = nil) {
+            self.sourceIndex = sourceIndex
+            self.codec = codec
+            self.channels = channels
+            self.language = language
+            self.title = title
+            self.isAtmosJOC = isAtmosJOC
+            self.delivery = delivery
+        }
+    }
+
+    enum SubtitleDelivery: String, Codable, Sendable {
+        /// Text cues are converted into the HLS WebVTT rendition named by `renditionIndex`.
+        case webVTT
+        /// The source is image-based and this build has no safe image-overlay decoder for it.
+        case bitmapUnavailable
+    }
+
+    /// Stable source-container subtitle identity. Available text rows map to an HLS media-option index;
+    /// bitmap rows remain visible with an honest reason instead of disappearing.
+    struct SubtitleTrack: Codable, Sendable, Equatable {
+        let sourceIndex: Int
+        let codec: String
+        let language: String
+        let title: String
+        let isForced: Bool
+        let delivery: SubtitleDelivery
+        let renditionIndex: Int?
+        let unavailableReason: String?
+    }
+
     /// Everything the client's player engine needs from a mount that is not on its own machine.
     ///
     /// This exists because the local mount object is not just a URL: the engine calls seven things on it
@@ -184,9 +245,9 @@ enum VortXEngineProtocol {
     /// `chapters`, `isMountHealthy`, `mountProgress`). A remote mount has to answer all seven, and this is that
     /// answer, polled.
     struct SessionStatus: Codable, Sendable, Equatable {
-        /// The init segment has published AND the remux buffer has not failed. False is AUTHORITATIVE: the host
-        /// is telling the client its remux died, and the client fails over to on-device immediately rather than
-        /// waiting out a threshold.
+        /// Legacy aggregate: the init segment has published AND the remux buffer has not failed. Before the
+        /// optional facts below existed, false also meant "init is still pending", so a client cannot treat a
+        /// lone false as terminal during the bounded startup wait.
         let healthy: Bool
         /// Source runtime in seconds, 0 when not yet parsed. The client synthesizes a finite VOD duration from
         /// it, since live HLS delivery keeps `AVPlayerItem.duration` indefinite.
@@ -204,6 +265,12 @@ enum VortXEngineProtocol {
         let producedBytes: Int
         /// The remux reached end of source.
         let ended: Bool
+        /// Exact init publication state. Optional so a newer client can still decode an older host, where nil
+        /// leaves `healthy == true` as the only positive init receipt.
+        let initPublished: Bool?
+        /// Exact terminal remux failure state. Optional so an older host's pre-init `healthy == false` remains
+        /// pending until the startup deadline rather than being mistaken for a diagnosed failure.
+        let failed: Bool?
         /// Whether classify has published signalling yet. Until it has, the fields below are meaningless.
         let signalingPublished: Bool
         /// Whether this session is genuinely Dolby Vision, plus the geometry needed to request the panel switch.
@@ -227,6 +294,14 @@ enum VortXEngineProtocol {
         let videoRange: String?
         /// Whether the source has an honest non-DV base layer. Nil means an older host and fails closed.
         let supportsHDRFallback: Bool?
+        /// Every source audio track this remux can deliver to AVPlayer. Optional for compatibility with hosts
+        /// built before source-track selection was part of the protocol.
+        let audioTracks: [AudioTrack]?
+        /// The source index actually selected after validation. Optional for older hosts and before classify.
+        let selectedAudioStreamIndex: Int?
+        /// Stable subtitle inventory. Optional for compatibility with a host built before source identities
+        /// and explicit bitmap-unavailable rows were published.
+        let subtitleTracks: [SubtitleTrack]?
         /// The furthest source second produced so far. On a full-timeline session everything from
         /// `timelineOriginSeconds` to here is seekable; without it, only the sliding window is.
         let producedEdgeSeconds: Double

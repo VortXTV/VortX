@@ -11,10 +11,9 @@ import Foundation
 /// natively through its own media-selection group, so the video/audio pipeline, the Dolby Vision signaling and
 /// the delayed moov are all completely unaffected by anything in this file.
 ///
-/// SCOPE, stated honestly: TEXT subtitles ONLY (SubRip/SRT, ASS/SSA, mov_text/tx3g, WebVTT, raw text). BITMAP
-/// subtitles (PGS/HDMV, DVD/VobSub, DVB) are OUT OF SCOPE and are deliberately not offered: they are images,
-/// not text, so they cannot become WebVTT without OCR. A bitmap track is skipped at the source (the caller
-/// never builds a `SourceTrack` for it) and the user simply does not see a rendition for it, exactly as today.
+/// SCOPE, stated honestly: TEXT subtitles ONLY (SubRip/SRT, ASS/SSA, mov_text/tx3g, WebVTT, raw text). Bitmap
+/// tracks are inventoried by the caller as explicitly unavailable because they are images and cannot become
+/// WebVTT without OCR. They never enter this text rendition pipeline.
 ///
 /// Why the decisions live here: the code that USES them is split between `VortXMKVRemuxStream` (which pulls in
 /// the whole FFmpeg vendor tree) and `VortXRemuxHLSServer` (Network.framework). A suite written against either
@@ -80,11 +79,6 @@ enum SubtitleRenditionPolicy {
         let isAutoSelect: Bool
         let isForced: Bool
     }
-
-    /// Hard cap on advertised renditions. A rendition costs one playlist plus one WebVTT body per segment, all
-    /// built on the serve queue, so an anime rip carrying thirty signs/songs tracks must not turn every
-    /// playlist reload into thirty document builds. Eight covers every realistic language set.
-    static let maxRenditions = 8
 
     /// Comparison form of a language tag: trimmed and lowercased. Same normalisation `MultiAudioPolicy` uses,
     /// repeated rather than shared because both files are deliberately dependency-free.
@@ -156,29 +150,22 @@ enum SubtitleRenditionPolicy {
     ///
     /// Rules, each of which the suite asserts both ways:
     ///   - source order is kept, so the track the rip put first stays first in the picker;
-    ///   - at most `maxRenditions` are advertised (see that constant);
-    ///   - a track whose label AND language AND forced flag all match one already taken is dropped, because it
-    ///     is indistinguishable in the picker and would only make the user guess;
+    ///   - every text track is retained, including same-language tracks with identical metadata;
+    ///   - colliding labels gain a deterministic source-index suffix so the viewer never has to guess;
     ///   - at most ONE rendition carries DEFAULT=YES, which HLS requires, and it is the FIRST track the source
     ///     itself marked default. We never invent a default: turning subtitles on for a user who did not ask
     ///     is a worse failure than leaving them off.
     static func renditions(from tracks: [SourceTrack]) -> [Rendition] {
         var drafts: [Rendition] = []
-        var takenIdentities = Set<String>()
         var takenNames = Set<String>()
         var defaultTaken = false
         for track in tracks {
-            if drafts.count >= maxRenditions { break }
             let key = languageKey(track.language)
             let language = isUnknownLanguage(key) ? "und" : key
             let sourceName = displayName(language: track.language, title: track.title, isForced: track.isForced)
-            let identity = "\(language)|\(track.isForced)|\(sourceName.lowercased())"
-            if takenIdentities.contains(identity) { continue }
-            takenIdentities.insert(identity)
-
             var name = sourceName
             if takenNames.contains(name.lowercased()) {
-                name = "\(sourceName) (\(language.uppercased()))"
+                name = "\(sourceName) (Source \(track.index))"
             }
             let disambiguationBase = name
             var disambiguator = 1

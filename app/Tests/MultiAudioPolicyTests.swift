@@ -37,6 +37,10 @@ private typealias Track = MultiAudioPolicy.AudioTrack
 @MainActor @main
 enum MultiAudioPolicyTests {
     static func main() {
+        testSourceTrackInventoryAndSelection()
+        testReplacementRollbackAndNewestWins()
+        testPlaybackIntentNewestWinsAndExactOwnership()
+        testHostLossRecoveryChoosesTheOwnedTransaction()
         testQualificationAndDistinctSinks()
         testMasterTopology()
         testAbsolutePlaylistAndRequests()
@@ -64,6 +68,138 @@ enum MultiAudioPolicyTests {
         index: 1, codecID: eac3, channels: 6, language: "eng", title: "English")
     private static let japanese = Track(
         index: 2, codecID: eac3, channels: 6, language: "jpn", title: "Japanese")
+
+    private static func testSourceTrackInventoryAndSelection() {
+        let sameLanguage = [
+            Track(index: 8, codecID: eac3, channels: 6, language: "eng", title: "Main"),
+            Track(index: 3, codecID: ac3, channels: 2, language: "ENG", title: "Commentary"),
+            Track(index: 11, codecID: eac3, channels: 6, language: "eng", title: "Descriptive")
+        ]
+        let sameLanguageInventory = MultiAudioPolicy.selectableSourceTracks(from: sameLanguage)
+        check("source inventory: same-language tracks remain independently selectable",
+              sameLanguageInventory.map(\.index) == [3, 8, 11])
+
+        let many = (0..<15).map {
+            Track(index: 40 + $0, codecID: $0 == 14 ? 900 : eac3, channels: 6,
+                  language: $0.isMultiple(of: 2) ? "eng" : "fre",
+                  title: "Track \($0)")
+        }
+        let manyInventory = MultiAudioPolicy.selectableSourceTracks(from: Array(many.reversed()))
+        check("source inventory: more than ten compatible tracks are not capped",
+              manyInventory.count == 15)
+        check("source inventory: immutable source indices define stable row identity",
+              manyInventory.map(\.index) == Array(40..<55))
+        check("source inventory: decode-only codec identity is not filtered out",
+              manyInventory.last?.codecID == 900)
+        check("source selection: picker ID resolves to the exact source track",
+              MultiAudioPolicy.selectedSourceTrack(
+                from: manyInventory, requestedSourceIndex: 51)?.index == 51)
+        check("source selection: absent source identity fails closed to default ranking",
+              MultiAudioPolicy.selectedSourceTrack(
+                from: manyInventory, requestedSourceIndex: 999) == nil)
+    }
+
+    private static func testReplacementRollbackAndNewestWins() {
+        var failed = RemuxAudioReplacementPolicy.State(
+            rollbackSourceIndex: 4,
+            targetSourceIndex: 8,
+            sourceSeconds: 1_200,
+            generation: 41)
+        check(
+            "replacement: selected-source failure remounts the previous source at the original playhead",
+            failed.failureAction(generation: 41)
+                == .remountRollback(sourceIndex: 4, sourceSeconds: 1_200))
+        failed.bind(to: 42)
+        check(
+            "replacement: rollback failure cannot start a second rollback loop",
+            failed.failureAction(generation: 42) == .noFurtherRetry)
+
+        for lane in ["local", "hosted"] {
+            var rapid = RemuxAudioReplacementPolicy.State(
+                rollbackSourceIndex: 4,
+                targetSourceIndex: 8,
+                sourceSeconds: 1_200,
+                generation: 50)
+            rapid.retarget(to: 11)
+            rapid.bind(to: 51)
+            check(
+                "replacement: \(lane) B then C keeps C as the newest source identity",
+                rapid.targetSourceIndex == 11)
+            check(
+                "replacement: \(lane) B then C keeps the original source playhead",
+                rapid.sourceSeconds == 1_200)
+            check(
+                "replacement: \(lane) stale B failure cannot act on C",
+                rapid.failureAction(generation: 50) == .ignoreStale)
+            check(
+                "replacement: \(lane) current C generation reaches ready",
+                rapid.markReady(generation: 51))
+        }
+    }
+
+    private static func testPlaybackIntentNewestWinsAndExactOwnership() {
+        var intent = PlaybackIntentPolicy.Intent(
+            sourceSeconds: 300,
+            playbackRequested: false,
+            requestedRate: 1.25,
+            audioSelectionKnown: true,
+            audioSourceIndex: 2,
+            nativeAudioIndex: nil,
+            subtitle: .embedded(sourceIndex: 1))
+        intent.selectSourceAudio(5)
+        intent.selectEmbeddedSubtitle(sourceIndex: 4)
+        intent.selectSubtitlesOff()
+        intent.selectExternalSubtitle()
+        check("playback intent: external wins after embedded then Off",
+              intent.subtitle == .external)
+
+        intent.selectEmbeddedSubtitle(sourceIndex: 3)
+        check("playback intent: embedded source identity wins after external",
+              intent.subtitle == .embedded(sourceIndex: 3))
+
+        intent.selectSubtitlesOff()
+        check("playback intent: explicit Off wins after embedded",
+              intent.subtitle == .off)
+        intent.bind(generation: 70, mountIdentity: 9)
+        check("playback intent: stale generation cannot consume",
+              intent.consume(generation: 69, mountIdentity: 9) == nil)
+        check("playback intent: wrong mount cannot consume",
+              intent.consume(generation: 70, mountIdentity: 8) == nil)
+        let staleRestoreSnapshot = intent
+        intent.updateSourceSeconds(480)
+        intent.updateTransport(playbackRequested: true, requestedRate: 1.75)
+        check("playback intent: seek and transport mutation invalidate an async restore snapshot",
+              intent != staleRestoreSnapshot)
+        let restored = intent.consume(generation: 70, mountIdentity: 9)
+        check("playback intent: exact owner restores newest choices and transport",
+              restored?.audioSourceIndex == 5
+                  && restored?.subtitle == .off
+                  && restored?.sourceSeconds == 480
+                  && restored?.playbackRequested == true
+                  && restored?.requestedRate == 1.75)
+        check("playback intent: exact owner consumes only once",
+              intent.consume(generation: 70, mountIdentity: 9) == nil)
+
+        // HDR recovery keeps the mount while advancing the item; host loss advances both. The same intent
+        // can be rebound, but an older completion from either boundary remains stale.
+        intent.bind(generation: 71, mountIdentity: 9)
+        check("playback intent: HDR rebind rejects the retired item generation",
+              intent.consume(generation: 70, mountIdentity: 9) == nil)
+        intent.bind(generation: 72, mountIdentity: 10)
+        check("playback intent: host-loss rebind rejects the retired host mount",
+              intent.consume(generation: 72, mountIdentity: 9) == nil)
+    }
+
+    private static func testHostLossRecoveryChoosesTheOwnedTransaction() {
+        check(
+            "host loss: ordinary playback reaches the same-token local reload after intent capture",
+            PlaybackIntentPolicy.hostLossAction(hasAudioReplacement: false)
+                == .reloadLocalSameToken)
+        check(
+            "host loss: an in-flight audio replacement keeps replacement remount ownership",
+            PlaybackIntentPolicy.hostLossAction(hasAudioReplacement: true)
+                == .remountAudioReplacement)
+    }
 
     private static func testQualificationAndDistinctSinks() {
         let candidate = MultiAudioPolicy.alternateCandidate(
@@ -163,6 +299,18 @@ enum MultiAudioPolicyTests {
               capturedOfficialJOC?.jocComplexityIndex == 16)
         check("plan: captured FFmpeg plain E-AC3 dec3 is not a false Atmos positive",
               capturedPlainControl == .init(jocComplexityIndex: nil))
+        check("JOC honesty: only a stream-copy E-AC3 receipt can label Atmos",
+              MultiAudioPolicy.verifiedJOC(
+                  isStreamCopy: true, usesDec3: true,
+                  observation: capturedOfficialJOC))
+        check("JOC honesty: source hints cannot label a transcoded row",
+              !MultiAudioPolicy.verifiedJOC(
+                  isStreamCopy: false, usesDec3: true,
+                  observation: capturedOfficialJOC))
+        check("JOC honesty: a valid plain dec3 is not Atmos",
+              !MultiAudioPolicy.verifiedJOC(
+                  isStreamCopy: true, usesDec3: true,
+                  observation: capturedPlainControl))
         check("plan: a complete movenc-shaped non-JOC dec3 is a positive non-JOC observation",
               plainDec3 == .init(jocComplexityIndex: nil))
         check("plan: LFE in the base substream is not misread as a JOC extension flag",

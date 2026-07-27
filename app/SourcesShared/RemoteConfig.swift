@@ -40,7 +40,7 @@ import Foundation
 /// `gatedHosts`. With no secret provisioned the signature is a safe no-op the worker's observe mode allows.
 enum RemoteConfigDefaults {
     // Player read-ahead ceilings (MPVMetalViewController.loadFile). These MUST equal the shipping literals.
-    static let debridCeilingMiB = 768        // non-reduced iOS/tvOS debrid RAM ceiling (was `768 * 1024 * 1024`)
+    static let debridCeilingMiB = 256        // non-reduced iOS/tvOS hard ceiling; diag 12 measured 1.2 GB RSS at 768 MiB
     static let reducedCeilingMiB = 128       // Apple TV HD (PerformanceMode.reduced) ceiling (was `128 * 1024 * 1024`)
     static let macCeilingMiB = 1024          // macOS ceiling (was `1_024 * 1024 * 1024`)
     static let offFloorMiB = 64              // hard floor: no ceiling may drop below this
@@ -747,7 +747,7 @@ actor RemoteConfig {
 
         // --- Player read-ahead ceilings (THE jetsam knob). Clamp, then raise anything below the floor. ---
         let floor = clamp(data.player?.readAhead?.offFloorMiB, RemoteConfigDefaults.offFloorMiB, 64, 64)   // fixed 64
-        let debrid = max(floor, clamp(data.player?.readAhead?.debridCeilingMiB, RemoteConfigDefaults.debridCeilingMiB, 64, 900))
+        let debrid = max(floor, clamp(data.player?.readAhead?.debridCeilingMiB, RemoteConfigDefaults.debridCeilingMiB, 64, 256))
         let reduced = max(floor, clamp(data.player?.readAhead?.reducedCeilingMiB, RemoteConfigDefaults.reducedCeilingMiB, 64, 192))
         let mac = max(floor, clamp(data.player?.readAhead?.macCeilingMiB, RemoteConfigDefaults.macCeilingMiB, 128, 1536))
         let vodSecs = clamp(data.player?.vodReadaheadSecs, RemoteConfigDefaults.vodReadaheadSecs, 30, 600)

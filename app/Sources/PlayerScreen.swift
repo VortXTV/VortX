@@ -206,6 +206,7 @@ struct PlayerScreen: View {
         /// Render the detail on its own line below the label, wrapping in full instead of truncating to
         /// one line. Used by the Info panel's filename row so a long release name stays fully readable.
         var wraps: Bool = false
+        var isEnabled: Bool = true
         var apply: () -> Void = {}
     }
 
@@ -4641,6 +4642,10 @@ struct PlayerScreen: View {
                     .contentShape(Rectangle())
                 }
             }
+            .disabled(!row.isEnabled)
+            .opacity(row.isEnabled ? 1 : 0.6)
+            .accessibilityLabel(row.label)
+            .accessibilityValue(row.detail)
         }
     }
 
@@ -4717,7 +4722,9 @@ struct PlayerScreen: View {
             let secondaryID = mpvEngine?.secondarySubtitleID ?? -1
             let dualActive = secondaryID >= 0
             let primaryID = mpvEngine?.primarySubtitleID ?? -1
-            let primaryOff = dualActive ? (primaryID < 0) : subtitleTracks.allSatisfy { !$0.selected }
+            let primaryOff = dualActive
+                ? (primaryID < 0)
+                : subtitleTracks.allSatisfy { !$0.selected || !$0.isSelectable }
             let primarySel: ((MPVTrack) -> Bool)? = dualActive ? { $0.id == primaryID } : nil
             var rs: [Row] = [Row(label: String(localized: "Off"), selected: primaryOff) {
                 userPickedSubtitle = true
@@ -5005,11 +5012,31 @@ struct PlayerScreen: View {
             guard let ts = groups[code] else { continue }   // defensive; key comes from groups.keys so always present
             if ts.count == 1 {
                 let t = ts[0]
-                rs.append(Row(label: langName(code), detail: t.title, selected: sel(t)) { select(t.id) })
+                let detail = [
+                    t.title.isEmpty ? nil : t.title,
+                    t.unavailableReason
+                ].compactMap { $0 }.joined(separator: " · ")
+                rs.append(Row(
+                    label: langName(code),
+                    detail: detail,
+                    selected: t.isSelectable && sel(t),
+                    isEnabled: t.isSelectable
+                ) {
+                    guard t.isSelectable else { return }
+                    select(t.id)
+                })
             } else {
                 rs.append(Row(label: langName(code), isHeader: true))
                 for (i, t) in ts.enumerated() {
-                    rs.append(Row(label: t.title.isEmpty ? "Track \(i + 1)" : t.title, selected: sel(t)) { select(t.id) })
+                    rs.append(Row(
+                        label: t.title.isEmpty ? "Track \(i + 1)" : t.title,
+                        detail: t.unavailableReason ?? "",
+                        selected: t.isSelectable && sel(t),
+                        isEnabled: t.isSelectable
+                    ) {
+                        guard t.isSelectable else { return }
+                        select(t.id)
+                    })
                 }
             }
         }
@@ -5473,7 +5500,9 @@ struct PlayerScreen: View {
     /// (mandated check 8). Off when no track is selected; otherwise an add-on / pooled external sub (matched
     /// back by language against the added set) or an embedded track (by lang/title).
     private func captureSubtitleChoice() -> SubtitleChoice {
-        guard let sel = subtitleTracks.first(where: { $0.selected }) else { return .off }
+        guard let sel = subtitleTracks.first(where: {
+            $0.selected && $0.isSelectable
+        }) else { return .off }
         let selLang = sel.lang.lowercased()
         if let ext = addonSubs.first(where: { addedSubURLs.contains($0.url) && $0.lang.lowercased() == selLang }) {
             return .external(url: ext.url, title: ext.addonName, lang: ext.lang)
@@ -5493,8 +5522,13 @@ struct PlayerScreen: View {
             coordinator.player?.setSubtitleTrack(-1)
         case let .embedded(lang, title):
             let l = lang.lowercased(), t = title.lowercased()
-            let match = subtitleTracks.first { $0.lang.lowercased() == l && $0.title.lowercased() == t }
-                     ?? subtitleTracks.first { $0.lang.lowercased() == l }
+            let match = subtitleTracks.first {
+                $0.isSelectable
+                    && $0.lang.lowercased() == l
+                    && $0.title.lowercased() == t
+            } ?? subtitleTracks.first {
+                $0.isSelectable && $0.lang.lowercased() == l
+            }
             coordinator.player?.setSubtitleTrack(match?.id ?? -1)
         case let .external(urlStr, title, lang):
             guard let player = coordinator.player else { return }

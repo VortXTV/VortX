@@ -302,6 +302,77 @@ enum VortXEngineHostPolicy {
         return .keepRemote
     }
 
+    // MARK: - Remote mount readiness and ownership
+
+    /// A stable receipt for one hosted session. Session ids are host-minted and the media URL also carries the
+    /// per-session capability, so both fields must match before a delayed readiness result can attach.
+    struct RemoteMountIdentity: Equatable, Sendable {
+        let sessionID: String
+        let playlistURL: String
+    }
+
+    enum RemoteReadinessFailure: Equatable {
+        case explicitFailure
+        case unhealthy
+        case timeout
+    }
+
+    enum RemoteReadiness: Equatable {
+        case pending
+        case ready
+        case failed(RemoteReadinessFailure)
+    }
+
+    /// Decide whether a newly opened hosted session is ready to attach.
+    ///
+    /// `healthy` is the original aggregate wire field. On older hosts it is false both while init is pending
+    /// and after a pre-init failure, so false alone cannot be terminal during startup. New hosts publish the
+    /// optional `initPublished` and `failed` facts. Their absence preserves old-host compatibility under the
+    /// same bounded deadline.
+    static func remoteReadiness(
+        statusReceived: Bool,
+        healthy: Bool?,
+        initPublished: Bool?,
+        failed: Bool?,
+        signalingPublished: Bool,
+        deadlineExpired: Bool
+    ) -> RemoteReadiness {
+        if failed == true { return .failed(.explicitFailure) }
+        if statusReceived, initPublished == true, healthy == false {
+            return .failed(.unhealthy)
+        }
+        if deadlineExpired { return .failed(.timeout) }
+        let initIsReady = initPublished ?? (healthy == true)
+        if statusReceived, initIsReady, signalingPublished, healthy != false {
+            return .ready
+        }
+        return .pending
+    }
+
+    static func readinessReceiptMatches(
+        expected: RemoteMountIdentity,
+        received: RemoteMountIdentity
+    ) -> Bool {
+        expected == received
+    }
+
+    /// A load token may intentionally survive an internal replacement, so it is not enough by itself to own a
+    /// delayed host callback. The opening generation, current item generation, and exact hosted session must
+    /// all still belong to the mounted object.
+    static func remoteCallbackIsCurrent(
+        loadTokenMatches: Bool,
+        expectedOpeningGeneration: UInt64?,
+        emittingOpeningGeneration: UInt64,
+        itemGenerationMatches: Bool,
+        mountedIdentity: RemoteMountIdentity?,
+        emittingIdentity: RemoteMountIdentity
+    ) -> Bool {
+        loadTokenMatches
+            && expectedOpeningGeneration == emittingOpeningGeneration
+            && itemGenerationMatches
+            && mountedIdentity == emittingIdentity
+    }
+
     // MARK: - Forward buffer
 
     /// AVPlayer's own forward buffer, in seconds, for a mounted remux.
@@ -312,9 +383,11 @@ enum VortXEngineHostPolicy {
     /// memory in OUR process, and it is entirely correct for a loopback origin where the producer is also in
     /// our process.
     ///
-    /// For a REMOTE origin the memory it was protecting has moved to the host, and the thing we now need
-    /// protection from is the opposite: a LAN hiccup starving a 30s cushion. So the remote case buffers more.
-    /// This is the cheapest quality win in the whole architecture and it costs the Apple TV nothing it was not
-    /// already able to spend.
-    static func forwardBufferSeconds(remote: Bool) -> Double { remote ? 90 : 30 }
+    /// A remote producer moves remux storage to the Mac, but AVPlayer's forward network buffer remains in the
+    /// Apple TV process. Diag 12 measured severe device memory pressure, so both origins keep the proven 30s
+    /// device cap. The parameter remains explicit because origin-specific tuning can return after device proof.
+    static func forwardBufferSeconds(remote: Bool) -> Double {
+        _ = remote
+        return 30
+    }
 }

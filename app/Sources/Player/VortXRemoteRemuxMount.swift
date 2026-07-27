@@ -22,9 +22,28 @@ import Foundation
 /// REPORTS itself unhealthy is believed at once, while silence is ambiguous and has to run out a threshold.
 final class VortXRemoteRemuxMount: @unchecked Sendable {
 
+    /// Bounded time after session creation for the host to publish classify and init signalling.
+    static let signallingTimeoutSeconds: Double = 12
+
+    struct ReadinessReceipt: Sendable {
+        let identity: VortXEngineHostPolicy.RemoteMountIdentity
+        let status: VortXEngineProtocol.SessionStatus
+    }
+
+    enum ReadinessFailure: String, Error {
+        case explicitFailure = "explicit-failure"
+        case unhealthy = "unhealthy"
+        case timeout = "readiness-timeout"
+        case retired = "retired-mount"
+        case cancelled = "cancelled"
+    }
+
     /// Where the client's AVPlayer mounts. Composed against the address this client dialled, never against an
     /// address the host guessed about itself.
     let playlistURL: URL
+
+    /// Exact host-session identity carried by every readiness receipt and loss callback.
+    let identity: VortXEngineHostPolicy.RemoteMountIdentity
 
     /// Whether the host granted full-timeline retention. When true the whole produced timeline is seekable and
     /// the client must NOT clamp backward seeks; when false a hosted session behaves exactly like a local one.
@@ -47,6 +66,9 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
         self.session = session
         self.engine = engine
         self.playlistURL = session.playlistURL
+        self.identity = VortXEngineHostPolicy.RemoteMountIdentity(
+            sessionID: session.sessionID,
+            playlistURL: session.playlistURL.absoluteString)
         self.retainsFullTimeline = session.retainsFullTimeline
         self.onLost = onLost
     }
@@ -58,17 +80,19 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
                      headers: [String: String]?,
                      mode: VortXEngineProtocol.RemuxMode,
                      startAtSeconds: Double,
+                     selectedAudioStreamIndex: Int? = nil,
                      engine: VortXExternalEngine = .shared,
                      onLost: @escaping @Sendable (VortXRemoteRemuxMount) -> Void) async
         -> VortXRemoteRemuxMount? {
         guard let opened = await engine.openSession(
             input: input, headers: headers, mode: mode,
-            startAtSeconds: max(0, startAtSeconds)) else { return nil }
+            startAtSeconds: max(0, startAtSeconds),
+            selectedAudioStreamIndex: selectedAudioStreamIndex) else { return nil }
         return VortXRemoteRemuxMount(session: opened, engine: engine, onLost: onLost)
     }
 
-    /// Begin polling. Mirrors `VortXRemuxHLSServer.start()` in that the caller invokes it once the mount is
-    /// about to be used; the host has already begun producing the moment the session was created.
+    /// Begin steady-state polling after the bounded readiness wait succeeds. Startup owns its own status loop,
+    /// so a young session cannot spend the steady-state silence budget before it has published its first init.
     func start() {
         lock.lock()
         guard !invalidated, poller == nil else { lock.unlock(); return }
@@ -108,13 +132,16 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
         let alreadyGone = invalidated
         lock.unlock()
         guard !alreadyGone else { return }
+        let hostReportsHealthy = status?.failed == true ? false : status?.healthy
         let decision = VortXEngineHostPolicy.failover(
             consecutiveControlFailures: failures,
-            hostReportsHealthy: status?.healthy)
+            hostReportsHealthy: hostReportsHealthy)
         guard decision == .failOverToDevice else { return }
         DiagnosticsLog.log(
             "engine",
-            "host session lost (failures=\(failures) reportedHealthy=\(String(describing: status?.healthy))) -> falling back on-device")
+            "host session lost session=\(identity.sessionID) failures=\(failures) "
+                + "reportedHealthy=\(String(describing: status?.healthy)) "
+                + "reportedFailed=\(String(describing: status?.failed)) -> falling back on-device")
         VXProbe.log("dv", "external engine mount lost -> on-device remount at current position")
         invalidate()
         onLost(self)
@@ -123,20 +150,41 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
     /// Wait, bounded, for the host to publish classify signalling.
     ///
     /// The client needs this BEFORE it attaches an item, because on tvOS the Dolby Vision panel must be switched
-    /// before the AVPlayerItem is assigned. Bounded and fail-open: on timeout the item is attached anyway and
-    /// playback proceeds without the switch, which is the same outcome the on-device lane produces when its own
-    /// switch request is refused.
-    func awaitSignalling(timeoutSeconds: Double = 12) async -> VortXEngineProtocol.SessionStatus? {
+    /// before the AVPlayerItem is assigned. Bounded and fail-soft: timeout returns an explicit reason and the
+    /// caller logs it before rebuilding the same source on-device.
+    func awaitSignalling(
+        timeoutSeconds: Double = VortXRemoteRemuxMount.signallingTimeoutSeconds
+    ) async -> Result<ReadinessReceipt, ReadinessFailure> {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline, !isInvalidated {
-            if let status = await engine.status(session) {
+        while true {
+            if Task.isCancelled { return .failure(.cancelled) }
+            if isInvalidated { return .failure(.retired) }
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining <= 0 { return .failure(.timeout) }
+            if let status = await engine.status(session, timeoutSeconds: remaining) {
                 cacheSuccessfulStatus(status)
-                if status.signalingPublished { return status }
-                if !status.healthy { return nil }
+                let decision = VortXEngineHostPolicy.remoteReadiness(
+                    statusReceived: true,
+                    healthy: status.healthy,
+                    initPublished: status.initPublished,
+                    failed: status.failed,
+                    signalingPublished: status.signalingPublished,
+                    deadlineExpired: Date() >= deadline)
+                switch decision {
+                case .pending:
+                    break
+                case .ready:
+                    return .success(ReadinessReceipt(identity: identity, status: status))
+                case .failed(.explicitFailure):
+                    return .failure(.explicitFailure)
+                case .failed(.unhealthy):
+                    return .failure(.unhealthy)
+                case .failed(.timeout):
+                    return .failure(.timeout)
+                }
             }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
-        return nil
     }
 
     /// Refresh the host's HDR recovery capability at the exact failure boundary. The background poll can cache
@@ -188,6 +236,11 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
     var declaredBandwidth: Int { cached?.bandwidth ?? 0 }
     var videoRange: String? { cached?.videoRange }
     var supportsHDRFallback: Bool { cached?.supportsHDRFallback ?? false }
+    var sourceAudioTracks: [VortXEngineProtocol.AudioTrack] { cached?.audioTracks ?? [] }
+    var selectedSourceAudioIndex: Int? { cached?.selectedAudioStreamIndex }
+    var sourceSubtitleTracks: [VortXEngineProtocol.SubtitleTrack] {
+        cached?.subtitleTracks ?? []
+    }
 
     var chapters: [(start: Double, title: String)] {
         (cached?.chapters ?? []).map { ($0.start, $0.title) }
@@ -213,10 +266,10 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
             segmentCount: status.producedSegments,
             // The host does not report init publication separately; a published segment implies a published
             // init, since no segment can be advertised before the init exists.
-            initPublished: status.producedSegments > 0,
+            initPublished: status.initPublished ?? (status.producedSegments > 0),
             signalingPublished: status.signalingPublished,
             ended: status.ended,
-            failed: !status.healthy)
+            failed: status.failed ?? !status.healthy)
     }
 
     /// Stop polling and tell the host to release the session. Idempotent, and best-effort on the wire: a host

@@ -2,6 +2,86 @@ import SwiftUI
 import UIKit
 import os
 
+/// Pure startup decision for the tvOS AVPlayer watchdog. Kept outside `TVPlayerView` so the boundary cases can
+/// run in a standalone harness without compiling the full SwiftUI player surface.
+enum TVAVStartWatchdogPolicy {
+    static let remoteAttachSchedulingMarginSeconds: Double = 3
+
+    enum AwaitingMountDecision: Equatable {
+        case cancel
+        case keepWaiting
+        case monitorRemux
+        case demote
+    }
+
+    /// A direct AVPlayer start keeps its short deadline. A source whose route is expected to produce a remux
+    /// gets the bounded attach budget because the external engine sets `isRemuxMounted` asynchronously after
+    /// signalling. The instant that runtime truth appears, the caller moves to the progress-aware watchdog.
+    static func awaitingMountDecision(elapsed: Double,
+                                      ownerCurrent: Bool,
+                                      remuxMounted: Bool,
+                                      remuxExpected: Bool,
+                                      directTimeout: Double,
+                                      remuxAttachTimeout: Double) -> AwaitingMountDecision {
+        guard ownerCurrent else { return .cancel }
+        if remuxMounted { return .monitorRemux }
+        if elapsed < directTimeout { return .keepWaiting }
+        if remuxExpected, elapsed < remuxAttachTimeout { return .keepWaiting }
+        return .demote
+    }
+
+    /// Session creation and signalling are sequential bounded stages. The surface watchdog must cover both
+    /// real transport budgets plus a small scheduling margin, or it can demote a healthy remote mount first.
+    static func remoteAttachTimeout(controlResourceTimeout: Double,
+                                    signallingTimeout: Double) -> Double {
+        max(0, controlResourceTimeout)
+            + max(0, signallingTimeout)
+            + remoteAttachSchedulingMarginSeconds
+    }
+}
+
+/// Pure ownership and first-frame gates shared by the 30-second source-hop timer and the event surface.
+/// Position zero is a valid rendered first frame for AVPlayer, while every timer must still prove it belongs
+/// to the exact episode, source, retry generation and logical player load that armed it.
+enum TVPlaybackStartPolicy {
+    static func hasStarted(positionSeconds: Double, avPlayerRenderedFrame: Bool) -> Bool {
+        positionSeconds > 0 || avPlayerRenderedFrame
+    }
+
+    static func shouldIgnoreIssuedAdvanceTick(
+        positionSeconds: Double,
+        avPlayerRenderedFrame: Bool
+    ) -> Bool {
+        positionSeconds <= 0 && !avPlayerRenderedFrame
+    }
+
+    /// A remux start has its own exact-owner, progress-aware watchdog. The generic source-hop timer must not
+    /// race it using AVPlayer's still-empty loaded ranges and tear down a mount whose mux counters are moving.
+    static func genericLoadTimeoutDefersToRemuxWatchdog(
+        avPlayerActive: Bool,
+        remuxPendingOrMounted: Bool
+    ) -> Bool {
+        avPlayerActive && remuxPendingOrMounted
+    }
+
+    static func loadTimeoutOwnerIsCurrent<Token: Equatable>(
+        capturedEpisodeGeneration: Int,
+        currentEpisodeGeneration: Int,
+        capturedSourceGeneration: Int,
+        currentSourceGeneration: Int,
+        capturedResumeGeneration: Int,
+        currentResumeGeneration: Int,
+        capturedLoadToken: Token?,
+        currentLoadToken: Token?
+    ) -> Bool {
+        let loadOwnerCurrent = capturedLoadToken == nil || capturedLoadToken == currentLoadToken
+        return capturedEpisodeGeneration == currentEpisodeGeneration
+            && capturedSourceGeneration == currentSourceGeneration
+            && capturedResumeGeneration == currentResumeGeneration
+            && loadOwnerCurrent
+    }
+}
+
 /// Full-screen libmpv player for tvOS. All remote input is handled at the UIKit level by a focusable
 /// `RemoteCatcher` (pressesBegan), and the control bar / options panel are driven by plain state with
 /// no SwiftUI focus, because SwiftUI `@FocusState` is unreliable inside a full-screen cover on tvOS.
@@ -37,6 +117,9 @@ struct TVPlayerView: View {
     /// resume lookup exactly as `startFromZero` does and seeks here instead, leaving the stored resume point
     /// untouched. The engine records its own position from here on, so VortX stays the sole authority.
     var startAtSeconds: Double? = nil
+    /// Publishes only a media identity that reached the first-frame commit point. The detail page uses it to
+    /// return to the episode actually watched while engine Continue Watching persistence catches up.
+    var onPlaybackIdentityCommitted: (PlaybackMeta) -> Void = { _ in }
     var onClose: () -> Void = {}           // dismiss the dedicated player window
 
     /// The pinned source for this title (#15), so in-player failover, auto-next, and preload keep using the
@@ -221,6 +304,13 @@ struct TVPlayerView: View {
     // still bails in ~1s). NO LONGER a demote wall: the remux watchdog is PROGRESS-AWARE (see
     // startAVStartWatchdog), so this is now only the point past which it starts logging hold decisions.
     private let avRemuxStartWatchdogSeconds: Double = 20
+    // External-engine remux attachment is asynchronous: first the Mac control request opens the session, then
+    // the client waits for classify/init signalling. Cover both real transport budgets plus scheduling margin
+    // so the surface cannot demote a healthy mount before its own bounded startup work completes. Once mounted,
+    // the normal progress-aware stall policy takes over.
+    private let avRemuxAttachWatchdogSeconds = TVAVStartWatchdogPolicy.remoteAttachTimeout(
+        controlResourceTimeout: VortXExternalEngine.controlResourceTimeoutSeconds,
+        signallingTimeout: VortXRemoteRemuxMount.signallingTimeoutSeconds)
     // Progress-aware remux demote thresholds (the 0.3.13 field fix: a heavy 4K DV title that was still
     // steadily downloading produced its first frame AFTER a fixed 20s wall, so the watchdog demoted a
     // perfectly healthy true-DV session to HDR10 + PCM). Demote only on a TRUE stall: NOTHING moved (no new
@@ -914,15 +1004,25 @@ struct TVPlayerView: View {
                 let supersededTick = supersededAdvance?.pending.issued == true
                     && event.loadToken == supersededAdvance?.pending.loadToken
                 if supersededTick { return }
+                let avPlayerRenderedFrame =
+                    (coordinator.player as? AVPlayerEngineController)?
+                        .hasProducedPlayableVideoFrame == true
                 if pendingAdvance?.issued == true,
-                   event.loadToken == pendingAdvance?.loadToken, d <= 0 { return }
+                   event.loadToken == pendingAdvance?.loadToken,
+                   TVPlaybackStartPolicy.shouldIgnoreIssuedAdvanceTick(
+                    positionSeconds: d,
+                    avPlayerRenderedFrame: avPlayerRenderedFrame
+                   ) { return }
                 // Publish-at-first-frame guard: a tick of the OUTGOING file during an advance's resolve
                 // window (the incoming load has NOT been handed to the player yet, so the previous episode
                 // is still the one rendering) must not be mistaken for the incoming episode's first frame.
                 // Skip only the start-of-playback block; the normal tick handling below still runs, and its
                 // attribution reads (`curMeta`) still name the outgoing episode - exactly what is playing.
                 let outgoingResolveTick = pendingAdvance != nil && pendingAdvance?.issued != true
-                if d > 0, !hasStartedPlaying, !outgoingResolveTick {            // playback actually began
+                if TVPlaybackStartPolicy.hasStarted(
+                    positionSeconds: d,
+                    avPlayerRenderedFrame: avPlayerRenderedFrame),
+                   !hasStartedPlaying, !outgoingResolveTick {            // playback actually began
                     if let pending = pendingAdvance {
                         guard pending.generation == episodeSwitchGeneration,
                               PlayerLoadProvenanceState.canCommit(
@@ -946,6 +1046,9 @@ struct TVPlayerView: View {
                     }
                     if deferredTrackList {
                         handleProperty(MPVProperty.trackList, nil, loadToken: event.loadToken)
+                    }
+                    if let m = curMeta {
+                        onPlaybackIdentityCommitted(m)
                     }
                     loadTimeout?.cancel(); recoveryDeadline?.cancel(); recoveryDeadline = nil; loadFailed = false
                     avStartWatchdog?.cancel(); avStartWatchdog = nil   // a playable frame arrived: cancel the AVPlayer fallback
@@ -1183,6 +1286,14 @@ struct TVPlayerView: View {
             }
             loadTimeout?.cancel()
             if !hasStartedPlaying {
+                let failureMessage = (data as? String) ?? ""
+                // A strict low-resolution, audio-less, non-DV classification is not a decoder fallback case.
+                // It is the wrong asset behind a DV-ranked source, so preserve the typed reason and move the
+                // existing automatic path to another source instead of reopening the same preview in libmpv.
+                if DVPlaybackPolicy.isSourceCapabilityMismatch(failureMessage) {
+                    handleLoadFailure(failureMessage)
+                    return
+                }
                 // #76: an AVPlayer item failure before playback started (e.g. a Profile 7 DV remux or a
                 // Matroska AVFoundation cannot demux) demotes to libmpv IN PLACE: flipping `avEngineFailed`
                 // re-renders `playerSurface` to the mpv surface on the SAME view, which re-loads the stream.
@@ -1718,6 +1829,7 @@ struct TVPlayerView: View {
         var detail: String = ""        // right-aligned secondary text (e.g. current value)
         var isSelected: Bool = false
         var isHeader: Bool = false     // section header, not focusable, skipped in navigation
+        var isEnabled: Bool = true
         var skipField: SkipField? = nil   // non-nil only on the skip editor's Start/End rows
         var action: () -> Void = {}
     }
@@ -1759,7 +1871,10 @@ struct TVPlayerView: View {
             if audioDelay != 0 { rows.append(OptionRow(label: String(localized: "Reset")) { adjustAudioDelay(-audioDelay) }) }
             return rows
         case .subtitles:
-            var rows = [OptionRow(label: String(localized: "Off"), isSelected: subtitleTracks.allSatisfy { !$0.selected }) {
+            var rows = [OptionRow(
+                label: String(localized: "Off"),
+                isSelected: subtitleTracks.allSatisfy { !$0.selected || !$0.isSelectable }
+            ) {
                 userPickedSubtitle = true
                 optimisticSelect(type: "sub", id: -1)
                 coordinator.player?.setSubtitleTrack(-1); refreshTracksSoon()
@@ -1936,11 +2051,31 @@ struct TVPlayerView: View {
             let ts = groups[code]!
             if ts.count == 1 {
                 let t = ts[0]
-                rows.append(OptionRow(label: langName(code), detail: t.title, isSelected: t.selected) { select(t.id) })
+                let detail = [
+                    t.title.isEmpty ? nil : t.title,
+                    t.unavailableReason
+                ].compactMap { $0 }.joined(separator: " · ")
+                rows.append(OptionRow(
+                    label: langName(code),
+                    detail: detail,
+                    isSelected: t.isSelectable && t.selected,
+                    isEnabled: t.isSelectable
+                ) {
+                    guard t.isSelectable else { return }
+                    select(t.id)
+                })
             } else {
                 rows.append(OptionRow(label: langName(code), isHeader: true))
                 for (i, t) in ts.enumerated() {
-                    rows.append(OptionRow(label: t.title.isEmpty ? "Track \(i + 1)" : t.title, isSelected: t.selected) { select(t.id) })
+                    rows.append(OptionRow(
+                        label: t.title.isEmpty ? "Track \(i + 1)" : t.title,
+                        detail: t.unavailableReason ?? "",
+                        isSelected: t.isSelectable && t.selected,
+                        isEnabled: t.isSelectable
+                    ) {
+                        guard t.isSelectable else { return }
+                        select(t.id)
+                    })
                 }
             }
         }
@@ -2730,6 +2865,7 @@ struct TVPlayerView: View {
                                 .padding(.horizontal, Theme.Space.lg).padding(.vertical, Theme.Space.sm)
                                 .background(i == optionRow ? Theme.Palette.accent : Color.clear)
                                 .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                                .opacity(row.isEnabled ? 1 : 0.55)
                                 .id(i)
                             }
                         }
@@ -2776,14 +2912,19 @@ struct TVPlayerView: View {
 
     private func moveOption(_ d: Int) {
         let rows = panelRows
-        let selectable = rows.indices.filter { !rows[$0].isHeader }
+        let selectable = rows.indices.filter {
+            !rows[$0].isHeader && rows[$0].isEnabled
+        }
         guard !selectable.isEmpty else { return }
         let cur = selectable.firstIndex(of: optionRow) ?? 0
         optionRow = selectable[max(0, min(selectable.count - 1, cur + d))]
     }
     private func activateOption() {
         let rows = panelRows
-        guard optionRow >= 0, optionRow < rows.count, !rows[optionRow].isHeader else { return }
+        guard optionRow >= 0,
+              optionRow < rows.count,
+              !rows[optionRow].isHeader,
+              rows[optionRow].isEnabled else { return }
         rows[optionRow].action()
         // Selection state may have changed (speed, tracks, aspect, stats); one
         // recompute per press keeps the checkmarks honest.
@@ -2810,8 +2951,10 @@ struct TVPlayerView: View {
         // Single-choice panels open on the current selection; the mixed settings panel opens
         // at the top (its decoder radio would otherwise swallow the seed and skip "Play in").
         let seedOnSelection = kind != .playerSettings
-        optionRow = (seedOnSelection ? panelRows.firstIndex { $0.isSelected } : nil)
-            ?? panelRows.firstIndex { !$0.isHeader } ?? 0
+        optionRow = (seedOnSelection
+            ? panelRows.firstIndex { $0.isSelected && $0.isEnabled }
+            : nil)
+            ?? panelRows.firstIndex { !$0.isHeader && $0.isEnabled } ?? 0
         withAnimation { showOptions = true }
     }
     private func closePanel() {
@@ -2841,7 +2984,16 @@ struct TVPlayerView: View {
     /// (-1 = subtitles off). refreshTracksSoon reconciles from mpv's real track-list right after.
     private func optimisticSelect(type: String, id: Int) {
         func remap(_ tracks: [MPVTrack]) -> [MPVTrack] {
-            tracks.map { MPVTrack(id: $0.id, type: $0.type, title: $0.title, lang: $0.lang, selected: $0.id == id, forced: $0.forced) }
+            tracks.map {
+                MPVTrack(
+                    id: $0.id,
+                    type: $0.type,
+                    title: $0.title,
+                    lang: $0.lang,
+                    selected: $0.isSelectable && $0.id == id,
+                    forced: $0.forced,
+                    unavailableReason: $0.unavailableReason)
+            }
         }
         if type == "audio" { audioTracks = remap(audioTracks) } else { subtitleTracks = remap(subtitleTracks) }
         if showOptions { panelRows = optionRows }
@@ -2885,7 +3037,9 @@ struct TVPlayerView: View {
     /// (mandated check 8). Off when no track is selected; otherwise an add-on / pooled external sub (matched
     /// back by language against the added set) or an embedded track (by lang/title).
     private func captureSubtitleChoice() -> SubtitleChoice {
-        guard let sel = subtitleTracks.first(where: { $0.selected }) else { return .off }
+        guard let sel = subtitleTracks.first(where: {
+            $0.selected && $0.isSelectable
+        }) else { return .off }
         let selLang = sel.lang.lowercased()
         if let ext = addonSubs.first(where: { addedSubURLs.contains($0.url) && $0.lang.lowercased() == selLang }) {
             return .external(url: ext.url, title: ext.addonName, lang: ext.lang)
@@ -2905,8 +3059,13 @@ struct TVPlayerView: View {
             coordinator.player?.setSubtitleTrack(-1)
         case let .embedded(lang, title):
             let l = lang.lowercased(), t = title.lowercased()
-            let match = subtitleTracks.first { $0.lang.lowercased() == l && $0.title.lowercased() == t }
-                     ?? subtitleTracks.first { $0.lang.lowercased() == l }
+            let match = subtitleTracks.first {
+                $0.isSelectable
+                    && $0.lang.lowercased() == l
+                    && $0.title.lowercased() == t
+            } ?? subtitleTracks.first {
+                $0.isSelectable && $0.lang.lowercased() == l
+            }
             coordinator.player?.setSubtitleTrack(match?.id ?? -1)
         case let .external(urlStr, title, lang):
             guard let player = coordinator.player else { return }
@@ -3026,13 +3185,26 @@ struct TVPlayerView: View {
         startRecoveryDeadline()   // first call arms the overall cap; later calls (hops) leave it running
         startAVStartWatchdog()    // AVPlayer-only fast fallback to libmpv when it mounts but never plays
         lastBufferedAtWatchdog = bufferedTime   // snapshot the buffered edge so the fire path can tell if bytes moved
+        let capturedEpisodeGeneration = episodeSwitchGeneration
+        let capturedSourceGeneration = sourceSwitchGeneration
+        let capturedResumeGeneration = resumeRetryGeneration
+        let capturedLoadToken = coordinator.player?.activeLoadToken
         loadTimeout = Task { @MainActor in
             try? await Task.sleep(for: .seconds(30))
             // A cancelled watchdog (superseded by a hop / reload / new load) must NOT fire: Task.sleep throws
             // CancellationError on cancel and `try?` swallows it, so without this guard the cancelled timer runs
             // handleStartTimeout immediately, and each hop arms+cancels the next, cascading through every source
             // in milliseconds ("Tried N sources") over a source that was actually still loading.
-            guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
+            guard !Task.isCancelled, !hasStartedPlaying, !loadFailed,
+                  TVPlaybackStartPolicy.loadTimeoutOwnerIsCurrent(
+                      capturedEpisodeGeneration: capturedEpisodeGeneration,
+                      currentEpisodeGeneration: episodeSwitchGeneration,
+                      capturedSourceGeneration: capturedSourceGeneration,
+                      currentSourceGeneration: sourceSwitchGeneration,
+                      capturedResumeGeneration: capturedResumeGeneration,
+                      currentResumeGeneration: resumeRetryGeneration,
+                      capturedLoadToken: capturedLoadToken,
+                      currentLoadToken: coordinator.player?.activeLoadToken) else { return }
             handleStartTimeout()
         }
     }
@@ -3049,6 +3221,16 @@ struct TVPlayerView: View {
     ///  - Only the AUTO path (Watch Now / resume) hops to another source.
     private func handleStartTimeout() {
         if isTorrentPlayback { warmUpTorrent(); return }   // a peerless torrent never errors; warm it up
+        let avController = coordinator.player as? AVPlayerEngineController
+        if TVPlaybackStartPolicy.genericLoadTimeoutDefersToRemuxWatchdog(
+            avPlayerActive: avController != nil,
+            remuxPendingOrMounted: avController?.remuxStartupSignal.pendingOrMounted == true
+        ) {
+            DiagnosticsLog.log(
+                "dv",
+                "generic load timeout deferred to exact-owner progress-aware remux watchdog")
+            return
+        }
         // Bytes still arriving on a slow (typically 4K remux) first-buffer: extend rather than give up.
         if bufferGraceUsed < maxBufferGraceExtensions, bufferedTime > lastBufferedAtWatchdog + 0.25 {
             bufferGraceUsed += 1
@@ -3056,9 +3238,22 @@ struct TVPlayerView: View {
             buffering = true
             lastBufferedAtWatchdog = bufferedTime
             loadTimeout?.cancel()
+            let capturedEpisodeGeneration = episodeSwitchGeneration
+            let capturedSourceGeneration = sourceSwitchGeneration
+            let capturedResumeGeneration = resumeRetryGeneration
+            let capturedLoadToken = coordinator.player?.activeLoadToken
             loadTimeout = Task { @MainActor in
                 try? await Task.sleep(for: .seconds(20))
-                guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }   // cancelled re-arm must not fire (see start-watchdog)
+                guard !Task.isCancelled, !hasStartedPlaying, !loadFailed,
+                      TVPlaybackStartPolicy.loadTimeoutOwnerIsCurrent(
+                          capturedEpisodeGeneration: capturedEpisodeGeneration,
+                          currentEpisodeGeneration: episodeSwitchGeneration,
+                          capturedSourceGeneration: capturedSourceGeneration,
+                          currentSourceGeneration: sourceSwitchGeneration,
+                          capturedResumeGeneration: capturedResumeGeneration,
+                          currentResumeGeneration: resumeRetryGeneration,
+                          capturedLoadToken: capturedLoadToken,
+                          currentLoadToken: coordinator.player?.activeLoadToken) else { return }
                 handleStartTimeout()
             }
             return
@@ -3376,30 +3571,82 @@ struct TVPlayerView: View {
             // mount's monotonic progress counters (muxed bytes, published segments, classify/init flips) at
             // ~1 Hz and only demotes on a TRUE stall (nothing moved for avRemuxStallDemoteSeconds) or at a
             // generous hard ceiling (avRemuxStartHardCeilingSeconds) that bounds the spinner for a mount that
-            // trickles forever without framing. Read the mount BEFORE the first sleep: the mount happens
-            // synchronously in loadFile, so isRemuxMounted is already true at arm time. Everything else keeps
-            // the short fixed avStartWatchdogSeconds exactly as before, and the .failed instant-demote path is
-            // untouched (a real "Cannot Open" still bails in ~1s). A working remux cancels this via the
-            // timePos handler.
-            let remuxMounted = (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
-            if !remuxMounted {
-                try? await Task.sleep(for: .seconds(avStartWatchdogSeconds))
-                guard !Task.isCancelled, !hasStartedPlaying else { return }
-                guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
-                DiagnosticsLog.log("player", "AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame (remux mounted=false), falling back to libmpv")
-                demoteAVPlayerToMPV()
-                return
-            }
+            // trickles forever without framing. Local remuxes mount synchronously, but the external-engine path
+            // publishes `isRemuxMounted` only after its async open + signalling round trip. Re-read runtime state
+            // on every poll and transition when it appears; otherwise a one-shot false sample sends a healthy
+            // hosted remux down the direct 10s path and tears it down as segment zero becomes ready.
+            // Native/direct AVPlayer keeps the exact short deadline. Only a route expected to remux gets the
+            // bounded attach grace above, after which a never-attached route still demotes. The .failed
+            // instant-demote path is untouched. A working stream cancels this via the timePos handler.
             let armed = Date()
+            let surfaceRemuxExpected = activeAVPlayerWouldRemux || activeAVPlayerWouldPlainRemux
+            var watchedController = coordinator.player as? AVPlayerEngineController
+            var watchedLoadToken = watchedController?.activeLoadToken
+            var monitoringRemux = false
             var lastProgressAt = armed
-            var last = (coordinator.player as? AVPlayerEngineController)?.remuxMountProgress
+            var last: VortXMKVRemuxStream.MountProgress?
             var lastHoldLogAt = armed
             while true {
-                try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled, !hasStartedPlaying else { return }
-                guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
                 let now = Date()
-                if let cur = (coordinator.player as? AVPlayerEngineController)?.remuxMountProgress {
+                let controller = coordinator.player as? AVPlayerEngineController
+                if watchedController == nil, let controller {
+                    watchedController = controller
+                    watchedLoadToken = controller.activeLoadToken
+                }
+                let ownerCurrent: Bool
+                if let watchedController {
+                    ownerCurrent = controller === watchedController
+                        && watchedLoadToken != nil
+                        && controller?.activeLoadToken == watchedLoadToken
+                } else {
+                    ownerCurrent = true
+                }
+                let remuxSignal = controller?.remuxStartupSignal
+                let mountedNow = remuxSignal?.mounted == true
+                let remuxExpectedNow = surfaceRemuxExpected
+                    || (remuxSignal?.pendingOrMounted == true)
+                let elapsed = now.timeIntervalSince(armed)
+                let awaitingDecision = TVAVStartWatchdogPolicy.awaitingMountDecision(
+                    elapsed: elapsed,
+                    ownerCurrent: ownerCurrent,
+                    remuxMounted: mountedNow,
+                    remuxExpected: remuxExpectedNow,
+                    directTimeout: avStartWatchdogSeconds,
+                    remuxAttachTimeout: avRemuxAttachWatchdogSeconds
+                )
+                if awaitingDecision == .cancel { return }
+                if !monitoringRemux {
+                    switch awaitingDecision {
+                    case .cancel:
+                        return
+                    case .keepWaiting:
+                        try? await Task.sleep(for: .milliseconds(250))
+                        continue
+                    case .monitorRemux:
+                        monitoringRemux = true
+                        lastProgressAt = now
+                        last = controller?.remuxMountProgress
+                        DiagnosticsLog.log(
+                            "dv",
+                            "start watchdog transitioned to progress-aware remux monitoring "
+                                + "(attached after \(String(format: "%.1f", elapsed))s)")
+                    case .demote:
+                        // Before SwiftUI has installed the AV controller there is nothing to demote. This
+                        // matches the old fixed path's post-sleep active-engine guard.
+                        guard isAVPlayerActive else { return }
+                        let reason = remuxExpectedNow
+                            ? "expected remux did not attach within \(Int(avRemuxAttachWatchdogSeconds))s"
+                            : "direct AVPlayer produced no frame within \(Int(avStartWatchdogSeconds))s"
+                        DiagnosticsLog.log(
+                            "player",
+                            "AVPlayer start watchdog demoting (\(reason)), falling back to libmpv")
+                        demoteAVPlayerToMPV()
+                        return
+                    }
+                }
+                guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
+                if let cur = controller?.remuxMountProgress {
                     // Progress = any monotonic counter moved since the last poll. A FAILED mount never counts
                     // as progress; its demote belongs to the HLS-404 -> .failed path, and if that somehow
                     // never fires the stall window below still bounds it.
@@ -3413,7 +3660,6 @@ struct TVPlayerView: View {
                     if progressed, !cur.failed { lastProgressAt = now }
                     last = cur
                 }
-                let elapsed = now.timeIntervalSince(armed)
                 let stalled = now.timeIntervalSince(lastProgressAt)
                 let state = "produced=\(last?.producedBytes ?? -1)B segs=\(last?.segmentCount ?? -1) init=\(last?.initPublished ?? false) classify=\(last?.signalingPublished ?? false) failed=\(last?.failed ?? false)"
                 if stalled >= avRemuxStallDemoteSeconds || elapsed >= avRemuxStartHardCeilingSeconds {
@@ -3433,6 +3679,7 @@ struct TVPlayerView: View {
                     lastHoldLogAt = now
                     DiagnosticsLog.log("dv", "start watchdog holding: remux progressing (elapsed=\(Int(elapsed))s, quiet=\(Int(stalled))s, \(state))")
                 }
+                try? await Task.sleep(for: .seconds(1))
             }
         }
     }
@@ -3633,6 +3880,16 @@ struct TVPlayerView: View {
         }
         if isCurrentLiveStream {
             scheduleLiveStreamReconnect(reason: "load failure: \(msg)")
+            return
+        }
+        if DVPlaybackPolicy.isSourceCapabilityMismatch(msg) {
+            reconnecting = false
+            if currentPickWasExplicit && !currentPlaybackIsResume {
+                presentTerminalLoadFailure()
+                return
+            }
+            if hopToNextSource(reason: msg) { return }
+            presentTerminalLoadFailure()
             return
         }
         guard autoRetryCount < maxAutoRetries else {

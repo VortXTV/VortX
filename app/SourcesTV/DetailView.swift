@@ -1374,7 +1374,19 @@ struct CoreSeasonedEpisodes: View {
     /// episodes), read from the same source as resumeSeasonHint: the engine library for the main profile,
     /// the per-profile overlay otherwise. This is where Back should land after continuous play (#7).
     private var resumeVideoId: String? {
-        profiles.activeUsesEngineHistory ? core.metaDetails?.libraryItem?.state.videoId : profiles.watch[meta.id]?.videoId
+        resolvedResumeVideoID(committed: nil)
+    }
+
+    private func resolvedResumeVideoID(committed: PlaybackMeta?) -> String? {
+        EpisodeReturnIdentityPolicy.resolve(
+            libraryID: meta.id,
+            isVideoAvailable: { id in videos.contains { $0.id == id } },
+            committedLibraryID: committed?.libraryId,
+            committedVideoID: committed?.videoId,
+            engineVideoID: profiles.activeUsesEngineHistory
+                ? core.metaDetails?.libraryItem?.state.videoId
+                : profiles.watch[meta.id]?.videoId
+        )
     }
     private var resumeSeason: Int? { resumeVideoId.flatMap { id in videos.first { $0.id == id }?.season } }
 
@@ -1441,7 +1453,7 @@ struct CoreSeasonedEpisodes: View {
         // then focus that row (tvOS auto-scrolls focus into view) so Back returns to the CURRENT episode, not
         // the one originally launched. Async so the row exists after a season switch and the shell is frontmost.
         .onChange(of: presenter.request == nil) {
-            reanchorGridToEngineEpisode()
+            reanchorGridToEngineEpisode(preferPlaybackCloseReceipt: true)
         }
         // Binge-desync fix #4: ALSO re-derive on app foreground, not just player dismissal. This page can
         // sit in the nav stack across a background boundary with no dismissal event (the player is not
@@ -1449,7 +1461,7 @@ struct CoreSeasonedEpisodes: View {
         // it launched from. Same guarded re-point as the dismissal path; a live player keeps input focus
         // (the guard inside skips while the cover is up - dismissal then re-points as before).
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
-            reanchorGridToEngineEpisode()
+            reanchorGridToEngineEpisode(preferPlaybackCloseReceipt: false)
         }
         .onChange(of: season) {
             // A manual tap or the programmatic preferred-season apply locks the auto-pick, so a later
@@ -1471,9 +1483,13 @@ struct CoreSeasonedEpisodes: View {
     /// auto-scrolls focus into view) so Back returns to the CURRENT episode, not the one originally
     /// launched. Guarded on the player being down (never steal focus from a live player; the dismissal
     /// trigger re-points the moment it closes) and on the engine naming a known episode.
-    private func reanchorGridToEngineEpisode() {
-        guard presenter.request == nil, let id = resumeVideoId, videos.contains(where: { $0.id == id }) else { return }
-        if let s = resumeSeason, s != season, seasons.contains(s) { season = s }
+    private func reanchorGridToEngineEpisode(preferPlaybackCloseReceipt: Bool) {
+        let committed = preferPlaybackCloseReceipt ? presenter.playbackCloseReceipt : nil
+        guard presenter.request == nil,
+              let id = resolvedResumeVideoID(committed: committed),
+              videos.contains(where: { $0.id == id }) else { return }
+        if let s = videos.first(where: { $0.id == id })?.season,
+           s != season, seasons.contains(s) { season = s }
         DispatchQueue.main.async { focusedEpisode = id }
     }
 
@@ -1654,7 +1670,19 @@ struct CoreEpisodeStreams: View {
     /// episodes): the account-level engine library for the main profile, the per-profile overlay otherwise.
     /// Same source the grid's #7 signal reads. With fix 2 the engine's `state.videoId` is trustworthy input.
     private var resumeVideoId: String? {
-        profiles.activeUsesEngineHistory ? core.metaDetails?.libraryItem?.state.videoId : profiles.watch[meta.id]?.videoId
+        resolvedResumeVideoID(committed: nil)
+    }
+
+    private func resolvedResumeVideoID(committed: PlaybackMeta?) -> String? {
+        EpisodeReturnIdentityPolicy.resolve(
+            libraryID: meta.id,
+            isVideoAvailable: { id in episodes.contains { $0.id == id } },
+            committedLibraryID: committed?.libraryId,
+            committedVideoID: committed?.videoId,
+            engineVideoID: profiles.activeUsesEngineHistory
+                ? core.metaDetails?.libraryItem?.state.videoId
+                : profiles.watch[meta.id]?.videoId
+        )
     }
 
     /// The season the page shows: follows `currentVideo` so a cross-season binge advance re-labels correctly.
@@ -1719,7 +1747,7 @@ struct CoreEpisodeStreams: View {
         // resolves + plays THAT episode's streams. Guarded on a real move to a known episode, so a no-op close
         // (paused, same episode) leaves the page untouched.
         .onChange(of: presenter.request == nil) {
-            reanchorPageToEngineEpisode()
+            reanchorPageToEngineEpisode(preferPlaybackCloseReceipt: true)
         }
         // Binge-desync fix #4: ALSO re-derive on app foreground, not just player dismissal. This pushed
         // page stays mounted behind the player across a background boundary (no dismissal event fires),
@@ -1727,7 +1755,7 @@ struct CoreEpisodeStreams: View {
         // episode. Guarded inside: while the player cover is still up nothing moves (its dismissal
         // re-points as before), so the live player's engine slot is never reloaded from under it.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
-            reanchorPageToEngineEpisode()
+            reanchorPageToEngineEpisode(preferPlaybackCloseReceipt: false)
         }
     }
 
@@ -1737,8 +1765,11 @@ struct CoreEpisodeStreams: View {
     /// episode's streams. Guarded on the player being down (a foreground with the cover still up leaves
     /// the live player's engine slot alone) and on a real move to a known episode, so a no-op close
     /// (paused, same episode) leaves the page untouched.
-    private func reanchorPageToEngineEpisode() {
-        guard presenter.request == nil, let id = resumeVideoId, id != currentVideo.id,
+    private func reanchorPageToEngineEpisode(preferPlaybackCloseReceipt: Bool) {
+        let committed = preferPlaybackCloseReceipt ? presenter.playbackCloseReceipt : nil
+        guard presenter.request == nil,
+              let id = resolvedResumeVideoID(committed: committed),
+              id != currentVideo.id,
               let moved = episodes.first(where: { $0.id == id }) else { return }
         episodeTargetGeneration &+= 1
         currentVideo = moved

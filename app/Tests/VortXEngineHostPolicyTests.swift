@@ -298,7 +298,92 @@ check("failover: a healthy report with no accumulated failures keeps the remote 
 check("failover: a healthy report wins outright over a stale failure count",
       P.failover(consecutiveControlFailures: 999, hostReportsHealthy: true) == .keepRemote)
 
-// MARK: - 7. mountPath
+// MARK: - 7. Remote readiness and exact ownership
+
+check("readiness: no first status remains pending before the deadline",
+      P.remoteReadiness(
+        statusReceived: false, healthy: nil, initPublished: nil, failed: nil,
+        signalingPublished: false, deadlineExpired: false) == .pending)
+
+// An older host used healthy=false for both "init pending" and "failed before init". With neither optional
+// fact on the wire, that false stays pending under the bounded deadline.
+check("readiness: legacy pre-init false is pending, not terminal",
+      P.remoteReadiness(
+        statusReceived: true, healthy: false, initPublished: nil, failed: nil,
+        signalingPublished: false, deadlineExpired: false) == .pending)
+
+check("readiness: explicit terminal failure fails immediately",
+      P.remoteReadiness(
+        statusReceived: true, healthy: false, initPublished: false, failed: true,
+        signalingPublished: false, deadlineExpired: false) == .failed(.explicitFailure))
+
+check("readiness: a published init followed by an unhealthy report fails immediately",
+      P.remoteReadiness(
+        statusReceived: true, healthy: false, initPublished: true, failed: false,
+        signalingPublished: true, deadlineExpired: false) == .failed(.unhealthy))
+
+check("readiness: silence expires at the bounded deadline",
+      P.remoteReadiness(
+        statusReceived: false, healthy: nil, initPublished: nil, failed: nil,
+        signalingPublished: false, deadlineExpired: true) == .failed(.timeout))
+
+check("readiness: signalling without init remains pending",
+      P.remoteReadiness(
+        statusReceived: true, healthy: false, initPublished: false, failed: false,
+        signalingPublished: true, deadlineExpired: false) == .pending)
+
+check("readiness: eventual init plus signalling publication becomes ready",
+      P.remoteReadiness(
+        statusReceived: true, healthy: true, initPublished: true, failed: false,
+        signalingPublished: true, deadlineExpired: false) == .ready)
+
+check("readiness: a readiness report arriving after the deadline times out",
+      P.remoteReadiness(
+        statusReceived: true, healthy: true, initPublished: true, failed: false,
+        signalingPublished: true, deadlineExpired: true) == .failed(.timeout))
+
+check("readiness: an older healthy host remains compatible",
+      P.remoteReadiness(
+        statusReceived: true, healthy: true, initPublished: nil, failed: nil,
+        signalingPublished: true, deadlineExpired: false) == .ready)
+
+let mountA = P.RemoteMountIdentity(sessionID: "session-a", playlistURL: "http://mac/a/master.m3u8")
+let mountACopy = P.RemoteMountIdentity(sessionID: "session-a", playlistURL: "http://mac/a/master.m3u8")
+let mountB = P.RemoteMountIdentity(sessionID: "session-b", playlistURL: "http://mac/b/master.m3u8")
+check("identity: an exact session and playlist receipt matches",
+      P.readinessReceiptMatches(expected: mountA, received: mountACopy))
+check("identity: a different hosted session cannot attach",
+      !P.readinessReceiptMatches(expected: mountA, received: mountB))
+
+check("callback ownership: the exact current mount is accepted",
+      P.remoteCallbackIsCurrent(
+        loadTokenMatches: true,
+        expectedOpeningGeneration: 41,
+        emittingOpeningGeneration: 41,
+        itemGenerationMatches: true,
+        mountedIdentity: mountA,
+        emittingIdentity: mountACopy))
+
+// Internal fallback may reuse one logical token. The replacement generation and session identity still retire
+// callbacks from the first mount.
+check("callback ownership: same-token replacement rejects the retired generation",
+      !P.remoteCallbackIsCurrent(
+        loadTokenMatches: true,
+        expectedOpeningGeneration: 42,
+        emittingOpeningGeneration: 41,
+        itemGenerationMatches: true,
+        mountedIdentity: mountB,
+        emittingIdentity: mountA))
+check("callback ownership: same-token replacement rejects the retired session",
+      !P.remoteCallbackIsCurrent(
+        loadTokenMatches: true,
+        expectedOpeningGeneration: 42,
+        emittingOpeningGeneration: 42,
+        itemGenerationMatches: true,
+        mountedIdentity: mountB,
+        emittingIdentity: mountA))
+
+// MARK: - 8. mountPath
 
 check("mountpath: a bare resource name is mounted under /r/<capability>/",
       P.mountPath(capability: capA, resource: "master.m3u8") == "/r/\(capA)/master.m3u8")
@@ -308,12 +393,12 @@ check("mountpath: round-trips through route back to the bare resource path",
       P.route(header: "GET \(P.mountPath(capability: capA, resource: "master.m3u8")) HTTP/1.1", capability: capA)
         == .guarded(method: .get, path: "/master.m3u8", range: nil))
 
-// MARK: - 8. Forward buffer
+// MARK: - 9. Forward buffer
 
 check("buffer: local (loopback) origin uses the shipping 30s value",
       P.forwardBufferSeconds(remote: false) == 30)
-check("buffer: a remote origin buffers more than local",
-      P.forwardBufferSeconds(remote: true) > P.forwardBufferSeconds(remote: false))
+check("buffer: a remote producer still keeps AVPlayer's device-side buffer at 30s",
+      P.forwardBufferSeconds(remote: true) == 30)
 
 // MARK: - Result
 

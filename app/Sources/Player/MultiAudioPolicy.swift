@@ -1,5 +1,198 @@
 import Foundation
 
+/// One remount-spanning statement of what the viewer is watching and how they want it presented.
+///
+/// Audio replacement, HDR recovery and hosted-to-local recovery all bind this same value to the new item and
+/// mount identity. A restore consumes it once only after both identities match, so an older async completion
+/// cannot overwrite a newer B then C choice, explicit subtitle Off, pause, rate, or playhead.
+enum PlaybackIntentPolicy {
+    enum HostLossAction: Equatable, Sendable {
+        /// An in-flight audio replacement keeps ownership and remounts its newest target locally.
+        case remountAudioReplacement
+        /// Ordinary hosted playback carries the same logical load token into one local reload.
+        case reloadLocalSameToken
+    }
+
+    enum SubtitleSelection: Equatable, Sendable {
+        case unresolved
+        case off
+        case embedded(sourceIndex: Int)
+        case external
+    }
+
+    struct Restoration: Equatable, Sendable {
+        let sourceSeconds: Double
+        let playbackRequested: Bool
+        let requestedRate: Float
+        let audioSelectionKnown: Bool
+        let audioSourceIndex: Int?
+        let nativeAudioIndex: Int?
+        let subtitle: SubtitleSelection
+    }
+
+    struct Intent: Equatable, Sendable {
+        private(set) var sourceSeconds: Double
+        private(set) var playbackRequested: Bool
+        private(set) var requestedRate: Float
+        private(set) var audioSelectionKnown: Bool
+        private(set) var audioSourceIndex: Int?
+        private(set) var nativeAudioIndex: Int?
+        private(set) var subtitle: SubtitleSelection
+        private(set) var ownerGeneration: UInt64 = 0
+        private(set) var mountIdentity: UInt64 = 0
+        private(set) var consumed = false
+
+        init(sourceSeconds: Double,
+             playbackRequested: Bool,
+             requestedRate: Float,
+             audioSelectionKnown: Bool,
+             audioSourceIndex: Int?,
+             nativeAudioIndex: Int?,
+             subtitle: SubtitleSelection) {
+            self.sourceSeconds = sourceSeconds.isFinite ? max(0, sourceSeconds) : 0
+            self.playbackRequested = playbackRequested
+            self.requestedRate = requestedRate.isFinite && requestedRate > 0 ? requestedRate : 1
+            self.audioSelectionKnown = audioSelectionKnown
+            self.audioSourceIndex = audioSourceIndex
+            self.nativeAudioIndex = nativeAudioIndex
+            self.subtitle = subtitle
+        }
+
+        mutating func bind(generation: UInt64, mountIdentity: UInt64) {
+            ownerGeneration = generation
+            self.mountIdentity = mountIdentity
+            consumed = false
+        }
+
+        mutating func updateSourceSeconds(_ seconds: Double) {
+            guard seconds.isFinite else { return }
+            sourceSeconds = max(0, seconds)
+        }
+
+        mutating func updateTransport(playbackRequested: Bool, requestedRate: Float) {
+            self.playbackRequested = playbackRequested
+            if requestedRate.isFinite, requestedRate > 0 { self.requestedRate = requestedRate }
+        }
+
+        mutating func selectSourceAudio(_ sourceIndex: Int?) {
+            audioSelectionKnown = true
+            audioSourceIndex = sourceIndex
+            nativeAudioIndex = nil
+        }
+
+        mutating func selectNativeAudio(_ index: Int?) {
+            audioSelectionKnown = true
+            audioSourceIndex = nil
+            nativeAudioIndex = index
+        }
+
+        mutating func selectEmbeddedSubtitle(sourceIndex: Int) {
+            subtitle = .embedded(sourceIndex: sourceIndex)
+        }
+
+        mutating func selectSubtitlesOff() {
+            subtitle = .off
+        }
+
+        mutating func selectExternalSubtitle() {
+            subtitle = .external
+        }
+
+        mutating func consume(generation: UInt64,
+                              mountIdentity: UInt64) -> Restoration? {
+            guard !consumed,
+                  generation == ownerGeneration,
+                  mountIdentity == self.mountIdentity else { return nil }
+            consumed = true
+            return Restoration(
+                sourceSeconds: sourceSeconds,
+                playbackRequested: playbackRequested,
+                requestedRate: requestedRate,
+                audioSelectionKnown: audioSelectionKnown,
+                audioSourceIndex: audioSourceIndex,
+                nativeAudioIndex: nativeAudioIndex,
+                subtitle: subtitle)
+        }
+    }
+
+    /// The presence of a playback intent is not evidence that an audio replacement is active: host-loss
+    /// recovery creates that intent for every session before choosing its recovery path. Keep the branch tied
+    /// to the actual replacement transaction so an ordinary host loss cannot return without mounting locally.
+    static func hostLossAction(hasAudioReplacement: Bool) -> HostLossAction {
+        hasAudioReplacement ? .remountAudioReplacement : .reloadLocalSameToken
+    }
+}
+
+/// Pure ownership and rollback state for an audio-source replacement mount.
+///
+/// A source choice is a secondary operation over an already working primary video session. The old mount
+/// cannot remain alive because the bounded device lane permits one remux producer, so failure recovery is one
+/// replacement mount of the previously working source at the original source playhead. Generation ownership
+/// makes a rapid B then C choice newest-wins on both local and hosted mounts, while `rollbackAttempted` makes
+/// the recovery bounded.
+enum RemuxAudioReplacementPolicy {
+    enum Phase: Equatable, Sendable {
+        case replacing
+        case rollingBack
+        case ready
+    }
+
+    enum FailureAction: Equatable, Sendable {
+        case ignoreStale
+        case remountRollback(sourceIndex: Int?, sourceSeconds: Double)
+        case noFurtherRetry
+    }
+
+    struct State: Equatable, Sendable {
+        let rollbackSourceIndex: Int?
+        private(set) var targetSourceIndex: Int?
+        let sourceSeconds: Double
+        private(set) var generation: UInt64
+        private(set) var phase: Phase = .replacing
+        private(set) var rollbackAttempted = false
+
+        init(rollbackSourceIndex: Int?,
+             targetSourceIndex: Int,
+             sourceSeconds: Double,
+             generation: UInt64 = 0) {
+            self.rollbackSourceIndex = rollbackSourceIndex
+            self.targetSourceIndex = targetSourceIndex
+            self.sourceSeconds = sourceSeconds.isFinite ? max(0, sourceSeconds) : 0
+            self.generation = generation
+        }
+
+        mutating func bind(to generation: UInt64) {
+            self.generation = generation
+        }
+
+        mutating func retarget(to sourceIndex: Int) {
+            targetSourceIndex = sourceIndex
+            phase = .replacing
+        }
+
+        mutating func markReady(generation: UInt64) -> Bool {
+            guard generation == self.generation else { return false }
+            phase = .ready
+            return true
+        }
+
+        func isReady(generation: UInt64) -> Bool {
+            generation == self.generation && phase == .ready
+        }
+
+        mutating func failureAction(generation: UInt64) -> FailureAction {
+            guard generation == self.generation else { return .ignoreStale }
+            guard phase == .replacing, !rollbackAttempted else { return .noFurtherRetry }
+            rollbackAttempted = true
+            phase = .rollingBack
+            targetSourceIndex = rollbackSourceIndex
+            return .remountRollback(
+                sourceIndex: rollbackSourceIndex,
+                sourceSeconds: sourceSeconds)
+        }
+    }
+}
+
 /// Pure policy for the optional, separately muxed HLS alternate-audio rendition.
 ///
 /// The FFmpeg-owning stream converts these value decisions into muxer operations. Keeping qualification,
@@ -67,6 +260,26 @@ enum MultiAudioPolicy {
 
     static func isUnknownLanguage(_ key: String) -> Bool {
         key.isEmpty || key == "und" || key == "unk" || key == "mis" || key == "zxx"
+    }
+
+    /// Source identities exposed by the remount-based picker.
+    ///
+    /// Language is presentation and preference metadata, never an eligibility filter. Same-language
+    /// commentary, descriptive and alternate mixes therefore remain distinct, and there is deliberately no
+    /// rendition-count cap because these rows do not create parallel muxers or buffers.
+    static func selectableSourceTracks(from tracks: [AudioTrack]) -> [AudioTrack] {
+        tracks.sorted { lhs, rhs in
+            if lhs.index != rhs.index { return lhs.index < rhs.index }
+            return lhs.title < rhs.title
+        }
+    }
+
+    /// Resolve a picker row back to the immutable source-container index. Nil means the requested identity is
+    /// absent or incompatible and the caller must use its existing preference-ranked default.
+    static func selectedSourceTrack(from tracks: [AudioTrack],
+                                    requestedSourceIndex: Int?) -> AudioTrack? {
+        guard let requestedSourceIndex else { return nil }
+        return tracks.first { $0.index == requestedSourceIndex }
     }
 
     /// Selects the one metadata-qualified alternate without treating stream metadata as packet proof.
@@ -145,6 +358,14 @@ enum MultiAudioPolicy {
 
     struct Dec3Observation: Equatable, Sendable {
         let jocComplexityIndex: Int?
+    }
+
+    /// Atmos is a delivery receipt, not source metadata. Only a stream-copied E-AC3 output whose structured
+    /// muxed `dec3` path proves a valid JOC complexity may carry the label.
+    static func verifiedJOC(isStreamCopy: Bool,
+                            usesDec3: Bool,
+                            observation: Dec3Observation?) -> Bool {
+        isStreamCopy && usesDec3 && observation?.jocComplexityIndex != nil
     }
 
     private struct MP4Box {

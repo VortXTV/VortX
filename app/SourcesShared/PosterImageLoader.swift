@@ -161,28 +161,22 @@ enum PosterImageLoader {
     /// real failure OR on cancellation (the caller treats nil-from-cancel as "retry next appear", so a
     /// scroll-away never latches a blank card). `maxPixel` downsamples very large art to a sane on-card size.
     static func load(_ urlString: String?, maxPixel: CGFloat = 900) async -> VXPosterImage? {
-        VXProbe.log("poster", "load ENTRY host=\(probeHost(urlString)) maxPixel=\(Int(maxPixel))")
         guard let raw = urlString, !raw.isEmpty, let url = URL(string: raw) else {
             VXProbe.log("poster", "load BAIL bad/empty host=\(probeHost(urlString)) -> nil")
             return nil
         }
         if let hit = memory.object(forKey: url as NSURL) {
-            VXProbe.log("poster", "memory-cache HIT host=\(probeHost(raw)) -> returning cached")
             return hit
         }
-        VXProbe.log("poster", "memory-cache MISS host=\(probeHost(raw))")
 
         // A cancelled acquire holds NO permit, so return without releasing (releasing here would free a permit
         // we never took and let `active` drift below zero, over-admitting loads). Only release when granted.
         guard await gate.acquire() else {
-            VXProbe.log("poster", "gate ACQUIRE cancelled host=\(probeHost(raw)) -> nil (no permit held)")
             return nil
         }
-        VXProbe.log("poster", "gate ACQUIRE granted host=\(probeHost(raw))")
         defer { Task { await gate.release() } }
         // A cancel between acquiring the gate and starting the fetch: bail without a network hit.
         if Task.isCancelled {
-            VXProbe.log("poster", "cancelled after gate, before fetch host=\(probeHost(raw)) -> nil-because-cancelled")
             return nil
         }
 
@@ -196,9 +190,7 @@ enum PosterImageLoader {
             // (fail-open) for any non-gated host (tmdb / metahub / add-on art) and for an unprovisioned build.
             VortXEdgeAuth.sign(&req)
             let (data, _) = try await session.data(for: req)
-            VXProbe.log("poster", "fetch OK host=\(probeHost(raw)) bytes=\(data.count)")
             if Task.isCancelled {
-                VXProbe.log("poster", "cancelled after fetch, before decode host=\(probeHost(raw)) -> nil-because-cancelled")
                 return nil
             }
             // Decode + downsample OFF the main thread so scrolling never blocks on a poster decode.
@@ -207,10 +199,11 @@ enum PosterImageLoader {
                 return nil
             }
             memory.setObject(image, forKey: url as NSURL)
-            VXProbe.log("poster", "load SUCCESS host=\(probeHost(raw)) image=\(Int(image.size.width))x\(Int(image.size.height))")
             return image
         } catch {
-            VXProbe.log("poster", "fetch ERROR host=\(probeHost(raw)) error=\(error.localizedDescription) -> nil-because-failed (or cancel; caller retries)")
+            if !Task.isCancelled {
+                VXProbe.log("poster", "fetch ERROR host=\(probeHost(raw)) error=\(error.localizedDescription) -> nil-because-failed")
+            }
             return nil   // includes URLError.cancelled; the caller retries on the next appear
         }
     }
@@ -252,7 +245,6 @@ enum PosterImageLoader {
         #endif
         guard let cg, let tint = averageColor(of: cg) else { return nil }
         tintCache.setObject(TintBox(red: tint.red, green: tint.green, blue: tint.blue), forKey: url as NSURL)
-        VXProbe.log("poster", "averageColor host=\(probeHost(raw)) r=\(Int(tint.red * 255)) g=\(Int(tint.green * 255)) b=\(Int(tint.blue * 255))")
         return Color(red: tint.red, green: tint.green, blue: tint.blue)
     }
 
@@ -299,7 +291,6 @@ enum PosterImageLoader {
             VXProbe.log("poster", "decode ImageIO thumbnail FAILED bytes=\(data.count) -> platform-decoder fallback=\(fallback != nil ? "ok" : "nil")")
             return fallback
         }
-        VXProbe.log("poster", "decode ImageIO ok pixels=\(cg.width)x\(cg.height)")
         #if canImport(UIKit)
         return UIImage(cgImage: cg)
         #elseif canImport(AppKit)
