@@ -201,6 +201,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// import into Swift, so keep their exact values local to the single pre-mux seek.
     private static let avseekFlagBackward: Int32 = 1
     private static let avTimeBase: Int64 = 1_000_000
+    /// FFmpeg returns this from any blocking call aborted by the interrupt callback we install in
+    /// `makeInterruptibleInputContext`. It means WE cancelled, not that the source failed. Field
+    /// diagnostic 2026-07-27 logged it twice as "refusing zero restart", which reads as an unseekable
+    /// source and sent a whole investigation down the wrong path; the Unload had in fact been dispatched
+    /// 23ms earlier. FFERRTAG('E','X','I','T').
+    static let avErrorExit: Int32 = -1414092869
+
     private static let avTimeBaseQ = AVRational(num: 1, den: 1_000_000)
     /// Remux-thread-only resume state. A successful input seek must establish its shift from a mapped base-video
     /// packet before any buffered packet is processed, so early audio/subtitle arrivals cannot choose the clock.
@@ -1219,8 +1226,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     let fallback = fallbackResult.map { String($0) } ?? "not-attempted"
                     VXProbe.log(
                         "dv",
-                        "resume: both input seeks failed primary=\(primaryResult) fallback=\(fallback), "
-                            + "refusing zero restart")
+                        "resume: both input seeks failed primary=\(primaryResult) fallback=\(fallback)"
+                            + (primaryResult == Self.avErrorExit || fallbackResult == Self.avErrorExit
+                               ? " (AVERROR_EXIT: OUR interrupt callback fired, i.e. this session was being"
+                                 + " cancelled or torn down. Not a source limitation.)"
+                               : " (source rejected both seeks)")
+                            + ", refusing zero restart")
                     buffer.fail(
                         "resume input seek failed at \(Int(requestedOriginSeconds)) seconds "
                             + "(primary \(primaryResult), fallback \(fallback))")

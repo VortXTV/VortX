@@ -96,8 +96,35 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// Session-captured window-advancement policy (see `consumptionAnchorEnabled`).
     private let consumptionAnchored = VortXRemuxHLSServer.consumptionAnchorEnabled
     /// Fully-consumed segments retained in the published window behind the consumption frontier, so the
-    /// playhead (which trails the fetch frontier) and an immediate small back-seek stay inside the window.
-    private static let keepBehindSegments = 2
+    /// playhead (which trails the fetch frontier) and a real back-seek stay inside the window.
+    ///
+    /// This was 2 (about 8s at a 4s target duration) and that is far too small, because the fetch frontier
+    /// runs a long way ahead of the playhead. Field diagnostic 2026-07-27 build 198: AVPlayer fetched seg3
+    /// through seg18 in a single burst, so the playhead trailed the frontier by roughly fifteen segments while
+    /// the window retained two. A back-seek therefore clamped to a window start that was AHEAD of the viewer,
+    /// which is why a rewind jumped forward by 30 to 40 seconds instead of going back.
+    ///
+    /// Retention is bounded by BYTES as well as count, because segment size varies by an order of magnitude
+    /// between sources: the same capture had a 21 Mbps WEB-DL at about 8MB per 4s segment and a 97 Mbps
+    /// BluRay remux at 14MB for 1.17s. A fixed count would retain about 100MB on one and over a gigabyte on
+    /// the other, and tvOS was already reporting memory warnings at rss 534MB in that session.
+    private static let keepBehindSegments = 16
+    /// Ceiling on retained-behind bytes. Whichever bound binds first wins, so a high-bitrate source keeps
+    /// fewer segments and a modest one keeps the full count.
+    private static let keepBehindMaximumBytes = 96 * 1024 * 1024
+
+    /// The retained-behind floor for the current frontier, honouring both bounds.
+    private func consumptionFloor(frontier: Int, window: VortXHLSWindow) -> Int {
+        guard frontier >= 0 else { return frontier }
+        var allowed = 0
+        var bytes = 0
+        for segment in window.segments.reversed() where segment.id <= frontier {
+            bytes += segment.byteLength
+            if allowed >= Self.keepBehindSegments || bytes > Self.keepBehindMaximumBytes { break }
+            allowed += 1
+        }
+        return frontier - max(1, allowed)
+    }
     private var advertisedSubtitles: [SubtitleRenditionPolicy.Rendition] = []
     private var advertisedDolbyVision = false
     private var engineReady = false
@@ -1029,7 +1056,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 if consumptionAnchored {
                     let consumptionFloorID = highestServedVideoSegmentID < 0
                         ? current.mediaSequence
-                        : highestServedVideoSegmentID - Self.keepBehindSegments
+                        : consumptionFloor(frontier: highestServedVideoSegmentID, window: common)
                     let newStartID = max(current.mediaSequence, min(suffixStartID, consumptionFloorID))
                     let slid = common.segments.drop { $0.id < newStartID }
                     selectedVideo = slid.isEmpty ? common : VortXHLSWindow(segments: Array(slid))
