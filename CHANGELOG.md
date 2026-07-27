@@ -8,13 +8,13 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 The biggest release since 0.3.14 opened. A Mac can now do the heavy work for an Apple TV, the built-in player finally reads the second picture layer of a 4K Blu-ray rip, Dolby Vision plays through to the end instead of falling to HDR10, Atmos reaches your receiver, and Blu-ray subtitles work for the first time.
 
-## Let a Mac be the engine
+### Let a Mac be the engine
 
 **Turn on the engine on a Mac, pair an Apple TV to it with a six digit code, and the Mac does the container and file work while the Apple TV spends its whole chip decoding and showing the picture.** Video is copied across untouched, never re-encoded, so Dolby Vision stays true Dolby Vision and the picture is identical. Because the Mac has room to hold the whole film instead of a small moving window, you can seek anywhere, backwards as well as forwards, which the Apple TV cannot do alone. VortX finds the Mac on your network by itself, or you can type its address for setups like Tailscale, and nothing is shared until you pair. If the Mac sleeps, quits, or leaves the network mid-film, playback carries on where it was. The Mac can run the engine with no window open. Off by default, and nothing changes for anyone without a Mac.
 
 The protocol underneath is plain HTTP and JSON with a bearer token and no Apple-specific types in it, so the Android and desktop clients can implement the same thing later.
 
-## Dolby Vision
+### Dolby Vision
 
 **Dolby Vision plays, and keeps playing.** Alongside the Dolby Vision picture the app publishes a plain HDR one as a safety net. That safety net had its Dolby Vision configuration stripped out but kept the Dolby Vision brand in its header, so it announced a format it was not carrying, and the player threw it out within milliseconds every time it loaded it. It was also advertised as the cheaper of the two, so the player actively preferred the broken one over the working one. Nine times out of nine that safety net was loaded, playback died before a single frame was requested. The header is corrected, the two are no longer offered side by side inside one stream, and once a real Dolby Vision picture is on screen the player is held to it.
 
@@ -24,7 +24,7 @@ The protocol underneath is plain HTTP and JSON with a bearer token and no Apple-
 
 **Dolby Vision no longer flickers before it settles, and starts at the beginning.** Repeated identical display-mode requests are ignored, so the HDMI link renegotiates once instead of several times. Titles also start where you asked instead of about fourteen seconds in.
 
-## Audio
+### Audio
 
 **Dolby Atmos reaches your receiver.** On a file whose audio is Dolby Digital Plus with Atmos, the Atmos data is carried through untouched. On a file whose only audio is TrueHD, Apple TV cannot pass that through at any quality, so it is converted and the badge honestly says surround rather than Atmos.
 
@@ -32,13 +32,13 @@ The protocol underneath is plain HTTP and JSON with a bearer token and no Apple-
 
 **Every audio track in the file is offered.** The rule for alternate audio demanded a different language from the main track, so a file with seven English tracks qualified none of them and the audio menu had nothing to pick.
 
-## Subtitles
+### Subtitles
 
-**Blu-ray subtitles work for the first time.** Blu-ray discs store subtitles as pictures rather than text, and nothing in the subtitle path could read a picture, so a Blu-ray remux offered no subtitles of its own at all. Those pictures are now read on the device and turned into ordinary subtitles, appearing in the normal list with the normal styling and timing adjustment. Recognition is bounded so it can never slow playback, it is not flawless on stylised or non-Latin type, and a file carrying its own text subtitles still uses those first.
+**Blu-ray subtitles work for the first time.** Blu-ray discs store subtitles as pictures rather than text, and nothing in the subtitle path could read a picture, so a Blu-ray remux offered no subtitles of its own at all. Those pictures are now read on the device and turned into ordinary subtitles, appearing in the normal list with the normal styling. This is a first pass and it shows: recognition is bounded so it can never slow playback, which brings real limits worth reading in Known issues below. It is not flawless on stylised or non-Latin type, and a file carrying its own text subtitles still uses those first.
 
 **Every subtitle track in the file is offered.** A file carrying thirty-nine subtitle languages used to show one.
 
-## We build our own player engine now
+### We build our own player engine now
 
 This is the piece of the release we are proudest of, and it is what made everything above possible.
 
@@ -48,15 +48,15 @@ VortX used to take the player engine as a prebuilt package, which meant taking w
 
 **libplacebo is built from source at API 371 rather than the 360 the prebuilt package carried.** That one matters more than it looks: mpv's enhancement-layer support is compiled out entirely below API 367, silently, with a perfectly green build. Bumping mpv alone would have produced a build that looked correct and did nothing. Both had to move together, and finding that out cost real time.
 
-**FFmpeg moved to the 9.0 release line.** That is what unlocks the Dolby Vision splitter needed for single-track Profile 7 files, which simply does not exist in the version we were on.
+**FFmpeg stays where it was, deliberately.** We audited every one of the 67 FFmpeg functions VortX calls against the newer line and found none of them removed or changed, so the move is safe on our side. What we have not done yet is rebase the player package's own FFmpeg patches onto it, and until that is measured we are not moving. The bounded cost of standing still is one file type: a Profile 7 Dolby Vision file that packs both picture layers into a single interleaved track needs a splitter the current version does not carry, so those files play from the base layer alone. Files that carry the two layers as separate tracks, which is most of them, work.
 
 **Two patches are ours.** One carries the Dolby Vision enhancement-layer work through the packaging our Apple builds need. The other makes the render surface notice when it has been resized, which is why rotating a phone no longer tears down and rebuilds the entire video pipeline.
 
 We also turned on the Dolby Digital Plus encoder, which had never been compiled in, so the converter that always asked for it stopped silently settling for AAC.
 
-The cost of owning this is real and worth being honest about: nine slices to rebuild, upstream to track, and the two patches to carry forward. The 9.0 move also shipped one regression we caught and fixed inside this release, when certificate verification turned on by default and the build had no certificates to verify against. We keep the verification and ship the certificates now, which is a better place than where we started.
+The cost of owning this is real and worth being honest about: nine slices to rebuild, upstream to track, and the two patches to carry forward every time either moves.
 
-## Moving the app into the backend
+### Moving the app into the backend
 
 A sideloaded app is a pain to update. Unsigned IPAs expire, re-signing is a chore, and every fix we make is worthless until you go through that again. So we are steadily moving VortX's behaviour out of the app and onto our own servers.
 
@@ -66,9 +66,13 @@ A lot of it already works this way. Ratings, posters and artwork, the skip-intro
 
 What cannot move is the part that has to run on your device: the player, the decoder, Dolby Vision, and the engine. Those still need a build. Everything else is heading server-side, and each release moves more of it.
 
-## Everywhere else
+### Everywhere else
 
-**Apple TV tells the system what you are watching.** Playback registered nothing with tvOS, so the Now Playing card sat empty and no system transport reached VortX. The card now carries the title, show and episode, poster and position, and play, pause, skip and scrubbing all work.
+**Apple TV tells the system what you are watching, and the same card is fixed on iPhone, iPad and Mac.** Playback registered nothing with tvOS, so the Now Playing card sat empty and no system transport reached VortX. The card now carries the title, show and episode, poster and position, and play, pause, skip and scrubbing all work. On iPhone, iPad and Mac the card gains the poster, the series details and a working position bar, and an explicit Play sent from Control Center no longer pauses a playing title, which it used to because play, pause and toggle all ran the same toggle. The position it reports at the first frame is the real one rather than zero.
+
+**Turning subtitles off no longer loses your subtitle for the rest of the session.** Switching an add-on or external subtitle off used to discard it outright, so turning subtitles back on left you with nothing to turn back on. It is kept now, and external subtitles sit in the list as proper rows alongside the file's own.
+
+**The Mirror Continue Watching from Stremio setting does what it says.** The toggle existed but was not wired to anything, so turning it on changed nothing. It now genuinely mirrors, and the settings text on every platform was rewritten to describe what actually happens rather than what was intended.
 
 **Rewinding goes back.** The player was only offered a few seconds of film behind wherever it had downloaded to, and it downloads a long way ahead of what you are watching, so the earliest point it would return to was often already ahead of you. It now holds two and a half minutes of playing time behind you.
 
@@ -88,7 +92,9 @@ In-place update over Beta 8, nothing resets.
 
 - **Play from start, from inside the player, does not work.** The button on the detail page is fine; the one in the player controls is not.
 - **Recognised Blu-ray subtitles render larger than they should.** They read correctly; a sizing pass is next.
-- **A Blu-ray disc offers fewer recognised languages on the Dolby Vision lane than on the built-in player.** The built-in player reads the disc's pictures directly and can show any of them; the Dolby Vision lane recognises a bounded number so recognition can never slow playback.
+- **Recognised Blu-ray subtitles stop partway through a film.** Reading the pictures costs real time, so it is given a fixed budget to guarantee it can never stall playback. A feature-length disc carries well over a thousand lines per language and exhausts that budget long before the credits, and once it is spent no further lines are produced for the rest of the session. Lines already recognised keep showing; new ones stop appearing. This is the limitation we most want to remove.
+- **On the Dolby Vision lane, only the first four Blu-ray subtitle languages actually produce text, but every language is still listed.** Picking any of the others gives you an entry that stays permanently blank rather than an honest "not available". The cap exists so recognition can never slow playback; listing the ones it will never fill is our bug, not a design decision, and the menu should show only what it can deliver. The built-in player reads the disc's pictures directly and is not affected.
+- **Recognised Blu-ray subtitles cannot be time-shifted.** The subtitle delay control does not apply to them, because they travel a different path from the subtitles it was built for. A file's own text subtitles and add-on subtitles still adjust normally.
 
 ### Android
 
@@ -103,22 +109,6 @@ Android is a separate, from-scratch app on the same Rust engine, not a port. Tod
 **Then:** settings and profiles, Live TV, backup and import, and Android TV shipping as the same APK rather than a separate one.
 
 The published Android build remains Beta 6 and is unchanged by this release. The August target is the whole thing at parity, not a staged trickle.
-
-## Unreleased - build 193
-
-A local test build, not a published beta. The version stays 0.3.14 and only the build number moves, so a tester can say which build they are on. Four lanes land together so they can be tried in one pass: a Mac can act as the engine for another device, our own build of the player engine brings the Dolby Vision Profile 7 enhancement layer and a real Dolby Digital Plus encoder, rotating an iPhone or iPad stops restarting the picture, and the remote switches that turn features off are read for the first time.
-
-### Added
-
-- **Let a Mac act as the engine for another device.** Turn on the engine on a Mac, pair an Apple TV to it with a six digit code, and the Mac does the container and file work for Dolby Vision MKVs while the Apple TV spends its whole chip decoding and showing the picture. Video is copied across untouched, never re-encoded, so Dolby Vision stays true Dolby Vision. Because the Mac can hold the whole film rather than a small moving window, you can seek anywhere, backwards as well as forwards, which the Apple TV cannot do alone. Discovery finds the Mac by itself, or an address can be typed for Tailscale and similar setups, and nothing is shared until you pair. If the Mac sleeps, quits, or leaves the network mid-film, playback carries on where it was. Off by default. The Mac can also run the engine with no window open. Apple TV, iPhone, iPad, and Mac.
-- **Dolby Vision Profile 7 keeps its enhancement layer on the built-in player.** Most 4K Blu-ray Dolby Vision rips carry the picture as a base track plus an enhancement layer holding the highlight and shadow detail. On the built-in player that second track was thrown away unread and the picture was flattened to ordinary HDR with no Dolby Vision information at all. We now build our own player engine from pinned upstream sources, which pairs the two tracks and composites them. Files that pack both layers into a single track are unchanged and still play from the base picture alone. Apple TV, iPhone, iPad, and Mac.
-- **Dolby Digital Plus is actually produced for converted Dolby Vision audio.** A Dolby Vision file whose audio is TrueHD or DTS-HD MA has to be converted before that lane can play it. The converter always asked for Dolby Digital Plus and settled for AAC when it could not have it, and the Dolby Digital Plus encoder had never been built into the app, so it settled every single time and receivers showed plain multichannel with no Dolby badge. The encoder is now in the build. A 7.1 source folds to 5.1, which is that format's own ceiling. Apple TV, iPhone, iPad, and Mac.
-
-### Fixed
-
-- **Rotating an iPhone or iPad no longer restarts the picture.** Nothing could tell the player engine that the screen had changed shape, so the app made it notice by destroying the whole video pipeline and rebuilding it on every rotation, which is why playback stopped and came back. Our own build now spots the new shape and redraws at the new size with nothing torn down, including while paused. Resizing the player window on Mac gets the same fix. iPhone, iPad, and Mac.
-- **Eight remote switches are read, the foreground refresh runs, and a harmful setting cannot keep the app shut.** Eight feature switches, including every escape hatch covering the Dolby Vision work, were declared but never decoded, so a switch flipped on our side changed nothing on a device. They are decoded now. The foreground refresh had zero call sites, so a device that was never fully quit could hold a stale setting indefinitely; it now runs when the app returns to the front. A setting that is valid but harmful can no longer wedge the app permanently: three consecutive launches that fail to stay responsive discard the cached setting, quarantine it by content hash so a refresh cannot reinstall the same bytes, and boot on the built-in defaults. Two stale baked defaults were also corrected. Apple TV, iPhone, iPad, and Mac.
-- **The core build script writes its xcframework into the repo.** Its output path was relative to the engine checkout, which was only ever correct for the old in-repo layout; with the engine in a sibling checkout it wrote outside the repo, so the documented build sequence produced a green build that silently linked a stale engine. The path is now absolute against the repo root, correct for both layouts.
 
 ## 0.3.14 Beta 8 - 2026-07-23
 
