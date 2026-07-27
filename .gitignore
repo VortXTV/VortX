@@ -90,3 +90,8 @@ app/*.entitlements
 # runtime poster URLCache (PosterImageLoader diskPath)
 app/vortx-images/
 vortx-images/
+
+# Internal coordination docs and history snapshots; never committed
+/dept/
+# Local agent standing orders; never committed
+/AGENTS.md
