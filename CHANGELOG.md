@@ -56,6 +56,16 @@ We also turned on the Dolby Digital Plus encoder, which had never been compiled 
 
 The cost of owning this is real and worth being honest about: nine slices to rebuild, upstream to track, and the two patches to carry forward. The 9.0 move also shipped one regression we caught and fixed inside this release, when certificate verification turned on by default and the build had no certificates to verify against. We keep the verification and ship the certificates now, which is a better place than where we started.
 
+## Moving the app into the backend
+
+A sideloaded app is a pain to update. Unsigned IPAs expire, re-signing is a chore, and every fix we make is worthless until you go through that again. So we are steadily moving VortX's behaviour out of the app and onto our own servers.
+
+The goal is blunt: **as close to 99 percent of what VortX does should be changeable without you installing anything.** When something breaks, we fix it once on our side and every device picks it up, usually within a few minutes of opening the app.
+
+A lot of it already works this way. Ratings, posters and artwork, the skip-intro database, source pooling, the add-on and catalog behaviour, and a growing set of feature switches all come from our own services rather than being baked into the build. This release wired up several more of those switches and made the app pick up changes when you bring it back to the front rather than only after a full quit. It also made a bad setting unable to keep the app shut: after three failed launches it discards what we sent and starts on the settings built into the app.
+
+What cannot move is the part that has to run on your device: the player, the decoder, Dolby Vision, and the engine. Those still need a build. Everything else is heading server-side, and each release moves more of it.
+
 ## Everywhere else
 
 **Apple TV tells the system what you are watching.** Playback registered nothing with tvOS, so the Now Playing card sat empty and no system transport reached VortX. The card now carries the title, show and episode, poster and position, and play, pause, skip and scrubbing all work.
