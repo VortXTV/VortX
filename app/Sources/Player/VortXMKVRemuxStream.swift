@@ -265,6 +265,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
     /// Input stream index -> rendition decoding policy. Remux-thread only and empty with the flag off.
     private var subtitleCollectors: [Int: (renditionID: Int, format: SubtitleRenditionPolicy.TextFormat)] = [:]
+    /// Per-source-stream count of subtitle packets the parser rejected. Diagnostic only.
+    private var subtitleRejectedPackets: [Int: Int] = [:]
     private var subtitleBytesStored: [Int: Int] = [:]
     /// Non-file resident HLS state participates in the same 512 MiB admission ceiling as durable media and
     /// outstanding `.part` reservations through `hlsAuxiliaryAccounting`.
@@ -3506,7 +3508,23 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             payload: payload,
             format: collector.format,
             startSeconds: start,
-            durationSeconds: duration) else { return true }
+            durationSeconds: duration) else {
+            // A rejected payload was previously indistinguishable from "not a subtitle packet": both returned
+            // true with no record, which is how a whole session shipped 51-byte (cue-free) WebVTT documents
+            // while renditions reported healthy and nothing was invalidated. Count the rejections per source
+            // stream and report the first one with its timestamp, so the next diagnostic names the cause
+            // instead of leaving it to inference. Bounded to one log line per stream per session.
+            let priorRejects = subtitleRejectedPackets[inIdx] ?? 0
+            subtitleRejectedPackets[inIdx] = priorRejects + 1
+            if priorRejects == 0 {
+                DiagnosticsLog.log(
+                    "dv",
+                    "subtitle cue REJECTED stream=\(inIdx) format=\(collector.format) "
+                    + "start=\(String(format: "%.3f", start)) dur=\(String(format: "%.3f", duration)) "
+                    + "bytes=\(packetBytes) (first rejection on this stream)")
+            }
+            return true
+        }
 
         let cueBytes = cue.text.utf8.count
         guard SubtitleRenditionPolicy.canStore(existingBytes: stored, incomingBytes: cueBytes) else {
