@@ -95,36 +95,40 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private var highestServedVideoSegmentID = -1
     /// Session-captured window-advancement policy (see `consumptionAnchorEnabled`).
     private let consumptionAnchored = VortXRemuxHLSServer.consumptionAnchorEnabled
-    /// Fully-consumed segments retained in the published window behind the consumption frontier, so the
-    /// playhead (which trails the fetch frontier) and a real back-seek stay inside the window.
+    /// How much MEDIA TIME is retained behind the client's fetch frontier. Time, not a segment count.
     ///
-    /// This was 2 (about 8s at a 4s target duration) and that is far too small, because the fetch frontier
-    /// runs a long way ahead of the playhead. Field diagnostic 2026-07-27 build 198: AVPlayer fetched seg3
-    /// through seg18 in a single burst, so the playhead trailed the frontier by roughly fifteen segments while
-    /// the window retained two. A back-seek therefore clamped to a window start that was AHEAD of the viewer,
-    /// which is why a rewind jumped forward by 30 to 40 seconds instead of going back.
+    /// A count is the wrong unit because segment duration varies by source: the field capture on 2026-07-27
+    /// had a 21 Mbps WEB-DL at 4.00s per segment and a 97 Mbps BluRay remux at 1.17 to 1.58s. Sixteen segments
+    /// is 64 seconds on the first and 22 on the second.
     ///
-    /// Retention is bounded by BYTES as well as count, because segment size varies by an order of magnitude
-    /// between sources: the same capture had a 21 Mbps WEB-DL at about 8MB per 4s segment and a 97 Mbps
-    /// BluRay remux at 14MB for 1.17s. A fixed count would retain about 100MB on one and over a gigabyte on
-    /// the other, and tvOS was already reporting memory warnings at rss 534MB in that session.
-    private static let keepBehindSegments = 16
-    /// Ceiling on retained-behind bytes. Whichever bound binds first wins, so a high-bitrate source keeps
-    /// fewer segments and a modest one keeps the full count.
-    private static let keepBehindMaximumBytes = 96 * 1024 * 1024
+    /// It has to exceed the BUFFER-AHEAD distance, not just cover a rewind. AVPlayer fetches far ahead of the
+    /// playhead: build 199 logged the window starting at sequence 21 while the client had fetched seg37 and
+    /// the playhead was near seg16. The playhead was therefore OUTSIDE the published window, its seekable range
+    /// started ahead of it, and every backward seek clamped to that start. That is the "rewind only goes back
+    /// one second however far I ask" report: the range had no room behind the playhead at all.
+    ///
+    /// 150s covers a typical buffer-ahead plus a real rewind on both shapes above.
+    private static let keepBehindSeconds: Double = 150
+    /// Ceiling on retained-behind bytes. The spool writes segments to DISK and refuses to evict anything a
+    /// published playlist still references, so this bounds disk rather than memory and can be generous. A
+    /// 97 Mbps remux still gets a useful window; a modest source is never truncated by it.
+    private static let keepBehindMaximumBytes = 700 * 1024 * 1024
 
     /// The retained-behind floor for the current frontier, honouring both bounds.
     private func consumptionFloor(frontier: Int, window: VortXHLSWindow) -> Int {
         guard frontier >= 0 else { return frontier }
-        var allowed = 0
+        var seconds = 0.0
         var bytes = 0
+        var floor = frontier
         for segment in window.segments.reversed() where segment.id <= frontier {
+            seconds += segment.duration
             bytes += segment.byteLength
-            if allowed >= Self.keepBehindSegments || bytes > Self.keepBehindMaximumBytes { break }
-            allowed += 1
+            if seconds > Self.keepBehindSeconds || bytes > Self.keepBehindMaximumBytes { break }
+            floor = segment.id
         }
-        return frontier - max(1, allowed)
+        return min(floor, frontier)
     }
+
     private var advertisedSubtitles: [SubtitleRenditionPolicy.Rendition] = []
     private var advertisedDolbyVision = false
     private var engineReady = false
