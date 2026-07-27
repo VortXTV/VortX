@@ -4,6 +4,59 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 9 - 2026-07-27
+
+The Dolby Vision build. Beta 8 could not play a Dolby Vision title through to the end on any file we
+have; this one does, and the reason it could not was four bytes in a header we wrote ourselves.
+
+### Fixed
+
+- **Dolby Vision plays, and keeps playing.** Alongside the Dolby Vision picture the app publishes a
+  plain HDR one as a safety net. That safety net had its Dolby Vision configuration removed but kept
+  the Dolby Vision brand in its header, so it declared a format it did not carry, and the player
+  rejected it within milliseconds every time it was loaded. It was also advertised as the cheaper of
+  the two, so the player preferred the broken one over the working one. The header is corrected, the
+  two are no longer offered side by side inside a single stream, and once a real Dolby Vision picture
+  is on screen the player is held to it. Apple TV.
+- **A Dolby Vision title that needs a moment is no longer killed at ten seconds.** The startup check
+  read whether the remux had attached once, before it could have, then fell into a blind ten second
+  countdown with no progress check. Two of every eight titles were ended that way, one of them a
+  tenth of a second after its first segment was already published and waiting. The check is now
+  re-read on every poll and stamped to the exact playback it belongs to. Apple TV.
+- **Every audio and subtitle track in the file is offered.** A file carrying thirty-nine subtitle
+  languages exposed one. The alternate audio rule additionally required a different language from the
+  main track, so a file with seven English tracks qualified none of them. Both limits are removed.
+  Apple TV.
+- **Rewinding goes back.** Retention behind the playhead was measured in segments behind the point
+  the app had downloaded to, and it downloads far ahead of what is on screen, so the earliest point
+  available to seek was often already ahead of the viewer. Retention is now measured in playing time,
+  two and a half minutes, which covers the download lead and leaves a real window behind it. Apple TV.
+- **Coming back from an episode returns you to that episode.** The page restored whichever episode
+  Continue Watching had recorded, which its own saving can lag behind at the moment a player closes.
+  It now restores the episode that actually played, and refuses an identity from another series.
+  Apple TV.
+- **A failed resume says what really happened.** A seek aborted by the app's own teardown was
+  reported as an unseekable source, which is a different problem with a different fix. The two are
+  now distinguished in the log. Apple TV.
+
+### Added
+
+- **Blu-ray subtitles.** Blu-ray discs store subtitles as pictures rather than text, and nothing in
+  the subtitle path could read a picture, so a Blu-ray remux offered no subtitles of its own at all.
+  Those pictures are now read on the device and become ordinary subtitles, appearing in the normal
+  list with the normal styling and timing adjustment. Recognition is bounded so it cannot slow
+  playback, it is not flawless on stylised or non-Latin type, and a file carrying its own text
+  subtitles still uses those in preference. Apple TV.
+- **Dolby Atmos is carried through.** On a file whose audio is Dolby Digital Plus with Atmos, the
+  Atmos data now reaches the receiver untouched. On a file whose only audio is TrueHD, Apple TV
+  cannot pass that through at any quality, so it is converted and labelled honestly as surround
+  rather than Atmos. Apple TV.
+
+### Known
+
+- Blu-ray subtitle recognition and the rewind window shipped without a device test. If either
+  misbehaves, export the diagnostic log: both now report what they did and what it cost.
+
 ## Unreleased - build 193
 
 A local test build, not a published beta. The version stays 0.3.14 and only the build number moves, so a tester can say which build they are on. Four lanes land together so they can be tried in one pass: a Mac can act as the engine for another device, our own build of the player engine brings the Dolby Vision Profile 7 enhancement layer and a real Dolby Digital Plus encoder, rotating an iPhone or iPad stops restarting the picture, and the remote switches that turn features off are read for the first time.
