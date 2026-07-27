@@ -2,7 +2,7 @@
 // contract, `SourcesShared/TopShelfSnapshot.swift`: the deep-link parser (an OPEN door that any app on
 // the device can push URLs through), the link builder, and the payload's Codable round-trip.
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md), so,
+// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide), so,
 // exactly like app/Tests/StreamRankingChipsTests.swift and app/Tests/HouseholdCryptoTests.swift, this is
 // a self-contained Swift executable that runs directly with the system toolchain.
 //

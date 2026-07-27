@@ -5,7 +5,7 @@
 // the REAL SIMKL wire decode (SourcesShared/SIMKLModels.swift), so the string-vs-int tmdb asymmetry the read
 // path hits is covered end to end.
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md), so this
+// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide), so this
 // follows the ExternalSyncToggleSyncTests / TraktWatchedFoldTests convention: a self-contained executable run
 // with the system toolchain, compiling the REAL sources in. SIMKLWatchedShadow itself pulls in SIMKLService /
 // SIMKLAuth / WatchedIndex and cannot link standalone (exactly why its rules were extracted into the pure

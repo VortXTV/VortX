@@ -1,7 +1,7 @@
 // QRJoinerFlowTests: a standalone, runnable verification of the VortX-account QR sign-in JOINER's
 // decision logic (the loop that drove issue #153: an Apple TV stuck forever on "waiting").
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md),
+// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide),
 // so this is written as a self-contained Swift executable that runs directly with the system toolchain:
 //
 //     swift app/Tests/QRJoinerFlowTests.swift

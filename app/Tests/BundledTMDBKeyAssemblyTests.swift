@@ -1,7 +1,7 @@
 // BundledTMDBKeyAssemblyTests: a standalone, runnable proof that the MASKED bundled TMDB key
 // reassembles to the exact original key.
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md),
+// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide),
 // so this is a self-contained Swift executable that runs directly with the system toolchain:
 //
 //     swift app/Tests/BundledTMDBKeyAssemblyTests.swift

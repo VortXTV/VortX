@@ -1,7 +1,7 @@
 // RatingsDisplayContractTests: a standalone, runnable verification of the ratings DISPLAY decision surface
 // the CEO reported broken across every surface (detail row, posters, ERDB/XRDB, add-on catalog metas).
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md), so,
+// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide), so,
 // exactly like app/Tests/StreamRankingChipsTests.swift, this is a self-contained Swift executable run with
 // the system toolchain:
 //

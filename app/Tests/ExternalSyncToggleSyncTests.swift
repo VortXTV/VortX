@@ -1,7 +1,7 @@
 // ExternalSyncToggleSyncTests: a standalone, runnable verification of the cross-surface carriage for the
 // six Trakt / SIMKL toggles (ExternalSyncToggleSync.swift).
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md), so this
+// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide), so this
 // follows the HouseholdCryptoTests / StreamRankingChipsTests convention: a self-contained executable run with
 // the system toolchain. The REAL ExternalSyncToggleSync.swift is compiled in and is what gets exercised:
 //

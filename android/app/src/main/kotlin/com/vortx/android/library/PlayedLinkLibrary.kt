@@ -17,7 +17,7 @@ import java.net.URLEncoder
  * watched shows up in their library like any catalog item. Android port of
  * `app/SourcesShared/PlayedLinkLibrary.swift`.
  *
- * Hard invariant (CLAUDE.md "Never write app data into libraryItem", + the Apple SavedLinksStore/ProfileSync
+ * Hard invariant (the repository guide "Never write app data into libraryItem", + the Apple SavedLinksStore/ProfileSync
  * note): a raw magnet has no catalog meta id, and injecting a synthetic item into the stremio-core library
  * corrupts account-wide sync for the official Stremio clients. So we ONLY ever add a *resolved* item (a real
  * `tt…` / `tmdb:…` id from Cinemeta), and we add it through the engine's OWN AddToLibrary dispatch

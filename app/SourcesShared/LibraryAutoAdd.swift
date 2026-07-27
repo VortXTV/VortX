@@ -3,7 +3,7 @@ import Foundation
 /// Auto-add-to-Library at ~60s of playback (D8): once the user has genuinely committed to a title (crossed the
 /// ~60s watch tick that also marks progress), add it to the Library automatically so it is one tap away later.
 ///
-/// Invariants (see CLAUDE.md "Per-profile watch history" + "Never write app data into libraryItem"):
+/// Invariants (see the repository guide "Per-profile watch history" + "Never write app data into libraryItem"):
 ///   - MAIN profile (`activeUsesEngineHistory`): add through the ENGINE's AddToLibrary dispatch ONLY
 ///     (`CoreBridge.addToLibrary` / `addCatalogItemToAccount`), which syncs to the account exactly like the
 ///     manual Library button. Never an app-side libraryItem write.
@@ -92,7 +92,7 @@ enum LibraryAutoAdd {
 
     /// A pure app-side "want to watch" flag, kept in the SAME local-overlay style as the auto-added set above:
     /// a per-profile UserDefaults record, engine-safe ids only, and NEVER a write into a `libraryItem` doc or
-    /// any account-parsed schema (the CLAUDE.md invariant that once corrupted official-client sync). So marking
+    /// any account-parsed schema (the the repository guide invariant that once corrupted official-client sync). So marking
     /// a title for later cannot touch the account library or leak between profiles. Records carry the title's
     /// type (and an optional name/poster snapshot) so the Upcoming calendar can route and render each entry
     /// without a second meta lookup. This is intentionally SEPARATE from the Trakt / SIMKL remote watchlists in

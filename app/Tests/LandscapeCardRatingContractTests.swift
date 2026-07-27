@@ -6,7 +6,7 @@
 // client badge (CardRatingBadge, fed by the keyless VortXRatingsClient) whenever the visible art is NOT itself
 // baked.
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md), so,
+// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide), so,
 // exactly like app/Tests/RatingsDisplayContractTests.swift, this is a self-contained Swift executable run with
 // the system toolchain:
 //

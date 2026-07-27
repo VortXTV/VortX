@@ -1,0 +1,1 @@
+/Users/daksh/VortX/core/target/aarch64-linux-android/release/libstremiox_core.so: /Users/daksh/VortX/core/src/android_jni.rs /Users/daksh/VortX/core/src/env.rs /Users/daksh/VortX/core/src/lib.rs /Users/daksh/VortX/core/src/model.rs

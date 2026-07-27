@@ -4,7 +4,7 @@
 // shape (ids only, no rating), and the `/sync/ratings/{type}` read-back decode INCLUDING SIMKL's string-vs-int
 // tmdb asymmetry and its anime-split-from-shows envelope.
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md), so this
+// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide), so this
 // follows the SIMKLWatchedShadowTests / TraktWatchedFoldTests convention: a self-contained executable run with
 // the system toolchain, compiling the REAL sources in. SIMKLRatingsStore itself pulls in SIMKLService /
 // SIMKLAuth and cannot link standalone (exactly why its rules were extracted into the pure SIMKLRatingsCore),

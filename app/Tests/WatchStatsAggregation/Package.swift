@@ -5,7 +5,7 @@ import PackageDescription
 // `app/SourcesShared/WatchStatsAggregation.swift` (symlinked into Sources) with no app / engine
 // dependencies, so the record normalization and the records -> stats aggregation can be unit-tested in
 // isolation. This package is intentionally OUTSIDE the Xcode project (the app itself has no test target,
-// per CLAUDE.md); run it with `swift test` from this directory.
+// per the repository guide); run it with `swift test` from this directory.
 let package = Package(
     name: "WatchStatsAggregation",
     targets: [

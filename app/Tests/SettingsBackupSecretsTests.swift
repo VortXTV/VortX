@@ -1,7 +1,7 @@
 // SettingsBackupSecretsTests: verification that a Keychain fallback secret can never enter the synced
 // settings blob or the user-facing backup export (#145 pre-land, manager items A and B).
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md), so this
+// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide), so this
 // follows the same standalone-executable shape as HouseholdCryptoTests. It differs from that file in one way
 // that matters: HouseholdCryptoTests re-implements the primitives it checks, whereas this COMPILES THE REAL
 // SettingsBackup.swift AND Keychain.swift in. A re-typed copy of a filter would only ever prove the copy is

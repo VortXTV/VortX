@@ -1,7 +1,7 @@
 // AddonPairingReducerTests: a standalone, runnable verification of the tvOS "Install by QR" auto-install
 // contract (INS-260722-04) that tests the SHIPPED reducer directly - no mirror.
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md), so,
+// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide), so,
 // like app/Tests/HouseholdCryptoTests.swift and QRJoinerFlowTests.swift, this runs with the system toolchain.
 // UNLIKE those (which re-implement production logic in a mirror), this COMPILES THE REAL REDUCER FILE and asserts
 // against it, so the "auto-install on ready, install exactly once, fail honestly" rules are proven on the exact

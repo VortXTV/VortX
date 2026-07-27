@@ -21,7 +21,7 @@ import kotlin.math.roundToInt
  * through the account. The Android port of the watch-overlay half of Apple `ProfileStore`
  * (`Profiles.swift`, the "Watch overlay" section).
  *
- * HARD INVARIANT (CLAUDE.md): this is the profile's private store. It writes ONLY into the app-owned
+ * HARD INVARIANT (the repository guide): this is the profile's private store. It writes ONLY into the app-owned
  * per-profile cache key `stremiox.profiles.watch.<id>` (Apple's `watchCacheKey`) and never into a
  * `libraryItem` or any account/engine-parsed schema — that is what keeps official-app library sync from
  * being corrupted (the documented incident). The OWNER profile uses the engine/account library instead

@@ -3,7 +3,7 @@
 // the issue #143 contract that a title watched on Trakt must match its catalog cover by imdb AND by tmdb
 // identity.
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md), so this
+// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide), so this
 // follows the ExternalSyncToggleSyncTests / HouseholdCryptoTests convention: a self-contained executable run
 // with the system toolchain, compiling the REAL source in. WatchedFold.swift is Foundation-only and has
 // no app dependencies, so unlike TraktSyncEngine (which pulls in TraktAuth / TraktService / WatchedIndex and
