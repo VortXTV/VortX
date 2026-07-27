@@ -1,0 +1,101 @@
+name: Approval watch
+
+# Tells someone when a run is sitting on an environment approval instead of building.
+#
+# WHY THIS EXISTS. Beta 9's release build sat in `waiting` on the engine-ci gate for one hour and six
+# minutes while the release page carried notes and no downloads and people asked where the assets
+# were. Nothing was broken: the gate did exactly its job, holding ENGINE_REPO_TOKEN back until a
+# human confirmed. The failure was that the waiting state was invisible. Both the CEO and the agent
+# read "waiting" in a run list as "queued, it will start" rather than "stopped, needs you".
+#
+# The gate is deliberate and stays. This makes it loud.
+#
+# It keeps ONE issue and updates it in place, so a five minute schedule cannot become a notification
+# flood, and it closes that issue once nothing is waiting.
+#
+# INJECTION SAFETY. Run names and branch names come from the API and are attacker-influencable by
+# anyone who can create a branch. Nothing from the API is ever interpolated into a shell string or a
+# `run:` expression: values are written to a file with `jq -r`, and the issue body is assembled with
+# a quoted heredoc that performs no expansion. That is the pattern this file must keep.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_run:
+    workflows: ["Release apps (iOS + tvOS + macOS)"]
+    types: [requested]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  issues: write
+
+concurrency:
+  group: approval-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report runs stopped on an approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TITLE: "Action needed: a release build is waiting for approval"
+        run: |
+          set -uo pipefail
+
+          # jq writes the list; the shell never parses a name or a branch.
+          gh api "repos/$REPO/actions/runs?status=waiting&per_page=20" \
+            --jq '.workflow_runs[] | "- **\(.name)** on `\(.head_branch)`\n  \(.html_url)"' \
+            > waiting.txt 2>/dev/null || : > waiting.txt
+
+          EXISTING="$(gh issue list --repo "$REPO" --state open --search "$TITLE in:title" \
+            --json number --jq '.[0].number' 2>/dev/null || true)"
+
+          if [ ! -s waiting.txt ]; then
+            if [ -n "$EXISTING" ]; then
+              gh issue close "$EXISTING" --repo "$REPO" \
+                --comment "Nothing is waiting for approval any more. Closing." >/dev/null 2>&1 || true
+              echo "cleared: closed issue #$EXISTING"
+            else
+              echo "nothing waiting"
+            fi
+            exit 0
+          fi
+
+          {
+            cat <<'HEAD'
+          One or more runs are STOPPED on an environment approval. They are not queued and will not
+          start on their own.
+
+          HEAD
+            cat waiting.txt
+            cat <<'TAIL'
+
+          **To release them:** open the run above and click *Review deployments*.
+
+          From the command line, read the environment id first, then approve it:
+
+          ```
+          gh api repos/OWNER/REPO/actions/runs/RUN_ID/pending_deployments
+          printf '{"environment_ids":[ENV_ID],"state":"approved","comment":"approved"}' > /tmp/a.json
+          gh api -X POST repos/OWNER/REPO/actions/runs/RUN_ID/pending_deployments --input /tmp/a.json
+          ```
+
+          The gate is deliberate and should stay. That job holds ENGINE_REPO_TOKEN in the same job
+          that executes repo-controlled build scripts, so it waits for a human before private engine
+          source is reachable. This issue exists so the wait is visible, not so the gate is removed.
+
+          This issue updates in place and closes itself when nothing is waiting.
+          TAIL
+          } > body.md
+
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --repo "$REPO" --body-file body.md >/dev/null
+            echo "updated issue #$EXISTING"
+          else
+            gh issue create --repo "$REPO" --title "$TITLE" --body-file body.md >/dev/null
+            echo "opened a new issue"
+          fi
