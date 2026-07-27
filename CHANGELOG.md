@@ -52,10 +52,25 @@ have; this one does, and the reason it could not was four bytes in a header we w
   cannot pass that through at any quality, so it is converted and labelled honestly as surround
   rather than Atmos. Apple TV.
 
-### Known
+### Known issues
 
-- Blu-ray subtitle recognition and the rewind window shipped without a device test. If either
-  misbehaves, export the diagnostic log: both now report what they did and what it cost.
+- **Play from start from inside the player does not work.** The detail page button is fine; the one
+  in the player controls is not.
+- **Recognised Blu-ray subtitles render larger than they should.** They read correctly; a sizing pass
+  is next.
+- **A Blu-ray disc offers fewer recognised languages on the Dolby Vision lane than on the built-in
+  player.** The built-in player reads the disc's pictures directly and can show any of them; the
+  Dolby Vision lane recognises a bounded number of tracks so recognition can never slow playback.
+
+### Android
+
+Android is a separate from-scratch app on the same engine, not a port. It is roughly a third of the
+way to matching the Apple app: about 42,000 lines against 153,000, with 5 of 15 build sessions done.
+The foundation is complete, meaning the engine runs natively with catalogs, library, search,
+discover, account sync, add-on management, series and episode state and Continue Watching. Next is
+the player: source ranking, then ExoPlayer, then mpv as primary. Until that lands Android browses
+everything and plays very little, which is why it is not promoted alongside the Apple builds. The
+current Android build remains Beta 6 and is unchanged by this release.
 
 ## Unreleased - build 193
 
