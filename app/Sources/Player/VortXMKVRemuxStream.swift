@@ -267,6 +267,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var subtitleCollectors: [Int: (renditionID: Int, format: SubtitleRenditionPolicy.TextFormat)] = [:]
     /// Per-source-stream count of subtitle packets the parser rejected. Diagnostic only.
     private var subtitleRejectedPackets: [Int: Int] = [:]
+    /// Per-source-stream count of subtitle packets that REACHED the collector. Paired with the
+    /// rejection count this separates "the demuxer delivered nothing" from "the parser refused
+    /// everything", which static reading cannot distinguish and which decides the whole fix.
+    private var subtitleArrivedPackets: [Int: Int] = [:]
     private var subtitleBytesStored: [Int: Int] = [:]
     /// Non-file resident HLS state participates in the same 512 MiB admission ceiling as durable media and
     /// outstanding `.part` reservations through `hlsAuxiliaryAccounting`.
@@ -716,6 +720,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // Every guard/early return, cancellation, demotion and successful EOF reaches the real producer-terminal
         // edge only as this remux thread unwinds. Cancellation itself merely requests abort and cannot claim it.
         defer {
+            let arrived = subtitleArrivedPackets.values.reduce(0, +)
+            let rejected = subtitleRejectedPackets.values.reduce(0, +)
+            let stored = _subtitleCues.reduce(0) { $0 + $1.count }
+            if !subtitleCollectors.isEmpty || arrived > 0 || stored > 0 {
+                DiagnosticsLog.log(
+                    "dv",
+                    "subtitle cue tally: arrived=\(arrived) rejected=\(rejected) stored=\(stored) "
+                    + "collectors=\(subtitleCollectors.count) valid=\(_subtitleSettlement.isValid)")
+            }
             releaseHLSParserOpenClaim()
             hlsSpool?.producerDidTerminate()
         }
@@ -3480,6 +3493,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                                        inputStream: UnsafeMutablePointer<AVStream>,
                                        inIdx: Int) -> Bool {
         guard let collector = subtitleCollectors[inIdx] else { return false }
+        subtitleArrivedPackets[inIdx] = (subtitleArrivedPackets[inIdx] ?? 0) + 1
         hlsLock.lock(); let settlementValid = _subtitleSettlement.isValid; hlsLock.unlock()
         guard settlementValid else { return true }
 
