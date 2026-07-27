@@ -6,71 +6,93 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.3.14 Beta 9 - 2026-07-27
 
-The Dolby Vision build. Beta 8 could not play a Dolby Vision title through to the end on any file we
-have; this one does, and the reason it could not was four bytes in a header we wrote ourselves.
+The biggest release since 0.3.14 opened. A Mac can now do the heavy work for an Apple TV, the built-in player finally reads the second picture layer of a 4K Blu-ray rip, Dolby Vision plays through to the end instead of falling to HDR10, Atmos reaches your receiver, and Blu-ray subtitles work for the first time.
 
-### Fixed
+## Let a Mac be the engine
 
-- **Dolby Vision plays, and keeps playing.** Alongside the Dolby Vision picture the app publishes a
-  plain HDR one as a safety net. That safety net had its Dolby Vision configuration removed but kept
-  the Dolby Vision brand in its header, so it declared a format it did not carry, and the player
-  rejected it within milliseconds every time it was loaded. It was also advertised as the cheaper of
-  the two, so the player preferred the broken one over the working one. The header is corrected, the
-  two are no longer offered side by side inside a single stream, and once a real Dolby Vision picture
-  is on screen the player is held to it. Apple TV.
-- **A Dolby Vision title that needs a moment is no longer killed at ten seconds.** The startup check
-  read whether the remux had attached once, before it could have, then fell into a blind ten second
-  countdown with no progress check. Two of every eight titles were ended that way, one of them a
-  tenth of a second after its first segment was already published and waiting. The check is now
-  re-read on every poll and stamped to the exact playback it belongs to. Apple TV.
-- **Every audio and subtitle track in the file is offered.** A file carrying thirty-nine subtitle
-  languages exposed one. The alternate audio rule additionally required a different language from the
-  main track, so a file with seven English tracks qualified none of them. Both limits are removed.
-  Apple TV.
-- **Rewinding goes back.** Retention behind the playhead was measured in segments behind the point
-  the app had downloaded to, and it downloads far ahead of what is on screen, so the earliest point
-  available to seek was often already ahead of the viewer. Retention is now measured in playing time,
-  two and a half minutes, which covers the download lead and leaves a real window behind it. Apple TV.
-- **Coming back from an episode returns you to that episode.** The page restored whichever episode
-  Continue Watching had recorded, which its own saving can lag behind at the moment a player closes.
-  It now restores the episode that actually played, and refuses an identity from another series.
-  Apple TV.
-- **A failed resume says what really happened.** A seek aborted by the app's own teardown was
-  reported as an unseekable source, which is a different problem with a different fix. The two are
-  now distinguished in the log. Apple TV.
+**Turn on the engine on a Mac, pair an Apple TV to it with a six digit code, and the Mac does the container and file work while the Apple TV spends its whole chip decoding and showing the picture.** Video is copied across untouched, never re-encoded, so Dolby Vision stays true Dolby Vision and the picture is identical. Because the Mac has room to hold the whole film instead of a small moving window, you can seek anywhere, backwards as well as forwards, which the Apple TV cannot do alone. VortX finds the Mac on your network by itself, or you can type its address for setups like Tailscale, and nothing is shared until you pair. If the Mac sleeps, quits, or leaves the network mid-film, playback carries on where it was. The Mac can run the engine with no window open. Off by default, and nothing changes for anyone without a Mac.
 
-### Added
+The protocol underneath is plain HTTP and JSON with a bearer token and no Apple-specific types in it, so the Android and desktop clients can implement the same thing later.
 
-- **Blu-ray subtitles.** Blu-ray discs store subtitles as pictures rather than text, and nothing in
-  the subtitle path could read a picture, so a Blu-ray remux offered no subtitles of its own at all.
-  Those pictures are now read on the device and become ordinary subtitles, appearing in the normal
-  list with the normal styling and timing adjustment. Recognition is bounded so it cannot slow
-  playback, it is not flawless on stylised or non-Latin type, and a file carrying its own text
-  subtitles still uses those in preference. Apple TV.
-- **Dolby Atmos is carried through.** On a file whose audio is Dolby Digital Plus with Atmos, the
-  Atmos data now reaches the receiver untouched. On a file whose only audio is TrueHD, Apple TV
-  cannot pass that through at any quality, so it is converted and labelled honestly as surround
-  rather than Atmos. Apple TV.
+## Dolby Vision
+
+**Dolby Vision plays, and keeps playing.** Alongside the Dolby Vision picture the app publishes a plain HDR one as a safety net. That safety net had its Dolby Vision configuration stripped out but kept the Dolby Vision brand in its header, so it announced a format it was not carrying, and the player threw it out within milliseconds every time it loaded it. It was also advertised as the cheaper of the two, so the player actively preferred the broken one over the working one. Nine times out of nine that safety net was loaded, playback died before a single frame was requested. The header is corrected, the two are no longer offered side by side inside one stream, and once a real Dolby Vision picture is on screen the player is held to it.
+
+**Profile 7 files keep their second picture layer on the built-in player.** Most 4K Blu-ray Dolby Vision rips carry the picture as a base track plus an enhancement layer holding the detail in the brightest highlights and deepest shadows. On the built-in player that second track was thrown away unread and the picture was flattened to ordinary HDR with no Dolby Vision information at all. We now build our own player engine from pinned upstream sources, and it pairs the two tracks and combines them the way the format intends.
+
+**A title that needs a moment is no longer killed at ten seconds.** The startup check asked whether the file was ready once, before it could have been, then fell into a blind ten second countdown with no further checking. Two of every eight titles were ended that way, one a tenth of a second after its first piece of video was already prepared and waiting.
+
+**Dolby Vision no longer flickers before it settles, and starts at the beginning.** Repeated identical display-mode requests are ignored, so the HDMI link renegotiates once instead of several times. Titles also start where you asked instead of about fourteen seconds in.
+
+## Audio
+
+**Dolby Atmos reaches your receiver.** On a file whose audio is Dolby Digital Plus with Atmos, the Atmos data is carried through untouched. On a file whose only audio is TrueHD, Apple TV cannot pass that through at any quality, so it is converted and the badge honestly says surround rather than Atmos.
+
+**Dolby Digital Plus is actually produced now.** A Dolby Vision file with TrueHD or DTS-HD MA audio has to be converted before that lane can play it. The converter always asked for Dolby Digital Plus and settled for AAC when it could not have it, and that encoder had never been built into the app, so it settled every single time. It is in the build now.
+
+**Every audio track in the file is offered.** The rule for alternate audio demanded a different language from the main track, so a file with seven English tracks qualified none of them and the audio menu had nothing to pick.
+
+## Subtitles
+
+**Blu-ray subtitles work for the first time.** Blu-ray discs store subtitles as pictures rather than text, and nothing in the subtitle path could read a picture, so a Blu-ray remux offered no subtitles of its own at all. Those pictures are now read on the device and turned into ordinary subtitles, appearing in the normal list with the normal styling and timing adjustment. Recognition is bounded so it can never slow playback, it is not flawless on stylised or non-Latin type, and a file carrying its own text subtitles still uses those first.
+
+**Every subtitle track in the file is offered.** A file carrying thirty-nine subtitle languages used to show one.
+
+## We build our own player engine now
+
+This is the piece of the release we are proudest of, and it is what made everything above possible.
+
+VortX used to take the player engine as a prebuilt package, which meant taking whatever version that package happened to ship and waiting for someone else when it lagged. It no longer does. We build the whole stack ourselves from pinned upstream sources: mpv, libplacebo and FFmpeg, nine slices across Apple TV, iPhone, iPad and Mac, with two patches of our own on top.
+
+**Our mpv is 895 commits ahead of the last upstream release.** Not a fork that drifted, a deliberate pin to master because the Dolby Vision enhancement-layer work we needed lives there and has not been released yet. Waiting for it would have meant waiting months.
+
+**libplacebo is built from source at API 371 rather than the 360 the prebuilt package carried.** That one matters more than it looks: mpv's enhancement-layer support is compiled out entirely below API 367, silently, with a perfectly green build. Bumping mpv alone would have produced a build that looked correct and did nothing. Both had to move together, and finding that out cost real time.
+
+**FFmpeg moved to the 9.0 release line.** That is what unlocks the Dolby Vision splitter needed for single-track Profile 7 files, which simply does not exist in the version we were on.
+
+**Two patches are ours.** One carries the Dolby Vision enhancement-layer work through the packaging our Apple builds need. The other makes the render surface notice when it has been resized, which is why rotating a phone no longer tears down and rebuilds the entire video pipeline.
+
+We also turned on the Dolby Digital Plus encoder, which had never been compiled in, so the converter that always asked for it stopped silently settling for AAC.
+
+The cost of owning this is real and worth being honest about: nine slices to rebuild, upstream to track, and the two patches to carry forward. The 9.0 move also shipped one regression we caught and fixed inside this release, when certificate verification turned on by default and the build had no certificates to verify against. We keep the verification and ship the certificates now, which is a better place than where we started.
+
+## Everywhere else
+
+**Apple TV tells the system what you are watching.** Playback registered nothing with tvOS, so the Now Playing card sat empty and no system transport reached VortX. The card now carries the title, show and episode, poster and position, and play, pause, skip and scrubbing all work.
+
+**Rewinding goes back.** The player was only offered a few seconds of film behind wherever it had downloaded to, and it downloads a long way ahead of what you are watching, so the earliest point it would return to was often already ahead of you. It now holds two and a half minutes of playing time behind you.
+
+**Coming back from an episode returns you to that episode.** The page trusted whatever Continue Watching had got round to saving rather than what actually played.
+
+**Signing in with the QR code works.** The code pointed at a link that opens the home page, so scanning appeared to do nothing. It now opens the approve page, and that page no longer loses your request when you sign in.
+
+**Settings we send reach you, and a bad one cannot keep the app shut.** Several of the switches we use to turn a feature off without shipping a build were never read by the app. They are read now, they refresh when you bring the app back to the front, and a setting that stops the app opening is discarded after three attempts.
+
+**Ratings sit on the artwork like they belong there.** On landscape cards the badge is one piece of the app's own frosted glass, with the score leading and the other services following a hairline rule.
+
+**Rotating your phone no longer restarts the picture.** Our own build of the player engine notices the new shape and redraws instead of tearing the whole pipeline down. Resizing the Mac player window gets the same fix.
+
+In-place update over Beta 8, nothing resets.
 
 ### Known issues
 
-- **Play from start from inside the player does not work.** The detail page button is fine; the one
-  in the player controls is not.
-- **Recognised Blu-ray subtitles render larger than they should.** They read correctly; a sizing pass
-  is next.
-- **A Blu-ray disc offers fewer recognised languages on the Dolby Vision lane than on the built-in
-  player.** The built-in player reads the disc's pictures directly and can show any of them; the
-  Dolby Vision lane recognises a bounded number of tracks so recognition can never slow playback.
+- **Play from start, from inside the player, does not work.** The button on the detail page is fine; the one in the player controls is not.
+- **Recognised Blu-ray subtitles render larger than they should.** They read correctly; a sizing pass is next.
+- **A Blu-ray disc offers fewer recognised languages on the Dolby Vision lane than on the built-in player.** The built-in player reads the disc's pictures directly and can show any of them; the Dolby Vision lane recognises a bounded number so recognition can never slow playback.
 
 ### Android
 
-Android is a separate from-scratch app on the same engine, not a port. It is roughly a third of the
-way to matching the Apple app: about 42,000 lines against 153,000, with 5 of 15 build sessions done.
-The foundation is complete, meaning the engine runs natively with catalogs, library, search,
-discover, account sync, add-on management, series and episode state and Continue Watching. Next is
-the player: source ranking, then ExoPlayer, then mpv as primary. Until that lands Android browses
-everything and plays very little, which is why it is not promoted alongside the Apple builds. The
-current Android build remains Beta 6 and is unchanged by this release.
+**A fully functional Android app matching the Apple app feature for feature is landing this August.**
+
+Android is a separate, from-scratch app on the same Rust engine, not a port. Today it is roughly a third of the way there: about 42,000 lines against the Apple app's 153,000, with 5 of 15 build sessions finished.
+
+**Done:** the foundation, and it is real. The engine runs natively with the same catalogs, library, search, discover and account sync the Apple app uses. Add-ons install and manage. Titles, series, seasons, episodes, watched state and Continue Watching all work. The design system is in place across phones, tablets and foldables, and appearance, tab-bar, debrid-key and remote-config layers landed this cycle.
+
+**Next, and it is the one that matters:** the player. Source ranking, then ExoPlayer, then mpv as the primary engine, then torrents. Until that lands Android browses everything and plays very little, which is why it is not promoted alongside the Apple builds yet.
+
+**Then:** settings and profiles, Live TV, backup and import, and Android TV shipping as the same APK rather than a separate one.
+
+The published Android build remains Beta 6 and is unchanged by this release. The August target is the whole thing at parity, not a staged trickle.
 
 ## Unreleased - build 193
 

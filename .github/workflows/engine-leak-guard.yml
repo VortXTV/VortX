@@ -186,3 +186,11 @@ jobs:
           [ "$rc" -le 1 ] || { echo "::error::marker sweep failed (rc=$rc)"; exit 1; }
           [ "$rc" -eq 0 ] || { echo "::error::Files declaring the proprietary licence or closed-source header are present on the default branch."; exit 1; }
           echo "clean: no proprietary content markers"
+
+      - name: Tooling reference guard
+        # A second gate behind the local pre-push hook, because a hook lives on one machine and can be
+        # skipped with --no-verify. This one cannot be.
+        run: |
+          chmod +x scripts/tooling-reference-guard.sh
+          ./scripts/tooling-reference-guard.sh "${{ github.event.before }}..${{ github.sha }}" || \
+          ./scripts/tooling-reference-guard.sh
