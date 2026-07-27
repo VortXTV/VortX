@@ -190,7 +190,30 @@ jobs:
       - name: Tooling reference guard
         # A second gate behind the local pre-push hook, because a hook lives on one machine and can be
         # skipped with --no-verify. This one cannot be.
+        # Values reach the shell through env, never interpolated into `run:`. These two are
+        # GitHub-generated commit SHAs rather than attacker-authored text, so this is convention
+        # rather than a live hole, but the convention is what keeps the next edit safe.
+        env:
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
         run: |
           chmod +x scripts/tooling-reference-guard.sh
-          ./scripts/tooling-reference-guard.sh "${{ github.event.before }}..${{ github.sha }}" || \
-          ./scripts/tooling-reference-guard.sh
+          # Decide WHICH invocation is valid before running one, and run exactly one.
+          #
+          # This used to read `guard "$BEFORE..$SHA" || guard`, meaning to fall back to a rangeless
+          # scan when the range was unusable (a branch's first push sends an all-zero `before`, and
+          # `before` can name an object this checkout does not have). But `||` cannot tell "the range
+          # was invalid" from "the range contained a violation": a DETECTED commit-message leak took
+          # the fallback, the fallback found no upstream and so skipped the commit check entirely,
+          # and the step exited 0. The guard reported clean on exactly the thing it exists to catch.
+          #
+          # A guard must never have a path where finding something makes it pass.
+          if [ -n "$BEFORE" ] \
+             && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "scanning pushed range ${BEFORE}..${SHA}"
+            ./scripts/tooling-reference-guard.sh "${BEFORE}..${SHA}"
+          else
+            echo "::warning::pushed range unusable (before='${BEFORE}'); commit messages and identities in this push are NOT being checked, only tracked content and paths"
+            ./scripts/tooling-reference-guard.sh
+          fi
