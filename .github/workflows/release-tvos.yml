@@ -323,6 +323,29 @@ jobs:
           VORTX_ENGINE_DIR: vortx-core
         run: ./scripts/build-ffi-xcframework.sh
 
+      # The self-built player stack. `app/Vendor/MPVKit-DVFEL/artifacts/` is gitignored and reproducing it
+      # needs a multi-hour nine-slice source build, so CI fetches the prebuilt xcframeworks the same way it
+      # fetches NodeMobile. Beta 9's release run failed without this: SwiftPM reported "does not contain a
+      # binary artifact" for all nine local binary targets, and it failed at the SIMULATOR smoke test, which
+      # runs BEFORE the build, so nothing was produced at all.
+      - name: Fetch the MPVKit-DVFEL artifacts (pinned, sha256-verified)
+        run: |
+          set -euo pipefail
+          DEST="app/Vendor/MPVKit-DVFEL"
+          EXPECTED="6b22848743a9744dc4d61edadf6ae82eac583ea6802e2d154f4a6fbc9aa03fc1"
+          curl -sfL -o /tmp/mpvkit.zip \
+            "https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-1/mpvkit-dvfel-artifacts.zip"
+          ACTUAL="$(shasum -a 256 /tmp/mpvkit.zip | cut -d' ' -f1)"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::MPVKit artifact checksum mismatch. expected $EXPECTED got $ACTUAL"
+            exit 1
+          fi
+          rm -rf "$DEST/artifacts"
+          unzip -q /tmp/mpvkit.zip -d "$DEST"
+          test -d "$DEST/artifacts/Libmpv-GPL.xcframework/tvos-arm64_x86_64-simulator" \
+            || { echo "::error::tvOS simulator slice missing after unpack"; exit 1; }
+          echo "MPVKit-DVFEL artifacts in place: $(ls "$DEST/artifacts" | wc -l | tr -d ' ') xcframeworks"
+
       - name: Generate the Xcode project
         run: cd app && xcodegen generate
 
