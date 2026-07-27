@@ -92,7 +92,7 @@ enum LibraryAutoAdd {
 
     /// A pure app-side "want to watch" flag, kept in the SAME local-overlay style as the auto-added set above:
     /// a per-profile UserDefaults record, engine-safe ids only, and NEVER a write into a `libraryItem` doc or
-    /// any account-parsed schema (the the repository guide invariant that once corrupted official-client sync). So marking
+    /// any account-parsed schema (the repository guide invariant that once corrupted official-client sync). So marking
     /// a title for later cannot touch the account library or leak between profiles. Records carry the title's
     /// type (and an optional name/poster snapshot) so the Upcoming calendar can route and render each entry
     /// without a second meta lookup. This is intentionally SEPARATE from the Trakt / SIMKL remote watchlists in
