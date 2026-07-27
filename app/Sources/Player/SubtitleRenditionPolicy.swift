@@ -33,6 +33,11 @@ enum SubtitleRenditionPolicy {
     enum TextFormat: Equatable, Sendable {
         /// SubRip. The demuxer hands over the cue text itself, which may carry `<i>`/`<b>`/`<u>` markup that
         /// WebVTT understands unchanged.
+        /// HDMV PGS: BluRay bitmap subtitles, recognised to text by VortXPGSSubtitleOCR before they reach
+        /// this policy. By the time a payload carries this format it is already UTF-8 text, so the cue path
+        /// treats it exactly like plain text. The case exists so `renditions(from:)` can rank a source's own
+        /// text tracks ahead of recognised ones.
+        case pgs
         case subRip
         /// ASS/SSA. The demuxer hands over ONE dialogue line's fields without the `Dialogue:` keyword and
         /// without timing: `ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text`.
@@ -384,7 +389,7 @@ enum SubtitleRenditionPolicy {
             raw = unwrapped
         case .ass:
             raw = assDialogueText(decodeUTF8(payload))
-        case .subRip, .webVTT, .plainText:
+        case .subRip, .webVTT, .plainText, .pgs:
             raw = decodeUTF8(payload)
         }
         // ASS override blocks and escapes appear inside SRT payloads too (rips convert one to the other and

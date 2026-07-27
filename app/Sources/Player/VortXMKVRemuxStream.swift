@@ -278,6 +278,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// rejection count this separates "the demuxer delivered nothing" from "the parser refused
     /// everything", which static reading cannot distinguish and which decides the whole fix.
     private var subtitleArrivedPackets: [Int: Int] = [:]
+    /// PGS recognition switch. Defaults ON: without it a BluRay remux has no subtitles at all. The key
+    /// exists so a device that cannot afford the recognition cost can turn it off without a build.
+    static var pgsRecognitionEnabled: Bool {
+        if UserDefaults.standard.object(forKey: "vortx.pgsSubtitleOCR") != nil {
+            return UserDefaults.standard.bool(forKey: "vortx.pgsSubtitleOCR")
+        }
+        return true
+    }
+    /// Lazily created: a source with no PGS track never allocates a decoder or touches Vision.
+    private lazy var pgsOCR = VortXPGSSubtitleOCR()
     private var subtitleBytesStored: [Int: Int] = [:]
     /// Non-file resident HLS state participates in the same 512 MiB admission ceiling as durable media and
     /// outstanding `.part` reservations through `hlsAuxiliaryAccounting`.
@@ -734,7 +744,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 DiagnosticsLog.log(
                     "dv",
                     "subtitle cue tally: arrived=\(arrived) rejected=\(rejected) stored=\(stored) "
-                    + "collectors=\(subtitleCollectors.count) valid=\(_subtitleSettlement.isValid)")
+                    + "collectors=\(subtitleCollectors.count) valid=\(_subtitleSettlement.isValid) "
+                    + pgsOCR.summary)
             }
             releaseHLSParserOpenClaim()
             hlsSpool?.producerDidTerminate()
@@ -3454,6 +3465,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         case AV_CODEC_ID_MOV_TEXT: return .movText
         case AV_CODEC_ID_WEBVTT: return .webVTT
         case AV_CODEC_ID_TEXT: return .plainText
+        // BluRay bitmap subtitles. Accepted only when recognition is available, because the cue text is
+        // produced by VortXPGSSubtitleOCR rather than handed over by the demuxer. A BluRay remux carries
+        // nothing else, so refusing this is what made those discs show zero subtitle tracks.
+        case AV_CODEC_ID_HDMV_PGS_SUBTITLE: return Self.pgsRecognitionEnabled ? .pgs : nil
         default: return nil
         }
     }
@@ -3528,7 +3543,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             ? -1 : Double(timestamp) * Double(timeBase.num) / Double(timeBase.den)
         let duration = packet.pointee.duration > 0
             ? Double(packet.pointee.duration) * Double(timeBase.num) / Double(timeBase.den) : 0
-        let payload = Data(bytes: bytes, count: packetBytes)
+        // A PGS packet carries pixels, not text. Recognise it first; the rest of this function then
+        // treats the result exactly like any other text cue, which is what lets a recognised BluRay
+        // track become an ordinary WebVTT rendition with styling and delay support.
+        let payload: Data
+        if collector.format == .pgs {
+            guard let codecpar = inputStream.pointee.codecpar,
+                  let text = pgsOCR.recognise(packet: packet,
+                                              parameters: codecpar,
+                                              streamIndex: inIdx),
+                  let encoded = text.data(using: .utf8) else { return true }
+            payload = encoded
+        } else {
+            payload = Data(bytes: bytes, count: packetBytes)
+        }
         guard let cue = SubtitleRenditionPolicy.cue(
             payload: payload,
             format: collector.format,
