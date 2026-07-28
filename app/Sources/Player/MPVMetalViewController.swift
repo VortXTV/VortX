@@ -32,6 +32,55 @@ private final class WakeupRelay {
     init(_ controller: MPVMetalViewController) { self.controller = controller }
 }
 
+/// Mutable Core Image and receipt state confined to one explicit serial capture queue.
+/// The precondition turns an accidental future cross-queue access into a development failure.
+private final class CaptureQueueState: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private var ciContext: CIContext?
+    private var ciContextDevice: ObjectIdentifier?
+    private var receiptKey: String?
+
+    init(queue: DispatchQueue) {
+        self.queue = queue
+    }
+
+    func prepare(for texture: MTLTexture) -> (context: CIContext, shouldEmitReceipt: Bool) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        let deviceID = ObjectIdentifier(texture.device)
+        let context: CIContext
+        if let existing = ciContext, ciContextDevice == deviceID {
+            context = existing
+        } else {
+            let replacement = CIContext(mtlDevice: texture.device)
+            ciContext = replacement
+            ciContextDevice = deviceID
+            receiptKey = nil
+            context = replacement
+        }
+
+        let nextReceiptKey = "\(texture.width)x\(texture.height)-\(texture.pixelFormat.rawValue)"
+        let shouldEmitReceipt = receiptKey != nextReceiptKey
+        receiptKey = nextReceiptKey
+        return (context, shouldEmitReceipt)
+    }
+}
+
+#if os(tvOS)
+/// Thread-safe admission gate between mpv's serial event queue and the main-actor memory policy.
+private final class TVOSMemorySampleThrottle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastSample: TimeInterval = 0
+
+    func shouldSchedule(now: TimeInterval, interval: TimeInterval) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard now - lastSample >= interval else { return false }
+        lastSample = now
+        return true
+    }
+}
+#endif
+
 final class MPVMetalViewController: PlatformViewController {
     var metalLayer = MetalLayer()
     var mpv: OpaquePointer!
@@ -49,13 +98,10 @@ final class MPVMetalViewController: PlatformViewController {
         return loadProvenance.activeToken
     }
     private lazy var captureQueue = DispatchQueue(label: "com.stremiox.trickplay.capture", qos: .utility)
-    // Initialized on first capture using the same MTLDevice mpv renders into. Always accessed from
-    // captureQueue (serial), so no lock is needed.
-    private var ciContext: CIContext?
-    // Tracks the last drawable size and format for which captureTexture was created, so that
-    // updateCapturePipeline() is a no-op when called from captureFrameJPEGData every 10 s.
-    private var capturePipelineSize: CGSize = .zero
-    private var capturePipelineFormat: MTLPixelFormat = .invalid
+    private lazy var captureQueueState = CaptureQueueState(queue: captureQueue)
+    // Tracks the Metal device for which the capture queue/scaler were built. Drawable size and format
+    // are handled lazily inside MetalLayer because the bounded target follows each capture request.
+    private var capturePipelineDevice: ObjectIdentifier?
     var playUrl: URL?
     var playHeaders: [String: String]?
     var playUrlLive = false
@@ -98,6 +144,13 @@ final class MPVMetalViewController: PlatformViewController {
     /// not re-raise the cap, because the pressure that fired the warning is usually still there. Reset on
     /// the next loadFile (a new file starts with its buffers freed and gets its normal budget back).
     private var memoryCacheClamped = false
+    #if os(tvOS)
+    /// Nonisolated because the locked helper is the boundary between mpv's event queue and main actor.
+    private nonisolated let proactiveMemorySampleThrottle = TVOSMemorySampleThrottle()
+    /// Main-thread transition state. A pressure clamp is one-way for this file, so cache size never flaps.
+    private var proactiveMemoryCacheClamped = false
+    private var lastProactiveMemoryReceipt: TimeInterval = 0
+    #endif
     /// The dynamic range currently applied to the output chain (mpv transfer curve, Metal layer
     /// colorspace, and on tvOS the display mode), or nil = "unknown, force a fresh apply". Reset to nil on
     /// every file load and teardown so the FIRST re-evaluation of a new file always applies (the guard
@@ -1167,13 +1220,20 @@ final class MPVMetalViewController: PlatformViewController {
             #if os(macOS)
             readAhead = isLocalStream ? "128MiB" : "512MiB"
             #else
-            // iOS/tvOS run the streaming server IN-PROCESS and are jetsam-bound. Crucially, on iOS the node
-            // server's reported RSS INCLUDES this mpv demuxer cache (same process), so a big read-ahead is
-            // counted twice toward the jetsam ceiling AND grows even on DEBRID (direct CDN) playback, which
-            // is why the server "dies" on debrid, not just torrents. A 128 MiB read-ahead (down from 256)
-            // is still ample for a fast debrid link and shaves ~128 MiB off the peak; the Mac (out-of-process
-            // server + swap) keeps the larger buffer for slow-CDN resilience.
-            readAhead = isLocalStream ? "96MiB" : "256MiB"   // owner-raised remote base 128 -> 256 (ATV 4K has headroom); Streaming-cache lifts it further
+            // iOS/tvOS run the streaming server IN-PROCESS and are jetsam-bound. Crucially, the node
+            // server's reported RSS INCLUDES this mpv demuxer cache (same process), so a big read-ahead
+            // contributes directly to the process ceiling even on DEBRID playback. tvOS uses 128 MiB
+            // below; iOS keeps its existing 256 MiB baseline. The Mac keeps a larger buffer because its
+            // server and swap model are different.
+            #if os(tvOS)
+            // Build 199/200 field logs reached about 1.0-1.2 GiB RSS with a 256 MiB remote cache while
+            // libmpv was also decoding and capturing 4K frames. Keep useful read-ahead, but return tvOS
+            // to the 128 MiB baseline. The applied-cap policy below keeps this ceiling even when the
+            // disk-cache setting is enabled.
+            readAhead = isLocalStream ? "96MiB" : "128MiB"
+            #else
+            readAhead = isLocalStream ? "96MiB" : "256MiB"
+            #endif
             #endif
         }
         // With the on-disk cache armed (Settings → Streaming cache) we lift `demuxer-max-bytes` for a
@@ -1182,17 +1242,19 @@ final class MPVMetalViewController: PlatformViewController {
         // reliably move it to the Caches dir on this MPVKit build, so the budget is held in RAM. Setting
         // it to the full disk budget (hundreds of MB to GBs) jetsam-killed the Apple TV ~47s in, with the
         // buffer ~800s / ~700MB ahead, even on the 3 GB ATV 4K. So clamp the APPLIED value to a device-safe
-        // RAM ceiling: the chosen cache size can lift the buffer above the proven default, but never past
-        // what the device survives. demuxer-max-bytes is a hard byte cap, so it bounds RAM regardless of
-        // bitrate or whether cache-on-disk offloads. (A LOCAL torrent buffers into the embedded server's
-        // own disk cache, and live owns its tight buffers, so those keep the RAM-safe read-ahead above.)
+        // RAM ceiling: iOS and macOS may lift above their baseline within their platform ceiling. tvOS
+        // remains bounded to its 128 MiB normal or 96 MiB reduced baseline because its server and mpv
+        // share one jetsam-limited process. demuxer-max-bytes is a hard byte cap, so it bounds RAM
+        // regardless of bitrate or whether cache-on-disk offloads. A LOCAL torrent buffers into the
+        // embedded server's own disk cache, and live owns its tight buffers, so those retain readAhead.
         let appliedCap: String
         if DiskCacheSetting.diskCacheEnabled, !live, !isLocalStream {
             // DIAG-12 RECEIPT: restoring the tvOS ceiling to 768 MiB was not device-safe. The embedded
             // Node heartbeat rose from about 422 MiB to 1.2 GiB immediately after libmpv opened a debrid
             // stream while the JS heap stayed at 26 MiB. That native RSS delta matches the 768 MiB cap.
-            // Keep iOS/tvOS at the previously stable 256 MiB hard ceiling, reduced devices at 128 MiB,
-            // and macOS at 1 GiB because its server and swap model are different.
+            // tvOS is further bounded below to 128 MiB normal or 96 MiB reduced. iOS retains its
+            // 256 MiB normal and 128 MiB reduced ceilings, and macOS retains 1 GiB because its server
+            // and swap model are different.
             //
             // THE RECURRING JETSAM KNOB: these ceilings are now the RemoteConfig `player.readAhead.*` dials
             // (debrid 64..256, reduced 64..192, mac 128..1536, floor fixed 64). Baked fallbacks (256/128/1024)
@@ -1205,9 +1267,43 @@ final class MPVMetalViewController: PlatformViewController {
             #endif
             let ramCeiling = Int64(RemoteConfig.snapshot.readAheadDebridCeilingBytes(reduced: PerformanceMode.reduced, isMac: isMac))
             let applied = min(DiskCacheSetting.resolvedMaxBytes(), ramCeiling)
+            #if os(tvOS)
+            let baselineBytes = Int64(
+                VortXCacheShedPolicy.capBytes(readAhead)
+                    ?? (PerformanceMode.reduced ? 96 << 20 : 128 << 20)
+            )
+            let tvOSApplied = TVOSProactiveMemoryPressurePolicy.remoteVODCapBytes(
+                diskCacheEnabled: true,
+                baselineBytes: baselineBytes,
+                configuredDiskCacheBytes: applied,
+                performanceReduced: PerformanceMode.reduced,
+                enforceTVOSLimit: true
+            )
+            appliedCap = String(tvOSApplied)
+            #else
             appliedCap = String(applied)
+            #endif
         } else {
+            #if os(tvOS)
+            if !live, !isLocalStream {
+                let baselineBytes = Int64(
+                    VortXCacheShedPolicy.capBytes(readAhead)
+                        ?? (PerformanceMode.reduced ? 96 << 20 : 128 << 20)
+                )
+                let tvOSApplied = TVOSProactiveMemoryPressurePolicy.remoteVODCapBytes(
+                    diskCacheEnabled: false,
+                    baselineBytes: baselineBytes,
+                    configuredDiskCacheBytes: baselineBytes,
+                    performanceReduced: PerformanceMode.reduced,
+                    enforceTVOSLimit: true
+                )
+                appliedCap = String(tvOSApplied)
+            } else {
+                appliedCap = readAhead
+            }
+            #else
             appliedCap = readAhead
+            #endif
         }
         mpv_set_property_string(mpv, "demuxer-max-bytes", appliedCap)
         activeReadAheadCap = appliedCap
@@ -1217,6 +1313,9 @@ final class MPVMetalViewController: PlatformViewController {
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
         pausedCacheClamped = false
         memoryCacheClamped = false
+        #if os(tvOS)
+        proactiveMemoryCacheClamped = false
+        #endif
         // Restore the back-buffer for the new file too. shedForMemoryPressure dropped
         // `demuxer-max-back-bytes` to 8MiB and, unlike the forward cap re-applied above, nothing put it
         // back for later files on this instance (configureLiveMode(false) skips its write when
@@ -1418,26 +1517,71 @@ final class MPVMetalViewController: PlatformViewController {
         mpvLog.log("memory warning: demuxer cache stepped down to \(mib, privacy: .public)MiB for the rest of this file")
         DiagnosticsLog.log("player", "memory warning: mpv cache stepped down to \(mib)MiB + buffers dropped")
     }
+
+    #if os(tvOS)
+    /// Called from the mpv event queue. It posts at most one main-thread evaluation per sample interval.
+    private nonisolated func maybeScheduleProactiveMemoryCheck(now: TimeInterval) {
+        guard proactiveMemorySampleThrottle.shouldSchedule(
+            now: now,
+            interval: TVOSProactiveMemoryPressurePolicy.sampleInterval
+        ) else { return }
+        DispatchQueue.main.async { [weak self] in self?.evaluateProactiveMemoryPressure() }
+    }
+
+    /// Proactive tvOS headroom check using Apple's public dirty-memory-limit snapshot.
+    /// It only lowers a cache once per file and never disables caching or restores under pressure.
+    private func evaluateProactiveMemoryPressure() {
+        guard mpv != nil, !configuredLiveMode else { return }
+        let available = UInt64(os_proc_available_memory())
+        let physical = ProcessInfo.processInfo.physicalMemory
+        let threshold = TVOSProactiveMemoryPressurePolicy.pressureThresholdBytes(
+            physicalMemoryBytes: physical
+        )
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastProactiveMemoryReceipt
+                >= TVOSProactiveMemoryPressurePolicy.receiptInterval {
+            lastProactiveMemoryReceipt = now
+            DiagnosticsLog.log(
+                "player",
+                "tvOS memory headroom \(available >> 20)MiB, threshold \(threshold >> 20)MiB, mpv cache \(currentReadAheadBudgetBytes >> 20)MiB, proactive=\(proactiveMemoryCacheClamped)"
+            )
+        }
+
+        guard let target = TVOSProactiveMemoryPressurePolicy.clampTargetBytes(
+            availableMemoryBytes: available,
+            physicalMemoryBytes: physical,
+            currentCapBytes: currentReadAheadBudgetBytes,
+            floorBytes: VortXCacheShedPolicy.floorBytes,
+            alreadyClamped: proactiveMemoryCacheClamped
+        ) else { return }
+
+        proactiveMemoryCacheClamped = true
+        let targetString = String(target)
+        activeReadAheadCap = targetString
+        if !pausedCacheClamped {
+            setString("demuxer-max-bytes", targetString)
+        }
+        flushDemuxerCachePreservingPosition()
+        let targetMiB = target >> 20
+        mpvLog.log(
+            "proactive memory pressure: demuxer cache clamped to \(targetMiB, privacy: .public)MiB for this file"
+        )
+        DiagnosticsLog.log(
+            "player",
+            "proactive memory clamp: available \(available >> 20)MiB below \(threshold >> 20)MiB, mpv cache -> \(targetMiB)MiB + buffers dropped"
+        )
+    }
+    #endif
     #endif
 
     private func updateCapturePipeline() {
         guard let device = metalLayer.device else { return }
-        let size = metalLayer.drawableSize
-        let fmt = metalLayer.pixelFormat
-        guard size.width > 1, size.height > 1 else { return }
-        guard size != capturePipelineSize || fmt != capturePipelineFormat else { return }
+        let deviceID = ObjectIdentifier(device)
+        guard deviceID != capturePipelineDevice else { return }
 
         guard let queue = device.makeCommandQueue() else { return }
         metalLayer.setupCaptureQueue(queue)
-
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: fmt, width: Int(size.width), height: Int(size.height), mipmapped: false)
-        desc.usage = .shaderRead
-        desc.storageMode = .shared
-        guard let tex = device.makeTexture(descriptor: desc) else { return }
-        metalLayer.updateCaptureTexture(tex)
-        capturePipelineSize = size
-        capturePipelineFormat = fmt
+        capturePipelineDevice = deviceID
     }
 
     /// Re-derive the dynamic range from the CURRENTLY decoded video params and apply it. Used by the
@@ -2163,34 +2307,60 @@ final class MPVMetalViewController: PlatformViewController {
 
     func captureFrameJPEGData(maxWidth: CGFloat, completion: @escaping (Data?) -> Void) {
         guard mpv != nil else { completion(nil); return }
+        let captureQueue = captureQueue
+        let captureQueueState = captureQueueState
         // Build or rebuild the pipeline lazily; at VIDEO_RECONFIG time the device/drawableSize may
         // not be set yet (especially on tvOS); calling here retries until everything is ready.
-        // updateCapturePipeline is a no-op once the pipeline matches the current resolution/format.
+        // updateCapturePipeline is a no-op once the queue matches the current Metal device.
         updateCapturePipeline()
-        // requestCapture schedules a blit for the next nextDrawable() call on mpv's VO thread.
-        // handler(nil) is called immediately by MetalLayer if the blit cannot be submitted, so
+        // requestCapture schedules a bounded GPU scale for the next nextDrawable() call on mpv's VO thread.
+        // handler(nil) is called immediately by MetalLayer if the scale cannot be submitted, so
         // the caller's in-flight guard is always released even when the pipeline isn't ready yet.
-        metalLayer.requestCapture { [weak self] texture in
-            guard let self, let texture else { completion(nil); return }
-            self.captureQueue.async {
-                // CIImage(mtlTexture:) wraps the texture lazily. Metal textures have (0,0) at
-                // top-left; CIImage has (0,0) at bottom-left; flip y while scaling to 480px wide.
-                guard let raw = CIImage(mtlTexture: texture,
-                                        options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]) else {
-                    completion(nil); return
+        metalLayer.requestCapture(maxWidth: max(1, Int(maxWidth.rounded(.down)))) { [weak self] lease in
+            guard let lease else { completion(nil); return }
+            guard self != nil else {
+                lease.release()
+                completion(nil)
+                return
+            }
+            captureQueue.async {
+                let texture = lease.texture
+                let prepared = captureQueueState.prepare(for: texture)
+                let ctx = prepared.context
+                if prepared.shouldEmitReceipt {
+                    DiagnosticsLog.log(
+                        "player",
+                        "GPU capture \(texture.label ?? "bounded target"), format \(texture.pixelFormat.rawValue), requested max \(Int(maxWidth))px"
+                    )
                 }
-                let tw = CGFloat(texture.width), th = CGFloat(texture.height)
-                let s = min(maxWidth, tw) / tw   // never upscale: trickplay passes 480, frame-grab passes full
-                let image = raw.transformed(by: CGAffineTransform(a: s, b: 0, c: 0, d: -s, tx: 0, ty: th * s))
-                if self.ciContext == nil { self.ciContext = CIContext(mtlDevice: texture.device) }
-                guard let ctx = self.ciContext,
-                      let sRGB = CGColorSpace(name: CGColorSpace.sRGB),
-                      let jpeg = ctx.jpegRepresentation(
-                          of: image, colorSpace: sRGB,
-                          options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.7]
-                      ) else {
-                    completion(nil); return
-                }
+                let jpeg: Data? = {
+                    // CIImage(mtlTexture:) wraps the texture lazily. Metal textures have (0,0) at
+                    // top-left; CIImage has (0,0) at bottom-left; flip y while scaling to 480px wide.
+                    guard let raw = CIImage(
+                        mtlTexture: texture,
+                        options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]
+                    ) else {
+                        return nil
+                    }
+                    let tw = CGFloat(texture.width), th = CGFloat(texture.height)
+                    let s = min(maxWidth, tw) / tw
+                    let image = raw.transformed(
+                        by: CGAffineTransform(a: s, b: 0, c: 0, d: -s, tx: 0, ty: th * s)
+                    )
+                    guard let sRGB = CGColorSpace(name: CGColorSpace.sRGB) else {
+                        return nil
+                    }
+                    return ctx.jpegRepresentation(
+                        of: image,
+                        colorSpace: sRGB,
+                        options: [
+                            kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.7
+                        ]
+                    )
+                }()
+                // CI/JPEG has fully materialized the Data. Release the reusable GPU target before
+                // invoking arbitrary caller work so thumbnail decoding cannot hold the next capture.
+                lease.release()
                 completion(jpeg)
             }
         }
@@ -2312,6 +2482,9 @@ final class MPVMetalViewController: PlatformViewController {
                             // couple of Hz so the grey scrubber band updates smoothly without churn.
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 let now = ProcessInfo.processInfo.systemUptime
+                                #if os(tvOS)
+                                self.maybeScheduleProactiveMemoryCheck(now: now)
+                                #endif
                                 if now - self.lastCacheTimeEmit >= 0.5 {
                                     self.lastCacheTimeEmit = now
                                     self.emit(propertyName, value)
@@ -2320,6 +2493,9 @@ final class MPVMetalViewController: PlatformViewController {
                         case MPVProperty.timePos:
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 let now = ProcessInfo.processInfo.systemUptime
+                                #if os(tvOS)
+                                self.maybeScheduleProactiveMemoryCheck(now: now)
+                                #endif
                                 // Coalesce the play head (mpv fires this per decoded frame). 4 Hz on
                                 // capable hardware for a smooth progress bar; 2 Hz on a constrained
                                 // Apple TV (A8) so the play-head re-render stops competing with decode

@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import MetalPerformanceShaders
 import QuartzCore
 #if canImport(UIKit)
 import UIKit
@@ -7,44 +8,162 @@ import UIKit
 import AppKit
 #endif
 
+/// Serializes access to the reusable capture texture across GPU production and CPU consumption.
+/// A token remains active until the consumer explicitly releases its lease. Stale or repeated releases
+/// cannot unlock a newer capture.
+final class MetalCaptureLeaseState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nextToken: UInt64 = 0
+    private var activeToken: UInt64?
+
+    func acquire() -> UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeToken == nil else { return nil }
+        nextToken &+= 1
+        activeToken = nextToken
+        return nextToken
+    }
+
+    func release(token: UInt64) {
+        lock.lock()
+        if activeToken == token {
+            activeToken = nil
+        }
+        lock.unlock()
+    }
+}
+
+/// A single-owner view of the capture texture. `release` is idempotent, and deinit is a final
+/// safety net so an abandoned callback cannot permanently stall later capture requests.
+final class MetalCaptureTextureLease: @unchecked Sendable {
+    let texture: MTLTexture
+    private let state: MetalCaptureLeaseState
+    private let token: UInt64
+
+    init(texture: MTLTexture, state: MetalCaptureLeaseState, token: UInt64) {
+        self.texture = texture
+        self.state = state
+        self.token = token
+    }
+
+    func release() {
+        state.release(token: token)
+    }
+
+    deinit {
+        release()
+    }
+}
+
+/// Owns one callback and its prepared lease across Metal's @Sendable completion boundary.
+/// Every mutable field is lock-protected, and `complete` consumes the callback before invoking it,
+/// so replacement, submission failure, and GPU completion can never deliver more than once.
+private final class CaptureDelivery: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: ((MetalCaptureTextureLease?) -> Void)?
+    private var texture: MTLTexture?
+    private var leaseState: MetalCaptureLeaseState?
+    private var leaseToken: UInt64?
+
+    init(handler: @escaping (MetalCaptureTextureLease?) -> Void) {
+        self.handler = handler
+    }
+
+    func prepare(texture: MTLTexture, leaseState: MetalCaptureLeaseState, leaseToken: UInt64) {
+        var releaseUnusedToken = false
+        lock.lock()
+        if handler != nil {
+            self.texture = texture
+            self.leaseState = leaseState
+            self.leaseToken = leaseToken
+        } else {
+            releaseUnusedToken = true
+        }
+        lock.unlock()
+        if releaseUnusedToken {
+            leaseState.release(token: leaseToken)
+        }
+    }
+
+    func complete(succeeded: Bool) {
+        lock.lock()
+        guard let handler else {
+            lock.unlock()
+            return
+        }
+        self.handler = nil
+        let preparedTexture = texture
+        let preparedLeaseState = leaseState
+        let preparedLeaseToken = leaseToken
+        texture = nil
+        leaseState = nil
+        leaseToken = nil
+        lock.unlock()
+
+        let lease: MetalCaptureTextureLease?
+        if succeeded,
+           let preparedTexture,
+           let preparedLeaseState,
+           let preparedLeaseToken {
+            lease = MetalCaptureTextureLease(
+                texture: preparedTexture,
+                state: preparedLeaseState,
+                token: preparedLeaseToken
+            )
+        } else {
+            if let preparedLeaseState, let preparedLeaseToken {
+                preparedLeaseState.release(token: preparedLeaseToken)
+            }
+            lease = nil
+        }
+        handler(lease)
+    }
+}
+
 class MetalLayer: CAMetalLayer {
 
-    // Trickplay capture: when a capture is requested, the next nextDrawable() call blits the
+    // Trickplay capture: when a capture is requested, the next nextDrawable() call scales the
     // newly acquired drawable's texture into captureTexture before returning the drawable to mpv.
+    // Normal trickplay requests 480px width; explicit frame grabs may request a wider bounded target.
     // The newly acquired drawable holds the frame from 2+ renders ago, valid and not in transition,
     // unlike the previous drawable which MoltenVK may recycle inside super.nextDrawable().
     // All fields protected by captureLock (VO thread vs main thread).
     private let captureLock = NSLock()
     private var captureCommandQueue: MTLCommandQueue?
+    private var captureScaler: MPSImageBilinearScale?
     private var captureTexture: MTLTexture?
-    // Handler receives the texture on success, or nil if the blit could not be submitted
-    // (pipeline not ready, size mismatch). Caller MUST handle nil to unblock its in-flight guard.
-    private var _captureHandler: ((MTLTexture?) -> Void)?
+    private let captureLeaseState = MetalCaptureLeaseState()
+    private var captureMaxWidth = 1
+    // Delivery receives a leased texture on success, or nil if the GPU scale could not be submitted.
+    // Caller MUST release a successful lease after its final texture read.
+    private var captureDelivery: CaptureDelivery?
 
     func setupCaptureQueue(_ queue: MTLCommandQueue) {
         captureLock.lock()
         captureCommandQueue = queue
+        captureScaler = MPSImageBilinearScale(device: queue.device)
+        // updateCapturePipeline calls this when CAMetalLayer moves to a different device. Never
+        // carry a texture allocated by the old device into the new command queue.
+        captureTexture = nil
         captureLock.unlock()
     }
 
-    func updateCaptureTexture(_ texture: MTLTexture?) {
-        captureLock.lock()
-        captureTexture = texture
-        captureLock.unlock()
-    }
-
-    /// Schedule a single frame capture. handler(texture) fires on a Metal completion thread when
-    /// the GPU blit finishes, or handler(nil) fires immediately if the blit cannot be submitted.
+    /// Schedule a single frame capture. handler(lease) fires on a Metal completion thread when
+    /// the GPU scale finishes, or handler(nil) fires immediately if it cannot be submitted. A successful
+    /// handler must release its lease after the final texture read.
     /// Replaces any pending unserviced handler (best-effort, no backlog); that replaced handler is
     /// fired with nil so its caller's in-flight guard is never left stuck.
-    func requestCapture(handler: @escaping (MTLTexture?) -> Void) {
+    func requestCapture(maxWidth: Int, handler: @escaping (MetalCaptureTextureLease?) -> Void) {
+        let delivery = CaptureDelivery(handler: handler)
         captureLock.lock()
-        let previous = _captureHandler
-        _captureHandler = handler
+        let previous = captureDelivery
+        captureDelivery = delivery
+        captureMaxWidth = max(1, maxWidth)
         captureLock.unlock()
         // Honor the always-fires contract for a still-pending handler this request replaces (no drawable
         // serviced it yet). Invoked OUTSIDE the lock so the callback can never re-enter captureLock.
-        previous?(nil)
+        previous?.complete(succeeded: false)
     }
 
     override func nextDrawable() -> (any CAMetalDrawable)? {
@@ -52,57 +171,81 @@ class MetalLayer: CAMetalLayer {
         guard let d else { return nil }
 
         captureLock.lock()
-        let handler = _captureHandler
-        _captureHandler = nil
-        let queue = captureCommandQueue
-        let initialDst = captureTexture   // read under the lock (class contract: all fields captureLock-guarded)
+        let leaseToken = captureDelivery == nil ? nil : captureLeaseState.acquire()
+        let delivery = leaseToken == nil ? nil : captureDelivery
+        if delivery != nil {
+            captureDelivery = nil
+        }
+        let queue = delivery == nil ? nil : captureCommandQueue
+        let scaler = delivery == nil ? nil : captureScaler
+        let maxWidth = delivery == nil ? 1 : captureMaxWidth
+        let initialDst = delivery == nil ? nil : captureTexture
         captureLock.unlock()
 
-        if let handler {
+        if let delivery, let leaseToken {
             var committed = false
-            if let queue, let cmd = queue.makeCommandBuffer(),
-               let blit = cmd.makeBlitCommandEncoder() {
+            if let queue, let scaler, let cmd = queue.makeCommandBuffer() {
                 let src = d.texture
-                // The capture texture is pre-allocated to an SDR/HD descriptor, but a 4K/HDR/DV drawable
-                // arrives with a different size AND pixelFormat (e.g. bgr10a2 / rgba16Float). The old code
-                // required an exact match and otherwise dropped the frame (handler(nil)) -> EVERY 4K/HDR/DV
-                // frame was silently lost, so those titles never captured trickplay. Instead, reallocate the
-                // capture texture to match the source drawable's descriptor on a mismatch, then blit into it.
+                guard ObjectIdentifier(src.device) == ObjectIdentifier(queue.device) else {
+                    // The layer swapped devices after request setup. Fail this capture only; the
+                    // normal cadence will rebuild the pipeline and retry without blocking the VO.
+                    captureLeaseState.release(token: leaseToken)
+                    delivery.complete(succeeded: false)
+                    return d
+                }
+                let targetWidth = min(src.width, maxWidth)
+                let targetHeight = max(1, Int(
+                    (Double(src.height) * Double(targetWidth) / Double(src.width)).rounded()
+                ))
                 var dst = initialDst
-                if dst == nil || dst!.width != src.width || dst!.height != src.height || dst!.pixelFormat != src.pixelFormat {
+                if let existing = dst,
+                   ObjectIdentifier(existing.device) == ObjectIdentifier(queue.device),
+                   existing.width == targetWidth,
+                   existing.height == targetHeight,
+                   existing.pixelFormat == src.pixelFormat {
+                    dst = existing
+                } else {
+                    dst = nil
                     let desc = MTLTextureDescriptor.texture2DDescriptor(
-                        pixelFormat: src.pixelFormat, width: src.width, height: src.height, mipmapped: false)
-                    desc.usage = [.shaderRead]
-                    // .shared on EVERY platform (the Mac target is Apple-Silicon-only = unified memory). A
-                    // .managed texture keeps a separate CPU mirror that is NOT valid after a GPU blit until an
-                    // explicit blit.synchronize(resource:) - which this capture path never issues - so on macOS
-                    // the completion's CIImage(mtlTexture:) read a stale/empty mirror and the JPEG encode
-                    // silently returned nil, capturing ZERO community-trickplay frames for 4K/HDR/DV titles (the
-                    // reallocation branch ALWAYS fires for those, since the pre-allocated SDR/HD texture never
-                    // matches a 4K bgr10a2/rgba16F drawable). .shared has no CPU-sync gap and matches the sibling
-                    // allocator in MPVMetalViewController.updateCapturePipeline(), so both sites now agree.
+                        pixelFormat: src.pixelFormat,
+                        width: targetWidth,
+                        height: targetHeight,
+                        mipmapped: false
+                    )
+                    desc.usage = [.shaderRead, .shaderWrite]
                     desc.storageMode = .shared
-                    if let realloc = device?.makeTexture(descriptor: desc) {
+                    if let realloc = queue.device.makeTexture(descriptor: desc) {
+                        realloc.label = "VortX capture \(targetWidth)x\(targetHeight) from \(src.width)x\(src.height)"
                         dst = realloc
-                        captureLock.lock(); captureTexture = realloc; captureLock.unlock()
+                        captureLock.lock()
+                        if let activeQueue = captureCommandQueue,
+                           ObjectIdentifier(activeQueue.device) == ObjectIdentifier(queue.device) {
+                            captureTexture = realloc
+                        }
+                        captureLock.unlock()
                     }
                 }
                 if let dst {
-                    blit.copy(from: src, sourceSlice: 0, sourceLevel: 0,
-                              sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                              sourceSize: MTLSize(width: src.width, height: src.height, depth: 1),
-                              to: dst, destinationSlice: 0, destinationLevel: 0,
-                              destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-                    blit.endEncoding()
-                    cmd.addCompletedHandler { _ in handler(dst) }
+                    // MPS keeps the source pixel format, so HDR captures retain the same component
+                    // representation while the GPU writes only the requested thumbnail dimensions.
+                    scaler.encode(commandBuffer: cmd, sourceTexture: src, destinationTexture: dst)
+                    delivery.prepare(
+                        texture: dst,
+                        leaseState: captureLeaseState,
+                        leaseToken: leaseToken
+                    )
+                    cmd.addCompletedHandler { buffer in
+                        delivery.complete(succeeded: buffer.status == .completed)
+                    }
                     cmd.commit()
                     committed = true
-                } else {
-                    blit.endEncoding()
                 }
             }
             // Always unblock the caller so its in-flight guard never gets stuck.
-            if !committed { handler(nil) }
+            if !committed {
+                captureLeaseState.release(token: leaseToken)
+                delivery.complete(succeeded: false)
+            }
         }
 
         return d
