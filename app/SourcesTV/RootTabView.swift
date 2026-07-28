@@ -391,7 +391,12 @@ struct RootTabView: View {
         // Apple TV still owes its first VortX-account sync. armLaunchNag waits out the splash + the
         // profile picker so the sheet never fights a modal; skipped while something is playing. Always
         // dismissible, never blocks the app.
-        .sheet(isPresented: $showSeedingNag) { MoveSeedingNagTV() }
+        .sheet(isPresented: $showSeedingNag, onDismiss: {
+            // Menu/back, successful setup, Done, and Not now all close the same launch reminder.
+            // Persist the receipt at the sheet boundary so no dismissal path can make it return on
+            // every launch of this build. Settings still keys only on the first real sync.
+            MoveSeeding.recordLaunchNagDismissal()
+        }) { MoveSeedingNagTV() }
         .task { await armSeedingNag() }
         .onAppear {
             applyTabBarAccent()

@@ -53,6 +53,8 @@ enum SettingsBackup {
                                          // on an iPhone on cellular is actively harmful. Same class as
                                          // diskCacheBytes above: a number that is only correct for the hardware
                                          // that chose it.
+        "vortx.moveSeeding.launchNagDismissedBuild", // acknowledgement of a launch reminder on THIS device;
+                                                     // never suppress another device's migration reminder
         // DELIBERATELY NOT HERE: "vortx.downloads.autoDeleteWatched". It looks like it belongs with the two
         // above, and it does not. It is a real cross-device POLICY preference ("I do not want to keep watched
         // downloads"), which is true of the user rather than of the hardware, so it must keep syncing. The test

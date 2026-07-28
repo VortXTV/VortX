@@ -292,7 +292,11 @@ struct iOSRootView: View {
         // Phase-0 seeding nag for the com.vortx move (see MoveSeeding): once per launch, only while this
         // device still owes its first VortX-account sync. armLaunchNag waits out the splashless iOS launch
         // + the profile picker, so the sheet never fights a modal; always dismissible, never blocks use.
-        .sheet(isPresented: $showSeedingNag) { MoveSeedingNagView() }
+        .sheet(isPresented: $showSeedingNag, onDismiss: {
+            // Swipe-down, successful setup, Done, and Not now all close the same launch reminder.
+            // Persist at the sheet boundary so every dismissal stays quiet for this build.
+            MoveSeeding.recordLaunchNagDismissal()
+        }) { MoveSeedingNagView() }
         .task { await armSeedingNag() }
         .onChange(of: hideLiveTab) { hidden in
             if hidden, tab == .live { tab = .home }   // never leave the bar pointing at a hidden screen

@@ -80,12 +80,15 @@ struct MoveSeedingNagView: View {
                 .multilineTextAlignment(.center)
         }
 
-        Button("Not now") { dismiss() }
+        Button("Not now") {
+            MoveSeeding.recordLaunchNagDismissal()
+            dismiss()
+        }
             .buttonStyle(.plain)
             .foregroundStyle(Theme.Palette.textSecondary)
             .padding(.top, Theme.Space.sm)
 
-        Text("This reminder returns on the next launch until this device has synced once (or you keep a file backup).")
+        Text("This reminder may return after the app updates if this device still has not synced (or you keep a file backup).")
             .font(Theme.Typography.label)
             .foregroundStyle(Theme.Palette.textTertiary)
             .multilineTextAlignment(.center)
