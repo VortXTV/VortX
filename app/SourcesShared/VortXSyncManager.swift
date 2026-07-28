@@ -1619,6 +1619,9 @@ final class VortXSyncManager: ObservableObject {
         // spurious push of the just-applied doc (the same self-echo class this region exists to prevent).
         stampSyncSuccess()
         }   // end withRemoteApplySuppressed
+        // OwnerResumeStore changed without an engine event, so publish its new resume positions now. This stays
+        // unconditional because refreshOwnerResumeCache does not contribute to `restored`.
+        CoreBridge.shared.rebuildContinueWatching()
         return restored
     }
 

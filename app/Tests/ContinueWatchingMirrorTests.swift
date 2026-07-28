@@ -67,6 +67,42 @@ func resolve(engine: MirrorSettings.CWPosition,
                                            mayReplace: mayReplace, locallyRewound: locallyRewound)
 }
 
+func sharedSource(_ name: String) -> String {
+    let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let candidates = [
+        cwd.appendingPathComponent("app/SourcesShared").appendingPathComponent(name),
+        cwd.appendingPathComponent("SourcesShared").appendingPathComponent(name),
+    ]
+    for url in candidates {
+        if let value = try? String(contentsOf: url, encoding: .utf8) { return value }
+    }
+    fatalError("Run from the repository root or app directory")
+}
+
+func sourceSection(_ source: String, from start: String, until end: String) -> String {
+    guard let startRange = source.range(of: start),
+          let endRange = source.range(of: end, range: startRange.upperBound..<source.endIndex) else {
+        return ""
+    }
+    return String(source[startRange.lowerBound..<endRange.lowerBound])
+}
+
+func hasOrderedSyncDownContinueWatchingPublication(_ syncDown: String) -> Bool {
+    guard let refresh = syncDown.range(of: "refreshOwnerResumeCache(from: doc)"),
+          let suppressionEnd = syncDown.range(of: "}   // end withRemoteApplySuppressed"),
+          refresh.lowerBound < suppressionEnd.lowerBound else { return false }
+    let executableTail = syncDown[suppressionEnd.upperBound...]
+        .components(separatedBy: .newlines)
+        .filter {
+            let trimmed = $0.trimmingCharacters(in: .whitespaces)
+            return !trimmed.isEmpty && !trimmed.hasPrefix("//")
+        }
+    return executableTail.prefix(2) == [
+        "        CoreBridge.shared.rebuildContinueWatching()",
+        "        return restored",
+    ]
+}
+
 // MARK: - 1. The gate: what the toggle actually controls, and what the DEFAULT preserves
 
 func testGate() {
@@ -246,6 +282,42 @@ func testLocalRewindLog() {
     UserDefaults.standard.removeObject(forKey: "vortx.cw.localRewinds.v1")
 }
 
+// MARK: - 8. syncDown publishes the refreshed owner resume cache
+
+func testSyncDownPublishesOwnerResumeCache() {
+
+    print("\n8. syncDown publication wiring")
+
+    let manager = sharedSource("VortXSyncManager.swift")
+    let syncDown = sourceSection(
+        manager,
+        from: "func syncDown(force: Bool = false) async -> Bool {",
+        until: "// MARK: - Account owns everything"
+    )
+    expect(
+        hasOrderedSyncDownContinueWatchingPublication(syncDown),
+        "syncDown refreshes the owner cache, exits suppression, rebuilds Continue Watching, then returns"
+    )
+
+    let missingRebuild = syncDown.replacingOccurrences(
+        of: "CoreBridge.shared.rebuildContinueWatching()",
+        with: ""
+    )
+    expect(
+        !hasOrderedSyncDownContinueWatchingPublication(missingRebuild),
+        "removing the post-sync rebuild fails the publication contract"
+    )
+
+    let conditionalRebuild = syncDown.replacingOccurrences(
+        of: "        CoreBridge.shared.rebuildContinueWatching()",
+        with: "        if restored { CoreBridge.shared.rebuildContinueWatching() }"
+    )
+    expect(
+        !hasOrderedSyncDownContinueWatchingPublication(conditionalRebuild),
+        "gating the post-sync rebuild on restored fails the unconditional publication contract"
+    )
+}
+
 // MARK: - Result
 
 @main
@@ -258,6 +330,7 @@ struct ContinueWatchingMirrorTests {
         testSeriesEpisodeOrdering()
         testOverlayProfileUntouched()
         testLocalRewindLog()
+        testSyncDownPublishesOwnerResumeCache()
 
         UserDefaults.standard.removeObject(forKey: MirrorSettings.continueWatchingKey)
         print("")
