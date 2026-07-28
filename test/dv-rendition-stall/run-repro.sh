@@ -64,6 +64,25 @@ infra() {
   exit "$INFRA_EXIT"
 }
 
+# Every harness process uses the production user Caches/VortXHLS parent. Its launch registry is process-local,
+# so concurrent harnesses can each scavenge the other's live launch directory. Hold a kernel-backed lock around
+# the entire resolver, compile and run. Descriptor mode keeps a harmless inode for FIFO ordering; the kernel
+# releases the actual lock when this shell exits, so a crashed runner cannot strand a stale ownership claim.
+readonly HARNESS_LOCK_FILE="/tmp/vortx-dv-rendition-stall.lock"
+readonly HARNESS_LOCK_TIMEOUT_SECONDS=600
+[ -x /usr/bin/lockf ] || infra "/usr/bin/lockf is unavailable; concurrent spool ownership is unsafe."
+if ! exec 9>"$HARNESS_LOCK_FILE"; then
+  infra "cross-process harness lock file could not be opened."
+fi
+echo "  harness lock    waiting up to ${HARNESS_LOCK_TIMEOUT_SECONDS}s for $HARNESS_LOCK_FILE"
+set +e
+/usr/bin/lockf -s -t "$HARNESS_LOCK_TIMEOUT_SECONDS" 9
+lock_status=$?
+set -e
+[ "$lock_status" -eq 0 ] \
+  || infra "cross-process harness lock could not be acquired (lockf exit $lock_status)."
+echo "  harness lock    acquired $HARNESS_LOCK_FILE"
+
 # ----------------------------------------------------------------------------
 # 1. What does app/project.yml say the MPVKit package is?
 # ----------------------------------------------------------------------------
@@ -249,14 +268,47 @@ echo ""
 SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
 
 test/dv-rendition-stall/make-fixture.sh "${FIXTURE_SECONDS:-240}"
+for fixture in fixture-multiaudio.mkv fixture-mixedcodec.mkv fixture-manyaudio.mkv; do
+  [ -s "/tmp/dd-dvstall/fixtures/$fixture" ] \
+    || infra "fixture generation completed without a readable /tmp/dd-dvstall/fixtures/$fixture."
+done
+
+ENGINE_TRANSACTION_FLAGS=()
+ENGINE_TRANSACTION_FRAMEWORKS=()
+ENGINE_TRANSACTION_SOURCES=()
+if [ "${ENGINE_TRANSACTION:-0}" = "1" ]; then
+  ENGINE_TRANSACTION_FLAGS=( -D ENGINE_TRANSACTION_HARNESS )
+  ENGINE_TRANSACTION_FRAMEWORKS=(
+    -framework AVKit
+    -framework CoreImage
+    -framework ImageIO
+    -framework UniformTypeIdentifiers
+    -framework AppKit
+  )
+  ENGINE_TRANSACTION_SOURCES=(
+    app/SourcesShared/CoreModels.swift
+    app/Sources/Player/MPVPlayerDelegate.swift
+    app/Sources/Player/MPVTrack.swift
+    app/Sources/Player/SkipSegments.swift
+    app/Sources/Player/AudioOutputMode.swift
+    app/Sources/Player/PerformanceMode.swift
+    app/Sources/Player/MPVProperty.swift
+    app/Sources/Player/VortXRemuxResourceLoader.swift
+    app/Sources/Player/AVPlayerEngine.swift
+  )
+  echo "  engine gate     ENABLED: actual AVPlayerEngine setAudioTrack success + rollback"
+fi
 
 mkdir -p /tmp/dd-dvstall
+# macOS ships Bash 3.2, whose `set -u` treats an empty `"${array[@]}"` as an unbound variable.
+# The `+` guard preserves zero arguments in stock mode and every discrete argument in engine mode.
 xcrun swiftc -sdk "$SDK_PATH" \
+  "${ENGINE_TRANSACTION_FLAGS[@]+"${ENGINE_TRANSACTION_FLAGS[@]}"}" \
   "${LINK_FLAGS[@]}" "$MOLTEN_ARCHIVE" \
   -framework AVFoundation -framework CoreAudio -framework AudioToolbox -framework CoreVideo \
   -framework CoreFoundation -framework CoreMedia -framework Metal -framework VideoToolbox \
   -framework Foundation -framework IOKit -framework IOSurface -framework QuartzCore \
-  -framework Network \
+  -framework Network "${ENGINE_TRANSACTION_FRAMEWORKS[@]+"${ENGINE_TRANSACTION_FRAMEWORKS[@]}"}" \
   -lbz2 -liconv -lexpat -lresolv -lxml2 -lz -lc++ \
   -o /tmp/dd-dvstall/repro-harness \
   test/dv-rendition-stall/Stubs.swift \
@@ -267,10 +319,14 @@ xcrun swiftc -sdk "$SDK_PATH" \
   app/Sources/Player/RemuxResumePolicy.swift \
   app/Sources/Player/AudioTranscodePolicy.swift \
   app/Sources/Player/VortXAudioTranscoder.swift \
+  app/SourcesShared/VortXEngineProtocol.swift \
+  app/Sources/Player/PGSOCRPolicy.swift \
+  app/Sources/Player/VortXPGSSubtitleOCR.swift \
   app/Sources/Player/VortXMKVRemuxStream.swift \
   app/SourcesShared/VortXEngineHostPolicy.swift \
   app/Sources/Player/VortXHostedResponse.swift \
   app/Sources/Player/VortXRemuxHLSServer.swift \
+  "${ENGINE_TRANSACTION_SOURCES[@]+"${ENGINE_TRANSACTION_SOURCES[@]}"}" \
   test/dv-rendition-stall/main.swift
 
-exec /tmp/dd-dvstall/repro-harness
+/tmp/dd-dvstall/repro-harness 9>&-

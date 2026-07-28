@@ -147,6 +147,7 @@ private final class ManualSegmentSender {
 enum PlayerLiveContractTests {
     static func main() {
         testInitialMountPinsStartupBytes()
+        testInitialMasterPublishesPrimaryAudioOnly()
         testResidentSlidingPlaylistAndAbsoluteRequests()
         testReadLeaseLifecycle()
         testSessionSpoolAdmissionAndFailures()
@@ -188,6 +189,44 @@ enum PlayerLiveContractTests {
         check("startup: initial contract carries the precise zero-start preference",
               lines.contains("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES"))
         check("startup: media sequence is exactly zero", lines.contains("#EXT-X-MEDIA-SEQUENCE:0"))
+    }
+
+    private static func testInitialMasterPublishesPrimaryAudioOnly() {
+        let primaryTag = MultiAudioPolicy.inBandPrimaryTag(
+            languageRaw: "eng",
+            title: "English Atmos",
+            physicalChannels: 6,
+            usesDec3: true,
+            dec3: .init(jocComplexityIndex: 16))
+        let input = DVPlaybackPolicy.MasterPlaylistInput(
+            videoCodec: "dvh1.08.06",
+            supplementalCodec: nil,
+            videoRange: "PQ",
+            audioCodec: "ec-3",
+            width: 3840,
+            height: 2160,
+            bandwidth: 24_000_000,
+            fps: 23.976,
+            dolbyVision: true)
+        let data = DVPlaybackPolicy.masterPlaylistData(
+            input: input,
+            mediaTags: primaryTag.map { [$0] } ?? [],
+            streamInfAttributes: primaryTag == nil ? "" : #",AUDIO="audio""#)
+        let lines = String(decoding: data, as: UTF8.self)
+            .split(separator: "\n").map(String.init)
+        let audioRows = lines.filter { $0.hasPrefix("#EXT-X-MEDIA:TYPE=AUDIO") }
+        let variants = lines.filter { $0.hasPrefix("#EXT-X-STREAM-INF:") }
+
+        check("startup master: exactly one video variant is published",
+              variants.count == 1 && lines.filter { $0 == "media.m3u8" }.count == 1)
+        check("startup master: the selected primary is named and URI-less",
+              audioRows.count == 1
+                  && audioRows[0].contains(#"NAME="English Atmos""#)
+                  && audioRows[0].contains(#"LANGUAGE="eng""#)
+                  && audioRows[0].contains(#"CHANNELS="16/JOC""#)
+                  && !audioRows[0].contains("URI="))
+        check("startup master: no alternate audio resource is advertised",
+              !lines.contains(where: { $0.hasPrefix("audio") && $0.hasSuffix(".m3u8") }))
     }
 
     private static func testResidentSlidingPlaylistAndAbsoluteRequests() {
@@ -2308,6 +2347,10 @@ enum PlayerLiveContractTests {
             from: "refreshRemuxSourceAudioTracks()",
             to: "loadSelectionGroups()")
         let manualSelection = sourceSection(engine, from: "private func select(", to: "/// Re-read AVPlayer's")
+        let sourceAudioSelection = sourceSection(
+            engine,
+            from: "private func mountCurrentAudioReplacement(reason:",
+            to: "/// Selecting an embedded/HLS legible track")
         let externalSubtitleRow = sourceSection(
             engine, from: "private func externalSubtitleTracks()", to: "func setAudioTrack(")
         let externalSubtitleSelection = sourceSection(
@@ -2371,6 +2414,10 @@ enum PlayerLiveContractTests {
             server,
             from: "private func prepareMasterPublication()",
             to: "private func logStartupCohortTimeout()")
+        let masterRendering = sourceSection(
+            server,
+            from: "let audioPlan = publication.audioPlan",
+            to: "/// Freeze the shortest absolute-zero cohort")
         let rollingPublication = sourceSection(
             server,
             from: "private func currentPublication()",
@@ -2403,6 +2450,10 @@ enum PlayerLiveContractTests {
             stream,
             from: "func hlsWindowSnapshot()",
             to: "/// Monotonic mount-progress counters")
+        let sourceAudioStartup = sourceSection(
+            stream,
+            from: "let policyAudioTracks = MultiAudioPolicy.selectableSourceTracks(",
+            to: "var transcodeAudioName = \"none\"")
         let alternateMuxer = sourceSection(
             stream,
             from: "private final class VortXAlternateAudioMuxer",
@@ -2495,6 +2546,26 @@ enum PlayerLiveContractTests {
                       "let audioPublished = _alternateAudioState == .ready && _alternateAudioPlan != nil") == true
                   && immutableSnapshot?.contains("audioPlan: audioPublished ? _alternateAudioPlan : nil") == true
                   && immutableSnapshot?.contains("subtitleFailureReason: _subtitleSettlement.invalidationReason") == true)
+        check("wiring: initial construction leaves the optional alternate failed and producer-free",
+              sourceContainsInOrder(sourceAudioStartup, [
+                  "_sourceAudioTracks = publishedAudioTracks",
+                  "_selectedSourceAudioIndex = mappedAudioIn >= 0",
+                  "let alternateAudioTracks: [MultiAudioPolicy.AudioTrack] = []",
+                  "let alternateAudioIn = -1",
+              ])
+                  && stream?.contains("_alternateAudioState = .pending") == false
+                  && sourceAudioStartup?.contains("_alternateAudioState = .pending") == false
+                  && sourceAudioStartup?.contains("_alternateAudioCandidatePlan") == false
+                  && sourceAudioStartup?.contains("MultiAudioPolicy.alternateCandidate(") == false
+                  && sourceAudioStartup?.contains("mappable.insert(alternateAudioIn)") == false)
+        check("wiring: initial master falls back to one named URI-less primary row",
+              sourceContainsInOrder(masterRendering, [
+                  "let audioPlan = publication.audioPlan",
+                  "} else if let primaryTag = publication.primaryAudioTag",
+                  "audioTags = [primaryTag]",
+                  "let audioAttribute = audioTags.isEmpty ? \"\" : \",AUDIO=\\\"audio\\\"\"",
+                  "DVPlaybackPolicy.masterPlaylistData(",
+              ]))
         // The startup floor is the flat four-second / one-decodable-segment budget; the 3x-target multiplication was the
         // build 189 regression (36s of media before the master, while the start watchdog fires at 10s).
         check("wiring: master waits for the flat first-decodable-segment startup floor",
@@ -2769,10 +2840,10 @@ enum PlayerLiveContractTests {
                   && subtitleInvalidation?.contains("_subtitleCues.removeAll") == true
                   && subtitleInvalidation?.contains("buffer.fail") == false
                   && subtitleInvalidation?.contains("_hlsSegments") == false)
-        check("wiring: optional audio and subtitle renditions ship default-on with local rollback keys",
-              stream?.contains("isFeatureOn(\"dvRemuxMultiAudio\", default: true)") == true
+        check("wiring: only optional subtitle renditions retain a default-on rollback key",
+              stream?.contains("dvRemuxMultiAudio") == false
+                  && stream?.contains("stremiox.dvRemuxMultiAudio") == false
                   && stream?.contains("isFeatureOn(\"dvRemuxSubtitles\", default: true)") == true
-                  && stream?.contains("stremiox.dvRemuxMultiAudio") == true
                   && stream?.contains("stremiox.dvRemuxSubtitles") == true)
         check("wiring: PlayerEngine exposes the exact pre-load resume-origin API",
               engineContract?.contains("func configureResumeOrigin(seconds: Double)") == true
@@ -3102,6 +3173,31 @@ enum PlayerLiveContractTests {
                       "audioTracks = remuxSourceAudioTracks.isEmpty",
                       "audioGroup.map { Self.mpvTracks(",
                       ": sourceAudioMPVTracks()",
+                  ]))
+        check("wiring only: source inventory remains complete and picker calls production remount",
+              sourceAudioStartup?.contains(
+                  "let publishedAudioTracks: [VortXEngineProtocol.AudioTrack] = policyAudioTracks.compactMap")
+                  == true
+                  && sourceAudioStartup?.contains("prefix(") == false
+                  && sourceAudioStartup?.contains("_sourceAudioTracks = publishedAudioTracks") == true
+                  && sourceContainsInOrder(sourceAudioSelection, [
+                      "private func mountCurrentAudioReplacement(reason:",
+                      "selectedRemuxAudioSourceIndex = replacement.targetSourceIndex",
+                      "configureResumeOrigin(seconds: replacement.sourceSeconds)",
+                      "loadFile(",
+                      "reusing: loadToken",
+                      "func setAudioTrack(_ id: Int)",
+                      "remuxSourceAudioTracks.contains(where:",
+                      "RemuxAudioReplacementPolicy.State(",
+                      "sourceSeconds: playbackPositionSeconds",
+                      "mountCurrentAudioReplacement(reason: \"audio source selected\")",
+                  ])
+                  && sourceContainsInOrder(sourceAudioSelection, [
+                      "private func recoverAudioReplacementIfNeeded(",
+                      "replacement.failureAction(generation: generation)",
+                      "case .remountRollback(let sourceIndex, let sourceSeconds):",
+                      "pendingPlaybackIntent?.selectSourceAudio(sourceIndex)",
+                      "mountCurrentAudioReplacement(reason: \"audio replacement rollback\")",
                   ]))
         check("wiring: transcoded primary publishes an honest in-band label from its actual output codec",
               sourceContainsInOrder(transcodePrimaryPublication, [

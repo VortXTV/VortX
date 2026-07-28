@@ -12,6 +12,254 @@
 
 import Foundation
 import AVFoundation
+#if ENGINE_TRANSACTION_HARNESS
+import Darwin
+#endif
+
+#if ENGINE_TRANSACTION_HARNESS
+// Standalone shells for app services outside the player lane. The transaction gate below still compiles and
+// calls the production AVPlayerEngineController, VortXRemuxHLSServer, VortXMKVRemuxStream, and PlayerLoadToken.
+// These shells only make the otherwise app-wide dependency graph finite for one executable.
+protocol PlayerEngine: AnyObject {}
+
+enum PlayerEngineRouter {
+    static func shouldDVRemux(url: URL) -> Bool { false }
+    static func shouldPlainRemux(url: URL) -> Bool { url.pathExtension.lowercased() == "mkv" }
+    static func plainRemuxEnabled() -> Bool { true }
+    static func isPlainRemuxRetryCandidate(_ url: URL) -> Bool {
+        url.pathExtension.lowercased() == "mkv"
+    }
+    static func dvRemuxEnabled(dvDisplayCapable: Bool) -> Bool { false }
+}
+
+enum DVDisplaySupport {
+    @MainActor static var isCapable: Bool { false }
+}
+
+final class VortXExternalEngine: @unchecked Sendable {
+    static let shared = VortXExternalEngine()
+    var mountPlan: VortXEngineHostPolicy.MountPlan { .onDevice }
+}
+
+final class VortXRemoteRemuxMount: @unchecked Sendable {
+    static let signallingTimeoutSeconds: Double = 0
+
+    struct ReadinessReceipt: Sendable {
+        let identity: VortXEngineHostPolicy.RemoteMountIdentity
+        let status: VortXEngineProtocol.SessionStatus
+    }
+
+    enum ReadinessFailure: String, Error {
+        case explicitFailure = "explicit-failure"
+        case unhealthy = "unhealthy"
+        case timeout = "readiness-timeout"
+        case retired = "retired-mount"
+        case cancelled
+    }
+
+    let playlistURL: URL
+    let identity: VortXEngineHostPolicy.RemoteMountIdentity
+    let retainsFullTimeline = false
+
+    private init(playlistURL: URL) {
+        self.playlistURL = playlistURL
+        identity = .init(sessionID: "test", playlistURL: playlistURL.absoluteString)
+    }
+
+    static func open(
+        input: URL,
+        headers: [String: String]?,
+        mode: VortXEngineProtocol.RemuxMode,
+        startAtSeconds: Double,
+        selectedAudioStreamIndex: Int? = nil,
+        engine: VortXExternalEngine = .shared,
+        onLost: @escaping @Sendable (VortXRemoteRemuxMount) -> Void
+    ) async -> VortXRemoteRemuxMount? {
+        nil
+    }
+
+    func awaitSignalling(
+        timeoutSeconds: Double = VortXRemoteRemuxMount.signallingTimeoutSeconds
+    ) async -> Result<ReadinessReceipt, ReadinessFailure> {
+        .failure(.timeout)
+    }
+
+    func start() {}
+    func invalidate() {}
+    func markEngineReady() -> Bool { true }
+    func awaitHDRFallbackCapability(timeoutSeconds: Double = 0) async -> Bool { false }
+
+    var sourceDurationSeconds: Double { 0 }
+    var timelineOriginSeconds: Double { 0 }
+    var authoritativeFrameRate: Double { 0 }
+    var declaredBandwidth: Int { 0 }
+    var videoRange: String? { nil }
+    var supportsHDRFallback: Bool { false }
+    var sourceAudioTracks: [VortXEngineProtocol.AudioTrack] { [] }
+    var selectedSourceAudioIndex: Int? { nil }
+    var sourceSubtitleTracks: [VortXEngineProtocol.SubtitleTrack] { [] }
+    var chapters: [(start: Double, title: String)] { [] }
+    var isMountHealthy: Bool { false }
+    var producedEdgeSeconds: Double { 0 }
+    var mountProgress: VortXMKVRemuxStream.MountProgress {
+        .init(
+            producedBytes: 0,
+            segmentCount: 0,
+            initPublished: false,
+            signalingPublished: false,
+            ended: false,
+            failed: false)
+    }
+}
+
+struct LastStreamStore {
+    struct Entry {
+        var videoId: String
+        var url: String
+        var title: String
+        var season: Int?
+        var episode: Int?
+        var name: String
+        var poster: String?
+        var type: String
+        var qualityText: String?
+        var bingeGroup: String?
+        var torrent: Bool?
+        var savedAt: Date
+        var headers: [String: String]?
+        var debridService: String?
+        var infoHash: String?
+        var debridFileId: Int?
+        var debridTorrentId: Int?
+        var fileIdx: Int?
+        var linkSavedAt: Date?
+    }
+}
+
+enum DebridService: String {
+    case realDebrid, allDebrid, premiumize, torBox
+}
+
+struct DebridEpisode {
+    let season: Int
+    let episode: Int
+    let sourceFilename: String?
+
+    init(season: Int, episode: Int, sourceFilename: String? = nil) {
+        self.season = season
+        self.episode = episode
+        self.sourceFilename = sourceFilename
+    }
+}
+
+final class DebridCoordinator {
+    static let shared = DebridCoordinator()
+
+    func reresolve(
+        service: DebridService,
+        infoHash: String,
+        torrentId: Int?,
+        fileId: Int?,
+        fileIdx: Int?,
+        episode: DebridEpisode? = nil,
+        requiresSemanticSelection: Bool
+    ) async throws -> URL {
+        throw URLError(.unsupportedURL)
+    }
+}
+
+enum CatalogRowResolution {
+    static func metaHandlesTMDB(providesMeta: Bool, idPrefixes: [String]) -> Bool {
+        providesMeta && idPrefixes.contains { "tmdb:0".hasPrefix($0) }
+    }
+}
+
+enum AddonTombstones {
+    static func normalize(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
+
+enum VortXSyncManager {
+    static var appliedAddonOrder: [String] { [] }
+}
+
+enum DetailMetaRecoveryPolicy {
+    enum Resolution { case ready, pending, unresolved }
+    enum EntryState { case ready, loading, failed, notStarted }
+
+    static func resolution(entries: [EntryState]) -> Resolution {
+        if entries.contains(where: {
+            if case .ready = $0 { return true }
+            return false
+        }) {
+            return .ready
+        }
+        return entries.isEmpty ? .unresolved : .pending
+    }
+
+    static func resolution(
+        selectedID: String?,
+        requestedID: String,
+        entries: [EntryState]
+    ) -> Resolution? {
+        selectedID == requestedID ? resolution(entries: entries) : nil
+    }
+}
+
+final class DebridKeys {
+    static let shared = DebridKeys()
+    func isConfigured(_ service: DebridService) -> Bool { false }
+}
+
+enum PlaybackSettings {
+    static var torrentsDisabled: Bool { false }
+}
+
+enum StremioServer {
+    static let base = "http://127.0.0.1"
+    static let trailerResolverBase = "https://example.invalid"
+}
+
+final class SubtitleCueRenderer {
+    struct Cue {}
+    var hasCues: Bool { false }
+    var offset: Double = 0
+    static func parse(data: Data) -> [Cue] { [] }
+    func load(cues: [Cue]) {}
+    func clear() {}
+    func activeText(atClock clock: Double) -> String? { nil }
+}
+
+enum SubtitleFileFetcher {
+    static func fetch(_ url: URL, timeout: TimeInterval, completion: @escaping (Data?) -> Void) {
+        completion(nil)
+    }
+}
+
+enum SubtitleStyle {
+    static let colorHex = "#FFFFFF"
+    static let backgroundId = "outline"
+    static let fontSize = 55
+}
+
+final class SubtitleOverlayView {
+    func applyStyle() {}
+    func setVideoBottomInset(_ inset: CGFloat) {}
+    func setText(_ text: String?) {}
+}
+
+final class VXProbeState {
+    static let shared = VXProbeState()
+    func setPlayer(state: String, source: String, engine: String) {}
+    func setPlayer(state: String, engine: String, buffering: Bool) {}
+    func setPlayer(pos: Int, dur: Int?, engine: String) {}
+}
+
+extension VXProbe {
+    static func event(_ category: String, _ message: String) {}
+}
+#endif
 
 let fixtureDir = "/tmp/dd-dvstall/fixtures"
 
@@ -59,6 +307,7 @@ struct ScenarioResult {
     var mediaBody = ""
     var startupRenderedSeconds = 0.0
     var audioMediaTags = 0
+    var audioMediaLines: [String] = []
     var subtitleMediaTags = 0
     var nonEmptyVTTs = 0
     var totalVTTs = 0
@@ -92,8 +341,10 @@ func runScenario(name: String, fixture: String, startAt: Double,
     result.masterBody = String(decoding: master.body, as: UTF8.self)
     print("master status=\(master.status) latency=\(String(format: "%.1f", master.latency))s bytes=\(master.body.count)")
     print(result.masterBody)
-    result.audioMediaTags = result.masterBody.split(separator: "\n")
-        .filter { $0.hasPrefix("#EXT-X-MEDIA:TYPE=AUDIO") }.count
+    result.audioMediaLines = result.masterBody.split(separator: "\n")
+        .map(String.init)
+        .filter { $0.hasPrefix("#EXT-X-MEDIA:TYPE=AUDIO") }
+    result.audioMediaTags = result.audioMediaLines.count
     result.subtitleMediaTags = result.masterBody.split(separator: "\n")
         .filter { $0.hasPrefix("#EXT-X-MEDIA:TYPE=SUBTITLES") }.count
 
@@ -313,13 +564,14 @@ func consumerScenario(name: String, fixture: String, startAt: Double,
     return result
 }
 
-// MARK: - REAL-CONSUMER SELECTION gate (build 191 field defect: renditions advertised, selection dead).
+// MARK: - REAL-CONSUMER SELECTION gate.
 //
 // The consumer gate above proves the stream PLAYS. It cannot prove a viewer can CHANGE anything: the field
 // report on build 191 was that audio showed one name with no options, subtitles showed Off while built-in
-// subs rendered, and picking a row buffered without switching. This gate drives a REAL AVPlayer, waits for
-// steady playback, then SELECTS an alternate audio rendition and an alternate subtitle rendition mid-play
-// and requires three things per switch:
+// subs rendered, and picking a row buffered without switching. Audio now keeps its complete source inventory
+// outside AVFoundation and remounts one selected in-band primary. The direct remount receipts below are
+// supplemental producer evidence only, not a consumer audio switch. This gate drives a REAL AVPlayer, waits
+// for steady playback, then SELECTS an alternate subtitle rendition mid-play and requires three things:
 //   1. AVPlayerItem.currentMediaSelection reports the option we asked for (the selection BOUND),
 //   2. the server actually SERVED that rendition's own resources afterwards (the switch reached the wire),
 //   3. playback continued for 20s+ with no stall, no error and a monotonically advancing clock.
@@ -340,12 +592,14 @@ struct SwitchOutcome {
 
 struct SelectionResult {
     var audioOptions: [String] = []
+    var selectedNativeAudioName: String?
     var subtitleOptions: [String] = []
-    var audio = SwitchOutcome()
     var subtitles = SwitchOutcome()
     var itemError: String?
     var remuxFailed = false
     var reachedSecondsBeforeSwitch = 0.0
+    var sourceAudioRows: [(index: Int, title: String)] = []
+    var selectedSourceAudioIndex: Int?
 }
 
 /// Pump the main run loop until `ready()` returns true or `seconds` elapse. Returns whether it went true.
@@ -436,6 +690,8 @@ func selectionScenario(name: String, fixture: String, playSeconds: Double,
     result.reachedSecondsBeforeSwitch = item.currentTime().seconds
     result.itemError = warm.error
     if server.mountProgress.failed { result.remuxFailed = true }
+    result.sourceAudioRows = server.sourceAudioTracks.map { ($0.sourceIndex, $0.title) }
+    result.selectedSourceAudioIndex = server.selectedSourceAudioIndex
     print(String(format: "selection warm-up: clock=%.1fs advanced=%.1fs stall=%.1fs",
                  result.reachedSecondsBeforeSwitch, warm.played, warm.longestStall))
 
@@ -451,42 +707,12 @@ func selectionScenario(name: String, fixture: String, playSeconds: Double,
     // What AVFoundation picked on its own, BEFORE anything asked it to. A legible rendition auto-selected
     // here renders subtitles the viewer never asked for, and any chrome that reports "Off" while this is
     // non-nil is lying about the state (the build 191 "built-in subs show but settings say off" report).
-    let initialAudio = audioGroup
-        .flatMap { item.currentMediaSelection.selectedMediaOption(in: $0)?.displayName } ?? "none"
+    result.selectedNativeAudioName = audioGroup
+        .flatMap { item.currentMediaSelection.selectedMediaOption(in: $0)?.displayName }
+    let initialAudio = result.selectedNativeAudioName ?? "none"
     let initialSubtitle = subGroup
         .flatMap { item.currentMediaSelection.selectedMediaOption(in: $0)?.displayName } ?? "none"
     print("selection at mount (AVFoundation's own automatic pick): audio=\(initialAudio) subtitle=\(initialSubtitle)")
-
-    // --- audio switch ---
-    if let group = audioGroup {
-        let current = item.currentMediaSelection.selectedMediaOption(in: group)
-        if let target = group.options.first(where: { $0 != current }) {
-            result.audio.attempted = true
-            result.audio.requested = target.displayName
-            let mark = DiagnosticsLog.capturedLines().count
-            let selectAt = Date()
-            item.select(target, in: group)
-            // AVFoundation may settle an HLS rendition switch asynchronously; give it a bounded window and
-            // record how long it took, because the chrome re-reads at 0.25s.
-            if pump(seconds: 10, until: {
-                item.currentMediaSelection.selectedMediaOption(in: group) == target
-            }) { result.audio.settleSeconds = Date().timeIntervalSince(selectAt) }
-            result.audio.observed = item.currentMediaSelection
-                .selectedMediaOption(in: group)?.displayName ?? "nil"
-            let after = observePlayback(item: item, seconds: holdSeconds)
-            result.audio.secondsPlayedAfter = after.played
-            result.audio.longestStallAfter = after.longestStall
-            result.audio.errorAfter = after.error
-            // A URI-bearing alternate proves itself by its OWN media resources reaching the wire.
-            result.audio.servedRenditionResources = servedSince(mark, marker: "/audio")
-            print(String(format: "audio switch: requested=%@ observed=%@ settle=%.2fs served=%@ played=%.1fs stall=%.1fs",
-                         result.audio.requested, result.audio.observed, result.audio.settleSeconds,
-                         String(result.audio.servedRenditionResources),
-                         result.audio.secondsPlayedAfter, result.audio.longestStallAfter))
-        } else {
-            print("audio switch: NO alternate option exists (options=\(result.audioOptions.count))")
-        }
-    }
 
     // --- subtitle switch ---
     if let group = subGroup, !group.options.isEmpty {
@@ -523,6 +749,51 @@ func selectionScenario(name: String, fixture: String, playSeconds: Double,
     return result
 }
 
+struct SourceRemountReceipt {
+    let requestedSourceIndex: Int
+    let sourceAudioIndices: [Int]
+    let selectedSourceIndex: Int?
+    let timelineOriginSeconds: Double
+    let audioMediaLines: [String]
+    let failed: Bool
+}
+
+/// Mount one immutable source index as the sole in-band primary at the carried source playhead.
+/// This is supplemental producer evidence for AVPlayerEngine's replacement transaction. It does not invoke
+/// setAudioTrack and must not be reported as a physical consumer audio switch; the focused player contract
+/// owns the transaction and rollback state gate.
+func sourceRemountReceipt(fixture: String,
+                          sourceIndex: Int,
+                          sourcePlayhead: Double) -> SourceRemountReceipt {
+    let input = URL(fileURLWithPath: "\(fixtureDir)/\(fixture)")
+    guard let (server, _) = VortXRemuxHLSServer.make(
+        input: input,
+        headers: nil,
+        mode: .plain,
+        startAtSeconds: sourcePlayhead,
+        selectedAudioStreamIndex: sourceIndex) else {
+        print("FATAL source remount server did not bind")
+        exit(2)
+    }
+    let base = "http://127.0.0.1:\(server.port)"
+    server.start()
+    let master = fetch(base, "/master.m3u8")
+    let audioLines = String(decoding: master.body, as: UTF8.self)
+        .split(separator: "\n")
+        .map(String.init)
+        .filter { $0.hasPrefix("#EXT-X-MEDIA:TYPE=AUDIO") }
+    let receipt = SourceRemountReceipt(
+        requestedSourceIndex: sourceIndex,
+        sourceAudioIndices: server.sourceAudioTracks.map(\.sourceIndex),
+        selectedSourceIndex: server.selectedSourceAudioIndex,
+        timelineOriginSeconds: server.timelineOriginSeconds,
+        audioMediaLines: audioLines,
+        failed: master.status != 200 || server.mountProgress.failed)
+    server.invalidate()
+    Thread.sleep(forTimeInterval: 0.25)
+    return receipt
+}
+
 func judgeSwitch(_ label: String, _ outcome: SwitchOutcome, holdSeconds: Double, optionCount: Int) {
     check("selection \(label): an alternate rendition is offered at all",
           red: optionCount < 2,
@@ -542,6 +813,293 @@ func judgeSwitch(_ label: String, _ outcome: SwitchOutcome, holdSeconds: Double,
                          outcome.secondsPlayedAfter, holdSeconds, outcome.longestStallAfter,
                          outcome.errorAfter ?? "none"))
 }
+
+#if ENGINE_TRANSACTION_HARNESS
+@MainActor
+private final class EngineTransactionDelegate: MPVPlayerDelegate {
+    private(set) var errors: [String] = []
+
+    func propertyChange(propertyName: String, data: Any?, loadToken: PlayerLoadToken) {
+        if propertyName == MPVProperty.endFileError {
+            errors.append(data.map(String.init(describing:)) ?? "unknown")
+        }
+    }
+}
+
+private struct EngineTransactionResult {
+    var initialRows: [Int] = []
+    var rowsAfterReady: [Int] = []
+    var targetSourceIndex: Int?
+    var selectedAfterReady: Int?
+    var tokenWasReused = false
+    var sourceSecondsBeforeSwitch = 0.0
+    var sourceSecondsAtReady = 0.0
+    var advancedAfterReady = 0.0
+    var longestStallAfterReady = 0.0
+    var errors: [String] = []
+    var sawProductionSelection = false
+    var sawProductionReady = false
+    var sawProductionRestore = false
+}
+
+private struct EngineRollbackResult {
+    var sourceWasSuspended = false
+    var rollbackCount = 0
+    var targetFailureReason: String?
+    var priorSourceIndex: Int?
+    var targetSourceIndex: Int?
+    var selectedAfterRollback: Int?
+    var tokenWasReused = false
+    var sourceSecondsBeforeSwitch = 0.0
+    var rollbackSourceSeconds: Double?
+    var advancedAfterRollback = 0.0
+    var errors: [String] = []
+    var sawTargetFailure = false
+    var sawRollbackReady = false
+    var sawRollbackRestore = false
+}
+
+@MainActor
+private func waitForEngineState(
+    timeout: TimeInterval,
+    _ predicate: () -> Bool
+) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if predicate() { return true }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+    }
+    return predicate()
+}
+
+/// Execute the physical source-remount transaction through the production controller. No private state is
+/// seeded: a real HLS mount publishes the source inventory, then the public picker entry point performs the
+/// same-token loadFile remount and production readiness/intent restoration.
+@MainActor
+private func engineTransactionSuccessScenario(
+    fixture: String,
+    pacedBytesPerSecond: Int
+) -> EngineTransactionResult {
+    print("=== ENGINE TRANSACTION SUCCESS fixture=\(fixture) ===")
+    var result = EngineTransactionResult()
+    let source = startPacedSource(fixture: fixture, bytesPerSecond: pacedBytesPerSecond)
+    defer {
+        if source.process.isRunning { source.process.terminate() }
+    }
+
+    let delegate = EngineTransactionDelegate()
+    let engine = AVPlayerEngineController()
+    engine.playDelegate = delegate
+    engine.configureResumeOrigin(seconds: 18)
+    let initialToken = engine.loadFile(
+        source.url,
+        headers: nil,
+        live: false,
+        audioSidecar: nil,
+        reusing: nil)
+
+    let initialReady = waitForEngineState(timeout: 40) {
+        let rows = engine.tracks(ofType: "audio")
+        return rows.count == 5
+            && rows.contains(where: \.selected)
+            && engine.playbackPositionSeconds >= 18
+    }
+    guard initialReady else {
+        result.errors = delegate.errors + ["initial production engine mount did not become ready"]
+        engine.stop()
+        return result
+    }
+
+    let initialTracks = engine.tracks(ofType: "audio")
+    result.initialRows = initialTracks.map(\.id)
+    guard let initialSelected = initialTracks.first(where: \.selected)?.id,
+          let target = initialTracks.first(where: { $0.id != initialSelected })?.id else {
+        result.errors = delegate.errors + ["source inventory did not provide a replacement target"]
+        engine.stop()
+        return result
+    }
+    result.targetSourceIndex = target
+
+    _ = waitForEngineState(timeout: 8) {
+        engine.playbackPositionSeconds >= 20
+    }
+    result.sourceSecondsBeforeSwitch = engine.playbackPositionSeconds
+    let logOffset = DiagnosticsLog.capturedLines().count
+    engine.setAudioTrack(target)
+
+    let replacementReady = waitForEngineState(timeout: 40) {
+        let transactionLines = DiagnosticsLog.capturedLines().dropFirst(logOffset)
+        return transactionLines.contains(where: {
+            $0.contains("audio replacement generation") && $0.contains("reached source ready")
+        }) && transactionLines.contains(where: {
+            $0.contains("playback intent restored once")
+        })
+    }
+    let transactionLines = Array(DiagnosticsLog.capturedLines().dropFirst(logOffset))
+    result.sawProductionSelection = transactionLines.contains {
+        $0.contains("audio source selected source=\(target)")
+    }
+    result.sawProductionReady = transactionLines.contains {
+        $0.contains("audio replacement generation") && $0.contains("reached source ready")
+    }
+    result.sawProductionRestore = transactionLines.contains {
+        $0.contains("playback intent restored once")
+    }
+    result.tokenWasReused = engine.activeLoadToken == initialToken
+    let replacementTracks = replacementReady ? engine.tracks(ofType: "audio") : []
+    result.rowsAfterReady = replacementTracks.map(\.id)
+    result.selectedAfterReady = replacementTracks.first(where: \.selected)?.id
+    result.sourceSecondsAtReady = engine.playbackPositionSeconds
+
+    if replacementReady {
+        var lastPosition = result.sourceSecondsAtReady
+        var lastAdvance = Date()
+        let targetAdvance = 20.0
+        let deadline = Date().addingTimeInterval(targetAdvance + 15)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+            let now = engine.playbackPositionSeconds
+            if now > lastPosition + 0.05 {
+                result.longestStallAfterReady = max(
+                    result.longestStallAfterReady,
+                    Date().timeIntervalSince(lastAdvance))
+                lastAdvance = Date()
+                lastPosition = now
+            }
+            result.advancedAfterReady = max(
+                result.advancedAfterReady,
+                now - result.sourceSecondsAtReady)
+            if result.advancedAfterReady >= targetAdvance { break }
+        }
+        result.longestStallAfterReady = max(
+            result.longestStallAfterReady,
+            Date().timeIntervalSince(lastAdvance))
+    }
+    result.errors = delegate.errors
+    engine.stop()
+    return result
+}
+
+/// Force the requested remount's real AVPlayer item to fail by pausing the paced HTTP origin. The origin
+/// resumes after AVFoundation has rejected that target, so the controller's single rollback remount can open
+/// the same immutable source and restore the prior audio at the captured playhead.
+@MainActor
+private func engineTransactionRollbackScenario(
+    fixture: String,
+    pacedBytesPerSecond: Int
+) -> EngineRollbackResult {
+    print("=== ENGINE TRANSACTION ROLLBACK fixture=\(fixture) ===")
+    var result = EngineRollbackResult()
+    let source = startPacedSource(fixture: fixture, bytesPerSecond: pacedBytesPerSecond)
+    let sourcePID = source.process.processIdentifier
+    defer {
+        _ = Darwin.kill(sourcePID, SIGCONT)
+        if source.process.isRunning { source.process.terminate() }
+    }
+
+    let delegate = EngineTransactionDelegate()
+    let engine = AVPlayerEngineController()
+    engine.playDelegate = delegate
+    engine.configureResumeOrigin(seconds: 36)
+    let initialToken = engine.loadFile(
+        source.url,
+        headers: nil,
+        live: false,
+        audioSidecar: nil,
+        reusing: nil)
+
+    let initialReady = waitForEngineState(timeout: 40) {
+        let rows = engine.tracks(ofType: "audio")
+        return rows.count == 5
+            && rows.contains(where: \.selected)
+            && engine.playbackPositionSeconds >= 36
+    }
+    guard initialReady else {
+        result.errors = delegate.errors + ["rollback setup mount did not become ready"]
+        engine.stop()
+        return result
+    }
+
+    let tracks = engine.tracks(ofType: "audio")
+    guard let prior = tracks.first(where: \.selected)?.id,
+          let target = tracks.first(where: { $0.id != prior })?.id else {
+        result.errors = delegate.errors + ["rollback setup had no alternate source target"]
+        engine.stop()
+        return result
+    }
+    result.priorSourceIndex = prior
+    result.targetSourceIndex = target
+    _ = waitForEngineState(timeout: 8) {
+        engine.playbackPositionSeconds >= 38
+    }
+    result.sourceSecondsBeforeSwitch = engine.playbackPositionSeconds
+    let logOffset = DiagnosticsLog.capturedLines().count
+
+    result.sourceWasSuspended = Darwin.kill(sourcePID, SIGSTOP) == 0
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 31) {
+        _ = Darwin.kill(sourcePID, SIGCONT)
+    }
+    engine.setAudioTrack(target)
+
+    let rollbackReady = waitForEngineState(timeout: 55) {
+        let transactionLines = DiagnosticsLog.capturedLines().dropFirst(logOffset)
+        return transactionLines.contains(where: {
+            $0.contains("audio replacement failed") && $0.contains("one rollback")
+        }) && transactionLines.contains(where: {
+            $0.contains("audio replacement generation")
+                && $0.contains("reached source ready source=\(prior)")
+        }) && transactionLines.contains(where: {
+            $0.contains("playback intent restored once")
+                && $0.contains("audio=\(prior)")
+        })
+    }
+
+    let transactionLines = Array(DiagnosticsLog.capturedLines().dropFirst(logOffset))
+    let rollbackLines = transactionLines.filter {
+        $0.contains("audio replacement failed") && $0.contains("one rollback")
+    }
+    result.rollbackCount = rollbackLines.count
+    result.targetFailureReason = rollbackLines.first.flatMap { line in
+        guard let reasonStart = line.range(of: "audio replacement failed (")?.upperBound,
+              let reasonEnd = line.range(
+                of: ") -> one rollback",
+                range: reasonStart..<line.endIndex)?.lowerBound
+        else { return nil }
+        return String(line[reasonStart..<reasonEnd])
+    }
+    result.sawTargetFailure = result.targetFailureReason == "resource unavailable"
+    result.sawRollbackReady = transactionLines.contains {
+        $0.contains("audio replacement generation")
+            && $0.contains("reached source ready source=\(prior)")
+    }
+    result.sawRollbackRestore = transactionLines.contains {
+        $0.contains("playback intent restored once") && $0.contains("audio=\(prior)")
+    }
+    result.rollbackSourceSeconds = rollbackLines.first.flatMap { line in
+        guard let atRange = line.range(of: " at "),
+              let secondsRange = line.range(
+                of: "s",
+                range: atRange.upperBound..<line.endIndex)
+        else { return nil }
+        return Double(line[atRange.upperBound..<secondsRange.lowerBound])
+    }
+    result.tokenWasReused = engine.activeLoadToken == initialToken
+    result.selectedAfterRollback = rollbackReady
+        ? engine.tracks(ofType: "audio").first(where: \.selected)?.id
+        : nil
+
+    if rollbackReady {
+        let restoredAt = engine.playbackPositionSeconds
+        _ = waitForEngineState(timeout: 15) {
+            engine.playbackPositionSeconds >= restoredAt + 8
+        }
+        result.advancedAfterRollback = max(0, engine.playbackPositionSeconds - restoredAt)
+    }
+    result.errors = delegate.errors
+    engine.stop()
+    return result
+}
+#endif
 
 // Iteration affordance ONLY: `ONLY_SELECTION=1` runs just the selection gate while that gate is being
 // developed. Every reported run is a full run (the variable is unset), and the summary states which it was.
@@ -563,9 +1121,13 @@ check("first media playlist starts pinned at sequence zero",
       detail: "first media playlist rendered=\(String(format: "%.1f", fresh.startupRenderedSeconds))s, seq0=\(fresh.mediaBody.contains("#EXT-X-MEDIA-SEQUENCE:0"))")
 check("master served at all (fresh)", red: fresh.masterStatus != 200,
       detail: "status=\(fresh.masterStatus)")
-check("same-codec alternate audio advertised with labels",
-      red: fresh.audioMediaTags < 2,
-      detail: "audio EXT-X-MEDIA tags=\(fresh.audioMediaTags) (need primary+alternate for eng/fre E-AC-3 pair)")
+check("initial master advertises one named primary audio row",
+      red: fresh.audioMediaTags != 1
+          || fresh.audioMediaLines.first?.contains(#"NAME="English 5.1""#) != true,
+      detail: "audio rows=\(fresh.audioMediaLines)")
+check("initial master advertises no alternate audio URI",
+      red: fresh.audioMediaLines.contains(where: { $0.contains("URI=") }),
+      detail: "audio rows=\(fresh.audioMediaLines)")
 check("subtitle renditions advertised", red: fresh.subtitleMediaTags < 2,
       detail: "subtitle EXT-X-MEDIA tags=\(fresh.subtitleMediaTags)")
 check("startup VTTs carry cues (fresh)", red: fresh.totalVTTs > 0 && fresh.nonEmptyVTTs == 0,
@@ -587,9 +1149,11 @@ check("resume VTTs carry cues (timeline rebase)",
 // --- Scenario 3: mixed-codec audio (the CEO's 4-language file shape) ---
 let mixed = runScenario(name: "fresh-mixedcodec", fixture: "fixture-mixedcodec.mkv",
                         startAt: 0, consumeSeconds: 6)
-check("primary audio labeled even without a qualifying alternate",
-      red: mixed.audioMediaTags < 1,
-      detail: "audio EXT-X-MEDIA tags=\(mixed.audioMediaTags) (field: audio=0 master -> AVPlayer shows one Unknown entry)")
+check("mixed-codec master keeps one named primary without an alternate",
+      red: mixed.audioMediaTags != 1
+          || mixed.audioMediaLines.first?.contains(#"NAME="English 5.1""#) != true
+          || mixed.audioMediaLines.contains(where: { $0.contains("URI=") }),
+      detail: "audio rows=\(mixed.audioMediaLines)")
 check("master served (mixed)", red: mixed.masterStatus != 200,
       detail: "status=\(mixed.masterStatus)")
 
@@ -628,13 +1192,133 @@ let selection = selectionScenario(
 check("selection: every text subtitle track is offered",
       red: selection.subtitleOptions.count < 5,
       detail: "subtitle options=\(selection.subtitleOptions.count) \(selection.subtitleOptions) (fixture carries 5)")
-judgeSwitch("audio", selection.audio, holdSeconds: selectionHold,
-            optionCount: selection.audioOptions.count)
+check("selection: AVFoundation sees only the in-band primary audio",
+      red: selection.audioOptions.count != 1 || selection.selectedNativeAudioName == nil,
+      detail: "native audio options=\(selection.audioOptions) selected=\(selection.selectedNativeAudioName ?? "nil")")
+check("selection: every source audio row remains visible outside the HLS group",
+      red: selection.sourceAudioRows.count != 5
+          || Set(selection.sourceAudioRows.map(\.index)).count != 5,
+      detail: "source rows=\(selection.sourceAudioRows)")
+check("selection: the initial source receipt names one visible row",
+      red: selection.selectedSourceAudioIndex.map {
+          selection.sourceAudioRows.map(\.index).contains($0)
+      } != true,
+      detail: "selected=\(selection.selectedSourceAudioIndex.map(String.init) ?? "nil") rows=\(selection.sourceAudioRows)")
 judgeSwitch("subtitle", selection.subtitles, holdSeconds: selectionHold,
             optionCount: selection.subtitleOptions.count)
-check("selection: the session survived both switches",
+check("selection: the session survived the subtitle switch",
       red: selection.remuxFailed || selection.itemError != nil,
       detail: "remuxFailed=\(selection.remuxFailed) itemError=\(selection.itemError ?? "none")")
+
+let sourcePlayhead = 18.0
+let remountReceipts = selection.sourceAudioRows.map {
+    sourceRemountReceipt(
+        fixture: "fixture-manyaudio.mkv",
+        sourceIndex: $0.index,
+        sourcePlayhead: sourcePlayhead)
+}
+let remountSummary = remountReceipts.map {
+    "\($0.requestedSourceIndex)->\($0.selectedSourceIndex.map(String.init) ?? "nil")"
+}
+let remountOrigins = remountReceipts.map {
+    String(format: "%.3f", $0.timelineOriginSeconds)
+}
+check("producer supplemental: every immutable source index is remounted as the sole primary",
+      red: remountReceipts.count != 5
+          || remountReceipts.contains {
+              $0.failed
+                  || $0.selectedSourceIndex != $0.requestedSourceIndex
+                  || $0.audioMediaLines.count != 1
+                  || !$0.audioMediaLines[0].contains("NAME=")
+                  || $0.audioMediaLines[0].contains("URI=")
+          },
+      detail: "receipts=\(remountSummary)")
+check("producer supplemental: every remount preserves the complete source inventory",
+      red: remountReceipts.contains {
+          $0.sourceAudioIndices != selection.sourceAudioRows.map(\.index)
+      },
+      detail: "inventories=\(remountReceipts.map(\.sourceAudioIndices))")
+check("producer supplemental: every remount carries the source playhead",
+      red: remountReceipts.contains {
+          abs($0.timelineOriginSeconds - sourcePlayhead) > 1.5
+      },
+      detail: "origins=\(remountOrigins)")
+
+#if ENGINE_TRANSACTION_HARNESS
+private let engineTransaction = MainActor.assumeIsolated {
+    engineTransactionSuccessScenario(
+        fixture: "fixture-manyaudio.mkv",
+        pacedBytesPerSecond: pacedRate)
+}
+private let engineRollback = MainActor.assumeIsolated {
+    engineTransactionRollbackScenario(
+        fixture: "fixture-manyaudio.mkv",
+        pacedBytesPerSecond: pacedRate)
+}
+check("engine transaction: production picker path starts and reaches readiness",
+      red: !engineTransaction.sawProductionSelection
+          || !engineTransaction.sawProductionReady
+          || !engineTransaction.sawProductionRestore,
+      detail: "selected=\(engineTransaction.sawProductionSelection) ready=\(engineTransaction.sawProductionReady) restore=\(engineTransaction.sawProductionRestore)")
+check("engine transaction: complete source inventory survives the physical remount",
+      red: engineTransaction.initialRows.count != 5
+          || Set(engineTransaction.initialRows).count != 5
+          || engineTransaction.rowsAfterReady != engineTransaction.initialRows,
+      detail: "initial=\(engineTransaction.initialRows) postRemount=\(engineTransaction.rowsAfterReady)")
+check("engine transaction: requested source becomes the selected in-band primary",
+      red: engineTransaction.targetSourceIndex == nil
+          || engineTransaction.selectedAfterReady != engineTransaction.targetSourceIndex,
+      detail: "target=\(engineTransaction.targetSourceIndex.map(String.init) ?? "nil") selected=\(engineTransaction.selectedAfterReady.map(String.init) ?? "nil")")
+check("engine transaction: logical PlayerLoadToken is reused",
+      red: !engineTransaction.tokenWasReused,
+      detail: "same token=\(engineTransaction.tokenWasReused)")
+check("engine transaction: source playhead is carried into the replacement",
+      red: abs(engineTransaction.sourceSecondsAtReady
+          - engineTransaction.sourceSecondsBeforeSwitch) > 1.5,
+      detail: String(
+        format: "before=%.3fs ready=%.3fs drift=%.3fs tolerance=1.500s",
+        engineTransaction.sourceSecondsBeforeSwitch,
+        engineTransaction.sourceSecondsAtReady,
+        abs(engineTransaction.sourceSecondsAtReady
+            - engineTransaction.sourceSecondsBeforeSwitch)))
+check("engine transaction: replacement advances 20s without a long stall or terminal error",
+      red: engineTransaction.advancedAfterReady < 20
+          || engineTransaction.longestStallAfterReady > 5
+          || !engineTransaction.errors.isEmpty,
+      detail: String(
+        format: "advanced=%.1fs longestStall=%.1fs errors=%@",
+        engineTransaction.advancedAfterReady,
+        engineTransaction.longestStallAfterReady,
+        engineTransaction.errors.description))
+check("engine rollback: deterministic target failure triggers exactly one rollback",
+      red: !engineRollback.sourceWasSuspended
+          || !engineRollback.sawTargetFailure
+          || engineRollback.rollbackCount != 1,
+      detail: "sourceSuspended=\(engineRollback.sourceWasSuspended) failure=\(engineRollback.sawTargetFailure) reason=\(engineRollback.targetFailureReason ?? "nil") rollbackCount=\(engineRollback.rollbackCount)")
+check("engine rollback: prior source becomes ready and is restored",
+      red: !engineRollback.sawRollbackReady
+          || !engineRollback.sawRollbackRestore
+          || engineRollback.priorSourceIndex == nil
+          || engineRollback.selectedAfterRollback != engineRollback.priorSourceIndex,
+      detail: "prior=\(engineRollback.priorSourceIndex.map(String.init) ?? "nil") target=\(engineRollback.targetSourceIndex.map(String.init) ?? "nil") selected=\(engineRollback.selectedAfterRollback.map(String.init) ?? "nil") ready=\(engineRollback.sawRollbackReady) restore=\(engineRollback.sawRollbackRestore)")
+check("engine rollback: measured playhead and logical PlayerLoadToken survive",
+      red: !engineRollback.tokenWasReused
+          || engineRollback.rollbackSourceSeconds == nil
+          || abs((engineRollback.rollbackSourceSeconds ?? 0)
+              - engineRollback.sourceSecondsBeforeSwitch) > 1.5,
+      detail: String(
+        format: "sameToken=%@ before=%.3fs rollback=%.3fs",
+        String(engineRollback.tokenWasReused),
+        engineRollback.sourceSecondsBeforeSwitch,
+        engineRollback.rollbackSourceSeconds ?? -1))
+check("engine rollback: recovered playback advances without a terminal error",
+      red: engineRollback.advancedAfterRollback < 8
+          || !engineRollback.errors.isEmpty,
+      detail: String(
+        format: "advanced=%.1fs errors=%@",
+        engineRollback.advancedAfterRollback,
+        engineRollback.errors.description))
+#endif
 
 print("=== REPRO SUMMARY: \(redCount) RED\(onlySelection ? " (SELECTION GATE ONLY)" : " (full run)") ===")
 exit(Int32(min(redCount, 125)))

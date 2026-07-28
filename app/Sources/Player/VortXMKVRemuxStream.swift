@@ -30,8 +30,8 @@ import Libdovi
 ///     Vorbis, PCM variants), that ONE track is TRANSCODED in-flight by `VortXAudioTranscoder` (EAC3-first,
 ///     else AAC with today's bundled FFmpeg) so the DV lane no longer bails to libmpv's HDR10 tone-map over
 ///     audio alone. A source with no decodable AND no transcodable audio still fails fast to libmpv.
-///     Behind a default-on rollback flag, at most one proven same-codec/different-language alternate is written to a
-///     SEPARATE audio-only fMP4 muxer. It never enters the primary mux or delays primary init.
+///     Initial HLS publishes only the selected in-band primary. The complete source inventory stays available
+///     to the picker, whose source choices remount that track as the next in-band primary.
 ///   - Subtitles: never mapped. Behind a default-on rollback flag, bounded text tracks become separate WebVTT HLS
 ///     renditions. Bitmap subtitle codecs remain out of scope.
 ///
@@ -597,15 +597,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// of media even if all-video), so 12s of pure deferral is conclusive without tripping inside the drain.
     private static let hlsPreInitMoovDeadlineSecs = 12.0
 
-    // MARK: - Default-on Beta 7 HLS rendition flags
-
-    static let multiAudioKey = "stremiox.dvRemuxMultiAudio"
-    static var multiAudioEnabled: Bool {
-        if UserDefaults.standard.object(forKey: multiAudioKey) != nil {
-            return UserDefaults.standard.bool(forKey: multiAudioKey)
-        }
-        return RemoteConfig.snapshot.isFeatureOn("dvRemuxMultiAudio", default: true)
-    }
+    // MARK: - Default-on Beta 7 subtitle rendition flag
 
     static let subtitleRenditionsKey = "stremiox.dvRemuxSubtitles"
     static var subtitleRenditionsEnabled: Bool {
@@ -1210,20 +1202,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             ? mappedAudioIn : (transcodeActive ? transcodeAudioIn : nil)
         hlsLock.unlock()
 
-        // Select but do not advertise one alternate. Its first real packet must still prove the track and
-        // initialize the separate muxer; pending state merely tells the master request to apply its <=2s wait.
-        var alternateAudioTracks: [MultiAudioPolicy.AudioTrack] = []
-        var alternateAudioIn = -1
-        if Self.multiAudioEnabled, hlsIndexingEnabled, !transcodeActive, mappedAudioIn >= 0 {
-            alternateAudioTracks = copyablePolicyAudioTracks
-            if let candidate = MultiAudioPolicy.alternateCandidate(
-                from: alternateAudioTracks, primaryIndex: mappedAudioIn) {
-                alternateAudioIn = candidate.index
-                hlsLock.lock()
-                _alternateAudioState = .pending
-                hlsLock.unlock()
-            }
-        }
+        // Initial playback publishes only the selected in-band primary. Keep every source row above so a
+        // picker choice can remount that source as the new primary without an eager alternate producer.
+        let alternateAudioTracks: [MultiAudioPolicy.AudioTrack] = []
+        let alternateAudioIn = -1
         var transcodeAudioName = "none"
         if transcodeActive, let s = inCtx.pointee.streams[transcodeAudioIn], let p = s.pointee.codecpar {
             transcodeAudioName = Self.codecName(p.pointee.codec_id)
