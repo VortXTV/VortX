@@ -577,6 +577,11 @@ enum DVPlaybackPolicy {
             if wasApplied { applied = request }
         }
 
+        func isApplied(_ request: DisplayRequest, manager: AnyObject) -> Bool {
+            managerID == ObjectIdentifier(manager)
+                && applied?.selectsSameMode(as: request) == true
+        }
+
         mutating func reset() {
             managerID = nil
             pending = nil
@@ -1240,10 +1245,14 @@ struct VortXHLSStartupReadiness: Equatable, Sendable {
     /// the normal rolling publication grow.
     var maximumUnconsumedSegmentCount: Int { max(2, minimumSegmentCount) }
 
-    func unconsumedStartupWindow(_ window: VortXHLSWindow) -> VortXHLSWindow {
-        guard window.segments.count > maximumUnconsumedSegmentCount else { return window }
+    func unconsumedStartupWindow(
+        _ window: VortXHLSWindow,
+        startupCohortCount: Int
+    ) -> VortXHLSWindow {
+        let maximumCount = max(maximumUnconsumedSegmentCount, startupCohortCount)
+        guard window.segments.count > maximumCount else { return window }
         return VortXHLSWindow(
-            segments: Array(window.segments.prefix(maximumUnconsumedSegmentCount)))
+            segments: Array(window.segments.prefix(maximumCount)))
     }
 
     init?(frozenTarget: VortXHLSFrozenTarget, minimumSegmentCount: Int = 1) {

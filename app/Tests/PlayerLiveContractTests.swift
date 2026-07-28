@@ -2221,6 +2221,14 @@ enum PlayerLiveContractTests {
             encoding: .utf8)
         let display = try? String(contentsOf: playerURL.appendingPathComponent("HDRDisplayMode.swift"),
                                   encoding: .utf8)
+        let displayModeRequest = sourceSection(
+            display,
+            from: "static func request(",
+            to: "/// Build the criteria.")
+        let remuxDisplayRequest = sourceSection(
+            server,
+            from: "private func requestDisplaySwitch(",
+            to: "private func displayRequestWasDispatched(")
         let engine = try? String(contentsOf: playerURL.appendingPathComponent("AVPlayerEngine.swift"),
                                  encoding: .utf8)
         let engineContract = try? String(contentsOf: playerURL.appendingPathComponent("PlayerEngine.swift"),
@@ -2499,8 +2507,23 @@ enum PlayerLiveContractTests {
                   && policy?.contains("minimumSegmentCount: Int = 1") == true
                   && rollingPublication?.contains(
                       "startupReadiness.maximumUnconsumedSegmentCount") == true
+                  && rollingPublication?.contains(
+                      "startupCohortCount: startup.window.segments.count") == true
                   && policy?.contains("frozenTarget.seconds.multipliedReportingOverflow(by: 3)") == false
                   && server?.contains("minimumStartupDurationMilliseconds = 15_000") == false)
+        check("wiring: failed speculative display requests remain retryable at final signaling",
+              displayModeRequest?.contains(") -> Bool {") == true
+                  && displayModeRequest?.contains(
+                      "return displayRequestLedger.isApplied") == true
+                  && remuxDisplayRequest?.contains(
+                      "let applied = MainActor.assumeIsolated") == true
+                  && remuxDisplayRequest?.contains(
+                      "primaryDisplayDispatched = true") == true
+                  && remuxDisplayRequest?.contains(
+                      "primaryDisplayDispatched = applied") == false
+                  && remuxDisplayRequest?.contains(
+                      "range=\\(requestedRange.rawValue) applied=\\(applied)") == true
+                  && remuxDisplayRequest?.contains("primaryDisplayRequested") == false)
         check("wiring: one frozen target renders identically across video, audio and subtitle routes",
               server?.components(separatedBy:
                   "targetDuration: startupReadiness.frozenTarget.seconds").count == 4

@@ -264,18 +264,25 @@ enum HDRDisplayMode {
 
     /// Ask tvOS to switch the display into the mode matching the content.
     @MainActor
-    static func request(_ range: ContentDynamicRange, fps: Double, width: Int, height: Int, in window: UIWindow?) {
+    @discardableResult
+    static func request(
+        _ range: ContentDynamicRange,
+        fps: Double,
+        width: Int,
+        height: Int,
+        in window: UIWindow?
+    ) -> Bool {
         installModeSwitchObservers()
         guard let window = window ?? fallbackWindow else {
             note("display switch skipped: no window")
-            return
+            return false
         }
         // UIWindow.avDisplayManager is declared in the SDK for all of tvOS but the
         // SIMULATOR runtime does not implement it: touching the property throws an
         // unrecognized-selector exception and aborts the app (two live crashes,
         // 2026-06-10, .ips on file). Real hardware has it since tvOS 11.2. Guard at
         // runtime too in case some device variant ever lacks it.
-        guard let manager = displayManager(of: window) else { return }
+        guard let manager = displayManager(of: window) else { return false }
         // SDR: historically an unconditional reset (clear the criteria, let the panel sit in its default
         // mode). With Match Frame Rate ON and a KNOWN frame rate we instead fall through to the criteria
         // path below, which builds an SDR criteria carrying `fps` so 24p films stop juddering. Toggle OFF,
@@ -284,7 +291,7 @@ enum HDRDisplayMode {
         let isFrameRateMatch = (range == .sdr)
         if isFrameRateMatch, !(matchFrameRateEnabled && fps > 0) {
             reset(in: window)
-            return
+            return true
         }
         guard manager.isDisplayCriteriaMatchingEnabled else {
             // Same silent-refusal guardrail for both kinds of request, but the actionable setting differs, so
@@ -302,7 +309,7 @@ enum HDRDisplayMode {
                         userInfo: ["message": "Turn on Settings > Video and Audio > Match Content > Match Frame Rate to play this title at its own frame rate"])
                 }
                 reset(in: window)   // refused: land exactly where the toggle-off path lands
-                return
+                return true
             }
             note("display switch skipped: Match Dynamic Range is OFF (tvOS Settings > Video and Audio > Match Content)")
             // Guardrail: this silent refusal is the #1 real-world reason "DV/HDR never engages" (Match
@@ -314,18 +321,18 @@ enum HDRDisplayMode {
                     name: userHintNotification, object: nil,
                     userInfo: ["message": "Turn on Settings > Video and Audio > Match Content > Match Dynamic Range for Dolby Vision / HDR output"])
             }
-            return
+            return false
         }
         // Never manufacture 60Hz for an unknown track. The remux master carries the classifier's authoritative
         // session rate, and AVPlayerEngine preserves that value when its local HLS asset exposes no track rate.
         guard let resolvedRate = DVPlaybackPolicy.frameRate(classified: fps, assetTrack: 0) else {
             note("display switch deferred: frame rate is unknown")
-            return
+            return false
         }
         let rate = Float(resolvedRate)
         guard let criteria = makeCriteria(range: range, rate: rate, width: width, height: height) else {
             note("display switch failed: could not build criteria")
-            return
+            return false
         }
         let encoded = (criteria.value(forKey: "videoDynamicRange") as? Int) ?? -999
         // Skip only a pending or successfully applied request on this exact manager. Criteria-build failures and
@@ -334,7 +341,7 @@ enum HDRDisplayMode {
             range: range.rawValue, rate: rate, width: width, height: height)
         if !displayRequestLedger.begin(thisRequest, manager: manager) {
             note("display switch skipped: already asking for \(range.rawValue) @\(rate)fps \(width)x\(height)")
-            return
+            return displayRequestLedger.isApplied(thisRequest, manager: manager)
         }
         // AVDisplayManager declares this property `copy` in the tvOS SDK. Capture its prior stored object so a
         // rejected setter that leaves an old non-nil criterion in place cannot masquerade as this request's
@@ -346,7 +353,7 @@ enum HDRDisplayMode {
         displayRequestLedger.complete(thisRequest, manager: manager, applied: applied)
         guard applied else {
             note("display switch failed: display manager rejected preferred criteria")
-            return
+            return false
         }
         // Close the master-parse race at its earliest point: a switch is now pending but the ModeSwitchStart
         // notification has not necessarily fired yet, so mark unsettled here rather than waiting on Start. The
@@ -369,6 +376,7 @@ enum HDRDisplayMode {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
             note("display switch +2.5s: switchInProgress=\(manager.isDisplayModeSwitchInProgress) criteriaStillSet=\(manager.preferredDisplayCriteria != nil)")
         }
+        return true
     }
 
     /// Build the criteria. The PUBLIC `AVDisplayCriteria(refreshRate:formatDescription:)` (tvOS 17+) is

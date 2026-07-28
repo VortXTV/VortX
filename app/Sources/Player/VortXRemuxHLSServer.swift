@@ -134,8 +134,6 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private var engineReady = false
     private var startupTimeoutLogged = false
     private let displayRequestLock = NSLock()
-    private var primaryDisplayRequested = false
-    private var recoveryDisplayRequested = false
     private var primaryDisplayDispatched = false
     private var recoveryDisplayDispatched = false
     private let startupReadiness: VortXHLSStartupReadiness
@@ -677,23 +675,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         recovery: Bool,
         source: String
     ) {
-        displayRequestLock.lock()
-        let alreadyRequested = recovery ? recoveryDisplayRequested : primaryDisplayRequested
-        if !alreadyRequested {
-            if recovery {
-                recoveryDisplayRequested = true
-            } else {
-                primaryDisplayRequested = true
-            }
-        }
-        displayRequestLock.unlock()
-        guard !alreadyRequested else { return }
-
         let switched = DispatchSemaphore(value: 0)
         DispatchQueue.main.async { [weak self] in
             defer { switched.signal() }
             guard let self, !self.isInvalidated else { return }
-            MainActor.assumeIsolated {
+            let applied = MainActor.assumeIsolated {
                 HDRDisplayMode.request(
                     requestedRange, fps: fps, width: width, height: height, in: nil)
             }
@@ -706,7 +692,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             self.displayRequestLock.unlock()
             DiagnosticsLog.log(
                 "dv",
-                "startup phase=display-request source=\(source) range=\(requestedRange.rawValue) "
+                "startup phase=display-request source=\(source) range=\(requestedRange.rawValue) applied=\(applied) "
                     + "elapsedMs=\(self.stream.startupElapsedMilliseconds)")
         }
         let switchBudget = min(2, remainingMountBudget())
@@ -1170,8 +1156,14 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
            consumptionAnchored,
            highestServedVideoSegmentID < 0,
            !ended,
-           selectedVideo.segments.count > startupReadiness.maximumUnconsumedSegmentCount {
-            selectedVideo = startupReadiness.unconsumedStartupWindow(selectedVideo)
+           selectedVideo.segments.count > max(
+            startupReadiness.maximumUnconsumedSegmentCount,
+            startup.window.segments.count
+           ) {
+            selectedVideo = startupReadiness.unconsumedStartupWindow(
+                selectedVideo,
+                startupCohortCount: startup.window.segments.count
+            )
             publishedVideoWindow = selectedVideo
         }
 

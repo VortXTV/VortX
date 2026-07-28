@@ -504,11 +504,30 @@ let producerAheadAtStart = VortXHLSWindow(segments: (0..<8).map {
         duration: 4)
 })
 check("startup readiness: the executable unconsumed window keeps the first two absolute segments",
-      targetSevenReadiness?.unconsumedStartupWindow(producerAheadAtStart)
+      targetSevenReadiness?.unconsumedStartupWindow(
+          producerAheadAtStart,
+          startupCohortCount: 0
+      )
           .segments.map(\.id) == [0, 1])
 let alreadySmallStart = VortXHLSWindow(segments: Array(producerAheadAtStart.segments.prefix(1)))
 check("startup readiness: an already-small unconsumed window is byte-range identical",
-      targetSevenReadiness?.unconsumedStartupWindow(alreadySmallStart) == alreadySmallStart)
+      targetSevenReadiness?.unconsumedStartupWindow(
+          alreadySmallStart,
+          startupCohortCount: 0
+      ) == alreadySmallStart)
+let shortFragmentStart = VortXHLSWindow(segments: (0..<8).map {
+    VortXHLSSegment(
+        id: $0,
+        byteOffset: $0 * 100,
+        byteLength: 100,
+        start: Double($0) * 1.2,
+        duration: 1.2)
+})
+check("startup readiness: the unconsumed cap never truncates a four-segment readiness cohort",
+      targetSevenReadiness?.unconsumedStartupWindow(
+          shortFragmentStart,
+          startupCohortCount: 4
+      ).segments.map(\.id) == [0, 1, 2, 3])
 check("startup readiness: invalid target bounds and segment counts are rejected without a force unwrap",
       VortXHLSStartupReadiness(
           frozenTarget: .init(seconds: 4, authority: .validatedCompleteIndex)) == nil
@@ -1104,8 +1123,12 @@ let dv60 = Req(range: "dolbyVision", rate: 60, width: 3840, height: 2160)
 // The property that matters: an identical repeat is redundant, so the caller skips the assignment.
 check("flicker: the first request is accepted", ledger.begin(dv60, manager: manager))
 check("flicker: an identical pending request is redundant", !ledger.begin(dv60, manager: manager))
+check("flicker: an in-flight request is not falsely reported as applied",
+      !ledger.isApplied(dv60, manager: manager))
 ledger.complete(dv60, manager: manager, applied: true)
 check("flicker: an identical applied request is redundant", !ledger.begin(dv60, manager: manager))
+check("flicker: a completed matching request is reported as applied",
+      ledger.isApplied(dv60, manager: manager))
 // The property that keeps it SAFE: anything that can change the negotiated mode may never be skipped.
 check("flicker: a different rate is NOT redundant",
       ledger.begin(Req(range: "dolbyVision", rate: 23.976, width: 3840, height: 2160),
@@ -1123,6 +1146,19 @@ check("flicker: a dims-only height change of an applied mode IS redundant",
       !ledger.begin(Req(range: "dolbyVision", rate: 60, width: 3840, height: 1080), manager: manager))
 ledger.reset()
 check("flicker: reset makes an identical request eligible", ledger.begin(dv60, manager: manager))
+
+let retryManager = FakeDisplayManager()
+var retryLedger = DVPlaybackPolicy.DisplayRequestLedger()
+check("display retry: the speculative request is admitted",
+      retryLedger.begin(dv60, manager: retryManager))
+retryLedger.complete(dv60, manager: retryManager, applied: false)
+check("display retry: a failed speculative request remains unapplied and final signaling may retry",
+      !retryLedger.isApplied(dv60, manager: retryManager)
+          && retryLedger.begin(dv60, manager: retryManager))
+retryLedger.complete(dv60, manager: retryManager, applied: true)
+check("display retry: successful final signaling is latched and a duplicate master is redundant",
+      retryLedger.isApplied(dv60, manager: retryManager)
+          && !retryLedger.begin(dv60, manager: retryManager))
 
 // MARK: - Result
 
