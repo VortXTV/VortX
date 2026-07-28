@@ -20,12 +20,13 @@ import Vision
 /// the delay control the external-overlay path already has. One conversion, and every downstream feature works
 /// without being taught about bitmaps.
 ///
-/// THE COST, stated honestly. OCR is not free and it is not perfect. Recognition runs on the Neural Engine via
-/// Vision, but a two-hour disc can carry well over a thousand cues per language and a remux commonly ships a
+/// THE COST, stated honestly. OCR is not free and it is not perfect. Vision chooses its own compute path, and
+/// a two-hour disc can carry well over a thousand cues per language while a remux commonly ships a
 /// dozen or more PGS tracks. Recognising every one would cost more than the remux itself. So this is BOUNDED on
 /// three axes: a hard cap on how many PGS streams are recognised at all, a per-image time budget, and a global
-/// budget after which recognition stops and the remaining cues are dropped rather than stalling the producer.
-/// A dropped cue is a missing subtitle line; a stalled producer is a stalled film.
+/// budget after which recognition stops and the remaining cues are dropped. These checks are accounting
+/// limits, not preemptive deadlines: the synchronous Vision call can overrun them before control returns.
+/// This is why the feature remains opt-in until recognition leaves the remux producer thread.
 ///
 /// ACCURACY. Recognition is per-image with language correction on. Typeset subtitle bitmaps are high-contrast
 /// and uniform, which is the easy case for OCR, but expect occasional errors on stylised or overlapping text
@@ -36,10 +37,11 @@ final class VortXPGSSubtitleOCR {
     /// Recognise at most this many PGS streams per session. A remux with fifteen PGS tracks would otherwise
     /// pay recognition fifteen times over for tracks nobody selected.
     static let maximumStreams = 4
-    /// Stop recognising once this much wall time has been spent across the whole session. The producer must
-    /// never wait on OCR; when the budget is gone the remaining cues are simply not produced.
+    /// Stop starting new recognition once this much completed OCR wall time has accumulated. This is not a
+    /// deadline: a synchronous Vision request can overrun it before the remaining cues are dropped.
     static let totalBudgetSeconds: Double = 25
-    /// Skip any single image that would take longer than this. A pathological rect must not stall the demux.
+    /// Stop processing more rects after a completed image has pushed this packet over the accounting limit.
+    /// It cannot interrupt a Vision request already in flight.
     static let perImageBudgetSeconds: Double = 0.6
     /// Ignore rects smaller than this in either axis: they are almost always a stray anti-aliasing artefact
     /// rather than a glyph run, and Vision spends real time on them for nothing.

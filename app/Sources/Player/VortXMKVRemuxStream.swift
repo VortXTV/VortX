@@ -278,13 +278,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// rejection count this separates "the demuxer delivered nothing" from "the parser refused
     /// everything", which static reading cannot distinguish and which decides the whole fix.
     private var subtitleArrivedPackets: [Int: Int] = [:]
-    /// PGS recognition switch. Defaults ON: without it a BluRay remux has no subtitles at all. The key
-    /// exists so a device that cannot afford the recognition cost can turn it off without a build.
+    /// PGS recognition switch. Defaults OFF while Vision recognition runs synchronously on the sole remux
+    /// producer thread. Opting in can recover bitmap subtitles, but must never be the default at the cost of
+    /// starving the primary video/audio delivery. The explicit key keeps the experimental path testable.
     static var pgsRecognitionEnabled: Bool {
-        if UserDefaults.standard.object(forKey: "vortx.pgsSubtitleOCR") != nil {
-            return UserDefaults.standard.bool(forKey: "vortx.pgsSubtitleOCR")
-        }
-        return true
+        PGSOCRPolicy.isEnabled()
     }
     /// Lazily created: a source with no PGS track never allocates a decoder or touches Vision.
     private lazy var pgsOCR = VortXPGSSubtitleOCR()
