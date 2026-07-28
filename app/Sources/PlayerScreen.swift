@@ -235,6 +235,14 @@ struct PlayerScreen: View {
     @State private var lastLocalTrickplayCapture = -1000.0
     @State private var localTrickplayCaptureInFlight = false
     @State private var localTrickplayCaptureGeneration: UInt64 = 0
+    @State private var assetSanityAttempt = EpisodicAssetSanityAttempt<PlayerLoadToken>()
+    @State private var assetSanityTrackListToken: PlayerLoadToken?
+    @State private var assetSanityRequestedResume = 0.0
+    @State private var assetSanityDeferredStartToken: PlayerLoadToken?
+    @State private var assetSanityDeferredStartPosition = 0.0
+    @State private var assetSanityStartEffectsToken: PlayerLoadToken?
+    @State private var assetSanityObservationTask: Task<Void, Never>?
+    @State private var assetSanityObservationToken: PlayerLoadToken?
     /// Wall-clock trickplay capture driver (player-agnostic backstop to the timePos-driven tick). Cancelled on
     /// disappear. See startTrickplayCaptureTimer.
     @State private var trickplayCaptureTimer: Task<Void, Never>?
@@ -371,6 +379,12 @@ struct PlayerScreen: View {
     @State private var resumeRetryGeneration = 0
     @State private var episodeSwitchGeneration = 0
     @State private var episodeResolveGeneration: Int?
+    @State private var episodeResolutionTask: Task<Void, Never>?
+    @State private var episodeResolutionDeadlineTask: Task<Void, Never>?
+    @State private var episodeResolutionOwner: EpisodeResolutionOwner?
+    @State private var episodeResolutionTargetVideoID: String?
+    @State private var episodeResolutionAdmitted = false
+    private static let episodeResolutionDeadlineSeconds: Double = 30
     @State private var playbackExited = false
     private var curMeta: PlaybackMeta? { curMetaState ?? recordMeta }
     private var curTitle: String { curTitleState ?? title }
@@ -980,8 +994,11 @@ struct PlayerScreen: View {
             #endif
         }
         .onDisappear {
+            let assetSanityAccepted =
+                assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken)
             invalidateEpisodeWorkForExit()
             invalidateLocalTrickplayCapture()
+            cancelAssetSanityObservationDeadline()
             core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
             hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
             stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
@@ -992,7 +1009,9 @@ struct PlayerScreen: View {
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
             // (first-writer-wins, background, gated; no-op if the community already had a set). Never
             // touches the player teardown below.
-            scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)   // tag the set's source height (tvOS parity)
+            if assetSanityAccepted {
+                scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)   // tag the set's source height (tvOS parity)
+            }
             NowPlayingCenter.clear()   // drop the Lock Screen / Control Center now-playing on close
             #if os(iOS)
             UIApplication.shared.isIdleTimerDisabled = false  // let the screensaver / auto-lock resume once the player closes
@@ -1107,7 +1126,202 @@ struct PlayerScreen: View {
             && loadToken == coordinator.player?.activeLoadToken
     }
 
+    private func beginAssetSanityAttemptIfNeeded(
+        loadToken: PlayerLoadToken,
+        requestedResumeOrigin: Double
+    ) {
+        guard loadToken == coordinator.player?.activeLoadToken,
+              assetSanityAttempt.owner != loadToken else { return }
+        assetSanityAttempt.begin(owner: loadToken)
+        assetSanityTrackListToken = nil
+        assetSanityRequestedResume = max(0, requestedResumeOrigin)
+        assetSanityDeferredStartToken = nil
+        assetSanityStartEffectsToken = nil
+        cancelAssetSanityObservationDeadline()
+    }
+
+    private var assetSanityExpectedRuntimeSeconds: Double? {
+        guard let m = curMeta,
+              let loaded = core.metaDetails?.meta,
+              loaded.id == m.libraryId,
+              let seconds = loaded.runtimeSeconds,
+              seconds > 0 else { return nil }
+        return seconds
+    }
+
+    private func assetSanityEvidence(
+        loadToken: PlayerLoadToken
+    ) -> EpisodicAssetSanityPolicy.Evidence {
+        let player = coordinator.player
+        let summary = player?.mediaSummary()
+        let engineDuration = player?.mediaDurationSeconds() ?? 0
+        let observedDuration = duration > 0 ? duration : engineDuration
+        return .init(
+            isLibMPV: !(player is AVPlayerEngineController),
+            season: curMeta?.season,
+            episode: curMeta?.episode,
+            isLive: effectivelyLive,
+            isTrailer: isTrailer,
+            claimedResolutionRank: curSourceStream.map(StreamRanking.resolutionRank) ?? 0,
+            actualWidth: summary?.width ?? videoWidth,
+            actualHeight: summary?.height ?? videoHeight,
+            framesPerSecond: player?.containerFrameRate() ?? 0,
+            durationSeconds: observedDuration,
+            trackListObserved: assetSanityTrackListToken == loadToken,
+            audioTrackCount: audioTracks.count,
+            expectedRuntimeSeconds: assetSanityExpectedRuntimeSeconds
+        )
+    }
+
+    private func publishAssetSanityStartEffectsIfNeeded(
+        loadToken: PlayerLoadToken,
+        position: Double
+    ) {
+        guard assetSanityAttempt.isAccepted(owner: loadToken),
+              assetSanityStartEffectsToken != loadToken else { return }
+        assetSanityStartEffectsToken = loadToken
+        recordLastStream()
+        if let m = curMeta, !effectivelyLive {
+            ScrobbleCoordinator.shared.playbackStarted(
+                m, position: position, duration: duration,
+                sessionToken: playbackSessionID
+            )
+        }
+    }
+
+    private func cancelAssetSanityObservationDeadline() {
+        assetSanityObservationTask?.cancel()
+        assetSanityObservationTask = nil
+        assetSanityObservationToken = nil
+    }
+
+    private func armAssetSanityObservationDeadlineIfNeeded(
+        loadToken: PlayerLoadToken
+    ) {
+        guard assetSanityObservationToken != loadToken,
+              assetSanityDeferredStartToken == loadToken else { return }
+        cancelAssetSanityObservationDeadline()
+        assetSanityObservationToken = loadToken
+        assetSanityObservationTask = Task { @MainActor in
+            try? await Task.sleep(
+                for: .seconds(EpisodicAssetSanityPolicy.incompleteEvidenceGraceSeconds)
+            )
+            guard !Task.isCancelled,
+                  assetSanityObservationToken == loadToken else { return }
+            guard loadToken == coordinator.player?.activeLoadToken,
+                  loadToken == committedLoadToken,
+                  assetSanityDeferredStartToken == loadToken else {
+                cancelAssetSanityObservationDeadline()
+                return
+            }
+            srcProbe("asset sanity telemetry incomplete after bounded observation; accepting exact load")
+            _ = acceptIncompleteAssetSanityIfCurrent(
+                loadToken: loadToken,
+                position: assetSanityDeferredStartPosition
+            )
+        }
+    }
+
+    @discardableResult
+    private func acceptIncompleteAssetSanityIfCurrent(
+        loadToken: PlayerLoadToken,
+        position: Double
+    ) -> Bool {
+        guard loadToken == coordinator.player?.activeLoadToken,
+              loadToken == committedLoadToken else { return false }
+        switch assetSanityAttempt.acceptIncompleteEvidence(owner: loadToken) {
+        case .accepted, .settled(.accept):
+            cancelAssetSanityObservationDeadline()
+            publishAssetSanityStartEffectsIfNeeded(
+                loadToken: loadToken, position: position
+            )
+            return true
+        case .rejected, .settled(.reject):
+            cancelAssetSanityObservationDeadline()
+            return false
+        case .stale, .waiting, .settled(.wait):
+            return false
+        }
+    }
+
+    @discardableResult
+    private func settleAssetSanityIfPossible(
+        loadToken: PlayerLoadToken,
+        position: Double
+    ) -> Bool {
+        guard loadToken == coordinator.player?.activeLoadToken,
+              loadToken == committedLoadToken else { return false }
+        switch assetSanityAttempt.evaluate(
+            owner: loadToken,
+            evidence: assetSanityEvidence(loadToken: loadToken)
+        ) {
+        case .stale:
+            return false
+        case .waiting, .settled(.wait):
+            armAssetSanityObservationDeadlineIfNeeded(loadToken: loadToken)
+            return true
+        case .accepted, .settled(.accept):
+            cancelAssetSanityObservationDeadline()
+            publishAssetSanityStartEffectsIfNeeded(
+                loadToken: loadToken, position: position
+            )
+            return true
+        case .rejected:
+            cancelAssetSanityObservationDeadline()
+            handleRejectedEpisodicAsset(loadToken: loadToken)
+            return false
+        case .settled(.reject):
+            cancelAssetSanityObservationDeadline()
+            return false
+        }
+    }
+
+    private func handleRejectedEpisodicAsset(loadToken: PlayerLoadToken) {
+        guard loadToken == coordinator.player?.activeLoadToken,
+              assetSanityAttempt.isRejected(owner: loadToken) else { return }
+        let originalResume = assetSanityRequestedResume
+        let hasAlternative = nextUntriedStream() != nil
+        srcProbe(
+            "rejected preview-shaped episodic asset originalResume=\(Int(originalResume))s alternative=\(hasAlternative)"
+        )
+        loadTimeout?.cancel()
+        recoveryDeadline?.cancel()
+        recoveryDeadline = nil
+        coordinator.player?.pause()
+        invalidateLocalTrickplayCapture()
+        assetSanityDeferredStartToken = nil
+        cancelAssetSanityObservationDeadline()
+        switch EpisodicAssetSanityPolicy.recovery(
+            explicitPick: currentPickWasExplicit,
+            continueWatching: currentPlaybackIsResume,
+            hasAlternative: hasAlternative,
+            originalResumeSeconds: originalResume
+        ) {
+        case .hop(let requestedResume):
+            hasStartedPlaying = false
+            currentTime = 0
+            if hopToNextSource(
+                reason: "source returned a short audio-less preview",
+                resumeOverride: requestedResume,
+                allowBeyondFailureBudget: true
+            ) {
+                return
+            }
+        case .showMismatch:
+            break
+        }
+        loadErrorMsg = "This source returned a short, audio-less preview instead of the selected episode."
+        presentTerminalLoadFailure()
+    }
+
     private func handleProperty(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
+        if let loadToken, loadToken == coordinator.player?.activeLoadToken {
+            beginAssetSanityAttemptIfNeeded(
+                loadToken: loadToken,
+                requestedResumeOrigin: avSurfaceResumeOrigin
+                    ?? (hasStartedPlaying ? currentTime : resumeSeconds)
+            )
+        }
         if pendingAdvance == nil, supersededAdvance == nil,
            let loadToken, loadToken == coordinator.player?.activeLoadToken {
             committedLoadToken = loadToken
@@ -1193,6 +1407,11 @@ struct PlayerScreen: View {
                     if let deferredSeekable {
                         handleProperty(MPVProperty.seekable, deferredSeekable, loadToken: event.loadToken)
                     }
+                    assetSanityDeferredStartToken = event.loadToken
+                    assetSanityDeferredStartPosition = d
+                    guard settleAssetSanityIfPossible(
+                        loadToken: event.loadToken, position: d
+                    ) else { return }
                     loadTimeout?.cancel(); autoRetryTask?.cancel()
                     recoveryDeadline?.cancel(); recoveryDeadline = nil
                     #if os(iOS) || os(macOS)
@@ -1209,13 +1428,6 @@ struct PlayerScreen: View {
                     reconnecting = episodeResolveGeneration != nil
                     loadFailed = false
                     autoRetryCount = 0; stallRecoveries = 0
-                    recordLastStream()              // remember this working link for CW direct-resume (parity with tvOS)
-                    // External sync (Trakt/SIMKL): live scrobble START. Additive + fail-soft + gated inside
-                    // the coordinator (owner profile only, provider connected, toggle on); a no-op with empty
-                    // creds. Live content is excluded (no scrobble meaning), mirroring the stop hooks. Duration
-                    // is often still 0 at first frame, so this starts at 0% and later ticks / the stop carry
-                    // the real percentage.
-                    if let m = curMeta, !effectivelyLive { ScrobbleCoordinator.shared.playbackStarted(m, position: d, duration: duration, sessionToken: playbackSessionID) }
                     // Lock Screen / Control Center / media-key transport. Relative mpv seek so the skip always
                     // works off the LIVE position (a captured currentTime would be stale in these long-lived
                     // targets); the absolute seek is the system progress bar's own drag. play/pause are
@@ -1239,6 +1451,15 @@ struct PlayerScreen: View {
                 }
                 if !scrubbing {
                     currentTime = d
+                    if assetSanityDeferredStartToken == event.loadToken,
+                       !assetSanityAttempt.isAccepted(owner: event.loadToken),
+                       !assetSanityAttempt.isRejected(owner: event.loadToken),
+                       !settleAssetSanityIfPossible(
+                        loadToken: event.loadToken, position: d
+                       ) {
+                        return
+                    }
+                    let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: event.loadToken)
                     // Durationless-stream fallback (mirrors TVPlayerView): many debrid direct-HTTP MKVs
                     // never DELIVER mpv's `duration` EVENT, yet the property reads fine - and the resume
                     // seek, the ~5s progress pushes, and watched-at-90% all key off `duration > 0`, so
@@ -1260,12 +1481,13 @@ struct PlayerScreen: View {
                         NowPlayingPolicy.allowsScrubbing(duration: duration, isLive: effectivelyLive))
                     // Provision the community key off meta.runtime the moment the behind-playback meta lands
                     // (idempotent; no-op once keyed), so capture starts even without a duration event.
-                    configureCommunityTrickplayProvisional()
+                    if assetSanityAccepted { configureCommunityTrickplayProvisional() }
                     maybeCaptureLocalTrickplay(at: d)
                     // Live streams must NOT write a resume offset: their "position" is just elapsed
                     // wall-clock of the buffer, and persisting it would make a later open seek into a
                     // bogus offset (or drop a fake Continue-Watching entry).
-                    if !effectivelyLive, duration > 0, d - lastReported >= 5 {   // push progress ~every 5s
+                    if assetSanityAccepted, !effectivelyLive,
+                       duration > 0, d - lastReported >= 5 {   // push progress ~every 5s
                         lastReported = d
                         reportProgress(d)
                     }
@@ -1274,7 +1496,8 @@ struct PlayerScreen: View {
                     // (D8 by the setting + per-profile dedup; D9 by MoatConsent + per-title/day dedup), so a
                     // resume that starts past 60s, a source hop, or an episode switch never double-fires here
                     // for the same title. Skipped for live (no library/ranking meaning) and ad-hoc plays.
-                    if !autoAddedThisPlayback, !effectivelyLive, d >= 60, let m = curMeta {
+                    if assetSanityAccepted, !autoAddedThisPlayback,
+                       !effectivelyLive, d >= 60, let m = curMeta {
                         autoAddedThisPlayback = true
                         LibraryAutoAdd.addIfNeeded(meta: m, core: core, enabled: autoAddLibrary)
                         // Resolve a tmdb:… hub/catalog id to its tt identity first (fire-and-forget on a cache
@@ -1290,10 +1513,14 @@ struct PlayerScreen: View {
                     // ISN'T: many debrid MKVs never emit mpv's `duration`, so the duration>60 trigger alone
                     // never fired for them and the next episode never pre-heated (the "next episode cold-starts"
                     // case). warmNextIfNeeded is idempotent per episode.
-                    if !effectivelyLive, (duration > 60 && d / duration >= 0.5) || (duration <= 0 && d >= 120) { warmNextIfNeeded() }
+                    if assetSanityAccepted, !effectivelyLive,
+                       ((duration > 60 && d / duration >= 0.5) || (duration <= 0 && d >= 120)) {
+                        warmNextIfNeeded()
+                    }
                     // ~90% in → flip the engine's watched marker live, so the title leaves Continue
                     // Watching / shows as watched without waiting for EOF (mirrors tvOS:180-183).
-                    if !markedWatched, !effectivelyLive, duration > 0, d / duration >= 0.9,
+                    if assetSanityAccepted, !markedWatched,
+                       !effectivelyLive, duration > 0, d / duration >= 0.9,
                        let m = curMeta {
                         markedWatched = true
                         core.markPlaybackWatched(m, allowEngineWrite: engineWritesOpen)
@@ -1347,6 +1574,14 @@ struct PlayerScreen: View {
                 // The real duration sharpens the release fingerprint: rebuild it and re-fetch the pool so the
                 // rip-matched community sync offset seeds this exact encode (P3). Fail-soft + gated inside.
                 if d > 0 { refreshSubFingerprint(force: true); fetchPooledSubtitles() }
+                if let loadToken,
+                   assetSanityDeferredStartToken == loadToken,
+                   !settleAssetSanityIfPossible(
+                    loadToken: loadToken,
+                    position: assetSanityDeferredStartPosition
+                   ) {
+                    return
+                }
             }
         case MPVProperty.seekable:
             // Runtime live-detection: a VOD turns seekable once playback starts, a live feed stays
@@ -1368,6 +1603,7 @@ struct PlayerScreen: View {
                 // a no-op with empty creds. Live content is excluded (parity with the start/stop hooks).
                 // SIMKL has no live scrobble, so it is skipped by capability.
                 if callbackBelongsToCommittedMedia(loadToken),
+                   assetSanityAttempt.isAccepted(owner: loadToken),
                    let m = curMeta, !effectivelyLive {
                     let pos = max(currentTime, suppressedResumeFloor ?? 0)
                     if b { ScrobbleCoordinator.shared.playbackPaused(m, position: pos, duration: duration) }
@@ -1376,6 +1612,9 @@ struct PlayerScreen: View {
             }
         case MPVProperty.trackList:
             refreshTracks()
+            if let loadToken, callbackBelongsToCommittedMedia(loadToken) {
+                assetSanityTrackListToken = loadToken
+            }
             let summary = coordinator.player?.mediaSummary()
             videoWidth = summary?.width ?? 0; videoHeight = summary?.height ?? 0; audioCodec = summary?.audioCodec ?? ""
             metadataLine = computeMetadataLine()
@@ -1386,6 +1625,14 @@ struct PlayerScreen: View {
             if !appliedAutoTracks, !audioTracks.isEmpty || !subtitleTracks.isEmpty {
                 appliedAutoTracks = true
                 autoSelectTracks()
+            }
+            if let loadToken,
+               assetSanityDeferredStartToken == loadToken,
+               !settleAssetSanityIfPossible(
+                loadToken: loadToken,
+                position: assetSanityDeferredStartPosition
+               ) {
+                return
             }
         case MPVProperty.endFileError:
             switch terminalAction(for: loadToken, kind: .error) {
@@ -1447,6 +1694,27 @@ struct PlayerScreen: View {
                 completionOnly = true
             case .ignoreOutgoingError, .ignoreStale:
                 return
+            }
+            if !completionOnly, let loadToken {
+                guard EpisodicAssetSanityPolicy.canAcceptIncompleteEvidenceAtEOF(
+                    callbackOwner: loadToken,
+                    deferredFirstFrameOwner: assetSanityDeferredStartToken,
+                    hasStartedPlaying: hasStartedPlaying
+                ) else {
+                    loadTimeout?.cancel()
+                    handleLoadFailure("Media ended before its first frame")
+                    return
+                }
+                guard settleAssetSanityIfPossible(
+                    loadToken: loadToken, position: currentTime
+                ) else {
+                    return
+                }
+                if !assetSanityAttempt.isAccepted(owner: loadToken) {
+                    guard acceptIncompleteAssetSanityIfCurrent(
+                        loadToken: loadToken, position: currentTime
+                    ) else { return }
+                }
             }
             // Mark watched if the 90% tick didn't already (short clips), then advance or finish.
             if !markedWatched, !effectivelyLive, let m = curMeta {
@@ -1529,7 +1797,7 @@ struct PlayerScreen: View {
     // MARK: - Local trickplay capture
 
     private var trickplayLocalCacheKey: String {
-        if let m = recordMeta { return "v:\(m.libraryId):\(m.videoId)" }
+        if let m = curMeta { return "v:\(m.libraryId):\(m.videoId)" }
         return "u:\((curURL ?? url).absoluteString)"
     }
 
@@ -1573,7 +1841,8 @@ struct PlayerScreen: View {
                 return
             }
             await MainActor.run {
-                guard curMeta?.libraryId == m.libraryId else { return }   // still the same title
+                guard curMeta?.libraryId == m.libraryId,
+                      curMeta?.videoId == m.videoId else { return }   // still the same episode
                 scrubThumbnails.configureCommunity(imdbId: ttId, season: m.season, episode: m.episode,
                                                    duration: secs, isRealDuration: false)
             }
@@ -1632,6 +1901,7 @@ struct PlayerScreen: View {
         // AVPlayer engine's periodic time observer), so this drives capture on Mac/iOS for libmpv AND AVPlayer.
         // A parallel wall-clock timer (startTrickplayCaptureTimer) is the belt-and-suspenders backstop for a
         // stream whose timePos events are sparse/coalesced. Both funnel through captureTrickplayFrame.
+        guard assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken) else { return }
         guard !scrubbing, !buffering, !isPaused else { return }
         guard time - lastLocalTrickplayCapture >= Self.trickplayCaptureIntervalSecs else { return }
         captureTrickplayFrame(at: time)
@@ -1652,6 +1922,9 @@ struct PlayerScreen: View {
     /// refused, whether captureFrameJPEGData returned nil (no output attached / protected frame), and whether
     /// the frame was recorded. Engine-agnostic: uses whatever `coordinator.player` is mounted.
     private func captureTrickplayFrame(at time: Double) {
+        guard assetSanityAttempt.isAccepted(
+            owner: coordinator.player?.activeLoadToken
+        ) else { return }
         guard !localTrickplayCaptureInFlight else { return }
         guard let player = coordinator.player else { VXProbe.log("tp", "no player mounted at \(Int(time))s"); return }
         lastLocalTrickplayCapture = time
@@ -1935,15 +2208,22 @@ struct PlayerScreen: View {
             reusing: loadToken
         )
         let issuedToken = candidateToken == player.activeLoadToken ? candidateToken : nil
+        if let issuedToken {
+            beginAssetSanityAttemptIfNeeded(
+                loadToken: issuedToken,
+                requestedResumeOrigin: requestedResumeOrigin
+            )
+        }
         if pendingAdvance != nil {
             pendingAdvance?.loadToken = issuedToken
             pendingAdvance?.issued = issuedToken != nil
-            if issuedToken != nil {
+            if let issuedToken {
                 pendingAdvance?.terminal = false
                 pendingAdvance?.deferredDuration = nil
                 pendingAdvance?.deferredTrackList = false
                 pendingAdvance?.deferredSeekable = nil
                 supersededAdvance = nil
+                admitEpisodeResolutionIfCurrent(loadToken: issuedToken)
             }
         } else if let issuedToken {
             committedLoadToken = issuedToken
@@ -2725,7 +3005,11 @@ struct PlayerScreen: View {
     /// next-best untried source automatically. Returns false when the hop budget is spent or nothing
     /// untried remains; the caller then shows the error overlay. Mirrors tvOS `hopToNextSource`.
     @discardableResult
-    private func hopToNextSource(reason: String) -> Bool {
+    private func hopToNextSource(
+        reason: String,
+        resumeOverride: Double? = nil,
+        allowBeyondFailureBudget: Bool = false
+    ) -> Bool {
         // A trailer has no content stream of its own; nextUntriedStream() would fall back to whatever the
         // engine last loaded for this title, so a dead /yt route would silently play the ACTUAL movie.
         // Mirror tvOS (TVPlayerView.hopToNextSource): show "Trailer unavailable" and stop. Return true so
@@ -2745,16 +3029,24 @@ struct PlayerScreen: View {
             $0 + $1.streams.filter { playableURL(for: $0) != nil }.count
         }
         let srcProbeUntried = nextUntriedStream()
-        guard sourceHops < maxSourceHops, let stream = srcProbeUntried,
+        guard (allowBeyondFailureBudget || sourceHops < maxSourceHops),
+              let stream = srcProbeUntried,
               let newURL = playableURL(for: stream) else {
             srcProbe("hopToNextSource(\(reason)) FALSE: hops=\(sourceHops)/\(maxSourceHops) untriedFound=\(srcProbeUntried != nil ? "Y" : "N") totalPlayableCandidates=\(srcProbeCandidateCount) exhausted=\(exhaustedURLs.count) -> caller shows error overlay")
             return false
         }
         var tried = exhaustedURLs
         if let dead = curURL { tried.insert(dead) }
-        let resume: Double = hasStartedPlaying ? currentTime : resumeSeconds
+        let resume: Double = resumeOverride
+            ?? (hasStartedPlaying ? currentTime : resumeSeconds)
         srcProbe("hopToNextSource(\(reason)) HOP \(sourceHops)->\(sourceHops + 1) to host=\(newURL.host ?? "-") torrent=\(stream.isTorrent ? "Y" : "N") (candidates=\(srcProbeCandidateCount))")
-        switchStream(to: stream, url: newURL, userInitiated: false)
+        guard switchStream(
+            to: stream, url: newURL, userInitiated: false,
+            resumeOverride: resume
+        ) else {
+            srcProbe("hopToNextSource(\(reason)) FALSE: player command was not admitted")
+            return false
+        }
         exhaustedURLs = tried
         sourceHops += 1
         if resume > 5 { nudgeResume(to: resume) }
@@ -2799,24 +3091,39 @@ struct PlayerScreen: View {
     /// Switch the playing source in place: reload the picked stream's URL and resume at the current
     /// position, so a buffering or low-quality source can be swapped without leaving the player. A
     /// deliberate pick resets the failover budget; an automatic hop restores it in `hopToNextSource`.
+    @discardableResult
     private func switchStream(to stream: CoreStream, url newURL: URL, userInitiated: Bool,
                               explicitPick: Bool = false, resumeOverride: Double? = nil,
                               debridRef: DebridPlaybackRef? = nil, engineAlreadyBound: Bool = false,
-                              engineAddonBaseOverride: String? = nil) {
+                              engineAddonBaseOverride: String? = nil,
+                              mediaGenerationAlreadyClaimed: Bool = false) -> Bool {
         guard newURL != curURL else {
             if let pending = pendingAdvance, !pending.issued,
                pending.meta.videoId != curMeta?.videoId {
+                invalidateEpisodeResolution()
+                episodeResolveGeneration = nil
                 pendingAdvance = nil
-                if restoreSupersededAdvance() { return }
+                if restoreSupersededAdvance() { return false }
                 switchingEpisode = false; reconnecting = false
                 loadErrorMsg = "That episode resolved to the current episode's file."
                 presentTerminalLoadFailure()
-                return
+                return false
             }
             srcProbe("switchStream NO-OP (same url as current) userInitiated=\(userInitiated) explicit=\(explicitPick)")
-            if userInitiated { close() }; return
+            if userInitiated { close() }
+            return false
         }
-        resumeRetryGeneration &+= 1
+        if !mediaGenerationAlreadyClaimed {
+            let hadEpisodeResolution = episodeResolutionOwner != nil
+            invalidateEpisodeResolution()
+            if hadEpisodeResolution {
+                episodeResolveGeneration = nil
+                let healthyPending = pendingAdvance != nil && pendingAdvance?.terminal != true
+                switchingEpisode = healthyPending
+                reconnecting = healthyPending
+            }
+            resumeRetryGeneration &+= 1
+        }
         srcProbe("switchStream -> host=\(newURL.host ?? "-") userInitiated=\(userInitiated) explicitPick=\(explicitPick) torrent=\(stream.isTorrent ? "Y" : "N")")
         if userInitiated { close() }
         // Cleanly destroy the torrent engine we're leaving BEFORE loading the next source, so engines never
@@ -2853,19 +3160,21 @@ struct PlayerScreen: View {
                    priorPending.loadToken == coordinator.player?.activeLoadToken {
                     pendingAdvance = priorPending
                     switchingEpisode = true; reconnecting = true
-                    return
+                    return false
                 }
+                invalidateEpisodeResolution()
+                episodeResolveGeneration = nil
                 pendingAdvance = nil
-                if restoreSupersededAdvance() { return }
+                if restoreSupersededAdvance() { return false }
                 switchingEpisode = false
                 loadErrorMsg = "The player could not issue this episode."
                 presentTerminalLoadFailure()
-                return
+                return false
             }
             pendingAdvance?.loadToken = issuedToken
             pendingAdvance?.issued = true
         } else if issuedToken == nil {
-            return
+            return false
         }
         srcProbeLoadStart = Date()
         if priorPending?.issued == false {
@@ -2882,10 +3191,12 @@ struct PlayerScreen: View {
         curHint = nextHint
         if let oldHash, oldHash != stream.infoHash?.lowercased() { closeTorrent(hash: oldHash) }
         if resumeOverride != nil { currentTime = 0; duration = 0 }
-        scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
-        lastLocalTrickplayCapture = -1000
         invalidateLocalTrickplayCapture()
-        configureCommunityTrickplayProvisional()
+        if pendingAdvance == nil {
+            scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
+            lastLocalTrickplayCapture = -1000
+            configureCommunityTrickplayProvisional()
+        }
         if !engineAlreadyBound, isEpisodePlaybackContext,
            let meta = pendingAdvance?.meta ?? curMeta {
             let succeeded = core.loadEnginePlayer(
@@ -2899,6 +3210,7 @@ struct PlayerScreen: View {
         }
         startLoadTimeout()
         if resume > 5 { nudgeResume(to: resume) }
+        return true
     }
 
     // MARK: - Episode navigation (series; `episodes` is the ordered season list, switched in place)
@@ -3031,9 +3343,79 @@ struct PlayerScreen: View {
         Task { await warm(nextID) }
     }
 
+    private var currentEpisodeResolutionOwner: EpisodeResolutionOwner? {
+        guard let videoID = episodeResolutionTargetVideoID else { return nil }
+        return EpisodeResolutionOwner(
+            episodeGeneration: episodeSwitchGeneration,
+            sourceGeneration: resumeRetryGeneration,
+            videoID: videoID
+        )
+    }
+
+    private func armEpisodeResolutionDeadline(owner: EpisodeResolutionOwner) {
+        episodeResolutionTask?.cancel()
+        episodeResolutionDeadlineTask?.cancel()
+        episodeResolutionOwner = owner
+        episodeResolutionTargetVideoID = owner.videoID
+        episodeResolutionAdmitted = false
+        episodeResolutionDeadlineTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(Self.episodeResolutionDeadlineSeconds))
+            guard !Task.isCancelled else { return }
+            let decision = EpisodeResolutionDeadlinePolicy.decision(
+                captured: owner,
+                current: currentEpisodeResolutionOwner,
+                pendingVideoID: episodeResolutionTargetVideoID,
+                admitted: episodeResolutionAdmitted,
+                exited: playbackExited
+            )
+            guard decision == .timeOut else { return }
+            episodeResolutionTask?.cancel()
+            episodeResolutionTask = nil
+            episodeResolutionDeadlineTask = nil
+            episodeResolutionOwner = nil
+            episodeResolutionTargetVideoID = nil
+            episodeResolutionAdmitted = false
+            episodeResolveGeneration = nil
+            pendingAdvance = nil
+            if restoreSupersededAdvance() { return }
+            switchingEpisode = false
+            reconnecting = false
+            buffering = false
+            loadErrorMsg = "No playable source resolved within 30 seconds."
+            DiagnosticsLog.log(
+                "binge",
+                "episode resolve deadline reached before player admission for \(VXProbeRedaction.identityToken(owner.videoID))"
+            )
+            presentTerminalLoadFailure()
+        }
+    }
+
+    private func admitEpisodeResolutionIfCurrent(loadToken: PlayerLoadToken) {
+        guard let owner = episodeResolutionOwner,
+              owner == currentEpisodeResolutionOwner,
+              episodeResolutionTargetVideoID == owner.videoID,
+              pendingAdvance?.meta.videoId == owner.videoID,
+              pendingAdvance?.loadToken == loadToken,
+              coordinator.player?.activeLoadToken == loadToken else { return }
+        episodeResolutionAdmitted = true
+        episodeResolutionDeadlineTask?.cancel()
+        episodeResolutionDeadlineTask = nil
+    }
+
+    private func invalidateEpisodeResolution() {
+        episodeResolutionTask?.cancel()
+        episodeResolutionDeadlineTask?.cancel()
+        episodeResolutionTask = nil
+        episodeResolutionDeadlineTask = nil
+        episodeResolutionOwner = nil
+        episodeResolutionTargetVideoID = nil
+        episodeResolutionAdmitted = false
+    }
+
     private func invalidateEpisodeWorkForExit() {
         persistenceBlockedForExit = hasUncommittedIssuedMedia
         playbackExited = true
+        invalidateEpisodeResolution()
         episodeSwitchGeneration &+= 1
         episodeResolveGeneration = nil
         resumeRetryGeneration &+= 1
@@ -3107,11 +3489,17 @@ struct PlayerScreen: View {
         episodeResolveGeneration = episodeGeneration
         resumeRetryGeneration &+= 1
         let mediaGeneration = resumeRetryGeneration
+        let resolutionOwner = EpisodeResolutionOwner(
+            episodeGeneration: episodeGeneration,
+            sourceGeneration: mediaGeneration,
+            videoID: videoId
+        )
+        armEpisodeResolutionDeadline(owner: resolutionOwner)
         autoRetryTask?.cancel()
         if duration > 0, currentTime > 0 { reportProgress(currentTime) }   // flush the outgoing episode (floor-guarded)
         withAnimation { panel = nil }
         buffering = true; reconnecting = true; reconnectMsg = "Loading episode…"
-        Task {
+        episodeResolutionTask = Task { @MainActor in
             let resolved = await loadEpisode(videoId)
             let resultIsCurrent = !Task.isCancelled && !playbackExited
                 && episodeGeneration == episodeSwitchGeneration
@@ -3121,6 +3509,7 @@ struct PlayerScreen: View {
                 // only this generation's switch state; a newer episode request owns the state when generations
                 // differ and must never be reset by this stale completion.
                 if !playbackExited, episodeGeneration == episodeSwitchGeneration {
+                    invalidateEpisodeResolution()
                     episodeResolveGeneration = nil
                     let healthyPending = pendingAdvance != nil && pendingAdvance?.terminal != true
                     switchingEpisode = healthyPending
@@ -3129,6 +3518,7 @@ struct PlayerScreen: View {
                 return
             }
             guard let es = resolved else {
+                invalidateEpisodeResolution()
                 episodeResolveGeneration = nil
                 srcProbe("goToEpisode(\(videoId)) resolve returned nil (autoAdvance=\(autoAdvance ? "Y" : "N"))")
                 if pendingAdvance?.terminal == true {
@@ -3161,6 +3551,7 @@ struct PlayerScreen: View {
                 currentVideoID: curMeta?.videoId, targetVideoID: es.meta.videoId,
                 currentURL: curURL, targetURL: es.url
             ) else {
+                invalidateEpisodeResolution()
                 episodeResolveGeneration = nil
                 if pendingAdvance?.terminal == true {
                     switchingEpisode = false
@@ -3208,7 +3599,8 @@ struct PlayerScreen: View {
                   pendingAdvance?.meta.videoId == es.meta.videoId else { return }
             switchStream(to: es.stream, url: es.url, userInitiated: true, resumeOverride: es.resume,
                          debridRef: es.debridRef, engineAlreadyBound: false,
-                         engineAddonBaseOverride: es.engineAddonBase)
+                         engineAddonBaseOverride: es.engineAddonBase,
+                         mediaGenerationAlreadyClaimed: true)
         }
     }
 
@@ -3218,13 +3610,14 @@ struct PlayerScreen: View {
     /// scrobble attribution, and the LastStreamStore record that follows in the same first-frame block all
     /// name the episode whose file just rendered. No-op outside an advance, so launch playback, source
     /// switches, and stall reloads are untouched.
-    private func commitPendingAdvanceOnFirstFrame(loadToken: PlayerLoadToken) {
+    @discardableResult
+    private func commitPendingAdvanceOnFirstFrame(loadToken: PlayerLoadToken) -> Bool {
         guard let pending = pendingAdvance,
               PlayerLoadProvenanceState.canCommit(
                 callbackToken: loadToken,
                 activeToken: coordinator.player?.activeLoadToken,
                 pendingToken: pending.loadToken
-              ) else { return }
+              ) else { return false }
         pendingAdvance = nil
         supersededAdvance = nil
         committedLoadToken = loadToken
@@ -3235,6 +3628,12 @@ struct PlayerScreen: View {
         curDebridRef = pending.debridRef
         switchingEpisode = episodeResolveGeneration != nil
         playbackSessionID = UUID().uuidString
+        if EpisodeTrickplayIdentityPolicy.shouldRekey(committedPendingAdvance: true) {
+            scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
+            lastLocalTrickplayCapture = -1000
+            invalidateLocalTrickplayCapture()
+            configureCommunityTrickplayProvisional()
+        }
         // Code-level invariant (the extractable check; the app has no unit-test bundle): at commit, the
         // published episode IS the episode of the file that just first-framed - pending.url is kept in
         // step with curURL by goToEpisode and switchStream. Debug builds trap; user builds log.
@@ -3244,6 +3643,7 @@ struct PlayerScreen: View {
             srcProbe("binge COMMIT MISMATCH: pending url \(u.lastPathComponent) != curURL \(curURL?.lastPathComponent ?? "nil")")
         }
         srcProbe("binge advance committed at first frame -> \(pending.meta.videoId) (label/selector/store now agree)")
+        return true
     }
 
     /// FOREGROUND RECONCILE of an interrupted binge advance (mirror of TVPlayerView; UIKit platforms only,
@@ -3410,7 +3810,8 @@ struct PlayerScreen: View {
                     // Direct onSeek (a restart-to-0 must bypass reportSeek's resume floor), so the
                     // account write rides along explicitly, keyed on the CURRENT episode like every
                     // other save (the hosts no longer write the account from the closures).
-                    if duration > 0 {
+                    if assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken),
+                       duration > 0 {
                         if engineWritesOpen { onSeek(0, duration) }
                         lastReported = 0
                         saveAccountProgress(0)
@@ -5249,15 +5650,21 @@ struct PlayerScreen: View {
     /// the cover down - so a stuck load can never trap the user with a Task still spinning. Routed from
     /// the always-present pre-start close button, the error-overlay Back, and the top-bar chevron.
     @MainActor private func leavePlayback() {
+        let exitLoadToken = coordinator.player?.activeLoadToken
+        let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: exitLoadToken)
         invalidateEpisodeWorkForExit()
         invalidateLocalTrickplayCapture()
+        cancelAssetSanityObservationDeadline()
         hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel(); idleWatchTask?.cancel()
         stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
         #if os(iOS) || os(macOS)
         avStartWatchdog?.cancel()
         #endif
-        if !effectivelyLive, duration > 0 {
-            reportProgress(currentTime)
+        if assetSanityAccepted {
+            scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
+        }
+        if assetSanityAccepted, !effectivelyLive, duration > 0 {
+            reportProgress(currentTime, acceptedOwner: exitLoadToken)
             // A manual close at/near the end must clear Continue Watching too, not only a natural EOF. The
             // engine keeps any item with time_offset > 0 in the rail, so a title watched to the credits then
             // closed by hand would linger there forever (the "CW never clears" report). Rewind it OUT of CW,
@@ -5275,7 +5682,8 @@ struct PlayerScreen: View {
         // External sync (Trakt/SIMKL): scrobble STOP on a genuine user exit. Additive + fail-soft + gated +
         // once-latched inside the coordinator; a no-op with empty creds. Near the end this records the watch
         // (deduped against the 90%/EOF record); mid-title it saves a resume/pause point (live scrobble only).
-        if !persistenceBlockedForExit, !effectivelyLive, let m = curMeta {
+        if !persistenceBlockedForExit, assetSanityAccepted,
+           !effectivelyLive, let m = curMeta {
             ScrobbleCoordinator.shared.playbackStopped(
                 m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: duration
             )
@@ -5461,14 +5869,19 @@ struct PlayerScreen: View {
     /// keeps the real resume point only in `suppressedResumeFloor`; without this the periodic saves and the
     /// exit flush would overwrite the account resume with the restarted-low position. The floor clears once
     /// the playhead passes it (the viewer caught up) or on the next source/episode load.
-    private func reportProgress(_ position: Double) {
+    private func reportProgress(
+        _ position: Double,
+        acceptedOwner: PlayerLoadToken? = nil
+    ) {
+        let integrityOwner = acceptedOwner ?? coordinator.player?.activeLoadToken
+        guard assetSanityAttempt.isAccepted(owner: integrityOwner) else { return }
         guard !hasUncommittedIssuedMedia, !persistenceBlockedForExit else { return }
         if let floor = suppressedResumeFloor {
             if position < floor { return }
             suppressedResumeFloor = nil
         }
         if engineWritesOpen { onProgress(position, duration) }
-        saveAccountProgress(position)
+        saveAccountProgress(position, acceptedOwner: integrityOwner)
     }
 
     /// Persist a user-initiated seek (skip buttons, macOS arrow keys, slider commit) to the presenter, which
@@ -5477,6 +5890,7 @@ struct PlayerScreen: View {
     /// overwrite the real account resume until the playhead has actually passed the floor. The floor clears
     /// once passed. Backward / non-suppressed seeks pass straight through.
     private func reportSeek(_ target: Double) {
+        guard assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken) else { return }
         guard !hasUncommittedIssuedMedia, !persistenceBlockedForExit else { return }
         guard duration > 0 else { return }
         if let floor = suppressedResumeFloor {
@@ -5508,7 +5922,12 @@ struct PlayerScreen: View {
     /// floor-guarded `reportProgress`/`reportSeek` chokepoints (+ the Restart lane, which reported
     /// directly), so WHEN a save fires is unchanged; only WHICH episode it names moved. No meta
     /// (trailer / paste-a-link / web shell) is a no-op, exactly like the old host-side meta guards.
-    private func saveAccountProgress(_ position: Double) {
+    private func saveAccountProgress(
+        _ position: Double,
+        acceptedOwner: PlayerLoadToken? = nil
+    ) {
+        let integrityOwner = acceptedOwner ?? coordinator.player?.activeLoadToken
+        guard assetSanityAttempt.isAccepted(owner: integrityOwner) else { return }
         guard !hasUncommittedIssuedMedia, !persistenceBlockedForExit else { return }
         guard let m = curMeta else { return }
         let dur = duration

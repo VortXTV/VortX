@@ -84,11 +84,13 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
                              continuity: String?, binge: String? = nil, cachedHashes: Set<String> = [],
                              core: CoreBridge,
                              account: StremioAccount) async -> PlayerEpisodeStream? {
+    guard !Task.isCancelled else { return nil }
     guard let v = videos.first(where: { $0.id == videoId }) else { return nil }
     core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
     var groups: [CoreStreamSourceGroup] = []
     var firstPlayableAt: Date? = nil
     for _ in 0 ..< 80 {                                // ~20s ceiling, matching the episode page
+        guard !Task.isCancelled else { return nil }
         groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
         if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
         // Settle gate (see StreamRanking.resolveSettled): for a resume, hold out until the SAME quality the
@@ -99,8 +101,13 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
         let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
         if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
                                         secondsSinceFirstPlayable: elapsed, rememberedQuality: continuity) { break }
-        try? await Task.sleep(for: .milliseconds(250))
+        do {
+            try await Task.sleep(for: .milliseconds(250))
+        } catch {
+            return nil
+        }
     }
+    guard !Task.isCancelled else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
     guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge, pin: pin,
                                         debridCachedHashes: cachedHashes) else { return nil }
@@ -119,19 +126,24 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
             for: best, episode: episodeHint,
             confirmedCachedHashes: cachedHashes.isEmpty ? nil : cachedHashes
         )
+        guard !Task.isCancelled else { return nil }
     }
     guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
         isUsenet: best.isUsenet, resolvedURL: ref?.url,
         fallbackURL: best.playableURL(isEpisode: true)
     ) else { return nil }
-    if ref == nil { _ = prepareTorrentStream(best) }   // fire-and-forget prime; self-terminating backoff
     let pm = PlaybackMeta(libraryId: seriesId, videoId: v.id, type: "series",
                           name: seriesName, poster: v.thumbnail ?? fallbackPoster,
                           season: v.season, episode: v.episode)
     let title = "\(seriesName)  ·  S\(v.season ?? defaultSeason)E\(v.episodeNumber)"
     let resume: Double
     if let engine = core.engineResumeSeconds(for: pm) { resume = engine }
-    else { resume = await account.resumeOffset(for: pm) }
+    else {
+        resume = await account.resumeOffset(for: pm)
+        guard !Task.isCancelled else { return nil }
+    }
+    guard !Task.isCancelled else { return nil }
+    if ref == nil { _ = prepareTorrentStream(best) }   // fire-and-forget prime; self-terminating backoff
     return PlayerEpisodeStream(
         stream: best, url: url, meta: pm, title: title, resume: resume,
         debridRef: ref, engineAddonBase: iOSEngineAddonBase(for: best, in: groups)
@@ -4386,11 +4398,13 @@ struct iOSEpisodeStreams: View {
     /// the same load → rank → direct-links → torrent-prime → resume path as a manual source tap, so the
     /// player can switch episodes without owning any of that logic. Returns nil when nothing is playable.
     private func loadEpisodeStream(_ videoId: String) async -> PlayerEpisodeStream? {
+        guard !Task.isCancelled else { return nil }
         guard let v = seasonEpisodes.first(where: { $0.id == videoId }) else { return nil }
         core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: v.id)
         var groups: [CoreStreamSourceGroup] = []
         var firstPlayableAt: Date? = nil
         for _ in 0 ..< 80 {                                // ~20s ceiling, matching the page's settle timeout
+            guard !Task.isCancelled else { return nil }
             // Target-engine groups only. The page-owned auxiliary contributors are scoped to shownVideo and
             // must not leak into a different episode being resolved behind the player.
             groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
@@ -4401,8 +4415,13 @@ struct iOSEpisodeStreams: View {
             let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
             if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
                                             secondsSinceFirstPlayable: elapsed, rememberedQuality: rememberedQuality) { break }
-            try? await Task.sleep(for: .milliseconds(250))
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+            } catch {
+                return nil
+            }
         }
+        guard !Task.isCancelled else { return nil }
         guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
                                             debridCachedHashes: debridCache.cachedHashes) else { return nil }
         let targetSeason = v.season ?? season
@@ -4415,19 +4434,22 @@ struct iOSEpisodeStreams: View {
             ref = nil
         } else {
             ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: best, episode: episodeHint)
+            guard !Task.isCancelled else { return nil }
         }
         guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
             isUsenet: best.isUsenet, resolvedURL: ref?.url,
             fallbackURL: best.playableURL(isEpisode: true)
         ) else { return nil }
-        lastBinge = best.behaviorHints?.bingeGroup   // keep the next episode on this release group (#3)
-        torrentPrime?.cancel(); torrentPrime = ref == nil ? prepareTorrentStream(best) : nil
         let pm = PlaybackMeta(libraryId: meta.id, videoId: v.id, type: "series",
                               name: meta.name, poster: v.thumbnail ?? meta.poster,
                               season: v.season, episode: v.episode)
         let title = "\(meta.name)  ·  S\(v.season ?? season)E\(v.episodeNumber)"
+        let resolvedResume = await resume(pm)
+        guard !Task.isCancelled else { return nil }
+        lastBinge = best.behaviorHints?.bingeGroup   // keep the next episode on this release group (#3)
+        torrentPrime?.cancel(); torrentPrime = ref == nil ? prepareTorrentStream(best) : nil
         return PlayerEpisodeStream(
-            stream: best, url: url, meta: pm, title: title, resume: await resume(pm),
+            stream: best, url: url, meta: pm, title: title, resume: resolvedResume,
             debridRef: ref, engineAddonBase: iOSEngineAddonBase(for: best, in: groups)
         )
     }

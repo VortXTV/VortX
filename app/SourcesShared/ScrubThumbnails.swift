@@ -78,6 +78,7 @@ final class ScrubThumbnailsStore: ObservableObject {
     func configure(localCacheKey: String?) {
         guard self.localCacheKey != localCacheKey else { return }
         retireCommunityUploadIfNeeded()
+        _ = communityIdentityGeneration.advance()
         self.localCacheKey = localCacheKey
         image = nil
         // A new title: drop the previous community sheet + session frames.
@@ -157,16 +158,21 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// on failure: it then marks the id one-shot-failed so the per-tick callers stop re-firing the lookup
     /// (the session stays local-only, exactly the old behavior). Reset per title in `configure`.
     private var communityResolveTriedFor: String?
+    /// Captured by async TMDB to IMDb resolution. A first-frame episode re-key advances this
+    /// generation, so an outgoing episode's slow completion cannot configure the incoming episode.
+    private var communityIdentityGeneration = TrickplayIdentityGeneration()
 
     /// One-shot tmdb->imdb resolve, then re-enter `configureCommunity` with the tt identity. Fail-soft.
     private func resolveCommunityIdentity(rawId: String, season: Int?, episode: Int?,
                                           duration: Double, isRealDuration: Bool) {
         guard communityResolveTriedFor != rawId else { return }
         communityResolveTriedFor = rawId
+        let identityGeneration = communityIdentityGeneration.value
         Task { [weak self] in
             let tt = await CommunityTrickplay.resolveIMDbID(rawId: rawId, seriesHint: season != nil)
             await MainActor.run {
-                guard let self else { return }
+                guard let self,
+                      self.communityIdentityGeneration.accepts(identityGeneration) else { return }
                 guard let tt else {
                     VXProbe.log("tp", "tmdb->imdb resolve FAILED for \(VXProbeRedaction.identityToken(rawId)) (session stays local-only)")
                     return
