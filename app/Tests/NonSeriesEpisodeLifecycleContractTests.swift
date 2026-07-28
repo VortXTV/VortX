@@ -1,6 +1,8 @@
 // Standalone contract for the beta series-lifecycle fence and the broader physical-media identity.
 //
 //   xcrun swiftc -o /tmp/nonseries-episode-lifecycle-test \
+//     app/SourcesShared/DetailMetaRecoveryPolicy.swift \
+//     app/SourcesShared/CatalogRowResolution.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //     app/SourcesShared/DownloadModels.swift \

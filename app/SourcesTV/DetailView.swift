@@ -57,6 +57,15 @@ struct DetailView: View {
     /// instead of flat canvas. nil (no art / not computed) keeps today's canvas exactly.
     @State private var dominantTint: Color?
 
+    /// The route/catalog ID remains `id`. Only engine metadata and stream requests move to this recovered
+    /// IMDb ID, so existing catalog/source identity roles continue to receive the raw ID they require.
+    @State private var recoveredIMDbID: String?
+    @State private var metaRecoveryAttempted = false
+    @State private var metaRecoveryInFlight = false
+    @State private var metaWatchdogExpired = false
+    @State private var metaAttempt = 0
+    private static let metaWatchdogSeconds = 12
+
     /// The ONLY read of the engine's shared meta slot in this screen, id-fenced.
     ///
     /// THE DEFECT THIS CLOSES: `core.metaDetails` is one published slot on a singleton, and this view rendered
@@ -68,7 +77,7 @@ struct DetailView: View {
     /// Every resident-meta read below goes through this property. `IdentityCallerGateTests` fails if the raw
     /// `core.metaDetails?.meta` token reappears anywhere else in this file.
     private var fencedMeta: CoreMetaItem? {
-        ResidentMeta.fenced(core.metaDetails?.meta, pageID: id) { $0.id }
+        ResidentMeta.fenced(core.metaDetails?.meta, pageID: metaRequestID) { $0.id }
     }
 
     var body: some View {
@@ -90,14 +99,16 @@ struct DetailView: View {
                 } else {
                     moviePage(meta)
                 }
-            } else if !LiveTypes.contains(type), type != "series", id.hasPrefix("tt"),
-                      let placeholder = CoreMetaItem.placeholder(id: id, type: type, name: "") {
+            } else if !LiveTypes.contains(type), type != "series", metaRequestID.hasPrefix("tt"),
+                      let placeholder = CoreMetaItem.placeholder(id: metaRequestID, type: type, name: "") {
                 // Cinemeta meta is nil for this tt (a new/unreleased title: tt at TMDB, not yet in Cinemeta).
                 // The page is meta-driven, so without this it sat on a spinner forever AND the streams guard
                 // never passed -> "No sources found". Render moviePage from a metahub-by-tt placeholder so the
                 // hero paints and the sources list shows; the relaxed streams guard fires on the tt directly.
                 // When the real meta later arrives, onChange swaps to it.
                 moviePage(placeholder)
+            } else if metaUnavailable {
+                metaUnavailablePage
             } else {
                 // Focusable so Back pops this view instead of exiting the app while it loads.
                 ScrollView {
@@ -112,6 +123,10 @@ struct DetailView: View {
         // Compute the tint from the SAME art the hero backdrop paints (background, else poster), so tint
         // and art always agree; recomputes when the meta hydrates or the page repoints to another title.
         .task(id: tintArtURL) { await recomputeTint() }
+        .task(id: metaWatchdogTaskID) {
+            await runMetaWatchdog(requestID: metaRequestID, attempt: metaAttempt)
+        }
+        .task(id: metaRecoveryTaskID) { await recoverMetaIfNeeded() }
         // NO ignoresSafeArea on the content: tvOS's safe-area insets exist to keep UI out of
         // TV overscan, and pushing the whole page into them clipped the top of the detail page
         // on TVs that crop (field report). The backdrops self-bleed (FullBleedBackdrop ignores
@@ -124,11 +139,11 @@ struct DetailView: View {
             // the meta loads, so load meta FIRST then dispatch streams on meta-ready (loadMovieStreamsIfNeeded).
             // Series load streams per-episode (CoreEpisodeStreams), so a series detail loads meta only.
             if effectiveType == "series" {
-                core.loadMeta(type: effectiveType, id: id)
+                core.loadMeta(type: effectiveType, id: metaRequestID)
             } else if fencedMeta != nil {
                 loadMovieStreamsIfNeeded()
             } else {
-                core.loadMeta(type: effectiveType, id: id)
+                core.loadMeta(type: effectiveType, id: metaRequestID)
                 // An imdb tt whose Cinemeta meta may never arrive (new/unreleased) would never reach the
                 // onChange(meta?.id) that dispatches streams: fire the tt-keyed streams now so the sources
                 // list populates regardless of the meta race. No-op'd by hasStreams once they land.
@@ -173,6 +188,145 @@ struct DetailView: View {
         }
     }
 
+    // MARK: Metadata recovery
+
+    /// The engine request identity may move to a recovered IMDb ID. The route identity remains `id`
+    /// and continues to feed source catalog roles and TMDB-number extraction.
+    private var metaRequestID: String { recoveredIMDbID ?? id }
+
+    private var currentMetaResolution: DetailMetaRecoveryPolicy.Resolution? {
+        core.detailMetaResolution(for: metaRequestID)
+    }
+
+    /// Some catalog add-ons select a raw `tmdb:`/`tvdb:` path but return a canonical IMDb meta item.
+    /// The selected-ID fence proves the ready item belongs to this request before its different ID is
+    /// adopted, so the A-back-B residency guard remains intact.
+    private var canonicalReadyMetaTarget: (id: String, type: String)? {
+        guard !metaRequestID.hasPrefix("tt"),
+              let target = core.canonicalReadyMetaTarget(for: metaRequestID) else { return nil }
+        return target
+    }
+
+    private var metaIsTerminalOrStalled: Bool {
+        currentMetaResolution == .unresolved || metaWatchdogExpired
+    }
+
+    private var metaWatchdogTaskID: String {
+        "\(metaRequestID)#\(metaAttempt)"
+    }
+
+    private var metaRecoveryTaskID: String {
+        "\(metaRequestID)#\(metaAttempt)#\(currentMetaResolution?.rawValue ?? "none")#\(metaWatchdogExpired)"
+    }
+
+    private var metaUnavailable: Bool {
+        guard !LiveTypes.contains(type), fencedMeta == nil, metaIsTerminalOrStalled else { return false }
+        if metaRequestID.hasPrefix("tt") { return true }
+        return metaRecoveryAttempted && !metaRecoveryInFlight
+    }
+
+    private var metaUnavailablePage: some View {
+        ScrollView {
+            VStack(spacing: Theme.Space.lg) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 54, weight: .semibold))
+                    .foregroundStyle(Theme.Palette.accent)
+                Text("Details unavailable")
+                    .font(Theme.Typography.screenTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text("This catalog item could not be matched to metadata your installed add-ons can load.")
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 720)
+                Button("Try Again") { retryMeta() }
+                    .buttonStyle(PrimaryActionStyle())
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, Theme.Space.screenEdge)
+            .padding(.vertical, 120)
+        }
+    }
+
+    private func runMetaWatchdog(requestID: String, attempt: Int) async {
+        guard !LiveTypes.contains(type) else { return }
+        metaWatchdogExpired = false
+        guard fencedMeta == nil else { return }
+        try? await Task.sleep(for: .seconds(Self.metaWatchdogSeconds))
+        guard !Task.isCancelled,
+              requestID == metaRequestID,
+              attempt == metaAttempt,
+              fencedMeta == nil else { return }
+        VXProbe.log(
+            "detail",
+            "meta watchdog expired id=\(VXProbeRedaction.identityToken(requestID))"
+        )
+        metaWatchdogExpired = true
+    }
+
+    private func recoverMetaIfNeeded() async {
+        guard !LiveTypes.contains(type),
+              fencedMeta == nil,
+              !metaRequestID.hasPrefix("tt"),
+              !metaRecoveryAttempted else { return }
+
+        metaRecoveryAttempted = true
+        if let target = canonicalReadyMetaTarget {
+            adoptRecoveredIMDbID(target.id, requestType: target.type)
+            return
+        }
+
+        guard metaIsTerminalOrStalled else {
+            metaRecoveryAttempted = false
+            return
+        }
+
+        metaRecoveryInFlight = true
+        defer { metaRecoveryInFlight = false }
+
+        let rawID = id
+        let requestType = effectiveType
+        guard let imdb = await TMDBClient.imdbID(forCatalogID: rawID, type: requestType),
+              !Task.isCancelled,
+              imdb != rawID else {
+            if !Task.isCancelled {
+                VXProbe.log(
+                    "detail",
+                    "meta recovery unresolved id=\(VXProbeRedaction.identityToken(rawID))"
+                )
+            }
+            return
+        }
+
+        VXProbe.log(
+            "detail",
+            "meta recovery mapped catalog=\(VXProbeRedaction.identityToken(rawID)) request=\(VXProbeRedaction.identityToken(imdb))"
+        )
+        adoptRecoveredIMDbID(imdb, requestType: requestType)
+    }
+
+    private func adoptRecoveredIMDbID(_ imdb: String, requestType: String) {
+        recoveredIMDbID = imdb
+        metaWatchdogExpired = false
+        core.loadMeta(type: requestType, id: imdb)
+        if requestType != "series" { loadMovieStreamsIfNeeded() }
+        loadCredits()
+        loadCollection()
+        loadRatings()
+        loadWatchProviders()
+        loadSimilarFallback()
+    }
+
+    private func retryMeta() {
+        recoveredIMDbID = nil
+        metaRecoveryAttempted = false
+        metaRecoveryInFlight = false
+        metaWatchdogExpired = false
+        metaAttempt &+= 1
+        core.loadMeta(type: type, id: id)
+        if type != "series" { loadMovieStreamsIfNeeded() }
+    }
+
     /// The IMDb id to fetch MDBList ratings for: prefer the meta's imdb `defaultVideoId` (tt...) when the
     /// catalog id is non-imdb (tmdb:/kitsu:), else the catalog id when it is itself an imdb id.
     ///
@@ -182,7 +336,7 @@ struct DetailView: View {
     /// correct for the pool, which is why the source paths now read `sourceIndexIdentityID` below.
     private var ratingsImdbID: String? {
         if let dv = fencedMeta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
-        return id.hasPrefix("tt") ? id : nil
+        return metaRequestID.hasPrefix("tt") ? metaRequestID : nil
     }
 
     /// The identity ROLES this page hands to the SOURCE paths (Singularity pool + the IMDb-keyed TorBox
@@ -401,8 +555,8 @@ struct DetailView: View {
     /// carry the add-on's OWN video id verbatim, coordinates included, or imdb-keyed add-ons stop matching.
     /// Same title, different required shape: do not "unify" these two by canonicalizing this one.
     private var movieStreamId: String {
-        if let dv = fencedMeta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != id { return dv }
-        return id
+        if let dv = fencedMeta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != metaRequestID { return dv }
+        return metaRequestID
     }
 
     /// The AUTHORITATIVE type for the stream request + series/movie render: the loaded meta's type once
@@ -428,14 +582,19 @@ struct DetailView: View {
         // wait (their stream id only resolves from the meta). hasStreams keys on the effective id, so no
         // re-dispatch loop forms once the streams arrive.
         let metaResident = fencedMeta != nil
-        guard metaResident || id.hasPrefix("tt") else { return }
+        guard metaResident || metaRequestID.hasPrefix("tt") else { return }
         let streamId = movieStreamId
         // Either surface counts as resident: meta-embedded streams (metaStreams, #122) are keyed by the
         // same stream path id, and their presence means the engine already selected this id.
         let hasStreams = core.metaDetails?.allStreamGroups.contains { $0.request.path.id == streamId } ?? false
         guard !hasStreams else { return }
-        if effectiveType != type { NSLog("[detail] stream type corrected: hub-guess=%@ -> meta=%@ id=%@", type, effectiveType, id) }
-        core.loadMeta(type: effectiveType, id: id, streamType: effectiveType, streamId: streamId)
+        if effectiveType != type {
+            VXProbe.log(
+                "detail",
+                "stream type corrected guess=\(type) meta=\(effectiveType) id=\(VXProbeRedaction.identityToken(metaRequestID))"
+            )
+        }
+        core.loadMeta(type: effectiveType, id: metaRequestID, streamType: effectiveType, streamId: streamId)
     }
 
     /// H16 tvOS cast rail: a focusable horizontal rail of every cast member (photo circle + actor + character),
@@ -515,9 +674,10 @@ struct DetailView: View {
             let items = await AddonClient.similar(type: type, excludingId: id, genres: meta.genres, title: meta.name)
             var merged = items
             // When a TMDB key is set, prepend TMDB recommendations (deduped) for richer "more like this".
-            if ApiKeys.tmdbKey() != nil, id.hasPrefix("tt") {
+            if ApiKeys.tmdbKey() != nil, let imdb = ratingsImdbID {
                 let existing = Set(items.map(\.id))
-                let recs = await AddonClient.tmdbSimilar(type: type, imdbID: id).filter { $0.id != id && !existing.contains($0.id) }
+                let recs = await AddonClient.tmdbSimilar(type: type, imdbID: imdb)
+                    .filter { $0.id != id && $0.id != imdb && !existing.contains($0.id) }
                 merged = recs + items
             }
             // Never clobber an already-filled rail (the #29 fallback) with an empty meta-seeded result.
@@ -531,9 +691,11 @@ struct DetailView: View {
     /// them directly. Fail-soft, and it only fills while the rail is still empty, so a later richer
     /// meta-seeded result is never clobbered.
     private func loadSimilarFallback() {
-        guard !LiveTypes.contains(type), similarItems.isEmpty, id.hasPrefix("tt"), ApiKeys.tmdbKey() != nil else { return }
+        guard !LiveTypes.contains(type), similarItems.isEmpty,
+              let imdb = ratingsImdbID, ApiKeys.tmdbKey() != nil else { return }
         Task {
-            let recs = await AddonClient.tmdbSimilar(type: effectiveType, imdbID: id).filter { $0.id != id }
+            let recs = await AddonClient.tmdbSimilar(type: effectiveType, imdbID: imdb)
+                .filter { $0.id != id && $0.id != imdb }
             guard !recs.isEmpty else { return }
             await MainActor.run { if similarItems.isEmpty { similarItems = recs } }
         }
@@ -577,9 +739,9 @@ struct DetailView: View {
     /// Legal streaming availability for the title in the viewer's region (TMDB watch/providers). Only
     /// runs with a TMDB key + an IMDb id; a nil result simply hides the section.
     private func loadWatchProviders() {
-        guard !LiveTypes.contains(type), id.hasPrefix("tt") else { return }
+        guard !LiveTypes.contains(type), let imdb = ratingsImdbID else { return }
         Task {
-            let avail = await TMDBClient.watchProviders(imdbID: id, type: type)
+            let avail = await TMDBClient.watchProviders(imdbID: imdb, type: type)
             await MainActor.run { watchAvail = avail }
         }
     }

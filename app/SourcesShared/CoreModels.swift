@@ -471,7 +471,15 @@ enum LiveTypes {
 
 // MARK: meta_details
 
+/// The engine selection that owns the current `metaItems` payload. A detail page must fence terminal
+/// empty/error state to this ID, just as it already fences ready metadata, or title A can trigger
+/// title B's fallback while the shared bridge slot is changing pages.
+struct CoreMetaSelection: Decodable {
+    let metaPath: CoreResourcePath
+}
+
 struct CoreMetaDetails: Decodable {
+    let selected: CoreMetaSelection?
     let metaItems: [CoreMetaEntry]
     let streams: [CoreStreamGroup]
     /// Streams EMBEDDED in the meta itself (`MetaDetails.meta_streams`): the engine lifts the selected
@@ -524,6 +532,34 @@ struct CoreMetaDetails: Decodable {
         }
         return best?.meta ?? first.meta
     }
+
+    var selectedMetaID: String? { selected?.metaPath.id }
+
+    private var metaEntryStates: [DetailMetaRecoveryPolicy.EntryState] {
+        metaItems.map { entry in
+            switch entry.content {
+            case .ready?:      return .ready
+            case .loading?:    return .loading
+            case .err?:        return .failed
+            case .none:        return .notStarted
+            }
+        }
+    }
+
+    /// Unscoped state used by CoreBridge to notice pending-to-terminal transitions. Detail surfaces
+    /// must call `metaResolution(for:)` so a stale selected title cannot drive the current page.
+    var metaResolution: DetailMetaRecoveryPolicy.Resolution {
+        DetailMetaRecoveryPolicy.resolution(entries: metaEntryStates)
+    }
+
+    func metaResolution(for requestedID: String) -> DetailMetaRecoveryPolicy.Resolution? {
+        DetailMetaRecoveryPolicy.resolution(
+            selectedID: selectedMetaID,
+            requestedID: requestedID,
+            entries: metaEntryStates
+        )
+    }
+
     var watchedIds: Set<String> { Set(watchedVideoIds ?? []) }
 }
 

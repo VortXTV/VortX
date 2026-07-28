@@ -229,6 +229,102 @@ struct iOSDetailView: View {
 
     private var pinContext: SourcePinContext { SourcePinContext(metaId: id, isSeries: effectiveType == "series") }
 
+    // MARK: Metadata recovery
+
+    private var metaRequestID: String { recoveredIMDbID ?? id }
+
+    private var currentMetaResolution: DetailMetaRecoveryPolicy.Resolution? {
+        core.detailMetaResolution(for: metaRequestID)
+    }
+
+    private var canonicalReadyMetaTarget: (id: String, type: String)? {
+        guard !metaRequestID.hasPrefix("tt"),
+              let target = core.canonicalReadyMetaTarget(for: metaRequestID) else { return nil }
+        return target
+    }
+
+    private var metaIsTerminalOrStalled: Bool {
+        currentMetaResolution == .unresolved || metaWatchdogExpired
+    }
+
+    private var metaWatchdogTaskID: String {
+        "\(metaRequestID)#\(metaAttempt)"
+    }
+
+    private var metaRecoveryTaskID: String {
+        "\(metaRequestID)#\(metaAttempt)#\(currentMetaResolution?.rawValue ?? "none")#\(metaWatchdogExpired)"
+    }
+
+    private func runMetaWatchdog(requestID: String, attempt: Int) async {
+        guard !LiveTypes.contains(type) else { return }
+        metaWatchdogExpired = false
+        guard meta == nil else { return }
+        try? await Task.sleep(for: .seconds(Self.metaWatchdogSeconds))
+        guard !Task.isCancelled,
+              requestID == metaRequestID,
+              attempt == metaAttempt,
+              meta == nil else { return }
+        VXProbe.log(
+            "detail",
+            "meta watchdog expired id=\(VXProbeRedaction.identityToken(requestID))"
+        )
+        metaWatchdogExpired = true
+    }
+
+    private func recoverMetaIfNeeded() async {
+        guard !LiveTypes.contains(type),
+              meta == nil,
+              !metaRequestID.hasPrefix("tt"),
+              !metaRecoveryAttempted else { return }
+
+        metaRecoveryAttempted = true
+        if let target = canonicalReadyMetaTarget {
+            adoptRecoveredIMDbID(target.id, requestType: target.type)
+            return
+        }
+
+        guard metaIsTerminalOrStalled else {
+            metaRecoveryAttempted = false
+            return
+        }
+
+        metaRecoveryInFlight = true
+        defer { metaRecoveryInFlight = false }
+        let rawID = id
+        let requestType = effectiveType
+        guard let imdb = await TMDBClient.imdbID(forCatalogID: rawID, type: requestType),
+              !Task.isCancelled,
+              imdb != rawID else {
+            if !Task.isCancelled {
+                VXProbe.log(
+                    "detail",
+                    "meta recovery unresolved id=\(VXProbeRedaction.identityToken(rawID))"
+                )
+            }
+            return
+        }
+
+        VXProbe.log(
+            "detail",
+            "meta recovery mapped catalog=\(VXProbeRedaction.identityToken(rawID)) request=\(VXProbeRedaction.identityToken(imdb))"
+        )
+        adoptRecoveredIMDbID(imdb, requestType: requestType)
+    }
+
+    private func adoptRecoveredIMDbID(_ imdb: String, requestType: String) {
+        recoveredIMDbID = imdb
+        metaWatchdogExpired = false
+        core.loadMeta(type: requestType, id: imdb)
+        if requestType != "series" { loadMovieStreamsIfNeeded() }
+        loadCredits()
+        loadCollection()
+        loadRatings()
+        loadWatchProviders()
+        loadFinancials()
+        loadReleaseDates()
+        loadSimilarFallback()
+    }
+
     /// True for series AND for a COLLECTION/franchise meta: a non-series meta that carries MULTIPLE entries
     /// as videos[] (e.g. TVDB collections via AIOmetadata). >1 video distinguishes it from a normal movie
     /// (which has 0-1). Render those as an episodic list so the entries show, instead of trying to stream the
@@ -337,6 +433,12 @@ struct iOSDetailView: View {
     /// washed into the page background BELOW the hero band so the whole detail page carries the title's
     /// palette instead of flat canvas. nil (no art / not computed) keeps today's canvas exactly.
     @State private var dominantTint: Color?
+    @State private var recoveredIMDbID: String?
+    @State private var metaRecoveryAttempted = false
+    @State private var metaRecoveryInFlight = false
+    @State private var metaWatchdogExpired = false
+    @State private var metaAttempt = 0
+    private static let metaWatchdogSeconds = 12
     /// yt-direct: the detail hero's ambient clip ATTEMPTED device-direct resolve, keyed by the YouTube id it
     /// resolved so a language-pick upgrade re-resolves. `url == nil` = attempted, no direct stream (mount the
     /// /yt worker URL). The clip waits for the attempt so it never remounts mid-loop on a late resolve.
@@ -544,6 +646,10 @@ struct iOSDetailView: View {
         // Compute the tint from the SAME art fallback chain the hero backdrop paints, so tint and art
         // always agree; recomputes when meta hydrates (background/poster can arrive after the seed art).
         .task(id: tintArtURL) { await recomputeTint() }
+        .task(id: metaWatchdogTaskID) {
+            await runMetaWatchdog(requestID: metaRequestID, attempt: metaAttempt)
+        }
+        .task(id: metaRecoveryTaskID) { await recoverMetaIfNeeded() }
         // A6: the rare "no trailer available right now" notice (no full YouTube trailer AND no /clip). A small
         // capsule, auto-dismissed by `showTrailerNotice`, so the Trailer button never opens the source-error screen.
         .overlay(alignment: .top) {
@@ -596,11 +702,11 @@ struct iOSDetailView: View {
             if effectiveType == "series" {
                 torboxSearch.clearResults(); sourceIndex.clearResults(); mediaServers.clearResults()
                 // A series detail loads meta only; streams load per-episode from iOSEpisodeStreams.
-                if meta == nil { core.loadMeta(type: effectiveType, id: id) }
+                if meta == nil { core.loadMeta(type: effectiveType, id: metaRequestID) }
             } else if meta != nil {
                 loadMovieStreamsIfNeeded()        // meta already resident → dispatch streams now
             } else {
-                core.loadMeta(type: effectiveType, id: id) // load meta FIRST; onChange dispatches streams on arrival
+                core.loadMeta(type: effectiveType, id: metaRequestID) // load meta FIRST; onChange dispatches streams on arrival
                 // For an imdb tt id whose Cinemeta meta may never arrive (new/unreleased title), don't wait
                 // on the onChange(meta?.id) that would never fire: fire the tt-keyed streams now so the
                 // sources list populates regardless of the meta race. No-op'd by hasStreams once they land.
@@ -2034,8 +2140,8 @@ struct iOSDetailView: View {
     /// carry the add-on's OWN video id verbatim, coordinates included, or imdb-keyed add-ons stop matching.
     /// Same title, different required shape: do not "unify" these two by canonicalizing this one.
     private var movieStreamId: String {
-        if let dv = meta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != id { return dv }
-        return id
+        if let dv = meta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != metaRequestID { return dv }
+        return metaRequestID
     }
 
     /// Dispatch the movie/live stream request with the imdb-preferring stream id, unless those streams are
@@ -2052,7 +2158,7 @@ struct iOSDetailView: View {
         // (their stream id only resolves from the meta's defaultVideoId). The hasStreams guard keys on the
         // effective id, so this can't form a re-dispatch loop once the streams arrive.
         let metaResident = meta != nil
-        guard metaResident || id.hasPrefix("tt") else { return }
+        guard metaResident || metaRequestID.hasPrefix("tt") else { return }
         let streamId = movieStreamId
         // Either surface counts as resident: meta-embedded streams (metaStreams, #122) are keyed by the
         // same stream path id, and their presence means the engine already selected this id.
@@ -2061,15 +2167,20 @@ struct iOSDetailView: View {
         // Dispatch under the AUTHORITATIVE type (meta.type when resident), NOT the hub's TMDB movie/tv guess,
         // so a TV-movie / mini-series / anime the hub mis-typed still matches the add-on that indexes it. Log
         // a correction so a device/sim test can spot any residual (e.g. meta that never resolved under the guess).
-        if effectiveType != type { NSLog("[detail] stream type corrected: hub-guess=%@ -> meta=%@ id=%@", type, effectiveType, id) }
-        core.loadMeta(type: effectiveType, id: id, streamType: effectiveType, streamId: streamId)
+        if effectiveType != type {
+            VXProbe.log(
+                "detail",
+                "stream type corrected guess=\(type) meta=\(effectiveType) id=\(VXProbeRedaction.identityToken(metaRequestID))"
+            )
+        }
+        core.loadMeta(type: effectiveType, id: metaRequestID, streamType: effectiveType, streamId: streamId)
     }
 
     /// The IMDb id to fetch MDBList ratings for: prefer the meta's imdb `defaultVideoId` (tt...) when the
     /// catalog id is non-imdb (tmdb:/kitsu:), else the catalog id when it is itself an imdb id.
     private var ratingsImdbID: String? {
         if let dv = meta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
-        return id.hasPrefix("tt") ? id : nil
+        return metaRequestID.hasPrefix("tt") ? metaRequestID : nil
     }
 
     /// The numeric TMDB id when this page was opened from a TMDB-keyed catalog ("tmdb:123",
@@ -3354,9 +3465,10 @@ struct iOSDetailView: View {
             var merged = items
             // Prepend TMDB recommendations (deduped) for richer "more like this". No key gate: the
             // recommendations call routes through the keyless catalogs edge when the user has no key.
-            if id.hasPrefix("tt") {
+            if let imdb = ratingsImdbID {
                 let existing = Set(items.map(\.id))
-                let recs = await AddonClient.tmdbSimilar(type: type, imdbID: id).filter { $0.id != id && !existing.contains($0.id) }
+                let recs = await AddonClient.tmdbSimilar(type: type, imdbID: imdb)
+                    .filter { $0.id != id && $0.id != imdb && !existing.contains($0.id) }
                 merged = recs + items
             }
             await MainActor.run { similarItems = merged }
@@ -3367,9 +3479,11 @@ struct iOSDetailView: View {
     /// genres for the add-on path, but TMDB recommendations resolve from the tt id alone (keyless edge),
     /// so the rail still populates (#29). The full `loadSimilar` overwrites this once meta arrives.
     private func loadSimilarFallback() {
-        guard similarItems.isEmpty, meta == nil, id.hasPrefix("tt"), !LiveTypes.contains(type) else { return }
+        guard similarItems.isEmpty, meta == nil,
+              let imdb = ratingsImdbID, !LiveTypes.contains(type) else { return }
         Task {
-            let recs = await AddonClient.tmdbSimilar(type: type, imdbID: id).filter { $0.id != id }
+            let recs = await AddonClient.tmdbSimilar(type: type, imdbID: imdb)
+                .filter { $0.id != id && $0.id != imdb }
             await MainActor.run { if similarItems.isEmpty { similarItems = recs } }
         }
     }
@@ -3443,7 +3557,7 @@ struct iOSDetailView: View {
     // metaDetails is a single shared @Published on the CoreBridge singleton. Guard on the id so a
     // previous page's still-resident meta (A -> back -> B) can't render A's hero/title under B.
     private var meta: CoreMetaItem? {
-        ResidentMeta.fenced(core.metaDetails?.meta, pageID: id) { $0.id }
+        ResidentMeta.fenced(core.metaDetails?.meta, pageID: metaRequestID) { $0.id }
     }
 }
 

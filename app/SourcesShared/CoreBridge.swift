@@ -918,6 +918,23 @@ final class CoreBridge: ObservableObject {
 
     // MARK: Meta details
 
+    /// Scoped observations for detail recovery. Keeping these behind the bridge preserves the detail
+    /// screens' one-read identity contract while still fencing terminal and canonical-ready state to
+    /// the engine selection that owns it.
+    func detailMetaResolution(for requestedID: String) -> DetailMetaRecoveryPolicy.Resolution? {
+        metaDetails?.metaResolution(for: requestedID)
+    }
+
+    func canonicalReadyMetaTarget(for requestedID: String) -> (id: String, type: String)? {
+        guard let details = metaDetails,
+              details.selectedMetaID == requestedID,
+              let readyMeta = details.meta,
+              case .imdb(let imdb) = DetailMetaRecoveryPolicy.catalogIDShape(readyMeta.id) else {
+            return nil
+        }
+        return (imdb, readyMeta.type)
+    }
+
     /// Load a title's meta + streams. For a series episode, pass the episode's video id as the stream
     /// path so the engine fetches that episode's streams.
     func loadMeta(type: String, id: String, streamType: String? = nil, streamId: String? = nil) {
@@ -2252,13 +2269,18 @@ final class CoreBridge: ObservableObject {
 
     /// True when the newly decoded meta_details differs from the stored one in a way the UI or the
     /// in-player episode-switch path (which reads `streamGroups(forStreamId:)` off the stored value)
-    /// would observe: the loaded meta id, the per-group ready-stream signature (so a new episode's
-    /// streams or newly landed sources always republish), or the library/watched bits behind the
-    /// In-Library button and watched dots. A pure re-emit of the identical loaded payload returns false,
-    /// which is what drops the ~11 redundant source-search republishes for a high-source title.
+    /// would observe: the selected request id, metadata resolution, loaded meta id, per-group
+    /// ready-stream signature (so a new episode's streams or newly landed sources always republish),
+    /// or the library/watched bits behind the In-Library button and watched dots. A pure re-emit of
+    /// the identical loaded payload returns false, which drops the redundant source-search republishes.
     private static func metaDetailsNeedsRepublish(current: CoreMetaDetails?, next: CoreMetaDetails?) -> Bool {
         // Presence flips always republish (spinner -> loaded, or unload).
         guard let current, let next else { return (current != nil) != (next != nil) }
+        // `meta` is nil while an add-on is loading and after every add-on has failed. Publish both
+        // the selection change and pending-to-unresolved transition so detail recovery sees the
+        // terminal state even when the ready meta and stream signatures remain empty.
+        if current.selectedMetaID != next.selectedMetaID { return true }
+        if current.metaResolution != next.metaResolution { return true }
         if current.meta?.id != next.meta?.id { return true }
         if current.libraryItem?.id != next.libraryItem?.id
             || current.libraryItem?.removed != next.libraryItem?.removed
@@ -2287,6 +2309,7 @@ final class CoreBridge: ObservableObject {
     /// save while the stream set is unchanged.
     private static func metaDetailsStreamsChanged(current: CoreMetaDetails?, next: CoreMetaDetails?) -> Bool {
         guard let current, let next else { return (current != nil) != (next != nil) }
+        if current.selectedMetaID != next.selectedMetaID { return true }
         if current.meta?.id != next.meta?.id { return true }
         // Both surfaces, matching metaDetailsNeedsRepublish: a metaStreams arrival must bump streamsEpoch.
         return streamSetSignature(current.allStreamGroups) != streamSetSignature(next.allStreamGroups)

@@ -2,6 +2,8 @@
 // VortX has no Xcode test bundle, so compile the real production model file with minimal dependency stubs:
 //
 //   xcrun swiftc -o /tmp/episode-playback-identity-test \
+//     app/SourcesShared/DetailMetaRecoveryPolicy.swift \
+//     app/SourcesShared/CatalogRowResolution.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //     app/Tests/EpisodePlaybackIdentityTests.swift && \

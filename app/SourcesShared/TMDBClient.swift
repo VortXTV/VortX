@@ -1287,29 +1287,61 @@ enum TMDBClient {
         } catch { return .failure(.transport) }
     }
 
-    /// Resolve a catalog id to an IMDb `tt` id. A `tt` id passes straight through; a `tmdb:<n>` (or bare
-    /// numeric) id is resolved via /external_ids through the SAME keyless, edge-cached choke point as every
-    /// other call here (catalogs.vortx.tv caches external_ids ~24h with SWR, so a warm title resolves in a few
-    /// ms). Hub catalogs (Discover/Trending/genres/streaming tiles) deliver tmdb: ids, but Cinemeta meta,
-    /// stream add-ons and the ratings service all key on the imdb `tt` id - so resolving BEFORE pushing detail
-    /// is what makes hub items show art/ratings/sources on iOS+Mac the way tvOS already does. The hub type
-    /// guess is sometimes wrong, so try the guessed media then the other; external_ids is authoritative.
-    /// Fail-soft: returns nil on any failure, and the caller falls back to pushing the unresolved id.
+    /// Resolve a supported catalog ID shape to an IMDb `tt` ID through the same keyless edge path as the
+    /// rest of TMDBClient. Typed TMDB IDs honor their explicit media kind. Untyped TMDB IDs try the
+    /// caller's media guess and then the other kind. TVDB IDs first map through TMDB `/find`, then use
+    /// the returned TMDB media and ID for `/external_ids`.
     static func imdbID(forCatalogID cid: String, type: String) async -> String? {
-        if cid.hasPrefix("tt") { return cid }
-        let tmdbNumber: Int?
-        if cid.hasPrefix("tmdb:") { tmdbNumber = Int(cid.dropFirst(5)) }
-        else if let n = Int(cid) { tmdbNumber = n }
-        else { tmdbNumber = nil }
-        guard let tid = tmdbNumber else { return nil }
         let key = ApiKeys.effectiveTMDBKey()
-        let primary = (type == "series") ? "tv" : "movie"
-        let secondary = (primary == "tv") ? "movie" : "tv"
-        for media in [primary, secondary] {
-            if let ext = await get("/\(media)/\(tid)/external_ids?api_key=\(key)"),
+
+        let guessedPrimary: DetailMetaRecoveryPolicy.TMDBMedia = type == "series" ? .tv : .movie
+        let guessedSecondary: DetailMetaRecoveryPolicy.TMDBMedia = guessedPrimary == .tv ? .movie : .tv
+        var mediaOrder = [guessedPrimary, guessedSecondary]
+        let tmdbID: Int
+
+        switch DetailMetaRecoveryPolicy.catalogIDShape(cid) {
+        case .imdb(let imdb):
+            return imdb
+        case .tmdb(let id, let explicitMedia):
+            tmdbID = id
+            if let explicitMedia {
+                mediaOrder = [explicitMedia, explicitMedia == .tv ? .movie : .tv]
+            }
+        case .tvdb(let tvdbID):
+            guard let match = await tmdbMatch(
+                forTVDBID: tvdbID,
+                mediaOrder: mediaOrder,
+                key: key
+            ) else { return nil }
+            tmdbID = match.id
+            mediaOrder = [match.media, match.media == .tv ? .movie : .tv]
+        case .unsupported:
+            return nil
+        }
+
+        for media in mediaOrder {
+            if let ext = await get("/\(media.rawValue)/\(tmdbID)/external_ids?api_key=\(key)"),
                let imdb = ext["imdb_id"] as? String, imdb.hasPrefix("tt") {
                 return imdb
             }
+        }
+        return nil
+    }
+
+    private static func tmdbMatch(
+        forTVDBID tvdbID: Int,
+        mediaOrder: [DetailMetaRecoveryPolicy.TMDBMedia],
+        key: String
+    ) async -> (id: Int, media: DetailMetaRecoveryPolicy.TMDBMedia)? {
+        guard let result = await get(
+            "/find/\(tvdbID)?external_source=tvdb_id&api_key=\(key)"
+        ) else { return nil }
+
+        for media in mediaOrder {
+            let resultKey = media == .tv ? "tv_results" : "movie_results"
+            guard let first = (result[resultKey] as? [[String: Any]])?.first,
+                  let id = first["id"] as? Int else { continue }
+            return (id, media)
         }
         return nil
     }
