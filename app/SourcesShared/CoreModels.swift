@@ -1164,7 +1164,7 @@ enum EpisodePlaybackIdentity {
 
 /// A playable stream. `StreamSource` is `#[serde(untagged)]` + flattened, so the source fields
 /// (url / ytId / infoHash / externalUrl) sit at the top level, decode them all optionally.
-struct CoreStream: Decodable, Identifiable, Equatable {
+struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
     let url: String?
     let ytId: String?
     let infoHash: String?
@@ -1268,7 +1268,7 @@ struct CoreStream: Decodable, Identifiable, Equatable {
     }
 }
 
-struct CoreStreamBehaviorHints: Decodable, Equatable {
+struct CoreStreamBehaviorHints: Decodable, Equatable, Sendable {
     let notWebReady: Bool?
     let bingeGroup: String?
     let filename: String?
@@ -1276,12 +1276,12 @@ struct CoreStreamBehaviorHints: Decodable, Equatable {
 }
 
 /// `behaviorHints.proxyHeaders`: per-stream HTTP headers, `request` applied on the way out.
-struct CoreProxyHeaders: Decodable, Equatable {
+struct CoreProxyHeaders: Decodable, Equatable, Sendable {
     let request: [String: String]?
 }
 
 /// Streams grouped by source addon, for the per-addon filter + source labels.
-struct CoreStreamSourceGroup: Identifiable, Equatable {
+struct CoreStreamSourceGroup: Identifiable, Equatable, Sendable {
     let id: String
     let addon: String
     let streams: [CoreStream]

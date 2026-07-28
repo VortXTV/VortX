@@ -382,9 +382,14 @@ enum SourceIndexContract {
     ) async -> [Element] {
         let boundedAttempts = max(1, attempts)
         for attempt in 0..<boundedAttempts {
+            guard !Task.isCancelled else { return [] }
             let values = await produce()
+            guard !Task.isCancelled else { return [] }
             if !values.isEmpty { return values }
-            if attempt < boundedAttempts - 1 { await sleep(pollIntervalNanoseconds) }
+            if attempt < boundedAttempts - 1 {
+                await sleep(pollIntervalNanoseconds)
+                guard !Task.isCancelled else { return [] }
+            }
         }
         return []
     }

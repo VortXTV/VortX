@@ -76,7 +76,7 @@ struct Stream: Identifiable, Decodable, Hashable {
 }
 
 /// A stream-providing addon (base URL + display name), so streams can be tagged + filtered by source.
-struct StreamSource: Hashable { let base: String; let name: String }
+struct StreamSource: Hashable, Sendable { let base: String; let name: String }
 
 private struct MetasResponse: Decodable { let metas: [MetaPreview] }
 private struct MetaResponse: Decodable { let meta: MetaItem }

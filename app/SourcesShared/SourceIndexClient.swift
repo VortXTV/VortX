@@ -329,6 +329,11 @@ enum SourceIndexClient {
         let sources: [Descriptor]
     }
 
+    enum ContributionOutcome: Equatable, Sendable {
+        case deferred
+        case acceptedByProcess
+    }
+
     // MARK: - Content id (colon form: imdb[:season:episode])
 
     /// The pool `content_id` for a title, in the worker's colon form (`tt0903747` for a movie, `tt…:S:E` for an
@@ -418,6 +423,33 @@ enum SourceIndexClient {
         set { diagnosticSinkLock.withLock { diagnosticSinkStorage = newValue } }
     }
 
+    /// Process-wide playback pressure gate for contribution work. The provider is
+    /// replaceable only for deterministic contract tests; production reads the
+    /// main-actor player depth maintained by every player host.
+    nonisolated(unsafe) private static var playbackActiveProviderStorage:
+        @Sendable () async -> Bool = {
+            await MainActor.run { CoreBridge.shared.playerActive }
+        }
+    private static let playbackActiveProviderLock = NSLock()
+
+    static var playbackActiveProvider: @Sendable () async -> Bool {
+        get {
+            playbackActiveProviderLock.withLock {
+                playbackActiveProviderStorage
+            }
+        }
+        set {
+            playbackActiveProviderLock.withLock {
+                playbackActiveProviderStorage = newValue
+            }
+        }
+    }
+
+    static func contributionAllowedNow() async -> Bool {
+        let provider = playbackActiveProvider
+        return !(await provider())
+    }
+
     /// The ONLY way this file emits a diagnostic. Every textual part of a line -- the event label, the bail
     /// reason, the pool outcome, and each count's KEY -- is a case of a closed enum declared in
     /// SourceIndexIdentity.swift. There is no `String` parameter left, so free text genuinely cannot be
@@ -459,13 +491,34 @@ enum SourceIndexClient {
         var seen = Set<String>()
         var out: [Descriptor] = []
         for group in groups {
+            guard !Task.isCancelled else { return [] }
             for stream in group.streams where !stream.isYouTubeTrailer {
+                guard !Task.isCancelled else { return [] }
                 guard let d = descriptor(for: stream, providerByHash: providerByHash) else { continue }
                 guard seen.insert(d.kind + "|" + d.id).inserted else { continue }
                 out.append(d)
             }
         }
         return out
+    }
+
+    /// Stable fingerprint of the exact normalized descriptor snapshot. Order does not matter, so add-on
+    /// republishing or reranking the same rows cannot launch another full contribution walk.
+    static func descriptorFingerprint(_ descriptors: [Descriptor]) -> String {
+        let normalizedKeys = uploadableDescriptors(descriptors).map { descriptor in
+            "\(descriptor.kind)|\(descriptor.id)|\(descriptor.quality)|\(descriptor.sizeBytes)|\(descriptor.seeders ?? -1)|\(descriptor.provider ?? "")"
+        }.sorted()
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for key in normalizedKeys {
+            guard !Task.isCancelled else { return "" }
+            for byte in key.utf8 {
+                hash ^= UInt64(byte)
+                hash &*= 1_099_511_628_211
+            }
+            hash ^= 0xff
+            hash &*= 1_099_511_628_211
+        }
+        return String(format: "%016llx", hash)
     }
 
     /// One descriptor for one stream, or nil when it carries no poolable public identity.
@@ -538,7 +591,13 @@ enum SourceIndexClient {
     /// globally spaced start time, including overlapping detached detail/resume call sites. Each POST is
     /// fire-and-forget from the caller. A started POST has one attempt; any non-2xx or transport failure stops
     /// the current title's remaining batches and extends the shared pacing boundary by one interval.
-    static func contribute(contentID: String, descriptors: [Descriptor]) async {
+    @discardableResult
+    static func contribute(
+        contentID: String,
+        descriptors: [Descriptor]
+    ) async -> ContributionOutcome {
+        var acceptedByProcess = false
+
         // Every bail below used to be SILENT. A give-to-get pool whose "give" half fails invisibly is why this
         // shipped dead in the field: a full day of playback produced zero contributions and left no trace.
         // Each exit now names its reason exactly once, so the next diag log answers "why" without a code read.
@@ -550,12 +609,16 @@ enum SourceIndexClient {
             // cannot answer the only question this line exists for. The by-elimination consequence of the
             // split is documented on SourceIndexDiag.Reason.gateOff rather than left to be discovered.
             diag(.contributeSkip, reason: closedGateReason, counts: [(.candidates, descriptors.count)])
-            return
+            return .deferred
         }
         guard SourceIndexContract.canonicalContentID(contentID) == contentID else {
             diag(.contributeSkip, reason: .nonCanonicalContentID,
                  counts: [(.contentLen, SourceIndexDiag.identityLength(contentID))])
-            return
+            return .deferred
+        }
+        guard await contributionAllowedNow() else {
+            diag(.contributeStop, reason: .playbackActive)
+            return .deferred
         }
         // Revalidate at the network boundary. Descriptor is intentionally a simple value type, so a caller
         // can construct one without going through descriptors(from:); no such value reaches the encoder unless
@@ -563,7 +626,7 @@ enum SourceIndexClient {
         let uploadable = uploadableDescriptors(descriptors)
         guard !uploadable.isEmpty else {
             diag(.contributeSkip, reason: .nothingUploadable, counts: [(.candidates, descriptors.count)])
-            return
+            return .deferred
         }
         diag(.contributeBegin, counts: [(.candidates, descriptors.count), (.uploadable, uploadable.count)])
         // Read every remote-tunable pacing value ONCE, up front. A config swap partway through this loop would
@@ -586,7 +649,12 @@ enum SourceIndexClient {
         for (i, candidates) in batches.enumerated() {
             guard !Task.isCancelled else {
                 diag(.contributeStop, reason: .cancelled, counts: [(.batch, i + 1), (.batches, batches.count)])
-                return
+                return acceptedByProcess ? .acceptedByProcess : .deferred
+            }
+            guard await contributionAllowedNow() else {
+                diag(.contributeStop, reason: .playbackActive,
+                     counts: [(.batch, i + 1), (.batches, batches.count)])
+                return acceptedByProcess ? .acceptedByProcess : .deferred
             }
             guard let reservation = await SourceUploadCoordinator.shared.reserve(
                 contentID: contentID,
@@ -596,6 +664,7 @@ enum SourceIndexClient {
                 // anyway, so a whole title contributing nothing on a re-open is legible as dedupe, not loss.
                 diag(.contributeSkip, reason: .alreadyClaimed,
                      counts: [(.batch, i + 1), (.batches, batches.count), (.descriptors, candidates.count)])
+                acceptedByProcess = true
                 continue
             }
             guard let data = contributionBody(contentID: contentID,
@@ -613,7 +682,13 @@ enum SourceIndexClient {
                     await SourceUploadCoordinator.shared.release(reservation)
                     diag(.contributeStop, reason: .cancelled,
                          counts: [(.batch, i + 1), (.batches, batches.count)])
-                    return
+                    return acceptedByProcess ? .acceptedByProcess : .deferred
+                }
+                guard await contributionAllowedNow() else {
+                    await SourceUploadCoordinator.shared.release(reservation)
+                    diag(.contributeStop, reason: .playbackActive,
+                         counts: [(.batch, i + 1), (.batches, batches.count)])
+                    return acceptedByProcess ? .acceptedByProcess : .deferred
                 }
                 switch await SourceUploadCoordinator.shared.prepareLaunch(
                     reservation,
@@ -627,16 +702,17 @@ enum SourceIndexClient {
                         await SourceUploadCoordinator.shared.release(reservation)
                         diag(.contributeStop, reason: .cancelled,
                              counts: [(.batch, i + 1), (.batches, batches.count)])
-                        return
+                        return acceptedByProcess ? .acceptedByProcess : .deferred
                     }
                 case let .launch(descriptors):
                     committed = descriptors
+                    acceptedByProcess = true
                 case .unavailable:
                     // The live gate closed while this batch waited for its pacing slot, or the reservation is
                     // already gone. Distinct from the pre-loop gate check: this one happened MID-TITLE.
                     diag(.contributeStop, reason: closedGateReason,
                          counts: [(.batch, i + 1), (.batches, batches.count)])
-                    return
+                    return acceptedByProcess ? .acceptedByProcess : .deferred
                 }
             }
 
@@ -653,8 +729,9 @@ enum SourceIndexClient {
                                            (.descriptors, chunk.count)])
             // Detached from caller cancellation after commit: once the at-most-once claim is held, exactly one
             // network attempt is launched. The response is ignored and never buffered.
+            let transport = contributionTransport
             let succeeded = await runCancellationIndependentAttempt {
-                try await sourceIndexTransport.discardResponse(for: request)
+                try await transport(request)
             }
             // The POST OUTCOME. Without this a failed POST and a successful POST left byte-identical traces,
             // so an endpoint rejecting every contribution read exactly like a healthy one.
@@ -667,9 +744,10 @@ enum SourceIndexClient {
             ) else {
                 diag(.contributeStop, reason: .postFailed,
                      counts: [(.batch, i + 1), (.batches, batches.count)])
-                return
+                return .acceptedByProcess
             }
         }
+        return acceptedByProcess ? .acceptedByProcess : .deferred
     }
 
     /// Revalidate and normalize arbitrary descriptor values immediately before upload, deduped by (kind, id).
@@ -744,7 +822,7 @@ enum SourceIndexClient {
     /// device confirmed had it cached (from the per-view cache-check), so the pool learns provider facts.
     static func hoard(contentID: String, groups: [CoreStreamSourceGroup],
                       providerByHash: [String: String] = [:]) async {
-        guard isEnabled else { return }
+        guard isEnabled, await contributionAllowedNow() else { return }
         let descriptors = descriptors(from: groups, providerByHash: providerByHash)
         await contribute(contentID: contentID, descriptors: descriptors)
     }
@@ -790,7 +868,7 @@ enum SourceIndexClient {
                                    maxWaitMs: Int = RemoteConfig.snapshot.sourceIndexResumeHoardMaxWaitMs,
                                    pollIntervalMs: Int = RemoteConfig.snapshot.sourceIndexResumeHoardPollIntervalMs,
                                    resolveGroups: @MainActor @Sendable @escaping () -> [CoreStreamSourceGroup]) async {
-        guard isEnabled else { return }
+        guard isEnabled, await contributionAllowedNow() else { return }
         let candidateDescriptors = await resumedDescriptors(
             maxWaitMs: maxWaitMs,
             pollIntervalMs: pollIntervalMs,
@@ -798,6 +876,41 @@ enum SourceIndexClient {
         )
         guard !candidateDescriptors.isEmpty else { return }
         await contribute(contentID: contentID, descriptors: candidateDescriptors)
+    }
+
+    /// Continue-Watching launches this owned task beside player presentation. It
+    /// observes the mount, remains asleep throughout playback, then performs the
+    /// bounded group poll after the player releases the device. A failed mount
+    /// abandons after 30 seconds, and caller cancellation stops every wait.
+    static func hoardResumedGroupsAfterPlayback(
+        contentID: String,
+        resolveGroups: @MainActor @Sendable @escaping () -> [CoreStreamSourceGroup]
+    ) async {
+        let pollNanoseconds: UInt64 = 250_000_000
+        var deferral = ContinueWatchingHoardDeferral(
+            activationCheckLimit: 120
+        )
+        while !Task.isCancelled {
+            let active = await playbackActiveProvider()
+            switch deferral.observe(playerActive: active) {
+            case .run:
+                await hoardResumedGroups(
+                    contentID: contentID,
+                    resolveGroups: resolveGroups
+                )
+                return
+            case .abandon:
+                return
+            case .wait:
+                do {
+                    try await Task<Never, Never>.sleep(
+                        nanoseconds: pollNanoseconds
+                    )
+                } catch {
+                    return
+                }
+            }
+        }
     }
 
     /// Descriptor-first resume polling, split from the network submission so the late-arrival decision surface
@@ -821,6 +934,7 @@ enum SourceIndexClient {
             attempts: deadline,
             pollIntervalNanoseconds: UInt64(max(1, pollIntervalMs)) * 1_000_000
         ) {
+            guard !CoreBridge.shared.playerActive else { return [] }
             let groups = resolveGroups()
             return descriptors(from: groups)
         }
@@ -1204,6 +1318,27 @@ enum SourceIndexClient {
 
     /// One dedicated no-redirect session is shared by both signed GET and POST paths.
     private static let sourceIndexTransport = SourceIndexHTTPTransport.shared
+    nonisolated(unsafe) private static var contributionTransportStorage:
+        @Sendable (URLRequest) async throws -> Void = { request in
+            try await sourceIndexTransport.discardResponse(for: request)
+        }
+    private static let contributionTransportLock = NSLock()
+
+    /// Replaceable only by the standalone contract harness. Production always
+    /// uses the shared bounded, no-redirect transport above.
+    static var contributionTransport:
+        @Sendable (URLRequest) async throws -> Void {
+        get {
+            contributionTransportLock.withLock {
+                contributionTransportStorage
+            }
+        }
+        set {
+            contributionTransportLock.withLock {
+                contributionTransportStorage = newValue
+            }
+        }
+    }
 
     /// Whether an id is already in its canonical pooled form for its kind, used by the upload coordinator's
     /// at-most-once reservation. Torrent requires the exact stored 40-hex; http/usenet require only that the

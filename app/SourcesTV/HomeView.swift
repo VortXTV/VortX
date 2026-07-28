@@ -536,7 +536,9 @@ struct CoreContinueWatchingRow: View {
     @EnvironmentObject private var theme: ThemeManager   // observe so the rail's cards repaint on a theme change
     @EnvironmentObject private var presenter: PlayerPresenter
     @EnvironmentObject private var profiles: ProfileStore
+    @EnvironmentObject private var core: CoreBridge
     @State private var detailTarget: CWDetailTarget?
+    @State private var resumeHoardTask: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
@@ -561,6 +563,10 @@ struct CoreContinueWatchingRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .navigationDestination(item: $detailTarget) { DetailView(type: $0.type, id: $0.id) }
+        .onDisappear {
+            resumeHoardTask?.cancel()
+            resumeHoardTask = nil
+        }
     }
 
     /// Continue Watching resumes the exact link that was playing last time, straight
@@ -612,8 +618,11 @@ struct CoreContinueWatchingRow: View {
             if let cid = SourceIndexClient.resumeContentID(itemID: item.id, videoID: entry.videoId,
                                                           season: entry.season, episode: entry.episode) {
                 let streamId = entry.videoId
-                Task.detached {
-                    await SourceIndexClient.hoardResumedGroups(contentID: cid) {
+                resumeHoardTask?.cancel()
+                resumeHoardTask = Task(priority: .utility) {
+                    await SourceIndexClient.hoardResumedGroupsAfterPlayback(
+                        contentID: cid
+                    ) {
                         CoreBridge.shared.streamGroups(forStreamId: streamId)
                     }
                 }

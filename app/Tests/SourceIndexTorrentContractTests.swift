@@ -5,6 +5,7 @@
 //   xcrun swiftc -o /tmp/source-index-contract-test \
 //     app/SourcesShared/SourceIndexContract.swift \
 //     app/SourcesShared/SourceIndexIdentity.swift \
+//     app/SourcesShared/SourceContributionWorkPolicy.swift \
 //     app/SourcesShared/MoatToken.swift \
 //     app/SourcesShared/SourceIndexClient.swift \
 //     app/Tests/SourceIndexTorrentContractTests.swift && /tmp/source-index-contract-test
@@ -146,6 +147,12 @@ enum Keychain {
 final class VortXSyncManager {
     static let shared = VortXSyncManager()
     var isSignedIn = true
+}
+
+@MainActor
+final class CoreBridge {
+    static let shared = CoreBridge()
+    var playerActive = false
 }
 
 actor AttemptProbe {
@@ -711,6 +718,119 @@ struct SourceIndexTorrentContractTests {
                "serve boundary builds the content_id query for a canonical IMDb episode")
         expect(SourceIndexClient.serveURL(contentID: "tt1234567:1:2")?.absoluteString.contains("kind=") == false,
                "serve boundary requests ALL kinds (no kind filter) so http and usenet come back too")
+
+        // Playback owns the device. Home/detail hoards must not extract and
+        // contribute beside it, and a title already between batches must stop
+        // before launching the next POST.
+        let previousPlaybackProvider = SourceIndexClient.playbackActiveProvider
+        let previousContributionTransport = SourceIndexClient.contributionTransport
+        let playbackGate = LockedGate(true)
+        let postProbe = AttemptProbe()
+        SourceIndexClient.playbackActiveProvider = { playbackGate.value() }
+        SourceIndexClient.contributionTransport = { _ in
+            await postProbe.record()
+            playbackGate.reopen()
+        }
+        let blockedOutcome = await SourceIndexClient.contribute(
+            contentID: "tt1234567:1:3",
+            descriptors: [
+                SourceIndexClient.Descriptor(
+                    kind: "torrent",
+                    id: lower,
+                    quality: "1080p",
+                    sizeBytes: 1,
+                    seeders: nil
+                )
+            ]
+        )
+        expect(
+            blockedOutcome == .deferred,
+            "playback starting before the process ledger commits leaves the snapshot retryable"
+        )
+        let blockedGroup = CoreStreamSourceGroup(
+            id: "blocked",
+            addon: "blocked",
+            streams: [CoreStream(infoHash: lower)]
+        )
+        await SourceIndexClient.hoard(
+            contentID: "tt1234567:1:2",
+            groups: [blockedGroup]
+        )
+        let blockedPostCount = await postProbe.count()
+        expect(
+            blockedPostCount == 0,
+            "active playback stops a Home/detail hoard before any contribution transport"
+        )
+
+        playbackGate.close()
+        let playbackDiagnostics = CapturedDiagnostics()
+        let previousPlaybackSink = SourceIndexClient.diagnosticSink
+        SourceIndexClient.diagnosticSink = { playbackDiagnostics.append($0) }
+        let multiBatchDescriptors = (1...17).map { value in
+            SourceIndexClient.Descriptor(
+                kind: "torrent",
+                id: String(format: "%040x", value),
+                quality: "1080p",
+                sizeBytes: 1,
+                seeders: nil
+            )
+        }
+        let admittedOutcome = await SourceIndexClient.contribute(
+            contentID: "tt7654321:1:1",
+            descriptors: multiBatchDescriptors
+        )
+        let admittedPostCount = await postProbe.count()
+        expect(
+            admittedPostCount == 1,
+            "playback becoming active after batch one stops every later contribution batch"
+        )
+        expect(
+            admittedOutcome == .acceptedByProcess,
+            "a committed one-shot attempt stays accepted when playback stops later batches"
+        )
+        expect(
+            playbackDiagnostics.lines().contains {
+                $0.contains("reason=playback-active")
+                    && $0.contains("batch=2")
+            },
+            "the between-batch playback stop leaves a bounded diagnostic receipt"
+        )
+
+        playbackGate.close()
+        let failedPostProbe = AttemptProbe()
+        SourceIndexClient.contributionTransport = { _ in
+            await failedPostProbe.record()
+            throw SequenceFetchError.failed
+        }
+        let failedDescriptor = SourceIndexClient.Descriptor(
+            kind: "torrent",
+            id: String(format: "%040x", 999),
+            quality: "1080p",
+            sizeBytes: 1,
+            seeders: nil
+        )
+        let failedOutcome = await SourceIndexClient.contribute(
+            contentID: "tt7654322:1:1",
+            descriptors: [failedDescriptor]
+        )
+        let duplicateFailedOutcome = await SourceIndexClient.contribute(
+            contentID: "tt7654322:1:1",
+            descriptors: [failedDescriptor]
+        )
+        expect(
+            failedOutcome == .acceptedByProcess
+                && duplicateFailedOutcome == .acceptedByProcess,
+            "a committed transport failure remains a process-accepted one-shot attempt"
+        )
+        let failedAttemptCount = await failedPostProbe.count()
+        expect(
+            failedAttemptCount == 1,
+            "a failed committed attempt cannot become a refresh-driven transport storm"
+        )
+        SourceIndexClient.diagnosticSink = previousPlaybackSink
+        SourceIndexClient.playbackActiveProvider = previousPlaybackProvider
+        SourceIndexClient.contributionTransport = previousContributionTransport
+
         let exactOrigin = "https://sources.vortx.tv"
         let hostileOrigins = [
             "http://sources.vortx.tv",
@@ -2514,7 +2634,8 @@ struct SourceIndexTorrentContractTests {
                "B: every event label is distinct")
         let allReasons: [SourceIndexDiag.Reason] = [
             .notATitleID, .nonCanonicalEpisodeKey, .fleetOff, .gateOff, .nonCanonicalContentID,
-            .nothingUploadable, .alreadyClaimed, .bodyEncodingFailed, .cancelled, .postFailed, .gateClosed,
+            .nothingUploadable, .alreadyClaimed, .bodyEncodingFailed, .cancelled, .postFailed,
+            .playbackActive, .gateClosed,
             .gateChangedOrNoMoat, .gateClosedBeforeTransport, .gateClosedAfterTransport, .httpNon2xx,
             .httpError, .staleOrCancelled, .malformedServeURL,
         ]

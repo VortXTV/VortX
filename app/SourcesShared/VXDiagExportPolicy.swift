@@ -8,6 +8,106 @@ import Foundation
 /// file and WHAT bytes the file contains. Both are pure, so both live here.
 enum VXDiagExportPolicy {
 
+    // MARK: - Transfer lifecycle
+
+    struct TransferClaim: Equatable {
+        fileprivate let generation: UInt64
+    }
+
+    enum TransferCompletion: Equatable {
+        /// Network.framework finished processing the claimed sends. This consumes the one-shot capability,
+        /// but is not receiver acknowledgement, so the rolling log remains intact.
+        case deliveredPreservingLog
+        /// The send failed, so the same capability may be claimed again and the rolling log remains intact.
+        case retryableFailure
+        /// Completion belongs to a stopped/restarted export session or a claim that no longer owns the gate.
+        case stale
+
+        enum ConnectionCleanup: Equatable {
+            /// `finalMessage` performs the write-close. Keep the connection alive until the peer closes or
+            /// a bounded timeout expires so locally buffered response bytes and FIN are not truncated.
+            case waitForPeerClose
+            case cancelImmediately
+        }
+
+        var connectionCleanup: ConnectionCleanup {
+            switch self {
+            case .deliveredPreservingLog:
+                return .waitForPeerClose
+            case .retryableFailure, .stale:
+                return .cancelImmediately
+            }
+        }
+    }
+
+    /// The one-shot claim and local send completion are deliberately separate. Claiming excludes a second
+    /// simultaneous client. Local send completion consumes the capability, but cannot clear the log because
+    /// Network.framework's content-processed callback is not acknowledgement from the receiving phone.
+    struct TransferGate: Equatable {
+        private enum State: Equatable {
+            case available
+            case inFlight
+            case completed
+        }
+
+        private var generation: UInt64 = 0
+        private var state: State = .available
+
+        var blocksNewClaim: Bool { state != .available }
+
+        mutating func reset() {
+            generation &+= 1
+            state = .available
+        }
+
+        mutating func claim() -> TransferClaim? {
+            guard state == .available else { return nil }
+            state = .inFlight
+            return TransferClaim(generation: generation)
+        }
+
+        mutating func complete(_ claim: TransferClaim, success: Bool) -> TransferCompletion {
+            guard claim.generation == generation, state == .inFlight else { return .stale }
+            if success {
+                state = .completed
+                return .deliveredPreservingLog
+            }
+            state = .available
+            return .retryableFailure
+        }
+    }
+
+    static let responseChunkBytes = 64 * 1024
+
+    /// Exact non-overlapping body ranges for sequential Network.framework sends. Keeping this pure makes the
+    /// large-body contract testable without a live listener.
+    static func chunkRanges(
+        bodyBytes: Int,
+        chunkBytes: Int = responseChunkBytes
+    ) -> [Range<Int>] {
+        guard bodyBytes > 0, chunkBytes > 0 else { return [] }
+        var ranges: [Range<Int>] = []
+        var start = 0
+        while start < bodyBytes {
+            let end = min(bodyBytes, start + chunkBytes)
+            ranges.append(start..<end)
+            start = end
+        }
+        return ranges
+    }
+
+    /// Remove only the exact rolling-log prefix that was delivered. Bytes appended while the phone was
+    /// downloading remain in `current`. A prefix mismatch means the rolling file was trimmed or replaced
+    /// during transfer, so no deletion is safe and the caller must preserve the current file unchanged.
+    static func remainingLogAfterSuccessfulSnapshot(
+        snapshot: Data,
+        current: Data
+    ) -> Data? {
+        guard !snapshot.isEmpty else { return current }
+        guard current.starts(with: snapshot) else { return nil }
+        return current.subdata(in: snapshot.count..<current.count)
+    }
+
     // MARK: - Capability
 
     /// Bytes of capability material minted per `start()`. 16 bytes is 128 bits, encoded below as 32 hex

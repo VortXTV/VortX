@@ -455,7 +455,10 @@ struct TVPlayerView: View {
     }
     // Next-episode preload: fetched + ranked in the background mid-episode so auto-advance is instant.
     @State private var preloaded: PreloadedEpisode?
-    @State private var preloadingID: String?
+    @State private var preloadPolicy = NextEpisodePreloadPolicy()
+    @State private var preloadTask: Task<Void, Never>?
+    @State private var preloadTorrentLease: NextEpisodeTorrentPreparationLease?
+    @State private var preloadGeneration = 0
     @State private var switchingEpisode = false        // re-entrancy guard: a rapid double Next / Up-Next-Select must not launch two overlapping episode resolves (mirrors iOS goToEpisode)
     @State private var autoAdvanceRetryUsed = false     // one-shot latch for the EOF last-chance episode-list backfill (defense in depth for a lost launch backfill race)
     // "Still watching?" idle guard: after a long unattended stretch (no remote input for `idleWatchTimeout`,
@@ -470,6 +473,7 @@ struct TVPlayerView: View {
     private static let idleAutoAdvanceLimit = 4                       // 4 back-to-back auto-advances, zero input -> same
     @State private var leftPlayback = false             // set the instant leavePlayback() runs, so a pending EOF backfill never resurrects a stopped player
     @State private var warmedID: String?               // next episode whose source was pre-warmed
+    @State private var warmNextTask: Task<Void, Never>?
     @State private var curHint: String?                // quality signature of what is playing now
     @State private var curBinge: String?               // bingeGroup of what is playing now (drives sticky auto-next)
     // Mid-playback stall recovery: a watchdog reloads the stream in place when the
@@ -493,9 +497,17 @@ struct TVPlayerView: View {
     @StateObject private var scrubThumbnails = ScrubThumbnailsStore()
     @State private var lastLocalTrickplayCapture = -1000.0
     @State private var localTrickplayCaptureInFlight = false
+    @State private var localTrickplayCaptureGeneration: UInt64 = 0
     /// Wall-clock trickplay capture driver (player-agnostic backstop to the timePos tick). See startTrickplayCaptureTimer.
     @State private var trickplayCaptureTimer: Task<Void, Never>?
-    /// Capture cadence in seconds; matches the local cache tile interval + community upload interval.
+    @State private var lastFrameDropReceiptAt = 0.0
+    @State private var lastFrameDropCount = 0
+    @State private var trickplayCapturePressure = TrickplayCapturePressurePolicy()
+    @State private var trickplayCaptureAttemptsSinceReceipt = 0
+    @State private var trickplayCaptureCompletionsSinceReceipt = 0
+    @State private var trickplayCaptureNilSinceReceipt = 0
+    /// Both engines keep the shipping local-preview cadence. The libmpv GPU path now captures into a bounded
+    /// destination; only a measured high-drop interval can apply a temporary backoff.
     private static let trickplayCaptureIntervalSecs: Double = 10
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
@@ -725,9 +737,16 @@ struct TVPlayerView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             reconcileAdvanceOnForeground()
         }
+        .onChange(of: account.streamSources) { _ in
+            // Account/profile changes replace the add-on and credential authority behind a preload. A source
+            // resolved under the old account must never be published into the new one.
+            invalidateNextEpisodePreparation(reason: "stream sources changed")
+        }
         .onDisappear {
             core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
             LoopbackPlaybackAssertion.end()   // #130: release the loopback-playback background assertion
+            invalidateNextEpisodePreparation(reason: "player view disappeared")
+            invalidateLocalTrickplayCapture()
             hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel()
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
             // (first-writer-wins, background, gated; no-op if the community already had a set). Both engines
@@ -1132,6 +1151,7 @@ struct TVPlayerView: View {
                     }
                 }
                 currentTime = d
+                maybeLogFrameDropReceipt()
                 // Durationless-stream fallback (the "watch position never saved / no resume on some
                 // debrid MKVs" report): many debrid direct-HTTP MKVs never DELIVER mpv's `duration`
                 // EVENT, yet the property itself reads fine (the subtitle-fingerprint path already
@@ -1597,6 +1617,41 @@ struct TVPlayerView: View {
         if !release.isEmpty { rows.append(("Source", release)) }
         if let size = StreamRanking.sizeText(s) { rows.append(("Size", size)) }
         return rows
+    }
+
+    /// A low-rate receipt for the user-visible frame-drop counter and its likely causes. The snapshot reads
+    /// a handful of mpv properties, so do it once per 30 seconds rather than on the four-Hz player clock.
+    /// AVPlayer leaves the mpv-only snapshot empty and therefore emits nothing here.
+    private func maybeLogFrameDropReceipt() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard lastFrameDropReceiptAt == 0 || now - lastFrameDropReceiptAt >= 30 else { return }
+        guard let player = coordinator.player else { return }
+        let receipt = player.playbackDiagnostics()
+        guard receipt.hasValues else { return }
+        lastFrameDropReceiptAt = now
+        let count = receipt.frameDropCount ?? 0
+        let delta = count >= lastFrameDropCount ? count - lastFrameDropCount : count
+        lastFrameDropCount = count
+        let captureTransition = trickplayCapturePressure.observe(
+            droppedFrames: delta,
+            now: now
+        )
+        let captureSuppressed = trickplayCapturePressure.isSuppressed(at: now)
+        func intText(_ value: Int?) -> String { value.map(String.init) ?? "na" }
+        func boolText(_ value: Bool?) -> String {
+            value.map { $0 ? "true" : "false" } ?? "na"
+        }
+        func doubleText(_ value: Double?, decimals: Int = 3) -> String {
+            guard let value else { return "na" }
+            return String(format: "%.*f", decimals, value)
+        }
+        VXProbe.log(
+            "perf",
+            "libmpv frameDrop=\(count) delta30s=\(delta) decoderDrop=\(intText(receipt.decoderFrameDropCount)) mistimed=\(intText(receipt.mistimedFrameCount)) voDelayed=\(intText(receipt.delayedFrameCount)) avsync=\(doubleText(receipt.avSync)) totalAvsyncChange=\(doubleText(receipt.totalAVSyncChange)) pausedForCache=\(boolText(receipt.pausedForCache)) cacheUnderrun=\(boolText(receipt.cacheUnderrun)) cacheIdle=\(boolText(receipt.cacheIdle)) cacheFill=\(intText(receipt.cacheBufferingPercent)) cacheSeconds=\(doubleText(receipt.cacheDuration, decimals: 1)) hwdec=\(receipt.hardwareDecoder ?? "na") vfFps=\(doubleText(receipt.estimatedVideoFPS)) containerFps=\(doubleText(receipt.containerFPS)) displayFps=\(doubleText(receipt.displayFPS)) videoSync=\(receipt.videoSyncMode ?? "na") videoSpeedCorrection=\(doubleText(receipt.videoSpeedCorrection, decimals: 6)) audioSpeedCorrection=\(doubleText(receipt.audioSpeedCorrection, decimals: 6)) ao=\(receipt.audioOutput ?? "na") uiBuffering=\(buffering ? "true" : "false") statsOverlay=\(showStats ? "visible" : "hidden") trickplayCapture=\(localTrickplayCaptureInFlight ? "true" : "false") trickplayCaptureAttempts=\(trickplayCaptureAttemptsSinceReceipt) trickplayCaptureCompleted=\(trickplayCaptureCompletionsSinceReceipt) trickplayCaptureNil=\(trickplayCaptureNilSinceReceipt) trickplayContribution=\(scrubThumbnails.isCommunityUploadInFlight ? "active" : "idle") trickplaySuppressed=\(captureSuppressed ? "true" : "false") trickplayBackoffTransition=\(captureTransition.rawValue) trickplayBackoffThreshold=\(TrickplayCapturePressurePolicy.highDropThreshold) preload=\(preloadTask == nil ? "idle" : "active") warm=\(warmNextTask == nil ? "idle" : "active")"
+        )
+        trickplayCaptureAttemptsSinceReceipt = 0
+        trickplayCaptureCompletionsSinceReceipt = 0
+        trickplayCaptureNilSinceReceipt = 0
     }
 
     /// Live playback numbers, top-left, refreshed every second while visible.
@@ -2606,6 +2661,9 @@ struct TVPlayerView: View {
             if userInitiated { closePanel() }
             return
         }
+        // Continuity, binge-group and account ranking were snapshotted from the source being replaced.
+        // Cancel that preparation so the next player tick ranks against the source that actually won.
+        invalidateNextEpisodePreparation(reason: "source switch")
         sourceSwitchGeneration &+= 1
         resumeRetryGeneration &+= 1
         // closePanel forces the control bar up and teleports the highlight; right for a manual
@@ -2672,7 +2730,8 @@ struct TVPlayerView: View {
         curHeaders = nextHeaders
         if let oldHash, oldHash != stream.infoHash?.lowercased() { closeTorrent(hash: oldHash) }
         scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
-        lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
+        lastLocalTrickplayCapture = -1000
+        invalidateLocalTrickplayCapture()
         resumeSeconds = resume
         if let target {
             enginePlayerVideoId = bindEngine(
@@ -4854,11 +4913,31 @@ struct TVPlayerView: View {
         recoveryDeadline?.cancel(); recoveryDeadline = nil
     }
 
+    /// Device-local resume for an already-prepared episode. The optional Stremio
+    /// two-way mirror is deliberately excluded because it can require a remote
+    /// library fetch and must not delay an admitted warm source.
+    private func localPreparedResumeOffset(for meta: PlaybackMeta) -> Double {
+        if !ProfileStore.shared.activeUsesEngineHistory {
+            return ProfileStore.shared.resumeOffset(for: meta)
+        }
+        return core.engineResumeSeconds(for: meta)
+            ?? CoreBridge.shared.engineResumeSecondsByLibraryId(for: meta)
+            ?? 0
+    }
+
     /// Switch to another episode in place: flush progress, resolve a stream through the ENGINE (same path
     /// as launch), then reload mpv. If the next episode was preloaded in the background, it plays its
     /// already-ranked best source instantly with no resolution wait.
     private func play(episode v: CoreVideo) {
         guard let m = curMeta, !leftPlayback else { return }
+        let preparedEpisode = preloaded?.episodeID == v.id ? preloaded : nil
+        // The old episode's producer and ranged warm read no longer own the player. Preserve only the engine
+        // behind the exact prepared target being consumed below; every stale completion is generation-fenced.
+        if preparedEpisode != nil {
+            suspendNextEpisodePreparationForAdmission(reason: "episode switch")
+        } else {
+            invalidateNextEpisodePreparation(reason: "episode switch")
+        }
         if let pending = pendingAdvance, pending.issued {
             supersededAdvance = SupersededEpisodeAdvance(
                 pending: pending, source: currentEpisodeSourceSnapshot()
@@ -4903,13 +4982,12 @@ struct TVPlayerView: View {
         showInfo = true; selected = .play; flashControls()
 
         // The preload already fetched and ranked this episode across every add-on → play it now.
-        if let pre = preloaded, pre.episodeID == v.id {
-            preloaded = nil
-            warmedID = nil
+        if let pre = preparedEpisode {
             guard EpisodePlaybackIdentity.canIssueEpisodeSwitch(
                 currentVideoID: curMeta?.videoId, targetVideoID: v.id,
                 currentURL: curURL, targetURL: pre.url
             ) else {
+                discardPreparedEpisode(pre, reason: "episode admission rejected duplicate media")
                 pendingAdvance = nil
                 if restoreSupersededAdvance() { return }
                 switchingEpisode = false; reconnecting = false
@@ -4921,13 +4999,22 @@ struct TVPlayerView: View {
                 guard episodeSwitchIsCurrent(
                     generation: episodeGeneration, sourceGeneration: sourceGeneration,
                     videoID: v.id
-                ) else { return }
+                ) else {
+                    discardPreparedEpisode(pre, reason: "episode admission became stale")
+                    return
+                }
                 core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
-                let resolvedResume = await account.resumeOffset(for: newMeta)
+                // The prepared source must issue immediately. Only device-local resume authorities are read
+                // here; optional two-way Stremio sync can perform a network fetch and must never put that fetch
+                // back in front of an already-warm player command.
+                let resolvedResume = localPreparedResumeOffset(for: newMeta)
                 guard episodeSwitchIsCurrent(
                     generation: episodeGeneration, sourceGeneration: sourceGeneration,
                     videoID: v.id
-                ) else { return }
+                ) else {
+                    discardPreparedEpisode(pre, reason: "episode admission became stale before issue")
+                    return
+                }
                 DiagnosticsLog.log("binge", "auto-next PRELOAD: wanted binge=\(curBinge ?? "nil") got=\(pre.bingeGroup ?? "nil") name=\(pre.stream.name?.prefix(60) ?? "")")
                 pendingAdvance?.url = pre.url
                 pendingAdvance?.debridRef = pre.debridRef
@@ -4937,6 +5024,7 @@ struct TVPlayerView: View {
                     live: isLiveMeta(newMeta) && !(pre.debridRef == nil && pre.stream.isTorrent),
                     contentHint: pre.signature, resumeOrigin: resolvedResume
                 ) else {
+                    discardPreparedEpisode(pre, reason: "player rejected prepared episode command")
                     if episodeSwitchIsCurrent(
                         generation: episodeGeneration, sourceGeneration: sourceGeneration,
                         videoID: v.id
@@ -4952,9 +5040,13 @@ struct TVPlayerView: View {
                 guard episodeSwitchIsCurrent(
                     generation: episodeGeneration, sourceGeneration: sourceGeneration,
                     videoID: v.id
-                ) else { return }
+                ) else {
+                    discardPreparedEpisode(pre, reason: "prepared command lost admission ownership")
+                    return
+                }
                 // The exact engine accepted the replacement. Only now publish source state and retire the
                 // superseded physical source, so a command failure leaves E3 fully recoverable.
+                consumePreparedEpisode(pre)
                 if pre.debridRef == nil { prepareTorrent(pre.stream) }
                 resetRuntimeForIssuedEpisode()
                 resumeSeconds = resolvedResume
@@ -4978,7 +5070,8 @@ struct TVPlayerView: View {
                     requestedVideoID: v.id, bindingSucceeded: succeeded
                 )
                 scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
-                lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
+                lastLocalTrickplayCapture = -1000
+                invalidateLocalTrickplayCapture()
                 currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1
                 pendingAdvance?.loadToken = issuedToken
                 pendingAdvance?.issued = true
@@ -5122,7 +5215,8 @@ struct TVPlayerView: View {
                         closeTorrent(hash: oldHash)
                     }
                     scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
-                    lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
+                    lastLocalTrickplayCapture = -1000
+                    invalidateLocalTrickplayCapture()
                     let succeeded = core.loadEnginePlayer(
                         for: s, videoId: v.id,
                         base: engineAddonBase(for: s, groups: groups),
@@ -5218,6 +5312,7 @@ struct TVPlayerView: View {
     /// player still shows) is never disturbed.
     private struct PreloadedEpisode {
         let episodeID: String
+        let generation: Int
         let stream: CoreStream
         let url: URL
         let debridRef: DebridPlaybackRef?
@@ -5226,12 +5321,35 @@ struct TVPlayerView: View {
         let addonBase: String?
     }
 
-    /// Kick off the preload once per episode, triggered when playback crosses the halfway mark.
+    private struct PreloadResolution: Sendable {
+        let stream: CoreStream
+        let url: URL
+        let debridRef: DebridPlaybackRef?
+        let addonBase: String?
+        let streamCount: Int
+        let bingeStreamCount: Int
+    }
+
+    /// Kick off one owned preload attempt. The pure policy turns the four-Hz player clock into at most three
+    /// ordinary attempts plus one last credits attempt, so failure never becomes a fetch storm.
     private func preloadNextIfNeeded() {
-        guard let i = episodeIndex, i + 1 < allEpisodes.count else { return }
+        guard !switchingEpisode, !leftPlayback,
+              let i = episodeIndex, i + 1 < allEpisodes.count else { return }
         let next = allEpisodes[i + 1]
-        guard preloaded?.episodeID != next.id, preloadingID != next.id else { return }
-        preloadingID = next.id
+        var target = NextEpisodePreloadPolicy.Target(
+            episodeID: next.id, generation: preloadGeneration
+        )
+        if let owned = preloadPolicy.target, owned != target {
+            invalidateNextEpisodePreparation(reason: "next episode changed")
+            target = .init(episodeID: next.id, generation: preloadGeneration)
+        }
+        guard let attempt = preloadPolicy.evaluate(
+            target: target,
+            position: currentTime,
+            duration: duration,
+            now: ProcessInfo.processInfo.systemUptime
+        ) else { return }
+
         let sources = account.streamSources
         // Snapshot the main-actor @State continuity hints here (on the main actor) so the background
         // Task never reads them off-main; the heavy fetch + ranking stays off-main and only the @State
@@ -5239,88 +5357,290 @@ struct TVPlayerView: View {
         let hint = curHint
         let binge = curBinge
         let pin = sourcePin                     // snapshot on-main; the background rank uses it (#15)
-        plog.info("preloading next episode \(next.id, privacy: .public) from \(sources.count, privacy: .public) add-ons")
-        Task {
-            var groups: [CoreStreamSourceGroup] = []
-            await withTaskGroup(of: CoreStreamSourceGroup?.self) { tasks in
-                for source in sources {
-                    tasks.addTask { await Self.fetchStreams(base: source.base, addon: source.name, id: next.id) }
-                }
-                for await group in tasks { if let group { groups.append(group) } }
-            }
-            // Keep the user's add-on priority order for ranking ties. Bases can REPEAT in the
-            // add-on list, so this must unique (uniqueKeysWithValues: traps on duplicates).
-            let order = Dictionary(sources.enumerated().map { ($1.base, $0) },
-                                   uniquingKeysWith: { first, _ in first })
-            groups.sort { (order[$0.id] ?? .max) < (order[$1.id] ?? .max) }
-            let withBinge = groups.flatMap { $0.streams }.filter { ($0.behaviorHints?.bingeGroup?.isEmpty == false) }.count
-            DiagnosticsLog.log("binge", "preload next ep: want binge=\(binge ?? "nil"), \(withBinge) of \(groups.flatMap { $0.streams }.count) streams carry a bingeGroup")
-            let candidates = StreamRanking.rankedCandidates(
-                groups, continuity: hint, binge: binge, pin: pin
+        let nextID = next.id
+        let nextSeason = next.season
+        let nextEpisode = next.episodeNumber
+        let episodeToken = VXProbeRedaction.identityToken(next.id)
+        plog.info("preloading next episode \(episodeToken, privacy: .public) from \(sources.count, privacy: .public) add-ons")
+        // `evaluate` can preempt a timed-out or halfway owner for a credits attempt. Cancel that owner before
+        // replacing its task so its URLSession and debrid work do not continue in parallel.
+        preloadTask?.cancel()
+        preloadTask = Task.detached(priority: .utility) {
+            let selected = await Self.resolvePreloadedEpisode(
+                sources: sources,
+                attemptSequence: attempt.sequence,
+                episodeID: nextID,
+                season: nextSeason,
+                episodeNumber: nextEpisode,
+                continuityHint: hint,
+                bingeGroup: binge,
+                pin: pin
             )
-            let targetEpisode = next.episodeNumber
-            let episode = EpisodePlaybackIdentity.provenEpisodeNumbers(
-                season: next.season, episode: targetEpisode
-            ).map { DebridEpisode(season: $0.season, episode: $0.episode) }
-            let hashes = Set(candidates.compactMap { candidate -> String? in
-                guard candidate.isTorrent else { return nil }
-                return candidate.infoHash?.lowercased()
-            })
-            let cachedHashes = Set(
-                await DebridCoordinator.shared.cacheCheck(hashes: Array(hashes)).keys
-            )
-            var selected: (stream: CoreStream, url: URL, ref: DebridPlaybackRef?)?
-            for candidate in candidates {
-                let ref: DebridPlaybackRef?
-                let hash = candidate.infoHash?.lowercased()
-                let canResolveCached = episode != nil && hash.map(cachedHashes.contains) == true
-                if candidate.url == nil, !canResolveCached {
-                    ref = nil
-                } else {
-                    ref = await DebridCoordinator.shared.resolvedPlaybackRef(
-                        for: candidate, episode: episode,
-                        confirmedCachedHashes: cachedHashes
-                    )
-                }
-                if let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
-                    isUsenet: candidate.isUsenet, resolvedURL: ref?.url,
-                    fallbackURL: candidate.playableURL(isEpisode: true)
-                ) {
-                    selected = (candidate, url, ref)
-                    break
-                }
-            }
-            // @State writes go back on the main actor (the fetch + rank above intentionally ran off-main).
+            guard !Task.isCancelled else { return }
             await MainActor.run {
+                let completion = preloadPolicy.complete(
+                    attempt,
+                    success: selected != nil,
+                    now: ProcessInfo.processInfo.systemUptime
+                )
+                guard completion != .stale, !Task.isCancelled else { return }
+                preloadTask = nil
                 if let selected {
                     let best = selected.stream
-                    // The add-on base `best` came from, carried so the synchronous engine re-point on advance can
-                    // build this episode's stream request without waiting for the engine's own add-ons to answer.
-                    let bestBase = groups.first { $0.streams.contains(best) }?.id
-                    preloaded = PreloadedEpisode(episodeID: next.id, stream: best,
-                                                 url: selected.url, debridRef: selected.ref,
-                                                 signature: StreamRanking.signature(best),
-                                                 bingeGroup: best.behaviorHints?.bingeGroup, addonBase: bestBase)
-                    plog.info("preload ready: \(StreamRanking.qualityLabel(best), privacy: .public) for \(next.id, privacy: .public)")
+                    DiagnosticsLog.log(
+                        "binge",
+                        "preload next ep: want binge=\(binge ?? "nil"), \(selected.bingeStreamCount) of \(selected.streamCount) streams carry a bingeGroup"
+                    )
+                    preloaded = PreloadedEpisode(
+                        episodeID: nextID,
+                        generation: attempt.target.generation,
+                        stream: best,
+                        url: selected.url,
+                        debridRef: selected.debridRef,
+                        signature: StreamRanking.signature(best),
+                        bingeGroup: best.behaviorHints?.bingeGroup,
+                        addonBase: selected.addonBase
+                    )
+                    plog.info("preload ready: \(StreamRanking.qualityLabel(best), privacy: .public) for \(episodeToken, privacy: .public)")
                 } else {
-                    plog.info("preload found nothing for \(next.id, privacy: .public)")
+                    plog.info("preload found nothing for \(episodeToken, privacy: .public); state=\(String(describing: completion), privacy: .public)")
                 }
-                preloadingID = nil
             }
         }
     }
 
+    /// Fetch, order, rank, cache-check and resolve completely off the UI actor. A single attempt owner
+    /// surrounds this with a total deadline, so slow add-ons and serial provider resolution cannot run
+    /// through EOF.
+    private nonisolated static func resolvePreloadedEpisode(
+        sources: [StreamSource],
+        attemptSequence: Int,
+        episodeID: String,
+        season: Int?,
+        episodeNumber: Int,
+        continuityHint: String?,
+        bingeGroup: String?,
+        pin: ResolvedPin?
+    ) async -> PreloadResolution? {
+        let attemptDeadline = ProcessInfo.processInfo.systemUptime
+            + NextEpisodePreloadPolicy.attemptTimeout
+        let providerOrder = PreloadProviderRotation.order(
+            count: sources.count,
+            attemptSequence: attemptSequence,
+            stride: NextEpisodePreloadPolicy.providerRotationStride
+        )
+        let rotatedSources = providerOrder.map { sources[$0] }
+        let rotatedFetched: [CoreStreamSourceGroup?] = await BoundedPreloadWorkPool.map(
+            rotatedSources,
+            limit: NextEpisodePreloadPolicy.addonConcurrencyLimit,
+            timeoutNanoseconds: UInt64(
+                NextEpisodePreloadPolicy.addonFetchBudget * 1_000_000_000
+            ),
+            operationTimeoutNanoseconds: UInt64(
+                NextEpisodePreloadPolicy.addonRequestTimeout * 1_000_000_000
+            )
+        ) { source in
+            await Self.fetchStreams(
+                base: source.base,
+                addon: source.name,
+                id: episodeID
+            )
+        }
+        let fetched = PreloadProviderRotation.restoreOriginalOrder(
+            rotatedFetched,
+            order: providerOrder,
+            count: sources.count
+        )
+        // Each bounded retry begins at a different provider window, then this
+        // restoration preserves account order for ranking. Slow leading
+        // providers cannot starve later providers or change ranking precedence.
+        let groups = fetched.compactMap { $0 }
+        guard !Task.isCancelled else { return nil }
+
+        let allStreams = groups.flatMap(\.streams)
+        let candidates = StreamRanking.rankedCandidates(
+            groups,
+            continuity: continuityHint,
+            binge: bingeGroup,
+            pin: pin
+        )
+        let episode = EpisodePlaybackIdentity.provenEpisodeNumbers(
+            season: season,
+            episode: episodeNumber
+        ).map { DebridEpisode(season: $0.season, episode: $0.episode) }
+        let hashes = Set(candidates.compactMap { candidate -> String? in
+            guard candidate.isTorrent else { return nil }
+            return candidate.infoHash?.lowercased()
+        })
+        guard !Task.isCancelled else { return nil }
+        let cacheResults: [
+            String: (service: DebridService, files: [DebridFile])
+        ]? = await Self.valueBeforePreloadDeadline(
+            deadline: attemptDeadline
+        ) {
+                await DebridCoordinator.shared.cacheCheck(hashes: Array(hashes))
+        }
+        let cachedHashes: Set<String> = cacheResults.map {
+            Set($0.keys)
+        } ?? []
+        guard !Task.isCancelled else { return nil }
+
+        for candidate in candidates {
+            guard !Task.isCancelled else { return nil }
+            let ref: DebridPlaybackRef?
+            let hash = candidate.infoHash?.lowercased()
+            let canResolveCached = episode != nil && hash.map(cachedHashes.contains) == true
+            if candidate.url == nil, !canResolveCached {
+                ref = nil
+            } else {
+                ref = await Self.valueBeforePreloadDeadline(
+                    deadline: attemptDeadline
+                ) {
+                    await DebridCoordinator.shared.resolvedPlaybackRef(
+                        for: candidate,
+                        episode: episode,
+                        confirmedCachedHashes: cachedHashes
+                    )
+                } ?? nil
+                guard !Task.isCancelled else { return nil }
+            }
+            guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
+                isUsenet: candidate.isUsenet,
+                resolvedURL: ref?.url,
+                fallbackURL: candidate.playableURL(isEpisode: true)
+            ) else { continue }
+            return PreloadResolution(
+                stream: candidate,
+                url: url,
+                debridRef: ref,
+                addonBase: groups.first { $0.streams.contains(candidate) }?.id,
+                streamCount: allStreams.count,
+                bingeStreamCount: allStreams.filter {
+                    $0.behaviorHints?.bingeGroup?.isEmpty == false
+                }.count
+            )
+        }
+        return nil
+    }
+
+    /// Race one remaining preload phase against the attempt's absolute wall
+    /// clock deadline. Cancellation reaches the losing child.
+    private nonisolated static func valueBeforePreloadDeadline<Value: Sendable>(
+        deadline: TimeInterval,
+        operation: @escaping @Sendable () async -> Value
+    ) async -> Value? {
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0, !Task.isCancelled else { return nil }
+        return await withTaskGroup(of: (Bool, Value?).self) { group in
+            group.addTask {
+                guard !Task.isCancelled else { return (false, nil) }
+                return (true, await operation())
+            }
+            group.addTask {
+                do {
+                    try await Task<Never, Never>.sleep(
+                        nanoseconds: UInt64(remaining * 1_000_000_000)
+                    )
+                } catch {
+                    return (false, nil)
+                }
+                return (false, nil)
+            }
+            let first = await group.next()
+            group.cancelAll()
+            guard first?.0 == true else { return nil }
+            return first?.1
+        }
+    }
+
     /// One add-on's streams for an episode, straight over the Stremio addon protocol.
-    private static func fetchStreams(base: String, addon: String, id: String) async -> CoreStreamSourceGroup? {
+    private nonisolated static func fetchStreams(
+        base: String,
+        addon: String,
+        id: String
+    ) async -> CoreStreamSourceGroup? {
+        guard !Task.isCancelled else { return nil }
         let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         guard let url = URL(string: "\(base)/stream/series/\(escaped).json") else { return nil }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 25
+        request.timeoutInterval = NextEpisodePreloadPolicy.addonRequestTimeout
         struct Response: Decodable { let streams: [CoreStream]? }
         guard let (data, _) = try? await URLSession.shared.data(for: request),
+              !Task.isCancelled,
               let response = try? JSONDecoder().decode(Response.self, from: data),
               let streams = response.streams, !streams.isEmpty else { return nil }
         return CoreStreamSourceGroup(id: base, addon: addon, streams: streams)
+    }
+
+    /// Retire every async owner behind the prepared episode. Generation invalidation makes a completion that
+    /// was already queued on the main actor harmless. A separately primed torrent is closed when it is no
+    /// longer useful; a season-pack hash shared with the playing episode remains alive.
+    private func invalidateNextEpisodePreparation(reason: String) {
+        preloadGeneration &+= 1
+        preloadTask?.cancel()
+        preloadTask = nil
+        warmNextTask?.cancel()
+        warmNextTask = nil
+        preloadPolicy.invalidate()
+        abandonPreparedTorrentEngine(fallback: preloaded)
+        preloadTorrentLease = nil
+        preloaded = nil
+        warmedID = nil
+        VXProbe.log("binge", "next episode preparation invalidated: \(reason)")
+    }
+
+    /// Stop every producer while retaining the exact ready value and engine until
+    /// the replacement player command is admitted. A rejection can still clean it
+    /// up; a successful admission adopts it.
+    private func suspendNextEpisodePreparationForAdmission(reason: String) {
+        preloadGeneration &+= 1
+        preloadTask?.cancel()
+        preloadTask = nil
+        warmNextTask?.cancel()
+        warmNextTask = nil
+        preloadPolicy.invalidate()
+        warmedID = nil
+        VXProbe.log("binge", "next episode preparation suspended: \(reason)")
+    }
+
+    private func consumePreparedEpisode(_ episode: PreloadedEpisode) {
+        guard preloaded?.episodeID == episode.episodeID,
+              preloaded?.generation == episode.generation else { return }
+        let adopted = preloadTorrentLease?.adopt() == true
+        preloadTorrentLease = nil
+        preloaded = nil
+        warmedID = nil
+        VXProbe.log(
+            "binge",
+            "prepared episode admitted engine=\(adopted ? "adopted" : "not-prepared")"
+        )
+    }
+
+    private func discardPreparedEpisode(_ episode: PreloadedEpisode, reason: String) {
+        guard preloaded?.episodeID == episode.episodeID,
+              preloaded?.generation == episode.generation else { return }
+        abandonPreparedTorrentEngine(fallback: episode)
+        preloadTorrentLease = nil
+        preloaded = nil
+        warmedID = nil
+        VXProbe.log("binge", "prepared episode discarded: \(reason)")
+    }
+
+    /// Close both an explicitly prepared lease and a raw-torrent fallback. The
+    /// lease keeps the hash alive for a create completion that arrives after
+    /// cancellation and will issue a second remove if still abandoned.
+    private func abandonPreparedTorrentEngine(fallback: PreloadedEpisode?) {
+        let lease = preloadTorrentLease
+        _ = lease?.abandon()
+        var hashes = Set<String>()
+        if let lease { hashes.insert(lease.hash) }
+        if fallback?.debridRef == nil,
+           let hash = fallback?.stream.infoHash?.lowercased() {
+            hashes.insert(hash)
+        }
+        for hash in hashes where hash != currentTorrentHash {
+            closeTorrent(hash: hash)
+        }
     }
 
     /// One ranged read of the chosen next-episode source shortly before the
@@ -5330,18 +5650,133 @@ struct TVPlayerView: View {
     private func warmNextIfReady() {
         guard let pre = preloaded, warmedID != pre.episodeID else { return }
         let url = pre.url
+        let target = NextEpisodePreloadPolicy.Target(
+            episodeID: pre.episodeID, generation: preloadGeneration
+        )
+        guard preloadPolicy.isReady(for: target) else { return }
         warmedID = pre.episodeID
-        if pre.debridRef == nil { prepareTorrent(pre.stream) }
         var request = URLRequest(url: url)
         request.setValue("bytes=0-16777215", forHTTPHeaderField: "Range")   // first 16 MB
+        for (name, value) in pre.stream.requestHeaders ?? [:] where name.lowercased() != "range" {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
         request.timeoutInterval = 60
         let log = plog
-        let id = pre.episodeID
+        let id = VXProbeRedaction.identityToken(pre.episodeID)
         log.info("warming next episode source for \(id, privacy: .public)")
-        Task.detached(priority: .utility) {
-            let size = (try? await URLSession.shared.data(for: request))?.0.count ?? -1
-            log.info("warm result for \(id, privacy: .public): \(size) bytes")
+        warmNextTask?.cancel()
+        warmNextTask = Task(priority: .utility) {
+            do {
+                let requiresTorrentPreparation = pre.debridRef == nil
+                    && pre.stream.url == nil
+                    && pre.stream.infoHash?.isEmpty == false
+                if requiresTorrentPreparation {
+                    guard await preparePreloadedTorrent(
+                        pre.stream,
+                        target: target
+                    ) else {
+                        throw BoundedRangeWarmup.WarmupError.transport
+                    }
+                }
+                let result = try await BoundedRangeWarmup.fetch(request)
+                try Task.checkCancellation()
+                log.info("warm result for \(id, privacy: .public): status=\(result.statusCode, privacy: .public) bytes=\(result.byteCount, privacy: .public)")
+                await MainActor.run {
+                    guard target.generation == preloadGeneration,
+                          preloaded?.episodeID == target.episodeID,
+                          preloaded?.generation == target.generation else { return }
+                    warmNextTask = nil
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                log.info("warm result for \(id, privacy: .public): failed")
+                await MainActor.run {
+                    guard target.generation == preloadGeneration,
+                          preloaded?.episodeID == target.episodeID,
+                          preloaded?.generation == target.generation else { return }
+                    warmNextTask = nil
+                    if preloadPolicy.warmFailed(for: target) {
+                        // Keep the already-ranked value as a last-resort admission candidate, but close the
+                        // failed prepared engine. The credits refresh replaces it only if a better live value
+                        // resolves, so a failed refresh cannot erase the only usable next source.
+                        abandonPreparedTorrentEngine(fallback: pre)
+                        preloadTorrentLease = nil
+                        warmedID = nil
+                        preloadNextIfNeeded()
+                    }
+                }
+            }
         }
+    }
+
+    /// Prepare the raw-torrent engine under an owned, generation-fenced lease.
+    /// Cancellation cannot resurrect a stale engine: an abandoned lease removes
+    /// any create that still completes after invalidation.
+    private func preparePreloadedTorrent(
+        _ stream: CoreStream,
+        target: NextEpisodePreloadPolicy.Target
+    ) async -> Bool {
+        guard !PlaybackSettings.torrentsDisabled else { return false }
+        guard stream.url == nil,
+              let hash = stream.infoHash?.lowercased(),
+              let url = URL(string: "\(StremioServer.base)/\(hash)/create") else {
+            return false
+        }
+
+        if let old = preloadTorrentLease, old.hash != hash {
+            _ = old.abandon()
+            if old.hash != currentTorrentHash { closeTorrent(hash: old.hash) }
+        }
+        let sources = TorrentTrackers.sources(forHash: hash, streamSources: stream.sources)
+        let body: [String: Any] = [
+            "torrent": ["infoHash": hash],
+            "peerSearch": ["sources": sources, "min": 40, "max": 150]
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else {
+            return false
+        }
+        let lease = NextEpisodeTorrentPreparationLease(target: target, hash: hash)
+        preloadTorrentLease = lease
+
+        await StremioServer.applyServerConfig(maxAttempts: 3)
+        guard !Task.isCancelled,
+              target.generation == preloadGeneration,
+              lease.currentDisposition == .active,
+              preloadTorrentLease === lease,
+              preloaded?.episodeID == target.episodeID,
+              preloaded?.generation == target.generation else {
+            _ = lease.abandon()
+            if preloadTorrentLease === lease { preloadTorrentLease = nil }
+            if currentTorrentHash != hash { closeTorrent(hash: hash) }
+            return false
+        }
+
+        let status: Int
+        do {
+            status = try await TorrentCreateTransport.shared.create(url: url, jsonBody: data)
+        } catch {
+            status = 0
+        }
+
+        let stillOwned = !Task.isCancelled
+            && status / 100 == 2
+            && target.generation == preloadGeneration
+            && lease.currentDisposition == .active
+            && preloadTorrentLease === lease
+            && preloaded?.episodeID == target.episodeID
+            && preloaded?.generation == target.generation
+        if stillOwned {
+            _ = lease.markCreateSucceeded()
+        } else {
+            _ = lease.abandon()
+            if preloadTorrentLease === lease { preloadTorrentLease = nil }
+            if currentTorrentHash != hash { closeTorrent(hash: hash) }
+        }
+        VXProbe.log(
+            "binge",
+            "preload torrent prepare status=\(status) owned=\(stillOwned ? "true" : "false")"
+        )
+        return stillOwned && lease.canStartRangeWarmup
     }
 
     /// Torrents: ask the embedded server to start fetching peers before playback. No-op for url/debrid.
@@ -5362,10 +5797,14 @@ struct TVPlayerView: View {
         // No-op on a custom remote server (applyServerConfig returns immediately when isCustom).
         Task {
             await StremioServer.applyServerConfig(maxAttempts: 3)
-            var request = URLRequest(url: url); request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = data
-            URLSession.shared.dataTask(with: request).resume()
+            do {
+                let status = try await TorrentCreateTransport.shared.create(url: url, jsonBody: data)
+                if status / 100 != 2 {
+                    DiagnosticsLog.log("torrent", "create HTTP \(status) for \(hash.prefix(8))")
+                }
+            } catch {
+                DiagnosticsLog.log("torrent", "create failed for \(hash.prefix(8)): \(error.localizedDescription)")
+            }
         }
     }
 
@@ -5388,6 +5827,8 @@ struct TVPlayerView: View {
     /// engine is leaked.
     private func leavePlayback() {
         leftPlayback = true   // FIRST: a pending EOF last-chance backfill must never resurrect a player the user left
+        invalidateNextEpisodePreparation(reason: "playback exit")
+        invalidateLocalTrickplayCapture()
         persistenceBlockedForExit = hasUncommittedIssuedMedia
         episodeSwitchGeneration &+= 1
         sourceSwitchGeneration &+= 1
@@ -5631,26 +6072,48 @@ struct TVPlayerView: View {
         return "u:\((curURL ?? url).absoluteString)"
     }
 
+    private var activeTrickplayCaptureInterval: Double {
+        Self.trickplayCaptureIntervalSecs
+    }
+
+    private func invalidateLocalTrickplayCapture() {
+        localTrickplayCaptureGeneration &+= 1
+        localTrickplayCaptureInFlight = false
+    }
+
+    private func ownsLocalTrickplayCapture(_ generation: UInt64) -> Bool {
+        localTrickplayCaptureInFlight
+            && localTrickplayCaptureGeneration == generation
+    }
+
     private func maybeCaptureLocalTrickplay(at time: Double) {
         guard !scrubbing, !buffering, !isPaused else { return }   // AVPlayer now captures too (AVPlayerItemVideoOutput)
-        guard time - lastLocalTrickplayCapture >= Self.trickplayCaptureIntervalSecs else { return }
+        guard time - lastLocalTrickplayCapture >= activeTrickplayCaptureInterval else { return }
         captureTrickplayFrame(at: time)
     }
 
     /// The one place a trickplay frame is grabbed (from the timePos tick OR the wall-clock timer). Engine-
     /// agnostic + logged so a silent pool can be traced from a terminal run (which stage refused / nil frame).
     private func captureTrickplayFrame(at time: Double) {
+        guard !buffering, !isPaused else { return }
+        guard !trickplayCapturePressure.isSuppressed(
+            at: ProcessInfo.processInfo.systemUptime
+        ) else { return }
         guard !localTrickplayCaptureInFlight else { return }
         guard let player = coordinator.player else { VXProbe.log("tp", "no player mounted at \(Int(time))s (tvOS)"); return }
         lastLocalTrickplayCapture = time
+        localTrickplayCaptureGeneration &+= 1
+        let captureGeneration = localTrickplayCaptureGeneration
         localTrickplayCaptureInFlight = true
+        trickplayCaptureAttemptsSinceReceipt &+= 1
         let engine = (player is AVPlayerEngineController) ? "avplayer" : "libmpv"
         // In-flight watchdog: the libmpv capture is serviced on mpv's VO thread inside nextDrawable(); if that
         // thread is momentarily idle the handler may never fire, so release the guard after 3s to avoid a
         // permanent wedge that would silently skip every later capture.
         let watchdog = Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))
-            guard !Task.isCancelled, self.localTrickplayCaptureInFlight else { return }
+            guard !Task.isCancelled,
+                  self.ownsLocalTrickplayCapture(captureGeneration) else { return }
             self.localTrickplayCaptureInFlight = false
             VXProbe.log("tp", "\(engine) capture at \(Int(time))s never serviced (VO idle, tvOS) - releasing guard")
         }
@@ -5668,7 +6131,10 @@ struct TVPlayerView: View {
             guard let data else {
                 Task { @MainActor in
                     watchdog.cancel()
+                    guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
                     self.localTrickplayCaptureInFlight = false
+                    self.trickplayCaptureCompletionsSinceReceipt &+= 1
+                    self.trickplayCaptureNilSinceReceipt &+= 1
                     VXProbe.log("tp", "\(engine) captureFrameJPEGData returned NIL at \(Int(time))s (tvOS)")
                 }
                 return
@@ -5677,16 +6143,18 @@ struct TVPlayerView: View {
             let decoded = ScrubThumbnailsStore.decodeCapturedFrame(data, at: time)   // heavy decode OFF main
             Task { @MainActor in
                 watchdog.cancel()
+                guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
                 self.localTrickplayCaptureInFlight = false
+                self.trickplayCaptureCompletionsSinceReceipt &+= 1
                 guard let decoded else { return }   // decode failed / near-black: already logged off-actor
                 self.scrubThumbnails.recordDecodedFrame(decoded, data: data, at: time)
             }
         }
     }
 
-    /// Wall-clock capture driver (tvOS twin of PlayerScreen.startTrickplayCaptureTimer): a repeating ~10s
-    /// timer gated on active playback, capturing off the LIVE engine position so trickplay is generated even
-    /// when the engine's timePos event stream is sparse/coalesced on a 4K/HDR/DV stream.
+    /// Wall-clock capture driver (tvOS twin of PlayerScreen.startTrickplayCaptureTimer): a repeating
+    /// ten-second eligibility check for both engines. A measured high-drop interval may temporarily defer
+    /// capture through `TrickplayCapturePressurePolicy`; ordinary isolated drops never change the cadence.
     private func startTrickplayCaptureTimer() {
         trickplayCaptureTimer?.cancel()
         trickplayCaptureTimer = Task { @MainActor in
@@ -5697,7 +6165,7 @@ struct TVPlayerView: View {
                 guard let player = coordinator.player else { continue }
                 let now = player.playbackPositionSeconds
                 let t = now > 0 ? now : currentTime
-                guard t > 0, t - lastLocalTrickplayCapture >= Self.trickplayCaptureIntervalSecs else { continue }
+                guard t > 0, t - lastLocalTrickplayCapture >= activeTrickplayCaptureInterval else { continue }
                 captureTrickplayFrame(at: t)
             }
         }

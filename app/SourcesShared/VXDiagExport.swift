@@ -24,7 +24,7 @@ import Darwin   // getifaddrs / ifaddrs / getnameinfo for LAN IPv4 discovery
 /// FAIL-SOFT: every path is wrapped so a bad request or a gone client just closes that one connection.
 /// `start()` returns nil (caller shows a "connect to Wi-Fi" message) when there is no LAN IPv4 to advertise
 /// or the listener will not come up. `stop()` tears the listener down so the log is not left served.
-final class VXDiagExport {
+final class VXDiagExport: @unchecked Sendable {
 
     static let shared = VXDiagExport()
 
@@ -52,15 +52,20 @@ final class VXDiagExport {
     private static let coldStartBudget: TimeInterval = 6
     private static let coldStartRetryGap: TimeInterval = 0.3
 
-    /// Set once the LAN server has actually served the log to a phone at least once this session. Two jobs,
-    /// both guarded by `stateLock`: it is the ONE-SHOT gate (every later request is rejected without bytes),
-    /// and it lets `stop()` (export screen dismissed) CLEAR the rolling log then and only then, giving the
-    /// next export a fresh buffer without wiping data that was never downloaded.
-    private var didServe = false
+    /// Separates an in-flight one-shot claim from local send completion. A failed or interrupted client
+    /// releases its claim for retry, while nominal completion consumes the capability. Neither clears the
+    /// rolling log because Network.framework completion is not receiver acknowledgement.
+    /// Guarded by `stateLock`.
+    private var transferGate = VXDiagExportPolicy.TransferGate()
 
     /// The unguessable path minted for the CURRENT export session, guarded by `stateLock`. Re-minted on
     /// every `start()`, so a path scraped from an earlier session's QR code is dead.
     private var capabilityPath = ""
+
+    private struct ExportPayload {
+        let body: Data
+        let logSnapshot: VXProbeLogSnapshot
+    }
 
     private init() {}
 
@@ -81,7 +86,7 @@ final class VXDiagExport {
         // thing that can fetch this session's log, and it can do it once.
         stateLock.lock()
         capabilityPath = VXDiagExportPolicy.makeCapabilityPath()
-        didServe = false
+        transferGate.reset()
         let path = capabilityPath
         stateLock.unlock()
         let urlString = "http://\(ip):\(boundPort)\(path)"
@@ -131,19 +136,13 @@ final class VXDiagExport {
             stateLock.lock()
             let open = Array(connections.values)
             connections.removeAll()
-            let served = didServe
-            didServe = false
+            transferGate.reset()
             capabilityPath = ""   // retire the capability with the listener
             stateLock.unlock()
             open.forEach { $0.cancel() }
-            // Clear the rolling log ONLY if it was actually downloaded this session, so the next export starts
-            // fresh (owner request) without discarding a log the phone never fetched.
-            if served {
-                VXProbe.clearLog()
-                NSLog("[diag] export: stopped + cleared log (was served)")
-            } else {
-                NSLog("[diag] export: stopped")
-            }
+            // LAN sends never clear the rolling log without app-layer receiver acknowledgement. Stopping also
+            // retires the capability and cancels any incomplete connection.
+            NSLog("[diag] export: stopped")
         }
     }
 
@@ -197,15 +196,16 @@ final class VXDiagExport {
     /// Accept one phone connection: read its request header, then serve the log file. The connection is
     /// tracked so `stop()` can cancel it, and a deadline force-cancels a client that never sends a header.
     private func handle(_ connection: NWConnection) {
+        let connectionID = ObjectIdentifier(connection)
         stateLock.lock()
-        connections[ObjectIdentifier(connection)] = connection
+        connections[connectionID] = connection
         stateLock.unlock()
-        connection.stateUpdateHandler = { [weak self, weak connection] state in
+        connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .cancelled, .failed:
-                guard let self, let connection else { return }
+                guard let self else { return }
                 self.stateLock.lock()
-                self.connections.removeValue(forKey: ObjectIdentifier(connection))
+                self.connections.removeValue(forKey: connectionID)
                 self.stateLock.unlock()
             default:
                 break
@@ -241,14 +241,13 @@ final class VXDiagExport {
                 // Claim the one-shot under the lock so two simultaneous connections cannot both win it.
                 self.stateLock.lock()
                 let path = self.capabilityPath
-                let served = self.didServe
                 let decision = VXDiagExportPolicy.decide(request: accumulated,
                                                          capabilityPath: path,
-                                                         alreadyServed: served || path.isEmpty)
-                if decision == .serve { self.didServe = true }
+                                                         alreadyServed: self.transferGate.blocksNewClaim || path.isEmpty)
+                let claim = decision == .serve ? self.transferGate.claim() : nil
                 self.stateLock.unlock()
-                if decision == .serve {
-                    self.serve(connection)
+                if let claim {
+                    self.serve(connection, claim: claim)
                 } else {
                     NSLog("[diag] export: rejected a request")
                     connection.cancel()
@@ -266,8 +265,12 @@ final class VXDiagExport {
 
     /// Write the current diagnostic log as a text/plain attachment, then close. Any read failure yields an
     /// empty body rather than an error so the phone still gets a (harmless) file.
-    private func serve(_ connection: NWConnection) {
-        let body = Self.exportBody()
+    private func serve(
+        _ connection: NWConnection,
+        claim: VXDiagExportPolicy.TransferClaim
+    ) {
+        let payload = Self.exportPayload()
+        let body = payload.body
         let head = """
         HTTP/1.1 200 OK\r
         Content-Type: text/plain; charset=utf-8\r
@@ -278,14 +281,122 @@ final class VXDiagExport {
 
         """
         NSLog("[diag] export: sending log (%d bytes)", body.count)
-        var payload = Data(head.utf8)
-        payload.append(body)
-        connection.send(content: payload, completion: .contentProcessed { _ in
-            // `didServe` was already claimed under `stateLock` before this write started: it is the one-shot
-            // gate, so it has to be taken at the DECISION, not at completion, or two connections racing the
-            // decision would both be served.
-            connection.cancel()
+        let ranges = VXDiagExportPolicy.chunkRanges(bodyBytes: body.count)
+        connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            if error != nil {
+                self.finishTransfer(
+                    connection, claim: claim, success: false
+                )
+                return
+            }
+            self.sendBodyChunks(
+                body,
+                ranges: ranges,
+                index: 0,
+                connection: connection,
+                claim: claim
+            )
         })
+    }
+
+    private func sendBodyChunks(
+        _ body: Data,
+        ranges: [Range<Int>],
+        index: Int,
+        connection: NWConnection,
+        claim: VXDiagExportPolicy.TransferClaim
+    ) {
+        guard ranges.indices.contains(index) else {
+            finishTransfer(
+                connection, claim: claim, success: true
+            )
+            return
+        }
+        let chunk = body.subdata(in: ranges[index])
+        let isFinalChunk = index == ranges.index(before: ranges.endIndex)
+        connection.send(
+            content: chunk,
+            contentContext: isFinalChunk
+                ? NWConnection.ContentContext.finalMessage
+                : NWConnection.ContentContext.defaultMessage,
+            isComplete: true,
+            completion: .contentProcessed { [weak self] error in
+                guard let self else { return }
+                if error != nil {
+                    self.finishTransfer(
+                        connection, claim: claim, success: false
+                    )
+                    return
+                }
+                self.sendBodyChunks(
+                    body,
+                    ranges: ranges,
+                    index: index + 1,
+                    connection: connection,
+                    claim: claim
+                )
+            }
+        )
+    }
+
+    private func finishTransfer(
+        _ connection: NWConnection,
+        claim: VXDiagExportPolicy.TransferClaim,
+        success: Bool
+    ) {
+        stateLock.lock()
+        let completion = transferGate.complete(claim, success: success)
+        stateLock.unlock()
+        switch completion {
+        case .deliveredPreservingLog:
+            NSLog("[diag] export: LAN send completed; preserved rolling log because receiver did not ACK")
+        case .retryableFailure:
+            NSLog("[diag] export: transfer failed; preserved log for retry")
+        case .stale:
+            break
+        }
+        switch completion.connectionCleanup {
+        case .waitForPeerClose:
+            waitForPeerClose(connection)
+        case .cancelImmediately:
+            connection.cancel()
+        }
+    }
+
+    /// `contentProcessed` only means Network.framework accepted the final send locally. `finalMessage`
+    /// performs the TCP write-close, so cancelling at that callback can truncate buffered body bytes or FIN.
+    /// Keep the connection alive until the peer closes its side, with a fixed upper bound for cleanup.
+    private static let peerCloseTimeout: TimeInterval = 30
+
+    private func waitForPeerClose(_ connection: NWConnection) {
+        let timeout = DispatchWorkItem {
+            NSLog("[diag] export: peer-close timeout; preserved rolling log")
+            connection.cancel()
+        }
+        queue.asyncAfter(deadline: .now() + Self.peerCloseTimeout, execute: timeout)
+        receiveUntilPeerClose(connection, timeout: timeout)
+    }
+
+    private func receiveUntilPeerClose(
+        _ connection: NWConnection,
+        timeout: DispatchWorkItem
+    ) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1_024) {
+            [weak self] _, _, isComplete, error in
+            guard !timeout.isCancelled else { return }
+            if isComplete || error != nil {
+                timeout.cancel()
+                connection.cancel()
+                return
+            }
+            guard let self else {
+                timeout.cancel()
+                connection.cancel()
+                return
+            }
+            self.receiveUntilPeerClose(connection, timeout: timeout)
+        }
     }
 
     // MARK: - Helpers
@@ -303,11 +414,22 @@ final class VXDiagExport {
     ///
     /// Target-safe via ServerDiagnostics: on a build with no server (the Lite tvOS app) the provider is nil
     /// and the server section is omitted. Never throws.
-    static func exportBody() -> Data {
-        let contents = (try? String(contentsOf: VXProbe.logFileURL, encoding: .utf8)) ?? ""
+    private static func exportPayload() -> ExportPayload {
+        let snapshot = VXProbe.logSnapshot()
         let status = ServerDiagnostics.status()
         let tail = status == nil ? [] : ServerDiagnostics.logTail(100)
-        return VXDiagExportPolicy.exportBody(logContents: contents, serverStatus: status, serverTailLines: tail)
+        let body = VXDiagExportPolicy.exportBody(
+            logContents: snapshot.contents,
+            serverStatus: status,
+            serverTailLines: tail
+        )
+        return ExportPayload(body: body, logSnapshot: snapshot)
+    }
+
+    /// Materialize a sanitized point-in-time body for the native share-sheet and Finder export paths. The
+    /// caller decides whether a receiver acknowledgement exists and therefore whether consumption is safe.
+    static func exportBody() -> Data {
+        exportPayload().body
     }
 
     /// The device's LAN IPv4 for the Wi-Fi interface (`en0`), or nil when not on Wi-Fi. Uses getifaddrs so
@@ -377,14 +499,15 @@ extension VXDiagExport {
         // Write the SANITISED export body (overwriting any stale copy) rather than copying the live file:
         // the live file holds whatever every previous build wrote, and this is an export path like any
         // other. If the source is missing/empty the body is a placeholder, so the reveal is not a dead file.
-        let data = Self.exportBody()
+        let payload = Self.exportPayload()
+        let data = payload.body
         do {
             try data.write(to: dest, options: .atomic)
             NSWorkspace.shared.activateFileViewerSelecting([dest])
-            // The Downloads copy is an independent file, so it is safe to clear the live rolling log now: the
-            // next export starts fresh (owner request "once exported, clear it").
-            VXProbe.clearLog()
-            NSLog("[diag] export: revealed %@ in Finder + cleared live log", dest.path)
+            // Consume only the point-in-time prefix copied above. Lines appended while the atomic write or
+            // Finder reveal was in flight remain in the live log for the next export.
+            VXProbe.consumeLogSnapshot(payload.logSnapshot)
+            NSLog("[diag] export: revealed %@ in Finder + consumed exported snapshot", dest.path)
             return dest.path
         } catch {
             // Downloads not writable (unexpected on an unsandboxed Mac): fall back to the temp dir, still
@@ -396,7 +519,8 @@ extension VXDiagExport {
                 return nil
             }
             NSWorkspace.shared.activateFileViewerSelecting([temp])
-            NSLog("[diag] export: Downloads not writable (%@), revealed the temp copy", String(describing: error))
+            VXProbe.consumeLogSnapshot(payload.logSnapshot)
+            NSLog("[diag] export: Downloads not writable (%@), revealed the temp copy + consumed exported snapshot", String(describing: error))
             return temp.path
         }
     }

@@ -298,6 +298,7 @@ enum SourceIndexDiag {
         case alreadyClaimed = "already-claimed"
         case bodyEncodingFailed = "body-encoding-failed"
         case cancelled = "cancelled"
+        case playbackActive = "playback-active"
         case postFailed = "post-failed"
         case gateClosed = "gate-closed"
         case gateChangedOrNoMoat = "gate-changed-or-no-moat"

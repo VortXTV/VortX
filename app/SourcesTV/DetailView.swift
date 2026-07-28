@@ -1906,6 +1906,9 @@ struct CoreStreamList: View {
     @EnvironmentObject private var theme: ThemeManager
     @State private var sourceFilter: String? = nil
     @State private var sourceRefreshDebounce: Task<Void, Never>? = nil
+    @State private var sourceContributionTask: Task<Void, Never>? = nil
+    @State private var sourceContributionPolicy = SourceContributionWorkPolicy()
+    @State private var sourceRefreshPlaybackGate = SourceRefreshPlaybackGate()
     private static let sourceRefreshDebounceMs = 400   // trailing settle for the add-on load storm, mirrors coalesceMs intent
     @State private var showAllSources = false   // the full ranked list is revealed on demand (Watch-Now first)
     // Render only the top N ranked rows at a time; a popular title returns 4000+ sources and instantiating
@@ -2318,7 +2321,22 @@ struct CoreStreamList: View {
             refreshSourceIndex()
             scheduleSourceRefresh()
         }
-        .onDisappear { sourceRefreshDebounce?.cancel() }
+        .onChange(of: core.playerActive) { active in
+            if active {
+                sourceRefreshPlaybackGate.playbackStarted()
+                sourceRefreshDebounce?.cancel()
+                sourceRefreshDebounce = nil
+                cancelSourceContribution(reason: "playback started")
+            } else if sourceRefreshPlaybackGate.playbackEnded() {
+                scheduleSourceRefresh()
+            }
+        }
+        .onDisappear {
+            sourceRefreshDebounce?.cancel()
+            sourceRefreshDebounce = nil
+            sourceRefreshPlaybackGate.reset()
+            cancelSourceContribution(reason: "detail disappeared")
+        }
         // First-download storage-eviction warning (#30). Apple TV has no user-visible file system and the
         // OS can reclaim app storage under pressure, so a saved download may be removed by the system. Show
         // this once; on confirm we remember the ack and run the queued download, on cancel we drop it.
@@ -2523,6 +2541,9 @@ struct CoreStreamList: View {
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
     private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil,
                                     providerByHash: [String: String] = [:]) {
+        guard sourceRefreshPlaybackGate.permitsRefresh(
+            playerActive: core.playerActive
+        ) else { return }
         let contentID = sourceContentID
         let vortxSignedIn = VortXSyncManager.shared.isSignedIn
         sourceIndex.refresh(contentID: contentID, isSignedIn: vortxSignedIn)
@@ -2533,17 +2554,148 @@ struct CoreStreamList: View {
         // cache-check confirmed.
         let groups = torboxMerged ?? torboxSearch.merged(into: targetCoreGroups)
         guard !groups.isEmpty else { return }
-        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups, providerByHash: providerByHash) }
+        requestSourceContribution(
+            contentID: contentID, groups: groups, providerByHash: providerByHash
+        )
+    }
+
+    /// One contribution owner for the detail page. A source-load storm marks the owner dirty instead of
+    /// launching another full descriptor extraction. When the owner finishes, one newest-snapshot refresh
+    /// catches any rows that arrived meanwhile. Covered detail pages do no contribution work during playback.
+    private func requestSourceContribution(
+        contentID: String,
+        groups: [CoreStreamSourceGroup],
+        providerByHash: [String: String]
+    ) {
+        guard !core.playerActive else { return }
+        guard case .launch(let claim) = sourceContributionPolicy.request() else { return }
+        VXProbe.log(
+            "perf",
+            "source contribution start target=\(VXProbeRedaction.identityToken(contentID)) claim=\(claim.generation) groups=\(groups.count)"
+        )
+        sourceContributionTask = Task.detached(priority: .utility) {
+            guard await SourceIndexClient.contributionAllowedNow() else {
+                await MainActor.run {
+                    finishSourceContribution(
+                        claim: claim,
+                        target: nil,
+                        acceptedByProcess: false
+                    )
+                }
+                return
+            }
+            let descriptors = SourceIndexClient.descriptors(
+                from: groups, providerByHash: providerByHash
+            )
+            guard !Task.isCancelled else { return }
+            guard !descriptors.isEmpty else {
+                await MainActor.run {
+                    finishSourceContribution(
+                        claim: claim,
+                        target: nil,
+                        acceptedByProcess: false
+                    )
+                }
+                return
+            }
+            let fingerprint = SourceIndexClient.descriptorFingerprint(descriptors)
+            guard !Task.isCancelled else { return }
+            guard !fingerprint.isEmpty else {
+                await MainActor.run {
+                    finishSourceContribution(
+                        claim: claim,
+                        target: nil,
+                        acceptedByProcess: false
+                    )
+                }
+                return
+            }
+            let target = SourceContributionWorkPolicy.Target(
+                contentID: contentID, descriptorFingerprint: fingerprint
+            )
+            let shouldSubmit = await MainActor.run {
+                !CoreBridge.shared.playerActive
+                    && sourceContributionPolicy.shouldSubmit(target, for: claim)
+            }
+            guard shouldSubmit else {
+                await MainActor.run {
+                    finishSourceContribution(
+                        claim: claim,
+                        target: target,
+                        acceptedByProcess: false
+                    )
+                }
+                return
+            }
+            let outcome = await SourceIndexClient.contribute(
+                contentID: contentID,
+                descriptors: descriptors
+            )
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                finishSourceContribution(
+                    claim: claim,
+                    target: target,
+                    acceptedByProcess: outcome == .acceptedByProcess
+                )
+            }
+        }
+    }
+
+    private func finishSourceContribution(
+        claim: SourceContributionWorkPolicy.Claim,
+        target: SourceContributionWorkPolicy.Target?,
+        acceptedByProcess: Bool
+    ) {
+        let completion = sourceContributionPolicy.complete(
+            claim,
+            target: target,
+            acceptedByProcess: acceptedByProcess
+        )
+        guard case .current(let needsNewestSnapshot) = completion else {
+            return
+        }
+        sourceContributionTask = nil
+        VXProbe.log(
+            "perf",
+            "source contribution end claim=\(claim.generation) accepted=\(acceptedByProcess ? "true" : "false") deferred=\(needsNewestSnapshot ? "true" : "false")"
+        )
+        if needsNewestSnapshot, !core.playerActive {
+            scheduleSourceRefresh()
+        }
+    }
+
+    private func cancelSourceContribution(reason: String) {
+        let wasActive = sourceContributionTask != nil
+        sourceContributionTask?.cancel()
+        sourceContributionTask = nil
+        sourceContributionPolicy.cancel()
+        if wasActive {
+            VXProbe.log("perf", "source contribution cancel reason=\(reason)")
+        }
     }
 
     /// Trailing-debounced driver for the add-on load storm: the raw `.onChange` fired per add-on completion,
     /// each doing full O(N) merge walks on main. Coalesce to one pass ~400 ms after the burst settles, and
     /// compute the torbox-base ONCE so the debrid (pool-inclusive) and hoard (pool-excluded) sets share it.
     private func scheduleSourceRefresh() {
+        guard sourceRefreshPlaybackGate.permitsRefresh(
+            playerActive: core.playerActive
+        ) else {
+            sourceRefreshDebounce?.cancel()
+            sourceRefreshDebounce = nil
+            return
+        }
         sourceRefreshDebounce?.cancel()
         sourceRefreshDebounce = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
             guard !Task.isCancelled else { return }
+            guard sourceRefreshPlaybackGate.permitsRefresh(
+                playerActive: core.playerActive
+            ) else {
+                sourceRefreshDebounce = nil
+                return
+            }
             let torboxBase = torboxSearch.merged(into: targetCoreGroups)   // pool-EXCLUDED (hoard set)
             // Pool-INCLUDED: cache awareness needs raw torrents and TorBox-search NZBs that the Direct-links-only
             // filter would drop, plus Singularity's torrent-only pool sources. Torrents resolve through debrid;
@@ -2551,6 +2703,7 @@ struct CoreStreamList: View {
             debridCache.refresh(from: sourceIndex.merged(into: torboxBase))
             refreshSourceIndex(torboxMerged: torboxBase,
                                providerByHash: debridCache.cachedProviderByHash) // reuse the base; tag cached facts
+            sourceRefreshDebounce = nil
         }
     }
 

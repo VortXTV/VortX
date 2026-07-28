@@ -234,6 +234,7 @@ struct PlayerScreen: View {
     @State private var hoverPreviewRatio: CGFloat?
     @State private var lastLocalTrickplayCapture = -1000.0
     @State private var localTrickplayCaptureInFlight = false
+    @State private var localTrickplayCaptureGeneration: UInt64 = 0
     /// Wall-clock trickplay capture driver (player-agnostic backstop to the timePos-driven tick). Cancelled on
     /// disappear. See startTrickplayCaptureTimer.
     @State private var trickplayCaptureTimer: Task<Void, Never>?
@@ -980,6 +981,7 @@ struct PlayerScreen: View {
         }
         .onDisappear {
             invalidateEpisodeWorkForExit()
+            invalidateLocalTrickplayCapture()
             core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
             hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
             stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
@@ -1635,6 +1637,16 @@ struct PlayerScreen: View {
         captureTrickplayFrame(at: time)
     }
 
+    private func invalidateLocalTrickplayCapture() {
+        localTrickplayCaptureGeneration &+= 1
+        localTrickplayCaptureInFlight = false
+    }
+
+    private func ownsLocalTrickplayCapture(_ generation: UInt64) -> Bool {
+        localTrickplayCaptureInFlight
+            && localTrickplayCaptureGeneration == generation
+    }
+
     /// The one place a trickplay frame is grabbed (from either capture driver). Guards the in-flight flag,
     /// stamps the cadence, and logs each stage so a silent pool can be traced from a terminal run: which gate
     /// refused, whether captureFrameJPEGData returned nil (no output attached / protected frame), and whether
@@ -1643,6 +1655,8 @@ struct PlayerScreen: View {
         guard !localTrickplayCaptureInFlight else { return }
         guard let player = coordinator.player else { VXProbe.log("tp", "no player mounted at \(Int(time))s"); return }
         lastLocalTrickplayCapture = time
+        localTrickplayCaptureGeneration &+= 1
+        let captureGeneration = localTrickplayCaptureGeneration
         localTrickplayCaptureInFlight = true
         let engine = (player is AVPlayerEngineController) ? "avplayer" : "libmpv"
         // In-flight watchdog: the libmpv capture is serviced on mpv's VO thread inside nextDrawable(), which
@@ -1651,7 +1665,8 @@ struct PlayerScreen: View {
         // silently skipped). Release it after 3s so the next tick can retry. Idempotent with the real handler.
         let watchdog = Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))
-            guard !Task.isCancelled, self.localTrickplayCaptureInFlight else { return }
+            guard !Task.isCancelled,
+                  self.ownsLocalTrickplayCapture(captureGeneration) else { return }
             self.localTrickplayCaptureInFlight = false
             VXProbe.log("tp", "\(engine) capture at \(Int(time))s never serviced (VO idle) - releasing guard")
         }
@@ -1673,6 +1688,7 @@ struct PlayerScreen: View {
             guard let data else {
                 Task { @MainActor in
                     watchdog.cancel()
+                    guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
                     self.localTrickplayCaptureInFlight = false
                     VXProbe.log("tp", "\(engine) captureFrameJPEGData returned NIL at \(Int(time))s (no video output / protected / not-ready)")
                 }
@@ -1682,6 +1698,7 @@ struct PlayerScreen: View {
             let decoded = ScrubThumbnailsStore.decodeCapturedFrame(data, at: time)   // heavy decode + black-check OFF main
             Task { @MainActor in
                 watchdog.cancel()
+                guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
                 self.localTrickplayCaptureInFlight = false
                 guard let decoded else { return }   // decode failed / near-black: already logged off-actor
                 self.scrubThumbnails.recordDecodedFrame(decoded, data: data, at: time)
@@ -2866,7 +2883,8 @@ struct PlayerScreen: View {
         if let oldHash, oldHash != stream.infoHash?.lowercased() { closeTorrent(hash: oldHash) }
         if resumeOverride != nil { currentTime = 0; duration = 0 }
         scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
-        lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
+        lastLocalTrickplayCapture = -1000
+        invalidateLocalTrickplayCapture()
         configureCommunityTrickplayProvisional()
         if !engineAlreadyBound, isEpisodePlaybackContext,
            let meta = pendingAdvance?.meta ?? curMeta {
@@ -5232,6 +5250,7 @@ struct PlayerScreen: View {
     /// the always-present pre-start close button, the error-overlay Back, and the top-bar chevron.
     @MainActor private func leavePlayback() {
         invalidateEpisodeWorkForExit()
+        invalidateLocalTrickplayCapture()
         hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel(); idleWatchTask?.cancel()
         stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
         #if os(iOS) || os(macOS)

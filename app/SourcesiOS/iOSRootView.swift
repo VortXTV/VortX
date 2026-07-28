@@ -787,6 +787,9 @@ struct iOSHomeView: View {
     @State private var showCustomizeHome = false   // presents the Home rows reorder/hide editor
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
     @State private var player: iOSPlayerLaunch?
+    /// Owns the post-playback source contribution started by a direct resume.
+    /// Cancellation must follow Home teardown instead of escaping in a detached task.
+    @State private var resumeHoardTask: Task<Void, Never>?
     #if os(macOS)
     /// macOS keyboard browse: which Home poster card is focused. Passed to each rail so its cards become
     /// `.focusable()` and join native arrow traversal; nil on iOS (this whole member is macOS-only).
@@ -1150,7 +1153,11 @@ struct iOSHomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: SIMKLRailsModel.disconnectedNote)) { _ in simklRails.clear() }
         // A watchlist bookmark toggle feeds the Upcoming rails (refreshUpcoming folds it in), so rebuild them now.
         .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in refreshReleaseCalendar() }
-        .onDisappear { hero.stop() }
+        .onDisappear {
+            hero.stop()
+            resumeHoardTask?.cancel()
+            resumeHoardTask = nil
+        }
     }
 
     /// Render one reorderable Home section. Each case is the section's ORIGINAL block, unchanged, moved
@@ -1365,6 +1372,19 @@ struct iOSHomeView: View {
         Task {
             if let launch = await iOSDirectResume(for: item, core: core, account: account) {
                 player = launch
+                resumeHoardTask?.cancel()
+                if let contentID = launch.resumeHoardContentID,
+                   let streamID = launch.resumeHoardStreamID {
+                    resumeHoardTask = Task(priority: .utility) {
+                        await SourceIndexClient.hoardResumedGroupsAfterPlayback(
+                            contentID: contentID
+                        ) {
+                            CoreBridge.shared.streamGroups(forStreamId: streamID)
+                        }
+                    }
+                } else {
+                    resumeHoardTask = nil
+                }
             } else {
                 path.append(FeaturedHeroItem.from(rail: item))
             }
@@ -3041,6 +3061,10 @@ struct iOSPlayerLaunch: Identifiable {
     /// same in-player Next / Prev / episode-list as the detail page. Empty/nil for movies + paste-a-link.
     var episodes: [PlayerEpisodeRef] = []
     var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
+    /// A Continue-Watching launch carries the identity needed for one owned,
+    /// deferred source contribution after the player exits.
+    var resumeHoardContentID: String? = nil
+    var resumeHoardStreamID: String? = nil
     /// yt-direct adaptive pair (pasted YouTube links): the separate AUDIO stream mpv mounts alongside the
     /// video-only `url` (`--audio-file` sidecar). Forces the libmpv engine in PlayerScreen.
     var audioSidecarURL: URL? = nil
@@ -3126,17 +3150,12 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     // the latter's groups under tt1375666:1:1. `resumeContentID` compares canonical TITLE HEADS and returns nil
     // when they disagree, which SKIPS the pool contribution only. Playback below is untouched: a mismatch never
     // blocks the user's own resume.
-    if let cid = SourceIndexClient.resumeContentID(itemID: item.id, videoID: entry.videoId,
-                                                  season: entry.season, episode: entry.episode) {
-        let streamId = entry.videoId
-        Task.detached {
-            // Read groups off the shared bridge (not the captured `core`) so the detached task never captures a
-            // non-Sendable reference; there is one engine bridge, so this is the same state the resume loads.
-            await SourceIndexClient.hoardResumedGroups(contentID: cid) {
-                CoreBridge.shared.streamGroups(forStreamId: streamId)
-            }
-        }
-    }
+    let resumeHoardContentID = SourceIndexClient.resumeContentID(
+        itemID: item.id,
+        videoID: entry.videoId,
+        season: entry.season,
+        episode: entry.episode
+    )
     // Reresolve the EXACT stored source FIRST (same debrid file, fresh link) so the card tap resumes the source
     // the user chose instead of replaying a stale, expired URL and dead-ending into the cross-source auto-pick
     // ("Tried N sources / this source didn't load"). CWResume mints a fresh link for the SAME file when the
@@ -3269,7 +3288,9 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                            debridRef: explicitDebridRef, sourceStream: launchSource,
                            enginePlayerVideoId: enginePlayerVideoId,
                            wasExplicitPick: wasExplicitPick, wasResume: true,
-                           episodes: episodes, loadEpisode: loadEpisode)
+                           episodes: episodes, loadEpisode: loadEpisode,
+                           resumeHoardContentID: resumeHoardContentID,
+                           resumeHoardStreamID: resumeHoardContentID == nil ? nil : entry.videoId)
 }
 
 private func iOSDirectStream(url: URL, name: String) -> CoreStream? {

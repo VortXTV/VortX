@@ -1,6 +1,36 @@
 import AVFoundation
 import Foundation
 
+/// Low-rate, read-only playback evidence. Engines leave unsupported properties
+/// nil so diagnostics can fail soft without changing playback behavior.
+struct PlaybackDiagnostics: Sendable {
+    var frameDropCount: Int?
+    var decoderFrameDropCount: Int?
+    var mistimedFrameCount: Int?
+    var delayedFrameCount: Int?
+    var avSync: Double?
+    var totalAVSyncChange: Double?
+    var pausedForCache: Bool?
+    var cacheUnderrun: Bool?
+    var cacheIdle: Bool?
+    var cacheBufferingPercent: Int?
+    var cacheDuration: Double?
+    var hardwareDecoder: String?
+    var estimatedVideoFPS: Double?
+    var containerFPS: Double?
+    var displayFPS: Double?
+    var videoSyncMode: String?
+    var videoSpeedCorrection: Double?
+    var audioSpeedCorrection: Double?
+    var audioOutput: String?
+
+    var hasValues: Bool {
+        frameDropCount != nil || decoderFrameDropCount != nil
+            || mistimedFrameCount != nil || delayedFrameCount != nil
+            || avSync != nil || cacheUnderrun != nil || hardwareDecoder != nil
+    }
+}
+
 /// The finite surface the player chrome drives playback through. Today the chrome (`PlayerScreen` on
 /// iOS/Mac, `TVPlayerView` on tvOS) talks to the engine exclusively via `coordinator.player?.<method>`
 /// plus an inbound string-keyed property-event bus (`MPVPlayerDelegate`). Every member below is something
@@ -77,6 +107,7 @@ protocol PlayerEngine: AnyObject {
     func chapters() -> [MPVChapter]
     func mediaSummary() -> (width: Int, height: Int, audioCodec: String)
     func playbackStats() -> [(String, String)]
+    func playbackDiagnostics() -> PlaybackDiagnostics
 
     // Decode + audio routing
     func setHardwareDecoding(_ on: Bool)
@@ -143,6 +174,7 @@ extension PlayerEngine {
     func containerFrameRate() -> Double { 0 }
     func mediaDurationSeconds() -> Double { 0 }
     func currentSubDelaySeconds() -> Double { 0 }
+    func playbackDiagnostics() -> PlaybackDiagnostics { PlaybackDiagnostics() }
 
     /// Default 0 for any engine that doesn't override (the wall-clock capture driver falls back to the
     /// chrome's own `currentTime` when this is 0). Both concrete engines override with the real position.

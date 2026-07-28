@@ -1817,6 +1817,38 @@ final class MPVMetalViewController: PlatformViewController {
         return Int(data)
     }
 
+    /// Optional property reads used only by the low-rate performance receipt.
+    /// Unlike the player-facing helpers, these preserve "unsupported" as nil.
+    private func diagnosticDouble(_ name: String) -> Double? {
+        guard mpv != nil else { return nil }
+        var value = Double()
+        guard mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &value) >= 0,
+              value.isFinite else { return nil }
+        return value
+    }
+
+    private func diagnosticInt(_ name: String) -> Int? {
+        guard mpv != nil else { return nil }
+        var value = Int64()
+        guard mpv_get_property(mpv, name, MPV_FORMAT_INT64, &value) >= 0 else { return nil }
+        return Int(value)
+    }
+
+    private func diagnosticFlag(_ name: String) -> Bool? {
+        guard mpv != nil else { return nil }
+        var value = Int32()
+        guard mpv_get_property(mpv, name, MPV_FORMAT_FLAG, &value) >= 0 else { return nil }
+        return value > 0
+    }
+
+    private func diagnosticString(_ name: String) -> String? {
+        guard mpv != nil else { return nil }
+        guard let cString = mpv_get_property_string(mpv, name) else { return nil }
+        defer { mpv_free(cString) }
+        let value = String(cString: cString)
+        return value.isEmpty ? nil : value
+    }
+
     private func setString(_ name: String, _ value: String) {
         guard mpv != nil else { return }
         mpv_set_property_string(mpv, name, value)
@@ -2254,6 +2286,33 @@ final class MPVMetalViewController: PlatformViewController {
         let speed = getDouble("speed")
         if speed > 0, abs(speed - 1) > 0.01 { rows.append(("Speed", "\(speed.formatted())×")) }
         return rows
+    }
+
+    /// Read a larger mpv evidence set once per receipt interval. No property is
+    /// observed and no playback option is changed, so unsupported builds simply
+    /// report nil for that field.
+    func playbackDiagnostics() -> PlaybackDiagnostics {
+        PlaybackDiagnostics(
+            frameDropCount: diagnosticInt("frame-drop-count"),
+            decoderFrameDropCount: diagnosticInt("decoder-frame-drop-count"),
+            mistimedFrameCount: diagnosticInt("mistimed-frame-count"),
+            delayedFrameCount: diagnosticInt("vo-delayed-frame-count"),
+            avSync: diagnosticDouble("avsync"),
+            totalAVSyncChange: diagnosticDouble("total-avsync-change"),
+            pausedForCache: diagnosticFlag("paused-for-cache"),
+            cacheUnderrun: diagnosticFlag("demuxer-cache-state/underrun"),
+            cacheIdle: diagnosticFlag("demuxer-cache-state/idle"),
+            cacheBufferingPercent: diagnosticInt("cache-buffering-state"),
+            cacheDuration: diagnosticDouble("demuxer-cache-duration"),
+            hardwareDecoder: diagnosticString("hwdec-current"),
+            estimatedVideoFPS: diagnosticDouble("estimated-vf-fps"),
+            containerFPS: diagnosticDouble("container-fps"),
+            displayFPS: diagnosticDouble("display-fps"),
+            videoSyncMode: diagnosticString("video-sync"),
+            videoSpeedCorrection: diagnosticDouble("video-speed-correction"),
+            audioSpeedCorrection: diagnosticDouble("audio-speed-correction"),
+            audioOutput: diagnosticString("current-ao")
+        )
     }
 
     /// Re-apply the current subtitle appearance to a running player (used after a settings change).

@@ -301,7 +301,10 @@ enum CommunityTrickplay {
         intervalS: Double,
         frames: [CapturedFrame]
     ) async -> UploadOutcome {
-        guard isEnabled else { return .failed }
+        guard isEnabled,
+              TrickplayOwnedWorkGate.permitsStage(
+                  taskIsCancelled: Task.isCancelled
+              ) else { return .failed }
         let sorted = frames.sorted { $0.time < $1.time }
         // Store even a tiny capture (>=1 frame); the owner asked that even ~5s of coverage be kept + served.
         // Frame bounds come from the RemoteConfig `trickplay.minFrames`/`maxFrames` dials (clamped min 1..10,
@@ -341,6 +344,9 @@ enum CommunityTrickplay {
         var budget = min(sorted.count, maxTiles)
         var picked: (jpeg: Data, count: Int, cols: Int, interval: Double)?
         while budget >= 2 {
+            guard TrickplayOwnedWorkGate.permitsStage(
+                taskIsCancelled: Task.isCancelled
+            ) else { return .failed }
             let stride = sorted.count > budget ? Int(ceil(Double(sorted.count) / Double(budget))) : 1
             let effective = stride > 1
                 ? sorted.enumerated().compactMap { $0.offset % stride == 0 ? $0.element : nil }
@@ -357,6 +363,9 @@ enum CommunityTrickplay {
             }
             var fit: Data?
             for q in [0.7, 0.5, 0.4] {
+                guard TrickplayOwnedWorkGate.permitsStage(
+                    taskIsCancelled: Task.isCancelled
+                ) else { return .failed }
                 if let d = composed.jpegData(quality: CGFloat(q)), d.count <= maxBytes { fit = d; break }
             }
             if let fit {
@@ -386,6 +395,9 @@ enum CommunityTrickplay {
             "cols": picked.cols,
             "src_height": srcHeight,
         ]
+        guard TrickplayOwnedWorkGate.permitsStage(
+            taskIsCancelled: Task.isCancelled
+        ) else { return .failed }
         return await post(key: key, sprite: picked.jpeg, vtt: vtt, meta: meta)
     }
 
@@ -405,6 +417,9 @@ enum CommunityTrickplay {
         ctx.interpolationQuality = .medium
 
         for (i, frame) in frames.enumerated() {
+            guard TrickplayOwnedWorkGate.permitsStage(
+                taskIsCancelled: Task.isCancelled
+            ) else { return nil }
             guard let src = ScrubImage(data: frame.jpeg)?.cgImageForCrop else { continue }
             let col = i % cols
             let row = i / cols
@@ -443,7 +458,10 @@ enum CommunityTrickplay {
     /// `.rejected(reason)` (the Worker's `reason`, e.g. below_coverage_threshold or a keep-fuller race); a
     /// transport error, a non-200, or a body we cannot build is `.failed`. Never throws.
     private static func post(key: String, sprite: Data, vtt: String, meta: [String: Any]) async -> UploadOutcome {
-        guard let url = URL(string: "\(baseURL)/tp/\(key)"),
+        guard TrickplayOwnedWorkGate.permitsStage(
+                  taskIsCancelled: Task.isCancelled
+              ),
+              let url = URL(string: "\(baseURL)/tp/\(key)"),
               let metaJSON = try? JSONSerialization.data(withJSONObject: meta),
               let metaString = String(data: metaJSON, encoding: .utf8) else { return .failed }
 
