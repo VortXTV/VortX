@@ -45,8 +45,14 @@ struct PlayerModel {
     var backTargetVideoId: String         // 5. nav origin (detail page under the player)
 
     // Publish-at-first-frame machinery (mirror of PendingEpisodeAdvance):
-    struct Pending { let videoId: String; var url: String?; var issued: Bool }
+    struct Pending {
+        let videoId: String
+        var url: String?
+        var issued: Bool
+        var terminal = false
+    }
     var pending: Pending?
+    var superseded: Pending?
     var hasStartedPlaying = true
 
     var engineWritesOpen: Bool { enginePlayerVideoId == curMetaVideoId }
@@ -72,6 +78,7 @@ struct PlayerModel {
     /// the incoming file's first frame and commits the advance + the store record atomically.
     mutating func tick() {
         if !hasStartedPlaying {
+            if superseded != nil { return }
             if let p = pending, !p.issued { return }            // outgoing-resolve tick: skip start block
             hasStartedPlaying = true
             if let p = pending {                                 // FIRST-FRAME COMMIT
@@ -97,6 +104,34 @@ struct PlayerModel {
     mutating func foreground() -> Bool {
         guard let p = pending, p.issued, !hasStartedPlaying, p.url != nil else { return false }
         return true   // load re-issued for p.url; a later tick() commits
+    }
+
+    /// Mirror of a reentrant episode selection while the prior replacement is issued but has not first-framed.
+    /// The newer resolve owns the deadline, while the exact active pending identity remains restorable.
+    mutating func beginReplacementResolve() {
+        if let pending, pending.issued, !pending.terminal {
+            superseded = pending
+            self.pending = nil
+        }
+    }
+
+    /// Mirror of exact terminal routing while the issued physical load is owned by superseded.
+    mutating func markActiveReplacementTerminal() {
+        if superseded != nil {
+            superseded?.terminal = true
+        } else {
+            pending?.terminal = true
+        }
+    }
+
+    /// Mirror of the newer resolve deadline: clear only its unresolved work, then restore the exact issued
+    /// pending load whose token still owns the player.
+    mutating func replacementResolveTimedOut() {
+        pending = nil
+        if let superseded, !superseded.terminal {
+            pending = superseded
+        }
+        self.superseded = nil
     }
 
     /// Mirror of the detail-page re-anchor (dismissal AND foreground triggers): Back target follows
@@ -194,6 +229,40 @@ do {
     p.curURL = e18b.url; p.pending?.url = e18b.url; p.pending?.issued = true   // mirror of switchStream's pending update
     p.tick()
     expect(p.store == StoreEntry(videoId: e18.id, url: e18b.url), "mid-advance hop: store records the hopped-to file under E18")
+}
+
+// 6. An E19 request begins while issued E18 has not first-framed, then E19 resolution times out.
+//    The timeout must restore E18's exact pending identity before E18's first frame can commit.
+do {
+    var p = freshPlayerParkedOnE17()
+    p.advance(to: e18)
+    p.resolveLanded(e18, issue: true)
+    p.beginReplacementResolve()
+    p.replacementResolveTimedOut()
+    p.tick()
+    expect(
+        p.curMetaVideoId == e18.id
+            && p.curURL == e18.url
+            && p.store == StoreEntry(videoId: e18.id, url: e18.url),
+        "reentrant timeout: issued E18 first frame commits under E18, never outgoing E17"
+    )
+}
+
+// 7. E18 terminates while E19 is resolving. The timeout must not restore the terminal E18 snapshot.
+do {
+    var p = freshPlayerParkedOnE17()
+    p.advance(to: e18)
+    p.resolveLanded(e18, issue: true)
+    p.beginReplacementResolve()
+    p.markActiveReplacementTerminal()
+    p.replacementResolveTimedOut()
+    expect(
+        p.pending == nil
+            && p.superseded == nil
+            && p.curMetaVideoId == e17.id
+            && p.store == StoreEntry(videoId: e17.id, url: e17.url),
+        "reentrant terminal timeout: terminal E18 is never revived or published as a first frame"
+    )
 }
 
 print(failures == 0 ? "\nALL PASS" : "\n\(failures) FAILURE(S)")

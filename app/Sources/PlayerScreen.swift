@@ -1187,6 +1187,29 @@ struct PlayerScreen: View {
                 sessionToken: playbackSessionID
             )
         }
+        publishAcceptedDurationSideEffectsIfNeeded(
+            loadToken: loadToken, durationSeconds: duration
+        )
+    }
+
+    private func publishAcceptedDurationSideEffectsIfNeeded(
+        loadToken: PlayerLoadToken?,
+        durationSeconds: Double
+    ) {
+        let acceptedOwner = assetSanityAttempt.isAccepted(owner: loadToken) ? loadToken : nil
+        guard EpisodicAssetSanityPolicy.canPublishDurationSideEffects(
+            callbackOwner: loadToken,
+            acceptedOwner: acceptedOwner,
+            durationSeconds: durationSeconds
+        ) else { return }
+        if let m = curMeta {
+            scrubThumbnails.configureCommunity(
+                imdbId: m.libraryId, season: m.season, episode: m.episode,
+                duration: durationSeconds, isRealDuration: true
+            )
+        }
+        refreshSubFingerprint(force: true)
+        fetchPooledSubtitles()
     }
 
     private func cancelAssetSanityObservationDeadline() {
@@ -1460,6 +1483,12 @@ struct PlayerScreen: View {
                         return
                     }
                     let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: event.loadToken)
+                    if assetSanityAccepted {
+                        suppressedResumeFloor = DeferredResumeFloorPolicy.floorAfterAcceptedPlayback(
+                            currentFloor: suppressedResumeFloor,
+                            positionSeconds: d
+                        )
+                    }
                     // Durationless-stream fallback (mirrors TVPlayerView): many debrid direct-HTTP MKVs
                     // never DELIVER mpv's `duration` EVENT, yet the property reads fine - and the resume
                     // seek, the ~5s progress pushes, and watched-at-90% all key off `duration > 0`, so
@@ -1564,16 +1593,12 @@ struct PlayerScreen: View {
                     }
                 }
                 refreshSkipSegments()
-                // Community trickplay: re-key on the REAL playback duration (authoritative bucket) and
-                // unblock uploads. Capture already started from the provisional meta.runtime key, so a
-                // debrid MKV that never delivers this event still captures + can upload.
-                if d > 0, let m = curMeta {
-                    scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode,
-                                                       duration: d, isRealDuration: true)
-                }
-                // The real duration sharpens the release fingerprint: rebuild it and re-fetch the pool so the
-                // rip-matched community sync offset seeds this exact encode (P3). Fail-soft + gated inside.
-                if d > 0 { refreshSubFingerprint(force: true); fetchPooledSubtitles() }
+                // The real duration sharpens the community trickplay key and subtitle release fingerprint,
+                // but only after the exact load has passed asset sanity. A rejected short preview can share the
+                // episode's local cache key, so publishing its duration here would poison the replacement load.
+                publishAcceptedDurationSideEffectsIfNeeded(
+                    loadToken: loadToken, durationSeconds: d
+                )
                 if let loadToken,
                    assetSanityDeferredStartToken == loadToken,
                    !settleAssetSanityIfPossible(
@@ -2447,6 +2472,7 @@ struct PlayerScreen: View {
     /// later dismissal can each call this. Same shape as the debrid-crash straddle root cause
     /// (stop-before-dismiss): engine down first, then the surface state change.
     private func presentTerminalLoadFailure() {
+        deferredResumeAttempt.invalidate()
         TerminalLoadFailurePolicy.presentTerminal(
             retire: {
                 guard TerminalLoadFailurePolicy.shouldRetireBeforePublish(
@@ -2931,36 +2957,80 @@ struct PlayerScreen: View {
     /// Restore a source-timeline position after an in-place load. A remux consumes that origin before mount,
     /// so this waits for its authoritative achieved keyframe and never seeks into forward-only bytes. Other
     /// engines keep the ordinary post-load absolute seek.
-    @State private var pendingResume: Double?
+    @State private var deferredResumeAttempt = DeferredResumeAttempt()
     private func nudgeResume(to seconds: Double) {
-        pendingResume = seconds
+        let ticket = deferredResumeAttempt.begin(targetSeconds: seconds)
+        if let floor = DeferredResumeFloorPolicy.armedFloor(
+            targetSeconds: ticket.targetSeconds
+        ) {
+            suppressedResumeFloor = max(suppressedResumeFloor ?? 0, floor)
+            lastReported = max(lastReported, suppressedResumeFloor ?? floor)
+        }
         Task { @MainActor in
-            for _ in 0..<240 {
+            for _ in 0..<DeferredResumePolicy.maximumPollCount {
                 try? await Task.sleep(for: .milliseconds(500))
-                guard !Task.isCancelled, pendingResume == seconds else { return }
+                guard !Task.isCancelled, deferredResumeAttempt.owns(ticket) else { return }
                 if let av = coordinator.player as? AVPlayerEngineController, av.isRemuxMounted {
                     guard let origin = av.achievedRemuxTimelineOriginSeconds else { continue }
-                    switch RemuxResumePolicy.preStartSeek(target: seconds, origin: origin) {
+                    switch RemuxResumePolicy.preStartSeek(
+                        target: ticket.targetSeconds, origin: origin
+                    ) {
                     case .satisfied:
                         suppressedResumeFloor = nil
                         currentTime = origin
                         lastReported = origin
                     case .unreachable:
-                        suppressedResumeFloor = seconds
-                        lastReported = seconds
+                        suppressedResumeFloor = ticket.targetSeconds
+                        lastReported = ticket.targetSeconds
                         showEngineNotice("That resume point is unavailable for this source. Playing from the earliest available position.")
                     }
-                    pendingResume = nil
+                    _ = deferredResumeAttempt.complete(ticket)
                     return
                 }
-                if duration > seconds + 5 {
-                    coordinator.player?.seek(to: seconds)
-                    currentTime = seconds
+                let decision = DeferredResumePolicy.decision(
+                    targetSeconds: ticket.targetSeconds,
+                    observedDurationSeconds: duration,
+                    engineDurationSeconds: coordinator.player?.mediaDurationSeconds() ?? 0,
+                    deadlineReached: false
+                )
+                switch decision {
+                case .wait:
+                    continue
+                case .seek(let target):
+                    coordinator.player?.seek(to: target)
+                    currentTime = target
+                case .clear:
+                    break
                 }
-                pendingResume = nil
+                let ownedFloor = suppressedResumeFloor == ticket.targetSeconds
+                suppressedResumeFloor = DeferredResumeFloorPolicy.floorAfterDecision(
+                    currentFloor: suppressedResumeFloor,
+                    targetSeconds: ticket.targetSeconds,
+                    decision: decision
+                )
+                if decision == .clear, ownedFloor {
+                    lastReported = currentTime
+                }
+                _ = deferredResumeAttempt.complete(ticket)
                 return
             }
-            pendingResume = nil
+            guard deferredResumeAttempt.owns(ticket),
+                  DeferredResumePolicy.decision(
+                    targetSeconds: ticket.targetSeconds,
+                    observedDurationSeconds: duration,
+                    engineDurationSeconds: coordinator.player?.mediaDurationSeconds() ?? 0,
+                    deadlineReached: true
+                  ) == .clear else { return }
+            let ownedFloor = suppressedResumeFloor == ticket.targetSeconds
+            suppressedResumeFloor = DeferredResumeFloorPolicy.floorAfterDecision(
+                currentFloor: suppressedResumeFloor,
+                targetSeconds: ticket.targetSeconds,
+                decision: .clear
+            )
+            if ownedFloor {
+                lastReported = currentTime
+            }
+            _ = deferredResumeAttempt.complete(ticket)
         }
     }
 
@@ -3049,11 +3119,11 @@ struct PlayerScreen: View {
         }
         exhaustedURLs = tried
         sourceHops += 1
-        if resume > 5 { nudgeResume(to: resume) }
         return true
     }
 
     private func resetRuntimeForIssuedSourceSwitch(userInitiated: Bool, explicitPick: Bool) {
+        deferredResumeAttempt.invalidate()
         currentPickWasExplicit = explicitPick
         currentPlaybackIsResume = false
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
@@ -3419,6 +3489,7 @@ struct PlayerScreen: View {
         episodeSwitchGeneration &+= 1
         episodeResolveGeneration = nil
         resumeRetryGeneration &+= 1
+        deferredResumeAttempt.invalidate()
         autoRetryTask?.cancel()
         pendingAdvance = nil
         supersededAdvance = nil
@@ -3483,6 +3554,21 @@ struct PlayerScreen: View {
     /// chrome stays put and only the video reloads, the same feel as an in-player source switch.
     private func goToEpisode(_ videoId: String, autoAdvance: Bool = false) {
         guard let loadEpisode, !playbackExited else { return }
+        if let pending = pendingAdvance,
+           IssuedPendingEpisodeReentryPolicy.shouldPreserve(
+            issued: pending.issued, terminal: pending.terminal
+           ),
+           PlayerLoadProvenanceState.accepts(
+            callbackToken: pending.loadToken,
+            activeToken: coordinator.player?.activeLoadToken
+           ) {
+            supersededAdvance = SupersededEpisodeAdvance(
+                pending: pending, source: currentEpisodeSourceSnapshot()
+            )
+            // Move the active uncommitted load instead of copying it. Terminal callbacks during the newer
+            // resolve now update the one superseded owner, so a timeout cannot revive a stale non-terminal copy.
+            pendingAdvance = nil
+        }
         switchingEpisode = true
         episodeSwitchGeneration &+= 1
         let episodeGeneration = episodeSwitchGeneration
@@ -3511,6 +3597,7 @@ struct PlayerScreen: View {
                 if !playbackExited, episodeGeneration == episodeSwitchGeneration {
                     invalidateEpisodeResolution()
                     episodeResolveGeneration = nil
+                    if restoreSupersededAdvance() { return }
                     let healthyPending = pendingAdvance != nil && pendingAdvance?.terminal != true
                     switchingEpisode = healthyPending
                     reconnecting = healthyPending
@@ -3521,6 +3608,7 @@ struct PlayerScreen: View {
                 invalidateEpisodeResolution()
                 episodeResolveGeneration = nil
                 srcProbe("goToEpisode(\(videoId)) resolve returned nil (autoAdvance=\(autoAdvance ? "Y" : "N"))")
+                if restoreSupersededAdvance() { return }
                 if pendingAdvance?.terminal == true {
                     switchingEpisode = false
                     reconnecting = false; buffering = false
@@ -3553,6 +3641,7 @@ struct PlayerScreen: View {
             ) else {
                 invalidateEpisodeResolution()
                 episodeResolveGeneration = nil
+                if restoreSupersededAdvance() { return }
                 if pendingAdvance?.terminal == true {
                     switchingEpisode = false
                     reconnecting = false; buffering = false
@@ -4781,6 +4870,9 @@ struct PlayerScreen: View {
     /// P2/P3: fetch pooled community subtitles + the learned sync offset for this title, then (P3) seed the
     /// offset onto the player once. Gated + fail-soft inside the client. De-duped per content key.
     private func fetchPooledSubtitles() {
+        guard assetSanityAttempt.isAccepted(
+            owner: coordinator.player?.activeLoadToken
+        ) else { return }
         guard let contentKey = communityContentKey else { return }
         refreshSubFingerprint()
         let fp = subFingerprint

@@ -53,6 +53,121 @@ struct TrickplayIdentityGeneration: Equatable, Sendable {
     }
 }
 
+enum DeferredResumePolicy {
+    static let maximumPollCount = 240
+
+    enum Decision: Equatable {
+        case wait
+        case seek(to: Double)
+        case clear
+    }
+
+    /// A source switch may publish its duration later than the first polling tick. Keep waiting while both
+    /// duration views are unknown, prefer the surface's committed value when present, and use the engine's
+    /// direct property only as the durationless-event fallback.
+    static func decision(
+        targetSeconds: Double,
+        observedDurationSeconds: Double,
+        engineDurationSeconds: Double,
+        deadlineReached: Bool
+    ) -> Decision {
+        guard !deadlineReached,
+              targetSeconds.isFinite,
+              targetSeconds > 5 else { return .clear }
+        let duration: Double
+        if observedDurationSeconds.isFinite, observedDurationSeconds > 0 {
+            duration = observedDurationSeconds
+        } else if engineDurationSeconds.isFinite, engineDurationSeconds > 0 {
+            duration = engineDurationSeconds
+        } else {
+            return .wait
+        }
+        return duration > targetSeconds + 5 ? .seek(to: targetSeconds) : .clear
+    }
+}
+
+enum DeferredResumeFloorPolicy {
+    /// Arm the persistence fence synchronously with the deferred seek. A low first-frame or exit callback can
+    /// otherwise overwrite the saved resume before the next polling tick observes a usable duration.
+    static func armedFloor(targetSeconds: Double) -> Double? {
+        guard targetSeconds.isFinite, targetSeconds > 5 else { return nil }
+        return targetSeconds
+    }
+
+    /// Issuing a seek is not proof that the engine reached it. Keep the floor through wait and seek outcomes,
+    /// and clear it only when the target is explicitly abandoned.
+    static func floorAfterDecision(
+        currentFloor: Double?,
+        targetSeconds: Double,
+        decision: DeferredResumePolicy.Decision
+    ) -> Double? {
+        guard currentFloor == targetSeconds else { return currentFloor }
+        if decision == .clear { return nil }
+        return currentFloor
+    }
+
+    /// A provenance-gated player tick at or beyond the floor is the first authoritative proof that the seek
+    /// landed. Until then every lower progress value remains fenced from persistence.
+    static func floorAfterAcceptedPlayback(
+        currentFloor: Double?,
+        positionSeconds: Double
+    ) -> Double? {
+        guard let currentFloor,
+              positionSeconds.isFinite,
+              positionSeconds >= currentFloor else { return currentFloor }
+        return nil
+    }
+
+    static func allowsPersistence(positionSeconds: Double, currentFloor: Double?) -> Bool {
+        guard positionSeconds.isFinite else { return false }
+        guard let currentFloor else { return true }
+        return positionSeconds >= currentFloor
+    }
+}
+
+/// One logical deferred seek owns one generation, even when a replacement asks for the same second. This
+/// prevents an older polling task from becoming valid again merely because the target value was reused.
+struct DeferredResumeAttempt: Equatable, Sendable {
+    struct Ticket: Equatable, Sendable {
+        fileprivate let generation: UInt64
+        let targetSeconds: Double
+    }
+
+    private(set) var generation: UInt64 = 0
+    private(set) var targetSeconds: Double?
+
+    mutating func begin(targetSeconds: Double) -> Ticket {
+        generation &+= 1
+        let sanitized = targetSeconds.isFinite ? max(0, targetSeconds) : 0
+        self.targetSeconds = sanitized
+        return Ticket(generation: generation, targetSeconds: sanitized)
+    }
+
+    mutating func invalidate() {
+        generation &+= 1
+        targetSeconds = nil
+    }
+
+    func owns(_ ticket: Ticket) -> Bool {
+        generation == ticket.generation && targetSeconds == ticket.targetSeconds
+    }
+
+    @discardableResult
+    mutating func complete(_ ticket: Ticket) -> Bool {
+        guard owns(ticket) else { return false }
+        targetSeconds = nil
+        return true
+    }
+}
+
+enum IssuedPendingEpisodeReentryPolicy {
+    /// An issued, non-terminal replacement still owns the active player token until first frame. Preserve it
+    /// before a newer episode resolve starts so a timeout can restore that exact pending identity.
+    static func shouldPreserve(issued: Bool, terminal: Bool) -> Bool {
+        issued && !terminal
+    }
+}
+
 enum EpisodicAssetSanityPolicy {
     static let incompleteEvidenceGraceSeconds: Double = 5
 
@@ -128,6 +243,17 @@ enum EpisodicAssetSanityPolicy {
             return .hop(originalResumeSeconds: max(0, originalResumeSeconds))
         }
         return .showMismatch
+    }
+
+    /// Duration-derived shared keys and release fingerprints may publish only for the exact load whose sanity
+    /// verdict is accepted. This keeps a rejected preview's short runtime out of the real episode's stores.
+    static func canPublishDurationSideEffects<Token: Equatable>(
+        callbackOwner: Token?,
+        acceptedOwner: Token?,
+        durationSeconds: Double
+    ) -> Bool {
+        guard let callbackOwner, callbackOwner == acceptedOwner else { return false }
+        return durationSeconds.isFinite && durationSeconds > 0
     }
 
     /// EOF may close an incomplete-evidence window only after the exact load has rendered a

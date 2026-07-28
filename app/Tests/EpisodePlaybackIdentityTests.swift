@@ -182,6 +182,10 @@ private struct EpisodeTransactionHarness {
     var savedVideoIDs: [String] = []
 
     mutating func beginResolve(_ videoID: String) -> Int {
+        if let pending, pending.issued, !pending.terminal {
+            superseded = pending
+            self.pending = nil
+        }
         generation += 1
         resolvingVideoID = videoID
         return generation
@@ -196,20 +200,10 @@ private struct EpisodeTransactionHarness {
             capturedVideoID: videoID, currentVideoID: resolvingVideoID
         ) else { return false }
 
-        if let pending, pending.issued {
-            superseded = pending
-            self.pending = nil
-        }
         resolvingVideoID = nil
 
         guard commandAccepted else {
-            if let superseded, !superseded.terminal, superseded.token == activeToken {
-                pending = superseded
-                physicalSource = superseded.source
-                boundEngineVideoID = superseded.source.engineVideoID
-                self.superseded = nil
-            }
-            persistenceBlocked = pending?.issued == true || self.superseded?.issued == true
+            restoreSupersededIfHealthy()
             return false
         }
 
@@ -228,9 +222,24 @@ private struct EpisodeTransactionHarness {
             capturedVideoID: videoID, currentVideoID: resolvingVideoID
         ) else { return }
         resolvingVideoID = nil
-        if pending?.terminal == true || superseded?.terminal == true {
-            persistenceBlocked = true
+        restoreSupersededIfHealthy()
+    }
+
+    mutating func timeoutResolve(videoID: String, generation capturedGeneration: Int) {
+        resolveNil(videoID: videoID, generation: capturedGeneration)
+    }
+
+    private mutating func restoreSupersededIfHealthy() {
+        let terminalSeen = pending?.terminal == true || superseded?.terminal == true
+        if let superseded, !superseded.terminal, superseded.token == activeToken {
+            pending = superseded
+            physicalSource = superseded.source
+            boundEngineVideoID = superseded.source.engineVideoID
         }
+        superseded = nil
+        persistenceBlocked = persistenceBlocked
+            || terminalSeen
+            || pending?.issued == true
     }
 
     mutating func handleTerminal(_ callbackToken: PlayerLoadToken) -> EpisodePlaybackIdentity.TerminalEventRoute {
@@ -971,15 +980,16 @@ private struct EpisodePlaybackIdentityTests {
             source: transactionE3Source, token: terminalE3Token, commandAccepted: true
         )
         let terminalE4Generation = terminalPending.beginResolve(e4ID)
-        expect(terminalPending.handleEOF(terminalE3Token) == .pending,
-               "transaction: E3 terminal during E4 resolve routes to exact pending E3")
-        terminalPending.resolveNil(videoID: e4ID, generation: terminalE4Generation)
+        expect(terminalPending.handleEOF(terminalE3Token) == .superseded,
+               "transaction: E3 terminal during E4 resolve routes to its one superseded owner")
+        terminalPending.timeoutResolve(videoID: e4ID, generation: terminalE4Generation)
         expect(!terminalPending.commitFirstFrame(terminalE3Token)
-               && terminalPending.pending?.terminal == true
+               && terminalPending.pending == nil
+               && terminalPending.superseded == nil
                && terminalPending.completedVideoIDs.isEmpty
                && terminalPending.publishedVideoID == e2ID
                && terminalPending.persistenceBlocked,
-               "transaction: E4 nil cannot revive terminal E3 or persist mixed E2/E3 state")
+               "transaction: E4 timeout cannot revive terminal E3 or persist mixed E2/E3 state")
 
         // E4 resolves but its player command is rejected. Restore every source field of healthy physical E3,
         // retain the exact E3 token, and keep persistence blocked until E3 really first-frames.

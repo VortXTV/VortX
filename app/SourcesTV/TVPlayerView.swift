@@ -1052,6 +1052,29 @@ struct TVPlayerView: View {
                 sessionToken: playbackSessionID
             )
         }
+        publishAcceptedDurationSideEffectsIfNeeded(
+            loadToken: loadToken, durationSeconds: duration
+        )
+    }
+
+    private func publishAcceptedDurationSideEffectsIfNeeded(
+        loadToken: PlayerLoadToken?,
+        durationSeconds: Double
+    ) {
+        let acceptedOwner = assetSanityAttempt.isAccepted(owner: loadToken) ? loadToken : nil
+        guard EpisodicAssetSanityPolicy.canPublishDurationSideEffects(
+            callbackOwner: loadToken,
+            acceptedOwner: acceptedOwner,
+            durationSeconds: durationSeconds
+        ) else { return }
+        if let m = curMeta {
+            scrubThumbnails.configureCommunity(
+                imdbId: m.libraryId, season: m.season, episode: m.episode,
+                duration: durationSeconds, isRealDuration: true
+            )
+        }
+        refreshSubFingerprint(force: true)
+        fetchPooledSubtitles()
     }
 
     private func cancelAssetSanityObservationDeadline() {
@@ -1482,16 +1505,12 @@ struct TVPlayerView: View {
         case MPVProperty.duration:
             if let d = data as? Double {
                 duration = d; maybeResume(); refreshSkipSegments(); fetchSkipTimestamps(); fetchAddonSubtitles()
-                // Community trickplay: re-key on the REAL playback duration (this is the authoritative bucket)
-                // and unblock uploads. Capture already started from onAppear's provisional runtime key, so a
-                // debrid MKV that never delivers this event still captures + can upload via the provisional key.
-                if d > 0, let m = curMeta {
-                    scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode,
-                                                       duration: d, isRealDuration: true)
-                }
-                // The real duration sharpens the release fingerprint: rebuild it and re-fetch the pool so the
-                // rip-matched community sync offset seeds this exact encode (P3). Fail-soft + gated inside.
-                if d > 0 { refreshSubFingerprint(force: true); fetchPooledSubtitles() }
+                // The real duration sharpens the community trickplay key and subtitle release fingerprint,
+                // but only after the exact load has passed asset sanity. A rejected short preview can share the
+                // episode's local cache key, so publishing its duration here would poison the replacement load.
+                publishAcceptedDurationSideEffectsIfNeeded(
+                    loadToken: loadToken, durationSeconds: d
+                )
                 if let loadToken,
                    assetSanityDeferredStartToken == loadToken,
                    !settleAssetSanityIfPossible(
@@ -4540,6 +4559,9 @@ struct TVPlayerView: View {
     /// P2/P3: fetch pooled community subtitles + the learned sync offset for this title, then (P3) seed the
     /// offset onto the player once. Gated + fail-soft inside the client. De-duped per content key + fingerprint.
     private func fetchPooledSubtitles() {
+        guard assetSanityAttempt.isAccepted(
+            owner: coordinator.player?.activeLoadToken
+        ) else { return }
         guard let contentKey = communityContentKey else { return }
         refreshSubFingerprint()
         let fp = subFingerprint

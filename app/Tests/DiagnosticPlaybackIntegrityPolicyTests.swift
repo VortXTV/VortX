@@ -17,6 +17,12 @@ private enum DiagnosticPlaybackIntegrityPolicyTests {
         testTrickplayIdentityGates()
         testEOFFailOpenRequiresFirstFrameOwnership()
         testMismatchRecovery()
+        testDeferredResumeDelivery()
+        testDeferredResumePersistenceFloor()
+        testDeferredResumeGenerationOwnership()
+        testMismatchRecoveryDeliversOriginalResume()
+        testAcceptedDurationSideEffectOwnership()
+        testIssuedPendingEpisodeReentryOwnership()
         print("DiagnosticPlaybackIntegrityPolicyTests: \(passed)/\(passed) passed")
     }
 
@@ -448,6 +454,228 @@ private enum DiagnosticPlaybackIntegrityPolicyTests {
                 originalResumeSeconds: 5_400
             ) == .showMismatch,
             "an automatic mismatch with no alternative surfaces the mismatch"
+        )
+    }
+
+    private static func testDeferredResumeDelivery() {
+        expect(
+            DeferredResumePolicy.decision(
+                targetSeconds: 5_400,
+                observedDurationSeconds: 0,
+                engineDurationSeconds: 0,
+                deadlineReached: false
+            ) == .wait,
+            "an unknown duration keeps the resume pending"
+        )
+        expect(
+            DeferredResumePolicy.decision(
+                targetSeconds: 5_400,
+                observedDurationSeconds: 0,
+                engineDurationSeconds: 7_200,
+                deadlineReached: false
+            ) == .seek(to: 5_400),
+            "the engine duration can release a resume when the surface duration is still unknown"
+        )
+        expect(
+            DeferredResumePolicy.decision(
+                targetSeconds: 5_400,
+                observedDurationSeconds: 5_405,
+                engineDurationSeconds: 7_200,
+                deadlineReached: false
+            ) == .clear,
+            "a known near-end target clears without seeking"
+        )
+        expect(
+            DeferredResumePolicy.decision(
+                targetSeconds: 5_400,
+                observedDurationSeconds: 0,
+                engineDurationSeconds: 0,
+                deadlineReached: true
+            ) == .clear,
+            "the bounded deadline clears an unresolved resume"
+        )
+    }
+
+    private static func testDeferredResumePersistenceFloor() {
+        var floor = DeferredResumeFloorPolicy.armedFloor(targetSeconds: 5_400)
+        expect(
+            floor == 5_400,
+            "arming a delayed resume immediately installs its persistence floor"
+        )
+        floor = DeferredResumeFloorPolicy.floorAfterDecision(
+            currentFloor: floor,
+            targetSeconds: 5_400,
+            decision: .wait
+        )
+        expect(
+            floor == 5_400
+                && !DeferredResumeFloorPolicy.allowsPersistence(
+                    positionSeconds: 1, currentFloor: floor
+                ),
+            "a low first frame cannot persist while delayed resume waits for duration"
+        )
+        floor = DeferredResumeFloorPolicy.floorAfterDecision(
+            currentFloor: floor,
+            targetSeconds: 5_400,
+            decision: .seek(to: 5_400)
+        )
+        expect(
+            floor == 5_400,
+            "issuing the seek retains the floor until playback confirms it landed"
+        )
+        floor = DeferredResumeFloorPolicy.floorAfterAcceptedPlayback(
+            currentFloor: floor,
+            positionSeconds: 5_399
+        )
+        expect(
+            floor == 5_400,
+            "a pre-target playback tick cannot release the persistence floor"
+        )
+        floor = DeferredResumeFloorPolicy.floorAfterAcceptedPlayback(
+            currentFloor: floor,
+            positionSeconds: 5_400
+        )
+        expect(
+            floor == nil
+                && DeferredResumeFloorPolicy.allowsPersistence(
+                    positionSeconds: 5_400, currentFloor: floor
+                ),
+            "the exact accepted post-seek tick releases persistence"
+        )
+        let abandoned = DeferredResumeFloorPolicy.floorAfterDecision(
+            currentFloor: 5_400,
+            targetSeconds: 5_400,
+            decision: .clear
+        )
+        expect(
+            abandoned == nil,
+            "an explicit invalid-target or deadline clear retires its own floor"
+        )
+        expect(
+            DeferredResumeFloorPolicy.floorAfterDecision(
+                currentFloor: 7_200,
+                targetSeconds: 5_400,
+                decision: .clear
+            ) == 7_200,
+            "a stale clear cannot retire another resume floor"
+        )
+    }
+
+    private static func testDeferredResumeGenerationOwnership() {
+        var attempt = DeferredResumeAttempt()
+        let first = attempt.begin(targetSeconds: 5_400)
+        let replacement = attempt.begin(targetSeconds: 5_400)
+        expect(
+            !attempt.owns(first) && attempt.owns(replacement),
+            "a newer same-target generation retires the stale resume task"
+        )
+        expect(
+            !attempt.complete(first),
+            "a stale generation cannot complete the replacement resume"
+        )
+        expect(
+            attempt.complete(replacement),
+            "the current generation completes once"
+        )
+        expect(
+            !attempt.complete(replacement),
+            "a completed resume cannot seek twice"
+        )
+    }
+
+    private static func testMismatchRecoveryDeliversOriginalResume() {
+        guard case .hop(let originalResume) = EpisodicAssetSanityPolicy.recovery(
+            explicitPick: false,
+            continueWatching: true,
+            hasAlternative: true,
+            originalResumeSeconds: 5_400
+        ) else {
+            fatalError("automatic mismatch must hop")
+        }
+        var attempt = DeferredResumeAttempt()
+        let ticket = attempt.begin(targetSeconds: originalResume)
+        expect(
+            DeferredResumePolicy.decision(
+                targetSeconds: ticket.targetSeconds,
+                observedDurationSeconds: 0,
+                engineDurationSeconds: 0,
+                deadlineReached: false
+            ) == .wait,
+            "mismatch recovery retains the original resume through slow source startup"
+        )
+        expect(
+            DeferredResumePolicy.decision(
+                targetSeconds: ticket.targetSeconds,
+                observedDurationSeconds: 7_200,
+                engineDurationSeconds: 0,
+                deadlineReached: false
+            ) == .seek(to: 5_400),
+            "mismatch recovery delivers the original 5400-second resume once duration arrives"
+        )
+        expect(
+            attempt.complete(ticket),
+            "the delivered mismatch resume completes its exact generation"
+        )
+    }
+
+    private static func testAcceptedDurationSideEffectOwnership() {
+        let current = Token(value: 1)
+        let stale = Token(value: 2)
+        expect(
+            !EpisodicAssetSanityPolicy.canPublishDurationSideEffects(
+                callbackOwner: current,
+                acceptedOwner: nil,
+                durationSeconds: 120
+            ),
+            "preview duration side effects wait until asset sanity accepts the load"
+        )
+        expect(
+            !EpisodicAssetSanityPolicy.canPublishDurationSideEffects(
+                callbackOwner: stale,
+                acceptedOwner: current,
+                durationSeconds: 3_600
+            ),
+            "a stale load cannot publish duration-keyed community state"
+        )
+        expect(
+            EpisodicAssetSanityPolicy.canPublishDurationSideEffects(
+                callbackOwner: current,
+                acceptedOwner: current,
+                durationSeconds: 3_600
+            ),
+            "the exact accepted load may publish duration-keyed community state"
+        )
+        expect(
+            !EpisodicAssetSanityPolicy.canPublishDurationSideEffects(
+                callbackOwner: current,
+                acceptedOwner: current,
+                durationSeconds: 0
+            ),
+            "a non-positive duration cannot publish duration-keyed community state"
+        )
+    }
+
+    private static func testIssuedPendingEpisodeReentryOwnership() {
+        expect(
+            IssuedPendingEpisodeReentryPolicy.shouldPreserve(
+                issued: true,
+                terminal: false
+            ),
+            "an issued uncommitted episode is preserved before a newer resolve starts"
+        )
+        expect(
+            !IssuedPendingEpisodeReentryPolicy.shouldPreserve(
+                issued: false,
+                terminal: false
+            ),
+            "an unissued pending episode has no active player command to preserve"
+        )
+        expect(
+            !IssuedPendingEpisodeReentryPolicy.shouldPreserve(
+                issued: true,
+                terminal: true
+            ),
+            "a terminal pending episode is not restored"
         )
     }
 }
