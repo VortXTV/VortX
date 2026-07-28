@@ -125,6 +125,46 @@ private func usesAllSeasonDirectResume(_ rootSource: String) -> Bool {
         && !episodeList.contains(".filter { ($0.season ?? 1) == season }")
 }
 
+private func usesGenerationOwnedRetryResume(_ playerSource: String) -> Bool {
+    let helper = slice(
+        playerSource, from: "private func loadRetryIntoPlayer(",
+        to: "/// A pre-playback failure"
+    )
+    let sameSource = slice(
+        playerSource, from: "private func retryResumeSameSource()",
+        to: "private func handleLoadFailure("
+    )
+    let retryLoad = slice(
+        playerSource, from: "private func retryLoad(",
+        to: "/// REQ-260721-78 option A"
+    )
+    let foreground = slice(
+        playerSource, from: "private func reconcileAdvanceOnForeground()",
+        to: "private var bufferingOverlay"
+    )
+    return containsInOrder(helper, [
+        "loadIntoPlayer(",
+        "resumeOrigin: resumeTarget",
+        "if !live && resumeTarget > 5",
+        "nudgeResume(to: resumeTarget)",
+    ])
+        && containsInOrder(sameSource, [
+            "guard let retryLoadToken = coordinator.player?.activeLoadToken else { return false }",
+            "let retryResume = retryResumeTarget()",
+            "coordinator.player?.activeLoadToken == retryLoadToken",
+            "loadRetryIntoPlayer(",
+        ])
+        && containsInOrder(retryLoad, [
+            "let resume = retryResumeTarget()",
+            "loadRetryIntoPlayer(",
+        ])
+        && containsInOrder(foreground, [
+            "PlayerLoadProvenanceState.accepts(",
+            "let resume = retryResumeTarget()",
+            "loadRetryIntoPlayer(",
+        ])
+}
+
 private func stream(hash: String, fileIdx: Int?) -> CoreStream {
     var json: [String: Any] = ["infoHash": hash, "name": "Season pack"]
     if let fileIdx { json["fileIdx"] = fileIdx }
@@ -370,6 +410,11 @@ private struct EpisodePlaybackIdentityTests {
             currentEpisodeIndex: s1FinaleIndex,
             episodeCount: fullSeries.count
         ), "S1 finale is not terminal when the resident direct-resume list includes S2E1")
+        let playerScreenSource = source("Sources/PlayerScreen.swift")
+        expect(
+            usesGenerationOwnedRetryResume(playerScreenSource),
+            "PlayerScreen retries and foreground reissue all use generation-owned deferred resume delivery"
+        )
         let rootSource = source("SourcesiOS/iOSRootView.swift")
         expect(usesAllSeasonDirectResume(rootSource),
                "iOS direct resume wires the full all-season list into labels and resolver")
@@ -544,6 +589,9 @@ private struct EpisodePlaybackIdentityTests {
         expect(!PlayerLoadProvenanceState.accepts(
             callbackToken: queuedOutgoingCallback, activeToken: mpvState.activeToken
         ), "queued mpv callback from the invalidated load is rejected")
+        expect(!PlayerLoadProvenanceState.accepts(
+            callbackToken: nil, activeToken: nil
+        ), "foreground reconcile cannot treat two absent load tokens as ownership")
         expect(PlayerLoadProvenanceState.canCommit(
             callbackToken: incomingToken, activeToken: mpvState.activeToken,
             pendingToken: incomingToken

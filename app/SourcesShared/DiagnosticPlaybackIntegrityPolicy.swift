@@ -125,6 +125,54 @@ enum DeferredResumeFloorPolicy {
     }
 }
 
+enum RetryResumeTargetPolicy {
+    /// Select the requested origin only when its attempt has a provable owner. A native terminal failure
+    /// retires the exact active token before presenting Retry, so that one recorded retirement remains valid
+    /// while the engine has no active token. A newer active token always wins and rejects the retired owner.
+    static func ownedRequestedResume<Owner: Equatable>(
+        activeOwner: Owner?,
+        attemptOwner: Owner?,
+        terminalRetiredOwner: Owner?,
+        requestedResumeSeconds: Double
+    ) -> Double? {
+        guard let attemptOwner else { return nil }
+        if let activeOwner {
+            guard activeOwner == attemptOwner else { return nil }
+        } else {
+            guard terminalRetiredOwner == attemptOwner else { return nil }
+        }
+        return requestedResumeSeconds
+    }
+
+    /// A pre-first-frame retry belongs to the active load's requested origin, not necessarily the immutable
+    /// launch resume. Source hops and pending episode loads can each carry a different requested origin.
+    static func target(
+        isLive: Bool,
+        hasStartedPlaying: Bool,
+        currentTimeSeconds: Double,
+        activeRequestedResumeSeconds: Double?,
+        fallbackResumeSeconds: Double,
+        persistenceFloorSeconds: Double?
+    ) -> Double {
+        guard !isLive else { return 0 }
+        let requested: Double
+        if hasStartedPlaying {
+            requested = sanitized(currentTimeSeconds)
+        } else if let activeRequestedResumeSeconds,
+                  activeRequestedResumeSeconds.isFinite {
+            requested = sanitized(activeRequestedResumeSeconds)
+        } else {
+            requested = sanitized(fallbackResumeSeconds)
+        }
+        return max(requested, sanitized(persistenceFloorSeconds ?? 0))
+    }
+
+    private static func sanitized(_ seconds: Double) -> Double {
+        guard seconds.isFinite else { return 0 }
+        return max(0, seconds)
+    }
+}
+
 /// One logical deferred seek owns one generation, even when a replacement asks for the same second. This
 /// prevents an older polling task from becoming valid again merely because the target value was reused.
 struct DeferredResumeAttempt: Equatable, Sendable {

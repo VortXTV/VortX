@@ -19,6 +19,7 @@ private enum DiagnosticPlaybackIntegrityPolicyTests {
         testMismatchRecovery()
         testDeferredResumeDelivery()
         testDeferredResumePersistenceFloor()
+        testRetryResumeDeliveryAfterInitialLatch()
         testDeferredResumeGenerationOwnership()
         testMismatchRecoveryDeliversOriginalResume()
         testAcceptedDurationSideEffectOwnership()
@@ -558,6 +559,140 @@ private enum DiagnosticPlaybackIntegrityPolicyTests {
                 decision: .clear
             ) == 7_200,
             "a stale clear cannot retire another resume floor"
+        )
+    }
+
+    private static func testRetryResumeDeliveryAfterInitialLatch() {
+        let appliedInitialResume = true
+        let owner = Token(value: 1)
+        let newerOwner = Token(value: 2)
+        expect(
+            RetryResumeTargetPolicy.ownedRequestedResume(
+                activeOwner: Optional<Token>.none,
+                attemptOwner: Optional<Token>.none,
+                terminalRetiredOwner: Optional<Token>.none,
+                requestedResumeSeconds: 5_400
+            ) == nil,
+            "nil owner equality cannot revive stale retry state"
+        )
+        expect(
+            RetryResumeTargetPolicy.ownedRequestedResume(
+                activeOwner: owner,
+                attemptOwner: owner,
+                terminalRetiredOwner: nil,
+                requestedResumeSeconds: 5_400
+            ) == 5_400,
+            "the exact active attempt owns its requested retry origin"
+        )
+        expect(
+            RetryResumeTargetPolicy.ownedRequestedResume(
+                activeOwner: Optional<Token>.none,
+                attemptOwner: owner,
+                terminalRetiredOwner: owner,
+                requestedResumeSeconds: 5_400
+            ) == 5_400,
+            "manual Retry preserves the exact source-hop origin after native terminal retirement"
+        )
+        expect(
+            RetryResumeTargetPolicy.ownedRequestedResume(
+                activeOwner: newerOwner,
+                attemptOwner: owner,
+                terminalRetiredOwner: owner,
+                requestedResumeSeconds: 5_400
+            ) == nil,
+            "a newer active command rejects a previously retired attempt owner"
+        )
+        let retryTarget = RetryResumeTargetPolicy.target(
+            isLive: false,
+            hasStartedPlaying: false,
+            currentTimeSeconds: 0,
+            activeRequestedResumeSeconds: 5_400,
+            fallbackResumeSeconds: 120,
+            persistenceFloorSeconds: nil
+        )
+        expect(
+            appliedInitialResume && retryTarget == 5_400,
+            "a consumed initial-resume latch cannot replace the active load's retry origin"
+        )
+
+        var attempt = DeferredResumeAttempt()
+        let ticket = attempt.begin(targetSeconds: retryTarget)
+        var floor = DeferredResumeFloorPolicy.armedFloor(
+            targetSeconds: ticket.targetSeconds
+        )
+        let unknownDuration = DeferredResumePolicy.decision(
+            targetSeconds: ticket.targetSeconds,
+            observedDurationSeconds: 0,
+            engineDurationSeconds: 0,
+            deadlineReached: false
+        )
+        floor = DeferredResumeFloorPolicy.floorAfterDecision(
+            currentFloor: floor,
+            targetSeconds: ticket.targetSeconds,
+            decision: unknownDuration
+        )
+        expect(
+            unknownDuration == .wait
+                && !DeferredResumeFloorPolicy.allowsPersistence(
+                    positionSeconds: 2, currentFloor: floor
+                ),
+            "an initially durationless retry blocks low progress persistence"
+        )
+
+        let laterDuration = DeferredResumePolicy.decision(
+            targetSeconds: ticket.targetSeconds,
+            observedDurationSeconds: 0,
+            engineDurationSeconds: 7_200,
+            deadlineReached: false
+        )
+        floor = DeferredResumeFloorPolicy.floorAfterDecision(
+            currentFloor: floor,
+            targetSeconds: ticket.targetSeconds,
+            decision: laterDuration
+        )
+        expect(
+            laterDuration == .seek(to: 5_400)
+                && floor == 5_400
+                && attempt.complete(ticket),
+            "a later engine duration delivers the exact retry resume once and retains its floor"
+        )
+        expect(
+            !attempt.complete(ticket),
+            "the accepted retry cannot deliver its deferred seek twice"
+        )
+
+        expect(
+            RetryResumeTargetPolicy.target(
+                isLive: false,
+                hasStartedPlaying: false,
+                currentTimeSeconds: 0,
+                activeRequestedResumeSeconds: 3_600,
+                fallbackResumeSeconds: 900,
+                persistenceFloorSeconds: 5_400
+            ) == 5_400,
+            "an existing forward-only persistence floor remains the highest retry authority"
+        )
+        expect(
+            RetryResumeTargetPolicy.target(
+                isLive: false,
+                hasStartedPlaying: true,
+                currentTimeSeconds: 2_400,
+                activeRequestedResumeSeconds: 5_400,
+                fallbackResumeSeconds: 900,
+                persistenceFloorSeconds: nil
+            ) == 2_400,
+            "a started playback retry resumes from its live clock instead of a stale requested origin"
+        )
+        expect(
+            RetryResumeTargetPolicy.target(
+                isLive: true,
+                hasStartedPlaying: false,
+                currentTimeSeconds: 0,
+                activeRequestedResumeSeconds: 5_400,
+                fallbackResumeSeconds: 900,
+                persistenceFloorSeconds: 5_400
+            ) == 0,
+            "a live retry never inherits a stale VOD origin or persistence floor"
         )
     }
 

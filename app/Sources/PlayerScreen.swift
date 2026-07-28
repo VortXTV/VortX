@@ -238,6 +238,7 @@ struct PlayerScreen: View {
     @State private var assetSanityAttempt = EpisodicAssetSanityAttempt<PlayerLoadToken>()
     @State private var assetSanityTrackListToken: PlayerLoadToken?
     @State private var assetSanityRequestedResume = 0.0
+    @State private var terminalRetiredAssetSanityOwner: PlayerLoadToken?
     @State private var assetSanityDeferredStartToken: PlayerLoadToken?
     @State private var assetSanityDeferredStartPosition = 0.0
     @State private var assetSanityStartEffectsToken: PlayerLoadToken?
@@ -1133,6 +1134,7 @@ struct PlayerScreen: View {
         guard loadToken == coordinator.player?.activeLoadToken,
               assetSanityAttempt.owner != loadToken else { return }
         assetSanityAttempt.begin(owner: loadToken)
+        terminalRetiredAssetSanityOwner = nil
         assetSanityTrackListToken = nil
         assetSanityRequestedResume = max(0, requestedResumeOrigin)
         assetSanityDeferredStartToken = nil
@@ -2256,6 +2258,45 @@ struct PlayerScreen: View {
         return issuedToken
     }
 
+    /// Capture the resume origin owned by the exact active load before replacing it. An unframed source hop or
+    /// episode advance can differ from the immutable launch resume, while a started load resumes from its live
+    /// clock. The persistence floor remains authoritative when a forward-only engine has not reached it yet.
+    private func retryResumeTarget() -> Double {
+        let activeLoadToken = coordinator.player?.activeLoadToken
+        let activeRequestedResume = RetryResumeTargetPolicy.ownedRequestedResume(
+            activeOwner: activeLoadToken,
+            attemptOwner: assetSanityAttempt.owner,
+            terminalRetiredOwner: terminalRetiredAssetSanityOwner,
+            requestedResumeSeconds: assetSanityRequestedResume
+        )
+        return RetryResumeTargetPolicy.target(
+            isLive: isLive,
+            hasStartedPlaying: hasStartedPlaying,
+            currentTimeSeconds: currentTime,
+            activeRequestedResumeSeconds: activeRequestedResume,
+            fallbackResumeSeconds: resumeSeconds,
+            persistenceFloorSeconds: suppressedResumeFloor
+        )
+    }
+
+    /// Every accepted same-source reload re-arms the generation-owned deferred seek. `resumeOrigin` alone is
+    /// meaningful to the native remux lane; libmpv intentionally ignores configureResumeOrigin.
+    @discardableResult
+    private func loadRetryIntoPlayer(
+        _ u: URL,
+        headers: [String: String]?,
+        live: Bool,
+        resumeTarget: Double
+    ) -> PlayerLoadToken? {
+        guard let issuedToken = loadIntoPlayer(
+            u, headers: headers, live: live, resumeOrigin: resumeTarget
+        ) else { return nil }
+        if !live && resumeTarget > 5 {
+            nudgeResume(to: resumeTarget)
+        }
+        return issuedToken
+    }
+
     /// A pre-playback failure (an endFileError before the first frame). For a torrent, the engine simply
     /// isn't warm yet so a quick retry won't help - warm it up (poll peers/bytes) then reload. Otherwise
     /// auto-retry a couple of times, then hop to another source, then show the manual error overlay.
@@ -2283,6 +2324,8 @@ struct PlayerScreen: View {
         let targetVideoID = retryMeta?.videoId
         let retryURL = curURL
         let retrySource = currentStream
+        guard let retryLoadToken = coordinator.player?.activeLoadToken else { return false }
+        let retryResume = retryResumeTarget()
         resumeSourceReresolved = true
         // Fresh load state + in-place retry budget for a clean attempt at the SAME source; keep the resume offset.
         autoRetryCount = 0; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; bufferedTime = 0
@@ -2301,7 +2344,8 @@ struct PlayerScreen: View {
                     capturedGeneration: generation, currentGeneration: resumeRetryGeneration,
                     capturedVideoID: targetVideoID, currentVideoID: activeMeta?.videoId
                   ),
-                  activeRef == ref, curURL == retryURL, currentStream == retrySource else { return }
+                  activeRef == ref, curURL == retryURL, currentStream == retrySource,
+                  coordinator.player?.activeLoadToken == retryLoadToken else { return }
             if let fresh {
                 srcProbe("resume: re-selected the SAME source (fresh link) after the stored link expired")
                 reconnecting = false
@@ -2325,9 +2369,9 @@ struct PlayerScreen: View {
                         requestedVideoID: target.videoId, bindingSucceeded: succeeded
                     )
                 }
-                // resumeSeconds is the launch input (immutable) and the resume never started, so loadIntoPlayer
-                // applies the correct resume offset on its own.
-                let issuedToken = loadIntoPlayer(fresh, headers: curHeaders, live: isLive)
+                let issuedToken = loadRetryIntoPlayer(
+                    fresh, headers: curHeaders, live: isLive, resumeTarget: retryResume
+                )
                 if pendingAdvance != nil { pendingAdvance?.loadToken = issuedToken }
                 startLoadTimeout()
             } else {
@@ -2448,13 +2492,15 @@ struct PlayerScreen: View {
         }
         autoRetryTask?.cancel()
         srcProbe("retryLoad reload-in-place (resetAutoRetries=\(resetAutoRetries)) host=\((curURL ?? url).host ?? "-")")
-        let resume = hasStartedPlaying ? currentTime : resumeSeconds
+        let resume = retryResumeTarget()
         withAnimation { loadFailed = false }
         bufferedTime = 0   // reload: clear the buffered-ahead band so the buffer-grace watchdog re-baselines against the new fill, not the previous source's edge
         buffering = true; hasStartedPlaying = false; isSeekable = true; appliedSize = false; loadErrorMsg = ""
         subtitleLoadingURL = nil   // self-heal: a subtitle load stranded by the old engine must not gate the reload's picks
         srcProbeLoadStart = Date()   // [src-probe] a reload is a fresh attempt: re-anchor the elapsed clock
-        loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isLive, resumeOrigin: resume)
+        loadRetryIntoPlayer(
+            curURL ?? url, headers: curHeaders, live: isLive, resumeTarget: resume
+        )
         startLoadTimeout()
     }
 
@@ -2477,6 +2523,10 @@ struct PlayerScreen: View {
             retire: {
                 guard TerminalLoadFailurePolicy.shouldRetireBeforePublish(
                     engineIsNative: coordinator.player is AVPlayerEngineController) else { return }
+                if let activeLoadToken = coordinator.player?.activeLoadToken,
+                   assetSanityAttempt.owner == activeLoadToken {
+                    terminalRetiredAssetSanityOwner = activeLoadToken
+                }
                 srcProbe("terminal failure -> retiring AVPlayer engine BEFORE the overlay (option A)")
                 coordinator.player?.stop()
             },
@@ -3744,10 +3794,20 @@ struct PlayerScreen: View {
     /// Presentation NEVER moves here - the display only advances at the first-frame commit.
     private func reconcileAdvanceOnForeground() {
         guard let pending = pendingAdvance, pending.issued, !hasStartedPlaying, !loadFailed,
-              let u = pending.url else { return }
+              let u = pending.url,
+              // UIKit suspension does not invalidate either engine's active load token. Exact equality
+              // therefore proves this is still the half-open pending command. Nil or mismatch means there is
+              // no owned command to replace, so fail closed instead of stomping a newer load or torn-down view.
+              PlayerLoadProvenanceState.accepts(
+                callbackToken: pending.loadToken,
+                activeToken: coordinator.player?.activeLoadToken
+              ) else { return }
+        let resume = retryResumeTarget()
         srcProbe("foreground reconcile: re-issuing interrupted advance load for \(pending.meta.videoId)")
         buffering = true; reconnecting = true; reconnectMsg = "Loading episode…"
-        guard let loadToken = loadIntoPlayer(u, headers: curHeaders, live: isLive) else { return }
+        guard let loadToken = loadRetryIntoPlayer(
+            u, headers: curHeaders, live: isLive, resumeTarget: resume
+        ) else { return }
         pendingAdvance?.loadToken = loadToken
         startLoadTimeout()
     }
