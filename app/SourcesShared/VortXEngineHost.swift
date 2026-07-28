@@ -29,6 +29,20 @@ final class VortXEngineHost: @unchecked Sendable {
 
     static let shared = VortXEngineHost()
 
+    enum PairingOpenFailure: LocalizedError, Equatable, Sendable {
+        case disabled
+        case listenerUnavailable(port: Int)
+
+        var errorDescription: String? {
+            switch self {
+            case .disabled:
+                return "Turn on engine hosting before pairing a device."
+            case .listenerUnavailable(let port):
+                return "Could not start the engine host on port \(port). Check that the port is available, then try again."
+            }
+        }
+    }
+
     // MARK: - Persisted settings
 
     enum Defaults {
@@ -39,13 +53,14 @@ final class VortXEngineHost: @unchecked Sendable {
         static let fullTimelineKey = "vortx.engineHost.retainFullTimeline"
     }
 
-    /// Whether the host should be running. Setting it starts or stops the listener.
+    /// Whether the host should be running. Setting it records the preference immediately, then serializes the
+    /// corresponding lifecycle work away from the caller.
     var isEnabled: Bool {
         get { UserDefaults.standard.bool(forKey: Defaults.enabledKey) }
         set {
             guard newValue != isEnabled else { return }
             UserDefaults.standard.set(newValue, forKey: Defaults.enabledKey)
-            if newValue { _ = start() } else { stop() }
+            if newValue { startIfEnabledAsync() } else { stopAsync() }
         }
     }
 
@@ -83,9 +98,13 @@ final class VortXEngineHost: @unchecked Sendable {
     // MARK: - State
 
     private let queue = DispatchQueue(label: "vortx.enginehost.control")
+    private let listenerCallbackQueue = DispatchQueue(label: "vortx.enginehost.listener-callback")
+    private let lifecycleQueue = DispatchQueue(label: "vortx.enginehost.lifecycle")
     private let stateLock = NSLock()
     private var listener: NWListener?
-    private(set) var boundPort: UInt16 = 0
+    private var listenerReadiness: VortXEngineHostPolicy.ListenerReadiness = .stopped
+    private var lifecycleEpoch: UInt64 = 0
+    private var boundPortStorage: UInt16 = 0
     private var sessions: [String: HostedSession] = [:]
     private var pairing = VortXEnginePairingState()
     private var activityToken: NSObjectProtocol?
@@ -101,6 +120,10 @@ final class VortXEngineHost: @unchecked Sendable {
     static let sessionIdleTimeout: TimeInterval = 60
 
     let pairingRegistry: VortXEnginePairingRegistry
+
+    var boundPort: UInt16 {
+        stateLock.withLock { boundPortStorage }
+    }
 
     private init() {
         let stored = UserDefaults.standard.data(forKey: Defaults.devicesKey)
@@ -134,15 +157,124 @@ final class VortXEngineHost: @unchecked Sendable {
         }
     }
 
+    private final class ListenerStartReceipt: @unchecked Sendable {
+        enum Outcome {
+            case waiting
+            case ready(UInt16)
+            case failed
+        }
+
+        private let lock = NSLock()
+        private var outcome: Outcome = .waiting
+        private var didSignal = false
+        let signal = DispatchSemaphore(value: 0)
+
+        func record(_ next: Outcome) {
+            lock.lock()
+            outcome = next
+            let shouldSignal = !didSignal
+            didSignal = true
+            lock.unlock()
+            if shouldSignal { signal.signal() }
+        }
+
+        var snapshot: Outcome {
+            lock.lock(); defer { lock.unlock() }
+            return outcome
+        }
+    }
+
     // MARK: - Lifecycle
 
     /// Start the control listener. Idempotent, synchronous, and fail-soft: returns false rather than throwing
-    /// when the port is taken or the listener will not come up.
+    /// when the port is taken or the listener will not come up. The daemon uses this unconditional entry point.
     @discardableResult
     func start() -> Bool {
+        switch prepareStartRequest(requireEnabled: false) {
+        case .alreadyRunning:
+            return true
+        case .epoch(let epoch):
+            return lifecycleQueue.sync { startSerialized(epoch: epoch) }
+        case nil:
+            return false
+        }
+    }
+
+    /// Ordinary app-launch entry point. The persisted toggle is checked before requesting a lifecycle epoch,
+    /// and again indirectly by any later stop request invalidating that epoch.
+    func startIfEnabledAsync() {
+        guard let request = prepareStartRequest(requireEnabled: true) else { return }
+        switch request {
+        case .alreadyRunning:
+            return
+        case .epoch(let epoch):
+            lifecycleQueue.async { [weak self] in
+                _ = self?.startSerialized(epoch: epoch)
+            }
+        }
+    }
+
+    private enum StartRequest {
+        case alreadyRunning
+        case epoch(UInt64)
+    }
+
+    private func prepareStartRequest(requireEnabled: Bool) -> StartRequest? {
+        if requireEnabled, !isEnabled { return nil }
         stateLock.lock()
-        if listener != nil { stateLock.unlock(); return true }
+        if listener != nil, listenerReadiness == .ready, boundPortStorage != 0 {
+            stateLock.unlock()
+            return .alreadyRunning
+        }
+        lifecycleEpoch &+= 1
+        let epoch = lifecycleEpoch
+        listenerReadiness = .starting
         stateLock.unlock()
+        return .epoch(epoch)
+    }
+
+    private func ensureStartedIfEnabled() async -> Bool {
+        guard isEnabled else { return false }
+        return await withCheckedContinuation { continuation in
+            lifecycleQueue.async { [weak self] in
+                guard let self,
+                      let request = self.prepareStartRequest(requireEnabled: true) else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                switch request {
+                case .alreadyRunning:
+                    continuation.resume(returning: true)
+                case .epoch(let epoch):
+                    continuation.resume(returning: self.startSerialized(epoch: epoch))
+                }
+            }
+        }
+    }
+
+    /// Called only on `lifecycleQueue`. A stale result is cancelled rather than committed, which prevents an
+    /// in-flight bind from bringing the host back after a concurrent stop.
+    private func startSerialized(epoch: UInt64) -> Bool {
+        stateLock.lock()
+        guard VortXEngineHostPolicy.lifecycleResultIsCurrent(
+            requestEpoch: epoch,
+            currentEpoch: lifecycleEpoch
+        ) else {
+            stateLock.unlock()
+            return false
+        }
+        let staleListener = listener
+        let staleSessions = Array(sessions.values)
+        listener = nil
+        boundPortStorage = 0
+        sessions.removeAll()
+        pairing.close()
+        stateLock.unlock()
+        reaper?.cancel()
+        reaper = nil
+        staleListener?.cancel()
+        staleSessions.forEach { $0.server.invalidate() }
+        releaseActivityIfIdle()
 
         let port = controlPort
         do {
@@ -164,48 +296,131 @@ final class VortXEngineHost: @unchecked Sendable {
                 hostName: displayName,
                 controlPort: port,
                 capabilities: capabilities)
-            let ready = DispatchSemaphore(value: 0)
-            let portLock = NSLock()
-            var bound: UInt16 = 0
-            var failed = false
-            newListener.stateUpdateHandler = { state in
+            let receipt = ListenerStartReceipt()
+            newListener.stateUpdateHandler = { [weak self, weak newListener] state in
                 switch state {
                 case .ready:
-                    portLock.lock(); bound = newListener.port?.rawValue ?? 0; portLock.unlock()
-                    ready.signal()
+                    guard let newListener else {
+                        receipt.record(.failed)
+                        return
+                    }
+                    let port = newListener.port?.rawValue ?? 0
+                    receipt.record(port == 0 ? .failed : .ready(port))
                 case .failed, .cancelled:
-                    portLock.lock(); failed = true; portLock.unlock()
-                    ready.signal()
+                    receipt.record(.failed)
+                    if let self, let newListener {
+                        self.retireListenerIfCurrent(newListener)
+                    }
                 default: break
                 }
             }
-            newListener.start(queue: queue)
-            _ = ready.wait(timeout: .now() + 3)
-            portLock.lock(); let boundPortValue = bound; let didFail = failed; portLock.unlock()
-            guard !didFail, boundPortValue != 0 else {
+            // Listener state cannot share the control queue: a control request may synchronously enter the
+            // lifecycle queue while a lifecycle start waits for this readiness callback.
+            newListener.start(queue: listenerCallbackQueue)
+            _ = receipt.signal.wait(timeout: .now() + 3)
+            guard case .ready(let boundPortValue) = receipt.snapshot else {
                 newListener.cancel()
+                markStartFailedIfCurrent(epoch: epoch)
                 DiagnosticsLog.log("enginehost", "control listener failed to bind on :\(port)")
                 return false
             }
+
             stateLock.lock()
-            listener = newListener
-            boundPort = boundPortValue
+            let mayCommit = VortXEngineHostPolicy.lifecycleResultIsCurrent(
+                requestEpoch: epoch,
+                currentEpoch: lifecycleEpoch)
+            if mayCommit {
+                listener = newListener
+                listenerReadiness = .ready
+                boundPortStorage = boundPortValue
+            }
             stateLock.unlock()
+            guard mayCommit else {
+                newListener.cancel()
+                return false
+            }
             startReaper()
             DiagnosticsLog.log("enginehost", "control listening on 0.0.0.0:\(boundPortValue) name=\(displayName)")
             return true
         } catch {
+            markStartFailedIfCurrent(epoch: epoch)
             DiagnosticsLog.log("enginehost", "control listener start failed: \(error)")
             return false
         }
     }
 
+    private func markStartFailedIfCurrent(epoch: UInt64) {
+        stateLock.lock()
+        if VortXEngineHostPolicy.lifecycleResultIsCurrent(
+            requestEpoch: epoch,
+            currentEpoch: lifecycleEpoch
+        ) {
+            listenerReadiness = .stopped
+            boundPortStorage = 0
+            pairing.close()
+        }
+        stateLock.unlock()
+    }
+
+    private func retireListenerIfCurrent(_ failedListener: NWListener) {
+        lifecycleQueue.async { [weak self, weak failedListener] in
+            guard let self, let failedListener else { return }
+            self.stateLock.lock()
+            guard self.listener === failedListener else {
+                self.stateLock.unlock()
+                return
+            }
+            self.lifecycleEpoch &+= 1
+            self.listener = nil
+            self.listenerReadiness = .stopped
+            self.boundPortStorage = 0
+            self.pairing.close()
+            let open = Array(self.sessions.values)
+            self.sessions.removeAll()
+            self.stateLock.unlock()
+            self.reaper?.cancel()
+            self.reaper = nil
+            open.forEach { $0.server.invalidate() }
+            self.releaseActivityIfIdle()
+            DiagnosticsLog.log("enginehost", "control listener lost readiness, \(open.count) session(s) torn down")
+        }
+    }
+
     /// Stop the listener and tear down every hosted session. Idempotent.
     func stop() {
+        let epoch = prepareStopRequest()
+        lifecycleQueue.sync { stopSerialized(epoch: epoch) }
+    }
+
+    private func stopAsync() {
+        let epoch = prepareStopRequest()
+        lifecycleQueue.async { [weak self] in self?.stopSerialized(epoch: epoch) }
+    }
+
+    /// Invalidates an in-flight bind immediately. The serialized teardown then owns only this exact epoch.
+    private func prepareStopRequest() -> UInt64 {
         stateLock.lock()
+        lifecycleEpoch &+= 1
+        let epoch = lifecycleEpoch
+        listenerReadiness = .stopped
+        pairing.close()
+        stateLock.unlock()
+        return epoch
+    }
+
+    private func stopSerialized(epoch: UInt64) {
+        stateLock.lock()
+        guard VortXEngineHostPolicy.lifecycleResultIsCurrent(
+            requestEpoch: epoch,
+            currentEpoch: lifecycleEpoch
+        ) else {
+            stateLock.unlock()
+            return
+        }
         let current = listener
         listener = nil
-        boundPort = 0
+        listenerReadiness = .stopped
+        boundPortStorage = 0
         let open = Array(sessions.values)
         sessions.removeAll()
         stateLock.unlock()
@@ -218,7 +433,7 @@ final class VortXEngineHost: @unchecked Sendable {
 
     var isRunning: Bool {
         stateLock.lock(); defer { stateLock.unlock() }
-        return listener != nil
+        return listener != nil && listenerReadiness == .ready && boundPortStorage != 0
     }
 
     var activeSessionCount: Int {
@@ -241,13 +456,40 @@ final class VortXEngineHost: @unchecked Sendable {
 
     // MARK: - Pairing (owner side)
 
-    /// Open a pairing window and return the code to show the owner.
+    /// Open a pairing window only after the listener that redeems the code is ready.
     @discardableResult
-    func openPairing() -> String {
-        stateLock.lock(); defer { stateLock.unlock() }
-        let code = pairing.open(now: ProcessInfo.processInfo.systemUptime)
-        DiagnosticsLog.log("enginehost", "pairing window opened")
-        return code
+    func openPairing() async -> Result<String, PairingOpenFailure> {
+        guard isEnabled else {
+            DiagnosticsLog.log("enginehost", "pairing refused because host is disabled")
+            return .failure(.disabled)
+        }
+        guard await ensureStartedIfEnabled() else {
+            let failure: PairingOpenFailure = isEnabled
+                ? .listenerUnavailable(port: controlPort)
+                : .disabled
+            DiagnosticsLog.log("enginehost", "pairing refused because control listener is unavailable")
+            return .failure(failure)
+        }
+
+        return issuePairingCodeIfReady()
+    }
+
+    private func issuePairingCodeIfReady() -> Result<String, PairingOpenFailure> {
+        stateLock.withLock {
+            switch VortXEngineHostPolicy.pairingCodeDecision(
+                isEnabled: isEnabled,
+                listenerReadiness: listenerReadiness
+            ) {
+            case .issueCode:
+                let code = pairing.open(now: ProcessInfo.processInfo.systemUptime)
+                DiagnosticsLog.log("enginehost", "pairing window opened")
+                return .success(code)
+            case .refuseDisabled:
+                return .failure(.disabled)
+            case .refuseListenerDown:
+                return .failure(.listenerUnavailable(port: controlPort))
+            }
+        }
     }
 
     func closePairing() {
@@ -273,14 +515,25 @@ final class VortXEngineHost: @unchecked Sendable {
     /// exactly why the client-side failover exists and why it is not optional.
     private func acquireActivityIfNeeded() {
         stateLock.lock()
-        let needed = !sessions.isEmpty && activityToken == nil
+        let needed = VortXEngineHostPolicy.activityAcquisitionMayCommit(
+            hasSessions: !sessions.isEmpty,
+            alreadyHasToken: activityToken != nil)
         stateLock.unlock()
         guard needed else { return }
         let token = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled],
             reason: "VortX is producing a remux for another device on this network")
-        stateLock.lock(); activityToken = token; stateLock.unlock()
-        DiagnosticsLog.log("enginehost", "power assertion acquired")
+        stateLock.lock()
+        let mayCommit = VortXEngineHostPolicy.activityAcquisitionMayCommit(
+            hasSessions: !sessions.isEmpty,
+            alreadyHasToken: activityToken != nil)
+        if mayCommit { activityToken = token }
+        stateLock.unlock()
+        if mayCommit {
+            DiagnosticsLog.log("enginehost", "power assertion acquired")
+        } else {
+            ProcessInfo.processInfo.endActivity(token)
+        }
     }
 
     private func releaseActivityIfIdle() {
@@ -490,8 +743,17 @@ final class VortXEngineHost: @unchecked Sendable {
             return
         }
         stateLock.lock()
+        let openingEpoch = lifecycleEpoch
+        let listenerIsReady = listener != nil && listenerReadiness == .ready && boundPortStorage != 0
         let atCapacity = sessions.count >= Self.maximumSessions
         stateLock.unlock()
+        guard listenerIsReady else {
+            reply(connection, status: "503 Service Unavailable",
+                  body: VortXEngineProtocol.ErrorBody(
+                    error: "host_stopping",
+                    detail: "the engine host is stopping"))
+            return
+        }
         guard !atCapacity else {
             reply(connection, status: "503 Service Unavailable",
                   body: VortXEngineProtocol.ErrorBody(
@@ -526,9 +788,31 @@ final class VortXEngineHost: @unchecked Sendable {
         let id = UUID().uuidString.lowercased()
         let session = HostedSession(id: id, capability: capability, server: mounted.server,
                                     retainsFullTimeline: granted, now: now)
-        stateLock.lock(); sessions[id] = session; stateLock.unlock()
+        // Commit and start in the same serialized lifecycle operation, but never start the producer while
+        // holding the host state lock. A stop requested before this operation changes the epoch and rejects it;
+        // a stop requested after it is ordered behind the start and tears the committed session down.
+        let mayCommit = lifecycleQueue.sync {
+            stateLock.lock()
+            let accepted = VortXEngineHostPolicy.hostedSessionMayCommit(
+                openingEpoch: openingEpoch,
+                currentEpoch: lifecycleEpoch,
+                listenerReadiness: listenerReadiness)
+                && listener != nil
+                && sessions.count < Self.maximumSessions
+            if accepted { sessions[id] = session }
+            stateLock.unlock()
+            if accepted { mounted.server.start() }
+            return accepted
+        }
+        guard mayCommit else {
+            mounted.server.invalidate()
+            reply(connection, status: "503 Service Unavailable",
+                  body: VortXEngineProtocol.ErrorBody(
+                    error: "host_stopping",
+                    detail: "the engine host stopped while the session was opening"))
+            return
+        }
         acquireActivityIfNeeded()
-        mounted.server.start()
         DiagnosticsLog.log(
             "enginehost",
             "session \(id) hosting \(request.mode.rawValue) on media port \(mounted.server.port) retain=\(granted)\(wantsRetention && !granted ? " (requested but disk declined)" : "")")

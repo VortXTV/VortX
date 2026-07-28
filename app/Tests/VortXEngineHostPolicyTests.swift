@@ -252,7 +252,90 @@ check("host: a zero port is rejected",
 check("host: an out-of-range port is rejected",
       P.normalizeHost("host:70000") == nil)
 
-// MARK: - 5. Mount plan (the default-off gate)
+let authorityCases: [(name: String, host: String, port: Int, expected: String)] = [
+    ("hostname", "mac.local", 11471, "mac.local:11471"),
+    ("IPv4", "192.168.1.33", 11471, "192.168.1.33:11471"),
+    ("scoped IPv4 raw", "192.168.1.33%en0", 11471, "192.168.1.33%25en0:11471"),
+    ("scoped IPv4 encoded", "192.168.1.33%25en0", 11471, "192.168.1.33%25en0:11471"),
+    ("global IPv6", "2001:db8::1", 11471, "[2001:db8::1]:11471"),
+    ("scoped IPv6 raw", "fe80::1%en0", 11471, "[fe80::1%25en0]:11471"),
+    ("scoped IPv6 encoded", "fe80::1%25en0", 11471, "[fe80::1%25en0]:11471")
+]
+for fixture in authorityCases {
+    let rendered = P.authority(host: fixture.host, port: fixture.port)
+    check("authority: \(fixture.name) has one canonical rendering", rendered == fixture.expected)
+    let normalized = P.normalizeHost(rendered)
+    check("authority: \(fixture.name) normalize-render round trip is idempotent",
+          normalized.map { P.authority(host: $0.host, port: $0.port) } == rendered)
+    check("authority: \(fixture.name) builds a non-nil control URL",
+          P.httpURL(host: fixture.host, port: fixture.port, path: "/engine/v1/info")?.absoluteString
+            == "http://\(fixture.expected)/engine/v1/info")
+}
+
+check("authority: already bracketed IPv6 is not bracketed twice",
+      P.authority(host: "[fe80::1%25en0]", port: 11471) == "[fe80::1%25en0]:11471")
+for hostile in [
+    "owner@mac.local:11471",
+    "mac.local?peer=evil",
+    "mac.local#evil",
+    "mac.local\\@evil",
+    "mac.local\n.evil"
+] {
+    check("authority: hostile user authority is rejected: \(hostile.debugDescription)",
+          P.normalizeHost(hostile) == nil)
+}
+check("authority: direct URL construction also rejects userinfo",
+      P.httpURL(host: "owner@mac.local", port: 11471, path: "/engine/v1/info") == nil)
+check("authority: direct URL construction also rejects query and fragment delimiters",
+      P.httpURL(host: "mac.local?peer=evil", port: 11471, path: "/engine/v1/info") == nil
+        && P.httpURL(host: "mac.local#evil", port: 11471, path: "/engine/v1/info") == nil)
+
+// MARK: - 5. Host lifecycle and pairing
+
+check("pairing: a disabled host never issues a code",
+      P.pairingCodeDecision(isEnabled: false, listenerReadiness: .ready) == .refuseDisabled)
+check("pairing: an enabled but starting host never issues a code",
+      P.pairingCodeDecision(isEnabled: true, listenerReadiness: .starting) == .refuseListenerDown)
+check("pairing: an enabled host issues a code only after listener readiness",
+      P.pairingCodeDecision(isEnabled: true, listenerReadiness: .ready) == .issueCode)
+
+check("lifecycle: a bind result from the current epoch may commit",
+      P.lifecycleResultIsCurrent(requestEpoch: 8, currentEpoch: 8))
+check("lifecycle: a concurrent stop retires an in-flight bind result",
+      !P.lifecycleResultIsCurrent(requestEpoch: 8, currentEpoch: 9))
+check("lifecycle: a hosted session commits only on the current ready listener",
+      P.hostedSessionMayCommit(
+        openingEpoch: 12,
+        currentEpoch: 12,
+        listenerReadiness: .ready))
+check("lifecycle: stop/create generation mismatch rejects the producer commit",
+      !P.hostedSessionMayCommit(
+        openingEpoch: 12,
+        currentEpoch: 13,
+        listenerReadiness: .ready))
+check("lifecycle: a stopped listener rejects the producer commit even at the same epoch",
+      !P.hostedSessionMayCommit(
+        openingEpoch: 12,
+        currentEpoch: 12,
+        listenerReadiness: .stopped))
+check("lifecycle: rapid stop and restart reject the retired bind and session but accept the new generation",
+      !P.lifecycleResultIsCurrent(requestEpoch: 40, currentEpoch: 42)
+        && !P.hostedSessionMayCommit(
+            openingEpoch: 40,
+            currentEpoch: 42,
+            listenerReadiness: .ready)
+        && P.lifecycleResultIsCurrent(requestEpoch: 42, currentEpoch: 42)
+        && P.hostedSessionMayCommit(
+            openingEpoch: 42,
+            currentEpoch: 42,
+            listenerReadiness: .ready))
+check("lifecycle: an activity token commits only while a session still needs it",
+      P.activityAcquisitionMayCommit(hasSessions: true, alreadyHasToken: false)
+        && !P.activityAcquisitionMayCommit(hasSessions: false, alreadyHasToken: false))
+check("lifecycle: a concurrent activity acquisition cannot overwrite the winning token",
+      !P.activityAcquisitionMayCommit(hasSessions: true, alreadyHasToken: true))
+
+// MARK: - 6. Mount plan (the default-off gate)
 //
 // All three of userEnabled, killSwitchOn, and a valid host must hold, or the client stays on-device. Each is
 // tested false individually against the other two true, plus the all-true case.
@@ -267,7 +350,7 @@ check("mountplan: all three true yields an external mount",
       P.mountPlan(userEnabled: true, killSwitchOn: true, host: "192.168.1.33")
         == .external(host: "192.168.1.33", port: P.defaultControlPort))
 
-// MARK: - 6. Failover
+// MARK: - 7. Failover
 
 // The host's own diagnosis is authoritative and final: one unhealthy report fails over immediately, even at
 // zero accumulated control-plane failures.
@@ -280,7 +363,8 @@ check("failover: a nil report below the threshold keeps the remote mount",
       P.failover(consecutiveControlFailures: P.controlFailureThreshold - 1, hostReportsHealthy: nil)
         == .keepRemote)
 check("failover: a nil report exactly at the threshold fails over",
-      P.failover(consecutiveControlFailures: P.controlFailureThreshold, hostReportsHealthy: nil)
+      P.controlFailureThreshold == 3
+        && P.failover(consecutiveControlFailures: 3, hostReportsHealthy: nil)
         == .failOverToDevice)
 check("failover: a nil report above the threshold fails over",
       P.failover(consecutiveControlFailures: P.controlFailureThreshold + 5, hostReportsHealthy: nil)
@@ -298,12 +382,27 @@ check("failover: a healthy report with no accumulated failures keeps the remote 
 check("failover: a healthy report wins outright over a stale failure count",
       P.failover(consecutiveControlFailures: 999, hostReportsHealthy: true) == .keepRemote)
 
-// MARK: - 7. Remote readiness and exact ownership
+// MARK: - 8. Remote readiness and exact ownership
 
 check("readiness: no first status remains pending before the deadline",
       P.remoteReadiness(
         statusReceived: false, healthy: nil, initPublished: nil, failed: nil,
         signalingPublished: false, deadlineExpired: false) == .pending)
+
+check("readiness S0: status with no signal, init or failure remains pending",
+      P.remoteReadiness(
+        statusReceived: true, healthy: false, initPublished: false, failed: false,
+        signalingPublished: false, deadlineExpired: false) == .pending)
+
+check("readiness S1: signal without init remains pending",
+      P.remoteReadiness(
+        statusReceived: true, healthy: false, initPublished: false, failed: false,
+        signalingPublished: true, deadlineExpired: false) == .pending)
+
+check("readiness S2: signal plus init plus healthy becomes ready",
+      P.remoteReadiness(
+        statusReceived: true, healthy: true, initPublished: true, failed: false,
+        signalingPublished: true, deadlineExpired: false) == .ready)
 
 // An older host used healthy=false for both "init pending" and "failed before init". With neither optional
 // fact on the wire, that false stays pending under the bounded deadline.
@@ -311,6 +410,10 @@ check("readiness: legacy pre-init false is pending, not terminal",
       P.remoteReadiness(
         statusReceived: true, healthy: false, initPublished: nil, failed: nil,
         signalingPublished: false, deadlineExpired: false) == .pending)
+check("readiness: legacy pre-init false is bounded by the deadline",
+      P.remoteReadiness(
+        statusReceived: true, healthy: false, initPublished: nil, failed: nil,
+        signalingPublished: false, deadlineExpired: true) == .failed(.timeout))
 
 check("readiness: explicit terminal failure fails immediately",
       P.remoteReadiness(
@@ -383,7 +486,7 @@ check("callback ownership: same-token replacement rejects the retired session",
         mountedIdentity: mountB,
         emittingIdentity: mountA))
 
-// MARK: - 8. mountPath
+// MARK: - 9. mountPath
 
 check("mountpath: a bare resource name is mounted under /r/<capability>/",
       P.mountPath(capability: capA, resource: "master.m3u8") == "/r/\(capA)/master.m3u8")
@@ -393,7 +496,7 @@ check("mountpath: round-trips through route back to the bare resource path",
       P.route(header: "GET \(P.mountPath(capability: capA, resource: "master.m3u8")) HTTP/1.1", capability: capA)
         == .guarded(method: .get, path: "/master.m3u8", range: nil))
 
-// MARK: - 9. Forward buffer
+// MARK: - 10. Forward buffer
 
 check("buffer: local (loopback) origin uses the shipping 30s value",
       P.forwardBufferSeconds(remote: false) == 30)

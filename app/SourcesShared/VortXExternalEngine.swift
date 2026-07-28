@@ -148,12 +148,7 @@ final class VortXExternalEngine: @unchecked Sendable {
     /// Build a control URL against an explicit host. Takes the host as an argument rather than reading the
     /// stored one, so pairing (which happens BEFORE a host is committed to settings) uses the same code path.
     private func controlURL(host: String, port: Int, path: String) -> URL? {
-        var comps = URLComponents()
-        comps.scheme = "http"
-        comps.host = host
-        comps.port = port
-        comps.path = path
-        return comps.url
+        VortXEngineHostPolicy.httpURL(host: host, port: port, path: path)
     }
 
     private func request(_ url: URL, method: String, body: Data?, authorized: Bool) -> URLRequest {
@@ -214,7 +209,7 @@ final class VortXExternalEngine: @unchecked Sendable {
               let paired = await send(request(url, method: "POST", body: body, authorized: false),
                                       as: VortXEngineProtocol.PairResponse.self) else { return nil }
         Keychain.set(paired.token, for: Self.tokenAccount)
-        host = VortXEngineHostPolicy.normalizeHost(rawHost).map { "\($0.host):\($0.port)" } ?? rawHost
+        host = VortXEngineHostPolicy.authority(host: resolved.host, port: resolved.port)
         hostName = paired.hostName
         capabilities = paired.capabilities
         DiagnosticsLog.log("engine", "paired with host \(paired.hostName) caps=\(paired.capabilities.map(\.rawValue).joined(separator: ","))")
@@ -275,15 +270,17 @@ final class VortXExternalEngine: @unchecked Sendable {
             DiagnosticsLog.log("engine", "host session request failed; falling back to on-device")
             return nil
         }
-        var media = URLComponents()
-        media.scheme = "http"
-        media.host = hostString
-        media.port = opened.mediaPort
-        media.path = opened.mediaPath
-        guard let playlistURL = media.url else { return nil }
+        guard let playlistURL = VortXEngineHostPolicy.httpURL(
+            host: hostString,
+            port: opened.mediaPort,
+            path: opened.mediaPath
+        ) else { return nil }
+        let mediaAuthority = VortXEngineHostPolicy.authority(
+            host: hostString,
+            port: opened.mediaPort)
         DiagnosticsLog.log(
             "engine",
-            "host session \(opened.sessionID) media=\(hostString):\(opened.mediaPort) retain=\(opened.retainsFullTimeline)")
+            "host session \(opened.sessionID) media=\(mediaAuthority) retain=\(opened.retainsFullTimeline)")
         return OpenedSession(sessionID: opened.sessionID,
                              playlistURL: playlistURL,
                              retainsFullTimeline: opened.retainsFullTimeline,

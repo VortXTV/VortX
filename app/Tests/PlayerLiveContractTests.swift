@@ -2235,9 +2235,35 @@ enum PlayerLiveContractTests {
             .appendingPathComponent("SourcesTV/TVPlayerView.swift"), encoding: .utf8)
         let externalEngine = try? String(contentsOf: testsURL.deletingLastPathComponent()
             .appendingPathComponent("SourcesShared/VortXExternalEngine.swift"), encoding: .utf8)
+        let engineHost = try? String(contentsOf: testsURL.deletingLastPathComponent()
+            .appendingPathComponent("SourcesShared/VortXEngineHost.swift"), encoding: .utf8)
+        let iosApp = try? String(contentsOf: testsURL.deletingLastPathComponent()
+            .appendingPathComponent("SourcesiOS/VortXiOSApp.swift"), encoding: .utf8)
+        let iosSettings = try? String(contentsOf: testsURL.deletingLastPathComponent()
+            .appendingPathComponent("SourcesiOS/iOSSettingsView.swift"), encoding: .utf8)
         let remoteMount = try? String(
             contentsOf: playerURL.appendingPathComponent("VortXRemoteRemuxMount.swift"),
             encoding: .utf8)
+        let hostedSessionCommit = sourceSection(
+            engineHost,
+            from: "let mayCommit = lifecycleQueue.sync",
+            to: "guard mayCommit else")
+        let activityAcquisition = sourceSection(
+            engineHost,
+            from: "private func acquireActivityIfNeeded()",
+            to: "private func releaseActivityIfIdle()")
+        let listenerStart = sourceSection(
+            engineHost,
+            from: "let newListener = try NWListener",
+            to: "_ = receipt.signal.wait")
+        let acceptedConnection = sourceSection(
+            engineHost,
+            from: "private func accept(_ connection: NWConnection)",
+            to: "private func read(_ connection: NWConnection")
+        let pairingOpen = sourceSection(
+            engineHost,
+            from: "func openPairing() async",
+            to: "private func issuePairingCodeIfReady()")
         let initialAVMount = sourceSection(
             avPlayerView,
             from: "private func makeHostView()",
@@ -2821,11 +2847,57 @@ enum PlayerLiveContractTests {
                   && externalEngine?.contains(
                   "config.timeoutIntervalForResource = controlResourceTimeoutSeconds") == true
                   && remoteMount?.contains(
+                      "static let signallingTimeoutSeconds: Double = 12") == true
+                  && remoteMount?.contains(
                       "timeoutSeconds: Double = VortXRemoteRemuxMount.signallingTimeoutSeconds") == true
                   && tvPlayer?.contains(
                       "controlResourceTimeout: VortXExternalEngine.controlResourceTimeoutSeconds") == true
                   && tvPlayer?.contains(
                       "signallingTimeout: VortXRemoteRemuxMount.signallingTimeoutSeconds") == true)
+        check("wiring: an ordinary Mac launch restores the persisted engine host",
+              iosApp?.contains("#if os(macOS)") == true
+                  && iosApp?.contains("VortXEngineHost.shared.startIfEnabledAsync()") == true)
+        check("wiring: pairing starts the listener and surfaces an honest bind failure",
+              engineHost?.contains("guard await ensureStartedIfEnabled() else") == true
+                  && engineHost?.contains("case listenerUnavailable(port: Int)") == true
+                  && iosSettings?.contains("case .failure(let failure):") == true
+                  && iosSettings?.contains("enginePairingError = failure.errorDescription") == true)
+        check("wiring: hosted-session start is lifecycle-serialized but outside the host state lock",
+              sourceContainsInOrder(hostedSessionCommit, [
+                  "let mayCommit = lifecycleQueue.sync",
+                  "stateLock.lock()",
+                  "if accepted { sessions[id] = session }",
+                  "stateLock.unlock()",
+                  "if accepted { mounted.server.start() }",
+              ]))
+        check("wiring: a raced power assertion is either committed to a live session or ended",
+              sourceContainsInOrder(activityAcquisition, [
+                  "ProcessInfo.processInfo.beginActivity(",
+                  "let mayCommit = VortXEngineHostPolicy.activityAcquisitionMayCommit(",
+                  "if mayCommit { activityToken = token }",
+                  "ProcessInfo.processInfo.endActivity(token)",
+              ]))
+        check("wiring: listener readiness cannot deadlock behind control work entering lifecycle",
+              engineHost?.contains(
+                  "private let listenerCallbackQueue = DispatchQueue(label: \"vortx.enginehost.listener-callback\")")
+                  == true
+                  && sourceContainsInOrder(listenerStart, [
+                      "newListener.newConnectionHandler =",
+                      "self?.accept(connection)",
+                      "newListener.start(queue: listenerCallbackQueue)",
+                  ])
+                  && acceptedConnection?.contains("connection.start(queue: queue)") == true)
+        check("wiring: bound-port reads are state-lock synchronized",
+              engineHost?.contains("private var boundPortStorage: UInt16 = 0") == true
+                  && engineHost?.contains("stateLock.withLock { boundPortStorage }") == true
+                  && engineHost?.contains("private(set) var boundPort") == false)
+        check("wiring: async pairing never invokes unavailable lock operations",
+              pairingOpen?.contains("stateLock.lock()") == false
+                  && pairingOpen?.contains("return issuePairingCodeIfReady()") == true)
+        check("wiring: every external control and media URL uses the canonical authority helper",
+              externalEngine?.components(
+                  separatedBy: "VortXEngineHostPolicy.httpURL").count == 3
+                  && externalEngine?.contains("URLComponents") == false)
         check("wiring: display manager uses the success-aware request ledger",
               display?.contains("displayRequestLedger.begin") == true
                   && display?.contains("displayRequestLedger.complete") == true

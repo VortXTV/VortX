@@ -99,6 +99,50 @@ enum VortXEngineHostPolicy {
     /// host can run both without collision and a user cannot paste one into the other's field by accident.
     static let defaultControlPort = 11471
 
+    /// Canonical URL authority for every engine-host control and media request.
+    ///
+    /// Network.framework may report an interface-scoped address with either a raw zone delimiter (`%en0`) or
+    /// the URL-encoded form (`%25en0`). Canonicalising by decoding that delimiter once and encoding it once
+    /// makes this operation idempotent, so discovery, persistence and later URL construction cannot accumulate
+    /// `%2525`. IPv6 literals are bracketed; hostnames, IPv4 and interface-scoped IPv4 remain unbracketed.
+    static func authority(host rawHost: String, port: Int) -> String {
+        var host = rawHost
+        if host.hasPrefix("["), host.hasSuffix("]") {
+            host.removeFirst()
+            host.removeLast()
+        }
+        host = host.replacingOccurrences(of: "%25", with: "%", options: .caseInsensitive)
+        host = host.replacingOccurrences(of: "%", with: "%25")
+        return host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
+    }
+
+    /// Build an engine-host HTTP URL through the same authority renderer used by discovery and persistence.
+    /// `URLComponents.host` cannot represent a bracketed IPv6 literal, and setting a raw scoped host can
+    /// double-encode its zone, so the already-canonical authority is the single source of truth.
+    static func httpURL(host: String, port: Int, path: String) -> URL? {
+        guard port > 0, port <= 65535, isSafeHost(host) else { return nil }
+        let absolutePath = path.hasPrefix("/") ? path : "/" + path
+        return URL(string: "http://\(authority(host: host, port: port))\(absolutePath)")
+    }
+
+    /// Host text is interpolated into a URL authority only after URI delimiters and controls are excluded.
+    /// In particular, `@` must never turn a user-entered host into URL userinfo and silently change the peer.
+    private static func isSafeHost(_ rawHost: String) -> Bool {
+        var host = rawHost
+        let hasOpeningBracket = host.hasPrefix("[")
+        let hasClosingBracket = host.hasSuffix("]")
+        guard hasOpeningBracket == hasClosingBracket else { return false }
+        if hasOpeningBracket {
+            host.removeFirst()
+            host.removeLast()
+        }
+        guard !host.isEmpty, !host.contains("["), !host.contains("]") else { return false }
+        let forbidden = CharacterSet(charactersIn: "@/\\?#")
+            .union(.whitespacesAndNewlines)
+            .union(.controlCharacters)
+        return host.unicodeScalars.allSatisfy { !forbidden.contains($0) }
+    }
+
     /// Split a user-typed engine address into host + port. Accepts `192.168.1.33`, `192.168.1.33:11471`,
     /// `http://192.168.1.33:11471`, `mac.local`, and trailing slashes / whitespace. Returns nil for anything
     /// that is not a usable authority, which the caller treats as "not configured" (i.e. on-device).
@@ -137,8 +181,7 @@ enum VortXEngineHostPolicy {
             host = String(text[..<colon])
             port = parsed
         }
-        guard !host.isEmpty, port > 0, port <= 65535 else { return nil }
-        guard !host.contains(" ") else { return nil }
+        guard !host.isEmpty, port > 0, port <= 65535, isSafeHost(host) else { return nil }
         return (host, port)
     }
 
@@ -150,6 +193,52 @@ enum VortXEngineHostPolicy {
     static func mountPlan(userEnabled: Bool, killSwitchOn: Bool, host: String?) -> MountPlan {
         guard userEnabled, killSwitchOn, let resolved = normalizeHost(host) else { return .onDevice }
         return .external(host: resolved.host, port: resolved.port)
+    }
+
+    // MARK: - Host lifecycle and pairing
+
+    enum ListenerReadiness: Equatable {
+        case stopped
+        case starting
+        case ready
+    }
+
+    enum PairingCodeDecision: Equatable {
+        case issueCode
+        case refuseDisabled
+        case refuseListenerDown
+    }
+
+    /// A pairing code is useful only while the service that redeems it is reachable.
+    static func pairingCodeDecision(
+        isEnabled: Bool,
+        listenerReadiness: ListenerReadiness
+    ) -> PairingCodeDecision {
+        guard isEnabled else { return .refuseDisabled }
+        guard listenerReadiness == .ready else { return .refuseListenerDown }
+        return .issueCode
+    }
+
+    /// A delayed bind result belongs to the lifecycle request that opened it only while its epoch is current.
+    static func lifecycleResultIsCurrent(requestEpoch: UInt64, currentEpoch: UInt64) -> Bool {
+        requestEpoch == currentEpoch
+    }
+
+    /// A hosted remux may become visible only while both its opening epoch and the control listener remain
+    /// current. This is the pure guard used immediately before the producer is started and committed.
+    static func hostedSessionMayCommit(
+        openingEpoch: UInt64,
+        currentEpoch: UInt64,
+        listenerReadiness: ListenerReadiness
+    ) -> Bool {
+        lifecycleResultIsCurrent(requestEpoch: openingEpoch, currentEpoch: currentEpoch)
+            && listenerReadiness == .ready
+    }
+
+    /// A newly-created power assertion is committed only if a session still needs it and another concurrent
+    /// acquisition did not already win. Otherwise its caller must end the uncommitted assertion immediately.
+    static func activityAcquisitionMayCommit(hasSessions: Bool, alreadyHasToken: Bool) -> Bool {
+        hasSessions && !alreadyHasToken
     }
 
     // MARK: - Request routing

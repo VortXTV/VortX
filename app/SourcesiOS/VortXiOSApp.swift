@@ -80,6 +80,11 @@ struct VortXiOSApp: App {
             Task.detached(priority: .utility) { await StremioServer.applyServerConfig() }
         }
         #endif
+        #if os(macOS)
+        // The app-side toggle is persisted, so an ordinary launch must restore the listener without requiring
+        // the owner to flip it off and on. Daemon mode never reaches this initializer after its boot takes over.
+        VortXEngineHost.shared.startIfEnabledAsync()
+        #endif
         // Install the dedicated, large image URLCache BEFORE any poster loads. The default shared cache is
         // far too small to hold a catalog page of posters, which was the root of the "half the posters stay
         // blank + the app is laggy on open" report (constant re-fetch through the tiny shared cache).

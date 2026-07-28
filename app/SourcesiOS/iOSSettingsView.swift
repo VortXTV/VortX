@@ -53,6 +53,8 @@ struct iOSSettingsView: View {
     /// The live pairing code and its countdown, nil when no window is open.
     @State private var enginePairingCode: String?
     @State private var enginePairingRemaining: TimeInterval = 0
+    @State private var enginePairingError: String?
+    @State private var enginePairingPending = false
     @State private var enginePairedDevices: [VortXPairedDevice] = []
     @State private var didCopyEngineAddress = false
     @State private var showEngineRevokeAllConfirm = false
@@ -1314,13 +1316,15 @@ struct iOSSettingsView: View {
             get: { engineHostOn },
             set: { newValue in
                 engineHostOn = newValue
-                // The setter starts or stops the listener. Fail-soft: a port that will not bind leaves the
-                // service disabled and `isRunning` false, which the status row below reports honestly rather
-                // than showing a switch that says on over a service that is not.
+                // The setter serializes start or stop away from the main actor. A failed bind leaves the
+                // preference on and `isRunning` false, so pairing can retry and show the real failure.
                 VortXEngineHost.shared.isEnabled = newValue
                 // Turning the host off must also close any pairing window: a code left live over a stopped
                 // listener is a code the owner believes is doing something.
-                if !newValue { VortXEngineHost.shared.closePairing() }
+                if !newValue {
+                    VortXEngineHost.shared.closePairing()
+                    enginePairingError = nil
+                }
                 refreshEngineHostStatus()
             }
         )) {
@@ -1411,15 +1415,33 @@ struct iOSSettingsView: View {
                 Label("Stop pairing", systemImage: "xmark.circle")
             }
         } else {
+            if let enginePairingError {
+                Label(enginePairingError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.Palette.danger)
+            }
             Button {
+                guard !enginePairingPending else { return }
+                enginePairingPending = true
                 // Opening REPLACES any previous code and resets the attempt count, so an owner who closes
                 // and reopens this is never handed a window an attacker already spent guesses against.
-                _ = VortXEngineHost.shared.openPairing()
-                refreshEngineHostStatus()
+                Task {
+                    switch await VortXEngineHost.shared.openPairing() {
+                    case .success:
+                        enginePairingError = nil
+                    case .failure(let failure):
+                        enginePairingError = failure.errorDescription ?? "Could not open pairing. Try again."
+                    }
+                    enginePairingPending = false
+                    refreshEngineHostStatus()
+                }
             } label: {
-                Label("Pair a device", systemImage: "person.badge.key")
+                Label(enginePairingPending
+                      ? "Starting engine host"
+                      : (enginePairingError == nil ? "Pair a device" : "Try pairing again"),
+                      systemImage: "person.badge.key")
             }
-            .disabled(!engineHostRunning)
+            .disabled(enginePairingPending)
             Text("Opens a six-digit code for five minutes. Enter it on the Apple TV, iPhone, iPad or Mac you want to let use this engine.")
                 .font(.caption).foregroundStyle(.secondary)
         }

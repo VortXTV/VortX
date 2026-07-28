@@ -129,21 +129,11 @@ enum VortXEngineDiscovery {
         }
     }
 
-    /// Compose the authority string that `VortXEngineHostPolicy.normalizeHost` parses back.
-    ///
-    /// Two things this has to get right, both of which `normalizeHost` cares about:
-    ///
-    /// - An IPv6 literal is BRACKETED. `normalizeHost` only accepts an IPv6 host with a port in bracketed form,
-    ///   because that is "the only form that is unambiguous once a port is appended"; handing it a bare
-    ///   `fe80::1:11471` would make it parse the last group as the port.
-    /// - A link-local IPv6 zone is percent-encoded to `%25` per RFC 6874. `Foundation.URL` rejects a bare `%`
-    ///   in a host, so the verbatim `fe80::1%en0` that the resolver produces would build a nil URL at the exact
-    ///   moment the client tries to dial it. The zone is kept rather than dropped because without it a
-    ///   link-local address is not routable at all.
+    /// Forward discovery output through the canonical authority renderer used by persistence and every control
+    /// or media URL. Network.framework can attach an interface zone to IPv4 as well as IPv6 on a multi-homed
+    /// Mac, so zone escaping cannot live only inside the IPv6 branch.
     static func authority(host: String, port: Int) -> String {
-        guard host.contains(":") else { return "\(host):\(port)" }
-        let escaped = host.replacingOccurrences(of: "%", with: "%25")
-        return "[\(escaped)]:\(port)"
+        VortXEngineHostPolicy.authority(host: host, port: port)
     }
 }
 
