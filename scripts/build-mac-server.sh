@@ -16,13 +16,11 @@ cd "$(dirname "$0")/.."
 
 REPO_ROOT="$(pwd)"
 # Resolve the engine workspace the same way build-ffi-xcframework.sh does: an explicit override, then
-# a candidate list, rather than one hardcoded default. The old single default was
-# $HOME/vortx-engine/vortx-core, which was a WORKTREE of the public repo holding 316k engine files.
-# That worktree was deliberately removed on 2026-07-25 (engine source must not sit in a public-repo
-# worktree), so this script's only default pointed at a path that no longer exists.
+# a candidate list. A private monorepo cloned to $HOME/vortx-engine contains the engine workspace
+# at $HOME/vortx-engine/vortx-core; the monorepo root itself is not a workspace candidate.
 ENGINE_DIR="${VORTX_ENGINE_DIR:-}"
 if [ -z "$ENGINE_DIR" ]; then
-    for cand in "$REPO_ROOT/vortx-core" "$HOME/vortx-core" "$REPO_ROOT/../vortx-engine/vortx-core" "$HOME/vortx-engine/vortx-core"; do
+    for cand in "$REPO_ROOT/vortx-core" "$REPO_ROOT/../vortx-engine/vortx-core" "$HOME/vortx-engine/vortx-core"; do
         if [ -f "$cand/crates/streaming-server/Cargo.toml" ]; then ENGINE_DIR="$cand"; break; fi
     done
 fi
@@ -31,13 +29,12 @@ OUT="app/Vendor/vortx-streaming-server"
 
 if [ -z "$ENGINE_DIR" ] || [ ! -f "$ENGINE_DIR/crates/streaming-server/Cargo.toml" ]; then
     echo "ERROR: engine workspace not found. The native server builds from it, like the core xcframework." >&2
-    echo "       Looked at: \$VORTX_ENGINE_DIR, $REPO_ROOT/vortx-core, $HOME/vortx-core," >&2
+    echo "       Looked at: \$VORTX_ENGINE_DIR, $REPO_ROOT/vortx-core," >&2
     echo "       $REPO_ROOT/../vortx-engine/vortx-core, $HOME/vortx-engine/vortx-core" >&2
     echo "" >&2
     echo "       The engine is PROPRIETARY and lives in the private repo VortXTV/vortx-core." >&2
     echo "       Clone it OUTSIDE this repo (never as a worktree of the public one):" >&2
-    echo "         git clone https://github.com/VortXTV/vortx-core.git ~/vortx-core" >&2
-    echo "       A local git bundle also exists at ~/vortx-engine-backup/ as a second copy." >&2
+    echo "         git clone https://github.com/VortXTV/vortx-core.git ~/vortx-engine" >&2
     exit 1
 fi
 echo "engine workspace: $ENGINE_DIR"
