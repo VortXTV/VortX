@@ -38,11 +38,13 @@ private typealias Track = MultiAudioPolicy.AudioTrack
 enum MultiAudioPolicyTests {
     static func main() {
         testSourceTrackInventoryAndSelection()
+        testSourcePrimaryReadiness()
         testReplacementRollbackAndNewestWins()
         testPlaybackIntentNewestWinsAndExactOwnership()
         testHostLossRecoveryChoosesTheOwnedTransaction()
         testQualificationAndDistinctSinks()
         testMasterTopology()
+        testInBandPrimaryMetadata()
         testAbsolutePlaylistAndRequests()
         testAlignedPublicationLifecycle()
         testBoundedAlignmentHold()
@@ -97,6 +99,33 @@ enum MultiAudioPolicyTests {
         check("source selection: absent source identity fails closed to default ranking",
               MultiAudioPolicy.selectedSourceTrack(
                 from: manyInventory, requestedSourceIndex: 999) == nil)
+    }
+
+    private static func testSourcePrimaryReadiness() {
+        check(
+            "source primary: an authoritative in-band source needs no native selection group",
+            RemuxAudioReplacementPolicy.sourcePrimaryIsReady(
+                hasNativePrimaryOption: false,
+                nativePrimaryAligned: false,
+                selectedSourcePublished: true))
+        check(
+            "source primary: a native primary option requires exact alignment",
+            !RemuxAudioReplacementPolicy.sourcePrimaryIsReady(
+                hasNativePrimaryOption: true,
+                nativePrimaryAligned: false,
+                selectedSourcePublished: true))
+        check(
+            "source primary: exact native alignment completes the source receipt",
+            RemuxAudioReplacementPolicy.sourcePrimaryIsReady(
+                hasNativePrimaryOption: true,
+                nativePrimaryAligned: true,
+                selectedSourcePublished: true))
+        check(
+            "source primary: no published selected source fails closed",
+            !RemuxAudioReplacementPolicy.sourcePrimaryIsReady(
+                hasNativePrimaryOption: false,
+                nativePrimaryAligned: false,
+                selectedSourcePublished: false))
     }
 
     private static func testReplacementRollbackAndNewestWins() {
@@ -452,6 +481,32 @@ enum MultiAudioPolicyTests {
         check("master: source quotes and line breaks cannot escape an attribute",
               !MultiAudioPolicy.quoteSafe("A\"\r\nB").contains("\"")
                   && !MultiAudioPolicy.quoteSafe("A\"\r\nB").contains("\n"))
+    }
+
+    private static func testInBandPrimaryMetadata() {
+        let eac3BeforeReceipt = MultiAudioPolicy.inBandPrimaryTag(
+            languageRaw: "eng",
+            title: "Decoded surround",
+            physicalChannels: 6,
+            usesDec3: true,
+            dec3: nil)
+        check("master: transcoded E-AC-3 primary remains named before its dec3 receipt",
+              eac3BeforeReceipt?.contains(#"NAME="Decoded surround""#) == true
+                  && eac3BeforeReceipt?.contains(#"LANGUAGE="eng""#) == true)
+        check("master: E-AC-3 without a dec3 receipt cannot claim channels or JOC",
+              eac3BeforeReceipt?.contains("CHANNELS=") == false
+                  && eac3BeforeReceipt?.contains("JOC") == false)
+
+        let aac = MultiAudioPolicy.inBandPrimaryTag(
+            languageRaw: "fra",
+            title: "French",
+            physicalChannels: 8,
+            usesDec3: false,
+            dec3: nil)
+        check("master: non-dec3 transcode labels its physical output channels",
+              aac?.contains(#"LANGUAGE="fra""#) == true
+                  && aac?.contains(#"CHANNELS="8""#) == true
+                  && aac?.contains("JOC") == false)
     }
 
     private struct BitWriter {

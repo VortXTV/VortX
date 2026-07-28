@@ -260,8 +260,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var _alternateAudioPlan: MultiAudioPolicy.RenditionPlan?
     private var _alternateAudioCandidatePlan: MultiAudioPolicy.RenditionPlan?
     private var _alternateAudioState: MultiAudioPolicy.StartupState = .failed
-    /// Metadata of the ONE stream-copied (in-band) audio track, published at classify so the master can label
-    /// the muxed primary with a URI-less EXT-X-MEDIA row when no separately-muxed alternate qualifies.
+    /// Metadata of the ONE in-band audio track, published after its output codec is known so the master can
+    /// label the muxed primary with a URI-less EXT-X-MEDIA row when no separately-muxed alternate qualifies.
     private var _primaryAudioLabel: (languageRaw: String, title: String,
                                      channels: Int, usesDec3: Bool)?
     private var _alternateAudioResources: [MultiAudioPolicy.AudioResource] = []
@@ -1431,6 +1431,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     return
                 }
                 transcoder = t
+                let outputParameters = outStream.pointee.codecpar.pointee
+                let primaryLabel = (
+                    languageRaw: Self.streamLanguage(inStream),
+                    title: Self.streamMetadata(inStream, key: "title"),
+                    channels: Int(outputParameters.ch_layout.nb_channels),
+                    usesDec3: outputParameters.codec_id == AV_CODEC_ID_EAC3)
+                hlsLock.lock()
+                _primaryAudioLabel = primaryLabel
+                hlsLock.unlock()
+                // A transcoded E-AC-3 primary may expose its physical channel count only after the produced
+                // init segment proves a valid dec3 box. It must never inherit the source's Atmos/JOC label.
+                if outputParameters.codec_id == AV_CODEC_ID_EAC3 { dec3ScanDone = false }
                 VXProbe.log("dv", "audio transcode armed: \(transcodeAudioName) -> \(t.encoderName) (inStream=\(i))")
                 streamMap[i] = Int(outIndex)
                 outIndex += 1
@@ -2007,8 +2019,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
     /// Accumulates the FIRST bytes of muxed output until the `dec3` sample-entry box is found (it rides in
     /// the moov, which movenc writes with the first fragment under delay_moov) or the cap is hit. Touched
-    /// only on the remux thread (the AVIO write callback). Armed (dec3ScanDone = false) only when an E-AC3
-    /// track was stream-copied; otherwise the scan never runs.
+    /// only on the remux thread (the AVIO write callback). Armed (dec3ScanDone = false) whenever the produced
+    /// primary is E-AC-3, whether stream-copied or transcoded; otherwise the scan never runs. A transcoded
+    /// receipt may label physical channels, but the source-track update below still forbids inherited JOC.
     private var dec3ScanBuf: [UInt8] = []
     private var dec3ScanDone = true
     private static let dec3ScanCap = 1 << 20   // the moov lands with the first fragment, well inside 1 MiB

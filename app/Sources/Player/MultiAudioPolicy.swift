@@ -143,6 +143,20 @@ enum RemuxAudioReplacementPolicy {
         case noFurtherRetry
     }
 
+    /// Decide when the selected source audio is ready for publication and playhead restoration.
+    ///
+    /// A URI-less in-band HLS primary does not always produce an AVMediaSelectionGroup. In that topology the
+    /// remuxer's selected source index is the authoritative selection receipt, so the absence of a native
+    /// option is not a failure. When AVFoundation does expose a primary option, exact alignment remains
+    /// mandatory because publishing the source row before that option settles can show one track while another
+    /// is audible.
+    static func sourcePrimaryIsReady(hasNativePrimaryOption: Bool,
+                                     nativePrimaryAligned: Bool,
+                                     selectedSourcePublished: Bool) -> Bool {
+        guard selectedSourcePublished else { return false }
+        return !hasNativePrimaryOption || nativePrimaryAligned
+    }
+
     struct State: Equatable, Sendable {
         let rollbackSourceIndex: Int?
         private(set) var targetSourceIndex: Int?

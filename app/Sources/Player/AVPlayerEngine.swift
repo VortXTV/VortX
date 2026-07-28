@@ -2639,10 +2639,15 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             // audible in-band rendition aligned.
             player.appliesMediaSelectionCriteriaAutomatically = false
             let sourceBackedAudio = !remuxSourceAudioTracks.isEmpty
+            let selectedSourcePublished = selectedRemuxAudioSourceIndex.map { selected in
+                remuxSourceAudioTracks.contains(where: { $0.sourceIndex == selected })
+            } ?? false
+            var hasNativePrimaryOption = false
             var primaryAligned = false
             if sourceBackedAudio {
                 if let group = ag,
                    let inBandPrimary = group.defaultOption ?? group.options.first {
+                    hasNativePrimaryOption = true
                     // Await alignment before taking the intent snapshot. Nothing may suspend after that
                     // snapshot because every user action must either update the consumed intent or act on the
                     // settled item, never race a stale local copy across an await.
@@ -2659,14 +2664,25 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                     ) else { return }
                 }
             }
+            let sourcePrimaryReady = RemuxAudioReplacementPolicy.sourcePrimaryIsReady(
+                hasNativePrimaryOption: hasNativePrimaryOption,
+                nativePrimaryAligned: primaryAligned,
+                selectedSourcePublished: selectedSourcePublished)
+            if sourceBackedAudio {
+                DiagnosticsLog.log(
+                    "avplayer",
+                    "source audio topology count=\(remuxSourceAudioTracks.count) selected=\(selectedRemuxAudioSourceIndex.map(String.init) ?? "none") nativePrimary=\(hasNativePrimaryOption) aligned=\(primaryAligned) ready=\(sourcePrimaryReady)")
+            }
             if audioReplacement != nil {
-                if primaryAligned,
+                if sourcePrimaryReady,
                    audioReplacement?.markReady(generation: selectionGeneration) == true {
                     DiagnosticsLog.log(
                         "avplayer",
-                        "audio replacement generation \(selectionGeneration) reached aligned ready source=\(selectedRemuxAudioSourceIndex.map { String($0) } ?? "default")")
+                        "audio replacement generation \(selectionGeneration) reached source ready source=\(selectedRemuxAudioSourceIndex.map { String($0) } ?? "default")")
                 } else {
-                    let reason = "audio replacement primary selection did not settle"
+                    let reason = selectedSourcePublished
+                        ? "audio replacement native primary selection did not settle"
+                        : "audio replacement selected source was not published"
                     if recoverAudioReplacementIfNeeded(
                         generation: selectionGeneration,
                         reason: reason) {
@@ -2689,15 +2705,15 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                         loadToken: selectionLoadToken)
                     return
                 }
-            } else if sourceBackedAudio && !primaryAligned {
+            } else if sourceBackedAudio && !sourcePrimaryReady {
                 // An initial mount has no prior working source to roll back to. Keep playback alive, but do
-                // not claim that the source-level row is selected when AVFoundation says otherwise.
+                // not claim that a source-level row is selected without either the remuxer's authoritative
+                // selected source or exact alignment of the native primary option. Keep the full inventory
+                // visible so the viewer can still choose any source track and start an owned replacement.
                 DiagnosticsLog.log(
                     "avplayer",
-                    "source audio primary did not settle; publishing native HLS audio topology")
-                remuxSourceAudioTracks = []
+                    "source audio primary was not ready; retaining \(remuxSourceAudioTracks.count) source rows with no selected claim")
                 selectedRemuxAudioSourceIndex = nil
-                audioTracks = []
             }
             let intentSnapshot = pendingPlaybackIntent
             let replacementReady = audioReplacement.map {

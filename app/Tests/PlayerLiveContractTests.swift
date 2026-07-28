@@ -2210,6 +2210,10 @@ enum PlayerLiveContractTests {
                                  encoding: .utf8)
         let stream = try? String(contentsOf: playerURL.appendingPathComponent("VortXMKVRemuxStream.swift"),
                                  encoding: .utf8)
+        let transcodePrimaryPublication = sourceSection(
+            stream,
+            from: "if transcodeActive, i == transcodeAudioIn {",
+            to: "let cp = avcodec_parameters_copy(outStream.pointee.codecpar, par)")
         let policy = try? String(contentsOf: playerURL.appendingPathComponent("DVPlaybackPolicy.swift"),
                                  encoding: .utf8)
         let remuxBuffer = try? String(
@@ -2911,13 +2915,17 @@ enum PlayerLiveContractTests {
                       "selectionContextIsCurrent(",
                       "selectedMediaOption(in: group) == primary",
                   ]))
-        check("wiring: audio replacement becomes ready only after exact primary alignment",
+        check("wiring: audio replacement accepts an authoritative in-band source or exact native alignment",
               initialTrackPublication?.contains(
                   "audioReplacement?.markReady") == false
                   && sourceContainsInOrder(groupLoad, [
+                      "let selectedSourcePublished",
+                      "var hasNativePrimaryOption = false",
+                      "hasNativePrimaryOption = true",
                       "primaryAligned = await alignSourceBackedPrimaryAudio(",
+                      "let sourcePrimaryReady = RemuxAudioReplacementPolicy.sourcePrimaryIsReady(",
                       "if audioReplacement != nil",
-                      "if primaryAligned",
+                      "if sourcePrimaryReady",
                       "audioReplacement?.markReady(generation: selectionGeneration)",
                       "let intentSnapshot = pendingPlaybackIntent",
                       "let replacementReady = audioReplacement.map",
@@ -2926,7 +2934,7 @@ enum PlayerLiveContractTests {
         check("wiring: replacement alignment failure rolls back once or terminates as an owned error",
               sourceContainsInOrder(groupLoad, [
                   "if audioReplacement != nil",
-                  "if primaryAligned",
+                  "if sourcePrimaryReady",
                   "} else {",
                   "recoverAudioReplacementIfNeeded(",
                   "generation: selectionGeneration",
@@ -2938,8 +2946,7 @@ enum PlayerLiveContractTests {
                   "MPVProperty.endFileError",
                   "loadToken: selectionLoadToken",
                   "return",
-                  "} else if sourceBackedAudio && !primaryAligned",
-                  "remuxSourceAudioTracks = []",
+                  "} else if sourceBackedAudio && !sourcePrimaryReady",
                   "selectedRemuxAudioSourceIndex = nil",
               ]))
         check("wiring: selection restore guards group suspension then clamps without a second suspension",
@@ -2954,8 +2961,8 @@ enum PlayerLiveContractTests {
                   "playbackMountIdentity == selectionMountIdentity",
                   "await alignSourceBackedPrimaryAudio(",
                   "guard selectionContextIsCurrent(",
-                  "} else if sourceBackedAudio && !primaryAligned",
-                  "remuxSourceAudioTracks = []",
+                  "let sourcePrimaryReady",
+                  "} else if sourceBackedAudio && !sourcePrimaryReady",
                   "selectedRemuxAudioSourceIndex = nil",
                   "let intentSnapshot = pendingPlaybackIntent",
                   "RemuxResumePolicy.playerSeek(",
@@ -2983,11 +2990,13 @@ enum PlayerLiveContractTests {
         check("wiring: remux initial audio explicitly matches the selected in-band source",
               sourceContainsInOrder(groupLoad, [
                   "let inBandPrimary = group.defaultOption ?? group.options.first",
+                  "hasNativePrimaryOption = true",
                   "await alignSourceBackedPrimaryAudio(",
-                  "} else if sourceBackedAudio && !primaryAligned",
-                  "remuxSourceAudioTracks = []",
+                  "let sourcePrimaryReady",
+                  "} else if sourceBackedAudio && !sourcePrimaryReady",
                   "selectedRemuxAudioSourceIndex = nil",
               ])
+                  && groupLoad?.contains("remuxSourceAudioTracks = []") == false
                   && sourceContainsInOrder(selectionRefresh, [
                       "let audioID = remuxSourceAudioTracks.isEmpty",
                       "audioGroup.flatMap",
@@ -2996,6 +3005,18 @@ enum PlayerLiveContractTests {
                       "audioGroup.map { Self.mpvTracks(",
                       ": sourceAudioMPVTracks()",
                   ]))
+        check("wiring: transcoded primary publishes an honest in-band label from its actual output codec",
+              sourceContainsInOrder(transcodePrimaryPublication, [
+                  "transcoder = t",
+                  "let outputParameters = outStream.pointee.codecpar.pointee",
+                  "languageRaw: Self.streamLanguage(inStream)",
+                  "channels: Int(outputParameters.ch_layout.nb_channels)",
+                  "usesDec3: outputParameters.codec_id == AV_CODEC_ID_EAC3",
+                  "_primaryAudioLabel = primaryLabel",
+                  "if outputParameters.codec_id == AV_CODEC_ID_EAC3 { dec3ScanDone = false }",
+                  "audio transcode armed:",
+              ])
+                  && transcodePrimaryPublication?.contains("isAtmosJOC") == false)
         check("wiring: unavailable source subtitles are never selected by nil equality",
               sourceContainsInOrder(sourceSubtitleRows, [
                   "source.renditionIndex != nil",
