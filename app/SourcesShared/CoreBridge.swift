@@ -43,6 +43,9 @@ final class CoreBridge: ObservableObject {
     /// updates but only once per burst. Touched only on the main actor.
     private var boardRebuildWork: DispatchWorkItem?
     private static let boardRebuildDebounce: TimeInterval = 0.08
+    /// Raw catalog count from the engine board. Hidden, disabled, empty, and failed rows are filtered
+    /// out of `boardRows`, so their visible count cannot decide whether vertical pagination is finished.
+    private var boardCatalogTotal = 0
     /// Coalesces the `meta_details` re-decode+publish. Source search for a high-source title emits a BURST
     /// of `meta_details` events as stream batches land (GoT: ~11 re-emits of the same 1757-row payload as it
     /// grows), and each used to run a full off-main decode + a main-thread republish, invalidating every
@@ -163,6 +166,16 @@ final class CoreBridge: ObservableObject {
     /// so the URL leaves the set before the engine re-emits ctx and is therefore NOT suppressed here.
     private func refreshAddons() {
         let typed = decode(CoreCtx.self, field: "ctx")?.profile.addons ?? []
+        // A synced order can arrive before OR after the final add-on hydrate. Keep the full-range intent
+        // alive across both sequences: if an explicit order already exists when ctx grows, widen only when
+        // the new raw manifest count exceeds the range already requested. This is a LoadRange, not a full
+        // board Load; stremio-core has already replanned the board on ProfileChanged.
+        if !CatalogPrefsStore.order().isEmpty {
+            let installedCatalogTotal = typed.reduce(0) { $0 + $1.manifest.catalogs.count }
+            DispatchQueue.main.async { [weak self] in
+                self?.ensureCatalogOrderRangeLoaded(installedCatalogTotal: installedCatalogTotal)
+            }
+        }
         var raw: [String: [String: Any]] = [:]
         if let data = stateData("ctx"),
            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -667,7 +680,18 @@ final class CoreBridge: ObservableObject {
     /// Load the Home board: every catalog of every installed addon, then fetch the first `rows`.
     /// (Targets the `board` field specifically, `search` is also a CatalogsWithExtra.)
     func loadBoard(rows: Int = 30) {
-        boardRowsLoaded = rows
+        let installedCatalogTotal = installedCatalogs(
+            includeTombstoned: true,
+            includeDisabled: true
+        ).count
+        let requestedRows = CatalogPrefsStore.order().isEmpty
+            ? rows
+            : HomeCatalogLoadPolicy.fullLoadDepth(
+                current: rows,
+                engineCatalogTotal: boardCatalogTotal,
+                installedCatalogTotal: installedCatalogTotal
+            )
+        boardRowsLoaded = requestedRows
         boardPageInFlight = false
         boardRowPageInFlight = [:]   // catalogs reload from page 1, so engine indices reset (#95)
         boardRowExhausted = []
@@ -676,7 +700,7 @@ final class CoreBridge: ObservableObject {
                                    "args": ["type": NSNull(), "extra": []]]],
                  field: "board")
         dispatch(action: ["action": "CatalogsWithExtra",
-                          "args": ["action": "LoadRange", "args": ["start": 0, "end": rows]]],
+                          "args": ["action": "LoadRange", "args": ["start": 0, "end": requestedRows]]],
                  field: "board")
     }
 
@@ -696,9 +720,15 @@ final class CoreBridge: ObservableObject {
     private var boardRowPageInFlight: [Int: Int] = [:]   // engineIndex -> item count when the load was dispatched
     private var boardRowExhausted: Set<Int> = []          // engine indices whose last settled load added nothing
 
-    /// True while the last board load filled its requested window, so there may be more catalogs to show.
-    /// Once the engine returns fewer rows than asked, every catalog is on screen and this goes false.
-    var boardHasNextPage: Bool { boardRows.count >= boardRowsLoaded }
+    /// True while the requested range has not covered the engine's raw catalog count. The visible
+    /// `boardRows` count is intentionally irrelevant: hidden, disabled, empty, and failed rows are
+    /// filtered out but still occupy engine board indices.
+    var boardHasNextPage: Bool {
+        HomeCatalogLoadPolicy.hasNextPage(
+            loaded: boardRowsLoaded,
+            engineCatalogTotal: boardCatalogTotal
+        )
+    }
 
     /// Load the next page of Home catalogs (the vertical infinite scroll). Re-dispatches a wider LoadRange
     /// so more catalog rows hydrate; no-op at the end or while a page is already in flight. Without this
@@ -740,6 +770,40 @@ final class CoreBridge: ObservableObject {
             let count = pages.compactMap { $0.content?.ready }.flatMap { $0 }.count
             boardRowPageInFlight[index] = nil
             if count <= dispatchedCount { boardRowExhausted.insert(index) }
+        }
+    }
+
+    /// Apply a catalog presentation-order change to Home. The stored order only sorts populated rows after
+    /// the engine board is decoded; it does not change engine indices. A catalog moved to the top can still
+    /// sit at raw index 121, so hydrate the full raw range before rebuilding the visible order. This covers
+    /// local moves/grouping and a synced or backup-restored order through `CatalogPreferences`.
+    func catalogOrderDidChange() {
+        guard !CatalogPrefsStore.order().isEmpty else {
+            rebuildBoardRows()
+            return
+        }
+        let installedCatalogTotal = installedCatalogs(
+            includeTombstoned: true,
+            includeDisabled: true
+        ).count
+        ensureCatalogOrderRangeLoaded(installedCatalogTotal: installedCatalogTotal)
+        rebuildBoardRows()
+    }
+
+    /// Widen, but never restart, the board model. Kept separate so a late ctx hydrate can finish an order
+    /// restoration that ran against an interim add-on roster.
+    private func ensureCatalogOrderRangeLoaded(installedCatalogTotal: Int) {
+        let needed = HomeCatalogLoadPolicy.fullLoadDepth(
+            current: boardRowsLoaded,
+            engineCatalogTotal: boardCatalogTotal,
+            installedCatalogTotal: installedCatalogTotal
+        )
+        if needed > boardRowsLoaded {
+            boardRowsLoaded = needed
+            boardPageInFlight = true
+            dispatch(action: ["action": "CatalogsWithExtra",
+                              "args": ["action": "LoadRange", "args": ["start": 0, "end": needed]]],
+                     field: "board")
         }
     }
 
@@ -2360,8 +2424,14 @@ final class CoreBridge: ObservableObject {
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
                         self.reconcileBoardRowPagination(boardState)   // #95: settle per-row horizontal pagination
+                        self.boardCatalogTotal = boardState?.catalogs.count ?? 0
                         self.boardRows = rows
                         self.boardPageInFlight = false
+                        // The board emit is the authoritative raw total. If an explicit order is
+                        // already stored, close any gap left by an interim ctx manifest count.
+                        if !CatalogPrefsStore.order().isEmpty {
+                            self.ensureCatalogOrderRangeLoaded(installedCatalogTotal: 0)
+                        }
                     }
                 }
             }

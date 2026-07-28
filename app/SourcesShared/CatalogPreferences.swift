@@ -315,8 +315,10 @@ final class CatalogPreferences: ObservableObject {
     /// never fires a redundant hub reload). Call on the main thread.
     func reloadFromDefaults() {
         let savedHidden = CatalogPrefsStore.hidden()
+        let hiddenChanged = hidden != savedHidden
         if hidden != savedHidden { hidden = savedHidden }
         let savedOrder = CatalogPrefsStore.order()
+        let orderChanged = order != savedOrder
         if order != savedOrder { order = savedOrder }
         let savedCategories = CatalogPrefsStore.hiddenCategories()
         if hiddenCategories != savedCategories { hiddenCategories = savedCategories }
@@ -334,6 +336,16 @@ final class CatalogPreferences: ObservableObject {
         if regionOverride != savedRegion { regionOverride = savedRegion }
         let savedFilters = CatalogPrefsStore.discoverFilters()
         if discoverFilters != savedFilters { discoverFilters = savedFilters }
+        // Mutation channels for Home catalog presentation are intentionally closed here:
+        // 1. Local move, drag, and group-by-add-on all route through `reorder`.
+        // 2. Cloud sync and backup restore write UserDefaults directly, then route through this reload.
+        // 3. Local visibility changes route through `setHidden` and only need a row rebuild.
+        // A restored order can promote an unloaded raw engine index, so it must widen before rebuilding.
+        if orderChanged {
+            CoreBridge.shared.catalogOrderDidChange()
+        } else if hiddenChanged {
+            CoreBridge.shared.rebuildBoardRows()
+        }
     }
 
     func isHidden(_ key: String) -> Bool { hidden.contains(key) }
@@ -357,7 +369,7 @@ final class CatalogPreferences: ObservableObject {
     func reorder(_ keys: [String]) {
         order = keys
         CatalogPrefsStore.setOrder(keys)
-        CoreBridge.shared.rebuildBoardRows()
+        CoreBridge.shared.catalogOrderDidChange()
     }
 }
 
