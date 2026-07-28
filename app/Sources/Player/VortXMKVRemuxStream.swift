@@ -191,6 +191,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let dolbyVision: Bool
     }
 
+    /// Verified source-level facts that let tvOS begin preparing its Dolby Vision output while the remux thread
+    /// performs a resume seek and constructs the final mux. This is not master-playlist signaling: the server
+    /// still waits for `HLSSignaling`, the output header, init bytes and startup media before publishing anything.
+    struct HLSDisplayIntent: Equatable, Sendable {
+        let fps: Double
+        let width: Int
+        let height: Int
+    }
+
     /// Guards the four published index fields below (written on the remux thread, read from the HLS server's
     /// serve queue). The head-scan / cut state further down is remux-thread-only and needs no lock.
     private let hlsLock = NSLock()
@@ -232,6 +241,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var _hlsSegments: [HLSSegment] = []
     private var _hlsEnded = false
     private var _hlsSignaling: HLSSignaling?
+    private var _hlsDisplayIntent: HLSDisplayIntent?
     private var _primaryDec3Observation: MultiAudioPolicy.Dec3Observation?
     /// Every source audio track the remux can deliver, plus the one actually mapped into the primary output.
     /// Source indices are stable across remounts and are the picker IDs. Stream-copy and decode-only rows are
@@ -317,7 +327,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         hdrRecoveryInitSettled: Bool,
         segments: [HLSSegment],
         ended: Bool,
-        signaling: HLSSignaling?
+        signaling: HLSSignaling?,
+        displayIntent: HLSDisplayIntent?
     ) {
         hlsLock.lock(); defer { hlsLock.unlock() }
         return (
@@ -326,7 +337,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             _hlsInitHDRRecoverySettled,
             _hlsSegments,
             _hlsEnded,
-            _hlsSignaling)
+            _hlsSignaling,
+            _hlsDisplayIntent)
     }
 
     func openHLSResource(_ key: VortXHLSSessionSpool.ResourceKey,
@@ -528,6 +540,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// When this stream was created (== the AVPlayer mount instant for either delivery). Anchors the
     /// time-to-init / time-to-first-segment diagnostics so the next device log carries startup timing.
     private let mountedAt = Date()
+    private let mountedAtUptime = ProcessInfo.processInfo.systemUptime
+
+    /// Monotonic elapsed time for stage receipts shared by the producer, local server and AVPlayer engine.
+    var startupElapsedMilliseconds: Int {
+        max(0, Int((ProcessInfo.processInfo.systemUptime - mountedAtUptime) * 1_000))
+    }
+
+    private func logStartupPhase(_ phase: String) {
+        DiagnosticsLog.log("dv", "startup phase=\(phase) elapsedMs=\(startupElapsedMilliseconds)")
+    }
 
     // Init-segment head scan state (remux thread only). Accumulates ONLY the leading top-level box headers until
     // the `moov` box is LOCATED; the init CONTENT (ftyp+moov, any size) is then read straight from the produced
@@ -731,7 +753,68 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         return ctx
     }
 
+    /// Matroska exposes its track headers during `avformat_open_input`. When those headers already contain every
+    /// fact needed for a safe DV route, publish display intent before the slower bitstream analysis begins. A
+    /// sparse or incomplete header returns nil and the ordinary post-analysis path remains authoritative.
+    private func containerHeaderDisplayIntent(
+        _ inputContext: UnsafeMutablePointer<AVFormatContext>
+    ) -> HLSDisplayIntent? {
+        guard hlsIndexingEnabled, mode == .dolbyVision else { return nil }
+        var source = SourceInfo()
+        var baseVideoStream: UnsafeMutablePointer<AVStream>?
+        var hasAnyStreamCopyAudio = false
+        var requestedStreamCopyAudio = false
+        for index in 0..<Int(inputContext.pointee.nb_streams) {
+            guard let stream = inputContext.pointee.streams[index],
+                  let parameters = stream.pointee.codecpar else { continue }
+            switch parameters.pointee.codec_type {
+            case AVMEDIA_TYPE_VIDEO where baseVideoStream == nil:
+                baseVideoStream = stream
+                source.width = Int(parameters.pointee.width)
+                source.height = Int(parameters.pointee.height)
+                Self.readDoVi(parameters, into: &source)
+            case AVMEDIA_TYPE_AUDIO:
+                let streamCopy = Self.avPlayerDecodableAudio.contains(
+                    parameters.pointee.codec_id.rawValue)
+                hasAnyStreamCopyAudio = hasAnyStreamCopyAudio || streamCopy
+                if requestedAudioStreamIndex == index {
+                    requestedStreamCopyAudio = streamCopy
+                }
+            default:
+                break
+            }
+        }
+        guard let baseVideoStream, let baseParameters = baseVideoStream.pointee.codecpar else { return nil }
+        let frameRate = Self.frameRate(baseVideoStream)
+        let selectedAudioIsStreamCopy = requestedAudioStreamIndex == nil
+            ? hasAnyStreamCopyAudio
+            : requestedStreamCopyAudio
+        guard DVPlaybackPolicy.canPublishEarlyDisplayIntent(
+            requiresDolbyVision: true,
+            dolbyVisionProfile: source.dvProfile,
+            width: source.width,
+            height: source.height,
+            frameRate: frameRate,
+            hasBaseVideo: true,
+            hvc1ExtradataReady: Self.checkHvc1Extradata(baseParameters).eligible,
+            hasStreamCopyAudio: selectedAudioIsStreamCopy
+        ) else { return nil }
+        return HLSDisplayIntent(
+            fps: frameRate,
+            width: source.width,
+            height: source.height)
+    }
+
+    private func publishDisplayIntentIfAbsent(_ intent: HLSDisplayIntent, phase: String) {
+        hlsLock.lock()
+        let shouldPublish = _hlsDisplayIntent == nil
+        if shouldPublish { _hlsDisplayIntent = intent }
+        hlsLock.unlock()
+        if shouldPublish { logStartupPhase(phase) }
+    }
+
     private func run() {
+        logStartupPhase("producer-start")
         // Every guard/early return, cancellation, demotion and successful EOF reaches the real producer-terminal
         // edge only as this remux thread unwinds. Cancellation itself merely requests abort and cannot claim it.
         defer {
@@ -810,7 +893,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             buffer.fail("avformat_open_input failed (\(openRc))")
             return
         }
+        logStartupPhase("input-open")
         defer { var p: UnsafeMutablePointer<AVFormatContext>? = inCtx; avformat_close_input(&p) }
+        if let intent = containerHeaderDisplayIntent(inCtx) {
+            publishDisplayIntentIfAbsent(intent, phase: "display-intent-container")
+        }
 
         let si = avformat_find_stream_info(inCtx, nil)
         if si < 0 {
@@ -819,6 +906,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             buffer.fail("avformat_find_stream_info failed (\(si))")
             return
         }
+        logStartupPhase("stream-info")
 
         // Capture the source runtime while the demuxer context is open. AVFormatContext.duration is in
         // AV_TIME_BASE units (microseconds); a valid file reports a positive value, AV_NOPTS_VALUE (negative)
@@ -1182,6 +1270,25 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
            bpar.pointee.codec_id == AV_CODEC_ID_HEVC {
             hvc1Check = Self.checkHvc1Extradata(bpar)
         }
+        let classifiedFrameRate = baseVideoIn >= 0
+            ? Self.frameRate(inCtx.pointee.streams[baseVideoIn]) : 0
+        if hlsIndexingEnabled,
+           DVPlaybackPolicy.canPublishEarlyDisplayIntent(
+               requiresDolbyVision: mode == .dolbyVision,
+               dolbyVisionProfile: info.dvProfile,
+               width: info.width,
+               height: info.height,
+               frameRate: classifiedFrameRate,
+               hasBaseVideo: baseVideoIn >= 0,
+               hvc1ExtradataReady: hvc1Check.eligible,
+               hasStreamCopyAudio: hasDecodableAudio
+            ) {
+            let intent = HLSDisplayIntent(
+                fps: classifiedFrameRate,
+                width: info.width,
+                height: info.height)
+            publishDisplayIntentIfAbsent(intent, phase: "display-intent-classified")
+        }
         // In-band VPS/SPS/PPS harvested from the first base-video access unit (raw NALs), used to REBUILD the
         // output hvcC when the source's CodecPrivate carries empty parameter-set arrays. nil = not needed,
         // or nothing usable was found (the stream setup then fails fast, BEFORE write_header).
@@ -1406,6 +1513,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             buffer.fail("no AVPlayer-decodable audio track (source audio: \(audioSeen.joined(separator: ",")))")
             return
         }
+        logStartupPhase("source-preflight")
         var streamMap = [Int](repeating: -1, count: nb)
         var outIndex: Int32 = 0
         var baseVideoOut = -1        // output index of the base-layer video track (packets to convert)
@@ -1633,6 +1741,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
         let wh = avformat_write_header(outCtx, &opts)
         if wh < 0 { VXProbe.log("dv", "HDR10 FALLBACK: avformat_write_header rc=\(wh) (convertP7=\(convertP7); the relabel-8.1 dvvC box or the fMP4 muxer rejected the mapped streams)"); buffer.fail("avformat_write_header failed (\(wh))"); return }
+        logStartupPhase("output-header")
 
         // HLS lane: publish the master-playlist signaling now that the OUTPUT streams are final (post
         // extradata repair + DOVI sanitize/relabel). The local server blocks its master.m3u8 answer on this.
@@ -2263,6 +2372,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         hlsOutputVideoFormat = outputVideoFormat
         hlsSegmentStartByte = initLen   // segment 0 starts right after the init (BUFFER offsets: original length)
         hlsInitState.publish(); hlsHeadBuf = []
+        logStartupPhase("init-published")
         DiagnosticsLog.log("dv", "dec3 structured mux receipt: \(dec3Receipt)")
         DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B, \(Self.describeInitDoVi(initData))) served dv=\(servedDV.count)B [\(dvNote)] hdr=\(servedHDR?.count ?? 0)B [\(hdrNote)]" + String(format: " +%.1fs after mount", Date().timeIntervalSince(mountedAt)))
     }

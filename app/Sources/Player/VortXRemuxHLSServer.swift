@@ -133,6 +133,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private var advertisedDolbyVision = false
     private var engineReady = false
     private var startupTimeoutLogged = false
+    private let displayRequestLock = NSLock()
+    private var primaryDisplayRequested = false
+    private var recoveryDisplayRequested = false
+    private var primaryDisplayDispatched = false
+    private var recoveryDisplayDispatched = false
     private let startupReadiness: VortXHLSStartupReadiness
     private let onStartupTimeout: @Sendable (VortXRemuxHLSServer) -> Void
     private let deadlineLock = NSLock()
@@ -161,6 +166,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         /// URI-less in-band primary label, used ONLY when `audioPlan` is nil (see HLSWindowSnapshot).
         let primaryAudioTag: String?
         let subtitles: [SubtitleRenditionPolicy.Rendition]
+    }
+
+    private enum PrimaryMasterPrelude {
+        case displayIntent(VortXMKVRemuxStream.HLSDisplayIntent)
+        case signaling(VortXMKVRemuxStream.HLSSignaling)
     }
 
     // MARK: - Hosting (external engine mode)
@@ -291,6 +301,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         work?.cancel()
         publicationLock.lock(); engineReady = true; publicationLock.unlock()
         stream.markEngineReady()
+        DiagnosticsLog.log(
+            "dv",
+            "startup phase=ready-to-play elapsedMs=\(stream.startupElapsedMilliseconds)")
         return true
     }
 
@@ -354,6 +367,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     /// Monotonic mount-progress counters for the chrome's progress-aware start watchdog. Thread-safe passthrough.
     var mountProgress: VortXMKVRemuxStream.MountProgress { stream.mountProgress() }
+
+    /// Monotonic mount-to-now duration used for ready and first-frame timing receipts.
+    var startupElapsedMilliseconds: Int { stream.startupElapsedMilliseconds }
 
     /// The furthest SOURCE second a closed segment has been published for.
     ///
@@ -650,6 +666,64 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         return result.seconds
     }
 
+    #if os(tvOS)
+    /// Claim and dispatch one display request for each item variant. The claim is server-owned, so duplicate
+    /// master requests cannot queue repeated panel switches. Final master publication still waits for settlement.
+    private func requestDisplaySwitch(
+        _ requestedRange: ContentDynamicRange,
+        fps: Double,
+        width: Int,
+        height: Int,
+        recovery: Bool,
+        source: String
+    ) {
+        displayRequestLock.lock()
+        let alreadyRequested = recovery ? recoveryDisplayRequested : primaryDisplayRequested
+        if !alreadyRequested {
+            if recovery {
+                recoveryDisplayRequested = true
+            } else {
+                primaryDisplayRequested = true
+            }
+        }
+        displayRequestLock.unlock()
+        guard !alreadyRequested else { return }
+
+        let switched = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async { [weak self] in
+            defer { switched.signal() }
+            guard let self, !self.isInvalidated else { return }
+            MainActor.assumeIsolated {
+                HDRDisplayMode.request(
+                    requestedRange, fps: fps, width: width, height: height, in: nil)
+            }
+            self.displayRequestLock.lock()
+            if recovery {
+                self.recoveryDisplayDispatched = true
+            } else {
+                self.primaryDisplayDispatched = true
+            }
+            self.displayRequestLock.unlock()
+            DiagnosticsLog.log(
+                "dv",
+                "startup phase=display-request source=\(source) range=\(requestedRange.rawValue) "
+                    + "elapsedMs=\(self.stream.startupElapsedMilliseconds)")
+        }
+        let switchBudget = min(2, remainingMountBudget())
+        if switchBudget <= 0 || switched.wait(timeout: .now() + switchBudget) == .timedOut {
+            DiagnosticsLog.log(
+                "dv",
+                "DV display switch request not confirmed within 2s (main queue busy); "
+                    + "the switch may land after the master is served")
+        }
+    }
+
+    private func displayRequestWasDispatched(recovery: Bool) -> Bool {
+        displayRequestLock.lock(); defer { displayRequestLock.unlock() }
+        return recovery ? recoveryDisplayDispatched : primaryDisplayDispatched
+    }
+    #endif
+
     private func expireMountIfNeeded() {
         _ = remainingMountBudget()
     }
@@ -670,7 +744,39 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private func serveMaster(_ connection: NWConnection,
                              videoVariant: DVPlaybackPolicy.MasterVideoVariant = .primary,
                              delivery: Delivery = .legacy) {
-        guard let sig = waitForMount({ stream.hlsSnapshot().signaling }) else {
+        DiagnosticsLog.log(
+            "dv",
+            "startup phase=master-request variant=\(videoVariant == .primary ? "primary" : "recovery") "
+                + "elapsedMs=\(stream.startupElapsedMilliseconds)")
+        var preludeSignaling: VortXMKVRemuxStream.HLSSignaling?
+        #if os(tvOS)
+        if videoVariant == .primary {
+            let prelude = waitForMount { () -> PrimaryMasterPrelude? in
+                let snapshot = self.stream.hlsSnapshot()
+                if let signaling = snapshot.signaling { return .signaling(signaling) }
+                if let intent = snapshot.displayIntent { return .displayIntent(intent) }
+                return nil
+            }
+            guard let prelude else {
+                DiagnosticsLog.log("dv", "hls 404 /master.m3u8")
+                close(connection, status: "404 Not Found")
+                return
+            }
+            switch prelude {
+            case .displayIntent(let intent):
+                requestDisplaySwitch(
+                    .dolbyVision,
+                    fps: intent.fps,
+                    width: intent.width,
+                    height: intent.height,
+                    recovery: false,
+                    source: "verified-preflight")
+            case .signaling(let signaling):
+                preludeSignaling = signaling
+            }
+        }
+        #endif
+        guard let sig = preludeSignaling ?? waitForMount({ stream.hlsSnapshot().signaling }) else {
             DiagnosticsLog.log("dv", "hls 404 /master.m3u8")
             close(connection, status: "404 Not Found")
             return
@@ -695,55 +801,39 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             }
         }
         #if os(tvOS)
-        // #147: the panel switch below is DV-lane only. A PLAIN (non-DV) remux mount must never touch the
-        // panel: its master carries no DV declaration and its content is whatever the source was (usually
-        // SDR). `sig.dolbyVision` is mode-derived (every `.dolbyVision` master keeps today's behavior exactly,
-        // including a P8 with an unknown compat id).
+        // The verified preflight path may already have started this request while resume and mux setup ran.
+        // Sources that needed packet repair or audio transcode still use the final signaling path here.
         if sig.dolbyVision {
-        // #76: FIRE the Dolby Vision panel switch HERE, now that classify has published signaling, and BEFORE
-        // the media playlist / any segment (the real video mount). This replaces the old pre-attach switch in
-        // loadFile, which fired on mount for every remux candidate and cycled the panel twice per hop whenever
-        // classify then rejected a non-DV / undecodable source (that path fails the buffer BEFORE any signaling
-        // exists, 404s the guard above, and never reaches this line). Signaling PRESENCE is the gate: every
-        // served master is a classify-ACCEPTED DV source by construction (non-5/7/8 profiles are rejected
-        // pre-signaling), including a P8 with an unknown compat id whose CODECS string ships as plain HEVC.
-        // The native (non-remux) DV lane still switches pre-attach because AVPlayer cannot report the profile
-        // before it demuxes. `request` is @MainActor and a no-op on iOS/macOS. Fired synchronously (bounded
-        // semaphore) so setSwitchSettled(false) lands before the settle-wait below, which is what closes the
-        // master-parse race that wait exists for.
-        let switched = DispatchSemaphore(value: 0)
-        let dvFps = sig.fps, dvWidth = sig.width, dvHeight = sig.height
-        let recoveryRange = DVPlaybackPolicy.hdrFallbackDisplayRange(videoRange: sig.videoRange)
-        let requestedRange: ContentDynamicRange = videoVariant == .primary
-            ? .dolbyVision
-            : (recoveryRange == .hlg ? .hlg : .hdr10)
-        DispatchQueue.main.async { [weak self] in
-            defer { switched.signal() }   // signal on EVERY exit so the serve task never eats the full timeout
-            // Teardown race (#76 rework): if the user exited in this instant, invalidate() + stop()'s
-            // HDRDisplayMode.reset may already have run; an unguarded queued request would then flip the TV
-            // into DV mode on the home screen with nothing left to correct it. A torn-down server never
-            // switches the panel.
-            guard let self, !self.isInvalidated else { return }
-            MainActor.assumeIsolated {   // request() is @MainActor; this closure runs on the main queue
-                HDRDisplayMode.request(requestedRange, fps: dvFps, width: dvWidth, height: dvHeight, in: nil)
-            }
-            DiagnosticsLog.log(
-                "dv",
-                "remux classify confirmed DV -> requested \(requestedRange.rawValue) display mode before \(videoVariant == .primary ? "DV" : "HDR recovery") mount (fps=\(String(format: "%.3f", dvFps)) \(dvWidth)x\(dvHeight))")
+            let recoveryRange = DVPlaybackPolicy.hdrFallbackDisplayRange(videoRange: sig.videoRange)
+            let requestedRange: ContentDynamicRange = videoVariant == .primary
+                ? .dolbyVision
+                : (recoveryRange == .hlg ? .hlg : .hdr10)
+            requestDisplaySwitch(
+                requestedRange,
+                fps: sig.fps,
+                width: sig.width,
+                height: sig.height,
+                recovery: videoVariant == .hdrFallback,
+                source: "final-signaling")
         }
-        let switchBudget = min(2, remainingMountBudget())
-        if switchBudget <= 0 || switched.wait(timeout: .now() + switchBudget) == .timedOut {
-            DiagnosticsLog.log("dv", "DV display switch request not confirmed within 2s (main queue busy); the switch may land after the master is served")
-        }
-        }   // end sig.dolbyVision (#147)
         #endif
         // Hold the master until any in-flight HDR display-mode switch settles. AVFoundation's multivariant
         // selector can reject an explicit-range item whenever it parses the master before the output pipeline
         // is provably HDR, and that choice is session-persistent. HDRDisplayMode.isSwitchSettled is always true on iOS/macOS and
         // whenever Match Dynamic Range never started a switch, so this is a no-op except on the tvOS DV path.
-        _ = waitForMount(maximumStageSeconds: 6) {
-            HDRDisplayMode.isSwitchSettled ? true : nil
+        let displaySettled: Bool? = waitForMount(maximumStageSeconds: 6) {
+            #if os(tvOS)
+            if sig.dolbyVision,
+               !self.displayRequestWasDispatched(recovery: videoVariant == .hdrFallback) {
+                return nil
+            }
+            #endif
+            return HDRDisplayMode.isSwitchSettled ? true : nil
         }
+        DiagnosticsLog.log(
+            "dv",
+            "startup phase=display-settle settled=\(displaySettled == true) "
+                + "elapsedMs=\(stream.startupElapsedMilliseconds)")
 
         // Alternate qualification is hard-bounded and fail-open. Once this step finishes, the common startup
         // gate below treats the resulting topology as immutable: every advertised rendition must contribute
@@ -812,7 +902,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         let masterPath = videoVariant == .primary ? "/master.m3u8" : "/master-hdr.m3u8"
         DiagnosticsLog.log(
             "dv",
-            "hls resp \(masterPath) variants=1 mode=\(videoVariant == .primary ? "primary" : "hdr-recovery") audio=\(audioPlan == nil ? 0 : 1) audioTags=\(audioTags.count) subs=\(subtitleRenditions.count) \(body.count)B")
+            "hls resp \(masterPath) variants=1 mode=\(videoVariant == .primary ? "primary" : "hdr-recovery") audio=\(audioPlan == nil ? 0 : 1) audioTags=\(audioTags.count) subs=\(subtitleRenditions.count) \(body.count)B elapsedMs=\(stream.startupElapsedMilliseconds)")
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl", delivery: delivery)
     }
 
@@ -962,7 +1052,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         }
 
         let audioTerminated = audioDegraded(snapshot)
-        let selectedVideo: VortXHLSWindow
+        var selectedVideo: VortXHLSWindow
         let ended: Bool
         // Pre-ready and post-ready share ONE window rule now (the 187 EVENT-playlist shape): the START is
         // pinned until the client's own consumption advances it, and the TAIL always grows with production.
@@ -1071,6 +1161,18 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             }
             publishedVideoWindow = selectedVideo
             ended = commonReachedEOF
+        }
+
+        // Until AVPlayer requests its first media segment, keep the initial playlist near the independently
+        // decodable start. A delayed master can otherwise expose a long producer tail and AVPlayer may begin near
+        // that live edge despite EXT-X-START. The first segment fetch is the receipt that releases this cap.
+        if !engineReady,
+           consumptionAnchored,
+           highestServedVideoSegmentID < 0,
+           !ended,
+           selectedVideo.segments.count > startupReadiness.maximumUnconsumedSegmentCount {
+            selectedVideo = startupReadiness.unconsumedStartupWindow(selectedVideo)
+            publishedVideoWindow = selectedVideo
         }
 
         let ids = selectedVideo.segments.map(\.id)
@@ -1227,7 +1329,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             window: publication.videoWindow,
             ended: publication.ended,
             mapURI: hdr ? "init-hdr.mp4" : "init.mp4")
-        DiagnosticsLog.log("dv", "hls resp \(path) seq=\(publication.videoWindow.mediaSequence) segs=\(publication.videoWindow.segments.count) ended=\(publication.ended) \(body.count)B")
+        DiagnosticsLog.log(
+            "dv",
+            "hls resp \(path) seq=\(publication.videoWindow.mediaSequence) "
+                + "segs=\(publication.videoWindow.segments.count) ended=\(publication.ended) "
+                + "\(body.count)B elapsedMs=\(stream.startupElapsedMilliseconds)")
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl", delivery: delivery)
     }
 

@@ -112,10 +112,19 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// layer already displays the first decoded frame, so a positive time position cannot be the sole owner of
     /// timer cancellation or episode-identity publication.
     var hasProducedPlayableVideoFrame: Bool {
-        if videoFrameEverProduced { return true }
         let seconds = item?.currentTime().seconds ?? 0
-        guard hasProducedPicture(atClock: seconds.isFinite ? seconds : 0) else { return false }
+        return latchPlayableVideoFrame(atClock: seconds.isFinite ? seconds : 0)
+    }
+
+    private func latchPlayableVideoFrame(atClock seconds: Double) -> Bool {
+        if videoFrameEverProduced { return true }
+        guard hasProducedPicture(atClock: seconds) else { return false }
         videoFrameEverProduced = true
+        if let server = remuxHLSServer {
+            DiagnosticsLog.log(
+                "dv",
+                "startup phase=first-video-frame elapsedMs=\(server.startupElapsedMilliseconds)")
+        }
         return true
     }
     /// Pin the one-variant DV item only after AVFoundation has produced a real picture. This avoids a
@@ -2407,8 +2416,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             audioOverBlackSince = 0   // not advancing: never count paused/buffering time toward the window
             return
         }
-        if hasProducedPicture(atClock: position) {
-            videoFrameEverProduced = true
+        if latchPlayableVideoFrame(atClock: position) {
             audioOverBlackSince = 0
             return
         }
@@ -2421,7 +2429,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // Atmos lost for the whole title), so the demote may only fire while the layer itself reports NO
         // displayable frame, or no layer is attached at all.
         if playerLayer?.isReadyForDisplay == true {
-            videoFrameEverProduced = true
+            _ = latchPlayableVideoFrame(atClock: position)
             audioOverBlackSince = 0
             return
         }
@@ -2462,8 +2470,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// against a later selector reinterpretation. Hosted mounts receive the same value over the optional status
     /// field, while older hosts safely leave the preference unset.
     private func pinPreferredPeakBitRateAfterFirstFrame(_ item: AVPlayerItem, atClock seconds: Double) {
-        let producedPicture = hasProducedPicture(atClock: seconds)
-        if producedPicture { videoFrameEverProduced = true }
+        let producedPicture = latchPlayableVideoFrame(atClock: seconds)
         let signalingDolbyVision: Bool
         if let localSignaling = remuxHLSServer?.signaling {
             signalingDolbyVision = localSignaling.dolbyVision

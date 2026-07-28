@@ -2487,15 +2487,18 @@ enum PlayerLiveContractTests {
                       "let audioPublished = _alternateAudioState == .ready && _alternateAudioPlan != nil") == true
                   && immutableSnapshot?.contains("audioPlan: audioPublished ? _alternateAudioPlan : nil") == true
                   && immutableSnapshot?.contains("subtitleFailureReason: _subtitleSettlement.invalidationReason") == true)
-        // The startup floor is the FLAT 4-second/two-segment budget; the 3x-target multiplication was the
+        // The startup floor is the flat four-second / one-decodable-segment budget; the 3x-target multiplication was the
         // build 189 regression (36s of media before the master, while the start watchdog fires at 10s).
-        check("wiring: master waits for the flat two-segment startup floor",
+        check("wiring: master waits for the flat first-decodable-segment startup floor",
               masterPublication?.contains("DVPlaybackPolicy.pinnedStartupCohort(") == true
                   && masterPublication?.contains(
                     "minimumSegmentCount: startupReadiness.minimumSegmentCount") == true
                   && masterPublication?.contains(
                     "startupReadiness.minimumRenderedDurationMilliseconds") == true
                   && policy?.contains("static let startupFloorMilliseconds = 4_000") == true
+                  && policy?.contains("minimumSegmentCount: Int = 1") == true
+                  && rollingPublication?.contains(
+                      "startupReadiness.maximumUnconsumedSegmentCount") == true
                   && policy?.contains("frozenTarget.seconds.multipliedReportingOverflow(by: 3)") == false
                   && server?.contains("minimumStartupDurationMilliseconds = 15_000") == false)
         check("wiring: one frozen target renders identically across video, audio and subtitle routes",

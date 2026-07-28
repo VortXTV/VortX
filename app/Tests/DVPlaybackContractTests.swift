@@ -477,19 +477,38 @@ check("target authority: exact twelve is valid while malformed or over-twelve co
               adjacentIntervalsSeconds: [12.000_001])) == nil)
 let targetSevenReadiness = VortXHLSStartupReadiness(
     frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex))
-// The startup floor is a FLAT two-segment / four-second budget, decoupled from the frozen target: the
+// The startup floor is a flat one-decodable-segment / four-second budget, decoupled from the frozen target: the
 // 6-segment / 3x-target floor (36s at the conservative target) held every UHD master past the chrome's 10s
 // start watchdog and inflated the live window into the session spool's 512 MiB ceiling - the build 189
 // field regression, twice over.
-check("startup readiness: two segments and the flat four-second floor are one immutable contract",
+check("startup readiness: one independently decodable segment and four seconds are one immutable contract",
       targetSevenReadiness == .init(
           frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex),
-          minimumSegmentCount: 2))
+          minimumSegmentCount: 1))
 check("startup readiness: the startup floor is 4000 rendered milliseconds regardless of target",
       targetSevenReadiness?.minimumRenderedDurationMilliseconds == 4_000
           && VortXHLSStartupReadiness(
               frozenTarget: VortXHLSTargetPolicy.conservativeTarget)?
               .minimumRenderedDurationMilliseconds == 4_000)
+check("startup readiness: an unconsumed playlist exposes at most two startup segments",
+      targetSevenReadiness?.maximumUnconsumedSegmentCount == 2
+          && VortXHLSStartupReadiness(
+              frozenTarget: VortXHLSTargetPolicy.conservativeTarget,
+              minimumSegmentCount: 3)?.maximumUnconsumedSegmentCount == 3)
+let producerAheadAtStart = VortXHLSWindow(segments: (0..<8).map {
+    VortXHLSSegment(
+        id: $0,
+        byteOffset: $0 * 100,
+        byteLength: 100,
+        start: Double($0) * 4,
+        duration: 4)
+})
+check("startup readiness: the executable unconsumed window keeps the first two absolute segments",
+      targetSevenReadiness?.unconsumedStartupWindow(producerAheadAtStart)
+          .segments.map(\.id) == [0, 1])
+let alreadySmallStart = VortXHLSWindow(segments: Array(producerAheadAtStart.segments.prefix(1)))
+check("startup readiness: an already-small unconsumed window is byte-range identical",
+      targetSevenReadiness?.unconsumedStartupWindow(alreadySmallStart) == alreadySmallStart)
 check("startup readiness: invalid target bounds and segment counts are rejected without a force unwrap",
       VortXHLSStartupReadiness(
           frozenTarget: .init(seconds: 4, authority: .validatedCompleteIndex)) == nil
@@ -498,6 +517,36 @@ check("startup readiness: invalid target bounds and segment counts are rejected 
           && VortXHLSStartupReadiness(
               frozenTarget: VortXHLSTargetPolicy.conservativeTarget,
               minimumSegmentCount: 0) == nil)
+
+check("early display intent: only a fully described clean DV stream-copy source may overlap panel setup",
+      DVPlaybackPolicy.canPublishEarlyDisplayIntent(
+          requiresDolbyVision: true,
+          dolbyVisionProfile: 8,
+          width: 3840,
+          height: 2160,
+          frameRate: 23.976,
+          hasBaseVideo: true,
+          hvc1ExtradataReady: true,
+          hasStreamCopyAudio: true))
+for rejected in [
+    DVPlaybackPolicy.canPublishEarlyDisplayIntent(
+        requiresDolbyVision: false, dolbyVisionProfile: 8, width: 3840, height: 2160,
+        frameRate: 23.976, hasBaseVideo: true, hvc1ExtradataReady: true, hasStreamCopyAudio: true),
+    DVPlaybackPolicy.canPublishEarlyDisplayIntent(
+        requiresDolbyVision: true, dolbyVisionProfile: -1, width: 3840, height: 2160,
+        frameRate: 23.976, hasBaseVideo: true, hvc1ExtradataReady: true, hasStreamCopyAudio: true),
+    DVPlaybackPolicy.canPublishEarlyDisplayIntent(
+        requiresDolbyVision: true, dolbyVisionProfile: 8, width: 3840, height: 2160,
+        frameRate: 23.976, hasBaseVideo: true, hvc1ExtradataReady: false, hasStreamCopyAudio: true),
+    DVPlaybackPolicy.canPublishEarlyDisplayIntent(
+        requiresDolbyVision: true, dolbyVisionProfile: 8, width: 3840, height: 2160,
+        frameRate: 23.976, hasBaseVideo: true, hvc1ExtradataReady: true, hasStreamCopyAudio: false),
+    DVPlaybackPolicy.canPublishEarlyDisplayIntent(
+        requiresDolbyVision: true, dolbyVisionProfile: 8, width: 3840, height: 2160,
+        frameRate: 0, hasBaseVideo: true, hvc1ExtradataReady: true, hasStreamCopyAudio: true),
+] {
+    check("early display intent: incomplete or speculative source evidence fails closed", !rejected)
+}
 
 var sequentialDeadline = VortXHLSMountDeadlineState()
 check("mount deadline: start at monotonic 100 freezes one absolute edge at 130",

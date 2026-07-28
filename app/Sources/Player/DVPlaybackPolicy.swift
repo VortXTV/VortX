@@ -40,6 +40,32 @@ enum DVPlaybackPolicy {
         message.hasPrefix(sourceCapabilityMismatchPrefix)
     }
 
+    /// A tvOS Dolby Vision display switch may overlap the remaining remux setup only after source metadata
+    /// proves the route is viable without packet inspection. Final HLS signaling and master publication remain
+    /// gated on the completed output header, so this only moves the expensive display preparation earlier.
+    static func canPublishEarlyDisplayIntent(
+        requiresDolbyVision: Bool,
+        dolbyVisionProfile: Int,
+        width: Int,
+        height: Int,
+        frameRate: Double,
+        hasBaseVideo: Bool,
+        hvc1ExtradataReady: Bool,
+        hasStreamCopyAudio: Bool
+    ) -> Bool {
+        requiresDolbyVision
+            && (dolbyVisionProfile == 5
+                || dolbyVisionProfile == 7
+                || dolbyVisionProfile == 8)
+            && width > 0
+            && height > 0
+            && frameRate.isFinite
+            && frameRate > 0
+            && hasBaseVideo
+            && hvc1ExtradataReady
+            && hasStreamCopyAudio
+    }
+
     enum NativePreAttachOutcome: Equatable, Sendable {
         case stale
         case attachedWithLoadedCriteria
@@ -1193,8 +1219,11 @@ struct VortXHLSStartupReadiness: Equatable, Sendable {
     let minimumSegmentCount: Int
     let minimumRenderedDurationMilliseconds: Int
 
-    /// Startup floor: TWO segments and FOUR seconds of rendered media. This is deliberately a flat wall-clock
-    /// budget, NOT a multiple of the frozen target. The build 189 field regression: the floor was
+    /// Startup floor: ONE independently decodable segment and FOUR seconds of rendered media. This is a flat
+    /// wall-clock budget, not a multiple of the frozen target. A short segment still requires enough following
+    /// segments to reach four seconds; a complete four-second segment can be served immediately.
+    ///
+    /// The build 189 field regression: the floor was
     /// 6 segments AND 3x the conservative 12s target (36 SECONDS of media), so a UHD DV mount held its master
     /// until ~380 MB had been produced - 12-15s on a fast debrid link - while the chrome's start watchdog
     /// demotes at 10s. Every DV title "hung ~10s then fell to HDR10". The same floor sized the live window
@@ -1205,7 +1234,19 @@ struct VortXHLSStartupReadiness: Equatable, Sendable {
     /// RFC 8216 6.3.3 does not apply to this server's fixed-offset startup.
     static let startupFloorMilliseconds = 4_000
 
-    init?(frozenTarget: VortXHLSFrozenTarget, minimumSegmentCount: Int = 2) {
+    /// Before AVPlayer has fetched any media, advertise at most two segments. This leaves one segment beyond
+    /// the minimum cohort for readiness negotiation while preventing a delayed master from making AVPlayer
+    /// choose a much later live-edge segment. The first segment fetch becomes the consumption receipt that lets
+    /// the normal rolling publication grow.
+    var maximumUnconsumedSegmentCount: Int { max(2, minimumSegmentCount) }
+
+    func unconsumedStartupWindow(_ window: VortXHLSWindow) -> VortXHLSWindow {
+        guard window.segments.count > maximumUnconsumedSegmentCount else { return window }
+        return VortXHLSWindow(
+            segments: Array(window.segments.prefix(maximumUnconsumedSegmentCount)))
+    }
+
+    init?(frozenTarget: VortXHLSFrozenTarget, minimumSegmentCount: Int = 1) {
         guard frozenTarget.seconds >= VortXHLSTargetPolicy.minimumSeconds,
               frozenTarget.seconds <= VortXHLSTargetPolicy.conservativeSeconds,
               minimumSegmentCount > 0 else { return nil }
