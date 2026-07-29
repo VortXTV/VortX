@@ -103,11 +103,18 @@ enum VortXEngineProtocolCompatibilityTests {
             subtitleTracks: [
                 .init(sourceIndex: 7, codec: "subrip", language: "eng",
                       title: "English SDH", isForced: false, delivery: .webVTT,
-                      renditionIndex: 0, unavailableReason: nil),
+                      renditionIndex: 0, unavailableReason: nil,
+                      unavailableKind: nil),
                 .init(sourceIndex: 8, codec: "hdmv_pgs_subtitle", language: "eng",
                       title: "English PGS", isForced: false, delivery: .bitmapUnavailable,
                       renditionIndex: nil,
-                      unavailableReason: "Image subtitle is not available in AVPlayer")
+                      unavailableReason: "Image subtitle is not available in AVPlayer",
+                      unavailableKind: .bitmap),
+                .init(sourceIndex: 9, codec: "realtext", language: "eng",
+                      title: "Legacy text", isForced: false, delivery: .bitmapUnavailable,
+                      renditionIndex: nil,
+                      unavailableReason: "REALTEXT subtitle is not supported in AVPlayer",
+                      unavailableKind: .unsupported)
             ],
             producedEdgeSeconds: 12)
         let roundTrip = try JSONDecoder().decode(
@@ -118,6 +125,34 @@ enum VortXEngineProtocolCompatibilityTests {
         precondition(roundTrip.audioTracks?[0].activeCodec == "eac3")
         precondition(roundTrip.audioTracks?[1].codec == "ac3")
         precondition(roundTrip.audioTracks?[1].activeCodec == "ac3")
+        precondition(roundTrip.subtitleTracks?[0].resolvedUnavailableKind == nil)
+        precondition(roundTrip.subtitleTracks?[1].unavailableKind == .bitmap)
+        precondition(roundTrip.subtitleTracks?[1].resolvedUnavailableKind == .bitmap)
+        precondition(roundTrip.subtitleTracks?[2].unavailableKind == .unsupported)
+        precondition(roundTrip.subtitleTracks?[2].resolvedUnavailableKind == .unsupported)
+
+        let modernUnavailableTracks = Array(current.subtitleTracks!.dropFirst())
+        for (expectedKind, track) in zip(
+            [VortXEngineProtocol.SubtitleUnavailableKind.bitmap, .unsupported],
+            modernUnavailableTracks
+        ) {
+            let encoded = try JSONEncoder().encode(track)
+            let decoded = try JSONDecoder().decode(
+                VortXEngineProtocol.SubtitleTrack.self,
+                from: encoded)
+            precondition(decoded.unavailableKind == expectedKind)
+            precondition(decoded.resolvedUnavailableKind == expectedKind)
+
+            var legacyObject = try JSONSerialization.jsonObject(
+                with: encoded) as! [String: Any]
+            legacyObject.removeValue(forKey: "unavailableKind")
+            precondition(legacyObject["delivery"] as? String == "bitmapUnavailable")
+            let decodedLegacyTrack = try JSONDecoder().decode(
+                VortXEngineProtocol.SubtitleTrack.self,
+                from: JSONSerialization.data(withJSONObject: legacyObject))
+            precondition(decodedLegacyTrack.unavailableKind == nil)
+            precondition(decodedLegacyTrack.resolvedUnavailableKind == .bitmap)
+        }
 
         var legacyStatusObject = try JSONSerialization.jsonObject(
             with: JSONEncoder().encode(current)) as! [String: Any]

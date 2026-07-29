@@ -45,6 +45,7 @@ enum MultiAudioPolicyTests {
         testQualificationAndDistinctSinks()
         testMasterTopology()
         testInBandPrimaryMetadata()
+        testUnavailableSubtitleReasons()
         testAbsolutePlaylistAndRequests()
         testAlignedPublicationLifecycle()
         testBoundedAlignmentHold()
@@ -303,7 +304,7 @@ enum MultiAudioPolicyTests {
                 provenPacketStreamIndices: [2]) == nil)
         let jocPrimary = Track(
             index: 1, codecID: eac3, channels: 6, language: "eng",
-            title: "English Atmos", isJOC: true, usesDec3: true)
+            title: "English Atmos", sourceProfile30: true, usesDec3: true)
         let plainAlternate = Track(
             index: 2, codecID: eac3, channels: 6, language: "jpn",
             title: "Japanese", usesDec3: true)
@@ -330,14 +331,27 @@ enum MultiAudioPolicyTests {
               capturedPlainControl == .init(jocComplexityIndex: nil))
         check("JOC honesty: only a stream-copy E-AC3 receipt can label Atmos",
               MultiAudioPolicy.verifiedJOC(
+                  sourceProfile30: true,
                   isStreamCopy: true, usesDec3: true,
                   observation: capturedOfficialJOC))
-        check("JOC honesty: source hints cannot label a transcoded row",
+        check("JOC honesty: a JOC output receipt cannot label a non-profile-30 source",
               !MultiAudioPolicy.verifiedJOC(
+                  sourceProfile30: false,
+                  isStreamCopy: true, usesDec3: true,
+                  observation: capturedOfficialJOC))
+        check("JOC honesty: a profile-30 source and JOC receipt cannot label a transcoded row",
+              !MultiAudioPolicy.verifiedJOC(
+                  sourceProfile30: true,
                   isStreamCopy: false, usesDec3: true,
                   observation: capturedOfficialJOC))
+        check("JOC honesty: source and route witnesses cannot replace the output receipt",
+              !MultiAudioPolicy.verifiedJOC(
+                  sourceProfile30: true,
+                  isStreamCopy: true, usesDec3: true,
+                  observation: nil))
         check("JOC honesty: a valid plain dec3 is not Atmos",
               !MultiAudioPolicy.verifiedJOC(
+                  sourceProfile30: true,
                   isStreamCopy: true, usesDec3: true,
                   observation: capturedPlainControl))
         check("plan: a complete movenc-shaped non-JOC dec3 is a positive non-JOC observation",
@@ -399,9 +413,35 @@ enum MultiAudioPolicyTests {
         let plainPrimary = Track(
             index: 1, codecID: eac3, channels: 6, language: "eng",
             title: "English", usesDec3: true)
+        let plainSourceJOCOutputCandidate = MultiAudioPolicy.renditionPlan(
+            from: [plainPrimary, plainAlternate],
+            primaryIndex: 1,
+            provenPacketStreamIndices: [2])
+        let plainSourceJOCOutput = MultiAudioPolicy.finalizeForPublication(
+            plainSourceJOCOutputCandidate,
+            primaryDec3: primary16,
+            alternateDec3: plainDec3)
+        check("plan: output JOC without source profile 30 is signaled only as physical channels",
+              MultiAudioPolicy.mediaTags(plainSourceJOCOutput).first?.contains(#"CHANNELS="6""#) == true
+                  && MultiAudioPolicy.mediaTags(plainSourceJOCOutput).first?.contains("/JOC") == false)
+        let transcodedProfile30Primary = Track(
+            index: 1, codecID: eac3, channels: 6, language: "eng",
+            title: "Transcoded", sourceProfile30: true, usesDec3: true, isStreamCopy: false)
+        let transcodedJOCOutputCandidate = MultiAudioPolicy.renditionPlan(
+            from: [transcodedProfile30Primary, plainAlternate],
+            primaryIndex: 1,
+            provenPacketStreamIndices: [2])
+        let transcodedJOCOutput = MultiAudioPolicy.finalizeForPublication(
+            transcodedJOCOutputCandidate,
+            primaryDec3: primary16,
+            alternateDec3: plainDec3)
+        check("plan: output JOC and source profile 30 cannot label a transcoded rendition",
+              MultiAudioPolicy.mediaTags(transcodedJOCOutput).first?.contains(#"CHANNELS="6""#) == true
+                  && MultiAudioPolicy.mediaTags(transcodedJOCOutput).first?.contains("/JOC") == false)
+
         let jocAlternate = Track(
             index: 2, codecID: eac3, channels: 6, language: "jpn",
-            title: "Japanese Atmos", isJOC: true, usesDec3: true)
+            title: "Japanese Atmos", sourceProfile30: true, usesDec3: true)
         let jocAlternateCandidate = MultiAudioPolicy.renditionPlan(
             from: [plainPrimary, jocAlternate],
             primaryIndex: 1,
@@ -489,6 +529,8 @@ enum MultiAudioPolicyTests {
             title: "Decoded surround",
             physicalChannels: 6,
             usesDec3: true,
+            sourceProfile30: false,
+            isStreamCopy: false,
             dec3: nil)
         check("master: transcoded E-AC-3 primary remains named before its dec3 receipt",
               eac3BeforeReceipt?.contains(#"NAME="Decoded surround""#) == true
@@ -502,11 +544,65 @@ enum MultiAudioPolicyTests {
             title: "French",
             physicalChannels: 8,
             usesDec3: false,
+            sourceProfile30: false,
+            isStreamCopy: false,
             dec3: nil)
         check("master: non-dec3 transcode labels its physical output channels",
               aac?.contains(#"LANGUAGE="fra""#) == true
                   && aac?.contains(#"CHANNELS="8""#) == true
                   && aac?.contains("JOC") == false)
+
+        let jocReceipt = MultiAudioPolicy.dec3Observation(in: dec3Init(jocComplexity: 16))
+        let verified = MultiAudioPolicy.inBandPrimaryTag(
+            languageRaw: "eng",
+            title: "Verified Atmos",
+            physicalChannels: 6,
+            usesDec3: true,
+            sourceProfile30: true,
+            isStreamCopy: true,
+            dec3: jocReceipt)
+        check("master: /JOC requires source profile 30, stream copy, and the output receipt",
+              verified?.contains(#"CHANNELS="16/JOC""#) == true)
+        let missingSource = MultiAudioPolicy.inBandPrimaryTag(
+            languageRaw: "eng",
+            title: "Unverified source",
+            physicalChannels: 6,
+            usesDec3: true,
+            sourceProfile30: false,
+            isStreamCopy: true,
+            dec3: jocReceipt)
+        let transcoded = MultiAudioPolicy.inBandPrimaryTag(
+            languageRaw: "eng",
+            title: "Transcoded",
+            physicalChannels: 6,
+            usesDec3: true,
+            sourceProfile30: true,
+            isStreamCopy: false,
+            dec3: jocReceipt)
+        check("master: a JOC receipt without source profile 30 stays physical",
+              missingSource?.contains(#"CHANNELS="6""#) == true
+                  && missingSource?.contains("/JOC") == false)
+        check("master: a JOC receipt on a transcode stays physical",
+              transcoded?.contains(#"CHANNELS="6""#) == true
+                  && transcoded?.contains("/JOC") == false)
+    }
+
+    private static func testUnavailableSubtitleReasons() {
+        check("subtitle reason: a known bitmap codec may be called an image subtitle",
+              MultiAudioPolicy.unavailableSubtitleReason(
+                  codecName: "hdmv_pgs_subtitle",
+                  isKnownBitmap: true)
+                  == "Image subtitle is not available in AVPlayer")
+        check("subtitle reason: an unsupported text codec is not mislabeled as image",
+              MultiAudioPolicy.unavailableSubtitleReason(
+                  codecName: "realtext",
+                  isKnownBitmap: false)
+                  == "REALTEXT subtitle is not supported in AVPlayer")
+        check("subtitle reason: an unknown codec remains generic rather than image-labeled",
+              MultiAudioPolicy.unavailableSubtitleReason(
+                  codecName: " ",
+                  isKnownBitmap: false)
+                  == "This subtitle format is not supported in AVPlayer")
     }
 
     private struct BitWriter {

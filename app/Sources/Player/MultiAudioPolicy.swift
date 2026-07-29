@@ -222,24 +222,30 @@ enum MultiAudioPolicy {
         let channels: Int
         let language: String
         let title: String
-        let isJOC: Bool
+        /// The source demuxer reported FFmpeg's E-AC3 DDP Atmos profile (30).
+        ///
+        /// This is only one witness. It cannot authorize an Atmos label without a stream-copy route and a
+        /// structured JOC extension in the concrete muxer's output `dec3` box.
+        let sourceProfile30: Bool
         let usesDec3: Bool
+        let isStreamCopy: Bool
 
         init(index: Int, codecID: UInt32, channels: Int, language: String, title: String = "",
-             isJOC: Bool = false, usesDec3: Bool = false) {
+             sourceProfile30: Bool = false, usesDec3: Bool = false, isStreamCopy: Bool = true) {
             self.index = index
             self.codecID = codecID
             self.channels = channels
             self.language = language
             self.title = title
-            self.isJOC = isJOC
+            self.sourceProfile30 = sourceProfile30
             self.usesDec3 = usesDec3
+            self.isStreamCopy = isStreamCopy
         }
     }
 
     enum ChannelSignaling: Equatable, Sendable {
         case physical(Int)
-        case pendingDec3(physical: Int, sourceExpectsJOC: Bool)
+        case pendingDec3(physical: Int, sourceProfile30: Bool, isStreamCopy: Bool)
         case joc(complexityIndex: Int)
 
         fileprivate var attribute: String? {
@@ -366,7 +372,10 @@ enum MultiAudioPolicy {
     private static func channelSignaling(for track: AudioTrack) -> ChannelSignaling {
         let physical = max(1, track.channels)
         return track.usesDec3
-            ? .pendingDec3(physical: physical, sourceExpectsJOC: track.isJOC)
+            ? .pendingDec3(
+                physical: physical,
+                sourceProfile30: track.sourceProfile30,
+                isStreamCopy: track.isStreamCopy)
             : .physical(physical)
     }
 
@@ -374,12 +383,14 @@ enum MultiAudioPolicy {
         let jocComplexityIndex: Int?
     }
 
-    /// Atmos is a delivery receipt, not source metadata. Only a stream-copied E-AC3 output whose structured
-    /// muxed `dec3` path proves a valid JOC complexity may carry the label.
-    static func verifiedJOC(isStreamCopy: Bool,
+    /// Atmos authorization requires three independent witnesses: FFmpeg source profile 30, a stream-copy
+    /// route, and a structured JOC extension parsed from this concrete muxer's output `dec3` box.
+    static func verifiedJOC(sourceProfile30: Bool,
+                            isStreamCopy: Bool,
                             usesDec3: Bool,
                             observation: Dec3Observation?) -> Bool {
-        isStreamCopy && usesDec3 && observation?.jocComplexityIndex != nil
+        sourceProfile30 && isStreamCopy && usesDec3
+            && observation?.jocComplexityIndex != nil
     }
 
     private struct MP4Box {
@@ -555,12 +566,18 @@ enum MultiAudioPolicy {
         switch rendition.channelSignaling {
         case .physical, .joc:
             resolved = rendition.channelSignaling
-        case .pendingDec3(let physical, let sourceExpectsJOC):
+        case .pendingDec3(let physical, let sourceProfile30, let isStreamCopy):
             guard let observation else { return nil }
             if let complexity = observation.jocComplexityIndex {
-                resolved = .joc(complexityIndex: complexity)
+                resolved = verifiedJOC(
+                    sourceProfile30: sourceProfile30,
+                    isStreamCopy: isStreamCopy,
+                    usesDec3: true,
+                    observation: observation)
+                    ? .joc(complexityIndex: complexity)
+                    : .physical(physical)
             } else {
-                guard !sourceExpectsJOC else { return nil }
+                guard !sourceProfile30 || !isStreamCopy else { return nil }
                 resolved = .physical(physical)
             }
         }
@@ -623,6 +640,8 @@ enum MultiAudioPolicy {
                                  title: String,
                                  physicalChannels: Int,
                                  usesDec3: Bool,
+                                 sourceProfile30: Bool,
+                                 isStreamCopy: Bool,
                                  dec3: Dec3Observation?) -> String? {
         let key = languageKey(languageRaw)
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -635,7 +654,12 @@ enum MultiAudioPolicy {
         tag += ",DEFAULT=YES,AUTOSELECT=YES"
         let channels: String?
         if usesDec3 {
-            if let complexity = dec3?.jocComplexityIndex {
+            if verifiedJOC(
+                sourceProfile30: sourceProfile30,
+                isStreamCopy: isStreamCopy,
+                usesDec3: true,
+                observation: dec3),
+               let complexity = dec3?.jocComplexityIndex {
                 channels = "\(complexity)/JOC"
             } else if dec3 != nil {
                 channels = String(max(1, physicalChannels))
@@ -647,6 +671,21 @@ enum MultiAudioPolicy {
         }
         if let channels { tag += ",CHANNELS=\"\(channels)\"" }
         return tag
+    }
+
+    /// User-facing reason for a source subtitle row that has no WebVTT rendition.
+    ///
+    /// The transport protocol currently has one unavailable delivery enum, but the reason must still describe
+    /// the actual source truth. Only codecs positively classified as bitmap may be called image subtitles.
+    static func unavailableSubtitleReason(codecName: String,
+                                          isKnownBitmap: Bool) -> String {
+        if isKnownBitmap {
+            return "Image subtitle is not available in AVPlayer"
+        }
+        let codec = codecName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return codec.isEmpty
+            ? "This subtitle format is not supported in AVPlayer"
+            : "\(codec.uppercased()) subtitle is not supported in AVPlayer"
     }
 
     static func mediaTags(_ plan: RenditionPlan?) -> [String] {

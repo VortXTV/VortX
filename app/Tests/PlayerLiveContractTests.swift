@@ -198,6 +198,8 @@ enum PlayerLiveContractTests {
             title: "English Atmos",
             physicalChannels: 6,
             usesDec3: true,
+            sourceProfile30: true,
+            isStreamCopy: true,
             dec3: .init(jocComplexityIndex: 16))
         let input = DVPlaybackPolicy.MasterPlaylistInput(
             videoCodec: "dvh1.08.06",
@@ -2598,6 +2600,10 @@ enum PlayerLiveContractTests {
             stream,
             from: "let policyAudioTracks = MultiAudioPolicy.selectableSourceTracks(",
             to: "var transcodeAudioName = \"none\"")
+        let sourceSubtitleInventory = sourceSection(
+            stream,
+            from: "var subtitleTracks: [SubtitleRenditionPolicy.SourceTrack] = []",
+            to: "// The target language each pick keeps to:")
         let alternateMuxer = sourceSection(
             stream,
             from: "private final class VortXAlternateAudioMuxer",
@@ -2784,7 +2790,9 @@ enum PlayerLiveContractTests {
                   && closeVideoSegment?.contains("MultiAudioPolicy.finalizeForPublication(") == true
                   && stream?.contains("_alternateAudioPlan = candidateAudioPlan") == false)
         check("wiring: JOC observation reaches the fail-closed rendition policy",
-              stream?.contains("isJOC: $0.atmos") == true)
+              stream?.contains("sourceProfile30: $0.atmos") == true
+                  && stream?.contains("_sourceProfile30AudioIndices") == true
+                  && stream?.contains("sourceProfile30: sourceProfile30") == true)
         check("wiring: a cloned late packet is freed and fails only the optional alternate",
               alternatePacketHold?.contains("alignment.isBehindClosedFrontier(timestamp)") == true
                   && alternatePacketHold?.contains("av_packet_free(&optional)") == true
@@ -3352,6 +3360,8 @@ enum PlayerLiveContractTests {
                   "languageRaw: Self.streamLanguage(inStream)",
                   "channels: Int(outputParameters.ch_layout.nb_channels)",
                   "usesDec3: outputParameters.codec_id == AV_CODEC_ID_EAC3",
+                  "sourceProfile30: false",
+                  "isStreamCopy: false",
                   "_primaryAudioLabel = primaryLabel",
                   "if outputParameters.codec_id == AV_CODEC_ID_EAC3 { dec3ScanDone = false }",
                   "audio transcode armed:",
@@ -3389,6 +3399,17 @@ enum PlayerLiveContractTests {
                   "source.outputCodec.map { \" -> \\($0.uppercased())\" } ?? \" -> E-AC3/AAC\"",
                   "let shape = \"\\(codec) \\(source.channels)ch",
               ]))
+        check("wiring: only known bitmap subtitles receive the image-unavailable reason",
+              sourceSubtitleInventory?.contains(
+                  "Self.isKnownBitmapSubtitle(par.pointee.codec_id)") == true
+                  && sourceSubtitleInventory?.contains(
+                      "MultiAudioPolicy.unavailableSubtitleReason(") == true
+                  && sourceSubtitleInventory?.contains(
+                      "metadata.isKnownBitmap ? .bitmap : .unsupported") == true
+                  && sourceSubtitleInventory?.contains(
+                      "unavailableKind: unavailableKind") == true
+                  && sourceSubtitleInventory?.contains(
+                      "\"Image subtitle is not available in AVPlayer\"") == false)
         check("wiring: unavailable source subtitles are never selected by nil equality",
               sourceContainsInOrder(sourceSubtitleRows, [
                   "source.renditionIndex != nil",

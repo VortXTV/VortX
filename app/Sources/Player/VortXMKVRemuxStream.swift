@@ -384,6 +384,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// both present; delivery metadata tells the UI which path the selected remount will take.
     private var _sourceAudioTracks: [VortXEngineProtocol.AudioTrack] = []
     private var _selectedSourceAudioIndex: Int?
+    /// Stable source indices whose demuxed E-AC3 parameters carried FFmpeg profile 30. This source witness is
+    /// retained until the selected output init arrives, where it is joined with route and `dec3` witnesses.
+    private var _sourceProfile30AudioIndices: Set<Int> = []
     private var _sourceSubtitleTracks: [VortXEngineProtocol.SubtitleTrack] = []
 
     var sourceAudioTracks: [VortXEngineProtocol.AudioTrack] {
@@ -429,7 +432,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// Metadata of the ONE in-band audio track, published after its output codec is known so the master can
     /// label the muxed primary with a URI-less EXT-X-MEDIA row when no separately-muxed alternate qualifies.
     private var _primaryAudioLabel: (languageRaw: String, title: String,
-                                     channels: Int, usesDec3: Bool)?
+                                     channels: Int, usesDec3: Bool,
+                                     sourceProfile30: Bool, isStreamCopy: Bool)?
     private var _alternateAudioResources: [MultiAudioPolicy.AudioResource] = []
     private var _alternateAudioMuxer: VortXAlternateAudioMuxer?
     private var _subtitleRenditions: [SubtitleRenditionPolicy.Rendition] = []
@@ -647,6 +651,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 title: $0.title,
                 physicalChannels: $0.channels,
                 usesDec3: $0.usesDec3,
+                sourceProfile30: $0.sourceProfile30,
+                isStreamCopy: $0.isStreamCopy,
                 dec3: _primaryDec3Observation)
         }
         return HLSWindowSnapshot(
@@ -1170,7 +1176,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         var baseVideoIn = -1
         var subtitleTracks: [SubtitleRenditionPolicy.SourceTrack] = []
         var subtitleMetadata: [(index: Int, codec: String, language: String, title: String,
-                                forced: Bool, textFormat: SubtitleRenditionPolicy.TextFormat?)] = []
+                                forced: Bool, textFormat: SubtitleRenditionPolicy.TextFormat?,
+                                isKnownBitmap: Bool)] = []
         for i in 0..<nb {
             guard let inStream = inCtx.pointee.streams[i], let par = inStream.pointee.codecpar else { continue }
             switch par.pointee.codec_type {
@@ -1217,7 +1224,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 let title = Self.streamMetadata(inStream, key: "title")
                 let forced = (disposition & Self.avDispositionForced) != 0
                 subtitleMetadata.append(
-                    (i, Self.codecName(par.pointee.codec_id), language, title, forced, format))
+                    (i, Self.codecName(par.pointee.codec_id), language, title, forced, format,
+                     Self.isKnownBitmapSubtitle(par.pointee.codec_id)))
                 if Self.subtitleRenditionsEnabled, hlsIndexingEnabled, let format {
                     subtitleTracks.append(SubtitleRenditionPolicy.SourceTrack(
                         index: i,
@@ -1249,6 +1257,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             })
         let sourceSubtitleTracks = subtitleMetadata.map { metadata in
             let renditionIndex = renditionBySource[metadata.index]
+            let unavailableKind: VortXEngineProtocol.SubtitleUnavailableKind? =
+                renditionIndex == nil
+                    ? (metadata.isKnownBitmap ? .bitmap : .unsupported)
+                    : nil
             return VortXEngineProtocol.SubtitleTrack(
                 sourceIndex: metadata.index,
                 codec: metadata.codec,
@@ -1258,7 +1270,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 delivery: renditionIndex == nil ? .bitmapUnavailable : .webVTT,
                 renditionIndex: renditionIndex,
                 unavailableReason: renditionIndex == nil
-                    ? "Image subtitle is not available in AVPlayer" : nil)
+                    ? MultiAudioPolicy.unavailableSubtitleReason(
+                        codecName: metadata.codec,
+                        isKnownBitmap: metadata.isKnownBitmap)
+                    : nil,
+                unavailableKind: unavailableKind)
         }
         hlsLock.lock()
         _sourceSubtitleTracks = sourceSubtitleTracks
@@ -1278,7 +1294,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 channels: Int($0.channels),
                 language: $0.lang,
                 title: $0.title,
-                isJOC: $0.atmos,
+                sourceProfile30: $0.atmos,
                 usesDec3: $0.codecID == AV_CODEC_ID_EAC3.rawValue)
         })
         let transcodablePolicyAudioTracks = MultiAudioPolicy.selectableSourceTracks(from: transcodableAudio.map {
@@ -1287,7 +1303,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 codecID: $0.codecID,
                 channels: Int($0.channels),
                 language: $0.lang,
-                title: $0.title)
+                title: $0.title,
+                isStreamCopy: false)
         })
         let policyAudioTracks = MultiAudioPolicy.selectableSourceTracks(
             from: copyablePolicyAudioTracks + transcodablePolicyAudioTracks)
@@ -1359,6 +1376,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         if transcodeActive { mappable.insert(transcodeAudioIn) }
         hlsLock.lock()
         _sourceAudioTracks = publishedAudioTracks
+        _sourceProfile30AudioIndices = Set(
+            copyablePolicyAudioTracks.lazy.filter { $0.sourceProfile30 }.map(\.index))
         _selectedSourceAudioIndex = mappedAudioIn >= 0
             ? mappedAudioIn : (transcodeActive ? transcodeAudioIn : nil)
         hlsLock.unlock()
@@ -1384,7 +1403,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             let primaryLabel = (languageRaw: Self.streamLanguage(s),
                                 title: Self.streamMetadata(s, key: "title"),
                                 channels: Int(p.pointee.ch_layout.nb_channels),
-                                usesDec3: p.pointee.codec_id == AV_CODEC_ID_EAC3)
+                                usesDec3: p.pointee.codec_id == AV_CODEC_ID_EAC3,
+                                sourceProfile30: joc,
+                                isStreamCopy: true)
             hlsLock.lock()
             _primaryAudioLabel = primaryLabel
             hlsLock.unlock()
@@ -1739,7 +1760,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     languageRaw: Self.streamLanguage(inStream),
                     title: Self.streamMetadata(inStream, key: "title"),
                     channels: Int(outputParameters.ch_layout.nb_channels),
-                    usesDec3: outputParameters.codec_id == AV_CODEC_ID_EAC3)
+                    usesDec3: outputParameters.codec_id == AV_CODEC_ID_EAC3,
+                    sourceProfile30: false,
+                    isStreamCopy: false)
                 hlsLock.lock()
                 _primaryAudioLabel = primaryLabel
                 hlsLock.unlock()
@@ -2555,15 +2578,17 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
            }),
            _sourceAudioTracks[selected].delivery != .transcode {
             let track = _sourceAudioTracks[selected]
+            let sourceProfile30 = _sourceProfile30AudioIndices.contains(track.sourceIndex)
             _sourceAudioTracks[selected] = VortXEngineProtocol.AudioTrack(
                 sourceIndex: track.sourceIndex,
                 codec: track.codec,
                 channels: track.channels,
                 language: track.language,
                 title: track.title,
-                // The structured output receipt is the only authority. A source profile hint never reaches
-                // the picker, and transcoded audio can never inherit an Atmos label from its source.
+                // Picker authorization joins all three witnesses. No filename, title, profile alone, or
+                // transcoded output can inherit an Atmos label.
                 isAtmosJOC: MultiAudioPolicy.verifiedJOC(
+                    sourceProfile30: sourceProfile30,
                     isStreamCopy: track.delivery != .transcode,
                     usesDec3: track.activeCodec.lowercased() == "eac3",
                     observation: primaryDec3),
@@ -3794,6 +3819,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // nothing else, so refusing this is what made those discs show zero subtitle tracks.
         case AV_CODEC_ID_HDMV_PGS_SUBTITLE: return Self.pgsRecognitionEnabled ? .pgs : nil
         default: return nil
+        }
+    }
+
+    /// Positive bitmap classification for user-facing unavailability text. A nil text parser is not enough:
+    /// it can also mean an unknown or unsupported text codec, which must not be mislabeled as an image.
+    private static func isKnownBitmapSubtitle(_ codecID: AVCodecID) -> Bool {
+        switch codecID {
+        case AV_CODEC_ID_DVD_SUBTITLE,
+             AV_CODEC_ID_DVB_SUBTITLE,
+             AV_CODEC_ID_XSUB,
+             AV_CODEC_ID_HDMV_PGS_SUBTITLE:
+            return true
+        default:
+            return false
         }
     }
 

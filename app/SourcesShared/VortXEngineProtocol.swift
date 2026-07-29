@@ -231,12 +231,18 @@ enum VortXEngineProtocol {
     enum SubtitleDelivery: String, Codable, Sendable {
         /// Text cues are converted into the HLS WebVTT rendition named by `renditionIndex`.
         case webVTT
-        /// The source is image-based and this build has no safe image-overlay decoder for it.
+        /// Legacy unavailable marker retained for wire compatibility with older clients. New hosts pair this
+        /// with `SubtitleTrack.unavailableKind` to distinguish bitmap from other unsupported source formats.
         case bitmapUnavailable
     }
 
+    enum SubtitleUnavailableKind: String, Codable, Sendable {
+        case bitmap
+        case unsupported
+    }
+
     /// Stable source-container subtitle identity. Available text rows map to an HLS media-option index;
-    /// bitmap rows remain visible with an honest reason instead of disappearing.
+    /// unavailable rows remain visible with an honest reason instead of disappearing.
     struct SubtitleTrack: Codable, Sendable, Equatable {
         let sourceIndex: Int
         let codec: String
@@ -246,6 +252,34 @@ enum VortXEngineProtocol {
         let delivery: SubtitleDelivery
         let renditionIndex: Int?
         let unavailableReason: String?
+        /// Optional so older hosts remain decodable. `.bitmapUnavailable` is the legacy unavailable delivery
+        /// marker; a missing exact kind therefore resolves to bitmap for backward compatibility.
+        let unavailableKind: SubtitleUnavailableKind?
+
+        init(sourceIndex: Int,
+             codec: String,
+             language: String,
+             title: String,
+             isForced: Bool,
+             delivery: SubtitleDelivery,
+             renditionIndex: Int?,
+             unavailableReason: String?,
+             unavailableKind: SubtitleUnavailableKind? = nil) {
+            self.sourceIndex = sourceIndex
+            self.codec = codec
+            self.language = language
+            self.title = title
+            self.isForced = isForced
+            self.delivery = delivery
+            self.renditionIndex = renditionIndex
+            self.unavailableReason = unavailableReason
+            self.unavailableKind = unavailableKind
+        }
+
+        var resolvedUnavailableKind: SubtitleUnavailableKind? {
+            guard delivery == .bitmapUnavailable else { return nil }
+            return unavailableKind ?? .bitmap
+        }
     }
 
     /// Everything the client's player engine needs from a mount that is not on its own machine.
