@@ -941,6 +941,9 @@ struct TVPlayerView: View {
                       isDolbyVision: StreamRanking.isDolbyVision(sourceHint ?? ""))
                 .live(initialLiveMode)
                 .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
+                .onAppear {
+                    coordinator.player?.isFullPlayerPresentation = true
+                }
                 .ignoresSafeArea()
         }
     }
@@ -1923,7 +1926,8 @@ struct TVPlayerView: View {
         guard receipt.hasValues else { return }
         lastFrameDropReceiptAt = now
         let count = receipt.frameDropCount ?? 0
-        let delta = count >= lastFrameDropCount ? count - lastFrameDropCount : count
+        let fallbackDelta = count >= lastFrameDropCount ? count - lastFrameDropCount : count
+        let delta = receipt.framePresentation?.frameDropsSinceReceipt ?? fallbackDelta
         lastFrameDropCount = count
         let captureTransition = trickplayCapturePressure.observe(
             droppedFrames: delta,
@@ -1938,9 +1942,37 @@ struct TVPlayerView: View {
             guard let value else { return "na" }
             return String(format: "%.*f", decimals, value)
         }
+        let presentationText: String = {
+            guard let frame = receipt.framePresentation else { return "" }
+            let vo: String
+            if let passes = frame.voPasses {
+                vo = String(
+                    format: "%d/%.2f/%.2f/%@",
+                    passes.count, passes.averageMilliseconds,
+                    passes.peakMilliseconds, passes.slowest ?? "na"
+                )
+            } else {
+                vo = "pending"
+            }
+            return String(
+                format: " fp=g%llu gate=%@ cscale=%@ priorCscale=%@ draw=%d/%d waitMs=%.2f/%.2f presentSample30=%d/%d presentSampleMs=%.2f/%.2f decoderDelta30s=%d sub=%@/%@ cues=%d/%.1fpm vo=%@",
+                frame.generation, frame.mitigationGate,
+                frame.activeCscale ?? "na",
+                frame.mitigationPriorCscale ?? "na",
+                frame.drawableRequests, frame.drawableNil,
+                frame.drawableWaitAverageMilliseconds,
+                frame.drawableWaitMaximumMilliseconds,
+                frame.presentedSampleCallbacks, frame.presentedSampleTimeValid,
+                frame.presentedSampleAverageMilliseconds,
+                frame.presentedSampleMaximumMilliseconds,
+                frame.decoderDropsSinceReceipt, frame.subtitleSource,
+                frame.subtitleCodec ?? "na", frame.subtitleCueCount,
+                frame.subtitleCuesPerMinute, vo
+            )
+        }()
         VXProbe.log(
             "perf",
-            "libmpv frameDrop=\(count) delta30s=\(delta) decoderDrop=\(intText(receipt.decoderFrameDropCount)) mistimed=\(intText(receipt.mistimedFrameCount)) voDelayed=\(intText(receipt.delayedFrameCount)) avsync=\(doubleText(receipt.avSync)) totalAvsyncChange=\(doubleText(receipt.totalAVSyncChange)) pausedForCache=\(boolText(receipt.pausedForCache)) cacheUnderrun=\(boolText(receipt.cacheUnderrun)) cacheIdle=\(boolText(receipt.cacheIdle)) cacheFill=\(intText(receipt.cacheBufferingPercent)) cacheSeconds=\(doubleText(receipt.cacheDuration, decimals: 1)) hwdec=\(receipt.hardwareDecoder ?? "na") vfFps=\(doubleText(receipt.estimatedVideoFPS)) containerFps=\(doubleText(receipt.containerFPS)) displayFps=\(doubleText(receipt.displayFPS)) videoSync=\(receipt.videoSyncMode ?? "na") videoSpeedCorrection=\(doubleText(receipt.videoSpeedCorrection, decimals: 6)) audioSpeedCorrection=\(doubleText(receipt.audioSpeedCorrection, decimals: 6)) ao=\(receipt.audioOutput ?? "na") uiBuffering=\(buffering ? "true" : "false") statsOverlay=\(showStats ? "visible" : "hidden") trickplayCapture=\(localTrickplayCaptureInFlight ? "true" : "false") trickplayCaptureAttempts=\(trickplayCaptureAttemptsSinceReceipt) trickplayCaptureCompleted=\(trickplayCaptureCompletionsSinceReceipt) trickplayCaptureNil=\(trickplayCaptureNilSinceReceipt) trickplayContribution=\(scrubThumbnails.isCommunityUploadInFlight ? "active" : "idle") trickplaySuppressed=\(captureSuppressed ? "true" : "false") trickplayBackoffTransition=\(captureTransition.rawValue) trickplayBackoffThreshold=\(TrickplayCapturePressurePolicy.highDropThreshold) preload=\(preloadTask == nil ? "idle" : "active") warm=\(warmNextTask == nil ? "idle" : "active")"
+            "libmpv frameDrop=\(count) delta30s=\(delta) decoderDrop=\(intText(receipt.decoderFrameDropCount)) mistimed=\(intText(receipt.mistimedFrameCount)) voDelayed=\(intText(receipt.delayedFrameCount)) avsync=\(doubleText(receipt.avSync)) totalAvsyncChange=\(doubleText(receipt.totalAVSyncChange)) pausedForCache=\(boolText(receipt.pausedForCache)) cacheUnderrun=\(boolText(receipt.cacheUnderrun)) cacheIdle=\(boolText(receipt.cacheIdle)) cacheFill=\(intText(receipt.cacheBufferingPercent)) cacheSeconds=\(doubleText(receipt.cacheDuration, decimals: 1)) hwdec=\(receipt.hardwareDecoder ?? "na") vfFps=\(doubleText(receipt.estimatedVideoFPS)) containerFps=\(doubleText(receipt.containerFPS)) displayFps=\(doubleText(receipt.displayFPS)) videoSync=\(receipt.videoSyncMode ?? "na") videoSpeedCorrection=\(doubleText(receipt.videoSpeedCorrection, decimals: 6)) audioSpeedCorrection=\(doubleText(receipt.audioSpeedCorrection, decimals: 6)) ao=\(receipt.audioOutput ?? "na") uiBuffering=\(buffering ? "true" : "false") statsOverlay=\(showStats ? "visible" : "hidden") trickplayCapture=\(localTrickplayCaptureInFlight ? "true" : "false") trickplayCaptureAttempts=\(trickplayCaptureAttemptsSinceReceipt) trickplayCaptureCompleted=\(trickplayCaptureCompletionsSinceReceipt) trickplayCaptureNil=\(trickplayCaptureNilSinceReceipt) trickplayContribution=\(scrubThumbnails.isCommunityUploadInFlight ? "active" : "idle") trickplaySuppressed=\(captureSuppressed ? "true" : "false") trickplayBackoffTransition=\(captureTransition.rawValue) trickplayBackoffThreshold=\(TrickplayCapturePressurePolicy.highDropThreshold) preload=\(preloadTask == nil ? "idle" : "active") warm=\(warmNextTask == nil ? "idle" : "active")\(presentationText)"
         )
         trickplayCaptureAttemptsSinceReceipt = 0
         trickplayCaptureCompletionsSinceReceipt = 0

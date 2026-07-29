@@ -6,6 +6,8 @@ struct MPVProperty {
     static let videoParamsPrimaries = "video-params/primaries"
     static let videoParamsGamma = "video-params/gamma"
     static let videoParamsSigPeak = "video-params/sig-peak"
+    static let frameDropCount = "frame-drop-count"
+    static let decoderFrameDropCount = "decoder-frame-drop-count"
     static let videoParamsSceneMaxR = "video-params/scene-max-r"
     static let videoParamsSceneMaxG = "video-params/scene-max-g"
     static let videoParamsSceneMaxB = "video-params/scene-max-b"
@@ -28,6 +30,9 @@ struct MPVProperty {
     /// simultaneously with the primary `sid`, pinned to the top of the frame via `secondarySubPos` so the
     /// two languages never overlap. "no" = no secondary track.
     static let secondarySid = "secondary-sid"
+    /// Numeric start time of the currently rendered primary cue. Diagnostics observe this
+    /// as a double and retain only deduplicated starts, never subtitle text.
+    static let subtitleStart = "sub-start"
     /// On-screen position of the secondary subtitle line, 0 (top) ... 100 (bottom). Set to 0 so the
     /// secondary language sits at the top while the primary stays at its normal bottom position.
     static let secondarySubPos = "secondary-sub-pos"

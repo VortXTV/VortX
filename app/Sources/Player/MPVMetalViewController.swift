@@ -167,6 +167,34 @@ final class MPVMetalViewController: PlatformViewController {
     /// does on a decoded MKV. tvOS-only effect (the display-mode request is tvOS); harmless elsewhere.
     var contentIsDolbyVision = false
 
+    /// Set only by the full playback chrome. Embedded hero/trailer controllers keep the
+    /// default false and therefore cannot arm the tvOS chroma mitigation or diagnostics.
+    var isFullPlayerPresentation = false {
+        didSet {
+            #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+            if isFullPlayerPresentation {
+                startFramePresentationDiagnosticsIfReady()
+                updateFramePresentationPolicy()
+            } else {
+                stopFramePresentationDiagnostics()
+                restoreFramePresentationCscale()
+            }
+            #endif
+        }
+    }
+
+    #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+    private let framePresentationDiagnostics = FramePresentationDiagnosticsAccumulator()
+    private var framePresentationGeneration: UInt64 = 0
+    private var framePresentationLoadedGeneration: UInt64?
+    private var framePresentationStartedGeneration: UInt64?
+    private var framePresentationPriorCscale: String?
+    private var framePresentationMitigationApplied = false
+    private var framePresentationRestorePending = false
+    private var framePresentationVOPassesWork: DispatchWorkItem?
+    private static let framePresentationVOPassesCooldown: TimeInterval = 2
+    #endif
+
     override func viewDidLoad() {
         super.viewDidLoad()
         
@@ -178,6 +206,9 @@ final class MPVMetalViewController: PlatformViewController {
         // forever if drawables can't be recycled while the main thread is busy.
         metalLayer.presentsWithTransaction = false
         metalLayer.allowsNextDrawableTimeout = true
+        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        metalLayer.presentationDiagnostics = framePresentationDiagnostics
+        #endif
         #if canImport(UIKit)
         metalLayer.contentsScale = UIScreen.main.nativeScale
         metalLayer.backgroundColor = UIColor.black.cgColor
@@ -826,6 +857,13 @@ final class MPVMetalViewController: PlatformViewController {
         // sig-peak observer alone never flips it to HDR. A late gamma settle (pq/hlg arriving after the
         // first sig-peak event on an in-place switch) re-drives the dynamic-range apply.
         mpv_observe_property(mpv, 0, MPVProperty.videoParamsGamma, MPV_FORMAT_STRING)
+        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        // Sparse counter/cue events feed one lock-backed aggregate. `sub-start` is numeric,
+        // so repeated property notifications can be deduplicated without reading subtitle text.
+        mpv_observe_property(mpv, 0, MPVProperty.frameDropCount, MPV_FORMAT_INT64)
+        mpv_observe_property(mpv, 0, MPVProperty.decoderFrameDropCount, MPV_FORMAT_INT64)
+        mpv_observe_property(mpv, 0, MPVProperty.subtitleStart, MPV_FORMAT_DOUBLE)
+        #endif
         mpv_observe_property(mpv, 0, MPVProperty.pausedForCache, MPV_FORMAT_FLAG)
         mpv_observe_property(mpv, 0, MPVProperty.timePos, MPV_FORMAT_DOUBLE)
         mpv_observe_property(mpv, 0, MPVProperty.duration, MPV_FORMAT_DOUBLE)
@@ -1006,6 +1044,10 @@ final class MPVMetalViewController: PlatformViewController {
     /// prevents it from firing into a deallocated controller (the crash on close), and
     /// destruction is serialized onto the event queue so it can't race `readEvents`.
     func stop() {
+        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        stopFramePresentationDiagnostics()
+        restoreFramePresentationCscale()
+        #endif
         invalidateLoadToken()
         NotificationCenter.default.removeObserver(self)
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
@@ -1354,6 +1396,11 @@ final class MPVMetalViewController: PlatformViewController {
             entryID: entryID,
             token: issuedToken
         )
+        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        if commandResult >= 0 {
+            beginFramePresentationLoad()
+        }
+        #endif
         loadTokenLock.unlock()
         return issuedToken
     }
@@ -1584,6 +1631,303 @@ final class MPVMetalViewController: PlatformViewController {
         capturePipelineDevice = deviceID
     }
 
+    #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+    /// A successful replacement owns a fresh diagnostics generation. The old cscale is
+    /// restored before any new file can become eligible, including in-place episode loads.
+    private func beginFramePresentationLoad() {
+        restoreFramePresentationCscale()
+        framePresentationVOPassesWork?.cancel()
+        framePresentationVOPassesWork = nil
+        framePresentationDiagnostics.end()
+        framePresentationGeneration &+= 1
+        framePresentationLoadedGeneration = nil
+        framePresentationStartedGeneration = nil
+    }
+
+    private func framePresentationFileLoaded(loadToken: PlayerLoadToken) {
+        guard PlayerLoadProvenanceState.accepts(
+            callbackToken: loadToken,
+            activeToken: activeLoadToken
+        ) else { return }
+        framePresentationLoadedGeneration = framePresentationGeneration
+        startFramePresentationDiagnosticsIfReady()
+        updateFramePresentationPolicy()
+    }
+
+    private func startFramePresentationDiagnosticsIfReady() {
+        guard isFullPlayerPresentation,
+              mpv != nil,
+              framePresentationLoadedGeneration == framePresentationGeneration,
+              framePresentationStartedGeneration != framePresentationGeneration else {
+            return
+        }
+        framePresentationDiagnostics.begin(
+            generation: framePresentationGeneration,
+            now: ProcessInfo.processInfo.systemUptime,
+            frameDropRaw: diagnosticInt(MPVProperty.frameDropCount),
+            decoderDropRaw: diagnosticInt(MPVProperty.decoderFrameDropCount)
+        )
+        framePresentationStartedGeneration = framePresentationGeneration
+    }
+
+    private func stopFramePresentationDiagnostics() {
+        framePresentationVOPassesWork?.cancel()
+        framePresentationVOPassesWork = nil
+        framePresentationStartedGeneration = nil
+        framePresentationLoadedGeneration = nil
+        framePresentationDiagnostics.end()
+    }
+
+    private func scheduleFramePresentationTerminalCleanup(
+        generation: UInt64,
+        loadToken: PlayerLoadToken
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.framePresentationStartedGeneration == generation,
+                  self.framePresentationDiagnostics.currentGeneration() == generation,
+                  PlayerLoadProvenanceState.accepts(
+                    callbackToken: loadToken,
+                    activeToken: self.activeLoadToken
+                  ) else {
+                return
+            }
+            self.stopFramePresentationDiagnostics()
+            self.restoreFramePresentationCscale()
+        }
+    }
+
+    private func restoreFramePresentationCscale() {
+        guard !framePresentationRestorePending else { return }
+        guard framePresentationMitigationApplied,
+              let prior = framePresentationPriorCscale else {
+            // `mpv` is set to nil only when this controller permanently tears its
+            // handle down. Until then, keep any incomplete state available for a
+            // later retry rather than claiming an unverified restoration.
+            guard mpv == nil else { return }
+            framePresentationPriorCscale = nil
+            framePresentationMitigationApplied = false
+            return
+        }
+        guard mpv != nil else {
+            framePresentationPriorCscale = nil
+            framePresentationMitigationApplied = false
+            return
+        }
+
+        framePresentationRestorePending = true
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard let handle = self.mpv else {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.framePresentationRestorePending = false
+                    guard self.mpv == nil else { return }
+                    self.framePresentationPriorCscale = nil
+                    self.framePresentationMitigationApplied = false
+                }
+                return
+            }
+
+            let status = mpv_set_property_string(handle, "cscale", prior)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.framePresentationRestorePending = false
+                guard self.framePresentationMitigationApplied,
+                      self.framePresentationPriorCscale == prior else {
+                    return
+                }
+                if self.mpv == nil {
+                    // stop() has permanently retired the handle. There is no live
+                    // property left to restore and no future retry to preserve.
+                    self.framePresentationPriorCscale = nil
+                    self.framePresentationMitigationApplied = false
+                    return
+                }
+                // A result belongs only to the exact handle on which the setter ran.
+                // If a future controller lifecycle ever replaces the live handle,
+                // keep the state fail-closed instead of crediting the replacement
+                // with an old handle's result.
+                guard self.mpv == handle else { return }
+                guard status >= 0 else {
+                    self.mpvLog.error(
+                        "tvOS frame presentation cscale restore failed: \(String(cString: mpv_error_string(status)), privacy: .public)"
+                    )
+                    return
+                }
+
+                self.framePresentationPriorCscale = nil
+                self.framePresentationMitigationApplied = false
+                DiagnosticsLog.log(
+                    "perf",
+                    "tvOS frame presentation restored cscale=\(prior)"
+                )
+                // A new file can finish loading while the serialized restore is in
+                // flight. Re-evaluate it now that the previous state is truly gone.
+                self.updateFramePresentationPolicy()
+            }
+        }
+    }
+
+    /// Applies only the single requested runtime property. Every other scaler and
+    /// renderer option stays untouched, and an unreadable prior value fails closed.
+    private func updateFramePresentationPolicy() {
+        guard mpv != nil,
+              isFullPlayerPresentation,
+              framePresentationLoadedGeneration == framePresentationGeneration,
+              framePresentationStartedGeneration == framePresentationGeneration else {
+            restoreFramePresentationCscale()
+            return
+        }
+        let input = TVOSFramePresentationPolicy.Input(
+            fullPlayer: isFullPlayerPresentation,
+            standardQuality: PlaybackSettings.videoUpscaling == .standard,
+            videoWidth: getInt("video-params/w"),
+            videoHeight: getInt("video-params/h"),
+            gamma: getString(MPVProperty.videoParamsGamma) ?? "",
+            dolbyVision: contentIsDolbyVision,
+            signalPeak: getDouble(MPVProperty.videoParamsSigPeak),
+            customOptionKeys: PlaybackSettings.parsedCustomMpvOptions.map { $0.key }
+        )
+        let shouldApply = TVOSFramePresentationPolicy.shouldUseBilinearChroma(input)
+        if !shouldApply {
+            restoreFramePresentationCscale()
+            return
+        }
+        guard !framePresentationMitigationApplied,
+              let prior = diagnosticString("cscale")
+                ?? diagnosticString("options/cscale"),
+              let handle = mpv else {
+            return
+        }
+        let status = mpv_set_property_string(handle, "cscale", "bilinear")
+        guard status >= 0 else {
+            mpvLog.error(
+                "tvOS frame presentation cscale apply failed: \(String(cString: mpv_error_string(status)), privacy: .public)"
+            )
+            return
+        }
+        framePresentationPriorCscale = prior
+        framePresentationMitigationApplied = true
+        DiagnosticsLog.log(
+            "perf",
+            "tvOS frame presentation armed gate=tester size=\(input.videoWidth)x\(input.videoHeight) gamma=\(input.gamma) sigPeak=\(input.signalPeak) priorCscale=\(prior)"
+        )
+    }
+
+    private func scheduleFramePresentationVOPassesSnapshot(
+        generation: UInt64,
+        loadToken: PlayerLoadToken
+    ) {
+        guard isFullPlayerPresentation,
+              framePresentationStartedGeneration == generation,
+              PlayerLoadProvenanceState.accepts(
+                callbackToken: loadToken,
+                activeToken: activeLoadToken
+              ),
+              framePresentationVOPassesWork == nil,
+              !framePresentationDiagnostics.hasVOPasses(generation: generation) else {
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            // stop() nils mpv before enqueueing destruction on this same serial queue.
+            // One local handle therefore stays valid for every read in this work item.
+            guard let self,
+                  let handle = self.mpv,
+                  self.framePresentationDiagnostics.currentGeneration() == generation,
+                  PlayerLoadProvenanceState.accepts(
+                    callbackToken: loadToken,
+                    activeToken: self.callbackLoadToken(requiresLoadedFile: true)
+                  ) else {
+                return
+            }
+            self.captureFramePresentationVOPasses(
+                handle: handle,
+                generation: generation
+            )
+        }
+        framePresentationVOPassesWork = work
+        queue.asyncAfter(
+            deadline: .now() + Self.framePresentationVOPassesCooldown,
+            execute: work
+        )
+    }
+
+    /// One bounded snapshot shortly after a generation's first drop. Raw sample arrays
+    /// and perf-info are intentionally not read.
+    private func captureFramePresentationVOPasses(
+        handle: OpaquePointer,
+        generation: UInt64
+    ) {
+        guard framePresentationDiagnostics.currentGeneration() == generation,
+              !framePresentationDiagnostics.hasVOPasses(generation: generation) else {
+            return
+        }
+        let passCount = min(max(
+            diagnosticInt("vo-passes/fresh/count", handle: handle) ?? 0,
+            0
+        ), 16)
+        var totalAverageNanoseconds = 0
+        var peakNanoseconds = 0
+        var slowestPass: String?
+        for index in 0..<passCount {
+            let average = max(
+                0,
+                diagnosticInt(
+                    "vo-passes/fresh/\(index)/avg",
+                    handle: handle
+                ) ?? 0
+            )
+            let peak = max(
+                0,
+                diagnosticInt(
+                    "vo-passes/fresh/\(index)/peak",
+                    handle: handle
+                ) ?? 0
+            )
+            totalAverageNanoseconds += average
+            if peak > peakNanoseconds {
+                peakNanoseconds = peak
+                slowestPass = diagnosticString(
+                    "vo-passes/fresh/\(index)/desc",
+                    handle: handle
+                ).map { String($0.prefix(48)) }
+            }
+        }
+        framePresentationDiagnostics.recordVOPasses(
+            FramePresentationVOPassesSnapshot(
+                count: passCount,
+                averageMilliseconds: Double(totalAverageNanoseconds) / 1_000_000,
+                peakMilliseconds: Double(peakNanoseconds) / 1_000_000,
+                slowest: slowestPass
+            ),
+            generation: generation
+        )
+    }
+
+    private func selectedSubtitleFramePresentationInfo()
+        -> (codec: String?, source: String) {
+        let selectedID = getInt(MPVProperty.sid)
+        guard selectedID > 0 else { return (nil, "off") }
+        let count = getInt("track-list/count")
+        guard count > 0 else { return (nil, "unknown") }
+        for index in 0..<count {
+            guard getString("track-list/\(index)/type") == "sub",
+                  getInt("track-list/\(index)/id") == selectedID else {
+                continue
+            }
+            let source = diagnosticFlag("track-list/\(index)/external")
+                .map { $0 ? "external" : "embedded" }
+                ?? "unknown"
+            return (
+                diagnosticString("track-list/\(index)/codec"),
+                source
+            )
+        }
+        return (nil, "unknown")
+    }
+    #endif
+
     /// Re-derive the dynamic range from the CURRENTLY decoded video params and apply it. Used by the
     /// gamma observer and MPV_EVENT_VIDEO_RECONFIG, neither of which carries a sig-peak value, so it
     /// reads sig-peak fresh. Unlike the sig-peak property-change observer this does NOT depend on a value
@@ -1623,6 +1967,9 @@ final class MPVMetalViewController: PlatformViewController {
     private func syncDisplayDynamicRange(sigPeak: Double) {
         guard let handle = mpv else { return }
         let gamma = getString(MPVProperty.videoParamsGamma) ?? ""
+        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        updateFramePresentationPolicy()
+        #endif
         var range: ContentDynamicRange
         if gamma == "hlg" {
             range = .hlg
@@ -1828,9 +2175,13 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     private func diagnosticInt(_ name: String) -> Int? {
-        guard mpv != nil else { return nil }
+        guard let handle = mpv else { return nil }
+        return diagnosticInt(name, handle: handle)
+    }
+
+    private func diagnosticInt(_ name: String, handle: OpaquePointer) -> Int? {
         var value = Int64()
-        guard mpv_get_property(mpv, name, MPV_FORMAT_INT64, &value) >= 0 else { return nil }
+        guard mpv_get_property(handle, name, MPV_FORMAT_INT64, &value) >= 0 else { return nil }
         return Int(value)
     }
 
@@ -1842,8 +2193,12 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     private func diagnosticString(_ name: String) -> String? {
-        guard mpv != nil else { return nil }
-        guard let cString = mpv_get_property_string(mpv, name) else { return nil }
+        guard let handle = mpv else { return nil }
+        return diagnosticString(name, handle: handle)
+    }
+
+    private func diagnosticString(_ name: String, handle: OpaquePointer) -> String? {
+        guard let cString = mpv_get_property_string(handle, name) else { return nil }
         defer { mpv_free(cString) }
         let value = String(cString: cString)
         return value.isEmpty ? nil : value
@@ -2293,9 +2648,26 @@ final class MPVMetalViewController: PlatformViewController {
     /// observed and no playback option is changed, so unsupported builds simply
     /// report nil for that field.
     func playbackDiagnostics() -> PlaybackDiagnostics {
-        PlaybackDiagnostics(
-            frameDropCount: diagnosticInt("frame-drop-count"),
-            decoderFrameDropCount: diagnosticInt("decoder-frame-drop-count"),
+        let framePresentation: FramePresentationDiagnosticsSnapshot?
+        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        updateFramePresentationPolicy()
+        let subtitle = selectedSubtitleFramePresentationInfo()
+        framePresentation = framePresentationDiagnostics.takeSnapshot(
+            now: ProcessInfo.processInfo.systemUptime,
+            subtitleCodec: subtitle.codec,
+            subtitleSource: subtitle.source,
+            activeCscale: diagnosticString("cscale")
+                ?? diagnosticString("options/cscale"),
+            mitigationPriorCscale: framePresentationPriorCscale,
+            mitigationApplied: framePresentationMitigationApplied,
+            mitigationGate: "tester"
+        )
+        #else
+        framePresentation = nil
+        #endif
+        return PlaybackDiagnostics(
+            frameDropCount: diagnosticInt(MPVProperty.frameDropCount),
+            decoderFrameDropCount: diagnosticInt(MPVProperty.decoderFrameDropCount),
             mistimedFrameCount: diagnosticInt("mistimed-frame-count"),
             delayedFrameCount: diagnosticInt("vo-delayed-frame-count"),
             avSync: diagnosticDouble("avsync"),
@@ -2312,7 +2684,8 @@ final class MPVMetalViewController: PlatformViewController {
             videoSyncMode: diagnosticString("video-sync"),
             videoSpeedCorrection: diagnosticDouble("video-speed-correction"),
             audioSpeedCorrection: diagnosticDouble("audio-speed-correction"),
-            audioOutput: diagnosticString("current-ao")
+            audioOutput: diagnosticString("current-ao"),
+            framePresentation: framePresentation
         )
     }
 
@@ -2516,6 +2889,56 @@ final class MPVMetalViewController: PlatformViewController {
                                       ) else { return }
                                 self.reapplyDynamicRange()
                             }
+                        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                        case MPVProperty.frameDropCount:
+                            guard let loadToken = self.callbackLoadToken(
+                                    requiresLoadedFile: true
+                                  ),
+                                  let raw = UnsafePointer<Int64>(
+                                    OpaquePointer(property.data)
+                                  )?.pointee,
+                                  let sample = self.framePresentationDiagnostics
+                                    .recordDrop(raw: Int(raw), decoder: false) else {
+                                break
+                            }
+                            if sample.delta > 0 {
+                                DispatchQueue.main.async { [weak self] in
+                                    self?.scheduleFramePresentationVOPassesSnapshot(
+                                        generation: sample.generation,
+                                        loadToken: loadToken
+                                    )
+                                }
+                            }
+                        case MPVProperty.decoderFrameDropCount:
+                            guard let loadToken = self.callbackLoadToken(
+                                    requiresLoadedFile: true
+                                  ),
+                                  let raw = UnsafePointer<Int64>(
+                                    OpaquePointer(property.data)
+                                  )?.pointee,
+                                  let sample = self.framePresentationDiagnostics
+                                    .recordDrop(raw: Int(raw), decoder: true) else {
+                                break
+                            }
+                            if sample.delta > 0 {
+                                DispatchQueue.main.async { [weak self] in
+                                    self?.scheduleFramePresentationVOPassesSnapshot(
+                                        generation: sample.generation,
+                                        loadToken: loadToken
+                                    )
+                                }
+                            }
+                        case MPVProperty.subtitleStart:
+                            guard self.callbackLoadToken(requiresLoadedFile: true) != nil else {
+                                break
+                            }
+                            let start = property.format == MPV_FORMAT_DOUBLE
+                                ? UnsafePointer<Double>(
+                                    OpaquePointer(property.data)
+                                  )?.pointee
+                                : nil
+                            self.framePresentationDiagnostics.recordSubtitleStart(start)
+                        #endif
                         case MPVProperty.pausedForCache:
                             let buffering = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee ?? true
                             VXProbeState.shared.setPlayer(buffering: buffering)
@@ -2605,6 +3028,11 @@ final class MPVMetalViewController: PlatformViewController {
                     VXProbeState.shared.setPlayer(state: "playing", source: loadedHost, engine: "mpv")
                     VXProbe.event("player", "loaded \(loadedHost)")
                     self.probeEnhancementLayer()
+                    #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                    DispatchQueue.main.async { [weak self] in
+                        self?.framePresentationFileLoaded(loadToken: loadedToken)
+                    }
+                    #endif
                     // One-shot audio-negotiation diagnostic: what mpv DECODED vs what the AO actually OPENED
                     // (the negotiated output layout, e.g. 5.1 vs a silent stereo downmix). Delayed so the AO
                     // has opened; libmpv property reads are thread-safe and the handle is guarded on main.
@@ -2646,11 +3074,27 @@ final class MPVMetalViewController: PlatformViewController {
                         }
                         guard let loadToken = self.loadToken(forEntryID: ef.playlist_entry_id) else { break }
                         if ef.reason == MPV_END_FILE_REASON_ERROR {
+                            #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                            if let generation = self.framePresentationDiagnostics.currentGeneration() {
+                                self.scheduleFramePresentationTerminalCleanup(
+                                    generation: generation,
+                                    loadToken: loadToken
+                                )
+                            }
+                            #endif
                             let msg = String(cString: mpv_error_string(ef.error))
                             self.mpvLog.error("end-file error: \(msg, privacy: .public)")
                             VXProbe.event("player", "endfile error \(msg)")
                             self.emit(MPVProperty.endFileError, msg, loadToken: loadToken)
                         } else if ef.reason == MPV_END_FILE_REASON_EOF {
+                            #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                            if let generation = self.framePresentationDiagnostics.currentGeneration() {
+                                self.scheduleFramePresentationTerminalCleanup(
+                                    generation: generation,
+                                    loadToken: loadToken
+                                )
+                            }
+                            #endif
                             VXProbe.event("player", "endfile eof")
                             self.emit(MPVProperty.endFileEof, nil, loadToken: loadToken)
                         }

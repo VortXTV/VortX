@@ -123,6 +123,12 @@ private final class CaptureDelivery: @unchecked Sendable {
 
 class MetalLayer: CAMetalLayer {
 
+    #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+    /// Owned by the player controller. Kept weak so the layer and late drawable
+    /// callbacks cannot extend a finished playback generation.
+    weak var presentationDiagnostics: FramePresentationDiagnosticsAccumulator?
+    #endif
+
     // Trickplay capture: when a capture is requested, the next nextDrawable() call scales the
     // newly acquired drawable's texture into captureTexture before returning the drawable to mpv.
     // Normal trickplay requests 480px width; explicit frame grabs may request a wider bounded target.
@@ -167,7 +173,30 @@ class MetalLayer: CAMetalLayer {
     }
 
     override func nextDrawable() -> (any CAMetalDrawable)? {
+        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        let drawableWaitStartedAt = CACurrentMediaTime()
+        #endif
         let d = super.nextDrawable()
+        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        let drawableAcquiredAt = CACurrentMediaTime()
+        let presentationDiagnostics = presentationDiagnostics
+        let presentationGeneration = presentationDiagnostics?.recordDrawable(
+            wait: drawableAcquiredAt - drawableWaitStartedAt,
+            returned: d != nil
+        )
+        if let d, let presentationGeneration {
+            d.addPresentedHandler { [weak presentationDiagnostics] drawable in
+                let presentedTime = drawable.presentedTime
+                let latency = presentedTime > 0
+                    ? presentedTime - drawableAcquiredAt
+                    : nil
+                presentationDiagnostics?.recordPresented(
+                    generation: presentationGeneration,
+                    latency: latency
+                )
+            }
+        }
+        #endif
         guard let d else { return nil }
 
         captureLock.lock()

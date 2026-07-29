@@ -23,11 +23,13 @@ struct PlaybackDiagnostics: Sendable {
     var videoSpeedCorrection: Double?
     var audioSpeedCorrection: Double?
     var audioOutput: String?
+    var framePresentation: FramePresentationDiagnosticsSnapshot?
 
     var hasValues: Bool {
         frameDropCount != nil || decoderFrameDropCount != nil
             || mistimedFrameCount != nil || delayedFrameCount != nil
             || avSync != nil || cacheUnderrun != nil || hardwareDecoder != nil
+            || framePresentation != nil
     }
 }
 
@@ -71,6 +73,9 @@ protocol PlayerEngine: AnyObject {
     /// cannot present true DV; flipping the panel to DV over tone-mapped PQ is the "fake DV" other players
     /// are criticized for).
     var contentIsDolbyVision: Bool { get set }
+    /// True only for the app's full playback chrome. Embedded hero/trailer players leave
+    /// this false, so a frame-presentation mitigation can never alter their renderer.
+    var isFullPlayerPresentation: Bool { get set }
     func play()
     func pause()
     func togglePause()
@@ -185,6 +190,9 @@ extension PlayerEngine {
     /// tone-mapped DV output), and `AVPlayerEngineController` reads it in `loadFile` to switch the Apple TV
     /// into Dolby Vision mode BEFORE the item is attached (covers native DV MP4/MOV/HLS, not just the remux).
     var contentIsDolbyVision: Bool { get { false } set { } }
+
+    /// Engines without the libmpv/Metal presentation lane intentionally ignore this hint.
+    var isFullPlayerPresentation: Bool { get { false } set { } }
 }
 
 /// `MPVMetalViewController` already implements every `PlayerEngine` member, so this is a pure conformance
