@@ -651,12 +651,7 @@ struct iOSSettingsView: View {
                 .tint(Theme.Palette.accent)
             Text("Plays Dolby Vision .mkv from debrid via an in-app remux. Experimental; falls back automatically if it fails.")
                 .font(.caption).foregroundStyle(.secondary)
-            // EXTERNAL ENGINE MODE, client side. Sits next to the in-app remux row because it is the same
-            // job moved off this device. Default OFF, and this link is the only way to configure it: the
-            // screen behind it owns the pairing, the host choice and the master switch, so nothing here can
-            // turn it on by accident.
-            NavigationLink("Use a Mac as the engine") { ExternalEngineSettingsView() }
-            Text("Let a Mac on your network unpack and prepare the stream for this device. Off until you pair one.")
+            Text("Using a Mac for this lives under Streaming Server.")
                 .font(.caption).foregroundStyle(.secondary)
             #endif
             Picker("Skip step", selection: $seekStep) {
@@ -1213,6 +1208,14 @@ struct iOSSettingsView: View {
                 }
                 #endif
             }
+
+            #if os(iOS) || os(macOS)
+            // EXTERNAL ENGINE MODE, client side. Keep this beside the server rows because people
+            // looking for a Mac that serves this device will look under Streaming Server first.
+            NavigationLink("Use a Mac as the engine") { ExternalEngineSettingsView() }
+            Text("Let a Mac on your network unpack and prepare the stream for this device. Off until you pair one.")
+                .font(.caption).foregroundStyle(.secondary)
+            #endif
 
             #if os(macOS)
             // EXTERNAL ENGINE MODE, host side. Sits in this section because it is the other thing this Mac
@@ -2014,8 +2017,7 @@ private enum SettingsSearchSection: CaseIterable {
                                 "credits", "skip timestamps", "skip database", "seek bar", "community scrub previews",
                                 "trickplay", "autoplay trailers", "trailer language", "default volume",
                                 "auto-add watched", "landscape", "background playback", "keep playing", "play in",
-                                "external player", "external engine", "use a mac", "mac as engine",
-                                "engine host", "seek anywhere", "pair a mac"]
+                                "external player"]
         case .downloads: return ["downloads", "auto-delete", "delete watched", "offline", "storage", "reclaim space"]
         case .notifications: return ["new episode alerts", "episode", "notification"]
         case .streams: return ["quality preset", "smart source selection", "add-on ranking", "source type",
@@ -2024,7 +2026,8 @@ private enum SettingsSearchSection: CaseIterable {
         case .community: return ["contribute", "anonymized data", "singularity", "privacy"]
         case .server: return ["server", "configure server", "server log", "restart", "embedded", "node", "lan", "share",
                               "engine", "external engine", "act as the engine", "engine host", "pair a device",
-                              "paired devices", "revoke", "seek anywhere"]
+                              "paired devices", "revoke", "seek anywhere", "use a mac", "mac as engine",
+                              "pair a mac"]
         case .tabBar: return ["tab", "discover tab", "live tv tab", "library tab", "search tab"]
         case .appearance: return ["editorial home rows", "collections on home", "collections on discover",
                                   "refresh collections", "streaming services", "discover & region",

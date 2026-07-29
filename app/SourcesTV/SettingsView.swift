@@ -510,16 +510,7 @@ struct SettingsView: View {
                       selection: Binding(get: { dvRemux ? "1" : "0" }, set: { dvRemux = ($0 == "1") }))
             Text("Plays Dolby Vision .mkv from debrid via an in-app remux. Experimental; falls back automatically if it fails.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-            // EXTERNAL ENGINE MODE, client side. Sits next to the in-app remux row because it is the same
-            // job moved off this Apple TV and onto a Mac. Pushed rather than inlined for two reasons: the
-            // screen needs a live mDNS browse and a pairing sheet, neither of which belongs in a settings
-            // list; and a NavigationLink adds ONE child to this section instead of a new child to `body`,
-            // which is the metadata budget the AnyView note on `section(_:)` exists to protect.
-            NavigationLink { ExternalEngineSettingsView() } label: {
-                Label("Use a Mac as the engine", systemImage: "desktopcomputer")
-            }
-            .buttonStyle(ChipButtonStyle(selected: false))
-            Text("A Mac on your network can unpack the file, rewrite the Dolby Vision layer and hold the stream on its disk, so this Apple TV spends its whole chip decoding and showing the picture. Nothing is re-encoded. Off until you pair a Mac.")
+            Text("Using a Mac for this lives under Streaming Server.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Skip step"), [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
             choiceRow(String(localized: "Auto-skip intro & credits"), [("0", "Off"), ("1", "On")],
@@ -807,6 +798,14 @@ struct SettingsView: View {
                     .buttonStyle(RowFocusStyle())
                 }
             }
+            // EXTERNAL ENGINE MODE, client side. Keep this beside the server rows because people
+            // looking for a Mac that serves this Apple TV will look under Streaming Server first.
+            NavigationLink { ExternalEngineSettingsView() } label: {
+                Label("Use a Mac as the engine", systemImage: "desktopcomputer")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            Text("A Mac on your network can unpack the file, rewrite the Dolby Vision layer and hold the stream on its disk, so this Apple TV spends its whole chip decoding and showing the picture. Nothing is re-encoded. Off until you pair a Mac.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
     }
 
@@ -1520,15 +1519,16 @@ private enum SettingsSearchSection: CaseIterable {
                                 "player engine", "dolby vision", "mkv", "skip step", "auto-skip", "intro",
                                 "credits", "skip timestamps", "skip database", "seek bar", "community scrub previews",
                                 "trickplay", "autoplay trailers", "trailer language", "default volume",
-                                "auto-add watched", "play in", "external player", "external engine",
-                                "use a mac", "mac as engine", "engine host", "seek anywhere", "pair a mac"]
+                                "auto-add watched", "play in", "external player"]
         case .downloads: return ["downloads", "auto-delete", "delete watched", "offline", "storage", "reclaim space"]
         case .notifications: return ["new episode alerts", "episode", "notification"]
         case .streams: return ["quality preset", "smart source selection", "add-on ranking", "source type",
                                "safety filter", "regex", "max quality", "minimum quality", "max file size",
                                "compact source rows", "pinned sources", "resolution"]
         case .community: return ["contribute", "anonymized data", "singularity", "privacy"]
-        case .server: return ["server", "configure server", "restart", "embedded", "node"]
+        case .server: return ["server", "configure server", "restart", "embedded", "node",
+                              "external engine", "use a mac", "mac as engine", "engine host",
+                              "seek anywhere", "pair a mac"]
         case .tabBar: return ["tab", "discover tab", "live tv tab", "library tab", "search tab"]
         case .appearance: return ["accent", "background", "oled", "app language", "language",
                                   "cinematic catalog cards", "hide poster labels", "poster style",
