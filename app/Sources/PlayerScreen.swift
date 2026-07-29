@@ -2824,21 +2824,20 @@ struct PlayerScreen: View {
         clearCachedAudioOutputTruth()
         avEngineFailed = true
         avDemotedAt = Date()
-        // Demoting off a forward-only remux that started at 0 (its resume seek was dropped): the real position
-        // lives in suppressedResumeFloor, so carry the higher of the live position and the floor into the mpv
-        // re-load (mpv CAN seek). KEEP the floor across the demote: mpv's resume restore is DEFERRED (nudgeResume
-        // fires after a short sleep, plus a ~400ms re-point reload when the source had switched), and in that gap
-        // currentTime ticks near 0 on the fresh mount, so an exit inside the window would otherwise flush a low
-        // position over the account resume. reportProgress self-clears the floor once the restored playhead
-        // passes it. Pre-start / non-remux demotes are unaffected (floor is nil, currentTime wins).
-        // Pre-start demote (a remux mount that never produced a frame): currentTime is ~0, so fall back to the
-        // launch offset like tvOS (TVPlayerView demoteAVPlayerToMPV) instead of 0, so mpv reloads at the user's
-        // real position rather than restarting a half-watched title. Once started, carry the higher of the live
-        // position and the floor. The floor is derived from resumeSeconds on the launch/switch remux lanes, so
-        // max() keeps whichever is authoritative.
-        let resume = hasStartedPlaying
-            ? max(max(currentTime, suppressedResumeFloor ?? 0), engineRequestedResume ?? 0)
-            : max(max(resumeSeconds, suppressedResumeFloor ?? 0), engineRequestedResume ?? 0)
+        // An engine-owned target is a newer explicit seek and is authoritative in BOTH directions. In
+        // particular, a backward MediaRemote, chapter, or skip seek from 3600s to 600s must not be replaced by
+        // the stale 3600s chrome clock. Retire the old anti-regression floor first; nudgeResume arms a new floor
+        // for this exact target while libmpv is mounting. With no engine transaction, keep the existing floor
+        // behavior for a remux that had to restart near zero.
+        let resume: Double
+        if let engineRequestedResume {
+            suppressedResumeFloor = nil
+            resume = engineRequestedResume
+        } else if hasStartedPlaying {
+            resume = max(currentTime, suppressedResumeFloor ?? 0)
+        } else {
+            resume = max(resumeSeconds, suppressedResumeFloor ?? 0)
+        }
         if !silent, StreamRanking.isDolbyVision(recordQualityText ?? "") {
             showEngineNotice("Dolby Vision isn't supported for this file. Playing HDR10 instead.")
         }

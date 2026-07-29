@@ -2481,6 +2481,30 @@ enum PlayerLiveContractTests {
             tvPlayer,
             from: "private func demoteAVPlayerToMPV() -> Bool",
             to: "/// User-invoked mid-title engine swap")
+        let playerScreenNowPlaying = sourceSection(
+            playerScreen,
+            from: "NowPlayingCenter.wireCommands(",
+            to: "updateNowPlaying(at:")
+        let tvPlayerNowPlaying = sourceSection(
+            tvPlayer,
+            from: "NowPlayingCenter.wireCommands(",
+            to: "refreshNowPlaying(at:")
+        let playerScreenChapterRows = sourceSection(
+            playerScreen,
+            from: "case .chapters:\n            let chs =",
+            to: "case .playerSettings:")
+        let tvPlayerChapterRows = sourceSection(
+            tvPlayer,
+            from: "case .chapters:\n            let chs =",
+            to: "case .sources:")
+        let playerScreenSkipPill = sourceSection(
+            playerScreen,
+            from: "private func skipPill(_ segment: SkipSegment)",
+            to: "private func updateCurrentSkip(at time: Double)")
+        let tvPlayerSkipAction = sourceSection(
+            tvPlayer,
+            from: "private func skipTo(_ segment: SkipSegment)",
+            to: "private func hiddenSeek(_ delta: Double)")
         let tvScrub = sourceSection(
             tvPlayer,
             from: "private func scrubBy(_ dir: Int)",
@@ -3091,12 +3115,14 @@ enum PlayerLiveContractTests {
                 "loadFile(",
                 "reusing: loadToken",
               ]))
-        check("wiring: a seek during remux startup uses exact newest-wins retarget ownership",
+        check("wiring: a seek during remux startup uses exclusive exact newest-wins retarget ownership",
               sourceContainsInOrder(remuxSeekMapping, [
                 "guard isReady else",
-                "RemuxResumePolicy.pendingMountNeedsRetarget(",
+                "if let remountTarget = remuxSeekRemountTarget {",
+                "if RemuxResumePolicy.pendingMountNeedsRetarget(",
                 "mountedSourceRequestSeconds: remountTarget",
-                "remountForSeek(sourceSeconds: seconds)",
+                "_ = remountForSeek(sourceSeconds: seconds)",
+                "return",
                 "pendingRemuxGeneration != nil",
                 "RemuxResumePolicy.pendingMountNeedsRetarget(",
                 "mountedSourceRequestSeconds: currentLoadResumeOrigin",
@@ -3124,6 +3150,42 @@ enum PlayerLiveContractTests {
                     "coordinator.player?.stop()",
                     "engineRequestedResume",
                   ]))
+        let playerScreenDemotionUsesNewestEngineTarget = sourceContainsInOrder(
+            playerScreenAVDemote,
+            [
+                "if let engineRequestedResume {",
+                "suppressedResumeFloor = nil",
+                "resume = engineRequestedResume",
+                "} else if hasStartedPlaying {",
+                "resume = max(currentTime, suppressedResumeFloor ?? 0)",
+            ])
+        let tvPlayerDemotionUsesNewestEngineTarget = sourceContainsInOrder(
+            tvPlayerAVDemote,
+            [
+                "if let engineRequestedResume {",
+                "suppressedResumeFloor = nil",
+                "reconcileResume = engineRequestedResume",
+                "} else if hasStartedPlaying {",
+                "reconcileResume = max(currentTime, suppressedResumeFloor ?? 0)",
+            ])
+        check("wiring: backward MediaRemote targets survive failure demotion on both Apple surfaces",
+              playerScreenNowPlaying?.contains(
+                "seekTo: { position in coordinator.player?.seek(to: position) }") == true
+                  && tvPlayerNowPlaying?.contains(
+                    "seekTo: { position in coordinator.player?.seek(to: position) }") == true
+                  && playerScreenDemotionUsesNewestEngineTarget
+                  && tvPlayerDemotionUsesNewestEngineTarget)
+        check("wiring: chapter and skip targets survive failure demotion on both Apple surfaces",
+              playerScreenChapterRows?.contains(
+                "coordinator.player?.seek(to: ch.start)") == true
+                  && tvPlayerChapterRows?.contains(
+                    "coordinator.player?.seek(to: ch.start)") == true
+                  && playerScreenSkipPill?.contains(
+                    "coordinator.player?.seek(to: segment.end)") == true
+                  && tvPlayerSkipAction?.contains(
+                    "coordinator.player?.seek(to: segment.end)") == true
+                  && playerScreenDemotionUsesNewestEngineTarget
+                  && tvPlayerDemotionUsesNewestEngineTarget)
         check("wiring: Apple scrub chrome no longer pins a long seek to the buffered edge",
               playerScreen?.contains("remuxClampedTarget") == false
                   && tvScrub?.contains("bufferedTime") == false

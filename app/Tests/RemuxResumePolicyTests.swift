@@ -386,6 +386,11 @@ check("pending remount: an identical MediaRemote repeat is inert",
       !RemuxResumePolicy.pendingMountNeedsRetarget(
         requestedSourceSeconds: 3600,
         mountedSourceRequestSeconds: 3600))
+check("pending remount: an exact sub-floor repeat owns the zero-origin replacement without reopening it",
+      RemuxResumePolicy.originRequest(resumeSeconds: 2) == 0
+          && !RemuxResumePolicy.pendingMountNeedsRetarget(
+            requestedSourceSeconds: 2,
+            mountedSourceRequestSeconds: 2))
 check("pending remount: sub-frame clock noise is inert",
       !RemuxResumePolicy.pendingMountNeedsRetarget(
         requestedSourceSeconds: 3600 + RemuxResumePolicy.pendingRetargetToleranceSeconds / 2,

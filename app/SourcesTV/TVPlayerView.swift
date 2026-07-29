@@ -3765,18 +3765,17 @@ struct TVPlayerView: View {
         // Re-arm the load state + start watchdog for the libmpv re-load. Without this the mpv re-open after the
         // AVPlayer->mpv demote runs with NO start watchdog, so a stalled mpv re-open never fails over or surfaces
         // an error (mirrors iOS PlayerScreen.demoteAVPlayerToMPV).
-        // Carry the HIGHER of the live position and any suppressed resume floor: demoting off a forward-only
-        // remux that started at 0 (its resume seek was dropped) holds the REAL position only in
-        // suppressedResumeFloor, so currentTime alone would rewind the mpv re-open to ~0. mpv CAN seek, so
-        // maybeResume seeks the mpv re-open to this reconciled point. KEEP the floor across the demote: the mpv
-        // resume is DEFERRED to the duration event, and in that gap currentTime ticks near 0 on the fresh mount,
-        // so an exit inside the window would otherwise flush a low position over the account resume. saveProgress
-        // self-clears the floor once the restored playhead passes it.
+        // An engine-owned target is a newer explicit seek and is authoritative in BOTH directions. In
+        // particular, a backward MediaRemote, chapter, or skip seek from 3600s to 600s must not be replaced by
+        // the stale 3600s chrome clock. Retire the old anti-regression floor first; maybeResume and the
+        // in-flight seek guard own the exact target on the fresh libmpv item. With no engine transaction, keep
+        // the existing floor behavior for a remux that had to restart near zero.
         let reconcileResume: Double?
-        if hasStartedPlaying {
-            reconcileResume = max(max(currentTime, suppressedResumeFloor ?? 0), engineRequestedResume ?? 0)
-        } else if let engineRequestedResume {
-            reconcileResume = max(resumeSeconds ?? suppressedResumeFloor ?? 0, engineRequestedResume)
+        if let engineRequestedResume {
+            suppressedResumeFloor = nil
+            reconcileResume = engineRequestedResume
+        } else if hasStartedPlaying {
+            reconcileResume = max(currentTime, suppressedResumeFloor ?? 0)
         } else {
             reconcileResume = resumeSeconds ?? suppressedResumeFloor
         }

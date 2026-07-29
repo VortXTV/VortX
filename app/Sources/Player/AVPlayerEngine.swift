@@ -1212,11 +1212,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // Before the item is playable, remember the target and apply it on ready (covers the chrome's
         // resume seek issued right after loadFile, which AVPlayer would otherwise drop).
         guard isReady else {
-            if let remountTarget = remuxSeekRemountTarget,
-               RemuxResumePolicy.pendingMountNeedsRetarget(
-                requestedSourceSeconds: seconds,
-                mountedSourceRequestSeconds: remountTarget),
-               remountForSeek(sourceSeconds: seconds) {
+            if let remountTarget = remuxSeekRemountTarget {
+                if RemuxResumePolicy.pendingMountNeedsRetarget(
+                    requestedSourceSeconds: seconds,
+                    mountedSourceRequestSeconds: remountTarget
+                ) {
+                    _ = remountForSeek(sourceSeconds: seconds)
+                }
+                // `remuxSeekRemountTarget` is the sole owner of this replacement transaction. Even when its
+                // exact source target sanitizes to a different input origin, an equal repeat belongs to this
+                // mount and must not fall through to the generic pending-generation comparison below.
                 return
             }
             if pendingRemuxGeneration != nil,
