@@ -516,13 +516,14 @@ struct TVPlayerView: View {
     @State private var trickplayCaptureTimer: Task<Void, Never>?
     @State private var lastFrameDropReceiptAt = 0.0
     @State private var lastFrameDropCount = 0
-    @State private var trickplayCapturePressure = TrickplayCapturePressurePolicy()
     @State private var trickplayCaptureAttemptsSinceReceipt = 0
     @State private var trickplayCaptureCompletionsSinceReceipt = 0
     @State private var trickplayCaptureNilSinceReceipt = 0
-    /// Both engines keep the shipping local-preview cadence. The libmpv GPU path now captures into a bounded
-    /// destination; only a measured high-drop interval can apply a temporary backoff.
-    private static let trickplayCaptureIntervalSecs: Double = 10
+    /// Both engines use the same clamped cadence that community coverage/VTT advertises. The libmpv GPU
+    /// path remains bounded to one in-flight capture with a watchdog; frame-drop telemetry never suppresses it.
+    private static var trickplayCaptureIntervalSecs: Double {
+        Double(RemoteConfig.snapshot.captureIntervalSecs)
+    }
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
     private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, quality, settings, skipEdit }
@@ -1929,11 +1930,6 @@ struct TVPlayerView: View {
         let fallbackDelta = count >= lastFrameDropCount ? count - lastFrameDropCount : count
         let delta = receipt.framePresentation?.frameDropsSinceReceipt ?? fallbackDelta
         lastFrameDropCount = count
-        let captureTransition = trickplayCapturePressure.observe(
-            droppedFrames: delta,
-            now: now
-        )
-        let captureSuppressed = trickplayCapturePressure.isSuppressed(at: now)
         func intText(_ value: Int?) -> String { value.map(String.init) ?? "na" }
         func boolText(_ value: Bool?) -> String {
             value.map { $0 ? "true" : "false" } ?? "na"
@@ -1972,7 +1968,7 @@ struct TVPlayerView: View {
         }()
         VXProbe.log(
             "perf",
-            "libmpv frameDrop=\(count) delta30s=\(delta) decoderDrop=\(intText(receipt.decoderFrameDropCount)) mistimed=\(intText(receipt.mistimedFrameCount)) voDelayed=\(intText(receipt.delayedFrameCount)) avsync=\(doubleText(receipt.avSync)) totalAvsyncChange=\(doubleText(receipt.totalAVSyncChange)) pausedForCache=\(boolText(receipt.pausedForCache)) cacheUnderrun=\(boolText(receipt.cacheUnderrun)) cacheIdle=\(boolText(receipt.cacheIdle)) cacheFill=\(intText(receipt.cacheBufferingPercent)) cacheSeconds=\(doubleText(receipt.cacheDuration, decimals: 1)) hwdec=\(receipt.hardwareDecoder ?? "na") vfFps=\(doubleText(receipt.estimatedVideoFPS)) containerFps=\(doubleText(receipt.containerFPS)) displayFps=\(doubleText(receipt.displayFPS)) videoSync=\(receipt.videoSyncMode ?? "na") videoSpeedCorrection=\(doubleText(receipt.videoSpeedCorrection, decimals: 6)) audioSpeedCorrection=\(doubleText(receipt.audioSpeedCorrection, decimals: 6)) ao=\(receipt.audioOutput ?? "na") uiBuffering=\(buffering ? "true" : "false") statsOverlay=\(showStats ? "visible" : "hidden") trickplayCapture=\(localTrickplayCaptureInFlight ? "true" : "false") trickplayCaptureAttempts=\(trickplayCaptureAttemptsSinceReceipt) trickplayCaptureCompleted=\(trickplayCaptureCompletionsSinceReceipt) trickplayCaptureNil=\(trickplayCaptureNilSinceReceipt) trickplayContribution=\(scrubThumbnails.isCommunityUploadInFlight ? "active" : "idle") trickplaySuppressed=\(captureSuppressed ? "true" : "false") trickplayBackoffTransition=\(captureTransition.rawValue) trickplayBackoffThreshold=\(TrickplayCapturePressurePolicy.highDropThreshold) preload=\(preloadTask == nil ? "idle" : "active") warm=\(warmNextTask == nil ? "idle" : "active")\(presentationText)"
+            "libmpv frameDrop=\(count) delta30s=\(delta) decoderDrop=\(intText(receipt.decoderFrameDropCount)) mistimed=\(intText(receipt.mistimedFrameCount)) voDelayed=\(intText(receipt.delayedFrameCount)) avsync=\(doubleText(receipt.avSync)) totalAvsyncChange=\(doubleText(receipt.totalAVSyncChange)) pausedForCache=\(boolText(receipt.pausedForCache)) cacheUnderrun=\(boolText(receipt.cacheUnderrun)) cacheIdle=\(boolText(receipt.cacheIdle)) cacheFill=\(intText(receipt.cacheBufferingPercent)) cacheSeconds=\(doubleText(receipt.cacheDuration, decimals: 1)) hwdec=\(receipt.hardwareDecoder ?? "na") vfFps=\(doubleText(receipt.estimatedVideoFPS)) containerFps=\(doubleText(receipt.containerFPS)) displayFps=\(doubleText(receipt.displayFPS)) videoSync=\(receipt.videoSyncMode ?? "na") videoSpeedCorrection=\(doubleText(receipt.videoSpeedCorrection, decimals: 6)) audioSpeedCorrection=\(doubleText(receipt.audioSpeedCorrection, decimals: 6)) ao=\(receipt.audioOutput ?? "na") uiBuffering=\(buffering ? "true" : "false") statsOverlay=\(showStats ? "visible" : "hidden") trickplayCaptureInFlight=\(localTrickplayCaptureInFlight ? "true" : "false") trickplayCaptureIntervalS=\(Int(Self.trickplayCaptureIntervalSecs)) trickplayCaptureAttempts=\(trickplayCaptureAttemptsSinceReceipt) trickplayCaptureCompleted=\(trickplayCaptureCompletionsSinceReceipt) trickplayCaptureNil=\(trickplayCaptureNilSinceReceipt) trickplayContribution=\(scrubThumbnails.isCommunityUploadInFlight ? "active" : "idle") preload=\(preloadTask == nil ? "idle" : "active") warm=\(warmNextTask == nil ? "idle" : "active")\(presentationText)"
         )
         trickplayCaptureAttemptsSinceReceipt = 0
         trickplayCaptureCompletionsSinceReceipt = 0
@@ -6566,10 +6562,6 @@ struct TVPlayerView: View {
         return "u:\((curURL ?? url).absoluteString)"
     }
 
-    private var activeTrickplayCaptureInterval: Double {
-        Self.trickplayCaptureIntervalSecs
-    }
-
     private func invalidateLocalTrickplayCapture() {
         localTrickplayCaptureGeneration &+= 1
         localTrickplayCaptureInFlight = false
@@ -6582,8 +6574,14 @@ struct TVPlayerView: View {
 
     private func maybeCaptureLocalTrickplay(at time: Double) {
         guard assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken) else { return }
-        guard !scrubbing, !buffering, !isPaused else { return }   // AVPlayer now captures too (AVPlayerItemVideoOutput)
-        guard time - lastLocalTrickplayCapture >= activeTrickplayCaptureInterval else { return }
+        guard TrickplayCaptureCadencePolicy.shouldCapture(
+            playbackTime: time,
+            lastCaptureTime: lastLocalTrickplayCapture,
+            intervalSeconds: Self.trickplayCaptureIntervalSecs,
+            playbackActive: !buffering && !isPaused,
+            isScrubbing: scrubbing,
+            captureInFlight: localTrickplayCaptureInFlight
+        ) else { return }
         captureTrickplayFrame(at: time)
     }
 
@@ -6594,9 +6592,6 @@ struct TVPlayerView: View {
             owner: coordinator.player?.activeLoadToken
         ) else { return }
         guard !buffering, !isPaused else { return }
-        guard !trickplayCapturePressure.isSuppressed(
-            at: ProcessInfo.processInfo.systemUptime
-        ) else { return }
         guard !localTrickplayCaptureInFlight else { return }
         guard let player = coordinator.player else { VXProbe.log("tp", "no player mounted at \(Int(time))s (tvOS)"); return }
         lastLocalTrickplayCapture = time
@@ -6651,20 +6646,19 @@ struct TVPlayerView: View {
     }
 
     /// Wall-clock capture driver (tvOS twin of PlayerScreen.startTrickplayCaptureTimer): a repeating
-    /// ten-second eligibility check for both engines. A measured high-drop interval may temporarily defer
-    /// capture through `TrickplayCapturePressurePolicy`; ordinary isolated drops never change the cadence.
+    /// ten-second eligibility check for both engines. Frame-drop receipts are telemetry only and never
+    /// change this cadence.
     private func startTrickplayCaptureTimer() {
         trickplayCaptureTimer?.cancel()
         trickplayCaptureTimer = Task { @MainActor in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(Self.trickplayCaptureIntervalSecs))
                 guard !Task.isCancelled else { return }
-                guard hasStartedPlaying, !scrubbing, !buffering, !isPaused else { continue }
+                guard hasStartedPlaying else { continue }
                 guard let player = coordinator.player else { continue }
                 let now = player.playbackPositionSeconds
                 let t = now > 0 ? now : currentTime
-                guard t > 0, t - lastLocalTrickplayCapture >= activeTrickplayCaptureInterval else { continue }
-                captureTrickplayFrame(at: t)
+                maybeCaptureLocalTrickplay(at: t)
             }
         }
     }

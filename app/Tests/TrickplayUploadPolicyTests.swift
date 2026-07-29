@@ -5,11 +5,16 @@ private enum TrickplayUploadPolicyTests {
     nonisolated(unsafe) private static var passed = 0
 
     static func main() {
-        testCapturePressureNeedsMeaningfulDropDelta()
-        testCapturePressureTransitionsAreBounded()
+        testFixedCaptureCadenceContinuesDuringActivePlayback()
+        testCaptureCadenceKeepsWorkBounded()
+        testBackwardSeekRestartsCaptureCadence()
+        testCaptureSessionIdentityBoundaries()
+        testCommunityDurationRekeyPreservesSessionFramesWiring()
+        testSameMediaDiskCacheSurvivesRemount()
         testCaptureRequestOwnershipRejectsStaleCallbacks()
         testOneProgressiveAttempt()
         testStoredProgressiveAllowsOneMateriallyFullerFinal()
+        testProgressiveDeclineAllowsMateriallyFullerFinal()
         testRejectedAndStoredFinalAreTerminal()
         testFailedProgressiveGetsOneFinalRetry()
         testTeardownWhileProgressiveIsInFlight()
@@ -115,51 +120,231 @@ private enum TrickplayUploadPolicyTests {
         )
     }
 
-    private static func testCapturePressureNeedsMeaningfulDropDelta() {
-        var policy = TrickplayCapturePressurePolicy()
-        for delta in 0..<TrickplayCapturePressurePolicy.highDropThreshold {
+    private static func testFixedCaptureCadenceContinuesDuringActivePlayback() {
+        let interval = 10.0
+        var lastCaptureTime = 0.0
+        for playbackTime in stride(from: interval, through: 120.0, by: interval) {
             expect(
-                policy.observe(droppedFrames: delta, now: Double(delta)) == .unchanged,
-                "an incidental 30-second drop delta cannot suppress local previews"
+                TrickplayCaptureCadencePolicy.shouldCapture(
+                    playbackTime: playbackTime,
+                    lastCaptureTime: lastCaptureTime,
+                    intervalSeconds: interval,
+                    playbackActive: true,
+                    isScrubbing: false,
+                    captureInFlight: false
+                ),
+                "every active ten-second slot remains capturable regardless of frame-drop telemetry"
             )
+            lastCaptureTime = playbackTime
         }
+    }
+
+    private static func testCaptureCadenceKeepsWorkBounded() {
         expect(
-            !policy.isSuppressed(at: 29),
-            "ordinary isolated drops leave the ten-second capture cadence enabled"
+            !TrickplayCaptureCadencePolicy.shouldCapture(
+                playbackTime: 9.999,
+                lastCaptureTime: 0,
+                intervalSeconds: 10,
+                playbackActive: true,
+                isScrubbing: false,
+                captureInFlight: false
+            ),
+            "capture remains bounded to one attempt per ten playback seconds"
+        )
+        expect(
+            !TrickplayCaptureCadencePolicy.shouldCapture(
+                playbackTime: 10,
+                lastCaptureTime: 0,
+                intervalSeconds: 10,
+                playbackActive: true,
+                isScrubbing: false,
+                captureInFlight: true
+            ),
+            "one in-flight capture coalesces later eligibility ticks"
+        )
+        expect(
+            !TrickplayCaptureCadencePolicy.shouldCapture(
+                playbackTime: 10,
+                lastCaptureTime: 0,
+                intervalSeconds: 10,
+                playbackActive: false,
+                isScrubbing: false,
+                captureInFlight: false
+            ),
+            "paused or buffering playback does not capture"
+        )
+        expect(
+            !TrickplayCaptureCadencePolicy.shouldCapture(
+                playbackTime: 10,
+                lastCaptureTime: 0,
+                intervalSeconds: 10,
+                playbackActive: true,
+                isScrubbing: true,
+                captureInFlight: false
+            ),
+            "interactive scrubbing does not compete with background capture"
         )
     }
 
-    private static func testCapturePressureTransitionsAreBounded() {
-        var policy = TrickplayCapturePressurePolicy()
+    private static func testBackwardSeekRestartsCaptureCadence() {
         expect(
-            policy.observe(
-                droppedFrames: TrickplayCapturePressurePolicy.highDropThreshold,
-                now: 100
-            ) == .entered,
-            "a meaningful high-drop interval records entry into temporary backoff"
+            TrickplayCaptureCadencePolicy.shouldCapture(
+                playbackTime: 40,
+                lastCaptureTime: 120,
+                intervalSeconds: 10,
+                playbackActive: true,
+                isScrubbing: false,
+                captureInFlight: false
+            ),
+            "a backward seek is immediately eligible instead of waiting to catch the old playhead"
         )
         expect(
-            policy.isSuppressed(at: 159),
-            "high-drop backoff remains active inside its bounded window"
+            !TrickplayCaptureCadencePolicy.shouldCapture(
+                playbackTime: 49.999,
+                lastCaptureTime: 40,
+                intervalSeconds: 10,
+                playbackActive: true,
+                isScrubbing: false,
+                captureInFlight: false
+            ),
+            "the capture taken after a rewind starts a fresh bounded cadence"
         )
         expect(
-            policy.observe(
-                droppedFrames: TrickplayCapturePressurePolicy.highDropThreshold,
-                now: 130
-            ) == .extended,
-            "continued high-drop evidence records an explicit extension"
+            TrickplayCaptureCadencePolicy.shouldCapture(
+                playbackTime: 50,
+                lastCaptureTime: 40,
+                intervalSeconds: 10,
+                playbackActive: true,
+                isScrubbing: false,
+                captureInFlight: false
+            ),
+            "capture resumes ten playback seconds after the rewind frame"
         )
         expect(
-            policy.isSuppressed(at: 189),
-            "the evidence-backed extension remains bounded"
+            !TrickplayCaptureCadencePolicy.shouldCapture(
+                playbackTime: 110.001,
+                lastCaptureTime: 120,
+                intervalSeconds: 10,
+                playbackActive: true,
+                isScrubbing: false,
+                captureInFlight: false
+            ),
+            "sub-interval backward position jitter cannot trigger an extra capture"
         )
         expect(
-            policy.observe(droppedFrames: 0, now: 190) == .exited,
-            "the first low-drop receipt after expiry records the exit transition"
+            TrickplayCaptureCadencePolicy.shouldCapture(
+                playbackTime: 110,
+                lastCaptureTime: 120,
+                intervalSeconds: 10,
+                playbackActive: true,
+                isScrubbing: false,
+                captureInFlight: false
+            ),
+            "a rewind of exactly one configured interval is immediately eligible"
+        )
+    }
+
+    private static func testCaptureSessionIdentityBoundaries() {
+        let episodeA = "v:tt-series:tt-series:1:1"
+        let episodeB = "v:tt-series:tt-series:1:2"
+        expect(
+            TrickplayCaptureSessionPolicy.transition(
+                from: episodeA,
+                to: episodeA
+            ) == .preserve,
+            "an engine or physical-source remount preserves same-episode captures"
         )
         expect(
-            !policy.isSuppressed(at: 190),
-            "capture resumes after the bounded pressure interval"
+            TrickplayCaptureSessionPolicy.transition(
+                from: episodeA,
+                to: episodeB
+            ) == .reset,
+            "a new episode timeline starts a fresh capture session"
+        )
+        expect(
+            TrickplayCaptureSessionPolicy.transition(
+                from: episodeA,
+                to: "v:tt-movie:tt-movie"
+            ) == .reset,
+            "a true media change cannot inherit prior captures"
+        )
+        expect(
+            TrickplayCaptureSessionPolicy.transition(
+                from: nil,
+                to: episodeA
+            ) == .reset,
+            "the first stable media identity starts a capture session"
+        )
+    }
+
+    private static func testCommunityDurationRekeyPreservesSessionFramesWiring() {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let repositoryRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot.appendingPathComponent(
+            "app/SourcesShared/ScrubThumbnails.swift"
+        )
+        guard let source = try? String(contentsOf: sourceURL, encoding: .utf8),
+              let localStart = source.range(of: "func configure(localCacheKey: String?)"),
+              let communityStart = source.range(of: "func configureCommunity("),
+              let communityEnd = source.range(
+                of: "private var communityResolveTriedFor",
+                range: communityStart.upperBound..<source.endIndex
+              ) else {
+            fatalError("cannot verify ScrubThumbnails capture-session wiring")
+        }
+        let localConfigure = source[localStart.lowerBound..<communityStart.lowerBound]
+        let communityConfigure = source[communityStart.lowerBound..<communityEnd.lowerBound]
+        expect(
+            localConfigure.contains("TrickplayCaptureSessionPolicy.transition")
+                && localConfigure.contains("sessionFrames = []"),
+            "a true stable media-key change must clear captured session frames"
+        )
+        expect(
+            communityConfigure.contains("let rekeying = communityKey != nil")
+                && !communityConfigure.contains("sessionFrames =")
+                && !communityConfigure.contains("sessionFrames.remove"),
+            "a provisional-to-real community duration re-key must preserve time-indexed session frames"
+        )
+    }
+
+    private static func testSameMediaDiskCacheSurvivesRemount() {
+        let directory = URL(
+            fileURLWithPath: NSTemporaryDirectory(),
+            isDirectory: true
+        ).appendingPathComponent(
+            "vortx-trickplay-cache-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try! FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let episodeA = "v:tt-series:tt-series:1:1"
+        let episodeB = "v:tt-series:tt-series:1:2"
+        let frame = Data([0xff, 0xd8, 0x01, 0x02, 0xff, 0xd9])
+        let legacyFile = directory.appendingPathComponent(
+            "djp0dC1zZXJpZXM6dHQtc2VyaWVzOjE6MQ-41.jpg"
+        )
+        try! frame.write(to: legacyFile, options: .atomic)
+        let firstSession = TrickplayFrameDiskStore(directory: directory)
+        try! firstSession.write(frame, mediaKey: episodeA, bucket: 42)
+
+        let remountedSession = TrickplayFrameDiskStore(directory: directory)
+        expect(
+            remountedSession.data(mediaKey: episodeA, bucket: 41) == frame,
+            "the extracted reader preserves the pre-existing cache filename format"
+        )
+        expect(
+            remountedSession.data(mediaKey: episodeA, bucket: 42) == frame,
+            "a remounted same-media cache reads the prior session's frame bytes"
+        )
+        expect(
+            remountedSession.data(mediaKey: episodeB, bucket: 42) == nil,
+            "a true episode timeline change cannot read the prior identity's frame"
         )
     }
 
@@ -217,27 +402,58 @@ private enum TrickplayUploadPolicyTests {
     }
 
     private static func testRejectedAndStoredFinalAreTerminal() {
-        var rejected = TrickplayUploadPolicy()
-        let declined = started(rejected.request(
-            key: "episode-a", kind: .progressive,
-            frameCount: 20, existingFrameCount: 0, coverageReady: true
-        ))!
-        _ = rejected.complete(declined, outcome: .rejected)
-        expect(
-            rejected.request(
-                key: "episode-a", kind: .final,
-                frameCount: 100, existingFrameCount: 0, coverageReady: true
-            ) == nil,
-            "a deliberate server decline should be terminal for the exact key"
-        )
-
-        var finalOnly = TrickplayUploadPolicy()
-        let final = started(finalOnly.request(
+        var rejectedFinal = TrickplayUploadPolicy()
+        let rejected = started(rejectedFinal.request(
             key: "episode-a", kind: .final,
             frameCount: 20, existingFrameCount: 0, coverageReady: true
         ))!
-        _ = finalOnly.complete(final, outcome: .stored)
-        expect(finalOnly.isTerminal, "a stored teardown set should be terminal")
+        _ = rejectedFinal.complete(rejected, outcome: .rejected)
+        expect(rejectedFinal.isTerminal, "a rejected teardown set should be terminal")
+
+        var storedFinal = TrickplayUploadPolicy()
+        let stored = started(storedFinal.request(
+            key: "episode-a", kind: .final,
+            frameCount: 20, existingFrameCount: 0, coverageReady: true
+        ))!
+        _ = storedFinal.complete(stored, outcome: .stored)
+        expect(storedFinal.isTerminal, "a stored teardown set should be terminal")
+    }
+
+    private static func testProgressiveDeclineAllowsMateriallyFullerFinal() {
+        var policy = TrickplayUploadPolicy()
+        let progressive = started(policy.request(
+            key: "field-episode", kind: .progressive,
+            frameCount: 68, existingFrameCount: 67, coverageReady: true
+        ))!
+        _ = policy.complete(progressive, outcome: .rejected)
+        expect(
+            !policy.isTerminal,
+            "a not_better progressive decline cannot terminally discard later coverage"
+        )
+        expect(
+            policy.request(
+                key: "field-episode", kind: .progressive,
+                frameCount: 281, existingFrameCount: 67, coverageReady: true
+            ) == nil,
+            "the declined progressive attempt remains one-shot"
+        )
+        expect(
+            policy.request(
+                key: "field-episode", kind: .final,
+                frameCount: 84, existingFrameCount: 67, coverageReady: true
+            ) == nil,
+            "a final must materially exceed the declined 68-frame progressive baseline"
+        )
+        let final = started(policy.request(
+            key: "field-episode", kind: .final,
+            frameCount: 281, existingFrameCount: 67, coverageReady: true
+        ))
+        expect(
+            final?.frameCount == 281,
+            "the field-shaped 281-frame teardown must survive a 68-frame not_better progressive"
+        )
+        _ = policy.complete(final!, outcome: .stored)
+        expect(policy.isTerminal, "the stored materially fuller final remains terminal")
     }
 
     private static func testFailedProgressiveGetsOneFinalRetry() {

@@ -1,42 +1,75 @@
 import Foundation
 
-/// A high-drop playback interval can temporarily defer local trickplay capture,
-/// but ordinary isolated VO drops must never disable previews. The next low-drop
-/// receipt after the bounded interval records the exit transition.
-struct TrickplayCapturePressurePolicy: Equatable {
-    enum Transition: String, Equatable {
-        case unchanged
-        case entered
-        case extended
-        case exited
+/// Local-preview capture follows the same configured playback-time cadence that
+/// community coverage and VTT metadata advertise. Frame-drop diagnostics are
+/// deliberately absent: telemetry must never disable capture.
+struct TrickplayCaptureCadencePolicy {
+    static func shouldCapture(
+        playbackTime: Double,
+        lastCaptureTime: Double,
+        intervalSeconds: Double,
+        playbackActive: Bool,
+        isScrubbing: Bool,
+        captureInFlight: Bool
+    ) -> Bool {
+        guard playbackTime.isFinite,
+              lastCaptureTime.isFinite,
+              intervalSeconds.isFinite,
+              intervalSeconds > 0,
+              playbackTime > 0,
+              playbackActive,
+              !isScrubbing,
+              !captureInFlight else { return false }
+        let elapsed = playbackTime - lastCaptureTime
+        return elapsed <= -intervalSeconds || elapsed >= intervalSeconds
+    }
+}
+
+/// A physical engine or source remount keeps the same stable media key and must
+/// retain all local, community, and session capture state. Only a true media or
+/// episode-timeline key change starts a fresh capture session.
+enum TrickplayCaptureSessionPolicy {
+    enum Transition: Equatable {
+        case preserve
+        case reset
     }
 
-    static let highDropThreshold = 30
-    static let backoffSeconds: TimeInterval = 60
-
-    private(set) var suppressedUntil: TimeInterval = 0
-
-    mutating func observe(
-        droppedFrames: Int,
-        now: TimeInterval
+    static func transition(
+        from currentMediaKey: String?,
+        to nextMediaKey: String?
     ) -> Transition {
-        let wasSuppressed = isSuppressed(at: now)
-        if droppedFrames >= Self.highDropThreshold {
-            suppressedUntil = max(
-                suppressedUntil,
-                now + Self.backoffSeconds
-            )
-            return wasSuppressed ? .extended : .entered
-        }
-        if suppressedUntil > 0, !wasSuppressed {
-            suppressedUntil = 0
-            return .exited
-        }
-        return .unchanged
+        currentMediaKey == nextMediaKey ? .preserve : .reset
+    }
+}
+
+/// Data-only disk seam for local trickplay frames. LocalTrickplayFrameCache owns
+/// scheduling and decoded-image memory; this keeps its existing on-disk address
+/// stable and lets a fresh cache instance read a prior session's bytes.
+struct TrickplayFrameDiskStore {
+    let directory: URL
+
+    func write(_ data: Data, mediaKey: String, bucket: Int) throws {
+        try data.write(
+            to: fileURL(mediaKey: mediaKey, bucket: bucket),
+            options: .atomic
+        )
     }
 
-    func isSuppressed(at now: TimeInterval) -> Bool {
-        now < suppressedUntil
+    func data(mediaKey: String, bucket: Int) -> Data? {
+        try? Data(contentsOf: fileURL(mediaKey: mediaKey, bucket: bucket))
+    }
+
+    private func fileURL(mediaKey: String, bucket: Int) -> URL {
+        directory.appendingPathComponent(
+            "\(filePrefix(mediaKey))-\(bucket).jpg"
+        )
+    }
+
+    private func filePrefix(_ mediaKey: String) -> String {
+        Data(mediaKey.utf8).base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "=", with: "")
     }
 }
 
@@ -52,8 +85,8 @@ enum TrickplayOwnedWorkGate {
 /// Small state machine that keeps community trickplay useful without rebuilding the
 /// full sprite sheet every minute. Each exact content key gets one progressive
 /// attempt once its capture is storable, plus at most one teardown attempt after a
-/// failure or material coverage growth. A deliberate decline and a stored teardown
-/// response are final for that key.
+/// failure, progressive decline, or material coverage growth. A declined progressive
+/// remains one-shot; a declined or stored teardown response is final for that key.
 struct TrickplayUploadPolicy {
     enum Kind: Equatable, Sendable {
         case progressive
@@ -88,6 +121,7 @@ struct TrickplayUploadPolicy {
         var progressiveAttempted = false
         var finalAttempted = false
         var progressiveStoredFrameCount: Int?
+        var progressiveFinalBaselineFrameCount: Int?
     }
 
     private(set) var key: String?
@@ -150,9 +184,9 @@ struct TrickplayUploadPolicy {
             state.progressiveAttempted = true
         case .final:
             guard !state.finalAttempted else { return nil }
-            if let stored = state.progressiveStoredFrameCount {
-                let materialGrowth = max(6, stored / 4)
-                guard frameCount >= stored + materialGrowth else { return nil }
+            if let baseline = state.progressiveFinalBaselineFrameCount {
+                let materialGrowth = max(6, baseline / 4)
+                guard frameCount >= baseline + materialGrowth else { return nil }
             }
             if inFlight != nil,
                deferredFinals.count >= Self.maxDeferredFinals {
@@ -215,11 +249,16 @@ struct TrickplayUploadPolicy {
         case .stored:
             if claim.kind == .progressive {
                 state.progressiveStoredFrameCount = claim.frameCount
+                state.progressiveFinalBaselineFrameCount = claim.frameCount
             } else {
                 state.isTerminal = true
             }
         case .rejected:
-            state.isTerminal = true
+            if claim.kind == .progressive {
+                state.progressiveFinalBaselineFrameCount = claim.frameCount
+            } else {
+                state.isTerminal = true
+            }
         case .failed:
             break
         }
@@ -236,9 +275,9 @@ struct TrickplayUploadPolicy {
             let candidate = deferredFinals.removeFirst()
             guard let state = states[candidate.key],
                   !state.isTerminal else { continue }
-            if let stored = state.progressiveStoredFrameCount {
-                let materialGrowth = max(6, stored / 4)
-                guard candidate.frameCount >= stored + materialGrowth else {
+            if let baseline = state.progressiveFinalBaselineFrameCount {
+                let materialGrowth = max(6, baseline / 4)
+                guard candidate.frameCount >= baseline + materialGrowth else {
                     continue
                 }
             }

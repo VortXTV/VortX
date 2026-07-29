@@ -76,12 +76,15 @@ final class ScrubThumbnailsStore: ObservableObject {
     private static var captureInterval: Double { Double(RemoteConfig.snapshot.captureIntervalSecs) }
 
     func configure(localCacheKey: String?) {
-        guard self.localCacheKey != localCacheKey else { return }
+        guard TrickplayCaptureSessionPolicy.transition(
+            from: self.localCacheKey,
+            to: localCacheKey
+        ) == .reset else { return }
         retireCommunityUploadIfNeeded()
         _ = communityIdentityGeneration.advance()
         self.localCacheKey = localCacheKey
         image = nil
-        // A new title: drop the previous community sheet + session frames.
+        // A new stable media or episode timeline: drop the prior community sheet and session frames.
         communitySheet = nil
         communityAlreadyExists = false
         communityExistingFrameCount = 0
@@ -136,8 +139,8 @@ final class ScrubThumbnailsStore: ObservableObject {
         communitySeason = season
         communityEpisode = episode
         communityDurationBucket = CommunityTrickplay.durationBucket(duration)
-        // A re-key under a new bucket invalidates a fetched sheet (it belonged to the old key); the new
-        // fetch below replaces it. Captured session frames stay valid (they are time-indexed, not bucketed).
+        // A community duration-bucket re-key is separate from the stable local media identity above. It
+        // invalidates only the fetched sheet; captured session frames remain valid because they are time-indexed.
         if rekeying { communitySheet = nil; communityAlreadyExists = false; communityExistingFrameCount = 0 }
         uploadPolicy.reset(for: key)
         Task { [weak self] in
@@ -507,6 +510,7 @@ private final class LocalTrickplayFrameCache {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }()
+    private lazy var diskStore = TrickplayFrameDiskStore(directory: cacheDirectory)
 
     init() {
         ioQueue.async { _ = self.cacheDirectory }
@@ -516,7 +520,7 @@ private final class LocalTrickplayFrameCache {
         let bucket = bucketFor(time)
         ioQueue.async {
             self.memory.setObject(image, forKey: self.memKey(key, bucket))
-            try? data.write(to: self.fileURL(for: key, bucket: bucket), options: .atomic)
+            try? self.diskStore.write(data, mediaKey: key, bucket: bucket)
             self.pruneIfNeeded()
         }
     }
@@ -542,8 +546,7 @@ private final class LocalTrickplayFrameCache {
             let minBucket = max(0, target - self.maxLookbackBuckets)
             for bucket in stride(from: target, through: minBucket, by: -1) {
                 if let cached = self.memory.object(forKey: self.memKey(key, bucket)) { completion(cached); return }
-                let url = self.fileURL(for: key, bucket: bucket)
-                guard let data = try? Data(contentsOf: url),
+                guard let data = self.diskStore.data(mediaKey: key, bucket: bucket),
                       let decoded = ScrubImage(data: data) else { continue }
                 self.memory.setObject(decoded, forKey: self.memKey(key, bucket))
                 completion(decoded)
@@ -554,17 +557,6 @@ private final class LocalTrickplayFrameCache {
     }
 
     private func bucketFor(_ time: Double) -> Int { Int(max(0, floor(time / bucketSeconds))) }
-
-    private func fileURL(for key: String, bucket: Int) -> URL {
-        cacheDirectory.appendingPathComponent("\(filePrefix(for: key))-\(bucket).jpg")
-    }
-
-    private func filePrefix(for key: String) -> String {
-        Data(key.utf8).base64EncodedString()
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "=", with: "")
-    }
 
     private func pruneIfNeeded() {
         let now = Date()

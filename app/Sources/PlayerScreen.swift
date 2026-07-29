@@ -249,7 +249,9 @@ struct PlayerScreen: View {
     @State private var trickplayCaptureTimer: Task<Void, Never>?
     /// Capture cadence in seconds. Matches the local frame cache's ~10s tile interval and the community
     /// upload/vtt interval, so timer-driven and timePos-driven captures share one grid.
-    private static let trickplayCaptureIntervalSecs: Double = 10
+    private static var trickplayCaptureIntervalSecs: Double {
+        Double(RemoteConfig.snapshot.captureIntervalSecs)
+    }
     @AppStorage("stremiox.videoSize") private var videoSize = "original"   // whole frame, correct aspect
     @AppStorage("stremiox.seekStep") private var seekStep = "10"            // skip-button step in seconds ("10"/"15"/"30")
     // In-player volume (D5). Persisted 0...100 (libmpv `volume` scale; AVPlayer maps to 0...1) so the level
@@ -1929,8 +1931,14 @@ struct PlayerScreen: View {
         // A parallel wall-clock timer (startTrickplayCaptureTimer) is the belt-and-suspenders backstop for a
         // stream whose timePos events are sparse/coalesced. Both funnel through captureTrickplayFrame.
         guard assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken) else { return }
-        guard !scrubbing, !buffering, !isPaused else { return }
-        guard time - lastLocalTrickplayCapture >= Self.trickplayCaptureIntervalSecs else { return }
+        guard TrickplayCaptureCadencePolicy.shouldCapture(
+            playbackTime: time,
+            lastCaptureTime: lastLocalTrickplayCapture,
+            intervalSeconds: Self.trickplayCaptureIntervalSecs,
+            playbackActive: !buffering && !isPaused,
+            isScrubbing: scrubbing,
+            captureInFlight: localTrickplayCaptureInFlight
+        ) else { return }
         captureTrickplayFrame(at: time)
     }
 
@@ -2017,12 +2025,11 @@ struct PlayerScreen: View {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(Self.trickplayCaptureIntervalSecs))
                 guard !Task.isCancelled else { return }
-                guard hasStartedPlaying, !scrubbing, !buffering, !isPaused else { continue }
+                guard hasStartedPlaying else { continue }
                 guard let player = coordinator.player else { continue }
                 let now = player.playbackPositionSeconds
                 let t = now > 0 ? now : currentTime
-                guard t > 0, t - lastLocalTrickplayCapture >= Self.trickplayCaptureIntervalSecs else { continue }
-                captureTrickplayFrame(at: t)
+                maybeCaptureLocalTrickplay(at: t)
             }
         }
     }
