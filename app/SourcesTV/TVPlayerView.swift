@@ -3748,6 +3748,8 @@ struct TVPlayerView: View {
         let reissueMediaGeneration = resumeRetryGeneration
         let reissuePendingVideoID = pendingAdvance?.meta.videoId
         avStartWatchdog?.cancel(); avStartWatchdog = nil
+        let engineRequestedResume =
+            (coordinator.player as? AVPlayerEngineController)?.pendingRequestedSourcePositionSeconds
         // Always-on [dv] breadcrumb: the demotion edge, recorded in the exportable log (the VXProbe lines
         // around it are gated off in user builds). After this line the session is libmpv = HDR10 tone-map
         // + decoded multichannel PCM; true DV/Atmos for this play is over.
@@ -3770,7 +3772,14 @@ struct TVPlayerView: View {
         // resume is DEFERRED to the duration event, and in that gap currentTime ticks near 0 on the fresh mount,
         // so an exit inside the window would otherwise flush a low position over the account resume. saveProgress
         // self-clears the floor once the restored playhead passes it.
-        let reconcileResume: Double? = hasStartedPlaying ? max(currentTime, suppressedResumeFloor ?? 0) : (resumeSeconds ?? suppressedResumeFloor)   // capture BEFORE the reset below zeroes hasStartedPlaying
+        let reconcileResume: Double?
+        if hasStartedPlaying {
+            reconcileResume = max(max(currentTime, suppressedResumeFloor ?? 0), engineRequestedResume ?? 0)
+        } else if let engineRequestedResume {
+            reconcileResume = max(resumeSeconds ?? suppressedResumeFloor ?? 0, engineRequestedResume)
+        } else {
+            reconcileResume = resumeSeconds ?? suppressedResumeFloor
+        }
         hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false; loadErrorMsg = ""
         subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the AVPlayer engine; a stranded latch would gate every later pick
         inFlightSeekTarget = nil   // any seek in flight died with the AVPlayer engine; mpv's fresh ticks are authoritative

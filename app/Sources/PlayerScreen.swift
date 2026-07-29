@@ -2814,6 +2814,8 @@ struct PlayerScreen: View {
         let reissueMediaGeneration = resumeRetryGeneration
         let reissuePendingVideoID = pendingAdvance?.meta.videoId
         avStartWatchdog?.cancel(); avStartWatchdog = nil
+        let engineRequestedResume =
+            (coordinator.player as? AVPlayerEngineController)?.pendingRequestedSourcePositionSeconds
         // Fully tear down the outgoing AVFoundation engine BEFORE flipping `avEngineFailed` mounts the libmpv
         // surface, so the old AVPlayer decoder cannot straddle into the mpv mount (the player-teardown-straddle
         // that has jetsam-hung the device). Mirrors the tvOS twin's order. stop() is idempotent with the
@@ -2835,8 +2837,8 @@ struct PlayerScreen: View {
         // position and the floor. The floor is derived from resumeSeconds on the launch/switch remux lanes, so
         // max() keeps whichever is authoritative.
         let resume = hasStartedPlaying
-            ? max(currentTime, suppressedResumeFloor ?? 0)
-            : max(resumeSeconds, suppressedResumeFloor ?? 0)
+            ? max(max(currentTime, suppressedResumeFloor ?? 0), engineRequestedResume ?? 0)
+            : max(max(resumeSeconds, suppressedResumeFloor ?? 0), engineRequestedResume ?? 0)
         if !silent, StreamRanking.isDolbyVision(recordQualityText ?? "") {
             showEngineNotice("Dolby Vision isn't supported for this file. Playing HDR10 instead.")
         }

@@ -1052,6 +1052,9 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
            let primaryURL = (currentItem.asset as? AVURLAsset)?.url,
            let fallbackURL = DVPlaybackPolicy.hdrFallbackMasterURL(from: primaryURL),
            let loadToken = activeLoadToken else { return false }
+        if remountPendingSeekIfOutsideWindow() {
+            return true
+        }
 
         // Capture before groups and the current item are retired. If an audio replacement already owns an
         // intent, this refreshes that same value and preserves any newest choice made while groups were empty.
@@ -1128,6 +1131,27 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         pendingPlaybackIntent = intent
     }
 
+    /// A seek can arrive while hosted HDR capability is being refreshed on a failed item. Once the refresh
+    /// completes, a target outside that mount's produced window must start a replacement remux rather than be
+    /// clamped onto the old edge by the fresh HDR-only item.
+    private func remountPendingSeekIfOutsideWindow() -> Bool {
+        guard let target = pendingSeek, isRemuxMounted else { return false }
+        let sourceDuration = remuxHLSServer?.sourceDurationSeconds
+            ?? remuxRemoteMount?.sourceDurationSeconds ?? remuxLoader?.sourceDurationSeconds
+        switch RemuxResumePolicy.mountedSeekAction(
+            sourceSeconds: target,
+            origin: remuxTimelineOrigin,
+            authoritativeSourceDurationSeconds: sourceDuration,
+            playerDurationSeconds: item?.duration.seconds ?? 0,
+            servedStartPlayerSeconds: servedStartPlayerSeconds,
+            producedEdgePlayerSeconds: producedEdgeSeconds) {
+        case .seekPlayer:
+            return false
+        case .remountAtSource(let sourceSeconds):
+            return remountForSeek(sourceSeconds: sourceSeconds)
+        }
+    }
+
     func play() {
         playbackRequested = true
         refreshPendingIntentTransport()
@@ -1149,17 +1173,19 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
               (isRemuxMounted || pendingRemuxGeneration != nil || remuxSeekRemountTarget != nil),
               !lastLoadLive else { return false }
 
-        let target = RemuxResumePolicy.originRequest(resumeSeconds: sourceSeconds)
+        let requestedTarget = sourceSeconds.isFinite ? max(0, sourceSeconds) : 0
+        let mountOrigin = RemuxResumePolicy.originRequest(resumeSeconds: requestedTarget)
         var intent = capturePlaybackIntent(from: item)
-        intent.updateSourceSeconds(target)
+        intent.updateSourceSeconds(requestedTarget)
         pendingPlaybackIntent = intent
-        remuxSeekRemountTarget = target
+        remuxSeekRemountTarget = requestedTarget
         pendingSeek = nil
-        configureResumeOrigin(seconds: target)
+        configureResumeOrigin(seconds: mountOrigin)
         configureAudioSourceForNextLoad(selectedRemuxAudioSourceIndex)
         DiagnosticsLog.log(
             "avplayer",
-            "seek outside mounted window -> source remount at \(String(format: "%.3f", target))s")
+            "seek outside mounted window -> source target \(String(format: "%.3f", requestedTarget))s "
+                + "mount origin \(String(format: "%.3f", mountOrigin))s")
         _ = loadFile(
             url,
             headers: lastLoadHeaders,
@@ -1187,12 +1213,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // resume seek issued right after loadFile, which AVPlayer would otherwise drop).
         guard isReady else {
             if let remountTarget = remuxSeekRemountTarget,
-               abs(seconds - remountTarget) > RemuxResumePolicy.originToleranceSeconds,
+               RemuxResumePolicy.pendingMountNeedsRetarget(
+                requestedSourceSeconds: seconds,
+                mountedSourceRequestSeconds: remountTarget),
                remountForSeek(sourceSeconds: seconds) {
                 return
             }
             if pendingRemuxGeneration != nil,
-               abs(seconds - currentLoadResumeOrigin) > RemuxResumePolicy.originToleranceSeconds,
+               RemuxResumePolicy.pendingMountNeedsRetarget(
+                requestedSourceSeconds: seconds,
+                mountedSourceRequestSeconds: currentLoadResumeOrigin),
                remountForSeek(sourceSeconds: seconds) {
                 return
             }
@@ -1262,6 +1292,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         return RemuxResumePolicy.presented(
             playerSeconds: player.currentTime().seconds,
             origin: remuxTimelineOrigin)
+    }
+
+    /// Newest source destination owned by an in-flight replacement. Chrome fallback reads this before stop(),
+    /// because stop correctly clears every engine transaction and cannot be the point at which resume is derived.
+    var pendingRequestedSourcePositionSeconds: Double? {
+        if let pendingSeek, pendingSeek.isFinite { return max(0, pendingSeek) }
+        return pendingPlaybackIntent?.sourceSeconds
     }
 
     /// The authoritative source-timeline origin once a remux item is ready. nil distinguishes "not ready yet"

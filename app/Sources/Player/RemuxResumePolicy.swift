@@ -165,8 +165,28 @@ enum RemuxResumePolicy {
     enum MountedSeekAction: Equatable, Sendable {
         /// The current item already serves the target. The associated value is in AVPlayer's local clock.
         case seekPlayer(Double)
-        /// The target is outside the current item. Open a new remux whose source timeline begins here.
+        /// The target is outside the current item. Open a new remux for this exact source destination. The
+        /// engine separately sanitizes the mount origin, because a target inside the five-second input-seek
+        /// floor still needs to restore to its requested second after mounting from zero.
         case remountAtSource(Double)
+    }
+
+    /// Equality tolerance for repeated absolute seeks delivered by system transport. Values inside one 60 Hz
+    /// frame are the same destination for remount ownership; anything larger is a real newest-wins retarget.
+    static let pendingRetargetToleranceSeconds: Double = 1.0 / 60.0
+
+    /// Whether an in-flight remux must be replaced for a newer source destination. The comparison is against
+    /// the exact requested destination, not the achieved keyframe origin, which is unavailable until the new
+    /// item publishes. This keeps identical MediaRemote repeats inert without preserving the old one-GOP
+    /// dead zone that could silently clamp a newer seek after readiness.
+    static func pendingMountNeedsRetarget(
+        requestedSourceSeconds: Double,
+        mountedSourceRequestSeconds: Double
+    ) -> Bool {
+        guard requestedSourceSeconds.isFinite,
+              mountedSourceRequestSeconds.isFinite else { return false }
+        return abs(requestedSourceSeconds - mountedSourceRequestSeconds)
+            > pendingRetargetToleranceSeconds
     }
 
     /// Decide whether a source-time seek can stay inside the mounted AVPlayer item or needs a new remux.
@@ -198,19 +218,19 @@ enum RemuxResumePolicy {
 
         let playerTarget = sourceTarget - origin
         if playerTarget < 0 {
-            return .remountAtSource(originRequest(resumeSeconds: sourceTarget))
+            return .remountAtSource(sourceTarget)
         }
         if let servedStartPlayerSeconds,
            servedStartPlayerSeconds.isFinite,
            servedStartPlayerSeconds > 0,
            playerTarget < servedStartPlayerSeconds {
-            return .remountAtSource(originRequest(resumeSeconds: sourceTarget))
+            return .remountAtSource(sourceTarget)
         }
         if producedEdgePlayerSeconds > 0, playerTarget > producedEdgePlayerSeconds {
-            return .remountAtSource(originRequest(resumeSeconds: sourceTarget))
+            return .remountAtSource(sourceTarget)
         }
         if producedEdgePlayerSeconds <= 0, playerTarget > originToleranceSeconds {
-            return .remountAtSource(originRequest(resumeSeconds: sourceTarget))
+            return .remountAtSource(sourceTarget)
         }
 
         return .seekPlayer(playerSeek(

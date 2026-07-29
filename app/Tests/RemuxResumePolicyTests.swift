@@ -315,6 +315,16 @@ check("mounted seek: returning to the title start uses an explicit zero-origin r
         producedEdgePlayerSeconds: 300
       ) == .remountAtSource(0))
 
+check("mounted seek: a sub-floor destination remains exact while its remux mounts from zero",
+      RemuxResumePolicy.mountedSeekAction(
+        sourceSeconds: 2,
+        origin: 1830,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 5370,
+        servedStartPlayerSeconds: 0,
+        producedEdgePlayerSeconds: 300
+      ) == .remountAtSource(2))
+
 check("mounted seek: an evicted point remounts even though it is after the session origin",
       RemuxResumePolicy.mountedSeekAction(
         sourceSeconds: 1900,
@@ -371,6 +381,23 @@ check("mounted seek: a non-finite request remains fail-soft",
         origin: 1830,
         producedEdgePlayerSeconds: 300
       ) == .seekPlayer(0))
+
+check("pending remount: an identical MediaRemote repeat is inert",
+      !RemuxResumePolicy.pendingMountNeedsRetarget(
+        requestedSourceSeconds: 3600,
+        mountedSourceRequestSeconds: 3600))
+check("pending remount: sub-frame clock noise is inert",
+      !RemuxResumePolicy.pendingMountNeedsRetarget(
+        requestedSourceSeconds: 3600 + RemuxResumePolicy.pendingRetargetToleranceSeconds / 2,
+        mountedSourceRequestSeconds: 3600))
+check("pending remount: a one-second newest destination replaces the in-flight mount",
+      RemuxResumePolicy.pendingMountNeedsRetarget(
+        requestedSourceSeconds: 3601,
+        mountedSourceRequestSeconds: 3600))
+check("pending remount: a non-finite callback cannot churn the mount",
+      !RemuxResumePolicy.pendingMountNeedsRetarget(
+        requestedSourceSeconds: .nan,
+        mountedSourceRequestSeconds: 3600))
 
 // MARK: - The two directions are inverses
 

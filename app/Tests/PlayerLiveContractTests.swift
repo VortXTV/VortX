@@ -2469,6 +2469,18 @@ enum PlayerLiveContractTests {
             engine,
             from: "private func remountForSeek(sourceSeconds: Double)",
             to: "func seek(to seconds: Double)")
+        let hdrFallbackRetry = sourceSection(
+            engine,
+            from: "private func retryFreshHDRItemOnHealthyMount(",
+            to: "private func refreshPendingIntentTransport()")
+        let playerScreenAVDemote = sourceSection(
+            playerScreen,
+            from: "private func demoteAVPlayerToMPV(silent: Bool)",
+            to: "/// User-invoked mid-title engine swap")
+        let tvPlayerAVDemote = sourceSection(
+            tvPlayer,
+            from: "private func demoteAVPlayerToMPV() -> Bool",
+            to: "/// User-invoked mid-title engine swap")
         let tvScrub = sourceSection(
             tvPlayer,
             from: "private func scrubBy(_ dir: Int)",
@@ -3068,22 +3080,50 @@ enum PlayerLiveContractTests {
               ]))
         check("wiring: an out-of-window seek remounts the same logical source and carries playback intent",
               sourceContainsInOrder(remuxSeekRemount, [
-                "let target = RemuxResumePolicy.originRequest(",
+                "let requestedTarget =",
+                "let mountOrigin = RemuxResumePolicy.originRequest(",
                 "capturePlaybackIntent(from: item)",
-                "intent.updateSourceSeconds(target)",
+                "intent.updateSourceSeconds(requestedTarget)",
                 "pendingPlaybackIntent = intent",
-                "configureResumeOrigin(seconds: target)",
+                "remuxSeekRemountTarget = requestedTarget",
+                "configureResumeOrigin(seconds: mountOrigin)",
                 "configureAudioSourceForNextLoad(selectedRemuxAudioSourceIndex)",
                 "loadFile(",
                 "reusing: loadToken",
               ]))
-        check("wiring: a seek during remux startup retargets the pending source mount",
+        check("wiring: a seek during remux startup uses exact newest-wins retarget ownership",
               sourceContainsInOrder(remuxSeekMapping, [
                 "guard isReady else",
+                "RemuxResumePolicy.pendingMountNeedsRetarget(",
+                "mountedSourceRequestSeconds: remountTarget",
+                "remountForSeek(sourceSeconds: seconds)",
                 "pendingRemuxGeneration != nil",
+                "RemuxResumePolicy.pendingMountNeedsRetarget(",
+                "mountedSourceRequestSeconds: currentLoadResumeOrigin",
                 "remountForSeek(sourceSeconds: seconds)",
                 "if pendingPlaybackIntent == nil",
+              ])
+                  && remuxSeekMapping?.contains(
+                    "abs(seconds - remountTarget) > RemuxResumePolicy.originToleranceSeconds") == false
+                  && remuxSeekMapping?.contains(
+                    "abs(seconds - currentLoadResumeOrigin) > RemuxResumePolicy.originToleranceSeconds") == false)
+        check("wiring: a long seek during hosted HDR capability refresh remounts before edge-clamped restore",
+              sourceContainsInOrder(hdrFallbackRetry, [
+                "hdrFallbackCapabilityRefreshTask = nil",
+                "remountPendingSeekIfOutsideWindow()",
+                "capturePlaybackIntent(from: currentItem)",
               ]))
+        check("wiring: both AVPlayer demotions capture the engine-owned source target before stop",
+              sourceContainsInOrder(playerScreenAVDemote, [
+                "pendingRequestedSourcePositionSeconds",
+                "coordinator.player?.stop()",
+                "engineRequestedResume",
+              ])
+                  && sourceContainsInOrder(tvPlayerAVDemote, [
+                    "pendingRequestedSourcePositionSeconds",
+                    "coordinator.player?.stop()",
+                    "engineRequestedResume",
+                  ]))
         check("wiring: Apple scrub chrome no longer pins a long seek to the buffered edge",
               playerScreen?.contains("remuxClampedTarget") == false
                   && tvScrub?.contains("bufferedTime") == false
