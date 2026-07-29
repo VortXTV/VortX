@@ -771,6 +771,21 @@ private struct iOSCWDetailTarget: Hashable {
     let traktSessionID: TraktSessionID?
 }
 
+private struct iOSCWProducerProvenance: Sendable {
+    let source: TraktPlaybackShadow.ContinueWatchingSource
+    let traktSessionID: TraktSessionID?
+
+    func isCurrent(traktSessionID currentSessionID: TraktSessionID?) -> Bool {
+        switch source {
+        case .local:
+            return traktSessionID == nil
+        case .trakt:
+            guard let traktSessionID else { return false }
+            return currentSessionID == traktSessionID
+        }
+    }
+}
+
 struct iOSHomeView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
@@ -832,6 +847,14 @@ struct iOSHomeView: View {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress,
                      cwVideoId: $0.state.videoId, resumeSeconds: $0.resumeSeconds)
         }
+    }
+
+    private var continueWatchingProvenance: iOSCWProducerProvenance {
+        let selection = continueWatchingSelection
+        return iOSCWProducerProvenance(
+            source: selection.source,
+            traktSessionID: selection.sessionID
+        )
     }
 
     #if os(macOS)
@@ -1430,9 +1453,8 @@ struct iOSHomeView: View {
     /// plays; the first watch from the detail page seeds it.)
     private func handleContinueWatchingTap(_ item: RailItem) {
         hero.noteInteraction()
-        let expectedTraktSession = continueWatchingSelection.sessionID
-        guard expectedTraktSession == nil
-                || TraktAuth.storedSessionID == expectedTraktSession else { return }
+        let provenance = continueWatchingProvenance
+        guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
         // Computing the resume offset may await the account, so resolve the direct-resume launch in a
         // Task; fall back to opening detail when no remembered link fits.
         Task {
@@ -1440,10 +1462,9 @@ struct iOSHomeView: View {
                 for: item,
                 core: core,
                 account: account,
-                expectedTraktSession: expectedTraktSession
+                expectedTraktSession: provenance.traktSessionID
             ) {
-                guard expectedTraktSession == nil
-                        || TraktAuth.storedSessionID == expectedTraktSession else { return }
+                guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
                 player = launch
                 resumeHoardTask?.cancel()
                 if let contentID = launch.resumeHoardContentID,
@@ -1458,22 +1479,27 @@ struct iOSHomeView: View {
                 } else {
                     resumeHoardTask = nil
                 }
-            } else if let target = cwDetailTarget(for: item) {
+            } else if let target = cwDetailTarget(for: item, provenance: provenance) {
                 path.append(target)
             }
         }
     }
 
     private func cwDetailTarget(for item: RailItem) -> iOSCWDetailTarget? {
-        let selection = continueWatchingSelection
-        guard selection.sessionID == nil
-                || TraktAuth.storedSessionID == selection.sessionID else { return nil }
-        let carriesTraktResume = selection.source == .trakt
+        cwDetailTarget(for: item, provenance: continueWatchingProvenance)
+    }
+
+    private func cwDetailTarget(
+        for item: RailItem,
+        provenance: iOSCWProducerProvenance
+    ) -> iOSCWDetailTarget? {
+        guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return nil }
+        let carriesTraktResume = provenance.source == .trakt
         return iOSCWDetailTarget(
             item: FeaturedHeroItem.from(rail: item),
             resumeSeconds: carriesTraktResume ? item.resumeSeconds : nil,
             videoID: carriesTraktResume ? item.cwVideoId : nil,
-            traktSessionID: selection.sessionID
+            traktSessionID: provenance.traktSessionID
         )
     }
 

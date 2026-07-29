@@ -387,6 +387,48 @@ struct Issue164TraktContractTests {
                     && iosHome.contains("initialResumeSeconds: target.resumeSeconds")
                     && iosHome.contains("initialTraktSessionID: target.traktSessionID"),
                 "iOS direct-resume fallback must retain the Trakt resume target")
+        let iosContinueWatchingProvenance = segment(
+            in: iosHome,
+            from: "private struct iOSCWProducerProvenance: Sendable",
+            to: "struct iOSHomeView: View"
+        )
+        require(iosContinueWatchingProvenance.contains("case .local:")
+                    && iosContinueWatchingProvenance.contains("return traktSessionID == nil")
+                    && iosContinueWatchingProvenance.contains("case .trakt:")
+                    && iosContinueWatchingProvenance.contains(
+                        "guard let traktSessionID else { return false }"
+                    )
+                    && iosContinueWatchingProvenance.contains(
+                        "return currentSessionID == traktSessionID"
+                    ),
+                "iOS remote Continue Watching provenance must reject A-to-B account changes")
+        let iosContinueWatchingTap = segment(
+            in: iosHome,
+            from: "private func handleContinueWatchingTap(",
+            to: "private func cwDetailTarget(for item: RailItem)"
+        )
+        require(appearsInOrder(in: iosContinueWatchingTap, [
+                    "let provenance = continueWatchingProvenance",
+                    "guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID)",
+                    "expectedTraktSession: provenance.traktSessionID",
+                    "guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID)",
+                    "cwDetailTarget(for: item, provenance: provenance)"
+                ])
+                    && !iosContinueWatchingTap.contains("continueWatchingSelection"),
+                "iOS direct-resume fallback must retain one producer/session provenance across await")
+        let iosCapturedFallback = segment(
+            in: iosHome,
+            from: "private func cwDetailTarget(\n        for item: RailItem,",
+            to: "@ViewBuilder private var emptyState"
+        )
+        require(iosCapturedFallback.contains("provenance: iOSCWProducerProvenance")
+                    && iosCapturedFallback.contains(
+                        "guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID)"
+                    )
+                    && iosCapturedFallback.contains("let carriesTraktResume = provenance.source == .trakt")
+                    && iosCapturedFallback.contains("traktSessionID: provenance.traktSessionID")
+                    && !iosCapturedFallback.contains("continueWatchingSelection"),
+                "iOS A-to-B account changes during direct-resume await must fail closed before fallback")
         require(iosDetail.contains("var initialResumeSeconds: Double? = nil")
                     && iosDetail.contains("var initialVideoID: String? = nil")
                     && occurrences(of: "var initialTraktSessionID: TraktSessionID? = nil", in: iosDetail) >= 2
