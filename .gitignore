@@ -95,3 +95,7 @@ vortx-images/
 /dept/
 # Local agent standing orders; never committed
 /AGENTS.md
+
+# Rust build output must never be tracked (IR-03: 1.08GB private-engine artifacts were tracked)
+core/target/
+**/target/
