@@ -47,9 +47,30 @@ final class SIMKLWatchedShadow {
     /// and refuses to write back if it changed meanwhile, so a pull that started before a disconnect can
     /// never resurrect the wiped shadow into the next account.
     private var generation = 0
+    private var stateSessionID: SIMKLSessionID?
+
+    private struct PersistedSnapshot: Codable {
+        let sessionID: SIMKLSessionID
+        let watchedIDs: [String]
+    }
+
+    private static let storage = try? PrivateExternalSyncStorage.live(
+        provider: "SIMKL",
+        file: "watched.json",
+        legacyFiles: ["simkl-shadow-watched.json"]
+    )
 
     private init() {
-        core = SIMKLWatchedCore(watchedIDs: Self.loadWatched())
+        let initialSession = SIMKLAuth.storedSessionID
+        stateSessionID = initialSession
+        core = SIMKLWatchedCore(
+            watchedIDs: initialSession.map { Set(Self.loadWatched(for: $0)) } ?? []
+        )
+        SIMKLAuthBoundary.observe(key: "simkl-watched-shadow") { [weak self] sessionID in
+            self?.reset(to: sessionID)
+        }
+        let currentSession = SIMKLAuth.storedSessionID
+        if currentSession != initialSession { reset(to: currentSession) }
     }
 
     // MARK: - Read side (WatchedIndex consumes this)
@@ -59,7 +80,10 @@ final class SIMKLWatchedShadow {
     /// `visibleIDs`, so a single call site in WatchedIndex stays clean.
     func shadowWatchedIDs() -> Set<String> {
         let on = ExternalSyncToggle.isOn(ExternalSyncToggle.simklImportWatched, default: false)
+        guard let currentSession = SIMKLAuth.storedSessionID else { return [] }
         lock.lock(); defer { lock.unlock() }
+        guard stateSessionID == currentSession,
+              SIMKLAuth.storedSessionID == currentSession else { return [] }
         return core.visibleIDs(importOn: on)
     }
 
@@ -69,12 +93,18 @@ final class SIMKLWatchedShadow {
     /// disconnect / sign-out and one account's SIMKL history can never badge covers for the NEXT account that
     /// connects on this device. The caller notifies `WatchedIndex` so the read path rebuilds.
     func reset() {
+        reset(to: SIMKLAuth.storedSessionID)
+    }
+
+    private func reset(to sessionID: SIMKLSessionID?) {
         lock.lock()
         core.wipe()
         lastRefresh = nil
+        stateSessionID = sessionID
         generation &+= 1   // invalidate any in-flight pull so it cannot write its pre-reset result back
+        try? Self.storage?.reset()
         lock.unlock()
-        Self.saveWatched([])
+        DispatchQueue.main.async { WatchedIndex.shared.externalShadowChanged() }
     }
 
     // MARK: - Refresh (throttled) + force
@@ -91,7 +121,10 @@ final class SIMKLWatchedShadow {
         // `refreshNow` still exists for the flip-off-then-on-within-the-interval case (an earlier ON period's
         // stamp is still fresh) and to pull the instant the user asks rather than on the next rebuild tick.
         guard ExternalSyncToggle.isOn(ExternalSyncToggle.simklImportWatched, default: false) else { return }
+        guard let sessionID = SIMKLAuth.storedSessionID else { return }
         lock.lock()
+        guard stateSessionID == sessionID,
+              SIMKLAuth.storedSessionID == sessionID else { lock.unlock(); return }
         if refreshing { lock.unlock(); return }
         if let last = lastRefresh, Date().timeIntervalSince(last) < Self.refreshInterval { lock.unlock(); return }
         refreshing = true
@@ -106,7 +139,11 @@ final class SIMKLWatchedShadow {
                 // lastRefresh, and re-stamping here would make refreshIfStale early-return for up to
                 // refreshInterval, delaying the reconnected account's first pull. Leaving it nil on a stale
                 // generation lets the next call pull immediately.
-                if self.generation == gen { self.lastRefresh = Date() }
+                if self.generation == gen,
+                   self.stateSessionID == sessionID,
+                   SIMKLAuth.storedSessionID == sessionID {
+                    self.lastRefresh = Date()
+                }
                 // A force (refreshNow) arrived mid-refresh and was swallowed by the single-flight guard; its
                 // throttle clear was re-armed by the stamp above. Honor it now with one more pass.
                 let force = self.refreshAgain
@@ -114,8 +151,8 @@ final class SIMKLWatchedShadow {
                 self.lock.unlock()
                 if force { self.refreshNow() }
             }
-            guard await SIMKLAuth.shared.isSignedIn else { return }
-            await self.pullCompleted()
+            guard SIMKLAuth.storedSessionID == sessionID else { return }
+            await self.pullCompleted(expectedSession: sessionID, gen: gen)
         }
     }
 
@@ -136,9 +173,8 @@ final class SIMKLWatchedShadow {
     /// Pull `GET /sync/all-items/{movies,shows,anime}/completed` through `SIMKLService.list` and REPLACE the
     /// shadow with the folded identity set. Reads are not rate-gated (SIMKL's limit is on writes; see
     /// `SIMKLService`), and each leg is independent + fail-soft.
-    private func pullCompleted() async {
+    private func pullCompleted(expectedSession: SIMKLSessionID, gen: Int) async {
         guard ExternalSyncToggle.isOn(ExternalSyncToggle.simklImportWatched, default: false) else { return }
-        lock.lock(); let gen = generation; lock.unlock()
         var next = Set<String>()
         var allOK = true
         // Three independent legs. A leg that throws contributes nothing AND blocks the commit below, because
@@ -147,47 +183,63 @@ final class SIMKLWatchedShadow {
         // on a partial failure (the same discipline `TraktSyncEngine`'s two-leg commit gate uses).
         for type in SIMKLListType.allCases {
             do {
-                let entries = try await SIMKLService.shared.list(type: type, status: .completed)
+                let entries = try await SIMKLService.shared.list(
+                    type: type,
+                    status: .completed,
+                    expectedSession: expectedSession
+                )
                 for id in SIMKLWatchedCore.identities(from: entries) { next.insert(id) }
             } catch {
                 allOK = false
             }
         }
-        // Commit only when every leg answered and there is something to publish. An empty `next` with all
-        // legs OK means the account has nothing completed; matching Trakt, we do not publish an empty replace
-        // over a populated cache from one sweep.
-        guard allOK, !next.isEmpty else { return }
+        // Commit whenever every leg answered. An empty `next` is a truthful empty account result and must
+        // replace a populated cache, otherwise removed history remains visible forever.
+        guard allOK else { return }
         lock.lock()
         // A disconnect while this pull was in flight wiped the set and bumped generation; do NOT write the
         // pre-reset result back, or the imported badges would resurrect after the user disconnected.
-        guard generation == gen else { lock.unlock(); return }
+        guard generation == gen,
+              stateSessionID == expectedSession,
+              SIMKLAuth.storedSessionID == expectedSession else { lock.unlock(); return }
         let changed = core.replace(with: next)
-        let snapshot = core.watchedIDs
+        if changed { persistLocked() }
         lock.unlock()
         if changed {
-            Self.saveWatched(snapshot)
             await MainActor.run { WatchedIndex.shared.externalShadowChanged() }
         }
     }
 
-    // MARK: - Persistence (Application Support JSON)
+    // MARK: - Protected persistence
 
-    private static let watchedFile = "simkl-shadow-watched.json"
-
-    private static func supportURL(_ name: String) -> URL? {
-        guard let dir = try? FileManager.default.url(for: .applicationSupportDirectory,
-                                                     in: .userDomainMask, appropriateFor: nil, create: true) else { return nil }
-        return dir.appendingPathComponent(name)
+    private static func loadWatched(for sessionID: SIMKLSessionID) -> [String] {
+        guard let storage else { return [] }
+        let data: Data
+        do {
+            guard let stored = try storage.load() else { return [] }
+            data = stored
+        } catch {
+            try? storage.reset()
+            return []
+        }
+        guard let snapshot = try? JSONDecoder().decode(PersistedSnapshot.self, from: data),
+              snapshot.sessionID == sessionID else {
+            try? storage.reset()
+            return []
+        }
+        return snapshot.watchedIDs
     }
 
-    private static func loadWatched() -> Set<String> {
-        guard let url = supportURL(watchedFile), let data = try? Data(contentsOf: url),
-              let arr = try? JSONDecoder().decode([String].self, from: data) else { return [] }
-        return Set(arr)
-    }
-
-    private static func saveWatched(_ set: Set<String>) {
-        guard let url = supportURL(watchedFile), let data = try? JSONEncoder().encode(Array(set)) else { return }
-        try? data.write(to: url, options: .atomic)
+    private func persistLocked() {
+        guard let storage = Self.storage, let stateSessionID else {
+            try? Self.storage?.reset()
+            return
+        }
+        let snapshot = PersistedSnapshot(
+            sessionID: stateSessionID,
+            watchedIDs: Array(core.watchedIDs)
+        )
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        try? storage.save(data)
     }
 }

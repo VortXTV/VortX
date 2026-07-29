@@ -764,6 +764,13 @@ private extension View {
 /// Home: Continue Watching + each installed catalog as a horizontal poster rail, from the shared
 /// engine, under the interactive featured hero. Signed-out shows a sign-in prompt; the rails populate
 /// as the engine hydrates.
+private struct iOSCWDetailTarget: Hashable {
+    let item: FeaturedHeroItem
+    let resumeSeconds: Double?
+    let videoID: String?
+    let traktSessionID: TraktSessionID?
+}
+
 struct iOSHomeView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
@@ -787,6 +794,8 @@ struct iOSHomeView: View {
     @ObservedObject private var imported = ImportedCatalogs.shared   // user-imported list catalogs, rendered as Home rows
     @ObservedObject private var railPrefs = HomeRailPreferences.shared   // user's Home row order + hidden set (Continue Watching stays pinned first)
     @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
+    @AppStorage(ExternalSyncToggle.traktContinueWatching) private var useTraktContinueWatching = false
+    @State private var traktContinueWatchingRevision = 0
     @State private var path = NavigationPath()
     @State private var showCustomizeHome = false   // presents the Home rows reorder/hide editor
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
@@ -808,9 +817,18 @@ struct iOSHomeView: View {
     /// carry their in-progress `video_id` so a direct resume can confirm the remembered link
     /// still matches the episode the engine is parked on. The owner profile rides the account's
     /// engine history; an overlay profile rides its own private synced overlay (never the account).
+    private var continueWatchingSelection: TraktPlaybackShadow.ContinueWatchingSelection {
+        if profiles.activeUsesEngineHistory {
+            _ = traktContinueWatchingRevision
+            return TraktPlaybackShadow.shared.continueWatchingSelection(
+                fallback: core.continueWatching
+            )
+        }
+        return .init(items: profiles.cwItems, source: .local, sessionID: nil)
+    }
+
     private var continueWatchingItems: [RailItem] {
-        let source = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
-        return source.map {
+        continueWatchingSelection.items.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress,
                      cwVideoId: $0.state.videoId, resumeSeconds: $0.resumeSeconds)
         }
@@ -820,7 +838,8 @@ struct iOSHomeView: View {
     /// Every Home rail item flattened, for the keyboard-browse hero coupling: a focused card id resolves
     /// to its `RailItem` so the hero can feature it. Mirrors the same sources the rails render from.
     private var allRailItems: [RailItem] {
-        var out = continueWatchingItems
+        // A remote Trakt row stays keyboard-focusable, but never enters the generic hero enrichment pool.
+        var out = continueWatchingSelection.source == .trakt ? [] : continueWatchingItems
         out += topPicks.items.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
         out += core.boardRows.flatMap { $0.items }.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
@@ -964,10 +983,24 @@ struct iOSHomeView: View {
                         // the exact last-played stream straight into the player (#11), falling back to opening
                         // detail when no remembered link fits. Long-press offers "Remove from Continue Watching".
                         homeRail(PosterRail(title: String(localized: "Continue Watching"),
-                                            eyebrow: String(localized: "Pick up where you left off"),
+                                            eyebrow: continueWatchingSelection.source == .trakt
+                                                ? String(localized: "From Trakt")
+                                                : String(localized: "Pick up where you left off"),
                                             items: continueWatchingItems,
-                                            onTap: handleContinueWatchingTap, menu: .continueWatching,
-                                            onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) }))
+                                            onTap: handleContinueWatchingTap,
+                                            // Trakt-sourced rows are read-only. Their dismiss action targets
+                                            // the local engine, not Trakt, so omit it until remote delete is
+                                            // separately designed and authorized.
+                                            menu: continueWatchingSelection.source == .trakt
+                                                ? .none
+                                                : .continueWatching,
+                                            onDetails: {
+                                                guard let target = cwDetailTarget(for: $0) else { return }
+                                                path.append(target)
+                                            },
+                                            accessibilityProvenance: continueWatchingSelection.source == .trakt
+                                                ? String(localized: "From Trakt")
+                                                : nil))
                     }
                     // Every other Home section renders in the user's arranged order, minus the hidden ones
                     // (HomeRailPreferences). Default order + nothing hidden == today's Home exactly, so this is
@@ -1063,6 +1096,20 @@ struct iOSHomeView: View {
                 iOSDetailView(id: item.id, type: item.type, title: item.name,
                               seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
+            .navigationDestination(for: iOSCWDetailTarget.self) { target in
+                if target.traktSessionID == nil
+                    || TraktAuth.storedSessionID == target.traktSessionID {
+                    iOSDetailView(
+                        id: target.item.id,
+                        type: target.item.type,
+                        title: target.item.name,
+                        seedBackdrop: target.item.backdrop,
+                        seedLogo: target.item.logo,
+                        initialResumeSeconds: target.resumeSeconds,
+                        initialVideoID: target.videoID
+                    )
+                }
+            }
             .navigationDestination(for: HubTarget.self) { target in
                 iOSCategoryBrowse(target: target, path: $path)
             }
@@ -1090,6 +1137,7 @@ struct iOSHomeView: View {
             // so a signed-in session (board already loaded at bootstrap) isn't re-fetched.
             if core.boardRows.isEmpty { core.loadBoard() }
             FeaturedHeroModel.configureMetaSources(core.addons)
+            TraktPlaybackShadow.shared.refreshIfStale()
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
             refreshTopPicks()
             refreshReleaseCalendar()
@@ -1135,6 +1183,16 @@ struct iOSHomeView: View {
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
         }
         .onChange(of: profiles.activeID) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks() }
+        .onChange(of: useTraktContinueWatching) { on in
+            if on { TraktPlaybackShadow.shared.refreshNow() }
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+            refreshTopPicks()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TraktPlaybackShadow.changedNote)) { _ in
+            traktContinueWatchingRevision &+= 1
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+            refreshTopPicks()
+        }
         // Library membership drives both Top Picks (its seed set includes the library) and Upcoming Episodes.
         // Unbounded, so keyed on catalog.count with the same-count-swap bound documented above.
         .onChange(of: core.library?.catalog.count ?? 0) { _ in refreshTopPicks(); refreshReleaseCalendar() }
@@ -1371,10 +1429,20 @@ struct iOSHomeView: View {
     /// plays; the first watch from the detail page seeds it.)
     private func handleContinueWatchingTap(_ item: RailItem) {
         hero.noteInteraction()
+        let expectedTraktSession = continueWatchingSelection.sessionID
+        guard expectedTraktSession == nil
+                || TraktAuth.storedSessionID == expectedTraktSession else { return }
         // Computing the resume offset may await the account, so resolve the direct-resume launch in a
         // Task; fall back to opening detail when no remembered link fits.
         Task {
-            if let launch = await iOSDirectResume(for: item, core: core, account: account) {
+            if let launch = await iOSDirectResume(
+                for: item,
+                core: core,
+                account: account,
+                expectedTraktSession: expectedTraktSession
+            ) {
+                guard expectedTraktSession == nil
+                        || TraktAuth.storedSessionID == expectedTraktSession else { return }
                 player = launch
                 resumeHoardTask?.cancel()
                 if let contentID = launch.resumeHoardContentID,
@@ -1389,10 +1457,23 @@ struct iOSHomeView: View {
                 } else {
                     resumeHoardTask = nil
                 }
-            } else {
-                path.append(FeaturedHeroItem.from(rail: item))
+            } else if let target = cwDetailTarget(for: item) {
+                path.append(target)
             }
         }
+    }
+
+    private func cwDetailTarget(for item: RailItem) -> iOSCWDetailTarget? {
+        let selection = continueWatchingSelection
+        guard selection.sessionID == nil
+                || TraktAuth.storedSessionID == selection.sessionID else { return nil }
+        let carriesTraktResume = selection.source == .trakt
+        return iOSCWDetailTarget(
+            item: FeaturedHeroItem.from(rail: item),
+            resumeSeconds: carriesTraktResume ? item.resumeSeconds : nil,
+            videoID: carriesTraktResume ? item.cwVideoId : nil,
+            traktSessionID: selection.sessionID
+        )
     }
 
     @ViewBuilder private var emptyState: some View {
@@ -3121,7 +3202,10 @@ extension View {
 /// engine moved the series on to a different episode than the one we remembered.
 @MainActor
 private func iOSDirectResume(for item: RailItem, core: CoreBridge,
-                             account: StremioAccount) async -> iOSPlayerLaunch? {
+                             account: StremioAccount,
+                             expectedTraktSession: TraktSessionID?) async -> iOSPlayerLaunch? {
+    guard expectedTraktSession == nil
+            || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     let pid = ProfileStore.shared.activeID
     guard let entry = LastStreamStore.entry(for: item.id, profileID: pid) else {
         LastStreamStore.logResume("noEntry", libraryId: item.id, profileID: pid); return nil
@@ -3154,18 +3238,22 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     // the latter's groups under tt1375666:1:1. `resumeContentID` compares canonical TITLE HEADS and returns nil
     // when they disagree, which SKIPS the pool contribution only. Playback below is untouched: a mismatch never
     // blocks the user's own resume.
-    let resumeHoardContentID = SourceIndexClient.resumeContentID(
-        itemID: item.id,
-        videoID: entry.videoId,
-        season: entry.season,
-        episode: entry.episode
-    )
+    let resumeHoardContentID = expectedTraktSession == nil
+        ? SourceIndexClient.resumeContentID(
+            itemID: item.id,
+            videoID: entry.videoId,
+            season: entry.season,
+            episode: entry.episode
+        )
+        : nil
     // Reresolve the EXACT stored source FIRST (same debrid file, fresh link) so the card tap resumes the source
     // the user chose instead of replaying a stale, expired URL and dead-ending into the cross-source auto-pick
     // ("Tried N sources / this source didn't load"). CWResume mints a fresh link for the SAME file when the
     // entry carries debrid provenance; a non-debrid entry returns the stored url unchanged (refreshed == false),
     // so torrent / plain-direct resumes are byte-identical to before.
     let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
+    guard expectedTraktSession == nil
+            || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     let playURL = refreshed ? resolvedURL : url
     if hasEpisodicPhysicalIdentity, entry.torrent == true, entry.fileIdx == nil, !refreshed {
         LastStreamStore.logResume("episodeTorrentMissingFileIdx", libraryId: item.id, profileID: pid)
@@ -3196,14 +3284,18 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
                             name: entry.name, poster: entry.poster,
                             season: entry.season, episode: entry.episode)
-    // Resume where the user left off, not 0:00 (#11). The iOS PlayerScreen seeks ONLY to the passed
-    // `resume`, so the offset must be computed here, mirroring iOSDetailView.resume(_:):
-    // the engine's own offset for engine-history profiles, else the account/overlay offset.
+    // Resume at the offset printed on the tapped card. This is load-bearing for a Trakt-sourced row:
+    // consulting the engine/account instead would display one remote offset and play from another.
+    // Older/non-CW callers with no card offset retain the existing engine/account fallback.
     let resume: Double
-    if let engine = core.engineResumeSeconds(for: meta) {
+    if let displayed = item.resumeSeconds, displayed.isFinite, displayed > 0 {
+        resume = displayed
+    } else if let engine = core.engineResumeSeconds(for: meta) {
         resume = engine
     } else {
         resume = await account.resumeOffset(for: meta)
+        guard expectedTraktSession == nil
+                || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     }
     // For a MOVIE, kick off loading the title's streams in the background so a stale stored link (debrid URLs
     // are time-limited and expire between sessions) can AUTO-HOP to a freshly-resolved source instead of
@@ -3246,10 +3338,23 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                 )
             }
             loadEpisode = { vid in
-                await iOSResolveEpisodeStream(videoId: vid, in: allSeriesVideos, seriesId: item.id,
-                                              seriesName: entry.name, defaultSeason: season,
-                                              fallbackPoster: entry.poster, continuity: entry.qualityText,
-                                              binge: entry.bingeGroup, core: core, account: account)
+                guard expectedTraktSession == nil
+                        || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
+                let resolved = await iOSResolveEpisodeStream(
+                    videoId: vid,
+                    in: allSeriesVideos,
+                    seriesId: item.id,
+                    seriesName: entry.name,
+                    defaultSeason: season,
+                    fallbackPoster: entry.poster,
+                    continuity: entry.qualityText,
+                    binge: entry.bingeGroup,
+                    core: core,
+                    account: account
+                )
+                guard expectedTraktSession == nil
+                        || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
+                return resolved
             }
         }
     }
@@ -3285,6 +3390,8 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
             )
         }
     }
+    guard expectedTraktSession == nil
+            || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     return iOSPlayerLaunch(url: playURL, title: entry.title, headers: entry.headers,
                            resume: resume, meta: meta,
                            qualityText: entry.qualityText, bingeGroup: entry.bingeGroup,
@@ -3857,6 +3964,9 @@ private struct PosterRail: View {
     var menu: iOSPosterMenu = .none
     /// Opens a card's detail page (used by the Continue Watching menu's Details item, since a CW tap resumes).
     var onDetails: ((RailItem) -> Void)? = nil
+    /// Remote row provenance repeated in VoiceOver so account-private rows are never mistaken for
+    /// local engine history.
+    var accessibilityProvenance: String? = nil
     /// #111 (iOS mirror of tvOS): show the per-profile watched check badge + 55% dim on each card. Opt-in so
     /// only catalog/discovery rails badge, exactly as tvOS scopes it; Continue Watching keeps it off (its
     /// cards carry the resume timecode + progress stripe, not a watched badge).
@@ -3931,14 +4041,17 @@ private struct PosterRail: View {
             PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, caption: item.caption, imdbRating: item.imdbRating,
                           progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
                           isWatched: showWatchedBadges && watchedIndex.ids.contains(item.id),
-                          onDetails: onDetails.map { od in { od(item) } })
+                          onDetails: onDetails.map { od in { od(item) } },
+                          privateArtwork: accessibilityProvenance != nil)
         }
         // S3: shared card treatment (resting shadow, Mac hover lift, designed press, Reduce-Motion aware),
         // matching the browse grid and tvOS poster cards. scale 1.04 is touch-tuned.
         .buttonStyle(CardFocusStyle(scale: 1.04))
         .id(item.id)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(item.name)
+        .accessibilityLabel(
+            accessibilityProvenance.map { "\(item.name), \($0)" } ?? item.name
+        )
         .accessibilityHint("Opens details")
         .accessibilityValue(item.progress > 0 ? "\(Int(item.progress * 100)) percent watched" : "")
 
@@ -4061,6 +4174,35 @@ struct CachedPosterImage: View {
             image = img
         } else if !Task.isCancelled {
             failed = true
+        }
+    }
+}
+
+/// Privacy-preserving image for account-private remote rows. It paints only an already-decoded local
+/// poster and never starts a request or writes the shared artwork caches.
+private struct WarmCachedPosterImage: View {
+    let url: String?
+
+    private var image: VXPosterImage? {
+        guard let url, let parsed = URL(string: url) else { return nil }
+        return PosterImageLoader.cached(parsed)
+    }
+
+    var body: some View {
+        Group {
+            if let image {
+                #if canImport(UIKit)
+                Image(uiImage: image).resizable().scaledToFill()
+                #else
+                Image(nsImage: image).resizable().scaledToFill()
+                #endif
+            } else {
+                Theme.Palette.surface1.overlay(
+                    Image(systemName: "film")
+                        .font(.system(size: 28))
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                )
+            }
         }
     }
 }
@@ -4193,6 +4335,9 @@ struct PosterCardiOS: View {
     var isWatched: Bool = false
     /// Per-card "open details" action, wired into the Continue Watching menu's Details item.
     var onDetails: (() -> Void)? = nil
+    /// Account-private remote rows may reuse only already-warm local art. They must not enrich, resolve,
+    /// fetch, or persist artwork based on private playback history.
+    var privateArtwork = false
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized title/poster override
@@ -4200,13 +4345,13 @@ struct PosterCardiOS: View {
     @Environment(\.horizontalSizeClass) private var hSize
 
     /// The title to show: the pooled localized title in the user's language when available, else the add-on's.
-    private var displayName: String { l10n.title(for: id) ?? name }
+    private var displayName: String { privateArtwork ? name : (l10n.title(for: id) ?? name) }
     /// The poster to show: the pooled localized (language-matched) poster when available, else the add-on's.
-    private var displayPoster: String? { l10n.poster(for: id) ?? poster }
+    private var displayPoster: String? { privateArtwork ? poster : (l10n.poster(for: id) ?? poster) }
 
     /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
     /// a TMDB key so keyless users keep the clean portrait grid (no backdrop = degraded composite).
-    private var landscape: Bool { catalogPrefs.landscapeCards && apiKeys.hasTMDB }
+    private var landscape: Bool { !privateArtwork && catalogPrefs.landscapeCards && apiKeys.hasTMDB }
     // Card WIDTH comes from the user's Poster Style preset (default `.balanced` = today's 224 / 116). The
     // grid derives its adaptive column width from the SAME preset (iOSPillMetrics.gridPosterWidth), so grid
     // + cards stay in lockstep and the responsive column count recomputes from the chosen width. The height
@@ -4239,6 +4384,8 @@ struct PosterCardiOS: View {
                 Group {
                     if landscape {
                         LandscapeArtiOS(id: id, type: type, title: displayName, poster: displayPoster ?? fallbackArt)
+                    } else if privateArtwork {
+                        WarmCachedPosterImage(url: displayPoster ?? fallbackArt)
                     } else {
                         CachedPosterImage(url: PosterArtwork.poster(id: id, fallback: displayPoster ?? fallbackArt))
                     }

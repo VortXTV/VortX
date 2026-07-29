@@ -6,6 +6,8 @@ import SwiftUI
 struct DetailView: View {
     let type: String
     let id: String
+    var initialResumeSeconds: Double? = nil
+    var initialVideoID: String? = nil
     var client: AddonClient = AddonClient()   // kept for call-site compatibility (Search)
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
@@ -769,6 +771,12 @@ struct DetailView: View {
             TraktEpisodeShadow.watchedVideoIDs(showIdentity: meta.id, videos: videos))
         let primary = seriesPrimaryEpisode(videos, watched: watched, localWatched: localWatched, metaID: meta.id)
         let primaryProgress = primary.map { episodeProgress($0.video, metaID: meta.id) } ?? 0
+        let primaryResumeSeconds = primary.flatMap {
+            if $0.video.id == initialVideoID, let initialResumeSeconds {
+                return initialResumeSeconds
+            }
+            return $0.isResume ? primaryEpisodeResumeSeconds($0.video, metaID: meta.id) : nil
+        }
         // FIX (build 137): the series/season hero was chopped at the top + not full-bleed because the
         // backdrop lived INSIDE hero(), i.e. inside the VStack inside the ScrollView, so its
         // .ignoresSafeArea() could not escape the top nav-bar safe-area inset. Hoist FullBleedBackdrop +
@@ -786,6 +794,7 @@ struct DetailView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.xl) {
                         hero(meta, primaryEpisode: primary?.video, primaryIsResume: primary?.isResume == true,
+                             primaryResumeSeconds: primaryResumeSeconds,
                              primaryProgress: primaryProgress,
                              scrollToContent: { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } })
                         CoreSeasonedEpisodes(meta: meta, videos: videos,
@@ -878,7 +887,8 @@ struct DetailView: View {
                                                               type: m.type.isEmpty ? effectiveType : m.type,
                                                               name: m.name, poster: m.poster,
                                                               season: nil, episode: nil),
-                                           identityRoles: sourceIndexRoles)
+                                           identityRoles: sourceIndexRoles,
+                                           initialStartAtSeconds: initialResumeSeconds)
                         }
                     }
                     .padding(.horizontal, Theme.Space.screenEdge)
@@ -1064,6 +1074,7 @@ struct DetailView: View {
     /// Full-bleed backdrop with a canvas-blended gradient and the title / metadata / synopsis on the
     /// lower band. The serif title is the editorial signature.
     private func hero(_ m: CoreMetaItem, primaryEpisode: CoreVideo? = nil, primaryIsResume: Bool = false,
+                      primaryResumeSeconds: Double? = nil,
                       primaryProgress: Double = 0,
                       scrollToContent: @escaping () -> Void) -> some View {
         // FIX (build 137): the backdrop + trailer layer are now hoisted to the seriesPage page-root ZStack
@@ -1097,10 +1108,11 @@ struct DetailView: View {
                                 NavigationLink {
                                     CoreEpisodeStreams(meta: m, video: primaryEpisode,
                                                        season: primaryEpisode.season ?? 0,
-                                                       episodes: sortedEpisodes(m.videos ?? []))   // ALL seasons ordered → auto-advance crosses the season boundary
+                                                       episodes: sortedEpisodes(m.videos ?? []),
+                                                       initialStartAtSeconds: primaryResumeSeconds)   // ALL seasons ordered → auto-advance crosses the season boundary
                                 } label: {
                                     Label(primaryEpisodeLabel(primaryEpisode, isResume: primaryIsResume,
-                                                              resumeSeconds: primaryIsResume ? primaryEpisodeResumeSeconds(primaryEpisode, metaID: m.id) : nil),
+                                                              resumeSeconds: primaryResumeSeconds),
                                           systemImage: "play.fill")
                                 }
                                 .buttonStyle(PrimaryActionStyle())
@@ -1403,6 +1415,10 @@ struct DetailView: View {
     /// the next-unwatched season instead). nil when there is no resume position, so the caller falls back to the
     /// primary/next-unwatched season. seriesPrimaryEpisode still drives the Resume/Play button unchanged.
     private func resumeSeasonHint(_ videos: [CoreVideo], metaID: String) -> Int? {
+        if let initialVideoID,
+           let season = sortedEpisodes(videos).first(where: { $0.id == initialVideoID })?.season {
+            return season
+        }
         let videoId: String? = profiles.activeUsesEngineHistory
             ? core.metaDetails?.libraryItem?.state.videoId
             : profiles.watch[metaID]?.videoId
@@ -1417,6 +1433,12 @@ struct DetailView: View {
     private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>,
                                       localWatched: Set<String>, metaID: String) -> (video: CoreVideo, isResume: Bool)? {
         let sorted = sortedEpisodes(videos)
+        if let initialVideoID,
+           let initialResumeSeconds,
+           initialResumeSeconds > 0,
+           let video = sorted.first(where: { $0.id == initialVideoID }) {
+            return (video, true)
+        }
         // Resume position: the engine's library entry is account level, so overlay
         // profiles resolve theirs from the profile overlay instead (the same
         // invariant as the ticks and the progress stripes).
@@ -1806,6 +1828,7 @@ struct CoreEpisodeStreams: View {
     let video: CoreVideo
     let season: Int
     var episodes: [CoreVideo] = []
+    var initialStartAtSeconds: Double? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore   // per-profile engine-history gate (activeUsesEngineHistory)
@@ -1820,11 +1843,18 @@ struct CoreEpisodeStreams: View {
     @State private var currentVideo: CoreVideo
     @State private var episodeTargetGeneration = 0
 
-    init(meta: CoreMetaItem, video: CoreVideo, season: Int, episodes: [CoreVideo] = []) {
+    init(
+        meta: CoreMetaItem,
+        video: CoreVideo,
+        season: Int,
+        episodes: [CoreVideo] = [],
+        initialStartAtSeconds: Double? = nil
+    ) {
         self.meta = meta
         self.video = video
         self.season = season
         self.episodes = episodes
+        self.initialStartAtSeconds = initialStartAtSeconds
         _currentVideo = State(initialValue: video)
     }
 
@@ -1895,7 +1925,8 @@ struct CoreEpisodeStreams: View {
                                        defaultVideoID: meta.behaviorHints?.defaultVideoId,
                                        currentVideoID: currentVideo.id,
                                        kind: .series
-                                   ))
+                                   ),
+                                   initialStartAtSeconds: initialStartAtSeconds)
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
                 .padding(.bottom, Theme.Space.xl)
@@ -2027,6 +2058,8 @@ struct CoreStreamList: View {
     var identityRoles = SourceIndexIdentity.Roles(
         catalogID: nil, defaultVideoID: nil, currentVideoID: nil, kind: .movie
     )
+    /// One navigation-carried resume offset, consumed by the first content play only.
+    var initialStartAtSeconds: Double? = nil
 
     /// The title's resolved IMDb identity. ONE value: the pool and the IMDb-keyed TorBox index take the same
     /// IMDb-only key (decision REQ-260721-33), so there is no second field for a caller to pick wrongly.
@@ -2126,6 +2159,7 @@ struct CoreStreamList: View {
     /// Smart Source Selection (Lane A) auto-pick guard. Set once when the auto-pick fires so it never
     /// re-triggers; a viewer who backs out of the player lands on the full source list (the escape hatch).
     @State private var didAutoPick = false
+    @State private var didConsumeInitialStart = false
 
     /// Pin context derived from the title being shown - a movie pin or a show pin, both keyed by the
     /// library (meta) id. A series episode list passes a `type: "series"` PlaybackMeta, so every episode
@@ -2887,7 +2921,8 @@ struct CoreStreamList: View {
             Task { @MainActor in await playTrailerStream(stream) }
             return
         }
-        Task { await playResolving(stream, explicit: true) }   // a tapped source row / quality pick: honor it in the player
+        let startAt = consumeInitialStart(explicit: nil, fromStart: false)
+        Task { await playResolving(stream, explicit: true, startAt: startAt) }   // a tapped source row / quality pick: honor it in the player
     }
 
     /// #95: play a source-list TRAILER row (an `isYouTubeTrailer` `ytId` stream) the SAME reliable way the
@@ -2935,7 +2970,32 @@ struct CoreStreamList: View {
     /// playback. Nothing on this path reads Trakt. Mirrors iOS `playMovie(fromStart:startAt:)`.
     private func playBest(_ best: CoreStream, in groups: [CoreStreamSourceGroup], fromStart: Bool = false,
                           startAt: Double? = nil) {
-        Task { await playBestResolving(best, in: groups, fromStart: fromStart, startAt: startAt) }
+        let resolvedStart = consumeInitialStart(explicit: startAt, fromStart: fromStart)
+        Task {
+            await playBestResolving(
+                best,
+                in: groups,
+                fromStart: fromStart,
+                startAt: resolvedStart
+            )
+        }
+    }
+
+    private func consumeInitialStart(explicit: Double?, fromStart: Bool) -> Double? {
+        if fromStart {
+            didConsumeInitialStart = true
+            return explicit
+        }
+        if let explicit {
+            didConsumeInitialStart = true
+            return explicit
+        }
+        guard !didConsumeInitialStart,
+              let initialStartAtSeconds,
+              initialStartAtSeconds.isFinite,
+              initialStartAtSeconds > 0 else { return nil }
+        didConsumeInitialStart = true
+        return initialStartAtSeconds
     }
 
     @MainActor private func playBestResolving(_ best: CoreStream, in groups: [CoreStreamSourceGroup],

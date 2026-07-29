@@ -14,8 +14,15 @@ final class TraktRailsModel: ObservableObject {
     /// per-view `TraktRailsModel`) clears immediately instead of lingering up to the refresh interval.
     static let disconnectedNote = Notification.Name("vortx.trakt.disconnected")
 
-    /// The watchlist cards to render, resolved + capped. Empty hides the rail.
-    @Published private(set) var items: [MetaPreview] = []
+    /// Stored cards. Public reads below fail closed unless their exact auth session is still current.
+    @Published private var storedItems: [MetaPreview] = []
+    private var stateSessionID: TraktSessionID?
+
+    var items: [MetaPreview] {
+        guard let stateSessionID,
+              TraktAuth.storedSessionID == stateSessionID else { return [] }
+        return storedItems
+    }
 
     /// At most this many cards in the rail (bounds the Cinemeta poster resolves).
     private static let maxItems = 30
@@ -25,35 +32,62 @@ final class TraktRailsModel: ObservableObject {
     private var lastRefresh: Date?
     private var loadTask: Task<Void, Never>?
 
+    init() {
+        stateSessionID = TraktAuth.storedSessionID
+        TraktAuthBoundary.observe(key: "trakt-rails-\(UUID().uuidString)") { [weak self] sessionID in
+            Task { @MainActor [weak self] in
+                self?.handleBoundary(sessionID)
+            }
+        }
+        let currentSession = TraktAuth.storedSessionID
+        if currentSession != stateSessionID { handleBoundary(currentSession) }
+    }
+
     /// Pull the watchlist and resolve posters, at most once per `refreshInterval`. No-op when Trakt is
     /// unconfigured / not connected, leaving the rail hidden.
     func refresh() {
-        guard TraktAuth.isConfigured else { items = []; return }
-        if let last = lastRefresh, Date().timeIntervalSince(last) < Self.refreshInterval, !items.isEmpty { return }
+        guard TraktAuth.isConfigured,
+              let sessionID = TraktAuth.storedSessionID else {
+            clear()
+            stateSessionID = nil
+            return
+        }
+        if stateSessionID != sessionID { handleBoundary(sessionID) }
+        // Sign-in and exact-session gates precede the throttle. An account switch can never inherit the
+        // previous account's fresh timestamp and skip its first fetch.
+        if let last = lastRefresh,
+           Date().timeIntervalSince(last) < Self.refreshInterval,
+           !storedItems.isEmpty { return }
         guard loadTask == nil else { return }
         loadTask = Task { [weak self] in
             defer { self?.loadTask = nil }
-            guard await TraktAuth.shared.isSignedIn else {
-                self?.items = []; return
-            }
-            let resolved = await Self.fetch()
-            guard let self, !Task.isCancelled else { return }
+            let resolved = await Self.fetch(expectedSession: sessionID)
+            guard let self, !Task.isCancelled,
+                  self.stateSessionID == sessionID,
+                  TraktAuth.storedSessionID == sessionID else { return }
             self.lastRefresh = Date()
             // Keep the prior rail on an empty fetch (flaky network) rather than blanking a populated rail.
-            if !resolved.isEmpty { self.items = resolved }
+            if !resolved.isEmpty { self.storedItems = resolved }
         }
     }
 
     /// Clear on sign-out / disconnect.
     func clear() {
         loadTask?.cancel(); loadTask = nil
-        items = []; lastRefresh = nil
+        storedItems = []; lastRefresh = nil
+    }
+
+    private func handleBoundary(_ sessionID: TraktSessionID?) {
+        clear()
+        stateSessionID = sessionID
     }
 
     /// Fetch the watchlist, map each entry to its IMDb id + type + title, then resolve posters via
     /// Cinemeta in parallel. Entries without an IMDb id are dropped (Cinemeta keys on tt ids). Off-main.
-    private static func fetch() async -> [MetaPreview] {
-        guard let entries = try? await TraktService.shared.watchlist() else { return [] }
+    private static func fetch(expectedSession: TraktSessionID) async -> [MetaPreview] {
+        guard let entries = try? await TraktService.shared.watchlist(
+            expectedSession: expectedSession
+        ) else { return [] }
         // Map to (imdb, appType, title), keeping order, dropping non-tt entries, de-duplicating, capped.
         var seen = Set<String>()
         let seeds: [(imdb: String, type: String, title: String)] = entries.compactMap { entry in
@@ -75,6 +109,7 @@ final class TraktRailsModel: ObservableObject {
             return out
         }
         // Restore the watchlist order (task group completes out of order).
+        guard TraktAuth.storedSessionID == expectedSession else { return [] }
         return resolved.sorted { $0.0 < $1.0 }.map(\.1)
     }
 

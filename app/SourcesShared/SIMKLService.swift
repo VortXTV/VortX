@@ -30,14 +30,20 @@ actor SIMKLService {
 
     /// Mark items watched (`POST /sync/history`).
     @discardableResult
-    func addToHistory(_ items: SIMKLSyncItems) async throws -> Int {
-        try await write(path: "/sync/history", items: items)
+    func addToHistory(
+        _ items: SIMKLSyncItems,
+        expectedSession: SIMKLSessionID
+    ) async throws -> Int {
+        try await write(path: "/sync/history", items: items, expectedSession: expectedSession)
     }
 
     /// Remove items from history (`POST /sync/history/remove`).
     @discardableResult
-    func removeFromHistory(_ items: SIMKLSyncItems) async throws -> Int {
-        try await write(path: "/sync/history/remove", items: items)
+    func removeFromHistory(
+        _ items: SIMKLSyncItems,
+        expectedSession: SIMKLSessionID
+    ) async throws -> Int {
+        try await write(path: "/sync/history/remove", items: items, expectedSession: expectedSession)
     }
 
     // MARK: - Ratings (`POST /sync/ratings`, `/sync/ratings/remove`, and the `/sync/ratings/{type}` read-back)
@@ -45,14 +51,20 @@ actor SIMKLService {
     /// Add (or change) the user's title ratings (`POST /sync/ratings`). Anime ride the `shows` array. Rate-gated
     /// like every other SIMKL POST write.
     @discardableResult
-    func addRatings(_ items: SIMKLRatingItems) async throws -> Int {
-        try await writeEncodable(path: "/sync/ratings", body: items)
+    func addRatings(
+        _ items: SIMKLRatingItems,
+        expectedSession: SIMKLSessionID
+    ) async throws -> Int {
+        try await writeEncodable(path: "/sync/ratings", body: items, expectedSession: expectedSession)
     }
 
     /// Un-rate titles (`POST /sync/ratings/remove`): the ids alone identify what to clear, no `rating` field.
     @discardableResult
-    func removeRatings(_ items: SIMKLRatingItems) async throws -> Int {
-        try await writeEncodable(path: "/sync/ratings/remove", body: items)
+    func removeRatings(
+        _ items: SIMKLRatingItems,
+        expectedSession: SIMKLSessionID
+    ) async throws -> Int {
+        try await writeEncodable(path: "/sync/ratings/remove", body: items, expectedSession: expectedSession)
     }
 
     /// The user's own ratings across movies, shows AND anime (`POST /sync/ratings/{type}`).
@@ -64,23 +76,35 @@ actor SIMKLService {
     /// deletes - so a missing anime leg only defers that type a cycle, unlike the watched REPLACE). Sequential
     /// for the same reason `planToWatch` is: three authenticated POSTs fired together is exactly the burst shape
     /// that gets rate-limited.
-    func ratings() async throws -> SIMKLRatingsResponse {
-        _ = try await auth.validToken()
+    func ratings(expectedSession: SIMKLSessionID) async throws -> SIMKLRatingsResponse {
+        _ = try await auth.validToken(for: expectedSession)
         var movies: [SIMKLRatingEntry] = []
         var shows: [SIMKLRatingEntry] = []
         var anime: [SIMKLRatingEntry] = []
         for type in SIMKLListType.allCases {
-            guard let leg = try? await ratingsRead(type: type) else { continue }
-            movies += leg.movies ?? []
-            shows += leg.shows ?? []
-            anime += leg.anime ?? []
+            do {
+                let leg = try await ratingsRead(type: type, expectedSession: expectedSession)
+                movies += leg.movies ?? []
+                shows += leg.shows ?? []
+                anime += leg.anime ?? []
+            } catch SIMKLError.sessionChanged {
+                throw SIMKLError.sessionChanged
+            } catch {
+                continue
+            }
         }
         return SIMKLRatingsResponse(movies: movies, shows: shows, anime: anime)
     }
 
     /// One ratings-read leg: `POST /sync/ratings/{type}` with no body, decoded to the ratings envelope.
-    private func ratingsRead(type: SIMKLListType) async throws -> SIMKLRatingsResponse {
-        let data = try await readPost(path: "/sync/ratings/\(type.rawValue)")
+    private func ratingsRead(
+        type: SIMKLListType,
+        expectedSession: SIMKLSessionID
+    ) async throws -> SIMKLRatingsResponse {
+        let data = try await readPost(
+            path: "/sync/ratings/\(type.rawValue)",
+            expectedSession: expectedSession
+        )
         // SIMKL answers an EMPTY BODY for a type the user has rated nothing in; that is a success with zero rows.
         guard !data.isEmpty else { return SIMKLRatingsResponse(movies: nil, shows: nil, anime: nil) }
         return try decode(SIMKLRatingsResponse.self, from: data)
@@ -90,8 +114,11 @@ actor SIMKLService {
 
     /// Add items to the plan-to-watch list (`POST /sync/add-to-list`). Each item carries `to:"plantowatch"`.
     @discardableResult
-    func addToWatchlist(_ items: SIMKLSyncItems) async throws -> Int {
-        try await write(path: "/sync/add-to-list", items: items)
+    func addToWatchlist(
+        _ items: SIMKLSyncItems,
+        expectedSession: SIMKLSessionID
+    ) async throws -> Int {
+        try await write(path: "/sync/add-to-list", items: items, expectedSession: expectedSession)
     }
 
     // NOTE: there is deliberately NO watchlist-remove call here. SIMKL has no plan-to-watch remove
@@ -106,8 +133,15 @@ actor SIMKLService {
     /// READS ARE NOT RATE-GATED. The S-3 gate exists for SIMKL's 1-POST/sec write limit; putting GETs
     /// through it would serialize the three type reads a second apart for no reason and, worse, would let
     /// a rail refresh push the write slot into the future and delay a user's "mark watched" behind it.
-    func list(type: SIMKLListType, status: SIMKLListStatus) async throws -> [SIMKLListEntry] {
-        let data = try await read(path: "/sync/all-items/\(type.rawValue)/\(status.rawValue)")
+    func list(
+        type: SIMKLListType,
+        status: SIMKLListStatus,
+        expectedSession: SIMKLSessionID
+    ) async throws -> [SIMKLListEntry] {
+        let data = try await read(
+            path: "/sync/all-items/\(type.rawValue)/\(status.rawValue)",
+            expectedSession: expectedSession
+        )
         // SIMKL answers an EMPTY BODY (not `{}`) for a list with nothing in it. That is a success with zero
         // rows, so it must not surface as a decode error the caller might treat as an outage.
         guard !data.isEmpty else { return [] }
@@ -140,11 +174,21 @@ actor SIMKLService {
     ///
     /// Signing-in state is checked ONCE up front so "not connected" surfaces as a thrown error rather than
     /// as an innocent-looking empty list, which the rail would otherwise render as "you have nothing saved".
-    func planToWatch() async throws -> [SIMKLListEntry] {
-        _ = try await auth.validToken()
+    func planToWatch(expectedSession: SIMKLSessionID) async throws -> [SIMKLListEntry] {
+        _ = try await auth.validToken(for: expectedSession)
         var out: [SIMKLListEntry] = []
         for type in SIMKLListType.allCases {
-            out += (try? await list(type: type, status: .planToWatch)) ?? []
+            do {
+                out += try await list(
+                    type: type,
+                    status: .planToWatch,
+                    expectedSession: expectedSession
+                )
+            } catch SIMKLError.sessionChanged {
+                throw SIMKLError.sessionChanged
+            } catch {
+                continue
+            }
         }
         return out
     }
@@ -162,8 +206,8 @@ actor SIMKLService {
 
     /// An authenticated GET against the data API, carrying the same required query items + headers every
     /// SIMKL request needs (S-4 / S-5).
-    private func read(path: String) async throws -> Data {
-        let token = try await auth.validToken()
+    private func read(path: String, expectedSession: SIMKLSessionID) async throws -> Data {
+        let token = try await auth.validToken(for: expectedSession)
         guard var components = URLComponents(string: SIMKLAuth.apiBase + path) else { throw SIMKLError.badURL }
         components.queryItems = SIMKLAuth.requiredQueryItems
         guard let url = components.url else { throw SIMKLError.badURL }
@@ -176,6 +220,7 @@ actor SIMKLService {
         request.setValue(SIMKLAuth.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let (data, status) = try await perform(request)
+        guard await auth.sessionID == expectedSession else { throw SIMKLError.sessionChanged }
         try expectSuccess(status)
         return data
     }
@@ -185,30 +230,52 @@ actor SIMKLService {
         catch { throw SIMKLError.decoding }
     }
 
-    private func write(path: String, items: SIMKLSyncItems) async throws -> Int {
-        try await writeEncodable(path: path, body: items)
+    private func write(
+        path: String,
+        items: SIMKLSyncItems,
+        expectedSession: SIMKLSessionID
+    ) async throws -> Int {
+        try await writeEncodable(path: path, body: items, expectedSession: expectedSession)
     }
 
     /// A rate-gated authenticated POST carrying any Encodable body (history / watchlist / ratings all share
     /// this). Generic so the ratings write paths reuse the exact same S-3 gate + S-4/S-5 headers as the history
     /// and watchlist writes rather than forking a second POST path that could drift.
-    private func writeEncodable<T: Encodable>(path: String, body: T) async throws -> Int {
-        let token = try await auth.validToken()
+    private func writeEncodable<T: Encodable & Sendable>(
+        path: String,
+        body: T,
+        expectedSession: SIMKLSessionID
+    ) async throws -> Int {
         try await rateGate()
-        guard var components = URLComponents(string: SIMKLAuth.apiBase + path) else { throw SIMKLError.badURL }
-        // SIMKL requires client_id / app-name / app-version on EVERY request (S-4).
-        components.queryItems = SIMKLAuth.requiredQueryItems
-        guard let url = components.url else { throw SIMKLError.badURL }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 20
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(SIMKLAuth.clientID, forHTTPHeaderField: "simkl-api-key")
-        request.setValue(SIMKLAuth.userAgent, forHTTPHeaderField: "User-Agent")   // S-5
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try JSONEncoder().encode(body)
-        let (_, status) = try await perform(request)
+        let bodyData = try JSONEncoder().encode(body)
+        let urlSession = session
+        let status: Int = try await auth.performSessionBoundWrite(
+            expectedSession: expectedSession
+        ) { token in
+            guard var components = URLComponents(string: SIMKLAuth.apiBase + path) else {
+                throw SIMKLError.badURL
+            }
+            components.queryItems = SIMKLAuth.requiredQueryItems
+            guard let url = components.url else { throw SIMKLError.badURL }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 20
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(SIMKLAuth.clientID, forHTTPHeaderField: "simkl-api-key")
+            request.setValue(SIMKLAuth.userAgent, forHTTPHeaderField: "User-Agent")
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.httpBody = bodyData
+            do {
+                let (_, response) = try await urlSession.data(for: request)
+                return (response as? HTTPURLResponse)?.statusCode ?? 0
+            } catch {
+                throw SIMKLError.transport(error.localizedDescription)
+            }
+        }
+        if status == 401 || status == 403 {
+            await auth.signOut(ifCurrent: expectedSession)
+        }
         try expectSuccess(status)
         return status
     }
@@ -216,8 +283,8 @@ actor SIMKLService {
     /// An authenticated POST with NO body, used for the ratings read-back (`POST /sync/ratings/{type}`), which
     /// SIMKL models as a POST even though it retrieves. NOT rate-gated: it is a read (the S-3 gate exists for the
     /// 1-POST/sec WRITE limit, and gating reads would serialize convergence behind a user's "mark watched").
-    private func readPost(path: String) async throws -> Data {
-        let token = try await auth.validToken()
+    private func readPost(path: String, expectedSession: SIMKLSessionID) async throws -> Data {
+        let token = try await auth.validToken(for: expectedSession)
         guard var components = URLComponents(string: SIMKLAuth.apiBase + path) else { throw SIMKLError.badURL }
         components.queryItems = SIMKLAuth.requiredQueryItems
         guard let url = components.url else { throw SIMKLError.badURL }
@@ -230,6 +297,7 @@ actor SIMKLService {
         request.setValue(SIMKLAuth.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let (data, status) = try await perform(request)
+        guard await auth.sessionID == expectedSession else { throw SIMKLError.sessionChanged }
         try expectSuccess(status)
         return data
     }
@@ -285,18 +353,22 @@ struct SIMKLProvider: ExternalScrobbleProvider {
     var watchlistEnabled: Bool { SIMKLAuth.isConfigured && ExternalSyncToggle.isOn(ExternalSyncToggle.simklWatchlist) }
 
     // No live scrobble: these are no-ops (the coordinator also skips them by capability).
-    func scrobbleStart(_ ref: ExternalMediaRef) async {}
-    func scrobblePause(_ ref: ExternalMediaRef) async {}
-    func scrobbleStop(_ ref: ExternalMediaRef) async {}
+    func scrobbleStart(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async {}
+    func scrobblePause(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async {}
+    func scrobbleStop(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async {}
 
-    func recordWatched(_ ref: ExternalMediaRef) async {
-        guard let items = historyItems(ref) else { return }
-        _ = try? await SIMKLService.shared.addToHistory(items)
+    func recordWatched(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async {
+        guard case .simkl(let sessionID) = session,
+              SIMKLAuth.storedSessionID == sessionID,
+              let items = historyItems(ref) else { return }
+        _ = try? await SIMKLService.shared.addToHistory(items, expectedSession: sessionID)
     }
 
-    func addToWatchlist(_ ref: ExternalMediaRef) async {
-        guard let items = watchlistItems(ref) else { return }
-        _ = try? await SIMKLService.shared.addToWatchlist(items)
+    func addToWatchlist(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async {
+        guard case .simkl(let sessionID) = session,
+              SIMKLAuth.storedSessionID == sessionID,
+              let items = watchlistItems(ref) else { return }
+        _ = try? await SIMKLService.shared.addToWatchlist(items, expectedSession: sessionID)
     }
 
     // A library-remove is a NO-OP on SIMKL. SIMKL exposes no plan-to-watch remove endpoint, and the only
@@ -304,7 +376,7 @@ struct SIMKLProvider: ExternalScrobbleProvider {
     // payload removes every episode + status, with no undo). Silently destroying watch history from a
     // watchlist-remove intent is never acceptable, so removing a title from the VortX library leaves the
     // SIMKL plan-to-watch entry in place rather than risk that.
-    func removeFromWatchlist(_ ref: ExternalMediaRef) async {}
+    func removeFromWatchlist(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async {}
 
     // MARK: Mapping neutral ref -> SIMKL wire types
 

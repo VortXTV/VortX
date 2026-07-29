@@ -34,9 +34,28 @@ final class SIMKLRatingsStore {
     private var generation = 0
     private var lastRefresh: Date?
     private var refreshing = false
+    private var stateSessionID: SIMKLSessionID?
+
+    private struct PersistedSnapshot: Codable {
+        let sessionID: SIMKLSessionID
+        let entries: [String: SIMKLRatingsCore.RatingEntry]
+    }
+
+    private static let storage = try? PrivateExternalSyncStorage.live(
+        provider: "SIMKL",
+        file: "ratings.json",
+        legacyFiles: ["simkl-ratings-shadow.json"]
+    )
 
     private init() {
-        core = SIMKLRatingsCore(entries: Self.load())
+        let initialSession = SIMKLAuth.storedSessionID
+        stateSessionID = initialSession
+        core = SIMKLRatingsCore(entries: initialSession.map(Self.load(for:)) ?? [:])
+        SIMKLAuthBoundary.observe(key: "simkl-ratings-store") { [weak self] sessionID in
+            self?.reset(to: sessionID)
+        }
+        let currentSession = SIMKLAuth.storedSessionID
+        if currentSession != initialSession { reset(to: currentSession) }
     }
 
     // MARK: - Read side (the app's ONLY SIMKL-rating source)
@@ -44,7 +63,10 @@ final class SIMKLRatingsStore {
     /// The user's SIMKL rating for a title, or nil. Synchronous + lock-guarded so a detail-page body can read
     /// it inline. Never touches the network.
     func rating(imdb: String?, tmdb: Int?) -> Int? {
+        guard let currentSession = SIMKLAuth.storedSessionID else { return nil }
         lock.lock(); defer { lock.unlock() }
+        guard stateSessionID == currentSession,
+              SIMKLAuth.storedSessionID == currentSession else { return nil }
         return core.rating(imdb: imdb, tmdb: tmdb)
     }
 
@@ -62,16 +84,18 @@ final class SIMKLRatingsStore {
     }
 
     private func write(rating: Int?, imdb: String?, tmdb: Int?, isSeries: Bool) {
+        guard let sessionID = SIMKLAuth.storedSessionID else { return }
         lock.lock()
+        guard stateSessionID == sessionID,
+              SIMKLAuth.storedSessionID == sessionID else { lock.unlock(); return }
         guard let entry = core.write(rating: rating, imdb: imdb, tmdb: tmdb, isSeries: isSeries) else {
             lock.unlock(); return
         }
-        let snapshot = core.entries
         let gen = generation
+        persistLocked()
         lock.unlock()
-        Self.save(snapshot)
         notifyChanged()
-        mirror(entry, gen: gen)
+        mirror(entry, gen: gen, sessionID: sessionID)
     }
 
     // MARK: - Mirror (push one entry to SIMKL)
@@ -80,17 +104,26 @@ final class SIMKLRatingsStore {
     /// local value simply stands (and is not force-pushed the moment an account connects later). On success the
     /// entry is flipped to `pushed`; a failure leaves it unpushed, so the next `refreshIfStale` drain retries it
     /// (the unpushed entry is the durable queue). Fully fail-soft.
-    private func mirror(_ entry: SIMKLRatingsCore.RatingEntry, gen: Int) {
+    private func mirror(
+        _ entry: SIMKLRatingsCore.RatingEntry,
+        gen: Int,
+        sessionID: SIMKLSessionID
+    ) {
         guard SIMKLAuth.isConfigured,
-              ExternalSyncToggle.isOn(ExternalSyncToggle.simklRatings) else { return }
+              ExternalSyncToggle.isOn(ExternalSyncToggle.simklRatings),
+              SIMKLAuth.storedSessionID == sessionID else { return }
         Task.detached(priority: .utility) { [weak self] in
-            guard let self, await SIMKLAuth.shared.isSignedIn else { return }
-            await self.push(entry, gen: gen)
+            guard let self, SIMKLAuth.storedSessionID == sessionID else { return }
+            await self.push(entry, gen: gen, sessionID: sessionID)
         }
     }
 
     /// The actual SIMKL write for one entry (a set or a clear), flipping `pushed` on success. No-throw.
-    private func push(_ entry: SIMKLRatingsCore.RatingEntry, gen: Int) async {
+    private func push(
+        _ entry: SIMKLRatingsCore.RatingEntry,
+        gen: Int,
+        sessionID: SIMKLSessionID
+    ) async {
         let ids = SIMKLIDs(imdb: entry.imdb, tmdb: entry.tmdb)
         do {
             if let rating = entry.rating {
@@ -98,26 +131,32 @@ final class SIMKLRatingsStore {
                 let items = entry.isSeries
                     ? SIMKLRatingItems(shows: [SIMKLRatedShow(ids: ids, rating: rating, ratedAt: stamp)])
                     : SIMKLRatingItems(movies: [SIMKLRatedMovie(ids: ids, rating: rating, ratedAt: stamp)])
-                _ = try await SIMKLService.shared.addRatings(items)
+                _ = try await SIMKLService.shared.addRatings(items, expectedSession: sessionID)
             } else {
                 let items = entry.isSeries
                     ? SIMKLRatingItems(shows: [SIMKLRatedShow(ids: ids)])
                     : SIMKLRatingItems(movies: [SIMKLRatedMovie(ids: ids)])
-                _ = try await SIMKLService.shared.removeRatings(items)
+                _ = try await SIMKLService.shared.removeRatings(items, expectedSession: sessionID)
             }
-            markPushed(entry, gen: gen)
+            markPushed(entry, gen: gen, sessionID: sessionID)
         } catch {
             // Leave the entry unpushed so the next drain retries it. Nothing else to do (no queue file).
         }
     }
 
     /// Flip an entry to `pushed` once SIMKL has it, under the generation guard.
-    private func markPushed(_ entry: SIMKLRatingsCore.RatingEntry, gen: Int) {
+    private func markPushed(
+        _ entry: SIMKLRatingsCore.RatingEntry,
+        gen: Int,
+        sessionID: SIMKLSessionID
+    ) {
         lock.lock()
-        guard gen == generation, core.markPushed(entry) else { lock.unlock(); return }
-        let snapshot = core.entries
+        guard gen == generation,
+              stateSessionID == sessionID,
+              SIMKLAuth.storedSessionID == sessionID,
+              core.markPushed(entry) else { lock.unlock(); return }
+        persistLocked()
         lock.unlock()
-        Self.save(snapshot)
     }
 
     // MARK: - Convergence (throttled drain + read-back)
@@ -128,8 +167,11 @@ final class SIMKLRatingsStore {
     /// the toggle on or just connected.
     func refreshIfStale() {
         guard SIMKLAuth.isConfigured,
-              ExternalSyncToggle.isOn(ExternalSyncToggle.simklRatings) else { return }
+              ExternalSyncToggle.isOn(ExternalSyncToggle.simklRatings),
+              let sessionID = SIMKLAuth.storedSessionID else { return }
         lock.lock()
+        guard stateSessionID == sessionID,
+              SIMKLAuth.storedSessionID == sessionID else { lock.unlock(); return }
         if refreshing { lock.unlock(); return }
         if let last = lastRefresh, Date().timeIntervalSince(last) < Self.refreshInterval { lock.unlock(); return }
         refreshing = true
@@ -142,12 +184,18 @@ final class SIMKLRatingsStore {
                 self.lock.lock()
                 self.refreshing = false
                 // Only stamp when no disconnect happened mid-refresh, matching the other SIMKL refreshers.
-                if self.generation == gen { self.lastRefresh = Date() }
+                if self.generation == gen,
+                   self.stateSessionID == sessionID,
+                   SIMKLAuth.storedSessionID == sessionID {
+                    self.lastRefresh = Date()
+                }
                 self.lock.unlock()
             }
-            guard await SIMKLAuth.shared.isSignedIn else { return }
-            for entry in unpushed { await self.push(entry, gen: gen) }
-            await self.pull(gen: gen)
+            guard SIMKLAuth.storedSessionID == sessionID else { return }
+            for entry in unpushed {
+                await self.push(entry, gen: gen, sessionID: sessionID)
+            }
+            await self.pull(gen: gen, sessionID: sessionID)
         }
     }
 
@@ -162,17 +210,20 @@ final class SIMKLRatingsStore {
 
     /// Pull `POST /sync/ratings` and fold every row through the core. A failed / empty pull contributes nothing
     /// (rule 2): the read-back only reaches `merge` on a decoded 200.
-    private func pull(gen: Int) async {
-        guard let response = try? await SIMKLService.shared.ratings() else { return }
+    private func pull(gen: Int, sessionID: SIMKLSessionID) async {
+        guard let response = try? await SIMKLService.shared.ratings(
+            expectedSession: sessionID
+        ) else { return }
         let rows = SIMKLRatingsCore.remoteRatings(from: response)
         guard !rows.isEmpty else { return }
         lock.lock()
-        guard gen == generation else { lock.unlock(); return }
+        guard gen == generation,
+              stateSessionID == sessionID,
+              SIMKLAuth.storedSessionID == sessionID else { lock.unlock(); return }
         let result = core.merge(rows)
         guard result.dirty else { lock.unlock(); return }
-        let snapshot = core.entries
+        persistLocked()
         lock.unlock()
-        Self.save(snapshot)
         if result.valueChanged { notifyChanged() }
     }
 
@@ -180,12 +231,17 @@ final class SIMKLRatingsStore {
 
     /// Wipe the shadow (memory + disk) on disconnect / sign-out and invalidate any in-flight pull / push.
     func reset() {
+        reset(to: SIMKLAuth.storedSessionID)
+    }
+
+    private func reset(to sessionID: SIMKLSessionID?) {
         lock.lock()
         core.wipe()
         lastRefresh = nil
+        stateSessionID = sessionID
         generation &+= 1
+        try? Self.storage?.reset()
         lock.unlock()
-        Self.save([:])
         notifyChanged()
     }
 
@@ -193,24 +249,33 @@ final class SIMKLRatingsStore {
         DispatchQueue.main.async { NotificationCenter.default.post(name: Self.changedNote, object: nil) }
     }
 
-    // MARK: - Persistence (Application Support JSON)
+    // MARK: - Protected persistence
 
-    private static let file = "simkl-ratings-shadow.json"
-
-    private static func fileURL() -> URL? {
-        guard let dir = try? FileManager.default.url(for: .applicationSupportDirectory,
-                                                     in: .userDomainMask, appropriateFor: nil, create: true) else { return nil }
-        return dir.appendingPathComponent(file)
+    private static func load(for sessionID: SIMKLSessionID) -> [String: SIMKLRatingsCore.RatingEntry] {
+        guard let storage else { return [:] }
+        let data: Data
+        do {
+            guard let stored = try storage.load() else { return [:] }
+            data = stored
+        } catch {
+            try? storage.reset()
+            return [:]
+        }
+        guard let snapshot = try? JSONDecoder().decode(PersistedSnapshot.self, from: data),
+              snapshot.sessionID == sessionID else {
+            try? storage.reset()
+            return [:]
+        }
+        return snapshot.entries
     }
 
-    private static func load() -> [String: SIMKLRatingsCore.RatingEntry] {
-        guard let url = fileURL(), let data = try? Data(contentsOf: url),
-              let decoded = try? JSONDecoder().decode([String: SIMKLRatingsCore.RatingEntry].self, from: data) else { return [:] }
-        return decoded
-    }
-
-    private static func save(_ entries: [String: SIMKLRatingsCore.RatingEntry]) {
-        guard let url = fileURL(), let data = try? JSONEncoder().encode(entries) else { return }
-        try? data.write(to: url, options: .atomic)
+    private func persistLocked() {
+        guard let storage = Self.storage, let stateSessionID else {
+            try? Self.storage?.reset()
+            return
+        }
+        let snapshot = PersistedSnapshot(sessionID: stateSessionID, entries: core.entries)
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        try? storage.save(data)
     }
 }

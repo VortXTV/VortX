@@ -54,6 +54,12 @@ struct ExternalScrobbleCapabilities: Sendable {
     let watchlist: Bool
 }
 
+/// Exact credential session captured when an external intent is created.
+enum ExternalProviderSession: Sendable, Equatable {
+    case trakt(TraktSessionID)
+    case simkl(SIMKLSessionID)
+}
+
 // MARK: - Provider protocol
 
 /// One external service. Implementations wrap their existing auth + service actors unchanged and never
@@ -73,14 +79,14 @@ protocol ExternalScrobbleProvider: Sendable {
     var watchlistEnabled: Bool { get }
 
     /// Live scrobble transitions (no-ops when `capabilities.liveScrobble` is false).
-    func scrobbleStart(_ ref: ExternalMediaRef) async
-    func scrobblePause(_ ref: ExternalMediaRef) async
-    func scrobbleStop(_ ref: ExternalMediaRef) async
+    func scrobbleStart(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async
+    func scrobblePause(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async
+    func scrobbleStop(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async
     /// Record a definitive watch (history add). The coordinator calls this at most once per (item,session).
-    func recordWatched(_ ref: ExternalMediaRef) async
+    func recordWatched(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async
     /// Watchlist writes, driven by the library add/remove actions.
-    func addToWatchlist(_ ref: ExternalMediaRef) async
-    func removeFromWatchlist(_ ref: ExternalMediaRef) async
+    func addToWatchlist(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async
+    func removeFromWatchlist(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async
 }
 
 // MARK: - Per-provider toggle keys (shared with the settings view)
@@ -124,6 +130,10 @@ enum ExternalSyncToggle {
     /// the sole resume authority: nothing behind this key ever writes an engine libraryItem, the account, or
     /// Trakt. Callers MUST read it with `default: false`.
     static let traktResumeSuggestion = "vortx.trakt.resumeSuggestion"
+    /// Use Trakt's paused-playback list as the owner profile's Continue Watching source. Default OFF:
+    /// source selection is explicit, and overlay/guest profiles must never read the owner's Trakt account.
+    /// This changes only the Home read surface. Playback remains on the normal VortX detail/player path.
+    static let traktContinueWatching = "vortx.trakt.continueWatching"
     /// Offer an "I'm watching this" action on detail pages, for viewing that happens where VortX cannot
     /// see it (a cinema, someone else's TV). Default OFF, and it gates only whether the ACTION IS OFFERED:
     /// nothing behind this key ever fires on its own, so the check-in itself always takes a deliberate tap.
@@ -153,8 +163,8 @@ enum ExternalScrobbleRegistry {
 
 // MARK: - Trakt provider
 
-/// Trakt implementation: wraps the existing `TraktAuth` + `TraktService` actors unchanged. Full live
-/// scrobble plus history and watchlist.
+/// Trakt implementation: wraps the existing `TraktAuth` + `TraktService` actors. Full live scrobble
+/// plus history and watchlist.
 struct TraktProvider: ExternalScrobbleProvider {
     let id = "trakt"
     let capabilities = ExternalScrobbleCapabilities(liveScrobble: true, history: true, watchlist: true)
@@ -167,41 +177,99 @@ struct TraktProvider: ExternalScrobbleProvider {
     var scrobbleEnabled: Bool { TraktAuth.isConfigured && ExternalSyncToggle.isOn(ExternalSyncToggle.traktScrobble) }
     var watchlistEnabled: Bool { TraktAuth.isConfigured && ExternalSyncToggle.isOn(ExternalSyncToggle.traktWatchlist) }
 
-    func scrobbleStart(_ ref: ExternalMediaRef) async {
-        guard let item = Self.scrobbleItem(ref) else { return }
-        _ = try? await TraktService.shared.scrobbleStart(item: item, progress: ref.progress)
+    func scrobbleStart(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async {
+        guard case .trakt(let sessionID) = session,
+              TraktAuth.storedSessionID == sessionID,
+              let item = Self.scrobbleItem(ref) else { return }
+        do {
+            let response = try await TraktService.shared.scrobbleStart(
+                item: item,
+                progress: ref.progress,
+                expectedSession: sessionID
+            )
+            Self.logScrobble("start", response)
+        } catch {
+            Self.logScrobbleFailure("start", error)
+        }
     }
 
-    func scrobblePause(_ ref: ExternalMediaRef) async {
-        guard let item = Self.scrobbleItem(ref) else { return }
-        _ = try? await TraktService.shared.scrobblePause(item: item, progress: ref.progress)
+    func scrobblePause(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async {
+        guard case .trakt(let sessionID) = session,
+              TraktAuth.storedSessionID == sessionID,
+              let item = Self.scrobbleItem(ref) else { return }
+        do {
+            let response = try await TraktService.shared.scrobblePause(
+                item: item,
+                progress: ref.progress,
+                expectedSession: sessionID
+            )
+            Self.logScrobble("pause", response)
+        } catch {
+            Self.logScrobbleFailure("pause", error)
+        }
     }
 
-    func scrobbleStop(_ ref: ExternalMediaRef) async {
-        guard let item = Self.scrobbleItem(ref) else { return }
-        _ = try? await TraktService.shared.scrobbleStop(item: item, progress: ref.progress)
+    func scrobbleStop(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async {
+        guard case .trakt(let sessionID) = session,
+              TraktAuth.storedSessionID == sessionID,
+              let item = Self.scrobbleItem(ref) else { return }
+        do {
+            let response = try await TraktService.shared.scrobbleStop(
+                item: item,
+                progress: ref.progress,
+                expectedSession: sessionID
+            )
+            Self.logScrobble("stop", response)
+        } catch {
+            Self.logScrobbleFailure("stop", error)
+        }
     }
 
-    func recordWatched(_ ref: ExternalMediaRef) async {
+    func recordWatched(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async {
         // Record via the scrobble STOP endpoint rather than /sync/history: `scrobbleItem` models an
         // episode-of-show by season/number (show imdb + S/E), which the flat `TraktSyncItems.episodes`
         // array can't express from just the show's id. A stop at >=80% progress makes Trakt record the
         // watch in history, so the coordinator passes progress 100 on the definitive-watch path.
-        guard let item = Self.scrobbleItem(ref) else { return }
-        do { _ = try await TraktService.shared.scrobbleStop(item: item, progress: 100) }
-        catch { enqueueIfTransient(ref, .watched, error) }
+        guard case .trakt(let sessionID) = session,
+              TraktAuth.storedSessionID == sessionID,
+              let item = Self.scrobbleItem(ref) else { return }
+        do {
+            _ = try await TraktService.shared.scrobbleStop(
+                item: item,
+                progress: 100,
+                expectedSession: sessionID
+            )
+        } catch {
+            enqueueIfTransient(ref, .watched, sessionID: sessionID, error)
+        }
     }
 
-    func addToWatchlist(_ ref: ExternalMediaRef) async {
-        guard let items = titleItems(ref) else { return }
-        do { _ = try await TraktService.shared.addToWatchlist(items) }
-        catch { enqueueIfTransient(ref, .watchlistAdd, error) }
+    func addToWatchlist(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async {
+        guard case .trakt(let sessionID) = session,
+              TraktAuth.storedSessionID == sessionID,
+              let items = titleItems(ref) else { return }
+        do {
+            _ = try await TraktService.shared.addToWatchlist(
+                items,
+                expectedSession: sessionID
+            )
+        } catch {
+            enqueueIfTransient(ref, .watchlistAdd, sessionID: sessionID, error)
+        }
     }
 
-    func removeFromWatchlist(_ ref: ExternalMediaRef) async {
-        guard let items = titleItems(ref) else { return }
-        do { _ = try await TraktService.shared.removeFromWatchlist(items) }
-        catch { enqueueIfTransient(ref, .watchlistRemove, error) }
+    func removeFromWatchlist(_ ref: ExternalMediaRef, session: ExternalProviderSession?) async {
+        guard case .trakt(let sessionID) = session,
+              TraktAuth.storedSessionID == sessionID,
+              let items = titleItems(ref) else { return }
+        do {
+            _ = try await TraktService.shared.removeFromWatchlist(
+                items,
+                expectedSession: sessionID
+            )
+        } catch {
+            enqueueIfTransient(ref, .watchlistRemove, sessionID: sessionID, error)
+        }
     }
 
     /// Queue a failed push for offline retry, but ONLY for TRANSIENT failures (offline / rate-limit /
@@ -209,11 +277,17 @@ struct TraktProvider: ExternalScrobbleProvider {
     /// succeed: `.ignored` (too little watched, HTTP 422) is a legitimate skip, and `.unauthorized` (HTTP
     /// 401) needs a reconnect, not a blind replay that would 401 forever (and could drain into the next
     /// account). The live scrobble start/pause/stop are ephemeral and never reach here.
-    private func enqueueIfTransient(_ ref: ExternalMediaRef, _ kind: TraktSyncEngine.PendingPush.Kind, _ error: Error) {
+    private func enqueueIfTransient(
+        _ ref: ExternalMediaRef,
+        _ kind: TraktSyncEngine.PendingPush.Kind,
+        sessionID: TraktSessionID? = TraktAuth.storedSessionID,
+        _ error: Error
+    ) {
         if let e = error as? TraktServiceError, e == .ignored || e == .unauthorized { return }
+        if error as? TraktAuthError == .sessionChanged { return }
         TraktSyncEngine.shared.enqueue(TraktSyncEngine.PendingPush(
             kind: kind, isSeries: ref.isSeries, imdb: ref.imdb, tmdb: ref.tmdb,
-            season: ref.season, episode: ref.episode))
+            season: ref.season, episode: ref.episode, sessionID: sessionID))
     }
 
     // MARK: Mapping neutral ref -> Trakt wire types
@@ -247,5 +321,32 @@ struct TraktProvider: ExternalScrobbleProvider {
             return TraktSyncItems(shows: [TraktShow(ids: Self.ids(ref), title: ref.title, year: ref.year)])
         }
         return TraktSyncItems(movies: [TraktMovie(ids: Self.ids(ref), title: ref.title, year: ref.year)])
+    }
+
+    /// Receipt-only diagnostics. Never include media ids, titles, URLs, tokens, or transport text.
+    private static func logScrobble(_ requestedAction: String, _ response: TraktScrobbleResponse) {
+        DiagnosticsLog.log(
+            "trakt",
+            "scrobble requested=\(requestedAction) result=\(response.action.rawValue) progress=\(Int(response.progress.rounded()))"
+        )
+    }
+
+    private static func logScrobbleFailure(_ requestedAction: String, _ error: Error) {
+        var category: String
+        switch error as? TraktServiceError {
+        case .badURL: category = "bad-url"
+        case .unauthorized: category = "unauthorized"
+        case .rateLimited: category = "rate-limited"
+        case .ignored: category = "ignored"
+        case .alreadyCheckedIn: category = "conflict"
+        case .server: category = "server"
+        case .transport: category = "transport"
+        case .decoding: category = "decoding"
+        case nil: category = "unknown"
+        }
+        if error as? TraktAuthError == .sessionChanged {
+            category = "stale-session"
+        }
+        DiagnosticsLog.log("trakt", "scrobble requested=\(requestedAction) failed=\(category)")
     }
 }

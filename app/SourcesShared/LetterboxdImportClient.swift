@@ -400,7 +400,12 @@ enum LetterboxdImportClient {
 /// paste-a-public-URL path keeps the default false, so pasting a link never silently reaches into the
 /// connected account for a list the link itself could not open.
 enum TraktListImportClient {
-    static func fetchRawList(user: String, slug: String, authorized: Bool = false) async -> RawList {
+    static func fetchRawList(
+        user: String,
+        slug: String,
+        authorized: Bool = false,
+        expectedSession: TraktSessionID? = nil
+    ) async -> RawList {
         let path: String
         if user.isEmpty {
             path = "/lists/\(ListImport.encodePath(slug))/items/movie,show"
@@ -413,12 +418,17 @@ enum TraktListImportClient {
         req.setValue("2", forHTTPHeaderField: "trakt-api-version")
         req.setValue(TraktAuth.clientID, forHTTPHeaderField: "trakt-api-key")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if authorized, let token = try? await TraktAuth.shared.validToken() {
+        if authorized {
+            guard let expectedSession,
+                  let token = try? await TraktAuth.shared.validToken(for: expectedSession) else {
+                return RawList(title: nil, entries: [])
+            }
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              !authorized || TraktAuth.storedSessionID == expectedSession,
               let array = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
             return RawList(title: nil, entries: [])
         }

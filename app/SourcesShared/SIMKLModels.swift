@@ -341,6 +341,7 @@ struct SIMKLRatingsResponse: Decodable, Sendable {
 enum SIMKLError: LocalizedError, Sendable, Equatable {
     case notConfigured
     case notSignedIn
+    case sessionChanged
     case badURL
     case expired
     case server(status: Int)
@@ -351,6 +352,7 @@ enum SIMKLError: LocalizedError, Sendable, Equatable {
         switch self {
         case .notConfigured: return "SIMKL is not configured in this build."
         case .notSignedIn: return "You are not connected to SIMKL."
+        case .sessionChanged: return "The SIMKL account changed before this operation completed."
         case .badURL: return "The SIMKL service URL is invalid."
         case .expired: return "The SIMKL sign-in code expired. Please try again."
         case .server(let status): return "SIMKL returned an error (HTTP \(status))."

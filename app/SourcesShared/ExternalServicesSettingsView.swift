@@ -88,6 +88,7 @@ private struct TraktConnectCard: View {
     @AppStorage(ExternalSyncToggle.traktWatchlist) private var watchlist = true
     @AppStorage(ExternalSyncToggle.traktImportWatched) private var importWatched = false
     @AppStorage(ExternalSyncToggle.traktResumeSuggestion) private var resumeSuggestion = false
+    @AppStorage(ExternalSyncToggle.traktContinueWatching) private var traktContinueWatching = false
     // Defaults MUST match the `default:` each key is read with at runtime (see ExternalSyncToggle.isOn),
     // so a never-touched switch and the code behind it agree. Ratings default ON, like scrobble/watchlist.
     @AppStorage(ExternalSyncToggle.traktRatings) private var ratings = true
@@ -125,8 +126,22 @@ private struct TraktConnectCard: View {
                         // Turning it off drops the cached positions now rather than leaving them on disk for
                         // a feature the user just declined. Turning it on lets the next pre-play open pull
                         // (refreshIfStale's own toggle gate blocked every earlier attempt).
-                        if !on { TraktPlaybackShadow.shared.reset() }
+                        if !on, !traktContinueWatching {
+                            TraktPlaybackShadow.shared.reset()
+                        }
                     }
+                Toggle("Use Trakt for Continue Watching", isOn: $traktContinueWatching)
+                    .tint(Theme.Palette.accent)
+                    .onChange(of: traktContinueWatching) { on in
+                        if on {
+                            TraktPlaybackShadow.shared.refreshNow()
+                        } else if !resumeSuggestion {
+                            TraktPlaybackShadow.shared.reset()
+                        }
+                    }
+                Text("When selected, the owner profile's Home rail follows paused items from Trakt. VortX stays visible until the first complete Trakt snapshot arrives.")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
                 // Adds an "I'm watching this" action to detail pages, for a cinema or someone else's TV.
                 // Never fires on its own: what you play in VortX is already scrobbled, so this is only
                 // for viewing VortX cannot see, and it always takes a deliberate tap.
@@ -156,7 +171,10 @@ private struct TraktConnectCard: View {
             }
         }
         .task { connected = await TraktAuth.shared.isSignedIn }
-        .onDisappear { pollTask?.cancel() }
+        .onDisappear {
+            pollTask?.cancel()
+            Task { await TraktAuth.shared.cancelLoginAttempt() }
+        }
     }
 
     private func connect() {
@@ -168,6 +186,9 @@ private struct TraktConnectCard: View {
                 let image = QRCodeImage.make(dc.verificationURL)
                 await MainActor.run { code = dc; qr = image; working = false; status = "Waiting for you to authorize…" }
                 _ = try await TraktAuth.shared.pollForToken(deviceCode: dc.deviceCode, interval: dc.interval, expiresIn: dc.expiresIn)
+                // Authentication is a new account boundary. Supersede any signed-out no-op/in-flight pull
+                // and fetch the enabled playback surface immediately instead of inheriting its stale throttle.
+                TraktPlaybackShadow.shared.refreshNow()
                 await MainActor.run { connected = true; code = nil; qr = nil; status = "" }
             } catch is CancellationError {
                 return
@@ -180,6 +201,7 @@ private struct TraktConnectCard: View {
 
     private func cancel() {
         pollTask?.cancel(); pollTask = nil
+        Task { await TraktAuth.shared.cancelLoginAttempt() }
         code = nil; qr = nil; status = ""; working = false; errorMessage = nil
     }
 
@@ -280,7 +302,10 @@ private struct SIMKLConnectCard: View {
             }
         }
         .task { connected = await SIMKLAuth.shared.isSignedIn }
-        .onDisappear { pollTask?.cancel() }
+        .onDisappear {
+            pollTask?.cancel()
+            Task { await SIMKLAuth.shared.cancelLoginAttempt() }
+        }
     }
 
     private func connect() {
@@ -308,6 +333,7 @@ private struct SIMKLConnectCard: View {
 
     private func cancel() {
         pollTask?.cancel(); pollTask = nil
+        Task { await SIMKLAuth.shared.cancelLoginAttempt() }
         pin = nil; qr = nil; status = ""; working = false; errorMessage = nil
     }
 

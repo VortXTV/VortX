@@ -71,8 +71,17 @@ enum TraktMyListsClient {
     /// it is resolved once from `/users/settings` and used wherever a list does not name one. When a list DOES
     /// carry a user we prefer that, so this stays correct if Trakt returns one.
     static func personalLists() async -> [MyList] {
-        guard let dtos: [ListDTO] = await getArray("/users/me/lists") else { return [] }
-        let owner = await authenticatedUserSlug()
+        guard let sessionID = TraktAuth.storedSessionID else { return [] }
+        return await personalLists(expectedSession: sessionID)
+    }
+
+    private static func personalLists(expectedSession: TraktSessionID) async -> [MyList] {
+        guard let dtos: [ListDTO] = await getArray(
+            "/users/me/lists",
+            expectedSession: expectedSession
+        ) else { return [] }
+        let owner = await authenticatedUserSlug(expectedSession: expectedSession)
+        guard TraktAuth.storedSessionID == expectedSession else { return [] }
         return dtos.compactMap { myList(from: $0, kind: .personal, fallbackOwner: owner) }
     }
 
@@ -85,7 +94,16 @@ enum TraktMyListsClient {
     /// it looks like it worked. One page of `maxLikedLists` covers any realistic account and keeps this a
     /// single request; the sibling `/users/me/lists` is not paginated and needs no such parameter.
     static func likedLists() async -> [MyList] {
-        guard let dtos: [LikedListDTO] = await getArray("/users/likes/lists?limit=\(maxLikedLists)") else { return [] }
+        guard let sessionID = TraktAuth.storedSessionID else { return [] }
+        return await likedLists(expectedSession: sessionID)
+    }
+
+    private static func likedLists(expectedSession: TraktSessionID) async -> [MyList] {
+        guard let dtos: [LikedListDTO] = await getArray(
+            "/users/likes/lists?limit=\(maxLikedLists)",
+            expectedSession: expectedSession
+        ) else { return [] }
+        guard TraktAuth.storedSessionID == expectedSession else { return [] }
         return dtos.compactMap { $0.list }.compactMap { myList(from: $0, kind: .liked, fallbackOwner: nil) }
     }
 
@@ -100,7 +118,13 @@ enum TraktMyListsClient {
     /// as `imported:trakt:me:<slug>` on one load and `imported:trakt:<you>:<slug>` on the next, and the user
     /// would end up with the list painted on Home twice.
     static func authenticatedUserSlug() async -> String? {
-        guard let data = await getData("/users/settings"),
+        guard let sessionID = TraktAuth.storedSessionID else { return nil }
+        return await authenticatedUserSlug(expectedSession: sessionID)
+    }
+
+    private static func authenticatedUserSlug(expectedSession: TraktSessionID) async -> String? {
+        guard let data = await getData("/users/settings", expectedSession: expectedSession),
+              TraktAuth.storedSessionID == expectedSession,
               let settings = try? JSONDecoder().decode(SettingsDTO.self, from: data),
               let slug = settings.user?.ids?.slug?.trimmingCharacters(in: .whitespacesAndNewlines),
               !slug.isEmpty else { return nil }
@@ -111,10 +135,13 @@ enum TraktMyListsClient {
     /// and the personal entry wins because that is the more accurate description of it). Both legs run
     /// concurrently; a failing leg contributes nothing rather than failing the whole screen.
     static func allLists() async -> [MyList] {
-        guard TraktAuth.isConfigured, await TraktAuth.shared.isSignedIn else { return [] }
-        async let personal = personalLists()
-        async let liked = likedLists()
+        guard TraktAuth.isConfigured,
+              let sessionID = TraktAuth.storedSessionID,
+              await TraktAuth.shared.sessionID == sessionID else { return [] }
+        async let personal = personalLists(expectedSession: sessionID)
+        async let liked = likedLists(expectedSession: sessionID)
         let ordered = await personal + (await liked)
+        guard TraktAuth.storedSessionID == sessionID else { return [] }
         var seen = Set<String>()
         return ordered.filter { seen.insert($0.id).inserted }
     }
@@ -126,11 +153,18 @@ enum TraktMyListsClient {
     /// row and a pasted-URL row are the same kind of object built the same way. The caller registers it.
     static func importList(_ list: MyList) async -> Result<ImportedListCatalog, ImportedListError> {
         guard TraktAuth.isConfigured else { return .failure(.notConfigured(.trakt)) }
-        guard await TraktAuth.shared.isSignedIn else { return .failure(.network) }
+        guard let sessionID = TraktAuth.storedSessionID else { return .failure(.network) }
 
-        let raw = await TraktListImportClient.fetchRawList(user: list.owner, slug: list.slug, authorized: true)
+        let raw = await TraktListImportClient.fetchRawList(
+            user: list.owner,
+            slug: list.slug,
+            authorized: true,
+            expectedSession: sessionID
+        )
+        guard TraktAuth.storedSessionID == sessionID else { return .failure(.network) }
         guard !raw.entries.isEmpty else { return .failure(.empty) }
         let items = await ListImport.resolve(Array(raw.entries.prefix(ListImport.maxItems)))
+        guard TraktAuth.storedSessionID == sessionID else { return .failure(.network) }
         guard !items.isEmpty else { return .failure(.empty) }
 
         let catalog = ImportedListCatalog(
@@ -140,7 +174,8 @@ enum TraktMyListsClient {
             sourceURL: list.canonicalURL,
             items: items,
             addedAt: Date(),
-            requiresConnection: list.requiresConnection
+            requiresConnection: list.requiresConnection,
+            connectionSessionID: list.requiresConnection ? sessionID : nil
         )
         DiagnosticsLog.log("trakt-my-lists", "\(list.kind.rawValue) '\(list.name)' -> \(items.count) titles")
         return .success(catalog)
@@ -149,8 +184,11 @@ enum TraktMyListsClient {
     // MARK: - HTTP
 
     /// Authenticated GET returning the raw body, or nil on any failure (no token, non-200, transport).
-    private static func getData(_ path: String) async -> Data? {
-        guard let token = try? await TraktAuth.shared.validToken(),
+    private static func getData(
+        _ path: String,
+        expectedSession: TraktSessionID
+    ) async -> Data? {
+        guard let token = try? await TraktAuth.shared.validToken(for: expectedSession),
               let url = URL(string: TraktAuth.apiBase + path) else { return nil }
         var req = URLRequest(url: url, timeoutInterval: 20)
         req.cachePolicy = .reloadIgnoringLocalCacheData
@@ -159,13 +197,17 @@ enum TraktMyListsClient {
         req.setValue(TraktAuth.clientID, forHTTPHeaderField: "trakt-api-key")
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              TraktAuth.storedSessionID == expectedSession else { return nil }
         return data
     }
 
     /// Authenticated GET decoding a JSON array, or nil on any failure (including a bad shape).
-    private static func getArray<T: Decodable>(_ path: String) async -> [T]? {
-        guard let data = await getData(path),
+    private static func getArray<T: Decodable>(
+        _ path: String,
+        expectedSession: TraktSessionID
+    ) async -> [T]? {
+        guard let data = await getData(path, expectedSession: expectedSession),
               let decoded = try? JSONDecoder().decode([T].self, from: data) else { return nil }
         return decoded
     }

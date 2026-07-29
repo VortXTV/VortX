@@ -65,10 +65,33 @@ final class TraktRatingsStore {
     /// Bumped by `reset()`. An in-flight pull/push captures it before its awaits and refuses to write back
     /// if it changed, so a disconnect can never resurrect the wiped store into the next account.
     private var generation = 0
+    /// Session that owns every entry currently in memory and on disk.
+    private var stateSessionID: TraktSessionID?
+
+    private struct PersistedSnapshot: Codable {
+        let sessionID: TraktSessionID
+        let entries: [String: RatingEntry]
+    }
+
+    private static let storage = try? PrivateExternalSyncStorage.live(
+        provider: "Trakt",
+        file: "ratings.json",
+        legacyFiles: ["trakt-ratings-shadow.json"]
+    )
 
     private init() {
-        entries = Self.load()
+        let initialSession = TraktAuth.storedSessionID
+        stateSessionID = initialSession
+        entries = initialSession.map(Self.load(for:)) ?? [:]
         rebuildAliases()
+        TraktAuthBoundary.observe(key: "trakt-ratings-store") { [weak self] sessionID in
+            self?.reset(to: sessionID)
+        }
+        // Close the load-to-observer registration race.
+        let currentSession = TraktAuth.storedSessionID
+        if currentSession != initialSession {
+            reset(to: currentSession)
+        }
     }
 
     /// One rated title. `rating == nil` is a tombstone: the user explicitly cleared their rating, which is
@@ -90,7 +113,10 @@ final class TraktRatingsStore {
     /// The user's rating for a title, or nil when unrated / tombstoned / not known. Synchronous and
     /// lock-guarded so a detail-page body can read it inline. Never touches the network.
     func rating(imdb: String?, tmdb: Int?) -> Int? {
+        guard let currentSession = TraktAuth.storedSessionID else { return nil }
         lock.lock(); defer { lock.unlock() }
+        guard stateSessionID == currentSession,
+              TraktAuth.storedSessionID == currentSession else { return nil }
         guard let key = primaryKeyLocked(imdb: imdb, tmdb: tmdb) else { return nil }
         return entries[key]?.rating
     }
@@ -112,9 +138,15 @@ final class TraktRatingsStore {
 
     /// Shared local-write + mirror path for both set and clear.
     private func write(rating: Int?, imdb: String?, tmdb: Int?, isSeries: Bool) {
+        // Capture before local persistence. Another thread can cross an auth boundary even though this
+        // method itself has no await, so the later detached mirror must retain the account present when
+        // the user made the mutation.
+        guard let sessionID = TraktAuth.storedSessionID else { return }
         let cleanIMDb = (imdb?.isEmpty == false) ? imdb : nil
         guard cleanIMDb != nil || tmdb != nil else { return }   // no usable identity: nothing to key on
         lock.lock()
+        guard stateSessionID == sessionID,
+              TraktAuth.storedSessionID == sessionID else { lock.unlock(); return }
         // Re-file an existing entry under its ORIGINAL key (a title first rated under a `tmdb:` id keeps
         // that key even once its tt id is known); only a title we have never seen mints a new one.
         guard let key = primaryKeyLocked(imdb: cleanIMDb, tmdb: tmdb)
@@ -132,22 +164,23 @@ final class TraktRatingsStore {
         entries[key] = entry
         rebuildAliasesLocked()
         pruneLocked()
-        let snapshot = entries
         let gen = generation
+        persistLocked()
         lock.unlock()
-        Self.save(snapshot)
         notifyChanged()
-        mirror(entry, gen: gen)
+        mirror(entry, gen: gen, sessionID: sessionID)
     }
 
     /// Push one entry to Trakt. Gated on the ratings toggle + a configured, connected account; when the
     /// gate is closed the local value simply stands (and is NOT queued: a push the user never asked to
     /// mirror must not fire the moment they connect an account later).
-    private func mirror(_ entry: RatingEntry, gen: Int) {
+    private func mirror(_ entry: RatingEntry, gen: Int, sessionID: TraktSessionID?) {
         guard TraktAuth.isConfigured,
-              ExternalSyncToggle.isOn(ExternalSyncToggle.traktRatings) else { return }
+              ExternalSyncToggle.isOn(ExternalSyncToggle.traktRatings),
+              let sessionID,
+              TraktAuth.storedSessionID == sessionID else { return }
         Task.detached(priority: .utility) { [weak self] in
-            guard let self, await TraktAuth.shared.isSignedIn else { return }
+            guard let self, TraktAuth.storedSessionID == sessionID else { return }
             let ids = TraktIDs(imdb: entry.imdb, tmdb: entry.tmdb)
             do {
                 if let rating = entry.rating {
@@ -155,23 +188,31 @@ final class TraktRatingsStore {
                     let items = entry.isSeries
                         ? TraktRatingItems(shows: [TraktRatedShow(ids: ids, rating: rating, ratedAt: stamp)])
                         : TraktRatingItems(movies: [TraktRatedMovie(ids: ids, rating: rating, ratedAt: stamp)])
-                    _ = try await TraktService.shared.addRatings(items)
+                    _ = try await TraktService.shared.addRatings(
+                        items,
+                        expectedSession: sessionID
+                    )
                 } else {
                     let items = entry.isSeries
                         ? TraktRatingItems(shows: [TraktRatedShow(ids: ids)])
                         : TraktRatingItems(movies: [TraktRatedMovie(ids: ids)])
-                    _ = try await TraktService.shared.removeRatings(items)
+                    _ = try await TraktService.shared.removeRatings(
+                        items,
+                        expectedSession: sessionID
+                    )
                 }
-                self.markPushed(entry, gen: gen)
+                guard TraktAuth.storedSessionID == sessionID else { return }
+                self.markPushed(entry, gen: gen, sessionID: sessionID)
             } catch {
                 // Queue only TRANSIENT failures, mirroring TraktProvider.enqueueIfTransient: a 401 needs a
                 // reconnect (a blind replay would 401 forever, and could drain into the next account), and
                 // .ignored cannot arise on a ratings write. The local value stands either way.
                 if let e = error as? TraktServiceError, e == .unauthorized || e == .ignored { return }
+                if error as? TraktAuthError == .sessionChanged { return }
                 TraktSyncEngine.shared.enqueue(TraktSyncEngine.PendingPush(
                     kind: entry.rating == nil ? .ratingRemove : .ratingSet,
                     isSeries: entry.isSeries, imdb: entry.imdb, tmdb: entry.tmdb,
-                    season: nil, episode: nil,
+                    season: nil, episode: nil, sessionID: sessionID,
                     rating: entry.rating, ratedAtEpoch: entry.ratedAt.timeIntervalSince1970))
             }
         }
@@ -183,8 +224,14 @@ final class TraktRatingsStore {
     /// a rating the user changed while the push was in flight (or queued) is a different, still-unpushed
     /// edit, and clearing its pending flag would strip its rule-3 immunity and let a stale read-back row
     /// overwrite the newer value.
-    func markPushed(_ pushed: RatingEntry, gen: Int? = nil) {
+    func markPushed(
+        _ pushed: RatingEntry,
+        gen: Int? = nil,
+        sessionID: TraktSessionID
+    ) {
         lock.lock()
+        guard stateSessionID == sessionID,
+              TraktAuth.storedSessionID == sessionID else { lock.unlock(); return }
         if let gen, gen != generation { lock.unlock(); return }
         guard let key = primaryKeyLocked(imdb: pushed.imdb, tmdb: pushed.tmdb),
               var current = entries[key],
@@ -196,16 +243,23 @@ final class TraktRatingsStore {
         guard !current.pushed else { lock.unlock(); return }
         current.pushed = true
         entries[key] = current
-        let snapshot = entries
+        persistLocked()
         lock.unlock()
-        Self.save(snapshot)
     }
 
     /// Drain-side twin of `markPushed`, taking the queue's flat fields.
-    func markPushed(imdb: String?, tmdb: Int?, isSeries: Bool, rating: Int?, ratedAtEpoch: Double?) {
+    func markPushed(
+        imdb: String?,
+        tmdb: Int?,
+        isSeries: Bool,
+        rating: Int?,
+        ratedAtEpoch: Double?,
+        sessionID: TraktSessionID
+    ) {
         guard let epoch = ratedAtEpoch else { return }
         markPushed(RatingEntry(imdb: imdb, tmdb: tmdb, isSeries: isSeries, rating: rating,
-                               ratedAt: Date(timeIntervalSince1970: epoch), pushed: true))
+                               ratedAt: Date(timeIntervalSince1970: epoch), pushed: true),
+                   sessionID: sessionID)
     }
 
     // MARK: - Read-back (convergence, NOT authority)
@@ -214,10 +268,17 @@ final class TraktRatingsStore {
     /// anything actually changed (so the caller can notify the UI). Callers MUST NOT call this with a
     /// partial or failed fetch: only a fully decoded 200 is evidence (rule 2).
     @discardableResult
-    func merge(entries rows: [TraktRatingEntry], isSeries: Bool, gen: Int) -> Bool {
+    func merge(
+        entries rows: [TraktRatingEntry],
+        isSeries: Bool,
+        gen: Int,
+        sessionID: TraktSessionID
+    ) -> Bool {
         guard !rows.isEmpty else { return false }
         lock.lock()
-        guard generation == gen else { lock.unlock(); return false }
+        guard generation == gen,
+              stateSessionID == sessionID,
+              TraktAuth.storedSessionID == sessionID else { lock.unlock(); return false }
         // Two flags, deliberately: `valueChanged` is what the USER would see (a rating appeared or moved)
         // and drives the repaint; `dirty` is anything that must reach the alias index and disk, INCLUDING a
         // pure id enrichment that changes no value. Collapsing them would let an enrichment mutate `entries`
@@ -270,16 +331,15 @@ final class TraktRatingsStore {
         guard dirty else { lock.unlock(); return false }
         rebuildAliasesLocked()
         pruneLocked()
-        let snapshot = entries
+        persistLocked()
         lock.unlock()
-        Self.save(snapshot)
         return valueChanged
     }
 
     /// The generation an in-flight pull must present to `merge`, so a disconnect mid-pull discards it.
-    var currentGeneration: Int {
+    var currentContext: (generation: Int, sessionID: TraktSessionID?) {
         lock.lock(); defer { lock.unlock() }
-        return generation
+        return (generation, stateSessionID)
     }
 
     // MARK: - Disconnect
@@ -287,12 +347,17 @@ final class TraktRatingsStore {
     /// Wipe the shadow (memory + disk) on disconnect / sign-out, so ratings do not leak into the next
     /// account that connects on this device, and invalidate any in-flight pull or push.
     func reset() {
+        reset(to: TraktAuth.storedSessionID)
+    }
+
+    private func reset(to sessionID: TraktSessionID?) {
         lock.lock()
         entries = [:]
         aliases = [:]
+        stateSessionID = sessionID
         generation &+= 1
+        try? Self.storage?.reset()
         lock.unlock()
-        Self.save([:])
         notifyChanged()
     }
 
@@ -351,24 +416,34 @@ final class TraktRatingsStore {
         DispatchQueue.main.async { NotificationCenter.default.post(name: Self.changedNote, object: nil) }
     }
 
-    // MARK: - Persistence (Application Support JSON)
+    // MARK: - Protected persistence
 
-    private static let file = "trakt-ratings-shadow.json"
-
-    private static func fileURL() -> URL? {
-        guard let dir = try? FileManager.default.url(for: .applicationSupportDirectory,
-                                                     in: .userDomainMask, appropriateFor: nil, create: true) else { return nil }
-        return dir.appendingPathComponent(file)
+    private static func load(for sessionID: TraktSessionID) -> [String: RatingEntry] {
+        guard let storage else { return [:] }
+        let data: Data
+        do {
+            guard let stored = try storage.load() else { return [:] }
+            data = stored
+        } catch {
+            try? storage.reset()
+            return [:]
+        }
+        guard let snapshot = try? JSONDecoder().decode(PersistedSnapshot.self, from: data),
+              snapshot.sessionID == sessionID else {
+            try? storage.reset()
+            return [:]
+        }
+        return snapshot.entries
     }
 
-    private static func load() -> [String: RatingEntry] {
-        guard let url = fileURL(), let data = try? Data(contentsOf: url),
-              let decoded = try? JSONDecoder().decode([String: RatingEntry].self, from: data) else { return [:] }
-        return decoded
-    }
-
-    private static func save(_ entries: [String: RatingEntry]) {
-        guard let url = fileURL(), let data = try? JSONEncoder().encode(entries) else { return }
-        try? data.write(to: url, options: .atomic)
+    /// Called only with `lock` held, fencing every save against a concurrent reset.
+    private func persistLocked() {
+        guard let storage = Self.storage, let stateSessionID else {
+            try? Self.storage?.reset()
+            return
+        }
+        let snapshot = PersistedSnapshot(sessionID: stateSessionID, entries: entries)
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        try? storage.save(data)
     }
 }

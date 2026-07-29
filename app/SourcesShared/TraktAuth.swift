@@ -1,5 +1,70 @@
 import Foundation
 
+/// Injectable credential persistence used by the auth actor and its security tests.
+struct TraktCredentialStore: Sendable {
+    let read: @Sendable (String) -> String?
+    let write: @Sendable (String?, String) -> Void
+
+    static let keychain = TraktCredentialStore(
+        read: { Keychain.string($0) },
+        write: { value, account in Keychain.set(value, for: account) }
+    )
+}
+
+/// OAuth endpoint configuration. Production uses the app's build settings, while tests use a local
+/// protocol-backed URLSession without changing global app credentials.
+struct TraktAuthConfiguration: Sendable {
+    let clientID: String
+    let clientSecret: String
+    let apiBase: String
+
+    static var production: TraktAuthConfiguration {
+        TraktAuthConfiguration(
+            clientID: TraktAuth.clientID,
+            clientSecret: TraktAuth.clientSecret,
+            apiBase: TraktAuth.apiBase
+        )
+    }
+}
+
+/// Owns one device-login attempt at a time. A replacement attempt or credential boundary invalidates
+/// every older code, so a delayed OAuth response cannot install credentials after the user moved on.
+struct TraktLoginAttemptAuthority {
+    private var generation: UInt64 = 0
+    private var codeGenerations: [String: UInt64] = [:]
+
+    mutating func begin() -> UInt64 {
+        generation &+= 1
+        codeGenerations.removeAll(keepingCapacity: true)
+        return generation
+    }
+
+    mutating func register(code: String, generation expectedGeneration: UInt64) {
+        guard isCurrent(generation: expectedGeneration) else { return }
+        codeGenerations = [code: expectedGeneration]
+    }
+
+    func generation(for code: String) -> UInt64? {
+        guard let codeGeneration = codeGenerations[code],
+              isCurrent(generation: codeGeneration) else { return nil }
+        return codeGeneration
+    }
+
+    func owns(code: String, generation expectedGeneration: UInt64) -> Bool {
+        codeGenerations[code] == expectedGeneration
+            && isCurrent(generation: expectedGeneration)
+    }
+
+    func isCurrent(generation expectedGeneration: UInt64) -> Bool {
+        expectedGeneration != 0 && generation == expectedGeneration
+    }
+
+    mutating func invalidate() {
+        generation &+= 1
+        codeGenerations.removeAll(keepingCapacity: true)
+    }
+}
+
 /// Trakt.tv OAuth device-code flow plus Keychain-backed token storage.
 ///
 /// The flow is the standard Trakt device path (https://trakt.docs.apiary.io/reference/authentication-devices):
@@ -54,16 +119,37 @@ actor TraktAuth {
 
     // MARK: - Keychain accounts (token set lives here, nowhere else)
 
-    private let accessAccount = "vortx.trakt.accessToken"
-    private let refreshAccount = "vortx.trakt.refreshToken"
-    private let expiryAccount = "vortx.trakt.expiresAt"   // unix epoch seconds, stored as a string
+    private static let accessAccount = "vortx.trakt.accessToken"
+    private static let refreshAccount = "vortx.trakt.refreshToken"
+    private static let expiryAccount = "vortx.trakt.expiresAt"   // unix epoch seconds, stored as a string
     /// Unix epoch seconds when the token was ISSUED, stored as a string. Fourth slot: it lets
     /// `currentToken()` rebuild the token with its ORIGINAL lifetime so the 30-minute early-refresh
     /// leeway actually fires (see `TraktToken.defaultLeeway`). May be absent on installs whose token
     /// was stored before this slot existed; `currentToken()` degrades gracefully to hard-expiry-only.
-    private let createdAtAccount = "vortx.trakt.createdAt"
+    private static let createdAtAccount = "vortx.trakt.createdAt"
+    /// Random identity of the currently installed credential set. This is intentionally separate from
+    /// OAuth tokens so a normal token refresh does not invalidate queued work or private snapshots.
+    private static let sessionAccount = "vortx.trakt.sessionID"
 
     private let session: URLSession
+    private let credentials: TraktCredentialStore
+    private let configuration: TraktAuthConfiguration
+
+    /// Number of session-bound provider writes currently holding a credential lease. Auth boundaries
+    /// wait for these operations to finish, so credentials cannot switch after final validation but before
+    /// the network write. The actor may re-enter while the network awaits, and this explicit lease closes
+    /// that reentrancy window.
+    private var activeSessionWrites = 0
+    private var sessionWriteDrainWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Number of credential-boundary operations that have announced intent but have not finished.
+    /// This is incremented before the first suspension in every boundary path. Session-bound writes
+    /// reject while it is non-zero, so no write can enter after a boundary begins draining leases.
+    private var pendingCredentialBoundaries = 0
+    /// Credential replacements are serialized. Without this turnstile, two boundaries can both finish
+    /// draining and then interleave their clear/install sequences across actor suspension points.
+    private var credentialBoundaryActive = false
+    private var credentialBoundaryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var loginAttempts = TraktLoginAttemptAuthority()
 
     /// The single in-flight refresh, if one is running. Concurrent `validToken()` callers (scrobbleStart,
     /// TraktSyncEngine.pullWatched, a rail fetch) await THIS task instead of each firing their own refresh
@@ -78,8 +164,23 @@ actor TraktAuth {
     /// so `TraktAuth` stays free of a `VortXSyncManager` dependency.
     private var syncedTokenProvider: (@Sendable () async -> (access: String, refresh: String, expiryUnix: Int)?)?
 
-    init(session: URLSession = .shared) {
+    init(
+        session: URLSession = .shared,
+        credentials: TraktCredentialStore = .keychain,
+        configuration: TraktAuthConfiguration = .production
+    ) {
         self.session = session
+        self.credentials = credentials
+        self.configuration = configuration
+
+        // One-time migration for a credential set created before session identities existed. The session
+        // is stored last, so synchronous readers stay fail closed if credential persistence is unavailable.
+        if credentials.read(Self.accessAccount)?.isEmpty == false,
+           credentials.read(Self.refreshAccount)?.isEmpty == false,
+           let expiry = credentials.read(Self.expiryAccount), Int(expiry) != nil,
+           credentials.read(Self.sessionAccount)?.isEmpty != false {
+            credentials.write(TraktSessionID.random().rawValue, Self.sessionAccount)
+        }
     }
 
     /// Wire the cross-device synced-token lookup used by the refresh-401 recovery path (T-2). Called once
@@ -90,40 +191,85 @@ actor TraktAuth {
 
     // MARK: - Public state
 
-    /// True when a token set is stored (the user has connected Trakt). Does not check expiry.
-    var isSignedIn: Bool { Keychain.string(accessAccount)?.isEmpty == false }
+    /// The production session visible to synchronous read paths and enqueue sites. A partial credential
+    /// write is not a session: both the access token and random session slot must be present.
+    nonisolated static var storedSessionID: TraktSessionID? {
+        guard Keychain.string(Self.accessAccount)?.isEmpty == false,
+              Keychain.string(Self.refreshAccount)?.isEmpty == false,
+              let expiry = Keychain.string(Self.expiryAccount), Int(expiry) != nil,
+              let raw = Keychain.string(Self.sessionAccount), !raw.isEmpty else { return nil }
+        return TraktSessionID(rawValue: raw)
+    }
 
-    /// Drop all stored Trakt tokens (the user disconnected). Does not revoke server-side.
-    func signOut() {
-        Keychain.set(nil, for: accessAccount)
-        Keychain.set(nil, for: refreshAccount)
-        Keychain.set(nil, for: expiryAccount)
-        Keychain.set(nil, for: createdAtAccount)
+    /// The session in this actor's credential store. Tests use an isolated store, while production uses
+    /// the same Keychain slots as `storedSessionID`.
+    var sessionID: TraktSessionID? { currentSessionID() }
+
+    /// Test seam proving that a boundary has announced intent before its active write finishes.
+    var isCredentialBoundaryPending: Bool { pendingCredentialBoundaries > 0 }
+
+    /// True only when a complete token set and its session identity are stored.
+    var isSignedIn: Bool { currentSessionID() != nil }
+
+    /// Drop all stored Trakt credentials after any already-authorized provider write finishes.
+    func signOut() async {
+        loginAttempts.invalidate()
+        await performCredentialBoundary {
+            clearCredentialsAndPublishBoundary()
+        }
+    }
+
+    /// Automatic auth-loss path. A stale 401 from an older session cannot sign out a newer account.
+    func signOut(ifCurrent expectedSession: TraktSessionID) async {
+        guard currentSessionID() == expectedSession else { return }
+        loginAttempts.invalidate()
+        await performCredentialBoundary {
+            guard currentSessionID() == expectedSession else { return }
+            clearCredentialsAndPublishBoundary()
+        }
     }
 
     /// Adopt a token set that arrived from ANOTHER device over the E2E `doc.apiKeys` sync channel, so
     /// a Trakt connection made on one device follows the account to the rest. Writes the Keychain
-    /// slots directly (no network). `expiryUnix` is absolute unix-epoch seconds (what `store` persists
-    /// and `syncUp` mirrors). Ignores an empty access/refresh pair so a partial doc never clears a live
-    /// local session. Idempotent: adopting the same tokens twice is a harmless overwrite.
-    func adoptTokens(access: String, refresh: String, expiryUnix: Int) {
+    /// slots directly (no network). `expiryUnix` is absolute unix-epoch seconds (what token persistence
+    /// and `syncUp` mirror). Ignores an empty access/refresh pair so a partial doc never clears a live
+    /// local session. An identical replay is a no-op. A changed adoption is an account boundary.
+    func adoptTokens(access: String, refresh: String, expiryUnix: Int) async {
         guard !access.isEmpty, !refresh.isEmpty else { return }
-        Keychain.set(access, for: accessAccount)
-        Keychain.set(refresh, for: refreshAccount)
-        Keychain.set(String(expiryUnix), for: expiryAccount)
-        // The synced mirror carries no issue time, so stamp adoption time. The rebuilt "lifetime" is
-        // then the REMAINING lifetime at adoption, whose half-life leeway is always strictly less than
-        // the remaining time itself, so a just-adopted token is never instantly read as expired.
-        Keychain.set(String(Int(Date().timeIntervalSince1970)), for: createdAtAccount)
+        if let existing = syncableTokens(),
+           existing.access == access,
+           existing.refresh == refresh,
+           existing.expiryUnix == expiryUnix,
+           currentSessionID() != nil {
+            return
+        }
+        loginAttempts.invalidate()
+        await performCredentialBoundary {
+            // Re-check inside the serialized turn. A competing adoption may have installed this exact
+            // triple while this caller waited for the boundary turnstile.
+            if let existing = syncableTokens(),
+               existing.access == access,
+               existing.refresh == refresh,
+               existing.expiryUnix == expiryUnix,
+               currentSessionID() != nil {
+                return
+            }
+            replaceCredentialsWithNewSession(
+                access: access,
+                refresh: refresh,
+                expiryUnix: expiryUnix
+            )
+        }
     }
 
     /// The stored token triple for the sync PUSH side (access, refresh, absolute unix expiry), or nil
     /// when not signed in. Read-only mirror of `currentToken`; the sync manager sends these only when a
     /// local session exists and NEVER deletes them from the doc when absent (mirrors the debrid guard).
     func syncableTokens() -> (access: String, refresh: String, expiryUnix: Int)? {
-        guard let access = Keychain.string(accessAccount), !access.isEmpty,
-              let refresh = Keychain.string(refreshAccount), !refresh.isEmpty,
-              let expiryString = Keychain.string(expiryAccount), let expiry = Int(expiryString)
+        guard currentSessionID() != nil,
+              let access = credentials.read(Self.accessAccount), !access.isEmpty,
+              let refresh = credentials.read(Self.refreshAccount), !refresh.isEmpty,
+              let expiryString = credentials.read(Self.expiryAccount), let expiry = Int(expiryString)
         else { return nil }
         return (access, refresh, expiry)
     }
@@ -133,11 +279,12 @@ actor TraktAuth {
     /// Begin the device flow. Returns the codes and polling schedule to drive the UI and step 2.
     func requestDeviceCode() async throws -> TraktDeviceCode {
         try ensureConfigured()
+        let loginGeneration = loginAttempts.begin()
         struct Body: Encodable { let client_id: String }
         let request = try makeRequest(
             path: "/oauth/device/code",
             method: "POST",
-            body: Body(client_id: Self.clientID),
+            body: Body(client_id: configuration.clientID),
             authorized: false
         )
         let (data, status) = try await send(request)
@@ -148,7 +295,12 @@ actor TraktAuth {
             if status == 401 { throw TraktAuthError.invalidClient }
             throw TraktAuthError.server(status: status)
         }
-        return try decode(TraktDeviceCode.self, from: data)
+        let code = try decode(TraktDeviceCode.self, from: data)
+        guard loginAttempts.isCurrent(generation: loginGeneration) else {
+            throw TraktAuthError.sessionChanged
+        }
+        loginAttempts.register(code: code.deviceCode, generation: loginGeneration)
+        return code
     }
 
     // MARK: - Step 2: poll for the token
@@ -163,19 +315,45 @@ actor TraktAuth {
     }
 
     func poll(deviceCode: String) async throws -> PollResult {
+        guard let loginGeneration = loginAttempts.generation(for: deviceCode) else {
+            throw TraktAuthError.sessionChanged
+        }
+        return try await poll(deviceCode: deviceCode, loginGeneration: loginGeneration)
+    }
+
+    private func poll(deviceCode: String, loginGeneration: UInt64) async throws -> PollResult {
         try ensureConfigured()
+        guard loginAttempts.owns(code: deviceCode, generation: loginGeneration) else {
+            throw TraktAuthError.sessionChanged
+        }
         struct Body: Encodable { let code: String; let client_id: String; let client_secret: String }
         let request = try makeRequest(
             path: "/oauth/device/token",
             method: "POST",
-            body: Body(code: deviceCode, client_id: Self.clientID, client_secret: Self.clientSecret),
+            body: Body(
+                code: deviceCode,
+                client_id: configuration.clientID,
+                client_secret: configuration.clientSecret
+            ),
             authorized: false
         )
         let (data, status) = try await send(request)
+        guard loginAttempts.owns(code: deviceCode, generation: loginGeneration) else {
+            throw TraktAuthError.sessionChanged
+        }
         switch status {
         case 200:
             let token = try decode(TraktToken.self, from: data)
-            store(token)
+            let installed = await performCredentialBoundary(
+                expectedLoginGeneration: loginGeneration
+            ) {
+                guard loginAttempts.owns(code: deviceCode, generation: loginGeneration) else { return }
+                clearCredentialsAndPublishBoundary()
+                storeRefreshedToken(token)
+                installAndPublishNewSession()
+                loginAttempts.invalidate()
+            }
+            guard installed else { throw TraktAuthError.sessionChanged }
             DiagnosticsLog.log("trakt-auth", "device/token -> 200 authorized")
             return .authorized(token)
         case 400:
@@ -216,6 +394,9 @@ actor TraktAuth {
     /// On success the token is already stored in the Keychain; the return value is the same token.
     @discardableResult
     func pollForToken(deviceCode: String, interval: Int, expiresIn: Int) async throws -> TraktToken {
+        guard let loginGeneration = loginAttempts.generation(for: deviceCode) else {
+            throw TraktAuthError.sessionChanged
+        }
         let deadline = Date().addingTimeInterval(TimeInterval(expiresIn))
         let baseInterval = max(interval, 1)
         var waitSeconds = baseInterval
@@ -223,7 +404,7 @@ actor TraktAuth {
         while Date() < deadline {
             try await sleep(seconds: waitSeconds)
             try Task.checkCancellation()
-            switch try await poll(deviceCode: deviceCode) {
+            switch try await poll(deviceCode: deviceCode, loginGeneration: loginGeneration) {
             case .authorized(let token):
                 return token
             case .pending:
@@ -240,6 +421,11 @@ actor TraktAuth {
         throw TraktAuthError.expired
     }
 
+    /// Stop the currently displayed device flow without affecting an already authenticated account.
+    func cancelLoginAttempt() {
+        loginAttempts.invalidate()
+    }
+
     // MARK: - Token access + refresh
 
     /// A live access token, refreshing first if the stored one is near expiry. Throws
@@ -252,14 +438,54 @@ actor TraktAuth {
         return token.accessToken
     }
 
+    /// A live token proven to belong to `expectedSession` both before and after any refresh await.
+    /// Read-only callers use this to ensure an old account task never adopts a newer account's token.
+    func validToken(for expectedSession: TraktSessionID) async throws -> String {
+        guard pendingCredentialBoundaries == 0,
+              currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
+        let token = try await validToken()
+        guard pendingCredentialBoundaries == 0,
+              currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
+        return token
+    }
+
+    /// Run one provider write with a credential that cannot be replaced until the operation completes.
+    ///
+    /// The expected session is checked before token resolution and again after any refresh. Only then is
+    /// the lease counted. Sign-out and account replacement wait for the count to reach zero, closing the
+    /// final validation to network-use race without relying on cancellation.
+    func performSessionBoundWrite<Result: Sendable>(
+        expectedSession: TraktSessionID,
+        _ operation: @escaping @Sendable (String) async throws -> Result
+    ) async throws -> Result {
+        guard pendingCredentialBoundaries == 0,
+              currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
+        let token = try await validToken()
+        guard pendingCredentialBoundaries == 0,
+              currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
+
+        activeSessionWrites += 1
+        do {
+            let result = try await operation(token)
+            finishSessionWrite()
+            return result
+        } catch {
+            finishSessionWrite()
+            throw error
+        }
+    }
+
     /// Exchange the refresh token for a fresh set via `POST /oauth/token`, SINGLE-FLIGHT: if a refresh is
     /// already running, await it instead of starting a second one (Trakt rotates the refresh token, so a
     /// second concurrent refresh would spend an already-rotated token and 401). Stores and returns the set.
     @discardableResult
     func refresh(using refreshToken: String) async throws -> TraktToken {
+        guard let expectedSession = currentSessionID() else { throw TraktAuthError.notSignedIn }
         // Join an in-flight refresh rather than starting a competing one.
         if let existing = inFlightRefresh {
-            return try await existing.value
+            let token = try await existing.value
+            guard currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
+            return token
         }
         // A refresh that completed moments ago (whose defer already cleared `inFlightRefresh`) may have
         // stored a fresh token. A caller that just missed the in-flight window must not refresh again with
@@ -269,16 +495,24 @@ actor TraktAuth {
         }
         let task = Task<TraktToken, Error> { [weak self] in
             guard let self else { throw TraktAuthError.notSignedIn }
-            return try await self.performRefresh(using: refreshToken)
+            return try await self.performRefresh(
+                using: refreshToken,
+                expectedSession: expectedSession
+            )
         }
         inFlightRefresh = task
         defer { inFlightRefresh = nil }
-        return try await task.value
+        let token = try await task.value
+        guard currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
+        return token
     }
 
     /// The actual `POST /oauth/token` refresh network call. Only ever invoked from inside the single-flight
     /// `refresh(using:)`, so at most one runs at a time.
-    private func performRefresh(using refreshToken: String) async throws -> TraktToken {
+    private func performRefresh(
+        using refreshToken: String,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktToken {
         try ensureConfigured()
         struct Body: Encodable {
             let refresh_token: String
@@ -292,21 +526,26 @@ actor TraktAuth {
         }
         let body = Body(
             refresh_token: refreshToken,
-            client_id: Self.clientID,
-            client_secret: Self.clientSecret,
+            client_id: configuration.clientID,
+            client_secret: configuration.clientSecret,
             redirect_uri: Self.registeredRedirectURI,
             grant_type: "refresh_token"
         )
         let request = try makeRequest(path: "/oauth/token", method: "POST", body: body, authorized: false)
         let (data, status) = try await send(request)
+        guard currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
         guard status == 200 else {
             // A rejected refresh token USUALLY means the session is dead, but a concurrent winner (this
             // device pre single-flight, or a SIBLING device over sync) may already have rotated a NEWER
             // token. Only sign out when no fresher token exists anywhere; otherwise adopt it and keep going.
             if status == 401 {
-                if let recovered = await recoverAfterRefreshFailure(deadRefreshToken: refreshToken) {
+                if let recovered = await recoverAfterRefreshFailure(
+                    deadRefreshToken: refreshToken,
+                    expectedSession: expectedSession
+                ) {
                     return recovered
                 }
+                guard currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
                 // Terminal-wipe guard: the recovery path above SUSPENDS (it awaits the synced-token
                 // provider), so another actor turn (a syncDown `adoptTokens`, a device-code poll storing
                 // a brand-new set) may have landed a live token during that await. Re-check the Keychain
@@ -317,12 +556,14 @@ actor TraktAuth {
                 if let stored = currentToken(), stored.refreshToken != refreshToken {
                     return stored
                 }
-                signOut()
+                await signOut(ifCurrent: expectedSession)
             }
             throw TraktAuthError.server(status: status)
         }
         let token = try decode(TraktToken.self, from: data)
-        store(token)
+        // A normal refresh rotates tokens inside the same authenticated account. Never rotate the local
+        // session identity here: queued work and snapshots captured before refresh remain valid.
+        storeRefreshedToken(token)
         return token
     }
 
@@ -330,7 +571,11 @@ actor TraktAuth {
     /// minted: (T-1c) re-read the Keychain in case a local refresh rotated it, then (T-2) consult the
     /// cross-device synced mirror in case a SIBLING device rotated and pushed one. Returns the token to
     /// adopt, or nil when nothing fresher exists (the caller then signs out).
-    private func recoverAfterRefreshFailure(deadRefreshToken: String) async -> TraktToken? {
+    private func recoverAfterRefreshFailure(
+        deadRefreshToken: String,
+        expectedSession: TraktSessionID
+    ) async -> TraktToken? {
+        guard currentSessionID() == expectedSession else { return nil }
         // (T-1c) A local winner rotated the token while this refresh was in flight. A Trakt rotation always
         // changes the refresh token, so a stored refresh token different from the one we just spent means a
         // winner already stored a rotated set; adopt it REGARDLESS of the access token's age (even an aged
@@ -344,7 +589,18 @@ actor TraktAuth {
         // the Keychain and use it. Same-token or absent means nothing fresher exists remotely.
         if let synced = await syncedTokenProvider?(),
            !synced.access.isEmpty, !synced.refresh.isEmpty, synced.refresh != deadRefreshToken {
-            adoptTokens(access: synced.access, refresh: synced.refresh, expiryUnix: synced.expiryUnix)
+            guard currentSessionID() == expectedSession else { return nil }
+            // The synced token document carries no account fingerprint. A different refresh token may
+            // therefore belong to another account, not merely a sibling-device rotation. Treat it as
+            // a credential boundary unless a future protocol adds explicit same-account proof.
+            await performCredentialBoundary {
+                guard currentSessionID() == expectedSession else { return }
+                replaceCredentialsWithNewSession(
+                    access: synced.access,
+                    refresh: synced.refresh,
+                    expiryUnix: synced.expiryUnix
+                )
+            }
             return currentToken()
         }
         return nil
@@ -354,15 +610,16 @@ actor TraktAuth {
 
     /// The stored token set, reconstructed from the Keychain entries, or nil if not signed in.
     private func currentToken() -> TraktToken? {
-        guard let access = Keychain.string(accessAccount), !access.isEmpty,
-              let refresh = Keychain.string(refreshAccount), !refresh.isEmpty,
-              let expiryString = Keychain.string(expiryAccount),
+        guard currentSessionID() != nil,
+              let access = credentials.read(Self.accessAccount), !access.isEmpty,
+              let refresh = credentials.read(Self.refreshAccount), !refresh.isEmpty,
+              let expiryString = credentials.read(Self.expiryAccount),
               let expiry = Int(expiryString) else { return nil }
         // Rebuild with the ORIGINAL issue time when the fourth slot has it, so `expiresIn` is the
         // original lifetime and `defaultLeeway` gives a real 30-minute early refresh. (A rebuild from
         // the REMAINING lifetime makes `remaining <= min(1800, remaining/2)` unsatisfiable, so the
         // early refresh silently never fires and a data call can carry a token that expires in flight.)
-        if let createdAtString = Keychain.string(createdAtAccount),
+        if let createdAtString = credentials.read(Self.createdAtAccount),
            let createdAt = Int(createdAtString), createdAt < expiry {
             return TraktToken(accessToken: access, refreshToken: refresh,
                               expiresIn: expiry - createdAt, createdAt: createdAt)
@@ -376,23 +633,121 @@ actor TraktAuth {
                           expiresIn: expiry - now, createdAt: now)
     }
 
-    private func store(_ token: TraktToken) {
-        Keychain.set(token.accessToken, for: accessAccount)
-        Keychain.set(token.refreshToken, for: refreshAccount)
-        Keychain.set(String(Int(token.expiresAt.timeIntervalSince1970)), for: expiryAccount)
-        Keychain.set(String(token.createdAt), for: createdAtAccount)
+    private func storeRefreshedToken(_ token: TraktToken) {
+        credentials.write(token.accessToken, Self.accessAccount)
+        credentials.write(token.refreshToken, Self.refreshAccount)
+        credentials.write(String(Int(token.expiresAt.timeIntervalSince1970)), Self.expiryAccount)
+        credentials.write(String(token.createdAt), Self.createdAtAccount)
+    }
+
+    private func replaceCredentialsWithNewSession(access: String, refresh: String, expiryUnix: Int) {
+        clearCredentialsAndPublishBoundary()
+        credentials.write(access, Self.accessAccount)
+        credentials.write(refresh, Self.refreshAccount)
+        credentials.write(String(expiryUnix), Self.expiryAccount)
+        credentials.write(String(Int(Date().timeIntervalSince1970)), Self.createdAtAccount)
+        installAndPublishNewSession()
+    }
+
+    private func currentSessionID() -> TraktSessionID? {
+        guard credentials.read(Self.accessAccount)?.isEmpty == false,
+              credentials.read(Self.refreshAccount)?.isEmpty == false,
+              let expiry = credentials.read(Self.expiryAccount), Int(expiry) != nil,
+              let raw = credentials.read(Self.sessionAccount), !raw.isEmpty else { return nil }
+        return TraktSessionID(rawValue: raw)
+    }
+
+    private func installAndPublishNewSession() {
+        let sessionID = TraktSessionID.random()
+        credentials.write(sessionID.rawValue, Self.sessionAccount)
+        guard currentSessionID() == sessionID else {
+            clearCredentialsAndPublishBoundary()
+            DiagnosticsLog.log("trakt-auth", "credential session persistence failed")
+            return
+        }
+        TraktAuthBoundary.publish(sessionID)
+    }
+
+    private func clearCredentialsAndPublishBoundary() {
+        // Clear the session first. Every synchronous reader becomes fail closed before any token slot
+        // changes and before account-owned caches are synchronously notified.
+        credentials.write(nil, Self.sessionAccount)
+        TraktAuthBoundary.publish(nil)
+        credentials.write(nil, Self.accessAccount)
+        credentials.write(nil, Self.refreshAccount)
+        credentials.write(nil, Self.expiryAccount)
+        credentials.write(nil, Self.createdAtAccount)
+    }
+
+    private func waitForSessionWrites() async {
+        while activeSessionWrites > 0 {
+            await withCheckedContinuation { continuation in
+                sessionWriteDrainWaiters.append(continuation)
+            }
+        }
+    }
+
+    /// Announce, serialize, drain, and perform one credential boundary. The pending count is raised
+    /// synchronously before either the turnstile or write drain can suspend.
+    @discardableResult
+    private func performCredentialBoundary(
+        expectedLoginGeneration: UInt64? = nil,
+        _ mutation: () -> Void
+    ) async -> Bool {
+        pendingCredentialBoundaries += 1
+        defer { pendingCredentialBoundaries -= 1 }
+        await acquireCredentialBoundary()
+        defer { releaseCredentialBoundary() }
+        await waitForSessionWrites()
+        if let expectedLoginGeneration,
+           !loginAttempts.isCurrent(generation: expectedLoginGeneration) {
+            return false
+        }
+        mutation()
+        return true
+    }
+
+    private func acquireCredentialBoundary() async {
+        if !credentialBoundaryActive {
+            credentialBoundaryActive = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            credentialBoundaryWaiters.append(continuation)
+        }
+    }
+
+    private func releaseCredentialBoundary() {
+        if credentialBoundaryWaiters.isEmpty {
+            credentialBoundaryActive = false
+            return
+        }
+        let next = credentialBoundaryWaiters.removeFirst()
+        next.resume()
+    }
+
+    private func finishSessionWrite() {
+        precondition(activeSessionWrites > 0)
+        activeSessionWrites -= 1
+        guard activeSessionWrites == 0 else { return }
+        let waiters = sessionWriteDrainWaiters
+        sessionWriteDrainWaiters.removeAll(keepingCapacity: true)
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 
     // MARK: - HTTP plumbing
 
     private func ensureConfigured() throws {
-        guard Self.isConfigured else { throw TraktAuthError.notConfigured }
+        guard !configuration.clientID.isEmpty,
+              !configuration.clientSecret.isEmpty else { throw TraktAuthError.notConfigured }
     }
 
     private func makeRequest<Body: Encodable>(
         path: String, method: String, body: Body, authorized: Bool
     ) throws -> URLRequest {
-        guard let url = URL(string: Self.apiBase + path) else { throw TraktAuthError.badURL }
+        guard let url = URL(string: configuration.apiBase + path) else { throw TraktAuthError.badURL }
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = 20
@@ -400,7 +755,7 @@ actor TraktAuth {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // The API key header is required on every Trakt call, even unauthenticated ones.
         request.setValue("2", forHTTPHeaderField: "trakt-api-version")
-        request.setValue(Self.clientID, forHTTPHeaderField: "trakt-api-key")
+        request.setValue(configuration.clientID, forHTTPHeaderField: "trakt-api-key")
         request.httpBody = try JSONEncoder().encode(body)
         _ = authorized   // OAuth endpoints never carry a bearer; flag kept for call-site symmetry.
         return request
@@ -430,6 +785,7 @@ actor TraktAuth {
 enum TraktAuthError: LocalizedError, Sendable, Equatable {
     case notConfigured
     case notSignedIn
+    case sessionChanged
     case badURL
     case invalidDeviceCode
     case codeAlreadyUsed
@@ -447,6 +803,7 @@ enum TraktAuthError: LocalizedError, Sendable, Equatable {
         switch self {
         case .notConfigured: return "Trakt is not configured in this build."
         case .notSignedIn: return "You are not connected to Trakt."
+        case .sessionChanged: return "The Trakt account changed before this operation could finish."
         case .badURL: return "The Trakt service URL is invalid."
         case .invalidDeviceCode: return "This Trakt sign-in code is not valid."
         case .codeAlreadyUsed: return "This Trakt sign-in code was already used."

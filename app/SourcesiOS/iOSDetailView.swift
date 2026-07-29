@@ -206,6 +206,9 @@ struct iOSDetailView: View {
     /// to nil so the existing non-hub call sites (search / live / similar) keep compiling unchanged.
     var seedBackdrop: String? = nil
     var seedLogo: String? = nil
+    /// Navigation-carried Trakt offset. It is consumed by the first content play only.
+    var initialResumeSeconds: Double? = nil
+    var initialVideoID: String? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
@@ -364,6 +367,7 @@ struct iOSDetailView: View {
     // always presents reliably. The player-cover variant sizes its content to fill the macOS window.
     @State private var presentation: Presentation?
     @State private var preparing = false                 // movie Watch Now is resolving
+    @State private var didConsumeInitialResume = false
     @State private var downloadPicker: DownloadPickerRequest?   // pre-download quality picker payload (#30 follow-up)
     /// Owns the source-list assembly + ranking OFF the SwiftUI render path (snapshot -> merge -> rank
     /// off-main -> publish once, coalesced at ~250 ms). The body reads only its published output, so a
@@ -1769,6 +1773,12 @@ struct iOSDetailView: View {
     @ViewBuilder private var seriesHeroActions: some View {
         let primary = meta?.videos.flatMap { seriesPrimaryEpisode($0) }
         let primaryProgress = primary.map { episodeProgress($0.video) } ?? 0
+        let primaryResumeSeconds: Double? = primary.flatMap {
+            if $0.video.id == initialVideoID, let initialResumeSeconds {
+                return initialResumeSeconds
+            }
+            return $0.isResume ? primaryEpisodeResumeSeconds : nil
+        }
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             // Full-width primary episode CTA on its own line (matches the movie Play button), with the
             // resume stripe just beneath it.
@@ -1776,10 +1786,11 @@ struct iOSDetailView: View {
                 VStack(alignment: .leading, spacing: Theme.Space.xs) {
                     NavigationLink {
                         iOSEpisodeStreams(meta: m, video: primary.video, season: primary.video.season ?? 1,
-                              seasonEpisodes: sortedEpisodes(m.videos ?? []))
+                              seasonEpisodes: sortedEpisodes(m.videos ?? []),
+                              initialStartAtSeconds: primaryResumeSeconds)
                     } label: {
                         Label(primaryEpisodeLabel(primary.video, isResume: primary.isResume,
-                                                  resumeSeconds: primary.isResume ? primaryEpisodeResumeSeconds : nil),
+                                                  resumeSeconds: primaryResumeSeconds),
                               systemImage: "play.fill")
                     }
                     .buttonStyle(HeroPlayButtonStyle())
@@ -1824,6 +1835,10 @@ struct iOSDetailView: View {
     /// you were last in even after that episode is marked watched. nil when there is no resume position. Mirrors
     /// the tvOS DetailView helper; seriesPrimaryEpisode still drives the Resume/Play button unchanged.
     private func resumeSeasonHint(_ videos: [CoreVideo]) -> Int? {
+        if let initialVideoID,
+           let season = sortedEpisodes(videos).first(where: { $0.id == initialVideoID })?.season {
+            return season
+        }
         guard let m = meta else { return nil }
         let videoId: String? = profiles.activeUsesEngineHistory
             ? core.metaDetails?.libraryItem?.state.videoId
@@ -1835,6 +1850,12 @@ struct iOSDetailView: View {
     private func seriesPrimaryEpisode(_ videos: [CoreVideo]) -> (video: CoreVideo, isResume: Bool)? {
         guard let m = meta else { return nil }
         let sorted = sortedEpisodes(videos)
+        if let initialVideoID,
+           let initialResumeSeconds,
+           initialResumeSeconds > 0,
+           let video = sorted.first(where: { $0.id == initialVideoID }) {
+            return (video, true)
+        }
         let watched = watchedSet
         // Engine-history profiles read the engine library entry; overlay profiles their own entry,
         // exactly as resume / progress resolve everywhere else.
@@ -2618,8 +2639,21 @@ struct iOSDetailView: View {
     /// cannot contain `await`, so that spelling does not compile. The short-circuit is preserved either
     /// way, so `resume(pm)` is still only awaited when neither caller-supplied value applies.
     private func resolvedResumeSeconds(_ pm: PlaybackMeta, fromStart: Bool, startAt: Double?) async -> Double {
-        if let startAt { return startAt }
-        if fromStart { return 0 }
+        if let startAt {
+            didConsumeInitialResume = true
+            return startAt
+        }
+        if fromStart {
+            didConsumeInitialResume = true
+            return 0
+        }
+        if !didConsumeInitialResume,
+           let initialResumeSeconds,
+           initialResumeSeconds.isFinite,
+           initialResumeSeconds > 0 {
+            didConsumeInitialResume = true
+            return initialResumeSeconds
+        }
         return await resume(pm)
     }
 
@@ -2749,7 +2783,11 @@ struct iOSDetailView: View {
             isUsenet: stream.isUsenet, resolvedURL: ref?.url, fallbackURL: url
         ) else { return }
         presentation = .player(PlayerLaunch(url: playURL, title: pm.name, headers: stream.requestHeaders,
-                                            resume: await resume(pm), meta: pm,
+                                            resume: await resolvedResumeSeconds(
+                                                pm,
+                                                fromStart: false,
+                                                startAt: nil
+                                            ), meta: pm,
                                             qualityText: StreamRanking.signature(stream),
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             isTorrent: prime && stream.isTorrent, debridRef: ref,
@@ -3133,7 +3171,10 @@ struct iOSDetailView: View {
         if let m = meta {
             NavigationLink {
                 iOSEpisodeStreams(meta: m, video: v, season: v.season ?? season,
-                                  seasonEpisodes: sortedEpisodes(m.videos ?? []))
+                                  seasonEpisodes: sortedEpisodes(m.videos ?? []),
+                                  initialStartAtSeconds: v.id == initialVideoID
+                                      ? initialResumeSeconds
+                                      : nil)
             } label: {
                 episodeRowLabel(v, isWatched: isWatched, progress: progress)
             }
@@ -3586,6 +3627,7 @@ struct iOSEpisodeStreams: View {
     let video: CoreVideo
     let season: Int
     let seasonEpisodes: [CoreVideo]   // ALL episodes across seasons, ordered (season, episode), for in-player Next/Prev/list + auto-advance ACROSS the season boundary (so the last episode of a season rolls into the next season's first)
+    var initialStartAtSeconds: Double? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
@@ -3624,6 +3666,7 @@ struct iOSEpisodeStreams: View {
     // player cover could stop Watch from presenting. One enum-typed slot guarantees exactly one cover.
     @State private var presentation: Presentation?
     @State private var preparing = false
+    @State private var didConsumeInitialStart = false
     /// Smart Source Selection (Lane A) auto-pick: when `SourcePreferences.autoPickBest` is on, this page
     /// resolves + plays the best source on appear instead of making the viewer pick from the list. Guarded so
     /// it fires exactly once per appearance; backing out of the player reveals the full list (the escape hatch).
@@ -4291,6 +4334,14 @@ struct iOSEpisodeStreams: View {
     }
 
     private func resume(_ pm: PlaybackMeta) async -> Double {
+        if !didConsumeInitialStart,
+           pm.videoId == video.id,
+           let initialStartAtSeconds,
+           initialStartAtSeconds.isFinite,
+           initialStartAtSeconds > 0 {
+            didConsumeInitialStart = true
+            return initialStartAtSeconds
+        }
         if let engine = core.engineResumeSeconds(for: pm) { return engine }
         return await account.resumeOffset(for: pm)
     }

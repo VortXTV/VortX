@@ -914,9 +914,12 @@ struct ImportedListCatalog: Codable, Hashable, Identifiable {
     /// linger on-device into the next account that connects here, the same cross-account contamination rule
     /// `TraktSyncEngine.reset()` already enforces for the watched shadow set.
     ///
-    /// Optional on purpose: blobs written before this field existed decode to nil, which reads as "public,
-    /// never purge" and leaves every already-imported public row exactly as it was.
+    /// Optional on purpose: blobs written before this field existed decode to nil. Public rows remain
+    /// public through `requiresConnection`; a legacy private row has no session proof and is removed.
     var requiresConnection: Bool? = nil
+    /// Exact Trakt credential session that was allowed to read a private row. Legacy private rows have
+    /// no proof and are hidden and removed fail closed.
+    var connectionSessionID: TraktSessionID? = nil
 
     /// The row's cards, ready for the same poster-rail path the curated/add-on rows use.
     var previews: [MetaPreview] { items.map(\.preview) }
@@ -950,8 +953,31 @@ enum ImportedCatalogsStore {
 @MainActor
 final class ImportedCatalogs: ObservableObject {
     static let shared = ImportedCatalogs()
-    @Published private(set) var catalogs: [ImportedListCatalog] = ImportedCatalogsStore.load()
-    private init() {}
+    @Published private var storedCatalogs: [ImportedListCatalog]
+
+    var catalogs: [ImportedListCatalog] {
+        storedCatalogs.filter { catalog in
+            guard catalog.provider == .trakt,
+                  catalog.requiresConnection == true else { return true }
+            guard let sessionID = catalog.connectionSessionID else { return false }
+            return TraktAuth.storedSessionID == sessionID
+        }
+    }
+
+    private init() {
+        let currentSession = TraktAuth.storedSessionID
+        storedCatalogs = ImportedCatalogsStore.load().filter { catalog in
+            guard catalog.provider == .trakt,
+                  catalog.requiresConnection == true else { return true }
+            return catalog.connectionSessionID == currentSession && currentSession != nil
+        }
+        ImportedCatalogsStore.save(storedCatalogs)
+        TraktAuthBoundary.observe(key: "imported-catalogs") { _ in
+            Task { @MainActor in
+                ImportedCatalogs.shared.removeConnectionScoped(provider: .trakt)
+            }
+        }
+    }
 
     /// Whether a list from this exact source URL is already imported (drives the paste screen's "already
     /// added" hint and lets it offer refresh instead of a duplicate).
@@ -964,13 +990,17 @@ final class ImportedCatalogs: ObservableObject {
     @discardableResult
     func register(_ catalog: ImportedListCatalog) -> Bool {
         guard !catalog.isEmpty else { return false }
-        var next = catalogs.filter { $0.id != catalog.id && $0.sourceURL != catalog.sourceURL }
+        if catalog.provider == .trakt, catalog.requiresConnection == true {
+            guard let sessionID = catalog.connectionSessionID,
+                  TraktAuth.storedSessionID == sessionID else { return false }
+        }
+        var next = storedCatalogs.filter { $0.id != catalog.id && $0.sourceURL != catalog.sourceURL }
         next.insert(catalog, at: 0)
         persist(next)
         return true
     }
 
-    func remove(id: String) { persist(catalogs.filter { $0.id != id }) }
+    func remove(id: String) { persist(storedCatalogs.filter { $0.id != id }) }
 
     /// Drop every row from `provider` whose titles were only readable while signed in to it (a private or
     /// friends-only list). Called on disconnect. Public rows from the same provider survive: they were
@@ -978,8 +1008,8 @@ final class ImportedCatalogs: ObservableObject {
     /// row the user built for themselves. Returns the number of rows dropped (0 is the common case).
     @discardableResult
     func removeConnectionScoped(provider: ImportedListProvider) -> Int {
-        let next = catalogs.filter { !($0.provider == provider && $0.requiresConnection == true) }
-        let dropped = catalogs.count - next.count
+        let next = storedCatalogs.filter { !($0.provider == provider && $0.requiresConnection == true) }
+        let dropped = storedCatalogs.count - next.count
         if dropped > 0 { persist(next) }
         return dropped
     }
@@ -988,7 +1018,7 @@ final class ImportedCatalogs: ObservableObject {
     func rename(id: String, to title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        persist(catalogs.map { entry in
+        persist(storedCatalogs.map { entry in
             guard entry.id == id else { return entry }
             var updated = entry
             updated.title = trimmed
@@ -1000,7 +1030,7 @@ final class ImportedCatalogs: ObservableObject {
     func reorder(_ ordered: [ImportedListCatalog]) { persist(ordered) }
 
     private func persist(_ next: [ImportedListCatalog]) {
-        catalogs = next
+        storedCatalogs = next
         ImportedCatalogsStore.save(next)
     }
 }

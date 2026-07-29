@@ -17,8 +17,14 @@ final class SIMKLRailsModel: ObservableObject {
     /// Mirrors `TraktRailsModel.disconnectedNote`.
     static let disconnectedNote = Notification.Name("vortx.simkl.disconnected")
 
-    /// The plan-to-watch cards to render, resolved + capped. Empty hides the rail.
-    @Published private(set) var items: [MetaPreview] = []
+    @Published private var storedItems: [MetaPreview] = []
+    private var stateSessionID: SIMKLSessionID?
+
+    var items: [MetaPreview] {
+        guard let stateSessionID,
+              SIMKLAuth.storedSessionID == stateSessionID else { return [] }
+        return storedItems
+    }
 
     /// At most this many cards in the rail (bounds the Cinemeta poster resolves). Matches the Trakt rail.
     private static let maxItems = 30
@@ -28,29 +34,52 @@ final class SIMKLRailsModel: ObservableObject {
     private var lastRefresh: Date?
     private var loadTask: Task<Void, Never>?
 
+    init() {
+        stateSessionID = SIMKLAuth.storedSessionID
+        SIMKLAuthBoundary.observe(key: "simkl-rails-\(UUID().uuidString)") { [weak self] sessionID in
+            Task { @MainActor [weak self] in
+                self?.handleBoundary(sessionID)
+            }
+        }
+        let currentSession = SIMKLAuth.storedSessionID
+        if currentSession != stateSessionID { handleBoundary(currentSession) }
+    }
+
     /// Pull the plan-to-watch list and resolve posters, at most once per `refreshInterval`. No-op when
     /// SIMKL is unconfigured / not connected, leaving the rail hidden.
     func refresh() {
-        guard SIMKLAuth.isConfigured else { items = []; return }
-        if let last = lastRefresh, Date().timeIntervalSince(last) < Self.refreshInterval, !items.isEmpty { return }
+        guard SIMKLAuth.isConfigured,
+              let sessionID = SIMKLAuth.storedSessionID else {
+            clear()
+            stateSessionID = nil
+            return
+        }
+        if stateSessionID != sessionID { handleBoundary(sessionID) }
+        if let last = lastRefresh,
+           Date().timeIntervalSince(last) < Self.refreshInterval,
+           !storedItems.isEmpty { return }
         guard loadTask == nil else { return }
         loadTask = Task { [weak self] in
             defer { self?.loadTask = nil }
-            guard await SIMKLAuth.shared.isSignedIn else {
-                self?.items = []; return
-            }
-            let resolved = await Self.fetch()
-            guard let self, !Task.isCancelled else { return }
+            let resolved = await Self.fetch(expectedSession: sessionID)
+            guard let self, !Task.isCancelled,
+                  self.stateSessionID == sessionID,
+                  SIMKLAuth.storedSessionID == sessionID else { return }
             self.lastRefresh = Date()
             // Keep the prior rail on an empty fetch (flaky network) rather than blanking a populated rail.
-            if !resolved.isEmpty { self.items = resolved }
+            if !resolved.isEmpty { self.storedItems = resolved }
         }
     }
 
     /// Clear on sign-out / disconnect.
     func clear() {
         loadTask?.cancel(); loadTask = nil
-        items = []; lastRefresh = nil
+        storedItems = []; lastRefresh = nil
+    }
+
+    private func handleBoundary(_ sessionID: SIMKLSessionID?) {
+        clear()
+        stateSessionID = sessionID
     }
 
     /// How many list entries are considered before the tt-resolve. Larger than `maxItems` because
@@ -60,8 +89,10 @@ final class SIMKLRailsModel: ObservableObject {
 
     /// Fetch plan-to-watch, order it newest-listed-first, resolve every entry to a tt id, then resolve
     /// posters via Cinemeta in parallel. Off the main actor.
-    private static func fetch() async -> [MetaPreview] {
-        guard let entries = try? await SIMKLService.shared.planToWatch() else { return [] }
+    private static func fetch(expectedSession: SIMKLSessionID) async -> [MetaPreview] {
+        guard let entries = try? await SIMKLService.shared.planToWatch(
+            expectedSession: expectedSession
+        ) else { return [] }
 
         // Newest addition first. SIMKL returns one array PER TYPE, so the raw concatenation would read as
         // "every movie, then every show, then every anime" rather than as a list; sorting on the listed-at
@@ -131,6 +162,7 @@ final class SIMKLRailsModel: ObservableObject {
             return out
         }
         // Restore the list order (task group completes out of order).
+        guard SIMKLAuth.storedSessionID == expectedSession else { return [] }
         return resolved.sorted { $0.0 < $1.0 }.map(\.1)
     }
 }
