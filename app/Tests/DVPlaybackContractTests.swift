@@ -32,6 +32,213 @@ enum DiagnosticsLog {
     if condition { print("PASS  \(name)") } else { failures += 1; print("FAIL  \(name)") }
 }
 
+private func sourceSlice(_ source: String, from start: String, to end: String) -> String? {
+    guard let lower = source.range(of: start),
+          let upper = source.range(of: end, range: lower.upperBound..<source.endIndex) else {
+        return nil
+    }
+    return String(source[lower.lowerBound..<upper.lowerBound])
+}
+
+/// Removes formatting and comment-only lines so wiring checks are scoped to executable source. This is only the
+/// caller half of the contract: the assertions below still execute the production policy, while negative mutation
+/// controls prove that each caller rule turns red when its real assignment, guard, or receipt mutation is bypassed.
+private func compactSwift(_ source: String) -> String {
+    source.components(separatedBy: "\n").compactMap { rawLine -> String? in
+        let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.hasPrefix("//") else { return nil }
+        if let comment = rawLine.range(of: "//"),
+           !rawLine[..<comment.lowerBound].contains("\"") {
+            return String(rawLine[..<comment.lowerBound])
+        }
+        return rawLine
+    }
+    .joined()
+    .filter { !$0.isWhitespace }
+}
+
+private func replacingFirst(
+    _ source: String,
+    after anchor: String,
+    target: String,
+    with replacement: String
+) -> String? {
+    guard let anchorRange = source.range(of: anchor),
+          let targetRange = source.range(
+              of: target,
+              range: anchorRange.lowerBound..<source.endIndex) else {
+        return nil
+    }
+    var mutated = source
+    mutated.replaceSubrange(targetRange, with: replacement)
+    return mutated
+}
+
+private struct StartupWiringRule {
+    let name: String
+    let usesServer: Bool
+    let start: String
+    let end: String
+    let exactSection: String
+    let mutationTarget: String
+    let mutationReplacement: String
+
+    func passes(engine: String, server: String) -> Bool {
+        let source = usesServer ? server : engine
+        return sourceSlice(source, from: start, to: end)
+            .map { compactSwift($0) == compactSwift(exactSection) } ?? false
+    }
+}
+
+@MainActor private func checkStartupProductionWiring() {
+    let appRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let playerRoot = appRoot.appendingPathComponent("Sources/Player")
+    guard let engine = try? String(
+        contentsOf: playerRoot.appendingPathComponent("AVPlayerEngine.swift"),
+        encoding: .utf8),
+          let server = try? String(
+              contentsOf: playerRoot.appendingPathComponent("VortXRemuxHLSServer.swift"),
+              encoding: .utf8) else {
+        check("startup production wiring: governed sources are readable", false)
+        return
+    }
+
+    let rules = [
+        StartupWiringRule(
+            name: "local true-DV tester gate", usesServer: false,
+            start: "private var localRemuxStartupTesterEnabled: Bool {",
+            end: "/// Render proof for the chrome's first-frame commit.",
+            exactSection: """
+            private var localRemuxStartupTesterEnabled: Bool {
+                remuxHLSServer != nil
+                    && contentIsDolbyVision
+                    && VortXRemuxForwardBufferPolicy.buildEnablesStartupTester
+            }
+            """,
+            mutationTarget: "&& VortXRemuxForwardBufferPolicy.buildEnablesStartupTester",
+            mutationReplacement:
+                "&& false && VortXRemuxForwardBufferPolicy.buildEnablesStartupTester"),
+        StartupWiringRule(
+            name: "initial item forward-buffer assignment", usesServer: false,
+            start: "let newItem = AVPlayerItem(asset: newAsset)",
+            end: "// Attach a pull-model frame tap",
+            exactSection: """
+            let newItem = AVPlayerItem(asset: newAsset)
+            if remuxHLSServer != nil {
+                newItem.preferredForwardBufferDuration =
+                    VortXRemuxForwardBufferPolicy.preferredDuration(
+                        hasProducedFirstFrame: false,
+                        startupTesterEnabled: localRemuxStartupTesterEnabled)
+            }
+            """,
+            mutationTarget: "newItem.preferredForwardBufferDuration =",
+            mutationReplacement: "_ ="),
+        StartupWiringRule(
+            name: "first-frame steady-buffer restore", usesServer: false,
+            start: "videoFrameEverProduced = true",
+            end: "DiagnosticsLog.log(",
+            exactSection: """
+            videoFrameEverProduced = true
+            if let server = remuxHLSServer {
+                let steadyDuration = VortXRemuxForwardBufferPolicy.preferredDuration(
+                    hasProducedFirstFrame: true,
+                    startupTesterEnabled: localRemuxStartupTesterEnabled)
+                if item?.preferredForwardBufferDuration != steadyDuration {
+                    item?.preferredForwardBufferDuration = steadyDuration
+                }
+            """,
+            mutationTarget: "if item?.preferredForwardBufferDuration != steadyDuration {",
+            mutationReplacement:
+                "if false && item?.preferredForwardBufferDuration != steadyDuration {"),
+        StartupWiringRule(
+            name: "HDR replacement forward-buffer restore", usesServer: false,
+            start: "freshItem.preferredForwardBufferDuration =",
+            end: "let output = AVPlayerItemVideoOutput(",
+            exactSection: """
+            freshItem.preferredForwardBufferDuration = remuxRemoteMount == nil
+                ? VortXRemuxForwardBufferPolicy.preferredDuration(
+                    hasProducedFirstFrame: false,
+                    startupTesterEnabled: localRemuxStartupTesterEnabled)
+                : VortXEngineHostPolicy.forwardBufferSeconds(remote: true)
+            """,
+            mutationTarget: "freshItem.preferredForwardBufferDuration =",
+            mutationReplacement: "_ ="),
+        StartupWiringRule(
+            name: "memory-warning non-increasing mutation", usesServer: false,
+            start: "@objc private func handleMemoryWarningNote() {",
+            end: "DiagnosticsLog.log(",
+            exactSection: """
+            @objc private func handleMemoryWarningNote() {
+                guard let item,
+                      let replacement = VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
+                          currentDuration: item.preferredForwardBufferDuration,
+                          hasProducedFirstFrame: videoFrameEverProduced,
+                          startupTesterEnabled: localRemuxStartupTesterEnabled) else { return }
+                item.preferredForwardBufferDuration = replacement
+            """,
+            mutationTarget: "item.preferredForwardBufferDuration = replacement",
+            mutationReplacement: "item.preferredForwardBufferDuration = max(replacement, 30)"),
+        StartupWiringRule(
+            name: "cohort successor publication", usesServer: true,
+            start: "if !engineReady,\n           consumptionAnchored,",
+            end: "let ids = selectedVideo.segments.map(\\.id)",
+            exactSection: """
+            if !engineReady,
+               consumptionAnchored,
+               highestServedVideoSegmentID < 0,
+               !ended,
+               selectedVideo.segments.count > max(
+                startupReadiness.maximumUnconsumedSegmentCount,
+                startup.window.segments.count
+               ) {
+                selectedVideo = startupReadiness.unconsumedStartupWindow(
+                    selectedVideo,
+                    startupCohortCount: startup.window.segments.count
+                )
+                publishedVideoWindow = selectedVideo
+            }
+            """,
+            mutationTarget: "startupCohortCount: startup.window.segments.count",
+            mutationReplacement: "startupCohortCount: 0"),
+        StartupWiringRule(
+            name: "first media fetch release", usesServer: true,
+            start: "private func serveSegment(", end: "private static let segmentChunk",
+            exactSection: """
+            private func serveSegment(_ connection: NWConnection, index: Int, delivery: Delivery = .legacy) {
+                publicationLock.lock()
+                if index > highestServedVideoSegmentID { highestServedVideoSegmentID = index }
+                publicationLock.unlock()
+                serveSpoolResource(
+                    connection,
+                    key: .video(segmentID: index),
+                    path: "/seg\\(index).m4s",
+                    contentType: "video/mp4",
+                    delivery: delivery)
+            }
+            """,
+            mutationTarget: "highestServedVideoSegmentID = index",
+            mutationReplacement: "_ = index"),
+    ]
+
+    for rule in rules {
+        check("startup production wiring: \(rule.name)", rule.passes(engine: engine, server: server))
+        let source = rule.usesServer ? server : engine
+        let mutated = replacingFirst(
+            source,
+            after: rule.start,
+            target: rule.mutationTarget,
+            with: rule.mutationReplacement)
+        let caught = mutated.map {
+            rule.usesServer
+                ? !rule.passes(engine: engine, server: $0)
+                : !rule.passes(engine: $0, server: server)
+        } ?? false
+        check("startup production wiring mutation: \(rule.name) turns red", caught)
+    }
+}
+
 typealias Req = DVPlaybackPolicy.DisplayRequest
 final class FakeDisplayManager {}
 
@@ -490,6 +697,53 @@ check("startup readiness: the startup floor is 4000 rendered milliseconds regard
           && VortXHLSStartupReadiness(
               frozenTarget: VortXHLSTargetPolicy.conservativeTarget)?
               .minimumRenderedDurationMilliseconds == 4_000)
+check("startup forward buffer: the default-off branch preserves the field-proven thirty-second cap",
+      VortXRemuxForwardBufferPolicy.preferredDuration(
+          hasProducedFirstFrame: false,
+          startupTesterEnabled: false) == 30)
+#if VORTX_AVPLAYER_STARTUP_TESTER
+let expectedCompiledStartupTester = true
+#else
+let expectedCompiledStartupTester = false
+#endif
+check("startup forward buffer: the compile condition is the policy's single build-time authority",
+      VortXRemuxForwardBufferPolicy.buildEnablesStartupTester
+          == expectedCompiledStartupTester)
+check("startup forward buffer: the tester branch matches the four-second HLS readiness floor",
+      VortXRemuxForwardBufferPolicy.preferredDuration(
+          hasProducedFirstFrame: false,
+          startupTesterEnabled: true)
+          == Double(VortXHLSStartupReadiness.startupFloorMilliseconds) / 1_000)
+check("startup forward buffer: both branches restore thirty seconds after the first rendered frame",
+      VortXRemuxForwardBufferPolicy.preferredDuration(
+          hasProducedFirstFrame: true,
+          startupTesterEnabled: false) == 30
+          && VortXRemuxForwardBufferPolicy.preferredDuration(
+              hasProducedFirstFrame: true,
+              startupTesterEnabled: true) == 30)
+check("startup forward buffer: a memory warning never increases a positive duration",
+      VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
+          currentDuration: 4,
+          hasProducedFirstFrame: false,
+          startupTesterEnabled: true) == nil
+          && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
+              currentDuration: 4,
+              hasProducedFirstFrame: true,
+              startupTesterEnabled: true) == nil)
+check("startup forward buffer: memory pressure lowers oversized and system-selected buffers to the phase cap",
+      VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
+          currentDuration: 30,
+          hasProducedFirstFrame: false,
+          startupTesterEnabled: true) == 4
+          && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
+              currentDuration: 0,
+              hasProducedFirstFrame: false,
+              startupTesterEnabled: true) == 4
+          && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
+              currentDuration: 0,
+              hasProducedFirstFrame: false,
+              startupTesterEnabled: false) == 30)
+checkStartupProductionWiring()
 check("startup readiness: an unconsumed playlist exposes at most two startup segments",
       targetSevenReadiness?.maximumUnconsumedSegmentCount == 2
           && VortXHLSStartupReadiness(
@@ -676,11 +930,36 @@ let shortFragmentStart = VortXHLSWindow(segments: (0..<8).map {
         start: Double($0) * 1.2,
         duration: 1.2)
 })
-check("startup readiness: the unconsumed cap never truncates a four-segment readiness cohort",
+check("startup readiness: the unconsumed cap carries one produced successor beyond a four-segment cohort",
       targetSevenReadiness?.unconsumedStartupWindow(
           shortFragmentStart,
           startupCohortCount: 4
+      ).segments.map(\.id) == [0, 1, 2, 3, 4])
+let fieldStartupWindow = VortXHLSWindow(segments: [
+    VortXHLSSegment(id: 0, byteOffset: 0, byteLength: 100, start: 0, duration: 1.63),
+    VortXHLSSegment(id: 1, byteOffset: 100, byteLength: 100, start: 1.63, duration: 1.75),
+    VortXHLSSegment(id: 2, byteOffset: 200, byteLength: 100, start: 3.38, duration: 1.25),
+    VortXHLSSegment(id: 3, byteOffset: 300, byteLength: 100, start: 4.63, duration: 1.25),
+    VortXHLSSegment(id: 4, byteOffset: 400, byteLength: 100, start: 5.88, duration: 1.25),
+])
+let fieldStartupCohort = DVPlaybackPolicy.pinnedStartupCohort(
+    windows: [fieldStartupWindow],
+    ended: false,
+    minimumSegmentCount: targetSevenReadiness?.minimumSegmentCount ?? 0,
+    minimumRenderedDurationMilliseconds:
+        targetSevenReadiness?.minimumRenderedDurationMilliseconds ?? 0)
+check("startup readiness: the field-duration shape freezes the shortest three-segment cohort",
+      fieldStartupCohort?.window.segments.map(\.id) == [0, 1, 2])
+check("startup readiness: the first field-shaped body includes segment three as growth evidence",
+      targetSevenReadiness?.unconsumedStartupWindow(
+          fieldStartupWindow,
+          startupCohortCount: fieldStartupCohort?.window.segments.count ?? 0
       ).segments.map(\.id) == [0, 1, 2, 3])
+check("startup readiness: a successor that is not produced yet is never invented",
+      targetSevenReadiness?.unconsumedStartupWindow(
+          VortXHLSWindow(segments: Array(fieldStartupWindow.segments.prefix(3))),
+          startupCohortCount: 3
+      ).segments.map(\.id) == [0, 1, 2])
 check("startup readiness: invalid target bounds and segment counts are rejected without a force unwrap",
       VortXHLSStartupReadiness(
           frozenTarget: .init(seconds: 4, authority: .validatedCompleteIndex)) == nil

@@ -1125,8 +1125,10 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         }
 
         // Until AVPlayer requests its first media segment, keep the initial playlist near the independently
-        // decodable start. A delayed master can otherwise expose a long producer tail and AVPlayer may begin near
-        // that live edge despite EXT-X-START. The first segment fetch is the receipt that releases this cap.
+        // decodable start. Carry one produced successor beyond the exact master-frozen cohort so CoreMedia can
+        // observe bounded playlist growth without waiting half a target duration for its first reload. A delayed
+        // master still cannot expose the long producer tail and pull playback toward the live edge despite
+        // EXT-X-START. The first segment fetch is the receipt that releases this cap.
         if !engineReady,
            consumptionAnchored,
            highestServedVideoSegmentID < 0,

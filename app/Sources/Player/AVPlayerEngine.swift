@@ -111,6 +111,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     // anchors the sustained no-picture window (0 = not currently counting); `audioOverBlackFired` makes the
     // demote one-shot per item, alongside the fatalErrorEmitted latch it shares with the other fatal paths.
     private var videoFrameEverProduced = false
+    /// Explicit build-time A/B only. Shipping builds keep the proven 30-second value; the tester affects only
+    /// an on-device Dolby Vision remux and never a plain or remotely hosted mount.
+    private var localRemuxStartupTesterEnabled: Bool {
+        remuxHLSServer != nil
+            && contentIsDolbyVision
+            && VortXRemuxForwardBufferPolicy.buildEnablesStartupTester
+    }
     /// Render proof for the chrome's first-frame commit. AVPlayer can hold its clock at exactly zero while its
     /// layer already displays the first decoded frame, so a positive time position cannot be the sole owner of
     /// timer cancellation or episode-identity publication.
@@ -124,9 +131,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         guard hasProducedPicture(atClock: seconds) else { return false }
         videoFrameEverProduced = true
         if let server = remuxHLSServer {
+            let steadyDuration = VortXRemuxForwardBufferPolicy.preferredDuration(
+                hasProducedFirstFrame: true,
+                startupTesterEnabled: localRemuxStartupTesterEnabled)
+            if item?.preferredForwardBufferDuration != steadyDuration {
+                item?.preferredForwardBufferDuration = steadyDuration
+            }
             DiagnosticsLog.log(
                 "dv",
-                "startup phase=first-video-frame elapsedMs=\(server.startupElapsedMilliseconds)")
+                "startup phase=first-video-frame elapsedMs=\(server.startupElapsedMilliseconds) "
+                    + "forwardBufferSeconds=\(Int(VortXRemuxForwardBufferPolicy.steadyStateSeconds))")
         }
         return true
     }
@@ -538,9 +552,12 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         if remuxHLSServer != nil {
             // The remux window bounds OUR buffer, but AVPlayer keeps its OWN forward buffer of the served HLS
             // and, left unset, sizes it at its discretion (hundreds of MB at 4K DV bitrates, in the SAME
-            // jetsam-bound process as node + mpv - a major contributor to the ~900MB that gets the app killed
-            // on backgrounding). 30s is ample against a local loopback origin the producer already leads.
-            newItem.preferredForwardBufferDuration = 30
+            // jetsam-bound process as node + mpv). Shipping keeps the field-proven 30s cap. The explicit
+            // startup tester uses the four-second HLS floor, then restores 30s at the first rendered frame.
+            newItem.preferredForwardBufferDuration =
+                VortXRemuxForwardBufferPolicy.preferredDuration(
+                    hasProducedFirstFrame: false,
+                    startupTesterEnabled: localRemuxStartupTesterEnabled)
         }
         // Attach a pull-model frame tap so trickplay can grab the displayed frame on demand (see videoOutput).
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
@@ -1046,7 +1063,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             mountIdentity: playbackMountIdentity)
         item = freshItem
         freshItem.preferredForwardBufferDuration = remuxRemoteMount == nil
-            ? 30 : VortXEngineHostPolicy.forwardBufferSeconds(remote: true)
+            ? VortXRemuxForwardBufferPolicy.preferredDuration(
+                hasProducedFirstFrame: false,
+                startupTesterEnabled: localRemuxStartupTesterEnabled)
+            : VortXEngineHostPolicy.forwardBufferSeconds(remote: true)
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
         ])
@@ -2043,14 +2063,20 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     }
 
     #if canImport(UIKit)
-    /// System memory warning: cap the current item's forward buffer (default 0 = "system decides", which
-    /// on a high-bitrate stream is far too generous for a jetsam-bound app). 30s at even remux bitrates
-    /// is a modest, survivable footprint, and AVFoundation releases already-buffered media beyond the new
-    /// preference. Sticky for the rest of this item; the next loadFile mints a fresh item with defaults.
+    /// System memory warning: lower the current item's forward buffer to its phase cap (default 0 = "system
+    /// decides", which on a high-bitrate stream is far too generous for a jetsam-bound app). Never increase an
+    /// explicit smaller duration: that would undo the startup tester precisely while the system asks for relief.
+    /// Sticky for the rest of this item; the next loadFile mints a fresh item with its phase's normal value.
     @objc private func handleMemoryWarningNote() {
-        guard let item, item.preferredForwardBufferDuration != 30 else { return }
-        item.preferredForwardBufferDuration = 30
-        DiagnosticsLog.log("avplayer", "memory warning: preferredForwardBufferDuration capped to 30s")
+        guard let item,
+              let replacement = VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
+                  currentDuration: item.preferredForwardBufferDuration,
+                  hasProducedFirstFrame: videoFrameEverProduced,
+                  startupTesterEnabled: localRemuxStartupTesterEnabled) else { return }
+        item.preferredForwardBufferDuration = replacement
+        DiagnosticsLog.log(
+            "avplayer",
+            "memory warning: preferredForwardBufferDuration capped to \(Int(replacement))s")
     }
     #endif
 

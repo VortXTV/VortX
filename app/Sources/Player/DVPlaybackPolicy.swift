@@ -1219,6 +1219,45 @@ struct VortXHLSFrozenTarget: Equatable, Sendable {
     let authority: Authority
 }
 
+/// Default-off A/B policy for testing whether AVPlayer's local-remux buffer demand contributes to first-frame
+/// latency. Shipping keeps the field-proven 30-second cap. A tester build may use the same four-second floor as
+/// HLS publication until a decoded picture exists, then restores 30 seconds for sustained playback.
+enum VortXRemuxForwardBufferPolicy {
+    static let startupSeconds: TimeInterval = 4
+    static let steadyStateSeconds: TimeInterval = 30
+
+    #if VORTX_AVPLAYER_STARTUP_TESTER
+    static let buildEnablesStartupTester = true
+    #else
+    static let buildEnablesStartupTester = false
+    #endif
+
+    static func preferredDuration(
+        hasProducedFirstFrame: Bool,
+        startupTesterEnabled: Bool
+    ) -> TimeInterval {
+        startupTesterEnabled && !hasProducedFirstFrame
+            ? startupSeconds : steadyStateSeconds
+    }
+
+    /// A memory warning may replace AVPlayer's system-selected zero value or lower an oversized explicit
+    /// duration, but it must never increase an already-smaller positive buffer. This keeps the tester's
+    /// pre-frame four seconds intact while retaining the shipping 30-second cap everywhere else.
+    static func memoryWarningReplacementDuration(
+        currentDuration: TimeInterval,
+        hasProducedFirstFrame: Bool,
+        startupTesterEnabled: Bool
+    ) -> TimeInterval? {
+        let cap = preferredDuration(
+            hasProducedFirstFrame: hasProducedFirstFrame,
+            startupTesterEnabled: startupTesterEnabled)
+        guard !currentDuration.isFinite || currentDuration <= 0 || currentDuration > cap else {
+            return nil
+        }
+        return cap
+    }
+}
+
 struct VortXHLSStartupReadiness: Equatable, Sendable {
     let frozenTarget: VortXHLSFrozenTarget
     let minimumSegmentCount: Int
@@ -1239,17 +1278,19 @@ struct VortXHLSStartupReadiness: Equatable, Sendable {
     /// RFC 8216 6.3.3 does not apply to this server's fixed-offset startup.
     static let startupFloorMilliseconds = 4_000
 
-    /// Before AVPlayer has fetched any media, advertise at most two segments. This leaves one segment beyond
-    /// the minimum cohort for readiness negotiation while preventing a delayed master from making AVPlayer
-    /// choose a much later live-edge segment. The first segment fetch becomes the consumption receipt that lets
-    /// the normal rolling publication grow.
+    /// Before AVPlayer has fetched any media, advertise a base cap of two segments. The actual cap below also
+    /// carries one already-produced successor beyond the master-frozen cohort. That successor is bounded growth
+    /// evidence for CoreMedia's readiness negotiation, while the rest of a producer-ahead tail remains hidden.
+    /// The first segment fetch becomes the consumption receipt that lets normal rolling publication grow.
     var maximumUnconsumedSegmentCount: Int { max(2, minimumSegmentCount) }
 
     func unconsumedStartupWindow(
         _ window: VortXHLSWindow,
         startupCohortCount: Int
     ) -> VortXHLSWindow {
-        let maximumCount = max(maximumUnconsumedSegmentCount, startupCohortCount)
+        let cohortWithSuccessor = startupCohortCount == Int.max
+            ? Int.max : startupCohortCount + 1
+        let maximumCount = max(maximumUnconsumedSegmentCount, cohortWithSuccessor)
         guard window.segments.count > maximumCount else { return window }
         return VortXHLSWindow(
             segments: Array(window.segments.prefix(maximumCount)))
