@@ -517,6 +517,67 @@ check("settlement: an impossible global timestamp fails safely",
       !hugeWatermark.observeGlobalTimestamp(Double.greatestFiniteMagnitude)
         && !hugeWatermark.isValid)
 
+// MARK: - Per-rendition cue truth
+
+var permanentTextFailure = Policy.CueTruthState()
+permanentTextFailure.observeRejectedPacket()
+check("cue truth: one rejected packet remains recoverable before EOF",
+      permanentTextFailure.status == .waitingForEOF)
+permanentTextFailure.observeValidCue()
+check("cue truth: a later valid cue proves the track available",
+      permanentTextFailure.status == .available
+        && permanentTextFailure.validCueCount == 1
+        && permanentTextFailure.arrivedPacketCount == 2)
+permanentTextFailure.settleAtEOF()
+check("cue truth: EOF preserves a rendition that eventually produced a cue",
+      permanentTextFailure.status == .available)
+
+var ocrFailure = Policy.CueTruthState()
+ocrFailure.observeRejectedPacket()
+check("cue truth: an OCR miss remains recoverable for the whole live producer",
+      ocrFailure.status == .waitingForEOF)
+ocrFailure.settleAtEOF()
+check("cue truth: an OCR-only failure becomes unavailable only at EOF",
+      ocrFailure.status == .unavailable)
+
+var multipleFailures = Policy.CueTruthState()
+multipleFailures.observeRejectedPacket()
+multipleFailures.observeRejectedPacket()
+check("cue truth: any number of rejected packets remains provisional before EOF",
+      multipleFailures.status == .waitingForEOF)
+multipleFailures.settleAtEOF()
+check("cue truth: EOF permanently settles an all-rejected track",
+      multipleFailures.status == .unavailable)
+
+var dialogueFree = Policy.CueTruthState()
+check("cue truth: no packet during a dialogue-free interval is not a conversion failure",
+      dialogueFree.status == .waitingForPacket)
+dialogueFree.settleAtEOF()
+check("cue truth: a track proven empty at EOF makes its source row unavailable",
+      dialogueFree.status == .unavailable)
+
+var lateRecovery = Policy.CueTruthState()
+lateRecovery.observeRejectedPacket()
+lateRecovery.settleAtEOF()
+check("cue truth: an all-rejected row may publish unavailable at EOF",
+      lateRecovery.status == .unavailable)
+lateRecovery.observeValidCue()
+check("cue truth: an out-of-order valid callback recovers a published unavailable row",
+      lateRecovery.status == .available
+        && lateRecovery.validCueCount == 1
+        && lateRecovery.arrivedPacketCount == 2)
+lateRecovery.settleAtEOF()
+check("cue truth: EOF preserves a rendition that proved it can produce cues",
+      lateRecovery.status == .available)
+
+var untimedFailure = Policy.CueTruthState()
+untimedFailure.observeRejectedPacket()
+check("cue truth: an untimed rejection also waits for EOF",
+      untimedFailure.status == .waitingForEOF)
+untimedFailure.settleAtEOF()
+check("cue truth: EOF settles an otherwise untimed permanent failure",
+      untimedFailure.status == .unavailable)
+
 // MARK: - Documents
 
 let doc = Policy.webVTTDocument(cues: [

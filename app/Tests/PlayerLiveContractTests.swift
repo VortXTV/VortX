@@ -2532,6 +2532,14 @@ enum PlayerLiveContractTests {
             engine,
             from: "private func sourceSubtitleMPVTracks(item: AVPlayerItem)",
             to: "private func nativeSubtitleIndex")
+        let sourceSubtitleRefreshLoop = sourceSection(
+            engine,
+            from: "private func startRemuxSubtitleInventoryRefresh(",
+            to: "/// Propagate a local-stream or remote-status cue-truth change")
+        let sourceSubtitleRefresh = sourceSection(
+            engine,
+            from: "private func refreshRemuxSubtitleInventoryIfNeeded(",
+            to: "private func sourceSubtitleMPVTracks(item: AVPlayerItem)")
         let playerGroupedTracks = sourceSection(
             playerScreen,
             from: "private func groupedTrackRows(_ tracks: [MPVTrack]",
@@ -2587,6 +2595,10 @@ enum PlayerLiveContractTests {
         let subtitleInvalidation = sourceSection(
             stream,
             from: "private func invalidateSubtitles(",
+            to: "/// Decode one collected text packet")
+        let subtitleCueTruth = sourceSection(
+            stream,
+            from: "private func settleSubtitleCueTruthAtEOF()",
             to: "/// Decode one collected text packet")
         let subtitleCollection = sourceSection(
             stream,
@@ -2992,6 +3004,32 @@ enum PlayerLiveContractTests {
                   && subtitleInvalidation?.contains("_subtitleCues.removeAll") == true
                   && subtitleInvalidation?.contains("buffer.fail") == false
                   && subtitleInvalidation?.contains("_hlsSegments") == false)
+        check("wiring: text rejection and OCR failure both feed per-track cue truth",
+              sourceContainsInOrder(subtitleCollection, [
+                  "cause: \"ocr\"",
+                  "cause: \"parse\"",
+                  "acceptSubtitleCue(sourceIndex: inIdx)",
+              ]))
+        check("wiring: cue-truth unavailability updates only source rows and never primary A/V",
+              subtitleCueTruth?.contains(
+                  "SubtitleRenditionPolicy.cueConversionUnavailableReason") == true
+                  && subtitleCueTruth?.contains("_sourceSubtitleTracks = _sourceSubtitleTracks.map") == true
+                  && subtitleCueTruth?.contains("buffer.fail") == false
+                  && subtitleCueTruth?.contains("_hlsSegments") == false)
+        check("wiring: an out-of-order valid cue republishes recovery on the stable row",
+              sourceContainsInOrder(subtitleCueTruth, [
+                  "let recoversUnavailableRow = truth.status == .unavailable",
+                  "truth.observeValidCue()",
+                  "if recoversUnavailableRow",
+                  "publishSubtitleCueTruthRows()",
+              ]))
+        check("wiring: EOF settles no-packet and untimed subtitle truth after final media publication",
+              sourceContainsInOrder(eofPublication, [
+                  "hlsCloseSegment(",
+                  "_subtitleSettlement.finish()",
+                  "settleSubtitleCueTruthAtEOF()",
+                  "_hlsEnded = true",
+              ]))
         check("wiring: only optional subtitle renditions retain a default-on rollback key",
               stream?.contains("dvRemuxMultiAudio") == false
                   && stream?.contains("stremiox.dvRemuxMultiAudio") == false
@@ -3410,6 +3448,35 @@ enum PlayerLiveContractTests {
                       "unavailableKind: unavailableKind") == true
                   && sourceSubtitleInventory?.contains(
                       "\"Image subtitle is not available in AVPlayer\"") == false)
+        check("wiring: every convertible subtitle keeps its early source row and cue-truth state",
+              sourceSubtitleInventory?.contains(
+                  "subtitleCueTruthBySource[rendition.sourceIndex]") == true
+                  && sourceSubtitleInventory?.contains(
+                      "let sourceSubtitleTracks = subtitleMetadata.map") == true
+                  && sourceSubtitleInventory?.contains(
+                      "_sourceSubtitleTracks = sourceSubtitleTracks") == true)
+        check("wiring: AVPlayer polls remux subtitle truth on a bounded wall-clock cadence",
+              engine?.contains(
+                  "startRemuxSubtitleInventoryRefresh(for: item, loadToken: loadToken)") == true
+                  && sourceContainsInOrder(sourceSubtitleRefreshLoop, [
+                      "self.owns(item, loadToken: loadToken)",
+                      "self.refreshRemuxSubtitleInventoryIfNeeded()",
+                      "Task.sleep(for: Self.remuxSubtitleInventoryRefreshInterval)",
+                  ])
+                  && engine?.contains(
+                      "remuxSubtitleInventoryRefreshTask?.cancel()") == true)
+        check("wiring: subtitle truth refresh preserves source topology and republishes both edges",
+              sourceContainsInOrder(sourceSubtitleRefresh, [
+                  "let discovered = remuxHLSServer?.sourceSubtitleTracks",
+                  "remuxRemoteMount?.sourceSubtitleTracks ?? []",
+                  "let cachedSourceIndices = remuxSourceSubtitleTracks.map(\\.sourceIndex)",
+                  "let discoveredSourceIndices = discovered.map(\\.sourceIndex)",
+                  "cachedSourceIndices.isEmpty || cachedSourceIndices == discoveredSourceIndices",
+                  "discovered != remuxSourceSubtitleTracks",
+                  "remuxSourceSubtitleTracks = discovered",
+                  "publishSelectionTracks()",
+              ])
+                  && sourceSubtitleRefresh?.contains("unavailableReason") == false)
         check("wiring: unavailable source subtitles are never selected by nil equality",
               sourceContainsInOrder(sourceSubtitleRows, [
                   "source.renditionIndex != nil",

@@ -167,6 +167,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// Confined to the main actor (only read/written inside the observer's MainActor.assumeIsolated block).
     private var lastProbeEmit: TimeInterval = 0
     private var lastCacheEmit: TimeInterval = 0
+    /// Local stream truth can change after the initial AVMediaSelection load, while remote truth arrives through
+    /// the host's status poll. This wall-clock task keeps propagation bounded even while playback is paused.
+    private static let remuxSubtitleInventoryRefreshInterval: Duration = .milliseconds(500)
+    private var remuxSubtitleInventoryRefreshTask: Task<Void, Never>?
     private var observations: [NSKeyValueObservation] = []
     private var pipController: AVPictureInPictureController?
     private weak var playerLayer: AVPlayerLayer?
@@ -1327,6 +1331,37 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         }
     }
 
+    /// Poll independently of player-time progress so a pause cannot leave the picker on stale cue truth.
+    private func startRemuxSubtitleInventoryRefresh(
+        for item: AVPlayerItem,
+        loadToken: PlayerLoadToken
+    ) {
+        guard isRemuxMounted else { return }
+        remuxSubtitleInventoryRefreshTask?.cancel()
+        remuxSubtitleInventoryRefreshTask = Task { @MainActor [weak self, weak item] in
+            while let self, let item, !Task.isCancelled,
+                  self.owns(item, loadToken: loadToken) {
+                self.refreshRemuxSubtitleInventoryIfNeeded()
+                try? await Task.sleep(for: Self.remuxSubtitleInventoryRefreshInterval)
+            }
+        }
+    }
+
+    /// Propagate a local-stream or remote-status cue-truth change into the cached picker rows. Source indices
+    /// and order are immutable for one mount, so a status glitch cannot replace the established topology. Any
+    /// same-topology value change republishes, including unavailable -> available recovery.
+    private func refreshRemuxSubtitleInventoryIfNeeded() {
+        let discovered = remuxHLSServer?.sourceSubtitleTracks
+            ?? remuxRemoteMount?.sourceSubtitleTracks ?? []
+        guard !discovered.isEmpty else { return }
+        let cachedSourceIndices = remuxSourceSubtitleTracks.map(\.sourceIndex)
+        let discoveredSourceIndices = discovered.map(\.sourceIndex)
+        guard cachedSourceIndices.isEmpty || cachedSourceIndices == discoveredSourceIndices,
+              discovered != remuxSourceSubtitleTracks else { return }
+        remuxSourceSubtitleTracks = discovered
+        publishSelectionTracks()
+    }
+
     private func sourceSubtitleMPVTracks(item: AVPlayerItem) -> [MPVTrack] {
         let selectedRendition = subGroup.flatMap { Self.selectedIndex(in: $0, item: item) }
         return remuxSourceSubtitleTracks.map { source in
@@ -2069,6 +2104,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         NotificationCenter.default.addObserver(self, selector: #selector(mediaSelectionDidChange(_:)),
                                                name: AVPlayerItem.mediaSelectionDidChangeNotification,
                                                object: item)
+        startRemuxSubtitleInventoryRefresh(for: item, loadToken: loadToken)
         #if canImport(UIKit)
         // Jetsam relief (mirrors MPVMetalViewController.shedForMemoryPressure): a paused AVPlayer keeps
         // filling its forward buffer at its own discretion, and a 4K / DV-remux HLS stream buffers
@@ -2979,6 +3015,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     }
 
     private func teardownObservers() {
+        remuxSubtitleInventoryRefreshTask?.cancel()
+        remuxSubtitleInventoryRefreshTask = nil
         if let timeObserver { player.removeTimeObserver(timeObserver) }
         timeObserver = nil
         observations.forEach { $0.invalidate() }
@@ -2988,6 +3026,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
 
     deinit {
         // stop() is the normal teardown; this is a safety net if the engine is released without it.
+        remuxSubtitleInventoryRefreshTask?.cancel()
         if let timeObserver { player.removeTimeObserver(timeObserver) }
         observations.forEach { $0.invalidate() }
         NotificationCenter.default.removeObserver(self)   // matches teardownObservers(): drop AVPlayerItem note observers before dealloc

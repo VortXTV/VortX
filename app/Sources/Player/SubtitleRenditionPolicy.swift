@@ -543,6 +543,53 @@ enum SubtitleRenditionPolicy {
     /// stretch can still publish valid empty WebVTT segments.
     static let interleaveMarginSeconds = 2.0
 
+    /// User-facing reason used only at EOF, after the complete source proved that a convertible track produced
+    /// no valid cue. Silence and rejected packets remain provisional while the producer can still deliver a
+    /// later valid cue.
+    static let cueConversionUnavailableReason = "Subtitle conversion produced no usable cues"
+
+    enum CueTruthStatus: Equatable, Sendable {
+        /// No packet from this source track has reached the collector yet. This is normal during silent spans.
+        case waitingForPacket
+        /// One or more packets failed conversion, but the track remains recoverable until EOF.
+        case waitingForEOF
+        /// At least one packet produced a valid cue.
+        case available
+        /// EOF proved that the complete track produced no usable cue.
+        case unavailable
+    }
+
+    /// Per-source conversion truth. Global settlement still owns playlist completeness; this state answers the
+    /// separate question of whether one advertised source track has ever produced a usable cue.
+    struct CueTruthState: Equatable, Sendable {
+        private(set) var status: CueTruthStatus = .waitingForPacket
+        private(set) var arrivedPacketCount = 0
+        private(set) var validCueCount = 0
+
+        /// Record a packet whose text parser or bitmap recognizer produced no cue. A rejected packet is never
+        /// permanent evidence by itself because a later packet from the same track may still be valid.
+        mutating func observeRejectedPacket() {
+            arrivedPacketCount += 1
+            guard validCueCount == 0, status != .unavailable else { return }
+            status = .waitingForEOF
+        }
+
+        /// One real cue is sufficient proof that the rendition works. This also permits a row to recover from
+        /// a previously published unavailable state if an out-of-order producer callback arrives.
+        mutating func observeValidCue() {
+            arrivedPacketCount += 1
+            validCueCount += 1
+            status = .available
+        }
+
+        /// Only EOF is permanent negative evidence. The demux frontier proves an interval is complete, not that
+        /// a track cannot produce valid dialogue later in the title.
+        mutating func settleAtEOF() {
+            guard validCueCount == 0, status != .unavailable else { return }
+            status = .unavailable
+        }
+    }
+
     enum InvalidationReason: String, Equatable, Sendable {
         case lateTimestampRegression
         case timelineBounds
@@ -557,6 +604,8 @@ enum SubtitleRenditionPolicy {
         private(set) var isValid = true
         private(set) var invalidationReason: InvalidationReason?
         private var reachedEOF = false
+
+        var hasReachedEOF: Bool { reachedEOF }
 
         mutating func invalidate(_ reason: InvalidationReason) {
             guard isValid else { return }

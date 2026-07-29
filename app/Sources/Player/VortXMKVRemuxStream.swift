@@ -448,12 +448,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
     /// Input stream index -> rendition decoding policy. Remux-thread only and empty with the flag off.
     private var subtitleCollectors: [Int: (renditionID: Int, format: SubtitleRenditionPolicy.TextFormat)] = [:]
-    /// Per-source-stream count of subtitle packets the parser rejected. Diagnostic only.
+    /// Per-source-stream count of subtitle packets the parser or bitmap recognizer rejected. Diagnostic only.
     private var subtitleRejectedPackets: [Int: Int] = [:]
     /// Per-source-stream count of subtitle packets that REACHED the collector. Paired with the
     /// rejection count this separates "the demuxer delivered nothing" from "the parser refused
     /// everything", which static reading cannot distinguish and which decides the whole fix.
     private var subtitleArrivedPackets: [Int: Int] = [:]
+    /// Per-source evidence that distinguishes a valid silent interval from a track whose delivered packets
+    /// all failed text parsing or bitmap recognition. Remux-thread only; user-facing rows are copied under
+    /// `hlsLock` after a state transition.
+    private var subtitleCueTruthBySource: [Int: SubtitleRenditionPolicy.CueTruthState] = [:]
     /// PGS recognition switch. Defaults OFF while Vision recognition runs synchronously on the sole remux
     /// producer thread. Opting in can recover bitmap subtitles, but must never be the default at the cost of
     /// starving the primary video/audio delivery. The explicit key keeps the experimental path testable.
@@ -1254,6 +1258,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             hlsLock.unlock()
             for rendition in renditions {
                 subtitleCollectors[rendition.sourceIndex] = (rendition.id, rendition.format)
+                subtitleCueTruthBySource[rendition.sourceIndex] =
+                    SubtitleRenditionPolicy.CueTruthState()
             }
             DiagnosticsLog.log("dv", "subtitles: text-renditions-ready count=\(renditions.count)")
         }
@@ -2281,6 +2287,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 endSec: finalEnd, audioResource: finalAudioResource) else { return }
             hlsLock.lock()
             _subtitleSettlement.finish()
+            hlsLock.unlock()
+            settleSubtitleCueTruthAtEOF()
+            hlsLock.lock()
             _hlsEnded = true
             hlsLock.unlock()
         }
@@ -3885,6 +3894,89 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
     }
 
+    /// EOF is the only permanent negative proof for one source track. A settled interval may contain no
+    /// dialogue, and one rejected packet says nothing about later packets, so neither can disable a picker row.
+    private func settleSubtitleCueTruthAtEOF() {
+        hlsLock.lock()
+        let reachedEOF = _subtitleSettlement.hasReachedEOF
+        hlsLock.unlock()
+        guard reachedEOF else { return }
+
+        for sourceIndex in Array(subtitleCueTruthBySource.keys) {
+            guard var truth = subtitleCueTruthBySource[sourceIndex] else { continue }
+            truth.settleAtEOF()
+            subtitleCueTruthBySource[sourceIndex] = truth
+        }
+        publishSubtitleCueTruthRows()
+    }
+
+    /// Publish only availability fields on the existing stable source rows. Rendition cardinality and every
+    /// primary video/audio structure remain untouched; a later valid cue can clear the reason on the same row.
+    private func publishSubtitleCueTruthRows() {
+        let truthBySource = subtitleCueTruthBySource
+        var changed: [(sourceIndex: Int, status: SubtitleRenditionPolicy.CueTruthStatus)] = []
+        hlsLock.lock()
+        _sourceSubtitleTracks = _sourceSubtitleTracks.map { track in
+            guard let truth = truthBySource[track.sourceIndex] else { return track }
+            let unavailableReason = truth.status == .unavailable
+                ? SubtitleRenditionPolicy.cueConversionUnavailableReason : nil
+            guard track.unavailableReason != unavailableReason else { return track }
+            changed.append((track.sourceIndex, truth.status))
+            return VortXEngineProtocol.SubtitleTrack(
+                sourceIndex: track.sourceIndex,
+                codec: track.codec,
+                language: track.language,
+                title: track.title,
+                isForced: track.isForced,
+                delivery: track.delivery,
+                renditionIndex: track.renditionIndex,
+                unavailableReason: unavailableReason,
+                unavailableKind: track.unavailableKind)
+        }
+        hlsLock.unlock()
+
+        for change in changed {
+            let truth = truthBySource[change.sourceIndex]
+            DiagnosticsLog.log(
+                "dv",
+                "subtitle cue truth stream=\(change.sourceIndex) status=\(change.status) "
+                + "packets=\(truth?.arrivedPacketCount ?? 0) valid=\(truth?.validCueCount ?? 0)")
+        }
+    }
+
+    private func rejectSubtitlePacket(sourceIndex: Int,
+                                      format: SubtitleRenditionPolicy.TextFormat,
+                                      startSeconds: Double?,
+                                      durationSeconds: Double,
+                                      byteCount: Int,
+                                      cause: String) {
+        let priorRejects = subtitleRejectedPackets[sourceIndex] ?? 0
+        subtitleRejectedPackets[sourceIndex] = priorRejects + 1
+        if var truth = subtitleCueTruthBySource[sourceIndex] {
+            truth.observeRejectedPacket()
+            subtitleCueTruthBySource[sourceIndex] = truth
+        }
+
+        if priorRejects == 0 {
+            let start = startSeconds.map { String(format: "%.3f", $0) } ?? "unknown"
+            DiagnosticsLog.log(
+                "dv",
+                "subtitle cue REJECTED stream=\(sourceIndex) format=\(format) cause=\(cause) "
+                + "start=\(start) dur=\(String(format: "%.3f", durationSeconds)) "
+                + "bytes=\(byteCount) (first rejection on this stream)")
+        }
+    }
+
+    private func acceptSubtitleCue(sourceIndex: Int) {
+        guard var truth = subtitleCueTruthBySource[sourceIndex] else { return }
+        let recoversUnavailableRow = truth.status == .unavailable
+        truth.observeValidCue()
+        subtitleCueTruthBySource[sourceIndex] = truth
+        if recoversUnavailableRow {
+            publishSubtitleCueTruthRows()
+        }
+    }
+
     /// Decode one collected text packet after both packet and aggregate byte bounds pass. Every failure drops
     /// only the optional rendition; subtitle packets never enter the primary mux map.
     private func collectSubtitlePacket(packet: UnsafeMutablePointer<AVPacket>,
@@ -3897,7 +3989,6 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
         let packetBytes = Int(packet.pointee.size)
         let stored = subtitleBytesStored[collector.renditionID] ?? 0
-        guard let bytes = packet.pointee.data else { return true }
         guard SubtitleRenditionPolicy.canDecodePayload(byteCount: packetBytes) else {
             invalidateSubtitles(.payloadBound)
             return true
@@ -3908,13 +3999,42 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
 
         let timeBase = inputStream.pointee.time_base
-        guard timeBase.den > 0 else { return true }
+        guard timeBase.den > 0 else {
+            rejectSubtitlePacket(
+                sourceIndex: inIdx,
+                format: collector.format,
+                startSeconds: nil,
+                durationSeconds: 0,
+                byteCount: packetBytes,
+                cause: "invalid-time-base")
+            return true
+        }
         let timestamp = packet.pointee.pts != AV_NOPTS_VALUE_CONST
             ? packet.pointee.pts : packet.pointee.dts
         let start = timestamp == AV_NOPTS_VALUE_CONST
-            ? -1 : Double(timestamp) * Double(timeBase.num) / Double(timeBase.den)
+            ? nil : Double(timestamp) * Double(timeBase.num) / Double(timeBase.den)
         let duration = packet.pointee.duration > 0
             ? Double(packet.pointee.duration) * Double(timeBase.num) / Double(timeBase.den) : 0
+        guard let cueStart = start else {
+            rejectSubtitlePacket(
+                sourceIndex: inIdx,
+                format: collector.format,
+                startSeconds: nil,
+                durationSeconds: duration,
+                byteCount: packetBytes,
+                cause: "missing-timestamp")
+            return true
+        }
+        guard let bytes = packet.pointee.data else {
+            rejectSubtitlePacket(
+                sourceIndex: inIdx,
+                format: collector.format,
+                startSeconds: cueStart,
+                durationSeconds: duration,
+                byteCount: packetBytes,
+                cause: "missing-payload")
+            return true
+        }
         // A PGS packet carries pixels, not text. Recognise it first; the rest of this function then
         // treats the result exactly like any other text cue, which is what lets a recognised BluRay
         // track become an ordinary WebVTT rendition with styling and delay support.
@@ -3924,7 +4044,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                   let text = pgsOCR.recognise(packet: packet,
                                               parameters: codecpar,
                                               streamIndex: inIdx),
-                  let encoded = text.data(using: .utf8) else { return true }
+                  let encoded = text.data(using: .utf8) else {
+                rejectSubtitlePacket(
+                    sourceIndex: inIdx,
+                    format: collector.format,
+                    startSeconds: cueStart,
+                    durationSeconds: duration,
+                    byteCount: packetBytes,
+                    cause: "ocr")
+                return true
+            }
             payload = encoded
         } else {
             payload = Data(bytes: bytes, count: packetBytes)
@@ -3932,22 +4061,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         guard let cue = SubtitleRenditionPolicy.cue(
             payload: payload,
             format: collector.format,
-            startSeconds: start,
+            startSeconds: cueStart,
             durationSeconds: duration) else {
-            // A rejected payload was previously indistinguishable from "not a subtitle packet": both returned
-            // true with no record, which is how a whole session shipped 51-byte (cue-free) WebVTT documents
-            // while renditions reported healthy and nothing was invalidated. Count the rejections per source
-            // stream and report the first one with its timestamp, so the next diagnostic names the cause
-            // instead of leaving it to inference. Bounded to one log line per stream per session.
-            let priorRejects = subtitleRejectedPackets[inIdx] ?? 0
-            subtitleRejectedPackets[inIdx] = priorRejects + 1
-            if priorRejects == 0 {
-                DiagnosticsLog.log(
-                    "dv",
-                    "subtitle cue REJECTED stream=\(inIdx) format=\(collector.format) "
-                    + "start=\(String(format: "%.3f", start)) dur=\(String(format: "%.3f", duration)) "
-                    + "bytes=\(packetBytes) (first rejection on this stream)")
-            }
+            rejectSubtitlePacket(
+                sourceIndex: inIdx,
+                format: collector.format,
+                startSeconds: cueStart,
+                durationSeconds: duration,
+                byteCount: packetBytes,
+                cause: "parse")
             return true
         }
 
@@ -3975,6 +4097,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         _subtitleCues[collector.renditionID].append(cue)
         hlsLock.unlock()
         subtitleBytesStored[collector.renditionID] = stored + cueBytes
+        acceptSubtitleCue(sourceIndex: inIdx)
         return true
     }
 
