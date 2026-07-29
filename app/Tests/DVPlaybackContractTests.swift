@@ -479,7 +479,7 @@ let targetSevenReadiness = VortXHLSStartupReadiness(
     frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex))
 // The startup floor is a flat one-decodable-segment / four-second budget, decoupled from the frozen target: the
 // 6-segment / 3x-target floor (36s at the conservative target) held every UHD master past the chrome's 10s
-// start watchdog and inflated the live window into the session spool's 512 MiB ceiling - the build 189
+// start watchdog and inflated the live window into the then-smaller session spool ceiling - the build 189
 // field regression, twice over.
 check("startup readiness: one independently decodable segment and four seconds are one immutable contract",
       targetSevenReadiness == .init(
@@ -495,6 +495,159 @@ check("startup readiness: an unconsumed playlist exposes at most two startup seg
           && VortXHLSStartupReadiness(
               frozenTarget: VortXHLSTargetPolicy.conservativeTarget,
               minimumSegmentCount: 3)?.maximumUnconsumedSegmentCount == 3)
+
+let retentionMiB = 1024 * 1024
+check("consumption retention: two windows, operational reserve and safety headroom exactly fill the cap",
+      VortXHLSConsumptionWindowPolicy.ordinarySessionCapacityBytes
+          == 2 * VortXHLSConsumptionWindowPolicy.retainedWindowMaximumBytes
+              + VortXHLSConsumptionWindowPolicy.operationalReserveBytes
+              + VortXHLSConsumptionWindowPolicy.safetyHeadroomBytes
+          && VortXHLSConsumptionWindowPolicy.ordinarySessionCapacityBytes == 1024 * retentionMiB
+          && VortXHLSConsumptionWindowPolicy.retainedWindowMaximumBytes == 352 * retentionMiB
+          && VortXHLSConsumptionWindowPolicy.operationalReserveBytes == 256 * retentionMiB
+          && VortXHLSConsumptionWindowPolicy.safetyHeadroomBytes == 64 * retentionMiB)
+check("consumption retention: publication grace fits inside the producer backpressure deadline",
+      VortXHLSConsumptionWindowPolicy.keepBehindSeconds == 150
+          && VortXHLSBackpressureWaitState.stallLimitSeconds == 180
+          && VortXRemuxBuffer.stageBackpressureStallSeconds == 180)
+
+// Exact byte-length receipts from the Build 202 second mount (`vortx-diag 16.log:1383-1600`). Fixed legal
+// durations keep the independent 150-second time bound nonbinding so this fixture isolates the byte-floor proof.
+let fieldSegmentSizes = [
+    184_742, 1_047_150, 2_518_442, 2_836_990, 3_635_875, 3_146_346, 7_858_815, 15_571_013,
+    11_132_000, 8_060_199, 5_212_663, 3_992_461, 3_206_638, 3_403_501, 9_444_427, 11_712_910,
+    13_767_207, 10_340_394, 10_172_693, 11_311_393, 7_871_884, 2_528_177, 1_833_215, 415_326,
+    9_328_517, 9_084_461, 13_742_935, 11_680_604, 9_974_965, 10_356_184, 10_781_201, 11_078_838,
+    9_079_871, 9_759_553, 10_724_147, 10_480_971, 11_492_612, 11_624_650, 11_947_753, 9_125_284,
+    8_333_610, 9_099_184, 8_131_207, 13_055_562, 11_200_147, 10_545_344, 9_139_909, 10_998_145,
+    11_060_180, 11_411_404, 11_540_188, 12_052_489, 12_702_882, 11_719_529, 11_535_133,
+    11_517_230, 11_496_886, 10_924_036,
+]
+var fieldByteOffset = 0
+let fieldWindow = VortXHLSWindow(segments: fieldSegmentSizes.enumerated().map { id, byteLength in
+    defer { fieldByteOffset += byteLength }
+    return VortXHLSSegment(
+        id: id,
+        byteOffset: fieldByteOffset,
+        byteLength: byteLength,
+        start: Double(id) * 1.25,
+        duration: 1.25)
+})
+let fieldFloor = VortXHLSConsumptionWindowPolicy.floor(frontier: 57, window: fieldWindow)
+let fieldRetained = fieldWindow.segments.filter { $0.id >= fieldFloor }
+check("consumption retention: the 58-segment field shape slides before the ordinary cap",
+      fieldFloor == 22
+          && fieldRetained.count == 36
+          && fieldRetained.reduce(0) { $0 + $1.byteLength } == 368_974_152
+          && fieldWindow.segments.reduce(0) { $0 + $1.byteLength } == 517_930_072
+          && fieldWindow.segments.reduce(0) { $0 + $1.byteLength }
+              < VortXHLSConsumptionWindowPolicy.ordinarySessionCapacityBytes)
+check("consumption retention: the field-shaped slide still keeps useful rewind history",
+      fieldRetained.reduce(0.0) { $0 + $1.duration } == 45)
+
+let fieldSegmentBytes = 8 * retentionMiB
+let producedAheadWindow = VortXHLSWindow(segments: (0..<80).map {
+    VortXHLSSegment(
+        id: $0,
+        byteOffset: $0 * fieldSegmentBytes,
+        byteLength: fieldSegmentBytes,
+        start: Double($0) * 1.25,
+        duration: 1.25)
+})
+let producedAheadFloor = VortXHLSConsumptionWindowPolicy.floor(
+    frontier: 59,
+    window: producedAheadWindow)
+let producedAheadRetained = producedAheadWindow.segments.filter { $0.id >= producedAheadFloor }
+check("consumption retention: produced-ahead bytes consume the same retained-window budget",
+      producedAheadFloor == 36
+          && producedAheadRetained.count == 44
+          && producedAheadRetained.reduce(0) { $0 + $1.byteLength }
+              == VortXHLSConsumptionWindowPolicy.retainedWindowMaximumBytes)
+
+let longPlaylistWindow = VortXHLSWindow(segments: (0..<26).map {
+    VortXHLSSegment(
+        id: $0,
+        byteOffset: $0,
+        byteLength: 1,
+        start: Double($0) * 12,
+        duration: 12)
+})
+let longPlaylistFloor = VortXHLSConsumptionWindowPolicy.floor(
+    frontier: 20,
+    window: longPlaylistWindow)
+let longPlaylist = longPlaylistWindow.segments.filter { $0.id >= longPlaylistFloor }
+check("backpressure: produced-ahead media makes the legal playlist grace exceed 180 seconds",
+      longPlaylistFloor == 9
+          && longPlaylist.count == 17
+          && longPlaylist.reduce(0.0) { $0 + $1.duration } == 204)
+var longPlaylistWait = VortXHLSBackpressureWaitState(
+    now: 0,
+    progress: .init(
+        physicalBytes: 26,
+        frontierGeneration: 1,
+        latestRetentionDeadline: 216))
+check("backpressure: actual armed retention prevents failure at the static 180-second edge",
+      !longPlaylistWait.shouldFail(
+          now: 180,
+          progress: .init(
+              physicalBytes: 26,
+              frontierGeneration: 1,
+              latestRetentionDeadline: 216)))
+check("backpressure: a resource remains protected at its exact 216-second deadline",
+      !longPlaylistWait.shouldFail(
+          now: 216,
+          progress: .init(
+              physicalBytes: 26,
+              frontierGeneration: 1,
+              latestRetentionDeadline: 216)))
+var expiredLongPlaylistWait = VortXHLSBackpressureWaitState(
+    now: 0,
+    progress: .init(
+        physicalBytes: 26,
+        frontierGeneration: 1,
+        latestRetentionDeadline: 216))
+check("backpressure: no progress fails immediately after both the 180-second stall edge and legal retention deadline",
+      expiredLongPlaylistWait.shouldFail(
+          now: 216.001,
+          progress: .init(
+              physicalBytes: 26,
+              frontierGeneration: 1,
+              latestRetentionDeadline: 216)))
+check("backpressure: reclamation progress resets the monotonic stall clock",
+      !longPlaylistWait.shouldFail(
+          now: 216.001,
+          progress: .init(
+              physicalBytes: 25,
+              frontierGeneration: 1,
+              latestRetentionDeadline: nil))
+          && longPlaylistWait.stalledSince == 216.001)
+var frontierOnlyWait = VortXHLSBackpressureWaitState(
+    now: 0,
+    progress: .init(
+        physicalBytes: 26,
+        frontierGeneration: 1,
+        latestRetentionDeadline: 216))
+check("backpressure: frontier-only progress resets the stall clock with unchanged physical bytes",
+      !frontierOnlyWait.shouldFail(
+          now: 216.001,
+          progress: .init(
+              physicalBytes: 26,
+              frontierGeneration: 2,
+              latestRetentionDeadline: 216))
+          && frontierOnlyWait.stalledSince == 216.001
+          && !frontierOnlyWait.shouldFail(
+              now: 396.001,
+              progress: .init(
+                  physicalBytes: 26,
+                  frontierGeneration: 2,
+                  latestRetentionDeadline: 216))
+          && frontierOnlyWait.shouldFail(
+              now: 396.002,
+              progress: .init(
+                  physicalBytes: 26,
+                  frontierGeneration: 2,
+                  latestRetentionDeadline: 216)))
+
 let producerAheadAtStart = VortXHLSWindow(segments: (0..<8).map {
     VortXHLSSegment(
         id: $0,

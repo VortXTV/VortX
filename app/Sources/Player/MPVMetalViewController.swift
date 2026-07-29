@@ -1922,6 +1922,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func setAudioTrack(_ id: Int) {
+        guard TrackSelector.shouldApplyAudioSelection(id, to: tracks(ofType: "audio")) else { return }
         #if os(tvOS)
         armSeekCacheHold()   // an aid change triggers a demuxer refresh-seek that discards + re-reads the forward cache
         #endif

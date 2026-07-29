@@ -75,6 +75,9 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// notification can BOTH fire for one failure; a duplicate event lands after the chrome has already
     /// demoted to libmpv and used to punch through into its retry/error path (the DV "error screen").
     private var fatalErrorEmitted = false
+    /// EOF and error share one exact-item terminal edge. Unlike `fatalErrorEmitted`, this also suppresses a
+    /// later failure after EOF and resets only when `itemGeneration` advances.
+    private var terminalLatch = VortXPlaybackTerminalLatch()
     /// One-shot per mount for an explicit HDR-only recovery item. The initial DV item has exactly one video
     /// variant, so AVPlayer cannot jump into a stripped-DV representation inside the same adaptive set. An exact
     /// CoreMedia -12927 rejection on a healthy, base-layer-compatible mount gets one fresh item at
@@ -364,6 +367,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         let requestedRemuxOrigin = currentLoadResumeOrigin
         let issuedToken = loadToken ?? PlayerLoadToken()
         itemGeneration &+= 1
+        terminalLatch.reset(generation: itemGeneration)
         playbackMountIdentity &+= 1
         let issuedGeneration = itemGeneration
         audioReplacement?.bind(to: issuedGeneration)
@@ -520,6 +524,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             }
             DiagnosticsLog.log("avplayer", "\(lane) mount build failed host=\(url.host ?? "?") -> demoting to libmpv")
             VXProbe.log("dv", "\(lane) mount build failed -> endFileError demote host=\(url.host ?? "?")")
+            guard terminalLatch.claim(generation: issuedGeneration) else { return issuedToken }
             fatalErrorEmitted = true
             emit(MPVProperty.endFileError,
                  wantsPlainRemux ? "Remux unavailable" : "DV remux unavailable",
@@ -1031,6 +1036,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
 
         let freshItem = AVPlayerItem(asset: AVURLAsset(url: fallbackURL))
         itemGeneration &+= 1
+        terminalLatch.reset(generation: itemGeneration)
         if remuxRemoteMount != nil {
             remuxRemoteItemGeneration = itemGeneration
         }
@@ -1183,6 +1189,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         currentLoadResumeOrigin = 0
         remuxTimelineOrigin = 0
         itemGeneration &+= 1
+        terminalLatch.reset(generation: itemGeneration)
         pendingRemuxGeneration = nil
         #if os(tvOS)
         nativePreAttachTask?.cancel()
@@ -1439,6 +1446,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     }
 
     func setAudioTrack(_ id: Int) {
+        guard TrackSelector.shouldApplyAudioSelection(id, to: audioTracks) else { return }
         guard remuxSourceAudioTracks.contains(where: { $0.sourceIndex == id }) else {
             select(id, in: audioGroup)
             return
@@ -2051,12 +2059,14 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         guard remuxHLSServer === timedOutServer,
               activeLoadToken == loadToken,
               !isReady,
-              !fatalErrorEmitted else { return }
+              !fatalErrorEmitted,
+              !terminalLatch.hasEmitted else { return }
         if recoverAudioReplacementIfNeeded(
             generation: itemGeneration,
             reason: "local remux startup timeout") {
             return
         }
+        guard terminalLatch.claim(generation: itemGeneration) else { return }
         fatalErrorEmitted = true
         DiagnosticsLog.log(
             "dv", "HLS mount-to-ready deadline expired -> endFileError demote")
@@ -2226,7 +2236,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             // Identity guard (#76 rework): a status Task enqueued for the OLD item can deliver after the
             // healthy-mount retry swapped in a fresh item and reset fatalErrorEmitted; acting on it would
             // re-emit endFileError and insta-demote the retry. Only the CURRENT item's failure may demote.
-            guard item === self.item else { break }
+            guard item === self.item, !terminalLatch.hasEmitted else { break }
             let ns = item.error as NSError?
             let underlying = (ns?.userInfo[NSUnderlyingErrorKey] as? NSError).map { "\($0.domain)#\($0.code)" } ?? "none"
             DiagnosticsLog.log("avplayer", "item FAILED: \(ns?.localizedDescription ?? "?") domain=\(ns?.domain ?? "?") code=\(ns?.code ?? 0) underlying=\(underlying)")
@@ -2275,6 +2285,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 VXProbe.log(
                     "dv",
                     "AVPlayer item .failed -> terminal recovery: \(terminalMessage)")
+                guard self.terminalLatch.claim(generation: self.itemGeneration) else { return }
                 self.fatalErrorEmitted = true
                 self.emit(
                     MPVProperty.endFileError,
@@ -2375,6 +2386,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             )
         } else {
             guard !fatalErrorEmitted else { return }
+            guard terminalLatch.claim(generation: itemGeneration) else { return }
             fatalErrorEmitted = true
             DiagnosticsLog.log("dv", "native DV \(fourcc) sample entry is not AVPlayer-decodable and the remux lane is off -> demoting to libmpv HDR10")
             VXProbe.log("dv", "native DV \(fourcc) -> libmpv HDR10 (remux lane off)")
@@ -2438,6 +2450,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // window, and the [dv] trail is triage-critical, so the watchdog must never log a demote claim for
         // a fallback that .failed actually caused.
         guard !fatalErrorEmitted else { return }
+        guard terminalLatch.claim(generation: itemGeneration) else { return }
         fatalErrorEmitted = true
         let size = item?.presentationSize ?? .zero
         DiagnosticsLog.log("dv", "audio-over-black watchdog: \(Int(audioOverBlackWindowSeconds))s of advancing clock with ZERO video frames (presentationSize=\(Int(size.width))x\(Int(size.height)) pos=\(Int(position))s) -> endFileError demote to libmpv HDR10")
@@ -2499,11 +2512,50 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         guard let endedItem = note.object as? AVPlayerItem,
               let loadToken = activeLoadToken,
               owns(endedItem, loadToken: loadToken) else { return }
-        VXProbe.event("player", "endfile eof")
-        emit(MPVProperty.endFileEof, nil, loadToken: loadToken)
+        let remuxTerminal: (ended: Bool, failureReason: String?)?
+        if let server = remuxHLSServer {
+            remuxTerminal = (server.hasReachedEndOfStream, server.terminalFailureReason)
+        } else if let remote = remuxRemoteMount {
+            let progress = remote.mountProgress
+            remuxTerminal = (
+                progress.ended,
+                progress.failed ? VortXRemuxItemEndPolicy.producerFailedReason : nil)
+        } else if let loader = remuxLoader {
+            let progress = loader.mountProgress
+            remuxTerminal = (
+                progress.ended,
+                progress.failed ? VortXRemuxItemEndPolicy.producerFailedReason : nil)
+        } else {
+            remuxTerminal = nil
+        }
+        switch VortXRemuxItemEndPolicy.classify(
+            isRemux: remuxTerminal != nil,
+            producerEnded: remuxTerminal?.ended ?? true,
+            producerFailureReason: remuxTerminal?.failureReason
+        ) {
+        case .contentEOF:
+            guard terminalLatch.claim(generation: itemGeneration) else { return }
+            VXProbe.event("player", "endfile eof")
+            emit(MPVProperty.endFileEof, nil, loadToken: loadToken)
+        case .remuxFailure(let reason):
+            guard !fatalErrorEmitted, !terminalLatch.hasEmitted else { return }
+            if recoverAudioReplacementIfNeeded(
+                generation: itemGeneration,
+                reason: reason) {
+                return
+            }
+            guard terminalLatch.claim(generation: itemGeneration) else { return }
+            fatalErrorEmitted = true
+            DiagnosticsLog.log(
+                "dv",
+                "AVPlayer item ended without a clean remux completion -> endFileError: \(reason)")
+            VXProbe.event("player", "endfile error \(reason)")
+            emit(MPVProperty.endFileError, reason, loadToken: loadToken)
+        }
     }
     @objc private func failedToEnd(_ note: Notification) {
         guard !fatalErrorEmitted,
+              !terminalLatch.hasEmitted,
               let failedItem = note.object as? AVPlayerItem,
               let loadToken = activeLoadToken,
               owns(failedItem, loadToken: loadToken) else { return }
@@ -2519,6 +2571,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                   self.owns(failedItem, loadToken: loadToken),
                   !self.fatalErrorEmitted else { return }
             let terminalMessage = self.remuxHLSServer?.terminalFailureReason ?? message
+            guard self.terminalLatch.claim(generation: self.itemGeneration) else { return }
             self.fatalErrorEmitted = true
             VXProbe.event("player", "endfile error \(terminalMessage)")
             self.emit(
@@ -2702,6 +2755,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                             mountIdentity: selectionMountIdentity
                           ),
                           !fatalErrorEmitted else { return }
+                    guard terminalLatch.claim(generation: itemGeneration) else { return }
                     fatalErrorEmitted = true
                     DiagnosticsLog.log(
                         "avplayer",

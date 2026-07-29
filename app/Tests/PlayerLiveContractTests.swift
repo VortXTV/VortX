@@ -154,6 +154,7 @@ enum PlayerLiveContractTests {
         testMutableOpenStageContract()
         testMutableOpenStageFailuresAndCleanup()
         testPlaylistRetentionAndFileLeases()
+        testRetentionCapacityAndDeadlineAdmission()
         testSpoolResponsePump()
         testSessionLifecycleAndScavenge()
         testDisplayRequestLifecycle()
@@ -686,8 +687,8 @@ enum PlayerLiveContractTests {
                   && source.residentByteRange.lowerBound == 0)
         check("spool memory: segment spill never snapshots more than its configured bounded chunk",
               exact.accounting.peakChunkBytes <= 3)
-        check("spool production: the default session admission cap is exactly 512 MiB",
-              VortXHLSSessionSpool.defaultCapacityBytes == 512 * 1024 * 1024)
+        check("spool production: the default session admission cap is exactly 1024 MiB",
+              VortXHLSSessionSpool.defaultCapacityBytes == 1024 * 1024 * 1024)
         let legalLargeGOPBytes = 33 * 1024 * 1024
         check("spool bitrate: a GOP above the retired 32 MiB guard remains logically legal through twelve seconds",
               legalLargeGOPBytes > 32 * 1024 * 1024
@@ -2020,6 +2021,129 @@ enum PlayerLiveContractTests {
                   now: .infinity) == nil
                   && nonfinite.playlistGenerationCount(playlistID: "finite") == 1
                   && nonfinite.retentionDeadline(for: finite) == nil)
+    }
+
+    /// Scales the production C = 2W + O + H topology down to nine bytes so the real spool coordinator can
+    /// execute exact-cap admission, deadline inclusivity and post-expiry recovery without allocating 1 GiB.
+    private static func testRetentionCapacityAndDeadlineAdmission() {
+        let root = scratchDirectory("retention-capacity-deadline")
+        defer { try? FileManager.default.removeItem(at: root) }
+        guard let spool = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 9,
+            chunkSize: 1,
+            scavengeStaleSessions: false) else {
+            check("retention capacity: scaled production topology is creatable", false)
+            return
+        }
+
+        let prior = VortXHLSSessionSpool.ResourceKey.video(segmentID: 0)
+        let current = VortXHLSSessionSpool.ResourceKey.video(segmentID: 1)
+        let safety = VortXHLSSessionSpool.ResourceKey.video(segmentID: 2)
+        let over = VortXHLSSessionSpool.ResourceKey.video(segmentID: 3)
+        let oneWindow = Data(repeating: 0x11, count: 3)
+        let currentWindow = Data(repeating: 0x22, count: 3)
+
+        let windowsAdmitted = spool.spill([
+            .init(key: prior, data: oneWindow, durationMilliseconds: 1_000),
+            .init(key: current, data: currentWindow, durationMilliseconds: 1_000),
+        ])
+        let reserveAdmitted = spool.setAuxiliaryBytes(2)
+        let firstPublished = spool.recordPlaylistGeneration(
+            playlistID: "video", resourceKeys: [prior], now: 0)
+        let secondPublished = spool.recordPlaylistGeneration(
+            playlistID: "video", resourceKeys: [current], now: 10)
+        let exactCapAdmitted = spool.spill([
+            .init(key: safety, data: Data([0x33]), durationMilliseconds: 1_000),
+        ])
+        check("retention capacity: two windows plus representative overhead admit at exact hard cap",
+              windowsAdmitted
+                  && reserveAdmitted
+                  && firstPublished != nil
+                  && secondPublished != nil
+                  && spool.retentionDeadline(for: prior) == 12
+                  && exactCapAdmitted
+                  && spool.accounting.admittedBytes == 9)
+        check("retention capacity: one byte over the exact cap parks admission",
+              !spool.spill([
+                  .init(key: over, data: Data([0x44]), durationMilliseconds: 1_000),
+              ])
+                  && !spool.contains(over)
+                  && spool.accounting.admittedBytes == 9)
+
+        spool.collectExpired(now: 12)
+        check("retention deadline: the exact deadline remains protected and admission stays parked",
+              spool.contains(prior)
+                  && !spool.spill([
+                      .init(key: over, data: Data([0x44]), durationMilliseconds: 1_000),
+                  ])
+                  && spool.accounting.admittedBytes == 9)
+
+        spool.collectExpired(now: 12.001)
+        check("retention deadline: just after expiry reclaims the prior window and admission resumes",
+              !spool.contains(prior)
+                  && spool.spill([
+                      .init(key: over, data: Data([0x44]), durationMilliseconds: 1_000),
+                  ])
+                  && spool.contains(over)
+                  && spool.accounting.admittedBytes == 7)
+        withExtendedLifetime(spool) {}
+
+        guard let longPlaylistSpool = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 26,
+            chunkSize: 1,
+            scavengeStaleSessions: false) else {
+            check("backpressure clock: 26-segment counterexample is creatable", false)
+            return
+        }
+        let longResources = (0..<26).map {
+            VortXHLSSessionSpool.SpillResource(
+                key: .video(segmentID: $0),
+                data: Data([UInt8($0)]),
+                durationMilliseconds: 12_000)
+        }
+        let firstLongKeys = (9..<26).map {
+            VortXHLSSessionSpool.ResourceKey.video(segmentID: $0)
+        }
+        let secondLongKeys = (10..<26).map {
+            VortXHLSSessionSpool.ResourceKey.video(segmentID: $0)
+        }
+        let longPrior = VortXHLSSessionSpool.ResourceKey.video(segmentID: 9)
+        let longExtra = VortXHLSSessionSpool.ResourceKey.video(segmentID: 26)
+        let longFixtureReady = longPlaylistSpool.spill(longResources)
+            && longPlaylistSpool.recordPlaylistGeneration(
+                playlistID: "video", resourceKeys: firstLongKeys, now: 0) != nil
+            && longPlaylistSpool.recordPlaylistGeneration(
+                playlistID: "video", resourceKeys: secondLongKeys, now: 0) != nil
+        var longWait = VortXHLSBackpressureWaitState(
+            now: 0,
+            progress: longPlaylistSpool.backpressureProgressSnapshot)
+        check("backpressure clock: 204-second playlist plus segment arms exact 216-second protection",
+              longFixtureReady
+                  && longPlaylistSpool.retentionDeadline(for: longPrior) == 216
+                  && !longPlaylistSpool.spill([
+                      .init(key: longExtra, data: Data([0xff]), durationMilliseconds: 12_000),
+                  ])
+                  && !longWait.shouldFail(
+                      now: 180,
+                      progress: longPlaylistSpool.backpressureProgressSnapshot))
+        longPlaylistSpool.collectExpired(now: 216)
+        check("backpressure clock: exact legal expiry remains protected without timing out",
+              longPlaylistSpool.contains(longPrior)
+                  && !longWait.shouldFail(
+                      now: 216,
+                      progress: longPlaylistSpool.backpressureProgressSnapshot))
+        longPlaylistSpool.collectExpired(now: 216.001)
+        check("backpressure clock: reclamation after legal expiry resets stall and resumes admission",
+              !longPlaylistSpool.contains(longPrior)
+                  && !longWait.shouldFail(
+                      now: 216.001,
+                      progress: longPlaylistSpool.backpressureProgressSnapshot)
+                  && longPlaylistSpool.spill([
+                      .init(key: longExtra, data: Data([0xff]), durationMilliseconds: 12_000),
+                  ]))
+        withExtendedLifetime(longPlaylistSpool) {}
     }
 
     private static func testSpoolResponsePump() {

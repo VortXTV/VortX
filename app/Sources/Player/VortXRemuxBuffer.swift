@@ -36,6 +36,157 @@ struct VortXHLSWindow: Equatable, Sendable {
     }
 }
 
+/// Shared capacity and sliding-window policy for an ordinary on-device HLS remux session.
+///
+/// A published video generation can remain protected for one segment duration plus the duration of its
+/// containing playlist after a replacement is distributed. The ordinary capacity therefore plans for both the
+/// current retained video window and its unexpired predecessor, then assigns operational and safety allowances:
+///
+///     2W + O + H = C
+///
+/// O and H are a planning decomposition, not separately enforced runtime ceilings. Only aggregate physical
+/// admission at C is hard; aligned audio/subtitle resources and open-GOP state share that same aggregate cap.
+///
+/// The video byte window covers the whole published video suffix, including segments produced ahead of the
+/// client's fetch frontier. The time window applies only at and behind that frontier, where it represents useful
+/// rewind history. If the produced-ahead suffix alone exceeds W, the demonstrated frontier remains the hard
+/// lower bound: this policy never discards an unseen segment or splits a GOP. The session spool's admission
+/// ceiling then provides the physical bound and backpressures the producer.
+enum VortXHLSConsumptionWindowPolicy {
+    private static let mebibyte = 1024 * 1024
+
+    static let ordinarySessionCapacityBytes = 1024 * mebibyte
+    static let retainedWindowMaximumBytes = 352 * mebibyte
+    static let operationalReserveBytes = 256 * mebibyte
+    static let safetyHeadroomBytes = 64 * mebibyte
+    static let keepBehindSeconds: Double = 150
+
+    /// Returns the oldest absolute segment ID that may remain published without crossing the time or byte
+    /// budget. Segments ahead of `frontier` consume byte budget but not rewind-time budget.
+    static func floor(frontier: Int, window: VortXHLSWindow) -> Int {
+        guard frontier >= 0 else { return frontier }
+        var rewindSeconds = 0.0
+        var retainedBytes = 0
+        var floor = frontier
+
+        for segment in window.segments.reversed() {
+            guard segment.byteLength >= 0 else { return frontier }
+            let (nextBytes, byteOverflow) = retainedBytes.addingReportingOverflow(segment.byteLength)
+            guard !byteOverflow else { return frontier }
+
+            if segment.id > frontier {
+                retainedBytes = nextBytes
+                continue
+            }
+
+            guard segment.duration.isFinite, segment.duration >= 0 else { return frontier }
+            let nextSeconds = rewindSeconds + segment.duration
+            guard nextSeconds.isFinite else { return frontier }
+            if nextSeconds > keepBehindSeconds || nextBytes > retainedWindowMaximumBytes { break }
+            rewindSeconds = nextSeconds
+            retainedBytes = nextBytes
+            floor = segment.id
+        }
+        return min(floor, frontier)
+    }
+}
+
+/// Capacity and retention state relevant to a producer parked on the session spool.
+struct VortXHLSBackpressureProgress: Equatable, Sendable {
+    let physicalBytes: Int
+    let frontierGeneration: UInt64
+    let latestRetentionDeadline: TimeInterval?
+}
+
+/// Monotonic stall detector for spool backpressure. The 180-second value is a no-progress interval, not an
+/// absolute wait: an armed playlist receipt extends the legal edge to its actual deadline, while a reclaimed
+/// byte or a changed publication frontier restarts the stall clock.
+struct VortXHLSBackpressureWaitState: Equatable, Sendable {
+    static let stallLimitSeconds: TimeInterval = 180
+
+    private(set) var stalledSince: TimeInterval
+    private var lastObservedAt: TimeInterval
+    private var lastPhysicalBytes: Int
+    private var lastFrontierGeneration: UInt64
+
+    init(now: TimeInterval, progress: VortXHLSBackpressureProgress) {
+        stalledSince = now
+        lastObservedAt = now
+        lastPhysicalBytes = progress.physicalBytes
+        lastFrontierGeneration = progress.frontierGeneration
+    }
+
+    mutating func shouldFail(now: TimeInterval,
+                             progress: VortXHLSBackpressureProgress) -> Bool {
+        guard now.isFinite, now >= lastObservedAt else { return true }
+        if progress.physicalBytes < lastPhysicalBytes
+            || progress.frontierGeneration != lastFrontierGeneration {
+            stalledSince = now
+        }
+        lastObservedAt = now
+        lastPhysicalBytes = progress.physicalBytes
+        lastFrontierGeneration = progress.frontierGeneration
+
+        let stallDeadline = stalledSince + Self.stallLimitSeconds
+        guard stallDeadline.isFinite else { return false }
+        let retentionDeadline = progress.latestRetentionDeadline.flatMap {
+            $0.isFinite ? $0 : nil
+        }
+        return now > max(stallDeadline, retentionDeadline ?? stallDeadline)
+    }
+}
+
+/// Classifies AVPlayer's item-end notification without mistaking the current tail of a growing remux playlist
+/// for the end of the source. Kept dependency-free so the notification contract is executable in isolation.
+enum VortXRemuxItemEndPolicy {
+    enum Decision: Equatable, Sendable {
+        case contentEOF
+        case remuxFailure(String)
+    }
+
+    static let prematureEndReason = "Remux playback reached the published tail before the producer ended"
+    static let producerFailedReason = "Remux producer reported a terminal failure"
+
+    static func producerEnded(indexedHLS: Bool,
+                              indexedEnd: Bool,
+                              streamFinished: Bool,
+                              streamFailureReason: String?) -> Bool {
+        indexedHLS ? indexedEnd : (streamFinished && streamFailureReason == nil)
+    }
+
+    static func classify(isRemux: Bool,
+                         producerEnded: Bool,
+                         producerFailureReason: String?) -> Decision {
+        guard isRemux else { return .contentEOF }
+        let concrete = producerFailureReason?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let concrete, !concrete.isEmpty { return .remuxFailure(concrete) }
+        guard !producerEnded else { return .contentEOF }
+        return .remuxFailure(prematureEndReason)
+    }
+}
+
+/// One terminal chrome event per exact AVPlayer item generation. Recovery is evaluated before `claim`; a
+/// replacement calls `reset` with its newly minted generation, so stale callbacks can never consume its event.
+struct VortXPlaybackTerminalLatch: Equatable, Sendable {
+    private(set) var generation: UInt64
+    private(set) var hasEmitted = false
+
+    init(generation: UInt64 = 0) {
+        self.generation = generation
+    }
+
+    mutating func reset(generation: UInt64) {
+        self.generation = generation
+        hasEmitted = false
+    }
+
+    mutating func claim(generation: UInt64) -> Bool {
+        guard generation == self.generation, !hasEmitted else { return false }
+        hasEmitted = true
+        return true
+    }
+}
+
 /// A thread-safe, forward-only growing byte buffer for the DV-for-MKV streaming remux (Phase 1). The remux
 /// thread (`VortXMKVRemuxStream`) appends muxed fragmented-MP4 bytes as they are produced; the local HLS
 /// server (`VortXRemuxHLSServer`, the default delivery) reads closed-segment byte ranges out of it, and the
@@ -409,16 +560,16 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         condition.unlock()
     }
 
-    /// How long the stage-append producer may PARK on a full session spool before the mount is declared dead.
-    /// Retention deadlines are seconds-to-a-minute (segment + longest-playlist duration), so a healthy playing
-    /// session reclaims space well inside this bound; only a genuinely wedged spool exhausts it.
-    fileprivate static let stageBackpressureLimitSeconds: TimeInterval = 120
+    /// How long the stage-append producer may make no frontier or accounting progress after every relevant
+    /// retention deadline has passed before the mount is declared dead.
+    static let stageBackpressureStallSeconds =
+        VortXHLSBackpressureWaitState.stallLimitSeconds
 
     /// HLS-only append path. Stage admission and any filesystem write happen with the buffer condition unlocked;
     /// the producer then advances the buffer head. A memory stage materializes the bytes in RAM. An active stage
     /// is durable first and advances an already-empty resident frontier without copying those bytes into `Data`.
     ///
-    /// A FULL session spool is BACKPRESSURE, not death (build 189 field lesson): the 512 MiB ceiling is
+    /// A FULL session spool is BACKPRESSURE, not death (build 189 field lesson): the admission ceiling is
     /// admission-only and expired-retention reclamation frees space as playback advances, so a producer that
     /// out-runs the budget must PARK and retry exactly like the legacy resident-ceiling path above - failing
     /// here killed every healthy UHD DV play ~25s in ("remux failed" 404s -> AVPlayer endFileError -> HDR10
@@ -426,7 +577,7 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// retry loop with the honest first failure preserved.
     private func append(_ bytes: UnsafePointer<UInt8>, count: Int,
                         through stage: VortXHLSSessionSpool.OpenStage) {
-        let parkDeadline = Date().addingTimeInterval(Self.stageBackpressureLimitSeconds)
+        var backpressureWait: VortXHLSBackpressureWaitState?
         var forwardReceipt: VortXHLSSessionSpool.OpenStage.ForwardReceipt?
         var head = 0
         var nextHead = 0
@@ -459,11 +610,23 @@ final class VortXRemuxBuffer: @unchecked Sendable {
             // nil admission with a healthy buffer = the spool is at capacity (or a transient state race).
             // Sweep expired retention entries, park briefly, retry. A real stage death fails the buffer and
             // the guard at the top of the loop returns on the next pass.
-            if Date() >= parkDeadline {
-                fail("HLS session spool stayed full for \(Int(Self.stageBackpressureLimitSeconds))s (backpressure limit)")
+            let now = ProcessInfo.processInfo.systemUptime
+            guard let progress = stage.reclaimExpiredForBackpressure(now: now) else {
+                fail("HLS session spool lost its backpressure coordinator")
                 return
             }
-            stage.reclaimExpiredForBackpressure()
+            if var wait = backpressureWait {
+                let shouldFail = wait.shouldFail(now: now, progress: progress)
+                backpressureWait = wait
+                if shouldFail {
+                    fail("HLS session spool stayed full without reclaimable progress (backpressure stall)")
+                    return
+                }
+            } else {
+                backpressureWait = VortXHLSBackpressureWaitState(
+                    now: now,
+                    progress: progress)
+            }
             condition.lock()
             if !isFinished {
                 condition.wait(until: Date().addingTimeInterval(0.25))
@@ -971,11 +1134,11 @@ final class VortXRemuxBuffer: @unchecked Sendable {
 
 /// Session-global durable backing for closed HLS media. A process launch owns one UUID directory and each
 /// playback owns one child UUID directory, so stale prior-launch roots can be scavenged once without touching a
-/// live sibling. The 512 MiB production ceiling is admission only: protected resources are never evicted to make
+/// live sibling. The production ceiling is admission only: protected resources are never evicted to make
 /// room. Playlist deadlines and open-handle leases decide when an individual resource may be reclaimed.
 final class VortXHLSSessionSpool: @unchecked Sendable {
 
-    static let defaultCapacityBytes = 512 * 1024 * 1024
+    static let defaultCapacityBytes = VortXHLSConsumptionWindowPolicy.ordinarySessionCapacityBytes
     static let defaultChunkBytes = 512 * 1024
 
     // MARK: - Hosted full-timeline retention (external engine mode)
@@ -994,8 +1157,8 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     /// ceiling; a host is bounded by a disk, so it can simply keep everything and let the client seek back into
     /// any of it. Retention itself needs no eviction change: the spool's retention is playlist-receipt driven,
     /// so a playlist that never drops a segment never arms a deadline and nothing is ever collected. The only
-    /// thing standing in the way is this admission ceiling, which at 512 MiB is roughly 60 to 90 seconds of UHD
-    /// media, after which every append is refused and the mount dies on the 120s backpressure limit.
+    /// thing standing in the way is the ordinary admission ceiling, after which every append is refused and
+    /// the mount dies on the bounded backpressure limit.
     ///
     /// NOT `Int.max`, deliberately. `Accounting.admittedBytes` saturates to `Int.max` on overflow, so an
     /// unbounded ceiling would let `physical <= capacityBytes` pass with a meaningless total. Worse, it would
@@ -1637,8 +1800,11 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
 
         /// Backpressure recovery sweep: a producer parked on a full spool collects expired retention entries
         /// itself, so reclamation does not depend on client playlist traffic arriving while it is parked.
-        fileprivate func reclaimExpiredForBackpressure() {
-            owner?.collectExpired(now: ProcessInfo.processInfo.systemUptime)
+        fileprivate func reclaimExpiredForBackpressure(now: TimeInterval)
+            -> VortXHLSBackpressureProgress? {
+            guard let owner else { return nil }
+            owner.collectExpired(now: now)
+            return owner.backpressureProgressSnapshot
         }
 
         fileprivate func requestAbort() {
@@ -2162,6 +2328,9 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     private var closeArtifactRemovalFailuresRemaining = 0
     private var quarantinedArtifacts: Set<URL> = []
     private var auxiliaryGeneration = 0
+    /// Advances only when a successful playlist receipt changes its protected key frontier. Repeating an
+    /// identical reload is not progress and cannot keep a permanently full spool alive.
+    private var backpressureFrontierGeneration: UInt64 = 0
     private var openStageArmReceipt: OpenStageArmReceipt?
     private var fileOperationProbe: ((VortXHLSSessionSpool) -> Void)?
     private var openStageArmAccountingProbe: ((VortXHLSSessionSpool) -> Void)?
@@ -2204,7 +2373,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         }
     }
 
-    /// The ordinary session spool: a sliding window under Caches, 512 MiB, exactly as shipped.
+    /// The ordinary session spool: a sliding window under Caches with the shared on-device admission budget.
     static func makeDefault() -> VortXHLSSessionSpool? {
         guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
             return nil
@@ -2256,6 +2425,14 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     var accounting: Accounting {
         lock.lock(); defer { lock.unlock() }
         return currentAccounting
+    }
+
+    var backpressureProgressSnapshot: VortXHLSBackpressureProgress {
+        lock.lock(); defer { lock.unlock() }
+        return VortXHLSBackpressureProgress(
+            physicalBytes: currentAccounting.physicalBytes,
+            frontierGeneration: backpressureFrontierGeneration,
+            latestRetentionDeadline: entries.values.compactMap(\.retentionDeadline).max())
     }
 
     var activeLeaseCount: Int {
@@ -2739,8 +2916,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
             }
             transientBytes = combined
         }
-        let closeAdmissionDeadline = Date().addingTimeInterval(
-            VortXRemuxBuffer.stageBackpressureLimitSeconds)
+        var backpressureWait: VortXHLSBackpressureWaitState?
         admissionLoop: while true {
             switch reserveOpenClose(
                 id: reservationID,
@@ -2755,14 +2931,23 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
                 // same backpressure condition as a forward append, not a corrupt parser claim. Let client
                 // consumption expire older playlist receipts, reclaim them, and retry without publishing or
                 // discarding the claimed boundary.
-                if Date() >= closeAdmissionDeadline {
-                    buffer.fail(
-                        "HLS mutable open-stage close stayed full for "
-                            + "\(Int(VortXRemuxBuffer.stageBackpressureLimitSeconds))s "
-                            + "(backpressure limit)")
-                    return false
+                let now = ProcessInfo.processInfo.systemUptime
+                collectExpired(now: now)
+                let progress = backpressureProgressSnapshot
+                if var wait = backpressureWait {
+                    let shouldFail = wait.shouldFail(now: now, progress: progress)
+                    backpressureWait = wait
+                    if shouldFail {
+                        buffer.fail(
+                            "HLS mutable open-stage close stayed full without reclaimable progress "
+                                + "(backpressure stall)")
+                        return false
+                    }
+                } else {
+                    backpressureWait = VortXHLSBackpressureWaitState(
+                        now: now,
+                        progress: progress)
                 }
-                collectExpired(now: ProcessInfo.processInfo.systemUptime)
                 if buffer.status().finished { return false }
                 Thread.sleep(forTimeInterval: 0.25)
             case .rejected:
@@ -3382,6 +3567,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         }
         var state = playlists[playlistID] ?? PlaylistState()
         let nextKeys = Set(resourceKeys)
+        let frontierChanged = state.currentKeys != nextKeys
         let removed = state.currentKeys.subtracting(nextKeys)
         let (nextGeneration, generationOverflow) = state.generation.addingReportingOverflow(1)
         guard !generationOverflow else { return nil }
@@ -3413,6 +3599,9 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         }
         entries = updatedEntries
         playlists[playlistID] = state
+        if frontierChanged {
+            backpressureFrontierGeneration &+= 1
+        }
         let receipt = PlaylistGeneration(
             playlistID: playlistID,
             generation: state.generation,

@@ -297,7 +297,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// Lazily created: a source with no PGS track never allocates a decoder or touches Vision.
     private lazy var pgsOCR = VortXPGSSubtitleOCR()
     private var subtitleBytesStored: [Int: Int] = [:]
-    /// Non-file resident HLS state participates in the same 512 MiB admission ceiling as durable media and
+    /// Non-file resident HLS state participates in the same ordinary admission ceiling as durable media and
     /// outstanding `.part` reservations through `hlsAuxiliaryAccounting`.
     // Known source runtime, read from the demuxer at find_stream_info time. Published under hlsLock (written
     // once on the remux thread, read from the player thread). 0 means "unknown / not yet parsed". The HLS
@@ -522,18 +522,23 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let initPublished: Bool      // ftyp+moov indexed and served (false on the legacy loader delivery)
         let signalingPublished: Bool // classify finished (master-playlist signaling exists)
         let ended: Bool              // trailer written (the whole source remuxed)
-        let failed: Bool             // remux failed; the HLS 404 -> AVPlayer .failed path owns that demote
+        let failed: Bool             // remux failed; item failure or item-end classification owns that demote
     }
 
     /// Current mount progress. See `MountProgress`.
     func mountProgress() -> MountProgress {
         let snap = hlsSnapshot()
         let st = buffer.status()
+        let ended = VortXRemuxItemEndPolicy.producerEnded(
+            indexedHLS: hlsIndexingEnabled,
+            indexedEnd: snap.ended,
+            streamFinished: st.finished,
+            streamFailureReason: st.failure)
         return MountProgress(producedBytes: st.produced,
                              segmentCount: snap.segments.count,
                              initPublished: snap.initData != nil,
                              signalingPublished: snap.signaling != nil,
-                             ended: snap.ended,
+                             ended: ended,
                              failed: st.failure != nil)
     }
 

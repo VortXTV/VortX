@@ -95,40 +95,6 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private var highestServedVideoSegmentID = -1
     /// Session-captured window-advancement policy (see `consumptionAnchorEnabled`).
     private let consumptionAnchored = VortXRemuxHLSServer.consumptionAnchorEnabled
-    /// How much MEDIA TIME is retained behind the client's fetch frontier. Time, not a segment count.
-    ///
-    /// A count is the wrong unit because segment duration varies by source: the field capture on 2026-07-27
-    /// had a 21 Mbps WEB-DL at 4.00s per segment and a 97 Mbps BluRay remux at 1.17 to 1.58s. Sixteen segments
-    /// is 64 seconds on the first and 22 on the second.
-    ///
-    /// It has to exceed the BUFFER-AHEAD distance, not just cover a rewind. AVPlayer fetches far ahead of the
-    /// playhead: build 199 logged the window starting at sequence 21 while the client had fetched seg37 and
-    /// the playhead was near seg16. The playhead was therefore OUTSIDE the published window, its seekable range
-    /// started ahead of it, and every backward seek clamped to that start. That is the "rewind only goes back
-    /// one second however far I ask" report: the range had no room behind the playhead at all.
-    ///
-    /// 150s covers a typical buffer-ahead plus a real rewind on both shapes above.
-    private static let keepBehindSeconds: Double = 150
-    /// Ceiling on retained-behind bytes. The spool writes segments to DISK and refuses to evict anything a
-    /// published playlist still references, so this bounds disk rather than memory and can be generous. A
-    /// 97 Mbps remux still gets a useful window; a modest source is never truncated by it.
-    private static let keepBehindMaximumBytes = 700 * 1024 * 1024
-
-    /// The retained-behind floor for the current frontier, honouring both bounds.
-    private func consumptionFloor(frontier: Int, window: VortXHLSWindow) -> Int {
-        guard frontier >= 0 else { return frontier }
-        var seconds = 0.0
-        var bytes = 0
-        var floor = frontier
-        for segment in window.segments.reversed() where segment.id <= frontier {
-            seconds += segment.duration
-            bytes += segment.byteLength
-            if seconds > Self.keepBehindSeconds || bytes > Self.keepBehindMaximumBytes { break }
-            floor = segment.id
-        }
-        return min(floor, frontier)
-    }
-
     private var advertisedSubtitles: [SubtitleRenditionPolicy.Rendition] = []
     private var advertisedDolbyVision = false
     private var engineReady = false
@@ -146,6 +112,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// typed source or storage failure to CoreMedia's generic "URL not found" string.
     var terminalFailureReason: String? {
         stream.buffer.status().failure
+    }
+
+    /// True only after the remux producer has closed the source and published its terminal index state.
+    /// AVPlayer can emit an item-end notification at the current tail of a still-growing playlist, so callers
+    /// must use this receipt before translating that notification into content EOF.
+    var hasReachedEndOfStream: Bool {
+        stream.hlsSnapshot().ended
     }
 
     private struct Publication {
@@ -1097,7 +1070,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 // Nothing has to be taught not to evict. Spool retention is playlist-receipt driven: a deadline
                 // is armed only for a key that was in the PREVIOUS generation and is absent from this one, so a
                 // playlist that never drops an entry never arms a deadline and nothing is ever collected. The
-                // only real obstacle was the 512 MiB admission ceiling, raised for a retaining spool.
+                // only real obstacle was the ordinary admission ceiling, raised for a retaining spool.
                 //
                 // Skipping `minimumConformingSuffix` here is not an optimisation, it is a requirement. That
                 // function walks every suffix of the window and re-renders each one's duration through
@@ -1136,7 +1109,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 if consumptionAnchored {
                     let consumptionFloorID = highestServedVideoSegmentID < 0
                         ? current.mediaSequence
-                        : consumptionFloor(frontier: highestServedVideoSegmentID, window: common)
+                        : VortXHLSConsumptionWindowPolicy.floor(
+                            frontier: highestServedVideoSegmentID,
+                            window: common)
                     let newStartID = max(current.mediaSequence, min(suffixStartID, consumptionFloorID))
                     let slid = common.segments.drop { $0.id < newStartID }
                     selectedVideo = slid.isEmpty ? common : VortXHLSWindow(segments: Array(slid))
