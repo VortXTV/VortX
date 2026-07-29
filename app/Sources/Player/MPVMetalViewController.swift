@@ -2501,11 +2501,13 @@ final class MPVMetalViewController: PlatformViewController {
     /// Manual audio sync, in seconds. Maps to mpv `audio-delay`.
     func setAudioDelay(_ seconds: Double) { setString("audio-delay", String(format: "%.2f", seconds)) }
 
-    /// Current media summary for the player's metadata line: encoded video height (e.g. 2160) and the
-    /// active audio codec (e.g. "eac3"). Both can be 0/"" early in load, before the first frame.
-    func mediaSummary() -> (width: Int, height: Int, audioCodec: String) {
-        guard mpv != nil else { return (0, 0, "") }
-        return (getInt("video-params/w"), getInt("video-params/h"), getString("audio-codec-name") ?? "")
+    /// Current media summary for the player's metadata line: encoded video size and active audio codec.
+    /// The channel field stays zero on this unchanged libmpv lane; produced-channel truth is currently owned
+    /// only by the AVPlayer remux, where source and encoded output can differ.
+    func mediaSummary() -> (width: Int, height: Int, audioCodec: String, audioChannels: Int) {
+        guard mpv != nil else { return (0, 0, "", 0) }
+        return (getInt("video-params/w"), getInt("video-params/h"),
+                getString("audio-codec-name") ?? "", 0)
     }
 
     /// Persisted video-size mode, read at startup so the first frame already uses it.

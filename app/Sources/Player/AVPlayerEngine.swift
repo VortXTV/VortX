@@ -1407,7 +1407,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             let codec = source.codec.uppercased()
             let delivery: String
             if source.delivery == .transcode {
-                delivery = source.outputCodec.map { " -> \($0.uppercased())" } ?? " -> E-AC3/AAC"
+                delivery = (source.outputCodec.map { " -> \($0.uppercased())" } ?? " -> E-AC3/AAC")
+                    + (source.outputChannels.flatMap { $0 > 0 ? " \($0)ch" : nil } ?? "")
             } else {
                 delivery = ""
             }
@@ -1742,9 +1743,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// Encoded video height (so the chrome's metadata line can label "4K" / "1080p") and the active audio
     /// codec name. Height comes from the item's presentation size (its decoded frame dimensions); the codec
     /// from the selected audible option's media format. Both are best-effort and empty before the item loads.
-    func mediaSummary() -> (width: Int, height: Int, audioCodec: String) {
+    func mediaSummary() -> (width: Int, height: Int, audioCodec: String, audioChannels: Int) {
         let size = item?.presentationSize ?? .zero
-        return (Int(size.width), Int(size.height), selectedAudioCodec())
+        return (
+            width: Int(size.width),
+            height: Int(size.height),
+            audioCodec: selectedAudioCodec(),
+            audioChannels: selectedAudioChannels())
     }
 
     /// Video frame rate for the community-subtitle release fingerprint (Gap 8). The libmpv engine reads the
@@ -1793,6 +1798,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             if byte > 32 { chars.append(Character(UnicodeScalar(byte))) }
         }
         return chars.lowercased()
+    }
+
+    /// Produced primary channel count for the selected remux row. A prior host that identifies a transcode but
+    /// omits outputChannels stays unknown (0), while a fully legacy stream-copy row safely falls back to source.
+    private func selectedAudioChannels() -> Int {
+        guard let selectedRemuxAudioSourceIndex,
+              let source = remuxSourceAudioTracks.first(where: {
+                  $0.sourceIndex == selectedRemuxAudioSourceIndex
+              }) else { return 0 }
+        return source.activeChannels ?? 0
     }
 
     /// Load asset chapter markers off the main thread, then cache them and re-emit track-list so the chrome

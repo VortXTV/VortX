@@ -147,6 +147,7 @@ struct TVPlayerView: View {
     @State private var videoWidth = 0           // metadata line: encoded width (resolution is by WIDTH, so 2.40:1 4K is not mislabeled 1440p)
     @State private var videoHeight = 0          // metadata line: encoded height
     @State private var audioCodec = ""          // metadata line: active audio codec (e.g. "eac3")
+    @State private var audioChannels = 0        // metadata line: produced remux channels when known
     @State private var isHDR = false            // metadata line: HDR/DV detected (sig-peak > 1)
     @State private var resumeSeconds: Double? = nil   // nil until fetched; applied once duration known
     // Set when a resume seek was SUPPRESSED because the forward-only DV remux is mounted (maybeResume):
@@ -1533,8 +1534,9 @@ struct TVPlayerView: View {
             if let loadToken, callbackBelongsToCommittedMedia(loadToken) {
                 assetSanityTrackListToken = loadToken
             }
-            let s = coordinator.player?.mediaSummary()
-            videoWidth = s?.width ?? 0; videoHeight = s?.height ?? 0; audioCodec = s?.audioCodec ?? ""
+            let summary = coordinator.player?.mediaSummary()
+            videoWidth = summary?.width ?? 0; videoHeight = summary?.height ?? 0; audioCodec = summary?.audioCodec ?? ""
+            audioChannels = summary?.audioChannels ?? 0
             metadataLine = computeMetadataLine()
             // Gap A (#76): on AVPlayer, chapters() is [] at readyToPlay (loadChapters is async) and the engine
             // re-emits trackList once they resolve, so re-pull skip candidates + scrubber chapter marks here.
@@ -2022,8 +2024,20 @@ struct TVPlayerView: View {
         default:          break
         }
         if isHDR { parts.append("HDR") }
-        if !audioCodec.isEmpty { parts.append(audioLabel(audioCodec)) }
+        if !audioCodec.isEmpty {
+            let channelSuffix = audioChannels > 0 ? " \(audioChannels)ch" : ""
+            parts.append("\(audioLabel(audioCodec))\(channelSuffix)")
+        }
         return parts.joined(separator: "  ·  ")
+    }
+
+    /// Clear produced AVPlayer audio facts at every physical-load boundary. A following track-list event
+    /// republishes truth from the newly mounted engine; until then the chrome must show no prior engine's
+    /// codec or channel count, especially during an AVPlayer-to-libmpv demotion.
+    private func clearCachedAudioOutputTruth() {
+        audioCodec = ""
+        audioChannels = 0
+        metadataLine = computeMetadataLine()
     }
 
     private func audioLabel(_ c: String) -> String {
@@ -2879,6 +2893,7 @@ struct TVPlayerView: View {
             contentHint ?? curHint ?? sourceHint ?? ""
         )
         guard let player = coordinator.player else { return nil }
+        clearCachedAudioOutputTruth()
         let requestedResumeOrigin = live ? 0 : (
             resumeOrigin ?? avSurfaceResumeOrigin ?? (hasStartedPlaying ? currentTime : (resumeSeconds ?? 0))
         )
@@ -2974,6 +2989,7 @@ struct TVPlayerView: View {
     }
 
     private func resetRuntimeForIssuedSourceSwitch(userInitiated: Bool) {
+        clearCachedAudioOutputTruth()
         currentPickWasExplicit = userInitiated
         currentPlaybackIsResume = false
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
@@ -3737,6 +3753,7 @@ struct TVPlayerView: View {
         // + decoded multichannel PCM; true DV/Atmos for this play is over.
         DiagnosticsLog.log("dv", "AVPlayer -> libmpv demote in place (engine flip; DV/Atmos lane lost for this play)")
         coordinator.player?.stop()
+        clearCachedAudioOutputTruth()
         engineSwitchedAt = Date()   // grace window swallows a stale KVO .failed from the outgoing AV engine
         // SILENT demote. Flipping `avEngineFailed` re-renders `playerSurface` to the mpv surface on the SAME
         // view, which re-loads the SAME stream URL (initialPlayback.url) on libmpv. It does NOT increment
@@ -3826,6 +3843,7 @@ struct TVPlayerView: View {
         // before the reset below, so the new engine re-applies it instead of the preference-derived auto pick.
         pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
         coordinator.player?.stop()          // straddle invariant: old engine fully down before the surface swap
+        clearCachedAudioOutputTruth()
         avSurfaceResumeOrigin = reconcileResume
         manualEngineAVPlayer = toAVPlayer
         avEngineFailed = false              // a manual pick gets a fresh chance even after a prior demote
@@ -5359,6 +5377,7 @@ struct TVPlayerView: View {
     /// While an episode is merely resolving, every flag below still describes the outgoing file and must
     /// remain intact for its callbacks, engine routing, persistence, and subtitle publication fences.
     private func resetRuntimeForIssuedEpisode() {
+        clearCachedAudioOutputTruth()
         buffering = true; hasStartedPlaying = false; appliedResume = false
         loadFailed = false; resumeSeconds = nil
         appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false

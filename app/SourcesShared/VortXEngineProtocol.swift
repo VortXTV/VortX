@@ -201,7 +201,12 @@ enum VortXEngineProtocol {
         /// Codec actually carried by the produced primary audio stream. Nil is a legacy host that reported
         /// source identity only, so clients fall back to `codec`.
         let outputCodec: String?
+        /// Channel count stored in the source container. This remains source-inventory truth even when the
+        /// selected row is transcoded to a narrower produced layout.
         let channels: Int
+        /// Channel count carried by the produced primary audio stream. Nil means an older host did not publish
+        /// this fact; a known transcode must then remain unknown rather than borrowing the source count.
+        let outputChannels: Int?
         let language: String
         let title: String
         /// True only after the selected stream-copy output's structured `dec3` receipt proved JOC. Source
@@ -212,11 +217,13 @@ enum VortXEngineProtocol {
         let delivery: AudioDelivery?
 
         init(sourceIndex: Int, codec: String, channels: Int, language: String, title: String,
-             isAtmosJOC: Bool, delivery: AudioDelivery? = nil, outputCodec: String? = nil) {
+             isAtmosJOC: Bool, delivery: AudioDelivery? = nil, outputCodec: String? = nil,
+             outputChannels: Int? = nil) {
             self.sourceIndex = sourceIndex
             self.codec = codec
             self.outputCodec = outputCodec
             self.channels = channels
+            self.outputChannels = outputChannels
             self.language = language
             self.title = title
             self.isAtmosJOC = isAtmosJOC
@@ -226,6 +233,15 @@ enum VortXEngineProtocol {
         /// Best available truth for the audible stream. Older hosts omit `outputCodec`, where source and
         /// output were historically treated as the same value.
         var activeCodec: String { outputCodec ?? codec }
+
+        /// Best available channel truth for the audible stream. Legacy rows omitted `delivery` and represented
+        /// only stream-copyable tracks, so their source count remains a safe fallback. Once a row is explicitly
+        /// a transcode, a missing output count is unknown rather than the source layout.
+        var activeChannels: Int? {
+            if let outputChannels, outputChannels > 0 { return outputChannels }
+            guard delivery != .transcode, channels > 0 else { return nil }
+            return channels
+        }
     }
 
     enum SubtitleDelivery: String, Codable, Sendable {

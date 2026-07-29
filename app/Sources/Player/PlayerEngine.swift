@@ -110,7 +110,7 @@ protocol PlayerEngine: AnyObject {
 
     // Chapters + media info
     func chapters() -> [MPVChapter]
-    func mediaSummary() -> (width: Int, height: Int, audioCodec: String)
+    func mediaSummary() -> (width: Int, height: Int, audioCodec: String, audioChannels: Int)
     func playbackStats() -> [(String, String)]
     func playbackDiagnostics() -> PlaybackDiagnostics
 

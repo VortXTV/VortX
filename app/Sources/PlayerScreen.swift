@@ -278,6 +278,7 @@ struct PlayerScreen: View {
     @State private var videoWidth = 0           // from mediaSummary; resolution is by WIDTH (2.40:1 4K not mislabeled 1440p)
     @State private var videoHeight = 0          // from mediaSummary, for the metadata line (#20)
     @State private var audioCodec = ""
+    @State private var audioChannels = 0
     @State private var isHDR = false
     @State private var metadataLine = ""        // "4K · HDR · EAC3"-style line shown under the title
     @State private var controlsVisible = true
@@ -1646,6 +1647,7 @@ struct PlayerScreen: View {
             }
             let summary = coordinator.player?.mediaSummary()
             videoWidth = summary?.width ?? 0; videoHeight = summary?.height ?? 0; audioCodec = summary?.audioCodec ?? ""
+            audioChannels = summary?.audioChannels ?? 0
             metadataLine = computeMetadataLine()
             // Gap A (#76): on AVPlayer, chapters() is [] at readyToPlay (loadChapters is async) and the engine
             // re-emits trackList precisely once they resolve, so re-pull skip candidates + chapter marks here.
@@ -2232,6 +2234,7 @@ struct PlayerScreen: View {
             contentHint ?? curHint ?? recordQualityText ?? ""
         )
         guard let player = coordinator.player else { return nil }
+        clearCachedAudioOutputTruth()
         let requestedResumeOrigin = live ? 0 : (
             resumeOrigin ?? avSurfaceResumeOrigin ?? (hasStartedPlaying ? currentTime : resumeSeconds)
         )
@@ -2816,6 +2819,7 @@ struct PlayerScreen: View {
         // that has jetsam-hung the device). Mirrors the tvOS twin's order. stop() is idempotent with the
         // SwiftUI dismantle path.
         coordinator.player?.stop()
+        clearCachedAudioOutputTruth()
         avEngineFailed = true
         avDemotedAt = Date()
         // Demoting off a forward-only remux that started at 0 (its resume seek was dropped): the real position
@@ -2888,6 +2892,7 @@ struct PlayerScreen: View {
         // before the reset below, so the new engine re-applies it instead of the preference-derived auto pick.
         pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
         coordinator.player?.stop()          // straddle invariant: old engine fully down before the surface swap
+        clearCachedAudioOutputTruth()
         avSurfaceResumeOrigin = resume
         manualEngineAVPlayer = toAVPlayer
         avEngineFailed = false              // a manual pick gets a fresh chance even after a prior demote
@@ -3180,6 +3185,7 @@ struct PlayerScreen: View {
     }
 
     private func resetRuntimeForIssuedSourceSwitch(userInitiated: Bool, explicitPick: Bool) {
+        clearCachedAudioOutputTruth()
         deferredResumeAttempt.invalidate()
         currentPickWasExplicit = explicitPick
         currentPlaybackIsResume = false
@@ -3208,6 +3214,7 @@ struct PlayerScreen: View {
     /// earlier would let a rejected replacement duplicate its watched/auto-add/progress side effects or undo
     /// the viewer's Watch Credits choice.
     private func resetRuntimeForIssuedEpisode() {
+        clearCachedAudioOutputTruth()
         markedWatched = false
         autoAddedThisPlayback = false
         upNextSuppressed = false
@@ -3893,8 +3900,20 @@ struct PlayerScreen: View {
         default:          break
         }
         if isHDR { parts.append("HDR") }
-        if !audioCodec.isEmpty { parts.append(audioLabel(audioCodec)) }
+        if !audioCodec.isEmpty {
+            let channelSuffix = audioChannels > 0 ? " \(audioChannels)ch" : ""
+            parts.append("\(audioLabel(audioCodec))\(channelSuffix)")
+        }
         return parts.joined(separator: "  ·  ")
+    }
+
+    /// Clear produced AVPlayer audio facts at every physical-load boundary. A following track-list event
+    /// republishes truth from the newly mounted engine; until then the chrome must show no prior engine's
+    /// codec or channel count, especially during an AVPlayer-to-libmpv demotion.
+    private func clearCachedAudioOutputTruth() {
+        audioCodec = ""
+        audioChannels = 0
+        metadataLine = computeMetadataLine()
     }
 
     private func audioLabel(_ c: String) -> String {

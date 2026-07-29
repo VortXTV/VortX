@@ -404,9 +404,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         return _sourceSubtitleTracks
     }
 
-    /// Publish codec truth only for the source row that became the produced in-band primary. Inventory rows
-    /// retain their source codec; this field records the output codecpar after copy or transcoder setup.
-    private func publishSelectedAudioOutputCodec(sourceIndex: Int, outputCodecID: AVCodecID) {
+    /// Publish output truth only for the source row that became the produced in-band primary. Inventory rows
+    /// retain their source codec and channel count; the optional output fields record the codecpar after copy
+    /// or transcoder setup.
+    private func publishSelectedAudioOutputCodec(
+        sourceIndex: Int,
+        outputCodecID: AVCodecID,
+        outputChannels: Int
+    ) {
         hlsLock.lock(); defer { hlsLock.unlock() }
         guard sourceIndex == _selectedSourceAudioIndex,
               let selected = _sourceAudioTracks.firstIndex(where: {
@@ -421,7 +426,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             title: track.title,
             isAtmosJOC: track.isAtmosJOC,
             delivery: track.delivery,
-            outputCodec: Self.codecName(outputCodecID))
+            outputCodec: Self.codecName(outputCodecID),
+            outputChannels: outputChannels > 0 ? outputChannels : nil)
     }
 
     // Optional rendition state. Every field is published under hlsLock, and every feature starts empty so the
@@ -1755,7 +1761,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 let outputParameters = outStream.pointee.codecpar.pointee
                 publishSelectedAudioOutputCodec(
                     sourceIndex: i,
-                    outputCodecID: outputParameters.codec_id)
+                    outputCodecID: outputParameters.codec_id,
+                    outputChannels: Int(outputParameters.ch_layout.nb_channels))
                 let primaryLabel = (
                     languageRaw: Self.streamLanguage(inStream),
                     title: Self.streamMetadata(inStream, key: "title"),
@@ -1781,7 +1788,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             if i == mappedAudioIn {
                 publishSelectedAudioOutputCodec(
                     sourceIndex: i,
-                    outputCodecID: outStream.pointee.codecpar.pointee.codec_id)
+                    outputCodecID: outStream.pointee.codecpar.pointee.codec_id,
+                    outputChannels: Int(outStream.pointee.codecpar.pointee.ch_layout.nb_channels))
             }
             if i == baseVideoIn {
                 baseVideoOut = Int(outIndex)
@@ -2593,7 +2601,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     usesDec3: track.activeCodec.lowercased() == "eac3",
                     observation: primaryDec3),
                 delivery: track.delivery,
-                outputCodec: track.outputCodec)
+                outputCodec: track.outputCodec,
+                outputChannels: track.outputChannels)
         }
         hlsLock.unlock()
         hlsVideoTrackID = videoTrackID
