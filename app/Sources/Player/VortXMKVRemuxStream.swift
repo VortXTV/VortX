@@ -265,6 +265,26 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         return _sourceSubtitleTracks
     }
 
+    /// Publish codec truth only for the source row that became the produced in-band primary. Inventory rows
+    /// retain their source codec; this field records the output codecpar after copy or transcoder setup.
+    private func publishSelectedAudioOutputCodec(sourceIndex: Int, outputCodecID: AVCodecID) {
+        hlsLock.lock(); defer { hlsLock.unlock() }
+        guard sourceIndex == _selectedSourceAudioIndex,
+              let selected = _sourceAudioTracks.firstIndex(where: {
+                  $0.sourceIndex == sourceIndex
+              }) else { return }
+        let track = _sourceAudioTracks[selected]
+        _sourceAudioTracks[selected] = VortXEngineProtocol.AudioTrack(
+            sourceIndex: track.sourceIndex,
+            codec: track.codec,
+            channels: track.channels,
+            language: track.language,
+            title: track.title,
+            isAtmosJOC: track.isAtmosJOC,
+            delivery: track.delivery,
+            outputCodec: Self.codecName(outputCodecID))
+    }
+
     // Optional rendition state. Every field is published under hlsLock, and every feature starts empty so the
     // flag-off master/media bytes follow the exact pre-feature rendering path.
     private var _alternateAudioPlan: MultiAudioPolicy.RenditionPlan?
@@ -1525,6 +1545,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 }
                 transcoder = t
                 let outputParameters = outStream.pointee.codecpar.pointee
+                publishSelectedAudioOutputCodec(
+                    sourceIndex: i,
+                    outputCodecID: outputParameters.codec_id)
                 let primaryLabel = (
                     languageRaw: Self.streamLanguage(inStream),
                     title: Self.streamMetadata(inStream, key: "title"),
@@ -1545,6 +1568,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             let cp = avcodec_parameters_copy(outStream.pointee.codecpar, par)
             if cp < 0 { VXProbe.log("dv", "HDR10 FALLBACK: avcodec_parameters_copy rc=\(cp) (inStream=\(i))"); buffer.fail("avcodec_parameters_copy failed (\(cp))"); return }
             outStream.pointee.codecpar.pointee.codec_tag = 0
+            if i == mappedAudioIn {
+                publishSelectedAudioOutputCodec(
+                    sourceIndex: i,
+                    outputCodecID: outStream.pointee.codecpar.pointee.codec_id)
+            }
             if i == baseVideoIn {
                 baseVideoOut = Int(outIndex)
                 // A Dolby Vision config box (dvcC/dvvC) demands a sample entry whose parameter sets are
@@ -2350,9 +2378,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 // the picker, and transcoded audio can never inherit an Atmos label from its source.
                 isAtmosJOC: MultiAudioPolicy.verifiedJOC(
                     isStreamCopy: track.delivery != .transcode,
-                    usesDec3: track.codec.lowercased() == "eac3",
+                    usesDec3: track.activeCodec.lowercased() == "eac3",
                     observation: primaryDec3),
-                delivery: track.delivery)
+                delivery: track.delivery,
+                outputCodec: track.outputCodec)
         }
         hlsLock.unlock()
         hlsVideoTrackID = videoTrackID

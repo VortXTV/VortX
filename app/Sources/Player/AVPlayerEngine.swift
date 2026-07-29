@@ -1405,7 +1405,12 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         return remuxSourceAudioTracks.map { source in
             let cleanTitle = source.title.trimmingCharacters(in: .whitespacesAndNewlines)
             let codec = source.codec.uppercased()
-            let delivery = source.delivery == .transcode ? " -> E-AC3/AAC" : ""
+            let delivery: String
+            if source.delivery == .transcode {
+                delivery = source.outputCodec.map { " -> \($0.uppercased())" } ?? " -> E-AC3/AAC"
+            } else {
+                delivery = ""
+            }
             let shape = "\(codec) \(source.channels)ch\(source.isAtmosJOC ? " Atmos" : "")\(delivery)"
             let identity = "\(source.language.lowercased())|\(source.title.lowercased())|\(source.codec.lowercased())|\(source.channels)"
             let stableSuffix = identityCounts[identity, default: 0] > 1
@@ -1775,7 +1780,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
            let source = remuxSourceAudioTracks.first(where: {
                $0.sourceIndex == selectedRemuxAudioSourceIndex
            }) {
-            return source.codec.lowercased()
+            return source.activeCodec.lowercased()
         }
         guard let item = player.currentItem, let group = audioGroup,
               let option = item.currentMediaSelection.selectedMediaOption(in: group),

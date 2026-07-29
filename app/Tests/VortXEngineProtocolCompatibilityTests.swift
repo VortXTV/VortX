@@ -92,8 +92,12 @@ enum VortXEngineProtocolCompatibilityTests {
             videoRange: "PQ",
             supportsHDRFallback: true,
             audioTracks: [
-                .init(sourceIndex: 4, codec: "eac3", channels: 6,
-                      language: "eng", title: "Main", isAtmosJOC: true)
+                .init(sourceIndex: 4, codec: "truehd", channels: 8,
+                      language: "eng", title: "Main", isAtmosJOC: false,
+                      delivery: .transcode, outputCodec: "eac3"),
+                .init(sourceIndex: 5, codec: "ac3", channels: 6,
+                      language: "eng", title: "Compatibility", isAtmosJOC: false,
+                      delivery: .streamCopy, outputCodec: "ac3")
             ],
             selectedAudioStreamIndex: 4,
             subtitleTracks: [
@@ -110,12 +114,19 @@ enum VortXEngineProtocolCompatibilityTests {
             VortXEngineProtocol.SessionStatus.self,
             from: JSONEncoder().encode(current))
         precondition(roundTrip == current)
+        precondition(roundTrip.audioTracks?[0].codec == "truehd")
+        precondition(roundTrip.audioTracks?[0].activeCodec == "eac3")
+        precondition(roundTrip.audioTracks?[1].codec == "ac3")
+        precondition(roundTrip.audioTracks?[1].activeCodec == "ac3")
 
         var legacyStatusObject = try JSONSerialization.jsonObject(
             with: JSONEncoder().encode(current)) as! [String: Any]
         legacyStatusObject.removeValue(forKey: "subtitleTracks")
         if var audio = legacyStatusObject["audioTracks"] as? [[String: Any]] {
-            for index in audio.indices { audio[index].removeValue(forKey: "delivery") }
+            for index in audio.indices {
+                audio[index].removeValue(forKey: "delivery")
+                audio[index].removeValue(forKey: "outputCodec")
+            }
             legacyStatusObject["audioTracks"] = audio
         }
         let decodedLegacyStatus = try JSONDecoder().decode(
@@ -123,6 +134,8 @@ enum VortXEngineProtocolCompatibilityTests {
             from: JSONSerialization.data(withJSONObject: legacyStatusObject))
         precondition(decodedLegacyStatus.subtitleTracks == nil)
         precondition(decodedLegacyStatus.audioTracks?.first?.delivery == nil)
+        precondition(decodedLegacyStatus.audioTracks?.first?.outputCodec == nil)
+        precondition(decodedLegacyStatus.audioTracks?.first?.activeCodec == "truehd")
 
         print("VortXEngineProtocolCompatibilityTests: ALL PASS")
     }

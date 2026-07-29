@@ -2377,6 +2377,18 @@ enum PlayerLiveContractTests {
             stream,
             from: "if transcodeActive, i == transcodeAudioIn {",
             to: "let cp = avcodec_parameters_copy(outStream.pointee.codecpar, par)")
+        let selectedOutputCodecPublication = sourceSection(
+            stream,
+            from: "private func publishSelectedAudioOutputCodec(",
+            to: "// Optional rendition state.")
+        let streamCopyOutputCodecPublication = sourceSection(
+            stream,
+            from: "let cp = avcodec_parameters_copy(outStream.pointee.codecpar, par)",
+            to: "if i == baseVideoIn {")
+        let jocAudioReconstruction = sourceSection(
+            stream,
+            from: "if let selectedSourceAudioIndex = _selectedSourceAudioIndex,",
+            to: "hlsLock.unlock()")
         let policy = try? String(contentsOf: playerURL.appendingPathComponent("DVPlaybackPolicy.swift"),
                                  encoding: .utf8)
         let remuxBuffer = try? String(
@@ -2458,6 +2470,10 @@ enum PlayerLiveContractTests {
             engine,
             from: "private func capturePlaybackIntent(",
             to: "private func sourceAudioMPVTracks()")
+        let sourceAudioRows = sourceSection(
+            engine,
+            from: "private func sourceAudioMPVTracks()",
+            to: "private func mountCurrentAudioReplacement(reason:")
         let externalEngineLoss = sourceSection(
             engine,
             from: "private func handleExternalEngineLost(",
@@ -2475,6 +2491,10 @@ enum PlayerLiveContractTests {
             engine,
             from: "private func mountCurrentAudioReplacement(reason:",
             to: "/// Selecting an embedded/HLS legible track")
+        let selectedAudioCodec = sourceSection(
+            engine,
+            from: "private func selectedAudioCodec()",
+            to: "/// Load asset chapter markers")
         let externalSubtitleRow = sourceSection(
             engine, from: "private func externalSubtitleTracks()", to: "func setAudioTrack(")
         let externalSubtitleSelection = sourceSection(
@@ -3327,6 +3347,8 @@ enum PlayerLiveContractTests {
               sourceContainsInOrder(transcodePrimaryPublication, [
                   "transcoder = t",
                   "let outputParameters = outStream.pointee.codecpar.pointee",
+                  "publishSelectedAudioOutputCodec(",
+                  "outputCodecID: outputParameters.codec_id",
                   "languageRaw: Self.streamLanguage(inStream)",
                   "channels: Int(outputParameters.ch_layout.nb_channels)",
                   "usesDec3: outputParameters.codec_id == AV_CODEC_ID_EAC3",
@@ -3335,6 +3357,38 @@ enum PlayerLiveContractTests {
                   "audio transcode armed:",
               ])
                   && transcodePrimaryPublication?.contains("isAtmosJOC") == false)
+        check("wiring: selected produced audio records output codecpar without rewriting source identity",
+              sourceContainsInOrder(selectedOutputCodecPublication, [
+                  "sourceIndex == _selectedSourceAudioIndex",
+                  "let track = _sourceAudioTracks[selected]",
+                  "codec: track.codec",
+                  "outputCodec: Self.codecName(outputCodecID)",
+              ])
+                  && sourceContainsInOrder(streamCopyOutputCodecPublication, [
+                      "outStream.pointee.codecpar.pointee.codec_tag = 0",
+                      "if i == mappedAudioIn",
+                      "publishSelectedAudioOutputCodec(",
+                      "outputCodecID: outStream.pointee.codecpar.pointee.codec_id",
+                  ]))
+        check("wiring: JOC receipt reconstruction preserves selected output codec truth",
+              sourceContainsInOrder(jocAudioReconstruction, [
+                  "let track = _sourceAudioTracks[selected]",
+                  "usesDec3: track.activeCodec.lowercased() == \"eac3\"",
+                  "delivery: track.delivery",
+                  "outputCodec: track.outputCodec",
+              ]))
+        check("wiring: active AVPlayer metadata prefers produced codec with legacy fallback",
+              sourceContainsInOrder(selectedAudioCodec, [
+                  "let source = remuxSourceAudioTracks.first",
+                  "return source.activeCodec.lowercased()",
+              ]))
+        check("wiring: selected transcode row shows proven output while source remains the left identity",
+              sourceContainsInOrder(sourceAudioRows, [
+                  "let codec = source.codec.uppercased()",
+                  "if source.delivery == .transcode",
+                  "source.outputCodec.map { \" -> \\($0.uppercased())\" } ?? \" -> E-AC3/AAC\"",
+                  "let shape = \"\\(codec) \\(source.channels)ch",
+              ]))
         check("wiring: unavailable source subtitles are never selected by nil equality",
               sourceContainsInOrder(sourceSubtitleRows, [
                   "source.renditionIndex != nil",

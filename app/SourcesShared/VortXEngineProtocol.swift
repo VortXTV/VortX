@@ -195,7 +195,12 @@ enum VortXEngineProtocol {
     /// deliverable source track visible without multiplying live muxers and buffers.
     struct AudioTrack: Codable, Sendable, Equatable {
         let sourceIndex: Int
+        /// Codec stored in the source container. This remains the picker identity even when the selected row
+        /// is decoded and encoded to a different AVPlayer-compatible codec.
         let codec: String
+        /// Codec actually carried by the produced primary audio stream. Nil is a legacy host that reported
+        /// source identity only, so clients fall back to `codec`.
+        let outputCodec: String?
         let channels: Int
         let language: String
         let title: String
@@ -207,15 +212,20 @@ enum VortXEngineProtocol {
         let delivery: AudioDelivery?
 
         init(sourceIndex: Int, codec: String, channels: Int, language: String, title: String,
-             isAtmosJOC: Bool, delivery: AudioDelivery? = nil) {
+             isAtmosJOC: Bool, delivery: AudioDelivery? = nil, outputCodec: String? = nil) {
             self.sourceIndex = sourceIndex
             self.codec = codec
+            self.outputCodec = outputCodec
             self.channels = channels
             self.language = language
             self.title = title
             self.isAtmosJOC = isAtmosJOC
             self.delivery = delivery
         }
+
+        /// Best available truth for the audible stream. Older hosts omit `outputCodec`, where source and
+        /// output were historically treated as the same value.
+        var activeCodec: String { outputCodec ?? codec }
     }
 
     enum SubtitleDelivery: String, Codable, Sendable {
