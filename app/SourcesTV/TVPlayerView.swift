@@ -6521,16 +6521,11 @@ struct TVPlayerView: View {
         // - and the viewer's real progress is wiped (the "scrubbed fast, exited, progress and episode
         // selection gone" report). Landing 5s short shows the actual ending and lets natural playback
         // reach EOF with all the finished semantics intact; a short clip keeps the plain full-range clamp.
-        var scrubCeiling = duration > 30 ? duration - 5 : duration
-        // P2 (#76): the AUTHORITATIVE forward-only remux clamp now lives at the engine chokepoint
-        // (AVPlayerEngineController.seek(to:) caps every seek at producedEdgeSeconds), so a commit past the
-        // produced bytes can no longer strand the mount. This per-surface cap is kept ONLY to keep the visible
-        // scrub PREVIEW (the thumbnail + scrubTarget) from overshooting the buffered band; the actual seek is
-        // clamped by the engine regardless. bufferedTime is the player-buffered (loadedTimeRanges) edge, a
-        // conservative stand-in for the produced edge. Backward scrubs / non-remux sessions are unaffected.
-        if (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true, bufferedTime > currentTime {
-            scrubCeiling = min(scrubCeiling, bufferedTime)
-        }
+        let scrubCeiling = duration > 30 ? duration - 5 : duration
+        // The AVPlayer engine owns the forward-only boundary. A target inside the mounted HLS window remains a
+        // cheap in-item seek; a target outside it opens a fresh remux at the requested source second. Keeping
+        // the preview on the full source timeline is therefore truthful and lets a viewer reach an arbitrary
+        // point instead of pinning every long scrub to the first few buffered seconds.
         scrubTarget = min(scrubCeiling, max(0, scrubTarget + Double(dir) * scrubStep))
         scrubThumbnails.show(time: scrubTarget)
         flashControls()

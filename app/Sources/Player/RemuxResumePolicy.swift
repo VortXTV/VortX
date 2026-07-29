@@ -25,16 +25,17 @@ import Foundation
 /// marks, skip segments, trickplay keys. The player speaks PLAYER seconds, which now start at the origin. If
 /// the two are not reconciled at a single point, a resumed title saves its progress an hour early and wipes the
 /// viewer's real position. So the engine converts at its one chokepoint: everything it REPORTS is
-/// `presented(playerSeconds:origin:)`, and everything it is ASKED to seek to goes through
-/// `playerSeek`, which clamps in source time, maps through the origin, then clamps in player time.
+/// `presented(playerSeconds:origin:)`, and every requested seek goes through `mountedSeekAction`. Targets the
+/// current item serves then use `playerSeek`, which clamps in source time, maps through the origin, and clamps
+/// in player time.
 ///
-/// # What is deliberately NOT reachable
+/// # Reaching content outside the current mount
 ///
-/// Content before the origin is not in the produced stream and cannot be, so a backward seek past it CLAMPS to
-/// the origin rather than failing. That is the whole cost of resuming this way, and it is bounded and visible:
-/// the clamp is in one function, the chrome's clamps read the same produced edge, and no path can strand the
-/// mount frameless. Serving arbitrary positions on demand needs a different production model entirely; see the
-/// note at the foot of this file.
+/// Content before the origin or beyond the produced edge is not in the current stream. An in-item seek still
+/// clamps to the bytes that item can serve, but the engine now asks `mountedSeekAction` first. A target outside
+/// the current served window opens a fresh remux at that source second, using the same one-shot input seek and
+/// timeline mapping as initial resume. This keeps ordinary in-window seeks cheap while making long scrubs and
+/// backward seeks real instead of silently pinning them to the first few produced seconds.
 enum RemuxResumePolicy {
 
     // MARK: - Should this mount start part-way in?
@@ -159,6 +160,65 @@ enum RemuxResumePolicy {
             target = producedEdgePlayerSeconds
         }
         return target
+    }
+
+    enum MountedSeekAction: Equatable, Sendable {
+        /// The current item already serves the target. The associated value is in AVPlayer's local clock.
+        case seekPlayer(Double)
+        /// The target is outside the current item. Open a new remux whose source timeline begins here.
+        case remountAtSource(Double)
+    }
+
+    /// Decide whether a source-time seek can stay inside the mounted AVPlayer item or needs a new remux.
+    ///
+    /// A forward-only HLS item cannot serve bytes before its achieved origin or after its produced edge.
+    /// Likewise, a sliding playlist may have evicted old bytes even though they are after the origin. Issuing
+    /// an AVPlayer seek into any of those holes either pins the UI to the edge or produces no frame and demotes
+    /// Dolby Vision. A fresh remux is the seek operation for those targets.
+    ///
+    /// `servedStartPlayerSeconds` comes from the earliest current seekable range. A nil value means AVPlayer
+    /// has not published the range yet, so only the proven origin and produced-edge boundaries are applied.
+    static func mountedSeekAction(
+        sourceSeconds: Double,
+        origin: Double,
+        authoritativeSourceDurationSeconds: Double? = nil,
+        playerDurationSeconds: Double = 0,
+        servedStartPlayerSeconds: Double? = nil,
+        producedEdgePlayerSeconds: Double
+    ) -> MountedSeekAction {
+        guard sourceSeconds.isFinite else { return .seekPlayer(0) }
+
+        var sourceTarget = sourceSeconds
+        if let sourceDuration = authoritativeSourceDurationSeconds,
+           sourceDuration.isFinite, sourceDuration > 0 {
+            sourceTarget = min(max(sourceTarget, 0), max(sourceDuration - 1, 0))
+        } else {
+            sourceTarget = max(sourceTarget, 0)
+        }
+
+        let playerTarget = sourceTarget - origin
+        if playerTarget < 0 {
+            return .remountAtSource(originRequest(resumeSeconds: sourceTarget))
+        }
+        if let servedStartPlayerSeconds,
+           servedStartPlayerSeconds.isFinite,
+           servedStartPlayerSeconds > 0,
+           playerTarget < servedStartPlayerSeconds {
+            return .remountAtSource(originRequest(resumeSeconds: sourceTarget))
+        }
+        if producedEdgePlayerSeconds > 0, playerTarget > producedEdgePlayerSeconds {
+            return .remountAtSource(originRequest(resumeSeconds: sourceTarget))
+        }
+        if producedEdgePlayerSeconds <= 0, playerTarget > originToleranceSeconds {
+            return .remountAtSource(originRequest(resumeSeconds: sourceTarget))
+        }
+
+        return .seekPlayer(playerSeek(
+            sourceSeconds: sourceTarget,
+            origin: origin,
+            authoritativeSourceDurationSeconds: authoritativeSourceDurationSeconds,
+            playerDurationSeconds: playerDurationSeconds,
+            producedEdgePlayerSeconds: producedEdgePlayerSeconds))
     }
 
     /// Duration published to SOURCE-time chrome. A remux item's finite duration is measured from player zero,

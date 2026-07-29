@@ -2465,6 +2465,14 @@ enum PlayerLiveContractTests {
             engine,
             from: "func seek(to seconds: Double)",
             to: "func seek(by seconds: Double)")
+        let remuxSeekRemount = sourceSection(
+            engine,
+            from: "private func remountForSeek(sourceSeconds: Double)",
+            to: "func seek(to seconds: Double)")
+        let tvScrub = sourceSection(
+            tvPlayer,
+            from: "private func scrubBy(_ dir: Int)",
+            to: "private func scheduleScrubCommit()")
         let playControl = sourceSection(engine, from: "func play() {", to: "func pause() {")
         let pauseControl = sourceSection(engine, from: "func pause() {", to: "func togglePause()")
         let speedControl = sourceSection(engine, from: "func setSpeed(_ speed: Double)", to: "/// Live playback position")
@@ -3048,13 +3056,38 @@ enum PlayerLiveContractTests {
         check("wiring: remux seek maps source bounds before player bounds and preserves the non-remux clamp",
               sourceContainsInOrder(remuxSeekMapping, [
                 "let sourceDuration =",
+                "RemuxResumePolicy.mountedSeekAction(",
                 "sourceSeconds: seconds",
                 "authoritativeSourceDurationSeconds: sourceDuration",
                 "playerDurationSeconds: dur",
                 "producedEdgePlayerSeconds: producedEdgeSeconds",
+                "case .remountAtSource(let sourceSeconds):",
+                "remountForSeek(sourceSeconds: sourceSeconds)",
                 "} else {",
                 "clamped = (dur.isFinite && dur > 1)",
               ]))
+        check("wiring: an out-of-window seek remounts the same logical source and carries playback intent",
+              sourceContainsInOrder(remuxSeekRemount, [
+                "let target = RemuxResumePolicy.originRequest(",
+                "capturePlaybackIntent(from: item)",
+                "intent.updateSourceSeconds(target)",
+                "pendingPlaybackIntent = intent",
+                "configureResumeOrigin(seconds: target)",
+                "configureAudioSourceForNextLoad(selectedRemuxAudioSourceIndex)",
+                "loadFile(",
+                "reusing: loadToken",
+              ]))
+        check("wiring: a seek during remux startup retargets the pending source mount",
+              sourceContainsInOrder(remuxSeekMapping, [
+                "guard isReady else",
+                "pendingRemuxGeneration != nil",
+                "remountForSeek(sourceSeconds: seconds)",
+                "if pendingPlaybackIntent == nil",
+              ]))
+        check("wiring: Apple scrub chrome no longer pins a long seek to the buffered edge",
+              playerScreen?.contains("remuxClampedTarget") == false
+                  && tvScrub?.contains("bufferedTime") == false
+                  && tvScrub?.contains("scrubCeiling = min(scrubCeiling, bufferedTime)") == false)
         check("wiring: ready status always maps remux duration into source time",
               sourceContainsInOrder(remuxDurationMapping, [
                 "let authoritativeDuration =",

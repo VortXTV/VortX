@@ -4081,21 +4081,8 @@ struct PlayerScreen: View {
     /// The seek-step setting as seconds, falling back to 10 if the stored value is somehow unparsable.
     private var seekStepSeconds: Double { Double(seekStep) ?? 10 }
 
-    /// Seek relative to the play head, clamped to the timeline, and report it. Shared by the on-screen skip
-    /// buttons and the macOS keyboard shortcuts.
-    /// P2 (#76): the AUTHORITATIVE forward-only remux clamp lives at the engine chokepoint
-    /// (AVPlayerEngineController.seek(to:) caps every seek at producedEdgeSeconds). This helper keeps the
-    /// REPORTED position (onSeek / lastReported) in step with what the engine will actually honor, so the
-    /// scrubber and saved progress don't claim a position past the produced edge. bufferedTime is the
-    /// player-buffered edge, a conservative stand-in. Backward seeks / non-remux sessions pass through unchanged.
-    private func remuxClampedTarget(_ target: Double) -> Double {
-        guard (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true,
-              bufferedTime > currentTime, target > bufferedTime else { return target }
-        return bufferedTime
-    }
-
     private func seekBy(_ delta: Double) {
-        let target = remuxClampedTarget(min(max(currentTime + delta, 0), max(duration - 1, 0)))
+        let target = min(max(currentTime + delta, 0), max(duration - 1, 0))
         coordinator.player?.seek(to: target)
         currentTime = target
         reportSeek(target)
@@ -4142,7 +4129,7 @@ struct PlayerScreen: View {
                                 scrubTarget = currentTime; hideTask?.cancel()
                                 hoverPreviewTime = nil; hoverPreviewRatio = nil
                             } else {
-                                let target = remuxClampedTarget(scrubTarget)   // P2: cap forward scrub at the remux edge
+                                let target = scrubTarget
                                 currentTime = target
                                 coordinator.player?.seek(to: target)
                                 reportSeek(target)

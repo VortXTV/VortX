@@ -273,6 +273,105 @@ check("seek: the backward clamp holds even when the edge is unknown",
 check("seek: a non-finite target lands at the start of the player timeline",
       near(RemuxResumePolicy.playerSeek(sourceSeconds: .nan, origin: 1830, producedEdgePlayerSeconds: 300), 0))
 
+// MARK: - mounted seek action
+
+check("mounted seek: a target inside the current served window stays on the player",
+      RemuxResumePolicy.mountedSeekAction(
+        sourceSeconds: 1900,
+        origin: 1830,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 5370,
+        servedStartPlayerSeconds: 0,
+        producedEdgePlayerSeconds: 300
+      ) == .seekPlayer(70))
+
+check("mounted seek: a long forward scrub remounts at the requested source second",
+      RemuxResumePolicy.mountedSeekAction(
+        sourceSeconds: 5400,
+        origin: 0,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 7200,
+        servedStartPlayerSeconds: 0,
+        producedEdgePlayerSeconds: 75
+      ) == .remountAtSource(5400))
+
+check("mounted seek: a backward scrub before a resumed origin remounts instead of pinning to zero",
+      RemuxResumePolicy.mountedSeekAction(
+        sourceSeconds: 600,
+        origin: 1830,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 5370,
+        servedStartPlayerSeconds: 0,
+        producedEdgePlayerSeconds: 300
+      ) == .remountAtSource(600))
+
+check("mounted seek: returning to the title start uses an explicit zero-origin remount",
+      RemuxResumePolicy.mountedSeekAction(
+        sourceSeconds: 0,
+        origin: 1830,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 5370,
+        servedStartPlayerSeconds: 0,
+        producedEdgePlayerSeconds: 300
+      ) == .remountAtSource(0))
+
+check("mounted seek: an evicted point remounts even though it is after the session origin",
+      RemuxResumePolicy.mountedSeekAction(
+        sourceSeconds: 1900,
+        origin: 1830,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 5370,
+        servedStartPlayerSeconds: 120,
+        producedEdgePlayerSeconds: 300
+      ) == .remountAtSource(1900))
+
+check("mounted seek: the exact produced edge remains an in-item seek",
+      RemuxResumePolicy.mountedSeekAction(
+        sourceSeconds: 2130,
+        origin: 1830,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 5370,
+        servedStartPlayerSeconds: 0,
+        producedEdgePlayerSeconds: 300
+      ) == .seekPlayer(300))
+
+check("mounted seek: the authoritative source end is sanitized before remount",
+      RemuxResumePolicy.mountedSeekAction(
+        sourceSeconds: 9000,
+        origin: 0,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 7200,
+        servedStartPlayerSeconds: 0,
+        producedEdgePlayerSeconds: 100
+      ) == .remountAtSource(7199))
+
+check("mounted seek: an unknown produced edge remounts a distant target instead of risking a frameless seek",
+      RemuxResumePolicy.mountedSeekAction(
+        sourceSeconds: 70,
+        origin: 0,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 7200,
+        servedStartPlayerSeconds: nil,
+        producedEdgePlayerSeconds: 0
+      ) == .remountAtSource(70))
+
+check("mounted seek: an unknown edge still permits a small in-GOP nudge",
+      RemuxResumePolicy.mountedSeekAction(
+        sourceSeconds: 10,
+        origin: 0,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 7200,
+        servedStartPlayerSeconds: nil,
+        producedEdgePlayerSeconds: 0
+      ) == .seekPlayer(10))
+
+check("mounted seek: a non-finite request remains fail-soft",
+      RemuxResumePolicy.mountedSeekAction(
+        sourceSeconds: .nan,
+        origin: 1830,
+        producedEdgePlayerSeconds: 300
+      ) == .seekPlayer(0))
+
 // MARK: - The two directions are inverses
 
 // This is what makes a scrub land where the scrubber said it would: converting a reported position back into a

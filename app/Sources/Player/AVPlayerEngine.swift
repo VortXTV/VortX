@@ -266,6 +266,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     private var resumeConfiguration = RemuxResumeConfiguration()
     private var currentLoadResumeOrigin: Double = 0
     private var remuxTimelineOrigin: Double = 0
+    /// A user seek outside the current forward-only item is fulfilled by opening a new remux at that source
+    /// second. The target remains set until the replacement publishes and restores its playback intent, so a
+    /// failed replacement still exposes the requested source position to the chrome's libmpv fallback.
+    private var remuxSeekRemountTarget: Double?
     /// Whether the forward-only remux is mounted for the CURRENT item (either delivery). A mounted origin can
     /// begin part-way through the source, but later seeks remain bounded to the bytes produced from that point.
     var isRemuxMounted: Bool { remuxLoader != nil || remuxHLSServer != nil || remuxRemoteMount != nil }
@@ -319,6 +323,20 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             if end.isFinite { edge = max(edge, end) }
         }
         return edge
+    }
+
+    /// Earliest player-clock second the currently advertised HLS window can serve. A local sliding playlist
+    /// may evict old segments even though they remain after the session origin. Seeking before this boundary
+    /// needs the same source remount as seeking before the origin.
+    private var servedStartPlayerSeconds: Double? {
+        guard let item else { return nil }
+        var start: Double?
+        for value in item.seekableTimeRanges {
+            let candidate = value.timeRangeValue.start.seconds
+            guard candidate.isFinite, candidate >= 0 else { continue }
+            start = min(start ?? candidate, candidate)
+        }
+        return start
     }
     /// The launch site sets this from the stream's Dolby Vision flag BEFORE loadFile (same plumbing as the
     /// libmpv lane, MPVMetalViewController.contentIsDolbyVision). Used to request the Apple TV's Dolby Vision
@@ -417,7 +435,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
         if !isIntentRemount { playbackRequested = true }
         hdrFallbackRetried = false; usingHDRFallbackItem = false
-        if !isIntentRemount { pendingPlaybackIntent = nil }
+        if !isIntentRemount {
+            pendingPlaybackIntent = nil
+            remuxSeekRemountTarget = nil
+        }
         incompatibleEntryHandled = false; plainRemuxRetried = false
         lastLoadURL = url; lastLoadHeaders = headers; lastLoadLive = live
         videoFrameEverProduced = false; preferredPeakBitRatePinned = false
@@ -1119,6 +1140,35 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     }
     func togglePause() { playbackRequested ? pause() : play() }
 
+    /// Replace a forward-only remux with one whose input begins at the requested source second. This is the
+    /// actual seek operation when the current HLS item has not produced, or no longer retains, that point.
+    @discardableResult
+    private func remountForSeek(sourceSeconds: Double) -> Bool {
+        guard let loadToken = activeLoadToken,
+              let url = lastLoadURL,
+              (isRemuxMounted || pendingRemuxGeneration != nil || remuxSeekRemountTarget != nil),
+              !lastLoadLive else { return false }
+
+        let target = RemuxResumePolicy.originRequest(resumeSeconds: sourceSeconds)
+        var intent = capturePlaybackIntent(from: item)
+        intent.updateSourceSeconds(target)
+        pendingPlaybackIntent = intent
+        remuxSeekRemountTarget = target
+        pendingSeek = nil
+        configureResumeOrigin(seconds: target)
+        configureAudioSourceForNextLoad(selectedRemuxAudioSourceIndex)
+        DiagnosticsLog.log(
+            "avplayer",
+            "seek outside mounted window -> source remount at \(String(format: "%.3f", target))s")
+        _ = loadFile(
+            url,
+            headers: lastLoadHeaders,
+            live: lastLoadLive,
+            audioSidecar: nil,
+            reusing: loadToken)
+        return true
+    }
+
     func seek(to seconds: Double) {
         if var intent = pendingPlaybackIntent {
             intent.updateSourceSeconds(seconds)
@@ -1136,28 +1186,48 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // Before the item is playable, remember the target and apply it on ready (covers the chrome's
         // resume seek issued right after loadFile, which AVPlayer would otherwise drop).
         guard isReady else {
+            if let remountTarget = remuxSeekRemountTarget,
+               abs(seconds - remountTarget) > RemuxResumePolicy.originToleranceSeconds,
+               remountForSeek(sourceSeconds: seconds) {
+                return
+            }
+            if pendingRemuxGeneration != nil,
+               abs(seconds - currentLoadResumeOrigin) > RemuxResumePolicy.originToleranceSeconds,
+               remountForSeek(sourceSeconds: seconds) {
+                return
+            }
             if pendingPlaybackIntent == nil { pendingSeek = seconds }
             return
         }
         let dur = item?.duration.seconds ?? 0
-        // FORWARD-ONLY REMUX (P2, #76): cap the target at the produced edge at the ONE engine chokepoint, so
-        // EVERY seek surface is covered (scrubber, hiddenSeek right-nudge, the fwd transport button, Lock Screen
-        // / Control Center seek, chapter jumps, skip-pill / auto-skip) instead of each chrome clamping on its
-        // own. A seek past the produced bytes lands in content that does not exist yet, no frame arrives, and
-        // the start / stall watchdog demotes the whole true-DV session to libmpv (losing DV + Atmos). The chrome
-        // speaks SOURCE seconds while a resumed mount's player clock begins at zero. Clamp in source space
-        // against the demuxer's source duration, map through the achieved origin, then clamp in player space
-        // against AVPlayer's duration and the produced edge. Non-remux items keep the original expression.
+        // FORWARD-ONLY REMUX: keep an in-item seek only when the current HLS window serves the target. Anything
+        // before the origin, behind an evicted seekable range, or after the produced edge opens a fresh remux at
+        // that source second. This single chokepoint covers the scrubber, D-pad nudges, system transport,
+        // chapters, and skip actions without issuing AVPlayer seeks into bytes that do not exist.
         let clamped: Double
         if isRemuxMounted {
             let sourceDuration = remuxHLSServer?.sourceDurationSeconds
                 ?? remuxRemoteMount?.sourceDurationSeconds ?? remuxLoader?.sourceDurationSeconds
-            clamped = RemuxResumePolicy.playerSeek(
+            switch RemuxResumePolicy.mountedSeekAction(
                 sourceSeconds: seconds,
                 origin: remuxTimelineOrigin,
                 authoritativeSourceDurationSeconds: sourceDuration,
                 playerDurationSeconds: dur,
-                producedEdgePlayerSeconds: producedEdgeSeconds)
+                servedStartPlayerSeconds: servedStartPlayerSeconds,
+                producedEdgePlayerSeconds: producedEdgeSeconds) {
+            case .seekPlayer(let playerSeconds):
+                clamped = playerSeconds
+            case .remountAtSource(let sourceSeconds):
+                if remountForSeek(sourceSeconds: sourceSeconds) {
+                    return
+                }
+                clamped = RemuxResumePolicy.playerSeek(
+                    sourceSeconds: sourceSeconds,
+                    origin: remuxTimelineOrigin,
+                    authoritativeSourceDurationSeconds: sourceDuration,
+                    playerDurationSeconds: dur,
+                    producedEdgePlayerSeconds: producedEdgeSeconds)
+            }
         } else {
             clamped = (dur.isFinite && dur > 1) ? min(max(seconds, 0), max(dur - 1, 0)) : max(seconds, 0)
         }
@@ -1186,7 +1256,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// Live playback position in SOURCE seconds. A resumed remux adds its achieved timeline origin; an
     /// unreadable pre-first-sample clock reports that origin instead of zero, protecting stored progress.
     var playbackPositionSeconds: Double {
-        RemuxResumePolicy.presented(
+        if remuxSeekRemountTarget != nil, let pendingPlaybackIntent {
+            return pendingPlaybackIntent.sourceSeconds
+        }
+        return RemuxResumePolicy.presented(
             playerSeconds: player.currentTime().seconds,
             origin: remuxTimelineOrigin)
     }
@@ -1239,6 +1312,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         playbackRequested = false
         usingHDRFallbackItem = false
         pendingPlaybackIntent = nil
+        remuxSeekRemountTarget = nil
         audioReplacement = nil
         remuxSourceAudioTracks = []
         remuxSourceSubtitleTracks = []
@@ -2929,6 +3003,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                     player.pause()
                 }
                 pendingPlaybackIntent = nil
+                remuxSeekRemountTarget = nil
                 audioReplacement = nil
                 DiagnosticsLog.log(
                     "avplayer",
