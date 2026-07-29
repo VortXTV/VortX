@@ -99,7 +99,7 @@ struct Issue164TraktContractTests {
         require(tvHome.contains("menu: continueWatchingSelection.source == .trakt")
                     && tvHome.contains("? .none"),
                 "tvOS must use actual row provenance before omitting local dismiss")
-        require(iosHome.contains("menu: continueWatchingSelection.source == .trakt")
+        require(iosHome.contains("menu: renderedContinueWatching.provenance.source == .trakt")
                     && iosHome.contains("? .none"),
                 "iOS/macOS must use actual row provenance before omitting local dismiss")
 
@@ -402,20 +402,55 @@ struct Issue164TraktContractTests {
                         "return currentSessionID == traktSessionID"
                     ),
                 "iOS remote Continue Watching provenance must reject A-to-B account changes")
+        let iosContinueWatchingSnapshot = segment(
+            in: iosHome,
+            from: "private var continueWatchingRenderSnapshot: iOSCWRenderSnapshot",
+            to: "#if os(macOS)"
+        )
+        require(occurrences(of: "continueWatchingSelection", in: iosContinueWatchingSnapshot) == 1
+                    && iosContinueWatchingSnapshot.contains("let selection = continueWatchingSelection")
+                    && iosContinueWatchingSnapshot.contains("let items = selection.items.map")
+                    && iosContinueWatchingSnapshot.contains("items: items")
+                    && iosContinueWatchingSnapshot.contains("source: selection.source")
+                    && iosContinueWatchingSnapshot.contains("traktSessionID: selection.sessionID"),
+                "iOS rendered Continue Watching items and provenance must come from one selection snapshot")
+        let iosHomeBody = segment(
+            in: iosHome,
+            from: """
+            var body: some View {
+                    let renderedContinueWatching = continueWatchingRenderSnapshot
+            """,
+            to: "private func refreshReleaseCalendar()"
+        )
+        require(iosHomeBody.contains(
+                    "let renderedContinueWatching = continueWatchingRenderSnapshot"
+                )
+                    && iosHomeBody.contains("items: renderedContinueWatching.items")
+                    && occurrences(
+                        of: "provenance: renderedContinueWatching.provenance",
+                        in: iosHomeBody
+                    ) == 2
+                    && !iosHomeBody.contains("continueWatchingSelection")
+                    && !iosHomeBody.contains("continueWatchingItems"),
+                "iOS stale rendered cards must retain their original producer/session in every action")
         let iosContinueWatchingTap = segment(
             in: iosHome,
             from: "private func handleContinueWatchingTap(",
-            to: "private func cwDetailTarget(for item: RailItem)"
+            to: "private func cwDetailTarget("
         )
-        require(appearsInOrder(in: iosContinueWatchingTap, [
-                    "let provenance = continueWatchingProvenance",
+        require(iosContinueWatchingTap.contains("provenance: iOSCWProducerProvenance")
+                    && appearsInOrder(in: iosContinueWatchingTap, [
                     "guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID)",
+                    "Task {",
                     "expectedTraktSession: provenance.traktSessionID",
                     "guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID)",
+                    "player = launch",
+                    "resumeHoardTask?.cancel()",
                     "cwDetailTarget(for: item, provenance: provenance)"
                 ])
-                    && !iosContinueWatchingTap.contains("continueWatchingSelection"),
-                "iOS direct-resume fallback must retain one producer/session provenance across await")
+                    && !iosContinueWatchingTap.contains("continueWatchingSelection")
+                    && !iosContinueWatchingTap.contains("continueWatchingRenderSnapshot"),
+                "iOS stale A cards must fail before launch, fallback, or hoard after local/B replaces A")
         let iosCapturedFallback = segment(
             in: iosHome,
             from: "private func cwDetailTarget(\n        for item: RailItem,",

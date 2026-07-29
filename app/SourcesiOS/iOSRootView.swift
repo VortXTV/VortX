@@ -786,6 +786,11 @@ private struct iOSCWProducerProvenance: Sendable {
     }
 }
 
+private struct iOSCWRenderSnapshot {
+    let items: [RailItem]
+    let provenance: iOSCWProducerProvenance
+}
+
 struct iOSHomeView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
@@ -842,19 +847,23 @@ struct iOSHomeView: View {
         return .init(items: profiles.cwItems, source: .local, sessionID: nil)
     }
 
-    private var continueWatchingItems: [RailItem] {
-        continueWatchingSelection.items.map {
+    private var continueWatchingRenderSnapshot: iOSCWRenderSnapshot {
+        let selection = continueWatchingSelection
+        let items = selection.items.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress,
                      cwVideoId: $0.state.videoId, resumeSeconds: $0.resumeSeconds)
         }
+        return iOSCWRenderSnapshot(
+            items: items,
+            provenance: iOSCWProducerProvenance(
+                source: selection.source,
+                traktSessionID: selection.sessionID
+            )
+        )
     }
 
-    private var continueWatchingProvenance: iOSCWProducerProvenance {
-        let selection = continueWatchingSelection
-        return iOSCWProducerProvenance(
-            source: selection.source,
-            traktSessionID: selection.sessionID
-        )
+    private var continueWatchingItems: [RailItem] {
+        continueWatchingRenderSnapshot.items
     }
 
     #if os(macOS)
@@ -862,7 +871,8 @@ struct iOSHomeView: View {
     /// to its `RailItem` so the hero can feature it. Mirrors the same sources the rails render from.
     private var allRailItems: [RailItem] {
         // A remote Trakt row stays keyboard-focusable, but never enters the generic hero enrichment pool.
-        var out = continueWatchingSelection.source == .trakt ? [] : continueWatchingItems
+        let continueWatching = continueWatchingRenderSnapshot
+        var out = continueWatching.provenance.source == .trakt ? [] : continueWatching.items
         out += topPicks.items.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
         out += core.boardRows.flatMap { $0.items }.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
@@ -966,6 +976,7 @@ struct iOSHomeView: View {
     }
 
     var body: some View {
+        let renderedContinueWatching = continueWatchingRenderSnapshot
         NavigationStack(path: $path) {
             // The hero is the first scrolling element (an ambient billboard header), not a
             // behind-the-scroll backdrop: that keeps its Play / Trailer buttons + the tappable poster
@@ -1000,28 +1011,37 @@ struct iOSHomeView: View {
                     }
                     .padding(.horizontal, Theme.Space.md)
                     #endif
-                    if !continueWatchingItems.isEmpty {
+                    if !renderedContinueWatching.items.isEmpty {
                         // Continue Watching is PINNED first (not part of HomeRailPreferences): it is a resume
                         // queue stepped through in recency order, not a browse surface. A CW card tap resumes
                         // the exact last-played stream straight into the player (#11), falling back to opening
                         // detail when no remembered link fits. Long-press offers "Remove from Continue Watching".
                         homeRail(PosterRail(title: String(localized: "Continue Watching"),
-                                            eyebrow: continueWatchingSelection.source == .trakt
+                                            eyebrow: renderedContinueWatching.provenance.source == .trakt
                                                 ? String(localized: "From Trakt")
                                                 : String(localized: "Pick up where you left off"),
-                                            items: continueWatchingItems,
-                                            onTap: handleContinueWatchingTap,
+                                            items: renderedContinueWatching.items,
+                                            onTap: {
+                                                handleContinueWatchingTap(
+                                                    $0,
+                                                    provenance: renderedContinueWatching.provenance
+                                                )
+                                            },
                                             // Trakt-sourced rows are read-only. Their dismiss action targets
                                             // the local engine, not Trakt, so omit it until remote delete is
                                             // separately designed and authorized.
-                                            menu: continueWatchingSelection.source == .trakt
+                                            menu: renderedContinueWatching.provenance.source == .trakt
                                                 ? .none
                                                 : .continueWatching,
                                             onDetails: {
-                                                guard let target = cwDetailTarget(for: $0) else { return }
+                                                guard let target = cwDetailTarget(
+                                                    for: $0,
+                                                    provenance: renderedContinueWatching.provenance
+                                                ) else { return }
                                                 path.append(target)
                                             },
-                                            accessibilityProvenance: continueWatchingSelection.source == .trakt
+                                            accessibilityProvenance:
+                                                renderedContinueWatching.provenance.source == .trakt
                                                 ? String(localized: "From Trakt")
                                                 : nil))
                     }
@@ -1035,7 +1055,7 @@ struct iOSHomeView: View {
                     }
                     // Use the profile-aware CW source so an overlay profile WITH history never reads as
                     // empty, and one with none still shows the empty state honestly.
-                    if core.boardRows.isEmpty && continueWatchingItems.isEmpty {
+                    if core.boardRows.isEmpty && renderedContinueWatching.items.isEmpty {
                         emptyState
                     }
                 }
@@ -1451,9 +1471,11 @@ struct iOSHomeView: View {
     /// when one is remembered for this title/episode; otherwise fall back to opening the detail page so
     /// the user picks a source. (Direct resume needs a remembered link, which the player records as it
     /// plays; the first watch from the detail page seeds it.)
-    private func handleContinueWatchingTap(_ item: RailItem) {
+    private func handleContinueWatchingTap(
+        _ item: RailItem,
+        provenance: iOSCWProducerProvenance
+    ) {
         hero.noteInteraction()
-        let provenance = continueWatchingProvenance
         guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
         // Computing the resume offset may await the account, so resolve the direct-resume launch in a
         // Task; fall back to opening detail when no remembered link fits.
@@ -1483,10 +1505,6 @@ struct iOSHomeView: View {
                 path.append(target)
             }
         }
-    }
-
-    private func cwDetailTarget(for item: RailItem) -> iOSCWDetailTarget? {
-        cwDetailTarget(for: item, provenance: continueWatchingProvenance)
     }
 
     private func cwDetailTarget(
