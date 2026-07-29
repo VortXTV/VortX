@@ -3,6 +3,7 @@
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
 //     -o /tmp/multi-audio-policy-test \
 //     app/Sources/Player/VortXRemuxBuffer.swift \
+//     app/Sources/Player/AudioLanguagePolicy.swift \
 //     app/Sources/Player/MultiAudioPolicy.swift \
 //     app/Tests/MultiAudioPolicyTests.swift && /tmp/multi-audio-policy-test
 //
@@ -38,6 +39,7 @@ private typealias Track = MultiAudioPolicy.AudioTrack
 enum MultiAudioPolicyTests {
     static func main() {
         testSourceTrackInventoryAndSelection()
+        testInitialPreferredSourceSelection()
         testSourcePrimaryReadiness()
         testReplacementRollbackAndNewestWins()
         testPlaybackIntentNewestWinsAndExactOwnership()
@@ -100,6 +102,166 @@ enum MultiAudioPolicyTests {
         check("source selection: absent source identity fails closed to default ranking",
               MultiAudioPolicy.selectedSourceTrack(
                 from: manyInventory, requestedSourceIndex: 999) == nil)
+    }
+
+    private static func testInitialPreferredSourceSelection() {
+        let englishAtmos = Track(
+            index: 1, codecID: eac3, channels: 6, language: "eng",
+            title: "English Atmos", sourceProfile30: true, usesDec3: true,
+            codecRank: 0)
+        let japaneseAtmos = Track(
+            index: 2, codecID: eac3, channels: 6, language: "jpn",
+            title: "Japanese Atmos", sourceProfile30: true, usesDec3: true,
+            codecRank: 0)
+        let japaneseEightChannel = Track(
+            index: 3, codecID: eac3, channels: 8, language: "ja-JP",
+            title: "Japanese Main", codecRank: 0)
+        let japaneseCommentary = Track(
+            index: 4, codecID: eac3, channels: 8, language: "JPN",
+            title: "Director COMMENTARY", sourceProfile30: true, usesDec3: true,
+            codecRank: 0)
+        let japaneseSDH = Track(
+            index: 5, codecID: eac3, channels: 8, language: "jpn",
+            title: "Japanese SDH", sourceProfile30: true, usesDec3: true,
+            codecRank: 0)
+        let explicitTranscode = Track(
+            index: 6, codecID: 900, channels: 8, language: "fra",
+            title: "French commentary", isStreamCopy: false)
+        let inventory = [
+            englishAtmos,
+            japaneseAtmos,
+            japaneseEightChannel,
+            japaneseCommentary,
+            japaneseSDH,
+            explicitTranscode,
+        ]
+
+        check(
+            "initial selection: an explicit source identity overrides language, rejection, and delivery rank",
+            MultiAudioPolicy.initialSourceTrack(
+                from: inventory,
+                requestedSourceIndex: explicitTranscode.index,
+                preferredLanguages: ["en"],
+                rejectTerms: ["commentary"]) == explicitTranscode)
+        check(
+            "initial selection: canonical language tiers preserve caller priority",
+            MultiAudioPolicy.initialSourceTrack(
+                from: inventory,
+                requestedSourceIndex: nil,
+                preferredLanguages: ["ja-JP", "en-US"],
+                rejectTerms: ["commentary", "sdh"]) == japaneseAtmos)
+        let ukrainian = Track(
+            index: 7, codecID: eac3, channels: 6, language: "ukr",
+            title: "Ukrainian", codecRank: 0)
+        check(
+            "initial selection: shared canonicalization matches regular three-letter source tags",
+            MultiAudioPolicy.initialSourceTrack(
+                from: [englishAtmos, ukrainian],
+                requestedSourceIndex: nil,
+                preferredLanguages: ["uk-UA"],
+                rejectTerms: []) == ukrainian)
+        check(
+            "initial selection: canonical exception mapping does not cross Estonian into Spanish",
+            MultiAudioPolicy.canonicalLanguage("est") == "et"
+                && MultiAudioPolicy.canonicalLanguage("est") != "es")
+        check(
+            "initial selection: standard three-letter mapping keeps Scottish Gaelic distinct from Galician",
+            MultiAudioPolicy.canonicalLanguage("gla") == "gd"
+                && MultiAudioPolicy.canonicalLanguage("glg") == "gl"
+                && MultiAudioPolicy.canonicalLanguage("gla")
+                    != MultiAudioPolicy.canonicalLanguage("glg"))
+        check(
+            "initial selection: title rejection is case-insensitive and excludes commentary plus SDH",
+            MultiAudioPolicy.initialSourceTrack(
+                from: [
+                    japaneseCommentary,
+                    japaneseSDH,
+                    japaneseEightChannel,
+                ],
+                requestedSourceIndex: nil,
+                preferredLanguages: ["ja"],
+                rejectTerms: ["commentary", "SDH"]) == japaneseEightChannel)
+        check(
+            "initial selection: stream-copy E-AC-3 JOC outranks a higher-channel non-JOC copy",
+            MultiAudioPolicy.initialSourceTrack(
+                from: [japaneseEightChannel, japaneseAtmos],
+                requestedSourceIndex: nil,
+                preferredLanguages: ["jpn"],
+                rejectTerms: []) == japaneseAtmos)
+
+        let twoChannelCopy = Track(
+            index: 10, codecID: ac3, channels: 2, language: "eng",
+            title: "Copy", codecRank: 1)
+        let eightChannelTranscode = Track(
+            index: 11, codecID: 901, channels: 8, language: "eng",
+            title: "Transcode", isStreamCopy: false)
+        check(
+            "initial selection: every eligible stream copy outranks a transcode",
+            MultiAudioPolicy.initialSourceTrack(
+                from: [eightChannelTranscode, twoChannelCopy],
+                requestedSourceIndex: nil,
+                preferredLanguages: ["en"],
+                rejectTerms: []) == twoChannelCopy)
+
+        let sixChannelEAC3 = Track(
+            index: 12, codecID: eac3, channels: 6, language: "eng",
+            title: "E-AC-3", codecRank: 0)
+        let eightChannelAC3 = Track(
+            index: 13, codecID: ac3, channels: 8, language: "eng",
+            title: "Eight channel", codecRank: 1)
+        let eightChannelEAC3 = Track(
+            index: 14, codecID: eac3, channels: 8, language: "eng",
+            title: "Eight channel E-AC-3", codecRank: 0)
+        check(
+            "initial selection: channel count precedes codec rank for non-Atmos copies",
+            MultiAudioPolicy.initialSourceTrack(
+                from: [sixChannelEAC3, eightChannelAC3],
+                requestedSourceIndex: nil,
+                preferredLanguages: ["en"],
+                rejectTerms: []) == eightChannelAC3)
+        check(
+            "initial selection: codec rank breaks an equal-channel stream-copy tie",
+            MultiAudioPolicy.initialSourceTrack(
+                from: [eightChannelAC3, eightChannelEAC3],
+                requestedSourceIndex: nil,
+                preferredLanguages: ["en"],
+                rejectTerms: []) == eightChannelEAC3)
+
+        check(
+            "initial selection: a missing legacy preference field preserves the existing default",
+            MultiAudioPolicy.initialSourceTrack(
+                from: inventory,
+                requestedSourceIndex: nil,
+                preferredLanguages: nil,
+                rejectTerms: nil) == nil)
+        check(
+            "initial selection: an explicitly empty preference chain enables English fallback",
+            MultiAudioPolicy.initialSourceTrack(
+                from: inventory,
+                requestedSourceIndex: nil,
+                preferredLanguages: [],
+                rejectTerms: ["commentary", "sdh"]) == englishAtmos)
+        check(
+            "initial selection: English is not substituted for a nonempty unmatched preference chain",
+            MultiAudioPolicy.initialSourceTrack(
+                from: inventory,
+                requestedSourceIndex: nil,
+                preferredLanguages: ["de"],
+                rejectTerms: ["commentary", "sdh"]) == nil)
+        check(
+            "initial selection: a nonempty blank preference chain does not become English fallback",
+            MultiAudioPolicy.initialSourceTrack(
+                from: inventory,
+                requestedSourceIndex: nil,
+                preferredLanguages: [" "],
+                rejectTerms: ["commentary", "sdh"]) == nil)
+        check(
+            "initial selection: no matching preference or English track leaves the existing default untouched",
+            MultiAudioPolicy.initialSourceTrack(
+                from: [japaneseAtmos],
+                requestedSourceIndex: nil,
+                preferredLanguages: [],
+                rejectTerms: []) == nil)
     }
 
     private static func testSourcePrimaryReadiness() {

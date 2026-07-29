@@ -253,7 +253,9 @@ final class VortXExternalEngine: @unchecked Sendable {
                      headers: [String: String]?,
                      mode: VortXEngineProtocol.RemuxMode,
                      startAtSeconds: Double,
-                     selectedAudioStreamIndex: Int? = nil) async -> OpenedSession? {
+                     selectedAudioStreamIndex: Int? = nil,
+                     preferredAudioLanguages: [String]? = nil,
+                     audioRejectTerms: [String]? = nil) async -> OpenedSession? {
         guard case .external(let hostString, let port) = mountPlan,
               let url = controlURL(host: hostString, port: port,
                                    path: VortXEngineProtocol.Path.session) else { return nil }
@@ -263,7 +265,9 @@ final class VortXExternalEngine: @unchecked Sendable {
             mode: mode,
             startAtSeconds: startAtSeconds,
             requestFullTimeline: wantsFullTimeline,
-            selectedAudioStreamIndex: selectedAudioStreamIndex)
+            selectedAudioStreamIndex: selectedAudioStreamIndex,
+            preferredAudioLanguages: preferredAudioLanguages,
+            audioRejectTerms: audioRejectTerms)
         guard let body = try? JSONEncoder().encode(payload),
               let opened = await send(request(url, method: "POST", body: body, authorized: true),
                                       as: VortXEngineProtocol.SessionResponse.self) else {

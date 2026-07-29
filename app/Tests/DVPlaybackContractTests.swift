@@ -107,30 +107,29 @@ private struct StartupWiringRule {
 
     let rules = [
         StartupWiringRule(
-            name: "local true-DV tester gate", usesServer: false,
-            start: "private var localRemuxStartupTesterEnabled: Bool {",
+            name: "exact mount classification", usesServer: false,
+            start: "private var forwardBufferMount: VortXRemuxForwardBufferPolicy.Mount {",
             end: "/// Render proof for the chrome's first-frame commit.",
             exactSection: """
-            private var localRemuxStartupTesterEnabled: Bool {
-                remuxHLSServer != nil
-                    && contentIsDolbyVision
-                    && VortXRemuxForwardBufferPolicy.buildEnablesStartupTester
+            private var forwardBufferMount: VortXRemuxForwardBufferPolicy.Mount {
+                if remuxRemoteMount != nil { return .remoteRemux }
+                if remuxHLSServer != nil || remuxLoader != nil { return .localRemux }
+                return .direct
             }
             """,
-            mutationTarget: "&& VortXRemuxForwardBufferPolicy.buildEnablesStartupTester",
-            mutationReplacement:
-                "&& false && VortXRemuxForwardBufferPolicy.buildEnablesStartupTester"),
+            mutationTarget: "if remuxRemoteMount != nil { return .remoteRemux }",
+            mutationReplacement: "if remuxRemoteMount != nil { return .localRemux }"),
         StartupWiringRule(
             name: "initial item forward-buffer assignment", usesServer: false,
             start: "let newItem = AVPlayerItem(asset: newAsset)",
             end: "// Attach a pull-model frame tap",
             exactSection: """
             let newItem = AVPlayerItem(asset: newAsset)
-            if remuxHLSServer != nil {
+            if isRemuxMounted {
                 newItem.preferredForwardBufferDuration =
                     VortXRemuxForwardBufferPolicy.preferredDuration(
-                        hasProducedFirstFrame: false,
-                        startupTesterEnabled: localRemuxStartupTesterEnabled)
+                        mount: forwardBufferMount,
+                        hasProducedFirstFrame: false)
             }
             """,
             mutationTarget: "newItem.preferredForwardBufferDuration =",
@@ -138,16 +137,17 @@ private struct StartupWiringRule {
         StartupWiringRule(
             name: "first-frame steady-buffer restore", usesServer: false,
             start: "videoFrameEverProduced = true",
-            end: "DiagnosticsLog.log(",
+            end: "if let server = remuxHLSServer {",
             exactSection: """
             videoFrameEverProduced = true
-            if let server = remuxHLSServer {
+            if isRemuxMounted {
                 let steadyDuration = VortXRemuxForwardBufferPolicy.preferredDuration(
-                    hasProducedFirstFrame: true,
-                    startupTesterEnabled: localRemuxStartupTesterEnabled)
+                    mount: forwardBufferMount,
+                    hasProducedFirstFrame: true)
                 if item?.preferredForwardBufferDuration != steadyDuration {
                     item?.preferredForwardBufferDuration = steadyDuration
                 }
+            }
             """,
             mutationTarget: "if item?.preferredForwardBufferDuration != steadyDuration {",
             mutationReplacement:
@@ -157,11 +157,10 @@ private struct StartupWiringRule {
             start: "freshItem.preferredForwardBufferDuration =",
             end: "let output = AVPlayerItemVideoOutput(",
             exactSection: """
-            freshItem.preferredForwardBufferDuration = remuxRemoteMount == nil
-                ? VortXRemuxForwardBufferPolicy.preferredDuration(
-                    hasProducedFirstFrame: false,
-                    startupTesterEnabled: localRemuxStartupTesterEnabled)
-                : VortXEngineHostPolicy.forwardBufferSeconds(remote: true)
+            freshItem.preferredForwardBufferDuration =
+                VortXRemuxForwardBufferPolicy.preferredDuration(
+                    mount: forwardBufferMount,
+                    hasProducedFirstFrame: false)
             """,
             mutationTarget: "freshItem.preferredForwardBufferDuration =",
             mutationReplacement: "_ ="),
@@ -174,12 +173,53 @@ private struct StartupWiringRule {
                 guard let item,
                       let replacement = VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
                           currentDuration: item.preferredForwardBufferDuration,
-                          hasProducedFirstFrame: videoFrameEverProduced,
-                          startupTesterEnabled: localRemuxStartupTesterEnabled) else { return }
+                          mount: forwardBufferMount,
+                          hasProducedFirstFrame: videoFrameEverProduced) else { return }
                 item.preferredForwardBufferDuration = replacement
             """,
             mutationTarget: "item.preferredForwardBufferDuration = replacement",
             mutationReplacement: "item.preferredForwardBufferDuration = max(replacement, 30)"),
+        StartupWiringRule(
+            name: "remux-only automatic stall waiting", usesServer: false,
+            start: "player.automaticallyWaitsToMinimizeStalling =\n            VortXRemuxForwardBufferPolicy",
+            end: "player.allowsExternalPlayback",
+            exactSection: """
+            player.automaticallyWaitsToMinimizeStalling =
+                VortXRemuxForwardBufferPolicy.automaticallyWaitsToMinimizeStalling(
+                    mount: forwardBufferMount)
+            """,
+            mutationTarget: "mount: forwardBufferMount",
+            mutationReplacement: "mount: .direct"),
+        StartupWiringRule(
+            name: "remote initial adaptive buffer", usesServer: false,
+            start: "let newItem = AVPlayerItem(asset: AVURLAsset(url: mount.playlistURL))",
+            end: "let output = AVPlayerItemVideoOutput(",
+            exactSection: """
+            let newItem = AVPlayerItem(asset: AVURLAsset(url: mount.playlistURL))
+            newItem.preferredForwardBufferDuration =
+                VortXRemuxForwardBufferPolicy.preferredDuration(
+                    mount: .remoteRemux,
+                    hasProducedFirstFrame: false)
+            """,
+            mutationTarget: "mount: .remoteRemux",
+            mutationReplacement: "mount: .localRemux"),
+        StartupWiringRule(
+            name: "remote automatic stall waiting", usesServer: false,
+            start: """
+            #endif
+                    player.automaticallyWaitsToMinimizeStalling =
+                        VortXRemuxForwardBufferPolicy.automaticallyWaitsToMinimizeStalling(
+                            mount: .remoteRemux)
+            """,
+            end: "player.allowsExternalPlayback",
+            exactSection: """
+            #endif
+            player.automaticallyWaitsToMinimizeStalling =
+                VortXRemuxForwardBufferPolicy.automaticallyWaitsToMinimizeStalling(
+                    mount: .remoteRemux)
+            """,
+            mutationTarget: "mount: .remoteRemux",
+            mutationReplacement: "mount: .direct"),
         StartupWiringRule(
             name: "cohort successor publication", usesServer: true,
             start: "if !engineReady,\n           consumptionAnchored,",
@@ -697,52 +737,67 @@ check("startup readiness: the startup floor is 4000 rendered milliseconds regard
           && VortXHLSStartupReadiness(
               frozenTarget: VortXHLSTargetPolicy.conservativeTarget)?
               .minimumRenderedDurationMilliseconds == 4_000)
-check("startup forward buffer: the default-off branch preserves the field-proven thirty-second cap",
+check("startup forward buffer: local remux starts at the four-second publication floor",
       VortXRemuxForwardBufferPolicy.preferredDuration(
-          hasProducedFirstFrame: false,
-          startupTesterEnabled: false) == 30)
-#if VORTX_AVPLAYER_STARTUP_TESTER
-let expectedCompiledStartupTester = true
-#else
-let expectedCompiledStartupTester = false
-#endif
-check("startup forward buffer: the compile condition is the policy's single build-time authority",
-      VortXRemuxForwardBufferPolicy.buildEnablesStartupTester
-          == expectedCompiledStartupTester)
-check("startup forward buffer: the tester branch matches the four-second HLS readiness floor",
-      VortXRemuxForwardBufferPolicy.preferredDuration(
-          hasProducedFirstFrame: false,
-          startupTesterEnabled: true)
+          mount: .localRemux,
+          hasProducedFirstFrame: false)
           == Double(VortXHLSStartupReadiness.startupFloorMilliseconds) / 1_000)
-check("startup forward buffer: both branches restore thirty seconds after the first rendered frame",
+check("startup forward buffer: remote remux starts adaptive at zero",
       VortXRemuxForwardBufferPolicy.preferredDuration(
-          hasProducedFirstFrame: true,
-          startupTesterEnabled: false) == 30
+          mount: .remoteRemux,
+          hasProducedFirstFrame: false) == 0)
+check("startup forward buffer: local and remote restore thirty seconds after first frame",
+      VortXRemuxForwardBufferPolicy.preferredDuration(
+          mount: .localRemux,
+          hasProducedFirstFrame: true) == 30
           && VortXRemuxForwardBufferPolicy.preferredDuration(
-              hasProducedFirstFrame: true,
-              startupTesterEnabled: true) == 30)
+              mount: .remoteRemux,
+              hasProducedFirstFrame: true) == 30)
+check("startup forward buffer: direct playback retains its prior thirty-second memory cap",
+      VortXRemuxForwardBufferPolicy.preferredDuration(
+          mount: .direct,
+          hasProducedFirstFrame: false) == 30)
+check("startup waiting: only local and remote remux mounts minimize stalling automatically",
+      VortXRemuxForwardBufferPolicy.automaticallyWaitsToMinimizeStalling(
+          mount: .localRemux)
+          && VortXRemuxForwardBufferPolicy.automaticallyWaitsToMinimizeStalling(
+              mount: .remoteRemux)
+          && !VortXRemuxForwardBufferPolicy.automaticallyWaitsToMinimizeStalling(
+              mount: .direct))
 check("startup forward buffer: a memory warning never increases a positive duration",
       VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
           currentDuration: 4,
-          hasProducedFirstFrame: false,
-          startupTesterEnabled: true) == nil
+          mount: .localRemux,
+          hasProducedFirstFrame: false) == nil
           && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
               currentDuration: 4,
-              hasProducedFirstFrame: true,
-              startupTesterEnabled: true) == nil)
+              mount: .localRemux,
+              hasProducedFirstFrame: true) == nil)
 check("startup forward buffer: memory pressure lowers oversized and system-selected buffers to the phase cap",
       VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
           currentDuration: 30,
-          hasProducedFirstFrame: false,
-          startupTesterEnabled: true) == 4
+          mount: .localRemux,
+          hasProducedFirstFrame: false) == 4
           && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
               currentDuration: 0,
-              hasProducedFirstFrame: false,
-              startupTesterEnabled: true) == 4
+              mount: .localRemux,
+              hasProducedFirstFrame: false) == 4
           && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
               currentDuration: 0,
-              hasProducedFirstFrame: false,
-              startupTesterEnabled: false) == 30)
+              mount: .direct,
+              hasProducedFirstFrame: false) == 30
+          && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
+              currentDuration: 0,
+              mount: .remoteRemux,
+              hasProducedFirstFrame: false) == 4
+          && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
+              currentDuration: 2,
+              mount: .remoteRemux,
+              hasProducedFirstFrame: false) == nil
+          && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
+              currentDuration: 30,
+              mount: .remoteRemux,
+              hasProducedFirstFrame: false) == 4)
 checkStartupProductionWiring()
 check("startup readiness: an unconsumed playlist exposes at most two startup segments",
       targetSevenReadiness?.maximumUnconsumedSegmentCount == 2

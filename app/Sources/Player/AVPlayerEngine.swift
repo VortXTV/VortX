@@ -111,12 +111,11 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     // anchors the sustained no-picture window (0 = not currently counting); `audioOverBlackFired` makes the
     // demote one-shot per item, alongside the fatalErrorEmitted latch it shares with the other fatal paths.
     private var videoFrameEverProduced = false
-    /// Explicit build-time A/B only. Shipping builds keep the proven 30-second value; the tester affects only
-    /// an on-device Dolby Vision remux and never a plain or remotely hosted mount.
-    private var localRemuxStartupTesterEnabled: Bool {
-        remuxHLSServer != nil
-            && contentIsDolbyVision
-            && VortXRemuxForwardBufferPolicy.buildEnablesStartupTester
+    /// Exact origin for the current item's forward-buffer and stall-wait policy.
+    private var forwardBufferMount: VortXRemuxForwardBufferPolicy.Mount {
+        if remuxRemoteMount != nil { return .remoteRemux }
+        if remuxHLSServer != nil || remuxLoader != nil { return .localRemux }
+        return .direct
     }
     /// Render proof for the chrome's first-frame commit. AVPlayer can hold its clock at exactly zero while its
     /// layer already displays the first decoded frame, so a positive time position cannot be the sole owner of
@@ -130,17 +129,24 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         if videoFrameEverProduced { return true }
         guard hasProducedPicture(atClock: seconds) else { return false }
         videoFrameEverProduced = true
-        if let server = remuxHLSServer {
+        if isRemuxMounted {
             let steadyDuration = VortXRemuxForwardBufferPolicy.preferredDuration(
-                hasProducedFirstFrame: true,
-                startupTesterEnabled: localRemuxStartupTesterEnabled)
+                mount: forwardBufferMount,
+                hasProducedFirstFrame: true)
             if item?.preferredForwardBufferDuration != steadyDuration {
                 item?.preferredForwardBufferDuration = steadyDuration
             }
+        }
+        if let server = remuxHLSServer {
             DiagnosticsLog.log(
                 "dv",
                 "startup phase=first-video-frame elapsedMs=\(server.startupElapsedMilliseconds) "
                     + "forwardBufferSeconds=\(Int(VortXRemuxForwardBufferPolicy.steadyStateSeconds))")
+        } else if remuxRemoteMount != nil {
+            DiagnosticsLog.log(
+                "engine",
+                "startup phase=first-video-frame forwardBufferSeconds="
+                    + "\(Int(VortXRemuxForwardBufferPolicy.steadyStateSeconds))")
         }
         return true
     }
@@ -192,6 +198,11 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// IDs survive replacement mounts and include every deliverable track without spawning parallel muxers.
     private var remuxSourceAudioTracks: [VortXEngineProtocol.AudioTrack] = []
     private var selectedRemuxAudioSourceIndex: Int?
+    /// Main-actor snapshot taken once for a fresh logical load and retained across same-token fallbacks or
+    /// explicit source remounts. Optional storage distinguishes startup before any load from an explicit
+    /// current-client empty preference chain.
+    private var remuxPreferredAudioLanguages: [String]?
+    private var remuxAudioRejectTerms: [String]?
     /// Stable source subtitle identities. Text rows map to HLS rendition indices; bitmap rows stay visible
     /// with an unavailable reason instead of silently disappearing.
     private var remuxSourceSubtitleTracks: [VortXEngineProtocol.SubtitleTrack] = []
@@ -383,6 +394,22 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?,
                   reusing loadToken: PlayerLoadToken?) -> PlayerLoadToken {
         let isIntentRemount = loadToken != nil && pendingPlaybackIntent != nil
+        if loadToken == nil {
+            let preferences = TrackPreferences.current
+            if let normalized = VortXEngineProtocol.normalizedAudioSelectionPreferences(
+                preferredLanguages: preferences.audioLanguages,
+                rejectTerms: preferences.rejectTerms
+            ) {
+                remuxPreferredAudioLanguages = normalized.preferredLanguages
+                remuxAudioRejectTerms = normalized.rejectTerms
+            } else {
+                remuxPreferredAudioLanguages = nil
+                remuxAudioRejectTerms = nil
+                DiagnosticsLog.log(
+                    "avplayer",
+                    "ignored oversized initial audio preferences")
+            }
+        }
         if hasConfiguredAudioSourceIndex {
             selectedRemuxAudioSourceIndex = configuredAudioSourceIndex
             configuredAudioSourceIndex = nil
@@ -513,6 +540,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 wantsPlainRemux: wantsPlainRemux,
                 startAtSeconds: requestedRemuxOrigin,
                 selectedAudioStreamIndex: selectedRemuxAudioSourceIndex,
+                preferredAudioLanguages: remuxPreferredAudioLanguages,
+                audioRejectTerms: remuxAudioRejectTerms,
                 live: live,
                 audioSidecar: audioSidecar,
                 loadToken: issuedToken,
@@ -524,6 +553,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                                                   mode: wantsPlainRemux ? .plain : .dolbyVision,
                                                   startAtSeconds: requestedRemuxOrigin,
                                                   selectedAudioStreamIndex: selectedRemuxAudioSourceIndex,
+                                                  preferredAudioLanguages: remuxPreferredAudioLanguages,
+                                                  audioRejectTerms: remuxAudioRejectTerms,
                                                   onStartupTimeout: { [weak self] timedOutServer in
                 Task { @MainActor [weak self] in
                     self?.handleRemuxStartupTimeout(
@@ -541,7 +572,12 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             // channel so one grep still shows route -> mount -> classify -> demote in order).
             VXProbe.log("dv", "\(lane) mounted (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
         } else if wantsDVRemux, !VortXRemuxHLSServer.deliveryEnabled,
-                  let built = VortXRemuxResourceLoader.make(input: url, headers: headers) {
+                  let built = VortXRemuxResourceLoader.make(
+                    input: url,
+                    headers: headers,
+                    selectedAudioStreamIndex: selectedRemuxAudioSourceIndex,
+                    preferredAudioLanguages: remuxPreferredAudioLanguages,
+                    audioRejectTerms: remuxAudioRejectTerms) {
             remuxLoader = built.loader
             let asset = AVURLAsset(url: built.assetURL)
             asset.resourceLoader.setDelegate(built.loader, queue: remuxLoaderQueue)
@@ -574,15 +610,15 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             newAsset = AVURLAsset(url: url, options: options)
         }
         let newItem = AVPlayerItem(asset: newAsset)
-        if remuxHLSServer != nil {
+        if isRemuxMounted {
             // The remux window bounds OUR buffer, but AVPlayer keeps its OWN forward buffer of the served HLS
             // and, left unset, sizes it at its discretion (hundreds of MB at 4K DV bitrates, in the SAME
-            // jetsam-bound process as node + mpv). Shipping keeps the field-proven 30s cap. The explicit
-            // startup tester uses the four-second HLS floor, then restores 30s at the first rendered frame.
+            // jetsam-bound process as node + mpv). Local production starts at the four-second HLS floor,
+            // then restores the field-proven 30s cap at the first rendered frame.
             newItem.preferredForwardBufferDuration =
                 VortXRemuxForwardBufferPolicy.preferredDuration(
-                    hasProducedFirstFrame: false,
-                    startupTesterEnabled: localRemuxStartupTesterEnabled)
+                    mount: forwardBufferMount,
+                    hasProducedFirstFrame: false)
         }
         // Attach a pull-model frame tap so trickplay can grab the displayed frame on demand (see videoOutput).
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
@@ -621,12 +657,12 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             HDRDisplayMode.reset(in: nil)
         }
         #endif
-        // START PROMPTLY. With the default (true), AVPlayer waits to build a stall-proof buffer before it
-        // begins; for a large 4K / Dolby Vision debrid stream that wait can outlast any reasonable start
-        // deadline, so the player mounts, shows the chrome, and never produces a frame (no item .failed, no
-        // timePos) -> on tvOS that read as "AVPlayer plays nothing" and tripped the libmpv fallback for every
-        // stream. We drive our own start watchdog + stall handling, so let playback begin at the first samples.
-        player.automaticallyWaitsToMinimizeStalling = false
+        // Remux mounts use AVPlayer's stall-aware start against their explicit bounded startup buffer. Direct
+        // mounts retain the established prompt-start behavior because their source buffering remains unbounded
+        // by VortX and their watchdog contract has not changed.
+        player.automaticallyWaitsToMinimizeStalling =
+            VortXRemuxForwardBufferPolicy.automaticallyWaitsToMinimizeStalling(
+                mount: forwardBufferMount)
         player.allowsExternalPlayback = true   // AirPlay
         DiagnosticsLog.log("avplayer", "load host=\(url.host ?? "?") scheme=\(url.scheme ?? "?") ext=\(url.pathExtension) headers=\(headers?.count ?? 0) live=\(live)")
         #if os(tvOS)
@@ -747,6 +783,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                                           wantsPlainRemux: Bool,
                                           startAtSeconds: Double,
                                           selectedAudioStreamIndex: Int?,
+                                          preferredAudioLanguages: [String]?,
+                                          audioRejectTerms: [String]?,
                                           live: Bool,
                                           audioSidecar: URL?,
                                           loadToken: PlayerLoadToken,
@@ -759,6 +797,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             let mount = await VortXRemoteRemuxMount.open(
                 input: url, headers: headers, mode: mode, startAtSeconds: startAtSeconds,
                 selectedAudioStreamIndex: selectedAudioStreamIndex,
+                preferredAudioLanguages: preferredAudioLanguages,
+                audioRejectTerms: audioRejectTerms,
                 onLost: { [weak self] emittingMount in
                     Task { @MainActor [weak self] in
                         self?.handleExternalEngineLost(
@@ -856,9 +896,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         remuxRemoteItemGeneration = generation
         refreshRemuxSourceAudioTracks()
         let newItem = AVPlayerItem(asset: AVURLAsset(url: mount.playlistURL))
-        // Remux production moved to the Mac, but AVPlayer's network buffer remains inside the Apple TV process.
-        // Keep the same device-safe 30s ceiling until supported-device telemetry proves a larger cap is safe.
-        newItem.preferredForwardBufferDuration = VortXEngineHostPolicy.forwardBufferSeconds(remote: true)
+        newItem.preferredForwardBufferDuration =
+            VortXRemuxForwardBufferPolicy.preferredDuration(
+                mount: .remoteRemux,
+                hasProducedFirstFrame: false)
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
         ])
@@ -877,7 +918,9 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             HDRDisplayMode.reset(in: nil)
         }
         #endif
-        player.automaticallyWaitsToMinimizeStalling = false
+        player.automaticallyWaitsToMinimizeStalling =
+            VortXRemuxForwardBufferPolicy.automaticallyWaitsToMinimizeStalling(
+                mount: .remoteRemux)
         player.allowsExternalPlayback = true
         DiagnosticsLog.log(
             "avplayer",
@@ -1090,11 +1133,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             generation: itemGeneration,
             mountIdentity: playbackMountIdentity)
         item = freshItem
-        freshItem.preferredForwardBufferDuration = remuxRemoteMount == nil
-            ? VortXRemuxForwardBufferPolicy.preferredDuration(
-                hasProducedFirstFrame: false,
-                startupTesterEnabled: localRemuxStartupTesterEnabled)
-            : VortXEngineHostPolicy.forwardBufferSeconds(remote: true)
+        freshItem.preferredForwardBufferDuration =
+            VortXRemuxForwardBufferPolicy.preferredDuration(
+                mount: forwardBufferMount,
+                hasProducedFirstFrame: false)
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
         ])
@@ -1360,6 +1402,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         remuxSourceSubtitleTracks = []
         selectionTopologyGeneration = nil
         selectedRemuxAudioSourceIndex = nil
+        remuxPreferredAudioLanguages = nil
+        remuxAudioRejectTerms = nil
         configuredAudioSourceIndex = nil
         hasConfiguredAudioSourceIndex = false
     }
@@ -2243,8 +2287,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         guard let item,
               let replacement = VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
                   currentDuration: item.preferredForwardBufferDuration,
-                  hasProducedFirstFrame: videoFrameEverProduced,
-                  startupTesterEnabled: localRemuxStartupTesterEnabled) else { return }
+                  mount: forwardBufferMount,
+                  hasProducedFirstFrame: videoFrameEverProduced) else { return }
         item.preferredForwardBufferDuration = replacement
         DiagnosticsLog.log(
             "avplayer",
@@ -2368,8 +2412,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             if !didStart {
                 didStart = true
                 if playbackRequested {
-                    // Explicit play() then pin the rate. With automaticallyWaitsToMinimizeStalling = false this
-                    // begins at the first samples instead of waiting on a buffer heuristic that never settles.
+                    // Explicit play() then pin the rate. Direct mounts keep prompt-start behavior; remux mounts
+                    // wait only for their explicit bounded startup policy.
                     player.play()
                     player.rate = requestedRate
                     DiagnosticsLog.log("avplayer", "readyToPlay -> play() rate=\(requestedRate) tcs=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")

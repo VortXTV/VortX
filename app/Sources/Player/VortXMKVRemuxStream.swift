@@ -67,6 +67,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// Optional immutable source-container audio identity requested for this mount. Validation happens after
     /// libav has enumerated the source; an absent or incompatible index falls back to the existing ranking.
     private let requestedAudioStreamIndex: Int?
+    /// Optional means the caller predates initial preference forwarding. A present empty chain explicitly
+    /// requests English fallback; a present nonempty chain preserves its tier order.
+    private let preferredAudioLanguages: [String]?
+    /// Source-title terms excluded only from automatic selection. An explicit source identity still wins.
+    private let audioRejectTerms: [String]?
     /// Frozen once during construction. Current production deliberately has no validated complete index, so
     /// every mount uses the conservative 12-second authority for its whole lifetime.
     private let hlsTarget: VortXHLSFrozenTarget
@@ -141,7 +146,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// serve, just without seek-anywhere.
     init(input: String, headers: [String: String]?, indexForHLS: Bool = false,
          mode: Mode = .dolbyVision, startAtSeconds: Double = 0,
-         retainFullTimeline: Bool = false, selectedAudioStreamIndex: Int? = nil) {
+         retainFullTimeline: Bool = false, selectedAudioStreamIndex: Int? = nil,
+         preferredAudioLanguages: [String]? = nil, audioRejectTerms: [String]? = nil) {
         let primaryBuffer = VortXRemuxBuffer()
         let retaining = (indexForHLS && retainFullTimeline)
             ? VortXHLSSessionSpool.makeRetaining() : nil
@@ -153,6 +159,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         self.hlsIndexingEnabled = indexForHLS
         self.mode = mode
         self.requestedAudioStreamIndex = selectedAudioStreamIndex
+        self.preferredAudioLanguages = preferredAudioLanguages
+        self.audioRejectTerms = audioRejectTerms
         self.hlsTarget = VortXHLSTargetPolicy.conservativeTarget
         self.requestedOriginSeconds = RemuxResumePolicy.isEnabledByDefault
             ? RemuxResumePolicy.originRequest(resumeSeconds: startAtSeconds)
@@ -953,8 +961,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         guard hlsIndexingEnabled, mode == .dolbyVision else { return nil }
         var source = SourceInfo()
         var baseVideoStream: UnsafeMutablePointer<AVStream>?
-        var hasAnyStreamCopyAudio = false
-        var requestedStreamCopyAudio = false
+        var audioTracks: [MultiAudioPolicy.AudioTrack] = []
         for index in 0..<Int(inputContext.pointee.nb_streams) {
             guard let stream = inputContext.pointee.streams[index],
                   let parameters = stream.pointee.codecpar else { continue }
@@ -965,11 +972,22 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 source.height = Int(parameters.pointee.height)
                 Self.readDoVi(parameters, into: &source)
             case AVMEDIA_TYPE_AUDIO:
-                let streamCopy = Self.avPlayerDecodableAudio.contains(
+                let isStreamCopy = Self.avPlayerDecodableAudio.contains(
                     parameters.pointee.codec_id.rawValue)
-                hasAnyStreamCopyAudio = hasAnyStreamCopyAudio || streamCopy
-                if requestedAudioStreamIndex == index {
-                    requestedStreamCopyAudio = streamCopy
+                if isStreamCopy || avcodec_find_decoder(parameters.pointee.codec_id) != nil {
+                    let isAtmos = parameters.pointee.codec_id == AV_CODEC_ID_EAC3
+                        && parameters.pointee.profile == Self.eac3AtmosProfile
+                    audioTracks.append(MultiAudioPolicy.AudioTrack(
+                        index: index,
+                        codecID: parameters.pointee.codec_id.rawValue,
+                        channels: Int(parameters.pointee.ch_layout.nb_channels),
+                        language: Self.streamLanguage(stream),
+                        title: Self.streamMetadata(stream, key: "title"),
+                        sourceProfile30: isAtmos,
+                        usesDec3: parameters.pointee.codec_id == AV_CODEC_ID_EAC3,
+                        isStreamCopy: isStreamCopy,
+                        codecRank: isStreamCopy
+                            ? Self.audioCopyRank(parameters.pointee.codec_id) : .max))
                 }
             default:
                 break
@@ -977,9 +995,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
         guard let baseVideoStream, let baseParameters = baseVideoStream.pointee.codecpar else { return nil }
         let frameRate = Self.frameRate(baseVideoStream)
-        let selectedAudioIsStreamCopy = requestedAudioStreamIndex == nil
-            ? hasAnyStreamCopyAudio
-            : requestedStreamCopyAudio
+        let initialAudio = MultiAudioPolicy.initialSourceTrack(
+            from: audioTracks,
+            requestedSourceIndex: requestedAudioStreamIndex,
+            preferredLanguages: preferredAudioLanguages,
+            rejectTerms: audioRejectTerms)
+        // Nil means the additive policy did not apply, so the later classifier keeps its existing default:
+        // any stream-copy candidate wins before the transcode fallback.
+        let selectedAudioIsStreamCopy = initialAudio?.isStreamCopy
+            ?? audioTracks.contains(where: \.isStreamCopy)
         guard DVPlaybackPolicy.canPublishEarlyDisplayIntent(
             requiresDolbyVision: true,
             dolbyVisionProfile: source.dvProfile,
@@ -1346,7 +1370,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 language: $0.lang,
                 title: $0.title,
                 sourceProfile30: $0.atmos,
-                usesDec3: $0.codecID == AV_CODEC_ID_EAC3.rawValue)
+                usesDec3: $0.codecID == AV_CODEC_ID_EAC3.rawValue,
+                codecRank: $0.rank)
         })
         let transcodablePolicyAudioTracks = MultiAudioPolicy.selectableSourceTracks(from: transcodableAudio.map {
             MultiAudioPolicy.AudioTrack(
@@ -1368,9 +1393,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // bed is never masked by a 1-2ch stereo downmix or commentary ordered ahead of it (the "Atmos plays as
         // stereo" report), then EAC3 (beating AC3, then lossy), then file order.
         var mappedAudioIn = -1
-        let requestedAudio = MultiAudioPolicy.selectedSourceTrack(
+        let requestedAudio = MultiAudioPolicy.initialSourceTrack(
             from: policyAudioTracks,
-            requestedSourceIndex: requestedAudioStreamIndex)
+            requestedSourceIndex: requestedAudioStreamIndex,
+            preferredLanguages: preferredAudioLanguages,
+            rejectTerms: audioRejectTerms)
         let requestedCopyable = requestedAudio.flatMap { requested in
             decodableAudio.first { $0.index == requested.index }
         }

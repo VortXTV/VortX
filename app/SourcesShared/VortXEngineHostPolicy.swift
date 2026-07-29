@@ -462,21 +462,4 @@ enum VortXEngineHostPolicy {
             && mountedIdentity == emittingIdentity
     }
 
-    // MARK: - Forward buffer
-
-    /// AVPlayer's own forward buffer, in seconds, for a mounted remux.
-    ///
-    /// The shipping value is 30s, pinned because AVPlayer left unset "sizes it at its discretion (hundreds of
-    /// MB at 4K DV bitrates, in the SAME jetsam-bound process as node + mpv, a major contributor to the ~900MB
-    /// that gets the app killed on backgrounding)" (`AVPlayerEngine.loadFile`). That justification is about
-    /// memory in OUR process, and it is entirely correct for a loopback origin where the producer is also in
-    /// our process.
-    ///
-    /// A remote producer moves remux storage to the Mac, but AVPlayer's forward network buffer remains in the
-    /// Apple TV process. Diag 12 measured severe device memory pressure, so both origins keep the proven 30s
-    /// device cap. The parameter remains explicit because origin-specific tuning can return after device proof.
-    static func forwardBufferSeconds(remote: Bool) -> Double {
-        _ = remote
-        return 30
-    }
 }

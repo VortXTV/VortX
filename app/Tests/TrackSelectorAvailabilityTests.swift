@@ -3,6 +3,7 @@
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
 //     -o /tmp/track-selector-availability-test \
 //     app/Sources/Player/MPVTrack.swift \
+//     app/Sources/Player/AudioLanguagePolicy.swift \
 //     app/Sources/Player/TrackSelector.swift \
 //     app/Tests/TrackSelectorAvailabilityTests.swift && \
 //     /tmp/track-selector-availability-test
@@ -172,6 +173,36 @@ enum TrackSelectorAvailabilityTests {
                 ],
                 subtitles: [],
                 preferences: fallbackPreferences).audio == 8)
+        let unmatchedFallback = TrackSelector.select(
+            audio: [
+                track(7, type: "audio", lang: "en"),
+                track(8, type: "audio", lang: "fra", selected: true),
+            ],
+            subtitles: [],
+            preferences: fallbackPreferences).audio
+        check(
+            "audio: a remux suppresses the post-load English setter when initial selection is authoritative",
+            TrackSelector.automaticAudioSelection(
+                unmatchedFallback,
+                remuxOwnsInitialSelection: true) == nil)
+        check(
+            "audio: direct and libmpv loads retain the established English fallback setter",
+            TrackSelector.automaticAudioSelection(
+                unmatchedFallback,
+                remuxOwnsInitialSelection: false) == 7)
+        check(
+            "audio language: shared canonicalization matches regular three-letter tags",
+            TrackSelector.matches("ukr", "uk")
+                && TrackSelector.matches(" hun_HU ", "hu"))
+        check(
+            "audio language: explicit exception mapping prevents cross-language prefix matches",
+            TrackSelector.matches("est", "et")
+                && !TrackSelector.matches("est", "es"))
+        check(
+            "audio language: standard mapping keeps Scottish Gaelic distinct from Galician",
+            TrackSelector.matches("gla", "gd")
+                && TrackSelector.matches("glg", "gl")
+                && !TrackSelector.matches("gla", "gl"))
 
         check(
             "subtitles: selected-row stability remains audio-only",

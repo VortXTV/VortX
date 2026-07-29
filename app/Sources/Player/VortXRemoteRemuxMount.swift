@@ -81,13 +81,17 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
                      mode: VortXEngineProtocol.RemuxMode,
                      startAtSeconds: Double,
                      selectedAudioStreamIndex: Int? = nil,
+                     preferredAudioLanguages: [String]? = nil,
+                     audioRejectTerms: [String]? = nil,
                      engine: VortXExternalEngine = .shared,
                      onLost: @escaping @Sendable (VortXRemoteRemuxMount) -> Void) async
         -> VortXRemoteRemuxMount? {
         guard let opened = await engine.openSession(
             input: input, headers: headers, mode: mode,
             startAtSeconds: max(0, startAtSeconds),
-            selectedAudioStreamIndex: selectedAudioStreamIndex) else { return nil }
+            selectedAudioStreamIndex: selectedAudioStreamIndex,
+            preferredAudioLanguages: preferredAudioLanguages,
+            audioRejectTerms: audioRejectTerms) else { return nil }
         return VortXRemoteRemuxMount(session: opened, engine: engine, onLost: onLost)
     }
 

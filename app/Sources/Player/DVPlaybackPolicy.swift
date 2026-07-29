@@ -1219,38 +1219,52 @@ struct VortXHLSFrozenTarget: Equatable, Sendable {
     let authority: Authority
 }
 
-/// Default-off A/B policy for testing whether AVPlayer's local-remux buffer demand contributes to first-frame
-/// latency. Shipping keeps the field-proven 30-second cap. A tester build may use the same four-second floor as
-/// HLS publication until a decoded picture exists, then restores 30 seconds for sustained playback.
+/// Phase-aware AVPlayer buffering for remux mounts. Local production starts at the same four-second media floor
+/// as HLS publication. Remote production leaves the initial duration at zero so AVPlayer adapts to the network.
+/// Both restore the field-proven 30-second device cap after the first decoded picture.
 enum VortXRemuxForwardBufferPolicy {
+    enum Mount: Equatable, Sendable {
+        case direct
+        case localRemux
+        case remoteRemux
+    }
+
     static let startupSeconds: TimeInterval = 4
     static let steadyStateSeconds: TimeInterval = 30
 
-    #if VORTX_AVPLAYER_STARTUP_TESTER
-    static let buildEnablesStartupTester = true
-    #else
-    static let buildEnablesStartupTester = false
-    #endif
-
     static func preferredDuration(
-        hasProducedFirstFrame: Bool,
-        startupTesterEnabled: Bool
+        mount: Mount,
+        hasProducedFirstFrame: Bool
     ) -> TimeInterval {
-        startupTesterEnabled && !hasProducedFirstFrame
-            ? startupSeconds : steadyStateSeconds
+        if hasProducedFirstFrame { return steadyStateSeconds }
+        switch mount {
+        case .direct:
+            return steadyStateSeconds
+        case .localRemux:
+            return startupSeconds
+        case .remoteRemux:
+            return 0
+        }
+    }
+
+    static func automaticallyWaitsToMinimizeStalling(mount: Mount) -> Bool {
+        mount != .direct
     }
 
     /// A memory warning may replace AVPlayer's system-selected zero value or lower an oversized explicit
-    /// duration, but it must never increase an already-smaller positive buffer. This keeps the tester's
-    /// pre-frame four seconds intact while retaining the shipping 30-second cap everywhere else.
+    /// duration, but it must never increase an already-smaller positive buffer. Normal remote startup remains
+    /// adaptive at zero; under memory pressure only, use the finite local startup floor until first frame.
     static func memoryWarningReplacementDuration(
         currentDuration: TimeInterval,
-        hasProducedFirstFrame: Bool,
-        startupTesterEnabled: Bool
+        mount: Mount,
+        hasProducedFirstFrame: Bool
     ) -> TimeInterval? {
-        let cap = preferredDuration(
-            hasProducedFirstFrame: hasProducedFirstFrame,
-            startupTesterEnabled: startupTesterEnabled)
+        let phaseCap = preferredDuration(
+            mount: mount,
+            hasProducedFirstFrame: hasProducedFirstFrame)
+        let cap = mount == .remoteRemux && !hasProducedFirstFrame
+            ? startupSeconds : phaseCap
+        if currentDuration.isFinite, currentDuration == cap { return nil }
         guard !currentDuration.isFinite || currentDuration <= 0 || currentDuration > cap else {
             return nil
         }

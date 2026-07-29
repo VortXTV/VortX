@@ -314,6 +314,7 @@ xcrun swiftc -sdk "$SDK_PATH" \
   test/dv-rendition-stall/Stubs.swift \
   app/Sources/Player/DVPlaybackPolicy.swift \
   app/Sources/Player/VortXRemuxBuffer.swift \
+  app/Sources/Player/AudioLanguagePolicy.swift \
   app/Sources/Player/MultiAudioPolicy.swift \
   app/Sources/Player/SubtitleRenditionPolicy.swift \
   app/Sources/Player/RemuxResumePolicy.swift \

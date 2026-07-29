@@ -202,6 +202,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                      mode: VortXMKVRemuxStream.Mode = .dolbyVision,
                      startAtSeconds: Double = 0,
                      selectedAudioStreamIndex: Int? = nil,
+                     preferredAudioLanguages: [String]? = nil,
+                     audioRejectTerms: [String]? = nil,
                      hosting: HostingConfig? = nil,
                      onStartupTimeout: @escaping @Sendable (VortXRemuxHLSServer) -> Void = { _ in })
         -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
@@ -212,7 +214,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             mode: mode,
             startAtSeconds: startAtSeconds,
             retainFullTimeline: hosting?.retainFullTimeline ?? false,
-            selectedAudioStreamIndex: selectedAudioStreamIndex)
+            selectedAudioStreamIndex: selectedAudioStreamIndex,
+            preferredAudioLanguages: preferredAudioLanguages,
+            audioRejectTerms: audioRejectTerms)
         guard let server = VortXRemuxHLSServer(
             stream: stream,
             hosting: hosting,

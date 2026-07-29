@@ -496,13 +496,6 @@ check("mountpath: round-trips through route back to the bare resource path",
       P.route(header: "GET \(P.mountPath(capability: capA, resource: "master.m3u8")) HTTP/1.1", capability: capA)
         == .guarded(method: .get, path: "/master.m3u8", range: nil))
 
-// MARK: - 10. Forward buffer
-
-check("buffer: local (loopback) origin uses the shipping 30s value",
-      P.forwardBufferSeconds(remote: false) == 30)
-check("buffer: a remote producer still keeps AVPlayer's device-side buffer at 30s",
-      P.forwardBufferSeconds(remote: true) == 30)
-
 // MARK: - Result
 
 print("")

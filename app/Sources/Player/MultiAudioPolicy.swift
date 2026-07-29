@@ -229,9 +229,13 @@ enum MultiAudioPolicy {
         let sourceProfile30: Bool
         let usesDec3: Bool
         let isStreamCopy: Bool
+        /// Lower is better. The remuxer supplies its existing E-AC-3, AC-3, fallback ordering for
+        /// stream-copy candidates. Transcodes do not consult this value.
+        let codecRank: Int
 
         init(index: Int, codecID: UInt32, channels: Int, language: String, title: String = "",
-             sourceProfile30: Bool = false, usesDec3: Bool = false, isStreamCopy: Bool = true) {
+             sourceProfile30: Bool = false, usesDec3: Bool = false, isStreamCopy: Bool = true,
+             codecRank: Int = .max) {
             self.index = index
             self.codecID = codecID
             self.channels = channels
@@ -240,6 +244,7 @@ enum MultiAudioPolicy {
             self.sourceProfile30 = sourceProfile30
             self.usesDec3 = usesDec3
             self.isStreamCopy = isStreamCopy
+            self.codecRank = codecRank
         }
     }
 
@@ -300,6 +305,71 @@ enum MultiAudioPolicy {
                                     requestedSourceIndex: Int?) -> AudioTrack? {
         guard let requestedSourceIndex else { return nil }
         return tracks.first { $0.index == requestedSourceIndex }
+    }
+
+    /// Resolve the source that must be primary before the first remux starts.
+    ///
+    /// A valid explicit source identity has absolute precedence. A nil language chain means the request came
+    /// from a client predating this additive policy, so the caller retains its existing default unchanged. An
+    /// explicitly present but empty chain means the current client has no preference language and permits the
+    /// English fallback. A nonempty chain never silently substitutes English after its tiers fail.
+    static func initialSourceTrack(from tracks: [AudioTrack],
+                                   requestedSourceIndex: Int?,
+                                   preferredLanguages: [String]?,
+                                   rejectTerms: [String]?) -> AudioTrack? {
+        if let explicit = selectedSourceTrack(
+            from: tracks,
+            requestedSourceIndex: requestedSourceIndex
+        ) {
+            return explicit
+        }
+        guard let preferredLanguages else { return nil }
+
+        let rejected = (rejectTerms ?? []).compactMap { raw -> String? in
+            let term = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return term.isEmpty ? nil : term
+        }
+        let eligible = tracks.filter { track in
+            let title = track.title.lowercased()
+            return !rejected.contains { title.contains($0) }
+        }
+
+        var seen = Set<String>()
+        let canonicalPreferences = preferredLanguages.compactMap { raw -> String? in
+            let language = canonicalLanguage(raw)
+            guard !language.isEmpty, seen.insert(language).inserted else { return nil }
+            return language
+        }
+        let tiers = preferredLanguages.isEmpty ? ["en"] : canonicalPreferences
+        for language in tiers {
+            let candidates = eligible.filter {
+                canonicalLanguage($0.language) == language
+            }
+            if let selected = candidates.min(by: initialTrackRanksBefore) {
+                return selected
+            }
+        }
+        return nil
+    }
+
+    /// Canonical base language used only for initial preference matching. HLS presentation tags retain their
+    /// original values through `languageKey`.
+    static func canonicalLanguage(_ raw: String) -> String {
+        AudioLanguagePolicy.canonical(raw)
+    }
+
+    private static func initialTrackRanksBefore(_ lhs: AudioTrack, _ rhs: AudioTrack) -> Bool {
+        if lhs.isStreamCopy != rhs.isStreamCopy { return lhs.isStreamCopy }
+        if lhs.isStreamCopy {
+            let lhsAtmos = lhs.sourceProfile30 && lhs.usesDec3
+            let rhsAtmos = rhs.sourceProfile30 && rhs.usesDec3
+            if lhsAtmos != rhsAtmos { return lhsAtmos }
+            if lhs.channels != rhs.channels { return lhs.channels > rhs.channels }
+            if lhs.codecRank != rhs.codecRank { return lhs.codecRank < rhs.codecRank }
+        } else if lhs.channels != rhs.channels {
+            return lhs.channels > rhs.channels
+        }
+        return lhs.index < rhs.index
     }
 
     /// Selects the one metadata-qualified alternate without treating stream metadata as packet proof.

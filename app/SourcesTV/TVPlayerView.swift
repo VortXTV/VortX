@@ -3457,7 +3457,12 @@ struct TVPlayerView: View {
     /// Auto-pick the audio + subtitle track from the user's language preferences, once tracks are known.
     private func autoSelectTracks() {
         let pick = TrackSelector.select(audio: audioTracks, subtitles: subtitleTracks, preferences: TrackPreferences.current)
-        if let a = pick.audio { coordinator.player?.setAudioTrack(a) }
+        let remuxOwnsInitialAudio =
+            (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
+        let automaticAudio = TrackSelector.automaticAudioSelection(
+            pick.audio,
+            remuxOwnsInitialSelection: remuxOwnsInitialAudio)
+        if let automaticAudio { coordinator.player?.setAudioTrack(automaticAudio) }
         // Mandated check 8: an explicit in-session subtitle pick captured before an engine switch must SURVIVE
         // the switch. Re-apply it instead of the preference-derived auto pick, which would otherwise override
         // an explicit Off / language choice on the fresh mount. Only fall back to TrackSelector when there was

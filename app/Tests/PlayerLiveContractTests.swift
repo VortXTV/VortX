@@ -3,6 +3,7 @@
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors -o /tmp/player-live-contract \
 //     app/Sources/Player/DVPlaybackPolicy.swift \
 //     app/Sources/Player/VortXRemuxBuffer.swift \
+//     app/Sources/Player/AudioLanguagePolicy.swift \
 //     app/Sources/Player/MultiAudioPolicy.swift \
 //     app/Sources/Player/SubtitleRenditionPolicy.swift \
 //     app/Tests/PlayerLiveContractTests.swift && /tmp/player-live-contract

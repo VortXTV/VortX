@@ -742,6 +742,16 @@ final class VortXEngineHost: @unchecked Sendable {
                   body: VortXEngineProtocol.ErrorBody(error: "malformed", detail: nil))
             return
         }
+        guard let audioPreferences = VortXEngineProtocol.normalizedAudioSelectionPreferences(
+            preferredLanguages: request.preferredAudioLanguages,
+            rejectTerms: request.audioRejectTerms
+        ) else {
+            reply(connection, status: "400 Bad Request",
+                  body: VortXEngineProtocol.ErrorBody(
+                    error: "invalid_audio_preferences",
+                    detail: nil))
+            return
+        }
         stateLock.lock()
         let openingEpoch = lifecycleEpoch
         let listenerIsReady = listener != nil && listenerReadiness == .ready && boundPortStorage != 0
@@ -776,6 +786,8 @@ final class VortXEngineHost: @unchecked Sendable {
             mode: request.mode == .plain ? .plain : .dolbyVision,
             startAtSeconds: max(0, request.startAtSeconds),
             selectedAudioStreamIndex: request.selectedAudioStreamIndex,
+            preferredAudioLanguages: audioPreferences.preferredLanguages,
+            audioRejectTerms: audioPreferences.rejectTerms,
             hosting: hosting) else {
             reply(connection, status: "500 Internal Server Error",
                   body: VortXEngineProtocol.ErrorBody(error: "mount_failed",

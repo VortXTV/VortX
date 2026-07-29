@@ -3,6 +3,7 @@
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
 //     -o /tmp/remux-item-end-policy-test \
 //     app/Sources/Player/VortXRemuxBuffer.swift \
+//     app/Sources/Player/AudioLanguagePolicy.swift \
 //     app/Sources/Player/MultiAudioPolicy.swift \
 //     app/Tests/RemuxItemEndPolicyTests.swift && \
 //     /tmp/remux-item-end-policy-test

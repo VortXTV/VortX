@@ -13,6 +13,17 @@ private struct PreviousAudioTrack: Decodable {
     let delivery: VortXEngineProtocol.AudioDelivery?
 }
 
+/// A host from before initial preference forwarding. Decoding a current request through this shape proves
+/// Swift's synthesized decoder ignores the additive keys sent by a newer client.
+private struct PreviousSessionRequest: Decodable {
+    let input: String
+    let headers: [String: String]?
+    let mode: VortXEngineProtocol.RemuxMode
+    let startAtSeconds: Double
+    let requestFullTimeline: Bool
+    let selectedAudioStreamIndex: Int?
+}
+
 @main
 enum VortXEngineProtocolCompatibilityTests {
     static func main() throws {
@@ -60,6 +71,70 @@ enum VortXEngineProtocolCompatibilityTests {
             VortXEngineProtocol.SessionRequest.self,
             from: legacyRequest)
         precondition(decodedLegacyRequest.selectedAudioStreamIndex == nil)
+        precondition(decodedLegacyRequest.preferredAudioLanguages == nil)
+        precondition(decodedLegacyRequest.audioRejectTerms == nil)
+
+        let currentRequest = VortXEngineProtocol.SessionRequest(
+            input: "https://media.invalid/current.mkv",
+            headers: ["Authorization": "redacted"],
+            mode: .dolbyVision,
+            startAtSeconds: 12,
+            requestFullTimeline: false,
+            selectedAudioStreamIndex: nil,
+            preferredAudioLanguages: ["ja-JP", "en"],
+            audioRejectTerms: ["commentary", "sdh"])
+        let currentRequestData = try JSONEncoder().encode(currentRequest)
+        let roundTripRequest = try JSONDecoder().decode(
+            VortXEngineProtocol.SessionRequest.self,
+            from: currentRequestData)
+        precondition(roundTripRequest == currentRequest)
+        precondition(roundTripRequest.preferredAudioLanguages == ["ja-JP", "en"])
+        precondition(roundTripRequest.audioRejectTerms == ["commentary", "sdh"])
+
+        let previousHostRequest = try JSONDecoder().decode(
+            PreviousSessionRequest.self,
+            from: currentRequestData)
+        precondition(previousHostRequest.input == currentRequest.input)
+        precondition(previousHostRequest.headers == currentRequest.headers)
+        precondition(previousHostRequest.mode == currentRequest.mode)
+        precondition(previousHostRequest.startAtSeconds == currentRequest.startAtSeconds)
+        precondition(previousHostRequest.requestFullTimeline == currentRequest.requestFullTimeline)
+        precondition(previousHostRequest.selectedAudioStreamIndex == nil)
+
+        let missingPreferences = VortXEngineProtocol.normalizedAudioSelectionPreferences(
+            preferredLanguages: nil,
+            rejectTerms: nil)
+        precondition(missingPreferences == VortXEngineProtocol.AudioSelectionPreferences(
+            preferredLanguages: nil,
+            rejectTerms: nil))
+        let emptyPreferences = VortXEngineProtocol.normalizedAudioSelectionPreferences(
+            preferredLanguages: [],
+            rejectTerms: [])
+        precondition(emptyPreferences == VortXEngineProtocol.AudioSelectionPreferences(
+            preferredLanguages: [],
+            rejectTerms: []))
+        let normalizedPreferences = VortXEngineProtocol.normalizedAudioSelectionPreferences(
+            preferredLanguages: [" JA-JP ", "ja-jp", "EN"],
+            rejectTerms: [" Commentary ", "commentary", "SDH"])
+        precondition(normalizedPreferences == VortXEngineProtocol.AudioSelectionPreferences(
+            preferredLanguages: ["ja-jp", "en"],
+            rejectTerms: ["commentary", "sdh"]))
+        let nonemptyBlankPreferences = VortXEngineProtocol.normalizedAudioSelectionPreferences(
+            preferredLanguages: [" "],
+            rejectTerms: [" "])
+        precondition(nonemptyBlankPreferences == VortXEngineProtocol.AudioSelectionPreferences(
+            preferredLanguages: [""],
+            rejectTerms: [""]))
+        precondition(VortXEngineProtocol.normalizedAudioSelectionPreferences(
+            preferredLanguages: Array(
+                repeating: "en",
+                count: VortXEngineProtocol.maximumAudioPreferenceCount + 1),
+            rejectTerms: []) == nil)
+        precondition(VortXEngineProtocol.normalizedAudioSelectionPreferences(
+            preferredLanguages: ["en"],
+            rejectTerms: [String(
+                repeating: "x",
+                count: VortXEngineProtocol.maximumAudioPreferenceScalars + 1)]) == nil)
 
         let legacyPreInit = Data(
             """

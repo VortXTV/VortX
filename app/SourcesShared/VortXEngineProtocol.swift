@@ -137,6 +137,50 @@ enum VortXEngineProtocol {
         case plain
     }
 
+    struct AudioSelectionPreferences: Sendable, Equatable {
+        let preferredLanguages: [String]?
+        let rejectTerms: [String]?
+    }
+
+    /// The control body is already capped, but selection cost multiplies source tracks by both lists. Keep the
+    /// policy small and deterministic before any remux is created. Nil remains distinct from an explicit empty
+    /// list for backward compatibility and English-fallback semantics.
+    static let maximumAudioPreferenceCount = 16
+    static let maximumAudioPreferenceScalars = 64
+
+    private struct NormalizedOptionalList {
+        let value: [String]?
+    }
+
+    static func normalizedAudioSelectionPreferences(
+        preferredLanguages: [String]?,
+        rejectTerms: [String]?
+    ) -> AudioSelectionPreferences? {
+        guard let languages = normalizedAudioPreferenceList(preferredLanguages),
+              let rejects = normalizedAudioPreferenceList(rejectTerms) else {
+            return nil
+        }
+        return AudioSelectionPreferences(
+            preferredLanguages: languages.value,
+            rejectTerms: rejects.value)
+    }
+
+    private static func normalizedAudioPreferenceList(
+        _ rawValues: [String]?
+    ) -> NormalizedOptionalList? {
+        guard let rawValues else { return NormalizedOptionalList(value: nil) }
+        guard rawValues.count <= maximumAudioPreferenceCount else { return nil }
+        var seen = Set<String>()
+        var values: [String] = []
+        for raw in rawValues {
+            guard raw.unicodeScalars.count <= maximumAudioPreferenceScalars else { return nil }
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard seen.insert(normalized).inserted else { continue }
+            values.append(normalized)
+        }
+        return NormalizedOptionalList(value: values)
+    }
+
     struct SessionRequest: Codable, Sendable, Equatable {
         /// The source the HOST will fetch: a debrid URL, a direct URL, or the host's own streaming server.
         let input: String
@@ -154,6 +198,31 @@ enum VortXEngineProtocol {
         /// Stable source-container stream index to make primary for this remux. Nil preserves the host's
         /// preference-ranked default. This is a source identity, never an HLS option index.
         let selectedAudioStreamIndex: Int?
+        /// Ordered source-language preferences captured by the client before it starts the first remux.
+        /// Nil means an older client supplied no preference policy. An empty array explicitly permits the
+        /// policy's English fallback.
+        let preferredAudioLanguages: [String]?
+        /// Case-insensitive source-title terms excluded from automatic selection. Explicit source selection
+        /// still wins. Nil means an older client supplied no rejection policy.
+        let audioRejectTerms: [String]?
+
+        init(input: String,
+             headers: [String: String]?,
+             mode: RemuxMode,
+             startAtSeconds: Double,
+             requestFullTimeline: Bool,
+             selectedAudioStreamIndex: Int?,
+             preferredAudioLanguages: [String]? = nil,
+             audioRejectTerms: [String]? = nil) {
+            self.input = input
+            self.headers = headers
+            self.mode = mode
+            self.startAtSeconds = startAtSeconds
+            self.requestFullTimeline = requestFullTimeline
+            self.selectedAudioStreamIndex = selectedAudioStreamIndex
+            self.preferredAudioLanguages = preferredAudioLanguages
+            self.audioRejectTerms = audioRejectTerms
+        }
     }
 
     struct SessionResponse: Codable, Sendable, Equatable {
