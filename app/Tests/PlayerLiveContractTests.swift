@@ -2470,6 +2470,18 @@ enum PlayerLiveContractTests {
             engine,
             from: "private func remountForSeek(sourceSeconds: Double)",
             to: "func seek(to seconds: Double)")
+        let mountedRemuxWindow = sourceSection(
+            engine,
+            from: "private var mountedPlayerWindowBounds:",
+            to: "/// The launch site sets this")
+        let publishedRemuxWindow = sourceSection(
+            server,
+            from: "var publishedPlayerWindowSeconds: ClosedRange<Double>?",
+            to: "/// Stop everything")
+        let validatedResumeLanding = sourceSection(
+            stream,
+            from: "if !latchOriginFromFallbackIfNeeded()",
+            to: "let convertP7")
         let hdrFallbackRetry = sourceSection(
             engine,
             from: "private func retryFreshHDRItemOnHealthyMount(",
@@ -3106,12 +3118,32 @@ enum PlayerLiveContractTests {
                 "sourceSeconds: seconds",
                 "authoritativeSourceDurationSeconds: sourceDuration",
                 "playerDurationSeconds: dur",
-                "producedEdgePlayerSeconds: producedEdgeSeconds",
+                "producedEdgePlayerSeconds: mountedWindow.producedEdge",
                 "case .remountAtSource(let sourceSeconds):",
                 "remountForSeek(sourceSeconds: sourceSeconds)",
                 "} else {",
                 "clamped = (dur.isFinite && dur > 1)",
               ]))
+        check("wiring: local seeks use the exact published HLS window before AVPlayer range lag",
+              sourceContainsInOrder(publishedRemuxWindow, [
+                "publicationLock.lock()",
+                "publishedVideoWindow",
+                "window.segments.first",
+                "window.segments.last",
+                "first.start...last.end",
+                  ])
+                  && sourceContainsInOrder(mountedRemuxWindow, [
+                    "remuxHLSServer?.publishedPlayerWindowSeconds",
+                    "localWindow.lowerBound",
+                    "localWindow.upperBound",
+                    "var producedEdgeSeconds: Double",
+                    "mountedPlayerWindowBounds.producedEdge",
+                  ])
+                  && sourceContainsInOrder(remuxSeekMapping, [
+                    "let mountedWindow = mountedPlayerWindowBounds",
+                    "servedStartPlayerSeconds: mountedWindow.servedStart",
+                    "producedEdgePlayerSeconds: mountedWindow.producedEdge",
+                  ]))
         check("wiring: an out-of-window seek remounts the same logical source and carries playback intent",
               sourceContainsInOrder(remuxSeekRemount, [
                 "let requestedTarget =",
@@ -3251,6 +3283,13 @@ enum PlayerLiveContractTests {
                   && stream?.contains("rebaseFromOrigin(pkt, timeBase:") == true
                   && engine?.contains("remuxHLSServer?.timelineOriginSeconds") == true
                   && resumePolicy?.contains("static let isEnabledByDefault = true") == true)
+        check("wiring: a false-success input seek fails before remux output setup",
+              sourceContainsInOrder(validatedResumeLanding, [
+                "dts-ramp floor",
+                "RemuxResumePolicy.inputSeekLandingIsUsable(",
+                "buffer.fail(",
+                "return",
+              ]))
         check("wiring: mislabeled tiny DV sources keep their typed reason through automatic failover",
               stream?.contains("DVPlaybackPolicy.sourceCapabilityMismatch(") == true
                   && engine?.contains("remuxHLSServer?.terminalFailureReason") == true

@@ -1765,6 +1765,23 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             }
         }
 
+        if originSeekApplied {
+            let achievedOriginSeconds = Double(originShiftUsec) / Double(Self.avTimeBase)
+            if !RemuxResumePolicy.inputSeekLandingIsUsable(
+                requestedSourceSeconds: requestedOriginSeconds,
+                achievedOriginSeconds: achievedOriginSeconds
+            ) {
+                let requested = String(format: "%.3f", requestedOriginSeconds)
+                let achieved = String(format: "%.3f", achievedOriginSeconds)
+                VXProbe.log(
+                    "dv",
+                    "resume: input seek landed at \(achieved)s for \(requested)s request; refusing incorrect restart")
+                buffer.fail(
+                    "resume input seek landed at \(achieved) seconds for requested \(requested) seconds")
+                return
+            }
+        }
+
         let convertP7 = (mode == .dolbyVision && info.dvProfile == 7)
         if mode == .dolbyVision {
             guard info.dvProfile == 5 || info.dvProfile == 8 || convertP7 else {

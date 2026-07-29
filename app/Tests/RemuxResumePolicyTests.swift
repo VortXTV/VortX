@@ -126,6 +126,36 @@ check("input seek: two failed attempts cannot silently restart a requested resum
 check("input seek: a non-seekable source cannot claim that a resume was applied",
       RemuxResumePolicy.inputSeekOutcome(
         seekable: false, primaryResult: nil, fallbackResult: nil) == .unavailable)
+check("input seek landing: a nearby backward keyframe preserves a deep resume",
+      RemuxResumePolicy.inputSeekLandingIsUsable(
+        requestedSourceSeconds: 5_400, achievedOriginSeconds: 5_396))
+check("input seek landing: the exact one-GOP backward tolerance is accepted",
+      RemuxResumePolicy.inputSeekLandingIsUsable(
+        requestedSourceSeconds: 90,
+        achievedOriginSeconds: 90 - RemuxResumePolicy.originToleranceSeconds))
+check("input seek landing: subsecond presentation rounding after the request remains usable",
+      RemuxResumePolicy.inputSeekLandingIsUsable(
+        requestedSourceSeconds: 90, achievedOriginSeconds: 90.1))
+check("input seek landing: the exact forward rounding bound is accepted",
+      RemuxResumePolicy.inputSeekLandingIsUsable(
+        requestedSourceSeconds: 90,
+        achievedOriginSeconds: 90 + RemuxResumePolicy.forwardLandingToleranceSeconds))
+check("input seek landing: a timestamp just beyond the forward bound is rejected",
+      !RemuxResumePolicy.inputSeekLandingIsUsable(
+        requestedSourceSeconds: 90,
+        achievedOriginSeconds: 90 + RemuxResumePolicy.forwardLandingToleranceSeconds + 0.001))
+check("input seek landing: FFmpeg success at zero cannot satisfy a 90-second request",
+      !RemuxResumePolicy.inputSeekLandingIsUsable(
+        requestedSourceSeconds: 90, achievedOriginSeconds: 0))
+check("input seek landing: a half-second forward landing cannot skip requested content",
+      !RemuxResumePolicy.inputSeekLandingIsUsable(
+        requestedSourceSeconds: 90, achievedOriginSeconds: 90.5))
+check("input seek landing: invalid achieved timestamps fail honestly",
+      !RemuxResumePolicy.inputSeekLandingIsUsable(
+        requestedSourceSeconds: 90, achievedOriginSeconds: .nan))
+check("input seek landing: forward rounding allowance remains at most a quarter second",
+      RemuxResumePolicy.forwardLandingToleranceSeconds > 0
+        && RemuxResumePolicy.forwardLandingToleranceSeconds <= 0.25)
 
 // MARK: - origin latch source
 
@@ -284,6 +314,16 @@ check("mounted seek: a target inside the current served window stays on the play
         servedStartPlayerSeconds: 0,
         producedEdgePlayerSeconds: 300
       ) == .seekPlayer(70))
+
+check("mounted seek: a published 45-second window admits a scrub beyond a lagging 10-second range",
+      RemuxResumePolicy.mountedSeekAction(
+        sourceSeconds: 30,
+        origin: 0,
+        authoritativeSourceDurationSeconds: 7200,
+        playerDurationSeconds: 7200,
+        servedStartPlayerSeconds: 0,
+        producedEdgePlayerSeconds: 45
+      ) == .seekPlayer(30))
 
 check("mounted seek: a long forward scrub remounts at the requested source second",
       RemuxResumePolicy.mountedSeekAction(

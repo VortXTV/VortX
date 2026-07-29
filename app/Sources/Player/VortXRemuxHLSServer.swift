@@ -357,6 +357,21 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         return timelineOriginSeconds + last.end
     }
 
+    /// The exact player-clock range in the most recently coordinated local playlist. This is more current than
+    /// AVPlayer's asynchronously refreshed seekable ranges, while remaining safe for a forward-only producer:
+    /// every point admitted here is backed by a segment the server has already published.
+    var publishedPlayerWindowSeconds: ClosedRange<Double>? {
+        publicationLock.lock(); defer { publicationLock.unlock() }
+        guard let window = publishedVideoWindow,
+              let first = window.segments.first,
+              let last = window.segments.last,
+              first.start.isFinite,
+              last.end.isFinite,
+              first.start >= 0,
+              last.end >= first.start else { return nil }
+        return first.start...last.end
+    }
+
     /// Stop everything: the remux thread, the listener, and every open connection. Idempotent.
     func invalidate() {
         stateLock.lock()

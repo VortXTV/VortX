@@ -306,40 +306,52 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         return nil
     }
 
-    /// The furthest position the forward-only DV remux has actually produced, used to clamp forward seeks at
-    /// the one engine chokepoint (`seek(to:)`) so a scrub / nudge / skip past the produced bytes can't strand
-    /// the mount frameless and demote the whole true-DV session to libmpv. Prefer the item's seekable ranges
-    /// (the HLS sliding playlist advertises produced media there); fall back to the loaded (player-buffered)
-    /// edge for the legacy loader delivery. 0 means "unknown / no produced edge yet" (callers do not clamp).
-    var producedEdgeSeconds: Double {
+    /// One coherent player-clock window for a mounted remux. Local HLS reads both bounds from one server
+    /// snapshot so a concurrent playlist slide cannot combine an evicted lower bound with a newer upper bound.
+    /// Other deliveries retain their existing AVPlayer range fallback.
+    private var mountedPlayerWindowBounds: (servedStart: Double?, producedEdge: Double) {
         // EXTERNAL ENGINE with full-timeline retention: AVPlayer's seekable range now advertises the WHOLE
         // timeline, which is exactly the point (it is what makes a backward seek an ordinary seek instead of a
         // demote), but it therefore can no longer stand in for the PRODUCED edge. The host reports that
         // separately and it is the only trustworthy forward bound here. Converted from source seconds to player
         // seconds through the achieved origin, which is the space this property is read in.
         if let remote = remuxRemoteMount, remote.retainsFullTimeline {
-            return max(0, remote.producedEdgeSeconds - remuxTimelineOrigin)
+            return (
+                avPlayerServedStartPlayerSeconds,
+                max(0, remote.producedEdgeSeconds - remuxTimelineOrigin)
+            )
         }
-        guard let item else { return 0 }
+        if let localWindow = remuxHLSServer?.publishedPlayerWindowSeconds {
+            return (localWindow.lowerBound, localWindow.upperBound)
+        }
+        guard let item else { return (nil, 0) }
+        var start: Double?
         var edge = 0.0
         for value in item.seekableTimeRanges {
             let r = value.timeRangeValue
+            let candidate = r.start.seconds
+            if candidate.isFinite, candidate >= 0 {
+                start = min(start ?? candidate, candidate)
+            }
             let end = (r.start + r.duration).seconds
             if end.isFinite { edge = max(edge, end) }
         }
-        if edge > 0 { return edge }
-        for value in item.loadedTimeRanges {
-            let r = value.timeRangeValue
-            let end = (r.start + r.duration).seconds
-            if end.isFinite { edge = max(edge, end) }
+        if edge <= 0 {
+            for value in item.loadedTimeRanges {
+                let r = value.timeRangeValue
+                let end = (r.start + r.duration).seconds
+                if end.isFinite { edge = max(edge, end) }
+            }
         }
-        return edge
+        return (start, edge)
     }
 
-    /// Earliest player-clock second the currently advertised HLS window can serve. A local sliding playlist
-    /// may evict old segments even though they remain after the session origin. Seeking before this boundary
-    /// needs the same source remount as seeking before the origin.
-    private var servedStartPlayerSeconds: Double? {
+    /// The furthest position the forward-only remux can serve. 0 means unknown and does not clamp.
+    var producedEdgeSeconds: Double { mountedPlayerWindowBounds.producedEdge }
+
+    /// Earliest AVPlayer seekable second, used only by a retaining remote mount whose produced edge is reported
+    /// separately. Local HLS obtains both bounds atomically from `mountedPlayerWindowBounds`.
+    private var avPlayerServedStartPlayerSeconds: Double? {
         guard let item else { return nil }
         var start: Double?
         for value in item.seekableTimeRanges {
@@ -349,6 +361,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         }
         return start
     }
+
     /// The launch site sets this from the stream's Dolby Vision flag BEFORE loadFile (same plumbing as the
     /// libmpv lane, MPVMetalViewController.contentIsDolbyVision). Used to request the Apple TV's Dolby Vision
     /// display mode BEFORE the AVPlayerItem is attached (Apple Tech Talk 503 ordering) for ALL DV routes:
@@ -1180,13 +1193,14 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         guard let target = pendingSeek, isRemuxMounted else { return false }
         let sourceDuration = remuxHLSServer?.sourceDurationSeconds
             ?? remuxRemoteMount?.sourceDurationSeconds ?? remuxLoader?.sourceDurationSeconds
+        let mountedWindow = mountedPlayerWindowBounds
         switch RemuxResumePolicy.mountedSeekAction(
             sourceSeconds: target,
             origin: remuxTimelineOrigin,
             authoritativeSourceDurationSeconds: sourceDuration,
             playerDurationSeconds: item?.duration.seconds ?? 0,
-            servedStartPlayerSeconds: servedStartPlayerSeconds,
-            producedEdgePlayerSeconds: producedEdgeSeconds) {
+            servedStartPlayerSeconds: mountedWindow.servedStart,
+            producedEdgePlayerSeconds: mountedWindow.producedEdge) {
         case .seekPlayer:
             return false
         case .remountAtSource(let sourceSeconds):
@@ -1285,13 +1299,14 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         if isRemuxMounted {
             let sourceDuration = remuxHLSServer?.sourceDurationSeconds
                 ?? remuxRemoteMount?.sourceDurationSeconds ?? remuxLoader?.sourceDurationSeconds
+            let mountedWindow = mountedPlayerWindowBounds
             switch RemuxResumePolicy.mountedSeekAction(
                 sourceSeconds: seconds,
                 origin: remuxTimelineOrigin,
                 authoritativeSourceDurationSeconds: sourceDuration,
                 playerDurationSeconds: dur,
-                servedStartPlayerSeconds: servedStartPlayerSeconds,
-                producedEdgePlayerSeconds: producedEdgeSeconds) {
+                servedStartPlayerSeconds: mountedWindow.servedStart,
+                producedEdgePlayerSeconds: mountedWindow.producedEdge) {
             case .seekPlayer(let playerSeconds):
                 clamped = playerSeconds
             case .remountAtSource(let sourceSeconds):
@@ -1303,7 +1318,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                     origin: remuxTimelineOrigin,
                     authoritativeSourceDurationSeconds: sourceDuration,
                     playerDurationSeconds: dur,
-                    producedEdgePlayerSeconds: producedEdgeSeconds)
+                    producedEdgePlayerSeconds: mountedWindow.producedEdge)
             }
         } else {
             clamped = (dur.isFinite && dur > 1) ? min(max(seconds, 0), max(dur - 1, 0)) : max(seconds, 0)

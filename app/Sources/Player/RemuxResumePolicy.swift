@@ -103,6 +103,29 @@ enum RemuxResumePolicy {
         return .unavailable
     }
 
+    /// A nonnegative FFmpeg return code only means the demuxer accepted the seek operation. Some indexed
+    /// network inputs still return success after landing at the beginning of the file. Accept the landing only
+    /// when the mapped base-video clock proves that it reached the requested neighborhood. Otherwise the remux
+    /// must fail before publishing bytes so the existing recovery can reopen the same target with libmpv.
+    static func inputSeekLandingIsUsable(
+        requestedSourceSeconds: Double,
+        achievedOriginSeconds: Double
+    ) -> Bool {
+        let requested = originRequest(resumeSeconds: requestedSourceSeconds)
+        guard requested > 0,
+              achievedOriginSeconds.isFinite,
+              achievedOriginSeconds >= 0 else { return false }
+        let offset = achievedOriginSeconds - requested
+        if offset > 0 {
+            return offset <= forwardLandingToleranceSeconds
+        }
+        return -offset <= originToleranceSeconds
+    }
+
+    /// Timestamp basis differences can put the mapped presentation origin just after a backward-seek request.
+    /// Keep that allowance below one second so a successful return cannot silently skip meaningful content.
+    static let forwardLandingToleranceSeconds: Double = 0.25
+
     /// The output timeline origin belongs to mapped base video. Audio, subtitles, data streams and unmapped
     /// packets may arrive first after a seek, but none may establish the clock used by every video segment.
     static func canEstablishOrigin(packetStreamIndex: Int,
