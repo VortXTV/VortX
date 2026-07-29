@@ -1057,9 +1057,44 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // links sometimes need auth / a UA) through the demuxer options as a CRLF-joined "headers" string.
         // F1: pre-allocate the context so its interrupt_callback is set BEFORE the (blocking) open, letting
         // cancel() abort a stalled open in milliseconds.
+        guard let inputTransport = Self.inputTransport(input) else {
+            buffer.fail("remux input must be a local file or direct HTTP(S) URL")
+            return
+        }
         var ifmt: UnsafeMutablePointer<AVFormatContext>? = makeInterruptibleInputContext()
         guard ifmt != nil else { buffer.fail("avformat_alloc_context failed"); return }
         var openOpts: OpaquePointer? = nil    // AVDictionary*
+        // The normal lane accepts Matroska and the hvc1 repair lane accepts MOV/MP4. Excluding every
+        // manifest demuxer prevents a local HLS, DASH, or IMF file from opening unverified remote children.
+        let formatResult = av_dict_set(&openOpts, "format_whitelist", "matroska,mov", 0)
+        guard formatResult >= 0 else {
+            av_dict_free(&openOpts)
+            avformat_free_context(ifmt)
+            ifmt = nil
+            buffer.fail("required demuxer policy option failed (\(formatResult))")
+            return
+        }
+        // MOV data references can open a second URL with no inherited option dictionary. Keep the
+        // repair lane self-contained even if a future FFmpeg default changes.
+        let drefResult = av_dict_set(&openOpts, "enable_drefs", "0", 0)
+        guard drefResult >= 0 else {
+            av_dict_free(&openOpts)
+            avformat_free_context(ifmt)
+            ifmt = nil
+            buffer.fail("required external-reference policy option failed (\(drefResult))")
+            return
+        }
+        let requiresTLS = inputTransport == .https
+        // Plain HTTP can redirect into HTTPS, and FFmpeg forwards this option to the redirected protocol.
+        let canRedirectToTLS = inputTransport == .http || requiresTLS
+        let tlsOptionResult = Self.addRequiredTLSVerification(canRedirectToTLS, to: &openOpts)
+        guard tlsOptionResult >= 0 else {
+            av_dict_free(&openOpts)
+            avformat_free_context(ifmt)
+            ifmt = nil
+            buffer.fail("required TLS verification option failed (\(tlsOptionResult))")
+            return
+        }
         if let headers, !headers.isEmpty {
             let joined = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
             av_dict_set(&openOpts, "headers", joined, 0)
@@ -1081,7 +1116,29 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // the remux open matches mpv's resilience. Unknown keys are ignored by older protocol builds, not fatal.
         Self.applyDebridHTTPResilience(&openOpts)
         var openRc = avformat_open_input(&ifmt, input, nil, &openOpts)
+        let coldTLSOptionUnconsumed = requiresTLS
+            && av_dict_get(openOpts, "tls_verify", nil, 0) != nil
+        let coldFormatOptionUnconsumed =
+            av_dict_get(openOpts, "format_whitelist", nil, 0) != nil
+        let coldDrefOptionUnconsumed = openRc == 0
+            && Self.isMOVFamily(ifmt)
+            && av_dict_get(openOpts, "enable_drefs", nil, 0) != nil
         av_dict_free(&openOpts)
+        if openRc == 0,
+           coldTLSOptionUnconsumed || coldFormatOptionUnconsumed || coldDrefOptionUnconsumed {
+            if let context = ifmt {
+                var closeContext: UnsafeMutablePointer<AVFormatContext>? = context
+                avformat_close_input(&closeContext)
+                ifmt = nil
+            }
+            buffer.fail(
+                coldFormatOptionUnconsumed ? "required demuxer policy option was not consumed"
+                    : coldDrefOptionUnconsumed
+                        ? "required external-reference policy option was not consumed"
+                        : "required TLS verification option was not consumed"
+            )
+            return
+        }
         // Cold-debrid warm-up retry. The FIRST open of a debrid link frequently fails transiently: it times out
         // (rc=-60 ETIMEDOUT) OR the still-warming CDN answers the first request with HTTP 400 (rc=-808465656,
         // AVERROR_HTTP_BAD_REQUEST) while the provider pulls the file into cache. The first request primes it and
@@ -1092,6 +1149,28 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         if openRc == AVERROR_ETIMEDOUT_CONST || openRc == AVERROR_HTTP_BAD_REQUEST_CONST {
             VXProbe.log("dv", "probe open failed rc=\(openRc) (transient); retrying once (cold-debrid warm-up)")
             var retryOpts: OpaquePointer? = nil
+            let retryFormatResult = av_dict_set(
+                &retryOpts, "format_whitelist", "matroska,mov", 0
+            )
+            guard retryFormatResult >= 0 else {
+                av_dict_free(&retryOpts)
+                buffer.fail("required demuxer policy option failed on retry (\(retryFormatResult))")
+                return
+            }
+            let retryDrefResult = av_dict_set(&retryOpts, "enable_drefs", "0", 0)
+            guard retryDrefResult >= 0 else {
+                av_dict_free(&retryOpts)
+                buffer.fail(
+                    "required external-reference policy option failed on retry (\(retryDrefResult))"
+                )
+                return
+            }
+            let retryTLSOptionResult = Self.addRequiredTLSVerification(canRedirectToTLS, to: &retryOpts)
+            guard retryTLSOptionResult >= 0 else {
+                av_dict_free(&retryOpts)
+                buffer.fail("required TLS verification option failed on retry (\(retryTLSOptionResult))")
+                return
+            }
             if let headers, !headers.isEmpty {
                 let joined = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
                 av_dict_set(&retryOpts, "headers", joined, 0)
@@ -1104,7 +1183,31 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             ifmt = makeInterruptibleInputContext()
             guard ifmt != nil else { av_dict_free(&retryOpts); buffer.fail("avformat_alloc_context failed (retry)"); return }
             openRc = avformat_open_input(&ifmt, input, nil, &retryOpts)
+            let retryTLSOptionUnconsumed = requiresTLS
+                && av_dict_get(retryOpts, "tls_verify", nil, 0) != nil
+            let retryFormatOptionUnconsumed =
+                av_dict_get(retryOpts, "format_whitelist", nil, 0) != nil
+            let retryDrefOptionUnconsumed = openRc == 0
+                && Self.isMOVFamily(ifmt)
+                && av_dict_get(retryOpts, "enable_drefs", nil, 0) != nil
             av_dict_free(&retryOpts)
+            if openRc == 0,
+               retryTLSOptionUnconsumed || retryFormatOptionUnconsumed
+                || retryDrefOptionUnconsumed {
+                if let context = ifmt {
+                    var closeContext: UnsafeMutablePointer<AVFormatContext>? = context
+                    avformat_close_input(&closeContext)
+                    ifmt = nil
+                }
+                buffer.fail(
+                    retryFormatOptionUnconsumed
+                        ? "required demuxer policy option was not consumed on retry"
+                        : retryDrefOptionUnconsumed
+                            ? "required external-reference policy option was not consumed on retry"
+                            : "required TLS verification option was not consumed on retry"
+                )
+                return
+            }
             if openRc == 0 { VXProbe.log("dv", "probe open retry SUCCEEDED (warm debrid)") }
         }
         guard openRc == 0, let inCtx = ifmt else {
@@ -4436,6 +4539,40 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         av_dict_set(&opts, "reconnect_on_network_error", "1", 0)
         av_dict_set(&opts, "reconnect_delay_max", "5", 0)          // seconds
         av_dict_set(&opts, "multiple_requests", "1", 0)            // persistent connection across redirect+range
+    }
+
+    private enum InputTransport {
+        case local
+        case http
+        case https
+    }
+
+    private static func inputTransport(_ value: String) -> InputTransport? {
+        if value.hasPrefix("/") { return .local }
+        guard let scheme = URLComponents(string: value)?.scheme else { return nil }
+        switch scheme.lowercased() {
+        case "file": return .local
+        case "http": return .http
+        case "https": return .https
+        default: return nil
+        }
+    }
+
+    private static func isMOVFamily(
+        _ context: UnsafeMutablePointer<AVFormatContext>?
+    ) -> Bool {
+        guard let name = context?.pointee.iformat?.pointee.name else { return false }
+        return String(cString: name)
+            .split(separator: ",")
+            .contains("mov")
+    }
+
+    private static func addRequiredTLSVerification(
+        _ required: Bool,
+        to options: inout OpaquePointer?
+    ) -> Int32 {
+        guard required else { return 0 }
+        return av_dict_set(&options, "tls_verify", "1", 0)
     }
 
     private static func readDoVi(_ par: UnsafeMutablePointer<AVCodecParameters>?, into info: inout SourceInfo) {

@@ -121,6 +121,11 @@ final class MPVMetalViewController: PlatformViewController {
     var loopPlayback = false
     private let mpvLog = Logger(subsystem: "com.stremiox.app", category: "mpv")
     private var configuredLiveMode = false
+    /// Restrict Lavf to media formats whose nested-resource behavior is covered by VortX's TLS
+    /// policy. In particular, MLV opens numbered sidecar files without an option dictionary, so
+    /// allowing it would bypass the mandatory `tls_verify=1` inherited by normal child opens.
+    private static let secureLavfOptions =
+        "tls_verify=1,format_whitelist=\"matroska,mov,hls,dash,mpegts,mpegtsraw,mpeg,mpegvideo,avi,flv,asf,ogg,rm,mxf,h264,hevc,vvc,aac,ac3,eac3,truehd,dts,mp3,wav,flac,ape,ass,srt,webvtt,subviewer,subviewer1,microdvd,sami\""
     /// The forward-cache cap (`demuxer-max-bytes`, option-string form) loadFile applied for the CURRENT
     /// file, so the paused-cache clamp can restore it on resume. nil until the first load.
     private var activeReadAheadCap: String?
@@ -659,10 +664,6 @@ final class MPVMetalViewController: PlatformViewController {
         checkError(mpv_set_option_string(mpv, "user-agent",
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"))
         checkError(mpv_set_option_string(mpv, "network-timeout", "30"))
-        // Reconnect on dropped/stalled HTTP (debrid CDNs sometimes reset mid-stream); without this
-        // a hiccup looks like an infinite buffer. Followed by hard failure → MPV_EVENT_END_FILE.
-        checkError(mpv_set_option_string(mpv, "stream-lavf-o",
-            "reconnect=1,reconnect_streamed=1,reconnect_delay_max=7"))
 
         // Read-ahead cache: buffer past the play head so transient network dips on big 4K streams
         // don't stall playback. These are the exact values proven on-device for weeks (0.2.5 to
@@ -835,13 +836,21 @@ final class MPVMetalViewController: PlatformViewController {
         }
         mpvLog.log("video upscaling preset = \(upscaling.rawValue, privacy: .public)")
 
-        // Power-user custom mpv options. Applied LAST, after every VortX baseline option above, so an
-        // advanced viewer can override the defaults (the "mpv conf" setting). Each option is set with
-        // its own fail-safe: a bad key/value logs and is skipped, it must never abort the baseline
-        // config or crash playback. Set here (before mpv_initialize) so options that are pre-init-only
-        // also take effect; properties that only apply at runtime would need the property API instead,
-        // a known limitation documented in the setting hint.
+        // Power-user custom mpv options. Applied after ordinary VortX baseline options so an advanced
+        // viewer can override playback tuning, but never the app-owned TLS trust policy. In particular,
+        // stream-lavf-o is protected as a whole: libmpv applies that dictionary after tls-verify while
+        // constructing FFmpeg's network options, so a nested tls_verify=0 would otherwise win even when
+        // the top-level option below is reasserted. Each ordinary custom option keeps its own fail-safe:
+        // a bad key/value logs and is skipped, it must never abort the baseline config or crash playback.
         for (key, value) in PlaybackSettings.parsedCustomMpvOptions {
+            if key.utf8.contains(0) || value.utf8.contains(0) {
+                mpvLog.error("custom mpv option blocked because it contains a NUL byte")
+                continue
+            }
+            if isProtectedTLSOption(key) {
+                mpvLog.error("custom mpv option blocked by TLS trust policy: \(key, privacy: .public)")
+                continue
+            }
             let err = mpv_set_option_string(mpv, key, value)
             if err < 0 {
                 mpvLog.error("custom mpv option rejected: \(key, privacy: .public)=\(value, privacy: .public) (\(String(cString: mpv_error_string(err)), privacy: .public))")
@@ -849,6 +858,29 @@ final class MPVMetalViewController: PlatformViewController {
                 mpvLog.log("custom mpv option applied: \(key, privacy: .public)=\(value, privacy: .public)")
             }
         }
+
+        // Security invariants are applied after every user-controlled option. Failure is fatal to this
+        // context: continuing would silently start a player whose HTTPS trust behavior is unknown.
+        // libmpv otherwise lets a custom `config=yes` defer-load a file during mpv_initialize, after
+        // these assignments, and that file could replace the app-owned trust options.
+        requireMpvOption("config", "no")
+        // Auto-loaded Lua/JavaScript scripts can mutate options after initialization. VortX does not
+        // ship an mpv script bundle, so disabling that late code-loading channel has no playback cost.
+        requireMpvOption("load-scripts", "no")
+        // VortX owns resume. libmpv watch-later files are general option files and load per title after
+        // initialization, so allowing them would create another late trust-policy override channel.
+        requireMpvOption("resume-playback", "no")
+        requireMpvOption("tls-verify", "yes")
+        // Reconnect on dropped/stalled HTTP while keeping the entire FFmpeg protocol dictionary under
+        // app control. A custom stream-lavf-o is blocked above because it can override tls_verify.
+        requireMpvOption(
+            "stream-lavf-o",
+            "reconnect=1,reconnect_streamed=1,reconnect_delay_max=7"
+        )
+        // demuxer-lavf-o is the dictionary inherited by HLS/DASH child opens. Keep verification
+        // explicit there as well as at the top-level stream, and require libmpv to propagate it.
+        requireMpvOption("demuxer-lavf-o", Self.secureLavfOptions)
+        requireMpvOption("demuxer-lavf-propagate-opts", "yes")
 
         checkError(mpv_initialize(mpv))
 
@@ -1125,6 +1157,14 @@ final class MPVMetalViewController: PlatformViewController {
         // Teardown nils the handle; a loadFile racing close must not hand a NULL mpv to the raw
         // mpv_set_property_string calls below (the setString/command helpers self-guard, these do not).
         guard mpv != nil else { return issuedToken }
+        // Every app-owned stream enters as direct HTTP(S) or a local file. Reject libmpv wrapper
+        // protocols here because concat/lavf/subfile/archive/edl can open child URLs through a
+        // separate FFmpeg option path that does not inherit the app's required TLS policy.
+        guard Self.isAllowedMediaURL(url),
+              audioSidecar.map(Self.isAllowedMediaURL) ?? true else {
+            mpvLog.error("loadFile rejected a non-direct media URL")
+            return issuedToken
+        }
         // Re-arm HDR detection for THIS file. appliedDynamicRange otherwise persists from the previous
         // file, so an in-place episode / source switch left it stale and the guard SKIPPED re-applying the
         // colorspace; the new (HDR) episode then kept rendering in the previous SDR output (dull) until a
@@ -1434,7 +1474,9 @@ final class MPVMetalViewController: PlatformViewController {
         if live {
             mpv_set_property_string(mpv, "demuxer-readahead-secs", "18")
             mpv_set_property_string(mpv, "demuxer-max-back-bytes", "8MiB")
-            mpv_set_property_string(mpv, "demuxer-lavf-o", "live_start_index=-3")
+            mpv_set_property_string(
+                mpv, "demuxer-lavf-o", Self.secureLavfOptions + ",live_start_index=-3"
+            )
             // The VOD/debrid reconnect settings are hostile to HLS live: normal
             // playlist/segment EOFs trigger ffmpeg's exponential "reconnect at 0"
             // delay (1s, 3s, 7s), which is exactly the recurring live stall.
@@ -1443,7 +1485,7 @@ final class MPVMetalViewController: PlatformViewController {
         } else {
             mpv_set_property_string(mpv, "demuxer-readahead-secs", "300")
             mpv_set_property_string(mpv, "demuxer-max-back-bytes", "64MiB")
-            mpv_set_property_string(mpv, "demuxer-lavf-o", "")
+            mpv_set_property_string(mpv, "demuxer-lavf-o", Self.secureLavfOptions)
             mpv_set_property_string(mpv, "stream-lavf-o",
                                     "reconnect=1,reconnect_streamed=1,reconnect_delay_max=7")
         }
@@ -3132,6 +3174,72 @@ final class MPVMetalViewController: PlatformViewController {
     }
     
     
+    private func isProtectedTLSOption(_ key: String) -> Bool {
+        let normalized = key
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+        switch normalized {
+        case "tls-verify", "no-tls-verify", "tls-ca-file", "tls-cert-file", "tls-key-file",
+             "include", "config", "config-dir", "use-filedir-conf", "resume-playback",
+             "no-resume-playback", "save-position-on-quit", "load-scripts", "script", "scripts",
+             "input-commands", "input-conf", "input-ipc-server", "input-ipc-client",
+             "ytdl-raw-options", "external-files", "external-file", "audio-files", "audio-file",
+             "sub-files", "sub-file", "cover-art-files", "cover-art-file", "chapters-file",
+             "ordered-chapters-files", "ordered-chapters-file", "playlist", "load-unsafe-playlists",
+             "vf", "af", "lavfi-complex", "o", "stream-record",
+             "demuxer-lavf-propagate-opts", "demuxer-lavf-format",
+             "demuxer-lavf-hacks", "no-demuxer-lavf-hacks":
+            return true
+        default:
+            // Key-value-list options also expose generated append/remove aliases. Protect the complete
+            // network namespaces so none can smuggle a TLS override into FFmpeg's final protocol dictionary.
+            // Local config includes can define a protocol auto-profile that applies after initialization,
+            // and custom scripts are arbitrary local code, so neither is accepted through this text field.
+            return normalized == "stream-lavf-o"
+                || normalized.hasPrefix("stream-lavf-o-")
+                || normalized == "demuxer-lavf-o"
+                || normalized.hasPrefix("demuxer-lavf-o-")
+                || normalized.hasPrefix("demuxer-lavf-propagate-opts-")
+                || normalized.hasPrefix("demuxer-lavf-format-")
+                || normalized.hasPrefix("demuxer-lavf-hacks-")
+                || normalized.hasPrefix("watch-later-")
+                || normalized.hasPrefix("script-")
+                || normalized.hasPrefix("scripts-")
+                || normalized.hasPrefix("input-commands-")
+                || normalized.hasPrefix("ytdl-raw-options-")
+                || normalized.hasPrefix("external-file")
+                || normalized.hasPrefix("audio-file")
+                || normalized.hasPrefix("sub-file")
+                || normalized.hasPrefix("cover-art-file")
+                || normalized.hasPrefix("chapters-file")
+                || normalized.hasPrefix("ordered-chapters-file")
+                || normalized.hasPrefix("playlist-")
+                || normalized.hasPrefix("vf-")
+                || normalized.hasPrefix("af-")
+                || normalized.hasPrefix("lavfi-complex-")
+                || normalized.hasPrefix("stream-record-")
+        }
+    }
+
+    private static func isAllowedMediaURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return false }
+        return scheme == "file" || scheme == "http" || scheme == "https"
+    }
+
+    private func requireMpvOption(_ key: String, _ value: String) {
+        let status = mpv_set_option_string(mpv, key, value)
+        guard status >= 0 else {
+            mpvLog.fault(
+                "required mpv security option rejected: \(key, privacy: .public) (\(String(cString: mpv_error_string(status)), privacy: .public)); aborting player initialization"
+            )
+            let handle = mpv
+            mpv = nil
+            if let handle { mpv_destroy(handle) }
+            exit(1)
+        }
+    }
+
     private func checkError(_ status: CInt) {
         if status < 0 {
             mpvLog.error("MPV API error: \(String(cString: mpv_error_string(status)), privacy: .public)")
