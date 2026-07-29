@@ -218,6 +218,142 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     static let avErrorExit: Int32 = -1414092869
 
     private static let avTimeBaseQ = AVRational(num: 1, den: 1_000_000)
+    /// Value-only copy of one already-loaded libavformat index entry. The C pointer returned by
+    /// avformat_index_get_entry* is invalidated by later calls on the stream/context, so telemetry must copy
+    /// the safe scalar facts immediately and never retain that pointer across either input seek.
+    private struct ResumeIndexEntrySnapshot: Equatable {
+        let timestamp: Int64
+        let position: Int64
+        let flags: Int32
+
+        var logField: String {
+            "ts=\(timestamp),pos=\(position),key=\((flags & 0x0001) != 0 ? 1 : 0)"
+        }
+    }
+
+    /// Read-only snapshot of the input and base-video cue/index state surrounding the two existing resume
+    /// attempts. Every field comes from metadata already resident in AVFormatContext/AVIOContext/AVStream.
+    /// In particular this performs no reads, no size query and no seek of its own.
+    private struct ResumeSeekSnapshot {
+        let formatName: String
+        let formatFlags: Int32
+        let formatContextFlags: Int32
+        let formatContextStateFlags: Int32
+        let pbSeekable: Int32?
+        let pbPosition: Int64?
+        let timeBase: AVRational?
+        let targetTicks: Int64?
+        let indexCount: Int32
+        let first: ResumeIndexEntrySnapshot?
+        let last: ResumeIndexEntrySnapshot?
+        let backwardKeyframe: ResumeIndexEntrySnapshot?
+        let forwardKeyframe: ResumeIndexEntrySnapshot?
+
+        private var coverage: [ResumeIndexEntrySnapshot?] {
+            [first, last, backwardKeyframe, forwardKeyframe]
+        }
+
+        func coverageChanged(from prior: ResumeSeekSnapshot) -> Bool {
+            indexCount != prior.indexCount || coverage != prior.coverage
+        }
+
+        var logFields: String {
+            let tb = timeBase.map { "\($0.num)/\($0.den)" } ?? "none"
+            let target = targetTicks.map(String.init) ?? "none"
+            let seekable = pbSeekable.map(String.init) ?? "none"
+            let position = pbPosition.map(String.init) ?? "none"
+            let firstField = first?.logField ?? "none"
+            let lastField = last?.logField ?? "none"
+            let backwardField = backwardKeyframe?.logField ?? "none"
+            let forwardField = forwardKeyframe?.logField ?? "none"
+            return "format=\(formatName) formatFlags=\(formatFlags) "
+                + "formatContextFlags=\(formatContextFlags) ctxFlags=\(formatContextStateFlags) "
+                + "pbSeekable=\(seekable) pbPos=\(position) videoTB=\(tb) targetTicks=\(target) "
+                + "indexCount=\(indexCount) first={\(firstField)} last={\(lastField)} "
+                + "backwardKey={\(backwardField)} forwardKey={\(forwardField)}"
+        }
+    }
+
+    private static func resumeIndexEntry(
+        _ entry: UnsafePointer<AVIndexEntry>?
+    ) -> ResumeIndexEntrySnapshot? {
+        guard let entry else { return nil }
+        let value = entry.pointee
+        return ResumeIndexEntrySnapshot(
+            timestamp: value.timestamp,
+            position: value.pos,
+            flags: value.flags)
+    }
+
+    /// Query only libavformat's currently loaded index. avformat_index_get_entry* searches AVStream state and
+    /// does not touch the underlying protocol, unlike avio_size/avio_seek/read calls which are intentionally
+    /// forbidden here because diagnostics must not alter resume timing or transport behavior.
+    private static func resumeSeekSnapshot(
+        context: UnsafeMutablePointer<AVFormatContext>,
+        baseVideoStreamIndex: Int,
+        targetUsec: Int64
+    ) -> ResumeSeekSnapshot {
+        let formatName: String
+        if let format = context.pointee.iformat, let name = format.pointee.name {
+            formatName = String(cString: name)
+        } else {
+            formatName = "unknown"
+        }
+        let formatFlags = context.pointee.iformat?.pointee.flags ?? 0
+        let pbSeekable = context.pointee.pb.map { $0.pointee.seekable }
+        let pbPosition = context.pointee.pb.map { $0.pointee.pos }
+
+        guard baseVideoStreamIndex >= 0,
+              baseVideoStreamIndex < Int(context.pointee.nb_streams),
+              let stream = context.pointee.streams[baseVideoStreamIndex] else {
+            return ResumeSeekSnapshot(
+                formatName: formatName,
+                formatFlags: formatFlags,
+                formatContextFlags: context.pointee.flags,
+                formatContextStateFlags: context.pointee.ctx_flags,
+                pbSeekable: pbSeekable,
+                pbPosition: pbPosition,
+                timeBase: nil,
+                targetTicks: nil,
+                indexCount: 0,
+                first: nil,
+                last: nil,
+                backwardKeyframe: nil,
+                forwardKeyframe: nil)
+        }
+
+        let timeBase = stream.pointee.time_base
+        let targetTicks = (timeBase.num > 0 && timeBase.den > 0)
+            ? av_rescale_q(targetUsec, avTimeBaseQ, timeBase) : nil
+        let count = avformat_index_get_entries_count(stream)
+        let first = count > 0
+            ? resumeIndexEntry(avformat_index_get_entry(stream, 0)) : nil
+        let last = count > 0
+            ? resumeIndexEntry(avformat_index_get_entry(stream, count - 1)) : nil
+        let backward = targetTicks.flatMap {
+            resumeIndexEntry(
+                avformat_index_get_entry_from_timestamp(stream, $0, avseekFlagBackward))
+        }
+        let forward = targetTicks.flatMap {
+            resumeIndexEntry(
+                avformat_index_get_entry_from_timestamp(stream, $0, 0))
+        }
+        return ResumeSeekSnapshot(
+            formatName: formatName,
+            formatFlags: formatFlags,
+            formatContextFlags: context.pointee.flags,
+            formatContextStateFlags: context.pointee.ctx_flags,
+            pbSeekable: pbSeekable,
+            pbPosition: pbPosition,
+            timeBase: timeBase,
+            targetTicks: targetTicks,
+            indexCount: count,
+            first: first,
+            last: last,
+            backwardKeyframe: backward,
+            forwardKeyframe: forward)
+    }
+
     /// Remux-thread-only resume state. A successful input seek must establish its shift from a mapped base-video
     /// packet before any buffered packet is processed, so early audio/subtitle arrivals cannot choose the clock.
     private var originSeekApplied = false
@@ -1317,16 +1453,67 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             } else {
                 // stream_index -1 makes min/target/max AV_TIME_BASE timestamps. BACKWARD lands at or before
                 // the request so the first produced base-video packet is independently decodable.
+                let resumeTelemetryEnabled = VXProbe.enabled
+                let primaryBefore = resumeTelemetryEnabled
+                    ? Self.resumeSeekSnapshot(
+                        context: inCtx,
+                        baseVideoStreamIndex: baseVideoIn,
+                        targetUsec: target)
+                    : nil
+                if let primaryBefore {
+                    VXProbe.log(
+                        "dv",
+                        "resume seek telemetry phase=range-before \(primaryBefore.logFields)")
+                }
                 let primaryResult = avformat_seek_file(
                     inCtx, -1, Int64.min, target, target, Self.avseekFlagBackward)
+                let primaryAfter = resumeTelemetryEnabled
+                    ? Self.resumeSeekSnapshot(
+                        context: inCtx,
+                        baseVideoStreamIndex: baseVideoIn,
+                        targetUsec: target)
+                    : nil
+                if let primaryBefore, let primaryAfter {
+                    VXProbe.log(
+                        "dv",
+                        "resume seek telemetry phase=range-after rc=\(primaryResult) "
+                            + "indexDelta=\(primaryAfter.indexCount - primaryBefore.indexCount) "
+                            + "coverageChanged=\(primaryAfter.coverageChanged(from: primaryBefore) ? 1 : 0) "
+                            + primaryAfter.logFields)
+                }
                 var fallbackResult: Int32?
                 if primaryResult < 0 {
                     // Some Matroska/HTTP demuxers reject avformat_seek_file's exact min/target/max window while
                     // still supporting the simpler keyframe seek. Flush the failed attempt's buffered parser
                     // state before the one fallback so a successful resume cannot inherit stale packets.
                     avformat_flush(inCtx)
+                    let fallbackBefore = resumeTelemetryEnabled
+                        ? Self.resumeSeekSnapshot(
+                            context: inCtx,
+                            baseVideoStreamIndex: baseVideoIn,
+                            targetUsec: target)
+                        : nil
+                    if let fallbackBefore {
+                        VXProbe.log(
+                            "dv",
+                            "resume seek telemetry phase=keyframe-before \(fallbackBefore.logFields)")
+                    }
                     fallbackResult = av_seek_frame(
                         inCtx, -1, target, Self.avseekFlagBackward)
+                    let fallbackAfter = resumeTelemetryEnabled
+                        ? Self.resumeSeekSnapshot(
+                            context: inCtx,
+                            baseVideoStreamIndex: baseVideoIn,
+                            targetUsec: target)
+                        : nil
+                    if let fallbackBefore, let fallbackAfter {
+                        VXProbe.log(
+                            "dv",
+                            "resume seek telemetry phase=keyframe-after rc=\(fallbackResult ?? Int32.min) "
+                                + "indexDelta=\(fallbackAfter.indexCount - fallbackBefore.indexCount) "
+                                + "coverageChanged=\(fallbackAfter.coverageChanged(from: fallbackBefore) ? 1 : 0) "
+                                + fallbackAfter.logFields)
+                    }
                 }
                 switch RemuxResumePolicy.inputSeekOutcome(
                     seekable: true,
