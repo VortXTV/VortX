@@ -1,10 +1,424 @@
 import Foundation
+#if !TRICKPLAY_E2E_POLICY_TESTING
 import CryptoKit
 #if canImport(AppKit)
 import AppKit
 #elseif canImport(UIKit)
 import UIKit
 #endif
+#endif
+
+/// One time-bounded sprite tile. This Foundation-only value is shared by upload generation, community
+/// playback, and the focused standalone regression harness so all three exercise the same timeline rules.
+struct TrickplayTimelineCue: Equatable, Sendable {
+    let start: Double
+    let end: Double
+    let x: Int
+    let y: Int
+    let width: Int
+    let height: Int
+    let tileIndex: Int
+
+    func contains(_ time: Double) -> Bool {
+        time.isFinite && time >= start && time < end
+    }
+}
+
+/// Builds and consumes the time index for a community sprite. New sheets use the real capture timestamps.
+/// Older metadata with no advertised VTT remains compatible through `cue`'s legacy interval path.
+enum TrickplayTimeline {
+    /// Robust ordinary cadence of a retained timeline. The lower median ignores sparse seek gaps while still
+    /// reflecting deliberate whole-session decimation (for example, 1,201 ten-second captures retained as 600
+    /// frames yield an ordinary cadence near 20 seconds).
+    static func nominalCadence(
+        captureTimes: [Double],
+        fallbackInterval: Double
+    ) -> Double {
+        guard fallbackInterval.isFinite, fallbackInterval > 0 else { return 0 }
+        let sorted = Array(
+            Set(captureTimes.filter { $0.isFinite && $0 >= 0 })
+        ).sorted()
+        let deltas = zip(sorted, sorted.dropFirst())
+            .map { $1 - $0 }
+            .filter { $0.isFinite && $0 > 0 }
+            .sorted()
+        // A sparse seek-only timeline has no evidence of deliberate retention decimation. Keep the original
+        // cadence unless enough adjacent samples agree that the retained timeline is genuinely coarser.
+        guard deltas.count >= 8 else { return fallbackInterval }
+        let lowerMedian = deltas[(deltas.count - 1) / 2]
+        return max(fallbackInterval, lowerMedian)
+    }
+
+    /// Detects continuity-segment boundaries on the full retained timeline, before any additional sheet
+    /// sampling. Each returned value belongs to the selected tile at the same position and, when non-nil, is the
+    /// last pre-gap capture plus one retained cadence. This evidence remains valid regardless of sheet stride.
+    static func selectedCueEndFences(
+        retainedCaptureTimes: [Double],
+        selectedIndices: [Int],
+        retainedCadence: Double
+    ) -> [Double?]? {
+        guard retainedCadence.isFinite, retainedCadence > 0 else { return nil }
+        for index in retainedCaptureTimes.indices {
+            let time = retainedCaptureTimes[index]
+            guard time.isFinite, time >= 0,
+                  index == retainedCaptureTimes.startIndex
+                    || time > retainedCaptureTimes[index - 1] else { return nil }
+        }
+        for index in selectedIndices.indices {
+            let selected = selectedIndices[index]
+            guard retainedCaptureTimes.indices.contains(selected),
+                  index == selectedIndices.startIndex
+                    || selected > selectedIndices[index - 1] else { return nil }
+        }
+
+        var fences = Array<Double?>(repeating: nil, count: selectedIndices.count)
+        guard selectedIndices.count > 1 else { return fences }
+        let discontinuityThreshold = retainedCadence * 2
+        for selectedPosition in 0..<(selectedIndices.count - 1) {
+            let startIndex = selectedIndices[selectedPosition]
+            let endIndex = selectedIndices[selectedPosition + 1]
+            for retainedIndex in startIndex..<endIndex {
+                let delta = retainedCaptureTimes[retainedIndex + 1]
+                    - retainedCaptureTimes[retainedIndex]
+                if delta > discontinuityThreshold {
+                    fences[selectedPosition] = retainedCaptureTimes[retainedIndex]
+                        + retainedCadence
+                    break
+                }
+            }
+        }
+        return fences
+    }
+
+    static func makeCues(
+        captureTimes: [Double],
+        nominalInterval: Double,
+        gapFenceInterval: Double? = nil,
+        cueEndFences: [Double?]? = nil,
+        cols: Int,
+        tileW: Int,
+        tileH: Int
+    ) -> [TrickplayTimelineCue]? {
+        let gapFenceInterval = gapFenceInterval ?? nominalInterval
+        guard !captureTimes.isEmpty, nominalInterval.isFinite, nominalInterval > 0,
+              gapFenceInterval.isFinite, gapFenceInterval > 0,
+              cols > 0, tileW > 0, tileH > 0 else { return nil }
+        for index in captureTimes.indices {
+            let time = captureTimes[index]
+            guard time.isFinite, time >= 0,
+                  index == captureTimes.startIndex || time > captureTimes[index - 1] else { return nil }
+        }
+        if let cueEndFences {
+            guard cueEndFences.count == captureTimes.count else { return nil }
+            for index in cueEndFences.indices {
+                if let fence = cueEndFences[index] {
+                    guard index + 1 < captureTimes.count,
+                          fence.isFinite,
+                          fence > captureTimes[index],
+                          fence <= captureTimes[index + 1] else { return nil }
+                }
+            }
+        }
+
+        return captureTimes.indices.map { index in
+            let start = captureTimes[index]
+            let end: Double
+            if index + 1 < captureTimes.count {
+                let next = captureTimes[index + 1]
+                if let cueEndFences {
+                    end = cueEndFences[index].map { min($0, next) } ?? next
+                } else {
+                    let delta = next - start
+                    let discontinuityThreshold = nominalInterval + gapFenceInterval
+                    end = delta > discontinuityThreshold
+                        ? min(start + gapFenceInterval, next)
+                        : next
+                }
+            } else {
+                end = start + (cueEndFences == nil ? nominalInterval : gapFenceInterval)
+            }
+            return TrickplayTimelineCue(
+                start: start,
+                end: end,
+                x: (index % cols) * tileW,
+                y: (index / cols) * tileH,
+                width: tileW,
+                height: tileH,
+                tileIndex: index
+            )
+        }
+    }
+
+    static func makeVTT(
+        captureTimes: [Double],
+        nominalInterval: Double,
+        gapFenceInterval: Double? = nil,
+        cueEndFences: [Double?]? = nil,
+        cols: Int,
+        tileW: Int,
+        tileH: Int
+    ) -> String? {
+        guard let cues = makeCues(
+            captureTimes: captureTimes,
+            nominalInterval: nominalInterval,
+            gapFenceInterval: gapFenceInterval,
+            cueEndFences: cueEndFences,
+            cols: cols,
+            tileW: tileW,
+            tileH: tileH
+        ) else { return nil }
+        var lines = ["WEBVTT", ""]
+        for cue in cues {
+            lines.append("\(vttTime(cue.start)) --> \(vttTime(cue.end))")
+            lines.append("sprite#xywh=\(cue.x),\(cue.y),\(cue.width),\(cue.height)")
+            lines.append("")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Parses the subset of WEBVTT emitted by the trickplay worker. Invalid indexes return nil as a whole
+    /// instead of exposing partial or mismatched coverage.
+    static func parseVTT(
+        _ raw: String,
+        frameCount: Int,
+        cols: Int,
+        tileW: Int,
+        tileH: Int
+    ) -> [TrickplayTimelineCue]? {
+        guard frameCount > 0, cols > 0, tileW > 0, tileH > 0 else { return nil }
+        let lines = raw
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+        guard let first = lines.first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\u{feff}", with: ""),
+              first.hasPrefix("WEBVTT") else { return nil }
+
+        var parsed: [TrickplayTimelineCue] = []
+        var lineIndex = 1
+        while lineIndex < lines.count {
+            let timing = lines[lineIndex].trimmingCharacters(in: .whitespaces)
+            lineIndex += 1
+            guard let arrow = timing.range(of: "-->") else { continue }
+            let startText = timing[..<arrow.lowerBound].trimmingCharacters(in: .whitespaces)
+            let endAndSettings = timing[arrow.upperBound...].trimmingCharacters(in: .whitespaces)
+            guard let endText = endAndSettings.split(whereSeparator: \.isWhitespace).first,
+                  let start = parseVTTTime(String(startText)),
+                  let end = parseVTTTime(String(endText)),
+                  start >= 0, end > start else { return nil }
+
+            var coordinates: (x: Int, y: Int, width: Int, height: Int)?
+            while lineIndex < lines.count {
+                let payload = lines[lineIndex].trimmingCharacters(in: .whitespaces)
+                if payload.isEmpty {
+                    lineIndex += 1
+                    break
+                }
+                if payload.contains("-->") { break }
+                if coordinates == nil {
+                    coordinates = parseCoordinates(payload)
+                }
+                lineIndex += 1
+            }
+            guard let coordinates,
+                  coordinates.x >= 0, coordinates.y >= 0,
+                  coordinates.width == tileW, coordinates.height == tileH,
+                  coordinates.x % tileW == 0, coordinates.y % tileH == 0 else { return nil }
+            let col = coordinates.x / tileW
+            let row = coordinates.y / tileH
+            guard col < cols else { return nil }
+            let (rowOffset, rowOverflow) = row.multipliedReportingOverflow(by: cols)
+            guard !rowOverflow else { return nil }
+            let (tileIndex, tileIndexOverflow) = rowOffset.addingReportingOverflow(col)
+            guard !tileIndexOverflow, tileIndex < frameCount else { return nil }
+            if let prior = parsed.last {
+                guard start >= prior.end, tileIndex > prior.tileIndex else { return nil }
+            }
+            parsed.append(
+                TrickplayTimelineCue(
+                    start: start,
+                    end: end,
+                    x: coordinates.x,
+                    y: coordinates.y,
+                    width: coordinates.width,
+                    height: coordinates.height,
+                    tileIndex: tileIndex
+                )
+            )
+        }
+        guard parsed.count == frameCount else { return nil }
+        return parsed
+    }
+
+    /// Finds genuine coverage only. With parsed VTT, gaps and both outer bounds return nil. With an older
+    /// interval-only sheet, coverage is the finite half-open range [0, frameCount * interval).
+    static func cue(
+        at time: Double,
+        parsedCues: [TrickplayTimelineCue]?,
+        frameCount: Int,
+        legacyInterval: Double,
+        cols: Int,
+        tileW: Int,
+        tileH: Int
+    ) -> TrickplayTimelineCue? {
+        guard time.isFinite, time >= 0 else { return nil }
+        if let parsedCues {
+            var lower = 0
+            var upper = parsedCues.count
+            while lower < upper {
+                let middle = lower + (upper - lower) / 2
+                if parsedCues[middle].start <= time {
+                    lower = middle + 1
+                } else {
+                    upper = middle
+                }
+            }
+            guard lower > 0 else { return nil }
+            let candidate = parsedCues[lower - 1]
+            return candidate.contains(time) ? candidate : nil
+        }
+
+        guard frameCount > 0, cols > 0, tileW > 0, tileH > 0,
+              legacyInterval.isFinite, legacyInterval > 0 else { return nil }
+        let coverageEnd = Double(frameCount) * legacyInterval
+        guard coverageEnd.isFinite, time < coverageEnd else { return nil }
+        let tileIndex = Int((time / legacyInterval).rounded(.down))
+        return TrickplayTimelineCue(
+            start: Double(tileIndex) * legacyInterval,
+            end: Double(tileIndex + 1) * legacyInterval,
+            x: (tileIndex % cols) * tileW,
+            y: (tileIndex / cols) * tileH,
+            width: tileW,
+            height: tileH,
+            tileIndex: tileIndex
+        )
+    }
+
+    private static func parseCoordinates(
+        _ payload: String
+    ) -> (x: Int, y: Int, width: Int, height: Int)? {
+        guard let marker = payload.range(of: "#xywh=") else { return nil }
+        let values = payload[marker.upperBound...].split(separator: ",", omittingEmptySubsequences: false)
+        guard values.count == 4,
+              let x = Int(values[0].trimmingCharacters(in: .whitespaces)),
+              let y = Int(values[1].trimmingCharacters(in: .whitespaces)),
+              let width = Int(values[2].trimmingCharacters(in: .whitespaces)),
+              let height = Int(values[3].trimmingCharacters(in: .whitespaces)) else { return nil }
+        return (x, y, width, height)
+    }
+
+    private static func parseVTTTime(_ raw: String) -> Double? {
+        let fields = raw.split(separator: ":", omittingEmptySubsequences: false)
+        guard fields.count == 2 || fields.count == 3 else { return nil }
+        let hours: Double
+        let minutes: Double
+        let seconds: Double
+        if fields.count == 3 {
+            guard let parsedHours = Double(fields[0]), let parsedMinutes = Double(fields[1]),
+                  let parsedSeconds = Double(fields[2]) else { return nil }
+            hours = parsedHours
+            minutes = parsedMinutes
+            seconds = parsedSeconds
+        } else {
+            guard let parsedMinutes = Double(fields[0]), let parsedSeconds = Double(fields[1]) else { return nil }
+            hours = 0
+            minutes = parsedMinutes
+            seconds = parsedSeconds
+        }
+        guard hours >= 0, minutes >= 0, minutes < 60, seconds >= 0, seconds < 60 else { return nil }
+        let result = hours * 3600 + minutes * 60 + seconds
+        return result.isFinite ? result : nil
+    }
+
+    private static func vttTime(_ seconds: Double) -> String {
+        let totalMilliseconds = Int64((seconds * 1000).rounded())
+        let milliseconds = totalMilliseconds % 1000
+        let totalSeconds = totalMilliseconds / 1000
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let remainder = totalSeconds % 60
+        return String(
+            format: "%02lld:%02lld:%02lld.%03lld",
+            hours, minutes, remainder, milliseconds
+        )
+    }
+}
+
+/// Keeps a bounded, time-spanning sample while still admitting captures after the buffer fills. Each overflow
+/// removes the most temporally redundant interior sample and always preserves both observed timeline endpoints.
+enum TrickplaySessionFrameRetention {
+    static func captureLimit(frameBoundsMax: Int) -> Int {
+        max(2, frameBoundsMax)
+    }
+
+    static func retainedIndices(captureTimes: [Double], limit: Int) -> [Int] {
+        guard limit > 0 else { return [] }
+        var retained: [(index: Int, time: Double)] = []
+        for (index, time) in captureTimes.enumerated() where time.isFinite && time >= 0 {
+            retained.append((index: index, time: time))
+        }
+        retained.sort {
+            $0.time == $1.time ? $0.index < $1.index : $0.time < $1.time
+        }
+
+        var deduplicated: [(index: Int, time: Double)] = []
+        for candidate in retained {
+            if deduplicated.last?.time == candidate.time {
+                deduplicated[deduplicated.count - 1] = candidate
+            } else {
+                deduplicated.append(candidate)
+            }
+        }
+        retained = deduplicated
+
+        if limit == 1 {
+            return retained.last.map { [$0.index] } ?? []
+        }
+        while retained.count > limit {
+            var removal = 1
+            var narrowestSpan = retained[2].time - retained[0].time
+            if retained.count > 3 {
+                for index in 2..<(retained.count - 1) {
+                    let span = retained[index + 1].time - retained[index - 1].time
+                    if span < narrowestSpan {
+                        narrowestSpan = span
+                        removal = index
+                    }
+                }
+            }
+            retained.remove(at: removal)
+        }
+        return retained.map { $0.index }
+    }
+
+    /// Row-major sheet sampling with both timeline endpoints and the requested count preserved.
+    static func evenlySpacedIndices(count: Int, targetCount: Int) -> [Int] {
+        guard count > 0, targetCount > 0 else { return [] }
+        guard targetCount < count else { return Array(0..<count) }
+        guard targetCount > 1 else { return [count - 1] }
+        return (0..<targetCount).map { index in
+            Int(
+                (Double(index) * Double(count - 1) / Double(targetCount - 1)).rounded()
+            )
+        }
+    }
+}
+
+/// Admission check for a decoded local thumbnail callback. Both request order and stable media identity must
+/// still match, so an outgoing episode cannot publish after a true reconfigure even if its disk read finishes late.
+enum TrickplayPreviewReadGate {
+    static func accepts(
+        requestToken: Int,
+        requestMediaKey: String,
+        currentToken: Int,
+        currentMediaKey: String?
+    ) -> Bool {
+        requestToken == currentToken && requestMediaKey == currentMediaKey
+    }
+}
+
+#if !TRICKPLAY_E2E_POLICY_TESTING
 
 /// Community trickplay: scrub-preview thumbnails SHARED across users, like Netflix / Plex storyboards.
 ///
@@ -64,7 +478,7 @@ enum CommunityTrickplay {
 
     /// Coverage of a would-be upload, computed identically to the Worker's `decision.ts` computeCoverage:
     /// clamp[0,1]( frame_count / max(1, round(durationBucket / interval_s)) ) for the GIVEN frame_count/interval.
-    /// A prediction from the RAW capture cadence + session frame count is a conservative estimate, NOT an exact
+    /// A prediction from the RETAINED ordinary cadence + session frame count is a conservative estimate, NOT exact
     /// match to what the Worker stores: when the session outgrows one sheet's tile budget, buildAndUpload
     /// decimates before POSTing, and decimation changes BOTH terms (fewer frames over a longer interval) with
     /// independent rounding, so the stored coverage can land either side of the raw estimate. uploadCanStore
@@ -209,17 +623,24 @@ enum CommunityTrickplay {
         let intervalS: Double
         let frameCount: Int
         let cols: Int
+        /// nil means legacy metadata had no VTT; empty means an advertised VTT could not establish coverage.
+        let cues: [TrickplayTimelineCue]?
 
-        /// The cropped tile nearest `time`, drawn from the sheet sub-rect. nil if out of range.
+        /// The cropped tile covering `time`, drawn from the sheet sub-rect. nil outside genuine VTT coverage.
         func crop(at time: Double) -> ScrubImage? {
-            guard frameCount > 0, cols > 0, intervalS > 0 else { return nil }
-            let idx = max(0, min(frameCount - 1, Int((time / intervalS).rounded(.down))))
-            let col = idx % cols
-            let row = idx / cols
-            let rect = CGRect(x: col * tileW, y: row * tileH, width: tileW, height: tileH)
+            guard let cue = TrickplayTimeline.cue(
+                at: time,
+                parsedCues: cues,
+                frameCount: frameCount,
+                legacyInterval: intervalS,
+                cols: cols,
+                tileW: tileW,
+                tileH: tileH
+            ) else { return nil }
+            let rect = CGRect(x: cue.x, y: cue.y, width: cue.width, height: cue.height)
             guard let sub = cgImage.cropping(to: rect) else { return nil }
             #if canImport(AppKit)
-            return NSImage(cgImage: sub, size: NSSize(width: tileW, height: tileH))
+            return NSImage(cgImage: sub, size: NSSize(width: cue.width, height: cue.height))
             #else
             return UIImage(cgImage: sub)
             #endif
@@ -257,8 +678,33 @@ enum CommunityTrickplay {
             guard let imgHttp = imgResp as? HTTPURLResponse, imgHttp.statusCode == 200,
                   let image = ScrubImage(data: imgData), let cg = image.cgImageForCrop else { return nil }
 
+            let cues: [TrickplayTimelineCue]?
+            if let rawVTTURL = meta.vtt {
+                // nil is reserved for old metadata that never advertised a VTT and therefore needs the legacy
+                // interval path. A declared but unavailable/invalid VTT becomes an empty index, so unknown
+                // coverage falls through to the persistent local cache instead of inventing a time mapping.
+                if let vttURL = URL(string: rawVTTURL),
+                   let (vttData, vttResponse) = try? await URLSession.shared.data(
+                       for: URLRequest(url: vttURL, timeoutInterval: 8)
+                   ),
+                   let vttHTTP = vttResponse as? HTTPURLResponse, vttHTTP.statusCode == 200,
+                   let vtt = String(data: vttData, encoding: .utf8) {
+                    cues = TrickplayTimeline.parseVTT(
+                        vtt,
+                        frameCount: meta.frame_count,
+                        cols: meta.cols,
+                        tileW: meta.tile_w,
+                        tileH: meta.tile_h
+                    ) ?? []
+                } else {
+                    cues = []
+                }
+            } else {
+                cues = nil
+            }
             return Sheet(image: image, cgImage: cg, tileW: meta.tile_w, tileH: meta.tile_h,
-                         intervalS: meta.interval_s, frameCount: meta.frame_count, cols: meta.cols)
+                         intervalS: meta.interval_s, frameCount: meta.frame_count, cols: meta.cols,
+                         cues: cues)
         } catch {
             return nil
         }
@@ -287,7 +733,8 @@ enum CommunityTrickplay {
     /// for a 200 the Worker declined, and `.failed` for a transport/non-200 error or a local build failure that
     /// never POSTed. Never throws.
     ///
-    /// `intervalS` is the capture cadence the local pipeline uses (~10s). Frames are sorted by time, packed
+    /// `intervalS` is the caller's retained ordinary cadence (falling back to the capture dial). Frames are sorted
+    /// and the cadence is re-derived from their timestamps before they are packed
     /// left-to-right / top-to-bottom into a grid, and each tile is downscaled to ~480x270 (16:9) so the
     /// sheet stays tiny. The WEBVTT maps each tile's time window to `sprite#xywh=x,y,w,h` (Jellyfin/Plex web
     /// convention); the app crops the sub-rect itself, so no native trickplay support is needed.
@@ -305,7 +752,15 @@ enum CommunityTrickplay {
               TrickplayOwnedWorkGate.permitsStage(
                   taskIsCancelled: Task.isCancelled
               ) else { return .failed }
-        let sorted = frames.sorted { $0.time < $1.time }
+        let retainedIndices = TrickplaySessionFrameRetention.retainedIndices(
+            captureTimes: frames.map(\.time),
+            limit: max(1, frames.count)
+        )
+        let sorted = retainedIndices.map { frames[$0] }
+        let retainedInterval = TrickplayTimeline.nominalCadence(
+            captureTimes: sorted.map(\.time),
+            fallbackInterval: intervalS
+        )
         // Store even a tiny capture (>=1 frame); the owner asked that even ~5s of coverage be kept + served.
         // Frame bounds come from the RemoteConfig `trickplay.minFrames`/`maxFrames` dials (clamped min 1..10,
         // max 30..600). Baked defaults (min 1, max 600) == the shipping literals, so a null/out-of-range
@@ -324,8 +779,8 @@ enum CommunityTrickplay {
         // under the worker's 3 MB cap, so the full-session sheet blew the cap and the upload was dropped before
         // the POST ever fired (the "frames=401 -> failed" case). Instead of TRUNCATING to the first N tiles
         // (which would only ever preview the film's opening), DECIMATE evenly across the whole capture so the
-        // sheet still spans the entire duration, just at a coarser scrub interval. A short watch (<= budget) is
-        // untouched: stride 1, effectiveInterval == intervalS, identical to before.
+        // sheet still spans the entire duration, just at a coarser scrub interval. A short watch (<= budget) keeps
+        // stride 1 and advertises its retained ordinary cadence.
         let maxTiles = max(1, RemoteConfig.snapshot.trickplayMaxTilesValue)
         // Tile size: 16:9 at 320 wide. Smaller than the 480px local capture so a `maxTiles`-tile sheet stays a
         // fraction of the pixels of the old 480x270 sheet, keeping q0.7 under the 3 MB cap in the common case.
@@ -342,16 +797,33 @@ enum CommunityTrickplay {
         // denominator re-rounds, so it can land either side of the raw value); uploadCanStore predicts the exact
         // decimated frame_count and interval this posts, so a sheet the worker would keep is never skipped.
         var budget = min(sorted.count, maxTiles)
-        var picked: (jpeg: Data, count: Int, cols: Int, interval: Double)?
+        var picked: (
+            jpeg: Data,
+            frames: [CapturedFrame],
+            cueEndFences: [Double?],
+            cols: Int,
+            interval: Double
+        )?
         while budget >= 2 {
             guard TrickplayOwnedWorkGate.permitsStage(
                 taskIsCancelled: Task.isCancelled
             ) else { return .failed }
             let stride = sorted.count > budget ? Int(ceil(Double(sorted.count) / Double(budget))) : 1
-            let effective = stride > 1
-                ? sorted.enumerated().compactMap { $0.offset % stride == 0 ? $0.element : nil }
-                : sorted
-            let effectiveInterval = intervalS * Double(stride)
+            let targetCount = Int(ceil(Double(sorted.count) / Double(stride)))
+            let effectiveIndices = TrickplaySessionFrameRetention.evenlySpacedIndices(
+                count: sorted.count,
+                targetCount: targetCount
+            )
+            let effective = effectiveIndices.map { sorted[$0] }
+            let effectiveInterval = retainedInterval * Double(stride)
+            guard let cueEndFences = TrickplayTimeline.selectedCueEndFences(
+                retainedCaptureTimes: sorted.map(\.time),
+                selectedIndices: effectiveIndices,
+                retainedCadence: retainedInterval
+            ) else {
+                VXProbe.log("tp", "buildAndUpload could not propagate retained timeline gaps -> dropped")
+                return .failed
+            }
             let cols = max(1, Int(ceil(sqrt(Double(effective.count)))))
             let rows = Int(ceil(Double(effective.count) / Double(cols)))
 
@@ -369,7 +841,7 @@ enum CommunityTrickplay {
                 if let d = composed.jpegData(quality: CGFloat(q)), d.count <= maxBytes { fit = d; break }
             }
             if let fit {
-                picked = (fit, effective.count, cols, effectiveInterval)
+                picked = (fit, effective, cueEndFences, cols, effectiveInterval)
                 break
             }
             VXProbe.log("tp", "buildAndUpload over 3MB at q0.4 tiles=\(effective.count) cols=\(cols) rows=\(rows) budget=\(budget) -> re-decimate")
@@ -381,14 +853,25 @@ enum CommunityTrickplay {
             return .failed
         }
 
-        let vtt = buildVTT(frameCount: picked.count, cols: picked.cols, tileW: tileW, tileH: tileH, intervalS: picked.interval)
+        guard let vtt = TrickplayTimeline.makeVTT(
+            captureTimes: picked.frames.map(\.time),
+            nominalInterval: picked.interval,
+            gapFenceInterval: retainedInterval,
+            cueEndFences: picked.cueEndFences,
+            cols: picked.cols,
+            tileW: tileW,
+            tileH: tileH
+        ) else {
+            VXProbe.log("tp", "buildAndUpload could not build a valid timestamp VTT -> dropped")
+            return .failed
+        }
 
         let meta: [String: Any] = [
             "imdb": imdbId,
             "season": season ?? 0,
             "episode": episode ?? 0,
             "durationBucket": durationBucket,
-            "frame_count": picked.count,
+            "frame_count": picked.frames.count,
             "tile_w": tileW,
             "tile_h": tileH,
             "interval_s": picked.interval,
@@ -428,30 +911,6 @@ enum CommunityTrickplay {
             ctx.draw(src, in: CGRect(x: col * tileW, y: y, width: tileW, height: tileH))
         }
         return ctx.makeImage()
-    }
-
-    /// WEBVTT mapping each tile window [t, t+interval) to `sprite#xywh=x,y,w,h`. Matches the worker's expected
-    /// layout (row-major, cols per row).
-    private static func buildVTT(frameCount: Int, cols: Int, tileW: Int, tileH: Int, intervalS: Double) -> String {
-        var lines = ["WEBVTT", ""]
-        for i in 0..<frameCount {
-            let start = Double(i) * intervalS
-            let end = Double(i + 1) * intervalS
-            let col = i % cols
-            let row = i / cols
-            let x = col * tileW, y = row * tileH
-            lines.append("\(vttTime(start)) --> \(vttTime(end))")
-            lines.append("sprite#xywh=\(x),\(y),\(tileW),\(tileH)")
-            lines.append("")
-        }
-        return lines.joined(separator: "\n")
-    }
-
-    private static func vttTime(_ seconds: Double) -> String {
-        let total = Int(seconds)
-        let ms = Int((seconds - Double(total)) * 1000)
-        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
-        return String(format: "%02d:%02d:%02d.%03d", h, m, s, ms)
     }
 
     /// POST the multipart body. `.stored` only on `{ ok:true, stored:true }`; a 200 the Worker declined is
@@ -558,3 +1017,4 @@ extension CGImage {
         #endif
     }
 }
+#endif

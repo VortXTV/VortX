@@ -74,6 +74,14 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// coverage density with no app update. Baked default 10 == the shipping value; a null/out-of-range remote
     /// value keeps 10. Read once at use; the value is stable for a playback session.
     private static var captureInterval: Double { Double(RemoteConfig.snapshot.captureIntervalSecs) }
+    /// Ordinary spacing represented by the currently retained timeline. Whole-session retention may make this
+    /// coarser than the capture dial; coverage admission and uploaded metadata must describe that coarser cadence.
+    private var sessionNominalInterval: Double {
+        TrickplayTimeline.nominalCadence(
+            captureTimes: sessionFrames.map(\.time),
+            fallbackInterval: Self.captureInterval
+        )
+    }
 
     func configure(localCacheKey: String?) {
         guard TrickplayCaptureSessionPolicy.transition(
@@ -82,6 +90,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         ) == .reset else { return }
         retireCommunityUploadIfNeeded()
         _ = communityIdentityGeneration.advance()
+        showToken &+= 1
         self.localCacheKey = localCacheKey
         image = nil
         // A new stable media or episode timeline: drop the prior community sheet and session frames.
@@ -217,13 +226,20 @@ final class ScrubThumbnailsStore: ObservableObject {
         let token = showToken
         Self.localFrameCache.imageAsync(for: key, time: time) { [weak self] resolved in
             Task { @MainActor in
-                guard let self, self.showToken == token else { return }   // user scrubbed on; drop the stale frame
+                guard let self,
+                      TrickplayPreviewReadGate.accepts(
+                          requestToken: token,
+                          requestMediaKey: key,
+                          currentToken: self.showToken,
+                          currentMediaKey: self.localCacheKey
+                      ) else { return }
                 self.image = resolved
             }
         }
     }
 
     func clear() {
+        showToken &+= 1
         image = nil
     }
 
@@ -286,10 +302,21 @@ final class ScrubThumbnailsStore: ObservableObject {
     func recordDecodedFrame(_ decoded: ScrubImage, data: Data, at time: Double) {
         guard let key = localCacheKey, !key.isEmpty else { return }
         Self.localFrameCache.store(image: decoded, data: data, for: key, time: time)
-        // Keep the raw JPEG for a possible community upload (bounded; the worker caps at 600 tiles anyway).
+        // Keep a bounded sample spanning the whole observed timeline. Once the current validated fleet maximum
+        // is full, admit every later capture and remove the most temporally redundant interior frame.
         // Buffer EVEN when a community set already exists, so a fuller local capture can improve a thin one.
-        if communityKey != nil, sessionFrames.count < 600 {
-            sessionFrames.append(CommunityTrickplay.CapturedFrame(time: time, jpeg: data))
+        if communityKey != nil {
+            let candidates = sessionFrames + [
+                CommunityTrickplay.CapturedFrame(time: time, jpeg: data)
+            ]
+            let captureLimit = TrickplaySessionFrameRetention.captureLimit(
+                frameBoundsMax: RemoteConfig.snapshot.trickplayFrameBounds.max
+            )
+            let retained = TrickplaySessionFrameRetention.retainedIndices(
+                captureTimes: candidates.map(\.time),
+                limit: captureLimit
+            )
+            sessionFrames = retained.map { candidates[$0] }
             maybeUploadProgressively()   // upload DURING playback, not only at a teardown that may never fire
         }
     }
@@ -301,7 +328,8 @@ final class ScrubThumbnailsStore: ObservableObject {
               let key = communityKey,
               let imdb = communityImdb else { return }
         let coverageReady = CommunityTrickplay.uploadCanStore(
-            frameCount: sessionFrames.count, intervalS: Self.captureInterval, durationBucket: communityDurationBucket)
+            frameCount: sessionFrames.count, intervalS: sessionNominalInterval,
+            durationBucket: communityDurationBucket)
         let admission = uploadPolicy.request(
             key: key, kind: .progressive, frameCount: sessionFrames.count,
             existingFrameCount: communityExistingFrameCount, coverageReady: coverageReady
@@ -322,7 +350,8 @@ final class ScrubThumbnailsStore: ObservableObject {
               let key = communityKey,
               let imdb = communityImdb else { return }
         let coverageReady = CommunityTrickplay.uploadCanStore(
-            frameCount: sessionFrames.count, intervalS: Self.captureInterval, durationBucket: communityDurationBucket)
+            frameCount: sessionFrames.count, intervalS: sessionNominalInterval,
+            durationBucket: communityDurationBucket)
         let admission = uploadPolicy.request(
             key: key, kind: .final, frameCount: sessionFrames.count,
             existingFrameCount: communityExistingFrameCount, coverageReady: coverageReady
@@ -347,7 +376,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         }
         let coverageReady = CommunityTrickplay.uploadCanStore(
             frameCount: sessionFrames.count,
-            intervalS: Self.captureInterval,
+            intervalS: sessionNominalInterval,
             durationBucket: communityDurationBucket
         )
         let admission = uploadPolicy.retireCurrent(
@@ -380,7 +409,7 @@ final class ScrubThumbnailsStore: ObservableObject {
             episode: communityEpisode,
             durationBucket: communityDurationBucket,
             srcHeight: communitySrcHeight,
-            interval: Self.captureInterval,
+            interval: sessionNominalInterval,
             frames: Array(sessionFrames.prefix(claim.frameCount))
         )
         switch admission {
