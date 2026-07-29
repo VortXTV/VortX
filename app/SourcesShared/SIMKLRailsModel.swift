@@ -67,13 +67,20 @@ final class SIMKLRailsModel: ObservableObject {
         guard loadTask == nil else { return }
         loadTask = Task { [weak self] in
             defer { self?.loadTask = nil }
-            let resolved = await Self.fetch(expectedSession: sessionID)
+            let outcome = await Self.fetch(expectedSession: sessionID)
             guard let self, !Task.isCancelled,
                   self.stateSessionID == sessionID,
                   SIMKLAuth.storedSessionID == sessionID else { return }
-            self.lastRefresh = Date()
-            // Keep the prior rail on an empty fetch (flaky network) rather than blanking a populated rail.
-            if !resolved.isEmpty { self.storedItems = resolved }
+            switch outcome {
+            case .success:
+                self.storedItems = ExternalRailSnapshotPolicy.resolved(
+                    current: self.storedItems,
+                    outcome: outcome
+                )
+                self.lastRefresh = Date()
+            case .failure:
+                break
+            }
         }
     }
 
@@ -95,10 +102,13 @@ final class SIMKLRailsModel: ObservableObject {
 
     /// Fetch plan-to-watch, order it newest-listed-first, resolve every entry to a tt id, then resolve
     /// posters via Cinemeta in parallel. Off the main actor.
-    private static func fetch(expectedSession: SIMKLSessionID) async -> [MetaPreview] {
+    private static func fetch(
+        expectedSession: SIMKLSessionID
+    ) async -> ExternalRailFetchOutcome<MetaPreview> {
         guard let entries = try? await SIMKLService.shared.planToWatch(
             expectedSession: expectedSession
-        ) else { return [] }
+        ) else { return .failure }
+        guard !entries.isEmpty else { return .success([]) }
 
         // Newest addition first. SIMKL returns one array PER TYPE, so the raw concatenation would read as
         // "every movie, then every show, then every anime" rather than as a list; sorting on the listed-at
@@ -154,7 +164,7 @@ final class SIMKLRailsModel: ObservableObject {
                 return (row.imdb, row.type, row.title)
             }
         let capped = Array(seeds.prefix(maxItems))
-        guard !capped.isEmpty else { return [] }
+        guard !capped.isEmpty else { return .failure }
 
         let resolved: [(Int, MetaPreview)] = await withTaskGroup(of: (Int, MetaPreview?).self) { group in
             for (index, seed) in capped.enumerated() {
@@ -168,7 +178,7 @@ final class SIMKLRailsModel: ObservableObject {
             return out
         }
         // Restore the list order (task group completes out of order).
-        guard SIMKLAuth.storedSessionID == expectedSession else { return [] }
-        return resolved.sorted { $0.0 < $1.0 }.map(\.1)
+        guard SIMKLAuth.storedSessionID == expectedSession else { return .failure }
+        return .success(resolved.sorted { $0.0 < $1.0 }.map(\.1))
     }
 }

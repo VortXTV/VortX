@@ -18,6 +18,7 @@ struct Issue164TraktContractTests {
             .deletingLastPathComponent()
 
         let coordinator = read(app, "SourcesShared/ScrobbleCoordinator.swift")
+        let sessionPolicy = read(app, "SourcesShared/ExternalSyncSessionPolicy.swift")
         let provider = read(app, "SourcesShared/ExternalScrobbleProvider.swift")
         let settings = read(app, "SourcesShared/ExternalServicesSettingsView.swift")
         let shadow = read(app, "SourcesShared/TraktPlaybackShadow.swift")
@@ -56,7 +57,7 @@ struct Issue164TraktContractTests {
                 "only initial play and resume may send Trakt start")
         require(coordinator.contains("private let lifecycleQueue = TraktScrobbleLifecycleQueue()"),
                 "Trakt lifecycle operations must share the FIFO")
-        require(occurrences(of: "dispatchLifecycle(meta", in: coordinator) >= 5,
+        require(occurrences(of: "dispatchLifecycle(", in: coordinator) >= 6,
                 "start, pause, resume, stop, and completion must use the serialized lane")
 
         // Existing issue #164 surface contracts.
@@ -253,16 +254,29 @@ struct Issue164TraktContractTests {
                     && simklService.contains("guard case .simkl(let sessionID) = session,"),
                 "the coordinator and provider must transport the captured SIMKL session end to end")
 
-        // A Trakt-only account boundary cannot reopen provider-neutral SIMKL completion.
-        let traktInvalidation = segment(
+        // Provider boundaries invalidate only that provider's exact playback owner. The item+player token
+        // and completion latches survive, so the old playback cannot adopt a replacement account.
+        let providerInvalidation = segment(
             in: coordinator,
             from: "private func invalidateTraktSession()",
             to: "private func recordCompletion("
         )
-        require(traktInvalidation.contains("traktCompleted = false")
-                    && !traktInvalidation.contains("simklCompleted")
+        let lifecycleDispatch = segment(
+            in: coordinator,
+            from: "private func dispatchLifecycle(",
+            to: "private static func performDispatch("
+        )
+        require(providerInvalidation.contains("sessionOwnership.invalidateTrakt()")
+                    && providerInvalidation.contains("sessionOwnership.invalidateSIMKL()")
+                    && !providerInvalidation.contains("traktCompleted = false")
+                    && !providerInvalidation.contains("simklCompleted = false")
+                    && coordinator.contains("SIMKLAuthBoundary.observe(key: \"scrobble-coordinator\")")
+                    && lifecycleDispatch.contains("providerSessions:")
+                    && !lifecycleDispatch.contains("TraktAuth.storedSessionID")
+                    && !lifecycleDispatch.contains("SIMKLAuth.storedSessionID")
+                    && sessionPolicy.contains("struct PlaybackScrobbleSessionOwnership")
                     && coordinator.contains("if provider.id == \"simkl\", !sendSIMKL { return }"),
-                "Trakt boundary invalidation must preserve the SIMKL completion latch")
+                "active playback must retain exact provider ownership across both account boundaries")
 
         // Ratings, watched caches, and rails publish only into the exact current account session.
         require(ratingsStore.contains("TraktAuthBoundary.observe(key: \"trakt-ratings-store\")")
@@ -364,8 +378,9 @@ struct Issue164TraktContractTests {
                     && tvDetail.contains("var initialVideoID: String? = nil")
                     && occurrences(of: "var initialTraktSessionID: TraktSessionID? = nil", in: tvDetail) >= 3
                     && occurrences(of: "TraktAuth.storedSessionID == initialTraktSessionID", in: tvDetail) >= 3
-                    && tvDetail.contains("didConsumeInitialStart")
-                    && occurrences(of: "commitInitialStart(consumesInitialStart)", in: tvDetail) == 4,
+                    && tvDetail.contains("OneShotResumeAdmissionGate<TraktSessionID>()")
+                    && occurrences(of: "initialStartGate.admit(", in: tvDetail) == 4
+                    && occurrences(of: "currentSessionID: TraktAuth.storedSessionID", in: tvDetail) == 4,
                 "tvOS detail/source selection must revalidate the remote session and consume only after launch")
         require(iosHome.contains("resumeSeconds: carriesTraktResume ? item.resumeSeconds : nil")
                     && iosHome.contains("videoID: carriesTraktResume ? item.cwVideoId : nil")
@@ -376,10 +391,40 @@ struct Issue164TraktContractTests {
                     && iosDetail.contains("var initialVideoID: String? = nil")
                     && occurrences(of: "var initialTraktSessionID: TraktSessionID? = nil", in: iosDetail) >= 2
                     && occurrences(of: "TraktAuth.storedSessionID == initialTraktSessionID", in: iosDetail) >= 3
-                    && iosDetail.contains("didConsumeInitialResume")
-                    && iosDetail.contains("didConsumeInitialStart")
-                    && iosDetail.contains("return validInitialResumeSeconds"),
+                    && occurrences(of: "OneShotResumeAdmissionGate<TraktSessionID>()", in: iosDetail) == 2
+                    && occurrences(of: "currentSessionID: TraktAuth.storedSessionID", in: iosDetail) == 7
+                    && !iosDetail.contains("didConsumeInitialResume")
+                    && !iosDetail.contains("didConsumeInitialStart"),
                 "iOS detail/source selection must revalidate the remote session on the first content play")
+        require(shadow.contains("AccountBoundResumeSuggestion<TraktSessionID>?")
+                    && shadow.contains("AccountBoundResumeSuggestion(seconds: seconds, sessionID: currentSession)")
+                    && tvDetail.contains("resumeSuggestion: suggestion")
+                    && iosDetail.contains("playMovie(resumeSuggestion: suggestion)")
+                    && occurrences(of: "TraktAuth.storedSessionID", in: segment(
+                        in: tvDetail,
+                        from: "if let suggestion = traktSuggestion",
+                        to: ".buttonStyle(ChipButtonStyle())"
+                    )) == 0
+                    && occurrences(of: "TraktAuth.storedSessionID", in: segment(
+                        in: iosDetail,
+                        from: "if movieReady, let suggestion = movieTraktSuggestion",
+                        to: ".buttonStyle(ChipButtonStyle())"
+                    )) == 0
+                    && tvDetail.contains("return resumeSuggestion.proposal")
+                    && iosDetail.contains("return resumeSuggestion.proposal"),
+                "rendered Trakt suggestions must carry their producer session through final admission")
+        require(traktRails.contains("ExternalRailFetchOutcome<MetaPreview>")
+                    && traktRails.contains("case .success:")
+                    && traktRails.contains("case .failure:")
+                    && simklRails.contains("ExternalRailFetchOutcome<MetaPreview>")
+                    && simklRails.contains("case .success:")
+                    && simklRails.contains("case .failure:"),
+                "successful empty rails must clear while failed reads preserve the last complete snapshot")
+        require(traktRails.contains("guard !entries.isEmpty else { return .success([]) }")
+                    && traktRails.contains("guard !capped.isEmpty else { return .failure }")
+                    && simklRails.contains("guard !entries.isEmpty else { return .success([]) }")
+                    && simklRails.contains("guard !capped.isEmpty else { return .failure }"),
+                "only an authoritative empty provider response may clear a rail")
 
         // Final review boundaries: stale login attempts, aggregate reads, Upcoming, and remote CW privacy.
         require(auth.contains("struct TraktLoginAttemptAuthority")

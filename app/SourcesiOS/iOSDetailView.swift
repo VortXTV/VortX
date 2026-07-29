@@ -380,7 +380,7 @@ struct iOSDetailView: View {
     // always presents reliably. The player-cover variant sizes its content to fill the macOS window.
     @State private var presentation: Presentation?
     @State private var preparing = false                 // movie Watch Now is resolving
-    @State private var didConsumeInitialResume = false
+    @State private var initialResumeGate = OneShotResumeAdmissionGate<TraktSessionID>()
     @State private var downloadPicker: DownloadPickerRequest?   // pre-download quality picker payload (#30 follow-up)
     /// Owns the source-list assembly + ranking OFF the SwiftUI render path (snapshot -> merge -> rank
     /// off-main -> publish once, coalesced at ~250 ms). The body reads only its published output, so a
@@ -2060,9 +2060,13 @@ struct iOSDetailView: View {
             // saved position, and tapping this only changes where this one playback begins (the same seam
             // "Play from start" uses). Nothing here writes engine state, the account, or Trakt. Hidden
             // unless the user opted in, and hidden while sources resolve so it can never be a dead press.
-            if movieReady, let suggestion = movieTraktSuggestionSeconds,
-               let stamp = resumeTimecode(suggestion) {
-                Button { Task { await playMovie(startAt: suggestion) } } label: {
+            if movieReady, let suggestion = movieTraktSuggestion,
+               let stamp = resumeTimecode(suggestion.seconds) {
+                Button {
+                    Task {
+                        await playMovie(resumeSuggestion: suggestion)
+                    }
+                } label: {
                     Label("Resume from \(stamp)", systemImage: "arrow.triangle.branch")
                 }
                 .buttonStyle(ChipButtonStyle())
@@ -2606,10 +2610,10 @@ struct iOSDetailView: View {
     /// this is NOT consulted by `movieResumeSeconds` or by `playMovie`'s own `resume(_:)`, so the primary
     /// Resume button is byte-identical with or without Trakt. All of the policy (toggle, staleness band,
     /// clamps) lives in `TraktPlaybackShadow` so iOS and tvOS cannot drift apart on it.
-    private var movieTraktSuggestionSeconds: Double? {
-        TraktPlaybackShadow.shared.suggestionSeconds(for: moviePlaybackMeta,
-                                                     localSeconds: movieResumeSeconds,
-                                                     durationSeconds: movieDurationSeconds)
+    private var movieTraktSuggestion: AccountBoundResumeSuggestion<TraktSessionID>? {
+        TraktPlaybackShadow.shared.suggestion(for: moviePlaybackMeta,
+                                              localSeconds: movieResumeSeconds,
+                                              durationSeconds: movieDurationSeconds)
     }
 
     /// #11: the selected source's spec line for the primary CTA ("4K · DV · Remux · Atmos · 24.5 GB"),
@@ -2640,38 +2644,53 @@ struct iOSDetailView: View {
     /// position). Play-from-start must NOT re-pick the source: it only changes WHERE playback begins, never
     /// WHICH source plays (owner: "it auto changed the source when I tried to play from start").
     ///
-    /// `startAt` is the same idea generalized: begin at an explicit second instead of 0 or the saved
+    /// `resumeSuggestion` is the same idea generalized: begin at an explicit second instead of 0 or the saved
     /// position, still WITHOUT re-picking the source and still WITHOUT touching the stored resume point.
     /// It exists for the Trakt "Resume from <time>" chip, and it is deliberately the ONLY way that feature
     /// can influence playback: it chooses a start position for this one play, exactly as a manual scrub
     /// would, and the engine then records its own position through its normal path. Nothing reads Trakt
-    /// inside this function. `startAt` wins over `fromStart` because a caller passes one or the other.
+    /// inside this function. `resumeSuggestion` wins over `fromStart` because a caller passes one or the other.
     ///
-    /// The second to hand the player for this one play: an explicit `startAt` wins, then `fromStart` (0),
-    /// otherwise the saved resume point. Deliberately a statement chain and NOT
-    /// `startAt ?? (fromStart ? 0 : await resume(pm))`: `??`'s right operand is an `@autoclosure`, which
-    /// cannot contain `await`, so that spelling does not compile. The short-circuit is preserved either
-    /// way, so `resume(pm)` is still only awaited when neither caller-supplied value applies.
-    private func resolvedResumeSeconds(_ pm: PlaybackMeta, fromStart: Bool, startAt: Double?) async -> Double {
-        if let startAt {
-            didConsumeInitialResume = true
-            return startAt
+    /// The second to hand the player for this one play: an account-bound suggestion wins, then
+    /// `fromStart` (0), otherwise the saved resume point. The saved position is only awaited when neither
+    /// caller-supplied value applies.
+    private func proposedResume(
+        _ pm: PlaybackMeta,
+        fromStart: Bool,
+        resumeSuggestion: AccountBoundResumeSuggestion<TraktSessionID>?
+    ) async -> AccountBoundResumeProposal<TraktSessionID> {
+        if let resumeSuggestion {
+            return resumeSuggestion.proposal
         }
         if fromStart {
-            didConsumeInitialResume = true
-            return 0
+            return AccountBoundResumeProposal(
+                seconds: 0,
+                expectedSessionID: nil,
+                consumesInitial: true
+            )
         }
-        if !didConsumeInitialResume,
+        if !initialResumeGate.isConsumed,
            let validInitialResumeSeconds,
            validInitialResumeSeconds.isFinite,
            validInitialResumeSeconds > 0 {
-            didConsumeInitialResume = true
-            return validInitialResumeSeconds
+            return AccountBoundResumeProposal(
+                seconds: validInitialResumeSeconds,
+                expectedSessionID: initialTraktSessionID,
+                consumesInitial: true,
+                requiresUnconsumedInitial: true
+            )
         }
-        return await resume(pm)
+        return AccountBoundResumeProposal(
+            seconds: await resume(pm),
+            expectedSessionID: nil,
+            consumesInitial: false
+        )
     }
 
-    private func playMovie(fromStart: Bool = false, startAt: Double? = nil) async {
+    private func playMovie(
+        fromStart: Bool = false,
+        resumeSuggestion: AccountBoundResumeSuggestion<TraktSessionID>? = nil
+    ) async {
         // A4b: no longer gated on `meta != nil`, a hub-opened title with nil/mismatched Cinemeta meta still
         // has a resolved best stream (off the same groups the list renders) and plays off its seed identity.
         guard !preparing, let stream = movieBest else { return }
@@ -2692,9 +2711,17 @@ struct iOSDetailView: View {
             if refreshed {
                 core.loadEnginePlayer(for: stream)
                 let pm = moviePlaybackMeta
-                let resumeSeconds = await resolvedResumeSeconds(pm, fromStart: fromStart, startAt: startAt)
+                let resumeProposal = await proposedResume(
+                    pm,
+                    fromStart: fromStart,
+                    resumeSuggestion: resumeSuggestion
+                )
+                guard let admittedResume = initialResumeGate.admit(
+                    resumeProposal,
+                    currentSessionID: TraktAuth.storedSessionID
+                ) else { return }
                 presentation = .player(PlayerLaunch(url: url, title: pm.name, headers: entry.headers,
-                                                    resume: resumeSeconds, meta: pm,
+                                                    resume: admittedResume.seconds ?? 0, meta: pm,
                                                     qualityText: entry.qualityText, bingeGroup: entry.bingeGroup,
                                                     isTorrent: false,
                                                     debridRef: DebridPlaybackRef(url: url, service: service,
@@ -2724,9 +2751,17 @@ struct iOSDetailView: View {
             cachedUsenetURLs: debridCache.cachedUsenetURLs, labeledBest: stream) {
             core.loadEnginePlayer(for: win.stream)
             let pm = moviePlaybackMeta
-            let resumeSeconds = await resolvedResumeSeconds(pm, fromStart: fromStart, startAt: startAt)
+            let resumeProposal = await proposedResume(
+                pm,
+                fromStart: fromStart,
+                resumeSuggestion: resumeSuggestion
+            )
+            guard let admittedResume = initialResumeGate.admit(
+                resumeProposal,
+                currentSessionID: TraktAuth.storedSessionID
+            ) else { return }
             presentation = .player(PlayerLaunch(url: win.ref.url, title: pm.name, headers: win.stream.requestHeaders,
-                                                resume: resumeSeconds, meta: pm,
+                                                resume: admittedResume.seconds ?? 0, meta: pm,
                                                 qualityText: StreamRanking.signature(win.stream),
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
                                                 isTorrent: false, debridRef: win.ref,
@@ -2748,9 +2783,17 @@ struct iOSDetailView: View {
         let pm = moviePlaybackMeta
         // fromStart: hand the player resume 0 so it starts at the beginning. The stored resume point is NOT
         // cleared here - it stays until normal playback progress overwrites it (D10: play-from-start, not reset).
-        let resumeSeconds = await resolvedResumeSeconds(pm, fromStart: fromStart, startAt: startAt)
+        let resumeProposal = await proposedResume(
+            pm,
+            fromStart: fromStart,
+            resumeSuggestion: resumeSuggestion
+        )
+        guard let admittedResume = initialResumeGate.admit(
+            resumeProposal,
+            currentSessionID: TraktAuth.storedSessionID
+        ) else { return }
         presentation = .player(PlayerLaunch(url: url, title: pm.name, headers: stream.requestHeaders,
-                                            resume: resumeSeconds, meta: pm,
+                                            resume: admittedResume.seconds ?? 0, meta: pm,
                                             qualityText: StreamRanking.signature(stream),
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             isTorrent: prime && stream.isTorrent, debridRef: ref,
@@ -2796,12 +2839,17 @@ struct iOSDetailView: View {
         guard let playURL = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
             isUsenet: stream.isUsenet, resolvedURL: ref?.url, fallbackURL: url
         ) else { return }
+        let resumeProposal = await proposedResume(
+            pm,
+            fromStart: false,
+            resumeSuggestion: nil
+        )
+        guard let admittedResume = initialResumeGate.admit(
+            resumeProposal,
+            currentSessionID: TraktAuth.storedSessionID
+        ) else { return }
         presentation = .player(PlayerLaunch(url: playURL, title: pm.name, headers: stream.requestHeaders,
-                                            resume: await resolvedResumeSeconds(
-                                                pm,
-                                                fromStart: false,
-                                                startAt: nil
-                                            ), meta: pm,
+                                            resume: admittedResume.seconds ?? 0, meta: pm,
                                             qualityText: StreamRanking.signature(stream),
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             isTorrent: prime && stream.isTorrent, debridRef: ref,
@@ -3682,7 +3730,7 @@ struct iOSEpisodeStreams: View {
     // player cover could stop Watch from presenting. One enum-typed slot guarantees exactly one cover.
     @State private var presentation: Presentation?
     @State private var preparing = false
-    @State private var didConsumeInitialStart = false
+    @State private var initialStartGate = OneShotResumeAdmissionGate<TraktSessionID>()
     /// Smart Source Selection (Lane A) auto-pick: when `SourcePreferences.autoPickBest` is on, this page
     /// resolves + plays the best source on appear instead of making the viewer pick from the list. Guarded so
     /// it fires exactly once per appearance; backing out of the player reveals the full list (the escape hatch).
@@ -4166,7 +4214,7 @@ struct iOSEpisodeStreams: View {
         let pm = PlaybackMeta(libraryId: meta.id, videoId: target.id, type: "series",
                               name: meta.name, poster: target.thumbnail ?? meta.poster,
                               season: target.season, episode: target.episode)
-        let resumeSeconds = await resume(pm)
+        let resumeProposal = await proposedResume(pm)
         guard presentation == nil,
               episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
         let bindingSucceeded = core.loadEnginePlayer(
@@ -4179,8 +4227,12 @@ struct iOSEpisodeStreams: View {
         )
         guard presentation == nil,
               episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
+        guard let admittedResume = initialStartGate.admit(
+            resumeProposal,
+            currentSessionID: TraktAuth.storedSessionID
+        ) else { return }
         presentation = .player(iOSDetailView.PlayerLaunch(url: playURL, title: name, headers: stream.requestHeaders,
-                                            resume: resumeSeconds, meta: pm,
+                                            resume: admittedResume.seconds ?? 0, meta: pm,
                                             qualityText: StreamRanking.signature(stream),
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             isTorrent: isTorrent, debridRef: ref,
@@ -4216,7 +4268,7 @@ struct iOSEpisodeStreams: View {
             let pm = PlaybackMeta(libraryId: meta.id, videoId: target.id, type: "series",
                                   name: meta.name, poster: target.thumbnail ?? meta.poster,
                                   season: target.season, episode: target.episode)
-            let resumeSeconds = await resume(pm)
+            let resumeProposal = await proposedResume(pm)
             guard presentation == nil,
                   episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
             let bindingSucceeded = core.loadEnginePlayer(
@@ -4229,8 +4281,12 @@ struct iOSEpisodeStreams: View {
             )
             guard presentation == nil,
                   episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
+            guard let admittedResume = initialStartGate.admit(
+                resumeProposal,
+                currentSessionID: TraktAuth.storedSessionID
+            ) else { return }
             presentation = .player(iOSDetailView.PlayerLaunch(url: win.ref.url, title: name, headers: win.stream.requestHeaders,
-                                                resume: resumeSeconds, meta: pm,
+                                                resume: admittedResume.seconds ?? 0, meta: pm,
                                                 qualityText: StreamRanking.signature(win.stream),
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
                                                 isTorrent: false, debridRef: win.ref,
@@ -4267,6 +4323,10 @@ struct iOSEpisodeStreams: View {
         guard presentation == nil, let e = resolved,
               e.meta.videoId == target.id,
               episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
+        let resumeProposal = await proposedResume(e.meta, localFallback: e.resume)
+        guard presentation == nil,
+              e.meta.videoId == target.id,
+              episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
         let bindingSucceeded = core.loadEnginePlayer(
             for: e.stream, videoId: e.meta.videoId, base: e.engineAddonBase,
             resolvedURL: e.debridRef?.url
@@ -4277,9 +4337,13 @@ struct iOSEpisodeStreams: View {
         guard presentation == nil,
               e.meta.videoId == target.id,
               episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
+        guard let admittedResume = initialStartGate.admit(
+            resumeProposal,
+            currentSessionID: TraktAuth.storedSessionID
+        ) else { return }
         presentation = .player(iOSDetailView.PlayerLaunch(
             url: e.url, title: e.title, headers: e.stream.requestHeaders,
-            resume: e.resume, meta: e.meta,
+            resume: admittedResume.seconds ?? 0, meta: e.meta,
             qualityText: StreamRanking.signature(e.stream),
             bingeGroup: e.stream.behaviorHints?.bingeGroup,
             isTorrent: e.debridRef == nil && e.stream.isTorrent,
@@ -4349,16 +4413,37 @@ struct iOSEpisodeStreams: View {
         return (nil, stream.isTorrent)
     }
 
-    private func resume(_ pm: PlaybackMeta) async -> Double {
-        if !didConsumeInitialStart,
+    private func proposedResume(
+        _ pm: PlaybackMeta,
+        localFallback: Double? = nil
+    ) async -> AccountBoundResumeProposal<TraktSessionID> {
+        if !initialStartGate.isConsumed,
            pm.videoId == video.id,
            initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID,
            let initialStartAtSeconds,
            initialStartAtSeconds.isFinite,
            initialStartAtSeconds > 0 {
-            didConsumeInitialStart = true
-            return initialStartAtSeconds
+            return AccountBoundResumeProposal(
+                seconds: initialStartAtSeconds,
+                expectedSessionID: initialTraktSessionID,
+                consumesInitial: true,
+                requiresUnconsumedInitial: true
+            )
         }
+        let seconds: Double
+        if let localFallback {
+            seconds = localFallback
+        } else {
+            seconds = await localResume(pm)
+        }
+        return AccountBoundResumeProposal(
+            seconds: seconds,
+            expectedSessionID: nil,
+            consumesInitial: false
+        )
+    }
+
+    private func localResume(_ pm: PlaybackMeta) async -> Double {
         if let engine = core.engineResumeSeconds(for: pm) { return engine }
         return await account.resumeOffset(for: pm)
     }
@@ -4512,7 +4597,7 @@ struct iOSEpisodeStreams: View {
                               name: meta.name, poster: v.thumbnail ?? meta.poster,
                               season: v.season, episode: v.episode)
         let title = "\(meta.name)  ·  S\(v.season ?? season)E\(v.episodeNumber)"
-        let resolvedResume = await resume(pm)
+        let resolvedResume = await localResume(pm)
         guard !Task.isCancelled else { return nil }
         lastBinge = best.behaviorHints?.bingeGroup   // keep the next episode on this release group (#3)
         torrentPrime?.cancel(); torrentPrime = ref == nil ? prepareTorrentStream(best) : nil

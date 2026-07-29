@@ -94,20 +94,24 @@ final class TraktPlaybackShadow {
         let sessionID: TraktSessionID?
     }
 
-    /// A resume point Trakt holds that is worth offering, or nil. THE single decision point, so iOS and
-    /// tvOS cannot drift apart on the policy.
+    /// A resume point Trakt holds that is worth offering, atomically paired with the account that produced
+    /// it. THE single decision point, so iOS and tvOS cannot drift apart on the policy or account ownership.
     ///
     /// - Parameters:
     ///   - meta: the title/episode about to play.
     ///   - localSeconds: VortX's OWN resume position (the authority), or nil when it has none.
     ///   - durationSeconds: the runtime used to turn Trakt's percent into a timecode. Pass the engine's real
     ///     duration when there is one; a provisional runtime is accepted but is why the result is clamped.
-    /// - Returns: the seconds to offer, or nil when there is nothing worth offering.
+    /// - Returns: the seconds and exact producer session to offer, or nil when there is nothing worth offering.
     ///
     /// Returns nil (no chip) whenever: the toggle is off, no runtime is known (we will not invent a
     /// timecode we cannot compute), Trakt has no entry, the position is trivially early or near the end, or
     /// VortX's own position is already at/ahead of Trakt's. Never throws, never blocks: a pure cache read.
-    func suggestionSeconds(for meta: PlaybackMeta, localSeconds: Double?, durationSeconds: Double?) -> Double? {
+    func suggestion(
+        for meta: PlaybackMeta,
+        localSeconds: Double?,
+        durationSeconds: Double?
+    ) -> AccountBoundResumeSuggestion<TraktSessionID>? {
         guard ExternalSyncToggle.isOn(ExternalSyncToggle.traktResumeSuggestion, default: false) else { return nil }
         // OWNER/GUEST gate, the READ-side mirror of ScrobbleCoordinator's gate 1. The Trakt token is a single
         // device-global Keychain slot, so everything it returns belongs to the OWNER. Offering it to an
@@ -147,7 +151,7 @@ final class TraktPlaybackShadow {
         // one authority: we only ever ADD information the local side does not have.
         if let local = localSeconds, local > 0, seconds <= local + Self.staleLocalThresholdSeconds { return nil }
         guard TraktAuth.storedSessionID == currentSession else { return nil }
-        return seconds
+        return AccountBoundResumeSuggestion(seconds: seconds, sessionID: currentSession)
     }
 
     /// The episode key shape shared by the writer and the reader, so the two can never drift.

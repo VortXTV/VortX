@@ -2180,7 +2180,7 @@ struct CoreStreamList: View {
     /// Smart Source Selection (Lane A) auto-pick guard. Set once when the auto-pick fires so it never
     /// re-triggers; a viewer who backs out of the player lands on the full source list (the escape hatch).
     @State private var didAutoPick = false
-    @State private var didConsumeInitialStart = false
+    @State private var initialStartGate = OneShotResumeAdmissionGate<TraktSessionID>()
 
     /// Pin context derived from the title being shown - a movie pin or a show pin, both keyed by the
     /// library (meta) id. A series episode list passes a `type: "series"` PlaybackMeta, so every episode
@@ -2214,11 +2214,11 @@ struct CoreStreamList: View {
     /// consulted by `resumeSeconds` or by the primary Watch/Resume button, which keep reading VortX's own
     /// authority. All policy lives in `TraktPlaybackShadow`, shared with iOS so the two cannot drift.
     /// Suppressed for live channels, which have no resume point to offer.
-    private var traktSuggestionSeconds: Double? {
+    private var traktSuggestion: AccountBoundResumeSuggestion<TraktSessionID>? {
         guard let meta, !isLive else { return nil }
-        return TraktPlaybackShadow.shared.suggestionSeconds(for: meta,
-                                                            localSeconds: resumeSeconds,
-                                                            durationSeconds: traktDurationSeconds)
+        return TraktPlaybackShadow.shared.suggestion(for: meta,
+                                                     localSeconds: resumeSeconds,
+                                                     durationSeconds: traktDurationSeconds)
     }
 
     /// Owns the source-list assembly + ranking OFF the SwiftUI render path (see `SourceListModel`):
@@ -2345,8 +2345,14 @@ struct CoreStreamList: View {
                     // begins (the same seam "Play from start" uses, via playBest's exact-source path, so it
                     // never re-picks the source either). Nothing here writes engine state, the account, or
                     // Trakt. Hidden unless the user opted in. Mirrors iOS iOSDetailView.
-                    if let suggestion = traktSuggestionSeconds, let stamp = resumeTimecode(suggestion) {
-                        Button { playBest(best, in: groups, startAt: suggestion) } label: {
+                    if let suggestion = traktSuggestion, let stamp = resumeTimecode(suggestion.seconds) {
+                        Button {
+                            playBest(
+                                best,
+                                in: groups,
+                                resumeSuggestion: suggestion
+                            )
+                        } label: {
                             Label("Resume from \(stamp)", systemImage: "arrow.triangle.branch")
                         }
                         .buttonStyle(ChipButtonStyle())
@@ -2942,13 +2948,12 @@ struct CoreStreamList: View {
             Task { @MainActor in await playTrailerStream(stream) }
             return
         }
-        let proposedStart = proposedInitialStart(explicit: nil, fromStart: false)
+        let proposedStart = proposedInitialStart(fromStart: false)
         Task {
             await playResolving(
                 stream,
                 explicit: true,
-                startAt: proposedStart.seconds,
-                consumesInitialStart: proposedStart.consumesInitial
+                startProposal: proposedStart
             )
         }   // a tapped source row / quality pick: honor it in the player
     }
@@ -2992,49 +2997,69 @@ struct CoreStreamList: View {
     /// race yields nothing (no confirmed-cached row, or every leg failed) it falls straight through to today's
     /// single-resolve `play(best)`, so the no-key / no-cache path is unchanged. A MANUAL row tap still calls
     /// `play(_:)` directly (`streamRow`), resolving exactly the row the user chose.
-    /// `startAt` is "Play from start" generalized past 0:00: begin at an explicit second, still WITHOUT
+    /// `resumeSuggestion` is "Play from start" generalized past 0:00: begin at an explicit second, still WITHOUT
     /// re-picking the source and still WITHOUT touching the stored resume point. It carries the Trakt
     /// "Resume from <time>" chip's offer down to the player and is the ONLY way that feature reaches
-    /// playback. Nothing on this path reads Trakt. Mirrors iOS `playMovie(fromStart:startAt:)`.
-    private func playBest(_ best: CoreStream, in groups: [CoreStreamSourceGroup], fromStart: Bool = false,
-                          startAt: Double? = nil) {
-        let proposedStart = proposedInitialStart(explicit: startAt, fromStart: fromStart)
+    /// playback. Nothing on this path reads Trakt. Mirrors iOS `playMovie(fromStart:resumeSuggestion:)`.
+    private func playBest(
+        _ best: CoreStream,
+        in groups: [CoreStreamSourceGroup],
+        fromStart: Bool = false,
+        resumeSuggestion: AccountBoundResumeSuggestion<TraktSessionID>? = nil
+    ) {
+        let proposedStart = proposedInitialStart(
+            fromStart: fromStart,
+            resumeSuggestion: resumeSuggestion
+        )
         Task {
             await playBestResolving(
                 best,
                 in: groups,
                 fromStart: fromStart,
-                startAt: proposedStart.seconds,
-                consumesInitialStart: proposedStart.consumesInitial
+                startProposal: proposedStart
             )
         }
     }
 
-    private func proposedInitialStart(explicit: Double?, fromStart: Bool) -> (
-        seconds: Double?,
-        consumesInitial: Bool
-    ) {
+    private func proposedInitialStart(
+        fromStart: Bool,
+        resumeSuggestion: AccountBoundResumeSuggestion<TraktSessionID>? = nil
+    ) -> AccountBoundResumeProposal<TraktSessionID> {
         if fromStart {
-            return (explicit, true)
+            return AccountBoundResumeProposal(
+                seconds: nil,
+                expectedSessionID: nil,
+                consumesInitial: true
+            )
         }
-        if let explicit {
-            return (explicit, true)
+        if let resumeSuggestion {
+            return resumeSuggestion.proposal
         }
-        guard !didConsumeInitialStart,
+        guard !initialStartGate.isConsumed,
               initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID,
               let initialStartAtSeconds,
               initialStartAtSeconds.isFinite,
-              initialStartAtSeconds > 0 else { return (nil, false) }
-        return (initialStartAtSeconds, true)
+              initialStartAtSeconds > 0 else {
+            return AccountBoundResumeProposal(
+                seconds: nil,
+                expectedSessionID: nil,
+                consumesInitial: false
+            )
+        }
+        return AccountBoundResumeProposal(
+            seconds: initialStartAtSeconds,
+            expectedSessionID: initialTraktSessionID,
+            consumesInitial: true,
+            requiresUnconsumedInitial: true
+        )
     }
 
-    private func commitInitialStart(_ shouldConsume: Bool) {
-        if shouldConsume { didConsumeInitialStart = true }
-    }
-
-    @MainActor private func playBestResolving(_ best: CoreStream, in groups: [CoreStreamSourceGroup],
-                                              fromStart: Bool = false, startAt: Double? = nil,
-                                              consumesInitialStart: Bool = false) async {
+    @MainActor private func playBestResolving(
+        _ best: CoreStream,
+        in groups: [CoreStreamSourceGroup],
+        fromStart: Bool = false,
+        startProposal: AccountBoundResumeProposal<TraktSessionID>
+    ) async {
         let targetVideoID = episodeStreamId
         let targetGeneration = episodeTargetGeneration
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
@@ -3075,14 +3100,17 @@ struct CoreStreamList: View {
                 guard targetIsCurrent(
                     videoID: targetVideoID, generation: targetGeneration
                 ) else { return }
-                commitInitialStart(consumesInitialStart)
+                guard let admittedStart = initialStartGate.admit(
+                    startProposal,
+                    currentSessionID: TraktAuth.storedSessionID
+                ) else { return }
                 presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
                                                     sourceHint: entry.qualityText, torrent: false,
                                                     bingeGroup: entry.bingeGroup, headers: entry.headers,
                                                     debridRef: ref, sourceStream: resumeSource,
                                                     enginePlayerVideoId: engineVideoID,
                                                     wasExplicitPick: true, wasResume: true, startFromZero: fromStart,
-                                                    startAtSeconds: startAt)
+                                                    startAtSeconds: admittedStart.seconds)
                 return
             }
         }
@@ -3101,14 +3129,17 @@ struct CoreStreamList: View {
             guard targetIsCurrent(
                 videoID: targetVideoID, generation: targetGeneration
             ) else { return }
-            commitInitialStart(consumesInitialStart)
+            guard let admittedStart = initialStartGate.admit(
+                startProposal,
+                currentSessionID: TraktAuth.storedSessionID
+            ) else { return }
             presenter.request = PlaybackRequest(url: win.ref.url, title: title, meta: meta, episodes: episodes,
                                                 sourceHint: StreamRanking.signature(win.stream), torrent: false,
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
                                                 headers: win.stream.requestHeaders, debridRef: win.ref,
                                                 sourceStream: win.stream,
                                                 enginePlayerVideoId: engineVideoID, startFromZero: fromStart,
-                                                startAtSeconds: startAt)
+                                                startAtSeconds: admittedStart.seconds)
             return
         }
         // No parallel-cached winner: today's single-resolve path on the ranked best, unchanged. This is an
@@ -3118,16 +3149,18 @@ struct CoreStreamList: View {
             best,
             explicit: false,
             fromStart: fromStart,
-            startAt: startAt,
-            consumesInitialStart: consumesInitialStart
+            startProposal: startProposal
         )
     }
 
     /// `explicit`: true when the user tapped this exact source row / quality (honor it in the player, no
     /// silent hop on a start-timeout); false when it is the auto Watch-Now single-resolve fallback.
-    @MainActor private func playResolving(_ stream: CoreStream, explicit: Bool, fromStart: Bool = false,
-                                          startAt: Double? = nil,
-                                          consumesInitialStart: Bool = false) async {
+    @MainActor private func playResolving(
+        _ stream: CoreStream,
+        explicit: Bool,
+        fromStart: Bool = false,
+        startProposal: AccountBoundResumeProposal<TraktSessionID>
+    ) async {
         let targetVideoID = episodeStreamId
         let targetGeneration = episodeTargetGeneration
         let targetHint = episodeHint
@@ -3156,14 +3189,18 @@ struct CoreStreamList: View {
             guard targetIsCurrent(
                 videoID: targetVideoID, generation: targetGeneration
             ) else { return }
-            commitInitialStart(consumesInitialStart)
+            guard let admittedStart = initialStartGate.admit(
+                startProposal,
+                currentSessionID: TraktAuth.storedSessionID
+            ) else { return }
             presenter.request = PlaybackRequest(url: ref.url, title: title, meta: meta, episodes: episodes,
                                                 sourceHint: StreamRanking.signature(stream), torrent: false,
                                                 bingeGroup: stream.behaviorHints?.bingeGroup,
                                                 headers: stream.requestHeaders, debridRef: ref,
                                                 sourceStream: stream,
                                                 enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
-                                                startFromZero: fromStart, startAtSeconds: startAt)
+                                                startFromZero: fromStart,
+                                                startAtSeconds: admittedStart.seconds)
             return
         }
         // A raw NZB URL is a descriptor for the resolver, never media bytes for the player.
@@ -3175,14 +3212,18 @@ struct CoreStreamList: View {
         let engineVideoID = bindEngine(to: stream)
         prepareTorrent(stream)
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
-        commitInitialStart(consumesInitialStart)
+        guard let admittedStart = initialStartGate.admit(
+            startProposal,
+            currentSessionID: TraktAuth.storedSessionID
+        ) else { return }
         presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
                                             sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             headers: stream.requestHeaders, sourceStream: stream,
                                             enginePlayerVideoId: engineVideoID,
                                             wasExplicitPick: explicit,
-                                            startFromZero: fromStart, startAtSeconds: startAt)
+                                            startFromZero: fromStart,
+                                            startAtSeconds: admittedStart.seconds)
     }
 
     private func filterBar(_ groups: [CoreStreamSourceGroup], total: Int) -> some View {

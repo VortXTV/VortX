@@ -67,13 +67,20 @@ final class TraktRailsModel: ObservableObject {
         guard loadTask == nil else { return }
         loadTask = Task { [weak self] in
             defer { self?.loadTask = nil }
-            let resolved = await Self.fetch(expectedSession: sessionID)
+            let outcome = await Self.fetch(expectedSession: sessionID)
             guard let self, !Task.isCancelled,
                   self.stateSessionID == sessionID,
                   TraktAuth.storedSessionID == sessionID else { return }
-            self.lastRefresh = Date()
-            // Keep the prior rail on an empty fetch (flaky network) rather than blanking a populated rail.
-            if !resolved.isEmpty { self.storedItems = resolved }
+            switch outcome {
+            case .success:
+                self.storedItems = ExternalRailSnapshotPolicy.resolved(
+                    current: self.storedItems,
+                    outcome: outcome
+                )
+                self.lastRefresh = Date()
+            case .failure:
+                break
+            }
         }
     }
 
@@ -90,10 +97,13 @@ final class TraktRailsModel: ObservableObject {
 
     /// Fetch the watchlist, map each entry to its IMDb id + type + title, then resolve posters via
     /// Cinemeta in parallel. Entries without an IMDb id are dropped (Cinemeta keys on tt ids). Off-main.
-    private static func fetch(expectedSession: TraktSessionID) async -> [MetaPreview] {
+    private static func fetch(
+        expectedSession: TraktSessionID
+    ) async -> ExternalRailFetchOutcome<MetaPreview> {
         guard let entries = try? await TraktService.shared.watchlist(
             expectedSession: expectedSession
-        ) else { return [] }
+        ) else { return .failure }
+        guard !entries.isEmpty else { return .success([]) }
         // Map to (imdb, appType, title), keeping order, dropping non-tt entries, de-duplicating, capped.
         var seen = Set<String>()
         let seeds: [(imdb: String, type: String, title: String)] = entries.compactMap { entry in
@@ -104,7 +114,7 @@ final class TraktRailsModel: ObservableObject {
             return (imdb, isShow ? "series" : "movie", title)
         }
         let capped = Array(seeds.prefix(maxItems))
-        guard !capped.isEmpty else { return [] }
+        guard !capped.isEmpty else { return .failure }
 
         let resolved: [(Int, MetaPreview)] = await withTaskGroup(of: (Int, MetaPreview?).self) { group in
             for (index, seed) in capped.enumerated() {
@@ -115,8 +125,8 @@ final class TraktRailsModel: ObservableObject {
             return out
         }
         // Restore the watchlist order (task group completes out of order).
-        guard TraktAuth.storedSessionID == expectedSession else { return [] }
-        return resolved.sorted { $0.0 < $1.0 }.map(\.1)
+        guard TraktAuth.storedSessionID == expectedSession else { return .failure }
+        return .success(resolved.sorted { $0.0 < $1.0 }.map(\.1))
     }
 
     /// Resolve one title to a `MetaPreview` (poster + name) via Cinemeta's meta endpoint, the same host
