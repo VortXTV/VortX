@@ -19,6 +19,13 @@ struct PrivateExternalSyncStorageTestRunner {
             if !condition { failures.append(message) }
         }
 
+        expect(ImportedCatalogPersistencePolicy.isDurable(requiresConnection: nil),
+               "legacy/public catalogs remain eligible for ordinary persistence")
+        expect(ImportedCatalogPersistencePolicy.isDurable(requiresConnection: false),
+               "explicitly public catalogs remain eligible for ordinary persistence")
+        expect(!ImportedCatalogPersistencePolicy.isDurable(requiresConnection: true),
+               "connection-scoped private catalogs are never eligible for UserDefaults persistence")
+
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("vortx-private-storage-\(UUID().uuidString)", isDirectory: true)
         let live = root

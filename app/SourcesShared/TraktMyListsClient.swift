@@ -177,7 +177,7 @@ enum TraktMyListsClient {
             requiresConnection: list.requiresConnection,
             connectionSessionID: list.requiresConnection ? sessionID : nil
         )
-        DiagnosticsLog.log("trakt-my-lists", "\(list.kind.rawValue) '\(list.name)' -> \(items.count) titles")
+        DiagnosticsLog.log("trakt-my-lists", "\(list.kind.rawValue) import -> \(items.count) titles")
         return .success(catalog)
     }
 

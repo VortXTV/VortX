@@ -209,6 +209,7 @@ struct iOSDetailView: View {
     /// Navigation-carried Trakt offset. It is consumed by the first content play only.
     var initialResumeSeconds: Double? = nil
     var initialVideoID: String? = nil
+    var initialTraktSessionID: TraktSessionID? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
@@ -227,6 +228,18 @@ struct iOSDetailView: View {
     // Circular in-hero back chevron dismisses this pushed detail (the cinematic-media chrome, in place of
     // the plain system nav-bar back on iOS). On Mac the existing .macBackAffordance() still supplies Esc / Cmd-[.
     @Environment(\.dismiss) private var dismiss
+
+    /// A remote Continue Watching offer remains readable only while its exact Trakt credential session is
+    /// current. Detail views can stay mounted across sign-out, so this check belongs at every use site.
+    private var validInitialResumeSeconds: Double? {
+        guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
+        return initialResumeSeconds
+    }
+
+    private var validInitialVideoID: String? {
+        guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
+        return initialVideoID
+    }
 
     /// The pin context for this title - a movie pin or a show pin, both keyed by the meta id. The
     /// resolved pin feeds `StreamRanking` (auto-pick + list order) and the per-row pin menu/badge.
@@ -1774,8 +1787,8 @@ struct iOSDetailView: View {
         let primary = meta?.videos.flatMap { seriesPrimaryEpisode($0) }
         let primaryProgress = primary.map { episodeProgress($0.video) } ?? 0
         let primaryResumeSeconds: Double? = primary.flatMap {
-            if $0.video.id == initialVideoID, let initialResumeSeconds {
-                return initialResumeSeconds
+            if $0.video.id == validInitialVideoID, let validInitialResumeSeconds {
+                return validInitialResumeSeconds
             }
             return $0.isResume ? primaryEpisodeResumeSeconds : nil
         }
@@ -1787,7 +1800,8 @@ struct iOSDetailView: View {
                     NavigationLink {
                         iOSEpisodeStreams(meta: m, video: primary.video, season: primary.video.season ?? 1,
                               seasonEpisodes: sortedEpisodes(m.videos ?? []),
-                              initialStartAtSeconds: primaryResumeSeconds)
+                              initialStartAtSeconds: primaryResumeSeconds,
+                              initialTraktSessionID: initialTraktSessionID)
                     } label: {
                         Label(primaryEpisodeLabel(primary.video, isResume: primary.isResume,
                                                   resumeSeconds: primaryResumeSeconds),
@@ -1835,8 +1849,8 @@ struct iOSDetailView: View {
     /// you were last in even after that episode is marked watched. nil when there is no resume position. Mirrors
     /// the tvOS DetailView helper; seriesPrimaryEpisode still drives the Resume/Play button unchanged.
     private func resumeSeasonHint(_ videos: [CoreVideo]) -> Int? {
-        if let initialVideoID,
-           let season = sortedEpisodes(videos).first(where: { $0.id == initialVideoID })?.season {
+        if let validInitialVideoID,
+           let season = sortedEpisodes(videos).first(where: { $0.id == validInitialVideoID })?.season {
             return season
         }
         guard let m = meta else { return nil }
@@ -1850,10 +1864,10 @@ struct iOSDetailView: View {
     private func seriesPrimaryEpisode(_ videos: [CoreVideo]) -> (video: CoreVideo, isResume: Bool)? {
         guard let m = meta else { return nil }
         let sorted = sortedEpisodes(videos)
-        if let initialVideoID,
-           let initialResumeSeconds,
-           initialResumeSeconds > 0,
-           let video = sorted.first(where: { $0.id == initialVideoID }) {
+        if let validInitialVideoID,
+           let validInitialResumeSeconds,
+           validInitialResumeSeconds > 0,
+           let video = sorted.first(where: { $0.id == validInitialVideoID }) {
             return (video, true)
         }
         let watched = watchedSet
@@ -2648,11 +2662,11 @@ struct iOSDetailView: View {
             return 0
         }
         if !didConsumeInitialResume,
-           let initialResumeSeconds,
-           initialResumeSeconds.isFinite,
-           initialResumeSeconds > 0 {
+           let validInitialResumeSeconds,
+           validInitialResumeSeconds.isFinite,
+           validInitialResumeSeconds > 0 {
             didConsumeInitialResume = true
-            return initialResumeSeconds
+            return validInitialResumeSeconds
         }
         return await resume(pm)
     }
@@ -3172,9 +3186,10 @@ struct iOSDetailView: View {
             NavigationLink {
                 iOSEpisodeStreams(meta: m, video: v, season: v.season ?? season,
                                   seasonEpisodes: sortedEpisodes(m.videos ?? []),
-                                  initialStartAtSeconds: v.id == initialVideoID
-                                      ? initialResumeSeconds
-                                      : nil)
+                                  initialStartAtSeconds: v.id == validInitialVideoID
+                                      ? validInitialResumeSeconds
+                                      : nil,
+                                  initialTraktSessionID: initialTraktSessionID)
             } label: {
                 episodeRowLabel(v, isWatched: isWatched, progress: progress)
             }
@@ -3628,6 +3643,7 @@ struct iOSEpisodeStreams: View {
     let season: Int
     let seasonEpisodes: [CoreVideo]   // ALL episodes across seasons, ordered (season, episode), for in-player Next/Prev/list + auto-advance ACROSS the season boundary (so the last episode of a season rolls into the next season's first)
     var initialStartAtSeconds: Double? = nil
+    var initialTraktSessionID: TraktSessionID? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
@@ -4336,6 +4352,7 @@ struct iOSEpisodeStreams: View {
     private func resume(_ pm: PlaybackMeta) async -> Double {
         if !didConsumeInitialStart,
            pm.videoId == video.id,
+           initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID,
            let initialStartAtSeconds,
            initialStartAtSeconds.isFinite,
            initialStartAtSeconds > 0 {

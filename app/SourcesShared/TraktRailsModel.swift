@@ -31,16 +31,22 @@ final class TraktRailsModel: ObservableObject {
 
     private var lastRefresh: Date?
     private var loadTask: Task<Void, Never>?
+    private let boundaryObserverKey = "trakt-rails-\(UUID().uuidString)"
 
     init() {
         stateSessionID = TraktAuth.storedSessionID
-        TraktAuthBoundary.observe(key: "trakt-rails-\(UUID().uuidString)") { [weak self] sessionID in
+        TraktAuthBoundary.observe(key: boundaryObserverKey) { [weak self] sessionID in
             Task { @MainActor [weak self] in
                 self?.handleBoundary(sessionID)
             }
         }
         let currentSession = TraktAuth.storedSessionID
         if currentSession != stateSessionID { handleBoundary(currentSession) }
+    }
+
+    deinit {
+        loadTask?.cancel()
+        TraktAuthBoundary.removeObserver(key: boundaryObserverKey)
     }
 
     /// Pull the watchlist and resolve posters, at most once per `refreshInterval`. No-op when Trakt is

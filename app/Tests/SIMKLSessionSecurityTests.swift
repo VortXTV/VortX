@@ -75,6 +75,23 @@ final class MemorySIMKLCredentials: @unchecked Sendable {
     }
 }
 
+final class SIMKLBoundaryCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    func snapshot() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
 actor SIMKLWriteRecorder {
     private var values: [String] = []
 
@@ -241,6 +258,23 @@ struct SIMKLSessionSecurityTestRunner {
                "serialized SIMKL boundaries deterministically install B")
         expect(boundary.finalSession != boundary.sessionWhileDraining,
                "SIMKL B receives a distinct account session")
+
+        let firstBoundaryCounter = SIMKLBoundaryCounter()
+        let secondBoundaryCounter = SIMKLBoundaryCounter()
+        SIMKLAuthBoundary.observe(key: "simkl-boundary-removal-first") { _ in
+            firstBoundaryCounter.increment()
+        }
+        SIMKLAuthBoundary.observe(key: "simkl-boundary-removal-second") { _ in
+            secondBoundaryCounter.increment()
+        }
+        SIMKLAuthBoundary.publish(nil)
+        SIMKLAuthBoundary.removeObserver(key: "simkl-boundary-removal-first")
+        SIMKLAuthBoundary.publish(nil)
+        expect(firstBoundaryCounter.snapshot() == 1,
+               "removing one SIMKL boundary observer stops only that observer")
+        expect(secondBoundaryCounter.snapshot() == 2,
+               "a remaining SIMKL boundary observer survives another observer's removal")
+        SIMKLAuthBoundary.removeObserver(key: "simkl-boundary-removal-second")
 
         if failures.isEmpty {
             print("PASS: \(checks) SIMKL session security checks")

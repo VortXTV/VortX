@@ -79,6 +79,12 @@ enum SIMKLAuthBoundary {
         state.lock.unlock()
     }
 
+    static func removeObserver(key: String) {
+        state.lock.lock()
+        state.observers.removeValue(forKey: key)
+        state.lock.unlock()
+    }
+
     static func publish(_ sessionID: SIMKLSessionID?) {
         state.lock.lock()
         let observers = Array(state.observers.values)

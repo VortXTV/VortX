@@ -95,10 +95,11 @@ final class ReleaseCalendarModel: ObservableObject {
     /// with the same library doesn't refetch every series' meta over the network.
     private var lastSignature: String?
     private var loadTask: Task<Void, Never>?
+    private let simklBoundaryObserverKey = "release-calendar-model-\(UUID().uuidString)"
 
     init() {
         simklSeedSessionID = SIMKLAuth.storedSessionID
-        SIMKLAuthBoundary.observe(key: "release-calendar-model") { [weak self] sessionID in
+        SIMKLAuthBoundary.observe(key: simklBoundaryObserverKey) { [weak self] sessionID in
             Task { @MainActor [weak self] in
                 self?.handleSIMKLBoundary(sessionID)
             }
@@ -107,7 +108,12 @@ final class ReleaseCalendarModel: ObservableObject {
 
     /// Cancel any in-flight sweep when the owning Home view is torn down, so a slow fetch can't keep the
     /// model (and its captured state) alive for up to the per-series timeout after the view disappears.
-    deinit { loadTask?.cancel(); movieLoadTask?.cancel(); simklSeedTask?.cancel() }
+    deinit {
+        loadTask?.cancel()
+        movieLoadTask?.cancel()
+        simklSeedTask?.cancel()
+        SIMKLAuthBoundary.removeObserver(key: simklBoundaryObserverKey)
+    }
 
     /// Build the rail from the series library + installed meta add-on bases, derived by the caller the SAME
     /// way `NewEpisodeNotifications.sweepLibrary`'s caller does (series-typed library ids + names, and the

@@ -33,16 +33,22 @@ final class SIMKLRailsModel: ObservableObject {
 
     private var lastRefresh: Date?
     private var loadTask: Task<Void, Never>?
+    private let boundaryObserverKey = "simkl-rails-\(UUID().uuidString)"
 
     init() {
         stateSessionID = SIMKLAuth.storedSessionID
-        SIMKLAuthBoundary.observe(key: "simkl-rails-\(UUID().uuidString)") { [weak self] sessionID in
+        SIMKLAuthBoundary.observe(key: boundaryObserverKey) { [weak self] sessionID in
             Task { @MainActor [weak self] in
                 self?.handleBoundary(sessionID)
             }
         }
         let currentSession = SIMKLAuth.storedSessionID
         if currentSession != stateSessionID { handleBoundary(currentSession) }
+    }
+
+    deinit {
+        loadTask?.cancel()
+        SIMKLAuthBoundary.removeObserver(key: boundaryObserverKey)
     }
 
     /// Pull the plan-to-watch list and resolve posters, at most once per `refreshInterval`. No-op when

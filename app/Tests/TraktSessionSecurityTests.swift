@@ -194,6 +194,23 @@ final class BoundaryVisibility: @unchecked Sendable {
     }
 }
 
+final class TraktBoundaryCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    func snapshot() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
 @MainActor private var failures: [String] = []
 @MainActor private var checks = 0
 
@@ -470,6 +487,23 @@ struct TraktSessionSecurityTestRunner {
         loginAuthority.invalidate()
         expect(!loginAuthority.owns(code: "code-B", generation: loginB),
                "an account boundary invalidates an in-flight Trakt login")
+
+        let firstBoundaryCounter = TraktBoundaryCounter()
+        let secondBoundaryCounter = TraktBoundaryCounter()
+        TraktAuthBoundary.observe(key: "trakt-boundary-removal-first") { _ in
+            firstBoundaryCounter.increment()
+        }
+        TraktAuthBoundary.observe(key: "trakt-boundary-removal-second") { _ in
+            secondBoundaryCounter.increment()
+        }
+        TraktAuthBoundary.publish(nil)
+        TraktAuthBoundary.removeObserver(key: "trakt-boundary-removal-first")
+        TraktAuthBoundary.publish(nil)
+        expect(firstBoundaryCounter.snapshot() == 1,
+               "removing one Trakt boundary observer stops only that observer")
+        expect(secondBoundaryCounter.snapshot() == 2,
+               "a remaining Trakt boundary observer survives another observer's removal")
+        TraktAuthBoundary.removeObserver(key: "trakt-boundary-removal-second")
 
         let now = Int(Date().timeIntervalSince1970)
 

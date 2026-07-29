@@ -296,6 +296,7 @@ struct Issue164TraktContractTests {
             ]
         )
                     && traktRails.contains("TraktAuthBoundary.observe(")
+                    && traktRails.contains("TraktAuthBoundary.removeObserver(key: boundaryObserverKey)")
                     && traktRails.contains("expectedSession: sessionID")
                     && traktRails.contains("TraktAuth.storedSessionID == expectedSession"),
                 "Trakt rail auth/session gates must precede throttle and fence response publication")
@@ -308,6 +309,7 @@ struct Issue164TraktContractTests {
             ]
         )
                     && simklRails.contains("SIMKLAuthBoundary.observe(")
+                    && simklRails.contains("SIMKLAuthBoundary.removeObserver(key: boundaryObserverKey)")
                     && simklRails.contains("expectedSession: sessionID")
                     && simklRails.contains("SIMKLAuth.storedSessionID == expectedSession"),
                 "SIMKL rail auth/session gates must precede throttle and fence response publication")
@@ -337,34 +339,47 @@ struct Issue164TraktContractTests {
         require(catalogs.contains("var connectionSessionID: TraktSessionID?")
                     && catalogs.contains("TraktAuthBoundary.observe(key: \"imported-catalogs\")")
                     && catalogs.contains("removeConnectionScoped(provider: .trakt)")
-                    && catalogs.contains("TraktAuth.storedSessionID == sessionID"),
+                    && catalogs.contains("TraktAuth.storedSessionID == sessionID")
+                    && catalogs.contains("ImportedCatalogPersistencePolicy.isDurable("),
                 "private imported Trakt lists must be fingerprinted and cleared on every auth boundary")
+        let myListsImport = segment(
+            in: myLists,
+            from: "static func importList(",
+            to: "// MARK: - HTTP"
+        )
         require(myLists.contains("validToken(for: expectedSession)")
                     && myLists.contains("connectionSessionID: list.requiresConnection ? sessionID : nil")
-                    && occurrences(of: "TraktAuth.storedSessionID == sessionID", in: myLists) >= 3,
-                "private list reads and publication must remain bound to their captured Trakt session")
+                    && occurrences(of: "TraktAuth.storedSessionID == sessionID", in: myLists) >= 3
+                    && !myListsImport.contains("DiagnosticsLog.log(\"trakt-my-lists\", \"\\(list.kind.rawValue) '\\(list.name)'"),
+                "private list reads, publication, persistence, and logs must remain session-bound and private")
 
         // A failed direct resume keeps the remote card's offset and episode identity through source choice.
         require(tvHome.contains("resumeSeconds: traktSessionID == nil ? nil : item.resumeSeconds")
                     && tvHome.contains("videoID: traktSessionID == nil ? nil : item.state.videoId")
                     && tvHome.contains("initialResumeSeconds: $0.resumeSeconds")
+                    && tvHome.contains("initialTraktSessionID: $0.traktSessionID")
                     && tvSharedUI.contains("else if let onDetails"),
                 "tvOS direct-resume fallback must retain the Trakt resume target")
         require(tvDetail.contains("var initialResumeSeconds: Double? = nil")
                     && tvDetail.contains("var initialVideoID: String? = nil")
+                    && occurrences(of: "var initialTraktSessionID: TraktSessionID? = nil", in: tvDetail) >= 3
+                    && occurrences(of: "TraktAuth.storedSessionID == initialTraktSessionID", in: tvDetail) >= 3
                     && tvDetail.contains("didConsumeInitialStart")
-                    && tvDetail.contains("return initialStartAtSeconds"),
-                "tvOS detail/source selection must consume the remote offset on the first content play")
+                    && occurrences(of: "commitInitialStart(consumesInitialStart)", in: tvDetail) == 4,
+                "tvOS detail/source selection must revalidate the remote session and consume only after launch")
         require(iosHome.contains("resumeSeconds: carriesTraktResume ? item.resumeSeconds : nil")
                     && iosHome.contains("videoID: carriesTraktResume ? item.cwVideoId : nil")
-                    && iosHome.contains("initialResumeSeconds: target.resumeSeconds"),
+                    && iosHome.contains("initialResumeSeconds: target.resumeSeconds")
+                    && iosHome.contains("initialTraktSessionID: target.traktSessionID"),
                 "iOS direct-resume fallback must retain the Trakt resume target")
         require(iosDetail.contains("var initialResumeSeconds: Double? = nil")
                     && iosDetail.contains("var initialVideoID: String? = nil")
+                    && occurrences(of: "var initialTraktSessionID: TraktSessionID? = nil", in: iosDetail) >= 2
+                    && occurrences(of: "TraktAuth.storedSessionID == initialTraktSessionID", in: iosDetail) >= 3
                     && iosDetail.contains("didConsumeInitialResume")
                     && iosDetail.contains("didConsumeInitialStart")
-                    && iosDetail.contains("return initialResumeSeconds"),
-                "iOS detail/source selection must consume the remote offset on the first content play")
+                    && iosDetail.contains("return validInitialResumeSeconds"),
+                "iOS detail/source selection must revalidate the remote session on the first content play")
 
         // Final review boundaries: stale login attempts, aggregate reads, Upcoming, and remote CW privacy.
         require(auth.contains("struct TraktLoginAttemptAuthority")
@@ -377,11 +392,18 @@ struct Issue164TraktContractTests {
                     && simklAuth.contains("loginAttempts.owns(code: userCode")
                     && simklAuth.contains("func cancelLoginAttempt()"),
                 "SIMKL PIN responses must remain owned by one live generation")
-        require(occurrences(of: "catch SIMKLError.sessionChanged", in: simklService) >= 2
-                    && !simklService.contains("out += (try? await list(")
-                    && !simklService.contains("guard let leg = try? await ratingsRead"),
-                "SIMKL aggregate reads must rethrow account boundaries instead of returning mixed partial data")
-        require(releaseCalendar.contains("SIMKLAuthBoundary.observe(key: \"release-calendar-model\")")
+        let planToWatch = segment(
+            in: simklService,
+            from: "func planToWatch(expectedSession:",
+            to: "private static func entry("
+        )
+        require(planToWatch.contains("out += try await list(")
+                    && !planToWatch.contains("catch")
+                    && !planToWatch.contains("continue"),
+                "SIMKL plan-to-watch must fail as a whole instead of publishing mixed partial data")
+        require(releaseCalendar.contains("private let simklBoundaryObserverKey = \"release-calendar-model-\\(UUID().uuidString)\"")
+                    && releaseCalendar.contains("SIMKLAuthBoundary.observe(key: simklBoundaryObserverKey)")
+                    && releaseCalendar.contains("SIMKLAuthBoundary.removeObserver(key: simklBoundaryObserverKey)")
                     && releaseCalendar.contains("simklSeedSessionID == currentSession")
                     && releaseCalendar.contains("simklSeedGeneration == generation")
                     && releaseCalendar.contains("SIMKLAuth.storedSessionID == sessionID"),

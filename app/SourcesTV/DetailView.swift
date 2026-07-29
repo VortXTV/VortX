@@ -8,6 +8,7 @@ struct DetailView: View {
     let id: String
     var initialResumeSeconds: Double? = nil
     var initialVideoID: String? = nil
+    var initialTraktSessionID: TraktSessionID? = nil
     var client: AddonClient = AddonClient()   // kept for call-site compatibility (Search)
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
@@ -80,6 +81,18 @@ struct DetailView: View {
     /// `core.metaDetails?.meta` token reappears anywhere else in this file.
     private var fencedMeta: CoreMetaItem? {
         ResidentMeta.fenced(core.metaDetails?.meta, pageID: metaRequestID) { $0.id }
+    }
+
+    /// Navigation-carried Trakt state is private to the credential session that created it. Revalidate at
+    /// every use because the detail page can remain mounted across sign-out or an account replacement.
+    private var validInitialResumeSeconds: Double? {
+        guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
+        return initialResumeSeconds
+    }
+
+    private var validInitialVideoID: String? {
+        guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
+        return initialVideoID
     }
 
     var body: some View {
@@ -772,8 +785,8 @@ struct DetailView: View {
         let primary = seriesPrimaryEpisode(videos, watched: watched, localWatched: localWatched, metaID: meta.id)
         let primaryProgress = primary.map { episodeProgress($0.video, metaID: meta.id) } ?? 0
         let primaryResumeSeconds = primary.flatMap {
-            if $0.video.id == initialVideoID, let initialResumeSeconds {
-                return initialResumeSeconds
+            if $0.video.id == validInitialVideoID, let validInitialResumeSeconds {
+                return validInitialResumeSeconds
             }
             return $0.isResume ? primaryEpisodeResumeSeconds($0.video, metaID: meta.id) : nil
         }
@@ -888,7 +901,8 @@ struct DetailView: View {
                                                               name: m.name, poster: m.poster,
                                                               season: nil, episode: nil),
                                            identityRoles: sourceIndexRoles,
-                                           initialStartAtSeconds: initialResumeSeconds)
+                                           initialStartAtSeconds: validInitialResumeSeconds,
+                                           initialTraktSessionID: initialTraktSessionID)
                         }
                     }
                     .padding(.horizontal, Theme.Space.screenEdge)
@@ -1109,7 +1123,8 @@ struct DetailView: View {
                                     CoreEpisodeStreams(meta: m, video: primaryEpisode,
                                                        season: primaryEpisode.season ?? 0,
                                                        episodes: sortedEpisodes(m.videos ?? []),
-                                                       initialStartAtSeconds: primaryResumeSeconds)   // ALL seasons ordered → auto-advance crosses the season boundary
+                                                       initialStartAtSeconds: primaryResumeSeconds,
+                                                       initialTraktSessionID: initialTraktSessionID)   // ALL seasons ordered → auto-advance crosses the season boundary
                                 } label: {
                                     Label(primaryEpisodeLabel(primaryEpisode, isResume: primaryIsResume,
                                                               resumeSeconds: primaryResumeSeconds),
@@ -1415,8 +1430,8 @@ struct DetailView: View {
     /// the next-unwatched season instead). nil when there is no resume position, so the caller falls back to the
     /// primary/next-unwatched season. seriesPrimaryEpisode still drives the Resume/Play button unchanged.
     private func resumeSeasonHint(_ videos: [CoreVideo], metaID: String) -> Int? {
-        if let initialVideoID,
-           let season = sortedEpisodes(videos).first(where: { $0.id == initialVideoID })?.season {
+        if let validInitialVideoID,
+           let season = sortedEpisodes(videos).first(where: { $0.id == validInitialVideoID })?.season {
             return season
         }
         let videoId: String? = profiles.activeUsesEngineHistory
@@ -1433,10 +1448,10 @@ struct DetailView: View {
     private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>,
                                       localWatched: Set<String>, metaID: String) -> (video: CoreVideo, isResume: Bool)? {
         let sorted = sortedEpisodes(videos)
-        if let initialVideoID,
-           let initialResumeSeconds,
-           initialResumeSeconds > 0,
-           let video = sorted.first(where: { $0.id == initialVideoID }) {
+        if let validInitialVideoID,
+           let validInitialResumeSeconds,
+           validInitialResumeSeconds > 0,
+           let video = sorted.first(where: { $0.id == validInitialVideoID }) {
             return (video, true)
         }
         // Resume position: the engine's library entry is account level, so overlay
@@ -1829,6 +1844,7 @@ struct CoreEpisodeStreams: View {
     let season: Int
     var episodes: [CoreVideo] = []
     var initialStartAtSeconds: Double? = nil
+    var initialTraktSessionID: TraktSessionID? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore   // per-profile engine-history gate (activeUsesEngineHistory)
@@ -1848,13 +1864,15 @@ struct CoreEpisodeStreams: View {
         video: CoreVideo,
         season: Int,
         episodes: [CoreVideo] = [],
-        initialStartAtSeconds: Double? = nil
+        initialStartAtSeconds: Double? = nil,
+        initialTraktSessionID: TraktSessionID? = nil
     ) {
         self.meta = meta
         self.video = video
         self.season = season
         self.episodes = episodes
         self.initialStartAtSeconds = initialStartAtSeconds
+        self.initialTraktSessionID = initialTraktSessionID
         _currentVideo = State(initialValue: video)
     }
 
@@ -1926,7 +1944,8 @@ struct CoreEpisodeStreams: View {
                                        currentVideoID: currentVideo.id,
                                        kind: .series
                                    ),
-                                   initialStartAtSeconds: initialStartAtSeconds)
+                                   initialStartAtSeconds: initialStartAtSeconds,
+                                   initialTraktSessionID: initialTraktSessionID)
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
                 .padding(.bottom, Theme.Space.xl)
@@ -2060,6 +2079,8 @@ struct CoreStreamList: View {
     )
     /// One navigation-carried resume offset, consumed by the first content play only.
     var initialStartAtSeconds: Double? = nil
+    /// Exact Trakt session that owns `initialStartAtSeconds`. nil means the offset is local, not remote.
+    var initialTraktSessionID: TraktSessionID? = nil
 
     /// The title's resolved IMDb identity. ONE value: the pool and the IMDb-keyed TorBox index take the same
     /// IMDb-only key (decision REQ-260721-33), so there is no second field for a caller to pick wrongly.
@@ -2921,8 +2942,15 @@ struct CoreStreamList: View {
             Task { @MainActor in await playTrailerStream(stream) }
             return
         }
-        let startAt = consumeInitialStart(explicit: nil, fromStart: false)
-        Task { await playResolving(stream, explicit: true, startAt: startAt) }   // a tapped source row / quality pick: honor it in the player
+        let proposedStart = proposedInitialStart(explicit: nil, fromStart: false)
+        Task {
+            await playResolving(
+                stream,
+                explicit: true,
+                startAt: proposedStart.seconds,
+                consumesInitialStart: proposedStart.consumesInitial
+            )
+        }   // a tapped source row / quality pick: honor it in the player
     }
 
     /// #95: play a source-list TRAILER row (an `isYouTubeTrailer` `ytId` stream) the SAME reliable way the
@@ -2970,36 +2998,43 @@ struct CoreStreamList: View {
     /// playback. Nothing on this path reads Trakt. Mirrors iOS `playMovie(fromStart:startAt:)`.
     private func playBest(_ best: CoreStream, in groups: [CoreStreamSourceGroup], fromStart: Bool = false,
                           startAt: Double? = nil) {
-        let resolvedStart = consumeInitialStart(explicit: startAt, fromStart: fromStart)
+        let proposedStart = proposedInitialStart(explicit: startAt, fromStart: fromStart)
         Task {
             await playBestResolving(
                 best,
                 in: groups,
                 fromStart: fromStart,
-                startAt: resolvedStart
+                startAt: proposedStart.seconds,
+                consumesInitialStart: proposedStart.consumesInitial
             )
         }
     }
 
-    private func consumeInitialStart(explicit: Double?, fromStart: Bool) -> Double? {
+    private func proposedInitialStart(explicit: Double?, fromStart: Bool) -> (
+        seconds: Double?,
+        consumesInitial: Bool
+    ) {
         if fromStart {
-            didConsumeInitialStart = true
-            return explicit
+            return (explicit, true)
         }
         if let explicit {
-            didConsumeInitialStart = true
-            return explicit
+            return (explicit, true)
         }
         guard !didConsumeInitialStart,
+              initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID,
               let initialStartAtSeconds,
               initialStartAtSeconds.isFinite,
-              initialStartAtSeconds > 0 else { return nil }
-        didConsumeInitialStart = true
-        return initialStartAtSeconds
+              initialStartAtSeconds > 0 else { return (nil, false) }
+        return (initialStartAtSeconds, true)
+    }
+
+    private func commitInitialStart(_ shouldConsume: Bool) {
+        if shouldConsume { didConsumeInitialStart = true }
     }
 
     @MainActor private func playBestResolving(_ best: CoreStream, in groups: [CoreStreamSourceGroup],
-                                              fromStart: Bool = false, startAt: Double? = nil) async {
+                                              fromStart: Bool = false, startAt: Double? = nil,
+                                              consumesInitialStart: Bool = false) async {
         let targetVideoID = episodeStreamId
         let targetGeneration = episodeTargetGeneration
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
@@ -3040,6 +3075,7 @@ struct CoreStreamList: View {
                 guard targetIsCurrent(
                     videoID: targetVideoID, generation: targetGeneration
                 ) else { return }
+                commitInitialStart(consumesInitialStart)
                 presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
                                                     sourceHint: entry.qualityText, torrent: false,
                                                     bingeGroup: entry.bingeGroup, headers: entry.headers,
@@ -3065,6 +3101,7 @@ struct CoreStreamList: View {
             guard targetIsCurrent(
                 videoID: targetVideoID, generation: targetGeneration
             ) else { return }
+            commitInitialStart(consumesInitialStart)
             presenter.request = PlaybackRequest(url: win.ref.url, title: title, meta: meta, episodes: episodes,
                                                 sourceHint: StreamRanking.signature(win.stream), torrent: false,
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
@@ -3077,13 +3114,20 @@ struct CoreStreamList: View {
         // No parallel-cached winner: today's single-resolve path on the ranked best, unchanged. This is an
         // AUTO pick (the Watch-Now fallback), so it may hop normally on a start-timeout.
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
-        await playResolving(best, explicit: false, fromStart: fromStart, startAt: startAt)
+        await playResolving(
+            best,
+            explicit: false,
+            fromStart: fromStart,
+            startAt: startAt,
+            consumesInitialStart: consumesInitialStart
+        )
     }
 
     /// `explicit`: true when the user tapped this exact source row / quality (honor it in the player, no
     /// silent hop on a start-timeout); false when it is the auto Watch-Now single-resolve fallback.
     @MainActor private func playResolving(_ stream: CoreStream, explicit: Bool, fromStart: Bool = false,
-                                          startAt: Double? = nil) async {
+                                          startAt: Double? = nil,
+                                          consumesInitialStart: Bool = false) async {
         let targetVideoID = episodeStreamId
         let targetGeneration = episodeTargetGeneration
         let targetHint = episodeHint
@@ -3112,6 +3156,7 @@ struct CoreStreamList: View {
             guard targetIsCurrent(
                 videoID: targetVideoID, generation: targetGeneration
             ) else { return }
+            commitInitialStart(consumesInitialStart)
             presenter.request = PlaybackRequest(url: ref.url, title: title, meta: meta, episodes: episodes,
                                                 sourceHint: StreamRanking.signature(stream), torrent: false,
                                                 bingeGroup: stream.behaviorHints?.bingeGroup,
@@ -3130,6 +3175,7 @@ struct CoreStreamList: View {
         let engineVideoID = bindEngine(to: stream)
         prepareTorrent(stream)
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
+        commitInitialStart(consumesInitialStart)
         presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
                                             sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
                                             bingeGroup: stream.behaviorHints?.bingeGroup,

@@ -926,8 +926,9 @@ struct ImportedListCatalog: Codable, Hashable, Identifiable {
     var isEmpty: Bool { items.isEmpty }
 }
 
-/// On-device persistence for imported list catalogs (JSON in UserDefaults). Plain statics so a launch-time
-/// read can build the rows off the main actor, mirroring `CatalogPrefsStore`.
+/// On-device persistence for public imported list catalogs (JSON in UserDefaults). Connection-scoped private
+/// lists stay memory-only for the authenticated session that fetched them, so their titles, source URL, and
+/// contents never enter an unprotected preferences backup.
 enum ImportedCatalogsStore {
     static let key = "vortx.catalog.importedLists"
     /// Ceiling on stored lists, so the persisted blob (each list up to `ListImport.maxItems` small records)
@@ -937,13 +938,23 @@ enum ImportedCatalogsStore {
     static func load() -> [ImportedListCatalog] {
         guard let data = UserDefaults.standard.data(forKey: key),
               let decoded = try? JSONDecoder().decode([ImportedListCatalog].self, from: data) else { return [] }
-        return decoded
+        let durable = durableCatalogs(decoded)
+        if durable.count != decoded.count { save(durable) }
+        return durable
     }
 
     static func save(_ catalogs: [ImportedListCatalog]) {
-        let capped = Array(catalogs.prefix(maxCatalogs))
+        let capped = Array(durableCatalogs(catalogs).prefix(maxCatalogs))
         guard let data = try? JSONEncoder().encode(capped) else { return }
         UserDefaults.standard.set(data, forKey: key)
+    }
+
+    /// Private/friends-only rows contain account data. They remain in `ImportedCatalogs.storedCatalogs`
+    /// for the live session but are never eligible for UserDefaults persistence.
+    static func durableCatalogs(_ catalogs: [ImportedListCatalog]) -> [ImportedListCatalog] {
+        catalogs.filter {
+            ImportedCatalogPersistencePolicy.isDurable(requiresConnection: $0.requiresConnection)
+        }
     }
 }
 

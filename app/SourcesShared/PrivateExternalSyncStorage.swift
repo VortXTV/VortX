@@ -1,5 +1,15 @@
 import Foundation
 
+/// Persistence boundary for imported catalogs.
+///
+/// Public catalogs may use the ordinary preferences store. A catalog that required an authenticated
+/// connection can contain private titles and source identity, so it must remain memory-only.
+enum ImportedCatalogPersistencePolicy {
+    static func isDurable(requiresConnection: Bool?) -> Bool {
+        requiresConnection != true
+    }
+}
+
 enum PrivateExternalSyncStorageError: String, Error, Sendable {
     case location
     case directory

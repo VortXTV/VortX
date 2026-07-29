@@ -163,10 +163,8 @@ actor SIMKLService {
 
     /// The user's whole plan-to-watch list across movies, shows AND anime.
     ///
-    /// Each type is fetched INDEPENDENTLY, and a type that throws contributes an empty list instead of
-    /// failing the call. That matters most for the anime read: SIMKL's anime rows are shaped like shows,
-    /// but anime is a separate catalogue, so if that one response ever shifts, the movies and shows the
-    /// user actually has still reach the rail.
+    /// All three type reads form one snapshot. If any leg fails, the whole read fails so callers retain their
+    /// prior complete snapshot instead of publishing a plausible-looking movies-only or shows-only result.
     ///
     /// Sequential on purpose. The three reads are one throttled rail refresh, not a user-blocking path, so
     /// there is nothing to win by firing them together, and three concurrent authenticated GETs is exactly
@@ -178,17 +176,11 @@ actor SIMKLService {
         _ = try await auth.validToken(for: expectedSession)
         var out: [SIMKLListEntry] = []
         for type in SIMKLListType.allCases {
-            do {
-                out += try await list(
-                    type: type,
-                    status: .planToWatch,
-                    expectedSession: expectedSession
-                )
-            } catch SIMKLError.sessionChanged {
-                throw SIMKLError.sessionChanged
-            } catch {
-                continue
-            }
+            out += try await list(
+                type: type,
+                status: .planToWatch,
+                expectedSession: expectedSession
+            )
         }
         return out
     }

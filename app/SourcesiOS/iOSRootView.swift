@@ -1106,7 +1106,8 @@ struct iOSHomeView: View {
                         seedBackdrop: target.item.backdrop,
                         seedLogo: target.item.logo,
                         initialResumeSeconds: target.resumeSeconds,
-                        initialVideoID: target.videoID
+                        initialVideoID: target.videoID,
+                        initialTraktSessionID: target.traktSessionID
                     )
                 }
             }

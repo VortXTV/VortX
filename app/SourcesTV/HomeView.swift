@@ -636,7 +636,8 @@ struct CoreContinueWatchingRow: View {
                     type: $0.type,
                     id: $0.id,
                     initialResumeSeconds: $0.resumeSeconds,
-                    initialVideoID: $0.videoID
+                    initialVideoID: $0.videoID,
+                    initialTraktSessionID: $0.traktSessionID
                 )
             }
         }

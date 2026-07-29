@@ -37,6 +37,12 @@ enum TraktAuthBoundary {
         state.lock.unlock()
     }
 
+    static func removeObserver(key: String) {
+        state.lock.lock()
+        state.observers.removeValue(forKey: key)
+        state.lock.unlock()
+    }
+
     static func publish(_ sessionID: TraktSessionID?) {
         state.lock.lock()
         let observers = Array(state.observers.values)
