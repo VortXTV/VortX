@@ -269,23 +269,20 @@ private func productionWiring() {
                     generation: UInt64,
                     loadToken: PlayerLoadToken
                 ) {
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self,
-                              self.framePresentationStartedGeneration == generation,
-                              self.framePresentationDiagnostics.currentGeneration() == generation,
-                              PlayerLoadProvenanceState.accepts(
-                                callbackToken: loadToken,
-                                activeToken: self.activeLoadToken
-                              ) else {
-                            return
-                        }
-                        self.stopFramePresentationDiagnostics()
-                        self.restoreFramePresentationCscale()
+                    guard framePresentationStartedGeneration == generation,
+                          framePresentationDiagnostics.currentGeneration() == generation,
+                          PlayerLoadProvenanceState.accepts(
+                            callbackToken: loadToken,
+                            activeToken: activeLoadToken
+                          ) else {
+                        return
                     }
+                    stopFramePresentationDiagnostics()
+                    restoreFramePresentationCscale()
                 }
             """,
-            mutationTarget: "self.restoreFramePresentationCscale()",
-            mutationReplacement: "_ = self.framePresentationPriorCscale"),
+            mutationTarget: "restoreFramePresentationCscale()",
+            mutationReplacement: "_ = framePresentationPriorCscale"),
         FramePresentationWiringRule(
             name: "failed live-handle restore remains retryable",
             file: "MPVMetalViewController.swift",
@@ -359,18 +356,17 @@ private func productionWiring() {
             exactSection: """
                 if ef.reason == MPV_END_FILE_REASON_ERROR {
                     #if os(tvOS)
-                    if let generation = self.framePresentationDiagnostics.currentGeneration() {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self,
+                              let generation = self.framePresentationDiagnostics.currentGeneration()
+                        else { return }
                         self.scheduleFramePresentationTerminalCleanup(
-                            generation: generation,
-                            loadToken: loadToken
-                        )
+                            generation: generation, loadToken: loadToken)
                     }
                     #endif
             """,
-            mutationTarget:
-                "if let generation = self.framePresentationDiagnostics.currentGeneration() {",
-            mutationReplacement:
-                "if false, let generation = self.framePresentationDiagnostics.currentGeneration() {"),
+            mutationTarget: "guard let self,",
+            mutationReplacement: "guard false, let self,"),
         FramePresentationWiringRule(
             name: "end-file EOF cleanup dispatch",
             file: "MPVMetalViewController.swift",
@@ -379,18 +375,17 @@ private func productionWiring() {
             exactSection: """
                 } else if ef.reason == MPV_END_FILE_REASON_EOF {
                     #if os(tvOS)
-                    if let generation = self.framePresentationDiagnostics.currentGeneration() {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self,
+                              let generation = self.framePresentationDiagnostics.currentGeneration()
+                        else { return }
                         self.scheduleFramePresentationTerminalCleanup(
-                            generation: generation,
-                            loadToken: loadToken
-                        )
+                            generation: generation, loadToken: loadToken)
                     }
                     #endif
             """,
-            mutationTarget:
-                "if let generation = self.framePresentationDiagnostics.currentGeneration() {",
-            mutationReplacement:
-                "if false, let generation = self.framePresentationDiagnostics.currentGeneration() {"),
+            mutationTarget: "guard let self,",
+            mutationReplacement: "guard false, let self,"),
     ]
 
     for rule in rules {
