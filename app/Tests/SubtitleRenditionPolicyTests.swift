@@ -476,6 +476,21 @@ check("settlement: later global progress settles the remaining empty subtitle se
       settlement.observeGlobalTimestamp(14)
         && settlement.settledWindow(videoWindow: absoluteVideoWindow)?.segments.map(\.id) == [40, 41, 42])
 
+var pendingSettlement = Policy.SettlementState()
+check("settlement: async work registers before the global watermark advances",
+      pendingSettlement.registerPending(token: 101, timestamp: 3))
+check("settlement: pending OCR caps the publishable frontier",
+      pendingSettlement.observeGlobalTimestamp(20)
+        && pendingSettlement.pendingCount == 1
+        && pendingSettlement.settledBefore == 3
+        && pendingSettlement.settledWindow(videoWindow: absoluteVideoWindow) == nil)
+check("settlement: resolving after cue append opens the advanced frontier",
+      pendingSettlement.resolvePending(token: 101)
+        && !pendingSettlement.containsPending(token: 101)
+        && pendingSettlement.settledWindow(videoWindow: absoluteVideoWindow)?.segments.map(\.id)
+            == [40, 41, 42])
+check("settlement: a token resolves once", !pendingSettlement.resolvePending(token: 101))
+
 var readiness = Policy.SettlementState()
 let futureWindow = VortXHLSWindow(segments: [
     VortXHLSSegment(id: 70, byteOffset: 0, byteLength: 10, start: 8, duration: 4),
@@ -488,11 +503,36 @@ check("settlement: the same shared window becomes visible after its boundary set
 
 var eofSettlement = Policy.SettlementState()
 _ = eofSettlement.observeGlobalTimestamp(1)
-eofSettlement.finish()
+check("settlement: EOF without pending work finishes",
+      eofSettlement.finish())
 check("settlement: EOF settles the complete resident video window",
       eofSettlement.settledWindow(videoWindow: absoluteVideoWindow) == absoluteVideoWindow)
+var pendingEOFSettlement = Policy.SettlementState()
+_ = pendingEOFSettlement.registerPending(token: 202, timestamp: 3)
+_ = pendingEOFSettlement.observeGlobalTimestamp(20)
+check("settlement: EOF refuses to discard admitted OCR",
+      !pendingEOFSettlement.finish()
+        && pendingEOFSettlement.pendingCount == 1
+        && !pendingEOFSettlement.hasReachedEOF)
+check("settlement: unfinished OCR cannot publish ENDLIST",
+      !Policy.mediaPlaylist(
+          renditionID: 0,
+          window: absoluteVideoWindow,
+          ended: pendingEOFSettlement.hasReachedEOF,
+          targetDuration: 4).contains("#EXT-X-ENDLIST"))
+_ = pendingEOFSettlement.resolvePending(token: 202)
+check("settlement: EOF publishes only after the admitted tail resolves",
+      pendingEOFSettlement.finish()
+        && pendingEOFSettlement.pendingCount == 0
+        && pendingEOFSettlement.settledWindow(videoWindow: absoluteVideoWindow)
+            == absoluteVideoWindow
+        && Policy.mediaPlaylist(
+            renditionID: 0,
+            window: absoluteVideoWindow,
+            ended: pendingEOFSettlement.hasReachedEOF,
+            targetDuration: 4).contains("#EXT-X-ENDLIST"))
 var emptyEOFSettlement = Policy.SettlementState()
-emptyEOFSettlement.finish()
+_ = emptyEOFSettlement.finish()
 check("settlement: EOF is the only valid empty publication state",
       emptyEOFSettlement.settledWindow(videoWindow: VortXHLSWindow(segments: []))
         == VortXHLSWindow(segments: []))

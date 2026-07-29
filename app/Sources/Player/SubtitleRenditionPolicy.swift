@@ -11,9 +11,9 @@ import Foundation
 /// natively through its own media-selection group, so the video/audio pipeline, the Dolby Vision signaling and
 /// the delayed moov are all completely unaffected by anything in this file.
 ///
-/// SCOPE, stated honestly: TEXT subtitles ONLY (SubRip/SRT, ASS/SSA, mov_text/tx3g, WebVTT, raw text). Bitmap
-/// tracks are inventoried by the caller as explicitly unavailable because they are images and cannot become
-/// WebVTT without OCR. They never enter this text rendition pipeline.
+/// SCOPE, stated honestly: native text subtitles plus HDMV PGS packets that the caller's bounded asynchronous
+/// recognizer has already converted to UTF-8. Other bitmap formats remain explicitly unavailable because this
+/// policy has no pixel payload path.
 ///
 /// Why the decisions live here: the code that USES them is split between `VortXMKVRemuxStream` (which pulls in
 /// the whole FFmpeg vendor tree) and `VortXRemuxHLSServer` (Network.framework). A suite written against either
@@ -28,15 +28,14 @@ enum SubtitleRenditionPolicy {
     /// The text subtitle payload shapes this file can turn into WebVTT cue text.
     ///
     /// Carried as a case rather than a libav codec id because AVCodecID raw values are not stable across
-    /// FFmpeg versions, and this file must stay free of libav. The caller maps `codec_id` to a case (and to
-    /// `nil` for every bitmap codec) where the libav headers are already imported.
+    /// FFmpeg versions, and this file must stay free of libav. The caller maps `codec_id` to a case where the
+    /// libav headers are already imported, including PGS only when its recognition pipeline is available.
     enum TextFormat: Equatable, Sendable {
         /// SubRip. The demuxer hands over the cue text itself, which may carry `<i>`/`<b>`/`<u>` markup that
         /// WebVTT understands unchanged.
         /// HDMV PGS: BluRay bitmap subtitles, recognised to text by VortXPGSSubtitleOCR before they reach
         /// this policy. By the time a payload carries this format it is already UTF-8 text, so the cue path
-        /// treats it exactly like plain text. The case exists so `renditions(from:)` can rank a source's own
-        /// text tracks ahead of recognised ones.
+        /// treats it exactly like plain text while preserving the source track's original order.
         case pgs
         case subRip
         /// ASS/SSA. The demuxer hands over ONE dialogue line's fields without the `Dialogue:` keyword and
@@ -53,7 +52,7 @@ enum SubtitleRenditionPolicy {
 
     // MARK: - Track qualification
 
-    /// One TEXT subtitle track of the source, carried as plain values so this file needs no libav types.
+    /// One subtitle track eligible for WebVTT delivery, carried as plain values so this file needs no libav types.
     struct SourceTrack: Equatable, Sendable {
         let index: Int          // the libav input stream index; the caller's key for routing packets back
         let format: TextFormat
@@ -604,13 +603,50 @@ enum SubtitleRenditionPolicy {
         private(set) var isValid = true
         private(set) var invalidationReason: InvalidationReason?
         private var reachedEOF = false
+        /// Pending asynchronous work keyed by a mount-local token. The value is the earliest point at which
+        /// the eventual cue could overlap the media window.
+        private var pending: [UInt64: Double] = [:]
 
         var hasReachedEOF: Bool { reachedEOF }
+        var pendingCount: Int { pending.count }
 
         mutating func invalidate(_ reason: InvalidationReason) {
             guard isValid else { return }
             isValid = false
             invalidationReason = reason
+            pending.removeAll(keepingCapacity: false)
+        }
+
+        /// Register OCR work before the same packet advances the global watermark. A pending token holds the
+        /// publication frontier at its timestamp until a cue or terminal no-cue result resolves it.
+        @discardableResult
+        mutating func registerPending(token: UInt64, timestamp: Double) -> Bool {
+            guard isValid, pending[token] == nil else { return false }
+            guard timestamp.isFinite,
+                  timestamp >= 0,
+                  timestamp <= maximumTimelineSeconds else {
+                invalidate(.timelineBounds)
+                return false
+            }
+            guard timestamp >= settledBefore else {
+                invalidate(.lateTimestampRegression)
+                return false
+            }
+            pending[token] = timestamp
+            recomputeSettledBefore()
+            return true
+        }
+
+        func containsPending(token: UInt64) -> Bool {
+            pending[token] != nil
+        }
+
+        /// The caller appends any recognised cue before resolving the token.
+        @discardableResult
+        mutating func resolvePending(token: UInt64) -> Bool {
+            guard pending.removeValue(forKey: token) != nil else { return false }
+            recomputeSettledBefore()
+            return true
         }
 
         /// Returns false and permanently invalidates this optional feature when input arrives behind the
@@ -628,14 +664,16 @@ enum SubtitleRenditionPolicy {
                 return false
             }
             maximumGlobalTimestamp = max(maximumGlobalTimestamp, timestamp)
-            settledBefore = max(settledBefore, maximumGlobalTimestamp - interleaveMarginSeconds)
+            recomputeSettledBefore()
             return true
         }
 
-        mutating func finish() {
-            guard isValid else { return }
+        @discardableResult
+        mutating func finish() -> Bool {
+            guard isValid, pending.isEmpty else { return false }
             reachedEOF = true
             settledBefore = maximumTimelineSeconds
+            return true
         }
 
         /// Returns the fully settled prefix of the exact resident video window. A failure is represented by
@@ -651,6 +689,13 @@ enum SubtitleRenditionPolicy {
             })
             guard !settled.isEmpty else { return nil }
             return VortXHLSWindow(segments: settled)
+        }
+
+        private mutating func recomputeSettledBefore() {
+            guard isValid, !reachedEOF else { return }
+            let globalCandidate = max(0, maximumGlobalTimestamp - interleaveMarginSeconds)
+            let pendingCandidate = pending.values.min() ?? maximumTimelineSeconds
+            settledBefore = max(settledBefore, min(globalCandidate, pendingCandidate))
         }
     }
 

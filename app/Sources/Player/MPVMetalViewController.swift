@@ -171,7 +171,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// default false and therefore cannot arm the tvOS chroma mitigation or diagnostics.
     var isFullPlayerPresentation = false {
         didSet {
-            #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+            #if os(tvOS)
             if isFullPlayerPresentation {
                 startFramePresentationDiagnosticsIfReady()
                 updateFramePresentationPolicy()
@@ -183,7 +183,7 @@ final class MPVMetalViewController: PlatformViewController {
         }
     }
 
-    #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+    #if os(tvOS)
     private let framePresentationDiagnostics = FramePresentationDiagnosticsAccumulator()
     private var framePresentationGeneration: UInt64 = 0
     private var framePresentationLoadedGeneration: UInt64?
@@ -206,7 +206,7 @@ final class MPVMetalViewController: PlatformViewController {
         // forever if drawables can't be recycled while the main thread is busy.
         metalLayer.presentsWithTransaction = false
         metalLayer.allowsNextDrawableTimeout = true
-        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        #if os(tvOS)
         metalLayer.presentationDiagnostics = framePresentationDiagnostics
         #endif
         #if canImport(UIKit)
@@ -857,7 +857,7 @@ final class MPVMetalViewController: PlatformViewController {
         // sig-peak observer alone never flips it to HDR. A late gamma settle (pq/hlg arriving after the
         // first sig-peak event on an in-place switch) re-drives the dynamic-range apply.
         mpv_observe_property(mpv, 0, MPVProperty.videoParamsGamma, MPV_FORMAT_STRING)
-        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        #if os(tvOS)
         // Sparse counter/cue events feed one lock-backed aggregate. `sub-start` is numeric,
         // so repeated property notifications can be deduplicated without reading subtitle text.
         mpv_observe_property(mpv, 0, MPVProperty.frameDropCount, MPV_FORMAT_INT64)
@@ -1044,7 +1044,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// prevents it from firing into a deallocated controller (the crash on close), and
     /// destruction is serialized onto the event queue so it can't race `readEvents`.
     func stop() {
-        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        #if os(tvOS)
         stopFramePresentationDiagnostics()
         restoreFramePresentationCscale()
         #endif
@@ -1396,7 +1396,7 @@ final class MPVMetalViewController: PlatformViewController {
             entryID: entryID,
             token: issuedToken
         )
-        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        #if os(tvOS)
         if commandResult >= 0 {
             beginFramePresentationLoad()
         }
@@ -1631,7 +1631,7 @@ final class MPVMetalViewController: PlatformViewController {
         capturePipelineDevice = deviceID
     }
 
-    #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+    #if os(tvOS)
     /// A successful replacement owns a fresh diagnostics generation. The old cscale is
     /// restored before any new file can become eligible, including in-place episode loads.
     private func beginFramePresentationLoad() {
@@ -1682,19 +1682,16 @@ final class MPVMetalViewController: PlatformViewController {
         generation: UInt64,
         loadToken: PlayerLoadToken
     ) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self,
-                  self.framePresentationStartedGeneration == generation,
-                  self.framePresentationDiagnostics.currentGeneration() == generation,
-                  PlayerLoadProvenanceState.accepts(
-                    callbackToken: loadToken,
-                    activeToken: self.activeLoadToken
-                  ) else {
-                return
-            }
-            self.stopFramePresentationDiagnostics()
-            self.restoreFramePresentationCscale()
+        guard framePresentationStartedGeneration == generation,
+              framePresentationDiagnostics.currentGeneration() == generation,
+              PlayerLoadProvenanceState.accepts(
+                callbackToken: loadToken,
+                activeToken: activeLoadToken
+              ) else {
+            return
         }
+        stopFramePresentationDiagnostics()
+        restoreFramePresentationCscale()
     }
 
     private func restoreFramePresentationCscale() {
@@ -1811,7 +1808,7 @@ final class MPVMetalViewController: PlatformViewController {
         framePresentationMitigationApplied = true
         DiagnosticsLog.log(
             "perf",
-            "tvOS frame presentation armed gate=tester size=\(input.videoWidth)x\(input.videoHeight) gamma=\(input.gamma) sigPeak=\(input.signalPeak) priorCscale=\(prior)"
+            "tvOS frame presentation armed gate=production-4k-hdr size=\(input.videoWidth)x\(input.videoHeight) gamma=\(input.gamma) sigPeak=\(input.signalPeak) priorCscale=\(prior)"
         )
     }
 
@@ -1967,7 +1964,7 @@ final class MPVMetalViewController: PlatformViewController {
     private func syncDisplayDynamicRange(sigPeak: Double) {
         guard let handle = mpv else { return }
         let gamma = getString(MPVProperty.videoParamsGamma) ?? ""
-        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        #if os(tvOS)
         updateFramePresentationPolicy()
         #endif
         var range: ContentDynamicRange
@@ -2651,7 +2648,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// report nil for that field.
     func playbackDiagnostics() -> PlaybackDiagnostics {
         let framePresentation: FramePresentationDiagnosticsSnapshot?
-        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        #if os(tvOS)
         updateFramePresentationPolicy()
         let subtitle = selectedSubtitleFramePresentationInfo()
         framePresentation = framePresentationDiagnostics.takeSnapshot(
@@ -2662,7 +2659,7 @@ final class MPVMetalViewController: PlatformViewController {
                 ?? diagnosticString("options/cscale"),
             mitigationPriorCscale: framePresentationPriorCscale,
             mitigationApplied: framePresentationMitigationApplied,
-            mitigationGate: "tester"
+            mitigationGate: "production-4k-hdr"
         )
         #else
         framePresentation = nil
@@ -2891,7 +2888,7 @@ final class MPVMetalViewController: PlatformViewController {
                                       ) else { return }
                                 self.reapplyDynamicRange()
                             }
-                        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                        #if os(tvOS)
                         case MPVProperty.frameDropCount:
                             guard let loadToken = self.callbackLoadToken(
                                     requiresLoadedFile: true
@@ -3030,7 +3027,7 @@ final class MPVMetalViewController: PlatformViewController {
                     VXProbeState.shared.setPlayer(state: "playing", source: loadedHost, engine: "mpv")
                     VXProbe.event("player", "loaded \(loadedHost)")
                     self.probeEnhancementLayer()
-                    #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                    #if os(tvOS)
                     DispatchQueue.main.async { [weak self] in
                         self?.framePresentationFileLoaded(loadToken: loadedToken)
                     }
@@ -3076,12 +3073,13 @@ final class MPVMetalViewController: PlatformViewController {
                         }
                         guard let loadToken = self.loadToken(forEntryID: ef.playlist_entry_id) else { break }
                         if ef.reason == MPV_END_FILE_REASON_ERROR {
-                            #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
-                            if let generation = self.framePresentationDiagnostics.currentGeneration() {
+                            #if os(tvOS)
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self,
+                                      let generation = self.framePresentationDiagnostics.currentGeneration()
+                                else { return }
                                 self.scheduleFramePresentationTerminalCleanup(
-                                    generation: generation,
-                                    loadToken: loadToken
-                                )
+                                    generation: generation, loadToken: loadToken)
                             }
                             #endif
                             let msg = String(cString: mpv_error_string(ef.error))
@@ -3089,12 +3087,13 @@ final class MPVMetalViewController: PlatformViewController {
                             VXProbe.event("player", "endfile error \(msg)")
                             self.emit(MPVProperty.endFileError, msg, loadToken: loadToken)
                         } else if ef.reason == MPV_END_FILE_REASON_EOF {
-                            #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
-                            if let generation = self.framePresentationDiagnostics.currentGeneration() {
+                            #if os(tvOS)
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self,
+                                      let generation = self.framePresentationDiagnostics.currentGeneration()
+                                else { return }
                                 self.scheduleFramePresentationTerminalCleanup(
-                                    generation: generation,
-                                    loadToken: loadToken
-                                )
+                                    generation: generation, loadToken: loadToken)
                             }
                             #endif
                             VXProbe.event("player", "endfile eof")

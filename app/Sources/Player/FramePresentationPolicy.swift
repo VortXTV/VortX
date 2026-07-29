@@ -97,7 +97,7 @@ struct FramePresentationDiagnosticsSnapshot: Equatable, Sendable {
     let mitigationGate: String
 }
 
-/// Shared by mpv's event queue, Metal presented handlers, and the 30-second reader.
+/// Shared by mpv's event queue, the Metal drawable boundary, and the 30-second reader.
 final class FramePresentationDiagnosticsAccumulator: @unchecked Sendable {
     static let presentedSampleStride = 30
 
@@ -145,7 +145,7 @@ final class FramePresentationDiagnosticsAccumulator: @unchecked Sendable {
         return state?.generation
     }
 
-    /// A non-nil return arms one sampled Metal presented handler for this generation.
+    /// A non-nil return identifies a future platform-supported presentation sample for this generation.
     func recordDrawable(wait: Double, returned: Bool) -> UInt64? {
         lock.lock()
         defer { lock.unlock() }

@@ -45,6 +45,9 @@ enum SettingsBackup {
         "stremiox.dvRemux",          // Settings -> Dolby Vision for MKV (per-device: depends on THIS device's DV
                                      // display + decode). Was syncing, so a pull kept reverting a freshly-toggled
                                      // device back to a peer's OFF value, which is why enabling it never "took".
+        "vortx.pgsSubtitleOCR",      // on-device Vision workload escape hatch. A weaker device may need this
+                                     // off while another device keeps it on, so profile/cloud restore must not
+                                     // overwrite the local choice.
         "vortx.downloads.queueOrder",    // an array of download UUIDs whose FILES are device-local, so a peer's
                                          // queue order can never apply here: the UUIDs it names do not exist on
                                          // this device. Was syncing, so a pull replaced this device's real order

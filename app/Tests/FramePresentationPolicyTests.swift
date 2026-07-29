@@ -144,7 +144,6 @@ private func productionWiring() {
             .appendingPathComponent("Sources/Player/MetalLayer.swift"),
         "TVPlayerView.swift": appRoot
             .appendingPathComponent("SourcesTV/TVPlayerView.swift"),
-        "project.yml": appRoot.appendingPathComponent("project.yml"),
     ]
     var sources: [String: String] = [:]
     for (name, path) in paths {
@@ -155,31 +154,17 @@ private func productionWiring() {
         return
     }
 
-    let testerGate = "#if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER"
-    let project = sources["project.yml"] ?? ""
-    let testerConditionIsDisabled: (String) -> Bool = {
-        !$0.contains("VORTX_FRAME_PRESENTATION_TESTER")
-    }
-    check(
-        "frame production wiring: tester condition is default-off",
-        testerConditionIsDisabled(project)
-    )
-    let enabledProjectMutant = project
-        + "\nSWIFT_ACTIVE_COMPILATION_CONDITIONS: VORTX_FRAME_PRESENTATION_TESTER\n"
-    check(
-        "frame production wiring mutation: enabling tester condition turns red",
-        !testerConditionIsDisabled(enabledProjectMutant)
-    )
+    let productionGate = "#if os(tvOS)"
 
     let rules = [
         FramePresentationWiringRule(
-            name: "tester-only controller state",
+            name: "production controller state",
             file: "MPVMetalViewController.swift",
-            start: "#if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER\n"
+            start: "#if os(tvOS)\n"
                 + "    private let framePresentationDiagnostics",
             end: "override func viewDidLoad()",
             exactSection: """
-                #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                #if os(tvOS)
                 private let framePresentationDiagnostics = FramePresentationDiagnosticsAccumulator()
                 private var framePresentationGeneration: UInt64 = 0
                 private var framePresentationLoadedGeneration: UInt64?
@@ -191,20 +176,20 @@ private func productionWiring() {
                 private static let framePresentationVOPassesCooldown: TimeInterval = 2
                 #endif
             """,
-            mutationTarget: testerGate,
-            mutationReplacement: "#if os(tvOS)"),
+            mutationTarget: productionGate,
+            mutationReplacement: "#if false"),
         FramePresentationWiringRule(
             name: "full-player activation and teardown",
             file: "MPVMetalViewController.swift",
             start: "var isFullPlayerPresentation = false {",
             end: """
-                #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                #if os(tvOS)
                 private let framePresentationDiagnostics
             """,
             exactSection: """
                 var isFullPlayerPresentation = false {
                     didSet {
-                        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                        #if os(tvOS)
                         if isFullPlayerPresentation {
                             startFramePresentationDiagnosticsIfReady()
                             updateFramePresentationPolicy()
@@ -236,13 +221,13 @@ private func productionWiring() {
             mutationTarget: "coordinator.player?.isFullPlayerPresentation = true",
             mutationReplacement: "coordinator.player?.isFullPlayerPresentation = false"),
         FramePresentationWiringRule(
-            name: "tester-only mpv observers",
+            name: "production mpv observers",
             file: "MPVMetalViewController.swift",
             searchAfter: "checkError(mpv_initialize(mpv))",
-            start: testerGate,
+            start: productionGate,
             end: "mpv_observe_property(mpv, 0, MPVProperty.pausedForCache",
             exactSection: """
-                #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                #if os(tvOS)
                 mpv_observe_property(mpv, 0, MPVProperty.frameDropCount, MPV_FORMAT_INT64)
                 mpv_observe_property(mpv, 0, MPVProperty.decoderFrameDropCount, MPV_FORMAT_INT64)
                 mpv_observe_property(mpv, 0, MPVProperty.subtitleStart, MPV_FORMAT_DOUBLE)
@@ -253,39 +238,27 @@ private func productionWiring() {
             mutationReplacement:
                 "mpv_observe_property(mpv, 0, MPVProperty.subtitleStart, MPV_FORMAT_STRING)"),
         FramePresentationWiringRule(
-            name: "Metal presented-time callback",
+            name: "Metal drawable wait receipt",
             file: "MetalLayer.swift",
             start: "override func nextDrawable() -> (any CAMetalDrawable)? {",
             end: "guard let d else { return nil }",
             exactSection: """
                 override func nextDrawable() -> (any CAMetalDrawable)? {
-                    #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                    #if os(tvOS)
                     let drawableWaitStartedAt = CACurrentMediaTime()
                     #endif
                     let d = super.nextDrawable()
-                    #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                    #if os(tvOS)
                     let drawableAcquiredAt = CACurrentMediaTime()
                     let presentationDiagnostics = presentationDiagnostics
-                    let presentationGeneration = presentationDiagnostics?.recordDrawable(
+                    _ = presentationDiagnostics?.recordDrawable(
                         wait: drawableAcquiredAt - drawableWaitStartedAt,
                         returned: d != nil
                     )
-                    if let d, let presentationGeneration {
-                        d.addPresentedHandler { [weak presentationDiagnostics] drawable in
-                            let presentedTime = drawable.presentedTime
-                            let latency = presentedTime > 0
-                                ? presentedTime - drawableAcquiredAt
-                                : nil
-                            presentationDiagnostics?.recordPresented(
-                                generation: presentationGeneration,
-                                latency: latency
-                            )
-                        }
-                    }
                     #endif
             """,
-            mutationTarget: "let presentedTime = drawable.presentedTime",
-            mutationReplacement: "let presentedTime = CACurrentMediaTime()"),
+            mutationTarget: "wait: drawableAcquiredAt - drawableWaitStartedAt",
+            mutationReplacement: "wait: 0"),
         FramePresentationWiringRule(
             name: "generation-safe terminal cleanup",
             file: "MPVMetalViewController.swift",
@@ -385,7 +358,7 @@ private func productionWiring() {
             end: "let msg = String(cString: mpv_error_string(ef.error))",
             exactSection: """
                 if ef.reason == MPV_END_FILE_REASON_ERROR {
-                    #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                    #if os(tvOS)
                     if let generation = self.framePresentationDiagnostics.currentGeneration() {
                         self.scheduleFramePresentationTerminalCleanup(
                             generation: generation,
@@ -405,7 +378,7 @@ private func productionWiring() {
             end: #"VXProbe.event("player", "endfile eof")"#,
             exactSection: """
                 } else if ef.reason == MPV_END_FILE_REASON_EOF {
-                    #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+                    #if os(tvOS)
                     if let generation = self.framePresentationDiagnostics.currentGeneration() {
                         self.scheduleFramePresentationTerminalCleanup(
                             generation: generation,
@@ -584,7 +557,7 @@ private enum FramePresentationPolicyTests {
         let first = accumulator.takeSnapshot(
             now: 130, subtitleCodec: "ass", subtitleSource: "embedded",
             activeCscale: "bilinear", mitigationPriorCscale: "ewa_lanczossharp",
-            mitigationApplied: true, mitigationGate: "tester"
+            mitigationApplied: true, mitigationGate: "production-4k-hdr"
         )
         check("drawable aggregate", first?.drawableRequests == 2 && first?.drawableNil == 1)
         check("drawable wait aggregate",

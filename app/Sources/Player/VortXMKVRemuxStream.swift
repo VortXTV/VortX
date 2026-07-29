@@ -455,17 +455,31 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// everything", which static reading cannot distinguish and which decides the whole fix.
     private var subtitleArrivedPackets: [Int: Int] = [:]
     /// Per-source evidence that distinguishes a valid silent interval from a track whose delivered packets
-    /// all failed text parsing or bitmap recognition. Remux-thread only; user-facing rows are copied under
-    /// `hlsLock` after a state transition.
+    /// all failed text parsing or bitmap recognition. Initialized by the producer, then guarded by `hlsLock`
+    /// because OCR completions arrive from the worker.
     private var subtitleCueTruthBySource: [Int: SubtitleRenditionPolicy.CueTruthState] = [:]
-    /// PGS recognition switch. Defaults OFF while Vision recognition runs synchronously on the sole remux
-    /// producer thread. Opting in can recover bitmap subtitles, but must never be the default at the cost of
-    /// starving the primary video/audio delivery. The explicit key keeps the experimental path testable.
+    /// PGS recognition switch. The production default is safe because Vision runs only on one bounded worker,
+    /// while an explicit false remains a fleet escape hatch.
     static var pgsRecognitionEnabled: Bool {
         PGSOCRPolicy.isEnabled()
     }
-    /// Lazily created: a source with no PGS track never allocates a decoder or touches Vision.
-    private lazy var pgsOCR = VortXPGSSubtitleOCR()
+    /// Created only after classification proves at least one admitted PGS rendition.
+    private var pgsOCR: VortXPGSSubtitleOCR?
+    private let pgsEpoch = UInt64.random(in: UInt64.min...UInt64.max)
+    /// Producer admission closes at normal EOF, while the completion generation stays active until every
+    /// admitted token resolves or reaches its existing deadline. Cancel and failure retire both immediately.
+    private var pgsAcceptingPackets = false
+    private var pgsAcceptingCompletions = false
+    private var pgsDrainRequestedAtEOF = false
+    private var pgsTallyLogged = false
+    /// Worker tokens that still hold the subtitle settlement frontier. Guarded by hlsLock.
+    private var pgsPendingSources: [UInt64: Int] = [:]
+    /// Producer-confined monotonic token allocator. Zero is skipped after integer wrap.
+    private var nextPGSToken: UInt64 = 1
+    private var pgsCompleted = 0
+    private var pgsTimedOut = 0
+    private var pgsFailed = 0
+    /// Guarded by hlsLock because worker completions and producer text cues both update it.
     private var subtitleBytesStored: [Int: Int] = [:]
     /// Non-file resident HLS state participates in the same ordinary admission ceiling as durable media and
     /// outstanding `.part` reservations through `hlsAuxiliaryAccounting`.
@@ -816,6 +830,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // waiting out rw_timeout x reconnects. Set-after cancelledFlag so isCancelled is already true when the
         // interrupt lands. Never freed here: only in deinit, after the thread has exited (see interruptFlag).
         interruptFlag.pointee = 1
+        hlsLock.lock()
+        pgsAcceptingPackets = false
+        pgsAcceptingCompletions = false
+        pgsDrainRequestedAtEOF = false
+        pgsPendingSources.removeAll(keepingCapacity: false)
+        let subtitleOCR = pgsOCR
+        hlsLock.unlock()
+        _ = subtitleOCR?.invalidateAndStop()
         // Wake any buffer reader blocked in AVPlayer's loader so it stops waiting on bytes that won't come.
         buffer.fail("cancelled")
         hlsSpool?.invalidateSession()
@@ -987,16 +1009,21 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // Every guard/early return, cancellation, demotion and successful EOF reaches the real producer-terminal
         // edge only as this remux thread unwinds. Cancellation itself merely requests abort and cannot claim it.
         defer {
-            let arrived = subtitleArrivedPackets.values.reduce(0, +)
-            let rejected = subtitleRejectedPackets.values.reduce(0, +)
-            let stored = _subtitleCues.reduce(0) { $0 + $1.count }
-            if !subtitleCollectors.isEmpty || arrived > 0 || stored > 0 {
-                DiagnosticsLog.log(
-                    "dv",
-                    "subtitle cue tally: arrived=\(arrived) rejected=\(rejected) stored=\(stored) "
-                    + "collectors=\(subtitleCollectors.count) valid=\(_subtitleSettlement.isValid) "
-                    + pgsOCR.summary)
+            hlsLock.lock()
+            let preservesNormalEOFDrain = pgsDrainRequestedAtEOF && pgsAcceptingCompletions
+            if !preservesNormalEOFDrain {
+                pgsAcceptingPackets = false
+                pgsAcceptingCompletions = false
+                pgsDrainRequestedAtEOF = false
+                pgsPendingSources.removeAll(keepingCapacity: false)
             }
+            let subtitleOCR = pgsOCR
+            hlsLock.unlock()
+            if !preservesNormalEOFDrain {
+                _ = subtitleOCR?.invalidateAndStop()
+            }
+            subtitleOCR?.closeProducerResources()
+            if !preservesNormalEOFDrain { logSubtitleTallyIfNeeded() }
             releaseHLSParserOpenClaim()
             hlsSpool?.producerDidTerminate()
         }
@@ -1260,6 +1287,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 subtitleCollectors[rendition.sourceIndex] = (rendition.id, rendition.format)
                 subtitleCueTruthBySource[rendition.sourceIndex] =
                     SubtitleRenditionPolicy.CueTruthState()
+            }
+            if renditions.contains(where: { $0.format == .pgs }) {
+                let ocr = VortXPGSSubtitleOCR(
+                    epoch: pgsEpoch,
+                    completion: { [weak self] completion in
+                        self?.completePGSOCR(completion)
+                    })
+                hlsLock.lock()
+                pgsOCR = ocr
+                pgsAcceptingPackets = true
+                pgsAcceptingCompletions = true
+                hlsLock.unlock()
             }
             DiagnosticsLog.log("dv", "subtitles: text-renditions-ready count=\(renditions.count)")
         }
@@ -2286,12 +2325,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             guard hlsCloseSegment(
                 endSec: finalEnd, audioResource: finalAudioResource) else { return }
             hlsLock.lock()
-            _subtitleSettlement.finish()
+            pgsAcceptingPackets = false
+            pgsDrainRequestedAtEOF = true
+            let subtitleOCR = pgsOCR
             hlsLock.unlock()
-            settleSubtitleCueTruthAtEOF()
-            hlsLock.lock()
-            _hlsEnded = true
-            hlsLock.unlock()
+            subtitleOCR?.finishAdmissionAndDrain()
+            finishHLSAtEOFIfPGSSettled()
         }
         buffer.finish()
         NSLog("[dv-remux-stream] done: %d bytes muxed", buffer.producedCount)
@@ -3865,13 +3904,21 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let accepted = _subtitleSettlement.observeGlobalTimestamp(seconds)
         let reason = _subtitleSettlement.invalidationReason
         if !accepted {
+            pgsAcceptingPackets = false
+            pgsAcceptingCompletions = false
+            pgsDrainRequestedAtEOF = false
+        }
+        let subtitleOCR = accepted ? nil : pgsOCR
+        if !accepted {
+            pgsPendingSources.removeAll(keepingCapacity: false)
             _subtitleRenditions.removeAll(keepingCapacity: false)
             _subtitleCues.removeAll(keepingCapacity: false)
+            subtitleBytesStored.removeAll(keepingCapacity: false)
         }
         hlsLock.unlock()
         if !accepted {
+            _ = subtitleOCR?.invalidateAndStop()
             subtitleCollectors.removeAll(keepingCapacity: false)
-            subtitleBytesStored.removeAll(keepingCapacity: false)
             _ = updateHLSAuxiliaryBytes(subtitles: 0)
             DiagnosticsLog.log("dv", "subtitles omitted category=\((reason ?? .timelineBounds).rawValue)")
         }
@@ -3885,12 +3932,67 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         _subtitleSettlement.invalidate(reason)
         _subtitleRenditions.removeAll(keepingCapacity: false)
         _subtitleCues.removeAll(keepingCapacity: false)
-        hlsLock.unlock()
-        subtitleCollectors.removeAll(keepingCapacity: false)
         subtitleBytesStored.removeAll(keepingCapacity: false)
+        pgsAcceptingPackets = false
+        pgsAcceptingCompletions = false
+        pgsDrainRequestedAtEOF = false
+        pgsPendingSources.removeAll(keepingCapacity: false)
+        let subtitleOCR = pgsOCR
+        hlsLock.unlock()
+        _ = subtitleOCR?.invalidateAndStop()
+        subtitleCollectors.removeAll(keepingCapacity: false)
         _ = updateHLSAuxiliaryBytes(subtitles: 0)
         if wasValid {
             DiagnosticsLog.log("dv", "subtitles omitted category=\(reason.rawValue)")
+        }
+    }
+
+    /// Normal EOF is a two-stage terminal edge: media production stops first, then admitted OCR work settles
+    /// asynchronously. ENDLIST and permanent subtitle truth become visible only after both pending registries
+    /// are empty. Cancel and feature invalidation never enter this path.
+    private func finishHLSAtEOFIfPGSSettled() {
+        hlsLock.lock()
+        guard pgsDrainRequestedAtEOF,
+              pgsPendingSources.isEmpty,
+              _subtitleSettlement.pendingCount == 0,
+              !_hlsEnded else {
+            hlsLock.unlock()
+            return
+        }
+        pgsDrainRequestedAtEOF = false
+        pgsAcceptingCompletions = false
+        _subtitleSettlement.finish()
+        _hlsEnded = true
+        hlsLock.unlock()
+
+        settleSubtitleCueTruthAtEOF()
+        logSubtitleTallyIfNeeded()
+    }
+
+    private func logSubtitleTallyIfNeeded() {
+        hlsLock.lock()
+        guard !pgsTallyLogged else {
+            hlsLock.unlock()
+            return
+        }
+        pgsTallyLogged = true
+        let stored = _subtitleCues.reduce(0) { $0 + $1.count }
+        let settlementValid = _subtitleSettlement.isValid
+        let completed = pgsCompleted
+        let timedOut = pgsTimedOut
+        let failed = pgsFailed
+        let subtitleOCR = pgsOCR
+        hlsLock.unlock()
+
+        let arrived = subtitleArrivedPackets.values.reduce(0, +)
+        let rejected = subtitleRejectedPackets.values.reduce(0, +)
+        if !subtitleCollectors.isEmpty || arrived > 0 || stored > 0 {
+            DiagnosticsLog.log(
+                "dv",
+                "subtitle cue tally: arrived=\(arrived) rejected=\(rejected) stored=\(stored) "
+                + "collectors=\(subtitleCollectors.count) valid=\(settlementValid) "
+                + "pgsComplete=\(completed) pgsTimeout=\(timedOut) pgsFailed=\(failed) "
+                + (subtitleOCR?.summary ?? "pgs-ocr inactive"))
         }
     }
 
@@ -3899,23 +4001,24 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private func settleSubtitleCueTruthAtEOF() {
         hlsLock.lock()
         let reachedEOF = _subtitleSettlement.hasReachedEOF
+        if reachedEOF {
+            for sourceIndex in Array(subtitleCueTruthBySource.keys) {
+                guard var truth = subtitleCueTruthBySource[sourceIndex] else { continue }
+                truth.settleAtEOF()
+                subtitleCueTruthBySource[sourceIndex] = truth
+            }
+        }
         hlsLock.unlock()
         guard reachedEOF else { return }
-
-        for sourceIndex in Array(subtitleCueTruthBySource.keys) {
-            guard var truth = subtitleCueTruthBySource[sourceIndex] else { continue }
-            truth.settleAtEOF()
-            subtitleCueTruthBySource[sourceIndex] = truth
-        }
         publishSubtitleCueTruthRows()
     }
 
     /// Publish only availability fields on the existing stable source rows. Rendition cardinality and every
     /// primary video/audio structure remain untouched; a later valid cue can clear the reason on the same row.
     private func publishSubtitleCueTruthRows() {
-        let truthBySource = subtitleCueTruthBySource
         var changed: [(sourceIndex: Int, status: SubtitleRenditionPolicy.CueTruthStatus)] = []
         hlsLock.lock()
+        let truthBySource = subtitleCueTruthBySource
         _sourceSubtitleTracks = _sourceSubtitleTracks.map { track in
             guard let truth = truthBySource[track.sourceIndex] else { return track }
             let unavailableReason = truth.status == .unavailable
@@ -3950,12 +4053,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                                       durationSeconds: Double,
                                       byteCount: Int,
                                       cause: String) {
-        let priorRejects = subtitleRejectedPackets[sourceIndex] ?? 0
-        subtitleRejectedPackets[sourceIndex] = priorRejects + 1
-        if var truth = subtitleCueTruthBySource[sourceIndex] {
-            truth.observeRejectedPacket()
-            subtitleCueTruthBySource[sourceIndex] = truth
-        }
+        hlsLock.lock()
+        let priorRejects = recordSubtitleRejectionLocked(sourceIndex: sourceIndex)
+        hlsLock.unlock()
 
         if priorRejects == 0 {
             let start = startSeconds.map { String(format: "%.3f", $0) } ?? "unknown"
@@ -3967,34 +4067,140 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
     }
 
-    private func acceptSubtitleCue(sourceIndex: Int) {
-        guard var truth = subtitleCueTruthBySource[sourceIndex] else { return }
-        let recoversUnavailableRow = truth.status == .unavailable
-        truth.observeValidCue()
-        subtitleCueTruthBySource[sourceIndex] = truth
-        if recoversUnavailableRow {
-            publishSubtitleCueTruthRows()
+    /// Caller holds hlsLock. Returns the prior rejection count so only the first producer-side failure logs.
+    private func recordSubtitleRejectionLocked(sourceIndex: Int) -> Int {
+        let priorRejects = subtitleRejectedPackets[sourceIndex] ?? 0
+        subtitleRejectedPackets[sourceIndex] = priorRejects + 1
+        if var truth = subtitleCueTruthBySource[sourceIndex] {
+            truth.observeRejectedPacket()
+            subtitleCueTruthBySource[sourceIndex] = truth
         }
+        return priorRejects
     }
 
-    /// Decode one collected text packet after both packet and aggregate byte bounds pass. Every failure drops
-    /// only the optional rendition; subtitle packets never enter the primary mux map.
+    private enum SubtitleCueAppendResult {
+        case appended(recoveredUnavailableRow: Bool)
+        case inactive
+        case storedBound
+        case cueCountBound
+    }
+
+    /// Caller holds hlsLock. Cue publication, byte accounting, and source truth change as one snapshot.
+    private func appendSubtitleCueLocked(_ cue: SubtitleRenditionPolicy.Cue,
+                                         renditionID: Int,
+                                         sourceIndex: Int) -> SubtitleCueAppendResult {
+        guard _subtitleSettlement.isValid,
+              renditionID >= 0,
+              renditionID < _subtitleCues.count else { return .inactive }
+        guard _subtitleCues[renditionID].count < Self.maxCuesPerRendition else {
+            return .cueCountBound
+        }
+        let cueBytes = cue.text.utf8.count
+        let stored = subtitleBytesStored[renditionID] ?? 0
+        guard SubtitleRenditionPolicy.canStore(
+            existingBytes: stored,
+            incomingBytes: cueBytes) else { return .storedBound }
+        let totalStored = subtitleBytesStored.values.reduce(0, +)
+        let (nextTotal, overflow) = totalStored.addingReportingOverflow(cueBytes)
+        guard !overflow,
+              updateHLSAuxiliaryBytes(subtitles: nextTotal) else { return .storedBound }
+
+        _subtitleCues[renditionID].append(cue)
+        subtitleBytesStored[renditionID] = stored + cueBytes
+        var recoveredUnavailableRow = false
+        if var truth = subtitleCueTruthBySource[sourceIndex] {
+            recoveredUnavailableRow = truth.status == .unavailable
+            truth.observeValidCue()
+            subtitleCueTruthBySource[sourceIndex] = truth
+        }
+        return .appended(recoveredUnavailableRow: recoveredUnavailableRow)
+    }
+
+    /// Worker completion never reaches the render or remux producer threads. A timeout, queue eviction, OCR
+    /// failure, or late generation loses only that optional cue and always releases its settlement token.
+    private func completePGSOCR(_ completion: PGSOCRCompletion) {
+        var shouldPublishTruthRecovery = false
+        hlsLock.lock()
+        let tokenIsPending = _subtitleSettlement.containsPending(token: completion.token)
+        guard PGSOCRCompletionPolicy.accepts(
+            completion,
+            activeEpoch: pgsEpoch,
+            tokenIsPending: tokenIsPending,
+            generationIsActive: pgsAcceptingCompletions),
+            pgsPendingSources[completion.token] == completion.sourceIndex else {
+            hlsLock.unlock()
+            return
+        }
+        pgsPendingSources.removeValue(forKey: completion.token)
+
+        var appended = false
+        switch completion.outcome {
+        case .text(let text):
+            if let payload = text.data(using: .utf8),
+               let cue = SubtitleRenditionPolicy.cue(
+                   payload: payload,
+                   format: .pgs,
+                   startSeconds: completion.startSeconds,
+                   durationSeconds: completion.durationSeconds) {
+                switch appendSubtitleCueLocked(
+                    cue,
+                    renditionID: completion.renditionID,
+                    sourceIndex: completion.sourceIndex) {
+                case .appended(let recovered):
+                    appended = true
+                    shouldPublishTruthRecovery = recovered
+                    pgsCompleted += 1
+                case .inactive, .storedBound, .cueCountBound:
+                    pgsFailed += 1
+                }
+            } else {
+                pgsFailed += 1
+            }
+        case .timedOut:
+            pgsTimedOut += 1
+        case .failed:
+            pgsFailed += 1
+        case .empty:
+            break
+        }
+        if !appended {
+            _ = recordSubtitleRejectionLocked(sourceIndex: completion.sourceIndex)
+        }
+        _ = _subtitleSettlement.resolvePending(token: completion.token)
+        hlsLock.unlock()
+
+        if shouldPublishTruthRecovery {
+            publishSubtitleCueTruthRows()
+        }
+        finishHLSAtEOFIfPGSSettled()
+    }
+
+    /// Decode one collected subtitle packet. Text stays on the producer's cheap parser path. PGS is decoded
+    /// into immutable bitmap values and submitted to one bounded worker; Vision never blocks media production.
     private func collectSubtitlePacket(packet: UnsafeMutablePointer<AVPacket>,
                                        inputStream: UnsafeMutablePointer<AVStream>,
                                        inIdx: Int) -> Bool {
         guard let collector = subtitleCollectors[inIdx] else { return false }
         subtitleArrivedPackets[inIdx] = (subtitleArrivedPackets[inIdx] ?? 0) + 1
-        hlsLock.lock(); let settlementValid = _subtitleSettlement.isValid; hlsLock.unlock()
+        hlsLock.lock()
+        let settlementValid = _subtitleSettlement.isValid
+        let pgsAdmissionOpen = pgsAcceptingPackets
+        hlsLock.unlock()
         guard settlementValid else { return true }
 
         let packetBytes = Int(packet.pointee.size)
-        let stored = subtitleBytesStored[collector.renditionID] ?? 0
         guard SubtitleRenditionPolicy.canDecodePayload(byteCount: packetBytes) else {
-            invalidateSubtitles(.payloadBound)
-            return true
-        }
-        guard SubtitleRenditionPolicy.canStore(existingBytes: stored, incomingBytes: packetBytes) else {
-            invalidateSubtitles(.storedBound)
+            if collector.format == .pgs {
+                rejectSubtitlePacket(
+                    sourceIndex: inIdx,
+                    format: collector.format,
+                    startSeconds: nil,
+                    durationSeconds: 0,
+                    byteCount: packetBytes,
+                    cause: "payload-bound")
+            } else {
+                invalidateSubtitles(.payloadBound)
+            }
             return true
         }
 
@@ -4035,29 +4241,80 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 cause: "missing-payload")
             return true
         }
-        // A PGS packet carries pixels, not text. Recognise it first; the rest of this function then
-        // treats the result exactly like any other text cue, which is what lets a recognised BluRay
-        // track become an ordinary WebVTT rendition with styling and delay support.
-        let payload: Data
         if collector.format == .pgs {
-            guard let codecpar = inputStream.pointee.codecpar,
-                  let text = pgsOCR.recognise(packet: packet,
-                                              parameters: codecpar,
-                                              streamIndex: inIdx),
-                  let encoded = text.data(using: .utf8) else {
+            guard pgsAdmissionOpen,
+                  let codecpar = inputStream.pointee.codecpar,
+                  let pgsOCR else { return true }
+            let token = nextPGSToken
+            nextPGSToken &+= 1
+            if nextPGSToken == 0 { nextPGSToken = 1 }
+            guard let work = pgsOCR.prepare(
+                packet: packet,
+                parameters: codecpar,
+                streamIndex: inIdx,
+                renditionID: collector.renditionID,
+                token: token,
+                startSeconds: cueStart,
+                durationSeconds: duration) else {
                 rejectSubtitlePacket(
                     sourceIndex: inIdx,
                     format: collector.format,
                     startSeconds: cueStart,
                     durationSeconds: duration,
                     byteCount: packetBytes,
-                    cause: "ocr")
+                    cause: "ocr-prepare")
                 return true
             }
-            payload = encoded
-        } else {
-            payload = Data(bytes: bytes, count: packetBytes)
+
+            hlsLock.lock()
+            let registered = pgsAcceptingPackets
+                && pgsAcceptingCompletions
+                && _subtitleSettlement.registerPending(
+                    token: token,
+                    timestamp: work.startSeconds)
+            if registered { pgsPendingSources[token] = inIdx }
+            let registrationFailure = _subtitleSettlement.invalidationReason
+            hlsLock.unlock()
+            guard registered else {
+                if let registrationFailure {
+                    invalidateSubtitles(registrationFailure)
+                } else {
+                    rejectSubtitlePacket(
+                        sourceIndex: inIdx,
+                        format: collector.format,
+                        startSeconds: work.startSeconds,
+                        durationSeconds: work.durationSeconds,
+                        byteCount: packetBytes,
+                        cause: "ocr-retired")
+                }
+                return true
+            }
+
+            let submission = pgsOCR.submit(work)
+            hlsLock.lock()
+            for droppedToken in submission.droppedTokens {
+                if let sourceIndex = pgsPendingSources.removeValue(forKey: droppedToken) {
+                    _ = recordSubtitleRejectionLocked(sourceIndex: sourceIndex)
+                }
+                _ = _subtitleSettlement.resolvePending(token: droppedToken)
+            }
+            if !submission.accepted {
+                pgsPendingSources.removeValue(forKey: token)
+                _ = recordSubtitleRejectionLocked(sourceIndex: inIdx)
+                _ = _subtitleSettlement.resolvePending(token: token)
+            }
+            hlsLock.unlock()
+            return true
         }
+
+        hlsLock.lock()
+        let stored = subtitleBytesStored[collector.renditionID] ?? 0
+        hlsLock.unlock()
+        guard SubtitleRenditionPolicy.canStore(existingBytes: stored, incomingBytes: packetBytes) else {
+            invalidateSubtitles(.storedBound)
+            return true
+        }
+        let payload = Data(bytes: bytes, count: packetBytes)
         guard let cue = SubtitleRenditionPolicy.cue(
             payload: payload,
             format: collector.format,
@@ -4073,31 +4330,22 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             return true
         }
 
-        let cueBytes = cue.text.utf8.count
-        guard SubtitleRenditionPolicy.canStore(existingBytes: stored, incomingBytes: cueBytes) else {
-            invalidateSubtitles(.storedBound)
-            return true
-        }
-
         hlsLock.lock()
-        let canAppend = collector.renditionID < _subtitleCues.count
-            && _subtitleCues[collector.renditionID].count < Self.maxCuesPerRendition
+        let appendResult = appendSubtitleCueLocked(
+            cue,
+            renditionID: collector.renditionID,
+            sourceIndex: inIdx)
         hlsLock.unlock()
-        guard canAppend else {
+        switch appendResult {
+        case .appended(let recovered):
+            if recovered { publishSubtitleCueTruthRows() }
+        case .inactive:
+            break
+        case .storedBound:
+            invalidateSubtitles(.storedBound)
+        case .cueCountBound:
             invalidateSubtitles(.cueCountBound)
-            return true
         }
-        let totalStored = subtitleBytesStored.values.reduce(0, +)
-        let (nextTotal, overflow) = totalStored.addingReportingOverflow(cueBytes)
-        guard !overflow, updateHLSAuxiliaryBytes(subtitles: nextTotal) else {
-            invalidateSubtitles(.storedBound)
-            return true
-        }
-        hlsLock.lock()
-        _subtitleCues[collector.renditionID].append(cue)
-        hlsLock.unlock()
-        subtitleBytesStored[collector.renditionID] = stored + cueBytes
-        acceptSubtitleCue(sourceIndex: inIdx)
         return true
     }
 

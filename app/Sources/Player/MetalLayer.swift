@@ -123,7 +123,7 @@ private final class CaptureDelivery: @unchecked Sendable {
 
 class MetalLayer: CAMetalLayer {
 
-    #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+    #if os(tvOS)
     /// Owned by the player controller. Kept weak so the layer and late drawable
     /// callbacks cannot extend a finished playback generation.
     weak var presentationDiagnostics: FramePresentationDiagnosticsAccumulator?
@@ -173,29 +173,19 @@ class MetalLayer: CAMetalLayer {
     }
 
     override func nextDrawable() -> (any CAMetalDrawable)? {
-        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        #if os(tvOS)
         let drawableWaitStartedAt = CACurrentMediaTime()
         #endif
         let d = super.nextDrawable()
-        #if os(tvOS) && VORTX_FRAME_PRESENTATION_TESTER
+        #if os(tvOS)
         let drawableAcquiredAt = CACurrentMediaTime()
         let presentationDiagnostics = presentationDiagnostics
-        let presentationGeneration = presentationDiagnostics?.recordDrawable(
+        _ = presentationDiagnostics?.recordDrawable(
             wait: drawableAcquiredAt - drawableWaitStartedAt,
             returned: d != nil
         )
-        if let d, let presentationGeneration {
-            d.addPresentedHandler { [weak presentationDiagnostics] drawable in
-                let presentedTime = drawable.presentedTime
-                let latency = presentedTime > 0
-                    ? presentedTime - drawableAcquiredAt
-                    : nil
-                presentationDiagnostics?.recordPresented(
-                    generation: presentationGeneration,
-                    latency: latency
-                )
-            }
-        }
+        // tvOS does not expose MTLDrawable.addPresentedHandler or presentedTime. Drawable wait and nil
+        // receipts are the platform-supported boundary here; mpv's VO counters cover the downstream result.
         #endif
         guard let d else { return nil }
 

@@ -37,6 +37,12 @@ import Foundation
 
 // MARK: - Stubs (only for what SettingsBackup.reloadLiveStores touches; no test calls it)
 
+enum MoatConsent { static let key = "stremiox.moat.consent" }
+enum SourceIndexClient { static let serveKey = "stremiox.sourceindex.serve" }
+final class SourceIndexLifecycleScope {
+    static let shared = SourceIndexLifecycleScope()
+    func preferencesWillApply(consent: Bool?, serve: Bool?) {}
+}
 enum AppLanguage { static func reapplyOverride() {} }
 final class ThemeManager { static let shared = ThemeManager(); func reloadFromDefaults() {} }
 final class HomeRailPreferences { static let shared = HomeRailPreferences(); func reloadFromDefaults() {} }
@@ -111,6 +117,7 @@ struct SettingsBackupSecretsTests {
             "vortx.downloads.queueOrder": ["11111111-1111-1111-1111-111111111111"],
             "vortx.downloads.maxConcurrent": 5,
             "stremiox.diskCacheBytes": 12_345,
+            "vortx.pgsSubtitleOCR": false,
             "vortx.sync.lastSyncedVersion.acct_1": 42,
         ]
         UserDefaults.standard.setPersistentDomain(seeded, forName: bundleID)
@@ -159,6 +166,20 @@ struct SettingsBackupSecretsTests {
         check("T4.5 maxConcurrent absent from a real backup", backupRaw["vortx.downloads.maxConcurrent"] == nil)
         check("T4.6 autoDeleteWatched present in a real backup",
               backupRaw["vortx.downloads.autoDeleteWatched"] != nil)
+        check("T4.7 image-subtitle recognition is device-local",
+              !SettingsBackup.isSyncable("vortx.pgsSubtitleOCR"))
+        check("T4.8 image-subtitle recognition is absent from a real backup",
+              backupRaw["vortx.pgsSubtitleOCR"] == nil)
+        let poisonedDeviceLocal = try? SettingsBackup.encode(
+            domain: ["vortx.pgsSubtitleOCR": true, "stremiox.accentColor": "green"],
+            bundleID: bundleID,
+            app: "VortX")
+        let decodedDeviceLocal = poisonedDeviceLocal.flatMap {
+            try? SettingsBackup.decodeDomain(from: $0)
+        }
+        check("T4.9 incoming cloud or file restore cannot reset the local OCR choice",
+              decodedDeviceLocal?["vortx.pgsSubtitleOCR"] == nil
+                && decodedDeviceLocal?["stremiox.accentColor"] as? String == "green")
 
         print("\n=== T5: pre-existing guards still hold (no regression) ===")
         check("T5.1 diskCacheBytes still device-local", !SettingsBackup.isSyncable("stremiox.diskCacheBytes"))

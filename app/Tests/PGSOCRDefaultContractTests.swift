@@ -17,8 +17,8 @@ struct PGSOCRDefaultContractTests {
         }
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        guard !PGSOCRPolicy.isEnabled(in: defaults) else {
-            fputs("FAIL: a missing override must default PGS OCR off\n", stderr)
+        guard PGSOCRPolicy.isEnabled(in: defaults) else {
+            fputs("FAIL: a missing override must default safe asynchronous PGS OCR on\n", stderr)
             exit(1)
         }
 
@@ -34,6 +34,27 @@ struct PGSOCRDefaultContractTests {
             exit(1)
         }
 
-        print("PASS: PGS OCR defaults off and honors explicit true and false overrides")
+        let appRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        guard let profiles = try? String(
+            contentsOf: appRoot.appendingPathComponent("SourcesShared/Profiles.swift"),
+            encoding: .utf8),
+              !profiles.contains(PGSOCRPolicy.overrideKey) else {
+            fputs("FAIL: profile capture/apply must not mutate the device-local OCR key\n", stderr)
+            exit(1)
+        }
+        for relativePath in ["SourcesTV/SettingsView.swift", "SourcesiOS/iOSSettingsView.swift"] {
+            guard let settings = try? String(
+                contentsOf: appRoot.appendingPathComponent(relativePath),
+                encoding: .utf8),
+                  settings.contains("@AppStorage(PGSOCRPolicy.overrideKey)"),
+                  settings.contains("Recognize image subtitles") else {
+                fputs("FAIL: \(relativePath) must expose the device-local OCR toggle\n", stderr)
+                exit(1)
+            }
+        }
+
+        print("PASS: PGS OCR defaults on, honors device-local overrides, and is not profile-mutated")
     }
 }

@@ -2639,11 +2639,11 @@ enum PlayerLiveContractTests {
         let subtitleInvalidation = sourceSection(
             stream,
             from: "private func invalidateSubtitles(",
-            to: "/// Decode one collected text packet")
+            to: "private func collectSubtitlePacket(")
         let subtitleCueTruth = sourceSection(
             stream,
             from: "private func settleSubtitleCueTruthAtEOF()",
-            to: "/// Decode one collected text packet")
+            to: "private func collectSubtitlePacket(")
         let subtitleCollection = sourceSection(
             stream,
             from: "private func collectSubtitlePacket(",
@@ -3050,9 +3050,9 @@ enum PlayerLiveContractTests {
                   && subtitleInvalidation?.contains("_hlsSegments") == false)
         check("wiring: text rejection and OCR failure both feed per-track cue truth",
               sourceContainsInOrder(subtitleCollection, [
-                  "cause: \"ocr\"",
+                  "cause: \"ocr-prepare\"",
                   "cause: \"parse\"",
-                  "acceptSubtitleCue(sourceIndex: inIdx)",
+                  "appendSubtitleCueLocked(",
               ]))
         check("wiring: cue-truth unavailability updates only source rows and never primary A/V",
               subtitleCueTruth?.contains(
@@ -3062,18 +3062,27 @@ enum PlayerLiveContractTests {
                   && subtitleCueTruth?.contains("_hlsSegments") == false)
         check("wiring: an out-of-order valid cue republishes recovery on the stable row",
               sourceContainsInOrder(subtitleCueTruth, [
-                  "let recoversUnavailableRow = truth.status == .unavailable",
+                  "recoveredUnavailableRow = truth.status == .unavailable",
                   "truth.observeValidCue()",
-                  "if recoversUnavailableRow",
+                  "case .appended(let recovered)",
                   "publishSubtitleCueTruthRows()",
               ]))
-        check("wiring: EOF settles no-packet and untimed subtitle truth after final media publication",
+        check("wiring: EOF closes admission and starts an asynchronous admitted-tail drain",
               sourceContainsInOrder(eofPublication, [
                   "hlsCloseSegment(",
-                  "_subtitleSettlement.finish()",
-                  "settleSubtitleCueTruthAtEOF()",
-                  "_hlsEnded = true",
+                  "pgsAcceptingPackets = false",
+                  "pgsDrainRequestedAtEOF = true",
+                  "finishAdmissionAndDrain()",
+                  "finishHLSAtEOFIfPGSSettled()",
               ]))
+        check("wiring: subtitle settlement and ENDLIST wait for both pending registries",
+              subtitleInvalidation?.contains("pgsPendingSources.isEmpty") == true
+                  && subtitleInvalidation?.contains("_subtitleSettlement.pendingCount == 0") == true
+                  && sourceContainsInOrder(subtitleInvalidation, [
+                      "_subtitleSettlement.finish()",
+                      "_hlsEnded = true",
+                      "settleSubtitleCueTruthAtEOF()",
+                  ]))
         check("wiring: only optional subtitle renditions retain a default-on rollback key",
               stream?.contains("dvRemuxMultiAudio") == false
                   && stream?.contains("stremiox.dvRemuxMultiAudio") == false
