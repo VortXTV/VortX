@@ -1,7 +1,24 @@
 package com.vortx.android.player.mpv
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.security.KeyChain
+import androidx.core.content.ContextCompat
 import com.vortx.android.player.DiskCacheSetting
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
+import java.util.Base64
+import java.util.Collections
+import java.util.concurrent.Executors
 
 /// The SINGLE source of the libmpv option set for VortX Android, ported line-for-line from the Apple
 /// reference `app/Sources/Player/MPVMetalViewController.swift` (`setupMpv`). This is the Android mirror
@@ -63,9 +80,6 @@ object MpvConfig {
 
     const val NETWORK_TIMEOUT_SECS = "30"
 
-    /// Reconnect on dropped/stalled HTTP (debrid CDNs reset mid-stream); IDENTICAL to Apple's VOD value.
-    const val STREAM_LAVF_O = "reconnect=1,reconnect_streamed=1,reconnect_delay_max=7"
-
     /// Read-ahead cache seconds. IDENTICAL to Apple (`demuxer-readahead-secs=300`), the proven VOD value.
     const val DEMUXER_READAHEAD_SECS = "300"
 
@@ -114,11 +128,10 @@ object MpvConfig {
         // HDR -> SDR tone curve for the forced-SDR compatibility path. Identical to Apple.
         "tone-mapping" to TONE_MAPPING,
 
-        // Networking: browser-like UA + timeout + mid-stream reconnect for debrid/CDN links. The UA
-        // and reconnect string are byte-for-byte the Apple values.
+        // Networking identity and timeout. Trust-critical options are applied last through
+        // [requiredSecurityOptions], after every ordinary setting, so nothing can overwrite them.
         "user-agent" to USER_AGENT,
         "network-timeout" to NETWORK_TIMEOUT_SECS,
-        "stream-lavf-o" to STREAM_LAVF_O,
 
         // Read-ahead cache. `cache=yes` + 300s readahead + the jetsam-safe byte defaults (the per-file
         // `demuxer-max-bytes` cap is applied per load as a property, device-scaled, like Apple).
@@ -131,6 +144,176 @@ object MpvConfig {
         "hls-bitrate" to HLS_BITRATE,
     )
 
+    /**
+     * App-owned trust policy. [MpvPlayer] applies these after every ordinary preference and treats
+     * any rejected option as a hard initialization failure, which safely demotes to the platform
+     * player instead of starting libmpv with unknown certificate behavior.
+     *
+     * Config, script, and watch-later loading are disabled because each is a late option channel
+     * that could otherwise replace the trust policy after this list is applied.
+     */
+    fun requiredSecurityOptions(caBundlePath: String): List<Pair<String, String>> {
+        require(caBundlePath.isNotBlank()) { "TLS CA bundle path must not be blank" }
+        require('\u0000' !in caBundlePath) { "TLS CA bundle path must not contain NUL" }
+        require(',' !in caBundlePath) { "TLS CA bundle path must not contain commas" }
+
+        return listOf(
+            "config" to "no",
+            "load-scripts" to "no",
+            "resume-playback" to "no",
+            "tls-verify" to "yes",
+            "tls-ca-file" to caBundlePath,
+            "stream-lavf-o" to
+                "tls_verify=1,ca_file=$caBundlePath,reconnect=1,reconnect_streamed=1,reconnect_delay_max=7",
+            "demuxer-lavf-o" to "tls_verify=1,ca_file=$caBundlePath",
+            "demuxer-lavf-propagate-opts" to "yes",
+        )
+    }
+
+    /**
+     * Export Android's current system trust anchors into the PEM bundle required by the packaged
+     * FFmpeg mbedTLS backend. Only `system:` aliases are used, matching the app's network-security
+     * policy: user-installed roots must not silently expand native-player trust.
+     *
+     * A failure returns null so [MpvPlayer] can demote to the platform player. The prior bundle is
+     * invalidated before every refresh so a revoked root cannot remain usable after publication
+     * fails.
+     */
+    fun provisionSystemCaBundle(context: Context): String? = synchronized(this) {
+        val directory = context.noBackupFilesDir
+        runCatching {
+            invalidateSystemCaBundle(directory)
+            val keyStore = KeyStore.getInstance("AndroidCAStore").apply { load(null) }
+            val aliases = Collections.list(keyStore.aliases())
+                .filter { alias -> alias.startsWith(SYSTEM_CA_ALIAS_PREFIX) }
+                .sorted()
+            val certificates = aliases.mapNotNull { alias ->
+                keyStore.getCertificate(alias) as? X509Certificate
+            }
+            writeCaBundle(directory, certificates).absolutePath
+        }.getOrNull()
+    }
+
+    /**
+     * Keep the native PEM aligned with Android trust-store changes while the process remains alive.
+     * The system broadcast is protected, and rebuilding only rereads AndroidCAStore and atomically
+     * republishes app-private data. Failure leaves the known bundle path absent, making later child
+     * TLS opens fail closed.
+     */
+    fun ensureSystemTrustStoreObserver(context: Context): Boolean = synchronized(this) {
+        if (trustStoreObserver != null) return@synchronized true
+
+        val appContext = context.applicationContext
+        runCatching {
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(receiverContext: Context?, intent: Intent?) {
+                    if (intent?.action == KeyChain.ACTION_TRUST_STORE_CHANGED) {
+                        val pendingResult = goAsync()
+                        runCatching {
+                            trustStoreRefreshExecutor.execute {
+                                try {
+                                    provisionSystemCaBundle(appContext)
+                                } finally {
+                                    pendingResult.finish()
+                                }
+                            }
+                        }.onFailure {
+                            runCatching { invalidateSystemCaBundle(appContext.noBackupFilesDir) }
+                            pendingResult.finish()
+                        }
+                    }
+                }
+            }
+            ContextCompat.registerReceiver(
+                appContext,
+                receiver,
+                IntentFilter(KeyChain.ACTION_TRUST_STORE_CHANGED),
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            trustStoreObserver = receiver
+        }.isSuccess
+    }
+
+    /**
+     * Deterministic, atomic PEM publication seam. Internal for JVM regression tests.
+     */
+    internal fun writeCaBundle(
+        directory: File,
+        certificates: List<X509Certificate>,
+    ): File {
+        require(certificates.isNotEmpty()) { "Android system CA store is empty" }
+        if (!directory.isDirectory && !directory.mkdirs()) {
+            error("Unable to create TLS CA directory")
+        }
+
+        val digest = MessageDigest.getInstance("SHA-256")
+        val unique = LinkedHashMap<String, X509Certificate>()
+        for (certificate in certificates) {
+            val fingerprint = digest.digest(certificate.encoded).hex()
+            unique.putIfAbsent(fingerprint, certificate)
+        }
+        require(unique.isNotEmpty()) { "Android system CA store has no encodable certificates" }
+
+        val target = File(directory, SYSTEM_CA_BUNDLE_FILENAME)
+        val temporary = File.createTempFile("$SYSTEM_CA_BUNDLE_FILENAME.", ".tmp", directory)
+        try {
+            FileOutputStream(temporary).use { output ->
+                for (certificate in unique.values) {
+                    output.write("-----BEGIN CERTIFICATE-----\n".toByteArray(Charsets.US_ASCII))
+                    output.write(
+                        Base64.getMimeEncoder(64, byteArrayOf('\n'.code.toByte()))
+                            .encode(certificate.encoded),
+                    )
+                    output.write("\n-----END CERTIFICATE-----\n".toByteArray(Charsets.US_ASCII))
+                }
+                output.flush()
+                output.fd.sync()
+            }
+
+            val parsed = temporary.inputStream().use { input ->
+                CertificateFactory.getInstance("X.509")
+                    .generateCertificates(input)
+                    .filterIsInstance<X509Certificate>()
+            }
+            val parsedFingerprints = parsed.map { certificate ->
+                digest.digest(certificate.encoded).hex()
+            }
+            require(parsedFingerprints == unique.keys.toList()) {
+                "Published TLS CA bundle failed validation"
+            }
+
+            try {
+                Files.move(
+                    temporary.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(
+                    temporary.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+            return target
+        } finally {
+            if (temporary.exists()) temporary.delete()
+        }
+    }
+
+    /**
+     * Invalidate the last trust snapshot before rebuilding it. This intentionally prefers a
+     * temporary playback failure over continuing to trust an anchor Android has just revoked.
+     */
+    internal fun replaceCaBundle(
+        directory: File,
+        certificates: List<X509Certificate>,
+    ): File {
+        invalidateSystemCaBundle(directory)
+        return writeCaBundle(directory, certificates)
+    }
+
     /// The OPT-IN on-disk cache options (`cache-on-disk=yes` + `cache-dir=<path>`), applied pre-init
     /// ALONGSIDE [baseOptions] when the viewer has enabled the disk cache in Settings. Empty (the default)
     /// keeps mpv on its in-memory read-ahead, so shipping behavior is unchanged until opted in. The large
@@ -140,4 +323,21 @@ object MpvConfig {
     /// free-disk safety math lives in [DiskCacheSetting].
     fun diskCacheOptions(context: Context): List<Pair<String, String>> =
         DiskCacheSetting.mpvOptions(context)
+
+    private fun invalidateSystemCaBundle(directory: File) {
+        Files.deleteIfExists(File(directory, SYSTEM_CA_BUNDLE_FILENAME).toPath())
+    }
+
+    @Volatile
+    private var trustStoreObserver: BroadcastReceiver? = null
+
+    private val trustStoreRefreshExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "vortx-trust-store-refresh").apply { isDaemon = true }
+    }
+
+    private fun ByteArray.hex(): String =
+        joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }
+
+    private const val SYSTEM_CA_ALIAS_PREFIX = "system:"
+    private const val SYSTEM_CA_BUNDLE_FILENAME = "mpv-system-ca-bundle.pem"
 }

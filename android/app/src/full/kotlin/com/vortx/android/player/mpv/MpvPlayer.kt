@@ -45,6 +45,7 @@ import java.util.UUID
 class MpvPlayer private constructor(
     private val mpv: MPVLib,
     private val appContext: Context,
+    caBundlePath: String,
 ) : PlayerEngine {
 
     private val _state = MutableStateFlow(PlayerState())
@@ -152,6 +153,12 @@ class MpvPlayer private constructor(
         }
         for ((name, value) in AudioOutputMode.current(appContext).mpvOptions()) {
             mpv.setOptionString(name, value)
+        }
+        // Apply the trust policy last and fail closed if this packaged libmpv rejects any part of it.
+        // create() catches the exception, destroys this libmpv instance, and returns null so the router
+        // can use the platform player rather than continue with unknown certificate behavior.
+        for ((name, value) in MpvConfig.requiredSecurityOptions(caBundlePath)) {
+            requireMpvSecurityOption(name, mpv.setOptionString(name, value))
         }
         mpv.init()
 
@@ -551,11 +558,20 @@ class MpvPlayer private constructor(
         /// native `.so` for the running ABI / OOM), so [com.vortx.android.player.MpvEngineFactory]
         /// can fall back to ExoPlayer. Never throws.
         fun create(context: Context): MpvPlayer? {
-            val lib = MPVLib.create(context) ?: return null
-            return runCatching { MpvPlayer(lib, context.applicationContext) }.getOrElse {
+            val appContext = context.applicationContext
+            if (!MpvConfig.ensureSystemTrustStoreObserver(appContext)) return null
+            val caBundlePath = MpvConfig.provisionSystemCaBundle(appContext) ?: return null
+            val lib = MPVLib.create(appContext) ?: return null
+            return runCatching { MpvPlayer(lib, appContext, caBundlePath) }.getOrElse {
                 runCatching { lib.destroy() }
                 null
             }
         }
+    }
+}
+
+internal fun requireMpvSecurityOption(name: String, result: Int) {
+    check(result >= 0) {
+        "required libmpv security option rejected: $name ($result)"
     }
 }

@@ -6,26 +6,37 @@
 //! This is the Tauri/Rust twin of the macOS app's `app/SourcesShared/MacNodeServer.swift`: that app
 //! is unsandboxed and spawns the ordinary standalone `node` with Foundation's `Process`; here we
 //! bundle the same standalone `node` (fetched into `resources/` by `scripts/fetch-server-deps.sh`)
-//! and spawn it with `std::process::Command`. The env handling (HOME / APP_PATH / NO_CORS /
+//! and launch it through a same-binary Rust supervisor. The env handling (HOME / APP_PATH / NO_CORS /
 //! CASTING_DISABLED / UV_THREADPOOL_SIZE / ffmpeg discovery incl. Homebrew's Apple-silicon prefix)
 //! and the loopback-bind preload are ported directly from MacNodeServer.
 //!
 //! A monitor thread waits on the child and restarts it (bounded, backed off) if it dies unexpectedly,
 //! so a single crash doesn't permanently kill torrent playback. The child is force-killed on app
 //! exit. The frontend learns the base URL + liveness through the `server_status` / `server_base_url`
-//! Tauri commands (see lib.rs), and primes a torrent by POSTing `<base>/<infohash>/create` itself
-//! (mirroring the Apple `prepareTorrent`), then plays `<base>/<infohash>/<fileIdx>`.
+//! Tauri commands (see lib.rs). Readiness is not inferred from port ownership: every node child gets
+//! a fresh private owner key and must answer a bounded HMAC challenge through the preload before the
+//! frontend may rely on it. The frontend then primes a torrent by POSTing
+//! `<base>/<infohash>/create` itself (mirroring the Apple `prepareTorrent`) and plays
+//! `<base>/<infohash>/<fileIdx>`.
 
-use std::io::Write;
-use std::net::TcpStream;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(test)]
+use std::process::Child;
+#[cfg(any(unix, test))]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use hmac::{Hmac, Mac};
 use once_cell::sync::Lazy;
 use serde::Serialize;
+use sha2::Sha256;
+
+use crate::child_supervisor::SupervisedChild;
 
 /// How often the monitor polls the live child for exit. Short enough that a crash is noticed and
 /// restarted promptly, long enough to stay idle-cheap. The monitor holds no lock between polls, so
@@ -36,6 +47,20 @@ const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// and the port server.js listens on by default.
 const HOST: &str = "127.0.0.1";
 const PORT: u16 = 11470;
+
+/// Owner-authenticated readiness protocol. Each node child receives a fresh secret through its
+/// inherited environment; the preload removes the variable before loading server.cjs and retains
+/// the key only in its closure. Rust sends a fresh random challenge and accepts readiness only when
+/// the listener returns the matching HMAC. A process that merely occupies the port cannot pass.
+const HEALTH_TOKEN_ENV: &str = "VORTX_DESKTOP_HEALTH_TOKEN";
+const HEALTH_PATH: &str = "/__vortx_owner_health";
+const HEALTH_CHALLENGE_HEADER: &str = "X-VortX-Health-Challenge";
+const HEALTH_SECRET_BYTES: usize = 32;
+const HEALTH_PROOF_HEX_BYTES: usize = 64;
+const HEALTH_RESPONSE_LIMIT: usize = 1024;
+const HEALTH_IO_TIMEOUT: Duration = Duration::from_millis(400);
+type HealthToken = [u8; HEALTH_SECRET_BYTES];
+type HealthMac = Hmac<Sha256>;
 
 /// Restart policy: give up after this many crashes inside the window, so a server.js that can't boot
 /// (missing dep, port held) doesn't spin forever. A clean run resets the counter.
@@ -49,22 +74,22 @@ const RESTART_WINDOW: Duration = Duration::from_secs(60);
 pub enum ServerState {
     /// Never asked to start (e.g. resources missing). `reason` explains why, for the empty-state UI.
     Disabled { reason: String },
-    /// Child spawned; may still be booting (the frontend health-checks the base URL before relying on it).
+    /// Child spawned; may still be booting (the frontend waits for owner-authenticated readiness).
     Running,
     /// Child exited and we stopped restarting it. `reason` carries the last exit detail.
     Failed { reason: String },
 }
 
 struct Manager {
-    /// The running child, kept so we can wait on / kill it. `None` once stopped.
+    /// The running supervisor, kept so we can poll it or close its ownership pipe. `None` once
+    /// stopped.
     ///
     /// Shared with the monitor thread via `Arc<Mutex<…>>` so the child is reachable from BOTH the
     /// monitor (which polls it for exit) and `stop()` (which kills it). The monitor never holds this
-    /// lock across a blocking wait — it polls with `try_wait()` — so `stop()` can always lock and
-    /// `.kill()` the live child. This is what keeps `stop()`'s "never orphan a node process" contract
-    /// honest: the previous design moved the child onto the monitor's stack for a blocking `wait()`,
-    /// leaving `stop()` with nothing to kill.
-    child: Arc<Mutex<Option<Child>>>,
+    /// lock across a blocking wait; it polls with `try_wait()`, so `stop()` can always lock and
+    /// tear down the live supervisor. This keeps the ownership pipe reachable from explicit stop
+    /// while the helper independently covers app crash and SIGKILL.
+    child: Arc<Mutex<Option<SupervisedChild>>>,
     /// Set by `stop()` to tell the monitor an exit is an intentional shutdown, NOT a crash to restart.
     /// Shared with the monitor; the `Manager` itself is dropped on stop, so the monitor's `Arc` clone
     /// keeps the flag alive.
@@ -73,6 +98,8 @@ struct Manager {
     node_bin: PathBuf,
     server_js: PathBuf,
     home: PathBuf,
+    /// Per-child owner key used only for the bounded readiness challenge. Rotated on every restart.
+    health_token: HealthToken,
     /// Crash bookkeeping for the bounded-restart policy.
     restarts: u32,
     window_start: Instant,
@@ -135,7 +162,7 @@ fn node_binary_name() -> &'static str {
 
 /// Locate an ffmpeg/ffprobe pair the server can use for HLS transcoding (and, on macOS,
 /// VideoToolbox hw-accel). server.js's built-in search misses Homebrew's Apple-silicon prefix, so we
-/// probe the common locations and hand the pair to node via FFMPEG_BIN / FFPROBE_BIN — the first
+/// probe the common locations and hand the pair to node via FFMPEG_BIN / FFPROBE_BIN, the first
 /// entries server.js honours. Direct port of MacNodeServer.ffmpegBinaries() (plus Linux/Windows
 /// fallbacks); returns None when no usable pair is found (transcoding then no-ops, playback of an
 /// already-web-ready file still works).
@@ -168,24 +195,47 @@ fn ffmpeg_binaries() -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-/// The preload JS injected with `node -r`. It (a) tees uncaught errors to a log file, (b) pins every
-/// host-less `server.listen(port)` to loopback (127.0.0.1), and (c) installs a parent-death watchdog
-/// that exits the child once its parent pid changes — i.e. once it has been reparented. `stop()` only
-/// kills the child on a GRACEFUL app exit; on a crash / SIGKILL / Force-Quit the Tauri exit hook never
-/// runs and the OS reparents the child (to launchd/init), where it would keep holding the port as an
-/// orphan. The watchdog closes that gap (ported from MacNodeServer.swift's preload). server.js listens
-/// with no host, which Node treats as 0.0.0.0 (every interface) — i.e. LAN-reachable; the desktop app
-/// wants it private, so we monkeypatch `net.Server.prototype.listen` exactly like MacNodeServer.
+/// The preload JS injected with `node -r`. It (a) tees uncaught errors to a log file, (b) installs
+/// the private HMAC health route, and (c) pins every host-less `server.listen(port)` to loopback
+/// (127.0.0.1). Parent death is enforced outside JavaScript by the same-binary Rust supervisor:
+/// node is its direct child, and ownership-pipe EOF makes the supervisor kill and wait node on
+/// macOS, Linux, and Windows. server.js listens with no host, which Node treats as 0.0.0.0 (every
+/// interface), so we monkeypatch `net.Server.prototype.listen` exactly like MacNodeServer.
 fn write_preload(home: &Path) -> std::io::Result<PathBuf> {
     let preload_path = home.join("stremiox-preload.js");
     let log_path = home.join("stremio-server.log");
     let log_js = json_string(&log_path.to_string_lossy());
     let host_js = json_string(HOST);
+    let health_env_js = json_string(HEALTH_TOKEN_ENV);
+    let health_path_js = json_string(HEALTH_PATH);
+    let health_header_js = json_string(&HEALTH_CHALLENGE_HEADER.to_ascii_lowercase());
     let preload = format!(
-        r#"const fs=require('fs'),L={log};
+        r#"const fs=require('fs'),L={log},HENV={health_env},HPATH={health_path},HHEADER={health_header};
+const TOKEN=process.env[HENV]||'';
+delete process.env[HENV];
 const w=(t,a)=>{{try{{fs.appendFileSync(L,t+' '+Array.prototype.map.call(a,String).join(' ')+'\n')}}catch(e){{}}}};
 process.on('uncaughtException',function(e){{w('[uncaught]',[e&&e.stack||e])}});
 process.on('unhandledRejection',function(e){{w('[rej]',[e&&e.stack||e])}});
+try{{
+  const http=require('http'),crypto=require('crypto'),origEmit=http.Server.prototype.emit;
+  const key=/^[0-9a-f]{{64}}$/.test(TOKEN)?Buffer.from(TOKEN,'hex'):null;
+  http.Server.prototype.emit=function(event,req,res){{
+    if(event==='request' && req && req.url===HPATH){{
+      const challenge=req.headers[HHEADER];
+      if(req.method!=='GET' || !key || typeof challenge!=='string' || !/^[0-9a-f]{{64}}$/.test(challenge)){{
+        res.writeHead(404,{{'Cache-Control':'no-store','Content-Length':0,'Connection':'close'}});
+        res.end();
+        return true;
+      }}
+      const proof=crypto.createHmac('sha256',key).update(challenge,'ascii').digest('hex');
+      res.writeHead(200,{{'Content-Type':'text/plain','Cache-Control':'no-store','Content-Length':proof.length,'Connection':'close'}});
+      res.end(proof);
+      return true;
+    }}
+    return origEmit.apply(this,arguments);
+  }};
+  w('[health]',['owner challenge active']);
+}}catch(e){{w('[health-err]',[e&&e.stack||e]);}}
 try{{
   const net=require('net'),HOST={host},orig=net.Server.prototype.listen;
   net.Server.prototype.listen=function(){{
@@ -198,14 +248,12 @@ try{{
   }};
   w('[boot]',['desktop preload active; bind='+HOST]);
 }}catch(e){{w('[bind-err]',[e&&e.stack||e]);}}
-// parent-death watchdog (see fn doc): exit once our parent pid changes (we've been reparented) so a
-// crash / SIGKILL of the app can't leave us orphaned on the port. .unref() keeps this poll timer from
-// holding the process open by itself.
-const PPID0=process.ppid;
-setInterval(function(){{if(process.ppid!==PPID0){{w('[watchdog]',['parent gone; exiting']);process.exit(0);}}}},1000).unref();
 "#,
         log = log_js,
         host = host_js,
+        health_env = health_env_js,
+        health_path = health_path_js,
+        health_header = health_header_js,
     );
     std::fs::write(&preload_path, preload)?;
     Ok(preload_path)
@@ -217,9 +265,36 @@ fn json_string(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_owned())
 }
 
-/// Spawn `node -r preload server.js` with the Apple-equivalent environment. Returns the Child or an
-/// io::Error explaining why launch failed.
-fn spawn_child(node_bin: &Path, server_js: &Path, home: &Path) -> std::io::Result<Child> {
+/// Generate a fresh 256-bit owner key from the operating system CSPRNG. A failure is fatal for this
+/// child launch: starting without an authentication key would regress readiness to port ownership.
+fn fresh_health_token() -> std::io::Result<HealthToken> {
+    let mut token = [0u8; HEALTH_SECRET_BYTES];
+    getrandom::fill(&mut token).map_err(|error| {
+        std::io::Error::other(format!("generate embedded-server health token: {error}"))
+    })?;
+    Ok(token)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
+}
+
+/// Spawn an unstarted same-binary supervisor configured for `node -r preload server.js`. Each
+/// invocation creates a new owner key and returns it with the parked helper. The caller must store
+/// the helper in manager-owned state before sending GO, so owner death before parking cannot launch
+/// node and owner death afterwards makes the helper kill and wait node on every supported OS.
+fn spawn_child(
+    node_bin: &Path,
+    server_js: &Path,
+    home: &Path,
+) -> std::io::Result<(SupervisedChild, HealthToken)> {
+    let health_token = fresh_health_token()?;
     let server_data = home.join("stremio-server");
     std::fs::create_dir_all(&server_data)?;
     let preload = write_preload(home)?;
@@ -233,17 +308,19 @@ fn spawn_child(node_bin: &Path, server_js: &Path, home: &Path) -> std::io::Resul
         .open(&log_path)?;
     let log_err = log.try_clone()?;
 
-    let mut cmd = Command::new(node_bin);
-    cmd.arg("-r")
-        .arg(&preload)
-        .arg(server_js)
-        .current_dir(home)
+    let target_args = vec![
+        "-r".to_owned(),
+        preload.to_string_lossy().into_owned(),
+        server_js.to_string_lossy().into_owned(),
+    ];
+    let health_token_hex = hex_encode(&health_token);
+    let mut cmd = SupervisedChild::command(node_bin, &target_args)?;
+    cmd.current_dir(home)
         .env("HOME", home) // server reads HOME for its app-data path
         .env("APP_PATH", &server_data) // torrent cache + settings
         .env("NO_CORS", "1")
         .env("CASTING_DISABLED", "1") // no cast UI on desktop; skip the SSDP multicast loop
         .env("UV_THREADPOOL_SIZE", "16") // more libuv workers for tracker DNS + disk/crypto
-        .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
 
@@ -251,18 +328,18 @@ fn spawn_child(node_bin: &Path, server_js: &Path, home: &Path) -> std::io::Resul
         cmd.env("FFMPEG_BIN", &ffmpeg).env("FFPROBE_BIN", &ffprobe);
     }
 
-    cmd.spawn()
+    // The owner key crosses the private control pipe only after the helper is parked. It is never
+    // placed in the helper environment; node receives it at spawn and the preload immediately
+    // deletes process.env[...] before server.cjs loads.
+    SupervisedChild::spawn_with_private_env(cmd, &[(HEALTH_TOKEN_ENV, health_token_hex.as_str())])
+        .map(|child| (child, health_token))
 }
 
-/// Before the first spawn, reclaim the port if a STALE copy of OUR OWN node server is still holding it
-/// — e.g. a prior run force-killed / crashed before `stop()` could fire, leaving the child reparented
-/// (to launchd/init) and still bound. The preload's parent-death watchdog stops new orphans from
-/// forming; this clears any that predate it (or slipped through its ~1s poll window). We match "ours"
-/// narrowly — a process whose argv references the `stremiox-preload.js` we inject, a marker nothing
-/// else uses — so an unrelated process that merely happens to hold the port is left alone (server.cjs
-/// then fails to bind and the monitor surfaces it, rather than us killing a stranger). SIGTERM first,
-/// escalate to SIGKILL, mirroring `kill_child`. Best-effort: a missing/failing tool just skips the
-/// reclaim. Unix-only (lsof/ps/kill); a no-op elsewhere.
+/// Before the first spawn, reclaim the port if a legacy STALE copy of OUR OWN node server is still
+/// holding it. New supervised launches cannot orphan node when Tauri disappears on any supported
+/// OS; this Unix-only cleanup remains for processes left by older builds. We match "ours" narrowly:
+/// a process whose argv references the `stremiox-preload.js` we inject. An unrelated listener is
+/// left alone. Best-effort: a missing/failing lsof/ps/kill simply skips legacy cleanup.
 #[cfg(unix)]
 fn reclaim_stale_port() {
     for pid in port_listeners(PORT) {
@@ -270,13 +347,13 @@ fn reclaim_stale_port() {
             continue;
         }
         eprintln!("stremiox: reclaiming port {PORT} from a stale node server (pid {pid})");
-        let _ = Command::new("kill").arg(&pid).status(); // SIGTERM — ask it to exit cleanly
+        let _ = Command::new("kill").arg(&pid).status(); // SIGTERM; ask it to exit cleanly
         let deadline = Instant::now() + Duration::from_secs(2);
         while pid_alive(&pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         if pid_alive(&pid) {
-            let _ = Command::new("kill").args(["-9", &pid]).status(); // SIGKILL — guarantee release
+            let _ = Command::new("kill").args(["-9", &pid]).status(); // SIGKILL; guarantee release
         }
     }
 }
@@ -288,17 +365,20 @@ fn reclaim_stale_port() {}
 /// unavailable. Kept as strings since we only ever feed them back to `ps`/`kill`.
 #[cfg(unix)]
 fn port_listeners(port: u16) -> Vec<String> {
-    run_tool("lsof", &["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
-        .map(|out| {
-            out.lines()
-                .map(|l| l.trim().to_owned())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+    run_tool(
+        "lsof",
+        &["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"],
+    )
+    .map(|out| {
+        out.lines()
+            .map(|l| l.trim().to_owned())
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
-/// True if `pid`'s argv references our injected `stremiox-preload.js` — the marker that identifies one
+/// True if `pid`'s argv references our injected `stremiox-preload.js`, the marker identifying one
 /// of our embedded node servers (read via `ps -o command=`).
 #[cfg(unix)]
 fn is_our_node_server(pid: &str) -> bool {
@@ -336,10 +416,9 @@ fn run_tool(bin: &str, args: &[&str]) -> Option<String> {
 /// is a writable per-user dir the server uses as HOME (its torrent cache + settings). Called from the
 /// Tauri `.setup()` in lib.rs.
 pub fn start(resource_dir: &Path, cache_dir: &Path) {
-    let mut guard = match MANAGER.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
+    let mut guard = MANAGER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if guard.is_some() {
         return; // already started
     }
@@ -360,7 +439,8 @@ pub fn start(resource_dir: &Path, cache_dir: &Path) {
     }
     if !server_js.exists() {
         set_state(ServerState::Disabled {
-            reason: "server.cjs missing from resources. Run scripts/fetch-server-deps.sh.".to_owned(),
+            reason: "server.cjs missing from resources. Run scripts/fetch-server-deps.sh."
+                .to_owned(),
         });
         return;
     }
@@ -373,14 +453,11 @@ pub fn start(resource_dir: &Path, cache_dir: &Path) {
         return;
     }
 
-    // A prior run that was force-killed / crashed before `stop()` could fire may have left a node child
-    // reparented and still holding the port. Clear that stale orphan (only if it's ours) before we
-    // spawn, so this launch can bind instead of failing. The preload watchdog prevents new orphans.
+    // Clear a narrowly identified legacy orphan left by an older Unix build before supervised spawn.
     reclaim_stale_port();
 
     match spawn_child(&node_bin, &server_js, &home) {
-        Ok(child) => {
-            set_state(ServerState::Running);
+        Ok((child, health_token)) => {
             let child = Arc::new(Mutex::new(Some(child)));
             let shutdown = Arc::new(AtomicBool::new(false));
             // Clones the monitor thread owns for the lifetime of the server, so it can poll the child
@@ -388,16 +465,43 @@ pub fn start(resource_dir: &Path, cache_dir: &Path) {
             let monitor_child = Arc::clone(&child);
             let monitor_shutdown = Arc::clone(&shutdown);
             *guard = Some(Manager {
-                child,
-                shutdown,
+                child: Arc::clone(&child),
+                shutdown: Arc::clone(&shutdown),
                 node_bin,
                 server_js,
                 home,
+                health_token,
                 restarts: 0,
                 window_start: Instant::now(),
             });
+            let start_result = child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_mut()
+                .expect("server supervisor was parked before start")
+                .start();
+            if let Err(error) = start_result {
+                shutdown.store(true, Ordering::SeqCst);
+                let parked = child
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                *guard = None;
+                drop(guard);
+                if let Some(child) = parked {
+                    kill_child(child);
+                }
+                set_state(ServerState::Failed {
+                    reason: format!("failed to start node supervisor: {error}"),
+                });
+                return;
+            }
+            set_state(ServerState::Running);
             drop(guard);
-            spawn_monitor(monitor_child, monitor_shutdown);
+            if let Err(reason) = spawn_monitor(monitor_child, monitor_shutdown) {
+                stop();
+                set_state(ServerState::Failed { reason });
+            }
         }
         Err(err) => set_state(ServerState::Failed {
             reason: format!("failed to launch node: {err}"),
@@ -410,10 +514,13 @@ pub fn start(resource_dir: &Path, cache_dir: &Path) {
 /// `Manager` is gone) or the restart budget is spent.
 ///
 /// Crucially it polls with `try_wait()` and holds the child lock only for the moment of the poll,
-/// never across a blocking wait — so `stop()` can lock the same `Arc<Mutex<…>>` at any time and kill
+/// never across a blocking wait, so `stop()` can lock the same `Arc<Mutex<…>>` at any time and kill
 /// the live child. The shutdown flag lets an intentional `stop()`-triggered exit be distinguished
 /// from a crash, so shutdown never burns the restart budget or schedules a respawn.
-fn spawn_monitor(child: Arc<Mutex<Option<Child>>>, shutdown: Arc<AtomicBool>) {
+fn spawn_monitor(
+    child: Arc<Mutex<Option<SupervisedChild>>>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), String> {
     std::thread::Builder::new()
         .name("stremiox-server-monitor".to_owned())
         .spawn(move || loop {
@@ -422,7 +529,7 @@ fn spawn_monitor(child: Arc<Mutex<Option<Child>>>, shutdown: Arc<AtomicBool>) {
             let exit = match poll_child(&child) {
                 ChildPoll::Running => None,
                 ChildPoll::Exited(detail) => Some(detail),
-                ChildPoll::Empty | ChildPoll::Poisoned => return,
+                ChildPoll::Empty => return,
             };
 
             let detail = match exit {
@@ -436,7 +543,7 @@ fn spawn_monitor(child: Arc<Mutex<Option<Child>>>, shutdown: Arc<AtomicBool>) {
                 }
             };
 
-            // The child has exited. If a shutdown was requested, this is intentional — do NOT count
+            // The child has exited. If a shutdown was requested, this is intentional; do NOT count
             // it as a crash and do NOT restart.
             if shutdown.load(Ordering::SeqCst) {
                 return;
@@ -445,13 +552,19 @@ fn spawn_monitor(child: Arc<Mutex<Option<Child>>>, shutdown: Arc<AtomicBool>) {
             // Unexpected exit: apply the bounded-restart policy. Update crash bookkeeping in the
             // manager and decide whether we still have budget to restart.
             let restart_target = {
-                let mut guard = match MANAGER.lock() {
-                    Ok(g) => g,
-                    Err(_) => return,
-                };
+                let mut guard = MANAGER
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let manager = match guard.as_mut() {
-                    Some(m) => m,
-                    None => return, // stopped while we polled
+                    Some(manager)
+                        if !shutdown.load(Ordering::SeqCst)
+                            && Arc::ptr_eq(&manager.shutdown, &shutdown)
+                            && Arc::ptr_eq(&manager.child, &child) =>
+                    {
+                        manager
+                    }
+                    None => return,    // stopped while we polled
+                    Some(_) => return, // a newer manager generation replaced this monitor
                 };
 
                 // Reset the crash window if the last boot survived it (a healthy long-running server).
@@ -483,73 +596,121 @@ fn spawn_monitor(child: Arc<Mutex<Option<Child>>>, shutdown: Arc<AtomicBool>) {
             }
 
             match spawn_child(&node_bin, &server_js, &home) {
-                Ok(new_child) => {
+                Ok((new_child, new_health_token)) => {
                     // Park the fresh child back in the shared slot, unless `stop()` won the race
-                    // (shutdown set, slot already filled, lock poisoned, or the manager vanished). In
-                    // every lose-the-race case we kill the child we just spawned rather than orphan
-                    // it — otherwise a `stop()` that ran during the backoff would leave a node process
-                    // holding the port.
-                    let orphan: Option<Child> = if shutdown.load(Ordering::SeqCst) {
+                    // (shutdown set, slot already filled, or the manager vanished). In every
+                    // lose-the-race case we kill the child we just spawned rather than orphan it;
+                    // otherwise a `stop()` that ran during the backoff would leave a node process
+                    // holding the port. A poisoned slot is recovered so its existing child remains
+                    // reachable for teardown.
+                    let mut start_error = None;
+                    let orphan: Option<SupervisedChild> = if shutdown.load(Ordering::SeqCst) {
                         Some(new_child)
                     } else {
-                        match child.lock() {
-                            Ok(mut slot) if slot.is_none() => {
-                                *slot = Some(new_child);
-                                None
+                        let mut slot = child
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(new_child);
+                            match slot
+                                .as_mut()
+                                .expect("replacement was parked before supervisor start")
+                                .start()
+                            {
+                                Ok(()) => None,
+                                Err(error) => {
+                                    start_error =
+                                        Some(format!("restart supervisor start failed: {error}"));
+                                    slot.take()
+                                }
                             }
-                            // Slot already repopulated (shouldn't happen) or lock poisoned — don't
-                            // leak the extra child.
-                            Ok(_) => Some(new_child),
-                            Err(_) => Some(new_child),
+                        } else {
+                            // Slot already repopulated (shouldn't happen): do not leak the extra.
+                            Some(new_child)
                         }
                     };
 
                     if let Some(child) = orphan {
                         kill_child(child);
+                        if let Some(reason) = start_error {
+                            set_monitor_failure(&shutdown, reason);
+                        }
                         return;
                     }
 
                     // Child is parked in the shared slot. Re-check shutdown (a `stop()` racing the
                     // park may have already emptied the slot expecting it empty) and confirm the
-                    // manager still exists before announcing Running. If either lost, take the child
-                    // back out and kill it so it can't outlive the app.
-                    let still_live = !shutdown.load(Ordering::SeqCst)
-                        && matches!(MANAGER.lock(), Ok(g) if g.is_some());
+                    // manager still exists before publishing the replacement's owner token and
+                    // announcing Running. If either lost, take the child back out and kill it so it
+                    // cannot outlive the app or authenticate under stale ownership.
+                    let still_live = if shutdown.load(Ordering::SeqCst) {
+                        false
+                    } else {
+                        let mut guard = MANAGER
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        match guard.as_mut() {
+                            Some(manager)
+                                if !shutdown.load(Ordering::SeqCst)
+                                    && Arc::ptr_eq(&manager.shutdown, &shutdown)
+                                    && Arc::ptr_eq(&manager.child, &child) =>
+                            {
+                                manager.health_token = new_health_token;
+                                set_state(ServerState::Running);
+                                true
+                            }
+                            None | Some(_) => false,
+                        }
+                    };
                     if still_live {
-                        set_state(ServerState::Running);
                         continue;
                     }
-                    if let Some(child) = child.lock().ok().and_then(|mut slot| slot.take()) {
+                    let parked = child
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some(child) = parked {
                         kill_child(child);
                     }
                     return;
                 }
                 Err(err) => {
-                    set_state(ServerState::Failed {
-                        reason: format!("restart failed: {err}"),
-                    });
+                    set_monitor_failure(&shutdown, format!("restart failed: {err}"));
                     return;
                 }
             }
         })
-        .ok();
+        .map(|_| ())
+        .map_err(|error| format!("failed to start server monitor: {error}"))
+}
+
+fn set_monitor_failure(shutdown: &Arc<AtomicBool>, reason: String) {
+    if shutdown.load(Ordering::SeqCst) {
+        return;
+    }
+    let guard = MANAGER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.as_ref().is_some_and(|manager| {
+        Arc::ptr_eq(&manager.shutdown, shutdown) && !shutdown.load(Ordering::SeqCst)
+    }) {
+        set_state(ServerState::Failed { reason });
+    }
 }
 
 enum ChildPoll {
     Running,
     Exited(String),
     Empty,
-    Poisoned,
 }
 
 /// Poll the child and clear the shared slot atomically when it exits. The monitor must leave the slot
 /// empty before attempting a restart, otherwise the replacement process is treated as an orphan and
 /// killed immediately.
-fn poll_child(child: &Arc<Mutex<Option<Child>>>) -> ChildPoll {
-    let mut guard = match child.lock() {
-        Ok(g) => g,
-        Err(_) => return ChildPoll::Poisoned,
-    };
+fn poll_child(child: &Arc<Mutex<Option<SupervisedChild>>>) -> ChildPoll {
+    let mut guard = child
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let result = match guard.as_mut() {
         Some(c) => c.try_wait(),
         None => return ChildPoll::Empty,
@@ -571,31 +732,34 @@ fn poll_child(child: &Arc<Mutex<Option<Child>>>) -> ChildPoll {
 
 /// Force-kill a child and reap it. Used by both `stop()` and the monitor's shutdown-race path so we
 /// never leave a node process holding the port.
-fn kill_child(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+fn kill_child(child: SupervisedChild) {
+    child.shutdown_and_wait();
 }
 
-/// Force-kill the server child and stop monitoring. Called on app exit so we never orphan a node
-/// process. Idempotent.
+/// Stop the server supervisor and monitoring. Closing its ownership pipe makes the helper kill and
+/// wait node; the same EOF occurs if the app process disappears. Idempotent.
 ///
-/// Unlike the previous version, this actually owns a handle to the live child: the child lives in a
-/// shared `Arc<Mutex<Option<Child>>>` (not on the monitor thread's stack), so we lock that slot, take
-/// the child, and kill it here. The shutdown flag is raised first so the monitor treats the kill as
-/// an intentional exit, not a crash to restart.
+/// The supervisor lives in a shared slot rather than on the monitor thread's stack, so explicit stop
+/// can always take it and close the pipe. The shutdown flag is raised first so the monitor treats the
+/// resulting exit as intentional, not a crash to restart.
 pub fn stop() {
     // Pull the shared child slot + shutdown flag out of the manager, then drop the manager. We do the
     // actual kill without holding the MANAGER lock so we never block app exit on a wedged child.
-    let shared = MANAGER.lock().ok().and_then(|mut guard| {
-        guard.take().map(|manager| (manager.child, manager.shutdown))
-    });
+    let shared = MANAGER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .map(|manager| (manager.child, manager.shutdown));
 
     if let Some((child, shutdown)) = shared {
-        // Tell the monitor any exit from here on is intentional — not a crash to restart.
+        // Tell the monitor any exit from here on is intentional, not a crash to restart.
         shutdown.store(true, Ordering::SeqCst);
         // Take the live child out of the shared slot and kill it. After this the slot is `None`, so
         // the monitor's next poll sees no child and exits.
-        let live = child.lock().ok().and_then(|mut slot| slot.take());
+        let live = child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         if let Some(child) = live {
             kill_child(child);
         }
@@ -606,25 +770,192 @@ pub fn stop() {
     });
 }
 
-/// Best-effort liveness probe: can we open a TCP connection to the loopback port? Used by the
-/// `server_is_listening` command so the frontend can wait for boot before relying on the server. A
-/// plain TCP connect avoids pulling an HTTP client feature just for a health check.
+/// Owner-authenticated readiness probe for the currently managed child. A bare TCP listener, a
+/// stale server from another app launch, or a generic HTTP 200 cannot pass: the listener must prove
+/// possession of this child's secret over a fresh random challenge. The full connect/write/read
+/// exchange shares one wall-clock bound.
 pub fn is_listening() -> bool {
-    let addr = format!("{HOST}:{PORT}");
-    addr.parse()
-        .ok()
-        .and_then(|a| TcpStream::connect_timeout(&a, Duration::from_millis(400)).ok())
-        .map(|mut s| {
-            // A graceful close keeps the server's connection log quiet.
-            let _ = s.flush();
-            true
-        })
-        .unwrap_or(false)
+    let token = MANAGER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|manager| manager.health_token);
+    token.is_some_and(|token| {
+        let addr = SocketAddr::from(([127, 0, 0, 1], PORT));
+        authenticated_health_check(addr, &token)
+    })
+}
+
+fn authenticated_health_check(addr: SocketAddr, token: &HealthToken) -> bool {
+    let deadline = Instant::now() + HEALTH_IO_TIMEOUT;
+    let mut challenge = [0u8; HEALTH_SECRET_BYTES];
+    if getrandom::fill(&mut challenge).is_err() {
+        return false;
+    }
+    let challenge_hex = hex_encode(&challenge);
+
+    let Some(connect_timeout) = remaining_timeout(deadline) else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, connect_timeout) else {
+        return false;
+    };
+    let Some(io_timeout) = remaining_timeout(deadline) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(io_timeout)).is_err()
+        || stream.set_write_timeout(Some(io_timeout)).is_err()
+    {
+        return false;
+    }
+
+    let request = format!(
+        "GET {HEALTH_PATH} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n{HEALTH_CHALLENGE_HEADER}: {challenge_hex}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() || stream.flush().is_err() {
+        return false;
+    }
+
+    let Some(proof) = read_health_proof(&mut stream, deadline) else {
+        return false;
+    };
+    let mut mac = HealthMac::new_from_slice(token).expect("HMAC accepts a 32-byte key");
+    mac.update(challenge_hex.as_bytes());
+    mac.verify_slice(&proof).is_ok()
+}
+
+fn remaining_timeout(deadline: Instant) -> Option<Duration> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+/// Read one small, fixed-length HTTP response under the shared wall deadline. The preload always
+/// returns a Content-Length body and closes the connection; chunking, duplicate/missing lengths,
+/// oversized headers, extra bytes, malformed hex, and timeouts all fail closed.
+fn read_health_proof(stream: &mut TcpStream, deadline: Instant) -> Option<[u8; 32]> {
+    let mut response = Vec::with_capacity(256);
+    loop {
+        let remaining = remaining_timeout(deadline)?;
+        stream.set_read_timeout(Some(remaining)).ok()?;
+
+        let mut chunk = [0u8; 256];
+        let read = match stream.read(&mut chunk) {
+            Ok(0) => return None,
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return None;
+            }
+            Err(_) => return None,
+        };
+        if response.len() + read > HEALTH_RESPONSE_LIMIT {
+            return None;
+        }
+        response.extend_from_slice(&chunk[..read]);
+
+        let Some(header_marker) = response.windows(4).position(|window| window == b"\r\n\r\n")
+        else {
+            continue;
+        };
+        let body_start = header_marker + 4;
+        let headers = std::str::from_utf8(&response[..header_marker]).ok()?;
+        if !health_headers_are_valid(headers) {
+            return None;
+        }
+        let expected_end = body_start + HEALTH_PROOF_HEX_BYTES;
+        if response.len() < expected_end {
+            continue;
+        }
+        if response.len() != expected_end {
+            return None;
+        }
+        // The authenticated route promises `Connection: close`; require actual EOF before
+        // accepting so a valid prefix followed by smuggled/trailing bytes cannot authenticate.
+        let remaining = remaining_timeout(deadline)?;
+        stream.set_read_timeout(Some(remaining)).ok()?;
+        let mut trailing = [0u8; 1];
+        match stream.read(&mut trailing) {
+            Ok(0) => return decode_health_proof(&response[body_start..expected_end]),
+            Ok(_) => return None,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn health_headers_are_valid(headers: &str) -> bool {
+    let mut lines = headers.split("\r\n");
+    if lines.next() != Some("HTTP/1.1 200 OK") {
+        return false;
+    }
+
+    let mut content_length = None;
+    let mut content_type = None;
+    let mut cache_control = None;
+    let mut connection = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return false;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            if content_length.replace(value).is_some() {
+                return false;
+            }
+        } else if name.eq_ignore_ascii_case("content-type") {
+            if content_type.replace(value).is_some() {
+                return false;
+            }
+        } else if name.eq_ignore_ascii_case("cache-control") {
+            if cache_control.replace(value).is_some() {
+                return false;
+            }
+        } else if name.eq_ignore_ascii_case("connection") && connection.replace(value).is_some() {
+            return false;
+        }
+    }
+    content_length == Some("64")
+        && content_type.is_some_and(|value| value.eq_ignore_ascii_case("text/plain"))
+        && cache_control.is_some_and(|value| value.eq_ignore_ascii_case("no-store"))
+        && connection.is_some_and(|value| value.eq_ignore_ascii_case("close"))
+}
+
+fn decode_health_proof(encoded: &[u8]) -> Option<[u8; 32]> {
+    if encoded.len() != HEALTH_PROOF_HEX_BYTES {
+        return None;
+    }
+    let mut proof = [0u8; 32];
+    for (index, pair) in encoded.chunks_exact(2).enumerate() {
+        proof[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(proof)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     /// Serializes tests that mutate the global `MANAGER`/`STATE`, since cargo runs tests in parallel
     /// threads and these share process-global state.
@@ -657,6 +988,23 @@ mod tests {
         let encoded = json_string(r"C:\Users\me\app\server.log");
         assert!(encoded.starts_with('"') && encoded.ends_with('"'));
         assert!(encoded.contains(r"\\Users\\me"));
+    }
+
+    #[test]
+    fn health_tokens_come_from_fresh_full_width_random_values() {
+        let first = fresh_health_token().expect("first health token");
+        let second = fresh_health_token().expect("second health token");
+        assert_ne!(
+            first, second,
+            "each child launch must rotate owner identity"
+        );
+        assert_eq!(hex_encode(&first).len(), HEALTH_SECRET_BYTES * 2);
+        assert!(
+            hex_encode(&first)
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "the child environment receives canonical lowercase hex"
+        );
     }
 
     #[test]
@@ -727,11 +1075,12 @@ mod tests {
         let pid = child.id();
         let mut guard = MANAGER.lock().expect("manager lock");
         *guard = Some(Manager {
-            child: Arc::new(Mutex::new(Some(child))),
+            child: Arc::new(Mutex::new(Some(SupervisedChild::unsupervised(child)))),
             shutdown: Arc::new(AtomicBool::new(false)),
             node_bin: PathBuf::from("dummy-node"),
             server_js: PathBuf::from("dummy-server.cjs"),
             home: std::env::temp_dir(),
+            health_token: [7; HEALTH_SECRET_BYTES],
             restarts: 0,
             window_start: Instant::now(),
         });
@@ -746,7 +1095,10 @@ mod tests {
     fn stop_kills_the_managed_child_and_is_idempotent() {
         let _g = TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         let pid = install_dummy_manager();
-        assert!(pid_is_alive(pid), "dummy child should be running before stop()");
+        assert!(
+            pid_is_alive(pid),
+            "dummy child should be running before stop()"
+        );
 
         stop();
 
@@ -759,7 +1111,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(!alive, "stop() must kill the managed child (pid {pid} still alive)");
+        assert!(
+            !alive,
+            "stop() must kill the managed child (pid {pid} still alive)"
+        );
 
         // Manager is cleared and a second stop() is a harmless no-op.
         assert!(MANAGER.lock().expect("manager lock").is_none());
@@ -784,7 +1139,10 @@ mod tests {
             .as_ref()
             .map(|m| Arc::clone(&m.shutdown))
             .expect("manager present");
-        assert!(!shutdown.load(Ordering::SeqCst), "shutdown should start clear");
+        assert!(
+            !shutdown.load(Ordering::SeqCst),
+            "shutdown should start clear"
+        );
 
         stop();
 
@@ -809,7 +1167,7 @@ mod tests {
                     .expect("spawn exit")
             }
         };
-        let shared = Arc::new(Mutex::new(Some(child)));
+        let shared = Arc::new(Mutex::new(Some(SupervisedChild::unsupervised(child))));
         let mut exited = false;
         for _ in 0..50 {
             match poll_child(&shared) {
@@ -818,7 +1176,7 @@ mod tests {
                     exited = true;
                     break;
                 }
-                ChildPoll::Empty | ChildPoll::Poisoned => break,
+                ChildPoll::Empty => break,
             }
         }
         assert!(exited, "dummy child should exit during the test");
@@ -828,34 +1186,285 @@ mod tests {
         );
     }
 
-    /// The injected preload must carry the parent-death watchdog (the orphan fix) with the `format!`
-    /// brace-escaping correctly resolved, and must still carry the loopback pin. Pure string check —
-    /// no node runtime needed.
+    enum TestHealthReply {
+        Owned(HealthToken),
+        UnauthenticatedOk,
+        Silent,
+    }
+
+    fn spawn_test_health_server(
+        reply: TestHealthReply,
+    ) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((HOST, 0)).expect("bind test health listener");
+        let addr = listener.local_addr().expect("test listener address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept health probe");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("bound test request read");
+
+            if matches!(reply, TestHealthReply::Silent) {
+                std::thread::sleep(Duration::from_millis(700));
+                return;
+            }
+
+            let mut request = Vec::new();
+            while request.len() < 1024 && !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0u8; 256];
+                let read = stream.read(&mut chunk).expect("read health request");
+                assert_ne!(read, 0, "health request closed before headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = std::str::from_utf8(&request).expect("ASCII health request");
+            assert!(
+                request.starts_with(&format!("GET {HEALTH_PATH} HTTP/1.1\r\n")),
+                "probe uses only the private health route"
+            );
+            let challenge = request
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find_map(|(name, value)| {
+                    name.eq_ignore_ascii_case(HEALTH_CHALLENGE_HEADER)
+                        .then(|| value.trim())
+                })
+                .expect("health challenge header");
+
+            let body = match reply {
+                TestHealthReply::Owned(token) => {
+                    let mut mac =
+                        HealthMac::new_from_slice(&token).expect("HMAC accepts test owner key");
+                    mac.update(challenge.as_bytes());
+                    hex_encode(&mac.finalize().into_bytes())
+                }
+                TestHealthReply::UnauthenticatedOk => "0".repeat(HEALTH_PROOF_HEX_BYTES),
+                TestHealthReply::Silent => unreachable!(),
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write health response");
+        });
+        (addr, handle)
+    }
+
     #[test]
-    fn write_preload_carries_the_parent_death_watchdog() {
+    fn authenticated_health_check_accepts_only_the_owned_listener() {
+        let owner = fresh_health_token().expect("owner token");
+        let (owned_addr, owned_server) = spawn_test_health_server(TestHealthReply::Owned(owner));
+        assert!(
+            authenticated_health_check(owned_addr, &owner),
+            "matching child key must authenticate readiness"
+        );
+        owned_server.join().expect("owned test server");
+
+        let impostor_key = fresh_health_token().expect("impostor token");
+        let (wrong_addr, wrong_server) =
+            spawn_test_health_server(TestHealthReply::Owned(impostor_key));
+        assert!(
+            !authenticated_health_check(wrong_addr, &owner),
+            "a listener proving a different launch key is stale or foreign"
+        );
+        wrong_server.join().expect("wrong-key test server");
+
+        let (bare_addr, bare_server) = spawn_test_health_server(TestHealthReply::UnauthenticatedOk);
+        assert!(
+            !authenticated_health_check(bare_addr, &owner),
+            "a generic HTTP 200 on the expected port is not readiness"
+        );
+        bare_server.join().expect("bare HTTP test server");
+    }
+
+    #[test]
+    fn authenticated_health_check_has_one_bounded_wall_deadline() {
+        let owner = fresh_health_token().expect("owner token");
+        let (addr, silent_server) = spawn_test_health_server(TestHealthReply::Silent);
+        let started = Instant::now();
+        assert!(!authenticated_health_check(addr, &owner));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a silent listener must not hold the command thread indefinitely"
+        );
+        silent_server.join().expect("silent test server");
+    }
+
+    fn parse_raw_health_response(
+        response: String,
+        hold_open: bool,
+    ) -> (Option<[u8; 32]>, Duration) {
+        let listener = TcpListener::bind((HOST, 0)).expect("bind raw health listener");
+        let addr = listener.local_addr().expect("raw health address");
+        let sender = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept raw health parser");
+            stream
+                .write_all(response.as_bytes())
+                .expect("write raw health response");
+            if hold_open {
+                std::thread::sleep(Duration::from_millis(700));
+            }
+        });
+        let mut stream = TcpStream::connect(addr).expect("connect raw health parser");
+        let started = Instant::now();
+        let parsed = read_health_proof(&mut stream, Instant::now() + HEALTH_IO_TIMEOUT);
+        let elapsed = started.elapsed();
+        drop(stream);
+        sender.join().expect("raw health response sender");
+        (parsed, elapsed)
+    }
+
+    fn canonical_health_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{body}"
+        )
+    }
+
+    #[test]
+    fn health_response_requires_exact_security_headers_and_canonical_body() {
+        let valid_headers = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nContent-Length: 64\r\nConnection: close";
+        assert!(health_headers_are_valid(valid_headers));
+        for invalid in [
+            "HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Length: 64\r\nConnection: close",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=0\r\nContent-Length: 64\r\nConnection: close",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nContent-Length: 064\r\nConnection: close",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nContent-Length: 64\r\nConnection: keep-alive",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nContent-Length: 64\r\nConnection: close\r\nTransfer-Encoding: chunked",
+        ] {
+            assert!(
+                !health_headers_are_valid(invalid),
+                "unexpectedly accepted headers: {invalid}"
+            );
+        }
+
+        assert!(parse_raw_health_response(
+            canonical_health_response(&"0".repeat(HEALTH_PROOF_HEX_BYTES)),
+            false,
+        )
+        .0
+        .is_some());
+        assert!(parse_raw_health_response(
+            canonical_health_response(&"A".repeat(HEALTH_PROOF_HEX_BYTES)),
+            false,
+        )
+        .0
+        .is_none());
+        assert!(parse_raw_health_response(
+            format!(
+                "{}x",
+                canonical_health_response(&"0".repeat(HEALTH_PROOF_HEX_BYTES))
+            ),
+            false,
+        )
+        .0
+        .is_none());
+    }
+
+    #[test]
+    fn health_response_requires_eof_within_the_shared_deadline() {
+        let (parsed, elapsed) = parse_raw_health_response(
+            canonical_health_response(&"0".repeat(HEALTH_PROOF_HEX_BYTES)),
+            true,
+        );
+        assert!(parsed.is_none());
+        assert!(
+            elapsed < Duration::from_millis(650),
+            "held-open response exceeded the bounded parser deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn generated_preload_proves_owner_identity_with_real_node_when_available() {
+        let probe = TcpListener::bind((HOST, 0)).expect("reserve test node port");
+        let port = probe.local_addr().expect("reserved node address").port();
+        drop(probe);
+
+        let directory = tempfile::tempdir().expect("preload test directory");
+        let preload = write_preload(directory.path()).expect("write preload");
+        let owner = fresh_health_token().expect("owner token");
+        let script = format!(
+            "if(process.env.{HEALTH_TOKEN_ENV}!==undefined)process.exit(42);require('http').createServer((_q,r)=>{{r.writeHead(500);r.end()}}).listen({port})"
+        );
+        let mut child = match Command::new("node")
+            .arg("-r")
+            .arg(&preload)
+            .arg("-e")
+            .arg(script)
+            .env(HEALTH_TOKEN_ENV, hex_encode(&owner))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("spawn node preload test: {error}"),
+        };
+
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut authenticated = false;
+        while Instant::now() < deadline {
+            if authenticated_health_check(addr, &owner) {
+                authenticated = true;
+                break;
+            }
+            if child.try_wait().expect("poll node preload test").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let wrong_owner = fresh_health_token().expect("wrong owner token");
+        let rejects_wrong_owner = !authenticated_health_check(addr, &wrong_owner);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            authenticated,
+            "the emitted preload and Rust verifier must complete the same HMAC protocol"
+        );
+        assert!(
+            rejects_wrong_owner,
+            "the real preload must reject a different process identity"
+        );
+    }
+
+    /// Parent ownership lives in the cross-platform Rust supervisor, not in a process.ppid heuristic
+    /// that is ineffective on Windows. The preload retains only loopback pinning and health proof.
+    #[test]
+    fn write_preload_has_no_platform_specific_parent_watchdog() {
         let dir = std::env::temp_dir().join(format!("stremiox-preload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mk tmp dir");
         let path = write_preload(&dir).expect("write preload");
         let js = std::fs::read_to_string(&path).expect("read preload");
-        let _ = std::fs::remove_dir_all(&dir);
 
-        assert!(
-            js.contains("const PPID0=process.ppid;"),
-            "watchdog records the initial parent pid"
-        );
-        // Opening + closing braces must have resolved from `{{`/`}}` to single JS braces.
-        assert!(
-            js.contains("setInterval(function(){if(process.ppid!==PPID0){"),
-            "watchdog opening braces resolved by format!"
-        );
-        assert!(
-            js.contains("process.exit(0);}},1000).unref();"),
-            "watchdog closing braces resolved by format! and the timer is unref'd"
-        );
-        // The loopback pin still coexists with the new watchdog.
+        match Command::new("node").arg("--check").arg(&path).output() {
+            Ok(output) => assert!(
+                output.status.success(),
+                "generated preload must parse as JavaScript: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("run node --check on generated preload: {error}"),
+        }
+
+        assert!(!js.contains("process.ppid"));
         assert!(
             js.contains("net.Server.prototype.listen"),
-            "loopback-pin preload still present alongside the watchdog"
+            "loopback-pin preload still present"
         );
+        assert!(
+            js.contains("delete process.env[HENV];"),
+            "the owner key is removed from the child environment before server.cjs loads"
+        );
+        assert!(
+            js.contains("crypto.createHmac('sha256',key).update(challenge,'ascii')"),
+            "the health route proves key ownership over the caller's fresh challenge"
+        );
+        assert!(
+            js.contains("req.url===HPATH"),
+            "the health handler intercepts only its exact private route"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
