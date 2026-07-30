@@ -95,6 +95,92 @@ const { getSettings, updateSettings } = await import("./settings.ts");
 const { profiles, activeProfileId, setActiveProfile, addProfile, deleteProfile } = await import("./profiles.ts");
 const { adoptSession, applySyncDoc } = await import("./account.ts");
 
+const waitUntil = async (predicate, label, timeoutMs = 3_000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) assert.fail(`Timed out waiting for ${label}`);
+    await new Promise((resolve) => nativeSetTimeout(resolve, 10));
+  }
+};
+
+const makeAccountSession = (id) => ({
+  token: `token-${id}`,
+  account: { id, email: `${id}@example.test`, username: id },
+  dataKey: crypto.getRandomValues(new Uint8Array(32)),
+});
+
+async function installSyncServer(accountSession, initialDoc, initialVersion = 100, beforeAcceptPut) {
+  let serverVersion = initialVersion;
+  let serverDocument = await sealDocument(
+    accountSession.dataKey,
+    new TextEncoder().encode(JSON.stringify(initialDoc)),
+    accountSession.account.id,
+    serverVersion,
+    false,
+  );
+  const requests = [];
+  const puts = [];
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = { input: String(input), init };
+    requests.push(request);
+    if ((init.method ?? "GET") === "PUT") {
+      const body = JSON.parse(String(init.body));
+      puts.push(body);
+      if (beforeAcceptPut) await beforeAcceptPut(puts.length, body);
+      const accepted = body.version > serverVersion;
+      if (accepted) {
+        serverVersion = body.version;
+        serverDocument = body.document;
+      }
+      return new Response(JSON.stringify({ accepted }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ document: serverDocument, version: serverVersion }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  return {
+    requests,
+    puts,
+    async readDoc() {
+      const plaintext = await openDocument(
+        accountSession.dataKey,
+        serverDocument,
+        accountSession.account.id,
+        serverVersion,
+      );
+      assert.ok(plaintext, "server document must decrypt");
+      return JSON.parse(new TextDecoder().decode(plaintext));
+    },
+  };
+}
+
+const settingsDoc = (settings, apiKeys = {}) => ({
+  apiKeys,
+  vortx: {
+    updatedAt: 100,
+    profiles: [
+      {
+        id: "remote-owner",
+        name: "Owner",
+        main: true,
+        settings: {
+          accentID: "vortx",
+          oled: false,
+          textScale: 1,
+          playback: { audioLang: "en", subtitleLang: "en", safetyMode: "off" },
+          ...settings,
+        },
+      },
+    ],
+  },
+});
+
 test("settings sync writes only owner edits and never echoes hydration or overlay changes", async (t) => {
   t.after(() => {
     globalThis.setTimeout = nativeSetTimeout;
@@ -339,4 +425,116 @@ test("settings sync writes only owner edits and never echoes hydration or overla
     "strict",
     "the shared playback setting survives the later owner write",
   );
+});
+
+test("rapid separate settings edits union their changed keys into one latest-doc patch", async () => {
+  const accountSession = makeAccountSession("acct-rapid-settings");
+  const remote = settingsDoc();
+  adoptSession(accountSession);
+  applySyncDoc(remote);
+  const server = await installSyncServer(accountSession, remote);
+
+  updateSettings({ accentID: "ocean" });
+  updateSettings({ background: "oled" });
+
+  await waitUntil(() => server.puts.length === 1, "one coalesced settings PUT");
+  const written = await server.readDoc();
+  const owner = written.profileEdits.roster.find((row) => row.id === "remote-owner");
+  assert.equal(owner.settings.accent, "ocean");
+  assert.equal(owner.settings.oled, true);
+  assert.equal(server.puts.length, 1, "rapid changes must remain one write");
+});
+
+test("slow settings writes are serialized so the newest same-key edit wins", async () => {
+  let releaseFirstPut;
+  const firstPutGate = new Promise((resolve) => {
+    releaseFirstPut = resolve;
+  });
+  const accountSession = makeAccountSession("acct-serialized-settings");
+  const remote = settingsDoc();
+  adoptSession(accountSession);
+  applySyncDoc(remote);
+  const server = await installSyncServer(accountSession, remote, 100, async (putNumber) => {
+    if (putNumber === 1) await firstPutGate;
+  });
+
+  updateSettings({ accentID: "ocean" });
+  await waitUntil(() => server.puts.length === 1, "first slow settings PUT");
+  updateSettings({ accentID: "royal" });
+  await new Promise((resolve) => nativeSetTimeout(resolve, 900));
+  assert.equal(server.puts.length, 1, "a second settings PUT must not overlap the first");
+
+  releaseFirstPut();
+  await waitUntil(() => server.puts.length === 2, "serialized follow-up settings PUT");
+  const written = await server.readDoc();
+  const owner = written.profileEdits.roster.find((row) => row.id === "remote-owner");
+  assert.equal(owner.settings.accent, "royal", "the later edit must be the stored value");
+});
+
+test("switching accounts cancels a pending settings timer from the old session", async () => {
+  const first = makeAccountSession("acct-pending-first");
+  const second = makeAccountSession("acct-pending-second");
+  const requests = [];
+  globalThis.fetch = async (input, init = {}) => {
+    requests.push({ input: String(input), init });
+    return new Response(JSON.stringify({}), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  adoptSession(first);
+  applySyncDoc(settingsDoc());
+  updateSettings({ accentID: "forest" });
+  adoptSession(second);
+  applySyncDoc({});
+
+  await new Promise((resolve) => nativeSetTimeout(resolve, 1_000));
+  assert.equal(requests.length, 0, "the first account's pending timer must be discarded");
+});
+
+test("an owner edit preserves unrelated settings from the latest remote document", async () => {
+  const accountSession = makeAccountSession("acct-owner-stale-remote");
+  const hydrated = settingsDoc();
+  const newerRemote = settingsDoc({
+    oled: true,
+    playback: { audioLang: "fr", subtitleLang: "de", safetyMode: "strict" },
+  });
+  newerRemote.vortx.updatedAt = 200;
+
+  adoptSession(accountSession);
+  applySyncDoc(hydrated);
+  const server = await installSyncServer(accountSession, newerRemote, 200);
+  updateSettings({ accentID: "forest" });
+
+  await waitUntil(() => server.puts.length === 1, "owner delta PUT");
+  const written = await server.readDoc();
+  const owner = written.profileEdits.roster.find((row) => row.id === "remote-owner");
+  assert.equal(owner.settings.accent, "forest");
+  assert.equal(owner.settings.oled, true, "a stale local background must not replace the newer remote value");
+  assert.equal(
+    owner.settings.playback.safetyMode,
+    "strict",
+    "a stale local playback value must not replace the newer remote value",
+  );
+});
+
+test("API-key-only account documents support deletion and hydrate missing keys as cleared", async () => {
+  const accountSession = makeAccountSession("acct-api-keys-only");
+  const remote = { apiKeys: { tmdb: "test-tmdb-value", mdblist: "test-mdblist-value" } };
+  adoptSession(accountSession);
+  applySyncDoc(remote);
+  assert.equal(getSettings().tmdbKey, "test-tmdb-value");
+  assert.equal(getSettings().mdblistKey, "test-mdblist-value");
+  const server = await installSyncServer(accountSession, remote);
+
+  updateSettings({ tmdbKey: "" });
+  await waitUntil(() => server.puts.length === 1, "API key deletion PUT");
+  const written = await server.readDoc();
+  assert.equal(Object.hasOwn(written.apiKeys, "tmdb"), false, "clearing a key must remove it remotely");
+  assert.equal(written.apiKeys.mdblist, "test-mdblist-value", "deleting one key must preserve the other");
+
+  applySyncDoc({});
+  assert.equal(getSettings().tmdbKey, "");
+  assert.equal(getSettings().mdblistKey, "", "a remote missing key must clear the hydrated local value");
 });

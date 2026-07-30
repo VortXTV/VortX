@@ -33,7 +33,6 @@ import {
 import { getSettings, updateSettings, onSettingsChange, type Settings } from "./settings";
 import {
   settingsPatchFromDoc,
-  mergeWebappSettingsIntoProfile,
   mergeWebappSettingsPatchIntoProfile,
   effectiveMainSettings,
   mainProfileId,
@@ -50,6 +49,7 @@ const listeners = new Set<Listener>();
 
 /** Set the cache and tell every subscriber. The single mutation point for the session. */
 function setSession(next: Session | null): void {
+  bindSettingsSyncState(next);
   cached = next;
   notify();
 }
@@ -58,7 +58,10 @@ function setSession(next: Session | null): void {
  *  best-effort read: it does not validate the token with the server (use ensureValidSession on boot
  *  for that), so a revoked token still reads as signed-in until the next validation. */
 export function currentSession(): Session | null {
-  if (cached === undefined) cached = loadSession();
+  if (cached === undefined) {
+    cached = loadSession();
+    bindSettingsSyncState(cached);
+  }
   return cached;
 }
 
@@ -200,11 +203,15 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
   // account hydration must not replace an overlay profile's local look. The live application is wrapped
   // in suppressUp so hydration cannot bounce back up as a web-authored change (see the write-up below).
   const keys = (doc.apiKeys && typeof doc.apiKeys === "object" ? doc.apiKeys : {}) as Record<string, unknown>;
-  const metadataPatch: Partial<Settings> = {};
-  if (typeof keys.tmdb === "string" && keys.tmdb) metadataPatch.tmdbKey = keys.tmdb;
-  if (typeof keys.mdblist === "string" && keys.mdblist) metadataPatch.mdblistKey = keys.mdblist;
+  const metadataPatch: Partial<Settings> = {
+    tmdbKey: typeof keys.tmdb === "string" ? keys.tmdb : "",
+    mdblistKey: typeof keys.mdblist === "string" ? keys.mdblist : "",
+  };
+  settingsSyncState.apiKeysArmed = true;
   const settingsPatch = settingsPatchFromDoc(doc);
-  if (Object.keys(settingsPatch).length) settingsSyncArmed = true; // the account carries settings: web->up is now safe
+  if (Object.keys(settingsPatch).length) {
+    settingsSyncState.profileSettingsArmed = true;
+  }
   const ownerPatch = { ...metadataPatch, ...settingsPatch };
   if (Object.keys(ownerPatch).length) {
     const ownerSettings = mergeOwnerSettings(ownerPatch);
@@ -309,7 +316,8 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
  *  undecryptable doc never blocks sign-in. */
 export async function hydrateFromAccount(session: Session): Promise<void> {
   try {
-    applySyncDoc(await getSyncDoc(session));
+    const doc = await getSyncDoc(session);
+    if (sameSession(settingsSyncState.session, session)) applySyncDoc(doc);
   } catch {
     // network / decrypt failure: sign-in still succeeds with local state.
   }
@@ -321,27 +329,33 @@ export async function hydrateFromAccount(session: Session): Promise<void> {
 // goes through mutateSyncDoc (optimistic concurrency: read version, merge, PUT version+1, retry on a
 // stale-version rejection) so a concurrent app/device write is never clobbered.
 
-// Guard so settings applied by read-down hydration do not immediately echo back up as a "web edit".
-let suppressUp = false;
-// Gate settings write-up: only push web settings UP once read-down has seen that the account already
-// carries per-profile settings (i.e. an app/dashboard participates in settings sync). Otherwise the
-// webapp's first edit would push its DEFAULTS into profileEdits and could override the app's real
-// settings. Stays false on accounts whose app has not synced settings yet (e.g. older app builds), so
-// settings only flow web->account once it is safe; read-down works regardless.
-let settingsSyncArmed = false;
-function withSuppressedUp(fn: () => void): void {
-  suppressUp = true;
-  try {
-    fn();
-  } finally {
-    suppressUp = false;
-  }
+const SETTINGS_PUSH_DELAY = 800;
+const API_KEY_SETTING_KEYS: readonly (keyof Settings)[] = ["tmdbKey", "mdblistKey"];
+
+interface SettingsSyncState {
+  session: Session | null;
+  profileSettingsArmed: boolean;
+  apiKeysArmed: boolean;
+  suppressUpDepth: number;
+  pushTimer: ReturnType<typeof setTimeout> | undefined;
+  pendingKeys: Set<keyof Settings>;
+  pendingSettings: Settings | null;
+  profileAtLastChange: string;
+  ownerSettingsSnapshot: Settings;
 }
 
-// Debounce settings pushes: the user may flip several toggles quickly; coalesce into one write.
-const SETTINGS_PUSH_DELAY = 800;
-let settingsPushTimer: ReturnType<typeof setTimeout> | undefined;
-let settingsProfileAtLastChange = activeProfileId();
+let settingsSyncState: SettingsSyncState;
+// Every settings mutation, including one queued under a refreshed session, runs after the previous one.
+// Jobs still verify their captured state before starting, so a queued write from a departed account drops.
+let settingsWriteTail: Promise<void> = Promise.resolve();
+
+function sameSession(a: Session | null, b: Session | null): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.account.id !== b.account.id || a.token !== b.token || a.dataKey.length !== b.dataKey.length) {
+    return false;
+  }
+  return a.dataKey.every((byte, index) => byte === b.dataKey[index]);
+}
 
 function copySettings(settings: Settings): Settings {
   return { ...settings, sourceOrder: [...settings.sourceOrder] };
@@ -378,13 +392,48 @@ function initialOwnerSettings(): Settings {
   return copySettings(ownerLook ? { ...live, ...ownerLook } : live);
 }
 
-let ownerSettingsSnapshot = initialOwnerSettings();
+function createSettingsSyncState(session: Session | null): SettingsSyncState {
+  return {
+    session,
+    profileSettingsArmed: false,
+    apiKeysArmed: false,
+    suppressUpDepth: 0,
+    pushTimer: undefined,
+    pendingKeys: new Set(),
+    pendingSettings: null,
+    profileAtLastChange: activeProfileId(),
+    ownerSettingsSnapshot: initialOwnerSettings(),
+  };
+}
+
+settingsSyncState = createSettingsSyncState(null);
+
+function bindSettingsSyncState(session: Session | null): void {
+  if (sameSession(settingsSyncState.session, session)) {
+    settingsSyncState.session = session;
+    return;
+  }
+  if (settingsSyncState.pushTimer) clearTimeout(settingsSyncState.pushTimer);
+  settingsSyncState = createSettingsSyncState(session);
+}
+
+// Guard so settings applied by read-down hydration do not immediately echo back up as a web edit.
+function withSuppressedUp(fn: () => void): void {
+  const state = settingsSyncState;
+  state.suppressUpDepth += 1;
+  try {
+    fn();
+  } finally {
+    state.suppressUpDepth -= 1;
+  }
+}
 
 function rememberOwnerSettings(settings: Settings): void {
-  ownerSettingsSnapshot = copySettings(settings);
+  settingsSyncState.ownerSettingsSnapshot = copySettings(settings);
 }
 
 function mergeOwnerSettings(patch: Partial<Settings>): Settings {
+  const ownerSettingsSnapshot = settingsSyncState.ownerSettingsSnapshot;
   const next = {
     ...ownerSettingsSnapshot,
     ...patch,
@@ -395,13 +444,14 @@ function mergeOwnerSettings(patch: Partial<Settings>): Settings {
 }
 
 function restoreOwnerSettings(): void {
-  withSuppressedUp(() => updateSettings(copySettings(ownerSettingsSnapshot)));
+  withSuppressedUp(() => updateSettings(copySettings(settingsSyncState.ownerSettingsSnapshot)));
 }
 
 onProfilesChange(() => {
+  const state = settingsSyncState;
   const profileId = activeProfileId();
-  if (profileId === settingsProfileAtLastChange) return;
-  settingsProfileAtLastChange = profileId;
+  if (profileId === state.profileAtLastChange) return;
+  state.profileAtLastChange = profileId;
   if (isOwnerProfile(profileId)) restoreOwnerSettings();
 });
 
@@ -410,24 +460,21 @@ onProfilesChange(() => {
  *  buildRoster: non-main entries are {id,name} so the app no-ops them) and merges the webapp-owned keys
  *  over the main profile's existing settings, preserving keys the webapp does not model (avatar, isKids,
  *  ...). The delta is applied to the latest fetched base so unrelated changes from another device survive.
- *  No-op when there is no synced main profile yet. Fail-soft. */
+ *  Profile settings no-op when there is no synced main profile, while API-key deltas remain independent. */
 async function pushSettings(
   session: Session,
   s: Settings,
   changedKeys: readonly (keyof Settings)[],
-  writeFullProfile: boolean,
 ): Promise<void> {
-  try {
-    await mutateSyncDoc(session, (doc) => {
-      const mainId = mainProfileId(doc);
-      if (!mainId) return; // nothing to attach settings to; never invent a profile
+  await mutateSyncDoc(session, (doc) => {
+    const changed = new Set(changedKeys);
+    const mainId = mainProfileId(doc);
+    if (mainId) {
       const vortx = (doc.vortx && typeof doc.vortx === "object" ? doc.vortx : {}) as Record<string, unknown>;
       const profiles = (Array.isArray(vortx.profiles) ? vortx.profiles : []) as Record<string, unknown>[];
       const edits = (doc.profileEdits && typeof doc.profileEdits === "object" ? doc.profileEdits : {}) as Record<string, unknown>;
       const base = effectiveMainSettings(doc); // freshest known main settings (app mirror + newer overlay)
-      const merged = writeFullProfile
-        ? mergeWebappSettingsIntoProfile(base, s)
-        : mergeWebappSettingsPatchIntoProfile(base, s, changedKeys);
+      const merged = mergeWebappSettingsPatchIntoProfile(base, s, changedKeys);
       if (JSON.stringify(merged) !== JSON.stringify(base)) {
         const roster = profiles
           .filter((p) => p.id != null)
@@ -443,26 +490,24 @@ async function pushSettings(
           libraryAdds: (edits as Record<string, unknown>).libraryAdds ?? {},
         };
       }
+    }
 
-      if (changedKeys.includes("tmdbKey") || changedKeys.includes("mdblistKey")) {
-        const apiKeys =
-          doc.apiKeys && typeof doc.apiKeys === "object"
-            ? { ...(doc.apiKeys as Record<string, unknown>) }
-            : {};
-        if (changedKeys.includes("tmdbKey")) {
-          if (s.tmdbKey) apiKeys.tmdb = s.tmdbKey;
-          else delete apiKeys.tmdb;
-        }
-        if (changedKeys.includes("mdblistKey")) {
-          if (s.mdblistKey) apiKeys.mdblist = s.mdblistKey;
-          else delete apiKeys.mdblist;
-        }
-        doc.apiKeys = apiKeys;
+    if (changed.has("tmdbKey") || changed.has("mdblistKey")) {
+      const apiKeys =
+        doc.apiKeys && typeof doc.apiKeys === "object"
+          ? { ...(doc.apiKeys as Record<string, unknown>) }
+          : {};
+      if (changed.has("tmdbKey")) {
+        if (s.tmdbKey) apiKeys.tmdb = s.tmdbKey;
+        else delete apiKeys.tmdb;
       }
-    });
-  } catch {
-    // fail-soft: the local change is already saved; the next change retries the push.
-  }
+      if (changed.has("mdblistKey")) {
+        if (s.mdblistKey) apiKeys.mdblist = s.mdblistKey;
+        else delete apiKeys.mdblist;
+      }
+      doc.apiKeys = apiKeys;
+    }
+  });
 }
 
 /** Tombstone-identity normalization: trim + lowercase, byte-for-byte matching the app's
@@ -643,7 +688,7 @@ function mergeWebProgress(prior: unknown, mine: ReturnType<typeof webProgressEnt
 let webProgressTimer: ReturnType<typeof setTimeout> | null = null;
 const WEBPROGRESS_PUSH_DELAY = 25_000;
 registerCwSyncPusher(() => {
-  if (suppressUp) return; // hydration merges CW too; don't echo synced progress back up
+  if (settingsSyncState.suppressUpDepth > 0) return; // hydration merges CW too; don't echo synced progress back up
   if (!currentSession()) return; // signed out: progress stays local
   if (webProgressTimer) return; // a push is already scheduled within this window
   webProgressTimer = setTimeout(() => {
@@ -662,11 +707,63 @@ if (typeof window !== "undefined") {
     if (s) void pushWebProgress(s); // best-effort final flush (browsers allow a last fetch on pagehide)
   });
 }
+
+function syncableSettingsKeys(
+  state: SettingsSyncState,
+  changedKeys: readonly (keyof Settings)[],
+): (keyof Settings)[] {
+  if (state.profileSettingsArmed) return [...changedKeys];
+  if (!state.apiKeysArmed) return [];
+  return changedKeys.filter((key) => API_KEY_SETTING_KEYS.includes(key));
+}
+
+function flushSettingsPush(state: SettingsSyncState): void {
+  state.pushTimer = undefined;
+  if (state !== settingsSyncState || !state.session || !state.pendingSettings || !state.pendingKeys.size) {
+    state.pendingKeys.clear();
+    state.pendingSettings = null;
+    return;
+  }
+
+  const session = state.session;
+  const snapshot = copySettings(state.pendingSettings);
+  const changedKeys = [...state.pendingKeys];
+  state.pendingKeys.clear();
+  state.pendingSettings = null;
+
+  const write = async (): Promise<void> => {
+    if (state !== settingsSyncState || !sameSession(state.session, session)) return;
+    try {
+      await pushSettings(session, snapshot, changedKeys);
+    } catch {
+      // Keep failed keys for the next user-triggered flush, using the newest local values rather than
+      // replaying this batch's stale snapshot. Do not spin on a network outage.
+      if (state === settingsSyncState && sameSession(state.session, session)) {
+        for (const key of changedKeys) state.pendingKeys.add(key);
+        state.pendingSettings = copySettings(state.ownerSettingsSnapshot);
+      }
+    }
+  };
+  settingsWriteTail = settingsWriteTail.then(write, write);
+}
+
+function scheduleSettingsPush(
+  state: SettingsSyncState,
+  settings: Settings,
+  changedKeys: readonly (keyof Settings)[],
+): void {
+  for (const key of changedKeys) state.pendingKeys.add(key);
+  state.pendingSettings = copySettings(settings);
+  if (state.pushTimer) clearTimeout(state.pushTimer);
+  state.pushTimer = setTimeout(() => flushSettingsPush(state), SETTINGS_PUSH_DELAY);
+}
+
 onSettingsChange((next) => {
+  const state = settingsSyncState;
   const profileId = activeProfileId();
-  const switchedProfile = profileId !== settingsProfileAtLastChange;
-  settingsProfileAtLastChange = profileId;
-  if (suppressUp) {
+  const switchedProfile = profileId !== state.profileAtLastChange;
+  state.profileAtLastChange = profileId;
+  if (state.suppressUpDepth > 0) {
     if (isOwnerProfile(profileId)) rememberOwnerSettings(next);
     return; // hydration applied this, not the user; don't echo it back up
   }
@@ -674,7 +771,7 @@ onSettingsChange((next) => {
     if (isOwnerProfile(profileId)) restoreOwnerSettings();
     return; // applying another profile's local snapshot is not a settings edit
   }
-  const previousOwner = ownerSettingsSnapshot;
+  const previousOwner = state.ownerSettingsSnapshot;
   const ownerNext = isOwnerProfile(profileId)
     ? copySettings(next)
     : mergeOwnerSettings(sharedSettingsPatch(next));
@@ -683,13 +780,11 @@ onSettingsChange((next) => {
     return; // the overlay changed only one of its six profile-scoped fields
   }
   rememberOwnerSettings(ownerNext);
-  if (!settingsSyncArmed) return; // account has no settings mirror yet: keep web changes local (see flag)
-  if (!currentSession()) return; // signed out: settings stay local
-  if (settingsPushTimer) clearTimeout(settingsPushTimer);
-  settingsPushTimer = setTimeout(() => {
-    const cur = currentSession();
-    if (cur) void pushSettings(cur, ownerNext, changedKeys, isOwnerProfile(profileId));
-  }, SETTINGS_PUSH_DELAY);
+  const syncableKeys = syncableSettingsKeys(state, changedKeys);
+  if (!syncableKeys.length) return;
+  const session = currentSession();
+  if (!session || state !== settingsSyncState || !sameSession(state.session, session)) return;
+  scheduleSettingsPush(state, ownerNext, syncableKeys);
 });
 
 /** Sign out: clear storage, reset the cache, and notify subscribers so the nav drops back to signed-out. */
