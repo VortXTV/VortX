@@ -359,17 +359,21 @@ final class ProfileStore: ObservableObject {
         Set(active?.disabledAddons ?? []).contains(base)
     }
 
-    /// Remove a profile (never the last one). Its private session key is deleted with it. Returns
-    /// the switch outcome when the removed profile was the active one, nil otherwise.
+    /// Remove a non-owner profile (never the last one). Its private session key is deleted with it.
+    /// Authorization is based on the stored record, not caller-supplied flags. Returns the switch
+    /// outcome when the removed profile was the active one, nil otherwise.
     @discardableResult
     func remove(_ profile: UserProfile) -> SwitchOutcome? {
-        guard profiles.count > 1, profiles.contains(where: { $0.id == profile.id }) else { return nil }
-        profiles.removeAll { $0.id == profile.id }
-        if profile.usesOwnAccount { Keychain.set(nil, for: keychainAccount(for: profile)) }
-        UserDefaults.standard.removeObject(forKey: Self.watchCacheKey(profile.id))
-        tombstone(profile.id)   // durable cross-device delete; the union-merge can no longer resurrect it
+        guard profiles.count > 1,
+              let target = profiles.first(where: { $0.id == profile.id }),
+              !target.isOwner,
+              target.id != UserProfile.ownerID else { return nil }
+        profiles.removeAll { $0.id == target.id }
+        if target.usesOwnAccount { Keychain.set(nil, for: keychainAccount(for: target)) }
+        UserDefaults.standard.removeObject(forKey: Self.watchCacheKey(target.id))
+        tombstone(target.id)   // durable cross-device delete; the union-merge can no longer resurrect it
         persist()
-        if activeID == profile.id, let first = profiles.first { return select(first) }
+        if activeID == target.id, let first = profiles.first { return select(first) }
         return nil
     }
 
