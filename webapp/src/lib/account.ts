@@ -22,8 +22,15 @@ import {
   mergeContinueWatchingForScope,
   type CWEntry,
 } from "./store";
-import { mergeSyncedProfiles, activeProfileId, isOwnerProfile, type SyncedProfile } from "./profiles";
-import { updateSettings, onSettingsChange, type Settings } from "./settings";
+import {
+  mergeSyncedProfiles,
+  profiles as localProfiles,
+  activeProfileId,
+  isOwnerProfile,
+  onProfilesChange,
+  type SyncedProfile,
+} from "./profiles";
+import { getSettings, updateSettings, onSettingsChange, type Settings } from "./settings";
 import { settingsPatchFromDoc, mergeWebappSettingsIntoProfile, effectiveMainSettings, mainProfileId } from "./syncSettings";
 import { CINEMETA_URL, loadAddon } from "./addon";
 import type { MetaItem } from "./types";
@@ -182,17 +189,25 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
   const vortx = (doc.vortx && typeof doc.vortx === "object" ? doc.vortx : {}) as Record<string, unknown>;
 
   // Settings read-down: metadata API keys (doc.apiKeys) + the app/dashboard per-profile appearance,
-  // playback and stream-filter settings (doc.vortx.profiles[main].settings / doc.profileEdits). Applied
-  // through updateSettings so the theme + player prefs take effect live. Wrapped in suppressUp so this
-  // hydration does not immediately bounce back up as a web-authored change (see the write-up below).
+  // playback and stream-filter settings (doc.vortx.profiles[main].settings / doc.profileEdits). Merge
+  // them into the owner's complete snapshot. Apply that snapshot live only while the owner is active:
+  // account hydration must not replace an overlay profile's local look. The live application is wrapped
+  // in suppressUp so hydration cannot bounce back up as a web-authored change (see the write-up below).
   const keys = (doc.apiKeys && typeof doc.apiKeys === "object" ? doc.apiKeys : {}) as Record<string, unknown>;
-  const patch: Partial<Settings> = {};
-  if (typeof keys.tmdb === "string" && keys.tmdb) patch.tmdbKey = keys.tmdb;
-  if (typeof keys.mdblist === "string" && keys.mdblist) patch.mdblistKey = keys.mdblist;
+  const metadataPatch: Partial<Settings> = {};
+  if (typeof keys.tmdb === "string" && keys.tmdb) metadataPatch.tmdbKey = keys.tmdb;
+  if (typeof keys.mdblist === "string" && keys.mdblist) metadataPatch.mdblistKey = keys.mdblist;
   const settingsPatch = settingsPatchFromDoc(doc);
   if (Object.keys(settingsPatch).length) settingsSyncArmed = true; // the account carries settings: web->up is now safe
-  Object.assign(patch, settingsPatch);
-  if (Object.keys(patch).length) withSuppressedUp(() => updateSettings(patch));
+  const ownerPatch = { ...metadataPatch, ...settingsPatch };
+  if (Object.keys(ownerPatch).length) {
+    const ownerSettings = mergeOwnerSettings(ownerPatch);
+    if (isOwnerProfile(activeProfileId())) {
+      withSuppressedUp(() => updateSettings(ownerSettings));
+    } else if (Object.keys(metadataPatch).length) {
+      withSuppressedUp(() => updateSettings(metadataPatch));
+    }
+  }
 
   // Add-ons: the app summary (vortx.addons: [{transportUrl,name}]) + the web Stremio import (doc.addons).
   // Membership union first (never drops a local add-on), then apply the synced ORDER (vortx order wins,
@@ -317,6 +332,44 @@ function withSuppressedUp(fn: () => void): void {
 // Debounce settings pushes: the user may flip several toggles quickly; coalesce into one write.
 const SETTINGS_PUSH_DELAY = 800;
 let settingsPushTimer: ReturnType<typeof setTimeout> | undefined;
+let settingsProfileAtLastChange = activeProfileId();
+
+function copySettings(settings: Settings): Settings {
+  return { ...settings, sourceOrder: [...settings.sourceOrder] };
+}
+
+function initialOwnerSettings(): Settings {
+  const live = getSettings();
+  const ownerLook = localProfiles()[0]?.look;
+  return copySettings(ownerLook ? { ...live, ...ownerLook } : live);
+}
+
+let ownerSettingsSnapshot = initialOwnerSettings();
+
+function rememberOwnerSettings(settings: Settings): void {
+  ownerSettingsSnapshot = copySettings(settings);
+}
+
+function mergeOwnerSettings(patch: Partial<Settings>): Settings {
+  const next = {
+    ...ownerSettingsSnapshot,
+    ...patch,
+    sourceOrder: patch.sourceOrder ? [...patch.sourceOrder] : [...ownerSettingsSnapshot.sourceOrder],
+  };
+  rememberOwnerSettings(next);
+  return next;
+}
+
+function restoreOwnerSettings(): void {
+  withSuppressedUp(() => updateSettings(copySettings(ownerSettingsSnapshot)));
+}
+
+onProfilesChange(() => {
+  const profileId = activeProfileId();
+  if (profileId === settingsProfileAtLastChange) return;
+  settingsProfileAtLastChange = profileId;
+  if (isOwnerProfile(profileId)) restoreOwnerSettings();
+});
 
 /** Push the webapp's settings up to the MAIN profile via doc.profileEdits (dashboard-compatible shape).
  *  Builds the full roster from the synced profiles (idempotent for unchanged ones, matching the dashboard
@@ -549,7 +602,19 @@ if (typeof window !== "undefined") {
   });
 }
 onSettingsChange((next) => {
-  if (suppressUp) return; // hydration applied this, not the user; don't echo it back up
+  const profileId = activeProfileId();
+  const switchedProfile = profileId !== settingsProfileAtLastChange;
+  settingsProfileAtLastChange = profileId;
+  if (suppressUp) {
+    if (isOwnerProfile(profileId)) rememberOwnerSettings(next);
+    return; // hydration applied this, not the user; don't echo it back up
+  }
+  if (switchedProfile) {
+    if (isOwnerProfile(profileId)) restoreOwnerSettings();
+    return; // applying another profile's local snapshot is not a settings edit
+  }
+  if (!isOwnerProfile(profileId)) return; // overlay settings are local to that profile, never the owner's account mirror
+  rememberOwnerSettings(next);
   if (!settingsSyncArmed) return; // account has no settings mirror yet: keep web changes local (see flag)
   if (!currentSession()) return; // signed out: settings stay local
   if (settingsPushTimer) clearTimeout(settingsPushTimer);
