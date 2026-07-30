@@ -73,11 +73,18 @@ corepack npm run deploy     # build + wrangler pages deploy dist --project-name=
 
 **Git-connected Pages project (recommended):** point the Pages project `vortx-web` at this repo with:
 
-- Root directory: `web`
-- Build command: `corepack npm run build`
+- Root directory: `webapp`
+- Build command: `corepack install && corepack npm ci && corepack npm run build`
 - Build output directory: `dist`
+- Build environment variable, in both Production and Preview:
+  `SKIP_DEPENDENCY_INSTALL=1`
 
 Then attach the custom domain `web.vortx.tv` to the project in the Cloudflare dashboard.
+
+`SKIP_DEPENDENCY_INSTALL` is a Pages build-system setting. It stops Pages' bundled npm from
+rewriting the lockfile before the build command can install and run the npm version pinned in
+`package.json`. The Git root, build command, and this build variable must be set in the Pages
+dashboard; `wrangler.toml` cannot configure those Git-connected build settings.
 
 `public/_redirects` provides the SPA fallback (every path serves `index.html`) and `public/_headers`
 sets the production CSP and hardening headers. Both are copied verbatim into `dist/` by Vite.
