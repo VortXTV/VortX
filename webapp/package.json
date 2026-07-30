@@ -5,7 +5,7 @@
   "type": "module",
   "description": "VortX web client (web.vortx.tv). A direct/debrid/HLS-first web client that talks to the Stremio add-on protocol and Cinemeta straight from the browser. No streaming server, no native shell.",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.18.0"
   },
   "scripts": {
     "dev": "vite",

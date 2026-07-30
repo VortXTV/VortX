@@ -56,7 +56,7 @@ npm run build      # tsc && vite build -> dist/
 npm run preview    # serve the production build locally
 ```
 
-Requirements: Node 18+ and npm.
+Requirements: Node 22.18+ and npm.
 
 ## Deploy (Cloudflare Pages -> web.vortx.tv)
 
