@@ -204,8 +204,11 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
     const ownerSettings = mergeOwnerSettings(ownerPatch);
     if (isOwnerProfile(activeProfileId())) {
       withSuppressedUp(() => updateSettings(ownerSettings));
-    } else if (Object.keys(metadataPatch).length) {
-      withSuppressedUp(() => updateSettings(metadataPatch));
+    } else {
+      const sharedPatch = sharedSettingsPatch(ownerPatch);
+      if (Object.keys(sharedPatch).length) {
+        withSuppressedUp(() => updateSettings(sharedPatch));
+      }
     }
   }
 
@@ -336,6 +339,28 @@ let settingsProfileAtLastChange = activeProfileId();
 
 function copySettings(settings: Settings): Settings {
   return { ...settings, sourceOrder: [...settings.sourceOrder] };
+}
+
+// profiles.ts deliberately owns only these six fields per profile. Every other Settings field is shared
+// account state even while an overlay is active.
+const PROFILE_SCOPED_SETTING_KEYS: readonly (keyof Settings)[] = [
+  "accentID",
+  "background",
+  "textScale",
+  "audioLang",
+  "subtitleLang",
+  "subtitlesMode",
+];
+
+function sharedSettingsPatch(settings: Partial<Settings>): Partial<Settings> {
+  const shared = { ...settings };
+  for (const key of PROFILE_SCOPED_SETTING_KEYS) delete shared[key];
+  if (shared.sourceOrder) shared.sourceOrder = [...shared.sourceOrder];
+  return shared;
+}
+
+function sameSettings(a: Settings, b: Settings): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 function initialOwnerSettings(): Settings {
@@ -613,14 +638,20 @@ onSettingsChange((next) => {
     if (isOwnerProfile(profileId)) restoreOwnerSettings();
     return; // applying another profile's local snapshot is not a settings edit
   }
-  if (!isOwnerProfile(profileId)) return; // overlay settings are local to that profile, never the owner's account mirror
-  rememberOwnerSettings(next);
+  const previousOwner = ownerSettingsSnapshot;
+  const ownerNext = isOwnerProfile(profileId)
+    ? copySettings(next)
+    : mergeOwnerSettings(sharedSettingsPatch(next));
+  if (!isOwnerProfile(profileId) && sameSettings(previousOwner, ownerNext)) {
+    return; // the overlay changed only one of its six profile-scoped fields
+  }
+  rememberOwnerSettings(ownerNext);
   if (!settingsSyncArmed) return; // account has no settings mirror yet: keep web changes local (see flag)
   if (!currentSession()) return; // signed out: settings stay local
   if (settingsPushTimer) clearTimeout(settingsPushTimer);
   settingsPushTimer = setTimeout(() => {
     const cur = currentSession();
-    if (cur) void pushSettings(cur, next);
+    if (cur) void pushSettings(cur, ownerNext);
   }, SETTINGS_PUSH_DELAY);
 });
 
