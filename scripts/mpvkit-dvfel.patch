@@ -1,8 +1,21 @@
+diff --git a/Package.swift b/Package.swift
+index 9d9b0af..b19bd8e 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -77,7 +77,8 @@ let package = Package(
+             linkerSettings: [
+                 .linkedFramework("AudioToolbox"),
+                 .linkedFramework("CoreVideo"),
+                 .linkedFramework("CoreFoundation"),
++                .linkedFramework("Security"),
+                 .linkedFramework("CoreMedia"),
+                 .linkedFramework("Metal"),
+                 .linkedFramework("VideoToolbox"),
 diff --git a/Sources/BuildScripts/XCFrameworkBuild/main.swift b/Sources/BuildScripts/XCFrameworkBuild/main.swift
-index e5f872c..b46a86f 100644
+index e5f872c..dcaca5b 100644
 --- a/Sources/BuildScripts/XCFrameworkBuild/main.swift
 +++ b/Sources/BuildScripts/XCFrameworkBuild/main.swift
-@@ -45,10 +45,25 @@ do {
+@@ -45,12 +45,40 @@ do {
  
  enum Library: String, CaseIterable {
      case libmpv, FFmpeg, libshaderc, vulkan, lcms2, libdovi, openssl, libunibreak, libfreetype, libfribidi, libharfbuzz, libass, libsmbclient, libplacebo, libdav1d, gmp, nettle, gnutls, libuchardet, libbluray, libluajit, libuavs3d
@@ -15,8 +28,16 @@ index e5f872c..b46a86f 100644
 +    //   libplacebo 4c426e466814 (master, 2026-07-24) - carries 801b6812 FEL merging,
 +    //              187b1bd1 pl_frame.enhancement_layer, dbf8dd89 nlq_active/nlq,
 +    //              6e66d6d5 libav NLQ mapping. PL_API_VER 371 (>= 367 required by mpv).
++    //   FFmpeg     6e85193417f8 (release/9.0 tip, 2026-07-25) - libavcodec 63.1.100 carries
++    //              6026988b75 the `dovi_split` bitstream filter and 5f6dff5e7d hvcE ->
++    //              AV_PKT_DATA_HEVC_CONF, which is what mpv's single-track interleaved
++    //              Profile 7 splitter needs. libavformat 63.1.100 clears the >= 62.19.100
++    //              gate on demux_lavf's dual-track Dolby Vision grouping. release/9.0 is a
++    //              branch, not a tag: no n9* tag existed at pin time, so the SHA is the pin.
 +    static let mpvPinnedSHA = "8c67647b50059406c5c0444903597281b81516cf"
 +    static let placeboPinnedSHA = "4c426e466814536def653cb23f1d1c287ea7a7f5"
++    static let ffmpegPinnedSHA = "6e85193417f898868f04f8f6fc30db92a874a8cf"
++    static let ffmpegPinnedBranch = "release/9.0"
 +
      var version: String {
          switch self {
@@ -27,9 +48,17 @@ index e5f872c..b46a86f 100644
 +            // vf=format=enhancement-layer). Cloned by BuildMPV.beforeBuild, not by --branch.
 +            return "master-\(Library.mpvPinnedSHA.prefix(8))"
          case .FFmpeg:
-             return "n8.1.2"
+-            return "n8.1.2"
++            // SPIKE: FFmpeg release/9.0 pinned to a SHA. n8.1.2 shipped libavcodec 62.28.102,
++            // which has no `dovi_split` bitstream filter at all, so mpv's Profile 7 splitter
++            // returned NULL and single-track interleaved DV rendered base layer only.
++            // Cloned by BuildFFMPEG.beforeBuild, not by --branch: `git clone --branch` cannot
++            // take a bare SHA, and this SHA is not reachable from master.
++            return "9.0-\(Library.ffmpegPinnedSHA.prefix(8))"
          case .openssl:
-@@ -76,7 +91,10 @@ enum Library: String, CaseIterable {
+             return "3.3.5"
+         case .gnutls:
+@@ -76,7 +104,10 @@ enum Library: String, CaseIterable {
          case .lcms2:
              return "2.17.0"
          case .libplacebo:
@@ -41,7 +70,7 @@ index e5f872c..b46a86f 100644
          case .libdovi:
              return "3.3.2"
          case .vulkan:
-@@ -123,7 +141,8 @@ enum Library: String, CaseIterable {
+@@ -123,7 +154,8 @@ enum Library: String, CaseIterable {
          case .lcms2:
              return "https://github.com/mpvkit/lcms2-build/releases/download/\(self.version)/lcms2-all.zip"
          case .libplacebo:
@@ -51,7 +80,7 @@ index e5f872c..b46a86f 100644
          case .libdav1d:
              return "https://github.com/mpvkit/libdav1d-build/releases/download/\(self.version)/libdav1d-all.zip"
          case .libdovi:
-@@ -372,6 +391,16 @@ private class BuildMPV: BaseBuild {
+@@ -372,6 +404,16 @@ private class BuildMPV: BaseBuild {
          super.init(library: .libmpv)
      }
  
@@ -68,7 +97,7 @@ index e5f872c..b46a86f 100644
      override func flagsDependencelibrarys() -> [Library] {
          if BaseBuild.options.enableGPL {
              return [.gmp, .libsmbclient]
-@@ -396,6 +425,14 @@ private class BuildMPV: BaseBuild {
+@@ -396,6 +438,14 @@ private class BuildMPV: BaseBuild {
              "-Djpeg=disabled",
              "-Dvapoursynth=disabled",
              "-Drubberband=disabled",
@@ -83,7 +112,44 @@ index e5f872c..b46a86f 100644
          ]
          if BaseBuild.options.enableGPL {
              array.append("-Dgpl=true")
-@@ -681,6 +718,21 @@ private class BuildFFMPEG: BaseBuild {
+@@ -450,7 +500,15 @@ private class BuildFFMPEG: BaseBuild {
+     }
+ 
+     override func beforeBuild() throws {
+-        try super.beforeBuild()
++        // SPIKE: pinned release/9.0 SHA rather than the n8.1.2 tag, so BaseBuild's
++        // `git clone --branch <version>` cannot be used. release/9.0 is a maintenance
++        // branch and its tip is not reachable from master, so the clone must name the
++        // branch and then detach onto the SHA.
++        try SpikeGit.clonePinned(url: library.url,
++                                 sha: Library.ffmpegPinnedSHA,
++                                 branch: Library.ffmpegPinnedBranch,
++                                 into: directoryURL)
++        try SpikeGit.applyPatches(for: library, in: directoryURL)
+ 
+         if Utility.shell("which nasm") == nil {
+             Utility.shell("brew install nasm")
+@@ -609,7 +667,18 @@ private class BuildFFMPEG: BaseBuild {
+         //        if platform == .isimulator || platform == .tvsimulator {
+         //            arguments.append("--assert-level=1")
+         //        }
+-        var dependencyLibrary = [Library.gmp, .gnutls, .libfreetype, .libharfbuzz, .libfribidi, .libass, .vulkan, .libshaderc, .lcms2, .libplacebo, .libdav1d, .libuavs3d]
++        // SPIKE: `.libshaderc` removed. FFmpeg 062de19095 ("configure: remove libshaderc and
++        // libglslang support") is contained in release/9.0, so `--enable-libshaderc` is now an
++        // unknown option and configure dies on unknown options. Verified: the flag is absent
++        // from release/9.0's configure entirely (0 occurrences, vs 7 at n8.1.2), and a dry
++        // configure run with it appended prints `Unknown option "--enable-libshaderc".` and
++        // exits 1. This array only decides which `--enable-<name>` flags reach FFmpeg's
++        // configure, and only when the dependency's built artifact directory already exists
++        // (see the loop below). Shaderc remains built and shipped for libplacebo.
++        // Apple FFmpeg uses SecureTransport for TLS. GnuTLS remains built for libsmbclient,
++        // but FFmpeg must not select its unavailable tvOS system-trust implementation.
++        arguments += ["--disable-gnutls", "--enable-securetransport"]
++        var dependencyLibrary = [Library.gmp, .libfreetype, .libharfbuzz, .libfribidi, .libass, .vulkan, .lcms2, .libplacebo, .libdav1d, .libuavs3d]
+         if BaseBuild.options.enableGPL {
+             dependencyLibrary += [.libsmbclient]
+         }
+@@ -681,6 +750,21 @@ private class BuildFFMPEG: BaseBuild {
          "--enable-encoder=aac", "--enable-encoder=alac", "--enable-encoder=flac", "--enable-encoder=pcm*",
          "--enable-encoder=movtext", "--enable-encoder=mpeg4", "--enable-encoder=h264_videotoolbox",
          "--enable-encoder=hevc_videotoolbox", "--enable-encoder=prores", "--enable-encoder=prores_videotoolbox",
@@ -105,7 +171,7 @@ index e5f872c..b46a86f 100644
          // ./configure --list-protocols
          "--enable-protocols",
          // ./configure --list-demuxers
-@@ -778,10 +830,87 @@ private class BuildLuaJIT: ZipBaseBuild {
+@@ -778,10 +862,92 @@ private class BuildLuaJIT: ZipBaseBuild {
  }
  
  
@@ -161,14 +227,19 @@ index e5f872c..b46a86f 100644
 +// SPIKE: shared helpers for cloning a dependency at an exact commit. BaseBuild.beforeBuild
 +// can only clone a tag/branch via `--branch`, which cannot express a SHA.
 +enum SpikeGit {
-+    static func clonePinned(url: String, sha: String, into directoryURL: URL) throws {
++    static func clonePinned(url: String, sha: String, branch: String? = nil, into directoryURL: URL) throws {
 +        if FileManager.default.fileExists(atPath: directoryURL.path) {
 +            return
 +        }
-+        // Shallow-clone the default branch deep enough to contain the pin, then detach onto it.
-+        try! Utility.launch(path: "/usr/bin/git",
-+                            arguments: ["-c", "advice.detachedHead=false", "clone",
-+                                        "--depth", "150", url, directoryURL.path])
++        // Shallow-clone deep enough to contain the pin, then detach onto it. `branch` is
++        // required when the pin lives on a maintenance branch (FFmpeg release/9.0), because
++        // the default-branch clone would not contain that commit at any depth.
++        var cloneArgs = ["-c", "advice.detachedHead=false", "clone", "--depth", "150"]
++        if let branch {
++            cloneArgs += ["--branch", branch]
++        }
++        cloneArgs += [url, directoryURL.path]
++        try! Utility.launch(path: "/usr/bin/git", arguments: cloneArgs)
 +        try! Utility.launch(path: "/usr/bin/git",
 +                            arguments: ["-c", "advice.detachedHead=false", "checkout", sha],
 +                            currentDirectoryURL: directoryURL)
