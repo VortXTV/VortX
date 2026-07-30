@@ -963,9 +963,7 @@ actor PremiumizeResolver: DebridResolving {
         var req = URLRequest(url: c?.url ?? URL(string: Self.base)!)
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        req.httpBody = pairs
-            .map { "\($0.0)=\($0.1.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.1)" }
-            .joined(separator: "&").data(using: .utf8)
+        req.httpBody = DebridForm.encode(pairs)
         return try await DebridHTTP.decode(session, req)
     }
 }
@@ -975,8 +973,31 @@ actor PremiumizeResolver: DebridResolving {
 enum DebridForm {
     /// `application/x-www-form-urlencoded` body from string fields.
     static func encode(_ fields: [String: String]) -> Data {
-        fields.map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.value)" }
-            .joined(separator: "&").data(using: .utf8) ?? Data()
+        encode(fields.map { ($0.key, $0.value) })
+    }
+
+    /// Repeated-key variant for provider endpoints such as `items[]=...`.
+    static func encode(_ fields: [(String, String)]) -> Data {
+        Data(fields.map { "\(encodeComponent($0.0))=\(encodeComponent($0.1))" }
+            .joined(separator: "&").utf8)
+    }
+
+    /// WHATWG-style form component encoding. A literal `+` must be `%2B`, while a space becomes `+`.
+    /// Encoding the UTF-8 bytes directly keeps `&` and `=` inside magnet links from becoming form separators.
+    private static func encodeComponent(_ value: String) -> String {
+        var encoded = ""
+        encoded.reserveCapacity(value.utf8.count)
+        for byte in value.utf8 {
+            switch byte {
+            case 0x41...0x5A, 0x61...0x7A, 0x30...0x39, 0x2D, 0x2E, 0x5F, 0x7E:
+                encoded.unicodeScalars.append(UnicodeScalar(byte))
+            case 0x20:
+                encoded.append("+")
+            default:
+                encoded.append(String(format: "%%%02X", byte))
+            }
+        }
+        return encoded
     }
 }
 
