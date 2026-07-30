@@ -419,21 +419,10 @@ fn spawn_monitor(child: Arc<Mutex<Option<Child>>>, shutdown: Arc<AtomicBool>) {
         .spawn(move || loop {
             // Poll the live child for exit. Hold the lock only for the non-blocking `try_wait()`, so
             // `stop()` can acquire it between polls to kill the child.
-            let exit = {
-                let mut guard = match child.lock() {
-                    Ok(g) => g,
-                    Err(_) => return,
-                };
-                match guard.as_mut() {
-                    // Still running: release the lock, sleep, poll again.
-                    Some(c) => match c.try_wait() {
-                        Ok(None) => None,
-                        Ok(Some(status)) => Some(format!("exit {status}")),
-                        Err(err) => Some(format!("wait error: {err}")),
-                    },
-                    // `stop()` took the child (or it was already killed) — nothing left to monitor.
-                    None => return,
-                }
+            let exit = match poll_child(&child) {
+                ChildPoll::Running => None,
+                ChildPoll::Exited(detail) => Some(detail),
+                ChildPoll::Empty | ChildPoll::Poisoned => return,
             };
 
             let detail = match exit {
@@ -544,6 +533,40 @@ fn spawn_monitor(child: Arc<Mutex<Option<Child>>>, shutdown: Arc<AtomicBool>) {
             }
         })
         .ok();
+}
+
+enum ChildPoll {
+    Running,
+    Exited(String),
+    Empty,
+    Poisoned,
+}
+
+/// Poll the child and clear the shared slot atomically when it exits. The monitor must leave the slot
+/// empty before attempting a restart, otherwise the replacement process is treated as an orphan and
+/// killed immediately.
+fn poll_child(child: &Arc<Mutex<Option<Child>>>) -> ChildPoll {
+    let mut guard = match child.lock() {
+        Ok(g) => g,
+        Err(_) => return ChildPoll::Poisoned,
+    };
+    let result = match guard.as_mut() {
+        Some(c) => c.try_wait(),
+        None => return ChildPoll::Empty,
+    };
+    match result {
+        Ok(None) => ChildPoll::Running,
+        Ok(Some(status)) => {
+            guard.take();
+            ChildPoll::Exited(format!("exit {status}"))
+        }
+        Err(err) => {
+            if let Some(child) = guard.take() {
+                kill_child(child);
+            }
+            ChildPoll::Exited(format!("wait error: {err}"))
+        }
+    }
 }
 
 /// Force-kill a child and reap it. Used by both `stop()` and the monitor's shutdown-race path so we
@@ -768,6 +791,40 @@ mod tests {
         assert!(
             shutdown.load(Ordering::SeqCst),
             "stop() must set the shutdown flag so the monitor does not restart the killed child"
+        );
+    }
+
+    #[test]
+    fn exited_child_is_removed_before_restart() {
+        let child = {
+            #[cfg(not(target_os = "windows"))]
+            {
+                Command::new("true").spawn().expect("spawn true")
+            }
+            #[cfg(target_os = "windows")]
+            {
+                Command::new("cmd")
+                    .args(["/C", "exit", "0"])
+                    .spawn()
+                    .expect("spawn exit")
+            }
+        };
+        let shared = Arc::new(Mutex::new(Some(child)));
+        let mut exited = false;
+        for _ in 0..50 {
+            match poll_child(&shared) {
+                ChildPoll::Running => std::thread::sleep(Duration::from_millis(10)),
+                ChildPoll::Exited(_) => {
+                    exited = true;
+                    break;
+                }
+                ChildPoll::Empty | ChildPoll::Poisoned => break,
+            }
+        }
+        assert!(exited, "dummy child should exit during the test");
+        assert!(
+            shared.lock().expect("child lock").is_none(),
+            "the dead child must not occupy the slot used by the replacement"
         );
     }
 
