@@ -126,7 +126,7 @@ private enum class Tab(
 
 /// The whole app: a five-tab shell matching the iOS and Apple TV structure, with a detail overlay.
 /// [repo] defaults to the offline preview source; the real stremio-core engine is injected here (from
-/// `VortXApplication`), with no change to any screen — every screen consumes a ViewModel, and every
+/// `VortXApplication`), with no change to any screen; every screen consumes a ViewModel, and every
 /// ViewModel depends only on [CatalogRepository] (or, for the account screen, [AuthRepository]).
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -210,7 +210,7 @@ fun StremioXApp(
         val accountVm: AccountViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo, auth = auth))
 
         // The debug-only design-system gallery (S02) is the topmost overlay when open, above even the
-        // detail/player layers below — it is a review tool, not part of the product navigation graph.
+        // detail/player layers below; it is a review tool, not part of the product navigation graph.
         if (showGallery) {
             // Hardware/gesture Back dismisses the overlay instead of exiting the app. Every overlay layer
             // in this shell installs its own BackHandler the same way: with none, the system back (which

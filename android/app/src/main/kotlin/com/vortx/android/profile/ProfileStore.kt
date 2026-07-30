@@ -21,7 +21,7 @@ import org.json.JSONArray
  *
  * This is the LINCHPIN foundation the sync engine, realtime, and Trakt mirrors (next waves) build on,
  * and that per-profile watch / prefs / ranking key off. It ports the hard-won roster-merge guards
- * (union-never-shrink, owner-singleton, dup-Main / delete-resurrection) faithfully — see the WHY
+ * (union-never-shrink, owner-singleton, dup-Main / delete-resurrection) faithfully; see the WHY
  * comments; do NOT simplify them.
  *
  * SINGLETON: Apple has `ProfileStore.shared`; Android needs a `Context` for [SharedPreferences], so
@@ -33,7 +33,7 @@ import org.json.JSONArray
  * (resolve a per-profile token slot), plus the [WatchOverlayStore] push seams.
  *
  * RELOAD HOOKS: on every profile switch / sync fold, [notifySwitchListeners] fires the registered
- * listeners — `EngineStremioRepository` registers `{ SourcePreferences.reload(); SourcePin.reload() }`,
+ * listeners; `EngineStremioRepository` registers `{ SourcePreferences.reload(); SourcePin.reload() }`,
  * and `SourcePinStore` reads [activeProfileId] for its per-profile key, so per-profile source-ranking
  * isolation becomes real the moment a switch happens.
  */
@@ -118,7 +118,7 @@ class ProfileStore private constructor(context: Context) {
 
     /**
      * The token slot for [profile]. The owner IS the primary account (always the primary slot, whatever
-     * `usesOwnAccount` says — a synced roster once flipped that flag on the owner and "signed out" every
+     * `usesOwnAccount` says; a synced roster once flipped that flag on the owner and "signed out" every
      * device). Mirrors Apple `keychainAccount(for:)`.
      */
     fun keychainAccount(profile: UserProfile): String = keychainAccount(profile.isOwner, profile.usesOwnAccount, profile.id)
@@ -277,7 +277,7 @@ class ProfileStore private constructor(context: Context) {
             subtitleLang = base?.subtitleLang ?: lang,
             forcedPolicy = base?.forcedPolicy ?: "forced",
             // Subtitle style: carry a synced value, else seed Apple's documented SubtitleStyle.default*
-            // (modern / m / white / outline), NOT "" — an empty string synced to Apple blanks its styling.
+            // (modern / m / white / outline), NOT "": an empty string synced to Apple blanks its styling.
             subFont = base?.subFont ?: DEFAULT_SUB_FONT,
             subSize = base?.subSize ?: DEFAULT_SUB_SIZE,
             subColor = base?.subColor ?: DEFAULT_SUB_COLOR,
@@ -544,7 +544,7 @@ class ProfileStore private constructor(context: Context) {
     }
 
     /**
-     * UNION the live roster with [incoming] by profile id — the core cross-device safety guarantee: a
+     * UNION the live roster with [incoming] by profile id, the core cross-device safety guarantee: a
      * profile present on only ONE side is ALWAYS kept, so a cloud blob carrying fewer profiles can never
      * delete a richer local roster, and vice versa. For an id on BOTH sides, the newer roster (by
      * [incomingModified] vs [rosterModified], both epoch-SECONDS) wins the fields; either way the id is retained. Delete
@@ -602,7 +602,7 @@ class ProfileStore private constructor(context: Context) {
     /**
      * The owner profile can never be an own-account profile; scrub the flag. Then enforce the owner
      * SINGLETON: one account, one owner, with a STABLE id. A restore/merge can leave more than one (the
-     * account owner adopted alongside a leftover local placeholder minted with a random id — the
+     * account owner adopted alongside a leftover local placeholder minted with a random id, the
      * duplicate-"Main" bug). Collapse to ONE direction-independently: keep the genuine account owner
      * (identified by its account email), DROP the duplicates (an owner reads the account history and
      * carries no private overlay, so a clone has nothing unique to lose). Then re-key the survivor onto
@@ -627,8 +627,8 @@ class ProfileStore private constructor(context: Context) {
             if (activeID != null && dropIDs.contains(activeID)) activeID = keepID
         }
 
-        // Re-key the surviving owner onto the stable id (skip if it carries a PIN — its hash is salted with
-        // the current id, so re-keying would silently break the PIN — or if some other profile already
+        // Re-key the surviving owner onto the stable id (skip if it carries a PIN because its hash is salted with
+        // the current id, so re-keying would silently break the PIN, or if some other profile already
         // holds the stable id).
         val survivor = list.indexOfFirst { it.isOwner }
         if (survivor >= 0) {
@@ -648,7 +648,7 @@ class ProfileStore private constructor(context: Context) {
     /**
      * Collapse ACCIDENTAL duplicate secondaries: when two or more non-owner profiles share the same name
      * (trimmed, case-insensitive), an EMPTY one (no watch overlay) is almost always a cross-device sync
-     * artifact — the same person's profile re-created with a fresh id on another device — so the union
+     * artifact, the same person's profile re-created with a fresh id on another device, so the union
      * keeps both and the user sees a second "Daksh" a delete cannot clear. Drop AND tombstone the empty
      * duplicate. A profile that carries its OWN watch history is NEVER auto-removed. Mirrors Apple
      * `collapseEmptyDuplicateSecondaries`.

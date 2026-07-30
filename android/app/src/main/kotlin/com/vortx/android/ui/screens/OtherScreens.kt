@@ -225,7 +225,7 @@ fun SearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifie
 /// [onVortxAccountClick]); the Stremio row below it is real too (S03): it reflects the live engine
 /// [AuthState] and opens [AccountScreen] via
 /// [onAccountClick]. The Add-ons row (S04) opens the add-on management screen via [onAddonsClick]. In
-/// debug builds only, one extra row opens the S02 design-system gallery for visual review — the boundary
+/// debug builds only, one extra row opens the S02 design-system gallery for visual review; the boundary
 /// is [BuildConfig.DEBUG], not a build variant, so it never ships in a release build.
 ///
 /// The Playback row opens [PlaybackSettingsScreen]. It REPLACES two hardcoded rows ("Audio output / Auto"
