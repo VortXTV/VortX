@@ -6,6 +6,7 @@ import com.vortx.android.debrid.DebridService
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -287,12 +288,36 @@ object TorBoxSearch {
 /// the same title does not re-hit the index. The Kotlin port of Apple `TorBoxSearchSource` (the `@StateObject`
 /// class): `@Published streams` becomes a [StateFlow], the SwiftUI `Task` becomes a coroutine [Job] on an
 /// owned scope, and the session cache / cooldown / in-flight bookkeeping is preserved field-for-field.
-class TorBoxSearchSource(
-    private val debridKeys: DebridKeys,
-    /// The scope the fetch coroutines run on. Owned + cancellable via [close]; defaults to an IO scope so a
-    /// caller that never provides one still works standalone (matching Apple's self-owned `Task`).
-    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+class TorBoxSearchSource private constructor(
+    private val torBoxConfigured: () -> Boolean,
+    private val torBoxKey: () -> String,
+    private val scope: CoroutineScope,
+    private val fetchStreams: suspend (String, Int?, Int?, String) -> TorBoxSearch.Result,
 ) {
+    constructor(
+        debridKeys: DebridKeys,
+        /// The scope the fetch coroutines run on. Owned + cancellable via [close]; defaults to an IO scope so
+        /// a caller that never provides one still works standalone (matching Apple's self-owned `Task`).
+        scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    ) : this(
+        torBoxConfigured = { debridKeys.isConfigured(DebridService.TOR_BOX) },
+        torBoxKey = { debridKeys.key(DebridService.TOR_BOX) },
+        scope = scope,
+        fetchStreams = TorBoxSearch::streams,
+    )
+
+    /// Deterministic test seam for the asynchronous fetch boundary. Production always uses the public
+    /// [DebridKeys] constructor above.
+    internal constructor(
+        scope: CoroutineScope,
+        fetchStreams: suspend (String, Int?, Int?, String) -> TorBoxSearch.Result,
+    ) : this(
+        torBoxConfigured = { true },
+        torBoxKey = { "test-key" },
+        scope = scope,
+        fetchStreams = fetchStreams,
+    )
+
     private val _streams = MutableStateFlow<List<StreamSource>>(emptyList())
 
     /// The extra streams from the search index, ready to merge. Empty until a fetch completes (and always with
@@ -301,6 +326,7 @@ class TorBoxSearchSource(
     val streams: StateFlow<List<StreamSource>> = _streams.asStateFlow()
 
     private val epochCounter = AtomicInteger(0)
+    private val stateLock = Any()
 
     /// Monotonic epoch bumped whenever [streams] is REPLACED. [com.vortx.android.engine.SourceListModel] folds
     /// this into its O(1) rebuild signature (a single Int compare instead of hashing the array). Mirrors the
@@ -319,40 +345,60 @@ class TorBoxSearchSource(
     /// `refresh`.
     fun refresh(imdbId: String?, season: Int? = null, episode: Int? = null) {
         if (imdbId == null || !imdbId.startsWith("tt")) return
-        if (!debridKeys.isConfigured(DebridService.TOR_BOX)) return // gate: no TorBox key -> no-op
+        if (!torBoxConfigured()) return // gate: no TorBox key -> no-op
         val fetchKey = "$imdbId|${season ?: -1}|${episode ?: -1}"
-        // New title: publish its cached results (or clear), so the prior title's streams never linger.
-        if (fetchKey != shownKey) {
-            shownKey = fetchKey
-            publish(cache[fetchKey] ?: emptyList())
-        }
-        if (cache.containsKey(fetchKey)) return // cached: already published above, no round trip
-        if (inFlightKey == fetchKey) return // the paired refreshes for this id: fetch once
-        cooldownUntilMs?.let { if (it > System.currentTimeMillis()) return } // in scraper cooldown: don't burn
-        job?.cancel()
-        inFlightKey = fetchKey
-        val key = debridKeys.key(DebridService.TOR_BOX)
-        job = scope.launch {
-            val result = TorBoxSearch.streams(imdbId, season, episode, apiKey = key)
-            if (!isActive) return@launch
-            inFlightKey = null
-            if (result.rateLimited) {
-                // Over the TorBox scraper allowance. Back off ~15 min before re-probing; do NOT cache the
-                // empty result, so it re-fetches once the cooldown lifts.
-                cooldownUntilMs = System.currentTimeMillis() + COOLDOWN_MS
-                Log.i(TAG, "rate-limited (scraper cooldown) for id=$imdbId, backing off ~15m")
-                return@launch
+        val key = torBoxKey()
+        val launched = synchronized(stateLock) {
+            // New title: publish its cached results (or clear), so the prior title's streams never linger.
+            if (fetchKey != shownKey) {
+                shownKey = fetchKey
+                publishLocked(cache[fetchKey] ?: emptyList())
             }
-            if (result.transportError) {
-                // The request never completed (offline / network failure). Do NOT cache the empty result and
-                // do NOT set a cooldown, so the next meta change re-fetches once the network is back.
-                Log.i(TAG, "transport error for id=$imdbId, not caching, will retry")
-                return@launch
-            }
-            Log.i(TAG, "fetched ${result.streams.size} stream(s) for id=$imdbId")
-            cache[fetchKey] = result.streams
-            if (shownKey == fetchKey) publish(result.streams)
+            if (cache.containsKey(fetchKey)) return // cached: already published above, no round trip
+            if (inFlightKey == fetchKey) return // the paired refreshes for this id: fetch once
+            if ((cooldownUntilMs ?: 0L) > System.currentTimeMillis()) return // don't burn scraper allowance
+
+            job?.cancel()
+            inFlightKey = fetchKey
+            scope.launch(start = CoroutineStart.LAZY) {
+                val ownerJob = coroutineContext[Job]
+                try {
+                    val result = fetchStreams(imdbId, season, episode, key)
+                    if (!isActive) return@launch
+                    synchronized(stateLock) {
+                        // A newer refresh may have canceled this fetch and claimed the slot. A late blocking
+                        // response must never clear or publish over that newer request.
+                        if (job !== ownerJob || inFlightKey != fetchKey) return@synchronized
+                        inFlightKey = null
+                        job = null
+                        if (result.rateLimited) {
+                            // Over the TorBox scraper allowance. Back off ~15 min before re-probing; do NOT
+                            // cache the empty result, so it re-fetches once the cooldown lifts.
+                            cooldownUntilMs = System.currentTimeMillis() + COOLDOWN_MS
+                            Log.i(TAG, "rate-limited (scraper cooldown) for id=$imdbId, backing off ~15m")
+                        } else if (result.transportError) {
+                            // The request never completed (offline / network failure). Do NOT cache the empty
+                            // result and do NOT set a cooldown, so the next meta change re-fetches.
+                            Log.i(TAG, "transport error for id=$imdbId, not caching, will retry")
+                        } else {
+                            Log.i(TAG, "fetched ${result.streams.size} stream(s) for id=$imdbId")
+                            cache[fetchKey] = result.streams
+                            if (shownKey == fetchKey) publishLocked(result.streams)
+                        }
+                    }
+                } finally {
+                    synchronized(stateLock) {
+                        // Also release a fetch canceled before it could return (including a canceled scope).
+                        // Identity checks keep an obsolete completion from clobbering a newer request.
+                        if (job === ownerJob && inFlightKey == fetchKey) {
+                            inFlightKey = null
+                            job = null
+                        }
+                    }
+                }
+            }.also { job = it }
         }
+        launched.start()
     }
 
     /// Empty the PUBLISHED results (and the shown-key, so a later refresh for the same title re-publishes from
@@ -361,13 +407,19 @@ class TorBoxSearchSource(
     /// Mirrors Apple `clearResults`. A still-in-flight fetch is left running ON PURPOSE (the shownKey guard
     /// already blocks a stale publish).
     fun clearResults() {
-        shownKey = null
-        if (_streams.value.isNotEmpty()) publish(emptyList())
+        synchronized(stateLock) {
+            shownKey = null
+            if (_streams.value.isNotEmpty()) publishLocked(emptyList())
+        }
     }
 
     /// Cancel any in-flight fetch and tear down the owned scope. Call when the owning screen goes away.
     fun close() {
-        job?.cancel()
+        synchronized(stateLock) {
+            job?.cancel()
+            job = null
+            inFlightKey = null
+        }
         scope.coroutineContext[Job]?.cancel()
     }
 
@@ -375,7 +427,8 @@ class TorBoxSearchSource(
     /// there is nothing to add. Mirrors Apple `merged(into:)`.
     fun merged(into: List<StreamGroup>): List<StreamGroup> = merge(_streams.value, into)
 
-    private fun publish(value: List<StreamSource>) {
+    /// Caller holds [stateLock].
+    private fun publishLocked(value: List<StreamSource>) {
         _streams.value = value
         epochCounter.incrementAndGet()
     }
