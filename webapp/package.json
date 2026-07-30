@@ -26,9 +26,9 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "deploy": "npm run build && wrangler pages deploy dist --project-name=vortx-web",
+    "deploy": "tsc && vite build && wrangler pages deploy dist --project-name=vortx-web",
     "test:pages-contract": "node scripts/cloudflare-pages-contract.test.mjs",
-    "test": "npm run test:pages-contract && node --test src/lib/*.test.mjs"
+    "test": "node scripts/cloudflare-pages-contract.test.mjs && node --test src/lib/*.test.mjs"
   },
   "dependencies": {
     "@types/qrcode": "^1.5.6",

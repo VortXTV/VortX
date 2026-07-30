@@ -32,6 +32,19 @@ assert.equal(lock.packages[""].engines.node, `>=${nodeVersion}`);
 assert.equal(lock.packages[""].engines.npm, npmVersion);
 assert.equal(read(".node-version").trim(), nodeVersion);
 assert.equal(read(".npmrc").trim(), "engine-strict=true");
+assert.equal(
+  packageJson.scripts.test,
+  "node scripts/cloudflare-pages-contract.test.mjs && node --test src/lib/*.test.mjs",
+);
+assert.equal(
+  packageJson.scripts.deploy,
+  "tsc && vite build && wrangler pages deploy dist --project-name=vortx-web",
+);
+assert.doesNotMatch(
+  `${packageJson.scripts.test}\n${packageJson.scripts.deploy}`,
+  /(^|[;&|]\s*)npm\s+run\b/,
+  "scripts entered through Corepack must not escape to Node's bundled npm",
+);
 
 for (const [label, value] of [
   ["Pages root directory", rootDirectory],
