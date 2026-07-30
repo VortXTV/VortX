@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -19,6 +20,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -28,9 +30,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.vortx.android.model.LanguagePriority
 import com.vortx.android.model.TrackPreferences
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.AudioOutputMode
@@ -39,6 +44,7 @@ import com.vortx.android.player.DiskCacheSetting
 import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.skip.SkipConfig
+import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import kotlin.math.roundToInt
@@ -205,32 +211,18 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 
             SettingsSection(
                 title = "Audio & subtitle languages",
-                footer = "The player picks tracks in this order when a title ships more than one. Fallback " +
-                    "is used when your first choice is not in the file.",
+                footer = "The player tries every language in order. Add as many as you need, then move " +
+                    "them earlier or later to set priority.",
             ) {
-                PickerRow(
+                LanguagePriorityEditor(
                     label = "Audio",
-                    options = TrackPreferences.commonLanguages,
-                    selectedId = primaryOf(trackPrefs.audioLanguages),
-                    onSelect = { updateTracks(trackPrefs.copy(audioLanguages = setPrimary(trackPrefs.audioLanguages, it))) },
+                    languages = trackPrefs.audioLanguages,
+                    onChange = { updateTracks(trackPrefs.copy(audioLanguages = it)) },
                 )
-                PickerRow(
-                    label = "Audio fallback",
-                    options = languageOptionsWithNone,
-                    selectedId = fallbackOf(trackPrefs.audioLanguages),
-                    onSelect = { updateTracks(trackPrefs.copy(audioLanguages = setFallback(trackPrefs.audioLanguages, it))) },
-                )
-                PickerRow(
+                LanguagePriorityEditor(
                     label = "Subtitle",
-                    options = TrackPreferences.commonLanguages,
-                    selectedId = primaryOf(trackPrefs.subtitleLanguages),
-                    onSelect = { updateTracks(trackPrefs.copy(subtitleLanguages = setPrimary(trackPrefs.subtitleLanguages, it))) },
-                )
-                PickerRow(
-                    label = "Subtitle fallback",
-                    options = languageOptionsWithNone,
-                    selectedId = fallbackOf(trackPrefs.subtitleLanguages),
-                    onSelect = { updateTracks(trackPrefs.copy(subtitleLanguages = setFallback(trackPrefs.subtitleLanguages, it))) },
+                    languages = trackPrefs.subtitleLanguages,
+                    onChange = { updateTracks(trackPrefs.copy(subtitleLanguages = it)) },
                 )
             }
 
@@ -326,33 +318,110 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Language list <-> primary/fallback, ported from Apple's bindings
+// Language priority editor
 // ---------------------------------------------------------------------------------------------------
 
-/// The sentinel for "no fallback". Apple uses an empty tag on the fallback pickers
-/// (iOSSettingsView.swift:1339), which encodes as a one-element list.
-private const val NO_FALLBACK = ""
+@Composable
+private fun LanguagePriorityEditor(
+    label: String,
+    languages: List<String>,
+    onChange: (List<String>) -> Unit,
+) {
+    val colors = VortXTheme.colors
+    val ordered = LanguagePriority.normalized(languages)
+    val labels = TrackPreferences.commonLanguages.toMap()
+    val available = TrackPreferences.commonLanguages.filterNot { (id, _) -> id in ordered }
 
-private val languageOptionsWithNone: List<Pair<String, String>> =
-    listOf(NO_FALLBACK to "None") + TrackPreferences.commonLanguages
-
-/// Apple `primaryAudioLang.get` (iOSSettingsView.swift:1329): first element, defaulting to "en".
-private fun primaryOf(langs: List<String>): String = langs.firstOrNull() ?: "en"
-
-/// Apple `fallbackAudioLang.get` (iOSSettingsView.swift:1339): second element, else empty.
-private fun fallbackOf(langs: List<String>): String = langs.getOrNull(1) ?: NO_FALLBACK
-
-/// Apple `primaryAudioLang.set`: keep the fallback only when it exists AND differs from the new primary,
-/// so the chain can never contain the same language twice.
-private fun setPrimary(langs: List<String>, newPrimary: String): List<String> {
-    val fallback = langs.getOrNull(1) ?: NO_FALLBACK
-    return if (fallback.isEmpty() || fallback == newPrimary) listOf(newPrimary) else listOf(newPrimary, fallback)
+    Column(
+        modifier = Modifier.padding(horizontal = VortXTheme.spacing.sm, vertical = VortXTheme.spacing.xs),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+    ) {
+        Text(label, style = VortXTheme.type.label.copy(color = colors.textSecondary))
+        ordered.forEachIndexed { index, language ->
+            key(language) {
+                val languageLabel = labels[language] ?: language.uppercase()
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(VortXTheme.radius.card))
+                        .background(colors.surface2)
+                        .padding(VortXTheme.spacing.xs),
+                    verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+                ) {
+                    Text(
+                        "${index + 1}. $languageLabel",
+                        style = VortXTheme.type.body.copy(color = colors.textPrimary),
+                    )
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+                        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+                    ) {
+                        Chip(
+                            label = "Earlier",
+                            selected = false,
+                            enabled = index > 0,
+                            modifier = Modifier.semantics {
+                                contentDescription = languageActionDescription(
+                                    action = LanguagePriorityAction.EARLIER,
+                                    languageLabel = languageLabel,
+                                )
+                            },
+                            onClick = { onChange(LanguagePriority.move(ordered, index, -1)) },
+                        )
+                        Chip(
+                            label = "Later",
+                            selected = false,
+                            enabled = index < ordered.lastIndex,
+                            modifier = Modifier.semantics {
+                                contentDescription = languageActionDescription(
+                                    action = LanguagePriorityAction.LATER,
+                                    languageLabel = languageLabel,
+                                )
+                            },
+                            onClick = { onChange(LanguagePriority.move(ordered, index, 1)) },
+                        )
+                        Chip(
+                            label = "Remove",
+                            selected = false,
+                            enabled = ordered.size > 1,
+                            modifier = Modifier.semantics {
+                                contentDescription = languageActionDescription(
+                                    action = LanguagePriorityAction.REMOVE,
+                                    languageLabel = languageLabel,
+                                )
+                            },
+                            accent = colors.danger,
+                            accentText = colors.danger,
+                            onClick = { onChange(LanguagePriority.remove(ordered, index)) },
+                        )
+                    }
+                }
+            }
+        }
+        if (available.isNotEmpty()) {
+            PickerRow(
+                label = "Add language",
+                options = available,
+                selectedId = "",
+                onSelect = { onChange(LanguagePriority.add(ordered, it)) },
+            )
+        }
+    }
 }
 
-/// Apple `fallbackAudioLang.set`: an empty or duplicate fallback collapses the chain to the primary alone.
-private fun setFallback(langs: List<String>, newFallback: String): List<String> {
-    val primary = langs.firstOrNull() ?: "en"
-    return if (newFallback.isEmpty() || newFallback == primary) listOf(primary) else listOf(primary, newFallback)
+internal enum class LanguagePriorityAction {
+    EARLIER,
+    LATER,
+    REMOVE,
+}
+
+internal fun languageActionDescription(
+    action: LanguagePriorityAction,
+    languageLabel: String,
+): String = when (action) {
+    LanguagePriorityAction.EARLIER -> "Move $languageLabel earlier"
+    LanguagePriorityAction.LATER -> "Move $languageLabel later"
+    LanguagePriorityAction.REMOVE -> "Remove $languageLabel"
 }
 
 /// The crowd skip-database choices. The ids are the EXACT strings [SkipConfig.provider] stores and
