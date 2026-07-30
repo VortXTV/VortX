@@ -36,7 +36,7 @@ concurrency:
 
 jobs:
   watch:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Report runs stopped on an approval
         env:
