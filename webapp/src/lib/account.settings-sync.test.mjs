@@ -246,15 +246,52 @@ test("settings sync writes only owner edits and never echoes hydration or overla
     "overlay switching and deletion must not create an owner write",
   );
 
+  const remoteDoc = structuredClone(accountDoc);
+  remoteDoc.vortx.updatedAt = 20;
+  remoteDoc.vortx.profiles[0].settings.accentID = "forest";
+  serverVersion = 20;
+  serverDocument = await sealDocument(
+    dataKey,
+    new TextEncoder().encode(JSON.stringify(remoteDoc)),
+    accountSession.account.id,
+    serverVersion,
+    false,
+  );
+
   const globalProfile = addProfile("Global editor", "🎬");
   assert.equal(activeProfileId(), globalProfile.id);
   const schedulesBeforeGlobalEdit = settingsTimerSchedules;
-  updateSettings({ tmdbKey: "new-global-key" });
+  updateSettings({ tmdbKey: "new-global-key", safetyFilter: "strict" });
   await waitForSettingsPush();
   assert.equal(
     settingsTimerSchedules,
     schedulesBeforeGlobalEdit + 1,
     "an account-global metadata edit remains syncable while an overlay is active",
+  );
+  const overlayPut = requests.find((request) => request.init.method === "PUT");
+  const overlayPutBody = JSON.parse(String(overlayPut.init.body));
+  const overlayPlaintext = await openDocument(
+    dataKey,
+    overlayPutBody.document,
+    accountSession.account.id,
+    overlayPutBody.version,
+  );
+  assert.ok(overlayPlaintext, "the overlay settings write must remain a valid account document");
+  const overlayWritten = JSON.parse(new TextDecoder().decode(overlayPlaintext));
+  assert.equal(
+    overlayWritten.apiKeys.tmdb,
+    "new-global-key",
+    "the global metadata edit is written to the encrypted account document",
+  );
+  assert.equal(
+    overlayWritten.profileEdits.roster[0].settings.accentID,
+    "forest",
+    "an overlay shared-setting write preserves a newer remote owner appearance",
+  );
+  assert.equal(
+    overlayWritten.profileEdits.roster[0].settings.playback.safetyMode,
+    "strict",
+    "the overlay shared-setting delta reaches the owner without replacing unrelated owner fields",
   );
   setActiveProfile(ownerId);
   assert.equal(
@@ -299,7 +336,7 @@ test("settings sync writes only owner edits and never echoes hydration or overla
   assert.equal(written.profileEdits.roster[0].settings.oled, false, "overlay appearance never leaks into the owner write");
   assert.equal(
     written.profileEdits.roster[0].settings.playback.safetyMode,
-    "off",
-    "overlay-only playback settings never leak into the owner write",
+    "strict",
+    "the shared playback setting survives the later owner write",
   );
 });

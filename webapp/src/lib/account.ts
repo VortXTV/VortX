@@ -31,7 +31,13 @@ import {
   type SyncedProfile,
 } from "./profiles";
 import { getSettings, updateSettings, onSettingsChange, type Settings } from "./settings";
-import { settingsPatchFromDoc, mergeWebappSettingsIntoProfile, effectiveMainSettings, mainProfileId } from "./syncSettings";
+import {
+  settingsPatchFromDoc,
+  mergeWebappSettingsIntoProfile,
+  mergeWebappSettingsPatchIntoProfile,
+  effectiveMainSettings,
+  mainProfileId,
+} from "./syncSettings";
 import { CINEMETA_URL, loadAddon } from "./addon";
 import type { MetaItem } from "./types";
 
@@ -359,8 +365,11 @@ function sharedSettingsPatch(settings: Partial<Settings>): Partial<Settings> {
   return shared;
 }
 
-function sameSettings(a: Settings, b: Settings): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+function changedSettingKeys(a: Settings, b: Settings): (keyof Settings)[] {
+  return (Object.keys(b) as (keyof Settings)[]).filter((key) => {
+    if (key === "sourceOrder") return JSON.stringify(a.sourceOrder) !== JSON.stringify(b.sourceOrder);
+    return a[key] !== b[key];
+  });
 }
 
 function initialOwnerSettings(): Settings {
@@ -396,12 +405,18 @@ onProfilesChange(() => {
   if (isOwnerProfile(profileId)) restoreOwnerSettings();
 });
 
-/** Push the webapp's settings up to the MAIN profile via doc.profileEdits (dashboard-compatible shape).
+/** Push the changed webapp settings up to the MAIN profile via doc.profileEdits (dashboard-compatible shape).
  *  Builds the full roster from the synced profiles (idempotent for unchanged ones, matching the dashboard
  *  buildRoster: non-main entries are {id,name} so the app no-ops them) and merges the webapp-owned keys
  *  over the main profile's existing settings, preserving keys the webapp does not model (avatar, isKids,
- *  ...). No-op when there is no synced main profile yet. Fail-soft. */
-async function pushSettings(session: Session, s: Settings): Promise<void> {
+ *  ...). The delta is applied to the latest fetched base so unrelated changes from another device survive.
+ *  No-op when there is no synced main profile yet. Fail-soft. */
+async function pushSettings(
+  session: Session,
+  s: Settings,
+  changedKeys: readonly (keyof Settings)[],
+  writeFullProfile: boolean,
+): Promise<void> {
   try {
     await mutateSyncDoc(session, (doc) => {
       const mainId = mainProfileId(doc);
@@ -410,19 +425,40 @@ async function pushSettings(session: Session, s: Settings): Promise<void> {
       const profiles = (Array.isArray(vortx.profiles) ? vortx.profiles : []) as Record<string, unknown>[];
       const edits = (doc.profileEdits && typeof doc.profileEdits === "object" ? doc.profileEdits : {}) as Record<string, unknown>;
       const base = effectiveMainSettings(doc); // freshest known main settings (app mirror + newer overlay)
-      const roster = profiles
-        .filter((p) => p.id != null)
-        .map((p) => {
-          const id = String(p.id);
-          const name = String(p.name ?? "Profile");
-          return id === mainId ? { id, name, settings: mergeWebappSettingsIntoProfile(base, s) } : { id, name };
-        });
-      doc.profileEdits = {
-        ...edits,
-        editedAt: Date.now(),
-        roster,
-        libraryAdds: (edits as Record<string, unknown>).libraryAdds ?? {},
-      };
+      const merged = writeFullProfile
+        ? mergeWebappSettingsIntoProfile(base, s)
+        : mergeWebappSettingsPatchIntoProfile(base, s, changedKeys);
+      if (JSON.stringify(merged) !== JSON.stringify(base)) {
+        const roster = profiles
+          .filter((p) => p.id != null)
+          .map((p) => {
+            const id = String(p.id);
+            const name = String(p.name ?? "Profile");
+            return id === mainId ? { id, name, settings: merged } : { id, name };
+          });
+        doc.profileEdits = {
+          ...edits,
+          editedAt: Date.now(),
+          roster,
+          libraryAdds: (edits as Record<string, unknown>).libraryAdds ?? {},
+        };
+      }
+
+      if (changedKeys.includes("tmdbKey") || changedKeys.includes("mdblistKey")) {
+        const apiKeys =
+          doc.apiKeys && typeof doc.apiKeys === "object"
+            ? { ...(doc.apiKeys as Record<string, unknown>) }
+            : {};
+        if (changedKeys.includes("tmdbKey")) {
+          if (s.tmdbKey) apiKeys.tmdb = s.tmdbKey;
+          else delete apiKeys.tmdb;
+        }
+        if (changedKeys.includes("mdblistKey")) {
+          if (s.mdblistKey) apiKeys.mdblist = s.mdblistKey;
+          else delete apiKeys.mdblist;
+        }
+        doc.apiKeys = apiKeys;
+      }
     });
   } catch {
     // fail-soft: the local change is already saved; the next change retries the push.
@@ -642,7 +678,8 @@ onSettingsChange((next) => {
   const ownerNext = isOwnerProfile(profileId)
     ? copySettings(next)
     : mergeOwnerSettings(sharedSettingsPatch(next));
-  if (!isOwnerProfile(profileId) && sameSettings(previousOwner, ownerNext)) {
+  const changedKeys = changedSettingKeys(previousOwner, ownerNext);
+  if (!changedKeys.length) {
     return; // the overlay changed only one of its six profile-scoped fields
   }
   rememberOwnerSettings(ownerNext);
@@ -651,7 +688,7 @@ onSettingsChange((next) => {
   if (settingsPushTimer) clearTimeout(settingsPushTimer);
   settingsPushTimer = setTimeout(() => {
     const cur = currentSession();
-    if (cur) void pushSettings(cur, ownerNext);
+    if (cur) void pushSettings(cur, ownerNext, changedKeys, isOwnerProfile(profileId));
   }, SETTINGS_PUSH_DELAY);
 });
 
