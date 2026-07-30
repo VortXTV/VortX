@@ -161,8 +161,14 @@ let rules: [Rule] = [
             if let settings = files["app/SourcesiOS/iOSSettingsView.swift"] {
                 found += requiring(settings, "VXDiagExport.exportBody()",
                                    why: "ShareLink must hand over a sanitised copy")
+                found += requiring(settings, "FileRepresentation(exportedContentType: .plainText)",
+                                   why: "ShareLink must prepare the full export lazily after the owner taps it")
+                found += requiring(settings, "ShareLink(\"Save or share log\", item: DiagnosticLogTransfer())",
+                                   why: "the share surface must use the lazy sanitised transfer")
                 found += forbidding(settings, "let url = VXProbe.logFileURL",
                                     why: "ShareLink hands over the LIVE log URL, skipping the export-time sanitiser")
+                found += forbidding(settings, "private var diagLogExportURL: URL?",
+                                    why: "a computed share URL rewrites the whole diagnostic log on every SwiftUI body pass")
             }
             return found
         },

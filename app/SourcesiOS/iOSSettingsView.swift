@@ -1,6 +1,21 @@
 import SwiftUI
 import UserNotifications
 import UniformTypeIdentifiers
+import CoreTransferable
+
+/// A lazy share-sheet payload for the rolling diagnostic log. `ShareLink` asks this representation for
+/// the file only after the owner taps it, so rebuilding Settings never rereads and rewrites the entire log.
+/// The produced file is still a sanitised copy rather than the live cache file.
+private struct DiagnosticLogTransfer: Transferable {
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .plainText) { _ in
+            let destination = FileManager.default.temporaryDirectory
+                .appendingPathComponent("vortx-diag.log")
+            try VXDiagExport.exportBody().write(to: destination, options: .atomic)
+            return SentTransferredFile(destination)
+        }
+    }
+}
 
 /// Touch Settings at full parity with the tvOS Settings screen: profiles, account, playback,
 /// stream-source ranking, the embedded streaming server, appearance, audio & subtitle preferences,
@@ -759,8 +774,8 @@ struct iOSSettingsView: View {
             // user who turned logging off after capturing can still hand it over (matching the QR path, which
             // serves whatever bytes are on disk). Only when no capture has ever happened does a guidance
             // button explain how to produce a log, so we never hand over a nonexistent or empty file.
-            if let logURL = diagLogExportURL {
-                ShareLink("Save or share log", item: logURL)
+            if hasDiagnosticLog {
+                ShareLink("Save or share log", item: DiagnosticLogTransfer())
                     .tint(Theme.Palette.accent)
             } else {
                 Button("Save or share log") {
@@ -791,24 +806,17 @@ struct iOSSettingsView: View {
         }
     }
 
-    /// The diagnostic log to hand to the share sheet, or nil when the log is empty/missing. Keyed on file
-    /// content, not on VXProbe.enabled, so turning Diagnostic logging off after a capture still lets the user
-    /// save what was recorded (the QR export path serves the same bytes with no toggle gate). Gating on the
-    /// file size the way exportActiveLibrary guards its empty case means it never shares a nonexistent or
-    /// empty file; nil drives the guidance button instead.
+    /// Whether the share action has anything to export. This metadata check is intentionally the only file
+    /// work performed while SwiftUI evaluates the view. `DiagnosticLogTransfer` reads, sanitises, and writes
+    /// the share copy lazily after the owner taps Share, avoiding a full-log rewrite on every body pass.
     ///
-    /// It hands over a SANITISED COPY in the temp directory, never the live file. Sharing the live file was
-    /// the third export path that skipped the sanitiser: `Caches/vortx-diag.log` survives app updates, so it
-    /// holds whatever every previous build wrote, and a write-path scrubber does nothing for bytes that are
-    /// already on disk. `VXDiagExport.exportBody()` re-runs the current rules over every retained line and
-    /// folds in the streaming server's section, so this path emits exactly what the QR and macOS paths do.
-    private var diagLogExportURL: URL? {
+    /// This remains keyed on file content rather than VXProbe.enabled, so a capture can still be shared after
+    /// logging is turned off. The transfer hands over a sanitised copy, never the live cache file.
+    private var hasDiagnosticLog: Bool {
         let live = VXProbe.logFileURL
         guard let values = try? live.resourceValues(forKeys: [.fileSizeKey]),
-              let size = values.fileSize, size > 0 else { return nil }
-        let dest = FileManager.default.temporaryDirectory.appendingPathComponent("vortx-diag.log")
-        guard (try? VXDiagExport.exportBody().write(to: dest, options: .atomic)) != nil else { return nil }
-        return dest
+              let size = values.fileSize else { return false }
+        return size > 0
     }
 
     /// QR export sheet for the diagnostic log: the phone scans the code, downloads vortx-diag.log over the
