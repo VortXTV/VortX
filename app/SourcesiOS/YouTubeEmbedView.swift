@@ -225,6 +225,7 @@ private enum YouTubeEmbedHTML {
 
     static func page(id: String, mode: YouTubeEmbedView.Mode) -> String {
         let origin = embedOrigin
+        let videoIDLiteral = WebEmbeddingSafety.javaScriptStringLiteral(id)
         // Mode -> player vars + the onReady body (clip windowing vs plain autoplay).
         let vars: String
         let onReady: String
@@ -294,7 +295,7 @@ private enum YouTubeEmbedHTML {
             }
             function onYouTubeIframeAPIReady() {
               player = new YT.Player('player', {
-                videoId: '\(id)',
+                videoId: \(videoIDLiteral),
                 playerVars: { \(vars), enablejsapi: 1, origin: '\(origin)' },
                 events: {
                   onReady: function (e) {
@@ -340,4 +341,5 @@ private enum YouTubeEmbedHTML {
         </html>
         """
     }
+
 }

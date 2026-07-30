@@ -36,7 +36,17 @@ function escapeHtml(value: string): string {
   );
 }
 function httpUrl(value: string | undefined): string {
-  return value && /^https?:\/\//i.test(value) ? value : "";
+  if (!value) return "";
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : "";
+  } catch {
+    return "";
+  }
+}
+function applyBackgroundImage(root: HTMLElement, selector: string, value: string): void {
+  const target = root.querySelector<HTMLElement>(selector);
+  if (target && value) target.style.backgroundImage = `url(${JSON.stringify(value)})`;
 }
 function el(id: string): HTMLElement | null {
   return document.getElementById(id);
@@ -253,7 +263,7 @@ function renderMovie(overlay: HTMLElement, meta: MetaItem, md: MetaDetails | nul
   const trailer = trailerYouTubeID(meta);
 
   overlay.innerHTML = `
-    <div class="detail-bg"${bg ? ` style="background-image:url('${escapeHtml(bg)}')"` : ""}></div>
+    <div class="detail-bg"></div>
     <div class="detail-scrim"></div>
     <button class="back" data-action="close-detail">${icon("back")}<span>Back</span></button>
     <div class="detail-body">
@@ -264,6 +274,7 @@ function renderMovie(overlay: HTMLElement, meta: MetaItem, md: MetaDetails | nul
       ${meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""}
       ${creditsRow(meta)}
     </div>`;
+  applyBackgroundImage(overlay, ".detail-bg", bg);
 }
 
 /**
@@ -295,10 +306,11 @@ function renderSeries(overlay: HTMLElement, meta: MetaItem, md: MetaDetails | nu
       }`;
 
   overlay.innerHTML = `
-    <div class="detail-bg"${bg ? ` style="background-image:url('${escapeHtml(bg)}')"` : ""}></div>
+    <div class="detail-bg"></div>
     <div class="detail-scrim"></div>
     <button class="back" data-action="close-detail">${icon("back")}<span>Back</span></button>
     <div class="detail-body">${body}</div>`;
+  applyBackgroundImage(overlay, ".detail-bg", bg);
 }
 
 // ---- Series: season selector + episode list ----------------------------------------------------

@@ -28,7 +28,20 @@ function escapeHtml(value: string): string {
   );
 }
 function httpUrl(value: string | undefined): string {
-  return value && /^https?:\/\//i.test(value) ? value : "";
+  if (!value) return "";
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : "";
+  } catch {
+    return "";
+  }
+}
+function applyBackgroundImages(root: HTMLElement): void {
+  root.querySelectorAll<HTMLElement>("[data-background-url]").forEach((target) => {
+    const value = httpUrl(target.dataset.backgroundUrl);
+    if (value) target.style.backgroundImage = `url(${JSON.stringify(value)})`;
+    target.removeAttribute("data-background-url");
+  });
 }
 function setStatus(text: string): void {
   const el = document.getElementById("status");
@@ -65,6 +78,7 @@ function renderBoard(board: Board | null): void {
   }
   if (rails.length) {
     content.innerHTML = boardFeatured(board) + rails.join("");
+    applyBackgroundImages(content);
     setStatus("");
   }
 }
@@ -96,7 +110,7 @@ function featuredHeroHtml(item: MetaItem): string {
   const desc = item.description ? `<p class="featured-synopsis">${escapeHtml(item.description)}</p>` : "";
   return `
     <section class="featured" data-type="${escapeHtml(item.type)}" data-id="${escapeHtml(item.id)}">
-      <div class="featured-bg" style="background-image:url('${escapeHtml(bg)}')"></div>
+      <div class="featured-bg" data-background-url="${escapeHtml(bg)}"></div>
       <div class="featured-scrim"></div>
       <div class="featured-content">
         ${title}
