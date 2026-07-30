@@ -9,20 +9,27 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.InetAddress
+import java.net.Proxy
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 
 internal class AddonManifestFetcher(
-    timeoutMs: Int,
+    private val timeoutMs: Int,
     private val hostValidator: (String) -> Unit = { PublicAddressPolicy.requirePublic(it) },
     private val transport: ManifestTransport = OkHttpManifestTransport(timeoutMs),
+    private val nanoTime: () -> Long = System::nanoTime,
 ) {
     fun fetch(url: String): JSONObject? {
         var current = url.toHttpUrlOrNull()?.takeIf(::isAllowedUrl) ?: return null
         var redirects = 0
+        val startedAt = nanoTime()
+        val timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs.toLong())
 
         while (true) {
-            val response = runCatching { transport.execute(current) }.getOrNull() ?: return null
+            val remainingNanos = timeoutNanos - (nanoTime() - startedAt)
+            if (remainingNanos <= 0) return null
+            val remainingMs = TimeUnit.NANOSECONDS.toMillis(remainingNanos).coerceAtLeast(1)
+            val response = runCatching { transport.execute(current, remainingMs) }.getOrNull() ?: return null
             if (response.statusCode in REDIRECT_STATUS_CODES) {
                 if (redirects >= MAX_REDIRECTS) return null
                 val location = response.location ?: return null
@@ -52,7 +59,7 @@ internal class AddonManifestFetcher(
 }
 
 internal fun interface ManifestTransport {
-    fun execute(url: HttpUrl): ManifestTransportResponse
+    fun execute(url: HttpUrl, timeoutMs: Long): ManifestTransportResponse
 }
 
 internal data class ManifestTransportResponse(
@@ -62,22 +69,17 @@ internal data class ManifestTransportResponse(
 )
 
 private class OkHttpManifestTransport(timeoutMs: Int) : ManifestTransport {
-    private val client = OkHttpClient.Builder()
-        .dns(PublicOnlyDns)
-        .followRedirects(false)
-        .followSslRedirects(false)
-        .connectTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-        .readTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-        .callTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-        .build()
+    private val client = buildAddonManifestClient(timeoutMs)
 
-    override fun execute(url: HttpUrl): ManifestTransportResponse {
+    override fun execute(url: HttpUrl, timeoutMs: Long): ManifestTransportResponse {
         val request = Request.Builder()
             .url(url)
             .header("User-Agent", "VortX-Android/1.0")
             .get()
             .build()
-        return client.newCall(request).execute().use { response ->
+        val call = client.newCall(request)
+        call.timeout().timeout(timeoutMs, TimeUnit.MILLISECONDS)
+        return call.execute().use { response ->
             ManifestTransportResponse(
                 statusCode = response.code,
                 location = response.header("Location"),
@@ -110,6 +112,16 @@ private class OkHttpManifestTransport(timeoutMs: Int) : ManifestTransport {
         const val MAX_MANIFEST_BYTES = 1024 * 1024
     }
 }
+
+internal fun buildAddonManifestClient(timeoutMs: Int): OkHttpClient = OkHttpClient.Builder()
+    .proxy(Proxy.NO_PROXY)
+    .dns(PublicOnlyDns)
+    .followRedirects(false)
+    .followSslRedirects(false)
+    .connectTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+    .readTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+    .callTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+    .build()
 
 private object PublicOnlyDns : Dns {
     override fun lookup(hostname: String): List<InetAddress> = PublicAddressPolicy.requirePublic(hostname)
@@ -175,9 +187,6 @@ internal object PublicAddressPolicy {
         val first = bytes[0].toInt() and 0xff
         val second = bytes[1].toInt() and 0xff
 
-        if (first and 0xfe == 0xfc) return true
-        if (first == 0xfe && second and 0xc0 == 0x80) return true
-
         if (bytes.copyOfRange(0, 10).all { it == 0.toByte() } &&
             bytes[10] == 0xff.toByte() &&
             bytes[11] == 0xff.toByte()
@@ -185,15 +194,35 @@ internal object PublicAddressPolicy {
             return isBlockedIpv4(bytes.copyOfRange(12, 16))
         }
 
-        val nat64Prefix = byteArrayOf(0x00, 0x64, 0xff.toByte(), 0x9b.toByte())
-        if (bytes.copyOfRange(0, 4).contentEquals(nat64Prefix) &&
+        if (bytes.copyOfRange(0, 4).contentEquals(byteArrayOf(0x00, 0x64, 0xff.toByte(), 0x9b.toByte())) &&
             bytes.copyOfRange(4, 12).all { it == 0.toByte() }
         ) {
             return isBlockedIpv4(bytes.copyOfRange(12, 16))
         }
 
+        if (first !in 0x20..0x3f) return true
+
         if (first == 0x20 && second == 0x02) {
             return isBlockedIpv4(bytes.copyOfRange(2, 6))
+        }
+
+        if (first == 0x20 && second == 0x01 && bytes[2] == 0x00.toByte() && bytes[3] == 0x00.toByte()) {
+            return true
+        }
+        if (bytes.copyOfRange(0, 6).contentEquals(byteArrayOf(0x20, 0x01, 0x00, 0x02, 0x00, 0x00))) {
+            return true
+        }
+        val orchidPrefix = bytes[3].toInt() and 0xf0
+        if (first == 0x20 && second == 0x01 && bytes[2] == 0x00.toByte() &&
+            (orchidPrefix == 0x10 || orchidPrefix == 0x20)
+        ) {
+            return true
+        }
+        if (bytes.copyOfRange(0, 4).contentEquals(byteArrayOf(0x20, 0x01, 0x0d, 0xb8.toByte()))) {
+            return true
+        }
+        if (first == 0x3f && bytes[1] == 0xff.toByte() && bytes[2].toInt() and 0xf0 == 0) {
+            return true
         }
 
         return false

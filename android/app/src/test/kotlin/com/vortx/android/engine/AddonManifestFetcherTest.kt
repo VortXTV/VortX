@@ -8,7 +8,9 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.net.InetAddress
+import java.net.Proxy
 import java.net.UnknownHostException
+import java.util.concurrent.TimeUnit
 
 class AddonManifestFetcherTest {
     @Test
@@ -27,7 +29,14 @@ class AddonManifestFetcherTest {
             "fe80::1",
             "::ffff:127.0.0.1",
             "64:ff9b::7f00:1",
+            "64:ff9b:1::1",
+            "100::1",
+            "100:0:0:1::1",
+            "2001:2::1",
+            "2001:db8::1",
             "2002:7f00:0001::",
+            "3fff::1",
+            "5f00::1",
         )
 
         blocked.forEach { literal ->
@@ -99,6 +108,39 @@ class AddonManifestFetcherTest {
         assertNull(fetcher.fetch("https://public.test/manifest.json"))
     }
 
+    @Test
+    fun manifestClientDisablesSystemProxies() {
+        val client = buildAddonManifestClient(1_000)
+
+        assertEquals(Proxy.NO_PROXY, client.proxy)
+    }
+
+    @Test
+    fun timeoutBudgetIsSharedAcrossRedirects() {
+        var now = 0L
+        val transport = object : ManifestTransport {
+            var calls = 0
+            val timeouts = mutableListOf<Long>()
+
+            override fun execute(url: HttpUrl, timeoutMs: Long): ManifestTransportResponse {
+                calls += 1
+                timeouts += timeoutMs
+                now += TimeUnit.MILLISECONDS.toNanos(600)
+                return ManifestTransportResponse(302, location = "/hop-$calls")
+            }
+        }
+        val fetcher = AddonManifestFetcher(
+            timeoutMs = 1_000,
+            hostValidator = {},
+            transport = transport,
+            nanoTime = { now },
+        )
+
+        assertNull(fetcher.fetch("https://public.test/manifest.json"))
+        assertEquals(2, transport.calls)
+        assertEquals(listOf(1_000L, 400L), transport.timeouts)
+    }
+
     private fun validatorBlocking(blockedHost: String): (String) -> Unit = { host ->
         if (host == blockedHost) throw UnknownHostException("blocked")
     }
@@ -111,7 +153,7 @@ class AddonManifestFetcherTest {
         val requestedHosts: List<String>
             get() = requestedUrls.map { it.toHttpUrl().host }
 
-        override fun execute(url: HttpUrl): ManifestTransportResponse {
+        override fun execute(url: HttpUrl, timeoutMs: Long): ManifestTransportResponse {
             requestedUrls += url.toString()
             return remaining.removeFirst()
         }
