@@ -3,13 +3,137 @@ import Foundation
 import Security
 #endif
 
+/// Failure policy shared by the iOS/tvOS Keychain adapter and its executable tests.
+///
+/// A failed secure mutation may retain the caller's latest intent for this process only. The secret override is
+/// deliberately not serializable. A separate persistent marker contains no secret and rejects stale secure state
+/// after restart until a mutation succeeds. Every operation purges legacy plaintext slots.
+final class KeychainFailureClosedStore: @unchecked Sendable {
+    enum ReadResult {
+        case value(String)
+        case missing
+        case failure
+    }
+
+    enum MutationResult {
+        case success
+        case failure
+    }
+
+    typealias ReadSecure = (_ account: String) -> ReadResult
+    typealias WriteSecure = (_ value: String?, _ account: String) -> MutationResult
+    typealias IsInvalidated = (_ account: String) -> Bool
+    typealias MarkInvalidated = (_ account: String) -> Void
+    typealias ClearInvalidated = (_ account: String) -> Void
+    typealias PurgeAllLegacy = () -> Void
+    typealias PurgeLegacy = (_ account: String) -> Void
+
+    private enum VolatileValue {
+        case value(String)
+        case deleted
+    }
+
+    private let readSecure: ReadSecure
+    private let writeSecure: WriteSecure
+    private let isInvalidated: IsInvalidated
+    private let markInvalidated: MarkInvalidated
+    private let clearInvalidated: ClearInvalidated
+    private let purgeAllLegacy: PurgeAllLegacy
+    private let purgeLegacy: PurgeLegacy
+    private let lock = NSLock()
+    private var pendingOverrides: [String: VolatileValue] = [:]
+    private var lastKnownValues: [String: VolatileValue] = [:]
+    private var didSweepLegacy = false
+
+    init(
+        readSecure: @escaping ReadSecure,
+        writeSecure: @escaping WriteSecure,
+        isInvalidated: @escaping IsInvalidated,
+        markInvalidated: @escaping MarkInvalidated,
+        clearInvalidated: @escaping ClearInvalidated,
+        purgeAllLegacy: @escaping PurgeAllLegacy,
+        purgeLegacy: @escaping PurgeLegacy
+    ) {
+        self.readSecure = readSecure
+        self.writeSecure = writeSecure
+        self.isInvalidated = isInvalidated
+        self.markInvalidated = markInvalidated
+        self.clearInvalidated = clearInvalidated
+        self.purgeAllLegacy = purgeAllLegacy
+        self.purgeLegacy = purgeLegacy
+    }
+
+    func string(_ account: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        purgeLegacySlots(for: account)
+        if let volatileOverride = pendingOverrides[account] {
+            switch volatileOverride {
+            case let .value(value):
+                return value
+            case .deleted:
+                return nil
+            }
+        }
+
+        guard !isInvalidated(account) else { return nil }
+
+        switch readSecure(account) {
+        case let .value(value):
+            lastKnownValues[account] = .value(value)
+            return value
+        case .missing:
+            lastKnownValues[account] = .deleted
+            return nil
+        case .failure:
+            switch lastKnownValues[account] {
+            case let .value(value):
+                return value
+            case .deleted, nil:
+                return nil
+            }
+        }
+    }
+
+    func set(_ value: String?, for account: String) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        purgeLegacySlots(for: account)
+        markInvalidated(account)
+        switch writeSecure(value, account) {
+        case .success:
+            clearInvalidated(account)
+            pendingOverrides.removeValue(forKey: account)
+            if let value {
+                lastKnownValues[account] = .value(value)
+            } else {
+                lastKnownValues[account] = .deleted
+            }
+        case .failure:
+            if let value {
+                pendingOverrides[account] = .value(value)
+            } else {
+                pendingOverrides[account] = .deleted
+            }
+        }
+    }
+
+    private func purgeLegacySlots(for account: String) {
+        if !didSweepLegacy {
+            purgeAllLegacy()
+            didSweepLegacy = true
+        }
+        purgeLegacy(account)
+    }
+}
+
 /// Small-secret store for the Stremio auth token.
 ///
-/// On iOS/tvOS this prefers the Keychain (generic password, readable after first unlock, not
-/// iCloud-synced). If the Keychain is unavailable, which happens on the unsigned Simulator and can
-/// happen on a re-signed sideload where the keychain-access-group does not match, it falls back to
-/// UserDefaults so the token is never silently lost. On a normally signed device the Keychain path is
-/// used and nothing is mirrored to UserDefaults.
+/// On iOS/tvOS this uses the Keychain (generic password, readable after first unlock, not iCloud-synced).
+/// If Security.framework is unavailable, a mutation survives only in process memory and is lost at restart.
+/// Legacy plaintext fallback slots are purged on every operation and are never read or written.
 ///
 /// On macOS the app is ad-hoc signed (no Developer ID), so every `SecItem` access against the LOGIN
 /// keychain pops the "StremioX wants to use confidential information stored in '…' in your keychain"
@@ -17,14 +141,20 @@ import Security
 /// entirely, macOS stores the SAME accounts in an owner-only file under Application Support instead of
 /// the system keychain. The public API is identical across platforms, so no caller changes.
 enum Keychain {
-    /// Prefix of the UserDefaults fallback slots the iOS/tvOS `set` writes when the Keychain refuses.
+    /// Prefix of legacy UserDefaults fallback slots that current builds purge and SettingsBackup filters.
     ///
     /// Declared OUTSIDE the platform `#if`, and non-private, because `SettingsBackup.secretKeyPrefixes` has to
     /// exclude these keys from the synced blob and the backup export on EVERY platform, not just the ones that
-    /// can write them: a token leaked by an iPhone travels inside the account's document, so a Mac (which never
-    /// writes a fallback slot of its own) still has to refuse to carry or apply one. Single source of truth on
-    /// purpose, so the exclusion cannot drift away from the thing it excludes.
+    /// used to write them: a token leaked by an old iPhone build travels inside the account's document, so a Mac
+    /// still has to refuse to carry or apply one. Single source of truth on purpose, so the exclusion cannot
+    /// drift away from the thing it excludes.
     static let fallbackKeyPrefix = "kcfallback."
+
+    /// Device-local, non-secret marker for an account whose last Keychain mutation was not confirmed.
+    ///
+    /// The marker prevents an older secure value from reappearing after a failed delete or replacement and
+    /// process restart. It stores only `true`, never credential bytes, and SettingsBackup excludes the prefix.
+    static let invalidationKeyPrefix = "kcinvalidated."
 
 #if os(macOS)
     // MARK: macOS file-backed store (no system keychain, no password prompt)
@@ -87,49 +217,76 @@ enum Keychain {
         }
     }
 #else
-    // MARK: iOS / tvOS system Keychain with UserDefaults fallback (unchanged)
+    // MARK: iOS / tvOS system Keychain
 
     private static func fallbackKey(_ account: String) -> String { fallbackKeyPrefix + account }
+    private static func invalidationKey(_ account: String) -> String { invalidationKeyPrefix + account }
+
+    private static let secureStore = KeychainFailureClosedStore(
+        readSecure: { account in
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrAccount as String: account,
+                kSecReturnData as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne,
+            ]
+            var result: AnyObject?
+            switch SecItemCopyMatching(query as CFDictionary, &result) {
+            case errSecSuccess:
+                guard let data = result as? Data,
+                      let value = String(data: data, encoding: .utf8)
+                else { return .failure }
+                return .value(value)
+            case errSecItemNotFound:
+                return .missing
+            default:
+                return .failure
+            }
+        },
+        writeSecure: { value, account in
+            let base: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrAccount as String: account,
+            ]
+            let deleteStatus = SecItemDelete(base as CFDictionary)
+            guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+                return .failure
+            }
+
+            guard let value else { return .success }
+            guard let data = value.data(using: .utf8) else { return .failure }
+
+            var add = base
+            add[kSecValueData as String] = data
+            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            return SecItemAdd(add as CFDictionary, nil) == errSecSuccess ? .success : .failure
+        },
+        isInvalidated: { account in
+            UserDefaults.standard.object(forKey: invalidationKey(account)) != nil
+        },
+        markInvalidated: { account in
+            UserDefaults.standard.set(true, forKey: invalidationKey(account))
+        },
+        clearInvalidated: { account in
+            UserDefaults.standard.removeObject(forKey: invalidationKey(account))
+        },
+        purgeAllLegacy: {
+            let defaults = UserDefaults.standard
+            for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(fallbackKeyPrefix) {
+                defaults.removeObject(forKey: key)
+            }
+        },
+        purgeLegacy: { account in
+            UserDefaults.standard.removeObject(forKey: fallbackKey(account))
+        }
+    )
 
     static func string(_ account: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: AnyObject?
-        if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-           let data = result as? Data, let value = String(data: data, encoding: .utf8) {
-            return value
-        }
-        // Keychain miss or unavailable → fall back to UserDefaults.
-        return UserDefaults.standard.string(forKey: fallbackKey(account))
+        secureStore.string(account)
     }
 
     static func set(_ value: String?, for account: String) {
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(base as CFDictionary)   // replace any existing item
-
-        guard let value, let data = value.data(using: .utf8) else {
-            UserDefaults.standard.removeObject(forKey: fallbackKey(account))   // clearing the token
-            return
-        }
-
-        var add = base
-        add[kSecValueData as String] = data
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        let status = SecItemAdd(add as CFDictionary, nil)
-
-        if status == errSecSuccess {
-            UserDefaults.standard.removeObject(forKey: fallbackKey(account))   // Keychain is authoritative
-        } else {
-            // Keychain unavailable (unsigned Simulator, entitlement mismatch) → keep it working.
-            UserDefaults.standard.set(value, forKey: fallbackKey(account))
-        }
+        secureStore.set(value, for: account)
     }
 #endif
 }

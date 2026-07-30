@@ -24,6 +24,9 @@
 //     xcrun swiftc -o /tmp/sbctrl/bin /tmp/sbctrl/SettingsBackup.swift /tmp/sbctrl/Keychain.swift \
 //         app/Tests/SettingsBackupSecretsTests.swift && /tmp/sbctrl/bin   # expect exit 1
 //
+// A second negative control removes `Keychain.invalidationKeyPrefix` from `deviceLocalKeyPrefixes`.
+// T1.5/T2.3/T3.4/T5.5 must then turn RED and the executable must exit 1.
+//
 // When last run, that control printed the plaintext token and dataKey straight out of the backup blob, which
 // is what upgraded the leak from "plausible" to "demonstrated on the pre-fix code path".
 //
@@ -86,6 +89,8 @@ struct SettingsBackupSecretsTests {
     static var leakedKey: String { Keychain.fallbackKeyPrefix + "vortx.sync.session.v1" }
     // A second slot, to prove the PREFIX generalises past the one that motivated it.
     static var leakedTraktKey: String { Keychain.fallbackKeyPrefix + "vortx.trakt.accessToken" }
+    // Non-secret Keychain invalidation state is device-local and must not move to another device.
+    static var invalidationKey: String { Keychain.invalidationKeyPrefix + "vortx.sync.session.v1" }
 
     /// Raw decode that does NOT go through `decodeDomain`'s filter, so a test can see what was actually
     /// ENCODED rather than what the read side is willing to hand back. Without this, the read-side filter
@@ -112,6 +117,7 @@ struct SettingsBackupSecretsTests {
         let seeded: [String: Any] = [
             leakedKey: sessionBlob,
             leakedTraktKey: "SECRET-TOKEN-trakt-zzz",
+            invalidationKey: true,
             "stremiox.accentColor": "blue",
             "vortx.downloads.autoDeleteWatched": true,
             "vortx.downloads.queueOrder": ["11111111-1111-1111-1111-111111111111"],
@@ -133,12 +139,19 @@ struct SettingsBackupSecretsTests {
         check("T1.3 token/dataKey bytes absent from blob", !containsSecret(backup))
         check("T1.4 ordinary pref still present (not over-filtering)",
               backupRaw["stremiox.accentColor"] as? String == "blue")
+        check("T1.5 device-local invalidation absent from backup", backupRaw[invalidationKey] == nil)
 
         print("\n=== T2: decodeDomain() must not APPLY a secret (restore + pull-apply read side) ===")
         // Encode a POISONED blob directly, bypassing the write-side filter. This is an account doc or backup
         // file written by a PRE-FIX build, which is the case that exists in the wild right now.
         guard let poisoned = try? SettingsBackup.encode(
-            domain: [leakedKey: sessionBlob, "stremiox.accentColor": "red"], bundleID: bundleID, app: "VortX")
+            domain: [
+                leakedKey: sessionBlob,
+                invalidationKey: true,
+                "stremiox.accentColor": "red",
+            ],
+            bundleID: bundleID,
+            app: "VortX")
         else { print("  FAIL  T2.0 encode threw"); exit(1) }
         check("T2.0 poisoned blob really does contain the secret (test is honest)",
               rawPayload(poisoned)[leakedKey] != nil)
@@ -146,6 +159,7 @@ struct SettingsBackupSecretsTests {
         check("T2.1 secret filtered out on read", decoded[leakedKey] == nil,
               "found: \(String(describing: decoded[leakedKey]))")
         check("T2.2 ordinary pref still applied", decoded["stremiox.accentColor"] as? String == "red")
+        check("T2.3 incoming invalidation cannot cross devices", decoded[invalidationKey] == nil)
 
         print("\n=== T3: mergedSyncBlob() scrubs a secret already in the account doc (self-heal) ===")
         guard let merged = SettingsBackup.mergedSyncBlob(onto: poisoned.base64EncodedString()) else {
@@ -156,6 +170,7 @@ struct SettingsBackupSecretsTests {
               "found: \(String(describing: mergedRaw[leakedKey]))")
         check("T3.2 account's own pref preserved by the merge", mergedRaw["stremiox.accentColor"] != nil)
         check("T3.3 secret bytes absent from pushed blob", !containsSecret(merged))
+        check("T3.4 stale invalidation not carried into pushed blob", mergedRaw[invalidationKey] == nil)
 
         print("\n=== T4: device-local download keys (manager item A) ===")
         check("T4.1 queueOrder excluded", !SettingsBackup.isSyncable("vortx.downloads.queueOrder"))
@@ -187,6 +202,7 @@ struct SettingsBackupSecretsTests {
               !SettingsBackup.isSyncable("vortx.sync.lastSyncedVersion.acct_1"))
         check("T5.3 Apple/OS keys still excluded", !SettingsBackup.isSyncable("AppleLanguages"))
         check("T5.4 isSyncable false for the leaked key", !SettingsBackup.isSyncable(leakedKey))
+        check("T5.5 invalidation is device-local", !SettingsBackup.isSyncable(invalidationKey))
 
         UserDefaults.standard.removePersistentDomain(forName: bundleID)
 

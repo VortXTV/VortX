@@ -13,9 +13,10 @@ import Foundation
 /// What it deliberately does NOT capture: the account token, which comes back by signing in again (and with
 /// it the synced library, add-ons, and history). This used to be justified with "the token lives in the
 /// Keychain, not UserDefaults, so it never lands in the backup file". That reasoning was WRONG, and its
-/// wrongness is why the token leaked for as long as it did: `Keychain` on iOS/tvOS falls back to UserDefaults
-/// when the Keychain refuses it, so "it is in the Keychain" was never a property this file could assume, only
-/// one it could ENFORCE. It is now enforced, by `secretKeyPrefixes` below. Do not restore the old claim.
+/// wrongness is why the token leaked for as long as it did: older `Keychain` implementations on iOS/tvOS
+/// fell back to UserDefaults when the Keychain refused them. Current code fails closed, while
+/// `secretKeyPrefixes` still filters and self-heals plaintext written by an older build. Do not restore the
+/// old claim.
 ///
 /// 0.4 is FREE to rename the `@AppStorage` keys to `vortx.*`: restore runs every key through
 /// `migratedKey(_:)`, so a backup written by an older StremioX build still applies. The only place the old
@@ -83,7 +84,10 @@ enum SettingsBackup {
     /// `vortx.sync.appliedAddonOrder` is deliberately covered too, and this costs no sync behavior: the
     /// shared add-on order's real carrier is the doc's own top-level `addonOrder` key, which
     /// VortXSyncManager writes on push and applies on pull. The blob was never its transport.
-    static let deviceLocalKeyPrefixes: [String] = ["vortx.sync."]
+    static let deviceLocalKeyPrefixes: [String] = [
+        "vortx.sync.",
+        Keychain.invalidationKeyPrefix, // non-secret record of an unconfirmed Keychain mutation on this device
+    ]
 
     /// SECRETS, which must never leave this device in any form. Kept as its OWN list rather than folded into
     /// `deviceLocalKeyPrefixes` on purpose: that list answers a per-device TUNING question (cache size, DV
@@ -91,16 +95,10 @@ enum SettingsBackup {
     /// there is one careless "this does not need to be device-local any more" away from deletion. This is not
     /// a preference at all, and its name should say so.
     ///
-    /// WHAT LEAKED. `Keychain` (iOS/tvOS) falls back to writing a secret into UserDefaults under
-    /// "kcfallback.<account>" when `SecItemAdd` fails, a fallback its own comment attributes to an unsigned
-    /// Simulator or an entitlement mismatch. VortX ships UNSIGNED SIDELOADED IPAs, and re-signing is exactly
-    /// that named trigger. Those keys are the app's own and look nothing like OS state, so `isAppPref` passed
-    /// them, and `deviceLocalKeyPrefixes` did NOT catch them: the key is "kcfallback.vortx.sync.session.v1",
-    /// which starts with "kcfallback.", not "vortx.sync.". So `isSyncable` returned true and the ACCOUNT TOKEN
-    /// plus the E2E dataKey (VortXSyncManager persists { token, account, dataKey } as ONE blob in ONE slot)
-    /// were carried into both `doc.settings` and the user-facing export this very file calls "portable,
-    /// human-inspectable JSON". That breaks the standing invariant that the token is Keychain-only and never
-    /// enters preferences or backups.
+    /// WHAT LEAKED. Older `Keychain` code (iOS/tvOS) wrote a secret into UserDefaults under
+    /// "kcfallback.<account>" when `SecItemAdd` failed. Those keys passed `isAppPref`, so the account token plus
+    /// E2E dataKey were carried into `doc.settings` and the user-facing export. Current Keychain code never
+    /// writes that fallback, but this filter remains necessary for stale slots and old synced documents.
     ///
     /// A PREFIX, not an exact-match entry, because the slot names are open-ended by construction: the fallback
     /// wraps EVERY Keychain account (per-profile authKeys, Trakt access/refresh, the API keys), so no set of
