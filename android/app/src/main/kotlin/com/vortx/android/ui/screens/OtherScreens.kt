@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
@@ -249,6 +250,8 @@ fun SettingsScreen(
     vortxAccountValue: String?,
     onVortxAccountClick: () -> Unit,
     onProfilesClick: () -> Unit,
+    onAppearanceScreenClick: () -> Unit,
+    onTabBarScreenClick: () -> Unit,
     onAccountClick: () -> Unit,
     onAddonsClick: () -> Unit,
     onIntegrationsClick: () -> Unit,
@@ -294,12 +297,27 @@ fun SettingsScreen(
     val activeProfile = ProfileStore.sharedOrNull()?.active
     val profilesValue = activeProfile?.let { if (it.isKids) "${it.name}  ·  Kids" else it.name } ?: "Default"
     Column(
-        modifier = modifier.fillMaxSize().padding(VortXTheme.spacing.edge),
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(VortXTheme.spacing.edge),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
     ) {
         // Profiles first: it answers "who is watching" and is the entry to the "Who's watching?" switcher that
         // makes the whole multi-profile subsystem reachable.
         SettingRow(VortXIcons.profiles, "Profiles", profilesValue, onClick = onProfilesClick)
+        SettingRow(
+            VortXIcons.settings,
+            "Appearance",
+            "Theme, text size",
+            onClick = onAppearanceScreenClick,
+        )
+        SettingRow(
+            VortXIcons.listBullet,
+            "Tab bar",
+            "Choose visible tabs",
+            onClick = onTabBarScreenClick,
+        )
         // VortX Account above the Stremio row: the VortX account is the primary login (sign in /
         // create / recover + cross-device sync); Stremio below is the optional engine import.
         if (vortxAccountValue != null) {

@@ -25,6 +25,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -38,8 +39,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -59,10 +62,17 @@ import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.DefaultEmber
 import com.vortx.android.player.PlayerScreen
+import com.vortx.android.profile.ProfileStore
 import com.vortx.android.ui.components.Wordmark
 import com.vortx.android.ui.gallery.GalleryScreen
+import com.vortx.android.ui.prefs.AppearancePrefs
+import com.vortx.android.ui.prefs.TabBarPrefs
+import com.vortx.android.ui.prefs.TabSlot
+import com.vortx.android.ui.prefs.isVisible
+import com.vortx.android.ui.prefs.resolveSelected
 import com.vortx.android.ui.screens.AccountScreen
 import com.vortx.android.ui.screens.AddonsScreen
+import com.vortx.android.ui.screens.AppearanceScreen
 import com.vortx.android.ui.screens.DetailScreen
 import com.vortx.android.ui.screens.DiscoverScreen
 import com.vortx.android.ui.screens.DownloadsScreen
@@ -75,6 +85,7 @@ import com.vortx.android.ui.screens.PlaybackSettingsScreen
 import com.vortx.android.ui.screens.ProfilesScreen
 import com.vortx.android.ui.screens.SearchScreen
 import com.vortx.android.ui.screens.SettingsScreen
+import com.vortx.android.ui.screens.TabBarScreen
 import com.vortx.android.iptv.IPTVSettingsScreen
 import com.vortx.android.ui.screens.SourcesSettingsScreen
 import com.vortx.android.ui.screens.VortXAccountScreen
@@ -101,12 +112,16 @@ import kotlinx.coroutines.launch
 /// TVPlayerView.swift:810. Expressed in ms because Android reports position in ms.
 private const val AUTO_ADD_AFTER_MS = 60_000L
 
-private enum class Tab(val label: String, val icon: ImageVector) {
-    HOME("Home", VortXIcons.home),
-    DISCOVER("Discover", VortXIcons.discover),
-    LIBRARY("Library", VortXIcons.library),
-    SEARCH("Search", VortXIcons.search),
-    SETTINGS("Settings", VortXIcons.settings),
+private enum class Tab(
+    val label: String,
+    val icon: ImageVector,
+    val slot: TabSlot,
+) {
+    HOME("Home", VortXIcons.home, TabSlot.HOME),
+    DISCOVER("Discover", VortXIcons.discover, TabSlot.DISCOVER),
+    LIBRARY("Library", VortXIcons.library, TabSlot.LIBRARY),
+    SEARCH("Search", VortXIcons.search, TabSlot.SEARCH),
+    SETTINGS("Settings", VortXIcons.settings, TabSlot.SETTINGS),
 }
 
 /// The whole app: a five-tab shell matching the iOS and Apple TV structure, with a detail overlay.
@@ -123,8 +138,44 @@ fun StremioXApp(
     // hidden and everything else is unchanged -- sync is off the critical path by design.
     syncManager: VortXSyncManager? = null,
 ) {
-    VortXTheme {
-        var tab by remember { mutableStateOf(Tab.HOME) }
+    val appContext = LocalContext.current.applicationContext
+    val profileStore = ProfileStore.sharedOrNull()
+    val activeProfile by (
+        profileStore?.activeProfile?.collectAsStateWithLifecycle()
+            ?: remember { mutableStateOf(null) }
+    )
+    val appearancePrefs = remember(appContext) { AppearancePrefs(appContext) }
+    val tabBarPrefs = remember(appContext) { TabBarPrefs(appContext) }
+    val appearance by appearancePrefs.state.collectAsStateWithLifecycle()
+    val hiddenTabs by tabBarPrefs.state.collectAsStateWithLifecycle()
+
+    LaunchedEffect(activeProfile) {
+        appearancePrefs.applyProfile(activeProfile)
+    }
+
+    val accentId = activeProfile?.accentID ?: appearance.accentId
+    val oled = activeProfile?.oled ?: appearance.oled
+    val textScale = (activeProfile?.textScale ?: appearance.textScale)
+        .takeIf { it.isFinite() }
+        ?.coerceIn(AppearancePrefs.TEXT_SCALE_MIN, AppearancePrefs.TEXT_SCALE_MAX)
+        ?: AppearancePrefs.TEXT_SCALE_DEFAULT
+    val deviceDensity = LocalDensity.current
+
+    CompositionLocalProvider(
+        LocalDensity provides Density(
+            density = deviceDensity.density,
+            fontScale = deviceDensity.fontScale * textScale.toFloat(),
+        ),
+    ) {
+        VortXTheme(
+            accentId = accentId,
+            oled = oled,
+        ) {
+            var tab by remember { mutableStateOf(Tab.HOME) }
+            val visibleTabs = Tab.entries.filter { hiddenTabs.isVisible(it.slot) }
+            LaunchedEffect(tab, hiddenTabs) {
+                if (hiddenTabs.resolveSelected(tab.slot) != tab.slot) tab = Tab.HOME
+            }
         var detail by remember { mutableStateOf<MetaItem?>(null) }
         var playing by remember { mutableStateOf<Playable?>(null) }
         // The catalog meta of the title currently in [playing], captured at the moment play starts. This is
@@ -147,8 +198,9 @@ fun StremioXApp(
         var showLiveTv by remember { mutableStateOf(false) }
         var showLibraryTransfer by remember { mutableStateOf(false) }
         var showProfiles by remember { mutableStateOf(false) }
+        var showAppearance by remember { mutableStateOf(false) }
+        var showTabBar by remember { mutableStateOf(false) }
         val onItem: (MetaItem) -> Unit = { detail = it }
-        val appContext = LocalContext.current.applicationContext
         // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
         // (final progress tick + Player unload) still runs after the player leaves composition.
         val appScope = rememberCoroutineScope()
@@ -166,6 +218,24 @@ fun StremioXApp(
             // finishes it, so Back on any overlay quit the whole app (the device-audit finding).
             BackHandler { showGallery = false }
             GalleryScreen(onBack = { showGallery = false })
+            return@VortXTheme
+        }
+
+        if (showAppearance) {
+            BackHandler { showAppearance = false }
+            AppearanceScreen(
+                prefs = appearancePrefs,
+                onBack = { showAppearance = false },
+            )
+            return@VortXTheme
+        }
+
+        if (showTabBar) {
+            BackHandler { showTabBar = false }
+            TabBarScreen(
+                prefs = tabBarPrefs,
+                onBack = { showTabBar = false },
+            )
             return@VortXTheme
         }
 
@@ -543,7 +613,7 @@ fun StremioXApp(
                     tonalElevation = 0.dp,
                     modifier = Modifier.vortxGlassStrip(),
                 ) {
-                    Tab.entries.forEach { t ->
+                    visibleTabs.forEach { t ->
                         NavigationBarItem(
                             selected = t == tab,
                             onClick = { tab = t },
@@ -572,6 +642,8 @@ fun StremioXApp(
                     },
                     onVortxAccountClick = { showVortxAccount = true },
                     onProfilesClick = { showProfiles = true },
+                    onAppearanceScreenClick = { showAppearance = true },
+                    onTabBarScreenClick = { showTabBar = true },
                     onAccountClick = { showAccount = true },
                     onAddonsClick = { showAddons = true },
                     onIntegrationsClick = { showIntegrations = true },
@@ -586,6 +658,7 @@ fun StremioXApp(
                 )
             }
         }
+    }
     }
 }
 

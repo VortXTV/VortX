@@ -9,6 +9,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.MaterialTheme as TvMaterialTheme
@@ -20,6 +21,8 @@ import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.player.PlayerScreen
+import com.vortx.android.profile.ProfileStore
+import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
@@ -42,7 +45,14 @@ fun TvApp(
     repo: CatalogRepository = PreviewCatalogRepository(),
     auth: AuthRepository = PreviewAuthRepository(),
 ) {
-    VortXTheme {
+    val profileStore = ProfileStore.sharedOrNull()
+    val activeProfile by (profileStore?.activeProfile?.collectAsStateWithLifecycle()
+        ?: remember { mutableStateOf(null) })
+
+    VortXTheme(
+        accentId = activeProfile?.accentID ?: VortXAccents.default.id,
+        oled = activeProfile?.oled ?: false,
+    ) {
         // The title currently open in Detail; null = the Home browse wall.
         var detail by remember { mutableStateOf<MetaItem?>(null) }
         // The resolved source currently playing; null = not in the player. The DETAIL page resolves a
