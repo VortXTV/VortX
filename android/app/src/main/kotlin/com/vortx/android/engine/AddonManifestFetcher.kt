@@ -15,14 +15,14 @@ import java.util.concurrent.TimeUnit
 
 internal class AddonManifestFetcher(
     private val timeoutMs: Int,
-    private val hostValidator: (String) -> Unit = { PublicAddressPolicy.requirePublic(it) },
+    private val hostValidator: (String) -> Unit = { PublicAddressPolicy.requireLiteralPublicOrHostname(it) },
     private val transport: ManifestTransport = OkHttpManifestTransport(timeoutMs),
     private val nanoTime: () -> Long = System::nanoTime,
 ) {
     fun fetch(url: String): JSONObject? {
+        val startedAt = nanoTime()
         var current = url.toHttpUrlOrNull()?.takeIf(::isAllowedUrl) ?: return null
         var redirects = 0
-        val startedAt = nanoTime()
         val timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs.toLong())
 
         while (true) {
@@ -128,6 +128,19 @@ private object PublicOnlyDns : Dns {
 }
 
 internal object PublicAddressPolicy {
+    fun requireLiteralPublicOrHostname(hostname: String) {
+        val isLiteral = hostname.contains(':') ||
+            hostname.split('.').let { parts ->
+                parts.size == 4 && parts.all { part -> part.toIntOrNull() in 0..255 }
+            }
+        if (!isLiteral) return
+        val address = runCatching { InetAddress.getByName(hostname) }.getOrNull()
+            ?: throw UnknownHostException("Invalid add-on address")
+        if (isBlocked(address)) {
+            throw UnknownHostException("Add-on URL contains a non-public address")
+        }
+    }
+
     fun requirePublic(hostname: String): List<InetAddress> {
         val addresses = try {
             InetAddress.getAllByName(hostname).toList()
@@ -200,22 +213,23 @@ internal object PublicAddressPolicy {
             return isBlockedIpv4(bytes.copyOfRange(12, 16))
         }
 
+        val isIsatap = (
+            (bytes[8] == 0.toByte() && bytes[9] == 0.toByte()) ||
+                (bytes[8] == 0x02.toByte() && bytes[9] == 0.toByte())
+            ) &&
+            bytes[10] == 0x5e.toByte() &&
+            bytes[11] == 0xfe.toByte()
+        if (isIsatap) {
+            return isBlockedIpv4(bytes.copyOfRange(12, 16))
+        }
+
         if (first !in 0x20..0x3f) return true
 
         if (first == 0x20 && second == 0x02) {
             return isBlockedIpv4(bytes.copyOfRange(2, 6))
         }
 
-        if (first == 0x20 && second == 0x01 && bytes[2] == 0x00.toByte() && bytes[3] == 0x00.toByte()) {
-            return true
-        }
-        if (bytes.copyOfRange(0, 6).contentEquals(byteArrayOf(0x20, 0x01, 0x00, 0x02, 0x00, 0x00))) {
-            return true
-        }
-        val orchidPrefix = bytes[3].toInt() and 0xf0
-        if (first == 0x20 && second == 0x01 && bytes[2] == 0x00.toByte() &&
-            (orchidPrefix == 0x10 || orchidPrefix == 0x20)
-        ) {
+        if (first == 0x20 && second == 0x01 && bytes[2].toInt() and 0xfe == 0) {
             return true
         }
         if (bytes.copyOfRange(0, 4).contentEquals(byteArrayOf(0x20, 0x01, 0x0d, 0xb8.toByte()))) {

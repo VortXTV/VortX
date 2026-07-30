@@ -33,8 +33,13 @@ class AddonManifestFetcherTest {
             "100::1",
             "100:0:0:1::1",
             "2001:2::1",
+            "2001:5::1",
+            "2001:100::1",
+            "2001:1ff::1",
             "2001:db8::1",
             "2002:7f00:0001::",
+            "2606:4700:4700:0:0:5efe:0a00:0001",
+            "2606:4700:4700:0:200:5efe:7f00:0001",
             "3fff::1",
             "5f00::1",
         )
@@ -48,8 +53,12 @@ class AddonManifestFetcherTest {
     @Test
     fun publicLiteralIsAllowed() {
         val address = PublicAddressPolicy.requirePublic("93.184.216.34")
+        val publicIsatap = PublicAddressPolicy.requirePublic(
+            "2606:4700:4700:0:0:5efe:5db8:d822",
+        )
 
         assertEquals(listOf(InetAddress.getByName("93.184.216.34")), address)
+        assertEquals(1, publicIsatap.size)
     }
 
     @Test
@@ -58,7 +67,7 @@ class AddonManifestFetcherTest {
             listOf(ManifestTransportResponse(302, location = "http://internal.test/manifest.json")),
         )
         val fetcher = AddonManifestFetcher(
-            timeoutMs = 1,
+            timeoutMs = 1_000,
             hostValidator = validatorBlocking("internal.test"),
             transport = transport,
         )
@@ -139,6 +148,30 @@ class AddonManifestFetcherTest {
         assertNull(fetcher.fetch("https://public.test/manifest.json"))
         assertEquals(2, transport.calls)
         assertEquals(listOf(1_000L, 400L), transport.timeouts)
+    }
+
+    @Test
+    fun initialValidationIsIncludedInTimeoutBudget() {
+        var now = 0L
+        val transport = object : ManifestTransport {
+            var timeout = 0L
+
+            override fun execute(url: HttpUrl, timeoutMs: Long): ManifestTransportResponse {
+                timeout = timeoutMs
+                return ManifestTransportResponse(200, body = """{"id":"example","name":"Example"}""")
+            }
+        }
+        val fetcher = AddonManifestFetcher(
+            timeoutMs = 1_000,
+            hostValidator = {
+                now += TimeUnit.MILLISECONDS.toNanos(600)
+            },
+            transport = transport,
+            nanoTime = { now },
+        )
+
+        assertNotNull(fetcher.fetch("https://public.test/manifest.json"))
+        assertEquals(400L, transport.timeout)
     }
 
     private fun validatorBlocking(blockedHost: String): (String) -> Unit = { host ->
