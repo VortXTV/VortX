@@ -21,7 +21,7 @@ export type SubtitlesMode = "off" | "forced" | "always";
 export type SafetyFilter = "off" | "balanced" | "strict";
 export type Performance = "auto" | "full" | "reduced";
 export type SubtitleFont = "modern" | "classic";
-export type SubtitleColor = "white" | "yellow" | "soft";
+export type SubtitleColor = "white" | "yellow" | "soft" | "grey";
 export type SubtitleEdge = "outline" | "shaded" | "box";
 export type SourceType = "debrid" | "usenet" | "torrent" | "direct";
 
@@ -98,6 +98,7 @@ export const SUB_COLORS: Record<SubtitleColor, string> = {
   white: "#ffffff",
   yellow: "#ffff00",
   soft: "#f2f2f2",
+  grey: "#b3b3b3",
 };
 
 /** Subtitle font presets - the app's "Modern / Classic" choices map to web font stacks (SubtitleStyle.fonts). */
@@ -157,7 +158,7 @@ export const SUB_STEP = 0.1;
 export const SUB_MODE_IDS: readonly SubtitlesMode[] = ["off", "forced", "always"];
 export const SAFETY_IDS: readonly SafetyFilter[] = ["off", "balanced", "strict"];
 export const SUB_FONT_IDS: readonly SubtitleFont[] = ["modern", "classic"];
-export const SUB_COLOR_IDS: readonly SubtitleColor[] = ["white", "yellow", "soft"];
+export const SUB_COLOR_IDS: readonly SubtitleColor[] = ["white", "yellow", "soft", "grey"];
 export const SUB_EDGE_IDS: readonly SubtitleEdge[] = ["outline", "shaded", "box"];
 
 /** LEGACY SHIM: the webapp's old private spellings -> the app's vocabulary. Real accounts already hold these
