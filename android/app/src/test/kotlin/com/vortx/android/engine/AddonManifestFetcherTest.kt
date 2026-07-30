@@ -86,6 +86,60 @@ class AddonManifestFetcherTest {
     }
 
     @Test
+    fun malformedNumericHostsAreRejectedWithoutDnsOrTransport() {
+        val requestedUrls = mutableListOf<String>()
+        val transport = ManifestTransport { url, _ ->
+            requestedUrls += url.toString()
+            ManifestTransportResponse(200, body = """{"id":"private","name":"Private"}""")
+        }
+        val fetcher = AddonManifestFetcher(
+            timeoutMs = 1_000,
+            transport = transport,
+        )
+        val malformedHosts = listOf(
+            "1.2.3",
+            "1.2.3.999",
+            "1..2.3",
+            "99999999999999999999",
+            "2001:::1",
+            "2001:db8::gggg",
+            "1:2:3:4:5:6:7",
+            "1:2:3:4:5:6:7:8:9",
+            "1.2.3.4::",
+        )
+
+        malformedHosts.forEach { host ->
+            val result = runCatching {
+                PublicAddressPolicy.requireLiteralPublicOrHostname(host)
+            }
+            assertTrue("$host must fail closed", result.exceptionOrNull() is UnknownHostException)
+        }
+        for (url in listOf(
+            "http://1.2.3/manifest.json",
+            "http://1.2.3.999/manifest.json",
+            "http://1..2.3/manifest.json",
+            "http://99999999999999999999/manifest.json",
+        )) {
+            assertNull("$url must be rejected before transport", fetcher.fetch(url))
+        }
+        assertTrue("transport must never receive a malformed numeric URL", requestedUrls.isEmpty())
+    }
+
+    @Test
+    fun ordinaryPublicLiteralsPassNoDnsPreflight() {
+        for (host in listOf(
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+            "2606:4700:4700:0:0:ffff:93.184.216.34",
+        )) {
+            val result = runCatching {
+                PublicAddressPolicy.requireLiteralPublicOrHostname(host)
+            }
+            assertTrue("$host must pass literal preflight", result.isSuccess)
+        }
+    }
+
+    @Test
     fun dnsResolutionCannotOutliveItsDeadline() {
         val resolverStarted = CountDownLatch(1)
         val dns = DeadlinePublicDns(timeoutMs = 100) {

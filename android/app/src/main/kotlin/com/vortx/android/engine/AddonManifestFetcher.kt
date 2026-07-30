@@ -178,10 +178,12 @@ internal class DeadlinePublicDns(
 
 internal object PublicAddressPolicy {
     fun requireLiteralPublicOrHostname(hostname: String) {
-        val isLiteral = hostname.contains(':') || hostname.all { it.isDigit() || it == '.' }
-        if (!isLiteral) return
-        val address = runCatching { InetAddress.getByName(hostname) }.getOrNull()
-            ?: throw UnknownHostException("Invalid add-on address")
+        val address = when {
+            hostname.contains(':') -> parseIpv6Literal(hostname)
+            hostname.isNotEmpty() && hostname.all { it.isDigit() || it == '.' } ->
+                parseIpv4Literal(hostname)
+            else -> return
+        } ?: throw UnknownHostException("Invalid add-on address")
         if (isBlocked(address)) {
             throw UnknownHostException("Add-on URL contains a non-public address")
         }
@@ -216,6 +218,102 @@ internal object PublicAddressPolicy {
             16 -> isBlockedIpv6(bytes)
             else -> true
         }
+    }
+
+    private fun parseIpv4Literal(hostname: String): InetAddress? {
+        val parts = hostname.split('.')
+        if (parts.size != 4) return null
+
+        val bytes = ByteArray(4)
+        for ((index, part) in parts.withIndex()) {
+            if (
+                part.isEmpty() ||
+                part.length > 3 ||
+                (part.length > 1 && part.startsWith('0')) ||
+                part.any { !it.isDigit() }
+            ) {
+                return null
+            }
+            val value = part.toIntOrNull()?.takeIf { it in 0..255 } ?: return null
+            bytes[index] = value.toByte()
+        }
+        return InetAddress.getByAddress(bytes)
+    }
+
+    private fun parseIpv6Literal(hostname: String): InetAddress? {
+        if (hostname.isEmpty() || hostname.contains('%')) return null
+
+        val compression = hostname.indexOf("::")
+        if (compression >= 0 && hostname.indexOf("::", compression + 2) >= 0) return null
+
+        val leftText: String
+        val rightText: String
+        if (compression >= 0) {
+            leftText = hostname.substring(0, compression)
+            rightText = hostname.substring(compression + 2)
+        } else {
+            if (hostname.startsWith(':') || hostname.endsWith(':')) return null
+            leftText = hostname
+            rightText = ""
+        }
+
+        val left = parseIpv6Section(
+            leftText,
+            allowIpv4Tail = compression < 0,
+        ) ?: return null
+        val right = if (compression >= 0) {
+            parseIpv6Section(rightText, allowIpv4Tail = true) ?: return null
+        } else {
+            emptyList()
+        }
+
+        val explicitGroups = left.size + right.size
+        val zeroGroups = if (compression >= 0) {
+            if (explicitGroups >= 8) return null
+            8 - explicitGroups
+        } else {
+            if (explicitGroups != 8) return null
+            0
+        }
+
+        val groups = left + List(zeroGroups) { 0 } + right
+        val bytes = ByteArray(16)
+        groups.forEachIndexed { index, value ->
+            bytes[index * 2] = (value ushr 8).toByte()
+            bytes[index * 2 + 1] = value.toByte()
+        }
+        return InetAddress.getByAddress(bytes)
+    }
+
+    private fun parseIpv6Section(
+        section: String,
+        allowIpv4Tail: Boolean,
+    ): List<Int>? {
+        if (section.isEmpty()) return emptyList()
+        if (section.startsWith(':') || section.endsWith(':')) return null
+
+        val parts = section.split(':')
+        val groups = mutableListOf<Int>()
+        for ((index, part) in parts.withIndex()) {
+            if (part.contains('.')) {
+                if (!allowIpv4Tail || index != parts.lastIndex) return null
+                val ipv4 = parseIpv4Literal(part)?.address ?: return null
+                groups += ((ipv4[0].toInt() and 0xff) shl 8) or
+                    (ipv4[1].toInt() and 0xff)
+                groups += ((ipv4[2].toInt() and 0xff) shl 8) or
+                    (ipv4[3].toInt() and 0xff)
+                continue
+            }
+            if (
+                part.isEmpty() ||
+                part.length > 4 ||
+                part.any { !it.isDigit() && it.lowercaseChar() !in 'a'..'f' }
+            ) {
+                return null
+            }
+            groups += part.toInt(16)
+        }
+        return groups
     }
 
     private fun isBlockedIpv4(bytes: ByteArray): Boolean {
