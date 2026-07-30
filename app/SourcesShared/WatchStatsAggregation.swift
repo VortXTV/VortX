@@ -76,15 +76,23 @@ struct WatchStats {
     /// testable and cheap enough to run on every scope change.
     static func compute(records: [WatchRecord], genresByID: [String: [String]],
                         scopeLabel: String, topTitles: Int, topGenres: Int) -> WatchStats {
-        let movies = records.filter(\.isMovie)
-        let series = records.filter(\.isSeries)
-        let totalSeconds = records.reduce(0) { $0 + $1.watchSeconds }
-        let episodes = series.reduce(0) { $0 + max($1.plays, 0) }
+        // Every producer normally supplies small, non-negative play counts, but this pure boundary is also
+        // fed by persisted JSON and overlay models. Normalize here so a hostile or corrupt Int.max cannot
+        // escape through another constructor, dominate ranking, or trap the aggregate with overflowing `+`.
+        let safeRecords = records.map {
+            WatchRecord(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster,
+                        watchSeconds: $0.watchSeconds, plays: clampPlayCount($0.plays),
+                        lastWatched: $0.lastWatched)
+        }
+        let movies = safeRecords.filter(\.isMovie)
+        let series = safeRecords.filter(\.isSeries)
+        let totalSeconds = safeRecords.reduce(0) { $0 + $1.watchSeconds }
+        let episodes = series.reduce(0) { boundedPlayTotal($0, $1.plays) }
 
         // Top genres, weighted by watch time so a genre the user spent more hours on ranks higher.
         var genreSeconds: [String: Double] = [:]
         var covered = 0
-        for record in records {
+        for record in safeRecords {
             guard let genres = genresByID[record.id], !genres.isEmpty else { continue }
             covered += 1
             // Split the title's time evenly across its genres so a 3-genre title does not triple-count.
@@ -112,7 +120,7 @@ struct WatchStats {
         }
 
         // Most watched, ranked by time spent.
-        let ranked = records
+        let ranked = safeRecords
             .filter { $0.watchSeconds > 0 || $0.plays > 0 }
             .sorted { ($0.watchSeconds, Double($0.plays)) > ($1.watchSeconds, Double($1.plays)) }
             .prefix(topTitles)
@@ -122,7 +130,7 @@ struct WatchStats {
         return WatchStats(
             scopeLabel: scopeLabel,
             totalWatchSeconds: totalSeconds,
-            titlesCount: records.count,
+            titlesCount: safeRecords.count,
             moviesCount: movies.count,
             seriesCount: series.count,
             episodesCount: episodes,
@@ -140,6 +148,10 @@ extension WatchStats {
     /// How many titles to surface in the "most watched" list and the internal work caps.
     static let topTitlesLimit = 8
     static let topGenresLimit = 6
+    /// Corruption ceiling for a single title and the displayed all-series total. One million watched
+    /// episodes is already far beyond a human lifetime, while keeping the value small enough that every
+    /// aggregate remains mechanically non-trapping even when a producer hands us Int.max.
+    static let maximumPlayCount = 1_000_000
 
     /// A shared calendar for year bucketing (UTC so a title's year matches its stored `lastWatched` day
     /// regardless of the device time zone).
@@ -181,6 +193,15 @@ extension WatchStats {
         return 0
     }
 
+    static func clampPlayCount(_ value: Int) -> Int {
+        min(max(value, 0), maximumPlayCount)
+    }
+
+    private static func boundedPlayTotal(_ current: Int, _ next: Int) -> Int {
+        let remaining = maximumPlayCount - min(max(current, 0), maximumPlayCount)
+        return maximumPlayCount - max(remaining - clampPlayCount(next), 0)
+    }
+
     /// Preserve the historical truncation-toward-zero behavior without letting malformed persisted JSON
     /// (NaN, infinity, or a finite value outside Int's range) trap the stats screen.
     private static func safeTruncatedInt(_ value: Double) -> Int {
@@ -206,7 +227,7 @@ extension WatchStats {
         let last = parseISODate(state["lastWatched"] as? String)
         return WatchRecord(id: id, type: type, name: name, poster: poster,
                            watchSeconds: clampSeconds(overallMs / 1000),
-                           plays: timesWatched, lastWatched: last)
+                           plays: clampPlayCount(timesWatched), lastWatched: last)
     }
 
     // Self-contained ISO-8601 formatters (mirrors CoreModels' `epg`/`epgFractional` but kept local so this

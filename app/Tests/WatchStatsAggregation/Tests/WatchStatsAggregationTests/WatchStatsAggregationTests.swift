@@ -44,6 +44,34 @@ func persistedPlayCountsAreTrapSafe() {
     #expect(WatchStats.intValue(Double.infinity) == 0)
     #expect(WatchStats.intValue(Double.greatestFiniteMagnitude) == 0)
     #expect(WatchStats.intValue(NSNumber(value: Double.greatestFiniteMagnitude)) == 0)
+    #expect(WatchStats.intValue(NSNumber(value: Int.max)) == Int.max)
+}
+
+@Test("Native maximum integers cannot overflow or dominate aggregated watch counts")
+func nativeMaximumIntegersAreBoundedEndToEnd() throws {
+    let json = """
+    { "type": "series", "name": "Corrupt",
+      "state": { "overallTimeWatched": 1000, "timesWatched": 9223372036854775807,
+                 "flaggedWatched": 1 } }
+    """
+    let item = try #require(
+        try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+    let persisted = try #require(WatchStats.record(fromBucketItem: "series-corrupt", item))
+    #expect(persisted.plays == WatchStats.maximumPlayCount)
+
+    let stats = WatchStats.compute(
+        records: [
+            persisted,
+            rec("series-normal", "series", seconds: 100, plays: 1),
+            rec("series-direct-max", "series", seconds: 100, plays: Int.max),
+        ],
+        genresByID: [:],
+        scopeLabel: "All time",
+        topTitles: WatchStats.topTitlesLimit,
+        topGenres: WatchStats.topGenresLimit)
+    #expect(stats.episodesCount == WatchStats.maximumPlayCount)
+    #expect(stats.longestBinge?.episodes == WatchStats.maximumPlayCount)
+    #expect(stats.topTitles.allSatisfy { $0.plays <= WatchStats.maximumPlayCount })
 }
 
 @Test("A user with real history gets real numbers (counts, totals, binge, ranking)")
