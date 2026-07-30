@@ -480,7 +480,7 @@ struct ProfileEditorView: View {
                             .disabled(!canSave)
                         Button("Cancel") { dismiss() }
                             .buttonStyle(ChipButtonStyle(selected: false))
-                        if !isNew && store.profiles.count > 1 {
+                        if canDeleteProfile {
                             Button("Delete Profile", role: .destructive) { confirmDelete = true }
                                 .buttonStyle(ChipButtonStyle(selected: false))
                         }
@@ -500,7 +500,10 @@ struct ProfileEditorView: View {
                             isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
                 store.remove(original)
-                dismiss()
+                // `remove` authorizes against the current stored record and returns nil both for an
+                // inactive successful deletion and for a rejected deletion. Confirm disappearance before
+                // dismissing so a stale/spoofed owner editor never closes as if destructive work succeeded.
+                if !store.profiles.contains(where: { $0.id == original.id }) { dismiss() }
             }
         }
         .profileCover(isPresented: $signInNeeded) {
@@ -512,6 +515,14 @@ struct ProfileEditorView: View {
             iOSSignInView()
             #endif
         }
+    }
+
+    /// The store is the authorization source, not the editable draft or the caller's original copy. Hide the
+    /// destructive control for both owner identities and when the target has already disappeared.
+    private var canDeleteProfile: Bool {
+        guard !isNew, store.profiles.count > 1,
+              let target = store.profiles.first(where: { $0.id == original.id }) else { return false }
+        return !target.isOwner && target.id != UserProfile.ownerID
     }
 
     /// Shown instead of the form for a non-active profile: editing is only allowed from within that

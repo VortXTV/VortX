@@ -68,6 +68,26 @@ private func deletionViolations(in source: String) -> [String] {
     return found
 }
 
+private func deletionUIViolations(in source: String) -> [String] {
+    var found: [String] = []
+    if !source.contains("if canDeleteProfile {") {
+        found.append("the delete control is not gated by stored-profile authorization")
+    }
+    if !source.contains("let target = store.profiles.first(where: { $0.id == original.id })") {
+        found.append("the editor does not resolve the stored record before showing Delete")
+    }
+    if !source.contains("return !target.isOwner && target.id != UserProfile.ownerID") {
+        found.append("the editor does not hide Delete for both owner identities")
+    }
+    if !source.contains("if !store.profiles.contains(where: { $0.id == original.id }) { dismiss() }") {
+        found.append("the editor dismisses without confirming that deletion succeeded")
+    }
+    if source.contains("if !isNew && store.profiles.count > 1 {") {
+        found.append("the old count-only delete gate remains")
+    }
+    return found
+}
+
 private func overlayProgressViolations(in source: String) -> [String] {
     guard let body = functionBody(
         in: source,
@@ -97,9 +117,12 @@ let profilesPath = URL(fileURLWithPath: root)
     .appendingPathComponent("app/SourcesShared/Profiles.swift").path
 let accountPath = URL(fileURLWithPath: root)
     .appendingPathComponent("app/SourcesShared/StremioAccount.swift").path
+let profilesViewPath = URL(fileURLWithPath: root)
+    .appendingPathComponent("app/SourcesShared/ProfilesView.swift").path
 
 guard let profilesSource = try? String(contentsOfFile: profilesPath, encoding: .utf8),
-      let accountSource = try? String(contentsOfFile: accountPath, encoding: .utf8) else {
+      let accountSource = try? String(contentsOfFile: accountPath, encoding: .utf8),
+      let profilesViewSource = try? String(contentsOfFile: profilesViewPath, encoding: .utf8) else {
     print("FAIL  could not read production profile sources under \(root)")
     exit(1)
 }
@@ -107,6 +130,13 @@ guard let profilesSource = try? String(contentsOfFile: profilesPath, encoding: .
 let productionDeletionViolations = deletionViolations(in: profilesSource)
 check(productionDeletionViolations.isEmpty, "shipping removal rejects the stored owner profile")
 for violation in productionDeletionViolations {
+    print("      \(violation)")
+}
+
+let productionDeletionUIViolations = deletionUIViolations(in: profilesViewSource)
+check(productionDeletionUIViolations.isEmpty,
+      "shipping editor hides owner deletion and dismisses only after successful removal")
+for violation in productionDeletionUIViolations {
     print("      \(violation)")
 }
 
@@ -127,6 +157,20 @@ func remove(_ profile: UserProfile) -> SwitchOutcome? {
 check(
     !deletionViolations(in: callerTrustedDeletionFixture).isEmpty,
     "gate rejects the pre-fix caller-trusted deletion shape"
+)
+
+let countOnlyDeleteUIFixture = """
+if !isNew && store.profiles.count > 1 {
+    Button("Delete Profile", role: .destructive) { confirmDelete = true }
+}
+Button("Delete", role: .destructive) {
+    store.remove(original)
+    dismiss()
+}
+"""
+check(
+    !deletionUIViolations(in: countOnlyDeleteUIFixture).isEmpty,
+    "gate rejects the pre-fix count-only delete control and unconditional dismissal"
 )
 
 let accountFallthroughFixture = """
