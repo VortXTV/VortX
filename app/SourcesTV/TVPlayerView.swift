@@ -3611,8 +3611,10 @@ struct TVPlayerView: View {
         resumeSeconds = currentTime
         appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false
         buffering = true
+        hasStartedPlaying = false
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
                        resumeOrigin: currentTime)
+        startLoadTimeout()
     }
 
     /// REQ-260721-78 option A (surface side): the ONE way this view publishes a terminal load

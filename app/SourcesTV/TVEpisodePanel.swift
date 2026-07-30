@@ -173,6 +173,7 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
     var groups: [CoreStreamSourceGroup] = []
     var firstPlayableAt: Date?
     for _ in 0 ..< 80 {                                    // ~20s ceiling, matching the episode page
+        guard !Task.isCancelled else { return nil }
         groups = core.streamGroups(forStreamId: v.id)
         let hasCandidate = groups.contains { group in
             group.streams.contains { stream in
@@ -187,8 +188,13 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
         let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
         if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
                                         secondsSinceFirstPlayable: elapsed, rememberedQuality: continuity) { break }
-        try? await Task.sleep(for: .milliseconds(250))
+        do {
+            try await Task.sleep(for: .milliseconds(250))
+        } catch {
+            return nil
+        }
     }
+    guard !Task.isCancelled else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
     let candidates = StreamRanking.rankedCandidates(
         groups, continuity: continuity, binge: binge, pin: pin

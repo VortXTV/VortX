@@ -19,6 +19,15 @@ typealias PlatformViewController = UIViewController
 typealias PlatformViewController = NSViewController
 #endif
 
+/// Narrows mpv's floating-point duration to the integer probe format without allowing malformed,
+/// non-finite, or out-of-range media metadata to trap the event queue.
+enum MPVDurationProbePolicy {
+    static func integerSeconds(_ value: Double) -> Int? {
+        guard value.isFinite else { return nil }
+        return Int(exactly: value.rounded(.towardZero))
+    }
+}
+
 // warning: metal API validation has been disabled to ignore crash when playing HDR videos.
 // Edit Scheme -> Run -> Diagnostics -> Metal API Validation -> Turn it off
 // https://github.com/KhronosGroup/MoltenVK/issues/2226
@@ -2994,8 +3003,9 @@ final class MPVMetalViewController: PlatformViewController {
                             }
                             #endif
                         case MPVProperty.duration:
-                            if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
-                                VXProbeState.shared.setPlayer(dur: Int(value))
+                            if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee,
+                               let duration = MPVDurationProbePolicy.integerSeconds(value) {
+                                VXProbeState.shared.setPlayer(dur: duration)
                                 self.emit(propertyName, value)
                             }
                         case MPVProperty.seekable:
