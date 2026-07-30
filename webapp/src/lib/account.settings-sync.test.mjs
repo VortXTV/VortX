@@ -127,7 +127,8 @@ async function installSyncServer(accountSession, initialDoc, initialVersion = 10
     if ((init.method ?? "GET") === "PUT") {
       const body = JSON.parse(String(init.body));
       puts.push(body);
-      if (beforeAcceptPut) await beforeAcceptPut(puts.length, body);
+      const override = beforeAcceptPut ? await beforeAcceptPut(puts.length, body) : null;
+      if (override instanceof Response) return override;
       const accepted = body.version > serverVersion;
       if (accepted) {
         serverVersion = body.version;
@@ -537,4 +538,178 @@ test("API-key-only account documents support deletion and hydrate missing keys a
   applySyncDoc({});
   assert.equal(getSettings().tmdbKey, "");
   assert.equal(getSettings().mdblistKey, "", "a remote missing key must clear the hydrated local value");
+});
+
+test("settings writes preserve the effective web roster, tombstones, fields, and library references", async () => {
+  const accountSession = makeAccountSession("acct-effective-web-roster");
+  const remote = settingsDoc();
+  remote.vortx.profiles.push({
+    id: "native-child",
+    name: "Native child",
+    main: false,
+    settings: { accentID: "ocean", playback: {} },
+  });
+  remote.profileEdits = {
+    editedAt: 200,
+    roster: [
+      {
+        id: "remote-owner",
+        name: "Renamed owner",
+        familyEdit: true,
+        settings: { accent: "ocean", playback: { safetyMode: "strict" } },
+      },
+      {
+        id: "native-child",
+        name: "Renamed native child",
+        pin: "test-pin-hash",
+        disabledAddons: ["https://disabled.example/manifest.json"],
+      },
+      {
+        id: "web-created",
+        name: "Web created",
+        familyEdit: true,
+        settings: { avatar: "🛰️", playback: { audioLang: "fr" } },
+      },
+      { id: "web-deleted", name: "Deleted child", deleted: true },
+    ],
+    libraryAdds: {
+      "web-created": [{ id: "tt-web-created", type: "movie", name: "Pending web title" }],
+    },
+  };
+
+  adoptSession(accountSession);
+  applySyncDoc(remote);
+  setActiveProfile(profiles()[0].id);
+  const server = await installSyncServer(accountSession, remote, 200);
+  updateSettings({ accentID: "gold" });
+
+  await waitUntil(() => server.puts.length === 1, "effective roster settings PUT");
+  const written = await server.readDoc();
+  const roster = written.profileEdits.roster;
+  const owner = roster.find((row) => row.id === "remote-owner");
+  const nativeChild = roster.find((row) => row.id === "native-child");
+  const webCreated = roster.find((row) => row.id === "web-created");
+  const webDeleted = roster.find((row) => row.id === "web-deleted");
+
+  assert.equal(owner.name, "Renamed owner");
+  assert.equal(owner.familyEdit, true);
+  assert.equal(owner.settings.accent, "gold");
+  assert.equal(owner.settings.playback.safetyMode, "strict");
+  assert.equal(nativeChild.name, "Renamed native child");
+  assert.equal(nativeChild.pin, "test-pin-hash");
+  assert.deepEqual(nativeChild.disabledAddons, ["https://disabled.example/manifest.json"]);
+  assert.equal(webCreated.name, "Web created");
+  assert.equal(webCreated.familyEdit, true);
+  assert.equal(webCreated.settings.avatar, "🛰️");
+  assert.equal(webDeleted.deleted, true);
+  assert.deepEqual(written.profileEdits.libraryAdds, remote.profileEdits.libraryAdds);
+});
+
+test("a failed serialized batch merges into queued edits and retries an isolated failure", async () => {
+  let releaseFirstPut;
+  const firstPutGate = new Promise((resolve) => {
+    releaseFirstPut = resolve;
+  });
+  let activePuts = 0;
+  let maxActivePuts = 0;
+  const failedPuts = new Set([1, 3]);
+  const accountSession = makeAccountSession("acct-failed-settings-batch");
+  const remote = settingsDoc();
+  adoptSession(accountSession);
+  applySyncDoc(remote);
+  const server = await installSyncServer(accountSession, remote, 100, async (putNumber) => {
+    activePuts += 1;
+    maxActivePuts = Math.max(maxActivePuts, activePuts);
+    if (putNumber === 1) await firstPutGate;
+    activePuts -= 1;
+    if (failedPuts.has(putNumber)) {
+      return new Response(JSON.stringify({ error: "injected settings write failure" }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return null;
+  });
+
+  updateSettings({ safetyFilter: "strict", accentID: "ocean" });
+  await waitUntil(() => server.puts.length === 1, "first failing settings PUT");
+  updateSettings({ accentID: "royal", background: "oled" });
+  await new Promise((resolve) => nativeSetTimeout(resolve, 900));
+  assert.equal(server.puts.length, 1, "the queued batch must not overlap the failing write");
+
+  releaseFirstPut();
+  await waitUntil(() => server.puts.length === 2, "queued retry after the first failure");
+  let written = await server.readDoc();
+  let owner = written.profileEdits.roster.find((row) => row.id === "remote-owner");
+  assert.equal(owner.settings.accent, "royal", "the newest same-key value must win");
+  assert.equal(owner.settings.oled, true);
+  assert.equal(owner.settings.playback.safetyMode, "strict", "the failed batch's distinct key must be retried");
+
+  updateSettings({ subtitleFont: "classic" });
+  await waitUntil(() => server.puts.length === 3, "isolated failing settings PUT");
+  await waitUntil(() => server.puts.length === 4, "automatic retry without another user edit");
+  written = await server.readDoc();
+  owner = written.profileEdits.roster.find((row) => row.id === "remote-owner");
+  assert.equal(owner.settings.playback.subFont, "classic");
+  assert.equal(maxActivePuts, 1, "retry writes must remain serialized");
+});
+
+test("session identity changes clear account data immediately and preserve device-local settings", () => {
+  const first = makeAccountSession("acct-clear-first");
+  const refreshed = {
+    ...first,
+    token: "token-acct-clear-first-refreshed",
+  };
+  const second = makeAccountSession("acct-clear-second");
+
+  adoptSession(first);
+  applySyncDoc(
+    settingsDoc(
+      {
+        accentID: "royal",
+        oled: true,
+        playback: {
+          audioLang: "fr",
+          subtitleLang: "de",
+          safetyMode: "strict",
+          sourceTypeOrder: ["torrent", "direct"],
+          subFont: "classic",
+        },
+      },
+      { tmdb: "account-a-tmdb", mdblist: "account-a-mdblist" },
+    ),
+  );
+  const ownerId = profiles()[0].id;
+  addProfile("Account A overlay", "🧭");
+  updateSettings({
+    autoplayTrailers: false,
+    directLinksOnly: true,
+    skipStep: 30,
+    episodeAlerts: true,
+    performance: "reduced",
+  });
+
+  adoptSession(refreshed);
+  assert.equal(getSettings().tmdbKey, "account-a-tmdb", "a token refresh must retain the same account's settings");
+  assert.equal(getSettings().mdblistKey, "account-a-mdblist");
+  assert.equal(getSettings().accentID, "royal");
+  assert.equal(getSettings().background, "oled");
+  assert.equal(getSettings().safetyFilter, "strict");
+  assert.deepEqual(getSettings().sourceOrder, ["torrent", "direct"]);
+  assert.equal(getSettings().subtitleFont, "classic");
+  assert.equal(getSettings().autoplayTrailers, false);
+  assert.equal(getSettings().directLinksOnly, true);
+  assert.equal(getSettings().skipStep, 30);
+  assert.equal(getSettings().episodeAlerts, true);
+  assert.equal(getSettings().performance, "reduced");
+  setActiveProfile(ownerId);
+  assert.equal(getSettings().accentID, "royal");
+  assert.equal(getSettings().background, "oled");
+
+  applySyncDoc(settingsDoc({ accentID: "crimson", oled: true }, { tmdb: "refreshed-tmdb" }));
+  adoptSession(second);
+  assert.equal(getSettings().tmdbKey, "", "account A credentials must clear before account B hydration");
+  assert.equal(getSettings().accentID, "vortx", "account A appearance must clear before account B hydration");
+  assert.equal(getSettings().background, "warm");
+  assert.equal(getSettings().performance, "reduced", "safe device-local settings must survive account changes");
 });
