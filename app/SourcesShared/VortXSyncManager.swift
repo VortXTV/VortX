@@ -469,11 +469,13 @@ final class VortXSyncManager: ObservableObject {
     // MARK: - Flows
 
     func register(email: String, username: String, password: String) async -> (result: AuthResult, recoveryCode: String?) {
-        let kdfSalt = VortXSyncCrypto.randomBytes(16)
+        guard let kdfSalt = VortXSecureEntropy.randomBytes(16),
+              let dataKey = VortXSecureEntropy.randomBytes(32),
+              let recoveryCode = VortXSecureEntropy.makeRecoveryCode() else {
+            return (.failed("Could not create secure encryption keys. Try again."), nil)
+        }
         let iters = VortXSyncCrypto.defaultIters
         let masterKey = VortXSyncCrypto.masterKey(password: password, kdfSalt: kdfSalt, iters: iters)
-        let dataKey = VortXSyncCrypto.randomBytes(32)
-        let recoveryCode = VortXSyncCrypto.makeRecoveryCode()
         let recoveryKey = VortXSyncCrypto.recoveryKey(recoveryCode: recoveryCode, kdfSalt: kdfSalt, iters: iters)
         guard let wrappedPw = VortXSyncCrypto.seal(key: masterKey, dataKey),
               let wrappedRec = VortXSyncCrypto.seal(key: recoveryKey, dataKey) else {

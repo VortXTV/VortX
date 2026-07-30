@@ -118,37 +118,4 @@ enum VortXSyncCrypto {
         pbkdf2(recoveryKey, salt: Data(recoveryCode.utf8), iterations: 1).base64EncodedString()
     }
 
-    static func randomBytes(_ count: Int) -> Data {
-        var d = Data(count: count)
-        _ = d.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, count, $0.baseAddress!) }
-        return d
-    }
-
-    /// A strong human-friendly recovery code, identical scheme to the website: VX- + 26 Crockford
-    /// base32 chars over 128 random bits, grouped in 4s.
-    static func makeRecoveryCode() -> String {
-        let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
-        let bytes = randomBytes(16)
-        var bits = ""
-        for b in bytes { bits += String(b, radix: 2).leftPadded(to: 8) }
-        var out = ""
-        var i = bits.startIndex
-        while i < bits.endIndex {
-            let end = bits.index(i, offsetBy: 5, limitedBy: bits.endIndex) ?? bits.endIndex
-            let chunk = String(bits[i..<end]).rightPadded(to: 5)
-            if let v = Int(chunk, radix: 2) { out.append(alphabet[v]) }
-            i = end
-        }
-        let groups = stride(from: 0, to: out.count, by: 4).map { start -> String in
-            let s = out.index(out.startIndex, offsetBy: start)
-            let e = out.index(s, offsetBy: 4, limitedBy: out.endIndex) ?? out.endIndex
-            return String(out[s..<e])
-        }
-        return "VX-" + groups.joined(separator: "-")
-    }
-}
-
-private extension String {
-    func leftPadded(to n: Int) -> String { count >= n ? self : String(repeating: "0", count: n - count) + self }
-    func rightPadded(to n: Int) -> String { count >= n ? self : self + String(repeating: "0", count: n - count) }
 }
