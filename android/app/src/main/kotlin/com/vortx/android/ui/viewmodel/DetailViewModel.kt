@@ -549,6 +549,8 @@ class DetailViewModel(
                         resolvedUrl = playable.url,
                         sourceName = source.addon,
                         qualityText = StreamRanking.qualityLabel(source),
+                        isDolbyVision = playable.isDolbyVision,
+                        isAtmos = playable.isAtmos,
                         // Forward the resolved request headers (the stream's behaviorHints.proxyHeaders.request,
                         // decoded by the engine mapping) so a header-gated CDN serves the download too.
                         requestHeaders = playable.headers.takeIf { it.isNotEmpty() },

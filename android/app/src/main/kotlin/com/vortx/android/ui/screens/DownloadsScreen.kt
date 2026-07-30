@@ -20,15 +20,18 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.vortx.android.downloads.AndroidDownloadedMediaCapabilityProbe
 import com.vortx.android.downloads.DownloadGroup
 import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.downloads.DownloadStore
+import com.vortx.android.downloads.DownloadedMediaCapabilityResolver
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
 import com.vortx.android.model.Playable
@@ -37,6 +40,9 @@ import com.vortx.android.ui.components.SurfaceCard
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.vortxGlassStrip
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /// Settings > Downloads: the device's offline downloads with per-item state (Downloading %, Queued, Paused,
 /// Downloaded, Failed + error), a play-from-local action, a delete action, and the total storage used. Kotlin/Compose
@@ -262,13 +268,14 @@ private fun DownloadRow(record: DownloadRecord, title: String?, onPlay: (Playabl
 
 @Composable
 private fun DownloadRowActions(record: DownloadRecord, onPlay: (Playable) -> Unit) {
+    val scope = rememberCoroutineScope()
     Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
         when (record.state) {
             DownloadState.COMPLETED -> Chip(
                 label = "Play",
                 selected = false,
                 leadingIcon = VortXIcons.playFill,
-                onClick = { playLocal(record, onPlay) },
+                onClick = { scope.launch { playLocal(record, onPlay) } },
             )
             DownloadState.DOWNLOADING -> Chip(
                 label = "Pause",
@@ -298,27 +305,42 @@ private fun DownloadRowActions(record: DownloadRecord, onPlay: (Playable) -> Uni
 ///
 /// FIDELITY GAP, stated plainly rather than hidden: Apple rebuilds the engine `PlaybackMeta` from the record
 /// (`record.playbackMeta`) so progress / Continue Watching record against the same library item as a streamed play.
-/// Android has no `PlaybackMeta` port yet, so this hands the shell a plain [Playable] and the engine attributes
-/// progress to whatever item its session currently points at. The file PLAYS correctly; per-title progress
-/// attribution for a download started from THIS screen is not yet guaranteed. The record already carries every id
-/// needed to close the gap (`contentId` / `videoId` / `type` / `season` / `episode`), so it is a wiring job for the
-/// round that ports PlaybackMeta, not a schema change.
+/// Android has no `PlaybackMeta` port yet, so this hands the shell a local [Playable] and the engine attributes
+/// progress to whatever item its session currently points at. The record preserves known DV and Atmos routing
+/// flags; a legacy record is probed off the UI thread before routing. Per-title progress attribution for a download
+/// started from THIS screen is not yet guaranteed. It carries every id needed to close the gap (`contentId` /
+/// `videoId` / `type` / `season` / `episode`), so it is a wiring job for the round that ports PlaybackMeta, not a
+/// schema change.
 ///
 /// Fail-soft if the file was purged out from under us (the eviction caption above is not hypothetical): drop the
 /// stale row instead of presenting a dead player.
-private fun playLocal(record: DownloadRecord, onPlay: (Playable) -> Unit) {
-    if (record.state != DownloadState.COMPLETED || !DownloadStore.fileExists(record)) {
+private suspend fun playLocal(record: DownloadRecord, onPlay: (Playable) -> Unit) {
+    if (record.state != DownloadState.COMPLETED) return
+
+    val resolution = withContext(Dispatchers.IO) {
+        val file = DownloadStore.fileFor(record)
+        if (!file.isFile) return@withContext null
+        DownloadedMediaCapabilityResolver.resolve(
+            record = record,
+            file = file,
+            probe = AndroidDownloadedMediaCapabilityProbe,
+            persistResolved = { resolved ->
+                DownloadStore.update(record.id) { current ->
+                    current.copy(
+                        isDolbyVision = resolved.isDolbyVision,
+                        isAtmos = resolved.isAtmos,
+                    )
+                }
+            },
+        )
+    }
+    if (resolution == null) {
         if (record.state == DownloadState.COMPLETED) DownloadManager.cancel(record.id)
         return
     }
     onPlay(
-        Playable(
-            url = DownloadStore.fileFor(record).toURI().toString(),
-            title = record.displayTitle,
-            // A finished download plays directly from disk, never back through the loopback torrent server, so this
-            // is false even for a record whose isTorrent records HOW it was fetched. Matches Apple's `torrent: false`.
-            isTorrent = false,
-            viaStreamingServer = false,
+        resolution.record.localPlayable(
+            DownloadStore.fileFor(resolution.record).toURI().toString(),
         ),
     )
 }

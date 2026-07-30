@@ -298,7 +298,7 @@ object DownloadStore {
 
     // MARK: JSON
 
-    private fun recordToJson(record: DownloadRecord): JSONObject = JSONObject().apply {
+    internal fun recordToJson(record: DownloadRecord): JSONObject = JSONObject().apply {
         put("id", record.id)
         put("contentId", record.contentId)
         put("videoId", record.videoId)
@@ -309,6 +309,8 @@ object DownloadStore {
         record.episode?.let { put("episode", it) }
         record.sourceName?.let { put("sourceName", it) }
         record.qualityText?.let { put("qualityText", it) }
+        record.isDolbyVision?.let { put("isDolbyVision", it) }
+        record.isAtmos?.let { put("isAtmos", it) }
         put("isTorrent", record.isTorrent)
         record.headers?.takeIf { it.isNotEmpty() }?.let { headers ->
             put("headers", JSONObject().apply { headers.forEach { (k, v) -> put(k, v) } })
@@ -324,7 +326,7 @@ object DownloadStore {
         record.taskIdentifier?.let { put("taskIdentifier", it) }
     }
 
-    private fun recordFromJson(json: JSONObject): DownloadRecord? {
+    internal fun recordFromJson(json: JSONObject): DownloadRecord? {
         val id = json.optString("id").takeIf { it.isNotEmpty() } ?: return null
         val headers = json.optJSONObject("headers")?.let { obj ->
             obj.keys().asSequence().associateWith { obj.optString(it) }
@@ -340,6 +342,10 @@ object DownloadStore {
             episode = if (json.has("episode")) json.optInt("episode") else null,
             sourceName = json.optStringOrNull("sourceName"),
             qualityText = json.optStringOrNull("qualityText"),
+            // Old index rows contain only display quality such as "4K", not codec capabilities.
+            // Absence is therefore unknown and must be established from the completed local file.
+            isDolbyVision = json.optBooleanOrNull("isDolbyVision"),
+            isAtmos = json.optBooleanOrNull("isAtmos"),
             isTorrent = json.optBoolean("isTorrent", false),
             headers = headers,
             remoteURL = json.optString("remoteURL"),
@@ -360,6 +366,9 @@ object DownloadStore {
     /** `optString` returns "" for an absent key, which would turn a null poster/error into an empty string. */
     private fun JSONObject.optStringOrNull(key: String): String? =
         if (has(key) && !isNull(key)) optString(key).takeIf { it.isNotEmpty() } else null
+
+    private fun JSONObject.optBooleanOrNull(key: String): Boolean? =
+        if (has(key) && !isNull(key)) optBoolean(key) else null
 }
 
 /**

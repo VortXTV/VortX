@@ -51,6 +51,17 @@ data class DownloadRecord(
     val sourceName: String? = null,
     /** Quality signature shown on the row + re-recorded on play, so a CW resume keeps quality continuity. */
     val qualityText: String? = null,
+    /**
+     * Preserve the streamed source's routing decision when the completed file is opened offline.
+     * Null is reserved for legacy index rows that predate capability persistence and therefore need
+     * a one-time probe of the completed file before playback.
+     */
+    val isDolbyVision: Boolean? = null,
+    /**
+     * Preserve the streamed source's passthrough routing decision when the completed file is opened offline.
+     * Null means unknown, not false. Successful local probing replaces it with an evidence-backed value.
+     */
+    val isAtmos: Boolean? = null,
 
     /**
      * True when this was a torrent-to-disk download. A *finished* download always plays from the LOCAL file;
@@ -86,4 +97,18 @@ data class DownloadRecord(
     /** 0..1 download progress; 0 until a total is known (a torrent's total is unknown up front). */
     val fractionComplete: Double
         get() = if (bytesTotal > 0) (bytesDone.toDouble() / bytesTotal.toDouble()).coerceIn(0.0, 1.0) else 0.0
+
+    /**
+     * Rebuild the local playback handle without losing known source capabilities. Unknown legacy
+     * capabilities fail closed to false here; [com.vortx.android.downloads.DownloadedMediaCapabilityResolver]
+     * probes them before this function is called and leaves them unknown when probing fails.
+     */
+    fun localPlayable(localURL: String): Playable = Playable(
+        url = localURL,
+        title = displayTitle,
+        viaStreamingServer = false,
+        isTorrent = false,
+        isDolbyVision = isDolbyVision == true,
+        isAtmos = isAtmos == true,
+    )
 }

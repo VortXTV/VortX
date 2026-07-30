@@ -191,6 +191,8 @@ object DownloadManager {
         resolvedUrl: String,
         sourceName: String?,
         qualityText: String?,
+        isDolbyVision: Boolean = false,
+        isAtmos: Boolean = false,
         requestHeaders: Map<String, String>? = null,
     ): DownloadRecord {
         DownloadStore.records.value.firstOrNull { it.videoId == videoId && it.state != DownloadState.FAILED }
@@ -211,6 +213,7 @@ object DownloadManager {
             val failed = DownloadRecord(
                 id = id, contentId = contentId, videoId = videoId, type = type, name = name, poster = poster,
                 season = season, episode = episode, sourceName = sourceName, qualityText = qualityText,
+                isDolbyVision = isDolbyVision, isAtmos = isAtmos,
                 isTorrent = false, headers = headers, remoteURL = resolvedUrl,
                 localFilename = "$id.$ext", state = DownloadState.FAILED,
                 errorText = "This source streams in segments (HLS), which can't be saved for offline on Android yet. " +
@@ -227,6 +230,7 @@ object DownloadManager {
             val record = DownloadRecord(
                 id = id, contentId = contentId, videoId = videoId, type = type, name = name, poster = poster,
                 season = season, episode = episode, sourceName = sourceName, qualityText = qualityText,
+                isDolbyVision = isDolbyVision, isAtmos = isAtmos,
                 isTorrent = stream.isTorrent, headers = headers, remoteURL = resolvedUrl,
                 localFilename = "$id.$ext",
                 state = if (canStartNow) DownloadState.DOWNLOADING else DownloadState.QUEUED,
