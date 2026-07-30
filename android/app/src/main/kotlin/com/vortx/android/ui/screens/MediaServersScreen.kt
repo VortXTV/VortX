@@ -19,6 +19,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -50,6 +51,9 @@ import com.vortx.android.ui.components.SurfaceCard
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.util.UUID
 
@@ -281,6 +285,10 @@ private fun PlexAddFlow(onDone: () -> Unit) {
 private fun JellyfinAddFlow(onDone: () -> Unit) {
     val colors = VortXTheme.colors
     val scope = rememberCoroutineScope()
+    val quickConnectLifecycle = remember(scope) { JellyfinQuickConnectLifecycle(scope) }
+    DisposableEffect(quickConnectLifecycle) {
+        onDispose { quickConnectLifecycle.cancel() }
+    }
     var phase by remember { mutableStateOf(Phase.URL) }
     var base by remember { mutableStateOf("") }
     var username by remember { mutableStateOf("") }
@@ -317,6 +325,7 @@ private fun JellyfinAddFlow(onDone: () -> Unit) {
                 enabled = MediaServerResolve.normalizedBase(base) != null && !busy,
                 loading = busy,
                 onClick = {
+                    quickConnectLifecycle.cancel()
                     scope.launch {
                         busy = true
                         error = null
@@ -328,8 +337,16 @@ private fun JellyfinAddFlow(onDone: () -> Unit) {
                                 val init = JellyfinClient.initiateQuickConnect(base, deviceId)
                                 qcCode = init.code
                                 phase = Phase.QUICK_CONNECT
-                                val result = JellyfinClient.awaitQuickConnect(base, init.secret, deviceId)
-                                finish(result)
+                                quickConnectLifecycle.start(
+                                    await = {
+                                        JellyfinClient.awaitQuickConnect(base, init.secret, deviceId)
+                                    },
+                                    onSuccess = ::finish,
+                                    onFailure = {
+                                        phase = Phase.PASSWORD
+                                        error = it.message ?: "Could not finish Quick Connect."
+                                    },
+                                )
                             }
                         } catch (e: CancellationException) {
                             throw e
@@ -354,7 +371,17 @@ private fun JellyfinAddFlow(onDone: () -> Unit) {
                     onOpen = {},
                 )
             }
-            Chip(label = "Use username & password instead", selected = false, onClick = { phase = Phase.PASSWORD })
+            Chip(
+                label = "Use username & password instead",
+                selected = false,
+                onClick = {
+                    quickConnectLifecycle.cancel()
+                    qcCode = null
+                    error = null
+                    busy = false
+                    phase = Phase.PASSWORD
+                },
+            )
         }
 
         Phase.PASSWORD -> {
@@ -444,6 +471,49 @@ private fun EmbyAddFlow(onDone: () -> Unit) {
 // MARK: - Shared pieces
 
 private enum class Phase { URL, QUICK_CONNECT, PASSWORD }
+
+/**
+ * Owns one Jellyfin Quick Connect poll and invalidates all of its callbacks when the user falls back to
+ * password sign-in or leaves the add flow. Cancellation alone is not enough here: the poll's blocking
+ * HTTP call may take a moment to return, so [generation] also prevents a stale success from adding a
+ * server after the user has explicitly abandoned Quick Connect.
+ */
+internal class JellyfinQuickConnectLifecycle(private val scope: CoroutineScope) {
+    private var generation = 0L
+    private var pollJob: Job? = null
+
+    internal val isPolling: Boolean
+        get() = pollJob?.isActive == true
+
+    internal fun <T> start(
+        await: suspend () -> T,
+        onSuccess: (T) -> Unit,
+        onFailure: (Exception) -> Unit,
+    ) {
+        cancel()
+        val token = generation
+        val launched = scope.launch(start = CoroutineStart.LAZY) {
+            try {
+                val result = await()
+                if (token == generation) onSuccess(result)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (token == generation) onFailure(e)
+            } finally {
+                if (token == generation) pollJob = null
+            }
+        }
+        pollJob = launched
+        launched.start()
+    }
+
+    internal fun cancel() {
+        generation += 1
+        pollJob?.cancel()
+        pollJob = null
+    }
+}
 
 @Composable
 private fun PairingPanel(code: String, instruction: String, openLabel: String?, onOpen: () -> Unit) {

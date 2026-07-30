@@ -62,11 +62,12 @@ fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier:
 @Composable
 private fun TvHomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, modifier: Modifier) {
     val colors = VortXTheme.colors
+    val visibleCatalogs = remember(catalogs) { tvHomeCatalogs(catalogs) }
     // The tile the viewer is pointing at drives the hero backdrop. Initialised once to the first item (so
     // the hero is never empty on entry) and NOT re-keyed on catalog emissions, so a late engine tick that
     // replaces the row set does not yank the hero back to the top while the viewer is browsing.
-    var focused by remember { mutableStateOf<MetaItem?>(catalogs.firstOrNull()?.items?.firstOrNull()) }
-    val heroItem = focused ?: catalogs.firstOrNull()?.items?.firstOrNull()
+    var focused by remember { mutableStateOf<MetaItem?>(visibleCatalogs.firstOrNull()?.items?.firstOrNull()) }
+    val heroItem = focused ?: visibleCatalogs.firstOrNull()?.items?.firstOrNull()
 
     // Seed D-pad focus on the first tile of the first row so a fresh TV entry lands somewhere actionable
     // instead of nowhere (a TV has no touch to bootstrap focus). Guarded: requestFocus throws if the node
@@ -82,7 +83,7 @@ private fun TvHomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, m
             contentPadding = PaddingValues(top = TvDimens.rowGap, bottom = TvDimens.edge),
             verticalArrangement = Arrangement.spacedBy(TvDimens.rowGap),
         ) {
-            itemsIndexed(catalogs, key = { _, c -> c.id }) { index, catalog ->
+            itemsIndexed(visibleCatalogs, key = { _, c -> c.id }) { index, catalog ->
                 TvCatalogRow(
                     catalog = catalog,
                     onItem = onItem,
@@ -173,6 +174,7 @@ private fun TvCatalogRow(
     onFocused: (MetaItem) -> Unit,
     firstCardFocus: FocusRequester?,
 ) {
+    val visibleItems = remember(catalog.items) { tvHomeItems(catalog.items) }
     Column {
         val eyebrow = if (catalog.id == "continue") "Pick up where you left off" else null
         Column(modifier = Modifier.padding(start = TvDimens.edge, bottom = VortXTheme.spacing.sm)) {
@@ -185,7 +187,7 @@ private fun TvCatalogRow(
             contentPadding = PaddingValues(horizontal = TvDimens.edge),
             horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
         ) {
-            itemsIndexed(catalog.items, key = { _, it -> it.id }) { i, item ->
+            itemsIndexed(visibleItems, key = { _, it -> tvHomeItemKey(it) }) { i, item ->
                 TvPosterCard(
                     item = item,
                     onClick = { onItem(item) },
@@ -196,3 +198,20 @@ private fun TvCatalogRow(
         }
     }
 }
+
+/**
+ * A [Catalog.id] is the engine's stable add-on-qualified row identity (`base|type|catalog`), so two
+ * rows with the same id are the same logical rail. Keep the first engine-ranked occurrence and retain
+ * rows from different add-ons even when their bare manifest catalog names match.
+ */
+internal fun tvHomeCatalogs(catalogs: List<Catalog>): List<Catalog> =
+    catalogs.distinctBy { it.id }
+
+/**
+ * A content identity is type plus id: a movie and series may legitimately share an external id, while
+ * two entries with the same type/id in one rail are the same title repeated by an add-on or page edge.
+ */
+internal fun tvHomeItems(items: List<MetaItem>): List<MetaItem> =
+    items.distinctBy(::tvHomeItemKey)
+
+internal fun tvHomeItemKey(item: MetaItem): String = "${item.type.name}|${item.id}"
