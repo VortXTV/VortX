@@ -446,20 +446,18 @@ function createSettingsSyncState(session: Session | null, ownerSnapshot?: Settin
 settingsSyncState = createSettingsSyncState(null);
 
 function bindSettingsSyncState(session: Session | null): void {
-  if (sameSession(settingsSyncState.session, session)) {
+  if (sameAccountScope(settingsSyncState.session, session)) {
     settingsSyncState.session = session;
     return;
   }
   if (settingsSyncState.pushTimer) clearTimeout(settingsSyncState.pushTimer);
   let resetSnapshot: Settings | undefined;
-  if (!sameAccountScope(settingsSyncState.session, session)) {
-    withSuppressedUp(() => {
-      resetSnapshot = updateSettings({
-        ...ACCOUNT_SCOPED_SETTING_DEFAULTS,
-        sourceOrder: [...(ACCOUNT_SCOPED_SETTING_DEFAULTS.sourceOrder ?? [])],
-      });
+  withSuppressedUp(() => {
+    resetSnapshot = updateSettings({
+      ...ACCOUNT_SCOPED_SETTING_DEFAULTS,
+      sourceOrder: [...(ACCOUNT_SCOPED_SETTING_DEFAULTS.sourceOrder ?? [])],
     });
-  }
+  });
   settingsSyncState = createSettingsSyncState(session, resetSnapshot);
 }
 

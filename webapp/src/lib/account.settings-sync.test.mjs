@@ -713,3 +713,37 @@ test("session identity changes clear account data immediately and preserve devic
   assert.equal(getSettings().background, "warm");
   assert.equal(getSettings().performance, "reduced", "safe device-local settings must survive account changes");
 });
+
+test("token refresh preserves pending settings writes and armed sync state", async () => {
+  const accountSession = makeAccountSession("acct-token-refresh-pending");
+  const refreshed = {
+    ...accountSession,
+    token: "token-acct-token-refresh-pending-refreshed",
+  };
+  const remote = settingsDoc();
+
+  adoptSession(accountSession);
+  applySyncDoc(remote);
+  const server = await installSyncServer(accountSession, remote);
+
+  updateSettings({ accentID: "forest" });
+  adoptSession(refreshed);
+
+  await waitUntil(() => server.puts.length === 1, "pending settings PUT after token refresh");
+  const firstPut = server.requests.filter((request) => request.init.method === "PUT");
+  assert.equal(firstPut.length, 1, "the pending edit must produce exactly one PUT");
+  assert.equal(
+    firstPut[0].init.headers.authorization,
+    `Bearer ${refreshed.token}`,
+    "the preserved pending write must use the refreshed token",
+  );
+  let written = await server.readDoc();
+  let owner = written.profileEdits.roster.find((row) => row.id === "remote-owner");
+  assert.equal(owner.settings.accent, "forest", "the edit queued before refresh must survive");
+
+  updateSettings({ background: "oled" });
+  await waitUntil(() => server.puts.length === 2, "post-refresh settings PUT");
+  written = await server.readDoc();
+  owner = written.profileEdits.roster.find((row) => row.id === "remote-owner");
+  assert.equal(owner.settings.oled, true, "the refreshed session must remain armed for later edits");
+});
