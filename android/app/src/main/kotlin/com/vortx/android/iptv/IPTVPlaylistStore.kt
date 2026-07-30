@@ -281,7 +281,9 @@ class SharedPreferencesIPTVPersistence(context: Context) : IPTVPersistence {
     }
 
     override fun readCredential(slug: String): String? = creds.string(credKey(slug))
-    override fun writeCredential(slug: String, json: String?) = creds.set(credKey(slug), json)
+    override fun writeCredential(slug: String, json: String?) {
+        creds.set(credKey(slug), json)
+    }
 
     private fun credKey(slug: String): String = KEY_CRED_PREFIX + slug
 

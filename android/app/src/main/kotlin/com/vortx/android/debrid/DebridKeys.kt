@@ -1,10 +1,7 @@
 package com.vortx.android.debrid
 
 import android.content.Context
-import android.content.SharedPreferences
-import android.util.Log
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
+import com.vortx.android.security.FailClosedCredentialStore
 
 /// A debrid service VortX can hold an API key for. A debrid key turns cached torrents into instant
 /// direct links, so cached torrents play straight from the user's own debrid account without a debrid
@@ -25,18 +22,22 @@ enum class DebridService(val id: String, val displayName: String) {
 /// the Android analogue of the Apple `DebridKeys` (which is Keychain-backed): debrid keys are
 /// credentials, so they never sit in plain SharedPreferences.
 ///
-/// Fail-soft by construction: if the security-crypto artifact is missing or the encrypted store fails
-/// to open (a known-rare Keystore corruption), we fall back to a plain SharedPreferences file so the
-/// resolver still functions and the app never crashes at the storage boundary. The fallback is logged.
+/// If Keystore cannot open, keys remain memory-only for the current process. They are never written to
+/// plain SharedPreferences.
 ///
 /// A single instance is enough (keys are tiny and read on demand); [DebridResolver] builds one from the
-/// app context. Reads are synchronous and cheap; writes are `apply()` (async, off the caller's thread).
+/// app context. Reads and durable writes are synchronous because credential mutations are tiny.
 class DebridKeys(context: Context) {
 
-    private val prefs: SharedPreferences = openPrefs(context.applicationContext)
+    private val store = FailClosedCredentialStore(
+        context = context,
+        encryptedFileName = ENCRYPTED_FILE,
+        legacyPlainFileName = PLAIN_FALLBACK_FILE,
+        tag = TAG,
+    )
 
     /// The stored key for [service], or an empty string when none is set.
-    fun key(service: DebridService): String = prefs.getString(service.storageKey, null).orEmpty()
+    fun key(service: DebridService): String = store.string(service.storageKey).orEmpty()
 
     /// True when [service] has a non-empty key configured.
     fun isConfigured(service: DebridService): Boolean = key(service).isNotEmpty()
@@ -45,9 +46,11 @@ class DebridKeys(context: Context) {
     /// Apple `setKey`.
     fun setKey(service: DebridService, value: String) {
         val trimmed = value.trim()
-        prefs.edit().apply {
-            if (trimmed.isEmpty()) remove(service.storageKey) else putString(service.storageKey, trimmed)
-        }.apply()
+        if (trimmed.isEmpty()) {
+            store.clear(service.storageKey)
+        } else {
+            store.set(service.storageKey, trimmed)
+        }
     }
 
     /// Services with a key set, in preference order (Real-Debrid first, the most common), mirroring the
@@ -67,22 +70,5 @@ class DebridKeys(context: Context) {
         const val ENCRYPTED_FILE = "vortx_debrid_keys"
         const val PLAIN_FALLBACK_FILE = "vortx_debrid_keys_plain"
 
-        /// Open the encrypted store; on any failure (missing artifact, Keystore corruption) fall back to
-        /// a plain prefs file so the resolver still works. Never throws.
-        fun openPrefs(appContext: Context): SharedPreferences = runCatching {
-            val masterKey = MasterKey.Builder(appContext)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            EncryptedSharedPreferences.create(
-                appContext,
-                ENCRYPTED_FILE,
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-            )
-        }.getOrElse { error ->
-            Log.w(TAG, "EncryptedSharedPreferences unavailable; falling back to plain prefs", error)
-            appContext.getSharedPreferences(PLAIN_FALLBACK_FILE, Context.MODE_PRIVATE)
-        }
     }
 }

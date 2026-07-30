@@ -3,8 +3,7 @@ package com.vortx.android.sync
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
+import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.profile.ProfileStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -682,25 +681,17 @@ class VortXSyncManager(context: Context) {
         }
 
     /**
-     * Keystore-encrypted persistence for the session (token + account JSON + base64 data key), fail-soft
-     * exactly like [SecureTokenStore] / [com.vortx.android.auth.AuthIdentityStore]: prefer the AES-encrypted
-     * store, fall back to a plain file only if security-crypto itself is unavailable, so a storage-layer
-     * problem degrades to "signed out" instead of crashing.
+     * Keystore-encrypted persistence for the session (token + account JSON + base64 data key). If Keystore
+     * is unavailable, the live session remains memory-only and disappears on restart. It is never written
+     * to plain SharedPreferences.
      */
     private class SessionStore(appContext: Context) {
-        private val prefs: SharedPreferences = runCatching {
-            val masterKey = MasterKey.Builder(appContext)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            EncryptedSharedPreferences.create(
-                appContext, ENCRYPTED_FILE, masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-            )
-        }.getOrElse { error ->
-            Log.w(TAG, "EncryptedSharedPreferences unavailable; falling back to plain prefs", error)
-            appContext.getSharedPreferences(PLAIN_FALLBACK_FILE, Context.MODE_PRIVATE)
-        }
+        private val store = FailClosedCredentialStore(
+            context = appContext,
+            encryptedFileName = ENCRYPTED_FILE,
+            legacyPlainFileName = PLAIN_FALLBACK_FILE,
+            tag = TAG,
+        )
 
         fun persist(s: Session) {
             val acct = JSONObject().apply {
@@ -709,17 +700,19 @@ class VortXSyncManager(context: Context) {
                 put("username", s.account.username)
                 put("twoFactorEnabled", s.account.twoFactorEnabled)
             }
-            prefs.edit()
-                .putString(KEY_TOKEN, s.token)
-                .putString(KEY_ACCOUNT, acct.toString())
-                .putString(KEY_DATA_KEY, VortXCrypto.b64(s.dataKey))
-                .apply()
+            store.set(
+                mapOf(
+                    KEY_TOKEN to s.token,
+                    KEY_ACCOUNT to acct.toString(),
+                    KEY_DATA_KEY to VortXCrypto.b64(s.dataKey),
+                ),
+            )
         }
 
         fun load(): Session? {
-            val token = prefs.getString(KEY_TOKEN, null)?.takeIf { it.isNotEmpty() } ?: return null
-            val acctStr = prefs.getString(KEY_ACCOUNT, null) ?: return null
-            val dkStr = prefs.getString(KEY_DATA_KEY, null) ?: return null
+            val token = store.string(KEY_TOKEN)?.takeIf { it.isNotEmpty() } ?: return null
+            val acctStr = store.string(KEY_ACCOUNT) ?: return null
+            val dkStr = store.string(KEY_DATA_KEY) ?: return null
             val dataKey = VortXCrypto.unb64(dkStr) ?: return null
             val acct = runCatching { JSONObject(acctStr) }.getOrNull() ?: return null
             val account = Account(
@@ -732,7 +725,7 @@ class VortXSyncManager(context: Context) {
         }
 
         fun clear() {
-            prefs.edit().remove(KEY_TOKEN).remove(KEY_ACCOUNT).remove(KEY_DATA_KEY).apply()
+            store.clear(KEY_TOKEN, KEY_ACCOUNT, KEY_DATA_KEY)
         }
 
         private companion object {

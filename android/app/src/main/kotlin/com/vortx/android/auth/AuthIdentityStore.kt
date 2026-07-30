@@ -1,10 +1,7 @@
 package com.vortx.android.auth
 
 import android.content.Context
-import android.content.SharedPreferences
-import android.util.Log
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
+import com.vortx.android.security.FailClosedCredentialStore
 
 /// A tiny, Keystore-encrypted cache of "who was last signed in", for instant UI display (Settings'
 /// Account row, the account screen) before the engine's own `ctx` read has had a chance to land.
@@ -19,19 +16,24 @@ import androidx.security.crypto.MasterKey
 /// SharedPreferences (ANDROID-PLAN.md §0 invariant #5); this is the Keystore-backed home for that
 /// display cache, the same pattern [com.vortx.android.debrid.DebridKeys] uses for debrid API keys.
 class AuthIdentityStore(context: Context) {
-    private val prefs: SharedPreferences = openPrefs(context.applicationContext)
+    private val store = FailClosedCredentialStore(
+        context = context,
+        encryptedFileName = ENCRYPTED_FILE,
+        legacyPlainFileName = PLAIN_FALLBACK_FILE,
+        tag = TAG,
+    )
 
     /// The last-known signed-in email, or null if the cache says signed-out (or was never written).
-    fun cachedEmail(): String? = prefs.getString(KEY_EMAIL, null)
+    fun cachedEmail(): String? = store.string(KEY_EMAIL)
 
     /// Record a signed-in identity (called whenever [AuthState] becomes `SignedIn`).
     fun rememberSignedIn(email: String?) {
-        prefs.edit().putString(KEY_EMAIL, email).apply()
+        store.set(KEY_EMAIL, email)
     }
 
     /// Clear the cache (called on sign-out).
     fun forget() {
-        prefs.edit().remove(KEY_EMAIL).apply()
+        store.clear(KEY_EMAIL)
     }
 
     private companion object {
@@ -40,24 +42,5 @@ class AuthIdentityStore(context: Context) {
         const val PLAIN_FALLBACK_FILE = "vortx_auth_identity_plain"
         const val KEY_EMAIL = "email"
 
-        /// Same fail-soft pattern as [com.vortx.android.debrid.DebridKeys.openPrefs]: prefer the
-        /// AES-encrypted store, fall back to a plain file only if Keystore/security-crypto itself is
-        /// unavailable, so a storage-layer problem degrades the UI (a slower first paint of the account
-        /// row) instead of crashing the app.
-        fun openPrefs(appContext: Context): SharedPreferences = runCatching {
-            val masterKey = MasterKey.Builder(appContext)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            EncryptedSharedPreferences.create(
-                appContext,
-                ENCRYPTED_FILE,
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-            )
-        }.getOrElse { error ->
-            Log.w(TAG, "EncryptedSharedPreferences unavailable; falling back to plain prefs", error)
-            appContext.getSharedPreferences(PLAIN_FALLBACK_FILE, Context.MODE_PRIVATE)
-        }
     }
 }

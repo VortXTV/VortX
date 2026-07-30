@@ -143,8 +143,7 @@ object SIMKLAuth {
     /// Store a fresh access token. SIMKL tokens do not expire, so the expiry slot is "0" (non-expiring).
     private fun store(accessToken: String) {
         val store = tokenStore ?: return
-        store.set(ACCESS_KEY, accessToken)
-        store.set(EXPIRY_KEY, "0")
+        store.set(mapOf(ACCESS_KEY to accessToken, EXPIRY_KEY to "0"))
     }
 
     private fun ensureConfigured() {

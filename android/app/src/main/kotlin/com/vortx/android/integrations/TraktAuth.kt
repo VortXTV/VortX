@@ -249,10 +249,14 @@ object TraktAuth {
 
     private fun store(token: TraktToken) {
         val store = tokenStore ?: return
-        store.set(ACCESS_KEY, token.accessToken)
-        store.set(REFRESH_KEY, token.refreshToken)
-        store.set(EXPIRY_KEY, token.expiresAtSeconds.toString())
-        store.set(CREATED_KEY, token.createdAt.toString())
+        store.set(
+            mapOf(
+                ACCESS_KEY to token.accessToken,
+                REFRESH_KEY to token.refreshToken,
+                EXPIRY_KEY to token.expiresAtSeconds.toString(),
+                CREATED_KEY to token.createdAt.toString(),
+            ),
+        )
     }
 
     // MARK: - HTTP plumbing
