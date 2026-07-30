@@ -172,9 +172,21 @@ extension WatchStats {
 
     static func intValue(_ any: Any?) -> Int {
         if let i = any as? Int { return i }
-        if let d = any as? Double { return Int(d) }
-        if let n = any as? NSNumber { return n.intValue }
+        if let d = any as? Double {
+            return safeTruncatedInt(d)
+        }
+        if let n = any as? NSNumber {
+            return safeTruncatedInt(n.doubleValue)
+        }
         return 0
+    }
+
+    /// Preserve the historical truncation-toward-zero behavior without letting malformed persisted JSON
+    /// (NaN, infinity, or a finite value outside Int's range) trap the stats screen.
+    private static func safeTruncatedInt(_ value: Double) -> Int {
+        guard value.isFinite,
+              let converted = Int(exactly: value.rounded(.towardZero)) else { return 0 }
+        return converted
     }
 
     /// Normalize one persisted `LibraryItem` JSON into a `WatchRecord`, or nil to skip it (internal docs,

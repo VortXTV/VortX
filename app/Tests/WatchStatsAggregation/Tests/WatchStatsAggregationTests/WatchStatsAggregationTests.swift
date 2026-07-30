@@ -36,6 +36,16 @@ private func rec(_ id: String, _ type: String, seconds: Double, plays: Int,
                        watchSeconds: seconds, plays: plays, lastWatched: date)
 }
 
+@Test("Persisted play counts truncate safely and reject malformed numeric values")
+func persistedPlayCountsAreTrapSafe() {
+    #expect(WatchStats.intValue(12.9) == 12)
+    #expect(WatchStats.intValue(-12.9) == -12)
+    #expect(WatchStats.intValue(Double.nan) == 0)
+    #expect(WatchStats.intValue(Double.infinity) == 0)
+    #expect(WatchStats.intValue(Double.greatestFiniteMagnitude) == 0)
+    #expect(WatchStats.intValue(NSNumber(value: Double.greatestFiniteMagnitude)) == 0)
+}
+
 @Test("A user with real history gets real numbers (counts, totals, binge, ranking)")
 func realHistoryProducesRealNumbers() {
     let records = [
