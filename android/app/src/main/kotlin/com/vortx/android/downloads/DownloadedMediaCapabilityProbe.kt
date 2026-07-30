@@ -8,12 +8,13 @@ import java.io.File
 /**
  * Capabilities proven by inspecting a completed local media file.
  *
- * This deliberately records Atmos only for E-AC3 JOC. A TrueHD MIME value alone does not
- * expose evidence that the Atmos extension is present.
+ * Each field is tri-state. True means the extractor exposed positive evidence. Null means
+ * inconclusive. This probe never turns absence of an extractor MIME into a durable false because
+ * Android's MP4 extractor detects JOC inside `dec3` while still publishing plain `audio/eac3`.
  */
 data class DownloadedMediaCapabilities(
-    val isDolbyVision: Boolean,
-    val isAtmos: Boolean,
+    val isDolbyVision: Boolean?,
+    val isAtmos: Boolean?,
 )
 
 /** Blocking probe seam. Callers must invoke it off the UI thread. */
@@ -53,8 +54,12 @@ internal fun downloadedMediaCapabilitiesFromMimeTypes(
 ): DownloadedMediaCapabilities? {
     if (trackMimes.isEmpty()) return null
     return DownloadedMediaCapabilities(
-        isDolbyVision = trackMimes.any { it.equals("video/dolby-vision", ignoreCase = true) },
-        isAtmos = trackMimes.any { it.equals("audio/eac3-joc", ignoreCase = true) },
+        isDolbyVision = true.takeIf {
+            trackMimes.any { it.equals("video/dolby-vision", ignoreCase = true) }
+        },
+        isAtmos = true.takeIf {
+            trackMimes.any { it.equals("audio/eac3-joc", ignoreCase = true) }
+        },
     )
 }
 
@@ -85,6 +90,9 @@ object DownloadedMediaCapabilityResolver {
             isDolbyVision = record.isDolbyVision ?: detected.isDolbyVision,
             isAtmos = record.isAtmos ?: detected.isAtmos,
         )
+        if (resolved == record) {
+            return DownloadedMediaCapabilityResolution(record = record, shouldPersist = false)
+        }
         persistResolved(resolved)
         return DownloadedMediaCapabilityResolution(
             record = resolved,

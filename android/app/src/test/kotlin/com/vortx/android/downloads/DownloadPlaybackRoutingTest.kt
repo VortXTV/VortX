@@ -87,14 +87,14 @@ class DownloadPlaybackRoutingTest {
     }
 
     @Test
-    fun `authentic legacy 4K probe resolves Dolby Vision only`() {
+    fun `authentic legacy 4K probe persists positive Dolby Vision and leaves Atmos unknown`() {
         var persisted: DownloadRecord? = null
         val legacy = requireNotNull(DownloadStore.recordFromJson(authenticLegacyJson()))
         val resolution = DownloadedMediaCapabilityResolver.resolve(
             record = legacy,
             file = File("legacy.mkv"),
             probe = DownloadedMediaCapabilityProbe {
-                DownloadedMediaCapabilities(isDolbyVision = true, isAtmos = false)
+                DownloadedMediaCapabilities(isDolbyVision = true, isAtmos = null)
             },
             persistResolved = { persisted = it },
         )
@@ -102,33 +102,41 @@ class DownloadPlaybackRoutingTest {
         assertTrue(resolution.shouldPersist)
         assertEquals(resolution.record, persisted)
         assertEquals(true, resolution.record.isDolbyVision)
-        assertEquals(false, resolution.record.isAtmos)
+        assertNull(resolution.record.isAtmos)
         assertTrue(resolution.record.localPlayable("file:///legacy.mkv").isDolbyVision)
         assertFalse(resolution.record.localPlayable("file:///legacy.mkv").isAtmos)
     }
 
     @Test
-    fun `authentic legacy 4K probe resolves Atmos JOC only`() {
+    fun `authentic legacy 4K probe persists positive Atmos and leaves Dolby Vision unknown`() {
         val resolution = resolveLegacy(
-            DownloadedMediaCapabilities(isDolbyVision = false, isAtmos = true),
+            DownloadedMediaCapabilities(isDolbyVision = null, isAtmos = true),
         )
 
         assertTrue(resolution.shouldPersist)
-        assertEquals(false, resolution.record.isDolbyVision)
+        assertNull(resolution.record.isDolbyVision)
         assertEquals(true, resolution.record.isAtmos)
         assertFalse(resolution.record.localPlayable("file:///legacy.mkv").isDolbyVision)
         assertTrue(resolution.record.localPlayable("file:///legacy.mkv").isAtmos)
     }
 
     @Test
-    fun `authentic legacy 4K probe resolves neither capability`() {
-        val resolution = resolveLegacy(
-            DownloadedMediaCapabilities(isDolbyVision = false, isAtmos = false),
+    fun `inconclusive successful probe retains unknown and does not persist false`() {
+        var persistCalls = 0
+        val legacy = requireNotNull(DownloadStore.recordFromJson(authenticLegacyJson()))
+        val resolution = DownloadedMediaCapabilityResolver.resolve(
+            record = legacy,
+            file = File("legacy.mkv"),
+            probe = DownloadedMediaCapabilityProbe {
+                DownloadedMediaCapabilities(isDolbyVision = null, isAtmos = null)
+            },
+            persistResolved = { persistCalls += 1 },
         )
 
-        assertTrue(resolution.shouldPersist)
-        assertEquals(false, resolution.record.isDolbyVision)
-        assertEquals(false, resolution.record.isAtmos)
+        assertFalse(resolution.shouldPersist)
+        assertEquals(0, persistCalls)
+        assertNull(resolution.record.isDolbyVision)
+        assertNull(resolution.record.isAtmos)
     }
 
     @Test
@@ -160,7 +168,7 @@ class DownloadPlaybackRoutingTest {
             file = File("new-download.mkv"),
             probe = DownloadedMediaCapabilityProbe {
                 calls += 1
-                DownloadedMediaCapabilities(isDolbyVision = true, isAtmos = false)
+                DownloadedMediaCapabilities(isDolbyVision = true, isAtmos = null)
             },
         )
 
@@ -170,10 +178,15 @@ class DownloadPlaybackRoutingTest {
     }
 
     @Test
-    fun `mime evidence recognizes JOC but not ordinary TrueHD as Atmos`() {
+    fun `mime evidence recognizes JOC but keeps ordinary EAC3 and TrueHD inconclusive`() {
         val joc = requireNotNull(
             downloadedMediaCapabilitiesFromMimeTypes(
                 listOf("video/hevc", "audio/eac3-joc"),
+            ),
+        )
+        val eac3 = requireNotNull(
+            downloadedMediaCapabilitiesFromMimeTypes(
+                listOf("video/hevc", "audio/eac3"),
             ),
         )
         val trueHd = requireNotNull(
@@ -182,7 +195,9 @@ class DownloadPlaybackRoutingTest {
             ),
         )
 
-        assertTrue(joc.isAtmos)
-        assertFalse(trueHd.isAtmos)
+        assertEquals(true, joc.isAtmos)
+        assertNull(eac3.isAtmos)
+        assertNull(trueHd.isAtmos)
+        assertNull(trueHd.isDolbyVision)
     }
 }
