@@ -137,7 +137,22 @@ do {
     check(h.installEffectCount == 0, "already-installed: never dispatches an install")
 }
 
-// 4. WRONG-SESSION: a delivery whose token is not the live one is refused - no row, no install.
+// 4. DUPLICATE IN ONE DELIVERY: a relay batch can contain the same normalized URL more than once. It must
+//    still create one row and dispatch one install, rather than leaving a duplicate resolving row behind.
+do {
+    let h = Host()
+    h.manifestNames["https://good.example/manifest.json"] = "Good"
+    h.dispatch(.delivered(
+        urls: [good, good, good],
+        sessionToken: "S1",
+        liveToken: "S1"
+    ))
+    check(h.state.rows.count == 1, "same-batch idempotency: duplicate URLs create one row")
+    check(h.installEffectCount == 1, "same-batch idempotency: duplicate URLs install once")
+    check(h.state.rows[0].state == .installed, "same-batch idempotency: the sole row reaches installed")
+}
+
+// 5. WRONG-SESSION: a delivery whose token is not the live one is refused - no row, no install.
 do {
     let h = Host()
     h.dispatch(.delivered(urls: [good], sessionToken: "S-OTHER", liveToken: "S1"))
@@ -145,7 +160,7 @@ do {
     check(h.installEffectCount == 0, "wrong-session: nothing installed")
 }
 
-// 5. ROTATION PRUNE: a non-terminal row bound to a now-dead session is dropped on rotation; a terminal row
+// 6. ROTATION PRUNE: a non-terminal row bound to a now-dead session is dropped on rotation; a terminal row
 //    (installed history) is kept. Driven straight through the real reducer.
 do {
     var st = AddonPairingReducer.State()
@@ -158,7 +173,7 @@ do {
     check(st.rows[0].state == .installed, "rotation: the terminal row is kept as history")
 }
 
-// 6. FAILURE → RECOVERY: an engine install failure lands `.failed` (manual-actionable), and a manual Retry
+// 7. FAILURE → RECOVERY: an engine install failure lands `.failed` (manual-actionable), and a manual Retry
 //    re-dispatches the installer and succeeds. Failure is surfaced honestly, never swallowed as success.
 do {
     let flaky = "https://flaky.example/manifest.json"
@@ -179,7 +194,7 @@ do {
     check(h.installEffectCount == 2, "recovery: the installer ran again for the manual Retry")
 }
 
-// 7. MALFORMED: a non-http(s) URL is rejected in place as `.invalid`, never resolves, never installs, and an
+// 8. MALFORMED: a non-http(s) URL is rejected in place as `.invalid`, never resolves, never installs, and an
 //    invalid-only batch is NEVER allInstalled.
 do {
     let h = Host()
@@ -191,7 +206,7 @@ do {
     else { check(true, "malformed: invalid-only batch is NOT allInstalled") }
 }
 
-// 8. batchStatus + doneState pure reductions (the Done-never-silently-exits-a-pending-submission rule).
+// 9. batchStatus + doneState pure reductions (the Done-never-silently-exits-a-pending-submission rule).
 do {
     check(AddonPairingReducer.batchStatus([]) == .empty, "batch: empty")
     check(AddonPairingReducer.batchStatus([.resolving, .installed]) == .working, "batch: any in-flight → working")

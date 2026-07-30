@@ -119,13 +119,14 @@ enum AddonPairingReducer {
             // Only the live session's submissions are acted on; binding the row to `sessionToken` makes a
             // wrong-session URL structurally unable to install.
             guard sessionToken == liveToken else { return [] }
-            let known = Set(state.rows.map(\.id))
+            var known = Set(state.rows.map(\.id))
             var effects: [Effect] = []
             for url in urls {
                 let normalized = normalize(url)
                 let identity = normalized ?? url
                 let rowId = Row.makeId(sessionToken: sessionToken, identity: identity)
                 guard !known.contains(rowId) else { continue }   // duplicate delivery → no 2nd row / install
+                known.insert(rowId)   // also collapse duplicates inside this single relay payload
                 if normalized == nil {
                     // Malformed: reject in place with NO partial state - never resolves, never installs.
                     state.rows.append(Row(sessionToken: sessionToken, url: url, identity: identity, name: nil, state: .invalid))
