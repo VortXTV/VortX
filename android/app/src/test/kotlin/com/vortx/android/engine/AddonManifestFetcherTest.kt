@@ -10,6 +10,7 @@ import org.junit.Test
 import java.net.InetAddress
 import java.net.Proxy
 import java.net.UnknownHostException
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class AddonManifestFetcherTest {
@@ -59,6 +60,47 @@ class AddonManifestFetcherTest {
 
         assertEquals(listOf(InetAddress.getByName("93.184.216.34")), address)
         assertEquals(1, publicIsatap.size)
+    }
+
+    @Test
+    fun alternateLoopbackLiteralsAreRejectedBeforeTransport() {
+        val requestedUrls = mutableListOf<String>()
+        val transport = ManifestTransport { url, _ ->
+            requestedUrls += url.toString()
+            ManifestTransportResponse(200, body = """{"id":"private","name":"Private"}""")
+        }
+        val fetcher = AddonManifestFetcher(
+            timeoutMs = 1_000,
+            transport = transport,
+        )
+
+        for (url in listOf(
+            "http://2130706433:1234/manifest.json",
+            "http://127.1:1234/manifest.json",
+            "http://127.0.1:1234/manifest.json",
+            "http://127.0000000001:1234/manifest.json",
+        )) {
+            assertNull("$url must be rejected", fetcher.fetch(url))
+        }
+        assertTrue("transport must never receive a numeric loopback URL", requestedUrls.isEmpty())
+    }
+
+    @Test
+    fun dnsResolutionCannotOutliveItsDeadline() {
+        val resolverStarted = CountDownLatch(1)
+        val dns = DeadlinePublicDns(timeoutMs = 100) {
+            resolverStarted.countDown()
+            Thread.sleep(1_500)
+            listOf(InetAddress.getByName("93.184.216.34"))
+        }
+        val startedAt = System.nanoTime()
+
+        val result = runCatching { dns.lookup("slow.example") }
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+
+        assertTrue(resolverStarted.await(1, TimeUnit.SECONDS))
+        assertTrue(result.exceptionOrNull() is UnknownHostException)
+        assertTrue("DNS deadline took ${elapsedMs}ms", elapsedMs < 500)
     }
 
     @Test

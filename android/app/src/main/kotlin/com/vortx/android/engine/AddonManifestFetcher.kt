@@ -11,7 +11,12 @@ import java.io.ByteArrayOutputStream
 import java.net.InetAddress
 import java.net.Proxy
 import java.net.UnknownHostException
+import java.util.concurrent.Callable
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicInteger
 
 internal class AddonManifestFetcher(
     private val timeoutMs: Int,
@@ -72,12 +77,15 @@ private class OkHttpManifestTransport(timeoutMs: Int) : ManifestTransport {
     private val client = buildAddonManifestClient(timeoutMs)
 
     override fun execute(url: HttpUrl, timeoutMs: Long): ManifestTransportResponse {
+        val requestClient = client.newBuilder()
+            .dns(DeadlinePublicDns(timeoutMs))
+            .build()
         val request = Request.Builder()
             .url(url)
             .header("User-Agent", "VortX-Android/1.0")
             .get()
             .build()
-        val call = client.newCall(request)
+        val call = requestClient.newCall(request)
         call.timeout().timeout(timeoutMs, TimeUnit.MILLISECONDS)
         return call.execute().use { response ->
             ManifestTransportResponse(
@@ -115,7 +123,7 @@ private class OkHttpManifestTransport(timeoutMs: Int) : ManifestTransport {
 
 internal fun buildAddonManifestClient(timeoutMs: Int): OkHttpClient = OkHttpClient.Builder()
     .proxy(Proxy.NO_PROXY)
-    .dns(PublicOnlyDns)
+    .dns(DeadlinePublicDns(timeoutMs.toLong()))
     .followRedirects(false)
     .followSslRedirects(false)
     .connectTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
@@ -123,16 +131,54 @@ internal fun buildAddonManifestClient(timeoutMs: Int): OkHttpClient = OkHttpClie
     .callTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
     .build()
 
-private object PublicOnlyDns : Dns {
-    override fun lookup(hostname: String): List<InetAddress> = PublicAddressPolicy.requirePublic(hostname)
+internal class DeadlinePublicDns(
+    private val timeoutMs: Long,
+    private val resolver: (String) -> List<InetAddress> = PublicAddressPolicy::requirePublic,
+) : Dns {
+    override fun lookup(hostname: String): List<InetAddress> {
+        val future = try {
+            DNS_EXECUTOR.submit(Callable { resolver(hostname) })
+        } catch (error: RuntimeException) {
+            throw UnknownHostException("Unable to schedule add-on DNS lookup").apply {
+                initCause(error)
+            }
+        }
+        return try {
+            future.get(timeoutMs.coerceAtLeast(1), TimeUnit.MILLISECONDS)
+        } catch (error: TimeoutException) {
+            future.cancel(true)
+            throw UnknownHostException("Add-on DNS lookup exceeded its deadline").apply {
+                initCause(error)
+            }
+        } catch (error: Exception) {
+            future.cancel(true)
+            val cause = error.cause ?: error
+            if (cause is UnknownHostException) throw cause
+            throw UnknownHostException("Unable to resolve add-on host").apply {
+                initCause(cause)
+            }
+        }
+    }
+
+    private companion object {
+        val threadIds = AtomicInteger()
+        val DNS_EXECUTOR = ThreadPoolExecutor(
+            0,
+            2,
+            30,
+            TimeUnit.SECONDS,
+            SynchronousQueue(),
+        ) { task ->
+            Thread(task, "vortx-addon-dns-${threadIds.incrementAndGet()}").apply {
+                isDaemon = true
+            }
+        }
+    }
 }
 
 internal object PublicAddressPolicy {
     fun requireLiteralPublicOrHostname(hostname: String) {
-        val isLiteral = hostname.contains(':') ||
-            hostname.split('.').let { parts ->
-                parts.size == 4 && parts.all { part -> part.toIntOrNull() in 0..255 }
-            }
+        val isLiteral = hostname.contains(':') || hostname.all { it.isDigit() || it == '.' }
         if (!isLiteral) return
         val address = runCatching { InetAddress.getByName(hostname) }.getOrNull()
             ?: throw UnknownHostException("Invalid add-on address")
