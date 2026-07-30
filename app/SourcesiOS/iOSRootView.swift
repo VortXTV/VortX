@@ -2498,7 +2498,10 @@ struct iOSSearchView: View {
         let movies = core.searchResults.filter { $0.type == "movie" }
         let series = core.searchResults.filter { $0.type == "series" }
         let other = core.searchResults.filter { $0.type != "series" && $0.type != "movie" }
-        return [("Movies", movies), ("Series", series), ("Other", other)].filter { !$0.items.isEmpty }
+        return [(String(localized: "Movies"), movies),
+                (String(localized: "Series"), series),
+                (String(localized: "Other"), other)]
+            .filter { !$0.items.isEmpty }
     }
 
     private var suggestionTitles: [String] { core.searchSuggestionTitles(for: query) }
@@ -2800,7 +2803,10 @@ struct iOSDiscoverView: View {
             let movies = core.searchResults.filter { $0.type == "movie" }
             let series = core.searchResults.filter { $0.type == "series" }
             let other = core.searchResults.filter { $0.type != "series" && $0.type != "movie" }
-            let sections = [("Movies", movies), ("Series", series), ("Other", other)].filter { !$0.1.isEmpty }
+            let sections = [(String(localized: "Movies"), movies),
+                            (String(localized: "Series"), series),
+                            (String(localized: "Other"), other)]
+                .filter { !$0.1.isEmpty }
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 ForEach(sections, id: \.0) { section in
                     PosterRail(title: section.0,
