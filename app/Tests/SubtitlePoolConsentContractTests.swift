@@ -392,7 +392,7 @@ struct SubtitlePoolConsentContractTests {
             "offset": NSNull(),
         ]
         if let offsetMs {
-            root["offset"] = ["offsetMs": offsetMs, "votes": 1]
+            root["offset"] = ["offset_ms": offsetMs, "votes": 1]
         }
         return try! JSONSerialization.data(withJSONObject: root)
     }

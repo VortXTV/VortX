@@ -1010,5 +1010,10 @@ enum SubtitlePoolClient {
     private struct RawOffset: Decodable {
         let offsetMs: Int?
         let votes: Int?
+
+        private enum CodingKeys: String, CodingKey {
+            case offsetMs = "offset_ms"
+            case votes
+        }
     }
 }
