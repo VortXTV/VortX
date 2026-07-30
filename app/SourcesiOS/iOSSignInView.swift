@@ -21,10 +21,10 @@ struct iOSSignInView: View {
     // Pushes the typed VortX account form (the shared SyncSettingsView). A flag, not a Mode case, so the form
     // is a real pushed screen (its own ScrollView, a back button) instead of nesting inside this ScrollView.
     @State private var showVortXEmail = false
-    // The sign-in handoff below MUST run exactly once. `@Published` re-publishes on every assignment
-    // (true→true included), so without this latch the handler's own work re-fired `$isSignedIn` and
-    // re-entered itself in an unbounded main-thread loop, the iOS/iPad "stuck on Signing in, dead
-    // buttons, phone lags, then crashes" hang. (macOS has no main-thread watchdog so it rode it out.)
+    // The sign-in handoff below MUST run exactly once. Observe only a real false-to-true transition:
+    // subscribing to the `@Published` publisher directly replays a persisted true value when this sheet
+    // appears and dismisses the VortX sign-in path before the user can use it. The latch also prevents a
+    // second sign-in transition during the same presentation from repeating the handoff.
     @State private var didHandleSignIn = false
 
     // .vortx leads (QR joiner + a typed-form push); the Stremio link/password paths are the fallback.
@@ -79,11 +79,11 @@ struct iOSSignInView: View {
         // Home rails (boardRows / continueWatching) stay empty until the next cold launch. Mirrors the
         // proven tvOS LoginView handoff exactly.
         //
-        // Runs ONCE per presentation (didHandleSignIn latch): the handler must not write anything that
-        // re-publishes `$isSignedIn`, or it re-enters itself forever. Both sign-in entry points
+        // Runs ONCE per presentation (didHandleSignIn latch) and only after a real value transition.
+        // Both sign-in entry points
         // (signIn / signInWithAuthKey) already load add-ons + set the email, so reloadForActiveProfile()
         // is redundant here, and it was the second `isSignedIn = true` write that armed the loop.
-        .onReceive(account.$isSignedIn) { signedIn in
+        .onChange(of: account.isSignedIn) { signedIn in
             guard signedIn, !didHandleSignIn else { return }
             didHandleSignIn = true
             core.signedInWithLegacyAuthKey()
@@ -249,7 +249,7 @@ struct iOSSignInView: View {
         busy = true
         await account.signIn(email: email, password: password)
         busy = false
-        // Success (isSignedIn flips true) is handled centrally in .onReceive above, which runs the
+        // Success (isSignedIn flips true) is handled centrally in .onChange above, which runs the
         // signedInWithLegacyAuthKey() -> dismiss() sequence exactly once. On failure
         // account.signInError carries the message and the form stays put.
     }
