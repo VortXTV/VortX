@@ -96,6 +96,53 @@ enum SubtitleRenditionPolicy {
         key.isEmpty || key == "und" || key == "unk" || key == "mis" || key == "zxx"
     }
 
+    /// A bitmap subtitle can be decoded only when its source stream owns one of the bounded OCR contexts. This
+    /// reason is attached before the HLS master is advertised, so a row that cannot produce cues is disabled
+    /// rather than presented as a working selection.
+    static let pgsCapacityUnavailableReason =
+        "PGS subtitle unavailable because this playback session reached its OCR track limit"
+
+    /// Selects the PGS streams the bounded recognizer can actually serve while retaining every ordinary text
+    /// subtitle. Default, forced, and preferred-language PGS rows receive capacity first. The returned list
+    /// remains in source order so stable track identity and picker ordering do not change.
+    static func admittedTracks(
+        from tracks: [SourceTrack],
+        maximumPGSStreams: Int,
+        preferredLanguages: [String]
+    ) -> [SourceTrack] {
+        let capacity = max(0, maximumPGSStreams)
+        let pgs = tracks.enumerated().filter { $0.element.format == .pgs }
+        guard pgs.count > capacity else { return tracks }
+
+        let preferred = preferredLanguages.map(languageMatchKey)
+        func preferredRank(_ language: String) -> Int? {
+            preferred.firstIndex(of: languageMatchKey(language))
+        }
+        let ranked = pgs.sorted { lhs, rhs in
+            func rank(_ item: (offset: Int, element: SourceTrack)) -> (Int, Int, Int) {
+                if item.element.isDefault { return (0, 0, item.offset) }
+                if item.element.isForced { return (1, 0, item.offset) }
+                if let preferred = preferredRank(item.element.language) {
+                    return (2, preferred, item.offset)
+                }
+                return (3, 0, item.offset)
+            }
+            let left = rank(lhs)
+            let right = rank(rhs)
+            if left.0 != right.0 { return left.0 < right.0 }
+            if left.1 != right.1 { return left.1 < right.1 }
+            return left.2 < right.2
+        }
+        let admitted = Set(ranked.prefix(capacity).map { $0.element.index })
+        return tracks.filter { $0.format != .pgs || admitted.contains($0.index) }
+    }
+
+    private static func languageMatchKey(_ raw: String) -> String {
+        let key = languageKey(raw)
+        guard !isUnknownLanguage(key) else { return key }
+        return Locale(identifier: key).language.languageCode?.identifier.lowercased() ?? key
+    }
+
     /// English names for the language tags a media file actually carries, keyed by ISO 639-2/B and 639-1.
     /// Anything not listed falls back to the uppercased tag, which is still a usable label ("KAZ") and is
     /// honest about what the file said. Deliberately short: this is a display convenience, not a locale

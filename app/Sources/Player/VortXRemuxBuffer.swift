@@ -61,6 +61,48 @@ enum VortXHLSConsumptionWindowPolicy {
     static let safetyHeadroomBytes = 64 * mebibyte
     static let keepBehindSeconds: Double = 150
 
+    /// Maps AVPlayer's actual local-media clock to the absolute segment currently being displayed. A request
+    /// for a future segment is not playback proof: AVPlayer routinely reads many segments ahead. Invalid clocks,
+    /// malformed segment timing, and gaps fail closed so none of them can authorize playlist eviction.
+    static func segmentID(
+        atPlaybackSeconds seconds: Double,
+        window: VortXHLSWindow
+    ) -> Int? {
+        guard seconds.isFinite, seconds >= 0 else { return nil }
+        for (offset, segment) in window.segments.enumerated() {
+            guard segment.start.isFinite,
+                  segment.duration.isFinite,
+                  segment.start >= 0,
+                  segment.duration >= 0,
+                  segment.end.isFinite else { return nil }
+            if seconds >= segment.start, seconds < segment.end {
+                return segment.id
+            }
+            if offset == window.segments.count - 1, seconds == segment.end {
+                return segment.id
+            }
+        }
+        return nil
+    }
+
+    /// Returns the next legal playlist start. Until a real playhead receipt exists the existing sequence remains
+    /// pinned. Thereafter the byte/time retention floor may advance only behind the displayed segment, never
+    /// behind AVPlayer's speculative fetch frontier. A backward seek therefore moves eviction authority backward
+    /// as long as the destination is still present in the published window.
+    static func publicationStartID(
+        currentStartID: Int,
+        suffixStartID: Int,
+        playbackSegmentID: Int?,
+        window: VortXHLSWindow
+    ) -> Int {
+        guard let playbackSegmentID,
+              window.segment(id: playbackSegmentID) != nil else {
+            return currentStartID
+        }
+        let retentionFloorID = floor(frontier: playbackSegmentID, window: window)
+        return max(currentStartID, min(suffixStartID, retentionFloorID))
+    }
+
     /// Returns the oldest absolute segment ID that may remain published without crossing the time or byte
     /// budget. Segments ahead of `frontier` consume byte budget but not rewind-time budget.
     static func floor(frontier: Int, window: VortXHLSWindow) -> Int {

@@ -608,6 +608,7 @@ struct PlayerScreen: View {
     @State private var lastObservedTime = -1.0
     @State private var stalledTicks = 0
     @State private var stallRecoveries = 0
+    @State private var stallStableProgressTicks = 0
 
     // Skip intro / outro (chapter-derived + crowd-sourced timings), shown as a pill while controls hide.
     @State private var skipSegments: [SkipSegment] = []
@@ -1455,7 +1456,7 @@ struct PlayerScreen: View {
                     #endif
                     reconnecting = episodeResolveGeneration != nil
                     loadFailed = false
-                    autoRetryCount = 0; stallRecoveries = 0
+                    autoRetryCount = 0
                     // Lock Screen / Control Center / media-key transport. Relative mpv seek so the skip always
                     // works off the LIVE position (a captured currentTime would be stale in these long-lived
                     // targets); the absolute seek is the system progress bar's own drag. play/pause are
@@ -2738,28 +2739,52 @@ struct PlayerScreen: View {
         }
     }
 
-    /// Watch for a hard stall: the position frozen while NOT paused and NOT buffering (mpv's own cache
-    /// stalls set `buffering`, so this fires only on the freeze / black-screen case). Reloads in place at
-    /// the current position, then hops to another source, bounded so a genuinely dead source still
-    /// errors. Disabled for live (its position is wall-clock and reconnect is handled differently).
+    /// Watch for a hard stall after playback has started. Both a silent frozen surface and visible buffering
+    /// need a bounded recovery owner. Buffering gets a longer allowance so an ordinary short network pause is
+    /// not mistaken for a wedged player. Disabled for live, whose reconnect path owns recovery separately.
     private func startStallWatchdog() {
         stallWatchdog?.cancel()
-        lastObservedTime = -1; stalledTicks = 0
+        lastObservedTime = -1; stalledTicks = 0; stallStableProgressTicks = 0
         stallWatchdog = Task { @MainActor in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(6))
-                guard hasStartedPlaying, !isPaused, !buffering, !loadFailed, !isLive, duration > 0 else {
-                    lastObservedTime = currentTime; stalledTicks = 0; continue
+                try? await Task.sleep(
+                    for: .seconds(PlayerMidPlaybackStallPolicy.pollIntervalSeconds)
+                )
+                guard PlayerMidPlaybackStallPolicy.shouldObserve(
+                    hasStartedPlaying: hasStartedPlaying,
+                    isPaused: isPaused,
+                    loadFailed: loadFailed,
+                    isLive: isLive,
+                    duration: duration,
+                    buffering: buffering
+                ) else {
+                    lastObservedTime = -1
+                    stalledTicks = 0
+                    stallStableProgressTicks = 0
+                    continue
                 }
-                if lastObservedTime >= 0, abs(currentTime - lastObservedTime) < 0.25 {
+                if lastObservedTime < 0 {
+                    stalledTicks = 0
+                    stallStableProgressTicks = 0
+                } else if abs(currentTime - lastObservedTime) < 0.25 {
+                    stallStableProgressTicks = 0
                     stalledTicks += 1
-                    if stalledTicks >= 3 {            // ~18s frozen with no buffering → recover
+                    if stalledTicks >= PlayerMidPlaybackStallPolicy.recoveryTickThreshold(
+                        buffering: buffering
+                    ) {
                         stalledTicks = 0
                         recoverFromStall()
                     }
                 } else {
                     stalledTicks = 0
-                    stallRecoveries = 0               // sustained good playback clears the budget
+                    stallStableProgressTicks += 1
+                    if PlayerMidPlaybackStallPolicy.shouldResetRecoveryBudget(
+                        recoveries: stallRecoveries,
+                        stableProgressTicks: stallStableProgressTicks
+                    ) {
+                        stallRecoveries = 0
+                        stallStableProgressTicks = 0
+                    }
                 }
                 lastObservedTime = currentTime
             }
@@ -2779,14 +2804,20 @@ struct PlayerScreen: View {
             return
         }
         stallRecoveries += 1
+        stallStableProgressTicks = 0
         reconnectMsg = "Recovering…"
         srcProbe("OVERLAY SET (spinner): recoverFromStall reconnect='Recovering…' reload-in-place (NOT error)")
         withAnimation { reconnecting = true }
         // Resume where it froze: reload in place, the seek lands once duration is known again.
         let resume = currentTime
         appliedSize = false; hasStartedPlaying = false; isSeekable = true; buffering = true
-        loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isLive, resumeOrigin: resume)
-        if resume > 5 { nudgeResume(to: resume) }   // jump back to where it froze once mpv is ready
+        let issuedToken = loadIntoPlayer(
+            curURL ?? url, headers: curHeaders, live: isLive, resumeOrigin: resume
+        )
+        if issuedToken != nil { startLoadTimeout() }
+        if issuedToken != nil, resume > 5 {
+            nudgeResume(to: resume)
+        }
     }
 
     #if os(iOS) || os(macOS)
@@ -3192,10 +3223,11 @@ struct PlayerScreen: View {
         currentPlaybackIsResume = false
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         bufferedTime = 0
+        stallRecoveries = 0
+        stallStableProgressTicks = 0
         if userInitiated {
             sourceHops = 0; exhaustedURLs = []
             recoveryDeadline?.cancel(); recoveryDeadline = nil
-            stallRecoveries = 0
         }
         appliedSize = false; appliedAutoTracks = false; autoAddonSubTried = false
         userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false
@@ -3221,6 +3253,8 @@ struct PlayerScreen: View {
         upNextSuppressed = false
         appliedInitialResume = true
         lastReported = -1
+        stallRecoveries = 0
+        stallStableProgressTicks = 0
     }
 
     /// Switch the playing source in place: reload the picked stream's URL and resume at the current

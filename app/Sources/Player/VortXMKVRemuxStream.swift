@@ -1404,18 +1404,28 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             }
         }
 
-        if !subtitleTracks.isEmpty {
-            let renditions = SubtitleRenditionPolicy.renditions(from: subtitleTracks)
+        let admittedSubtitleTracks = SubtitleRenditionPolicy.admittedTracks(
+            from: subtitleTracks,
+            maximumPGSStreams: VortXPGSSubtitleOCR.maximumStreams,
+            preferredLanguages: TrackPreferences.current.subtitleLanguages)
+        let subtitleRenditions = SubtitleRenditionPolicy.renditions(
+            from: admittedSubtitleTracks)
+        let admittedPGSSourceIndices = Set(
+            admittedSubtitleTracks.filter { $0.format == .pgs }.map(\.index))
+        let capacityLimitedPGSSourceIndices = Set(
+            subtitleTracks.filter { $0.format == .pgs }.map(\.index))
+            .subtracting(admittedPGSSourceIndices)
+        if !subtitleRenditions.isEmpty {
             hlsLock.lock()
-            _subtitleRenditions = renditions
-            _subtitleCues = Array(repeating: [], count: renditions.count)
+            _subtitleRenditions = subtitleRenditions
+            _subtitleCues = Array(repeating: [], count: subtitleRenditions.count)
             hlsLock.unlock()
-            for rendition in renditions {
+            for rendition in subtitleRenditions {
                 subtitleCollectors[rendition.sourceIndex] = (rendition.id, rendition.format)
                 subtitleCueTruthBySource[rendition.sourceIndex] =
                     SubtitleRenditionPolicy.CueTruthState()
             }
-            if renditions.contains(where: { $0.format == .pgs }) {
+            if subtitleRenditions.contains(where: { $0.format == .pgs }) {
                 let ocr = VortXPGSSubtitleOCR(
                     epoch: pgsEpoch,
                     completion: { [weak self] completion in
@@ -1427,14 +1437,17 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 pgsAcceptingCompletions = true
                 hlsLock.unlock()
             }
-            DiagnosticsLog.log("dv", "subtitles: text-renditions-ready count=\(renditions.count)")
+            DiagnosticsLog.log(
+                "dv",
+                "subtitles: renditions-ready count=\(subtitleRenditions.count) pgs-capacity-refused=\(capacityLimitedPGSSourceIndices.count)")
         }
         let renditionBySource = Dictionary(
-            uniqueKeysWithValues: SubtitleRenditionPolicy.renditions(from: subtitleTracks).map {
+            uniqueKeysWithValues: subtitleRenditions.map {
                 ($0.sourceIndex, $0.id)
             })
         let sourceSubtitleTracks = subtitleMetadata.map { metadata in
             let renditionIndex = renditionBySource[metadata.index]
+            let pgsCapacityLimited = capacityLimitedPGSSourceIndices.contains(metadata.index)
             let unavailableKind: VortXEngineProtocol.SubtitleUnavailableKind? =
                 renditionIndex == nil
                     ? (metadata.isKnownBitmap ? .bitmap : .unsupported)
@@ -1448,9 +1461,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 delivery: renditionIndex == nil ? .bitmapUnavailable : .webVTT,
                 renditionIndex: renditionIndex,
                 unavailableReason: renditionIndex == nil
-                    ? MultiAudioPolicy.unavailableSubtitleReason(
-                        codecName: metadata.codec,
-                        isKnownBitmap: metadata.isKnownBitmap)
+                    ? (pgsCapacityLimited
+                        ? SubtitleRenditionPolicy.pgsCapacityUnavailableReason
+                        : MultiAudioPolicy.unavailableSubtitleReason(
+                            codecName: metadata.codec,
+                            isKnownBitmap: metadata.isKnownBitmap))
                     : nil,
                 unavailableKind: unavailableKind)
         }

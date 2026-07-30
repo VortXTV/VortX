@@ -142,6 +142,49 @@ check("renditions: a known language is published normalised",
       ]).first?.language == "eng")
 check("renditions: no tracks yields no renditions", Policy.renditions(from: []).isEmpty)
 
+var largePGSInventory = (0..<27).map {
+    Track(
+        index: 10 + $0,
+        format: .pgs,
+        language: "eng",
+        title: "PGS \($0)",
+        isDefault: false,
+        isForced: false)
+}
+largePGSInventory[10] = Track(
+    index: 20, format: .pgs, language: "spa", title: "Default",
+    isDefault: true, isForced: false)
+largePGSInventory[11] = Track(
+    index: 21, format: .pgs, language: "fra", title: "Forced",
+    isDefault: false, isForced: true)
+largePGSInventory[12] = Track(
+    index: 22, format: .pgs, language: "jpn", title: "Preferred",
+    isDefault: false, isForced: false)
+let textAlongsidePGS = Track(
+    index: 1, format: .subRip, language: "eng", title: "Text",
+    isDefault: false, isForced: false)
+let admittedLargeInventory = Policy.admittedTracks(
+    from: [textAlongsidePGS] + largePGSInventory,
+    maximumPGSStreams: 4,
+    preferredLanguages: ["ja"])
+let admittedPGSIndices = admittedLargeInventory
+    .filter { $0.format == .pgs }
+    .map(\.index)
+check("PGS admission: no more tracks are advertised than the OCR worker can serve",
+      admittedPGSIndices.count == 4)
+check("PGS admission: default, forced and preferred-language rows win deterministic capacity",
+      Set(admittedPGSIndices).isSuperset(of: [20, 21, 22]))
+check("PGS admission: the remaining slot goes to the earliest source row",
+      admittedPGSIndices.contains(10))
+check("PGS admission: admitted rows keep source order and every text row survives",
+      admittedLargeInventory.first?.index == textAlongsidePGS.index
+          && admittedPGSIndices == admittedPGSIndices.sorted())
+check("PGS admission: zero bitmap capacity still preserves ordinary text subtitles",
+      Policy.admittedTracks(
+        from: [textAlongsidePGS] + largePGSInventory,
+        maximumPGSStreams: 0,
+        preferredLanguages: ["en"]) == [textAlongsidePGS])
+
 let many = (0..<20).map {
     Track(index: $0, format: .subRip, language: "l\($0)", title: "T\($0)", isDefault: false, isForced: false)
 }

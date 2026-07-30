@@ -260,6 +260,36 @@ private struct StartupWiringRule {
             """,
             mutationTarget: "highestServedVideoSegmentID = index",
             mutationReplacement: "_ = index"),
+        StartupWiringRule(
+            name: "actual playhead receipt", usesServer: false,
+            start: "let position = RemuxResumePolicy.presented(",
+            end: "self.emit(\n                    MPVProperty.timePos,",
+            exactSection: """
+            let position = RemuxResumePolicy.presented(
+                playerSeconds: time.seconds,
+                origin: self.remuxTimelineOrigin)
+            self.remuxHLSServer?.reportPlaybackPosition(playerSeconds: time.seconds)
+            """,
+            mutationTarget:
+                "self.remuxHLSServer?.reportPlaybackPosition(playerSeconds: time.seconds)",
+            mutationReplacement: "_ = time.seconds"),
+        StartupWiringRule(
+            name: "publication slides behind playhead", usesServer: true,
+            start: "if consumptionAnchored {\n                    let playbackSegmentID",
+            end: "} else {\n                    // Escape hatch OFF-path:",
+            exactSection: """
+            if consumptionAnchored {
+                let playbackSegmentID = playbackSegmentID(in: common)
+                let newStartID = VortXHLSConsumptionWindowPolicy.publicationStartID(
+                    currentStartID: current.mediaSequence,
+                    suffixStartID: suffixStartID,
+                    playbackSegmentID: playbackSegmentID,
+                    window: common)
+                let slid = common.segments.drop { $0.id < newStartID }
+                selectedVideo = slid.isEmpty ? common : VortXHLSWindow(segments: Array(slid))
+            """,
+            mutationTarget: "playbackSegmentID: playbackSegmentID",
+            mutationReplacement: "playbackSegmentID: highestServedVideoSegmentID"),
     ]
 
     for rule in rules {
@@ -853,6 +883,59 @@ check("consumption retention: the 58-segment field shape slides before the ordin
               < VortXHLSConsumptionWindowPolicy.ordinarySessionCapacityBytes)
 check("consumption retention: the field-shaped slide still keeps useful rewind history",
       fieldRetained.reduce(0.0) { $0 + $1.duration } == 45)
+check("playhead mapping: exact segment boundaries map to the displayed segment",
+      VortXHLSConsumptionWindowPolicy.segmentID(
+        atPlaybackSeconds: 25,
+        window: fieldWindow) == 20
+          && VortXHLSConsumptionWindowPolicy.segmentID(
+            atPlaybackSeconds: 26.249,
+            window: fieldWindow) == 20
+          && VortXHLSConsumptionWindowPolicy.segmentID(
+            atPlaybackSeconds: 26.25,
+            window: fieldWindow) == 21)
+check("playhead mapping: invalid clocks and gaps never authorize eviction",
+      VortXHLSConsumptionWindowPolicy.segmentID(
+        atPlaybackSeconds: -.infinity,
+        window: fieldWindow) == nil
+          && VortXHLSConsumptionWindowPolicy.segmentID(
+            atPlaybackSeconds: .nan,
+            window: fieldWindow) == nil
+          && VortXHLSConsumptionWindowPolicy.segmentID(
+            atPlaybackSeconds: -1,
+            window: fieldWindow) == nil)
+
+let requestAheadOfPlayhead = 57
+let actualPlaybackSegment = 12
+let requestAnchoredStart = VortXHLSConsumptionWindowPolicy.publicationStartID(
+    currentStartID: fieldWindow.mediaSequence,
+    suffixStartID: requestAheadOfPlayhead,
+    playbackSegmentID: requestAheadOfPlayhead,
+    window: fieldWindow)
+let playheadAnchoredStart = VortXHLSConsumptionWindowPolicy.publicationStartID(
+    currentStartID: fieldWindow.mediaSequence,
+    suffixStartID: requestAheadOfPlayhead,
+    playbackSegmentID: actualPlaybackSegment,
+    window: fieldWindow)
+check("played frontier: twenty-segment fetch-ahead cannot evict the displayed segment",
+      requestAnchoredStart > actualPlaybackSegment
+          && playheadAnchoredStart <= actualPlaybackSegment)
+check("played frontier: no playhead receipt keeps the original sequence pinned",
+      VortXHLSConsumptionWindowPolicy.publicationStartID(
+        currentStartID: fieldWindow.mediaSequence,
+        suffixStartID: requestAheadOfPlayhead,
+        playbackSegmentID: nil,
+        window: fieldWindow) == fieldWindow.mediaSequence)
+check("played frontier: a backward seek moves eviction authority backward",
+      VortXHLSConsumptionWindowPolicy.publicationStartID(
+        currentStartID: fieldWindow.mediaSequence,
+        suffixStartID: requestAheadOfPlayhead,
+        playbackSegmentID: 12,
+        window: fieldWindow)
+          < VortXHLSConsumptionWindowPolicy.publicationStartID(
+            currentStartID: fieldWindow.mediaSequence,
+            suffixStartID: requestAheadOfPlayhead,
+            playbackSegmentID: 37,
+            window: fieldWindow))
 
 let fieldSegmentBytes = 8 * retentionMiB
 let producedAheadWindow = VortXHLSWindow(segments: (0..<80).map {

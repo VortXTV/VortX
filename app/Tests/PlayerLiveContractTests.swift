@@ -3,6 +3,8 @@
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors -o /tmp/player-live-contract \
 //     app/Sources/Player/DVPlaybackPolicy.swift \
 //     app/Sources/Player/VortXRemuxBuffer.swift \
+//     app/Sources/Player/PlayerStallPolicy.swift \
+//     app/Sources/Player/VortXHLSSeekAnchorState.swift \
 //     app/Sources/Player/AudioLanguagePolicy.swift \
 //     app/Sources/Player/MultiAudioPolicy.swift \
 //     app/Sources/Player/SubtitleRenditionPolicy.swift \
@@ -147,6 +149,51 @@ private final class ManualSegmentSender {
 @MainActor @main
 enum PlayerLiveContractTests {
     static func main() {
+        var seekAnchor = VortXHLSSeekAnchorState()
+        seekAnchor.reportPlaybackPosition(90)
+        seekAnchor.registerSeek(requestID: 1)
+        seekAnchor.reportPlaybackPosition(90)
+        check("seek admission pins the old periodic clock",
+              seekAnchor.currentPlaybackSeconds == nil
+                  && seekAnchor.pendingAdmissionRequestID == 1)
+        check("published destination advances from admission to completion receipt",
+              seekAnchor.admitSeek(
+                  requestID: 1,
+                  playerSeconds: 10,
+                  targetIsPublished: true)
+                  && seekAnchor.currentPlaybackSeconds == 10
+                  && seekAnchor.pendingAdmissionRequestID == nil
+                  && seekAnchor.pendingReceipt?.requestID == 1)
+        seekAnchor.reportPlaybackPosition(90)
+        check("seek completion receipt pins the destination against old periodic ticks",
+              seekAnchor.currentPlaybackSeconds == 10)
+        seekAnchor.completeSeek(requestID: 1, playerSeconds: 10.25)
+        seekAnchor.reportPlaybackPosition(10.5)
+        check("periodic clock resumes only after matching completion",
+              seekAnchor.currentPlaybackSeconds == 10.5
+                  && seekAnchor.pendingReceipt == nil)
+
+        seekAnchor.registerSeek(requestID: 2)
+        seekAnchor.registerSeek(requestID: 3)
+        check("superseded admission cannot clear or replace the newest pin",
+              !seekAnchor.admitSeek(
+                  requestID: 2,
+                  playerSeconds: 50,
+                  targetIsPublished: true)
+                  && seekAnchor.currentPlaybackSeconds == nil
+                  && seekAnchor.pendingAdmissionRequestID == 3)
+        seekAnchor.cancelSeek(requestID: 2)
+        check("stale cancellation cannot clear the newest admission",
+              seekAnchor.pendingAdmissionRequestID == 3)
+        check("failed latest admission clears only its matching pin",
+              !seekAnchor.admitSeek(
+                  requestID: 3,
+                  playerSeconds: 60,
+                  targetIsPublished: false)
+                  && seekAnchor.pendingAdmissionRequestID == nil
+                  && seekAnchor.currentPlaybackSeconds == nil)
+        testDeferredSeekAnchorLifecycle()
+
         testInitialMountPinsStartupBytes()
         testInitialMasterPublishesPrimaryAudioOnly()
         testResidentSlidingPlaylistAndAbsoluteRequests()
@@ -161,6 +208,7 @@ enum PlayerLiveContractTests {
         testDisplayRequestLifecycle()
         testSelectionRefreshLifecycle()
         testBoundaryKeyAgreement()
+        testMidPlaybackStallPolicy()
         testProductionWiring()
 
         print("")
@@ -170,6 +218,101 @@ enum PlayerLiveContractTests {
         }
         print("\(failures) FAILED")
         exit(1)
+    }
+
+    private static func testDeferredSeekAnchorLifecycle() {
+        var preReady = VortXHLSSeekAnchorState()
+        preReady.reportPlaybackPosition(20)
+        preReady.registerSeek(requestID: 10)
+        preReady.cancelSeek(requestID: 10)
+        preReady.reportPlaybackPosition(21)
+        check("seek anchor: pre-ready deferral cancels the old admission without pinning a new one",
+              preReady.pendingAdmissionRequestID == nil
+                  && preReady.pendingReceipt == nil
+                  && preReady.currentPlaybackSeconds == 21)
+
+        var capabilityRefresh = VortXHLSSeekAnchorState()
+        capabilityRefresh.registerSeek(requestID: 20)
+        _ = capabilityRefresh.admitSeek(
+            requestID: 20,
+            playerSeconds: 40,
+            targetIsPublished: true)
+        capabilityRefresh.cancelSeek(requestID: 20)
+        capabilityRefresh.reportPlaybackPosition(41)
+        check("seek anchor: capability-refresh deferral settles an admitted receipt before periodic playback",
+              capabilityRefresh.pendingAdmissionRequestID == nil
+                  && capabilityRefresh.pendingReceipt == nil
+                  && capabilityRefresh.currentPlaybackSeconds == 41)
+
+        var hdrReplacement = VortXHLSSeekAnchorState()
+        hdrReplacement.registerSeek(requestID: 30)
+        _ = hdrReplacement.admitSeek(
+            requestID: 30,
+            playerSeconds: 70,
+            targetIsPublished: true)
+        hdrReplacement.cancelSeek(requestID: 30)
+        // HDR item restoration is a direct seek on the replacement item. It deliberately does not register a
+        // server admission, so the replacement item's next periodic receipt must become authoritative.
+        hdrReplacement.reportPlaybackPosition(71)
+        check("seek anchor: HDR replacement raw restoration accepts the next periodic receipt",
+              hdrReplacement.pendingAdmissionRequestID == nil
+                  && hdrReplacement.pendingReceipt == nil
+                  && hdrReplacement.currentPlaybackSeconds == 71)
+    }
+
+    private static func testMidPlaybackStallPolicy() {
+        check("stall policy: visible buffering after first frame remains observable",
+              PlayerMidPlaybackStallPolicy.shouldObserve(
+                hasStartedPlaying: true,
+                isPaused: false,
+                loadFailed: false,
+                isLive: false,
+                duration: 7_200,
+                buffering: true))
+        check("stall policy: user pause, startup, live playback and terminal loads never recover",
+              !PlayerMidPlaybackStallPolicy.shouldObserve(
+                hasStartedPlaying: false,
+                isPaused: false,
+                loadFailed: false,
+                isLive: false,
+                duration: 7_200,
+                buffering: true)
+                  && !PlayerMidPlaybackStallPolicy.shouldObserve(
+                    hasStartedPlaying: true,
+                    isPaused: true,
+                    loadFailed: false,
+                    isLive: false,
+                    duration: 7_200,
+                    buffering: false)
+                  && !PlayerMidPlaybackStallPolicy.shouldObserve(
+                    hasStartedPlaying: true,
+                    isPaused: false,
+                    loadFailed: false,
+                    isLive: true,
+                    duration: 7_200,
+                    buffering: false)
+                  && !PlayerMidPlaybackStallPolicy.shouldObserve(
+                    hasStartedPlaying: true,
+                    isPaused: false,
+                    loadFailed: true,
+                    isLive: false,
+                    duration: 7_200,
+                    buffering: false))
+        check("stall policy: buffering receives a bounded but longer recovery window",
+              PlayerMidPlaybackStallPolicy.recoveryTickThreshold(buffering: false) == 3
+                  && PlayerMidPlaybackStallPolicy.recoveryTickThreshold(buffering: true) == 5)
+        check("stall policy: a brief restart cannot replenish the source recovery budget",
+              !PlayerMidPlaybackStallPolicy.shouldResetRecoveryBudget(
+                recoveries: 1,
+                stableProgressTicks: 1)
+                  && !PlayerMidPlaybackStallPolicy.shouldResetRecoveryBudget(
+                    recoveries: 3,
+                    stableProgressTicks:
+                        PlayerMidPlaybackStallPolicy.stableProgressTicksToResetRecoveryBudget - 1)
+                  && PlayerMidPlaybackStallPolicy.shouldResetRecoveryBudget(
+                    recoveries: 3,
+                    stableProgressTicks:
+                        PlayerMidPlaybackStallPolicy.stableProgressTicksToResetRecoveryBudget))
     }
 
     private static func testInitialMountPinsStartupBytes() {
@@ -2417,6 +2560,30 @@ enum PlayerLiveContractTests {
                                        encoding: .utf8)
         let playerScreen = try? String(contentsOf: testsURL.deletingLastPathComponent()
             .appendingPathComponent("Sources/PlayerScreen.swift"), encoding: .utf8)
+        let avTimeControl = sourceSection(
+            engine,
+            from: "observations.append(player.observe(\\.timeControlStatus",
+            to: "// ~4 Hz")
+        let avSeek = sourceSection(
+            engine,
+            from: "func seek(to seconds: Double)",
+            to: "func seek(by seconds: Double)")
+        let playheadReceipt = sourceSection(
+            server,
+            from: "func reportPlaybackPosition(playerSeconds: Double)",
+            to: "private func playbackSegmentID(in window:")
+        let midPlaybackWatchdog = sourceSection(
+            playerScreen,
+            from: "private func startStallWatchdog()",
+            to: "private func recoverFromStall()")
+        let midPlaybackRecovery = sourceSection(
+            playerScreen,
+            from: "private func recoverFromStall()",
+            to: "#if os(iOS) || os(macOS)")
+        let firstFrameCommit = sourceSection(
+            playerScreen,
+            from: "case MPVProperty.timePos:",
+            to: "case MPVProperty.pause:")
         let tvPlayer = try? String(contentsOf: testsURL.deletingLastPathComponent()
             .appendingPathComponent("SourcesTV/TVPlayerView.swift"), encoding: .utf8)
         let externalEngine = try? String(contentsOf: testsURL.deletingLastPathComponent()
@@ -3639,6 +3806,15 @@ enum PlayerLiveContractTests {
                       "let sourceSubtitleTracks = subtitleMetadata.map") == true
                   && sourceSubtitleInventory?.contains(
                       "_sourceSubtitleTracks = sourceSubtitleTracks") == true)
+        check("wiring: PGS advertisement is capped before OCR and excess rows are truthful",
+              sourceContainsInOrder(sourceSubtitleInventory, [
+                  "SubtitleRenditionPolicy.admittedTracks(",
+                  "maximumPGSStreams: VortXPGSSubtitleOCR.maximumStreams",
+                  "preferredLanguages: TrackPreferences.current.subtitleLanguages",
+                  "let subtitleRenditions = SubtitleRenditionPolicy.renditions(",
+                  "let capacityLimitedPGSSourceIndices",
+                  "SubtitleRenditionPolicy.pgsCapacityUnavailableReason",
+              ]))
         check("wiring: AVPlayer polls remux subtitle truth on a bounded wall-clock cadence",
               engine?.contains(
                   "startRemuxSubtitleInventoryRefresh(for: item, loadToken: loadToken)") == true
@@ -3694,6 +3870,117 @@ enum PlayerLiveContractTests {
         // DEFAULT=YES / AUTOSELECT rows, so leaving it set is a live fight with every explicit selection.
         check("wiring: VortX owns selection, so automatic media-selection criteria are cleared",
               groupLoad?.contains("player.appliesMediaSelectionCriteriaAutomatically = false") == true)
+        check("wiring: AVPlayer status clears stale cache state when playback resumes",
+              sourceContainsInOrder(avTimeControl, [
+                  "let waiting = player.timeControlStatus == .waitingToPlayAtSpecifiedRate",
+                  "self.emit(",
+                  "MPVProperty.pausedForCache, waiting,",
+              ]))
+        check("wiring: the mid-play watchdog observes buffering with its bounded threshold",
+              midPlaybackWatchdog?.contains(
+                "PlayerMidPlaybackStallPolicy.shouldObserve(") == true
+                  && midPlaybackWatchdog?.contains("!buffering") == false
+                  && sourceContainsInOrder(midPlaybackWatchdog, [
+                    "recoveryTickThreshold(",
+                    "buffering: buffering",
+                  ]))
+        check("wiring: periodic playhead reporting never enters the publication lock",
+              playheadReceipt?.contains("playbackClockLock.lock()") == true
+                  && sourceSection(
+                    playheadReceipt,
+                    from: "func reportPlaybackPosition(playerSeconds: Double)",
+                    to: "func prepareForSeek(")?
+                    .contains("publicationLock") == false
+                  && sourceContainsInOrder(playheadReceipt, [
+                    "seekAnchorState.reportPlaybackPosition(playerSeconds)",
+                    "self.seekAnchorState.admitSeek(",
+                    "func completePreparedSeek(requestID: UInt64, playerSeconds: Double)",
+                    "seekAnchorState.completeSeek(requestID: requestID, playerSeconds: playerSeconds)",
+                  ]))
+        check("wiring: local HLS seeks are newest-wins and retain the target through completion",
+              sourceContainsInOrder(avSeek, [
+                "let seekRequestID = supersedeSeekRequest()",
+                "if hdrFallbackCapabilityRefreshTask != nil",
+                "return",
+                "guard isReady else",
+                "return",
+                "if let server = remuxHLSServer",
+                "guard registerSeekAdmission(",
+                "preparedSeekTask = Task",
+                "self?.seekRequestGeneration == seekRequestID",
+                "let admitted = await server.prepareForSeek(",
+                "requestID: seekRequestID",
+                "self.seekRequestGeneration == seekRequestID",
+                "if !admitted {",
+                "self.cancelSeekAdmission(",
+                "if self.remountForSeek(sourceSeconds: seconds)",
+                "self.commitPlayerSeek(",
+                "requestID: seekRequestID",
+                "player.seek(to:",
+                "finished in",
+                "self.seekRequestGeneration == requestID",
+                "self.completeSeekAdmission(",
+                "requestID: requestID",
+              ]))
+        check("wiring: the latest seek is registered before queued admission and stale receipts fail closed",
+              sourceContainsInOrder(playheadReceipt, [
+                "func registerLatestSeekRequest(requestID: UInt64)",
+                "seekAnchorState.registerSeek(requestID: requestID)",
+                "func prepareForSeek(",
+                "self.publicationLock.lock()",
+                "self.seekAnchorState.isPendingLatestAdmission(requestID: requestID)",
+                "guard isLatestBeforeAdmission",
+                "self.seekAnchorState.admitSeek(",
+              ])
+                  && sourceContainsInOrder(avSeek, [
+                    "let seekRequestID = supersedeSeekRequest()",
+                    "if let server = remuxHLSServer",
+                    "guard registerSeekAdmission(",
+                    "preparedSeekTask = Task",
+                  ]))
+        check("wiring: seek supersession cancels without registering a phantom admission",
+              sourceContainsInOrder(engine, [
+                "private func supersedeSeekRequest() -> UInt64",
+                "server.cancelPreparedSeek(requestID: requestID)",
+                "registeredSeekServer = nil",
+                "registeredSeekRequestID = nil",
+                "seekRequestGeneration &+= 1",
+                "private func invalidateSeekRequests()",
+                "_ = supersedeSeekRequest()",
+                "private func registerSeekAdmission(",
+                "server.registerLatestSeekRequest(requestID: requestID)",
+              ]))
+        check("wiring: HDR item replacement settles server admission before raw intent restoration",
+              sourceContainsInOrder(hdrFallbackRetry, [
+                "invalidateSeekRequests()",
+                "player.replaceCurrentItem(with: freshItem)",
+                "observe(freshItem, loadToken: loadToken)",
+              ])
+                  && sourceContainsInOrder(groupLoad, [
+                    "let restore = replacementReady",
+                    "player.seek(",
+                    "pendingPlaybackIntent = nil",
+                  ])
+                  && groupLoad?.contains("registerSeekAdmission(") == false)
+        check("wiring: an accepted mid-play reload rearms the start watchdog",
+              sourceContainsInOrder(midPlaybackRecovery, [
+                  "let issuedToken = loadIntoPlayer(",
+                  "if issuedToken != nil { startLoadTimeout() }",
+              ]))
+        check("wiring: first-frame delivery does not replenish the mid-play recovery budget",
+              firstFrameCommit?.contains("stallRecoveries = 0") == false)
+        check("wiring: only sustained progress replenishes the mid-play recovery budget",
+              midPlaybackWatchdog?.contains(
+                "lastObservedTime = -1; stalledTicks = 0; stallStableProgressTicks = 0") == true
+                  && sourceContainsInOrder(midPlaybackWatchdog, [
+                "lastObservedTime = -1",
+                "stallStableProgressTicks = 0",
+                "if lastObservedTime < 0",
+                "stallStableProgressTicks = 0",
+                "stallStableProgressTicks += 1",
+                "PlayerMidPlaybackStallPolicy.shouldResetRecoveryBudget(",
+                "stallRecoveries = 0",
+              ]))
         check("release: Beta 7 is the first parseable changelog version",
               changelog?.range(of: "## 0.3.14 Beta 7")?.lowerBound
                   == changelog?.range(of: "## ")?.lowerBound)

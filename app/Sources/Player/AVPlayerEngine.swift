@@ -61,6 +61,12 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// delivery must also prove that the AVPlayerItem generation that emitted the event is still mounted.
     private var itemGeneration: UInt64 = 0
     private(set) var activeLoadToken: PlayerLoadToken?
+    /// Newest-wins ownership for asynchronous local-HLS seeks. A later scrub/D-pad input invalidates every
+    /// older task and completion callback, even when they target the same AVPlayerItem generation.
+    private var seekRequestGeneration: UInt64 = 0
+    private var preparedSeekTask: Task<Void, Never>?
+    private weak var registeredSeekServer: VortXRemuxHLSServer?
+    private var registeredSeekRequestID: UInt64?
     #if os(tvOS)
     /// Current native-DV preflight. A new load/stop cancels it, and its completion must also match both the
     /// logical load token and exact item generation before it may switch the display or attach anything.
@@ -391,6 +397,64 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         activeLoadToken = nil
     }
 
+    /// Retire the prior asynchronous admission without creating a replacement. Pre-ready intent updates,
+    /// capability-refresh deferrals, item replacement and teardown all pass through here, so none of them can
+    /// leave a server playhead pinned behind an admission that AVPlayer will never receive.
+    @discardableResult
+    private func supersedeSeekRequest() -> UInt64 {
+        preparedSeekTask?.cancel()
+        preparedSeekTask = nil
+        if let requestID = registeredSeekRequestID,
+           let server = registeredSeekServer {
+            server.cancelPreparedSeek(requestID: requestID)
+        }
+        registeredSeekServer = nil
+        registeredSeekRequestID = nil
+        seekRequestGeneration &+= 1
+        return seekRequestGeneration
+    }
+
+    private func invalidateSeekRequests() {
+        _ = supersedeSeekRequest()
+    }
+
+    private func registerSeekAdmission(
+        requestID: UInt64,
+        server: VortXRemuxHLSServer
+    ) -> Bool {
+        guard seekRequestGeneration == requestID else { return false }
+        server.registerLatestSeekRequest(requestID: requestID)
+        registeredSeekServer = server
+        registeredSeekRequestID = requestID
+        return true
+    }
+
+    private func cancelSeekAdmission(
+        requestID: UInt64,
+        server: VortXRemuxHLSServer
+    ) {
+        server.cancelPreparedSeek(requestID: requestID)
+        guard registeredSeekRequestID == requestID,
+              registeredSeekServer === server else { return }
+        registeredSeekServer = nil
+        registeredSeekRequestID = nil
+    }
+
+    private func completeSeekAdmission(
+        requestID: UInt64,
+        server: VortXRemuxHLSServer,
+        playerSeconds: Double
+    ) {
+        server.completePreparedSeek(
+            requestID: requestID,
+            playerSeconds: playerSeconds
+        )
+        guard registeredSeekRequestID == requestID,
+              registeredSeekServer === server else { return }
+        registeredSeekServer = nil
+        registeredSeekRequestID = nil
+    }
+
     /// Store a sanitized origin for exactly the next logical `loadFile`. This must be called before the load:
     /// initial AVPlayer attachment happens synchronously in `AVPlayerEngineView.makeHostView`, before any
     /// SwiftUI `onAppear` callback can safely retrofit the mount.
@@ -406,6 +470,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     @discardableResult
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?,
                   reusing loadToken: PlayerLoadToken?) -> PlayerLoadToken {
+        invalidateSeekRequests()
         let isIntentRemount = loadToken != nil && pendingPlaybackIntent != nil
         if loadToken == nil {
             let preferences = TrackPreferences.current
@@ -1126,6 +1191,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             "dv",
             "DV item -12927 on healthy mount -> ONE explicit HDR-only recovery item before demote")
 
+        invalidateSeekRequests()
         teardownObservers()
         player.pause()
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
@@ -1252,6 +1318,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     }
 
     func seek(to seconds: Double) {
+        let seekRequestID = supersedeSeekRequest()
         if var intent = pendingPlaybackIntent {
             intent.updateSourceSeconds(seconds)
             pendingPlaybackIntent = intent
@@ -1323,7 +1390,98 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         } else {
             clamped = (dur.isFinite && dur > 1) ? min(max(seconds, 0), max(dur - 1, 0)) : max(seconds, 0)
         }
-        player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
+        if let server = remuxHLSServer {
+            guard registerSeekAdmission(
+                requestID: seekRequestID,
+                server: server
+            ) else { return }
+            let seekGeneration = itemGeneration
+            let seekLoadToken = activeLoadToken
+            preparedSeekTask = Task { @MainActor [weak self] in
+                guard !Task.isCancelled,
+                      self?.seekRequestGeneration == seekRequestID,
+                      self?.itemGeneration == seekGeneration,
+                      self?.activeLoadToken == seekLoadToken else {
+                    self?.cancelSeekAdmission(
+                        requestID: seekRequestID,
+                        server: server
+                    )
+                    return
+                }
+                let admitted = await server.prepareForSeek(
+                    playerSeconds: clamped,
+                    requestID: seekRequestID
+                )
+                guard let self,
+                      !Task.isCancelled,
+                      self.seekRequestGeneration == seekRequestID,
+                      self.itemGeneration == seekGeneration,
+                      self.activeLoadToken == seekLoadToken else {
+                    self?.cancelSeekAdmission(
+                        requestID: seekRequestID,
+                        server: server
+                    )
+                    return
+                }
+                if !admitted {
+                    self.cancelSeekAdmission(
+                        requestID: seekRequestID,
+                        server: server
+                    )
+                    if self.remountForSeek(sourceSeconds: seconds) {
+                        return
+                    }
+                }
+                self.commitPlayerSeek(
+                    playerSeconds: clamped,
+                    requestID: seekRequestID,
+                    preparedServer: admitted ? server : nil
+                )
+                if self.seekRequestGeneration == seekRequestID {
+                    self.preparedSeekTask = nil
+                }
+            }
+            return
+        }
+        commitPlayerSeek(playerSeconds: clamped, requestID: seekRequestID)
+    }
+
+    private func commitPlayerSeek(
+        playerSeconds clamped: Double,
+        requestID: UInt64,
+        preparedServer: VortXRemuxHLSServer? = nil
+    ) {
+        let seekItem = item
+        let seekGeneration = itemGeneration
+        let seekLoadToken = activeLoadToken
+        player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600)) {
+            [weak self, weak preparedServer] finished in
+            Task { @MainActor in
+                guard let self,
+                      finished,
+                      self.seekRequestGeneration == requestID,
+                      self.itemGeneration == seekGeneration,
+                      self.item === seekItem,
+                      self.activeLoadToken == seekLoadToken else {
+                    if let self, let preparedServer {
+                        self.cancelSeekAdmission(
+                            requestID: requestID,
+                            server: preparedServer
+                        )
+                    } else {
+                        preparedServer?.cancelPreparedSeek(requestID: requestID)
+                    }
+                    return
+                }
+                if let preparedServer {
+                    self.completeSeekAdmission(
+                        requestID: requestID,
+                        server: preparedServer,
+                        playerSeconds: self.player.currentTime().seconds
+                    )
+                }
+            }
+        }
         let reported = RemuxResumePolicy.presented(
             playerSeconds: clamped,
             origin: remuxTimelineOrigin)
@@ -1378,6 +1536,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     func setMuted(_ muted: Bool) { player.isMuted = muted }
 
     func stop() {
+        invalidateSeekRequests()
         invalidateLoadToken()
         externalMountTask?.cancel()
         externalMountTask = nil
@@ -2206,6 +2365,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 VXProbeState.shared.setPlayer(state: stateText, engine: "avplayer", buffering: waiting)
                 VXProbe.event("player", "stall \(waiting ? "start" : "end")")
                 self.emit(
+                    MPVProperty.pausedForCache, waiting,
+                    loadToken: loadToken
+                )
+                self.emit(
                     MPVProperty.pause, player.timeControlStatus == .paused,
                     loadToken: loadToken
                 )
@@ -2224,6 +2387,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 let position = RemuxResumePolicy.presented(
                     playerSeconds: time.seconds,
                     origin: self.remuxTimelineOrigin)
+                self.remuxHLSServer?.reportPlaybackPosition(playerSeconds: time.seconds)
                 self.emit(
                     MPVProperty.timePos,
                     PlayerTimePositionEvent(seconds: position, loadToken: loadToken),

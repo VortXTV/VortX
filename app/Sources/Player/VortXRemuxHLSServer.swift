@@ -70,6 +70,10 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// Request servicing queue: concurrent, because playlist answers legitimately WAIT (poll) for the remux
     /// to produce segments and must not starve a parallel segment read.
     private let serveQueue = DispatchQueue(label: "vortx.dvremux.hls.serve", attributes: .concurrent)
+    /// Serializes explicit seek receipts without ever making AVPlayer's main-thread progress callback wait for
+    /// playlist publication. A seek waits for any in-flight publication, records its destination against that
+    /// exact generation, and only then lets AVPlayer move its clock.
+    private let seekReceiptQueue = DispatchQueue(label: "vortx.dvremux.hls.seek-receipt")
     private var listener: NWListener?
     private(set) var port: UInt16 = 0
     private let stateLock = NSLock()
@@ -89,10 +93,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// that later fails can freeze at this terminal window (ENDLIST) instead of killing the whole session.
     private var lastPublishedAudioWindow: VortXHLSWindow?
     private var advertisedAudioInitData: Data?
-    /// The client's demonstrated CONSUMPTION frontier: the highest video segment id it has requested.
-    /// -1 until the first fetch, which keeps the startup window pinned at its first sequence. Guarded by
-    /// `publicationLock`.
+    /// Highest video segment requested. This is only the startup receipt that releases the tiny unconsumed
+    /// cohort. It is not playback proof and must never authorize eviction because AVPlayer reads far ahead.
+    /// Guarded by `publicationLock`.
     private var highestServedVideoSegmentID = -1
+    /// AVPlayer's latest displayed local-media clock. The 4 Hz main-thread observer writes only this tiny value
+    /// under its own lock. Playlist publication maps it to the current common generation while already off the
+    /// main actor, so filesystem work under `publicationLock` cannot freeze player chrome or progress delivery.
+    private let playbackClockLock = NSLock()
+    private var seekAnchorState = VortXHLSSeekAnchorState()
     /// Session-captured window-advancement policy (see `consumptionAnchorEnabled`).
     private let consumptionAnchored = VortXRemuxHLSServer.consumptionAnchorEnabled
     private var advertisedSubtitles: [SubtitleRenditionPolicy.Rendition] = []
@@ -372,6 +381,85 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         return first.start...last.end
     }
 
+    /// Records the current AVPlayer clock without entering the publication critical section. Invalid clocks fail
+    /// closed. The publisher later maps the clock to its exact common generation, so speculative segment requests
+    /// still cannot substitute for playback proof.
+    func reportPlaybackPosition(playerSeconds: Double) {
+        playbackClockLock.lock()
+        seekAnchorState.reportPlaybackPosition(playerSeconds)
+        playbackClockLock.unlock()
+    }
+
+    func registerLatestSeekRequest(requestID: UInt64) {
+        playbackClockLock.lock()
+        seekAnchorState.registerSeek(requestID: requestID)
+        playbackClockLock.unlock()
+    }
+
+    /// Establishes an explicit seek destination before AVPlayer receives the asynchronous seek. Waiting happens
+    /// on `seekReceiptQueue`, never the main actor. If a concurrent publication already evicted the destination,
+    /// admission fails and the caller remounts at source time instead of seeking into a missing HLS segment.
+    func prepareForSeek(playerSeconds: Double, requestID: UInt64) async -> Bool {
+        guard playerSeconds.isFinite, playerSeconds >= 0 else {
+            cancelPreparedSeek(requestID: requestID)
+            return false
+        }
+        return await withCheckedContinuation { continuation in
+            seekReceiptQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                self.publicationLock.lock()
+                self.playbackClockLock.lock()
+                let isLatestBeforeAdmission =
+                    self.seekAnchorState.isPendingLatestAdmission(requestID: requestID)
+                self.playbackClockLock.unlock()
+                guard isLatestBeforeAdmission else {
+                    self.publicationLock.unlock()
+                    continuation.resume(returning: false)
+                    return
+                }
+                let targetIsPublished = self.publishedVideoWindow.flatMap {
+                    VortXHLSConsumptionWindowPolicy.segmentID(
+                        atPlaybackSeconds: playerSeconds,
+                        window: $0)
+                } != nil
+                self.playbackClockLock.lock()
+                let admitted = self.seekAnchorState.admitSeek(
+                    requestID: requestID,
+                    playerSeconds: playerSeconds,
+                    targetIsPublished: targetIsPublished)
+                self.playbackClockLock.unlock()
+                self.publicationLock.unlock()
+                continuation.resume(returning: admitted)
+            }
+        }
+    }
+
+    func completePreparedSeek(requestID: UInt64, playerSeconds: Double) {
+        playbackClockLock.lock()
+        seekAnchorState.completeSeek(requestID: requestID, playerSeconds: playerSeconds)
+        playbackClockLock.unlock()
+    }
+
+    func cancelPreparedSeek(requestID: UInt64) {
+        playbackClockLock.lock()
+        seekAnchorState.cancelSeek(requestID: requestID)
+        playbackClockLock.unlock()
+    }
+
+    private func playbackSegmentID(in window: VortXHLSWindow) -> Int? {
+        playbackClockLock.lock()
+        let seconds = seekAnchorState.currentPlaybackSeconds
+        playbackClockLock.unlock()
+        return seconds.flatMap {
+            VortXHLSConsumptionWindowPolicy.segmentID(
+                atPlaybackSeconds: $0,
+                window: window)
+        }
+    }
+
     /// Stop everything: the remux thread, the listener, and every open connection. Idempotent.
     func invalidate() {
         stateLock.lock()
@@ -387,6 +475,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         mountDeadlineWorkItem = nil
         deadlineLock.unlock()
         deadlineWork?.cancel()
+        playbackClockLock.lock()
+        seekAnchorState.invalidate()
+        playbackClockLock.unlock()
         stream.cancel()
         listener?.cancel()
         open.forEach { $0.cancel() }
@@ -1110,10 +1201,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 // reload; with the small startup floor, production outran playback ~20 sequences per reload
                 // (build 190 field log: seq=0 -> 29 -> 49 -> 59 at ~6s intervals, segs=4), AVPlayer's next
                 // fetch fell off the window's tail-end, and every DV play skipped/stalled into the HDR10
-                // demote. The playlist start may now advance ONLY behind the client's demonstrated
-                // consumption frontier (the highest video segment it has actually fetched, minus a small
-                // keep-behind), and never past the furthest slide the minimum floors would allow. Before the
-                // client fetches anything, the startup window stays PINNED at its first sequence. Memory
+                // demote. The playlist start may now advance ONLY behind the segment containing AVPlayer's
+                // displayed clock, and never past the furthest slide the minimum floors would allow. Before
+                // the first playhead receipt, the startup window stays PINNED at its first sequence. Memory
                 // stays bounded exactly as before: segments the window drops enter their RFC retention
                 // deadlines, and the producer parks on the spool ceiling (backpressure) instead of running
                 // unbounded ahead.
@@ -1126,12 +1216,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 }
                 let suffixStartID = suffix.segments.first?.id ?? current.mediaSequence
                 if consumptionAnchored {
-                    let consumptionFloorID = highestServedVideoSegmentID < 0
-                        ? current.mediaSequence
-                        : VortXHLSConsumptionWindowPolicy.floor(
-                            frontier: highestServedVideoSegmentID,
-                            window: common)
-                    let newStartID = max(current.mediaSequence, min(suffixStartID, consumptionFloorID))
+                    let playbackSegmentID = playbackSegmentID(in: common)
+                    let newStartID = VortXHLSConsumptionWindowPolicy.publicationStartID(
+                        currentStartID: current.mediaSequence,
+                        suffixStartID: suffixStartID,
+                        playbackSegmentID: playbackSegmentID,
+                        window: common)
                     let slid = common.segments.drop { $0.id < newStartID }
                     selectedVideo = slid.isEmpty ? common : VortXHLSWindow(segments: Array(slid))
                 } else {
@@ -1354,9 +1444,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// Resource lookup is independent of the current playlist window. A URI removed from a later generation
     /// stays openable through its receipt-derived deadline, and the lease is acquired before any 200 bytes.
     private func serveSegment(_ connection: NWConnection, index: Int, delivery: Delivery = .legacy) {
-        // A video segment REQUEST is the client's consumption receipt: requesting seg N proves its playlist
-        // coverage reaches N, so the published window may slide up to N minus the keep-behind (and no
-        // further). This is the anchor the consumption-bounded slide in `currentPublication` keys on.
+        // A request proves only that AVPlayer has started consuming the startup cohort. Read-ahead can run far
+        // beyond the displayed frame, so this receipt releases the tiny startup cap but never advances the
+        // playlist start. The periodic player clock supplies the separate eviction receipt.
         publicationLock.lock()
         if index > highestServedVideoSegmentID { highestServedVideoSegmentID = index }
         publicationLock.unlock()
