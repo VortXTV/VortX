@@ -149,7 +149,7 @@ index e5f872c..dcaca5b 100644
          if BaseBuild.options.enableGPL {
              dependencyLibrary += [.libsmbclient]
          }
-@@ -681,6 +750,21 @@ private class BuildFFMPEG: BaseBuild {
+@@ -681,6 +750,22 @@ private class BuildFFMPEG: BaseBuild {
          "--enable-encoder=aac", "--enable-encoder=alac", "--enable-encoder=flac", "--enable-encoder=pcm*",
          "--enable-encoder=movtext", "--enable-encoder=mpeg4", "--enable-encoder=h264_videotoolbox",
          "--enable-encoder=hevc_videotoolbox", "--enable-encoder=prores", "--enable-encoder=prores_videotoolbox",
@@ -162,7 +162,8 @@ index e5f872c..dcaca5b 100644
 +        //
 +        // Native FFmpeg encoder, so no external library and no licence change: configure has
 +        // `eac3_encoder_select="ac3_encoder"` and `ac3_encoder_select="ac3dsp audiodsp me_cmp"`, all
-+        // internal, and neither carries a gpl or nonfree marker at n8.1.2. ac3_encoder therefore
++        // internal, and neither carries a GPL or nonfree marker in the pinned release/9.0 config.
++        // ac3_encoder therefore
 +        // appears in the build too, as a selected dependency rather than a separate choice.
 +        // The mov/mp4 sink already supports it: movenc maps EAC3 to the 'ec-3' tag and writes the
 +        // dec3 atom, and mov_muxer_select already pulls in ac3_parser, which is what parses the
@@ -171,7 +172,7 @@ index e5f872c..dcaca5b 100644
          // ./configure --list-protocols
          "--enable-protocols",
          // ./configure --list-demuxers
-@@ -778,10 +862,92 @@ private class BuildLuaJIT: ZipBaseBuild {
+@@ -778,10 +863,92 @@ private class BuildLuaJIT: ZipBaseBuild {
  }
  
  

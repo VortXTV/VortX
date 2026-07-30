@@ -2256,10 +2256,10 @@ final class MPVMetalViewController: PlatformViewController {
     /// property that proves the demuxer paired a base and enhancement video track, so we read it and
     /// state the outcome plainly in the probe trail.
     ///
-    /// Note this reports the DEMUXER pairing, which is the step that can silently no-op on our stack
-    /// (single-track interleaved P7 needs FFmpeg's `dovi_split` BSF, which our pinned n8.1.2 does not
-    /// ship). A "paired" line plus no "Failed to set up enhancement-layer" warning from mpv means the
-    /// EL decoder came up and libplacebo is compositing it.
+    /// Note this reports the DEMUXER pairing. A "paired" line plus no "Failed to set up
+    /// enhancement-layer" warning from mpv means the EL decoder came up and libplacebo is
+    /// compositing it. Single-track interleaved Profile 7 uses mpv's splitter instead of track
+    /// pairing, backed by `dovi_split` in the pinned FFmpeg release/9.0 build.
     private func probeEnhancementLayer() {
         guard mpv != nil else { return }
         let count = getInt("track-list/count")

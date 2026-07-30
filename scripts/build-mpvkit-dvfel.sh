@@ -36,6 +36,11 @@
 # libavcodec past 62.30.100 switches on mpv's demux/packet.c App5 path whose FFmpeg API does not
 # exist at n8.1.2, so mpv stops compiling. master was unnecessary.
 #
+# Before the move, this file recorded a direct-Swift-API risk. A source audit refuted it: the 67
+# distinct FFmpeg functions VortX calls had zero removals or signature changes through master, and
+# libavutil/dovi_meta.h was byte-identical, so the synthetic DV record was unaffected. The remaining
+# unmeasured cost was MPVKit patch rebasing; the measured result below closed that gate.
+#
 # Apple TLS is pinned deliberately too. FFmpeg must select SecureTransport and explicitly disable
 # GnuTLS. The GnuTLS artifact stays available to libsmbclient, but its system-trust loader is
 # unavailable on tvOS. FFmpeg 9 enables peer verification, so selecting that backend leaves HTTPS
@@ -65,7 +70,7 @@
 #                                     MPVKit's own 0001-0003, because it edits the file MPVKit's 0001
 #                                     creates and so must be applied after it.
 # Everything not listed above still comes from upstream MPVKit's own prebuilt zips at the versions
-# the 0.41.0-n8.1.2 pin already used.
+# the MPVKit 1.0.0 base already used.
 #
 # Cost: a full clean run builds 9 slices (ios, isimulator x2, tvos x2, tvsimulator x2, macos x2)
 # of FFmpeg, libplacebo and mpv from source. Budget hours, not minutes, and ~20 GB of scratch.

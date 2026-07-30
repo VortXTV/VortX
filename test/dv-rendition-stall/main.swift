@@ -16,6 +16,21 @@ import AVFoundation
 import Darwin
 #endif
 
+// Golden init segments for FFmpeg-pin byte comparisons. VortX hand-parses and rewrites these boxes,
+// so their shape is a dependency on the pinned FFmpeg rather than an opaque implementation detail.
+let initDumpDir = "/tmp/dd-dvstall/init-golden"
+
+func dumpInitSegment(_ body: Data, scenario: String, variant: String) {
+    guard !body.isEmpty else { return }
+    try? FileManager.default.createDirectory(
+        atPath: initDumpDir,
+        withIntermediateDirectories: true
+    )
+    let path = "\(initDumpDir)/\(scenario)-\(variant).mp4"
+    try? body.write(to: URL(fileURLWithPath: path))
+    print("init dump \(variant) scenario=\(scenario) bytes=\(body.count) -> \(path)")
+}
+
 #if ENGINE_TRANSACTION_HARNESS
 // Standalone shells for app services outside the player lane. The transaction gate below still compiles and
 // calls the production AVPlayerEngineController, VortXRemuxHLSServer, VortXMKVRemuxStream, and PlayerLoadToken.
@@ -355,7 +370,12 @@ func runScenario(name: String, fixture: String, startAt: Double,
         let segs = segmentURIs(result.mediaBody)
         print("media status=\(media.status) segs=\(segs.count) rendered=\(String(format: "%.1f", result.startupRenderedSeconds))s")
 
-        _ = fetch(base, "/init.mp4")
+        let initSegment = fetch(base, "/init.mp4")
+        dumpInitSegment(initSegment.body, scenario: name, variant: "init")
+        let initHDR = fetch(base, "/init-hdr.mp4")
+        if initHDR.status == 200 {
+            dumpInitSegment(initHDR.body, scenario: name, variant: "init-hdr")
+        }
         for uri in segs.prefix(3) { _ = fetch(base, "/" + uri) }
         server.markEngineReady()
 
