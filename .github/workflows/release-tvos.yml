@@ -71,7 +71,7 @@ jobs:
     # repointed, and this job holds ENGINE_REPO_TOKEN + the release secrets). Each pin carries the
     # tag it resolved from.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -95,7 +95,7 @@ jobs:
 
       # stremiox-core is a STANDALONE crate (Cargo.toml at its repo root): check out straight into core/.
       - name: Fetch stremiox-core (private, pinned)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/stremiox-core
           # fix/meta-imdb-link-preserve: engine keeps addon-supplied imdbRating when the addon
@@ -112,7 +112,7 @@ jobs:
       # temp path, then promote only that subdir to the app-root vortx-core/ (where the build-ffi
       # step's VORTX_ENGINE_DIR + the hashFiles('vortx-core/...') cache keys expect it).
       - name: Fetch vortx-core (private monorepo, pinned)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
           ref: df6b8f5a200dc9ad2c23ad823ebcf97ba1b9b602
