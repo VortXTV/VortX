@@ -1,5 +1,7 @@
 package com.vortx.android.sync
 
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.Job
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -12,6 +14,196 @@ import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 class DurableSessionStateTest {
+
+    @Test
+    fun pendingSyncRetriesAfterFailureAndCompletesOnlyAfterSuccess() = runBlocking {
+        val waits = mutableListOf<Long>()
+        var attempts = 0
+        var pending = true
+
+        val completed = runPendingSyncRetryLoop(
+            initialDelayMs = 10,
+            maxDelayMs = 40,
+            shouldContinue = { true },
+            wait = { waits += it },
+            attempt = {
+                attempts += 1
+                attempts == 5
+            },
+        )
+        if (completed) pending = false
+
+        assertTrue(completed)
+        assertFalse(pending)
+        assertEquals(5, attempts)
+        assertEquals(listOf(10L, 20L, 40L, 40L, 40L), waits)
+    }
+
+    @Test
+    fun durablePendingMarkerRestoresAfterProcessRestartBeforeAnyPull() {
+        val storage = FakePendingMarkerStore()
+        val owner = pendingOwner()
+        val firstState = storage.openPendingState()
+        val firstAttempt = PendingSyncAttempt(owner)
+
+        firstState.recordEdit(owner, firstAttempt)
+
+        assertTrue(storage.durable)
+        val restartedStorage = storage.restartProcess()
+        val restartedState = restartedStorage.openPendingState()
+        val restoredAttempt = PendingSyncAttempt(owner)
+        val restored = restartedState.claimRestored(owner, restoredAttempt)
+
+        assertTrue(restored.blockPull)
+        assertTrue(restored.attemptToStart === restoredAttempt)
+    }
+
+    @Test
+    fun failedMarkerCommitIsNotMistakenForDurabilityAfterMutatingTheProcessCache() {
+        val storage = FakePendingMarkerStore().apply { rejectWrites = true }
+        val owner = pendingOwner()
+        val state = storage.openPendingState()
+        val firstAttempt = PendingSyncAttempt(owner)
+        val firstJob = Job()
+
+        state.recordEdit(owner, firstAttempt)
+        assertTrue(state.attachJob(firstAttempt, firstJob))
+        assertTrue(storage.cache)
+        assertFalse(storage.durable)
+        assertFalse(state.ensureMarker(firstAttempt, firstJob))
+        assertEquals(2, storage.writeCalls)
+
+        state.resetTransient()
+        val resumedAttempt = PendingSyncAttempt(owner)
+        val resumed = state.claimRestored(owner, resumedAttempt)
+        val resumedJob = Job()
+        assertTrue(resumed.blockPull)
+        assertTrue(resumed.attemptToStart === resumedAttempt)
+        assertTrue(state.attachJob(resumedAttempt, resumedJob))
+
+        storage.rejectWrites = false
+        assertTrue(state.ensureMarker(resumedAttempt, resumedJob))
+        assertTrue(storage.durable)
+        firstJob.cancel()
+        resumedJob.cancel()
+    }
+
+    @Test
+    fun failedDurableClearKeepsDirtyAndRetriesUntilTheAcceptedPushCanClear() {
+        val storage = FakePendingMarkerStore()
+        val owner = pendingOwner()
+        val state = storage.openPendingState()
+        val attempt = PendingSyncAttempt(owner)
+        val job = Job()
+        state.recordEdit(owner, attempt)
+        assertTrue(state.attachJob(attempt, job))
+        storage.rejectClears = true
+
+        assertFalse(state.completeAccepted(attempt, job) { true })
+        assertTrue(state.claimRestored(owner, PendingSyncAttempt(owner)).blockPull)
+        storage.rejectClears = false
+        assertTrue(state.ensureMarker(attempt, job))
+        assertTrue(state.completeAccepted(attempt, job) { true })
+        assertFalse(state.claimRestored(owner, PendingSyncAttempt(owner)).blockPull)
+        assertFalse(storage.durable)
+        job.cancel()
+    }
+
+    @Test
+    fun acceptedPushACannotClearTheMarkerWrittenByNewerEditB() {
+        val storage = FakePendingMarkerStore()
+        val owner = pendingOwner()
+        val state = storage.openPendingState()
+        val attemptA = PendingSyncAttempt(owner)
+        val jobA = Job()
+        state.recordEdit(owner, attemptA)
+        assertTrue(state.attachJob(attemptA, jobA))
+
+        val attemptB = PendingSyncAttempt(owner)
+        val jobB = Job()
+        val replacement = state.recordEdit(owner, attemptB)
+        assertTrue(replacement.replacedJob === jobA)
+        assertTrue(state.attachJob(attemptB, jobB))
+
+        assertFalse(state.completeAccepted(attemptA, jobA) { true })
+        assertTrue(storage.durable)
+        assertTrue(state.completeAccepted(attemptB, jobB) { true })
+        assertFalse(storage.durable)
+        jobA.cancel()
+        jobB.cancel()
+    }
+
+    @Test
+    fun confirmedDirtyTruthSurvivesDetachAndRebindsToTheNewSessionGeneration() {
+        val storage = FakePendingMarkerStore()
+        val operations = SessionOperationCoordinator()
+        val oldOwner = pendingOwner().copy(
+            operationGeneration = operations.snapshot { it },
+        )
+        val state = storage.openPendingState()
+        val oldAttempt = PendingSyncAttempt(oldOwner)
+        val oldJob = Job()
+        state.recordEdit(oldOwner, oldAttempt)
+        assertTrue(state.attachJob(oldAttempt, oldJob))
+
+        var retainedGeneration = -1L
+        assertFalse(
+            operations.invalidate {
+                retainedGeneration = operations.snapshot { it }
+                state.resetTransient()
+                false
+            },
+        )
+        val reboundOwner = oldOwner.copy(operationGeneration = retainedGeneration)
+        val reboundAttempt = PendingSyncAttempt(reboundOwner)
+        val rebound = state.claimRestored(reboundOwner, reboundAttempt)
+
+        assertTrue(rebound.blockPull)
+        assertTrue(rebound.attemptToStart === reboundAttempt)
+        assertTrue(storage.durable)
+        oldJob.cancel()
+    }
+
+    @Test
+    fun unknownMarkerReadBlocksPullWithoutInventingAPush() {
+        val storage = FakePendingMarkerStore().apply { rejectReads = true }
+        val owner = pendingOwner()
+        val state = storage.openPendingState()
+
+        val unknown = state.claimRestored(owner, PendingSyncAttempt(owner))
+
+        assertTrue(unknown.blockPull)
+        assertNull(unknown.attemptToStart)
+        assertEquals(0, storage.writeCalls)
+
+        storage.rejectReads = false
+        val clean = state.claimRestored(owner, PendingSyncAttempt(owner))
+        assertFalse(clean.blockPull)
+        assertNull(clean.attemptToStart)
+        assertEquals(0, storage.writeCalls)
+    }
+
+    @Test
+    fun failedSignOutResumesRealtimeOnlyWhenItWasPreviouslyActive() {
+        assertFalse(
+            shouldResumeRetainedRealtime(
+                hadActiveRealtime = false,
+                retainedSessionIsCurrent = true,
+            ),
+        )
+        assertTrue(
+            shouldResumeRetainedRealtime(
+                hadActiveRealtime = true,
+                retainedSessionIsCurrent = true,
+            ),
+        )
+        assertFalse(
+            shouldResumeRetainedRealtime(
+                hadActiveRealtime = true,
+                retainedSessionIsCurrent = false,
+            ),
+        )
+    }
 
     @Test
     fun registerStorageFailureRetainsTheAlreadyMintedRecoveryCode() {
@@ -243,7 +435,16 @@ class DurableSessionStateTest {
         val backend = FakeSessionBackend("account-old", initialOwnerEpoch = 4)
         val state = backend.open()
         val operations = SessionOperationCoordinator()
+        val syncGeneration = operations.snapshot { it }
+        var cancelledSyncCalls = 0
+        val syncCall = requireNotNull(
+            operations.acquireSessionCallPermit(syncGeneration) { true },
+        )
+        assertTrue(syncCall.attachCancellation { cancelledSyncCalls += 1 })
         val authA = operations.beginAuth()
+        var cancelledAuthCalls = 0
+        val authACall = requireNotNull(authA.acquireCallPermit())
+        assertTrue(authACall.attachCancellation { cancelledAuthCalls += 1 })
         val authB = operations.beginAuth()
         var cancelledSessionWork = 0
 
@@ -259,11 +460,53 @@ class DurableSessionStateTest {
         }
 
         assertEquals(SessionMutationResult.Applied(true), adoptedB)
+        assertEquals(1, cancelledAuthCalls)
+        assertFalse(authACall.isCurrent())
+        assertEquals(1, cancelledSyncCalls)
+        assertFalse(syncCall.isCurrent())
         assertEquals(1, cancelledSessionWork)
         assertEquals(SessionMutationResult.Stale, delayedA)
         assertFalse(delayedARan)
         assertEquals("account-b", state.value)
         assertEquals(5L, state.ownerEpoch)
+    }
+
+    @Test
+    fun retiredPermitCannotAttachAfterACompetingAuthWins() {
+        val operations = SessionOperationCoordinator()
+        val authA = operations.beginAuth()
+        val permitA = requireNotNull(authA.acquireCallPermit())
+
+        operations.beginAuth()
+        var cancellations = 0
+
+        assertFalse(permitA.attachCancellation { cancellations += 1 })
+        assertEquals(0, cancellations)
+        assertFalse(permitA.isCurrent())
+    }
+
+    @Test
+    fun permitCancellationRunsAfterTheCoordinatorLockIsReleased() {
+        val operations = SessionOperationCoordinator()
+        val auth = operations.beginAuth()
+        val permit = requireNotNull(auth.acquireCallPermit())
+        var cancellationObservedUnlockedCoordinator = false
+        assertTrue(
+            permit.attachCancellation {
+                val completed = CountDownLatch(1)
+                val reader = thread {
+                    operations.snapshot { it }
+                    completed.countDown()
+                }
+                cancellationObservedUnlockedCoordinator =
+                    completed.await(2, TimeUnit.SECONDS)
+                reader.join(2_000)
+            },
+        )
+
+        operations.beginAuth()
+
+        assertTrue(cancellationObservedUnlockedCoordinator)
     }
 
     @Test
@@ -274,6 +517,11 @@ class DurableSessionStateTest {
         val state = backend.open()
         val operations = SessionOperationCoordinator()
         val syncGeneration = operations.snapshot { it }
+        var cancelledSyncCalls = 0
+        val syncCall = requireNotNull(
+            operations.acquireSessionCallPermit(syncGeneration) { true },
+        )
+        assertTrue(syncCall.attachCancellation { cancelledSyncCalls += 1 })
         val auth = operations.beginAuth()
         var cancelledSessionWork = false
 
@@ -285,9 +533,12 @@ class DurableSessionStateTest {
 
         assertEquals(SessionMutationResult.Applied(false), adoption)
         assertFalse(cancelledSessionWork)
+        assertEquals(0, cancelledSyncCalls)
+        assertTrue(syncCall.isCurrent())
         assertTrue(operations.isCurrent(syncGeneration))
         assertEquals("account-a", state.value)
         assertEquals(6L, state.ownerEpoch)
+        syncCall.close()
     }
 
     @Test
@@ -298,7 +549,15 @@ class DurableSessionStateTest {
         val state = backend.open()
         val operations = SessionOperationCoordinator()
         val authA = operations.beginAuth()
+        var cancelledAuthCalls = 0
+        val authCall = requireNotNull(authA.acquireCallPermit())
+        assertTrue(authCall.attachCancellation { cancelledAuthCalls += 1 })
         val syncGeneration = operations.snapshot { it }
+        var cancelledSyncCalls = 0
+        val syncCall = requireNotNull(
+            operations.acquireSessionCallPermit(syncGeneration) { true },
+        )
+        assertTrue(syncCall.attachCancellation { cancelledSyncCalls += 1 })
         var retainedGeneration = -1L
         val retainedEpoch = state.ownerEpoch
         var pendingPush = true
@@ -312,6 +571,10 @@ class DurableSessionStateTest {
         )
         assertFalse(authA.isCurrent())
         assertFalse(operations.isCurrent(syncGeneration))
+        assertEquals(1, cancelledAuthCalls)
+        assertFalse(authCall.isCurrent())
+        assertEquals(1, cancelledSyncCalls)
+        assertFalse(syncCall.isCurrent())
         val rearmed = operations.mutateIfCurrent(retainedGeneration) {
             if (state.matches(retainedEpoch) { it == "account-a" }) {
                 pendingPush = true
@@ -450,4 +713,43 @@ class DurableSessionStateTest {
             ownerTransition = ownerTransition,
         )
     }
+
+    private class FakePendingMarkerStore(
+        var durable: Boolean = false,
+        var cache: Boolean = durable,
+    ) {
+        var rejectWrites = false
+        var rejectClears = false
+        var rejectReads = false
+        var writeCalls = 0
+
+        fun openPendingState(): DurablePendingSyncState =
+            DurablePendingSyncState(
+                readDirty = {
+                    if (rejectReads) error("marker read unavailable")
+                    cache
+                },
+                writeDirty = { _, pending ->
+                    writeCalls += 1
+                    cache = pending
+                    if ((pending && rejectWrites) || (!pending && rejectClears)) {
+                        false
+                    } else {
+                        durable = pending
+                        true
+                    }
+                },
+            )
+
+        fun restartProcess(): FakePendingMarkerStore =
+            FakePendingMarkerStore(durable = durable, cache = durable)
+    }
+
+    private fun pendingOwner(): PendingSyncOwner =
+        PendingSyncOwner(
+            operationGeneration = 3,
+            ownerEpoch = 7,
+            accountId = "account-a",
+            token = "token-a",
+        )
 }

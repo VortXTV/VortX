@@ -27,18 +27,30 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(setup.contains("initialOwnerEpoch = initialSessionLoad.ownerEpochOrInitial()"))
         assertTrue(setup.contains("ownerTransition = debridKeys::runOwnerTransition"))
         assertTrue(signOut.contains("operations.invalidate {"))
-        assertTrue(signOut.contains("hadPendingPush = hasPendingPush"))
+        assertFalse(signOut.contains("hadPendingPush"))
+        assertTrue(signOut.contains("hadActiveRealtime = realtime.isActive()"))
         assertTrue(signOut.contains("cancelSessionWork()"))
         assertTrue(signOut.contains("sessionState.clear {"))
         assertTrue(signOut.contains("resumeRetainedSessionWork(retained)"))
         assertTrue(signOut.indexOf("sessionState.serialized") < signOut.indexOf("cancelSessionWork()"))
         assertTrue(signOut.indexOf("cancelSessionWork()") < signOut.indexOf("sessionState.clear {"))
+        assertTrue(resume.contains("armPendingSync(it, recordEdit = false)"))
         assertTrue(resume.contains("operations.mutateIfCurrent(retained.operationGeneration)"))
         assertTrue(resume.contains("sessionState.matches(retained.ownerEpoch)"))
-        assertTrue(resume.contains("if (retained.hadPendingPush) requestSyncSoon()"))
+        assertTrue(
+            resume.contains(
+                "shouldResumeRetainedRealtime(retained.hadActiveRealtime, retainedSessionIsCurrent)",
+            ),
+        )
+        assertTrue(resume.contains("realtime.start()"))
+        assertTrue(
+            resume.indexOf("armPendingSync(it, recordEdit = false)") <
+                resume.indexOf("realtime.start()"),
+        )
         assertTrue(adopt.contains("val result = operation.commitSessionMutation("))
         assertTrue(adopt.contains("onCommitted = ::cancelSessionWork"))
         assertTrue(adopt.contains("sessionState.replace(s) {"))
+        assertTrue(adopt.contains("armPendingSync(it, recordEdit = false)"))
         assertFalse(adopt.contains("sessionState.serialized"))
     }
 
@@ -93,6 +105,7 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(clear.contains("KEY_ACCOUNT to null"))
         assertTrue(clear.contains("KEY_DATA_KEY to null"))
         assertTrue(clear.contains("KEY_OWNER_EPOCH to ownerEpoch.toString()"))
+        assertTrue(clear.contains("store.setAndPurgeLegacy("))
     }
 
     @Test
@@ -110,17 +123,136 @@ class VortXSessionOwnerTransitionContractTest {
         val recover = source
             .substringAfter("suspend fun recover(email: String, recoveryCode: String, newPassword: String)")
             .substringBefore("/** Sign out only after")
+        val transport = source
+            .substringAfter("private suspend fun request(")
+            .substringBefore("/**\n     * Keystore-encrypted persistence")
 
         assertTrue(beginAuth.contains("operations.beginAuth()"))
         assertFalse(beginAuth.contains("cancelSessionWork"))
         listOf(register, signIn, recover).forEach { flow ->
             assertTrue(flow.indexOf("val operation = beginAuthOperation()") in 0 until flow.indexOf("request("))
-            assertEquals(
-                flow.countOccurrences("request("),
-                flow.countOccurrences("operation.isCurrent()"),
-            )
+            assertResponseFenceAfterEveryRequest(flow)
             assertTrue(flow.contains("adopt(operation, token, acct, dataKey)"))
         }
+        assertMutatingAuthFence(
+            register,
+            endpoint = "\"/v1/auth/register\"",
+            guard = "if (!operation.isCurrent())",
+            permit = "val callPermit = operation.acquireCallPermit()",
+            permitArgument = "callPermit = callPermit",
+        )
+        assertMutatingAuthFence(
+            signIn,
+            endpoint = "\"/v1/auth/login\"",
+            guard = "if (!operation.isCurrent()) return AuthResult.Failed(AUTH_SUPERSEDED)",
+            permit = "val loginPermit = operation.acquireCallPermit()",
+            permitArgument = "callPermit = loginPermit",
+        )
+        assertMutatingAuthFence(
+            recover,
+            endpoint = "\"/v1/auth/recover-complete\"",
+            guard = "if (!operation.isCurrent()) return AuthResult.Failed(AUTH_SUPERSEDED)",
+            permit = "val completePermit = operation.acquireCallPermit()",
+            permitArgument = "callPermit = completePermit",
+        )
+        assertTrue(
+            signIn.indexOf("val preloginPermit = operation.acquireCallPermit()") <
+                signIn.indexOf("\"/v1/auth/prelogin\""),
+        )
+        assertTrue(signIn.contains("callPermit = preloginPermit"))
+        assertTrue(
+            recover.indexOf("val startPermit = operation.acquireCallPermit()") <
+                recover.indexOf("\"/v1/auth/recover-start\""),
+        )
+        assertTrue(recover.contains("callPermit = startPermit"))
+        val openConnection = transport.indexOf("URL(BASE + path).openConnection()")
+        val attach = transport.indexOf("callPermit.attachCancellation(opened::disconnect)")
+        val outputStream = transport.indexOf("outputStream.use")
+        assertTrue(transport.lastIndexOf("if (!callPermit.isCurrent())", openConnection) >= 0)
+        assertTrue(attach > openConnection)
+        assertTrue(transport.lastIndexOf("if (!callPermit.isCurrent())", outputStream) > attach)
+        assertTrue(transport.contains("callPermit.close()"))
+        assertTrue(transport.contains("Once the request body is accepted"))
+    }
+
+    @Test
+    fun outboundPermitRegistryAtomicallyFencesAuthAndSessionCalls() {
+        val source = readSource()
+        val coordinator = source
+            .substringAfter("internal class SessionOperationCoordinator")
+            .substringBefore("internal class SyncSessionLease")
+        val sessionAcquire = coordinator
+            .substringAfter("fun acquireSessionCallPermit(")
+            .substringBefore("internal inner class AuthOperation")
+        val authAcquire = coordinator
+            .substringAfter("fun acquireCallPermit(): OutboundCallPermit?")
+            .substringBefore("fun commitSessionMutation(")
+
+        assertTrue(coordinator.contains("Collections.newSetFromMap(IdentityHashMap())"))
+        assertTrue(coordinator.contains("retireCallsLocked { it.owner == OutboundCallOwner.AUTH }"))
+        assertTrue(coordinator.contains("cancellations = retireCallsLocked { true }"))
+        assertTrue(coordinator.contains("it.owner == OutboundCallOwner.SESSION"))
+        assertTrue(sessionAcquire.contains("synchronized(lock)"))
+        assertTrue(sessionAcquire.contains("sessionGeneration != expectedGeneration || !validate()"))
+        assertTrue(sessionAcquire.contains("registerCallLocked(OutboundCallOwner.SESSION"))
+        assertTrue(authAcquire.contains("synchronized(lock)"))
+        assertTrue(authAcquire.contains("authGeneration != expectedAuthGeneration"))
+        assertTrue(authAcquire.contains("registerCallLocked(OutboundCallOwner.AUTH"))
+        assertTrue(coordinator.contains("cancelCalls(cancellations)"))
+    }
+
+    @Test
+    fun debouncedPushClearsItsPendingSlotOnlyAfterASuccessfulRetry() {
+        val source = readSource()
+        val requestSync = source
+            .substringAfter("fun requestSyncSoon()")
+            .substringBefore("/** Catch-up PULL entry point")
+
+        val mark = requestSync.indexOf("pendingState.recordEdit(owner, proposedAttempt)")
+        val createJob = requestSync.indexOf("scope.launch(start = CoroutineStart.LAZY)")
+        val retry = requestSync.indexOf("runPendingSyncRetryLoop(")
+        val push = requestSync.indexOf("val synced = syncUp(lease)")
+        val complete = requestSync.indexOf("pendingState.completeAccepted(")
+
+        assertTrue(requestSync.contains("armPendingSync(lease, recordEdit = true)"))
+        assertTrue(mark >= 0)
+        assertTrue(mark < createJob)
+        assertTrue(createJob < retry)
+        assertTrue(retry < push)
+        assertTrue(push < complete)
+        assertTrue(requestSync.contains("pendingState.owns(attempt, runningJob)"))
+        assertTrue(requestSync.contains("maxDelayMs = SYNC_RETRY_MAX_MS"))
+    }
+
+    @Test
+    fun durableDirtyMarkerIsPerAccountAndRestoredBeforeRealtimeOrForegroundPull() {
+        val source = readSource()
+        val pendingState = source
+            .substringAfter("internal class DurablePendingSyncState(")
+            .substringBefore("/**\n * The VortX end-to-end-encrypted account")
+        val stateStore = source
+            .substringAfter("private class SyncStateStore(appContext: Context)")
+            .substringBefore("private companion object {")
+        val startRealtime = source
+            .substringAfter("fun startRealtime()")
+            .substringBefore("/** Close the real-time channel")
+        val syncDown = source
+            .substringAfter("private suspend fun syncDown(")
+            .substringBefore("/**\n     * Auto-sync")
+
+        assertTrue(pendingState.contains("writeMarker(nextOwner.accountId, true)"))
+        assertTrue(pendingState.contains("attempt !== expectedAttempt"))
+        assertTrue(pendingState.contains("expectedAttempt.job !== job"))
+        assertTrue(pendingState.contains("!isCurrentSnapshot()"))
+        assertTrue(pendingState.contains("writeMarker(accountId, false)"))
+        assertTrue(pendingState.contains("PendingMarkerTruth.DIRTY_UNCONFIRMED"))
+        assertTrue(pendingState.contains("PendingMarkerTruth.READ_UNKNOWN"))
+        assertTrue(pendingState.contains("PendingSyncClaim(blockPull = true)"))
+        assertTrue(stateStore.contains("KEY_PENDING_PUSH + accountId"))
+        assertTrue(stateStore.contains("return edit.commit()"))
+        assertTrue(source.contains("const val KEY_PENDING_PUSH = \"pendingPush.\""))
+        assertTrue(startRealtime.indexOf("retryPendingPushBeforePull") < startRealtime.indexOf("realtime.start()"))
+        assertTrue(syncDown.contains("if (retryPendingPushBeforePull(lease)) return false"))
     }
 
     @Test
@@ -155,10 +287,14 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(capture.contains("ownerEpoch = sessionState.ownerEpoch"))
         assertTrue(capture.contains("accountId = current.account.id"))
         assertTrue(capture.contains("token = current.token"))
+        assertTrue(pull.contains("val callPermit = acquireSyncCallPermit(lease)"))
         assertTrue(pull.contains("bearerToken = lease.token"))
+        assertTrue(pull.contains("callPermit = callPermit"))
         assertTrue(push.contains("lease.dataKeyCopy()"))
         assertTrue(push.contains("lease.accountId"))
+        assertTrue(push.contains("val callPermit = acquireSyncCallPermit(lease)"))
         assertTrue(push.contains("bearerToken = lease.token"))
+        assertTrue(push.contains("callPermit = callPermit"))
         assertTrue(push.contains("publishIfSyncLeaseCurrent(lease)"))
         assertTrue(matching.contains("sessionState.ownerEpoch == lease.ownerEpoch"))
         assertTrue(matching.contains("current.account.id == lease.accountId"))
@@ -188,8 +324,34 @@ class VortXSessionOwnerTransitionContractTest {
         assertEquals(1, mergeBoth.windowed("captureSyncLease".length).count { it == "captureSyncLease" })
     }
 
-    private fun String.countOccurrences(needle: String): Int =
-        windowed(needle.length).count { it == needle }
+    private fun assertResponseFenceAfterEveryRequest(flow: String) {
+        var request = flow.indexOf("request(")
+        while (request >= 0) {
+            val nextRequest = flow.indexOf("request(", request + 1)
+            val responseFence = flow.indexOf("if (!operation.isCurrent())", request)
+            assertTrue(responseFence > request)
+            assertTrue(nextRequest < 0 || responseFence < nextRequest)
+            request = nextRequest
+        }
+    }
+
+    private fun assertMutatingAuthFence(
+        flow: String,
+        endpoint: String,
+        guard: String,
+        permit: String,
+        permitArgument: String,
+    ) {
+        val endpointIndex = flow.indexOf(endpoint)
+        val guardIndex = flow.lastIndexOf(guard, endpointIndex)
+        val permitIndex = flow.lastIndexOf(permit, endpointIndex)
+        val permitArgumentIndex = flow.indexOf(permitArgument, endpointIndex)
+        assertTrue(endpointIndex >= 0)
+        assertTrue(guardIndex >= 0)
+        assertTrue(guardIndex < permitIndex)
+        assertTrue(permitIndex < endpointIndex)
+        assertTrue(permitArgumentIndex > endpointIndex)
+    }
 
     private fun readSource(): String {
         val candidates = listOf(

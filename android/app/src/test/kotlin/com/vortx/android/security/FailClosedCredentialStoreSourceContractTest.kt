@@ -1,6 +1,9 @@
 package com.vortx.android.security
 
 import java.io.File
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -21,6 +24,53 @@ class FailClosedCredentialStoreSourceContractTest {
 
         assertTrue(source.contains("getSharedPreferences(legacyPlainFileName"))
         assertTrue(source.contains("deleteSharedPreferences(legacyPlainFileName)"))
+    }
+
+    @Test
+    fun compoundCredentialTombstoneCommitsOnceThenPurgesLegacyPlaintext() {
+        val source = readStoreSource()
+        val compound = source
+            .substringAfter("fun setAndPurgeLegacy(values: Map<String, String?>): Boolean")
+            .substringBefore("fun clear(vararg keys: String): Boolean")
+        val clear = source
+            .substringAfter("fun clear(vararg keys: String): Boolean")
+            .substringBefore("private fun purgeLegacyPlaintext()")
+
+        assertEquals(1, compound.windowed("state.write(values)".length).count { it == "state.write(values)" })
+        assertTrue(compound.contains("purge = ::purgeLegacyPlaintext"))
+        assertTrue(clear.contains("setAndPurgeLegacy(keys.associateWith { null })"))
+    }
+
+    @Test
+    fun rejectedCompoundCredentialWriteStillPurgesLegacyPlaintext() {
+        var writes = 0
+        var purges = 0
+
+        val result = writeThenPurgeLegacy(
+            write = {
+                writes += 1
+                false
+            },
+            purge = { purges += 1 },
+        )
+
+        assertFalse(result)
+        assertEquals(1, writes)
+        assertEquals(1, purges)
+    }
+
+    @Test
+    fun exceptionalCompoundCredentialWriteStillPurgesLegacyPlaintext() {
+        var purges = 0
+
+        assertThrows(IllegalStateException::class.java) {
+            writeThenPurgeLegacy(
+                write = { error("write failed") },
+                purge = { purges += 1 },
+            )
+        }
+
+        assertEquals(1, purges)
     }
 
     @Test

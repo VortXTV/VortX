@@ -8,6 +8,7 @@ import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.profile.ProfileStore
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -23,6 +24,8 @@ import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Collections
+import java.util.IdentityHashMap
 
 internal const val INITIAL_SESSION_OWNER_EPOCH = 1L
 
@@ -145,17 +148,34 @@ internal sealed interface SessionMutationResult<out T> {
 internal class SessionOperationCoordinator {
     private val lock = Any()
     private var authGeneration = 0L
+    @Volatile
     private var sessionGeneration = 0L
+    private val activeCalls: MutableSet<OutboundCallPermit> =
+        Collections.newSetFromMap(IdentityHashMap())
 
-    fun beginAuth(): AuthOperation = synchronized(lock) {
-        authGeneration = nextGeneration(authGeneration)
-        AuthOperation(authGeneration)
+    fun beginAuth(): AuthOperation {
+        var cancellations = emptyList<() -> Unit>()
+        val operation = synchronized(lock) {
+            authGeneration = nextGeneration(authGeneration)
+            cancellations = retireCallsLocked { it.owner == OutboundCallOwner.AUTH }
+            AuthOperation(authGeneration)
+        }
+        cancelCalls(cancellations)
+        return operation
     }
 
-    fun <T> invalidate(mutation: () -> T): T = synchronized(lock) {
-        authGeneration = nextGeneration(authGeneration)
-        sessionGeneration = nextGeneration(sessionGeneration)
-        mutation()
+    fun <T> invalidate(mutation: () -> T): T {
+        var cancellations = emptyList<() -> Unit>()
+        return try {
+            synchronized(lock) {
+                authGeneration = nextGeneration(authGeneration)
+                sessionGeneration = nextGeneration(sessionGeneration)
+                cancellations = retireCallsLocked { true }
+                mutation()
+            }
+        } finally {
+            cancelCalls(cancellations)
+        }
     }
 
     fun <T> snapshot(read: (Long) -> T): T = synchronized(lock) {
@@ -165,6 +185,9 @@ internal class SessionOperationCoordinator {
     fun isCurrent(expectedGeneration: Long): Boolean = synchronized(lock) {
         sessionGeneration == expectedGeneration
     }
+
+    fun isCurrentSnapshot(expectedGeneration: Long): Boolean =
+        sessionGeneration == expectedGeneration
 
     fun <T> mutateIfCurrent(
         expectedGeneration: Long,
@@ -177,6 +200,17 @@ internal class SessionOperationCoordinator {
         }
     }
 
+    fun acquireSessionCallPermit(
+        expectedGeneration: Long,
+        validate: () -> Boolean,
+    ): OutboundCallPermit? = synchronized(lock) {
+        if (sessionGeneration != expectedGeneration || !validate()) {
+            null
+        } else {
+            registerCallLocked(OutboundCallOwner.SESSION, expectedGeneration)
+        }
+    }
+
     internal inner class AuthOperation internal constructor(
         private val expectedAuthGeneration: Long,
     ) {
@@ -184,22 +218,104 @@ internal class SessionOperationCoordinator {
             authGeneration == expectedAuthGeneration
         }
 
+        fun acquireCallPermit(): OutboundCallPermit? = synchronized(lock) {
+            if (authGeneration != expectedAuthGeneration) {
+                null
+            } else {
+                registerCallLocked(OutboundCallOwner.AUTH, expectedAuthGeneration)
+            }
+        }
+
         fun commitSessionMutation(
             onCommitted: () -> Unit = {},
             mutation: () -> Boolean,
-        ): SessionMutationResult<Boolean> = synchronized(lock) {
-            if (authGeneration != expectedAuthGeneration) {
-                SessionMutationResult.Stale
-            } else {
-                val nextSessionGeneration = nextGeneration(sessionGeneration)
-                val committed = mutation()
-                if (committed) {
-                    sessionGeneration = nextSessionGeneration
-                    onCommitted()
+        ): SessionMutationResult<Boolean> {
+            var cancellations = emptyList<() -> Unit>()
+            return try {
+                synchronized(lock) {
+                    if (authGeneration != expectedAuthGeneration) {
+                        SessionMutationResult.Stale
+                    } else {
+                        val nextSessionGeneration = nextGeneration(sessionGeneration)
+                        val committed = mutation()
+                        if (committed) {
+                            sessionGeneration = nextSessionGeneration
+                            cancellations = retireCallsLocked {
+                                it.owner == OutboundCallOwner.SESSION
+                            }
+                            onCommitted()
+                        }
+                        SessionMutationResult.Applied(committed)
+                    }
                 }
-                SessionMutationResult.Applied(committed)
+            } finally {
+                cancelCalls(cancellations)
             }
         }
+    }
+
+    internal inner class OutboundCallPermit internal constructor(
+        internal val owner: OutboundCallOwner,
+        private val expectedGeneration: Long,
+    ) {
+        internal var cancellation: (() -> Unit)? = null
+
+        fun isCurrent(): Boolean = synchronized(lock) {
+            isPermitCurrentLocked(this)
+        }
+
+        fun attachCancellation(cancellation: () -> Unit): Boolean = synchronized(lock) {
+            if (!isPermitCurrentLocked(this)) {
+                false
+            } else {
+                this.cancellation = cancellation
+                true
+            }
+        }
+
+        fun close() {
+            synchronized(lock) {
+                activeCalls.remove(this)
+                cancellation = null
+            }
+        }
+
+        internal fun matchesGeneration(): Boolean = when (owner) {
+            OutboundCallOwner.AUTH -> authGeneration == expectedGeneration
+            OutboundCallOwner.SESSION -> sessionGeneration == expectedGeneration
+        }
+    }
+
+    internal enum class OutboundCallOwner {
+        AUTH,
+        SESSION,
+    }
+
+    private fun registerCallLocked(
+        owner: OutboundCallOwner,
+        generation: Long,
+    ): OutboundCallPermit =
+        OutboundCallPermit(owner, generation).also(activeCalls::add)
+
+    private fun isPermitCurrentLocked(permit: OutboundCallPermit): Boolean =
+        permit in activeCalls && permit.matchesGeneration()
+
+    private fun retireCallsLocked(
+        shouldRetire: (OutboundCallPermit) -> Boolean,
+    ): List<() -> Unit> = buildList {
+        val iterator = activeCalls.iterator()
+        while (iterator.hasNext()) {
+            val permit = iterator.next()
+            if (shouldRetire(permit)) {
+                permit.cancellation?.let(::add)
+                permit.cancellation = null
+                iterator.remove()
+            }
+        }
+    }
+
+    private fun cancelCalls(cancellations: List<() -> Unit>) {
+        cancellations.forEach { cancellation -> runCatching(cancellation) }
     }
 
     private fun nextGeneration(current: Long): Long =
@@ -228,6 +344,236 @@ internal fun sessionTruthMatches(
     return left.token == right.token &&
         left.account == right.account &&
         left.dataKey.contentEquals(right.dataKey)
+}
+
+internal suspend fun runPendingSyncRetryLoop(
+    initialDelayMs: Long,
+    maxDelayMs: Long,
+    shouldContinue: () -> Boolean,
+    wait: suspend (Long) -> Unit,
+    attempt: suspend () -> Boolean,
+): Boolean {
+    require(initialDelayMs > 0 && maxDelayMs >= initialDelayMs)
+    var retryDelayMs = initialDelayMs
+    while (shouldContinue()) {
+        wait(retryDelayMs)
+        if (!shouldContinue()) return false
+        val succeeded = attempt()
+        if (succeeded) return true
+        if (!shouldContinue()) return false
+        retryDelayMs =
+            if (retryDelayMs > maxDelayMs / 2) maxDelayMs else retryDelayMs * 2
+    }
+    return false
+}
+
+internal fun shouldResumeRetainedRealtime(
+    hadActiveRealtime: Boolean,
+    retainedSessionIsCurrent: Boolean,
+): Boolean = hadActiveRealtime && retainedSessionIsCurrent
+
+internal data class PendingSyncOwner(
+    val operationGeneration: Long,
+    val ownerEpoch: Long,
+    val accountId: String,
+    val token: String,
+)
+
+internal class PendingSyncAttempt internal constructor(
+    val owner: PendingSyncOwner,
+) {
+    @Volatile
+    internal var job: Job? = null
+}
+
+internal data class PendingSyncClaim(
+    val blockPull: Boolean,
+    val attemptToStart: PendingSyncAttempt? = null,
+    val replacedJob: Job? = null,
+)
+
+internal enum class PendingMarkerTruth {
+    CLEAN_CONFIRMED,
+    DIRTY_CONFIRMED,
+    DIRTY_UNCONFIRMED,
+    READ_UNKNOWN,
+}
+
+/**
+ * Serializes the per-account durable dirty bit with ownership of the one pending coroutine. Persistence
+ * callbacks run under this dedicated lock, never under the auth/session coordinator.
+ */
+internal class DurablePendingSyncState(
+    private val readDirty: (String) -> Boolean,
+    private val writeDirty: (String, Boolean) -> Boolean,
+) {
+    private val lock = Any()
+    private val truthByAccount = mutableMapOf<String, PendingMarkerTruth>()
+    private var owner: PendingSyncOwner? = null
+    private var attempt: PendingSyncAttempt? = null
+
+    fun recordEdit(
+        nextOwner: PendingSyncOwner,
+        nextAttempt: PendingSyncAttempt,
+    ): PendingSyncClaim = synchronized(lock) {
+        // Synchronous durable write precedes creation and start of the debounce coroutine.
+        truthByAccount[nextOwner.accountId] = if (writeMarker(nextOwner.accountId, true)) {
+            PendingMarkerTruth.DIRTY_CONFIRMED
+        } else {
+            // A failed SharedPreferences commit may still mutate its process-local cache. Remember the
+            // uncertainty and never trust a same-process read as proof of restart durability.
+            PendingMarkerTruth.DIRTY_UNCONFIRMED
+        }
+        val replaced = attempt?.job
+        owner = nextOwner
+        attempt = nextAttempt
+        PendingSyncClaim(blockPull = true, attemptToStart = nextAttempt, replacedJob = replaced)
+    }
+
+    fun claimRestored(
+        nextOwner: PendingSyncOwner,
+        nextAttempt: PendingSyncAttempt,
+    ): PendingSyncClaim = synchronized(lock) {
+        when (resolveTruth(nextOwner.accountId)) {
+            PendingMarkerTruth.CLEAN_CONFIRMED ->
+                return@synchronized PendingSyncClaim(blockPull = false)
+            PendingMarkerTruth.READ_UNKNOWN ->
+                return@synchronized PendingSyncClaim(blockPull = true)
+            PendingMarkerTruth.DIRTY_CONFIRMED,
+            PendingMarkerTruth.DIRTY_UNCONFIRMED,
+            -> Unit
+        }
+        val current = attempt
+        if (
+            owner == nextOwner &&
+            current?.job?.let { !it.isCancelled && !it.isCompleted } == true
+        ) {
+            PendingSyncClaim(blockPull = true)
+        } else {
+            val replaced = current?.job
+            owner = nextOwner
+            attempt = nextAttempt
+            PendingSyncClaim(blockPull = true, attemptToStart = nextAttempt, replacedJob = replaced)
+        }
+    }
+
+    fun attachJob(
+        expectedAttempt: PendingSyncAttempt,
+        job: Job,
+    ): Boolean = synchronized(lock) {
+        if (attempt !== expectedAttempt || owner != expectedAttempt.owner) {
+            false
+        } else {
+            expectedAttempt.job = job
+            true
+        }
+    }
+
+    fun owns(
+        expectedAttempt: PendingSyncAttempt,
+        job: Job,
+    ): Boolean = synchronized(lock) {
+        truthByAccount[expectedAttempt.owner.accountId].isDirty() &&
+            owner == expectedAttempt.owner &&
+            attempt === expectedAttempt &&
+            expectedAttempt.job === job
+    }
+
+    fun ensureMarker(
+        expectedAttempt: PendingSyncAttempt,
+        job: Job,
+    ): Boolean = synchronized(lock) {
+        if (
+            owner != expectedAttempt.owner ||
+            attempt !== expectedAttempt ||
+            expectedAttempt.job !== job
+        ) {
+            false
+        } else {
+            when (truthByAccount[expectedAttempt.owner.accountId]) {
+                PendingMarkerTruth.DIRTY_CONFIRMED -> true
+                PendingMarkerTruth.DIRTY_UNCONFIRMED -> {
+                    val confirmed = writeMarker(expectedAttempt.owner.accountId, true)
+                    if (confirmed) {
+                        truthByAccount[expectedAttempt.owner.accountId] =
+                            PendingMarkerTruth.DIRTY_CONFIRMED
+                    }
+                    confirmed
+                }
+                PendingMarkerTruth.CLEAN_CONFIRMED,
+                PendingMarkerTruth.READ_UNKNOWN,
+                null,
+                -> false
+            }
+        }
+    }
+
+    fun completeAccepted(
+        expectedAttempt: PendingSyncAttempt,
+        job: Job,
+        isCurrentSnapshot: () -> Boolean,
+    ): Boolean = synchronized(lock) {
+        val accountId = expectedAttempt.owner.accountId
+        if (
+            owner != expectedAttempt.owner ||
+            attempt !== expectedAttempt ||
+            expectedAttempt.job !== job ||
+            truthByAccount[accountId] != PendingMarkerTruth.DIRTY_CONFIRMED ||
+            !isCurrentSnapshot()
+        ) {
+            false
+        } else if (!writeMarker(accountId, false)) {
+            truthByAccount[accountId] = PendingMarkerTruth.DIRTY_UNCONFIRMED
+            false
+        } else {
+            truthByAccount[accountId] = PendingMarkerTruth.CLEAN_CONFIRMED
+            owner = null
+            attempt = null
+            true
+        }
+    }
+
+    fun abandon(
+        expectedAttempt: PendingSyncAttempt,
+        job: Job,
+    ) {
+        synchronized(lock) {
+            if (attempt === expectedAttempt && expectedAttempt.job === job) {
+                owner = null
+                attempt = null
+            }
+        }
+    }
+
+    fun resetTransient(): Job? = synchronized(lock) {
+        val cancelled = attempt?.job
+        owner = null
+        attempt = null
+        cancelled
+    }
+
+    private fun resolveTruth(accountId: String): PendingMarkerTruth {
+        val known = truthByAccount[accountId]
+        if (known != null && known != PendingMarkerTruth.READ_UNKNOWN) return known
+        val observed = try {
+            if (readDirty(accountId)) {
+                PendingMarkerTruth.DIRTY_CONFIRMED
+            } else {
+                PendingMarkerTruth.CLEAN_CONFIRMED
+            }
+        } catch (_: Exception) {
+            PendingMarkerTruth.READ_UNKNOWN
+        }
+        truthByAccount[accountId] = observed
+        return observed
+    }
+
+    private fun writeMarker(accountId: String, pending: Boolean): Boolean =
+        runCatching { writeDirty(accountId, pending) }.getOrDefault(false)
+
+    private fun PendingMarkerTruth?.isDirty(): Boolean =
+        this == PendingMarkerTruth.DIRTY_CONFIRMED ||
+            this == PendingMarkerTruth.DIRTY_UNCONFIRMED
 }
 
 /**
@@ -323,16 +669,16 @@ class VortXSyncManager(context: Context) {
      * a bool are NOT sensitive (only the data key is), and Apple keeps them in UserDefaults, not the Keychain.
      */
     private val syncState = SyncStateStore(context.applicationContext)
+    private val pendingState = DurablePendingSyncState(
+        readDirty = syncState::hasPendingPush,
+        writeDirty = syncState::setPendingPush,
+    )
 
     /** IO scope for the debounced auto-push (requestSyncSoon) and background catch-up pulls. */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** The roster/overlay store the sync engine reads + folds into. Set by [attachSyncSeams]. */
     @Volatile private var profileStore: ProfileStore? = null
-
-    /** A debounced syncUp is queued; syncDown defers to it so a fresh local edit is never clobbered. */
-    @Volatile private var pendingSync: Job? = null
-    @Volatile private var hasPendingPush = false
 
     /**
      * Set while syncDown is applying a remote pull. The writes it makes (roster fold, overlay hydrate) must
@@ -404,9 +750,7 @@ class VortXSyncManager(context: Context) {
 
     private fun cancelSessionWork() {
         stopRealtime()
-        pendingSync?.cancel()
-        pendingSync = null
-        hasPendingPush = false
+        pendingState.resetTransient()?.cancel()
         applyingRemote = false
     }
 
@@ -415,19 +759,27 @@ class VortXSyncManager(context: Context) {
         val ownerEpoch: Long,
         val accountId: String,
         val token: String,
-        val hadPendingPush: Boolean,
+        val hadActiveRealtime: Boolean,
     )
 
     private fun resumeRetainedSessionWork(retained: RetainedSessionWork?) {
         retained ?: return
-        operations.mutateIfCurrent(retained.operationGeneration) {
-            val stillCurrent = sessionState.matches(retained.ownerEpoch) { current ->
-                current?.account?.id == retained.accountId &&
-                    current.token == retained.token
+        captureSyncLease()
+            ?.takeIf {
+                it.operationGeneration == retained.operationGeneration &&
+                    it.ownerEpoch == retained.ownerEpoch &&
+                    it.accountId == retained.accountId &&
+                    it.token == retained.token
             }
-            if (stillCurrent) {
-                startRealtime()
-                if (retained.hadPendingPush) requestSyncSoon()
+            ?.let { armPendingSync(it, recordEdit = false) }
+        operations.mutateIfCurrent(retained.operationGeneration) {
+            val retainedSessionIsCurrent =
+                sessionState.matches(retained.ownerEpoch) { current ->
+                    current?.account?.id == retained.accountId &&
+                        current.token == retained.token
+                }
+            if (shouldResumeRetainedRealtime(retained.hadActiveRealtime, retainedSessionIsCurrent)) {
+                realtime.start()
             }
         }
     }
@@ -450,6 +802,13 @@ class VortXSyncManager(context: Context) {
         operations.snapshot { operationGeneration ->
             operationGeneration == lease.operationGeneration &&
                 sessionState.serialized { sessionMatchesLease(lease) }
+        }
+
+    private fun acquireSyncCallPermit(
+        lease: SyncSessionLease,
+    ): SessionOperationCoordinator.OutboundCallPermit? =
+        operations.acquireSessionCallPermit(lease.operationGeneration) {
+            sessionState.serialized { sessionMatchesLease(lease) }
         }
 
     private fun publishIfSyncLeaseCurrent(
@@ -478,6 +837,23 @@ class VortXSyncManager(context: Context) {
             current.account.id == lease.accountId &&
             current.token == lease.token
     }
+
+    /**
+     * Lock-free, fail-closed fence used only while the pending-state lock is held. Owner fields and the
+     * coordinator generation are volatile, so invalidation or replacement becomes visible without a
+     * pending-lock to coordinator-lock edge.
+     */
+    private fun isSyncLeaseCurrentSnapshot(lease: SyncSessionLease): Boolean =
+        operations.isCurrentSnapshot(lease.operationGeneration) &&
+            sessionMatchesLease(lease)
+
+    private fun pendingOwner(lease: SyncSessionLease): PendingSyncOwner =
+        PendingSyncOwner(
+            operationGeneration = lease.operationGeneration,
+            ownerEpoch = lease.ownerEpoch,
+            accountId = lease.accountId,
+            token = lease.token,
+        )
 
     // MARK: - Flows
 
@@ -514,7 +890,17 @@ class VortXSyncManager(context: Context) {
             // welcome email falls back to a generic "save your code" note.
             put("recoveryCode", recoveryCode)
         }
-        val (code, json) = request("POST", "/v1/auth/register", body)
+        if (!operation.isCurrent()) {
+            return RegisterResult(AuthResult.Failed(AUTH_SUPERSEDED), null)
+        }
+        val callPermit = operation.acquireCallPermit()
+            ?: return RegisterResult(AuthResult.Failed(AUTH_SUPERSEDED), null)
+        val (code, json) = request(
+            "POST",
+            "/v1/auth/register",
+            body,
+            callPermit = callPermit,
+        )
         if (!operation.isCurrent()) {
             val created = code == 200 && !json?.optString("token").isNullOrEmpty()
             return if (created) {
@@ -547,7 +933,14 @@ class VortXSyncManager(context: Context) {
      */
     suspend fun signIn(login: String, password: String, totp: String? = null): AuthResult {
         val operation = beginAuthOperation()
-        val (_, pre) = request("POST", "/v1/auth/prelogin", JSONObject().put("login", login))
+        val preloginPermit = operation.acquireCallPermit()
+            ?: return AuthResult.Failed(AUTH_SUPERSEDED)
+        val (_, pre) = request(
+            "POST",
+            "/v1/auth/prelogin",
+            JSONObject().put("login", login),
+            callPermit = preloginPermit,
+        )
         if (!operation.isCurrent()) return AuthResult.Failed(AUTH_SUPERSEDED)
         val salt = pre?.optString("kdfSalt").takeUnless { it.isNullOrEmpty() }?.let { VortXCrypto.unb64(it) }
         val iters = pre?.optInt("kdfIters", -1)?.takeIf { it > 0 }
@@ -561,7 +954,15 @@ class VortXSyncManager(context: Context) {
             put("authVerifier", VortXCrypto.authVerifier(masterKey, password))
             if (!totp.isNullOrEmpty()) put("totp", totp)
         }
-        val (code, json) = request("POST", "/v1/auth/login", body)
+        if (!operation.isCurrent()) return AuthResult.Failed(AUTH_SUPERSEDED)
+        val loginPermit = operation.acquireCallPermit()
+            ?: return AuthResult.Failed(AUTH_SUPERSEDED)
+        val (code, json) = request(
+            "POST",
+            "/v1/auth/login",
+            body,
+            callPermit = loginPermit,
+        )
         if (!operation.isCurrent()) return AuthResult.Failed(AUTH_SUPERSEDED)
         if (code == 401 && json?.optString("error") == "totp_required") return AuthResult.TotpRequired
 
@@ -587,7 +988,14 @@ class VortXSyncManager(context: Context) {
     suspend fun recover(email: String, recoveryCode: String, newPassword: String): AuthResult {
         val operation = beginAuthOperation()
         val trimmed = recoveryCode.trim()
-        val (_, start) = request("POST", "/v1/auth/recover-start", JSONObject().put("email", email))
+        val startPermit = operation.acquireCallPermit()
+            ?: return AuthResult.Failed(AUTH_SUPERSEDED)
+        val (_, start) = request(
+            "POST",
+            "/v1/auth/recover-start",
+            JSONObject().put("email", email),
+            callPermit = startPermit,
+        )
         if (!operation.isCurrent()) return AuthResult.Failed(AUTH_SUPERSEDED)
         val salt = start?.optString("kdfSalt").takeUnless { it.isNullOrEmpty() }?.let { VortXCrypto.unb64(it) }
         val iters = start?.optInt("kdfIters", -1)?.takeIf { it > 0 }
@@ -609,7 +1017,15 @@ class VortXSyncManager(context: Context) {
             put("newAuthVerifier", VortXCrypto.authVerifier(newMaster, newPassword))
             put("newWrappedKeyPassword", wrappedPw)
         }
-        val (code, json) = request("POST", "/v1/auth/recover-complete", body)
+        if (!operation.isCurrent()) return AuthResult.Failed(AUTH_SUPERSEDED)
+        val completePermit = operation.acquireCallPermit()
+            ?: return AuthResult.Failed(AUTH_SUPERSEDED)
+        val (code, json) = request(
+            "POST",
+            "/v1/auth/recover-complete",
+            body,
+            callPermit = completePermit,
+        )
         if (!operation.isCurrent()) return AuthResult.Failed(AUTH_SUPERSEDED)
         val token = json?.optString("token").takeUnless { it.isNullOrEmpty() }
         val acct = json?.optJSONObject("account")
@@ -635,7 +1051,7 @@ class VortXSyncManager(context: Context) {
                             ownerEpoch = sessionState.ownerEpoch,
                             accountId = current.account.id,
                             token = current.token,
-                            hadPendingPush = hasPendingPush,
+                            hadActiveRealtime = realtime.isActive(),
                         )
                     }
                 }
@@ -771,7 +1187,14 @@ class VortXSyncManager(context: Context) {
      */
     private suspend fun pullSyncDocResult(lease: SyncSessionLease): SyncDocPull {
         if (!isSyncLeaseCurrent(lease)) return SyncDocPull.Failed
-        val (code, json) = request("GET", "/v1/backup", null, bearerToken = lease.token)
+        val callPermit = acquireSyncCallPermit(lease) ?: return SyncDocPull.Failed
+        val (code, json) = request(
+            "GET",
+            "/v1/backup",
+            null,
+            bearerToken = lease.token,
+            callPermit = callPermit,
+        )
         if (!isSyncLeaseCurrent(lease)) return SyncDocPull.Failed
         if (code == 404) return SyncDocPull.Empty                 // no backup yet
         if (code != 200) return SyncDocPull.Failed                // network/server error: do not clobber
@@ -823,7 +1246,14 @@ class VortXSyncManager(context: Context) {
             ?: return PushOutcome.Error
         if (!isSyncLeaseCurrent(lease)) return PushOutcome.Error
         val body = JSONObject().put("document", ciphertext).put("version", version)  // Long: no truncation
-        val (code, json) = request("PUT", "/v1/backup", body, bearerToken = lease.token)
+        val callPermit = acquireSyncCallPermit(lease) ?: return PushOutcome.Error
+        val (code, json) = request(
+            "PUT",
+            "/v1/backup",
+            body,
+            bearerToken = lease.token,
+            callPermit = callPermit,
+        )
         if (!isSyncLeaseCurrent(lease)) return PushOutcome.Error
         if (code != 200) return PushOutcome.Error
         val accepted = if (json != null && json.has("accepted")) json.optBoolean("accepted", true) else true
@@ -885,6 +1315,7 @@ class VortXSyncManager(context: Context) {
      */
     suspend fun syncUp(): Boolean {
         val lease = captureSyncLease() ?: return false
+        if (retryPendingPushBeforePull(lease)) return false
         val synced = syncUp(lease)
         return synced && isSyncLeaseCurrent(lease)
     }
@@ -942,8 +1373,8 @@ class VortXSyncManager(context: Context) {
     /**
      * Pull the account doc and apply what is NEWER than this device holds. Deferred while a local push is
      * queued (so it never re-applies the account's pre-edit value over a fresh local edit) and version-gated
-     * (applies only a strictly-newer remote). `force` ignores both guards (manual "Sync now" / sign-in
-     * reconciliation). A `.failed` / `.empty` pull applies NOTHING (never wipes local). Mirrors Apple `syncDown`.
+     * (applies only a strictly-newer remote). `force` ignores the version guard, but never the pending-edit
+     * guard. A `.failed` / `.empty` pull applies NOTHING (never wipes local). Mirrors Apple `syncDown`.
      */
     suspend fun syncDown(force: Boolean = false): Boolean {
         val lease = captureSyncLease() ?: return false
@@ -956,10 +1387,12 @@ class VortXSyncManager(context: Context) {
         force: Boolean = false,
     ): Boolean {
         if (!isSyncLeaseCurrent(lease)) return false
-        // PENDING-EDIT GUARD: defer while a genuine local edit's debounced push is queued.
-        if (!force && hasPendingPush) return false
+        // PENDING-EDIT GUARD: restore a durable process-death marker and retry its push before any
+        // foreground pull. Even a forced pull must not overwrite a fresh local edit.
+        if (retryPendingPushBeforePull(lease)) return false
         val pull = pullSyncDocResult(lease)
         if (!isSyncLeaseCurrent(lease)) return false
+        if (retryPendingPushBeforePull(lease)) return false
         val doc: JSONObject
         val version: Long
         when (pull) {
@@ -1018,25 +1451,72 @@ class VortXSyncManager(context: Context) {
     fun requestSyncSoon() {
         val lease = captureSyncLease() ?: return
         if (applyingRemote) return
-        publishIfSyncLeaseCurrent(lease) {
-            hasPendingPush = true
-            pendingSync?.cancel()
-            pendingSync = scope.launch {
-                delay(SYNC_DEBOUNCE_MS)
-                if (!isActive || !isSyncLeaseCurrent(lease)) return@launch
-                syncUp(lease)
-                if (!isActive) return@launch
-                val runningJob = currentCoroutineContext()[Job]
-                publishIfSyncLeaseCurrent(lease) {
-                    // A newer edit can replace this job after its final active check. Clear the pull guard only
-                    // when this exact job still owns the pending slot.
-                    if (pendingSync === runningJob) {
-                        hasPendingPush = false
-                        pendingSync = null
-                    }
-                }
-            }
+        armPendingSync(lease, recordEdit = true)
+    }
+
+    /**
+     * Restore a process-death dirty marker before a foreground pull. The caller's pull is deferred while
+     * the exact account/session lease retries its merge-before-push.
+     */
+    private fun retryPendingPushBeforePull(lease: SyncSessionLease): Boolean =
+        armPendingSync(lease, recordEdit = false)
+
+    /**
+     * Persist or restore dirty state before creating the lazy debounce job. Coordinator validation happens
+     * before and after the dedicated pending-state transaction, never while its lock is held.
+     */
+    private fun armPendingSync(
+        lease: SyncSessionLease,
+        recordEdit: Boolean,
+    ): Boolean {
+        if (!isSyncLeaseCurrent(lease)) return false
+        val owner = pendingOwner(lease)
+        val proposedAttempt = PendingSyncAttempt(owner)
+        val claim = if (recordEdit) {
+            pendingState.recordEdit(owner, proposedAttempt)
+        } else {
+            pendingState.claimRestored(owner, proposedAttempt)
         }
+        claim.replacedJob?.cancel()
+        val attempt = claim.attemptToStart ?: return claim.blockPull
+
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            val runningJob = currentCoroutineContext()[Job] ?: return@launch
+            runPendingSyncRetryLoop(
+                initialDelayMs = SYNC_DEBOUNCE_MS,
+                maxDelayMs = SYNC_RETRY_MAX_MS,
+                shouldContinue = {
+                    isActive &&
+                        isSyncLeaseCurrent(lease) &&
+                        pendingState.owns(attempt, runningJob)
+                },
+                wait = { delay(it) },
+                attempt = {
+                    if (!pendingState.ensureMarker(attempt, runningJob)) {
+                        false
+                    } else {
+                        val synced = syncUp(lease)
+                        synced &&
+                            pendingState.completeAccepted(
+                                expectedAttempt = attempt,
+                                job = runningJob,
+                                isCurrentSnapshot = { isSyncLeaseCurrentSnapshot(lease) },
+                            )
+                    }
+                },
+            )
+        }
+        if (!pendingState.attachJob(attempt, job)) {
+            job.cancel()
+            return claim.blockPull
+        }
+        if (!isSyncLeaseCurrent(lease)) {
+            pendingState.abandon(attempt, job)
+            job.cancel()
+            return claim.blockPull
+        }
+        job.start()
+        return claim.blockPull
     }
 
     /** Catch-up PULL entry point (manual "Sync now"); [startRealtime] is the foreground entry point. */
@@ -1064,6 +1544,7 @@ class VortXSyncManager(context: Context) {
      * to the fallback poll, never breaking the pull+debounced-push engine underneath.
      */
     fun startRealtime() {
+        captureSyncLease()?.let(::retryPendingPushBeforePull)
         realtime.start()
     }
 
@@ -1091,14 +1572,18 @@ class VortXSyncManager(context: Context) {
         return result.takeIf { isSyncLeaseCurrent(lease) } ?: AccountDataProbe.UNREACHABLE
     }
 
-    private suspend fun accountHasSyncData(lease: SyncSessionLease): AccountDataProbe =
-        when (val pull = pullSyncDocResult(lease)) {
-        is SyncDocPull.Doc ->
-            if (pull.doc.has("vortx") || pull.doc.has("settings") || pull.doc.has("apiKeys"))
-                AccountDataProbe.HAS_DATA else AccountDataProbe.EMPTY
-        is SyncDocPull.Empty -> AccountDataProbe.EMPTY           // genuinely no backup yet: safe to seed
-        is SyncDocPull.Failed -> AccountDataProbe.UNREACHABLE    // blip / refused doc: retry, NEVER seed
+    private suspend fun accountHasSyncData(lease: SyncSessionLease): AccountDataProbe {
+        if (retryPendingPushBeforePull(lease)) return AccountDataProbe.UNREACHABLE
+        val pull = pullSyncDocResult(lease)
+        if (retryPendingPushBeforePull(lease)) return AccountDataProbe.UNREACHABLE
+        return when (pull) {
+            is SyncDocPull.Doc ->
+                if (pull.doc.has("vortx") || pull.doc.has("settings") || pull.doc.has("apiKeys"))
+                    AccountDataProbe.HAS_DATA else AccountDataProbe.EMPTY
+            is SyncDocPull.Empty -> AccountDataProbe.EMPTY       // genuinely no backup yet: safe to seed
+            is SyncDocPull.Failed -> AccountDataProbe.UNREACHABLE // blip / refused doc: retry, NEVER seed
         }
+    }
 
     enum class SignInReconcile { SEEDED_FROM_DEVICE, HAS_ACCOUNT_DATA, UNREACHABLE }
 
@@ -1133,6 +1618,7 @@ class VortXSyncManager(context: Context) {
     /** Conflict resolution / "Sync now": push this device's roster + overlays to the account. */
     suspend fun pushThisDevice(): Boolean {
         val lease = captureSyncLease() ?: return false
+        if (retryPendingPushBeforePull(lease)) return false
         val pushed = syncUp(lease)
         return pushed && isSyncLeaseCurrent(lease)
     }
@@ -1140,8 +1626,10 @@ class VortXSyncManager(context: Context) {
     /** "Sync now" recommended path: union both ways so EVERY profile from both sides survives, then push. */
     suspend fun mergeBoth(): Boolean {
         val lease = captureSyncLease() ?: return false
+        if (retryPendingPushBeforePull(lease)) return false
         syncDown(lease, force = true)
         if (!isSyncLeaseCurrent(lease)) return false
+        if (retryPendingPushBeforePull(lease)) return false
         val pushed = syncUp(lease)
         return pushed && isSyncLeaseCurrent(lease)
     }
@@ -1167,7 +1655,7 @@ class VortXSyncManager(context: Context) {
             twoFactorEnabled = acct.optBoolean("twoFactorEnabled", false),
         )
         val s = Session(token, account, dataKey)
-        return when (
+        val adoption = when (
             val result = operation.commitSessionMutation(
                 onCommitted = ::cancelSessionWork,
             ) {
@@ -1181,6 +1669,12 @@ class VortXSyncManager(context: Context) {
                 if (result.value) SessionAdoption.ADOPTED else SessionAdoption.STORAGE_FAILURE
             SessionMutationResult.Stale -> SessionAdoption.STALE
         }
+        if (adoption == SessionAdoption.ADOPTED) {
+            captureSyncLease()
+                ?.takeIf { it.accountId == account.id && it.token == token }
+                ?.let { armPendingSync(it, recordEdit = false) }
+        }
+        return adoption
     }
 
     // MARK: - HTTP (tiny JSON-over-HttpURLConnection helper, same shape as IntegrationsHttp)
@@ -1195,35 +1689,56 @@ class VortXSyncManager(context: Context) {
         path: String,
         body: JSONObject?,
         bearerToken: String? = null,
-    ): Pair<Int, JSONObject?> =
-        withContext(Dispatchers.IO) {
-            var connection: HttpURLConnection? = null
-            try {
-                connection = (URL(BASE + path).openConnection() as HttpURLConnection).apply {
-                    requestMethod = method.uppercase()
-                    connectTimeout = TIMEOUT_MS
-                    readTimeout = TIMEOUT_MS
-                    useCaches = false
-                    // The session bearer for the backup/sync endpoints. `api.vortx.tv` is the account-authed
-                    // host and is deliberately NOT edge-signed (excluded from VortXEdgeAuth's gate).
-                    bearerToken?.let { setRequestProperty("authorization", "Bearer $it") }
-                    if (body != null) {
-                        doOutput = true
-                        setRequestProperty("content-type", "application/json")
-                        outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+        callPermit: SessionOperationCoordinator.OutboundCallPermit,
+    ): Pair<Int, JSONObject?> {
+        try {
+            return withContext(Dispatchers.IO) {
+                val bodyBytes = body?.toString()?.toByteArray(Charsets.UTF_8)
+                if (!callPermit.isCurrent()) return@withContext 0 to null
+                var connection: HttpURLConnection? = null
+                try {
+                    val opened = URL(BASE + path).openConnection() as HttpURLConnection
+                    connection = opened
+                    if (!callPermit.attachCancellation(opened::disconnect)) {
+                        opened.disconnect()
+                        return@withContext 0 to null
                     }
+                    opened.apply {
+                        requestMethod = method.uppercase()
+                        connectTimeout = TIMEOUT_MS
+                        readTimeout = TIMEOUT_MS
+                        useCaches = false
+                        // The session bearer for the backup/sync endpoints. `api.vortx.tv` is the account-authed
+                        // host and is deliberately NOT edge-signed (excluded from VortXEdgeAuth's gate).
+                        bearerToken?.let { setRequestProperty("authorization", "Bearer $it") }
+                        if (bodyBytes != null) {
+                            doOutput = true
+                            setRequestProperty("content-type", "application/json")
+                        }
+                    }
+                    if (bodyBytes != null) {
+                        if (!callPermit.isCurrent()) return@withContext 0 to null
+                        opened.outputStream.use { it.write(bodyBytes) }
+                        // Once the request body is accepted, absolute server-side cancellation requires a
+                        // server nonce. The post-response auth/session fence still blocks stale publication.
+                    }
+                    if (!callPermit.isCurrent()) return@withContext 0 to null
+                    val status = opened.responseCode
+                    val stream = if (status in 200..399) opened.inputStream else opened.errorStream
+                    val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+                    val json = runCatching { if (text.isNotEmpty()) JSONObject(text) else null }.getOrNull()
+                    status to json
+                } catch (_: IOException) {
+                    0 to null
+                } finally {
+                    callPermit.close()
+                    connection?.disconnect()
                 }
-                val status = connection.responseCode
-                val stream = if (status in 200..399) connection.inputStream else connection.errorStream
-                val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-                val json = runCatching { if (text.isNotEmpty()) JSONObject(text) else null }.getOrNull()
-                status to json
-            } catch (_: IOException) {
-                0 to null
-            } finally {
-                connection?.disconnect()
             }
+        } finally {
+            callPermit.close()
         }
+    }
 
     /**
      * Keystore-encrypted persistence for the session (token + account JSON + base64 data key). A rejected
@@ -1295,7 +1810,7 @@ class VortXSyncManager(context: Context) {
         }
 
         fun clear(ownerEpoch: Long): Boolean =
-            store.set(
+            store.setAndPurgeLegacy(
                 mapOf(
                     KEY_TOKEN to null,
                     KEY_ACCOUNT to null,
@@ -1333,9 +1848,9 @@ class VortXSyncManager(context: Context) {
     }
 
     /**
-     * Per-account version + downgrade-ratchet persistence for the sync engine. Plain SharedPreferences (the
-     * UserDefaults analogue Apple uses for these): the version high-water mark and the `sawDocV2` bool are
-     * not sensitive, so they never need the encrypted store the session lives in.
+     * Per-account version, downgrade-ratchet, and pending-push persistence for the sync engine. Plain
+     * SharedPreferences (the UserDefaults analogue Apple uses for these): the version high-water mark,
+     * booleans, and dirty bit are not sensitive, so they never need the encrypted session store.
      */
     private class SyncStateStore(appContext: Context) {
         private val prefs: SharedPreferences =
@@ -1351,10 +1866,25 @@ class VortXSyncManager(context: Context) {
             prefs.edit().putBoolean(KEY_SAW_V2 + accountId, true).apply()
         }
 
+        fun hasPendingPush(accountId: String): Boolean =
+            accountId.isNotEmpty() && prefs.getBoolean(KEY_PENDING_PUSH + accountId, false)
+
+        fun setPendingPush(accountId: String, pending: Boolean): Boolean {
+            if (accountId.isEmpty()) return false
+            val edit = prefs.edit()
+            if (pending) {
+                edit.putBoolean(KEY_PENDING_PUSH + accountId, true)
+            } else {
+                edit.remove(KEY_PENDING_PUSH + accountId)
+            }
+            return edit.commit()
+        }
+
         private companion object {
             const val STATE_FILE = "vortx_sync_state"
             const val KEY_VERSION = "lastSyncedVersion."
             const val KEY_SAW_V2 = "sawDocV2."
+            const val KEY_PENDING_PUSH = "pendingPush."
         }
     }
 
@@ -1376,6 +1906,9 @@ class VortXSyncManager(context: Context) {
 
         /** Debounce for the coalesced auto-push (Apple `requestSyncSoon`: 2.5s). */
         const val SYNC_DEBOUNCE_MS = 2_500L
+
+        /** Cap for failed pending-push retries; the delay doubles from [SYNC_DEBOUNCE_MS]. */
+        const val SYNC_RETRY_MAX_MS = 60_000L
 
         /** Bounded optimistic-concurrency retries for a derived push (Apple `pushDerivedDoc`: 3). */
         const val PUSH_MAX_RETRIES = 3

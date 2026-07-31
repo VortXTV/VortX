@@ -64,11 +64,14 @@ internal class FailClosedCredentialStore(
 
     fun set(values: Map<String, String?>): Boolean = state.write(values)
 
-    fun clear(vararg keys: String): Boolean {
-        val result = state.write(keys.associateWith { null })
-        purgeLegacyPlaintext()
-        return result
-    }
+    fun setAndPurgeLegacy(values: Map<String, String?>): Boolean =
+        writeThenPurgeLegacy(
+            write = { state.write(values) },
+            purge = ::purgeLegacyPlaintext,
+        )
+
+    fun clear(vararg keys: String): Boolean =
+        setAndPurgeLegacy(keys.associateWith { null })
 
     private fun purgeLegacyPlaintext() {
         val cleared = try {
@@ -89,6 +92,17 @@ internal class FailClosedCredentialStore(
         if (!cleared && !deleted) {
             Log.e(tag, "Legacy plaintext credential storage could not be cleared or deleted")
         }
+    }
+}
+
+internal fun writeThenPurgeLegacy(
+    write: () -> Boolean,
+    purge: () -> Unit,
+): Boolean {
+    return try {
+        write()
+    } finally {
+        purge()
     }
 }
 
