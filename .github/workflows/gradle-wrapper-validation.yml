@@ -1,0 +1,23 @@
+name: Gradle Wrapper Validation
+
+# Validates android/gradle/wrapper/gradle-wrapper.jar against Gradle's published known-good
+# checksums on every change. This is the accepted mitigation for the checked-in wrapper binary
+# (OSSF Scorecard Binary-Artifacts): the jar stays in the repo as Gradle intends, but a tampered
+# or unexpected wrapper can never slip through unnoticed.
+
+on:
+  push:
+    branches: [main, beta]
+  pull_request:
+    branches: [main, beta]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Gradle wrapper
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: gradle/actions/wrapper-validation@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
