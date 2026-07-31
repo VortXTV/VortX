@@ -4,6 +4,30 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 11 - 2026-07-31
+
+A hotfix that replaces Beta 10. Beta 10 could freeze on the splash screen and never open on a signed-in install, worst on Apple TV, where it could hang the device until it was unplugged. It was a real bug in Beta 10, not a bad download, which is why a fresh signed-out install could look fine while a signed-in one would not.
+
+### The launch freeze, fixed
+
+**Signed-in installs open again.** Beta 10 changed how VortX stores its secure credentials and, in doing so, wrapped every keychain read and write in a single lock that it held while also touching the system preferences store. A signed-in Home screen reads the keychain from many places at once, resolving the artwork for the Continue Watching and Discover rows and reading the Trakt and SIMKL tokens, and those reads collided on that one lock while the main thread was waiting on it too. The result was a deadlock: the splash, painted first, froze half-drawn and nothing after it could run. Beta 9 and earlier had no such lock, which is why they opened normally. The lock now guards only the small in-memory state it needs and never the storage itself, so the reads no longer serialize the main thread. Root-caused directly on an affected Apple TV with a live debugger trace of the frozen process, and confirmed against a second report of the same freeze on the same hardware (issue #180). Apple TV, iPhone, iPad, and Mac.
+
+Everything Beta 10 shipped is carried forward unchanged; Beta 11 is Beta 10 plus this fix.
+
+### Carried forward from Beta 10
+
+**Fresh starts begin at 0:00.** A container whose first frame carried a small positive timestamp was played from that timestamp, so some series began a few seconds in every time. Fresh remux timelines are rebased to zero, while an explicit resume still lands where you left off.
+
+**Playback and seeking hold together better.** Remux playback and seeking were tightened against a set of edge cases, and a memory-spool lease a rejected stream used to leak, which could stall the next play, is released the moment the stream is refused.
+
+**Apple corrections.** Diagnostic-log sharing builds and opens again and is prepared only on request; deleting the owner profile is refused at the store boundary and its control hidden; aggregate watch counts are bounded and malformed counts rejected; pooled subtitle offsets decode, debrid form fields encode, and search section titles are localized.
+
+**Web (web.vortx.tv).** Settings stop fighting across devices: overlay-profile settings are isolated from the owner's sync, shared settings are preserved across profiles, changes merge onto the latest account state instead of a stale snapshot, and a pending change survives a token refresh. The build toolchain is pinned for reproducible deploys.
+
+**Under the hood.** Trusted media transport is enforced at the app layer, several credential and entropy paths were made fail-closed, and release packaging validates the IPA before it replaces anything.
+
+The Android technical preview is unchanged from Beta 10: roughly a third of the way to the Apple apps, browses well, plays unevenly, full parity is the August target.
+
 ## 0.3.14 Beta 9 - 2026-07-27
 
 The biggest release since 0.3.14 opened. A Mac can now do the heavy work for an Apple TV, the built-in player finally reads the second picture layer of a 4K Blu-ray rip, Dolby Vision plays through to the end instead of falling to HDR10, Atmos reaches your receiver, and Blu-ray subtitles work for the first time.

@@ -63,68 +63,74 @@ final class KeychainFailureClosedStore: @unchecked Sendable {
         self.purgeLegacy = purgeLegacy
     }
 
+    // CRITICAL (FAIL-260731-tvwedge): the lock guards ONLY the in-memory maps below. It must NEVER be
+    // held across Keychain (`SecItem*`) or UserDefaults I/O. An earlier version held this lock across
+    // `purgeLegacySlots` (a UserDefaults write), and that write synchronously posts a change notification
+    // whose observer blocks on a main-thread operation — while the main thread was itself blocked here
+    // waiting for the lock. That lock-ordering inversion deadlocked the whole app at launch on a logged-in
+    // Apple TV (the Home screen fans out dozens of concurrent Keychain reads: 35 continue-watching + 47
+    // discover backdrop lookups via `ApiKeys.tmdbKey`, plus `WatchedIndex.rebuild` reading the SIMKL token
+    // on the main thread). Keep every SecItem/UserDefaults call outside the critical section.
     func string(_ account: String) -> String? {
+        // Snapshot in-memory state under the lock — no I/O.
         lock.lock()
-        defer { lock.unlock() }
+        let override = pendingOverrides[account]
+        let needSweep = !didSweepLegacy
+        didSweepLegacy = true
+        let cached = lastKnownValues[account]
+        lock.unlock()
 
-        purgeLegacySlots(for: account)
-        if let volatileOverride = pendingOverrides[account] {
-            switch volatileOverride {
-            case let .value(value):
-                return value
-            case .deleted:
-                return nil
+        purgeLegacySlots(for: account, fullSweep: needSweep)   // UserDefaults I/O, outside the lock
+
+        if let override {
+            switch override {
+            case let .value(value): return value
+            case .deleted: return nil
             }
         }
 
-        guard !isInvalidated(account) else { return nil }
+        guard !isInvalidated(account) else { return nil }      // UserDefaults read, outside the lock
 
-        switch readSecure(account) {
+        switch readSecure(account) {                           // SecItem read, outside the lock
         case let .value(value):
-            lastKnownValues[account] = .value(value)
+            lock.lock(); lastKnownValues[account] = .value(value); lock.unlock()
             return value
         case .missing:
-            lastKnownValues[account] = .deleted
+            lock.lock(); lastKnownValues[account] = .deleted; lock.unlock()
             return nil
         case .failure:
-            switch lastKnownValues[account] {
-            case let .value(value):
-                return value
-            case .deleted, nil:
-                return nil
-            }
+            if case let .value(value)? = cached { return value }
+            return nil
         }
     }
 
     func set(_ value: String?, for account: String) {
         lock.lock()
-        defer { lock.unlock() }
+        let needSweep = !didSweepLegacy
+        didSweepLegacy = true
+        lock.unlock()
 
-        purgeLegacySlots(for: account)
-        markInvalidated(account)
-        switch writeSecure(value, account) {
+        purgeLegacySlots(for: account, fullSweep: needSweep)   // UserDefaults I/O, outside the lock
+        markInvalidated(account)                               // UserDefaults write, outside the lock
+        switch writeSecure(value, account) {                   // SecItem write, outside the lock
         case .success:
-            clearInvalidated(account)
+            clearInvalidated(account)                          // UserDefaults write, outside the lock
+            lock.lock()
             pendingOverrides.removeValue(forKey: account)
-            if let value {
-                lastKnownValues[account] = .value(value)
-            } else {
-                lastKnownValues[account] = .deleted
-            }
+            lastKnownValues[account] = value.map { .value($0) } ?? .deleted
+            lock.unlock()
         case .failure:
-            if let value {
-                pendingOverrides[account] = .value(value)
-            } else {
-                pendingOverrides[account] = .deleted
-            }
+            lock.lock()
+            pendingOverrides[account] = value.map { .value($0) } ?? .deleted
+            lock.unlock()
         }
     }
 
-    private func purgeLegacySlots(for account: String) {
-        if !didSweepLegacy {
-            purgeAllLegacy()
-            didSweepLegacy = true
-        }
+    /// Legacy plaintext-slot cleanup. Runs entirely OUTSIDE the store lock (it does UserDefaults I/O that
+    /// posts change notifications — see the deadlock note on `string(_:)`). `fullSweep` is computed once by
+    /// the caller under the lock so the whole-store enumeration happens at most once per process.
+    private func purgeLegacySlots(for account: String, fullSweep: Bool) {
+        if fullSweep { purgeAllLegacy() }
         purgeLegacy(account)
     }
 }
@@ -277,7 +283,12 @@ enum Keychain {
             }
         },
         purgeLegacy: { account in
-            UserDefaults.standard.removeObject(forKey: fallbackKey(account))
+            // Only write (and thus post a UserDefaults change notification) when a legacy slot actually
+            // exists. On every normal read the slot is already gone, so this stays a pure no-op.
+            let key = fallbackKey(account)
+            if UserDefaults.standard.object(forKey: key) != nil {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
         }
     )
 
