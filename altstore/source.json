@@ -19,7 +19,7 @@
       "versions": [
         {
           "version": "0.3.14",
-          "buildVersion": "205",
+          "buildVersion": "204",
           "date": "2026-07-31",
           "localizedDescription": "0.3.14 Beta 10. Fresh episodes now start at 0:00 (fixes the few-seconds-in start), remux playback and seeking are hardened, a large Android and web settings-sync pass lands, and trusted media transport is enforced at the app layer. In-place update over Beta 9, nothing resets.",
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.10/VortX-iOS-v0.3.14-beta.10-ci.ipa",
@@ -59,7 +59,7 @@
       "versions": [
         {
           "version": "0.3.14",
-          "buildVersion": "205",
+          "buildVersion": "204",
           "date": "2026-07-31",
           "localizedDescription": "0.3.14 Beta 10. Fresh episodes now start at 0:00 (fixes the few-seconds-in start), remux playback and seeking are hardened, and trusted media transport is enforced at the app layer. In-place update over Beta 9, nothing resets.",
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.10/VortX-tvOS-v0.3.14-beta.10-ci.ipa",
