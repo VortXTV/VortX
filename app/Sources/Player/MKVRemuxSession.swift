@@ -20,11 +20,6 @@ enum MKVRemuxSession {
 
     enum RemuxError: Error, CustomStringConvertible {
         case openInput(Int32)
-        case configureInput(Int32)
-        case tlsVerificationUnavailable
-        case inputPolicyUnavailable
-        case unsupportedInput
-        case nonLocalOutput
         case findStreamInfo(Int32)
         case allocOutput(Int32)
         case newStream
@@ -37,11 +32,6 @@ enum MKVRemuxSession {
         var description: String {
             switch self {
             case .openInput(let c):     return "avformat_open_input failed (\(c))"
-            case .configureInput(let c): return "required input option failed (\(c))"
-            case .tlsVerificationUnavailable: return "input did not consume required TLS verification"
-            case .inputPolicyUnavailable: return "input did not consume the required demuxer policy"
-            case .unsupportedInput:     return "remux input must be a local file or direct HTTP(S) URL"
-            case .nonLocalOutput:       return "remux output must be a local file"
             case .findStreamInfo(let c): return "avformat_find_stream_info failed (\(c))"
             case .allocOutput(let c):    return "avformat_alloc_output_context2 failed (\(c))"
             case .newStream:             return "avformat_new_stream returned nil"
@@ -71,47 +61,9 @@ enum MKVRemuxSession {
     @discardableResult
     static func remux(input: String, output: String) throws -> SourceInfo {
         var info = SourceInfo()
-        guard let inputTransport = inputTransport(input) else {
-            throw RemuxError.unsupportedInput
-        }
-        guard isLocalFile(output) else { throw RemuxError.nonLocalOutput }
 
         var ifmt: UnsafeMutablePointer<AVFormatContext>? = nil
-        var inputOptions: OpaquePointer? = nil
-        // This path is Matroska-only. Pinning the demuxer family prevents a local manifest from opening
-        // unverified remote children through HLS, DASH, IMF, or another nested-resource demuxer.
-        let formatResult = av_dict_set(&inputOptions, "format_whitelist", "matroska", 0)
-        guard formatResult >= 0 else {
-            av_dict_free(&inputOptions)
-            throw RemuxError.configureInput(formatResult)
-        }
-        let requiresTLS = inputTransport == .https
-        // Plain HTTP can redirect into HTTPS, and FFmpeg forwards this option to the redirected protocol.
-        let canRedirectToTLS = inputTransport == .http || requiresTLS
-        if canRedirectToTLS {
-            let optionResult = av_dict_set(&inputOptions, "tls_verify", "1", 0)
-            guard optionResult >= 0 else {
-                av_dict_free(&inputOptions)
-                throw RemuxError.configureInput(optionResult)
-            }
-        }
-        let oi = avformat_open_input(&ifmt, input, nil, &inputOptions)
-        let tlsOptionUnconsumed = requiresTLS
-            && av_dict_get(inputOptions, "tls_verify", nil, 0) != nil
-        let formatOptionUnconsumed =
-            av_dict_get(inputOptions, "format_whitelist", nil, 0) != nil
-        av_dict_free(&inputOptions)
-        if oi == 0, tlsOptionUnconsumed || formatOptionUnconsumed {
-            if let context = ifmt {
-                var closeContext: UnsafeMutablePointer<AVFormatContext>? = context
-                avformat_close_input(&closeContext)
-                ifmt = nil
-            }
-            if formatOptionUnconsumed {
-                throw RemuxError.inputPolicyUnavailable
-            }
-            throw RemuxError.tlsVerificationUnavailable
-        }
+        let oi = avformat_open_input(&ifmt, input, nil, nil)
         guard oi == 0, let inCtx = ifmt else {
             throw RemuxError.openInput(oi)
         }
@@ -193,30 +145,6 @@ enum MKVRemuxSession {
     }
 
     // MARK: - helpers
-
-    private enum InputTransport {
-        case local
-        case http
-        case https
-    }
-
-    private static func inputTransport(_ value: String) -> InputTransport? {
-        if value.hasPrefix("/") { return .local }
-        guard let scheme = URLComponents(string: value)?.scheme else { return nil }
-        switch scheme.lowercased() {
-        case "file": return .local
-        case "http": return .http
-        case "https": return .https
-        default: return nil
-        }
-    }
-
-    private static func isLocalFile(_ value: String) -> Bool {
-        if value.hasPrefix("/") { return true }
-        guard let components = URLComponents(string: value),
-              let scheme = components.scheme else { return false }
-        return scheme.caseInsensitiveCompare("file") == .orderedSame
-    }
 
     /// Read the Dolby Vision configuration (profile + BL signal compatibility) from the video stream's coded
     /// side data, if present. Profile 5/8.1/8.4 -> AVPlayer can emit true DV; 7 -> HDR10 fallback; absent -> not DV.
