@@ -76,7 +76,17 @@ if [ -n "$RANGE" ]; then
             say "TOOLING REFERENCE in commit: $(git log -1 --format='%h %s' "$h" 2>/dev/null)"
             FAIL=1
         fi
-        if git log -1 --format='%B' "$h" 2>/dev/null | grep -qiE '^co-authored-by|generated with'; then
+        # Attribution trailers are banned, with ONE exception: GitHub's own dependabot bot adds a
+        # `Co-authored-by: dependabot[bot]` line to every squash-merged dependency PR. That is a
+        # public GitHub dependency bot, not an authorship or tooling-attribution leak, and refusing
+        # it would break every routine dependabot merge (it did, on the actions/checkout bump). Every
+        # other co-authored-by, and any "generated with", is still refused.
+        # Capture the offending lines rather than piping into `grep -q`: BSD `grep -q` combined with
+        # `-v` misreports its exit status through a pipe, which would make this pass on a real trailer.
+        ATTR="$(git log -1 --format='%B' "$h" 2>/dev/null \
+                  | grep -iE '^co-authored-by|generated with' \
+                  | grep -ivE '^co-authored-by:[[:space:]]*dependabot\[bot\]' || true)"
+        if [ -n "$ATTR" ]; then
             say "ATTRIBUTION TRAILER in commit: $(git log -1 --format='%h %s' "$h" 2>/dev/null)"
             FAIL=1
         fi
