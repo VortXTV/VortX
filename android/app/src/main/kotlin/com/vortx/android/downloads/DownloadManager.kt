@@ -5,7 +5,6 @@ import android.os.StatFs
 import android.os.UserManager
 import android.util.Log
 import androidx.work.ExistingWorkPolicy
-import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
@@ -14,6 +13,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.UUID
+import java.util.concurrent.Executor
 
 /**
  * The coordinator for offline downloads. Android port of Apple `app/SourcesShared/DownloadManager.swift`.
@@ -49,9 +49,9 @@ import java.util.UUID
  *    core plus the ranking settle loop and the contributor merges; it is its own unit.
  *
  * All state writes go through [DownloadStore] (the local index). Nothing here writes a `libraryItem` document or
- * syncs the list. Apple's manager is `@MainActor`-isolated; this one is guarded by `@Synchronized` instead, because
- * [DownloadWorker] calls back into it from a WorkManager background thread. The lock covers in-memory bookkeeping
- * plus store writes only, never a transfer.
+ * syncs the list. Apple's manager is `@MainActor`-isolated; this one uses [lock] instead because [DownloadWorker]
+ * calls back from a WorkManager thread. The lock covers bookkeeping, store writes, and each small partial-file
+ * mutation needed to make generation ownership atomic. It is never held across network I/O.
  */
 object DownloadManager {
 
@@ -106,13 +106,25 @@ object DownloadManager {
     val queueOrder: StateFlow<List<String>> = _queueOrder.asStateFlow()
 
     /**
-     * Record ids with a live transfer. Apple derives this from `taskForRecord`; here the [DownloadWorker] registers
-     * itself via [markActive] when it starts and the terminal handlers clear it, so the count is exactly the number
-     * of running downloads, which is what the cap gates on. After a process death this starts EMPTY and is refilled
-     * by whichever workers WorkManager revives (they call [markActive] on start), which is why [reconcileInFlight]
-     * only demotes records it can prove have no live work.
+     * Record id to opaque generation for every live transfer. The token makes ownership ABA-safe across pause/resume:
+     * a delayed callback from generation A cannot remove or complete the active generation B slot. After process death
+     * this starts empty and is refilled by revived workers through [claimTransfer] or by [reconcileInFlight].
      */
-    private val activeIds = mutableSetOf<String>()
+    private val activeGenerations = mutableMapOf<String, String>()
+
+    /**
+     * A generation published to the local index but whose WorkManager enqueue operation has not completed yet.
+     * Reconciliation must treat it as live: WorkManager can legitimately return no rows until its asynchronous
+     * database transaction commits. The operation callback clears this marker on success and generation-safely
+     * fails the record on error.
+     */
+    private val pendingEnqueueGenerations = mutableMapOf<String, String>()
+
+    /** A ListenableFuture invokes this only after completion, so running its tiny bookkeeping callback inline is safe. */
+    private val directExecutor = Executor { command -> command.run() }
+
+    /** Legacy DOWNLOADING rows without a generation still reserve capacity until reconciliation parks them. */
+    private val legacyStartupReservations = mutableSetOf<String>()
 
     /**
      * Records parked after a transfer could not write its file while the user was LOCKED. Restarting immediately
@@ -126,13 +138,6 @@ object DownloadManager {
      * recovery needs it. Persisting is what makes the #132 auto-recovery actually fire here.
      */
     private val awaitingUnlock = mutableSetOf<String>()
-
-    /**
-     * Per-record count of write-failure self-heal restarts, so a transient staging failure is retried once from
-     * scratch, but a genuinely unwritable destination still surfaces its error on the second hit instead of looping.
-     * Mirrors Apple's `cannotCreateFileRetries`.
-     */
-    private val writeFailureRetries = mutableMapOf<String, Int>()
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
@@ -160,6 +165,18 @@ object DownloadManager {
                 ?.split('\n')?.filter { it.isNotBlank() } ?: emptyList()
             awaitingUnlock.clear()
             awaitingUnlock.addAll(p.getStringSet(AWAITING_UNLOCK_KEY, emptySet()).orEmpty())
+            val persistedRecords = DownloadStore.records.value
+            val startupReservedIds = DownloadQueuePolicy.startupReservedIds(persistedRecords)
+            persistedRecords
+                .filter { it.id in startupReservedIds }
+                .forEach { record ->
+                    val generation = record.transferGeneration
+                    if (generation == null) {
+                        legacyStartupReservations.add(record.id)
+                    } else {
+                        activeGenerations[record.id] = generation
+                    }
+                }
             restored = true
         }
     }
@@ -194,11 +211,11 @@ object DownloadManager {
         isDolbyVision: Boolean = false,
         isAtmos: Boolean = false,
         requestHeaders: Map<String, String>? = null,
-    ): DownloadRecord {
+    ): DownloadRecord = synchronized(lock) {
         DownloadStore.records.value.firstOrNull { it.videoId == videoId && it.state != DownloadState.FAILED }
             ?.let { existing ->
                 if (existing.state == DownloadState.PAUSED) resume(existing.id)
-                return existing
+                return@synchronized existing
             }
 
         val id = UUID.randomUUID().toString()
@@ -220,46 +237,50 @@ object DownloadManager {
                     "Try a direct or debrid file source.",
             )
             DownloadStore.upsert(failed)
-            return failed
+            return@synchronized failed
         }
 
         // Honor the concurrency cap: start now only if a slot is free, else create the record QUEUED and let it
         // start when a running download finishes / fails / is cancelled / paused (start-next-on-finish).
-        synchronized(lock) {
-            val canStartNow = hasFreeSlot()
-            val record = DownloadRecord(
-                id = id, contentId = contentId, videoId = videoId, type = type, name = name, poster = poster,
-                season = season, episode = episode, sourceName = sourceName, qualityText = qualityText,
-                isDolbyVision = isDolbyVision, isAtmos = isAtmos,
-                isTorrent = stream.isTorrent, headers = headers, remoteURL = resolvedUrl,
-                localFilename = "$id.$ext",
-                state = if (canStartNow) DownloadState.DOWNLOADING else DownloadState.QUEUED,
-            )
-            DownloadStore.upsert(record)
-            runCatching { DownloadStore.ensureDownloadsDirectoryExists() }
-                .onFailure { Log.w(TAG, "could not create Downloads dir up front", it) }
+        val canStartNow = hasFreeSlot()
+        val generation = if (canStartNow) newTransferGeneration() else null
+        val record = DownloadRecord(
+            id = id, contentId = contentId, videoId = videoId, type = type, name = name, poster = poster,
+            season = season, episode = episode, sourceName = sourceName, qualityText = qualityText,
+            isDolbyVision = isDolbyVision, isAtmos = isAtmos,
+            isTorrent = stream.isTorrent, headers = headers, remoteURL = resolvedUrl,
+            localFilename = "$id.$ext",
+            state = if (canStartNow) DownloadState.DOWNLOADING else DownloadState.QUEUED,
+            transferGeneration = generation,
+        )
+        DownloadStore.upsert(record)
+        runCatching { DownloadStore.ensureDownloadsDirectoryExists() }
+            .onFailure { Log.w(TAG, "could not create Downloads dir up front", it) }
 
-            if (canStartNow) startTransfer(record) else appendToQueueOrder(id)
-            return DownloadStore.record(id) ?: record
+        if (canStartNow) {
+            if (startTransfer(record).freesSlot) afterSlotFreed()
+        } else {
+            appendToQueueOrder(id)
         }
+        DownloadStore.record(id) ?: record
     }
 
     /**
      * Pause a download. A queued item has no live transfer yet: just mark it paused so it stops being eligible to
-     * start. A running one has its worker cancelled; the partial file stays on disk and [resume] continues it with a
-     * Range request (Android's analogue of Apple's URLSession resume data, and a stronger one -- it survives process
-     * death, which Apple's in-memory `resumeData` does not).
+     * start. A running one has its worker cancelled; the partial file stays on disk and [resume] continues it only
+     * when a strong ETag proves the Range belongs to the same representation, otherwise it restarts from zero.
      */
     fun pause(id: String) {
         synchronized(lock) {
             val record = DownloadStore.record(id) ?: return
+            val pausedState = DownloadTransferStatePolicy.pause(record.state) ?: return
             if (record.state == DownloadState.QUEUED) {
-                DownloadStore.update(id) { it.copy(state = DownloadState.PAUSED) }
+                DownloadStore.update(id) { it.copy(state = pausedState, transferGeneration = null) }
                 return
             }
             cancelWork(id)
-            activeIds.remove(id)
-            DownloadStore.update(id) { it.copy(state = DownloadState.PAUSED) }
+            releaseSlotReservation(id, record.transferGeneration)
+            DownloadStore.update(id) { it.copy(state = pausedState, transferGeneration = null) }
             afterSlotFreed()
         }
     }
@@ -271,16 +292,27 @@ object DownloadManager {
     fun resume(id: String) {
         synchronized(lock) {
             val record = DownloadStore.record(id) ?: return
+            if (!DownloadTransferStatePolicy.mayResume(record.state)) return
             awaitingUnlock.remove(id)
             persistAwaitingUnlock()
             if (!hasFreeSlot()) {
-                DownloadStore.update(id) { it.copy(state = DownloadState.QUEUED, errorText = null) }
+                DownloadStore.update(id) {
+                    it.copy(
+                        state = DownloadState.QUEUED,
+                        transferGeneration = null,
+                        errorText = null,
+                    )
+                }
                 appendToQueueOrder(id)
                 return
             }
-            val updated = record.copy(state = DownloadState.DOWNLOADING, errorText = null)
+            val updated = record.copy(
+                state = DownloadState.DOWNLOADING,
+                transferGeneration = newTransferGeneration(),
+                errorText = null,
+            )
             DownloadStore.update(id) { updated }
-            startTransfer(updated)
+            if (startTransfer(updated).freesSlot) afterSlotFreed()
         }
     }
 
@@ -288,8 +320,8 @@ object DownloadManager {
     fun cancel(id: String) {
         synchronized(lock) {
             cancelWork(id)
-            activeIds.remove(id)
-            writeFailureRetries.remove(id)
+            val generation = DownloadStore.record(id)?.transferGeneration
+            releaseSlotReservation(id, generation)
             awaitingUnlock.remove(id)
             persistAwaitingUnlock()
             DownloadStore.remove(id)
@@ -304,12 +336,15 @@ object DownloadManager {
 
     /**
      * The concurrency-cap gate, funnelled through [DownloadQueuePolicy] so EVERY start path (create, resume, queue
-     * drain, cap raise) enforces the cap identically. Reads the live [activeIds] count, so it must be called under
+     * drain, cap raise) enforces the cap identically. Reads the live [activeGenerations] count, so it must be called under
      * [lock] like the state it gates. Kept as a thin instance wrapper (rather than inlining the policy call at each
      * site) so the four call sites stay a single readable predicate.
      */
     private fun hasFreeSlot(): Boolean =
-        DownloadQueuePolicy.canStartNow(activeIds.size, _maxConcurrentDownloads.value)
+        DownloadQueuePolicy.canStartNow(
+            activeCount = (activeGenerations.keys + legacyStartupReservations).size,
+            cap = _maxConcurrentDownloads.value,
+        )
 
     /**
      * Set the max-concurrent-downloads cap. Clamped to [CONCURRENCY_RANGE] and persisted. RAISING the cap pulls
@@ -322,7 +357,7 @@ object DownloadManager {
             if (clamped == _maxConcurrentDownloads.value) return
             _maxConcurrentDownloads.value = clamped
             appContext?.let { prefs(it).edit().putInt(MAX_CONCURRENT_KEY, clamped).apply() }
-            fillAvailableSlots() // no-op when the cap dropped (activeIds already >= cap)
+            fillAvailableSlots() // no-op when the cap dropped (active generations already >= cap)
         }
     }
 
@@ -381,10 +416,10 @@ object DownloadManager {
     private fun fillAvailableSlots() {
         fun queuedCount() = DownloadStore.records.value.count { it.state == DownloadState.QUEUED }
         while (hasFreeSlot()) {
-            val beforeActive = activeIds.size
+            val beforeActive = activeGenerations.size
             val beforeQueued = queuedCount()
             startNextQueued()
-            if (activeIds.size == beforeActive && queuedCount() == beforeQueued) break
+            if (activeGenerations.size == beforeActive && queuedCount() == beforeQueued) break
         }
     }
 
@@ -397,10 +432,19 @@ object DownloadManager {
         if (!hasFreeSlot()) return
         val next = orderedQueuedRecords().firstOrNull() ?: return
         if (next.remoteURL.toHttpUrlOrNull() == null) {
-            DownloadStore.update(next.id) { it.copy(state = DownloadState.FAILED, errorText = "Invalid source URL") }
+            DownloadStore.update(next.id) {
+                it.copy(
+                    state = DownloadState.FAILED,
+                    transferGeneration = null,
+                    errorText = "Invalid source URL",
+                )
+            }
             return
         }
-        val started = next.copy(state = DownloadState.DOWNLOADING)
+        val started = next.copy(
+            state = DownloadState.DOWNLOADING,
+            transferGeneration = newTransferGeneration(),
+        )
         DownloadStore.update(next.id) { started }
         startTransfer(started)
     }
@@ -442,31 +486,128 @@ object DownloadManager {
     /** Apple's ~200 MB margin, kept: the OS wants headroom and a partial write should not wedge the volume. */
     private const val STORAGE_MARGIN_BYTES = 200L * 1024L * 1024L
 
-    private fun startTransfer(record: DownloadRecord) {
+    private fun newTransferGeneration(): String = UUID.randomUUID().toString()
+
+    private fun releaseActive(id: String, generation: String?): Boolean {
+        if (generation == null) return false
+        if (pendingEnqueueGenerations[id] == generation) pendingEnqueueGenerations.remove(id)
+        if (activeGenerations[id] != generation) return false
+        activeGenerations.remove(id)
+        return true
+    }
+
+    private fun releaseSlotReservation(id: String, generation: String?): Boolean =
+        if (generation == null) legacyStartupReservations.remove(id) else releaseActive(id, generation)
+
+    private fun ownsTransferLocked(record: DownloadRecord?, generation: String): Boolean =
+        record != null &&
+            record.state == DownloadState.DOWNLOADING &&
+            DownloadTransferStatePolicy.owns(
+                recordGeneration = record.transferGeneration,
+                activeGeneration = activeGenerations[record.id],
+                requestedGeneration = generation,
+            )
+
+    private fun startTransfer(record: DownloadRecord): DownloadTransferStartResult {
         val context = appContext
         if (context == null) {
             Log.w(TAG, "startTransfer before init(); record ${record.id} left queued")
-            return
+            return DownloadTransferStartResult.NOT_STARTED
+        }
+        val generation = record.transferGeneration ?: run {
+            Log.w(TAG, "startTransfer without generation; record ${record.id} not scheduled")
+            return DownloadTransferStartResult.NOT_STARTED
+        }
+        val current = DownloadStore.record(record.id)
+        if (
+            current?.state != DownloadState.DOWNLOADING ||
+            current.transferGeneration != generation
+        ) {
+            return DownloadTransferStartResult.NOT_STARTED
         }
         if (storageShortfall(record)) {
-            DownloadStore.update(record.id) {
+            val failed = DownloadStore.updateIf(
+                id = record.id,
+                predicate = { it.transferGeneration == generation },
+            ) {
                 it.copy(
                     state = DownloadState.FAILED,
+                    transferGeneration = null,
                     errorText = "Not enough storage to save this download. Free up space and try again.",
                 )
             }
-            return
+            return if (failed != null) {
+                DownloadTransferStartResult.PREFLIGHT_FAILED
+            } else {
+                DownloadTransferStartResult.NOT_STARTED
+            }
         }
         runCatching { DownloadStore.ensureDownloadsDirectoryExists() }
             .onFailure { Log.w(TAG, "could not create Downloads dir before transfer", it) }
-        activeIds.add(record.id)
-        // KEEP, not REPLACE: if WorkManager already has live work for this record (a revived worker after process
-        // death), do not tear it down and restart the transfer from scratch.
-        WorkManager.getInstance(context).enqueueUniqueWork(
-            workName(record.id),
-            ExistingWorkPolicy.KEEP,
-            DownloadWorker.request(record.id),
-        )
+        activeGenerations[record.id] = generation
+        pendingEnqueueGenerations[record.id] = generation
+        // REPLACE any older generation still winding down after pause/cancel. KEEP can discard an immediate resume
+        // while the cancelled worker still owns the unique name, stranding the new generation with no worker.
+        // A revived current-generation worker never comes through startTransfer, so it is not replaced here.
+        val operation = try {
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                workName(record.id),
+                ExistingWorkPolicy.REPLACE,
+                DownloadWorker.request(record.id, generation),
+            )
+        } catch (cause: Throwable) {
+            return failEnqueue(record, generation, cause)
+        }
+        val result = operation.result
+        try {
+            result.addListener(
+                {
+                    val failure = runCatching { result.get() }.exceptionOrNull()
+                    synchronized(lock) {
+                        if (pendingEnqueueGenerations[record.id] != generation) return@synchronized
+                        if (failure == null) {
+                            pendingEnqueueGenerations.remove(record.id)
+                        } else if (failEnqueue(record, generation, failure).freesSlot) {
+                            afterSlotFreed()
+                        }
+                    }
+                },
+                directExecutor,
+            )
+        } catch (cause: Throwable) {
+            return failEnqueue(record, generation, cause)
+        }
+        return DownloadTransferStartResult.STARTED
+    }
+
+    private fun failEnqueue(
+        record: DownloadRecord,
+        generation: String,
+        cause: Throwable,
+    ): DownloadTransferStartResult {
+        if (pendingEnqueueGenerations[record.id] != generation) {
+            return DownloadTransferStartResult.NOT_STARTED
+        }
+        Log.w(TAG, "could not enqueue download ${record.id}", cause)
+        releaseActive(record.id, generation)
+        val failed = DownloadStore.updateIf(
+            id = record.id,
+            predicate = {
+                it.state == DownloadState.DOWNLOADING &&
+                    it.transferGeneration == generation
+            },
+        ) {
+            it.copy(
+                state = DownloadState.FAILED,
+                transferGeneration = null,
+                errorText = "Could not schedule this download. Try again.",
+            )
+        }
+        return if (failed != null) {
+            DownloadTransferStartResult.ENQUEUE_FAILED
+        } else {
+            DownloadTransferStartResult.NOT_STARTED
+        }
     }
 
     private fun cancelWork(id: String) {
@@ -476,32 +617,115 @@ object DownloadManager {
     // MARK: Worker callbacks
 
     /**
-     * The worker registers itself as it starts. This is what refills [activeIds] after a process death: WorkManager
-     * revives at most `cap` workers (the manager never enqueued more than the cap), so the count stays correct by
-     * construction rather than needing Apple's `getAllTasks` reconciliation.
+     * Atomically claim a record before any transfer or local finalization. WorkManager may deliver stale work after
+     * pause, failure, or completion; only QUEUED and DOWNLOADING remain authorized to run.
      */
-    fun markActive(id: String) {
+    fun claimTransfer(id: String, generation: String): Boolean {
         synchronized(lock) {
-            activeIds.add(id)
-            if (DownloadStore.record(id)?.state == DownloadState.QUEUED) {
-                DownloadStore.update(id) { it.copy(state = DownloadState.DOWNLOADING) }
+            val record = DownloadStore.record(id)
+            val claimedState = record?.let {
+                DownloadTransferStatePolicy.claim(
+                    state = it.state,
+                    recordGeneration = it.transferGeneration,
+                    requestedGeneration = generation,
+                )
+            } ?: return false
+            if (claimedState != record.state) {
+                DownloadStore.updateIf(
+                    id = id,
+                    predicate = { it.transferGeneration == generation },
+                ) {
+                    it.copy(state = claimedState)
+                } ?: return false
+            }
+            activeGenerations[id] = generation
+            legacyStartupReservations.remove(id)
+            return true
+        }
+    }
+
+    fun ownsTransfer(id: String, generation: String): Boolean =
+        synchronized(lock) { ownsTransferLocked(DownloadStore.record(id), generation) }
+
+    /**
+     * Couple a partial-file mutation to the same generation lock as pause/resume. This closes the small window where
+     * an old worker could pass an ownership check, get paused, then truncate or append to the new generation's file.
+     */
+    fun performTransferFileMutation(id: String, generation: String, mutate: () -> Unit): Boolean {
+        synchronized(lock) {
+            if (!ownsTransferLocked(DownloadStore.record(id), generation)) return false
+            mutate()
+            return true
+        }
+    }
+
+    /**
+     * Publish transfer progress only while both the record and active slot still belong to this generation. The
+     * mutation cannot change lifecycle ownership fields.
+     */
+    fun handleTransferProgress(
+        id: String,
+        generation: String,
+        persistIndex: Boolean = true,
+        mutate: (DownloadRecord) -> DownloadRecord,
+    ): DownloadRecord? {
+        synchronized(lock) {
+            val record = DownloadStore.record(id)
+            if (!ownsTransferLocked(record, generation)) return null
+            return DownloadStore.updateIf(
+                id = id,
+                persistIndex = persistIndex,
+                predicate = {
+                    it.state == DownloadState.DOWNLOADING &&
+                        it.transferGeneration == generation
+                },
+            ) { live ->
+                mutate(live).copy(
+                    state = live.state,
+                    transferGeneration = live.transferGeneration,
+                )
             }
         }
     }
 
-    /** The transfer finished and the file is in place. */
-    fun handleTransferComplete(id: String) {
+    /**
+     * Finalize and publish completion as one locked state transition. If pause/cancel/failure won first, the callback
+     * is not run and that resting state is preserved.
+     */
+    fun handleTransferComplete(
+        id: String,
+        generation: String,
+        completedBytes: Long,
+        finalize: () -> Unit,
+    ): Boolean {
         synchronized(lock) {
-            activeIds.remove(id)
-            writeFailureRetries.remove(id)
-            DownloadStore.update(id) {
+            val current = DownloadStore.record(id)
+            val completedState = current?.let {
+                DownloadTransferStatePolicy.complete(
+                    state = it.state,
+                    recordGeneration = it.transferGeneration,
+                    activeGeneration = activeGenerations[id],
+                    requestedGeneration = generation,
+                    onAuthorized = finalize,
+                )
+            }
+            if (current == null || completedState == null) return false
+
+            releaseActive(id, generation)
+            DownloadStore.updateIf(
+                id = id,
+                predicate = { it.transferGeneration == generation },
+            ) {
                 it.copy(
-                    state = DownloadState.COMPLETED,
-                    bytesDone = maxOf(it.bytesDone, it.bytesTotal),
+                    state = completedState,
+                    transferGeneration = null,
+                    bytesDone = completedBytes,
+                    bytesTotal = completedBytes,
                     errorText = null,
                 )
             }
             afterSlotFreed()
+            return true
         }
     }
 
@@ -513,12 +737,18 @@ object DownloadManager {
      *
      * A record the caller already moved out of DOWNLOADING (pause/cancel got there first) is left alone.
      */
-    fun handleTransferStopped(id: String) {
+    fun handleTransferStopped(id: String, generation: String) {
         synchronized(lock) {
-            activeIds.remove(id)
-            if (DownloadStore.record(id)?.state == DownloadState.DOWNLOADING) {
-                DownloadStore.update(id) { it.copy(state = DownloadState.PAUSED) }
-            }
+            val current = DownloadStore.record(id)
+            if (!ownsTransferLocked(current, generation)) return
+            releaseActive(id, generation)
+            DownloadStore.updateIf(
+                id = id,
+                predicate = {
+                    it.state == DownloadState.DOWNLOADING &&
+                        it.transferGeneration == generation
+                },
+            ) { it.copy(state = DownloadState.PAUSED, transferGeneration = null) }
             afterSlotFreed()
         }
     }
@@ -528,7 +758,7 @@ object DownloadManager {
      * #132 root cause -- and it keeps that branch's three cases and their ORDER, because the ordering is what makes
      * the lesson hold:
      *
-     *  1. **Could not write while the user is LOCKED** -> PARK, do not consume the self-heal budget. Restarting now
+     *  1. **Could not write while the user is LOCKED** -> PARK, do not consume a WorkManager attempt. Restarting now
      *     would just re-download gigabytes and fail again while still locked (Apple's "retry cap exhausted before the
      *     device unlocks" trap). The record parks [DownloadState.PAUSED] and auto-resumes on unlock via
      *     [DownloadUnlockReceiver], so a completed-while-locked download recovers itself instead of dead-ending.
@@ -538,7 +768,8 @@ object DownloadManager {
      *     recurs. A write failure is transient far more often than terminal, and dead-failing a 100%-downloaded title
      *     is exactly the #132 complaint.
      *
-     * Everything else (a network error, a dead link, a non-media body) fails honestly with its own message.
+     * Transient network failures get a bounded WorkManager retry and resume from the partial file. Permanent HTTP
+     * errors, dead links after the retry ceiling, and non-media bodies fail honestly with their own message.
      *
      * ANDROID EXPOSURE, HONESTLY: case 1's window is NARROWER here than on iOS. iOS's default file-protection class
      * makes app files unwritable whenever the SCREEN is locked, so an overnight transfer trips it routinely. Android
@@ -556,12 +787,19 @@ object DownloadManager {
      * the manager decides and [DownloadWorker] executes the decision through WorkManager's own retry, which reuses
      * the same work rather than fighting it.
      */
-    fun handleTransferFailure(id: String, cause: Throwable): FailureVerdict {
+    fun handleTransferFailure(
+        id: String,
+        generation: String,
+        cause: Throwable,
+        runAttemptCount: Int,
+    ): FailureVerdict {
         synchronized(lock) {
             val detail = failureDetail(cause)
-            if (DownloadStore.record(id) == null) {
-                // Cancelled out from under the worker; nothing to record.
-                activeIds.remove(id)
+            val current = DownloadStore.record(id) ?: return FailureVerdict.IGNORED
+            if (!ownsTransferLocked(current, generation)) return FailureVerdict.IGNORED
+            if (!DownloadTransferPolicy.mayRetryRecord(current.state)) {
+                // pause/cancel can win while a socket failure is being delivered. Never turn that resting state back
+                // into DOWNLOADING or ask WorkManager to retry work the user explicitly stopped.
                 return FailureVerdict.TERMINAL
             }
 
@@ -569,10 +807,14 @@ object DownloadManager {
             // that a full volume before first unlock still fails honestly instead of park-looping forever.
             if (isOutOfSpace(cause)) {
                 Log.w(TAG, "out of space id=$id detail=$detail")
-                activeIds.remove(id)
-                DownloadStore.update(id) {
+                releaseActive(id, generation)
+                DownloadStore.updateIf(
+                    id = id,
+                    predicate = { it.transferGeneration == generation },
+                ) {
                     it.copy(
                         state = DownloadState.FAILED,
+                        transferGeneration = null,
                         errorText = "Not enough storage to save this download. Free up space and try again.",
                     )
                 }
@@ -581,12 +823,13 @@ object DownloadManager {
             }
 
             if (isWriteFailure(cause)) {
-                // (1) Could not write while locked: park for unlock, do NOT consume the self-heal budget.
+                // (1) Could not write while locked: park for unlock, do NOT consume another WorkManager attempt.
                 if (!isUserUnlocked()) {
                     Log.w(TAG, "write failed while locked, parked for unlock retry id=$id detail=$detail")
-                    activeIds.remove(id)
+                    releaseActive(id, generation)
                     parkForUnlock(
                         id,
+                        generation,
                         "Waiting to finish saving. It will retry automatically when you unlock your device.",
                     )
                     afterSlotFreed()
@@ -598,34 +841,60 @@ object DownloadManager {
                 // because its resume state is an OPAQUE blob produced by a background daemon whose staging just
                 // misbehaved, so re-staging fresh is the only lever it has. Our resume state is the .part file we
                 // wrote ourselves; it is not suspect just because one write failed. So the retry RESUMES from it
-                // rather than re-downloading gigabytes. Same one-retry budget, far cheaper attempt.
-                val attempts = writeFailureRetries.getOrDefault(id, 0)
-                if (attempts < 1) {
-                    writeFailureRetries[id] = attempts + 1
-                    Log.w(TAG, "write failure retry id=$id attempt=${attempts + 1} detail=$detail")
+                // rather than re-downloading gigabytes. The persisted WorkManager attempt count grants it once.
+                if (DownloadTransferPolicy.canRetryWrite(runAttemptCount)) {
+                    Log.w(TAG, "write failure retry id=$id attempt=1 detail=$detail")
                     // Keep the slot: the SAME work retries, so releasing it here would let a queued download start
                     // alongside and momentarily exceed the cap.
-                    DownloadStore.update(id) { it.copy(state = DownloadState.DOWNLOADING, errorText = null) }
+                    DownloadStore.updateIf(
+                        id = id,
+                        predicate = { it.transferGeneration == generation },
+                    ) {
+                        it.copy(state = DownloadState.DOWNLOADING, errorText = null)
+                    }
                     return FailureVerdict.RETRY
                 }
                 // (3b) The one retry ALSO failed. Do NOT dead-fail (the #132 behaviour that stranded a
                 // 100%-downloaded title at "couldn't save"). Park it: it auto-retries on the next unlock / app
-                // foreground. Because a later resume resets the self-heal counter, each retry gets a fresh
-                // retry-then-re-park cycle rather than burning through to a hard failure.
+                // foreground. A later user resume creates a fresh generation and WorkRequest, so that explicit cycle
+                // gets one new retry without process death regranting retries to this generation.
                 Log.w(TAG, "write failure persisted after retry, parked id=$id detail=$detail")
-                activeIds.remove(id)
+                releaseActive(id, generation)
                 parkForUnlock(
                     id,
+                    generation,
                     "Waiting to finish saving. It will retry automatically when you unlock your device or reopen the app.",
                 )
                 afterSlotFreed()
                 return FailureVerdict.TERMINAL
             }
 
+            if (DownloadTransferPolicy.shouldRetry(cause, runAttemptCount)) {
+                Log.w(
+                    TAG,
+                    "transient transfer retry id=$id attempt=${runAttemptCount + 1} detail=$detail",
+                )
+                // Keep the slot: WorkManager retries this same work. Its .part resumes only with a matching ETag.
+                DownloadStore.updateIf(
+                    id = id,
+                    predicate = { it.transferGeneration == generation },
+                ) {
+                    it.copy(state = DownloadState.DOWNLOADING, errorText = null)
+                }
+                return FailureVerdict.RETRY
+            }
+
             Log.w(TAG, "transfer FAILED id=$id detail=$detail")
-            activeIds.remove(id)
-            DownloadStore.update(id) {
-                it.copy(state = DownloadState.FAILED, errorText = "Couldn't save this download: $detail")
+            releaseActive(id, generation)
+            DownloadStore.updateIf(
+                id = id,
+                predicate = { it.transferGeneration == generation },
+            ) {
+                it.copy(
+                    state = DownloadState.FAILED,
+                    transferGeneration = null,
+                    errorText = "Couldn't save this download: $detail",
+                )
             }
             afterSlotFreed()
             return FailureVerdict.TERMINAL
@@ -639,14 +908,29 @@ object DownloadManager {
 
         /** The record has reached a resting state (failed or parked); do not re-run. */
         TERMINAL,
+
+        /** A superseded generation reported late; finish its WorkManager row without touching current state. */
+        IGNORED,
     }
 
-    /** Park a record for unlock-triggered auto-resume, clearing its self-heal budget for the next attempt. */
-    private fun parkForUnlock(id: String, message: String) {
+    /** Park a record for unlock-triggered auto-resume; resume creates a fresh generation and attempt budget. */
+    private fun parkForUnlock(id: String, generation: String, message: String) {
+        if (
+            DownloadStore.updateIf(
+                id = id,
+                predicate = { it.transferGeneration == generation },
+            ) {
+                it.copy(
+                    state = DownloadState.PAUSED,
+                    transferGeneration = null,
+                    errorText = message,
+                )
+            } == null
+        ) {
+            return
+        }
         awaitingUnlock.add(id)
-        writeFailureRetries.remove(id)
         persistAwaitingUnlock()
-        DownloadStore.update(id) { it.copy(state = DownloadState.PAUSED, errorText = message) }
     }
 
     /**
@@ -687,22 +971,70 @@ object DownloadManager {
      */
     fun reconcileInFlight() {
         val context = appContext ?: return
-        val inFlight = DownloadStore.records.value.filter { it.state == DownloadState.DOWNLOADING }
+        val inFlight = synchronized(lock) {
+            DownloadStore.records.value.filter {
+                it.state == DownloadState.DOWNLOADING &&
+                    (
+                        it.transferGeneration == null ||
+                            pendingEnqueueGenerations[it.id] != it.transferGeneration
+                    )
+            }
+        }
         if (inFlight.isEmpty()) return
         val wm = WorkManager.getInstance(context)
         for (record in inFlight) {
-            val live = runCatching {
+            val generation = record.transferGeneration
+            val work = runCatching {
                 wm.getWorkInfosForUniqueWork(workName(record.id)).get()
-                    .any { !it.state.isFinished }
-            }.getOrDefault(true) // a query failure must not demote a healthy download
-            if (live) {
-                synchronized(lock) { activeIds.add(record.id) }
+                    .map {
+                        DownloadWorkSnapshot(
+                            id = it.id.toString(),
+                            generation = DownloadWorker.generationFromTags(it.tags),
+                            isFinished = it.state.isFinished,
+                        )
+                    }
+            }.getOrNull() ?: continue // a query failure must not demote or release a reserved slot
+            if (
+                generation != null &&
+                DownloadReconciliationPolicy.hasLiveGeneration(generation, work)
+            ) {
+                synchronized(lock) {
+                    val current = DownloadStore.record(record.id)
+                    if (
+                        current?.state == DownloadState.DOWNLOADING &&
+                        current.transferGeneration == generation
+                    ) {
+                        activeGenerations[record.id] = generation
+                    }
+                }
                 continue
             }
-            synchronized(lock) {
-                activeIds.remove(record.id)
-                if (DownloadStore.record(record.id)?.state == DownloadState.DOWNLOADING) {
-                    DownloadStore.update(record.id) { it.copy(state = DownloadState.PAUSED) }
+            val exactWorkIds = DownloadReconciliationPolicy.cancellableWorkIds(generation, work)
+            val demoted = synchronized(lock) {
+                val current = DownloadStore.record(record.id)
+                if (pendingEnqueueGenerations[record.id] == generation) {
+                    return@synchronized false
+                }
+                if (
+                    current?.state != DownloadState.DOWNLOADING ||
+                    current.transferGeneration != generation
+                ) {
+                    return@synchronized false
+                }
+                releaseSlotReservation(record.id, generation)
+                DownloadStore.updateIf(
+                    id = record.id,
+                    predicate = {
+                        it.state == DownloadState.DOWNLOADING &&
+                            it.transferGeneration == generation
+                    },
+                ) {
+                    it.copy(state = DownloadState.PAUSED, transferGeneration = null)
+                } != null
+            }
+            if (demoted) {
+                exactWorkIds.forEach { workId ->
+                    wm.cancelWorkById(UUID.fromString(workId))
                 }
             }
         }

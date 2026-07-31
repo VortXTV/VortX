@@ -76,6 +76,24 @@ class DownloadPlaybackRoutingTest {
     }
 
     @Test
+    fun `active transfer generation survives index round trip`() {
+        val decoded = DownloadStore.recordFromJson(
+            DownloadStore.recordToJson(
+                record().copy(
+                    state = DownloadState.DOWNLOADING,
+                    transferGeneration = "opaque-generation",
+                    representationETag = "\"representation-v1\"",
+                ),
+            ),
+        )
+
+        assertEquals("opaque-generation", decoded?.transferGeneration)
+        assertEquals("\"representation-v1\"", decoded?.representationETag)
+        assertNull(DownloadStore.recordFromJson(authenticLegacyJson())?.transferGeneration)
+        assertNull(DownloadStore.recordFromJson(authenticLegacyJson())?.representationETag)
+    }
+
+    @Test
     fun `authentic legacy 4K index keeps both capabilities unknown`() {
         val decoded = DownloadStore.recordFromJson(authenticLegacyJson())
 

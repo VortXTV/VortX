@@ -81,6 +81,16 @@ data class DownloadRecord(
     val bytesTotal: Long = 0,
     val bytesDone: Long = 0,
     val state: DownloadState = DownloadState.QUEUED,
+    /**
+     * Opaque ownership token for the currently scheduled transfer. Every worker callback must present this exact
+     * value; pause and terminal transitions clear it so delayed work from an older generation becomes inert.
+     */
+    val transferGeneration: String? = null,
+    /**
+     * Strong HTTP ETag for the bytes in the partial file. A Range continuation is allowed only when the response
+     * presents this exact validator; absent or weak validators force a zero-byte restart.
+     */
+    val representationETag: String? = null,
     /** Creation time, epoch millis (device-local; never cross-platform-synced). */
     val addedAt: Long = System.currentTimeMillis(),
     /** Human-readable failure reason when [state] == [DownloadState.FAILED]; null otherwise. */

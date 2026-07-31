@@ -32,6 +32,13 @@ internal object DownloadQueuePolicy {
      */
     fun canStartNow(activeCount: Int, cap: Int): Boolean = activeCount < cap
 
+    /**
+     * Persisted DOWNLOADING rows reserve their slots synchronously at process start. WorkManager reconciliation may
+     * later prove one stale, but treating it as live until then prevents new work from temporarily exceeding the cap.
+     */
+    fun startupReservedIds(records: List<DownloadRecord>): Set<String> =
+        records.filter { it.state == DownloadState.DOWNLOADING }.mapTo(mutableSetOf()) { it.id }
+
     // MARK: Queue drain order (reorderable)
 
     /**
@@ -86,9 +93,15 @@ internal object DownloadQueuePolicy {
      */
     fun hasStorageShortfall(bytesTotal: Long, bytesDone: Long, freeBytes: Long, marginBytes: Long): Boolean {
         if (bytesTotal <= 0) return false
-        val remaining = (bytesTotal - bytesDone).coerceAtLeast(0)
-        if (remaining == 0L) return false
-        return freeBytes < remaining + marginBytes
+        val completed = bytesDone.coerceAtLeast(0)
+        if (completed >= bytesTotal) return false
+        val remaining = bytesTotal - completed
+        val available = freeBytes.coerceAtLeast(0)
+        val margin = marginBytes.coerceAtLeast(0)
+        if (available < remaining) return true
+        // Compare the residual headroom instead of adding remaining + margin, which can overflow and turn a
+        // definite shortfall near Long.MAX_VALUE into a negative "required" byte count.
+        return available - remaining < margin
     }
 
     /**

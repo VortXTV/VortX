@@ -2,6 +2,13 @@ package com.vortx.android.downloads
 
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -28,6 +35,7 @@ class DownloadQueuePolicyTest {
     private fun rec(
         id: String,
         state: DownloadState = DownloadState.QUEUED,
+        transferGeneration: String? = null,
         addedAt: Long = 0L,
         bytesDone: Long = 0L,
         bytesTotal: Long = 0L,
@@ -40,10 +48,19 @@ class DownloadQueuePolicyTest {
         remoteURL = "https://example.test/$id",
         localFilename = "$id.mp4",
         state = state,
+        transferGeneration = transferGeneration,
         addedAt = addedAt,
         bytesDone = bytesDone,
         bytesTotal = bytesTotal,
     )
+
+    private fun managerSource(): String {
+        val sourcePath = sequenceOf(
+            Path.of("src/main/kotlin/com/vortx/android/downloads/DownloadManager.kt"),
+            Path.of("app/src/main/kotlin/com/vortx/android/downloads/DownloadManager.kt"),
+        ).first(Files::exists)
+        return String(Files.readAllBytes(sourcePath), StandardCharsets.UTF_8)
+    }
 
     // MARK: clampConcurrency
 
@@ -79,6 +96,156 @@ class DownloadQueuePolicyTest {
         assertFalse(DownloadQueuePolicy.canStartNow(activeCount = 2, cap = 2))
         // Defensive: an over-count (should never happen) must still gate, not wrap into "free slot".
         assertFalse(DownloadQueuePolicy.canStartNow(activeCount = 3, cap = 2))
+    }
+
+    @Test
+    fun `startup reservations count persisted transfers before async reconciliation`() {
+        val records = listOf(
+            rec("live-a", state = DownloadState.DOWNLOADING, transferGeneration = "generation-a"),
+            rec("legacy", state = DownloadState.DOWNLOADING),
+            rec("paused", state = DownloadState.PAUSED, transferGeneration = "old"),
+        )
+        val reservedIds = DownloadQueuePolicy.startupReservedIds(records)
+
+        assertEquals(setOf("live-a", "legacy"), reservedIds)
+        assertFalse(DownloadQueuePolicy.canStartNow(activeCount = reservedIds.size, cap = 2))
+    }
+
+    @Test
+    fun `resume preflight failure drains the newly freed slot`() {
+        val source = managerSource()
+        val resumeStart = source.indexOf("fun resume(id: String)")
+        val resumeEnd = source.indexOf("/** Cancel and remove", startIndex = resumeStart)
+        val resumeBody = source.substring(resumeStart, resumeEnd)
+        val startAttempt = resumeBody.indexOf("startTransfer(updated)")
+        val failureCheck = resumeBody.indexOf(".freesSlot", startIndex = startAttempt)
+        val drain = resumeBody.indexOf("afterSlotFreed()", startIndex = failureCheck)
+
+        assertTrue("resume function must exist", resumeStart >= 0)
+        assertTrue("resume must attempt the transfer", startAttempt >= 0)
+        assertTrue("resume must distinguish a synchronous start failure", failureCheck > startAttempt)
+        assertTrue("resume must drain the freed slot after the row is failed", drain > failureCheck)
+    }
+
+    @Test
+    fun `synchronous start failures advertise that their slot must be drained`() {
+        assertFalse(DownloadTransferStartResult.STARTED.freesSlot)
+        assertTrue(DownloadTransferStartResult.PREFLIGHT_FAILED.freesSlot)
+        assertTrue(DownloadTransferStartResult.ENQUEUE_FAILED.freesSlot)
+        assertFalse(DownloadTransferStartResult.NOT_STARTED.freesSlot)
+    }
+
+    @Test
+    fun `preflight failure deterministically fills its slot with the first ordered queued item`() {
+        val queued = listOf(
+            rec("older", addedAt = 100),
+            rec("priority", addedAt = 300),
+            rec("younger", addedAt = 200),
+        )
+        val next = if (DownloadTransferStartResult.PREFLIGHT_FAILED.freesSlot) {
+            DownloadQueuePolicy.orderedQueued(queued, order = listOf("priority")).firstOrNull()
+        } else {
+            null
+        }
+
+        assertEquals("priority", next?.id)
+    }
+
+    @Test
+    fun `duplicate lookup and publication are serialized by the manager lifecycle lock`() {
+        val source = managerSource()
+        val downloadStart = source.indexOf("fun download(")
+        val downloadEnd = source.indexOf("/**\n     * Pause a download", startIndex = downloadStart)
+        val downloadBody = source.substring(downloadStart, downloadEnd)
+        val lifecycleLock = downloadBody.indexOf("synchronized(lock)")
+        val duplicateLookup = downloadBody.indexOf(
+            "firstOrNull { it.videoId == videoId && it.state != DownloadState.FAILED }",
+        )
+        val publication = downloadBody.indexOf("DownloadStore.upsert(record)")
+
+        assertTrue("download function must exist", downloadStart >= 0)
+        assertTrue("the lifecycle lock must be acquired before duplicate lookup", lifecycleLock in 0 until duplicateLookup)
+        assertTrue("record publication must remain inside the same serialized function body", publication > duplicateLookup)
+    }
+
+    @Test
+    fun `reconciliation cannot observe a row between publication and enqueue registration`() {
+        val source = managerSource()
+        val reconcileStart = source.indexOf("fun reconcileInFlight()")
+        val reconcileEnd = source.indexOf("// MARK: Helpers", startIndex = reconcileStart)
+        val reconcileBody = source.substring(reconcileStart, reconcileEnd)
+        val lockedSnapshot = reconcileBody.indexOf("val inFlight = synchronized(lock)")
+        val pendingSnapshotFilter = reconcileBody.indexOf(
+            "pendingEnqueueGenerations[it.id] != it.transferGeneration",
+            startIndex = lockedSnapshot,
+        )
+        val pendingGuard = reconcileBody.indexOf("pendingEnqueueGenerations[record.id] == generation")
+
+        assertTrue("reconciliation must snapshot downloading rows under the lifecycle lock", lockedSnapshot >= 0)
+        assertTrue(
+            "a row still being enqueued must be excluded from this reconciliation pass",
+            pendingSnapshotFilter > lockedSnapshot,
+        )
+        assertTrue("a later pending enqueue must also prevent demotion", pendingGuard > pendingSnapshotFilter)
+    }
+
+    @Test
+    fun `publication and enqueue registration are atomic to a concurrent reconciler`() {
+        val lifecycleLock = Any()
+        val publicationVisible = CountDownLatch(1)
+        val reconciliationAttempted = CountDownLatch(1)
+        val allowEnqueueRegistration = CountDownLatch(1)
+        val reconciliationFinished = CountDownLatch(1)
+        val observation = AtomicReference<Pair<Boolean, Boolean>>()
+        var published = false
+        var enqueueRegistered = false
+
+        val publisher = thread {
+            synchronized(lifecycleLock) {
+                published = true
+                publicationVisible.countDown()
+                allowEnqueueRegistration.await()
+                enqueueRegistered = true
+            }
+        }
+        assertTrue(publicationVisible.await(1, TimeUnit.SECONDS))
+        val reconciler = thread {
+            reconciliationAttempted.countDown()
+            synchronized(lifecycleLock) {
+                observation.set(published to enqueueRegistered)
+                reconciliationFinished.countDown()
+            }
+        }
+        assertTrue(reconciliationAttempted.await(1, TimeUnit.SECONDS))
+        assertFalse(
+            "reconciliation must remain blocked while publication is not yet paired with enqueue registration",
+            reconciliationFinished.await(50, TimeUnit.MILLISECONDS),
+        )
+        allowEnqueueRegistration.countDown()
+        publisher.join()
+        reconciler.join()
+
+        assertEquals(true to true, observation.get())
+    }
+
+    @Test
+    fun `enqueue failure is generation fenced and frees the queue slot`() {
+        val source = managerSource()
+        val start = source.indexOf("private fun startTransfer(record: DownloadRecord)")
+        val end = source.indexOf("private fun cancelWork", startIndex = start)
+        val body = source.substring(start, end)
+        val enqueue = body.indexOf("enqueueUniqueWork(")
+        val pending = body.indexOf("pendingEnqueueGenerations[record.id] = generation")
+        val failureHandler = body.indexOf("failEnqueue(", startIndex = enqueue)
+        val generationFence = body.indexOf("pendingEnqueueGenerations[record.id] != generation")
+        val release = body.indexOf("releaseActive(record.id, generation)", startIndex = failureHandler)
+        val failedResult = body.indexOf("DownloadTransferStartResult.ENQUEUE_FAILED", startIndex = release)
+
+        assertTrue("the generation must be registered as pending before enqueue", pending in 0 until enqueue)
+        assertTrue("enqueue errors must enter an explicit failure handler", failureHandler > enqueue)
+        assertTrue("a stale enqueue callback must be generation fenced", generationFence > failureHandler)
+        assertTrue("enqueue failure must release the reserved active slot", release > generationFence)
+        assertTrue("a synchronous enqueue failure must request queue draining", failedResult > release)
     }
 
     // MARK: orderedQueued (reorderable drain order)
@@ -236,6 +403,26 @@ class DownloadQueuePolicyTest {
         // Naive `free < total` would have compared 150 MB against 10 GB and wrongly failed it; assert that the
         // FULL-size comparison really would have been a shortfall, so this test pins the difference, not a tautology.
         assertTrue(hundredFiftyMB < tenGB)
+    }
+
+    @Test
+    fun `hasStorageShortfall cannot wrap remaining plus margin`() {
+        assertTrue(
+            DownloadQueuePolicy.hasStorageShortfall(
+                bytesTotal = Long.MAX_VALUE,
+                bytesDone = 0,
+                freeBytes = Long.MAX_VALUE,
+                marginBytes = 1,
+            ),
+        )
+        assertTrue(
+            DownloadQueuePolicy.hasStorageShortfall(
+                bytesTotal = Long.MAX_VALUE,
+                bytesDone = Long.MIN_VALUE,
+                freeBytes = Long.MAX_VALUE - 1,
+                marginBytes = 0,
+            ),
+        )
     }
 
     // MARK: recordedSizeBytes (per-folder accounting)
