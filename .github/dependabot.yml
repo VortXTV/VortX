@@ -1,23 +1,11 @@
 version: 2
 updates:
-  # The Rust engine crate (stremio-core and its deps).
-  - package-ecosystem: cargo
-    directory: /core
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "chore(deps)"
-    ignore:
-      # jni 0.22 is a hard API break (GlobalRef removed -> Global<T>; JNIEnv split into EnvUnowned/Env;
-      # attach_current_thread redesigned around AttachGuard; call_method needs a MethodSignature; JValueGen
-      # removed). core/src/android_jni.rs targets the 0.21 mutable-borrow JNIEnv API, and the Apple build is
-      # cfg(target_os = "android")-gated away from it, so only android.yml catches the break and it fails.
-      # Pin to the 0.21.x line (patch updates still allowed); revisit only as a deliberate android_jni.rs port.
-      - dependency-name: "jni"
-        update-types:
-          - "version-update:semver-major"
-          - "version-update:semver-minor"
+  # NO cargo entry here on purpose. The Rust engine crate lives in a PRIVATE repo and is fetched at
+  # build time; the public tree carries only core/Cargo.lock, never core/Cargo.toml, so every
+  # dependabot cargo run aborted with "/core/Cargo.toml not found" and failed the Dependabot Updates
+  # workflow on a loop. Cargo dependency work (including security bumps such as quinn-proto
+  # GHSA-4w2j-m93h-cj5j) is done in the private engine repo. Dependency ALERTS still fire off the
+  # committed lockfile, so vulnerabilities stay visible here without a broken update job.
   # GitHub Actions workflows (kept current as CI is added).
   - package-ecosystem: github-actions
     directory: /
