@@ -775,7 +775,11 @@ struct iOSSettingsView: View {
             // serves whatever bytes are on disk). Only when no capture has ever happened does a guidance
             // button explain how to produce a log, so we never hand over a nonexistent or empty file.
             if hasDiagnosticLog {
-                ShareLink("Save or share log", item: DiagnosticLogTransfer())
+                ShareLink(
+                    "Save or share log",
+                    item: DiagnosticLogTransfer(),
+                    preview: SharePreview("VortX diagnostic log")
+                )
                     .tint(Theme.Palette.accent)
             } else {
                 Button("Save or share log") {

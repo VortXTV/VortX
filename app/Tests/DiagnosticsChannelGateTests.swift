@@ -163,8 +163,10 @@ let rules: [Rule] = [
                                    why: "ShareLink must hand over a sanitised copy")
                 found += requiring(settings, "FileRepresentation(exportedContentType: .plainText)",
                                    why: "ShareLink must prepare the full export lazily after the owner taps it")
-                found += requiring(settings, "ShareLink(\"Save or share log\", item: DiagnosticLogTransfer())",
+                found += requiring(settings, "item: DiagnosticLogTransfer(),",
                                    why: "the share surface must use the lazy sanitised transfer")
+                found += requiring(settings, "preview: SharePreview(\"VortX diagnostic log\")",
+                                   why: "custom transferable sharing must supply the preview required by current SwiftUI")
                 found += forbidding(settings, "let url = VXProbe.logFileURL",
                                     why: "ShareLink hands over the LIVE log URL, skipping the export-time sanitiser")
                 found += forbidding(settings, "private var diagLogExportURL: URL?",
