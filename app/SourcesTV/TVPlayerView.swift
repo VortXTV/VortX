@@ -1318,6 +1318,19 @@ struct TVPlayerView: View {
                             pendingToken: pending.loadToken
                         ) else { return }
                     }
+                    let startupResume = resumeSeconds.map {
+                        String(format: "%.3f", $0)
+                    } ?? "nil"
+                    DiagnosticsLog.log(
+                        "playback",
+                        String(
+                            format: "first frame position=%.3fs lane=%@ resume=%@ autoSkip=%@",
+                            d,
+                            isAVPlayerActive ? "avplayer" : "libmpv",
+                            startupResume,
+                            autoSkip ? "on" : "off"
+                        )
+                    )
                     hasStartedPlaying = true
                     // FIRST-FRAME COMMIT (binge-desync fix): the incoming episode's file actually rendered,
                     // so publish the advance NOW, before anything below (the LastStreamStore record, the
@@ -4918,6 +4931,16 @@ struct TVPlayerView: View {
         // Recording the start means a manual seek back into the same segment won't auto-skip it again.
         if autoSkip, let skip, !autoSkippedStarts.contains(skip.start) {
             autoSkippedStarts.insert(skip.start)
+            DiagnosticsLog.log(
+                "playback",
+                String(
+                    format: "automatic skip kind=%@ start=%.3fs end=%.3fs observed=%.3fs",
+                    skip.kind.rawValue,
+                    skip.start,
+                    skip.end,
+                    time
+                )
+            )
             skipTo(skip)
             if currentSkip != nil { currentSkip = nil }
             return
@@ -6428,7 +6451,13 @@ struct TVPlayerView: View {
         guard !isCurrentLiveStream else { return }
         guard !appliedResume, duration > 0, let r = resumeSeconds else { return }
         appliedResume = true
-        guard r > 5, r < duration - 10 else { return }   // ignore trivial / near-end positions
+        guard r > 5, r < duration - 10 else {
+            DiagnosticsLog.log(
+                "playback",
+                String(format: "resume decision=no-seek value=%.3fs duration=%.3fs", r, duration)
+            )
+            return
+        }   // ignore trivial / near-end positions
         // A remux resume is fulfilled before mount by rebuilding from the configured source origin. Do not seek
         // AVPlayer into a forward-only playlist after mount. Verify the achieved keyframe origin instead; only
         // a genuinely unreachable request needs the progress floor and an unavailable notice.
@@ -6448,6 +6477,12 @@ struct TVPlayerView: View {
             }
             return
         }
+        let resumeLane = coordinator.player is AVPlayerEngineController ? "avplayer" : "libmpv"
+        DiagnosticsLog.log(
+            "playback",
+            String(format: "resume decision=seek value=%.3fs duration=%.3fs", r, duration)
+                + " lane=\(resumeLane)"
+        )
         coordinator.player?.seek(to: r)
         currentTime = r
         lastSaved = r

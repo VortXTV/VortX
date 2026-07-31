@@ -1413,6 +1413,16 @@ struct PlayerScreen: View {
                                 pendingToken: pending.loadToken
                               ) else { return }
                     }
+                    DiagnosticsLog.log(
+                        "playback",
+                        String(
+                            format: "first frame position=%.3fs lane=%@ resume=%.3fs autoSkip=%@",
+                            d,
+                            isAVPlayerActive ? "avplayer" : "libmpv",
+                            resumeSeconds,
+                            autoSkip ? "on" : "off"
+                        )
+                    )
                     // [src-probe] FIRST FRAME: the overlay/spinner is about to clear and real playback begins.
                     // The gap between LOAD START and this line is the true startup latency; if a reconnect/hop
                     // message showed during that window (see the overlay-set probes) it was a transient shown
@@ -4774,6 +4784,16 @@ struct PlayerScreen: View {
         // Recording the start means a manual seek back into the same segment won't auto-skip it again.
         if autoSkip, let skip, !autoSkippedStarts.contains(skip.start) {
             autoSkippedStarts.insert(skip.start)
+            DiagnosticsLog.log(
+                "playback",
+                String(
+                    format: "automatic skip kind=%@ start=%.3fs end=%.3fs observed=%.3fs",
+                    skip.kind.rawValue,
+                    skip.start,
+                    skip.end,
+                    time
+                )
+            )
             coordinator.player?.seek(to: skip.end)
             currentTime = skip.end
             if currentSkip != nil { withAnimation { currentSkip = nil } }

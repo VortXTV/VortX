@@ -3676,6 +3676,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             byteLength: endByte - segStartByte,
             start: startSec,
             duration: duration)
+        if idx == 0 {
+            VXProbe.log(
+                "dv",
+                "hls first segment sourceStart=\(String(format: "%.3f", startSec))s "
+                    + "duration=\(String(format: "%.3f", duration))s "
+                    + "resumeSeek=\(originSeekApplied ? 1 : 0)")
+        }
         guard let videoDuration = DVPlaybackPolicy.renderedDurationMilliseconds(
             of: VortXHLSWindow(segments: [videoSegment])) else {
             buffer.fail("video segment duration could not be rendered")
