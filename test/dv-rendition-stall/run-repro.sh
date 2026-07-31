@@ -268,7 +268,8 @@ echo ""
 SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
 
 test/dv-rendition-stall/make-fixture.sh "${FIXTURE_SECONDS:-240}"
-for fixture in fixture-multiaudio.mkv fixture-mixedcodec.mkv fixture-manyaudio.mkv; do
+for fixture in fixture-multiaudio.mkv fixture-mixedcodec.mkv fixture-manyaudio.mkv \
+  fixture-shifted-timeline.mkv fixture-shifted-early-audio.mkv fixture-shifted-nodts.mkv; do
   [ -s "/tmp/dd-dvstall/fixtures/$fixture" ] \
     || infra "fixture generation completed without a readable /tmp/dd-dvstall/fixtures/$fixture."
 done
@@ -326,6 +327,7 @@ xcrun swiftc -sdk "$SDK_PATH" \
   app/Sources/Player/VortXMKVRemuxStream.swift \
   app/SourcesShared/VortXEngineHostPolicy.swift \
   app/Sources/Player/VortXHostedResponse.swift \
+  app/Sources/Player/VortXHLSSeekAnchorState.swift \
   app/Sources/Player/VortXRemuxHLSServer.swift \
   "${ENGINE_TRANSACTION_SOURCES[@]+"${ENGINE_TRANSACTION_SOURCES[@]}"}" \
   test/dv-rendition-stall/main.swift

@@ -362,9 +362,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             forwardKeyframe: forward)
     }
 
-    /// Remux-thread-only resume state. A successful input seek must establish its shift from a mapped base-video
-    /// packet before any buffered packet is processed, so early audio/subtitle arrivals cannot choose the clock.
+    /// Remux-thread-only resume state. This block also holds the separate fresh-HLS packet shift. A successful
+    /// input seek and a fresh HLS mount both establish one shift from a mapped base-video packet before any
+    /// buffered packet is processed, so early audio/subtitle arrivals cannot choose their own clocks. Fresh
+    /// mounts keep the published source origin at zero.
     private var originSeekApplied = false
+    private var freshTimelineRebaseActive = false
+    private var freshPrimaryAudioStartLogged = false
     private var originShiftUsec: Int64 = 0
     private var originShiftLatched = false
     /// Source second represented by produced player clock zero. Written once on the remux thread and read by
@@ -871,17 +875,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
     // MARK: - Remux loop (background thread)
 
-    /// Establish the resume clock from the first timestamped, mapped BASE-VIDEO packet after the input seek.
-    /// Audio, subtitles, attachments, and an unmapped enhancement-layer packet may arrive first, but none can
-    /// define the timeline shared by the video segmenter and player chrome.
-    private func establishTimelineOrigin(
+    private var timelineRebaseRequired: Bool {
+        originSeekApplied || freshTimelineRebaseActive
+    }
+
+    /// Establish one shared output shift from the first timestamped, mapped BASE-VIDEO packet. Audio, subtitles,
+    /// attachments, and an unmapped enhancement-layer packet may arrive first, but none can define the timeline.
+    private func establishTimelineShift(
         from packet: UnsafeMutablePointer<AVPacket>,
         timeBase: AVRational,
         packetStreamIndex: Int,
         baseVideoStreamIndex: Int,
         isMapped: Bool
     ) {
-        guard originSeekApplied, !originShiftLatched,
+        guard timelineRebaseRequired, !originShiftLatched,
               RemuxResumePolicy.canEstablishOrigin(
                 packetStreamIndex: packetStreamIndex,
                 baseVideoStreamIndex: baseVideoStreamIndex,
@@ -895,7 +902,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // from-the-head mux sees (dts from zero, pts at or above it). The first pts-only packet is kept as a
         // FALLBACK origin for sources that never deliver a dts inside the bounded pre-scan.
         if packet.pointee.dts != AV_NOPTS_VALUE_CONST {
-            latchOrigin(timestamp: packet.pointee.dts, timeBase: timeBase, basis: "dts")
+            latchTimelineShift(timestamp: packet.pointee.dts, timeBase: timeBase, basis: "dts")
         } else if packet.pointee.pts != AV_NOPTS_VALUE_CONST, originPtsFallbackUsec == nil {
             originPtsFallbackUsec = max(0, av_rescale_q(packet.pointee.pts, timeBase, Self.avTimeBaseQ))
         }
@@ -904,41 +911,75 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// First pts-only origin candidate observed while waiting for a dts-carrying base-video packet.
     private var originPtsFallbackUsec: Int64?
 
-    private func latchOrigin(timestamp: Int64, timeBase: AVRational, basis: String) {
+    private func latchTimelineShift(timestamp: Int64, timeBase: AVRational, basis: String) {
         originShiftUsec = max(0, av_rescale_q(timestamp, timeBase, Self.avTimeBaseQ))
         originShiftLatched = true
-        let origin = Double(originShiftUsec) / Double(Self.avTimeBase)
-        hlsLock.lock(); _timelineOriginSeconds = origin; hlsLock.unlock()
-        VXProbe.log(
-            "dv",
-            "resume: base-video timeline origin \(String(format: "%.3f", origin))s [\(basis)] (asked \(Int(requestedOriginSeconds))s)")
+        let shift = Double(originShiftUsec) / Double(Self.avTimeBase)
+        let publishedOrigin = originSeekApplied ? shift : 0
+        hlsLock.lock(); _timelineOriginSeconds = publishedOrigin; hlsLock.unlock()
+        if originSeekApplied {
+            VXProbe.log(
+                "dv",
+                "resume: base-video timeline origin \(String(format: "%.3f", shift))s [\(basis)] (asked \(Int(requestedOriginSeconds))s)")
+        } else {
+            VXProbe.log(
+                "dv",
+                "fresh: base-video timeline shift \(String(format: "%.3f", shift))s [\(basis)]")
+        }
     }
 
     /// End-of-pre-scan fallback: no dts-carrying base-video packet arrived inside the bounded scan, so the
     /// first pts-only candidate becomes the origin (the pre-fix behavior, correct for containers that carry
     /// no reordering). Returns whether ANY origin could be latched.
-    private func latchOriginFromFallbackIfNeeded() -> Bool {
-        guard originSeekApplied else { return true }
+    private func latchTimelineShiftFromFallbackIfNeeded() -> Bool {
+        guard timelineRebaseRequired else { return true }
         if originShiftLatched { return true }
         guard let fallback = originPtsFallbackUsec else { return false }
         originShiftUsec = fallback
         originShiftLatched = true
-        let origin = Double(originShiftUsec) / Double(Self.avTimeBase)
-        hlsLock.lock(); _timelineOriginSeconds = origin; hlsLock.unlock()
-        VXProbe.log(
-            "dv",
-            "resume: base-video timeline origin \(String(format: "%.3f", origin))s [pts fallback] (asked \(Int(requestedOriginSeconds))s)")
+        let shift = Double(originShiftUsec) / Double(Self.avTimeBase)
+        let publishedOrigin = originSeekApplied ? shift : 0
+        hlsLock.lock(); _timelineOriginSeconds = publishedOrigin; hlsLock.unlock()
+        if originSeekApplied {
+            VXProbe.log(
+                "dv",
+                "resume: base-video timeline origin \(String(format: "%.3f", shift))s [pts fallback] (asked \(Int(requestedOriginSeconds))s)")
+        } else {
+            VXProbe.log(
+                "dv",
+                "fresh: base-video timeline shift \(String(format: "%.3f", shift))s [pts fallback]")
+        }
         return true
     }
 
     /// Shift one packet by the already-established base-video origin. This runs before subtitle settlement,
     /// alternate-audio alignment, segment cutting, transcoding, or mux timestamp rescaling, so every consumer
     /// sees the same zero-based produced timeline and cross-rendition sync is preserved.
-    private func rebaseFromOrigin(_ packet: UnsafeMutablePointer<AVPacket>, timeBase: AVRational) {
-        guard originSeekApplied, originShiftLatched else { return }
+    private func rebaseFromTimelineShift(_ packet: UnsafeMutablePointer<AVPacket>, timeBase: AVRational) {
+        guard timelineRebaseRequired, originShiftLatched else { return }
         let shift = av_rescale_q(originShiftUsec, Self.avTimeBaseQ, timeBase)
         if packet.pointee.pts != AV_NOPTS_VALUE_CONST { packet.pointee.pts -= shift }
         if packet.pointee.dts != AV_NOPTS_VALUE_CONST { packet.pointee.dts -= shift }
+    }
+
+    /// One numeric receipt proves the shared shift reached primary audio unchanged. It intentionally carries no
+    /// source identifier, URL, title, or track label.
+    private func logFreshPrimaryAudioStartIfNeeded(
+        _ packet: UnsafeMutablePointer<AVPacket>,
+        timeBase: AVRational,
+        packetStreamIndex: Int,
+        primaryAudioStreamIndex: Int
+    ) {
+        guard freshTimelineRebaseActive, !freshPrimaryAudioStartLogged,
+              packetStreamIndex == primaryAudioStreamIndex else { return }
+        let timestamp = packet.pointee.dts != AV_NOPTS_VALUE_CONST
+            ? packet.pointee.dts : packet.pointee.pts
+        guard timestamp != AV_NOPTS_VALUE_CONST else { return }
+        freshPrimaryAudioStartLogged = true
+        let seconds = Double(timestamp) * Double(timeBase.num) / Double(timeBase.den)
+        VXProbe.log(
+            "dv",
+            "fresh: primary-audio first timestamp \(String(format: "%.3f", seconds))s after shared shift")
     }
 
     /// Allocate an input AVFormatContext with the F1 interrupt callback installed, so a blocking network
@@ -1767,6 +1808,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             }
         }
 
+        // A fresh HLS mount still needs a zero-based produced timeline when its container starts at a positive
+        // timestamp. This mode does not seek and never changes the published source origin. It only causes the
+        // bounded pre-scan to derive one base-video shift shared by every mapped packet.
+        freshTimelineRebaseActive =
+            hlsIndexingEnabled && requestedOriginSeconds == 0 && baseVideoIn >= 0
+
         // Profile 5 / 8.x are single-layer and stream-copy straight through (pure re-wrap, RPU untouched).
         // Profile 7 (BL+EL, ~every UHD-BluRay DV rip) has no VideoToolbox dual-layer decode, so we CONVERT its
         // RPU to Profile 8.1 and drop the EL (see the mux loop). A stream with no DOVI config (the filename
@@ -1789,7 +1836,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // runs ONLY for the HEVC extradata repair (`!hvc1Check.eligible`); an H.264 or clean-extradata HEVC
         // plain source reads zero extra packets. `.dolbyVision` mode keeps the exact original condition.
         if baseVideoIn >= 0,
-           originSeekApplied || (mode == .dolbyVision && info.dvProfile < 0) || !hvc1Check.eligible {
+           timelineRebaseRequired || (mode == .dolbyVision && info.dvProfile < 0) || !hvc1Check.eligible {
             let scanNalLen = Self.hevcNalLengthSize(inCtx.pointee.streams[baseVideoIn]?.pointee.codecpar)
             let maxScan = 240   // well within probesize; caps memory + reads if the base-video packet is late/absent
             var scanned = 0
@@ -1800,7 +1847,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 prebuffered.append(p)
                 if Int(p.pointee.stream_index) == baseVideoIn {
                     if let baseStream = inCtx.pointee.streams[baseVideoIn] {
-                        establishTimelineOrigin(
+                        establishTimelineShift(
                             from: p,
                             timeBase: baseStream.pointee.time_base,
                             packetStreamIndex: baseVideoIn,
@@ -1824,10 +1871,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     if !hvc1Check.eligible {
                         hvc1Harvest = Self.harvestParameterSets(p, nalLengthSize: scanNalLen)
                     }
-                    // The first base packet normally decides every pre-scan need. A resumed source may hand
-                    // out a timestamp-less packet first; keep buffering until a timestamped base packet can
-                    // establish the shared origin, bounded by maxScan like the existing DV/hvc1 probe.
-                    if !originSeekApplied || originShiftLatched { break }
+                    // A timestamp-less first base packet cannot establish either the fresh or resume shift.
+                    // Keep buffering until a real DTS arrives, bounded by maxScan like the DV/hvc1 probe.
+                    if !timelineRebaseRequired || originShiftLatched { break }
                 }
             }
         }
@@ -1842,8 +1888,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             buffer.fail(mismatch)
             return
         }
-        if !latchOriginFromFallbackIfNeeded() {
-            buffer.fail("resume input seek produced no timestamped base-video packet")
+        if !latchTimelineShiftFromFallbackIfNeeded() {
+            buffer.fail(originSeekApplied
+                ? "resume input seek produced no timestamped base-video packet"
+                : "fresh input produced no timestamped base-video packet")
             return
         }
         // RESUME LEADING-DTS REPAIR: after the seek, the demuxer's per-stream dts generation restarts, so the
@@ -1879,7 +1927,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                         - Int64(dtsLess.count - index) * frameTicks
                 }
                 let floorTicks = firstRealDts - Int64(dtsLess.count) * frameTicks
-                latchOrigin(timestamp: floorTicks, timeBase: tb, basis: "dts-ramp floor k=\(dtsLess.count)")
+                latchTimelineShift(
+                    timestamp: floorTicks,
+                    timeBase: tb,
+                    basis: "dts-ramp floor k=\(dtsLess.count)")
             }
         }
 
@@ -2227,7 +2278,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             defer { var pp: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&pp) }
             let inIdx = Int(p.pointee.stream_index)
             if inIdx >= 0, inIdx < nb, let inputStream = inCtx.pointee.streams[inIdx] {
-                rebaseFromOrigin(p, timeBase: inputStream.pointee.time_base)
+                rebaseFromTimelineShift(p, timeBase: inputStream.pointee.time_base)
+                logFreshPrimaryAudioStartIfNeeded(
+                    p,
+                    timeBase: inputStream.pointee.time_base,
+                    packetStreamIndex: inIdx,
+                    primaryAudioStreamIndex: mappedAudioIn)
                 observeSubtitleWatermark(packet: p, stream: inputStream)
                 if collectSubtitlePacket(packet: p, inputStream: inputStream, inIdx: inIdx) { continue }
                 if inIdx == alternateAudioIn {
@@ -2340,7 +2396,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             readRetries = 0   // a successful read resets the streak
             let inIdx = Int(pkt.pointee.stream_index)
             if inIdx >= 0, inIdx < nb, let inputStream = inCtx.pointee.streams[inIdx] {
-                rebaseFromOrigin(pkt, timeBase: inputStream.pointee.time_base)
+                rebaseFromTimelineShift(pkt, timeBase: inputStream.pointee.time_base)
+                logFreshPrimaryAudioStartIfNeeded(
+                    pkt,
+                    timeBase: inputStream.pointee.time_base,
+                    packetStreamIndex: inIdx,
+                    primaryAudioStreamIndex: mappedAudioIn)
                 observeSubtitleWatermark(packet: pkt, stream: inputStream)
                 if collectSubtitlePacket(packet: pkt, inputStream: inputStream, inIdx: inIdx) {
                     av_packet_unref(pkt)

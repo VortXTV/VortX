@@ -16,6 +16,23 @@ import AVFoundation
 import Darwin
 #endif
 
+// Standalone harness shapes for app-wide settings and diagnostics that the production remux reads.
+// Keep these deliberately narrow so the executable still compiles the real remux implementation.
+struct TrackPreferences {
+    let audioLanguages: [String]
+    let subtitleLanguages: [String]
+    let rejectTerms: [String]
+
+    static let current = TrackPreferences(
+        audioLanguages: ["en"],
+        subtitleLanguages: ["en"],
+        rejectTerms: ["commentary", "sdh"])
+}
+
+extension VXProbe {
+    static var enabled: Bool { true }
+}
+
 // Golden init segments for FFmpeg-pin byte comparisons. VortX hand-parses and rewrites these boxes,
 // so their shape is a dependency on the pinned FFmpeg rather than an opaque implementation detail.
 let initDumpDir = "/tmp/dd-dvstall/init-golden"
@@ -309,6 +326,35 @@ func segmentURIs(_ playlist: String) -> [String] {
     playlist.split(separator: "\n").map(String.init).filter { !$0.hasPrefix("#") && !$0.isEmpty }
 }
 
+func firstSegmentSourceStart(in lines: ArraySlice<String>) -> Double? {
+    let marker = "hls first segment sourceStart="
+    guard let line = lines.first(where: { $0.contains(marker) }),
+          let markerRange = line.range(of: marker) else { return nil }
+    let tail = line[markerRange.upperBound...]
+    guard let secondsEnd = tail.firstIndex(of: "s") else { return nil }
+    return Double(tail[..<secondsEnd])
+}
+
+func firstPrimaryAudioStart(in lines: ArraySlice<String>) -> Double? {
+    let marker = "fresh: primary-audio first timestamp "
+    guard let line = lines.first(where: { $0.contains(marker) }),
+          let markerRange = line.range(of: marker) else { return nil }
+    let tail = line[markerRange.upperBound...]
+    guard let secondsEnd = tail.firstIndex(of: "s") else { return nil }
+    return Double(tail[..<secondsEnd])
+}
+
+func firstWebVTTCueStart(in document: String) -> Double? {
+    guard let line = document.split(separator: "\n").first(where: { $0.contains("-->") }),
+          let stamp = line.split(separator: " ").first else { return nil }
+    let fields = stamp.split(separator: ":")
+    guard fields.count == 3,
+          let hours = Double(fields[0]),
+          let minutes = Double(fields[1]),
+          let seconds = Double(fields[2]) else { return nil }
+    return hours * 3_600 + minutes * 60 + seconds
+}
+
 var redCount = 0
 func check(_ name: String, red: Bool, detail: String) {
     print("\(red ? "REPRO-RED " : "REPRO-GREEN") \(name) :: \(detail)")
@@ -330,11 +376,19 @@ struct ScenarioResult {
     var producedAtEnd = 0
     var segmentsAtEnd = 0
     var producerFrozeWhileHealthy = false
+    var timelineOriginSeconds = 0.0
+    var firstSegmentSourceStartSeconds: Double?
+    var firstPrimaryAudioStartSeconds: Double?
+    var usedFreshPTSFallback = false
+    var videoTimelineProof: VortXFMP4FragmentParser.TrackTimelineProof?
+    var audioTimelineProof: VortXFMP4FragmentParser.TrackTimelineProof?
+    var firstSubtitleCueStartSeconds: Double?
 }
 
 func runScenario(name: String, fixture: String, startAt: Double,
                  consumeSeconds: Double) -> ScenarioResult {
     print("=== SCENARIO \(name) fixture=\(fixture) startAt=\(Int(startAt))s ===")
+    let diagnosticOffset = DiagnosticsLog.capturedLines().count
     var result = ScenarioResult()
     let input = URL(fileURLWithPath: "\(fixtureDir)/\(fixture)")
     guard FileManager.default.fileExists(atPath: input.path) else {
@@ -372,13 +426,34 @@ func runScenario(name: String, fixture: String, startAt: Double,
 
         let initSegment = fetch(base, "/init.mp4")
         dumpInitSegment(initSegment.body, scenario: name, variant: "init")
-        let initHDR = fetch(base, "/init-hdr.mp4")
-        if initHDR.status == 200 {
-            dumpInitSegment(initHDR.body, scenario: name, variant: "init-hdr")
-        }
-        for uri in segs.prefix(3) { _ = fetch(base, "/" + uri) }
+        // The simulated client has the master, media playlist, and primary init at this point. Mark it ready
+        // before probing an optional alternate init so a missing variant cannot trip the mount watchdog.
         server.markEngineReady()
-
+        if server.supportsHDRFallback {
+            let initHDR = fetch(base, "/init-hdr.mp4")
+            if initHDR.status == 200 {
+                dumpInitSegment(initHDR.body, scenario: name, variant: "init-hdr")
+            }
+        }
+        var firstMedia = Data()
+        for (index, uri) in segs.prefix(3).enumerated() {
+            let media = fetch(base, "/" + uri)
+            if index == 0, media.status == 200 { firstMedia = media.body }
+        }
+        if initSegment.status == 200, !firstMedia.isEmpty {
+            if let videoTrackID = VortXFMP4FragmentParser.videoTrackID(inInit: initSegment.body) {
+                result.videoTimelineProof = VortXFMP4FragmentParser.trackTimelineProof(
+                    inInit: initSegment.body,
+                    firstMedia: firstMedia,
+                    trackID: videoTrackID)
+            }
+            if let audioTrackID = VortXFMP4FragmentParser.audioTrackID(inInit: initSegment.body) {
+                result.audioTimelineProof = VortXFMP4FragmentParser.trackTimelineProof(
+                    inInit: initSegment.body,
+                    firstMedia: firstMedia,
+                    trackID: audioTrackID)
+            }
+        }
         // Audio rendition routes.
         for line in result.masterBody.split(separator: "\n")
             where line.hasPrefix("#EXT-X-MEDIA:TYPE=AUDIO") && line.contains("URI=") {
@@ -412,7 +487,12 @@ func runScenario(name: String, fixture: String, startAt: Double,
                 let vtt = fetch(base, "/" + suri, timeout: 10)
                 let text = String(decoding: vtt.body, as: UTF8.self)
                 result.totalVTTs += 1
-                if text.contains("-->") { result.nonEmptyVTTs += 1 }
+                if text.contains("-->") {
+                    result.nonEmptyVTTs += 1
+                    if result.firstSubtitleCueStartSeconds == nil {
+                        result.firstSubtitleCueStartSeconds = firstWebVTTCueStart(in: text)
+                    }
+                }
             }
             break   // rendition 0 is enough for the cue-presence check
         }
@@ -462,6 +542,13 @@ func runScenario(name: String, fixture: String, startAt: Double,
         if progress.failed { result.remuxFailedDuringRun = true }
     }
 
+    result.timelineOriginSeconds = server.timelineOriginSeconds
+    let scenarioDiagnostics = DiagnosticsLog.capturedLines().dropFirst(diagnosticOffset)
+    result.firstSegmentSourceStartSeconds = firstSegmentSourceStart(in: scenarioDiagnostics)
+    result.firstPrimaryAudioStartSeconds = firstPrimaryAudioStart(in: scenarioDiagnostics)
+    result.usedFreshPTSFallback = scenarioDiagnostics.contains {
+        $0.contains("fresh: base-video timeline shift") && $0.contains("[pts fallback]")
+    }
     server.invalidate()
     Thread.sleep(forTimeInterval: 0.5)
     return result
@@ -1124,10 +1211,141 @@ private func engineTransactionRollbackScenario(
 // Iteration affordance ONLY: `ONLY_SELECTION=1` runs just the selection gate while that gate is being
 // developed. Every reported run is a full run (the variable is unset), and the summary states which it was.
 let onlySelection = ProcessInfo.processInfo.environment["ONLY_SELECTION"] == "1"
+// Focused red-before / green-after affordance for the nonzero fresh-source clock. The full reported gate leaves
+// this unset; keeping the focused run short makes it practical to prove the regression before changing production.
+let onlyFreshTimeline = ProcessInfo.processInfo.environment["ONLY_FRESH_TIMELINE"] == "1"
 // ~2.6x the fixture's real-time byte rate: the producer leads the player modestly, the field shape.
 let pacedRate = 400_000
 
 if !onlySelection {
+
+// --- Scenario 0: ordinary play whose source clock begins at 5.000 s ---
+let shifted = runScenario(
+    name: "fresh-shifted-timeline",
+    fixture: "fixture-shifted-timeline.mkv",
+    startAt: 0,
+    consumeSeconds: 6)
+let shiftedVideoStart = shifted.videoTimelineProof?.effectiveStartSeconds
+let shiftedAudioStart = shifted.audioTimelineProof?.effectiveStartSeconds
+check("fresh shifted timeline: master served and remux stayed healthy",
+      red: shifted.masterStatus != 200 || shifted.remuxFailedDuringRun,
+      detail: "status=\(shifted.masterStatus) failed=\(shifted.remuxFailedDuringRun)")
+check("fresh shifted timeline: player clock zero still means title zero",
+      red: abs(shifted.timelineOriginSeconds) > 0.000_001,
+      detail: String(format: "reported origin=%.3fs", shifted.timelineOriginSeconds))
+check("fresh shifted timeline: first logical video segment starts at zero",
+      red: abs(shifted.firstSegmentSourceStartSeconds ?? .infinity) > 0.001,
+      detail: String(format: "logical start=%.3fs",
+                     shifted.firstSegmentSourceStartSeconds ?? .infinity))
+check("fresh shifted timeline: video timeline proof exists",
+      red: shifted.videoTimelineProof == nil,
+      detail: "proof=\(String(describing: shifted.videoTimelineProof))")
+check("fresh shifted timeline: video has no positive leading empty edit",
+      red: (shifted.videoTimelineProof?.leadingEmptyEditDuration ?? UInt64.max) != 0,
+      detail: String(format: "empty edit=%.3fs",
+                     shifted.videoTimelineProof?.leadingEmptyEditSeconds ?? .infinity))
+check("fresh shifted timeline: first video tfdt is zero",
+      red: (shifted.videoTimelineProof?.firstBaseDecodeTime ?? UInt64.max) != 0,
+      detail: String(format: "tfdt=%.3fs",
+                     shifted.videoTimelineProof?.firstBaseDecodeSeconds ?? .infinity))
+check("fresh shifted timeline: effective video presentation starts at zero",
+      red: abs(shiftedVideoStart ?? .infinity) > 0.001,
+      detail: String(format: "effective start=%.3fs", shiftedVideoStart ?? .infinity))
+check("fresh shifted timeline: one shared shift preserves the 250ms primary-audio offset",
+      red: abs((shiftedAudioStart ?? .infinity) - (shiftedVideoStart ?? 0) - 0.250) > 0.010
+          || abs((shifted.firstPrimaryAudioStartSeconds ?? .infinity) - 0.250) > 0.010,
+      detail: String(
+        format: "video=%.3fs audio=%.3fs delta=%.3fs packet=%.3fs",
+        shiftedVideoStart ?? .infinity,
+        shiftedAudioStart ?? .infinity,
+        (shiftedAudioStart ?? .infinity) - (shiftedVideoStart ?? 0),
+        shifted.firstPrimaryAudioStartSeconds ?? .infinity))
+check("fresh shifted timeline: subtitle cue remains aligned with video zero",
+      red: abs(shifted.firstSubtitleCueStartSeconds ?? .infinity) > 0.001,
+      detail: String(format: "first cue=%.3fs",
+                     shifted.firstSubtitleCueStartSeconds ?? .infinity))
+
+// --- Scenario 0b: the selected audio begins before the base video ---
+let earlyAudio = runScenario(
+    name: "fresh-shifted-early-audio",
+    fixture: "fixture-shifted-early-audio.mkv",
+    startAt: 0,
+    consumeSeconds: 2)
+let earlyVideoStart = earlyAudio.videoTimelineProof?.effectiveStartSeconds
+let earlyAudioStart = earlyAudio.audioTimelineProof?.effectiveStartSeconds
+check("fresh early-audio timeline: remux stays healthy",
+      red: earlyAudio.masterStatus != 200 || earlyAudio.remuxFailedDuringRun,
+      detail: "status=\(earlyAudio.masterStatus) failed=\(earlyAudio.remuxFailedDuringRun)")
+check("fresh early-audio timeline: server origin remains title zero",
+      red: abs(earlyAudio.timelineOriginSeconds) > 0.000_001,
+      detail: String(format: "reported origin=%.3fs", earlyAudio.timelineOriginSeconds))
+check("fresh early-audio timeline: base video still starts at zero",
+      red: abs(earlyVideoStart ?? .infinity) > 0.001
+          || abs(earlyAudio.firstSegmentSourceStartSeconds ?? .infinity) > 0.001,
+      detail: String(
+        format: "logical=%.3fs video=%.3fs",
+        earlyAudio.firstSegmentSourceStartSeconds ?? .infinity,
+        earlyVideoStart ?? .infinity))
+check("fresh early-audio timeline: mux does not create a positive audio edit",
+      red: (earlyAudio.audioTimelineProof?.leadingEmptyEditDuration ?? UInt64.max) != 0
+          || abs((earlyAudio.firstPrimaryAudioStartSeconds ?? .infinity) + 0.250) > 0.010,
+      detail: String(
+        format: "audio start=%.3fs emptyEdit=%.3fs packet=%.3fs",
+        earlyAudioStart ?? .infinity,
+        earlyAudio.audioTimelineProof?.leadingEmptyEditSeconds ?? .infinity,
+        earlyAudio.firstPrimaryAudioStartSeconds ?? .infinity))
+
+// --- Scenario 0c: a source with no base-video DTS uses the bounded PTS fallback ---
+let noDTS = runScenario(
+    name: "fresh-shifted-nodts",
+    fixture: "fixture-shifted-nodts.mkv",
+    startAt: 0,
+    consumeSeconds: 0)
+check("fresh no-DTS timeline: PTS fallback is exercised and stays healthy",
+      red: !noDTS.usedFreshPTSFallback
+          || noDTS.masterStatus != 200
+          || noDTS.remuxFailedDuringRun,
+      detail: "fallback=\(noDTS.usedFreshPTSFallback) status=\(noDTS.masterStatus) failed=\(noDTS.remuxFailedDuringRun)")
+check("fresh no-DTS timeline: fallback still publishes video zero",
+      red: abs(noDTS.timelineOriginSeconds) > 0.000_001
+          || abs(noDTS.firstSegmentSourceStartSeconds ?? .infinity) > 0.001
+          || abs(noDTS.videoTimelineProof?.effectiveStartSeconds ?? .infinity) > 0.001,
+      detail: String(
+        format: "origin=%.3fs logical=%.3fs video=%.3fs",
+        noDTS.timelineOriginSeconds,
+        noDTS.firstSegmentSourceStartSeconds ?? .infinity,
+        noDTS.videoTimelineProof?.effectiveStartSeconds ?? .infinity))
+
+// --- Scenario 0d: ordinary zero-based input remains byte-timeline compatible ---
+let ordinaryZero = runScenario(
+    name: "fresh-zero-control",
+    fixture: "fixture-multiaudio.mkv",
+    startAt: 0,
+    consumeSeconds: 2)
+check("fresh zero control: remux stays healthy at timeline zero",
+      red: ordinaryZero.masterStatus != 200 || ordinaryZero.remuxFailedDuringRun,
+      detail: "status=\(ordinaryZero.masterStatus) failed=\(ordinaryZero.remuxFailedDuringRun)")
+check("fresh zero control: public and produced video clocks remain zero",
+      red: abs(ordinaryZero.timelineOriginSeconds) > 0.000_001
+          || abs(ordinaryZero.firstSegmentSourceStartSeconds ?? .infinity) > 0.001
+          || abs(ordinaryZero.videoTimelineProof?.effectiveStartSeconds ?? .infinity) > 0.001,
+      detail: String(
+        format: "origin=%.3fs logical=%.3fs video=%.3fs",
+        ordinaryZero.timelineOriginSeconds,
+        ordinaryZero.firstSegmentSourceStartSeconds ?? .infinity,
+        ordinaryZero.videoTimelineProof?.effectiveStartSeconds ?? .infinity))
+check("fresh zero control: no edit or fragment offset is introduced",
+      red: (ordinaryZero.videoTimelineProof?.leadingEmptyEditDuration ?? UInt64.max) != 0
+          || (ordinaryZero.videoTimelineProof?.firstBaseDecodeTime ?? UInt64.max) != 0,
+      detail: String(
+        format: "emptyEdit=%.3fs tfdt=%.3fs",
+        ordinaryZero.videoTimelineProof?.leadingEmptyEditSeconds ?? .infinity,
+        ordinaryZero.videoTimelineProof?.firstBaseDecodeSeconds ?? .infinity))
+
+if onlyFreshTimeline {
+    print("=== REPRO SUMMARY: \(redCount) RED (FRESH TIMELINE GATE ONLY) ===")
+    exit(Int32(min(redCount, 125)))
+}
 
 // --- Scenario 1: fresh play, same-codec alternate + 2 text subs ---
 let fresh = runScenario(name: "fresh-multiaudio", fixture: "fixture-multiaudio.mkv",

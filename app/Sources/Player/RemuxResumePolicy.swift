@@ -58,8 +58,9 @@ enum RemuxResumePolicy {
     /// microsecond timestamp many orders of magnitude below `Int64.max`.
     static let maximumResumeSeconds: Double = 7.0 * 24 * 60 * 60
 
-    /// The source second the remux should begin producing at, or 0 for "start at the beginning" (which
-    /// reproduces today's behavior byte for byte, because 0 disables the input seek AND the packet rebase).
+    /// The source second the remux should begin producing at, or 0 for "start at the beginning." Zero disables
+    /// the resume input seek and keeps the public source origin at zero. A fresh HLS mount may still subtract a
+    /// positive container timestamp from all tracks so its produced presentation begins at title zero.
     ///
     /// Returns 0 rather than the raw value for anything not worth or not safe to act on: a non-finite value, a
     /// negative one, or a position inside the trivial floor.

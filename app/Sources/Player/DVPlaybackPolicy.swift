@@ -761,12 +761,81 @@ enum VortXFMP4FragmentParser {
         let firstSampleBytes: Data
     }
 
+    /// Presentation-clock proof for one track across the delayed init and its first media fragment.
+    ///
+    /// `tfdt == 0` alone does not prove a fresh item begins at zero. movenc can also write a positive leading
+    /// empty edit into `elst`, which makes AVFoundation expose the original source offset while the fragment's
+    /// decode clock still starts at zero. Keeping both witnesses in one proof prevents that false green.
+    struct TrackTimelineProof: Equatable, Sendable {
+        let movieTimescale: UInt32
+        let mediaTimescale: UInt32
+        let leadingEmptyEditDuration: UInt64
+        let firstBaseDecodeTime: UInt64
+
+        var leadingEmptyEditSeconds: Double {
+            Double(leadingEmptyEditDuration) / Double(movieTimescale)
+        }
+
+        var firstBaseDecodeSeconds: Double {
+            Double(firstBaseDecodeTime) / Double(mediaTimescale)
+        }
+
+        var effectiveStartSeconds: Double {
+            leadingEmptyEditSeconds + firstBaseDecodeSeconds
+        }
+    }
+
     static func videoTrackID(inInit data: Data) -> UInt32? {
         mediaTrackID(inInit: data, handlerType: "vide")
     }
 
     static func audioTrackID(inInit data: Data) -> UInt32? {
         mediaTrackID(inInit: data, handlerType: "soun")
+    }
+
+    static func trackTimelineProof(inInit initData: Data,
+                                   firstMedia: Data,
+                                   trackID: UInt32) -> TrackTimelineProof? {
+        guard trackID != 0,
+              let top = boxes(in: initData, range: initData.startIndex..<initData.endIndex),
+              top.filter({ $0.type == "moov" }).count == 1,
+              let moov = top.first(where: { $0.type == "moov" }),
+              let moovChildren = boxes(in: initData, range: moov.payload),
+              let mvhd = moovChildren.first(where: { $0.type == "mvhd" }),
+              let movieTimescale = timescale(inFullHeader: mvhd, data: initData) else { return nil }
+
+        var selectedTrack: Box?
+        for trak in moovChildren where trak.type == "trak" {
+            guard let trakChildren = boxes(in: initData, range: trak.payload),
+                  let tkhd = trakChildren.first(where: { $0.type == "tkhd" }),
+                  let candidateID = Self.trackID(inTKHD: tkhd, data: initData) else { return nil }
+            guard candidateID == trackID else { continue }
+            guard selectedTrack == nil else { return nil }
+            selectedTrack = trak
+        }
+        guard let selectedTrack,
+              let trakChildren = boxes(in: initData, range: selectedTrack.payload),
+              let mdia = trakChildren.first(where: { $0.type == "mdia" }),
+              let mdiaChildren = boxes(in: initData, range: mdia.payload),
+              let mdhd = mdiaChildren.first(where: { $0.type == "mdhd" }),
+              let mediaTimescale = timescale(inFullHeader: mdhd, data: initData) else { return nil }
+
+        let emptyEditDuration: UInt64
+        if let edts = trakChildren.first(where: { $0.type == "edts" }) {
+            guard let parsed = leadingEmptyEditDuration(in: edts, data: initData) else { return nil }
+            emptyEditDuration = parsed
+        } else {
+            emptyEditDuration = 0
+        }
+        guard let firstBaseDecodeTime = firstBaseDecodeTime(
+            in: firstMedia,
+            trackID: trackID
+        ) else { return nil }
+        return TrackTimelineProof(
+            movieTimescale: movieTimescale,
+            mediaTimescale: mediaTimescale,
+            leadingEmptyEditDuration: emptyEditDuration,
+            firstBaseDecodeTime: firstBaseDecodeTime)
     }
 
     static func videoSampleFormat(inInit data: Data, trackID: UInt32) -> VideoSampleFormat? {
@@ -996,6 +1065,70 @@ enum VortXFMP4FragmentParser {
         guard start + 4 <= tkhd.payload.upperBound else { return nil }
         let value = be32(data, start)
         return value == 0 ? nil : value
+    }
+
+    private static func timescale(inFullHeader box: Box, data: Data) -> UInt32? {
+        guard box.payload.count >= 1 else { return nil }
+        let offset: Int
+        switch data[box.payload.lowerBound] {
+        case 0: offset = 12
+        case 1: offset = 20
+        default: return nil
+        }
+        let start = box.payload.lowerBound + offset
+        guard start + 4 <= box.payload.upperBound else { return nil }
+        let value = be32(data, start)
+        return value == 0 ? nil : value
+    }
+
+    private static func leadingEmptyEditDuration(in edts: Box, data: Data) -> UInt64? {
+        guard let children = boxes(in: data, range: edts.payload),
+              children.count == 1,
+              let elst = children.first,
+              elst.type == "elst",
+              elst.payload.count >= 8 else { return nil }
+        let version = data[elst.payload.lowerBound]
+        let entryCount = be32(data, elst.payload.lowerBound + 4)
+        guard entryCount > 0 else { return nil }
+        let first = elst.payload.lowerBound + 8
+        switch version {
+        case 0:
+            guard first + 12 <= elst.payload.upperBound else { return nil }
+            return be32(data, first + 4) == UInt32.max ? UInt64(be32(data, first)) : 0
+        case 1:
+            guard first + 20 <= elst.payload.upperBound else { return nil }
+            return be64(data, first + 8) == UInt64.max ? be64(data, first) : 0
+        default:
+            return nil
+        }
+    }
+
+    private static func firstBaseDecodeTime(in data: Data, trackID: UInt32) -> UInt64? {
+        guard let top = boxes(in: data, range: data.startIndex..<data.endIndex),
+              let moof = top.first(where: { $0.type == "moof" }),
+              let children = boxes(in: data, range: moof.payload) else { return nil }
+        var resolved: UInt64?
+        for traf in children where traf.type == "traf" {
+            guard let trafChildren = boxes(in: data, range: traf.payload),
+                  let tfhdBox = trafChildren.first(where: { $0.type == "tfhd" }),
+                  let tfhd = trackFragmentHeader(in: tfhdBox, data: data) else { return nil }
+            guard tfhd.trackID == trackID else { continue }
+            guard resolved == nil,
+                  let tfdt = trafChildren.first(where: { $0.type == "tfdt" }),
+                  tfdt.payload.count >= 1 else { return nil }
+            let start = tfdt.payload.lowerBound + 4
+            switch data[tfdt.payload.lowerBound] {
+            case 0:
+                guard tfdt.payload.count == 8 else { return nil }
+                resolved = UInt64(be32(data, start))
+            case 1:
+                guard tfdt.payload.count == 12 else { return nil }
+                resolved = be64(data, start)
+            default:
+                return nil
+            }
+        }
+        return resolved
     }
 
     private static func fragmentSummary(in data: Data,

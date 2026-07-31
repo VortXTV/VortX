@@ -99,4 +99,40 @@ if [ ! -f "$OUT/fixture-manyaudio.mkv" ]; then
     "$OUT/fixture-manyaudio.mkv"
 fi
 
+# Fixture D (fixture-shifted-timeline.mkv): the exact ordinary-play regression shape. The first video
+# presentation/decode clock is 5.000 s instead of zero, while every primary audio track starts 250 ms after
+# video. A correct fresh mount subtracts the ONE base-video origin from every mapped packet, producing video
+# clock zero while retaining the audio offset. Per-stream zeroing would hide the source offset and fail the
+# cross-track assertion.
+if [ ! -f "$OUT/fixture-shifted-timeline.mkv" ]; then
+  "$FFMPEG" -y -hide_banner -loglevel error \
+    -itsoffset 5 -i "$OUT/fixture-multiaudio.mkv" \
+    -itsoffset 5.255 -i "$OUT/fixture-multiaudio.mkv" \
+    -map 0:v:0 -map 1:a -map 0:s \
+    -c copy -copyts \
+    "$OUT/fixture-shifted-timeline.mkv"
+fi
+
+# Fixture E (fixture-shifted-early-audio.mkv): video starts at 5.000 s and its selected audio begins
+# 250 ms earlier. The fresh rebase must retain that negative cross-track offset without letting audio choose
+# the shift, clamping the audio independently, creating a positive audio edit, or failing the mux.
+if [ ! -f "$OUT/fixture-shifted-early-audio.mkv" ]; then
+  "$FFMPEG" -y -hide_banner -loglevel error \
+    -itsoffset 5 -i "$OUT/fixture-multiaudio.mkv" \
+    -itsoffset 4.755 -i "$OUT/fixture-multiaudio.mkv" \
+    -map 0:v:0 -map 1:a:0 -map 0:s \
+    -c copy -copyts \
+    "$OUT/fixture-shifted-early-audio.mkv"
+fi
+
+# Fixture F (fixture-shifted-nodts.mkv): one HEVC keyframe whose DTS is absent and whose PTS is 5.000 s.
+# It forces the bounded fresh pre-scan to use its PTS fallback instead of a later real DTS.
+if [ ! -f "$OUT/fixture-shifted-nodts.mkv" ]; then
+  "$FFMPEG" -y -hide_banner -loglevel error \
+    -itsoffset 5 -i "$OUT/fixture-multiaudio.mkv" \
+    -map 0:v:0 -map 0:a:0 -frames:v 1 \
+    -c copy -copyts \
+    "$OUT/fixture-shifted-nodts.mkv"
+fi
+
 ls -la "$OUT"
