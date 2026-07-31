@@ -4115,7 +4115,7 @@ final class VortXSpoolResponsePump: @unchecked Sendable {
     private var terminated = false
 
     init?(lease: VortXHLSSessionSpool.ResourceLease, chunkSize: Int) {
-        guard chunkSize > 0 else { return nil }
+        guard chunkSize > 0 else { lease.close(); return nil }
         do {
             let first = try lease.read(maxLength: min(chunkSize, lease.length))
             guard !first.isEmpty else { lease.close(); return nil }

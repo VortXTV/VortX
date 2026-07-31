@@ -2308,8 +2308,23 @@ enum PlayerLiveContractTests {
         }
         let key = VortXHLSSessionSpool.ResourceKey.video(segmentID: 0)
         guard spool.spill([.init(
-            key: key, buffer: source, offset: 0, length: 8, durationMilliseconds: 4_000)]),
-              let lease = spool.openResource(key, now: 1),
+            key: key, buffer: source, offset: 0, length: 8, durationMilliseconds: 4_000)]) else {
+            check("file pump: durable fixture spills", false)
+            return
+        }
+        guard let invalidLease = spool.openResource(key, now: 1) else {
+            check("file pump: invalid-construction lease opens", false)
+            return
+        }
+        let invalidPump = VortXSpoolResponsePump(lease: invalidLease, chunkSize: 0)
+        let leasesAfterInvalidConstruction = spool.activeLeaseCount
+        invalidLease.close(now: 1)
+        check("file pump: invalid chunk construction releases its acquired lease exactly once",
+              invalidPump == nil
+                  && leasesAfterInvalidConstruction == 0
+                  && spool.activeLeaseCount == 0)
+
+        guard let lease = spool.openResource(key, now: 1),
               let response = VortXSpoolResponsePump(lease: lease, chunkSize: 2) else {
             check("file pump: durable resource opens before any response header", false)
             return
