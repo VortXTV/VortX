@@ -3,7 +3,7 @@
 # src-tauri/resources/ (both gitignored, bundled into the app by tauri.conf.json):
 #
 #   1) a standalone Node.js runtime for the HOST platform, and
-#   2) server.cjs (Stremio's official streaming server — torrent engine + /proxy + HLS).
+#   2) server.cjs (Stremio's official streaming server: torrent engine + /proxy + HLS).
 #
 # The Tauri desktop app spawns `node server.cjs` bound to 127.0.0.1:11470 so TORRENT
 # streams play (see src-tauri/src/server.rs). This mirrors the macOS app's approach
@@ -26,14 +26,84 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RES_DIR="${SCRIPT_DIR}/../src-tauri/resources"
 mkdir -p "${RES_DIR}"
 
+fail() {
+  echo "fetch-server-deps: ERROR - $*" >&2
+  exit 1
+}
+
+# Every temporary file/directory is registered here immediately after creation. A
+# single EXIT trap covers curl, checksum, unpack, copy, and later staging failures.
+TEMP_PATHS=()
+cleanup_temp_paths() {
+  local path
+  for path in "${TEMP_PATHS[@]}"; do
+    if [ -n "${path}" ]; then
+      rm -rf -- "${path}"
+    fi
+  done
+}
+trap cleanup_temp_paths EXIT
+
+normalize_sha256() { # <hash> <label>
+  local value="$1"
+  if [ "${#value}" -ne 64 ]; then
+    fail "$2 SHA-256 must contain exactly 64 hexadecimal characters"
+  fi
+  case "${value}" in
+    *[!0-9a-fA-F]*) fail "$2 SHA-256 contains a non-hexadecimal character" ;;
+  esac
+  printf '%s' "${value}" | tr 'A-F' 'a-f'
+}
+
+verify_sha256() { # <file> <expected-hash> <label>
+  local actual=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$1" | cut -d' ' -f1)"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$1" | cut -d' ' -f1)"
+  elif command -v openssl >/dev/null 2>&1; then
+    actual="$(openssl dgst -sha256 "$1" | awk '{print $NF}')"
+  elif command -v certutil >/dev/null 2>&1; then
+    # Windows fallback (Git Bash without coreutils): certutil prints the hash on line 2.
+    actual="$(certutil -hashfile "$1" SHA256 | sed -n '2p' | tr -dc '0-9a-fA-F' | tr 'A-F' 'a-f')"
+  else
+    echo "fetch-server-deps: ERROR - cannot verify $3: no SHA-256 tool (sha256sum/shasum/openssl/certutil)" >&2
+    rm -f "$1"
+    exit 1
+  fi
+  if [ "${actual}" != "$2" ]; then
+    echo "ERROR: $3 checksum mismatch" >&2
+    echo "  expected: $2" >&2
+    echo "  actual:   ${actual}" >&2
+    rm -f "$1"
+    exit 1
+  fi
+}
+
 # Pinned Node LTS. Standalone builds from nodejs.org depend only on the platform's
 # system libraries (otool/ldd-verifiable), so they spawn cleanly from the bundle.
-NODE_VERSION="${STREMIOX_NODE_VERSION:-v20.18.1}"
+DEFAULT_NODE_VERSION="v20.18.1"
+NODE_VERSION="${STREMIOX_NODE_VERSION:-${DEFAULT_NODE_VERSION}}"
+NODE_OVERRIDE_SHA256="${STREMIOX_NODE_SHA256:-}"
+NODE_BINARY_OVERRIDE_SHA256="${STREMIOX_NODE_BINARY_SHA256:-}"
+if [ "${NODE_VERSION}" != "${DEFAULT_NODE_VERSION}" ] &&
+    { [ -z "${NODE_OVERRIDE_SHA256}" ] || [ -z "${NODE_BINARY_OVERRIDE_SHA256}" ]; }; then
+  fail "STREMIOX_NODE_VERSION=${NODE_VERSION} requires STREMIOX_NODE_SHA256 and STREMIOX_NODE_BINARY_SHA256"
+fi
 
 # server.js: the standard desktop build that runs under plain Node. Pinned + checksum-
-# verified because it ships inside the app — verify the artifact, don't trust transport.
-SERVER_VERSION="${STREMIO_SERVER_VERSION:-4.21.0}"
+# verified because it ships inside the app: verify the artifact, don't trust transport.
+DEFAULT_SERVER_VERSION="4.21.0"
+SERVER_VERSION="${STREMIO_SERVER_VERSION:-${DEFAULT_SERVER_VERSION}}"
 SERVER_JS_4_21_0_SHA256="82175d7982bce864df071df93b4b3d567a401e65881a8ac579d7db0ce71dafd7"
+SERVER_SHA256="${STREMIO_SERVER_SHA256:-}"
+if [ -z "${SERVER_SHA256}" ]; then
+  if [ "${SERVER_VERSION}" != "${DEFAULT_SERVER_VERSION}" ]; then
+    fail "STREMIO_SERVER_VERSION=${SERVER_VERSION} requires STREMIO_SERVER_SHA256"
+  fi
+  SERVER_SHA256="${SERVER_JS_4_21_0_SHA256}"
+fi
+SERVER_SHA256="$(normalize_sha256 "${SERVER_SHA256}" "server.js v${SERVER_VERSION}")"
 
 # --- host platform detection -> nodejs.org package + the bundled binary name ----------
 # The bundled node keeps a platform-tagged name so a multi-platform CI build can stage
@@ -77,51 +147,84 @@ esac
 PKG="node-${NODE_VERSION}-${NODE_PLATFORM}"
 NODE_URL="https://nodejs.org/dist/${NODE_VERSION}/${PKG}.${NODE_EXT}"
 NODE_DEST="${RES_DIR}/${NODE_BIN_NAME}"
+if [ -n "${NODE_OVERRIDE_SHA256}" ]; then
+  NODE_SHA256="${NODE_OVERRIDE_SHA256}"
+else
+  # Official archive digests from:
+  # https://nodejs.org/dist/v20.18.1/SHASUMS256.txt
+  case "${NODE_PLATFORM}" in
+    darwin-arm64) NODE_SHA256="9e92ce1032455a9cc419fe71e908b27ae477799371b45a0844eedb02279922a4" ;;
+    darwin-x64) NODE_SHA256="c5497dd17c8875b53712edaf99052f961013cedc203964583fc0cfc0aaf93581" ;;
+    linux-arm64) NODE_SHA256="73cd297378572e0bc9dfc187c5ec8cca8d43aee6a596c10ebea1ed5f9ec682b6" ;;
+    linux-x64) NODE_SHA256="259e5a8bf2e15ecece65bd2a47153262eda71c0b2c9700d5e703ce4951572784" ;;
+    win-x64) NODE_SHA256="56e5aacdeee7168871721b75819ccacf2367de8761b78eaceacdecd41e04ca03" ;;
+    *) fail "no pinned Node SHA-256 for ${NODE_PLATFORM}" ;;
+  esac
+fi
+NODE_SHA256="$(normalize_sha256 "${NODE_SHA256}" "Node ${NODE_VERSION} ${NODE_PLATFORM}")"
+
+# The archive checksum authenticates the package, but an already-staged executable
+# has no archive around it. Pin its bytes too, and verify them before chmod or
+# execution. These binary digests were derived from the same five official
+# v20.18.1 archives above after their SHASUMS256 entries matched:
+#
+#   tar -xOf node-v20.18.1-<platform>.tar.gz \
+#     node-v20.18.1-<platform>/bin/node | shasum -a 256
+#   unzip -p node-v20.18.1-win-x64.zip \
+#     node-v20.18.1-win-x64/node.exe | shasum -a 256
+if [ -n "${NODE_BINARY_OVERRIDE_SHA256}" ]; then
+  NODE_BINARY_SHA256="${NODE_BINARY_OVERRIDE_SHA256}"
+else
+  case "${NODE_PLATFORM}" in
+    darwin-arm64) NODE_BINARY_SHA256="b4ccefa930e8a436b611b7cf4c73ef4c1905662197e3a243cb66fc49cd008adf" ;;
+    darwin-x64) NODE_BINARY_SHA256="81449ea83ebcf4b0ef1361a45803da80434db97f5d91b5cfcd3a3eae221f9f9f" ;;
+    linux-arm64) NODE_BINARY_SHA256="d0750f6ce0fe5c5432a228809ede96a7656af83c9ac03646d44df34875020f20" ;;
+    linux-x64) NODE_BINARY_SHA256="9292f9a3bb76f55338b4d34024bb0ca92c47986f12f6182fc5d992dd4a0b80ed" ;;
+    win-x64) NODE_BINARY_SHA256="06c1dec1b428927d6ff01c8f5882f119ec13b61ac77483760aa7fba215c72cf5" ;;
+    *) fail "no pinned Node binary SHA-256 for ${NODE_PLATFORM}" ;;
+  esac
+fi
+NODE_BINARY_SHA256="$(normalize_sha256 "${NODE_BINARY_SHA256}" "Node binary ${NODE_VERSION} ${NODE_PLATFORM}")"
 
 # --- 1) Node runtime (idempotent) -----------------------------------------------------
-if [ -x "${NODE_DEST}" ] && "${NODE_DEST}" --version 2>/dev/null | grep -q "${NODE_VERSION}"; then
+if [ -f "${NODE_DEST}" ]; then
+  # Never execute a staged runtime until its exact bytes match the platform pin.
+  verify_sha256 "${NODE_DEST}" "${NODE_BINARY_SHA256}" "Node binary ${NODE_VERSION} ${NODE_PLATFORM}"
+  chmod +x "${NODE_DEST}"
+  NODE_ACTUAL_VERSION="$("${NODE_DEST}" --version 2>/dev/null)" ||
+    fail "verified Node binary ${NODE_PLATFORM} could not report its version"
+  if [ "${NODE_ACTUAL_VERSION}" != "${NODE_VERSION}" ]; then
+    rm -f "${NODE_DEST}"
+    fail "verified Node binary ${NODE_PLATFORM} reported ${NODE_ACTUAL_VERSION}, expected ${NODE_VERSION}"
+  fi
   echo "fetch-server-deps: ${NODE_BIN_NAME} already present (${NODE_VERSION}), skipping."
 else
   echo "fetch-server-deps: downloading ${NODE_URL}"
   TMP="$(mktemp -d)"
-  trap 'rm -rf "${TMP}"' EXIT
+  TEMP_PATHS+=("${TMP}")
   curl -fsSL "${NODE_URL}" -o "${TMP}/node.${NODE_EXT}"
+  verify_sha256 "${TMP}/node.${NODE_EXT}" "${NODE_SHA256}" "Node ${NODE_VERSION} ${NODE_PLATFORM}"
   if [ "${NODE_EXT}" = "zip" ]; then
     unzip -q "${TMP}/node.${NODE_EXT}" -d "${TMP}"
   else
     tar -xzf "${TMP}/node.${NODE_EXT}" -C "${TMP}"
   fi
-  cp "${TMP}/${PKG}/${NODE_BIN_IN_PKG}" "${NODE_DEST}"
+  EXTRACTED_NODE="${TMP}/${PKG}/${NODE_BIN_IN_PKG}"
+  verify_sha256 "${EXTRACTED_NODE}" "${NODE_BINARY_SHA256}" \
+    "extracted Node binary ${NODE_VERSION} ${NODE_PLATFORM}"
+  cp "${EXTRACTED_NODE}" "${NODE_DEST}"
+  verify_sha256 "${NODE_DEST}" "${NODE_BINARY_SHA256}" "staged Node binary ${NODE_VERSION} ${NODE_PLATFORM}"
   chmod +x "${NODE_DEST}"
-  echo "fetch-server-deps: installed $("${NODE_DEST}" --version 2>/dev/null || echo node) at ${NODE_DEST}"
+  NODE_ACTUAL_VERSION="$("${NODE_DEST}" --version 2>/dev/null)" ||
+    fail "verified Node binary ${NODE_PLATFORM} could not report its version"
+  if [ "${NODE_ACTUAL_VERSION}" != "${NODE_VERSION}" ]; then
+    rm -f "${NODE_DEST}"
+    fail "verified Node binary ${NODE_PLATFORM} reported ${NODE_ACTUAL_VERSION}, expected ${NODE_VERSION}"
+  fi
+  echo "fetch-server-deps: installed ${NODE_ACTUAL_VERSION} at ${NODE_DEST}"
 fi
 
 # --- 2) server.cjs (idempotent + checksum-verified) -----------------------------------
-verify_sha256() { # <file> <expected-hash> <label>
-  local actual=""
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$1" | cut -d' ' -f1)"
-  elif command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 "$1" | cut -d' ' -f1)"
-  elif command -v openssl >/dev/null 2>&1; then
-    actual="$(openssl dgst -sha256 "$1" | awk '{print $NF}')"
-  elif command -v certutil >/dev/null 2>&1; then
-    # Windows fallback (Git Bash without coreutils): certutil prints the hash on line 2.
-    actual="$(certutil -hashfile "$1" SHA256 | sed -n '2p' | tr -dc '0-9a-fA-F' | tr 'A-F' 'a-f')"
-  else
-    echo "fetch-server-deps: ERROR - cannot verify $3: no SHA-256 tool (sha256sum/shasum/openssl/certutil)" >&2
-    rm -f "$1"
-    exit 1
-  fi
-  if [ "${actual}" != "$2" ]; then
-    echo "ERROR: $3 checksum mismatch" >&2
-    echo "  expected: $2" >&2
-    echo "  actual:   ${actual}" >&2
-    rm -f "$1"
-    exit 1
-  fi
-}
-
 # Staged with a .cjs extension on purpose: server.js is a CommonJS bundle (it `require()`s), but the
 # desktop project's package.json declares "type":"module", which would make Node treat a bare
 # `server.js` run from the source tree as an ES module ("require is not defined"). The .cjs extension
@@ -129,9 +232,11 @@ verify_sha256() { # <file> <expected-hash> <label>
 # (the official server.js download), independent of the on-disk name.
 SERVER_DEST="${RES_DIR}/server.cjs"
 if [ -f "${SERVER_DEST}" ]; then
-  echo "fetch-server-deps: server.cjs already present, skipping."
+  verify_sha256 "${SERVER_DEST}" "${SERVER_SHA256}" "server.js v${SERVER_VERSION}"
+  echo "fetch-server-deps: verified server.cjs already present, skipping."
 else
   TMP_SERVER="$(mktemp)"
+  TEMP_PATHS+=("${TMP_SERVER}")
   # Preference order: a local Stremio install (no network), else Stremio's CDN.
   found=""
   for candidate in "${STREMIO_APP:-}" "/Applications/Stremio.app"; do
@@ -146,12 +251,8 @@ else
   else
     echo "fetch-server-deps: downloading server.js v${SERVER_VERSION} from dl.strem.io..."
     curl -fsSL "https://dl.strem.io/server/v${SERVER_VERSION}/desktop/server.js" -o "${TMP_SERVER}"
-    if [ "${SERVER_VERSION}" = "4.21.0" ]; then
-      verify_sha256 "${TMP_SERVER}" "${SERVER_JS_4_21_0_SHA256}" "server.js v${SERVER_VERSION}"
-    else
-      echo "WARNING: no pinned checksum for server.js v${SERVER_VERSION}; skipping verification." >&2
-    fi
   fi
+  verify_sha256 "${TMP_SERVER}" "${SERVER_SHA256}" "server.js v${SERVER_VERSION}"
   mv "${TMP_SERVER}" "${SERVER_DEST}"
 fi
 
@@ -177,6 +278,7 @@ case "${uname_s}" in
       MPV_WIN_URL="https://github.com/zhongfly/mpv-winbuild/releases/download/${MPV_WIN_TAG}/${MPV_WIN_ASSET}"
       echo "fetch-server-deps: downloading mpv (zhongfly ${MPV_WIN_TAG})..."
       TMP_MPV="$(mktemp -d)"
+      TEMP_PATHS+=("${TMP_MPV}")
       if ! curl -fsSL "${MPV_WIN_URL}" -o "${TMP_MPV}/mpv.7z"; then
         echo "fetch-server-deps: ERROR - pinned Windows mpv artifact is unavailable: ${MPV_WIN_URL}" >&2
         rm -rf "${TMP_MPV}"
@@ -203,6 +305,7 @@ case "${uname_s}" in
         MPV_MAC_URL="https://laboratory.stolendata.net/~djinn/mpv_osx/mpv-arm64-${MPV_MAC_VER}.tar.gz"
         echo "fetch-server-deps: downloading mpv (stolendata ${MPV_MAC_VER} arm64)..."
         TMP_MPVM="$(mktemp -d)"
+        TEMP_PATHS+=("${TMP_MPVM}")
         curl -fsSL "${MPV_MAC_URL}" -o "${TMP_MPVM}/mpv.tar.gz"
         verify_sha256 "${TMP_MPVM}/mpv.tar.gz" "${MPV_MAC_SHA256}" "mpv macOS ${MPV_MAC_VER}"
         tar -xzf "${TMP_MPVM}/mpv.tar.gz" -C "${TMP_MPVM}"

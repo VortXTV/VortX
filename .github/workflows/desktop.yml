@@ -54,14 +54,15 @@ jobs:
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          # Node 22 (current LTS). Node 20 is EOL (April 2026), and vite 8 requires
-          # ^20.19.0 || >=22.12.0, so 22 is the clean floor.
-          node-version: "22"
+          # Exact Node 22 LTS patch. Node 20 is EOL (April 2026), and vite 8 requires
+          # ^20.19.0 || >=22.12.0.
+          node-version: "22.18.0"
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
         with:
+          toolchain: 1.97.1
           components: clippy, rustfmt
 
       - uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -89,6 +90,12 @@ jobs:
             https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           curl -fsSL -o linuxdeploy-plugin-appimage \
             https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage
+          printf '%s  %s\n' \
+            e87ee0815d109282fdda73e34c2361d64d02b0ffaea3674b18f1fd1f6a687dcf \
+            linuxdeploy.AppImage | sha256sum -c -
+          printf '%s  %s\n' \
+            1da16a46fa5e058ae740e7c35ed0d36d86cb869ac9cc8a5fd9a1847d7978d99a \
+            linuxdeploy-plugin-appimage | sha256sum -c -
           chmod +x linuxdeploy.AppImage linuxdeploy-plugin-appimage
           export APPIMAGE_EXTRACT_AND_RUN=1
           export PATH="$work:$PATH"
