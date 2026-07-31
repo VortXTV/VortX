@@ -123,7 +123,7 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
 
       <div class="pl-top">
         <button class="pl-icon pl-back" data-action="close-player" aria-label="Back">${icon("chevron-left") || "‹"}<span>Back</span></button>
-        <div class="pl-title">${escapeHtml(ctx.title)}</div>
+        <div class="pl-title" id="pl-title"></div>
       </div>
 
       <button class="pl-unmute" id="pl-unmute" hidden aria-label="Tap to unmute">${icon("volume-x") || "🔇"}<span>Tap to unmute</span></button>
@@ -164,6 +164,9 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
       <div class="pl-menu" id="pl-menu-settings" role="menu" hidden></div>
       <div class="pl-menu" id="pl-menu-subs" role="menu" hidden></div>`;
   host.appendChild(stageRoot);
+  // Set the (untrusted, add-on-supplied) title as plain text so it can never be reinterpreted as HTML.
+  const titleEl = stageRoot.querySelector<HTMLElement>("#pl-title");
+  if (titleEl) titleEl.textContent = ctx.title;
 
   const $ = <T extends HTMLElement = HTMLElement>(id: string) => host.querySelector<T>("#" + id);
   const stage = $("pl-stage")!;

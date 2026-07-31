@@ -667,9 +667,9 @@ function youTubeID(value: string): string | undefined {
   const trimmed = value.trim();
   try {
     const url = new URL(trimmed);
-    const host = url.host.toLowerCase();
-    if (host.includes("youtu.be")) return url.pathname.slice(1) || undefined;
-    if (host.includes("youtube.com")) {
+    const host = url.hostname.toLowerCase();
+    if (host === "youtu.be" || host.endsWith(".youtu.be")) return url.pathname.slice(1) || undefined;
+    if (host === "youtube.com" || host.endsWith(".youtube.com")) {
       const v = url.searchParams.get("v");
       if (v) return v;
       return url.pathname.split("/").filter(Boolean).pop() || undefined;

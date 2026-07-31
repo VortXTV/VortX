@@ -221,13 +221,17 @@ function trailerYouTubeID(meta: MetaItem): string | undefined {
   return link ? youTubeID(link.name) : undefined;
 }
 
+function hostIs(host: string, domain: string): boolean {
+  return host === domain || host.endsWith("." + domain);
+}
+
 function youTubeID(value: string): string | undefined {
   const trimmed = value.trim();
   try {
     const url = new URL(trimmed);
-    const host = url.host.toLowerCase();
-    if (host.includes("youtu.be")) return url.pathname.slice(1) || undefined;
-    if (host.includes("youtube.com")) {
+    const host = url.hostname.toLowerCase();
+    if (hostIs(host, "youtu.be")) return url.pathname.slice(1) || undefined;
+    if (hostIs(host, "youtube.com")) {
       const v = url.searchParams.get("v");
       if (v) return v;
       const last = url.pathname.split("/").filter(Boolean).pop();
