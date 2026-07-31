@@ -305,6 +305,34 @@ class TvDebridSettingsContractTest {
     }
 
     @Test
+    fun `normal danger action content clears contrast on default and OLED cards`() {
+        val source = readProjectFile(
+            "src/main/kotlin/com/vortx/android/ui/tv/TvDebridKeysScreen.kt",
+        )
+        val textPrimary = Color(0xFFF6F1E9)
+        val danger = Color(0xFFDE4856)
+        val dangerTint = danger.copy(alpha = 0.16f)
+        val defaultSurface1 = Color(0xFF211C16)
+        val oledSurface1 = Color(0xFF0E0E0F)
+        val defaultDangerContainer = compositeOver(dangerTint, defaultSurface1)
+        val oledDangerContainer = compositeOver(dangerTint, oledSurface1)
+
+        assertTrue(normalDangerActionContentColorContract(source))
+        assertTrue(contrastRatio(textPrimary, defaultDangerContainer) >= 4.5)
+        assertTrue(contrastRatio(textPrimary, oledDangerContainer) >= 4.5)
+        assertTrue(contrastRatio(danger, defaultDangerContainer) < 4.5)
+        assertTrue(contrastRatio(danger, oledDangerContainer) < 4.5)
+        assertFalse(
+            normalDangerActionContentColorContract(
+                source.replace(
+                    "danger -> colors.textPrimary",
+                    "danger -> colors.danger",
+                ),
+            ),
+        )
+    }
+
+    @Test
     fun `provider fields and actions have unique service names and traversal groups`() {
         val labels = DebridService.entries.map {
             tvDebridControlAccessibilityLabel(it, "Save API key")
@@ -395,6 +423,10 @@ class TvDebridSettingsContractTest {
             source.contains("focusedContainerColor = colors.surface3") &&
             source.contains("focusedContentColor = colors.textPrimary")
 
+    private fun normalDangerActionContentColorContract(source: String): Boolean =
+        source.contains("danger -> colors.danger.copy(alpha = 0.16f)") &&
+            source.contains("danger -> colors.textPrimary")
+
     private fun providerAccessibilityContract(source: String): Boolean =
         source.contains("isTraversalGroup = true") &&
             source.contains("tvDebridControlAccessibilityLabel(service, keyFieldLabel)") &&
@@ -403,6 +435,17 @@ class TvDebridSettingsContractTest {
 
     private fun dangerStatusContrastContract(source: String): Boolean =
         source.contains("TvDebridStatus.STORAGE_UNAVAILABLE -> colors.textPrimary")
+
+    private fun compositeOver(foreground: Color, background: Color): Color {
+        val foregroundAlpha = foreground.alpha
+        val backgroundWeight = 1f - foregroundAlpha
+        return Color(
+            red = foreground.red * foregroundAlpha + background.red * backgroundWeight,
+            green = foreground.green * foregroundAlpha + background.green * backgroundWeight,
+            blue = foreground.blue * foregroundAlpha + background.blue * backgroundWeight,
+            alpha = 1f,
+        )
+    }
 
     private fun contrastRatio(foreground: Color, background: Color): Double {
         val lighter = maxOf(relativeLuminance(foreground), relativeLuminance(background))

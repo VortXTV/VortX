@@ -458,7 +458,7 @@ private fun TvDebridAction(
     }
     val contentColor = when {
         !enabled -> colors.textTertiary
-        danger -> colors.danger
+        danger -> colors.textPrimary
         else -> colors.textPrimary
     }
     Surface(
