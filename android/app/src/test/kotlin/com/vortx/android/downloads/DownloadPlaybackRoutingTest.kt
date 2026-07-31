@@ -1,7 +1,10 @@
 package com.vortx.android.downloads
 
+import com.vortx.android.debrid.DebridAccountOwnerBinding
+import com.vortx.android.debrid.DebridAccountOwnerState
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
+import com.vortx.android.sync.DurableSessionState
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -120,6 +123,60 @@ class DownloadPlaybackRoutingTest {
                 decoded.debridOwnerIdentity,
                 decoded.debridOwnerGeneration,
                 DownloadDebridOwnerPolicy.Owner("account:account-b", 8),
+            ),
+        )
+    }
+
+    @Test
+    fun `durable debrid owner epoch keeps an account download valid after process restart`() {
+        var durableSession: String? = "account-a"
+        var durableEpoch = 17L
+        fun restartSession(): DurableSessionState<String> = DurableSessionState(
+            initialValue = durableSession,
+            initialOwnerEpoch = durableEpoch,
+            persist = { session, nextEpoch ->
+                durableSession = session
+                durableEpoch = nextEpoch
+                true
+            },
+            clear = { nextEpoch ->
+                durableSession = null
+                durableEpoch = nextEpoch
+                true
+            },
+        )
+
+        val firstProcess = restartSession()
+        val persistedDownload = requireNotNull(
+            DownloadStore.recordFromJson(
+                DownloadStore.recordToJson(
+                    record().copy(
+                        debridOwnerIdentity = "account:${firstProcess.value}",
+                        debridOwnerGeneration = firstProcess.ownerEpoch,
+                    ),
+                ),
+            ),
+        )
+        val restartedProcess = restartSession()
+        val restartedBinding = DebridAccountOwnerBinding().apply {
+            bind {
+                DebridAccountOwnerState.Account(
+                    id = requireNotNull(restartedProcess.value),
+                    generation = restartedProcess.ownerEpoch,
+                )
+            }
+        }
+        val restartedOwner = requireNotNull(restartedBinding.currentOwner())
+
+        assertEquals(17L, restartedProcess.ownerEpoch)
+        assertTrue(
+            DownloadDebridOwnerPolicy.isCurrent(
+                persistedDownload.debridOwnerIdentity,
+                persistedDownload.debridOwnerGeneration,
+                DownloadDebridOwnerPolicy.Owner(
+                    identity = restartedOwner.identity,
+                    generation = restartedOwner.generation,
+                ),
             ),
         )
     }

@@ -1,5 +1,6 @@
 package com.vortx.android.sync
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -24,6 +25,30 @@ class DurableSessionStateTest {
     }
 
     @Test
+    fun persistedSessionReloadMatchesByKeyBytesAndRejectsChangedTruth() {
+        val account = VortXSyncManager.Account(
+            id = "account-a",
+            email = "a@example.test",
+            username = "account-a",
+            twoFactorEnabled = false,
+        )
+        val live = VortXSyncManager.Session("token-a", account, byteArrayOf(1, 2, 3))
+        val identicalReload = VortXSyncManager.Session("token-a", account.copy(), byteArrayOf(1, 2, 3))
+
+        assertTrue(sessionTruthMatches(live, identicalReload))
+        assertFalse(sessionTruthMatches(live, identicalReload.copy(token = "token-b")))
+        assertFalse(
+            sessionTruthMatches(
+                live,
+                identicalReload.copy(account = account.copy(username = "changed")),
+            ),
+        )
+        assertFalse(sessionTruthMatches(live, identicalReload.copy(dataKey = byteArrayOf(1, 2, 4))))
+        assertFalse(sessionTruthMatches(live, null))
+        assertTrue(sessionTruthMatches(null, null))
+    }
+
+    @Test
     fun failedInitialPersistDoesNotPublishOrSurviveRestart() {
         val backend = FakeSessionBackend().apply { rejectPersist = true }
         val state = backend.open()
@@ -36,24 +61,36 @@ class DurableSessionStateTest {
 
     @Test
     fun failedReplacementKeepsPriorPublicAndRestartState() {
-        val backend = FakeSessionBackend("old-session").apply { rejectPersist = true }
+        val backend = FakeSessionBackend("old-session", initialOwnerEpoch = 9).apply {
+            rejectPersist = true
+        }
         val state = backend.open()
 
         assertFalse(state.replace("new-session"))
         assertEquals("old-session", state.value)
+        assertEquals(9L, state.ownerEpoch)
         assertEquals("old-session", backend.durableValue)
-        assertEquals("old-session", backend.open().value)
+        assertEquals(9L, backend.durableOwnerEpoch)
+        val restarted = backend.open()
+        assertEquals("old-session", restarted.value)
+        assertEquals(9L, restarted.ownerEpoch)
     }
 
     @Test
     fun failedClearKeepsPriorPublicAndRestartState() {
-        val backend = FakeSessionBackend("live-session").apply { rejectClear = true }
+        val backend = FakeSessionBackend("live-session", initialOwnerEpoch = 12).apply {
+            rejectClear = true
+        }
         val state = backend.open()
 
         assertFalse(state.clear())
         assertEquals("live-session", state.value)
+        assertEquals(12L, state.ownerEpoch)
         assertEquals("live-session", backend.durableValue)
-        assertEquals("live-session", backend.open().value)
+        assertEquals(12L, backend.durableOwnerEpoch)
+        val restarted = backend.open()
+        assertEquals("live-session", restarted.value)
+        assertEquals(12L, restarted.ownerEpoch)
     }
 
     @Test
@@ -175,25 +212,158 @@ class DurableSessionStateTest {
     }
 
     @Test
-    fun productionOwnerTrackerAdvancesFromUnavailableToAccountAndDefinitiveSignOut() {
-        val tracker = SessionOwnerGenerationTracker(
-            PersistentSessionOwnerState.UnknownOrUnavailable,
-        )
+    fun ownerEpochSurvivesRestartAndAdvancesForSameAccountReauthentication() {
+        val backend = FakeSessionBackend("account-a", initialOwnerEpoch = 41)
+        val state = backend.open()
 
-        assertEquals(1L, tracker.observe(PersistentSessionOwnerState.UnknownOrUnavailable))
-        assertEquals(2L, tracker.observe(PersistentSessionOwnerState.Account("account-a")))
-        assertEquals(2L, tracker.observe(PersistentSessionOwnerState.Account("account-a")))
-        assertEquals(3L, tracker.observe(PersistentSessionOwnerState.SignedOutLocal))
+        assertTrue(state.replace("account-a"))
+        assertEquals(42L, state.ownerEpoch)
+        assertEquals(42L, backend.durableOwnerEpoch)
+
+        val restarted = backend.open()
+        assertEquals("account-a", restarted.value)
+        assertEquals(42L, restarted.ownerEpoch)
     }
 
     @Test
-    fun productionOwnerTrackerInvalidatesTokensForSameAccountSessionMutation() {
-        val tracker = SessionOwnerGenerationTracker(
-            PersistentSessionOwnerState.Account("account-a"),
-        )
+    fun ownerEpochExhaustionFailsClosedWithoutReusingAnOldEpoch() {
+        val backend = FakeSessionBackend("account-a", initialOwnerEpoch = Long.MAX_VALUE)
+        val state = backend.open()
 
-        assertEquals(2L, tracker.recordMutation(PersistentSessionOwnerState.Account("account-a")))
-        assertEquals(2L, tracker.observe(PersistentSessionOwnerState.Account("account-a")))
+        assertFalse(state.replace("account-b"))
+        assertFalse(state.clear())
+        assertEquals("account-a", state.value)
+        assertEquals(Long.MAX_VALUE, state.ownerEpoch)
+        assertEquals("account-a", backend.durableValue)
+        assertEquals(Long.MAX_VALUE, backend.durableOwnerEpoch)
+    }
+
+    @Test
+    fun laterAuthenticationAdoptsBAndRejectsDelayedA() {
+        val backend = FakeSessionBackend("account-old", initialOwnerEpoch = 4)
+        val state = backend.open()
+        val operations = SessionOperationCoordinator()
+        val authA = operations.beginAuth()
+        val authB = operations.beginAuth()
+        var cancelledSessionWork = 0
+
+        val adoptedB = authB.commitSessionMutation(
+            onCommitted = { cancelledSessionWork += 1 },
+        ) {
+            state.replace("account-b")
+        }
+        var delayedARan = false
+        val delayedA = authA.commitSessionMutation {
+            delayedARan = true
+            state.replace("account-a")
+        }
+
+        assertEquals(SessionMutationResult.Applied(true), adoptedB)
+        assertEquals(1, cancelledSessionWork)
+        assertEquals(SessionMutationResult.Stale, delayedA)
+        assertFalse(delayedARan)
+        assertEquals("account-b", state.value)
+        assertEquals(5L, state.ownerEpoch)
+    }
+
+    @Test
+    fun failedAuthenticationPersistenceKeepsExistingSyncLeaseAndWorkCurrent() {
+        val backend = FakeSessionBackend("account-a", initialOwnerEpoch = 6).apply {
+            rejectPersist = true
+        }
+        val state = backend.open()
+        val operations = SessionOperationCoordinator()
+        val syncGeneration = operations.snapshot { it }
+        val auth = operations.beginAuth()
+        var cancelledSessionWork = false
+
+        val adoption = auth.commitSessionMutation(
+            onCommitted = { cancelledSessionWork = true },
+        ) {
+            state.replace("account-b")
+        }
+
+        assertEquals(SessionMutationResult.Applied(false), adoption)
+        assertFalse(cancelledSessionWork)
+        assertTrue(operations.isCurrent(syncGeneration))
+        assertEquals("account-a", state.value)
+        assertEquals(6L, state.ownerEpoch)
+    }
+
+    @Test
+    fun failedSignOutRetainsDurableSessionButInvalidatesAuthAndSyncLeases() {
+        val backend = FakeSessionBackend("account-a", initialOwnerEpoch = 7).apply {
+            rejectClear = true
+        }
+        val state = backend.open()
+        val operations = SessionOperationCoordinator()
+        val authA = operations.beginAuth()
+        val syncGeneration = operations.snapshot { it }
+        var retainedGeneration = -1L
+        val retainedEpoch = state.ownerEpoch
+        var pendingPush = true
+
+        assertFalse(
+            operations.invalidate {
+                retainedGeneration = operations.snapshot { it }
+                pendingPush = false
+                state.clear()
+            },
+        )
+        assertFalse(authA.isCurrent())
+        assertFalse(operations.isCurrent(syncGeneration))
+        val rearmed = operations.mutateIfCurrent(retainedGeneration) {
+            if (state.matches(retainedEpoch) { it == "account-a" }) {
+                pendingPush = true
+            }
+        }
+        assertEquals(SessionMutationResult.Applied(Unit), rearmed)
+        assertTrue(pendingPush)
+        assertEquals(
+            SessionMutationResult.Stale,
+            authA.commitSessionMutation { state.replace("delayed-account-a") },
+        )
+        assertEquals("account-a", state.value)
+        assertEquals(7L, state.ownerEpoch)
+        assertEquals("account-a", backend.durableValue)
+        assertEquals(7L, backend.durableOwnerEpoch)
+    }
+
+    @Test
+    fun pausedAccountASyncLeaseCannotPublishAfterAccountSwitchAndKeepsAIdentity() {
+        val backend = FakeSessionBackend("account-a", initialOwnerEpoch = 20)
+        val state = backend.open()
+        val operations = SessionOperationCoordinator()
+        val originalKey = byteArrayOf(1, 2, 3)
+        val lease = operations.snapshot { operationGeneration ->
+            SyncSessionLease(
+                operationGeneration = operationGeneration,
+                ownerEpoch = state.ownerEpoch,
+                accountId = "account-a",
+                token = "token-a",
+                dataKey = originalKey,
+            )
+        }
+        originalKey[0] = 99
+
+        val authB = operations.beginAuth()
+        val adoptedB = authB.commitSessionMutation { state.replace("account-b") }
+        var stalePullPublished = false
+        val stalePublication = operations.mutateIfCurrent(lease.operationGeneration) {
+            stalePullPublished = true
+        }
+
+        assertEquals(SessionMutationResult.Applied(true), adoptedB)
+        assertEquals(SessionMutationResult.Stale, stalePublication)
+        assertFalse(stalePullPublished)
+        assertEquals("account-a", lease.accountId)
+        assertEquals("token-a", lease.token)
+        assertArrayEquals(byteArrayOf(1, 2, 3), lease.dataKeyCopy())
+        val callerCopy = lease.dataKeyCopy()
+        callerCopy[1] = 88
+        assertArrayEquals(byteArrayOf(1, 2, 3), lease.dataKeyCopy())
+        assertEquals("account-b", state.value)
+        assertEquals(21L, state.ownerEpoch)
     }
 
     @Test
@@ -239,9 +409,14 @@ class DurableSessionStateTest {
         assertEquals("account-a", state.value)
     }
 
-    private class FakeSessionBackend(initialValue: String? = null) {
+    private class FakeSessionBackend(
+        initialValue: String? = null,
+        initialOwnerEpoch: Long = INITIAL_SESSION_OWNER_EPOCH,
+    ) {
         @Volatile
         var durableValue: String? = initialValue
+        @Volatile
+        var durableOwnerEpoch: Long = initialOwnerEpoch
         var rejectPersist = false
         var rejectClear = false
         var beforePersist: (String) -> Unit = {}
@@ -251,21 +426,24 @@ class DurableSessionStateTest {
             ownerTransition: ((() -> Boolean) -> Boolean) = { mutation -> mutation() },
         ): DurableSessionState<String> = DurableSessionState(
             initialValue = durableValue,
-            persist = {
-                beforePersist(it)
+            initialOwnerEpoch = durableOwnerEpoch,
+            persist = { candidate, nextOwnerEpoch ->
+                beforePersist(candidate)
                 if (rejectPersist) {
                     false
                 } else {
-                    durableValue = it
+                    durableValue = candidate
+                    durableOwnerEpoch = nextOwnerEpoch
                     true
                 }
             },
-            clear = {
+            clear = { nextOwnerEpoch ->
                 beforeClear()
                 if (rejectClear) {
                     false
                 } else {
                     durableValue = null
+                    durableOwnerEpoch = nextOwnerEpoch
                     true
                 }
             },
