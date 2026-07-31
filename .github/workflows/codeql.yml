@@ -1,10 +1,11 @@
 name: CodeQL
 
 # Static security analysis of the source tracked in this public repository, from source with no
-# cross-target build (build-mode: none). Covers Rust (incl. the desktop Tauri backend), the Kotlin
-# Android app, the TypeScript/JavaScript web + workers + desktop front ends, and the Python tooling.
-# The private engine repositories and the Swift apps are outside this source-only job: Swift is
-# covered by Semgrep (semgrep.yml), the engine in its own credential-gated repositories.
+# cross-target build (build-mode: none). Covers Rust (incl. the desktop Tauri backend), the
+# TypeScript/JavaScript web + workers + desktop front ends, and the Python tooling.
+# The compiled apps are covered without a build by Semgrep (semgrep.yml): Swift (the Apple apps) and
+# Kotlin (the Android app, which CodeQL cannot extract in build-mode: none and whose autobuild would
+# need the full Android + private-engine build). The private engine lives in its own gated repos.
 
 on:
   push:
@@ -25,7 +26,10 @@ jobs:
       fail-fast: false
       matrix:
         # Every one of these supports build-mode: none (source-only analysis, no compile step).
-        language: [rust, java-kotlin, javascript-typescript, python]
+        # java-kotlin is intentionally NOT here: CodeQL cannot extract Kotlin in build-mode: none,
+        # and autobuild would require the full Android + private-engine build. Kotlin is covered by
+        # Semgrep instead (semgrep.yml).
+        language: [rust, javascript-typescript, python]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

@@ -1,9 +1,10 @@
 name: Semgrep
 
-# Pattern-based SAST covering Swift (the Apple apps, which CodeQL cannot analyze in this repo
-# without the full Xcode + private-engine build) plus a general security ruleset over the rest of
-# the tree. Findings are uploaded to code scanning as their own tool; the scan never fails the build
-# (quality/finding triage happens in the code-scanning UI, not as a red X).
+# Pattern-based SAST covering the compiled apps that CodeQL cannot analyze in this repo without a
+# full build: Swift (the Apple apps, which would need Xcode + the private engine) and Kotlin (the
+# Android app, which CodeQL cannot extract in build-mode: none). A general security ruleset covers
+# the rest of the tree. Findings are uploaded to code scanning as their own tool; the scan never
+# fails the build (finding triage happens in the code-scanning UI, not as a red X).
 
 on:
   push:
@@ -29,10 +30,11 @@ jobs:
       - name: Install Semgrep
         run: pipx install semgrep
 
-      - name: Scan (Swift + general security rules)
+      - name: Scan (Swift + Kotlin + general security rules)
         run: |
           semgrep scan \
             --config p/swift \
+            --config p/kotlin \
             --config p/security-audit \
             --sarif --output semgrep.sarif \
             --timeout 300 --metrics off || true
