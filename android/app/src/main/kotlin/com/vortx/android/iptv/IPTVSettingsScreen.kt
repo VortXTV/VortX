@@ -39,6 +39,7 @@ import com.vortx.android.ui.components.PrimaryButton
 import com.vortx.android.ui.components.SurfaceCard
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 /// Settings > Live TV (IPTV): add an M3U playlist or an Xtream Codes login (with an optional XMLTV EPG URL),
@@ -58,11 +59,21 @@ import kotlinx.coroutines.launch
 @Composable
 fun IPTVSettingsScreen(repo: CatalogRepository, onBack: () -> Unit, modifier: Modifier = Modifier) {
     val appContext = LocalContext.current.applicationContext
-    LaunchedEffect(Unit) { IPTVPlaylists.init(appContext) }
 
     val scope = rememberCoroutineScope()
     var playlists by remember { mutableStateOf(runCatching { IPTVPlaylists.playlists() }.getOrDefault(emptyList())) }
-    fun refresh() { playlists = IPTVPlaylists.playlists() }
+    var pendingCleanups by remember {
+        mutableStateOf(
+            runCatching { IPTVPlaylists.pendingCleanupState().cleanupRows() }.getOrDefault(emptyList()),
+        )
+    }
+    var cleanupJournalUnavailable by remember { mutableStateOf(false) }
+    fun refresh() {
+        playlists = IPTVPlaylists.playlists()
+        val cleanupState = IPTVPlaylists.pendingCleanupState()
+        pendingCleanups = cleanupState.cleanupRows()
+        cleanupJournalUnavailable = cleanupState == IPTVPendingCleanupRead.UnavailableOrCorrupt
+    }
 
     var kind by remember { mutableStateOf(IPTVKind.M3U) }
     var name by remember { mutableStateOf("") }
@@ -75,6 +86,21 @@ fun IPTVSettingsScreen(repo: CatalogRepository, onBack: () -> Unit, modifier: Mo
     var isWorking by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var removingSlug by remember { mutableStateOf<String?>(null) }
+
+    fun cleanupActions() = iptvCleanupActions(repo)
+
+    fun cleanupCoordinator() = IPTVCleanupCoordinator(IPTVPlaylists.cleanupStore(), cleanupActions())
+
+    LaunchedEffect(repo) {
+        IPTVPlaylists.init(appContext)
+        val cleaned = cleanupCoordinator().resumeAll()
+        refresh()
+        if (cleanupJournalUnavailable) {
+            errorMessage = "Playlist cleanup data could not be read. Nothing was changed."
+        } else if (!cleaned) {
+            errorMessage = "A previous playlist cleanup still needs attention. Retry it below."
+        }
+    }
 
     fun clearForm() {
         name = ""; m3uUrl = ""; xtreamHost = ""; xtreamUser = ""; xtreamPass = ""; xmltvUrl = ""
@@ -94,63 +120,124 @@ fun IPTVSettingsScreen(repo: CatalogRepository, onBack: () -> Unit, modifier: Mo
         val trimmedName = name.trim()
         val trimmedEpg = xmltvUrl.trim().ifEmpty { null }
         scope.launch {
-            val result: Result<IPTVRegistration>
-            val credentials: IPTVCredentials
-            when (chosen) {
-                IPTVKind.M3U -> {
-                    val url = m3uUrl.trim()
-                    result = IPTVConverterClient.registerM3U(url, trimmedEpg, trimmedName.ifEmpty { null })
-                    credentials = IPTVCredentials(m3uUrl = url, xmltvUrl = trimmedEpg)
+            try {
+                val result: Result<IPTVRegistration>
+                val credentials: IPTVCredentials
+                when (chosen) {
+                    IPTVKind.M3U -> {
+                        val url = m3uUrl.trim()
+                        result = IPTVConverterClient.registerM3U(url, trimmedEpg, trimmedName.ifEmpty { null })
+                        credentials = IPTVCredentials(m3uUrl = url, xmltvUrl = trimmedEpg)
+                    }
+                    IPTVKind.XTREAM -> {
+                        val host = xtreamHost.trim()
+                        val user = xtreamUser.trim()
+                        result = IPTVConverterClient.registerXtream(
+                            host,
+                            user,
+                            xtreamPass,
+                            trimmedEpg,
+                            trimmedName.ifEmpty { null },
+                        )
+                        credentials = IPTVCredentials(
+                            xtreamHost = host,
+                            xtreamUser = user,
+                            xtreamPass = xtreamPass,
+                            xmltvUrl = trimmedEpg,
+                        )
+                    }
                 }
-                IPTVKind.XTREAM -> {
-                    val host = xtreamHost.trim()
-                    val user = xtreamUser.trim()
-                    result = IPTVConverterClient.registerXtream(host, user, xtreamPass, trimmedEpg, trimmedName.ifEmpty { null })
-                    credentials = IPTVCredentials(xtreamHost = host, xtreamUser = user, xtreamPass = xtreamPass, xmltvUrl = trimmedEpg)
+                val registration = result.getOrElse {
+                    errorMessage = it.message ?: "Could not add this playlist."
+                    return@launch
                 }
-            }
-            result.fold(
-                onSuccess = { reg ->
-                    // Install the returned manifest as a normal add-on through the existing pipeline. A failure
-                    // here surfaces to the user and the playlist is NOT recorded (so a failed install is never
-                    // left dangling in the list), matching Apple's ordering.
-                    repo.installAddon(reg.manifestUrl).fold(
-                        onSuccess = {
-                            val displayName = trimmedName.ifEmpty { defaultName(chosen) }
-                            IPTVPlaylists.add(
-                                IPTVPlaylist(
-                                    id = reg.slug,
-                                    name = displayName,
-                                    kind = chosen,
-                                    transportUrl = reg.manifestUrl,
-                                    createdAtMillis = System.currentTimeMillis(),
-                                ),
-                                credentials,
-                            )
-                            clearForm()
-                            refresh()
-                        },
-                        onFailure = { errorMessage = it.message ?: "Could not install this playlist." },
+                val displayName = trimmedName.ifEmpty { defaultName(chosen) }
+                when (
+                    val outcome = IPTVAddCoordinator(
+                        store = IPTVPlaylists.cleanupStore(),
+                        installAddon = repo::installAddon,
+                        cleanupActions = cleanupActions(),
+                    ).complete(
+                        registration = registration,
+                        playlist = IPTVPlaylist(
+                            id = registration.slug,
+                            name = displayName,
+                            kind = chosen,
+                            transportUrl = registration.manifestUrl,
+                            createdAtMillis = System.currentTimeMillis(),
+                        ),
+                        credentials = credentials,
                     )
-                },
-                onFailure = { errorMessage = it.message ?: "Could not add this playlist." },
-            )
-            isWorking = false
+                ) {
+                    is IPTVAddOutcome.Added -> {
+                        clearForm()
+                        refresh()
+                    }
+                    is IPTVAddOutcome.Failed -> {
+                        errorMessage = when (outcome.cleanupState) {
+                            IPTVCleanupFailureState.NONE -> outcome.message
+                            IPTVCleanupFailureState.JOURNALED ->
+                                "${outcome.message} Cleanup is pending; retry below."
+                            IPTVCleanupFailureState.UNCONFIRMED ->
+                                "${outcome.message} Contact support before retrying this source."
+                        }
+                        refresh()
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                errorMessage = "Could not add this playlist."
+            } finally {
+                isWorking = false
+            }
         }
     }
 
     fun remove(playlist: IPTVPlaylist) {
         removingSlug = playlist.id
         scope.launch {
-            // Uninstall the engine add-on first (so the pipeline stops serving it), then revoke the slug
-            // server-side (fail-soft), then drop the local record + credentials. Mirrors Apple's remove order.
-            repo.installedAddons().getOrNull()
-                ?.firstOrNull { it.transportUrl == playlist.transportUrl }
-                ?.let { repo.removeAddon(it) }
-            IPTVConverterClient.revoke(playlist.id)
-            IPTVPlaylists.remove(playlist.id)
-            refresh()
-            removingSlug = null
+            try {
+                errorMessage = null
+                val pending = IPTVPendingCleanup(
+                    slug = playlist.id,
+                    transportUrl = playlist.transportUrl,
+                    origin = IPTVCleanupOrigin.REMOVE,
+                )
+                if (!IPTVPlaylists.beginCleanup(pending)) {
+                    errorMessage = "Could not safely stage this removal. It is still installed. Try again."
+                    return@launch
+                }
+                if (!cleanupCoordinator().resume(playlist.id)) {
+                    errorMessage = "Could not finish removing this playlist. Retry cleanup below."
+                }
+                refresh()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                errorMessage = "Could not remove this playlist. Try again."
+            } finally {
+                removingSlug = null
+            }
+        }
+    }
+
+    fun retryCleanup(cleanup: IPTVPendingCleanup) {
+        removingSlug = cleanup.slug
+        scope.launch {
+            try {
+                errorMessage = null
+                if (!cleanupCoordinator().resume(cleanup.slug)) {
+                    errorMessage = "Could not finish playlist cleanup. Try again."
+                }
+                refresh()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                errorMessage = "Could not finish playlist cleanup. Try again."
+            } finally {
+                removingSlug = null
+            }
         }
     }
 
@@ -188,6 +275,14 @@ fun IPTVSettingsScreen(repo: CatalogRepository, onBack: () -> Unit, modifier: Mo
                 )
             }
 
+            if (pendingCleanups.isNotEmpty()) {
+                PendingCleanupSection(
+                    cleanups = pendingCleanups,
+                    removingSlug = removingSlug,
+                    onRetry = ::retryCleanup,
+                )
+            }
+
             AddSection(
                 kind = kind,
                 onKindChange = { kind = it; errorMessage = null },
@@ -211,6 +306,9 @@ fun IPTVSettingsScreen(repo: CatalogRepository, onBack: () -> Unit, modifier: Mo
         }
     }
 }
+
+private fun IPTVPendingCleanupRead.cleanupRows(): List<IPTVPendingCleanup> =
+    (this as? IPTVPendingCleanupRead.Available)?.cleanups.orEmpty()
 
 /// The default display name when the user leaves the name blank (Apple `defaultName(for:)`).
 private fun defaultName(kind: IPTVKind): String = when (kind) {
@@ -249,6 +347,43 @@ private fun InstalledSection(
                             Icon(VortXIcons.delete, contentDescription = "Remove ${playlist.name}", tint = colors.accent)
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PendingCleanupSection(
+    cleanups: List<IPTVPendingCleanup>,
+    removingSlug: String?,
+    onRetry: (IPTVPendingCleanup) -> Unit,
+) {
+    val colors = VortXTheme.colors
+    SurfaceCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(VortXTheme.spacing.lg),
+            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+        ) {
+            Text("Playlist cleanup", style = VortXTheme.type.cardTitle)
+            Text(
+                "Retry unfinished cleanup. Saved playlists stay installed; interrupted adds and removals are " +
+                    "uninstalled and revoked.",
+                style = VortXTheme.type.label.copy(color = colors.textSecondary),
+            )
+            cleanups.forEach { cleanup ->
+                if (removingSlug == cleanup.slug) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), color = colors.accent)
+                } else {
+                    Chip(
+                        label = if (cleanup.disposition == IPTVCleanupDisposition.COMMITTED) {
+                            "Finish saved playlist"
+                        } else {
+                            "Retry cleanup"
+                        },
+                        selected = false,
+                        onClick = { onRetry(cleanup) },
+                    )
                 }
             }
         }

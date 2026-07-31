@@ -6,6 +6,7 @@ import android.os.UserManager
 import android.util.Log
 import androidx.work.ExistingWorkPolicy
 import androidx.work.WorkManager
+import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
 import com.vortx.android.model.StreamSource
@@ -56,6 +57,8 @@ import java.util.concurrent.Executor
 object DownloadManager {
 
     private const val TAG = "downloads"
+    private const val OWNER_CHANGED_ERROR =
+        "The VortX account that created this debrid download is no longer active."
 
     private const val PREFS = "vortx.downloads"
     const val MAX_CONCURRENT_KEY = "vortx.downloads.maxConcurrent"
@@ -83,6 +86,8 @@ object DownloadManager {
 
     @Volatile
     private var appContext: Context? = null
+    @Volatile
+    private var debridKeys: DebridKeys? = null
 
     /**
      * Most downloads we run at once. Beyond this, new downloads are created [DownloadState.QUEUED] and start
@@ -156,6 +161,7 @@ object DownloadManager {
      */
     fun init(context: Context) {
         appContext = context.applicationContext
+        if (debridKeys == null) debridKeys = DebridKeys(context.applicationContext)
         if (restored) return
         synchronized(lock) {
             if (restored) return
@@ -211,16 +217,53 @@ object DownloadManager {
         isDolbyVision: Boolean = false,
         isAtmos: Boolean = false,
         requestHeaders: Map<String, String>? = null,
+        debridOwnerIdentity: String? = null,
+        debridOwnerGeneration: Long? = null,
     ): DownloadRecord = synchronized(lock) {
         DownloadStore.records.value.firstOrNull { it.videoId == videoId && it.state != DownloadState.FAILED }
             ?.let { existing ->
-                if (existing.state == DownloadState.PAUSED) resume(existing.id)
-                return@synchronized existing
+                if (
+                    existing.state != DownloadState.COMPLETED &&
+                    !isDebridOwnerCurrent(existing)
+                ) {
+                    cancelWork(existing.id)
+                    releaseSlotReservation(existing.id, existing.transferGeneration)
+                    DownloadStore.update(existing.id) {
+                        it.copy(
+                            state = DownloadState.FAILED,
+                            transferGeneration = null,
+                            errorText = OWNER_CHANGED_ERROR,
+                        )
+                    }
+                } else {
+                    if (existing.state == DownloadState.PAUSED) resume(existing.id)
+                    return@synchronized existing
+                }
             }
 
         val id = UUID.randomUUID().toString()
         val ext = fileExtension(resolvedUrl)
         val headers = requestHeaders?.takeIf { it.isNotEmpty() }
+        if (
+            !DownloadDebridOwnerPolicy.isCurrent(
+                expectedIdentity = debridOwnerIdentity,
+                expectedGeneration = debridOwnerGeneration,
+                current = currentDebridOwner(),
+            )
+        ) {
+            val failed = DownloadRecord(
+                id = id, contentId = contentId, videoId = videoId, type = type, name = name, poster = poster,
+                season = season, episode = episode, sourceName = sourceName, qualityText = qualityText,
+                isDolbyVision = isDolbyVision, isAtmos = isAtmos,
+                isTorrent = stream.isTorrent, headers = headers, remoteURL = resolvedUrl,
+                debridOwnerIdentity = debridOwnerIdentity,
+                debridOwnerGeneration = debridOwnerGeneration,
+                localFilename = "$id.$ext", state = DownloadState.FAILED,
+                errorText = OWNER_CHANGED_ERROR,
+            )
+            DownloadStore.upsert(failed)
+            return@synchronized failed
+        }
 
         // HLS sources (adaptive .m3u8) cannot be saved by a single-file transfer -- it fetches only the playlist,
         // not the media segments. Apple downloads them properly on iOS via AVAssetDownloadTask and fails honestly
@@ -232,6 +275,8 @@ object DownloadManager {
                 season = season, episode = episode, sourceName = sourceName, qualityText = qualityText,
                 isDolbyVision = isDolbyVision, isAtmos = isAtmos,
                 isTorrent = false, headers = headers, remoteURL = resolvedUrl,
+                debridOwnerIdentity = debridOwnerIdentity,
+                debridOwnerGeneration = debridOwnerGeneration,
                 localFilename = "$id.$ext", state = DownloadState.FAILED,
                 errorText = "This source streams in segments (HLS), which can't be saved for offline on Android yet. " +
                     "Try a direct or debrid file source.",
@@ -249,6 +294,8 @@ object DownloadManager {
             season = season, episode = episode, sourceName = sourceName, qualityText = qualityText,
             isDolbyVision = isDolbyVision, isAtmos = isAtmos,
             isTorrent = stream.isTorrent, headers = headers, remoteURL = resolvedUrl,
+            debridOwnerIdentity = debridOwnerIdentity,
+            debridOwnerGeneration = debridOwnerGeneration,
             localFilename = "$id.$ext",
             state = if (canStartNow) DownloadState.DOWNLOADING else DownloadState.QUEUED,
             transferGeneration = generation,
@@ -293,6 +340,16 @@ object DownloadManager {
         synchronized(lock) {
             val record = DownloadStore.record(id) ?: return
             if (!DownloadTransferStatePolicy.mayResume(record.state)) return
+            if (!isDebridOwnerCurrent(record)) {
+                DownloadStore.update(id) {
+                    it.copy(
+                        state = DownloadState.FAILED,
+                        transferGeneration = null,
+                        errorText = OWNER_CHANGED_ERROR,
+                    )
+                }
+                return
+            }
             awaitingUnlock.remove(id)
             persistAwaitingUnlock()
             if (!hasFreeSlot()) {
@@ -431,6 +488,16 @@ object DownloadManager {
     private fun startNextQueued() {
         if (!hasFreeSlot()) return
         val next = orderedQueuedRecords().firstOrNull() ?: return
+        if (!isDebridOwnerCurrent(next)) {
+            DownloadStore.update(next.id) {
+                it.copy(
+                    state = DownloadState.FAILED,
+                    transferGeneration = null,
+                    errorText = OWNER_CHANGED_ERROR,
+                )
+            }
+            return
+        }
         if (next.remoteURL.toHttpUrlOrNull() == null) {
             DownloadStore.update(next.id) {
                 it.copy(
@@ -517,6 +584,20 @@ object DownloadManager {
         val generation = record.transferGeneration ?: run {
             Log.w(TAG, "startTransfer without generation; record ${record.id} not scheduled")
             return DownloadTransferStartResult.NOT_STARTED
+        }
+        if (!isDebridOwnerCurrent(record)) {
+            releaseActive(record.id, generation)
+            DownloadStore.updateIf(
+                id = record.id,
+                predicate = { it.transferGeneration == generation },
+            ) {
+                it.copy(
+                    state = DownloadState.FAILED,
+                    transferGeneration = null,
+                    errorText = OWNER_CHANGED_ERROR,
+                )
+            }
+            return DownloadTransferStartResult.PREFLIGHT_FAILED
         }
         val current = DownloadStore.record(record.id)
         if (
@@ -622,26 +703,67 @@ object DownloadManager {
      */
     fun claimTransfer(id: String, generation: String): Boolean {
         synchronized(lock) {
-            val record = DownloadStore.record(id)
-            val claimedState = record?.let {
-                DownloadTransferStatePolicy.claim(
-                    state = it.state,
-                    recordGeneration = it.transferGeneration,
+            val record = DownloadStore.record(id) ?: return false
+            when (
+                val claim = DownloadTransferClaimPolicy.decide(
+                    record = record,
                     requestedGeneration = generation,
+                    isOwnerCurrent = ::isDebridOwnerCurrent,
                 )
-            } ?: return false
-            if (claimedState != record.state) {
-                DownloadStore.updateIf(
-                    id = id,
-                    predicate = { it.transferGeneration == generation },
-                ) {
-                    it.copy(state = claimedState)
-                } ?: return false
+            ) {
+                DownloadTransferClaimDecision.OwnerChanged -> {
+                    handleDebridOwnerChangedLocked(id, generation)
+                    return false
+                }
+                DownloadTransferClaimDecision.Rejected -> return false
+                is DownloadTransferClaimDecision.Claimed -> if (claim.state != record.state) {
+                    DownloadStore.updateIf(
+                        id = id,
+                        predicate = { it.transferGeneration == generation },
+                    ) {
+                        it.copy(state = claim.state)
+                    } ?: return false
+                }
             }
             activeGenerations[id] = generation
             legacyStartupReservations.remove(id)
             return true
         }
+    }
+
+    /** Fail a revived/in-flight native-debrid transfer whose capability URL belongs to another owner epoch. */
+    fun handleDebridOwnerChanged(id: String, generation: String) {
+        synchronized(lock) {
+            handleDebridOwnerChangedLocked(id, generation)
+        }
+    }
+
+    private fun handleDebridOwnerChangedLocked(id: String, generation: String) {
+        releaseSlotReservation(id, generation)
+        DownloadStore.updateIf(
+            id = id,
+            predicate = { it.transferGeneration == generation },
+        ) {
+            it.copy(
+                state = DownloadState.FAILED,
+                transferGeneration = null,
+                errorText = OWNER_CHANGED_ERROR,
+            )
+        }
+        afterSlotFreed()
+    }
+
+    fun isDebridOwnerCurrent(record: DownloadRecord): Boolean {
+        val identity = record.debridOwnerIdentity
+        val generation = record.debridOwnerGeneration
+        if (identity == null && generation == null) return true
+        if (identity == null || generation == null) return false
+        return debridKeys?.isCurrent(identity, generation) == true
+    }
+
+    private fun currentDebridOwner(): DownloadDebridOwnerPolicy.Owner? {
+        val token = debridKeys?.ownerToken() ?: return null
+        return DownloadDebridOwnerPolicy.Owner(token.identity, token.generation)
     }
 
     fun ownsTransfer(id: String, generation: String): Boolean =
@@ -700,6 +822,21 @@ object DownloadManager {
     ): Boolean {
         synchronized(lock) {
             val current = DownloadStore.record(id)
+            if (current != null && !isDebridOwnerCurrent(current)) {
+                releaseActive(id, generation)
+                DownloadStore.updateIf(
+                    id = id,
+                    predicate = { it.transferGeneration == generation },
+                ) {
+                    it.copy(
+                        state = DownloadState.FAILED,
+                        transferGeneration = null,
+                        errorText = OWNER_CHANGED_ERROR,
+                    )
+                }
+                afterSlotFreed()
+                return false
+            }
             val completedState = current?.let {
                 DownloadTransferStatePolicy.complete(
                     state = it.state,
@@ -1143,6 +1280,50 @@ object DownloadManager {
             depth++
         }
         return parts.joinToString(" | ")
+    }
+}
+
+internal object DownloadDebridOwnerPolicy {
+    data class Owner(val identity: String, val generation: Long)
+
+    /**
+     * Missing fields are a compatible pre-owner-schema record. A partially written owner is invalid; a complete
+     * owner must match both opaque scope and mutation generation.
+     */
+    fun isCurrent(
+        expectedIdentity: String?,
+        expectedGeneration: Long?,
+        current: Owner?,
+    ): Boolean {
+        if (expectedIdentity == null && expectedGeneration == null) return true
+        if (expectedIdentity == null || expectedGeneration == null) return false
+        return current?.identity == expectedIdentity && current.generation == expectedGeneration
+    }
+}
+
+internal sealed interface DownloadTransferClaimDecision {
+    data class Claimed(val state: DownloadState) : DownloadTransferClaimDecision
+    data object OwnerChanged : DownloadTransferClaimDecision
+    data object Rejected : DownloadTransferClaimDecision
+}
+
+/**
+ * Evaluate ownership as part of the claim decision, after the manager reloads the durable row under its lifecycle
+ * lock. A successful worker precheck therefore cannot authorize a later claim after the account has changed.
+ */
+internal object DownloadTransferClaimPolicy {
+    fun decide(
+        record: DownloadRecord,
+        requestedGeneration: String,
+        isOwnerCurrent: (DownloadRecord) -> Boolean,
+    ): DownloadTransferClaimDecision {
+        val state = DownloadTransferStatePolicy.claim(
+            state = record.state,
+            recordGeneration = record.transferGeneration,
+            requestedGeneration = requestedGeneration,
+        ) ?: return DownloadTransferClaimDecision.Rejected
+        if (!isOwnerCurrent(record)) return DownloadTransferClaimDecision.OwnerChanged
+        return DownloadTransferClaimDecision.Claimed(state)
     }
 }
 

@@ -3,7 +3,9 @@ package com.vortx.android.sync
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.security.FailClosedCredentialStore
+import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.profile.ProfileStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -20,6 +22,110 @@ import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+
+/**
+ * Publishes a session value only after its encrypted persistence mutation succeeds. Failed replacement
+ * and clear operations leave [value] unchanged, so live state and restart state cannot disagree.
+ */
+internal class DurableSessionState<T>(
+    initialValue: T?,
+    private val persist: (T) -> Boolean,
+    clear: () -> Boolean,
+    private val ownerTransition: ((() -> Boolean) -> Boolean) = { mutation -> mutation() },
+) {
+    private val clearDurably = clear
+
+    @Volatile
+    var value: T? = initialValue
+        private set
+
+    fun replace(candidate: T, publish: () -> Unit = {}): Boolean {
+        check(!Thread.holdsLock(this)) {
+            "replace must acquire the owner transition before the session monitor"
+        }
+        return ownerTransition {
+            synchronized(this) {
+                if (!persist(candidate)) {
+                    false
+                } else {
+                    value = candidate
+                    publish()
+                    true
+                }
+            }
+        }
+    }
+
+    fun clear(publish: () -> Unit = {}): Boolean {
+        check(!Thread.holdsLock(this)) {
+            "clear must acquire the owner transition before the session monitor"
+        }
+        return ownerTransition {
+            synchronized(this) {
+                if (!clearDurably()) {
+                    false
+                } else {
+                    value = null
+                    publish()
+                    true
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    fun restore(candidate: T?) {
+        value = candidate
+    }
+
+    /**
+     * Serialize a persistence read/reconcile with [replace] and [clear]. Mutations acquire their owner-transition
+     * transaction before this monitor and must not be called from [block]. This closes the stale-load race where a
+     * restore loaded account A, sign-out durably cleared A, and the delayed restore then published A back into memory.
+     */
+    @Synchronized
+    fun <R> serialized(block: () -> R): R = block()
+}
+
+internal sealed interface SessionOwnerSnapshot {
+    val generation: Long
+
+    data class UnknownOrUnavailable(override val generation: Long) : SessionOwnerSnapshot
+    data class SignedOutLocal(override val generation: Long) : SessionOwnerSnapshot
+    data class Account(val id: String, override val generation: Long) : SessionOwnerSnapshot
+}
+
+internal sealed interface PersistentSessionOwnerState {
+    data object UnknownOrUnavailable : PersistentSessionOwnerState
+    data object SignedOutLocal : PersistentSessionOwnerState
+    data class Account(val id: String) : PersistentSessionOwnerState
+}
+
+internal class SessionOwnerGenerationTracker(
+    initialState: PersistentSessionOwnerState,
+    initialGeneration: Long = 1,
+) {
+    private var observedState = initialState
+
+    var generation: Long = initialGeneration
+        private set
+
+    @Synchronized
+    fun observe(state: PersistentSessionOwnerState): Long {
+        if (state != observedState) {
+            observedState = state
+            generation++
+        }
+        return generation
+    }
+
+    @Synchronized
+    fun recordMutation(state: PersistentSessionOwnerState): Long {
+        observedState = state
+        generation++
+        return generation
+    }
+}
 
 /**
  * The VortX end-to-end-encrypted account on Android: create (register), sign in, and recover, plus the
@@ -54,6 +160,13 @@ class VortXSyncManager(context: Context) {
         val twoFactorEnabled: Boolean,
     )
 
+    /** Persistence-truthful session state for account UI. Unknown is never rendered as signed out. */
+    sealed interface SessionUiState {
+        data object UnknownOrUnavailable : SessionUiState
+        data object SignedOut : SessionUiState
+        data class SignedIn(val account: Account) : SessionUiState
+    }
+
     /** Result of an auth flow. `TotpRequired` asks the UI to reveal the 6-digit field and retry with a code. */
     sealed interface AuthResult {
         data object Ok : AuthResult
@@ -61,8 +174,18 @@ class VortXSyncManager(context: Context) {
         data class Failed(val message: String) : AuthResult
     }
 
-    /** [result] plus the one-time [recoveryCode] to show once on a successful `register` (null otherwise). */
-    data class RegisterResult(val result: AuthResult, val recoveryCode: String?)
+    /** [result] plus the one-time [recoveryCode] minted by a successful server-side registration. */
+    data class RegisterResult(val result: AuthResult, val recoveryCode: String?) {
+        companion object {
+            internal fun secureStorageFailure(recoveryCode: String): RegisterResult = RegisterResult(
+                result = AuthResult.Failed(
+                    "Your account was created, but this device could not securely save the session. " +
+                        "Save your recovery code, then sign in again.",
+                ),
+                recoveryCode = recoveryCode,
+            )
+        }
+    }
 
     /** A live signed-in session: bearer token + account + the decrypted 32-byte data key. */
     data class Session(val token: String, val account: Account, val dataKey: ByteArray) {
@@ -71,7 +194,16 @@ class VortXSyncManager(context: Context) {
         override fun hashCode(): Int = 31 * (31 * token.hashCode() + account.hashCode()) + dataKey.contentHashCode()
     }
 
+    private val debridKeys = DebridKeys(context.applicationContext)
     private val store = SessionStore(context.applicationContext)
+    private val initialSessionLoad = store.load()
+    private val sessionState = DurableSessionState(
+        initialValue = (initialSessionLoad as? SessionLoad.Available)?.session,
+        persist = store::persist,
+        clear = store::clear,
+        ownerTransition = debridKeys::runOwnerTransition,
+    )
+    private val ownerTracker = SessionOwnerGenerationTracker(initialSessionLoad.ownerStateKey())
 
     /**
      * Per-account version + downgrade-ratchet state for the sync engine (the analogue of Apple's
@@ -99,17 +231,61 @@ class VortXSyncManager(context: Context) {
      */
     @Volatile private var applyingRemote = false
 
-    @Volatile private var session: Session? = null
+    private val session: Session? get() = sessionState.value
 
-    private val _account = MutableStateFlow<Account?>(null)
-    /** The signed-in account, or null when signed out. Observed by Settings' Account row. */
+    private val _account = MutableStateFlow(session?.account)
+    /** The signed-in account, or null without one. Use [sessionUiState] to distinguish sign-out from unavailable. */
     val account: StateFlow<Account?> = _account.asStateFlow()
+
+    private val _sessionUiState = MutableStateFlow(initialSessionLoad.uiState())
+    /** Tri-state persistence truth for account surfaces, including an explicit unavailable/retry state. */
+    val sessionUiState: StateFlow<SessionUiState> = _sessionUiState.asStateFlow()
 
     /** True whenever a session is present (a token + data key were adopted and persisted). */
     val isSignedIn: Boolean get() = session != null
 
-    init {
-        restore()
+    /**
+     * A persistence-backed owner snapshot for account-scoped device credentials. `null account` is only
+     * published as a definitive signed-out state after the encrypted session store was read successfully.
+     * Keystore unavailability, a partial/corrupt session tuple, or any disagreement between the live and
+     * persisted session stays unknown so another subsystem cannot adopt signed-out local data by mistake.
+     */
+    internal fun sessionOwnerSnapshot(): SessionOwnerSnapshot = sessionState.serialized {
+        val loaded = store.load()
+        val nextState = loaded.ownerStateKey()
+        val ownerGeneration = ownerTracker.observe(nextState)
+        val available = loaded as? SessionLoad.Available
+        if (available == null) {
+            _sessionUiState.value = SessionUiState.UnknownOrUnavailable
+            return@serialized SessionOwnerSnapshot.UnknownOrUnavailable(ownerGeneration)
+        }
+        val persisted = available.session
+        val live = sessionState.value
+        if (live == null && persisted != null) {
+            sessionState.restore(persisted)
+            _account.value = persisted.account
+        } else if (
+            (live == null) != (persisted == null) ||
+            (live != null && persisted != null && live.account.id != persisted.account.id)
+        ) {
+            _sessionUiState.value = SessionUiState.UnknownOrUnavailable
+            return@serialized SessionOwnerSnapshot.UnknownOrUnavailable(ownerGeneration)
+        }
+        val current = sessionState.value
+        if (current == null) {
+            _account.value = null
+            _sessionUiState.value = SessionUiState.SignedOut
+            SessionOwnerSnapshot.SignedOutLocal(ownerGeneration)
+        } else {
+            _account.value = current.account
+            _sessionUiState.value = SessionUiState.SignedIn(current.account)
+            SessionOwnerSnapshot.Account(current.account.id, ownerGeneration)
+        }
+    }
+
+    /** Retry an unavailable/corrupt secure-session read without misclassifying it as sign-out. */
+    fun retrySessionRestore() {
+        sessionOwnerSnapshot()
     }
 
     // MARK: - Flows
@@ -150,7 +326,9 @@ class VortXSyncManager(context: Context) {
         val token = json?.optString("token").takeUnless { it.isNullOrEmpty() }
         val acct = json?.optJSONObject("account")
         if (code == 200 && token != null && acct != null) {
-            adopt(token, acct, dataKey)
+            if (!adopt(token, acct, dataKey)) {
+                return RegisterResult.secureStorageFailure(recoveryCode)
+            }
             return RegisterResult(AuthResult.Ok, recoveryCode)
         }
         val message = when (json?.optString("error")) {
@@ -188,7 +366,7 @@ class VortXSyncManager(context: Context) {
         val wrappedPw = json?.optString("wrappedKeyPassword").takeUnless { it.isNullOrEmpty() }
         val dataKey = wrappedPw?.let { VortXCrypto.open(masterKey, it) }
         if (code == 200 && token != null && acct != null && dataKey != null) {
-            adopt(token, acct, dataKey)
+            if (!adopt(token, acct, dataKey)) return AuthResult.Failed(SESSION_STORAGE_FAILURE)
             return AuthResult.Ok
         }
         return AuthResult.Failed(if (code == 401) "Wrong login or password." else "Could not sign in.")
@@ -226,23 +404,27 @@ class VortXSyncManager(context: Context) {
         val token = json?.optString("token").takeUnless { it.isNullOrEmpty() }
         val acct = json?.optJSONObject("account")
         if (code == 200 && token != null && acct != null) {
-            adopt(token, acct, dataKey)
+            if (!adopt(token, acct, dataKey)) return AuthResult.Failed(SESSION_STORAGE_FAILURE)
             return AuthResult.Ok
         }
         return AuthResult.Failed("Recovery failed.")
     }
 
-    /** Sign out: drop the realtime channel and the pending push, drop and clear the persisted session. */
-    fun signOut() {
-        stopRealtime()   // drop the SyncRoom socket + poll before clearing the token (Apple signOut order)
+    /** Sign out only after the encrypted session clear succeeds. */
+    fun signOut(): Boolean {
+        val cleared = sessionState.clear {
+            ownerTracker.recordMutation(PersistentSessionOwnerState.SignedOutLocal)
+            _account.value = null
+            _sessionUiState.value = SessionUiState.SignedOut
+        }
+        if (!cleared) return false
+        stopRealtime()
         pendingSync?.cancel()
         pendingSync = null
         hasPendingPush = false
-        session = null
-        _account.value = null
-        store.clear()
         // The per-account version / sawDocV2 keys are deliberately NOT reset (they are keyed by account id,
         // so a re-login for the SAME account keeps its high-water mark), mirroring Apple's signOut.
+        return true
     }
 
     /**
@@ -624,7 +806,7 @@ class VortXSyncManager(context: Context) {
 
     // MARK: - Session adoption + persistence
 
-    private fun adopt(token: String, acct: JSONObject, dataKey: ByteArray) {
+    private fun adopt(token: String, acct: JSONObject, dataKey: ByteArray): Boolean {
         val account = Account(
             id = acct.optString("id"),
             email = acct.optString("email"),
@@ -632,15 +814,11 @@ class VortXSyncManager(context: Context) {
             twoFactorEnabled = acct.optBoolean("twoFactorEnabled", false),
         )
         val s = Session(token, account, dataKey)
-        session = s
-        _account.value = account
-        store.persist(s)
-    }
-
-    private fun restore() {
-        val s = store.load() ?: return
-        session = s
-        _account.value = s.account
+        return sessionState.replace(s) {
+            ownerTracker.recordMutation(PersistentSessionOwnerState.Account(account.id))
+            _account.value = account
+            _sessionUiState.value = SessionUiState.SignedIn(account)
+        }
     }
 
     // MARK: - HTTP (tiny JSON-over-HttpURLConnection helper, same shape as IntegrationsHttp)
@@ -681,9 +859,9 @@ class VortXSyncManager(context: Context) {
         }
 
     /**
-     * Keystore-encrypted persistence for the session (token + account JSON + base64 data key). If Keystore
-     * is unavailable, the live session remains memory-only and disappears on restart. It is never written
-     * to plain SharedPreferences.
+     * Keystore-encrypted persistence for the session (token + account JSON + base64 data key). A rejected
+     * mutation returns false, which prevents [DurableSessionState] from publishing a memory-only session.
+     * Session credentials are never written to plain SharedPreferences.
      */
     private class SessionStore(appContext: Context) {
         private val store = FailClosedCredentialStore(
@@ -693,14 +871,14 @@ class VortXSyncManager(context: Context) {
             tag = TAG,
         )
 
-        fun persist(s: Session) {
+        fun persist(s: Session): Boolean {
             val acct = JSONObject().apply {
                 put("id", s.account.id)
                 put("email", s.account.email)
                 put("username", s.account.username)
                 put("twoFactorEnabled", s.account.twoFactorEnabled)
             }
-            store.set(
+            return store.set(
                 mapOf(
                     KEY_TOKEN to s.token,
                     KEY_ACCOUNT to acct.toString(),
@@ -709,24 +887,37 @@ class VortXSyncManager(context: Context) {
             )
         }
 
-        fun load(): Session? {
-            val token = store.string(KEY_TOKEN)?.takeIf { it.isNotEmpty() } ?: return null
-            val acctStr = store.string(KEY_ACCOUNT) ?: return null
-            val dkStr = store.string(KEY_DATA_KEY) ?: return null
-            val dataKey = VortXCrypto.unb64(dkStr) ?: return null
-            val acct = runCatching { JSONObject(acctStr) }.getOrNull() ?: return null
+        fun load(): SessionLoad {
+            val snapshot = store.confirmedSnapshot(KEY_TOKEN, KEY_ACCOUNT, KEY_DATA_KEY)
+            if (snapshot.availability != PersistentCredentialAvailability.AVAILABLE) {
+                return SessionLoad.UnknownOrUnavailable
+            }
+            val tokenRaw = snapshot.values[KEY_TOKEN]
+            val accountRaw = snapshot.values[KEY_ACCOUNT]
+            val dataKeyRaw = snapshot.values[KEY_DATA_KEY]
+            if (tokenRaw == null && accountRaw == null && dataKeyRaw == null) {
+                return SessionLoad.Available(null)
+            }
+            val token = tokenRaw?.takeIf { it.isNotBlank() }
+                ?: return SessionLoad.UnknownOrUnavailable
+            val acctStr = accountRaw ?: return SessionLoad.UnknownOrUnavailable
+            val dkStr = dataKeyRaw ?: return SessionLoad.UnknownOrUnavailable
+            val dataKey = VortXCrypto.unb64(dkStr)
+                ?.takeIf { it.size == 32 }
+                ?: return SessionLoad.UnknownOrUnavailable
+            val acct = runCatching { JSONObject(acctStr) }.getOrNull()
+                ?: return SessionLoad.UnknownOrUnavailable
             val account = Account(
                 id = acct.optString("id"),
                 email = acct.optString("email"),
                 username = acct.optString("username"),
                 twoFactorEnabled = acct.optBoolean("twoFactorEnabled", false),
             )
-            return Session(token, account, dataKey)
+            if (account.id.isBlank()) return SessionLoad.UnknownOrUnavailable
+            return SessionLoad.Available(Session(token, account, dataKey))
         }
 
-        fun clear() {
-            store.clear(KEY_TOKEN, KEY_ACCOUNT, KEY_DATA_KEY)
-        }
+        fun clear(): Boolean = store.clear(KEY_TOKEN, KEY_ACCOUNT, KEY_DATA_KEY)
 
         private companion object {
             const val TAG = "VortXSyncSession"
@@ -736,6 +927,24 @@ class VortXSyncManager(context: Context) {
             const val KEY_ACCOUNT = "account"
             const val KEY_DATA_KEY = "dataKey"
         }
+    }
+
+    private sealed interface SessionLoad {
+        data class Available(val session: Session?) : SessionLoad
+        data object UnknownOrUnavailable : SessionLoad
+    }
+
+    private fun SessionLoad.ownerStateKey(): PersistentSessionOwnerState = when (this) {
+        is SessionLoad.Available -> session?.let {
+            PersistentSessionOwnerState.Account(it.account.id)
+        } ?: PersistentSessionOwnerState.SignedOutLocal
+        SessionLoad.UnknownOrUnavailable -> PersistentSessionOwnerState.UnknownOrUnavailable
+    }
+
+    private fun SessionLoad.uiState(): SessionUiState = when (this) {
+        is SessionLoad.Available ->
+            session?.account?.let(SessionUiState::SignedIn) ?: SessionUiState.SignedOut
+        SessionLoad.UnknownOrUnavailable -> SessionUiState.UnknownOrUnavailable
     }
 
     /**
@@ -767,6 +976,8 @@ class VortXSyncManager(context: Context) {
     private companion object {
         const val BASE = "https://api.vortx.tv"
         const val TIMEOUT_MS = 20_000
+        const val SESSION_STORAGE_FAILURE =
+            "Secure storage is unavailable. Your VortX session was not changed. Please try again."
 
         /**
          * The v2 sync-document WRITE gate, held FALSE. Matches Apple `VortXSyncManager.writeSyncDocV2`

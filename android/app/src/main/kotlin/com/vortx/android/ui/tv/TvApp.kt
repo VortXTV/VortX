@@ -18,10 +18,12 @@ import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
+import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.player.PlayerScreen
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
@@ -44,6 +46,7 @@ import kotlinx.coroutines.launch
 fun TvApp(
     repo: CatalogRepository = PreviewCatalogRepository(),
     auth: AuthRepository = PreviewAuthRepository(),
+    syncManager: VortXSyncManager? = null,
 ) {
     val profileStore = ProfileStore.sharedOrNull()
     val activeProfile by (profileStore?.activeProfile?.collectAsStateWithLifecycle()
@@ -61,6 +64,16 @@ fun TvApp(
         var playing by remember { mutableStateOf<Playable?>(null) }
 
         val appContext = LocalContext.current.applicationContext
+        val debridKeys = remember(appContext) { DebridKeys(appContext) }
+        // Collect session truth so an account-generation transition recreates the title ViewModel and drops
+        // account-derived cache badges/resume refs on TV just as it does in the phone shell.
+        val sessionUiState by (
+            syncManager?.sessionUiState?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) }
+        )
+        val debridOwnerEpoch = remember(sessionUiState) {
+            debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
+        }
         // A scope tied to the whole shell (not the player layer), so the end-of-playback engine write (final
         // progress tick + Player unload) still completes after the player leaves composition -- the same
         // reason the phone shell uses an app-scoped coroutine for this.
@@ -108,7 +121,7 @@ fun TvApp(
                 // detail page respect the active profile's Kids source guard for free (the guard lives in
                 // DetailViewModel.buildContext).
                 val detailVm: DetailViewModel = viewModel(
-                    key = "tv-detail-${current.id}",
+                    key = "tv-detail-${current.id}-$debridOwnerEpoch",
                     factory = StremioXViewModelFactory(
                         repo = repo,
                         detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),

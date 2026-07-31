@@ -94,6 +94,108 @@ class DownloadPlaybackRoutingTest {
     }
 
     @Test
+    fun `debrid owner survives index round trip and fences another generation`() {
+        val decoded = requireNotNull(
+            DownloadStore.recordFromJson(
+                DownloadStore.recordToJson(
+                    record().copy(
+                        debridOwnerIdentity = "account:account-a",
+                        debridOwnerGeneration = 7,
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals("account:account-a", decoded.debridOwnerIdentity)
+        assertEquals(7L, decoded.debridOwnerGeneration)
+        assertTrue(
+            DownloadDebridOwnerPolicy.isCurrent(
+                decoded.debridOwnerIdentity,
+                decoded.debridOwnerGeneration,
+                DownloadDebridOwnerPolicy.Owner("account:account-a", 7),
+            ),
+        )
+        assertFalse(
+            DownloadDebridOwnerPolicy.isCurrent(
+                decoded.debridOwnerIdentity,
+                decoded.debridOwnerGeneration,
+                DownloadDebridOwnerPolicy.Owner("account:account-b", 8),
+            ),
+        )
+    }
+
+    @Test
+    fun `legacy ownerless index stays schema compatible but partial owner fails closed`() {
+        val legacy = requireNotNull(DownloadStore.recordFromJson(authenticLegacyJson()))
+
+        assertNull(legacy.debridOwnerIdentity)
+        assertNull(legacy.debridOwnerGeneration)
+        assertTrue(DownloadDebridOwnerPolicy.isCurrent(null, null, current = null))
+        assertFalse(
+            DownloadDebridOwnerPolicy.isCurrent(
+                expectedIdentity = "account:account-a",
+                expectedGeneration = null,
+                current = DownloadDebridOwnerPolicy.Owner("account:account-a", 1),
+            ),
+        )
+    }
+
+    @Test
+    fun `owner transition between worker precheck and locked claim rejects the fresh record`() {
+        val ownerBound = record().copy(
+            state = DownloadState.QUEUED,
+            transferGeneration = "generation-a",
+            debridOwnerIdentity = "account:account-a",
+            debridOwnerGeneration = 7,
+        )
+        var currentOwner = DownloadDebridOwnerPolicy.Owner("account:account-a", 7)
+
+        assertTrue(
+            DownloadDebridOwnerPolicy.isCurrent(
+                ownerBound.debridOwnerIdentity,
+                ownerBound.debridOwnerGeneration,
+                currentOwner,
+            ),
+        )
+
+        currentOwner = DownloadDebridOwnerPolicy.Owner("account:account-b", 8)
+        val decision = DownloadTransferClaimPolicy.decide(
+            record = ownerBound,
+            requestedGeneration = "generation-a",
+            isOwnerCurrent = {
+                DownloadDebridOwnerPolicy.isCurrent(
+                    it.debridOwnerIdentity,
+                    it.debridOwnerGeneration,
+                    currentOwner,
+                )
+            },
+        )
+
+        assertEquals(DownloadTransferClaimDecision.OwnerChanged, decision)
+    }
+
+    @Test
+    fun `terminal stale work is rejected before an owner mismatch can rewrite its state`() {
+        var ownerChecks = 0
+        val decision = DownloadTransferClaimPolicy.decide(
+            record = record().copy(
+                state = DownloadState.COMPLETED,
+                transferGeneration = null,
+                debridOwnerIdentity = "account:account-a",
+                debridOwnerGeneration = 7,
+            ),
+            requestedGeneration = "obsolete-generation",
+            isOwnerCurrent = {
+                ownerChecks += 1
+                false
+            },
+        )
+
+        assertEquals(DownloadTransferClaimDecision.Rejected, decision)
+        assertEquals(0, ownerChecks)
+    }
+
+    @Test
     fun `authentic legacy 4K index keeps both capabilities unknown`() {
         val decoded = DownloadStore.recordFromJson(authenticLegacyJson())
 

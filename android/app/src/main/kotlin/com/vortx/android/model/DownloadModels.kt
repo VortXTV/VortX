@@ -75,6 +75,13 @@ data class DownloadRecord(
     /** The resolved remote URL the download fetched. Kept for diagnostics; playback never uses it once completed. */
     val remoteURL: String,
 
+    /**
+     * Owner of a native-debrid capability URL. Both fields are null for direct/local and legacy records.
+     * Identity is the opaque account/local scope, never an API key or token.
+     */
+    val debridOwnerIdentity: String? = null,
+    val debridOwnerGeneration: Long? = null,
+
     /** On-disk filename (`<id>.<ext>`), relative to the Downloads directory. The absolute path is rebuilt on demand. */
     val localFilename: String,
 

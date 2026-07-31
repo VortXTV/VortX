@@ -153,7 +153,10 @@ interface CatalogRepository {
     /// does whatever the source requires: hand a magnet to the in-process streaming server and return
     /// its local HLS URL, unlock a debrid link, or pass an HTTP link straight through. It also folds in
     /// the per-profile resume position. The player only ever receives a concrete URL.
-    suspend fun resolve(source: StreamSource): Result<Playable>
+    suspend fun resolve(
+        source: StreamSource,
+        episode: Episode? = null,
+    ): Result<Playable>
 
     // ---- Live playback progress (engine Player) ----
     //
@@ -408,7 +411,10 @@ class PreviewCatalogRepository(
         )
     }
 
-    override suspend fun resolve(source: StreamSource): Result<Playable> {
+    override suspend fun resolve(
+        source: StreamSource,
+        episode: Episode?,
+    ): Result<Playable> {
         delay(latencyMs)
         // The preview hands back a real, public, royalty-free test stream so the player can be
         // exercised end to end before the engine + streaming server exist. Torrent sources resolve to

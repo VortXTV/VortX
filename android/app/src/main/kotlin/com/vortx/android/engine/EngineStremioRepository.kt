@@ -12,6 +12,7 @@ import com.vortx.android.debrid.DebridResolver
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
+import com.vortx.android.model.Episode
 import com.vortx.android.model.InstalledAddon
 import com.vortx.android.model.LibraryItemInfo
 import com.vortx.android.model.LibraryPortability
@@ -53,6 +54,26 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.net.URI
 import kotlin.time.Duration.Companion.seconds
+
+internal data class DebridResolveTarget(
+    val infoHash: String,
+    val episode: DebridResolver.Episode?,
+    val fileIdx: Int?,
+)
+
+internal fun StreamSource.debridResolveTarget(
+    fallbackHandle: String,
+    selectedEpisode: Episode?,
+): DebridResolveTarget = DebridResolveTarget(
+    infoHash = infoHash ?: fallbackHandle,
+    episode = selectedEpisode?.let {
+        DebridResolver.Episode(
+            season = it.season,
+            episode = it.episode,
+        )
+    },
+    fileIdx = fileIdx,
+)
 
 /// The real engine implementation of the UI seams. Drop-in replacement for `PreviewCatalogRepository`
 /// AND `PreviewAuthRepository`: it satisfies the SAME [CatalogRepository] (alias `StremioRepository`)
@@ -727,7 +748,10 @@ class EngineStremioRepository(
         StreamRanking.rankedGroups(groups, prefs = snapshot, pin = pin)
     } }
 
-    override suspend fun resolve(source: StreamSource): Result<Playable> = runCatching {
+    override suspend fun resolve(
+        source: StreamSource,
+        episode: Episode?,
+    ): Result<Playable> = runCatching {
         // A stream id encodes its handle (see EngineState.parseStream: id = handle#name#desc, handle is
         // url/externalUrl/infoHash). Direct URLs are playable as-is. A raw torrent (handle = infoHash)
         // resolves through the user's own debrid account when a key is configured (native in-client
@@ -766,7 +790,12 @@ class EngineStremioRepository(
             // cached, no playable file, provider/network error). With no key it never opens the key
             // store. On null the raw torrent falls through to the in-process streaming server below,
             // so a debrid-configured user keeps the exact direct path they have today.
-            val resolved = debridResolver.resolve(infoHash = handle)
+            val target = source.debridResolveTarget(handle, episode)
+            val resolved = debridResolver.resolve(
+                infoHash = target.infoHash,
+                episode = target.episode,
+                fileIdx = target.fileIdx,
+            )
             if (resolved != null) {
                 Playable(url = resolved, title = source.title, viaStreamingServer = false, isTorrent = false, isDolbyVision = isDolbyVision, isAtmos = isAtmos)
             } else {

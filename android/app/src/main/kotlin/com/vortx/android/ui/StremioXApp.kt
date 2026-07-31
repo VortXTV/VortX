@@ -51,6 +51,7 @@ import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
+import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.library.LibraryAutoAdd
 import com.vortx.android.model.Episode
@@ -73,6 +74,7 @@ import com.vortx.android.ui.prefs.resolveSelected
 import com.vortx.android.ui.screens.AccountScreen
 import com.vortx.android.ui.screens.AddonsScreen
 import com.vortx.android.ui.screens.AppearanceScreen
+import com.vortx.android.ui.screens.DebridKeysScreen
 import com.vortx.android.ui.screens.DetailScreen
 import com.vortx.android.ui.screens.DiscoverScreen
 import com.vortx.android.ui.screens.DownloadsScreen
@@ -139,11 +141,22 @@ fun StremioXApp(
     syncManager: VortXSyncManager? = null,
 ) {
     val appContext = LocalContext.current.applicationContext
+    // VortXApplication binds the persistence-backed owner before either the phone or TV launcher creates
+    // consumers. Compose only reads the shared binding; it must never redefine process ownership.
+    val debridKeys = remember(appContext) { DebridKeys(appContext) }
+    val vortxSessionUi by (
+        syncManager?.sessionUiState?.collectAsStateWithLifecycle()
+            ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) }
+    )
     val profileStore = ProfileStore.sharedOrNull()
     val activeProfile by (
         profileStore?.activeProfile?.collectAsStateWithLifecycle()
             ?: remember { mutableStateOf(null) }
     )
+    // Reading the bound identity after collecting account makes Compose reset the debrid editor at the same
+    // account transition that every resolver/coordinator/view-model DebridKeys instance observes.
+    val debridAccountIdentity = debridKeys.ownerIdentity()
+    val debridOwnerEpoch = debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
     val appearancePrefs = remember(appContext) { AppearancePrefs(appContext) }
     val tabBarPrefs = remember(appContext) { TabBarPrefs(appContext) }
     val appearance by appearancePrefs.state.collectAsStateWithLifecycle()
@@ -195,6 +208,7 @@ fun StremioXApp(
         var showDownloads by remember { mutableStateOf(false) }
         var showPlayback by remember { mutableStateOf(false) }
         var showSources by remember { mutableStateOf(false) }
+        var showDebridKeys by remember { mutableStateOf(false) }
         var showLiveTv by remember { mutableStateOf(false) }
         var showLibraryTransfer by remember { mutableStateOf(false) }
         var showProfiles by remember { mutableStateOf(false) }
@@ -274,7 +288,7 @@ fun StremioXApp(
             val advanceVm: DetailViewModel? =
                 if (showForNext != null && !playable.isTrailer) {
                     viewModel(
-                        key = "detail-${showForNext.id}",
+                        key = "detail-${showForNext.id}-$debridOwnerEpoch",
                         factory = StremioXViewModelFactory(
                             repo = repo,
                             detailArgs = StremioXViewModelFactory.DetailArgs(showForNext.type, showForNext.id),
@@ -529,6 +543,16 @@ fun StremioXApp(
             return@VortXTheme
         }
 
+        if (showDebridKeys) {
+            BackHandler { showDebridKeys = false }
+            DebridKeysScreen(
+                keys = debridKeys,
+                accountIdentity = debridAccountIdentity,
+                onBack = { showDebridKeys = false },
+            )
+            return@VortXTheme
+        }
+
         if (showLiveTv) {
             // Settings > Live TV (IPTV): add / remove M3U + Xtream playlists. UNLIKE the self-contained
             // settings overlays it takes [repo], the same way LibraryTransferScreen does: adding installs the
@@ -565,7 +589,7 @@ fun StremioXApp(
         if (current != null) {
             // A ViewModel keyed to this title's id, fed type+id through the factory's DetailArgs.
             val detailVm: DetailViewModel = viewModel(
-                key = "detail-${current.id}",
+                key = "detail-${current.id}-$debridOwnerEpoch",
                 factory = StremioXViewModelFactory(
                     repo = repo,
                     detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),
@@ -636,11 +660,23 @@ fun StremioXApp(
                     // account flow. Null manager (preview / keystore failure) hides the row entirely.
                     // The conditional collect is safe: [syncManager] is process-constant, so the
                     // composition never flips between the two branches.
-                    vortxAccountValue = syncManager?.let { manager ->
-                        val vortxAccount by manager.account.collectAsStateWithLifecycle()
-                        vortxAccount?.let { it.username.ifEmpty { it.email } } ?: "Not signed in"
+                    vortxAccountValue = syncManager?.let {
+                        when (val session = vortxSessionUi) {
+                            is VortXSyncManager.SessionUiState.SignedIn ->
+                                session.account.username.ifEmpty { session.account.email }
+                            VortXSyncManager.SessionUiState.SignedOut -> "Not signed in"
+                            VortXSyncManager.SessionUiState.UnknownOrUnavailable ->
+                                "Secure session unavailable · Tap to retry"
+                            null -> "Secure session unavailable · Tap to retry"
+                        }
                     },
-                    onVortxAccountClick = { showVortxAccount = true },
+                    onVortxAccountClick = {
+                        if (vortxSessionUi == VortXSyncManager.SessionUiState.UnknownOrUnavailable) {
+                            syncManager?.retrySessionRestore()
+                        } else {
+                            showVortxAccount = true
+                        }
+                    },
                     onProfilesClick = { showProfiles = true },
                     onAppearanceScreenClick = { showAppearance = true },
                     onTabBarScreenClick = { showTabBar = true },
@@ -652,6 +688,7 @@ fun StremioXApp(
                     onDownloadsClick = { showDownloads = true },
                     onPlaybackClick = { showPlayback = true },
                     onSourcesClick = { showSources = true },
+                    onDebridKeysScreenClick = { showDebridKeys = true },
                     onLibraryClick = { showLibraryTransfer = true },
                     modifier = content,
                     onOpenGallery = { showGallery = true },

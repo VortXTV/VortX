@@ -325,6 +325,8 @@ object DownloadStore {
             put("headers", JSONObject().apply { headers.forEach { (k, v) -> put(k, v) } })
         }
         put("remoteURL", record.remoteURL)
+        record.debridOwnerIdentity?.let { put("debridOwnerIdentity", it) }
+        record.debridOwnerGeneration?.let { put("debridOwnerGeneration", it) }
         put("localFilename", record.localFilename)
         put("bytesTotal", record.bytesTotal)
         put("bytesDone", record.bytesDone)
@@ -360,6 +362,12 @@ object DownloadStore {
             isTorrent = json.optBoolean("isTorrent", false),
             headers = headers,
             remoteURL = json.optString("remoteURL"),
+            debridOwnerIdentity = json.optStringOrNull("debridOwnerIdentity"),
+            debridOwnerGeneration = if (json.has("debridOwnerGeneration")) {
+                json.optLong("debridOwnerGeneration")
+            } else {
+                null
+            },
             localFilename = json.optString("localFilename"),
             bytesTotal = json.optLong("bytesTotal", 0L),
             bytesDone = json.optLong("bytesDone", 0L),

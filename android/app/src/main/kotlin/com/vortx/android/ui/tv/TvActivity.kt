@@ -33,6 +33,12 @@ class TvActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         val app = application as VortXApplication
-        setContent { TvApp(repo = app.catalogRepository, auth = app.authRepository) }
+        setContent {
+            TvApp(
+                repo = app.catalogRepository,
+                auth = app.authRepository,
+                syncManager = app.syncManager,
+            )
+        }
     }
 }

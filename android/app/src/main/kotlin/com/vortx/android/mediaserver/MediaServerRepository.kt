@@ -2,6 +2,7 @@ package com.vortx.android.mediaserver
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.vortx.android.integrations.CredentialStoreAccess
 import com.vortx.android.integrations.SecureTokenStore
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
@@ -39,23 +40,52 @@ object MediaServerRepository {
     private const val DEVICE_ID_KEY = "deviceId"
     private const val PLEX_CLIENT_KEY = "plexClientId"
     private const val PLEX_ACCOUNT_TOKEN_KEY = "vortx.mediaserver.plexAccount.token"
+    private const val PENDING_REMOVALS_KEY = "pendingRemovals"
+    private const val PENDING_ADDS_KEY = "pendingAdds"
 
     @Volatile private var metaPrefs: SharedPreferences? = null
-    @Volatile private var tokenStore: SecureTokenStore? = null
+    @Volatile private var metadataState: ConfirmedMediaServerMetadata? = null
+    @Volatile private var tokenStore: CredentialStoreAccess? = null
     @Volatile private var records: List<MediaServerRecord> = emptyList()
-    @Volatile private var providers: List<ServerProvider> = emptyList()
 
     private data class ServerProvider(val id: UUID, val provider: MediaServerProvider)
+    private data class ProviderState(
+        val generation: Long,
+        val providers: List<ServerProvider>,
+        val activeIds: Set<UUID>,
+    )
+
+    @Volatile
+    private var providerState = ProviderState(
+        generation = 0L,
+        providers = emptyList(),
+        activeIds = emptySet(),
+    )
 
     /// Idempotent init: build the plain metadata prefs + encrypted token store, load persisted records, and
     /// warm the providers so a server connected in a previous run is queryable after a restart WITHOUT the
     /// user opening settings. Safe to call from every entry point (the Application, the settings screen).
     fun init(context: Context) {
-        if (metaPrefs != null && tokenStore != null) return
         synchronized(this) {
-            if (metaPrefs == null) metaPrefs = context.applicationContext.getSharedPreferences(META_PREFS, Context.MODE_PRIVATE)
+            if (metaPrefs == null) {
+                val prefs =
+                    context.applicationContext.getSharedPreferences(META_PREFS, Context.MODE_PRIVATE)
+                metaPrefs = prefs
+                metadataState = ConfirmedMediaServerMetadata(
+                    readPersisted = { readMetadataSnapshot(prefs) },
+                    writePersisted = { snapshot -> writeMetadataSnapshot(prefs, snapshot) },
+                )
+            }
             if (tokenStore == null) tokenStore = SecureTokenStore(context.applicationContext, TOKEN_PREFS)
-            records = loadRecords()
+            val snapshot = confirmedMetadata()
+            if (snapshot == null) {
+                records = emptyList()
+                rebuildProviders()
+                return@synchronized
+            }
+            records = snapshot.records
+            resumePendingAdds()
+            resumePendingRemovals()
             rebuildProviders()
         }
     }
@@ -87,20 +117,166 @@ object MediaServerRepository {
 
     /// Record a freshly-connected server: stash its token (+ the Plex account token) in the encrypted store,
     /// prepend the metadata, persist, and rebuild the providers. Idempotent by id.
-    fun add(record: MediaServerRecord, token: String, plexAccountToken: String? = null) {
-        tokenStore?.set(tokenKey(record.id), token)
-        if (!plexAccountToken.isNullOrEmpty()) tokenStore?.set(PLEX_ACCOUNT_TOKEN_KEY, plexAccountToken)
-        records = listOf(record) + records.filter { it.id != record.id }
-        persistRecords()
-        rebuildProviders()
-    }
+    fun add(
+        record: MediaServerRecord,
+        token: String,
+        plexAccountToken: String? = null,
+    ): MediaServerAddResult =
+        synchronized(this) {
+            val store = tokenStore ?: return@synchronized MediaServerAddResult.NOT_CONNECTED
+            val current = confirmedMetadata()
+                ?: return@synchronized MediaServerAddResult.NOT_CONNECTED
+            if (current.pendingAdds.any { it.serverId == record.id }) {
+                return@synchronized MediaServerAddResult.RECOVERY_PENDING
+            }
+
+            val tokenKey = tokenKey(record.id)
+            val backupKey = addBackupKey(record.id)
+            val preparation = prepareMediaServerAddCredentials(
+                store = store,
+                tokenKey = tokenKey,
+                backupKey = backupKey,
+                token = token,
+                plexAccountTokenKey = PLEX_ACCOUNT_TOKEN_KEY,
+                plexAccountToken = plexAccountToken,
+            )
+            val values = when (preparation) {
+                is MediaServerAddCredentialPreparation.Ready -> preparation.values
+                MediaServerAddCredentialPreparation.Unavailable ->
+                    return@synchronized MediaServerAddResult.NOT_CONNECTED
+                MediaServerAddCredentialPreparation.RecoveryPending ->
+                    return@synchronized MediaServerAddResult.RECOVERY_PENDING
+            }
+
+            val rollback = MediaServerAddJournal(
+                serverId = record.id,
+                disposition = MediaServerAddDisposition.ROLLBACK,
+            )
+            val rollbackSnapshot = current.copy(
+                pendingAdds = listOf(rollback) + current.pendingAdds,
+            )
+            if (!persistRepositoryState(rollbackSnapshot)) {
+                return@synchronized MediaServerAddResult.NOT_CONNECTED
+            }
+
+            if (!store.set(values)) {
+                return@synchronized if (finishAddJournal(rollback)) {
+                    MediaServerAddResult.NOT_CONNECTED
+                } else {
+                    MediaServerAddResult.RECOVERY_PENDING
+                }
+            }
+
+            val committed = rollback.copy(disposition = MediaServerAddDisposition.COMMITTED)
+            val nextRecords = listOf(record) + records.filter { it.id != record.id }
+            val committedSnapshot = rollbackSnapshot.copy(
+                records = nextRecords,
+                pendingRemovals = rollbackSnapshot.pendingRemovals - record.id,
+                pendingAdds = rollbackSnapshot.pendingAdds.map {
+                    if (it.serverId == record.id) committed else it
+                },
+            )
+            if (!persistRepositoryState(committedSnapshot)) {
+                resolveMediaServerAddCredentials(
+                    store = store,
+                    tokenKey = tokenKey,
+                    backupKey = backupKey,
+                    plexAccountTokenKey = PLEX_ACCOUNT_TOKEN_KEY,
+                    disposition = MediaServerAddDisposition.ROLLBACK,
+                )
+                return@synchronized MediaServerAddResult.RECOVERY_PENDING
+            }
+
+            records = nextRecords
+            rebuildProviders()
+            finishAddJournal(committed)
+            MediaServerAddResult.CONNECTED
+        }
 
     /// Forget a server: drop its token and metadata, persist, rebuild the providers.
-    fun remove(id: UUID) {
-        tokenStore?.set(tokenKey(id), null)
-        records = records.filter { it.id != id }
-        persistRecords()
-        rebuildProviders()
+    fun remove(id: UUID): MediaServerRemovalResult = synchronized(this) {
+        val store = tokenStore ?: return@synchronized MediaServerRemovalResult.UNCHANGED
+        val current = confirmedMetadata()
+            ?: return@synchronized MediaServerRemovalResult.UNCHANGED
+        val nextRecords = records.filter { it.id != id }
+        val pending = current.pendingRemovals + id
+        completeMediaServerRemoval(
+            publishRemoval = {
+                if (!persistRepositoryState(
+                        current.copy(
+                            records = nextRecords,
+                            pendingRemovals = pending,
+                        ),
+                    )
+                ) {
+                    false
+                } else {
+                    records = nextRecords
+                    rebuildProviders()
+                    true
+                }
+            },
+            clearCredential = { store.clear(tokenKey(id)) },
+            finishCleanup = {
+                val latest = confirmedMetadata() ?: return@completeMediaServerRemoval false
+                persistRepositoryState(latest.copy(pendingRemovals = pending - id))
+            },
+        )
+    }
+
+    private fun resumePendingAdds() {
+        val store = tokenStore ?: return
+        val pending = confirmedMetadata()?.pendingAdds ?: return
+        resumeMediaServerAddJournals(
+            journals = pending,
+            resolveCredentials = { journal ->
+                resolveMediaServerAddCredentials(
+                    store = store,
+                    tokenKey = tokenKey(journal.serverId),
+                    backupKey = addBackupKey(journal.serverId),
+                    plexAccountTokenKey = PLEX_ACCOUNT_TOKEN_KEY,
+                    disposition = journal.disposition,
+                )
+            },
+            publishRemaining = { remaining ->
+                val latest = confirmedMetadata() ?: return@resumeMediaServerAddJournals false
+                persistRepositoryState(latest.copy(pendingAdds = remaining))
+            },
+        )
+    }
+
+    private fun finishAddJournal(journal: MediaServerAddJournal): Boolean {
+        val store = tokenStore ?: return false
+        if (!resolveMediaServerAddCredentials(
+                store = store,
+                tokenKey = tokenKey(journal.serverId),
+                backupKey = addBackupKey(journal.serverId),
+                plexAccountTokenKey = PLEX_ACCOUNT_TOKEN_KEY,
+                disposition = journal.disposition,
+            )
+        ) {
+            return false
+        }
+        val latest = confirmedMetadata() ?: return false
+        return persistRepositoryState(
+            latest.copy(
+                pendingAdds = latest.pendingAdds.filter { it.serverId != journal.serverId },
+            ),
+        )
+    }
+
+    private fun resumePendingRemovals() {
+        val store = tokenStore ?: return
+        val pending = confirmedMetadata()?.pendingRemovals ?: return
+        resumeMediaServerRemovals(
+            pendingIds = pending,
+            activeIds = records.mapTo(linkedSetOf()) { it.id },
+            clearCredential = { id -> store.clear(tokenKey(id)) },
+            publishPending = { ids ->
+                val latest = confirmedMetadata() ?: return@resumeMediaServerRemovals false
+                persistRepositoryState(latest.copy(pendingRemovals = ids))
+            },
+        )
     }
 
     /// Mark a server as needing re-auth (a provider 401/403). Surfaced as a settings badge; never blocks the
@@ -110,8 +286,11 @@ object MediaServerRepository {
         // copy-on-write against a second server failing at the same instant.
         val idx = records.indexOfFirst { it.id == id }
         if (idx < 0 || records[idx].needsReauth) return@synchronized
-        records = records.toMutableList().also { it[idx] = it[idx].copy(needsReauth = true) }
-        persistRecords()
+        val next = records.toMutableList().also { it[idx] = it[idx].copy(needsReauth = true) }
+        val current = confirmedMetadata() ?: return@synchronized
+        if (persistRepositoryState(current.copy(records = next))) {
+            records = next
+        }
     }
 
     // MARK: - Lookup (coordinator)
@@ -122,30 +301,43 @@ object MediaServerRepository {
     /// (an AuthFailed additionally badges that server needs-reauth), so one bad server never sinks the rest.
     /// Mirrors the Apple `MediaServerCoordinator.find`.
     suspend fun find(detailId: String?, season: Int?, episode: Int?, title: String?, year: Int?): List<MediaServerHit> {
-        val snapshot = providers
-        if (snapshot.isEmpty()) return emptyList()
+        val snapshot = providerState
+        if (snapshot.providers.isEmpty()) return emptyList()
         // Off the main thread: library-sized `/Items` and `/allLeaves` responses are parsed here (the Apple
         // flowOn discipline: never decode a library-sized response on the main thread). Network itself
         // already hops to Dispatchers.IO inside IntegrationsHttp.
         return withContext(Dispatchers.Default) {
-            coroutineScope {
-            snapshot.map { sp ->
-                async {
-                    try {
-                        var hit = if (!detailId.isNullOrEmpty()) sp.provider.findByImdb(detailId, season, episode) else null
-                        if (hit == null && !title.isNullOrEmpty()) hit = sp.provider.findByTitle(title, year, season, episode)
-                        hit
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: MediaServerProviderException.AuthFailed) {
-                        markNeedsReauth(sp.id)
-                        null
-                    } catch (e: Exception) {
-                        null // fail soft: a flaky/unreachable server never breaks the others
+            val hits = coroutineScope {
+                snapshot.providers.map { sp ->
+                    async {
+                        try {
+                            var hit = if (!detailId.isNullOrEmpty()) {
+                                sp.provider.findByImdb(detailId, season, episode)
+                            } else {
+                                null
+                            }
+                            if (hit == null && !title.isNullOrEmpty()) {
+                                hit = sp.provider.findByTitle(title, year, season, episode)
+                            }
+                            hit
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: MediaServerProviderException.AuthFailed) {
+                            markNeedsReauth(sp.id)
+                            null
+                        } catch (e: Exception) {
+                            null // fail soft: a flaky/unreachable server never breaks the others
+                        }
                     }
-                }
-            }.awaitAll().filterNotNull()
+                }.awaitAll().filterNotNull()
             }
+            val current = providerState
+            fenceMediaServerHits(
+                startGeneration = snapshot.generation,
+                currentGeneration = current.generation,
+                activeIds = current.activeIds,
+                hits = hits,
+            )
         }
     }
 
@@ -219,8 +411,8 @@ object MediaServerRepository {
 
     private fun rebuildProviders() {
         val store = tokenStore
-        providers = records.mapNotNull { r ->
-            val token = store?.string(tokenKey(r.id)).orEmpty()
+        val nextProviders = records.mapNotNull { r ->
+            val token = store?.confirmedString(tokenKey(r.id)).orEmpty()
             if (token.isEmpty()) return@mapNotNull null
             val base = r.urls.firstOrNull() ?: return@mapNotNull null
             val config = MediaServerConfig(
@@ -238,15 +430,21 @@ object MediaServerRepository {
             }
             ServerProvider(r.id, provider)
         }
+        providerState = ProviderState(
+            generation = providerState.generation + 1L,
+            providers = nextProviders,
+            activeIds = nextProviders.mapTo(linkedSetOf()) { it.id },
+        )
     }
 
     private fun tokenKey(id: UUID): String = "vortx.mediaserver.$id.token"
+    private fun addBackupKey(id: UUID): String = "vortx.mediaserver.$id.addRollback.previous"
 
     // MARK: - Persistence
 
-    private fun persistRecords() {
+    private fun encodeRecords(source: List<MediaServerRecord>): String {
         val arr = JSONArray()
-        for (r in records) {
+        for (r in source) {
             val o = JSONObject()
                 .put("id", r.id.toString())
                 .put("name", r.name)
@@ -258,14 +456,98 @@ object MediaServerRepository {
             r.machineId?.let { o.put("machineId", it) }
             arr.put(o)
         }
-        metaPrefs?.edit()?.putString(RECORDS_KEY, arr.toString())?.apply()
+        return arr.toString()
     }
 
-    private fun loadRecords(): List<MediaServerRecord> {
-        val raw = metaPrefs?.getString(RECORDS_KEY, null) ?: return emptyList()
-        val arr = runCatching { JSONArray(raw) }.getOrNull() ?: return emptyList()
-        return (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i)?.let(::parseRecord) }
-            .sortedByDescending { it.addedAtMillis }
+    private fun confirmedMetadata(): MediaServerMetadataSnapshot? =
+        (metadataState?.read() as? MediaServerMetadataRead.Available)?.snapshot
+
+    private fun persistRepositoryState(next: MediaServerMetadataSnapshot): Boolean =
+        metadataState?.publish(next) ?: false
+
+    private fun writeMetadataSnapshot(
+        prefs: SharedPreferences,
+        snapshot: MediaServerMetadataSnapshot,
+    ): Boolean =
+        runCatching {
+            prefs.edit()
+                .putString(RECORDS_KEY, encodeRecords(snapshot.records))
+                .putStringSet(
+                    PENDING_REMOVALS_KEY,
+                    snapshot.pendingRemovals.mapTo(linkedSetOf()) { it.toString() },
+                )
+                .putString(PENDING_ADDS_KEY, encodePendingAdds(snapshot.pendingAdds))
+                .commit()
+        }.getOrDefault(false)
+
+    private fun readMetadataSnapshot(prefs: SharedPreferences): MediaServerMetadataRead =
+        try {
+            val records = prefs.getString(RECORDS_KEY, null)
+                ?.let(::decodeRecords)
+                ?: if (prefs.contains(RECORDS_KEY)) {
+                    return MediaServerMetadataRead.Unavailable
+                } else {
+                    emptyList()
+                }
+            val pendingRemovals = linkedSetOf<UUID>()
+            for (value in prefs.getStringSet(PENDING_REMOVALS_KEY, emptySet()).orEmpty()) {
+                val id = runCatching { UUID.fromString(value) }.getOrNull()
+                    ?: return MediaServerMetadataRead.Unavailable
+                pendingRemovals += id
+            }
+            val pendingAdds = prefs.getString(PENDING_ADDS_KEY, null)
+                ?.let(::decodePendingAdds)
+                ?: if (prefs.contains(PENDING_ADDS_KEY)) {
+                    return MediaServerMetadataRead.Unavailable
+                } else {
+                    emptyList()
+                }
+            MediaServerMetadataRead.Available(
+                MediaServerMetadataSnapshot(
+                    records = records,
+                    pendingRemovals = pendingRemovals,
+                    pendingAdds = pendingAdds,
+                ),
+            )
+        } catch (_: Exception) {
+            MediaServerMetadataRead.Unavailable
+        }
+
+    private fun decodeRecords(raw: String): List<MediaServerRecord>? {
+        val array = runCatching { JSONArray(raw) }.getOrNull() ?: return null
+        val decoded = ArrayList<MediaServerRecord>(array.length())
+        for (index in 0 until array.length()) {
+            decoded += array.optJSONObject(index)?.let(::parseRecord) ?: return null
+        }
+        return decoded.sortedByDescending { it.addedAtMillis }
+    }
+
+    private fun encodePendingAdds(pending: List<MediaServerAddJournal>): String {
+        val array = JSONArray()
+        pending.forEach { journal ->
+            array.put(
+                JSONObject()
+                    .put("serverId", journal.serverId.toString())
+                    .put("disposition", journal.disposition.wire),
+            )
+        }
+        return array.toString()
+    }
+
+    private fun decodePendingAdds(raw: String): List<MediaServerAddJournal>? {
+        val array = runCatching { JSONArray(raw) }.getOrNull() ?: return null
+        val decoded = ArrayList<MediaServerAddJournal>(array.length())
+        val ids = hashSetOf<UUID>()
+        for (index in 0 until array.length()) {
+            val obj = array.optJSONObject(index) ?: return null
+            val id = runCatching { UUID.fromString(obj.optString("serverId")) }.getOrNull()
+                ?: return null
+            val disposition = MediaServerAddDisposition.fromWire(obj.optString("disposition"))
+                ?: return null
+            if (!ids.add(id)) return null
+            decoded += MediaServerAddJournal(id, disposition)
+        }
+        return decoded
     }
 
     private fun parseRecord(o: JSONObject): MediaServerRecord? {
@@ -285,4 +567,46 @@ object MediaServerRepository {
             needsReauth = o.optBoolean("needsReauth", false),
         )
     }
+}
+
+internal fun fenceMediaServerHits(
+    startGeneration: Long,
+    currentGeneration: Long,
+    activeIds: Set<UUID>,
+    hits: List<MediaServerHit>,
+): List<MediaServerHit> {
+    if (startGeneration != currentGeneration) return emptyList()
+    return hits.filter { it.serverId in activeIds }
+}
+
+internal fun resumeMediaServerRemovals(
+    pendingIds: Set<UUID>,
+    activeIds: Set<UUID>,
+    clearCredential: (UUID) -> Boolean,
+    publishPending: (Set<UUID>) -> Boolean,
+): Set<UUID> {
+    var remaining = pendingIds
+    for (id in pendingIds) {
+        if (id in activeIds || !clearCredential(id)) continue
+        val next = remaining - id
+        if (publishPending(next)) remaining = next
+    }
+    return remaining
+}
+
+enum class MediaServerRemovalResult {
+    REMOVED,
+    UNCHANGED,
+    CLEANUP_PENDING,
+}
+
+internal fun completeMediaServerRemoval(
+    publishRemoval: () -> Boolean,
+    clearCredential: () -> Boolean,
+    finishCleanup: () -> Boolean,
+): MediaServerRemovalResult {
+    if (!publishRemoval()) return MediaServerRemovalResult.UNCHANGED
+    if (!clearCredential()) return MediaServerRemovalResult.CLEANUP_PENDING
+    if (!finishCleanup()) return MediaServerRemovalResult.CLEANUP_PENDING
+    return MediaServerRemovalResult.REMOVED
 }

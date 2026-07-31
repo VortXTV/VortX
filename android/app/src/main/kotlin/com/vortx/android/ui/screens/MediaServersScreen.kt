@@ -37,8 +37,11 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.vortx.android.mediaserver.MediaServerAuthException
+import com.vortx.android.mediaserver.MediaServerAuthResult
+import com.vortx.android.mediaserver.MediaServerAddResult
 import com.vortx.android.mediaserver.MediaServerKind
 import com.vortx.android.mediaserver.MediaServerRecord
+import com.vortx.android.mediaserver.MediaServerRemovalResult
 import com.vortx.android.mediaserver.MediaServerRepository
 import com.vortx.android.mediaserver.MediaServerResolve
 import com.vortx.android.mediaserver.PlexClient
@@ -74,6 +77,7 @@ fun MediaServersScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 
     var servers by remember { mutableStateOf(MediaServerRepository.servers()) }
     var adding by remember { mutableStateOf<MediaServerKind?>(null) }
+    var mutationError by remember { mutableStateOf<String?>(null) }
     fun refresh() { servers = MediaServerRepository.servers() }
 
     Scaffold(
@@ -100,9 +104,32 @@ fun MediaServersScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     "the server to this device. Your servers rank against your other sources.",
                 style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
             )
+            mutationError?.let {
+                Text(it, style = VortXTheme.type.label.copy(color = VortXTheme.colors.danger))
+            }
 
             servers.forEach { record ->
-                ServerCard(record = record, onRemove = { MediaServerRepository.remove(record.id); refresh() })
+                ServerCard(
+                    record = record,
+                    onRemove = {
+                        mutationError = null
+                        val result = MediaServerRepository.remove(record.id)
+                        refresh()
+                        when (result) {
+                            MediaServerRemovalResult.REMOVED -> true
+                            MediaServerRemovalResult.UNCHANGED -> {
+                                mutationError =
+                                    "Could not securely remove this server. It is still connected. Try again."
+                                false
+                            }
+                            MediaServerRemovalResult.CLEANUP_PENDING -> {
+                                mutationError =
+                                    "The server is disconnected. Secure cleanup will retry after restart."
+                                true
+                            }
+                        }
+                    },
+                )
             }
 
             val kind = adding
@@ -137,7 +164,7 @@ private fun AddSection(hasServers: Boolean, onPick: (MediaServerKind) -> Unit) {
 }
 
 @Composable
-private fun ServerCard(record: MediaServerRecord, onRemove: () -> Unit) {
+private fun ServerCard(record: MediaServerRecord, onRemove: () -> Boolean) {
     val colors = VortXTheme.colors
     var confirmRemove by remember { mutableStateOf(false) }
     SurfaceCard(modifier = Modifier.fillMaxWidth()) {
@@ -164,7 +191,9 @@ private fun ServerCard(record: MediaServerRecord, onRemove: () -> Unit) {
                     Chip(
                         label = "Remove server",
                         selected = false,
-                        onClick = onRemove,
+                        onClick = {
+                            if (onRemove()) confirmRemove = false
+                        },
                         accent = colors.danger,
                         accentText = colors.danger,
                     )
@@ -206,11 +235,13 @@ private fun PlexAddFlow(onDone: () -> Unit) {
     var accountToken by remember { mutableStateOf<String?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
+    val retryIdentities = remember { MediaServerRetryIdentities() }
 
     fun connect(candidate: PlexServerCandidate) {
-        MediaServerRepository.add(
+        val retryKey = candidate.machineId.ifEmpty { candidate.urls.joinToString(separator = "|") }
+        val result = MediaServerRepository.add(
             record = MediaServerRecord(
-                id = UUID.randomUUID(),
+                id = retryIdentities.idFor(retryKey),
                 name = candidate.name,
                 kind = MediaServerKind.PLEX,
                 urls = candidate.urls,
@@ -222,7 +253,21 @@ private fun PlexAddFlow(onDone: () -> Unit) {
             token = candidate.accessToken,
             plexAccountToken = accountToken,
         )
-        onDone()
+        when (result) {
+            MediaServerAddResult.CONNECTED -> {
+                retryIdentities.forget(retryKey)
+                error = null
+                onDone()
+            }
+            MediaServerAddResult.NOT_CONNECTED -> {
+                error = "Could not connect this server. It is not connected. Try again."
+            }
+            MediaServerAddResult.RECOVERY_PENDING -> {
+                error =
+                    "Could not confirm the server connection. Secure recovery will finish after restart. " +
+                        "Do not retry it yet."
+            }
+        }
     }
 
     Text("Plex", style = VortXTheme.type.cardTitle)
@@ -296,13 +341,16 @@ private fun JellyfinAddFlow(onDone: () -> Unit) {
     var qcCode by remember { mutableStateOf<String?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
+    var pendingResult by remember { mutableStateOf<MediaServerAuthResult?>(null) }
+    val retryIdentities = remember { MediaServerRetryIdentities() }
 
-    fun finish(result: com.vortx.android.mediaserver.MediaServerAuthResult) {
+    fun finish(result: MediaServerAuthResult) {
         val root = MediaServerResolve.normalizedBase(base)
         if (root == null) { error = MediaServerAuthException.BadUrl.message; return }
-        MediaServerRepository.add(
+        val retryKey = "jellyfin|$root|${result.serverId}|${result.userId}"
+        val addResult = MediaServerRepository.add(
             record = MediaServerRecord(
-                id = UUID.randomUUID(),
+                id = retryIdentities.idFor(retryKey),
                 name = result.serverName ?: hostOf(root) ?: "Jellyfin",
                 kind = MediaServerKind.JELLYFIN,
                 urls = listOf(root),
@@ -313,7 +361,24 @@ private fun JellyfinAddFlow(onDone: () -> Unit) {
             ),
             token = result.accessToken,
         )
-        onDone()
+        when (addResult) {
+            MediaServerAddResult.CONNECTED -> {
+                retryIdentities.forget(retryKey)
+                pendingResult = null
+                error = null
+                onDone()
+            }
+            MediaServerAddResult.NOT_CONNECTED -> {
+                pendingResult = result
+                error = "Could not connect this server. It is not connected. Try again."
+            }
+            MediaServerAddResult.RECOVERY_PENDING -> {
+                pendingResult = null
+                error =
+                    "Could not confirm the server connection. Secure recovery will finish after restart. " +
+                        "Do not retry it yet."
+            }
+        }
     }
 
     Text("Jellyfin", style = VortXTheme.type.cardTitle)
@@ -409,6 +474,13 @@ private fun JellyfinAddFlow(onDone: () -> Unit) {
             )
         }
     }
+    pendingResult?.let { result ->
+        PrimaryButton(
+            text = "Retry saving server",
+            onClick = { finish(result) },
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
     error?.let { Text(it, style = VortXTheme.type.label.copy(color = colors.danger)) }
 }
 
@@ -421,13 +493,16 @@ private fun EmbyAddFlow(onDone: () -> Unit) {
     var password by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
+    var pendingResult by remember { mutableStateOf<MediaServerAuthResult?>(null) }
+    val retryIdentities = remember { MediaServerRetryIdentities() }
 
-    fun finish(result: com.vortx.android.mediaserver.MediaServerAuthResult) {
+    fun finish(result: MediaServerAuthResult) {
         val root = MediaServerResolve.normalizedBase(base)
         if (root == null) { error = MediaServerAuthException.BadUrl.message; return }
-        MediaServerRepository.add(
+        val retryKey = "emby|$root|${result.serverId}|${result.userId}"
+        val addResult = MediaServerRepository.add(
             record = MediaServerRecord(
-                id = UUID.randomUUID(),
+                id = retryIdentities.idFor(retryKey),
                 name = result.serverName ?: hostOf(root) ?: "Emby",
                 kind = MediaServerKind.EMBY,
                 urls = listOf(root),
@@ -438,7 +513,24 @@ private fun EmbyAddFlow(onDone: () -> Unit) {
             ),
             token = result.accessToken,
         )
-        onDone()
+        when (addResult) {
+            MediaServerAddResult.CONNECTED -> {
+                retryIdentities.forget(retryKey)
+                pendingResult = null
+                error = null
+                onDone()
+            }
+            MediaServerAddResult.NOT_CONNECTED -> {
+                pendingResult = result
+                error = "Could not connect this server. It is not connected. Try again."
+            }
+            MediaServerAddResult.RECOVERY_PENDING -> {
+                pendingResult = null
+                error =
+                    "Could not confirm the server connection. Secure recovery will finish after restart. " +
+                        "Do not retry it yet."
+            }
+        }
     }
 
     Text("Emby", style = VortXTheme.type.cardTitle)
@@ -465,12 +557,31 @@ private fun EmbyAddFlow(onDone: () -> Unit) {
         },
         modifier = Modifier.fillMaxWidth(),
     )
+    pendingResult?.let { result ->
+        PrimaryButton(
+            text = "Retry saving server",
+            onClick = { finish(result) },
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
     error?.let { Text(it, style = VortXTheme.type.label.copy(color = colors.danger)) }
 }
 
 // MARK: - Shared pieces
 
 private enum class Phase { URL, QUICK_CONNECT, PASSWORD }
+
+internal class MediaServerRetryIdentities(
+    private val generate: () -> UUID = UUID::randomUUID,
+) {
+    private val ids = mutableMapOf<String, UUID>()
+
+    fun idFor(key: String): UUID = ids.getOrPut(key, generate)
+
+    fun forget(key: String) {
+        ids.remove(key)
+    }
+}
 
 /**
  * Owns one Jellyfin Quick Connect poll and invalidates all of its callbacks when the user falls back to

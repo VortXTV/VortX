@@ -18,6 +18,52 @@ import java.security.MessageDigest
 import java.util.UUID
 import kotlin.coroutines.coroutineContext
 
+/**
+ * Pure selection policy for arrays returned by debrid providers.
+ *
+ * [providerFileIdx] is accepted only to make the rejected provenance explicit: a Stremio stream's raw
+ * torrent index is not an offset into a provider-local array. Episodes require one digit-bounded semantic
+ * filename match, with a sole effective file as the only no-match fallback. Movies retain the existing
+ * largest-video behavior.
+ */
+internal object DebridFileSelection {
+    @Suppress("UNUSED_PARAMETER")
+    fun pick(
+        files: List<DebridResolver.DebridFile>,
+        episode: DebridResolver.Episode?,
+        providerFileIdx: Int?,
+    ): DebridResolver.DebridFile? {
+        val videos = files.filter { it.isVideo }
+        val pool = videos.ifEmpty { files }
+        if (pool.isEmpty()) return null
+        if (episode == null) return pool.maxByOrNull { it.size }
+
+        val matches =
+            if (episode.season >= 0 && episode.episode > 0) {
+                val patterns = episodePatterns(episode.season, episode.episode)
+                pool.filter { file ->
+                    val name = file.name.ifEmpty { file.shortName }
+                    patterns.any { it.containsMatchIn(name) }
+                }
+            } else {
+                emptyList()
+            }
+        if (matches.size == 1) return matches.single()
+        if (matches.isNotEmpty()) return null
+        return pool.singleOrNull()
+    }
+
+    private fun episodePatterns(season: Int, episode: Int): List<Regex> =
+        listOf(
+            Regex("(?<![0-9])s0*$season" + "e0*$episode(?![0-9])", RegexOption.IGNORE_CASE),
+            Regex("(?<![0-9])$season" + "x0*$episode(?![0-9])", RegexOption.IGNORE_CASE),
+            Regex(
+                "(?<![0-9])season[ ._-]+0*$season[ ._-]+episode[ ._-]+0*$episode(?![0-9])",
+                RegexOption.IGNORE_CASE,
+            ),
+        )
+}
+
 /// Native in-client debrid resolution for Android: turn a torrent (infoHash / magnet) into a DIRECT,
 /// streamable HTTPS URL through the user's own debrid account, so cached torrents play instantly without
 /// a debrid add-on. This is the Kotlin port of the Apple `DebridResolver.swift` (RealDebrid + TorBox
@@ -31,11 +77,12 @@ import kotlin.coroutines.coroutineContext
 /// so the caller falls back to today's path and the user is never left unable to play. All network work
 /// runs on [Dispatchers.IO]; the poll loops honor coroutine cancellation so a bounded resolve stops
 /// promptly.
-class DebridResolver(private val keys: DebridKeys) {
+internal class DebridResolver(private val keys: DebridKeys) {
 
     /// Which errors a resolve can surface. Mirrors the Apple `DebridError`.
     sealed class DebridException(message: String) : Exception(message) {
         object NoKey : DebridException("no debrid key configured")
+        object OwnerChanged : DebridException("debrid account changed during resolve")
         object InvalidKey : DebridException("debrid key rejected (401/403)")
         object NotCached : DebridException("torrent not cached on this account")
         object NoMatchingFile : DebridException("no playable file in the torrent")
@@ -82,13 +129,21 @@ class DebridResolver(private val keys: DebridKeys) {
         service: DebridService? = null,
         trackers: List<String> = emptyList(),
         episode: Episode? = null,
+        fileIdx: Int? = null,
     ): String? {
+        val owner = keys.ownerToken() ?: return null
         val hash = infoHash.trim().lowercase()
         if (hash.isEmpty()) return null
-        val chosen = service?.takeIf(keys::isConfigured) ?: keys.configuredServices().firstOrNull() ?: return null
+        val chosen = service?.takeIf { keys.isConfigured(it, owner) }
+            ?: keys.configuredServices(owner).firstOrNull()
+            ?: return null
         val mag = magnet?.takeIf { it.isNotBlank() } ?: buildMagnet(hash, trackers)
         return try {
-            withContext(Dispatchers.IO) { resolveWithIdsInternal(chosen, hash, mag, fileIdx = null, episode).url }
+            withContext(Dispatchers.IO) {
+                resolveWithIdsInternal(chosen, hash, mag, fileIdx, episode, owner)
+                    .also { requireCurrentOwner(owner) }
+                    .url
+            }
         } catch (cancel: CancellationException) {
             throw cancel
         } catch (error: DebridException) {
@@ -117,10 +172,17 @@ class DebridResolver(private val keys: DebridKeys) {
         fileIdx: Int? = null,
         episode: Episode? = null,
         trackers: List<String> = emptyList(),
+        expectedOwner: DebridOwnerToken? = null,
     ): ResolvedLink {
+        val owner = expectedOwner ?: keys.ownerToken() ?: throw DebridException.NoKey
+        if (!keys.isCurrent(owner)) throw DebridException.OwnerChanged
+        if (!keys.isConfigured(service, owner)) throw DebridException.NoKey
         val hash = infoHash.trim().lowercase()
         val mag = magnet?.takeIf { it.isNotBlank() } ?: buildMagnet(hash, trackers)
-        return withContext(Dispatchers.IO) { resolveWithIdsInternal(service, hash, mag, fileIdx, episode) }
+        return withContext(Dispatchers.IO) {
+            resolveWithIdsInternal(service, hash, mag, fileIdx, episode, owner)
+                .also { requireCurrentOwner(owner) }
+        }
     }
 
     /// Regenerate a FRESH direct link for an already-resolved file through the SAME [service], skipping the
@@ -134,21 +196,43 @@ class DebridResolver(private val keys: DebridKeys) {
         torrentId: Int?,
         fileId: Int?,
         fileIdx: Int?,
+        episode: Episode?,
+        expectedOwner: DebridOwnerToken? = null,
     ): String = withContext(Dispatchers.IO) {
+        val owner = expectedOwner ?: keys.ownerToken() ?: throw DebridException.NoKey
+        if (!keys.isCurrent(owner)) throw DebridException.OwnerChanged
+        if (!keys.isConfigured(service, owner)) throw DebridException.NoKey
         val hash = infoHash.trim().lowercase()
         // TorBox fast path: mint a fresh link from the stored ids with no re-add. Any DEBRID-side failure
         // (evicted file, provider blip, transient auth, not-ready) is recoverable by the full re-add below,
         // so fall through on all of them; only a genuine cancellation aborts.
         if (service == DebridService.TOR_BOX && torrentId != null && fileId != null) {
             try {
-                return@withContext torBoxRequestDl(TORBOX_BASE, keys.key(DebridService.TOR_BOX), torrentId, fileId)
+                val url = requestForOwner(owner) {
+                    torBoxRequestDl(
+                        TORBOX_BASE,
+                        keys.key(DebridService.TOR_BOX, owner),
+                        torrentId,
+                        fileId,
+                    )
+                }
+                requireCurrentOwner(owner)
+                return@withContext url
             } catch (cancel: CancellationException) {
                 throw cancel
             } catch (error: DebridException) {
+                if (error === DebridException.OwnerChanged) throw error
                 Log.d(TAG, "torbox reresolve fast-path failed (${error.message}); re-adding")
             }
         }
-        resolveWithIdsInternal(service, hash, buildMagnet(hash, emptyList()), fileIdx, episode = null).url
+        resolveWithIdsInternal(
+            service,
+            hash,
+            buildMagnet(hash, emptyList()),
+            fileIdx,
+            episode,
+            owner,
+        ).also { requireCurrentOwner(owner) }.url
     }
 
     /// Build a minimal magnet from an [infoHash] (+ optional [trackers]) for the coordinator's failover
@@ -164,11 +248,15 @@ class DebridResolver(private val keys: DebridKeys) {
         magnet: String,
         fileIdx: Int?,
         episode: Episode?,
+        owner: DebridOwnerToken,
     ): ResolvedLink = when (service) {
-        DebridService.TOR_BOX -> resolveTorBox(hash, magnet, episode, fileIdx)
-        DebridService.REAL_DEBRID -> ResolvedLink(resolveRealDebrid(magnet, episode, fileIdx), null, null)
-        DebridService.ALL_DEBRID -> ResolvedLink(resolveAllDebrid(magnet, episode, fileIdx), null, null)
-        DebridService.PREMIUMIZE -> ResolvedLink(resolvePremiumize(magnet, episode, fileIdx), null, null)
+        DebridService.TOR_BOX -> resolveTorBox(hash, magnet, episode, fileIdx, owner)
+        DebridService.REAL_DEBRID ->
+            ResolvedLink(resolveRealDebrid(magnet, episode, fileIdx, owner), null, null)
+        DebridService.ALL_DEBRID ->
+            ResolvedLink(resolveAllDebrid(magnet, episode, fileIdx, owner), null, null)
+        DebridService.PREMIUMIZE ->
+            ResolvedLink(resolvePremiumize(magnet, episode, fileIdx, owner), null, null)
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -181,18 +269,24 @@ class DebridResolver(private val keys: DebridKeys) {
 
     /// Which of [hashes] [service] has cached, hash -> files. Runs on IO. Never throws (fail-soft): a
     /// provider/network error simply yields no confirmations for that batch.
-    suspend fun checkCache(service: DebridService, hashes: List<String>): Map<String, List<DebridFile>> {
-        if (hashes.isEmpty() || !keys.isConfigured(service)) return emptyMap()
+    suspend fun checkCache(
+        service: DebridService,
+        hashes: List<String>,
+        expectedOwner: DebridOwnerToken? = null,
+    ): Map<String, List<DebridFile>> {
+        val owner = expectedOwner ?: keys.ownerToken() ?: return emptyMap()
+        if (!keys.isCurrent(owner)) return emptyMap()
+        if (hashes.isEmpty() || !keys.isConfigured(service, owner)) return emptyMap()
         val normalized = hashes.map { it.trim().lowercase() }.filter { it.isNotEmpty() }
         if (normalized.isEmpty()) return emptyMap()
         return try {
             withContext(Dispatchers.IO) {
                 when (service) {
-                    DebridService.TOR_BOX -> torBoxCheckCache(normalized)
+                    DebridService.TOR_BOX -> torBoxCheckCache(normalized, owner)
                     DebridService.REAL_DEBRID -> emptyMap()   // removed upstream
-                    DebridService.ALL_DEBRID -> allDebridCheckCache(normalized)
-                    DebridService.PREMIUMIZE -> premiumizeCheckCache(normalized)
-                }
+                    DebridService.ALL_DEBRID -> allDebridCheckCache(normalized, owner)
+                    DebridService.PREMIUMIZE -> premiumizeCheckCache(normalized, owner)
+                }.takeIf { keys.isCurrent(owner) }.orEmpty()
             }
         } catch (cancel: CancellationException) {
             throw cancel
@@ -208,43 +302,59 @@ class DebridResolver(private val keys: DebridKeys) {
     // of the four that kept an instant cache-check, but the resolve path here is add-then-poll like RD.
     // ------------------------------------------------------------------------------------------------
 
-    private suspend fun resolveTorBox(hash: String, magnet: String, episode: Episode?, fileIdx: Int?): ResolvedLink {
-        val apiKey = keys.key(DebridService.TOR_BOX)
+    private suspend fun resolveTorBox(
+        hash: String,
+        magnet: String,
+        episode: Episode?,
+        fileIdx: Int?,
+        owner: DebridOwnerToken,
+    ): ResolvedLink {
+        val apiKey = keys.key(DebridService.TOR_BOX, owner)
+        if (apiKey.isEmpty()) throw DebridException.OwnerChanged
         val base = TORBOX_BASE
 
         // 1. Add the magnet (idempotent; returns the existing torrent_id if already in the library).
-        val created = postMultipart("$base/createtorrent", apiKey, mapOf("magnet" to magnet))
+        val created = requestForOwner(owner) {
+            postMultipart("$base/createtorrent", apiKey, mapOf("magnet" to magnet))
+        }
         var torrentId = created.optJSONObject("data")?.optIntOrNull("torrent_id")
 
         // 2. Poll mylist by hash until a torrent_id appears AND it is ready (cached should be ~1 poll).
         var files = emptyList<DebridFile>()
         val immediate = torrentId?.let { id ->
-            runCatching { torBoxItem(base, apiKey, id) }.getOrNull()?.takeIf(::torBoxReady)
+            optionalRequestForOwner(owner) { torBoxItem(base, apiKey, id) }
+                ?.takeIf(::torBoxReady)
         }
         if (immediate != null) {
             files = torBoxFiles(immediate)
         } else {
-            val polled = torBoxPollByHash(base, apiKey, hash)
+            val polled = torBoxPollByHash(base, apiKey, hash, owner)
             torrentId = polled.first
             files = polled.second
         }
         val id = torrentId ?: throw DebridException.NotReady
-        val pick = pickFile(files, episode, fileIdx) ?: throw DebridException.NoMatchingFile
+        val pick = DebridFileSelection.pick(files, episode, fileIdx) ?: throw DebridException.NoMatchingFile
 
         // 3. Request the direct stream URL; carry the stable ids for a later reresolve.
-        val url = torBoxRequestDl(base, apiKey, id, pick.id)
+        val url = requestForOwner(owner) { torBoxRequestDl(base, apiKey, id, pick.id) }
         return ResolvedLink(url, id, pick.id)
     }
 
     /// TorBox torrent cache-check: `/checkcached?hash=<comma-list>&format=list&list_files=true`, Bearer auth.
     /// TorBox is the only one of the four that kept an instant cache-check. Up to 100 hashes per call.
-    private suspend fun torBoxCheckCache(hashes: List<String>): Map<String, List<DebridFile>> {
+    private suspend fun torBoxCheckCache(
+        hashes: List<String>,
+        owner: DebridOwnerToken,
+    ): Map<String, List<DebridFile>> {
         val out = HashMap<String, List<DebridFile>>()
-        val apiKey = keys.key(DebridService.TOR_BOX)
+        val apiKey = keys.key(DebridService.TOR_BOX, owner)
+        if (apiKey.isEmpty()) return emptyMap()
         for (chunk in hashes.chunked(100)) {
             coroutineContext.ensureActive()
             val joined = chunk.joinToString(",")
-            val env = getJson("$TORBOX_BASE/checkcached?hash=${enc(joined)}&format=list&list_files=true", apiKey)
+            val env = requestForOwner(owner) {
+                getJson("$TORBOX_BASE/checkcached?hash=${enc(joined)}&format=list&list_files=true", apiKey)
+            }
             val data = env.optJSONArray("data") ?: continue
             for (i in 0 until data.length()) {
                 val c = data.optJSONObject(i) ?: continue
@@ -289,11 +399,18 @@ class DebridResolver(private val keys: DebridKeys) {
     /// Poll the library by infohash until the torrent is ready (cached ~1 poll). ~30s streaming budget;
     /// an uncached download surfaces as [DebridException.NotReady] so the caller falls back to today's
     /// path. Honors cancellation so a bounded/raced resolve stops promptly.
-    private suspend fun torBoxPollByHash(base: String, apiKey: String, hash: String): Pair<Int?, List<DebridFile>> {
+    private suspend fun torBoxPollByHash(
+        base: String,
+        apiKey: String,
+        hash: String,
+        owner: DebridOwnerToken,
+    ): Pair<Int?, List<DebridFile>> {
         for (attempt in 0 until POLL_ATTEMPTS) {
             coroutineContext.ensureActive()
-            if (attempt > 0) delay(POLL_INTERVAL_MS)
-            val env = getJson("$base/mylist?bypass_cache=true", apiKey)
+            if (attempt > 0) delayForOwner(owner, POLL_INTERVAL_MS)
+            val env = requestForOwner(owner) {
+                getJson("$base/mylist?bypass_cache=true", apiKey)
+            }
             val list = env.optJSONArray("data") ?: continue
             for (i in 0 until list.length()) {
                 val item = list.optJSONObject(i) ?: continue
@@ -341,20 +458,30 @@ class DebridResolver(private val keys: DebridKeys) {
     // selection packs into a single unstreamable RAR, and selectFiles is a no-op once downloaded.
     // ------------------------------------------------------------------------------------------------
 
-    private suspend fun resolveRealDebrid(magnet: String, episode: Episode?, fileIdx: Int?): String {
-        val apiKey = keys.key(DebridService.REAL_DEBRID)
+    private suspend fun resolveRealDebrid(
+        magnet: String,
+        episode: Episode?,
+        fileIdx: Int?,
+        owner: DebridOwnerToken,
+    ): String {
+        val apiKey = keys.key(DebridService.REAL_DEBRID, owner)
+        if (apiKey.isEmpty()) throw DebridException.OwnerChanged
         val base = RD_BASE
 
         // 1. Add the magnet -> torrent id.
-        val add = postForm("$base/torrents/addMagnet", apiKey, mapOf("magnet" to magnet))
+        val add = requestForOwner(owner) {
+            postForm("$base/torrents/addMagnet", apiKey, mapOf("magnet" to magnet))
+        }
         val id = add.optStringOrNull("id") ?: throw DebridException.Provider("no torrent id")
 
         // 2. Wait for RD to parse the magnet into its file list.
         var fileList = emptyList<DebridFile>()
         for (attempt in 0 until RD_ATTEMPTS) {
             coroutineContext.ensureActive()
-            if (attempt > 0) delay(RD_INTERVAL_MS)
-            val info = getJson("$base/torrents/info/$id", apiKey)
+            if (attempt > 0) delayForOwner(owner, RD_INTERVAL_MS)
+            val info = requestForOwner(owner) {
+                getJson("$base/torrents/info/$id", apiKey)
+            }
             rdGuardStatus(info)
             val files = rdFiles(info)
             if (files.isNotEmpty()) { fileList = files; break }
@@ -362,8 +489,10 @@ class DebridResolver(private val keys: DebridKeys) {
         if (fileList.isEmpty()) throw DebridException.NotReady
 
         // 3. Pick the ONE target file, then select ONLY it.
-        val pick = pickFile(fileList, episode, fileIdx) ?: throw DebridException.NoMatchingFile
-        postFormNoBody("$base/torrents/selectFiles/$id", apiKey, mapOf("files" to pick.id.toString()))
+        val pick = DebridFileSelection.pick(fileList, episode, fileIdx) ?: throw DebridException.NoMatchingFile
+        requestForOwner(owner) {
+            postFormNoBody("$base/torrents/selectFiles/$id", apiKey, mapOf("files" to pick.id.toString()))
+        }
 
         // 4. Poll info until `downloaded`, with the NOT-CACHED FAST-FAIL: RD retired the instant
         //    cache-check, so a "cached" badge on an RD row is the add-on's claim, not a check against
@@ -374,8 +503,10 @@ class DebridResolver(private val keys: DebridKeys) {
         var link: String? = null
         for (attempt in 0 until RD_ATTEMPTS) {
             coroutineContext.ensureActive()
-            if (attempt > 0) delay(RD_INTERVAL_MS)
-            val info = getJson("$base/torrents/info/$id", apiKey)
+            if (attempt > 0) delayForOwner(owner, RD_INTERVAL_MS)
+            val info = requestForOwner(owner) {
+                getJson("$base/torrents/info/$id", apiKey)
+            }
             rdGuardStatus(info)
             val status = info.optString("status")
             if (status == "downloaded") {
@@ -387,7 +518,9 @@ class DebridResolver(private val keys: DebridKeys) {
         val restricted = link ?: throw DebridException.NotReady
 
         // 5. Unrestrict the restricted link into a direct, playable URL.
-        val un = postForm("$base/unrestrict/link", apiKey, mapOf("link" to restricted))
+        val un = requestForOwner(owner) {
+            postForm("$base/unrestrict/link", apiKey, mapOf("link" to restricted))
+        }
         return un.optStringOrNull("download") ?: throw DebridException.Provider("no download url")
     }
 
@@ -423,15 +556,23 @@ class DebridResolver(private val keys: DebridKeys) {
 
     private data class AllDebridLink(val link: String, val filename: String, val size: Long)
 
-    // fileIdx is accepted for a uniform dispatch signature but NOT applied to the pick: AD's link list can
-    // differ from the torrent's file order/count, so the pick runs the filename/size heuristic (fileIdx=null)
-    // to keep links[pick.id] aligned. Matches the Apple AllDebridResolver.resolve.
-    private suspend fun resolveAllDebrid(magnet: String, episode: Episode?, fileIdx: Int?): String {
-        val apiKey = keys.key(DebridService.ALL_DEBRID)
+    // fileIdx is accepted for a uniform dispatch signature but ignored by the picker: AD's link list can
+    // differ from the torrent's file order/count. Semantic filename/size selection keeps links[pick.id]
+    // aligned. Matches the Apple AllDebridResolver.resolve.
+    private suspend fun resolveAllDebrid(
+        magnet: String,
+        episode: Episode?,
+        fileIdx: Int?,
+        owner: DebridOwnerToken,
+    ): String {
+        val apiKey = keys.key(DebridService.ALL_DEBRID, owner)
+        if (apiKey.isEmpty()) throw DebridException.OwnerChanged
         val base = AD_BASE
 
         // 1. Upload the magnet -> magnet id. `data.magnets` is an ARRAY here (upload can carry several).
-        val upEnv = getJsonQueryAuth(adUrl(base, "/magnet/upload", apiKey, "magnets[]" to magnet))
+        val upEnv = requestForOwner(owner) {
+            getJsonQueryAuth(adUrl(base, "/magnet/upload", apiKey, "magnets[]" to magnet))
+        }
         val id = upEnv.optJSONObject("data")
             ?.optJSONArray("magnets")
             ?.optJSONObject(0)
@@ -443,8 +584,10 @@ class DebridResolver(private val keys: DebridKeys) {
         var links = emptyList<AllDebridLink>()
         for (attempt in 0 until AD_ATTEMPTS) {
             coroutineContext.ensureActive()
-            if (attempt > 0) delay(AD_INTERVAL_MS)
-            val st = getJsonQueryAuth(adUrl(base, "/magnet/status", apiKey, "id" to id.toString()))
+            if (attempt > 0) delayForOwner(owner, AD_INTERVAL_MS)
+            val st = requestForOwner(owner) {
+                getJsonQueryAuth(adUrl(base, "/magnet/status", apiKey, "id" to id.toString()))
+            }
             val m = st.optJSONObject("data")?.optJSONObject("magnets") ?: continue
             val statusCode = m.optIntOrNull("statusCode")
             if (statusCode == 4) {
@@ -460,11 +603,14 @@ class DebridResolver(private val keys: DebridKeys) {
         val files = links.mapIndexed { idx, l ->
             DebridFile(id = idx, name = l.filename, shortName = l.filename.substringAfterLast('/'), size = l.size)
         }
-        val pick = pickFile(files, episode, fileIdx = null)?.takeIf { it.id in links.indices }
+        val pick = DebridFileSelection.pick(files, episode, providerFileIdx = fileIdx)
+            ?.takeIf { it.id in links.indices }
             ?: throw DebridException.NoMatchingFile
 
         // 4. Unlock the chosen link into a direct, playable URL.
-        val un = getJsonQueryAuth(adUrl(base, "/link/unlock", apiKey, "link" to links[pick.id].link))
+        val un = requestForOwner(owner) {
+            getJsonQueryAuth(adUrl(base, "/link/unlock", apiKey, "link" to links[pick.id].link))
+        }
         return un.optJSONObject("data")?.optStringOrNull("link") ?: throw DebridException.Provider("unlock")
     }
 
@@ -496,17 +642,24 @@ class DebridResolver(private val keys: DebridKeys) {
     /// AllDebrid cache-check: `GET /magnet/instant`, repeated `magnets[]` = infohashes, query auth. AllDebrid
     /// still ships this (only RD removed its cache-check), but it is known flaky, so a failed/empty chunk
     /// simply yields no confirmations for those hashes (resolve still works). Batch ~40. Mirrors Apple.
-    private suspend fun allDebridCheckCache(hashes: List<String>): Map<String, List<DebridFile>> {
+    private suspend fun allDebridCheckCache(
+        hashes: List<String>,
+        owner: DebridOwnerToken,
+    ): Map<String, List<DebridFile>> {
         val out = HashMap<String, List<DebridFile>>()
-        val apiKey = keys.key(DebridService.ALL_DEBRID)
+        val apiKey = keys.key(DebridService.ALL_DEBRID, owner)
+        if (apiKey.isEmpty()) return emptyMap()
         for (chunk in hashes.chunked(40)) {
             coroutineContext.ensureActive()
             val pairs = chunk.map { "magnets[]" to it }.toTypedArray()
             val env = try {
-                getJsonQueryAuth(adUrl(AD_BASE, "/magnet/instant", apiKey, *pairs))
+                requestForOwner(owner) {
+                    getJsonQueryAuth(adUrl(AD_BASE, "/magnet/instant", apiKey, *pairs))
+                }
             } catch (cancel: CancellationException) {
                 throw cancel
             } catch (error: Exception) {
+                if (error === DebridException.OwnerChanged) throw error
                 continue
             }
             if (env.optString("status") != "success") continue
@@ -541,13 +694,21 @@ class DebridResolver(private val keys: DebridKeys) {
 
     private data class PremiumizeItem(val path: String, val size: Long, val link: String?, val streamLink: String?)
 
-    // fileIdx is accepted for a uniform dispatch signature but NOT applied to the pick: PM's directdl content
-    // order can differ from the torrent's, so the pick runs the filename/size heuristic (fileIdx=null) to keep
-    // items[pick.id] aligned. Matches the Apple PremiumizeResolver.resolve.
-    private suspend fun resolvePremiumize(magnet: String, episode: Episode?, fileIdx: Int?): String {
-        val apiKey = keys.key(DebridService.PREMIUMIZE)
+    // fileIdx is accepted for a uniform dispatch signature but ignored by the picker: PM's directdl content
+    // order can differ from the torrent's. Semantic filename/size selection keeps items[pick.id] aligned.
+    // Matches the Apple PremiumizeResolver.resolve.
+    private suspend fun resolvePremiumize(
+        magnet: String,
+        episode: Episode?,
+        fileIdx: Int?,
+        owner: DebridOwnerToken,
+    ): String {
+        val apiKey = keys.key(DebridService.PREMIUMIZE, owner)
+        if (apiKey.isEmpty()) throw DebridException.OwnerChanged
         val url = "$PM_BASE/transfer/directdl?apikey=${enc(apiKey)}"
-        val dl = postFormQueryAuth(url, mapOf("src" to magnet))
+        val dl = requestForOwner(owner) {
+            postFormQueryAuth(url, mapOf("src" to magnet))
+        }
         if (dl.optString("status") != "success") {
             throw DebridException.Provider("directdl ${dl.optString("status")}")
         }
@@ -570,7 +731,8 @@ class DebridResolver(private val keys: DebridKeys) {
         val files = items.mapIndexed { idx, c ->
             DebridFile(id = idx, name = c.path, shortName = c.path.substringAfterLast('/'), size = c.size)
         }
-        val pick = pickFile(files, episode, fileIdx = null)?.takeIf { it.id in items.indices }
+        val pick = DebridFileSelection.pick(files, episode, providerFileIdx = fileIdx)
+            ?.takeIf { it.id in items.indices }
             ?: throw DebridException.NoMatchingFile
         val item = items[pick.id]
         return item.streamLink ?: item.link ?: throw DebridException.Provider("no link")
@@ -580,17 +742,24 @@ class DebridResolver(private val keys: DebridKeys) {
     /// query). The `response` array is positionally aligned with `items[]`; a `true` means directdl will hit
     /// instantly. Premiumize still ships this (only RD removed its cache-check). Fail-soft per chunk; batch
     /// ~80. Mirrors the Apple PremiumizeResolver.checkCache.
-    private suspend fun premiumizeCheckCache(hashes: List<String>): Map<String, List<DebridFile>> {
+    private suspend fun premiumizeCheckCache(
+        hashes: List<String>,
+        owner: DebridOwnerToken,
+    ): Map<String, List<DebridFile>> {
         val out = HashMap<String, List<DebridFile>>()
-        val apiKey = keys.key(DebridService.PREMIUMIZE)
+        val apiKey = keys.key(DebridService.PREMIUMIZE, owner)
+        if (apiKey.isEmpty()) return emptyMap()
         for (chunk in hashes.chunked(80)) {
             coroutineContext.ensureActive()
             val url = "$PM_BASE/cache/check?apikey=${enc(apiKey)}"
             val r = try {
-                postFormPairsQueryAuth(url, chunk.map { "items[]" to it })
+                requestForOwner(owner) {
+                    postFormPairsQueryAuth(url, chunk.map { "items[]" to it })
+                }
             } catch (cancel: CancellationException) {
                 throw cancel
             } catch (error: Exception) {
+                if (error === DebridException.OwnerChanged) throw error
                 continue
             }
             if (r.optString("status") != "success") continue
@@ -632,20 +801,30 @@ class DebridResolver(private val keys: DebridKeys) {
 
     /// Which nzb md5s the user's TorBox usenet account has cached, md5 -> files. Empty (no-op) with no TorBox
     /// key. Never throws (fail-soft). Runs on IO. Mirrors the Apple usenet checkCache.
-    suspend fun usenetCheckCache(nzbMd5s: List<String>): Map<String, List<DebridFile>> {
-        if (nzbMd5s.isEmpty() || !keys.isConfigured(DebridService.TOR_BOX)) return emptyMap()
+    suspend fun usenetCheckCache(
+        nzbMd5s: List<String>,
+        expectedOwner: DebridOwnerToken? = null,
+    ): Map<String, List<DebridFile>> {
+        val owner = expectedOwner ?: keys.ownerToken() ?: return emptyMap()
+        if (!keys.isCurrent(owner)) return emptyMap()
+        if (nzbMd5s.isEmpty() || !keys.isConfigured(DebridService.TOR_BOX, owner)) {
+            return emptyMap()
+        }
         val normalized = nzbMd5s.map { it.trim().lowercase() }.filter { it.isNotEmpty() }
         if (normalized.isEmpty()) return emptyMap()
         return try {
             withContext(Dispatchers.IO) {
                 val out = HashMap<String, List<DebridFile>>()
-                val apiKey = keys.key(DebridService.TOR_BOX)
+                val apiKey = keys.key(DebridService.TOR_BOX, owner)
+                if (apiKey.isEmpty()) return@withContext emptyMap()
                 for (chunk in normalized.chunked(100)) {
                     coroutineContext.ensureActive()
-                    val env = getJson(
-                        "$USENET_BASE/checkcached?hash=${enc(chunk.joinToString(","))}&format=list&list_files=true",
-                        apiKey,
-                    )
+                    val env = requestForOwner(owner) {
+                        getJson(
+                            "$USENET_BASE/checkcached?hash=${enc(chunk.joinToString(","))}&format=list&list_files=true",
+                            apiKey,
+                        )
+                    }
                     val data = env.optJSONArray("data") ?: continue
                     for (i in 0 until data.length()) {
                         val c = data.optJSONObject(i) ?: continue
@@ -653,7 +832,7 @@ class DebridResolver(private val keys: DebridKeys) {
                         if (h.isNotEmpty()) out[h] = torBoxCachedFiles(c.optJSONArray("files"))
                     }
                 }
-                out
+                out.takeIf { keys.isCurrent(owner) }.orEmpty()
             }
         } catch (cancel: CancellationException) {
             throw cancel
@@ -673,42 +852,56 @@ class DebridResolver(private val keys: DebridKeys) {
         fileMustInclude: String? = null,
         fileIdx: Int? = null,
         episode: Episode? = null,
+        expectedOwner: DebridOwnerToken? = null,
     ): String = withContext(Dispatchers.IO) {
-        val apiKey = keys.key(DebridService.TOR_BOX)
+        val owner = expectedOwner ?: keys.ownerToken() ?: throw DebridException.NoKey
+        if (!keys.isCurrent(owner)) throw DebridException.OwnerChanged
+        val apiKey = keys.key(DebridService.TOR_BOX, owner)
+        if (apiKey.isEmpty()) throw DebridException.NoKey
         val base = USENET_BASE
 
         // 1. Add the nzb (JSON body; post_processing default -1). Idempotent: TorBox returns the existing
         //    download id if the same nzb is already in the user's usenet list.
-        val created = postJson(
-            "$base/createusenetdownload",
-            apiKey,
-            JSONObject().put("link", nzbUrl).put("post_processing", -1),
-        )
+        val created = requestForOwner(owner) {
+            postJson(
+                "$base/createusenetdownload",
+                apiKey,
+                JSONObject().put("link", nzbUrl).put("post_processing", -1),
+            )
+        }
         var usenetId = created.optJSONObject("data")?.optIntOrNull("usenetdownload_id")
 
         // 2. Poll mylist until the download is finished + present (cached should be ~1 poll).
         var files = emptyList<DebridFile>()
         val immediate = usenetId?.let { id ->
-            runCatching { usenetItem(base, apiKey, id) }.getOrNull()?.takeIf(::torBoxReady)
+            optionalRequestForOwner(owner) { usenetItem(base, apiKey, id) }
+                ?.takeIf(::torBoxReady)
         }
         if (immediate != null) {
             files = torBoxFiles(immediate)
         } else {
-            val polled = usenetPollByHash(base, apiKey, usenetId, knownHash?.lowercase() ?: usenetIdentifier(nzbUrl))
+            val polled = usenetPollByHash(
+                base,
+                apiKey,
+                usenetId,
+                knownHash?.lowercase() ?: usenetIdentifier(nzbUrl),
+                owner,
+            )
             usenetId = polled.first
             files = polled.second
         }
         val id = usenetId ?: throw DebridException.NotReady
 
-        // 3. Pick the file, honoring fileMustInclude / fileIdx, then the shared episode/size heuristic.
+        // 3. Pick the file, honoring fileMustInclude, then the shared semantic episode/movie heuristic.
         val pick = pickUsenetFile(files, fileMustInclude, fileIdx, episode) ?: throw DebridException.NoMatchingFile
 
         // 4. Request the direct stream URL.
-        usenetRequestDl(base, apiKey, id, pick.id)
+        requestForOwner(owner) { usenetRequestDl(base, apiKey, id, pick.id) }
     }
 
     /// File pick with the usenet-specific [mustInclude] regex applied FIRST (when present + it matches a
-    /// video), then the shared [pickFile] (explicit idx -> SxEy -> largest video). Mirrors the Apple pick.
+    /// video), then the shared provider-array policy. The raw [fileIdx] is provenance only and is never used
+    /// as an offset into [files].
     private fun pickUsenetFile(files: List<DebridFile>, mustInclude: String?, fileIdx: Int?, episode: Episode?): DebridFile? {
         if (!mustInclude.isNullOrEmpty()) {
             val re = runCatching { Regex(mustInclude, RegexOption.IGNORE_CASE) }.getOrNull()
@@ -717,10 +910,10 @@ class DebridResolver(private val keys: DebridKeys) {
                     if (!f.isVideo) return@filter false
                     re.containsMatchIn(f.shortName.ifEmpty { f.name })
                 }
-                pickFile(matched, episode, fileIdx = null)?.let { return it }
+                DebridFileSelection.pick(matched, episode, providerFileIdx = null)?.let { return it }
             }
         }
-        return pickFile(files, episode, fileIdx)
+        return DebridFileSelection.pick(files, episode, providerFileIdx = fileIdx)
     }
 
     /// The usenet `requestdl` leg: mint a direct stream URL for a known usenet_id+file_id. Auth rides the
@@ -739,21 +932,29 @@ class DebridResolver(private val keys: DebridKeys) {
     /// Poll the usenet list until the download is ready: by id when we have one (fetch that item), else scan
     /// mylist for the matching nzb md5, promoting the resolved id out. Uncached surfaces as [NotReady].
     /// Honors cancellation so a raced/bounded resolve stops promptly. Mirrors the Apple pollById.
-    private suspend fun usenetPollByHash(base: String, apiKey: String, startId: Int?, hash: String): Pair<Int?, List<DebridFile>> {
+    private suspend fun usenetPollByHash(
+        base: String,
+        apiKey: String,
+        startId: Int?,
+        hash: String,
+        owner: DebridOwnerToken,
+    ): Pair<Int?, List<DebridFile>> {
         var id = startId
         for (attempt in 0 until POLL_ATTEMPTS) {
             coroutineContext.ensureActive()
-            if (attempt > 0) delay(POLL_INTERVAL_MS)
+            if (attempt > 0) delayForOwner(owner, POLL_INTERVAL_MS)
             val known = id
             if (known != null) {
-                val item = runCatching { usenetItem(base, apiKey, known) }.getOrNull()
+                val item = optionalRequestForOwner(owner) { usenetItem(base, apiKey, known) }
                 if (item != null && torBoxReady(item)) {
                     val f = torBoxFiles(item)
                     if (f.isNotEmpty()) return known to f
                 }
                 continue
             }
-            val env = getJson("$base/mylist?bypass_cache=true", apiKey)
+            val env = requestForOwner(owner) {
+                getJson("$base/mylist?bypass_cache=true", apiKey)
+            }
             val list = env.optJSONArray("data") ?: continue
             for (i in 0 until list.length()) {
                 val item = list.optJSONObject(i) ?: continue
@@ -769,43 +970,49 @@ class DebridResolver(private val keys: DebridKeys) {
     }
 
     // ------------------------------------------------------------------------------------------------
-    // Shared file-pick heuristic (mirrors the Apple DebridResolve.pickFile / episodeMatchScore):
-    // explicit fileIdx -> SxEy filename match -> largest video file.
+    // Shared file-pick policy lives in DebridFileSelection so its fail-closed episode behavior is covered by
+    // pure JVM tests. Provider-local arrays are never indexed with raw stream fileIdx provenance.
     // ------------------------------------------------------------------------------------------------
-
-    private fun pickFile(files: List<DebridFile>, episode: Episode?, fileIdx: Int?): DebridFile? {
-        if (fileIdx != null && fileIdx in files.indices) return files[fileIdx]
-        val videos = files.filter { it.isVideo }
-        // Provider omitted filenames (isVideo false for every entry, e.g. AllDebrid on a cached single-file
-        // torrent): fall back to the whole file list so size selection still resolves instead of
-        // NoMatchingFile. Matches the Apple DebridResolve.pickFile `pool = videos.isEmpty ? files : videos`.
-        val pool = videos.ifEmpty { files }
-        if (pool.isEmpty()) return null
-        if (episode == null) return pool.maxByOrNull { it.size }
-        val best = pool
-            .mapNotNull { f ->
-                val name = f.shortName.ifEmpty { f.name }
-                val score = episodeMatchScore(name, episode.season, episode.episode)
-                if (score > 0) f to score else null
-            }
-            .maxByOrNull { it.second }
-            ?.first
-        return best ?: pool.maxByOrNull { it.size }   // pack fallback: biggest video
-    }
-
-    /// Score a filename against a SxEy target (SnnEnn, n x nn, "season n ... episode n"). 0 = no match.
-    private fun episodeMatchScore(filename: String, season: Int, episode: Int): Int {
-        val lower = filename.lowercase()
-        if (lower.contains("s%02de%02d".format(season, episode))) return 3
-        if (lower.contains("${season}x%02d".format(episode))) return 2
-        if (lower.contains("season $season") && lower.contains("episode $episode")) return 1
-        return 0
-    }
 
     private fun buildMagnet(hash: String, trackers: List<String>): String {
         val sb = StringBuilder("magnet:?xt=urn:btih:").append(hash)
         for (tr in trackers) sb.append("&tr=").append(enc(tr))
         return sb.toString()
+    }
+
+    private fun requireCurrentOwner(owner: DebridOwnerToken) {
+        if (!keys.isCurrent(owner)) throw DebridException.OwnerChanged
+    }
+
+    /**
+     * Fence every provider await with the owner generation captured by the initiating action. An in-flight
+     * request may finish while sign-out is happening, but no response can trigger another provider request or
+     * publish a result after ownership changes.
+     */
+    private suspend fun <T> requestForOwner(
+        owner: DebridOwnerToken,
+        request: suspend () -> T,
+    ): T = ownerFencedRequest(
+        ownerIsCurrent = { keys.isCurrent(owner) },
+        request = request,
+    )
+
+    private suspend fun delayForOwner(owner: DebridOwnerToken, millis: Long) {
+        requireCurrentOwner(owner)
+        delay(millis)
+        requireCurrentOwner(owner)
+    }
+
+    private suspend fun <T> optionalRequestForOwner(
+        owner: DebridOwnerToken,
+        request: suspend () -> T,
+    ): T? = try {
+        requestForOwner(owner, request)
+    } catch (cancel: CancellationException) {
+        throw cancel
+    } catch (error: Exception) {
+        if (error === DebridException.OwnerChanged) throw error
+        null
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -1028,4 +1235,14 @@ class DebridResolver(private val keys: DebridKeys) {
             "mkv", "mp4", "avi", "mov", "ts", "m2ts", "webm", "wmv", "flv", "m4v",
         )
     }
+}
+
+internal suspend fun <T> ownerFencedRequest(
+    ownerIsCurrent: () -> Boolean,
+    request: suspend () -> T,
+): T {
+    if (!ownerIsCurrent()) throw DebridResolver.DebridException.OwnerChanged
+    val result = request()
+    if (!ownerIsCurrent()) throw DebridResolver.DebridException.OwnerChanged
+    return result
 }

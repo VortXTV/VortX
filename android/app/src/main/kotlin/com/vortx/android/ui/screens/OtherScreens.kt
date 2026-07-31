@@ -259,6 +259,7 @@ fun SettingsScreen(
     onLiveTvClick: () -> Unit,
     onPlaybackClick: () -> Unit,
     onSourcesClick: () -> Unit,
+    onDebridKeysScreenClick: () -> Unit,
     onDownloadsClick: () -> Unit,
     onLibraryClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -332,6 +333,7 @@ fun SettingsScreen(
         SettingRow(VortXIcons.playRectangle, "Live TV", "IPTV", onClick = onLiveTvClick)
         SettingRow(VortXIcons.audioOutput, "Playback", playbackValue, onClick = onPlaybackClick)
         SettingRow(VortXIcons.sources, "Sources", sourcesValue, onClick = onSourcesClick)
+        SettingRow(VortXIcons.lock, "Debrid services", "API keys", onClick = onDebridKeysScreenClick)
         // The Downloads summary reads the live index, so the row can never disagree with the screen it opens
         // (the same rule the Playback row above follows). "None" rather than a byte count when empty: "0 B" reads
         // like a broken measurement, not like an empty list.

@@ -122,6 +122,11 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
         DownloadManager.init(applicationContext)
         val id = recordId ?: return@withContext Result.failure()
         val generation = transferGeneration ?: return@withContext Result.success()
+        val queuedRecord = DownloadStore.record(id) ?: return@withContext Result.success()
+        if (!DownloadManager.isDebridOwnerCurrent(queuedRecord)) {
+            DownloadManager.handleDebridOwnerChanged(id, generation)
+            return@withContext Result.success()
+        }
         if (!DownloadManager.claimTransfer(id, generation)) return@withContext Result.success()
         val record = DownloadStore.record(id) ?: run {
             DownloadManager.handleTransferStopped(id, generation)
@@ -139,11 +144,16 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 DownloadManager.handleTransferStopped(id, generation)
                 return@withContext Result.success()
             }
+            ensureDebridOwner(record)
             DownloadManager.handleTransferComplete(id, generation, prepared.completedBytes) {
+                ensureDebridOwner(record)
                 finalize(prepared.partFile, prepared.destination)
             }
             Result.success()
         } catch (_: StaleTransferGenerationException) {
+            Result.success()
+        } catch (_: StaleDebridOwnerException) {
+            DownloadManager.handleDebridOwnerChanged(id, generation)
             Result.success()
         } catch (cancellation: kotlinx.coroutines.CancellationException) {
             // pause() / cancel() cancelled the work, or WorkManager reclaimed it. The partial file stays on disk and
@@ -179,6 +189,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
         val partFile = DownloadStore.partFileFor(record)
         val destination = DownloadStore.fileFor(record)
         ensureOwnsTransfer(record.id, generation)
+        ensureDebridOwner(record)
 
         // Directory creation is a WRITE, and it is the first write that fails when the user is locked. Typing it as a
         // DownloadWriteException is what routes a Direct-Boot start into the park ladder instead of an opaque failure.
@@ -210,6 +221,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
 
         var connection: HttpURLConnection? = null
         while (connection == null) {
+            ensureDebridOwner(record)
             val candidate = openConnection(
                 record = record,
                 offset = requestedOffset,
@@ -221,6 +233,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 runCatching { candidate.disconnect() }
                 throw error
             }
+            ensureDebridOwner(record)
             if (status !in 200..299) {
                 val failure = DownloadHttpStatusException(status, candidate.responseMessage.orEmpty())
                 runCatching { candidate.disconnect() }
@@ -336,6 +349,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
 
         if (isStopped) return PreparedDownload(partFile, destination, partFile.length())
         ensureOwnsTransfer(record.id, generation)
+        ensureDebridOwner(record)
 
         val actualBytes = partFile.length()
         if (!DownloadTransferPolicy.hasCompleteLength(declaredTotal, actualBytes)) {
@@ -484,12 +498,14 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 if (!positioned) throw StaleTransferGenerationException()
                 connection.inputStream.use { input ->
                     val buffer = ByteArray(BUFFER_BYTES)
+                    ensureDebridOwner(record)
                     while (true) {
                         if (isStopped) return
                         ensureOwnsTransfer(record.id, generation)
                         val read = input.read(buffer)
                         if (read < 0) break
                         ensureOwnsTransfer(record.id, generation)
+                        ensureDebridOwner(record)
                         if (
                             expectedResponseBytes != null &&
                             read.toLong() > expectedResponseBytes - responseBytes
@@ -507,6 +523,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
 
                         val now = System.currentTimeMillis()
                         if (written - lastPushBytes >= PROGRESS_MIN_BYTES || now - lastPushAt >= PROGRESS_MIN_INTERVAL_MS) {
+                            ensureDebridOwner(record)
                             lastPushBytes = written
                             lastPushAt = now
                             val total = if (declaredTotal > 0) declaredTotal else 0L
@@ -538,7 +555,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 }
             }
         } catch (error: Throwable) {
-            if (error is StaleTransferGenerationException) throw error
+            if (error is StaleTransferGenerationException || error is StaleDebridOwnerException) throw error
             // A failure here is ambiguous: it could be the socket dying mid-read (network) or the volume refusing the
             // write (ours). Only classify it as a WRITE failure -- which routes it into the park / self-heal ladder --
             // when the evidence says so: an errno-bearing exception, or a user who cannot write CE storage right now.
@@ -558,6 +575,12 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
     private fun ensureOwnsTransfer(id: String, generation: String) {
         if (!DownloadManager.ownsTransfer(id, generation)) {
             throw StaleTransferGenerationException()
+        }
+    }
+
+    private fun ensureDebridOwner(record: DownloadRecord) {
+        if (!DownloadManager.isDebridOwnerCurrent(record)) {
+            throw StaleDebridOwnerException()
         }
     }
 
@@ -596,3 +619,4 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
 }
 
 private class StaleTransferGenerationException : IllegalStateException()
+private class StaleDebridOwnerException : IllegalStateException()
