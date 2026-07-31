@@ -1,0 +1,26 @@
+name: Dependency Review
+
+# Blocks a pull request that introduces a dependency with a known high-or-critical vulnerability or
+# a disallowed license. Runs only on pull requests: it diffs the PR's dependency changes against the
+# advisory database, so it never runs against main directly and adds no scheduled load.
+
+on:
+  pull_request:
+    branches: [main, beta]
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    name: Dependency review
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write   # only to post the summary comment on a failing PR
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure

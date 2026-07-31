@@ -1,0 +1,49 @@
+name: OSSF Scorecard
+
+# Supply-chain security posture for this public repository: checks branch protection, token
+# permissions, pinned dependencies (actions by SHA), dangerous workflow patterns, CI tests, and
+# more. Results are published to code scanning and to the public OpenSSF Scorecard API.
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "0 7 * * 1"   # weekly, Mondays 07:00 UTC
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege at the top; the analysis job widens only what it needs.
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write   # upload SARIF to code scanning
+      id-token: write          # publish results to the OpenSSF API
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@55891bbd73f2425e97637d96e306fc9d491d0b21 # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scorecard-results
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        with:
+          sarif_file: results.sarif

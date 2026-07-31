@@ -1,8 +1,10 @@
 name: CodeQL
 
-# Scans the Rust source tracked in this public repository, including the desktop Tauri backend.
-# The private engine repositories and Swift apps are outside this source-only job; their candidate
-# assurance belongs in their credential-gated build workflows.
+# Static security analysis of the source tracked in this public repository, from source with no
+# cross-target build (build-mode: none). Covers Rust (incl. the desktop Tauri backend), the Kotlin
+# Android app, the TypeScript/JavaScript web + workers + desktop front ends, and the Python tooling.
+# The private engine repositories and the Swift apps are outside this source-only job: Swift is
+# covered by Semgrep (semgrep.yml), the engine in its own credential-gated repositories.
 
 on:
   push:
@@ -14,21 +16,26 @@ on:
 
 jobs:
   analyze:
-    name: Analyze (Rust)
+    name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-24.04
     permissions:
       security-events: write
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every one of these supports build-mode: none (source-only analysis, no compile step).
+        language: [rust, java-kotlin, javascript-typescript, python]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
         with:
-          languages: rust
-          build-mode: none   # analyze source + Cargo metadata, no cross-target build needed
+          languages: ${{ matrix.language }}
+          build-mode: none
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
         with:
-          category: "/language:rust"
+          category: "/language:${{ matrix.language }}"

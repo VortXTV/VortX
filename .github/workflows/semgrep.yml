@@ -1,0 +1,46 @@
+name: Semgrep
+
+# Pattern-based SAST covering Swift (the Apple apps, which CodeQL cannot analyze in this repo
+# without the full Xcode + private-engine build) plus a general security ruleset over the rest of
+# the tree. Findings are uploaded to code scanning as their own tool; the scan never fails the build
+# (quality/finding triage happens in the code-scanning UI, not as a red X).
+
+on:
+  push:
+    branches: [main, beta]
+  pull_request:
+    branches: [main, beta]
+  schedule:
+    - cron: "0 7 * * 2"   # weekly, Tuesdays 07:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    name: Semgrep scan
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Semgrep
+        run: pipx install semgrep
+
+      - name: Scan (Swift + general security rules)
+        run: |
+          semgrep scan \
+            --config p/swift \
+            --config p/security-audit \
+            --sarif --output semgrep.sarif \
+            --timeout 300 --metrics off || true
+          # Guarantee a SARIF file exists so the upload step cannot fail even if the scan aborts.
+          test -s semgrep.sarif || printf '%s' '{"version":"2.1.0","runs":[]}' > semgrep.sarif
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
