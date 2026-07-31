@@ -11,13 +11,20 @@ import Darwin   // getifaddrs / ifaddrs / getnameinfo for LAN IPv4 discovery
 /// scans it with their phone on the same Wi-Fi, the log downloads to the phone, and they send it on.
 ///
 /// This mirrors `VXTrailerProxy`'s NWListener pattern (bind, resolve the ephemeral port on `.ready`, read
-/// the request header to CRLFCRLF, write an HTTP response, close), but binds to `0.0.0.0` (all interfaces)
-/// so a phone on the LAN can reach it, and answers a single GET `/` with the file rather than proxying.
+/// the request, write an HTTP response, close), but binds to `0.0.0.0` (all interfaces) so a phone on the
+/// LAN can reach it.
+///
+/// WHAT IT SERVES AND TO WHOM. Exactly one `GET` of one unguessable 128-bit path, once per start. It used to
+/// be described as one-shot and was neither one-shot nor addressed: it advertised a bare root URL, served
+/// ANY connection whose bytes happened to contain a CRLF pair without ever checking the method or the path,
+/// and kept the listener alive so any LAN peer could pull the log repeatedly for as long as the screen was
+/// up. `VXDiagExportPolicy` now mints the capability and makes the accept/reject decision; the scope of what
+/// that does and does not buy is written at `VXDiagExportPolicy.makeCapabilityPath`.
 ///
 /// FAIL-SOFT: every path is wrapped so a bad request or a gone client just closes that one connection.
 /// `start()` returns nil (caller shows a "connect to Wi-Fi" message) when there is no LAN IPv4 to advertise
 /// or the listener will not come up. `stop()` tears the listener down so the log is not left served.
-final class VXDiagExport {
+final class VXDiagExport: @unchecked Sendable {
 
     static let shared = VXDiagExport()
 
@@ -38,10 +45,27 @@ final class VXDiagExport {
     /// Header-read deadline so a phone that connects and then stalls never leaks its connection.
     private static let headerDeadline: TimeInterval = 15
 
-    /// Set once the LAN server has actually served the log to a phone at least once this session, so `stop()`
-    /// (export screen dismissed) can CLEAR the rolling log then and only then, giving the next export a fresh
-    /// buffer without wiping data that was never downloaded. Owner request: "once exported, clear it."
-    private var didServe = false
+    /// How long `startAsync()` keeps re-attempting the cold listener bring-up while Wi-Fi is present.
+    /// The FIRST export of a session pays for Network.framework init plus the local-network determination
+    /// on the `0.0.0.0` bind, which can outlast one `ensureListening()` `.ready` wait; the retry budget
+    /// covers that so the very first open produces the QR instead of only a later re-entry once warm.
+    private static let coldStartBudget: TimeInterval = 6
+    private static let coldStartRetryGap: TimeInterval = 0.3
+
+    /// Separates an in-flight one-shot claim from local send completion. A failed or interrupted client
+    /// releases its claim for retry, while nominal completion consumes the capability. Neither clears the
+    /// rolling log because Network.framework completion is not receiver acknowledgement.
+    /// Guarded by `stateLock`.
+    private var transferGate = VXDiagExportPolicy.TransferGate()
+
+    /// The unguessable path minted for the CURRENT export session, guarded by `stateLock`. Re-minted on
+    /// every `start()`, so a path scraped from an earlier session's QR code is dead.
+    private var capabilityPath = ""
+
+    private struct ExportPayload {
+        let body: Data
+        let logSnapshot: VXProbeLogSnapshot
+    }
 
     private init() {}
 
@@ -58,13 +82,48 @@ final class VXDiagExport {
             NSLog("[diag] export: listener failed to start")
             return nil
         }
-        let urlString = "http://\(ip):\(boundPort)/"
+        // Fresh capability per start, and the one-shot gate re-armed with it: the URL on screen is the only
+        // thing that can fetch this session's log, and it can do it once.
+        stateLock.lock()
+        capabilityPath = VXDiagExportPolicy.makeCapabilityPath()
+        transferGate.reset()
+        let path = capabilityPath
+        stateLock.unlock()
+        let urlString = "http://\(ip):\(boundPort)\(path)"
         guard let cg = Self.qrImage(urlString) else {
-            NSLog("[diag] export: QR generation failed for %@", urlString)
+            NSLog("[diag] export: QR generation failed")
             return nil
         }
-        NSLog("[diag] export: serving diagnostic log at %@", urlString)
+        // The capability is IN the URL, so the URL is a secret for the length of the export window and is
+        // never written to a log line.
+        NSLog("[diag] export: serving diagnostic log on port %d", boundPort)
         return (urlString, Image(decorative: cg, scale: 1))
+    }
+
+    /// `start()` off the main thread, retried through the cold bring-up. Apple TV opened the export screen
+    /// blank on the FIRST attempt and only filled it in on a later re-entry, because a single synchronous
+    /// `start()` on the main actor gave the cold LAN listener no time to reach `.ready` (Network.framework
+    /// init + local-network determination) inside one `ensureListening()` wait, so it returned nil and the
+    /// sheet showed its no-QR fallback. Here the work runs off the main thread (the caller shows a spinner)
+    /// and `start()` is re-attempted while Wi-Fi is present and we are inside `coldStartBudget`, so the QR
+    /// is produced as soon as the listener is actually ready.
+    ///
+    /// On the warm/happy path the first `start()` succeeds and the loop body never runs, so this is
+    /// byte-identical to a lone `start()`: same fresh capability, same one-shot `didServe` re-arm. When a
+    /// retry is needed, each `start()` re-mints the capability exactly as a fresh export should, and the
+    /// last successful attempt is the live one; the serve-once contract is untouched.
+    func startAsync() async -> (url: String, qr: Image)? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let deadline = Date().addingTimeInterval(Self.coldStartBudget)
+                var result = self.start()
+                while result == nil, Self.lanIPv4() != nil, Date() < deadline {
+                    Thread.sleep(forTimeInterval: Self.coldStartRetryGap)
+                    result = self.start()
+                }
+                continuation.resume(returning: result)
+            }
+        }
     }
 
     /// Tear the listener down so the log is no longer served. Safe to call when not started.
@@ -77,17 +136,13 @@ final class VXDiagExport {
             stateLock.lock()
             let open = Array(connections.values)
             connections.removeAll()
+            transferGate.reset()
+            capabilityPath = ""   // retire the capability with the listener
             stateLock.unlock()
             open.forEach { $0.cancel() }
-            // Clear the rolling log ONLY if it was actually downloaded this session, so the next export starts
-            // fresh (owner request) without discarding a log the phone never fetched.
-            if didServe {
-                VXProbe.clearLog()
-                didServe = false
-                NSLog("[diag] export: stopped + cleared log (was served)")
-            } else {
-                NSLog("[diag] export: stopped")
-            }
+            // LAN sends never clear the rolling log without app-layer receiver acknowledgement. Stopping also
+            // retires the capability and cancels any incomplete connection.
+            NSLog("[diag] export: stopped")
         }
     }
 
@@ -141,15 +196,16 @@ final class VXDiagExport {
     /// Accept one phone connection: read its request header, then serve the log file. The connection is
     /// tracked so `stop()` can cancel it, and a deadline force-cancels a client that never sends a header.
     private func handle(_ connection: NWConnection) {
+        let connectionID = ObjectIdentifier(connection)
         stateLock.lock()
-        connections[ObjectIdentifier(connection)] = connection
+        connections[connectionID] = connection
         stateLock.unlock()
-        connection.stateUpdateHandler = { [weak self, weak connection] state in
+        connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .cancelled, .failed:
-                guard let self, let connection else { return }
+                guard let self else { return }
                 self.stateLock.lock()
-                self.connections.removeValue(forKey: ObjectIdentifier(connection))
+                self.connections.removeValue(forKey: connectionID)
                 self.stateLock.unlock()
             default:
                 break
@@ -161,8 +217,12 @@ final class VXDiagExport {
         readRequest(connection, buffer: Data(), deadline: deadline)
     }
 
-    /// Read until the header terminator (CRLFCRLF), then serve. Bounds the read so a malformed client
-    /// cannot make us buffer without limit; the deadline force-cancels a header that never completes.
+    /// Read until the REQUEST LINE is complete (the first LF), then let `VXDiagExportPolicy` decide.
+    ///
+    /// The request line is enough: the decision is method plus path, and waiting for CRLFCRLF only gave a
+    /// peer more room to send bytes we do not read. Anything the policy rejects is closed WITHOUT a reply,
+    /// so a scanner probing the port learns nothing from us, not even a 404. The read is bounded and the
+    /// deadline force-cancels a client that never completes a line.
     private func readRequest(_ connection: NWConnection, buffer: Data, deadline: DispatchWorkItem) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [weak self] chunk, _, isComplete, error in
             guard let self else { return }
@@ -176,13 +236,25 @@ final class VXDiagExport {
                 accumulated.append(chunk)
             }
 
-            let terminator = Data("\r\n\r\n".utf8)
-            if accumulated.range(of: terminator) != nil {
+            if accumulated.contains(0x0A) {
                 deadline.cancel()
-                self.serve(connection)
+                // Claim the one-shot under the lock so two simultaneous connections cannot both win it.
+                self.stateLock.lock()
+                let path = self.capabilityPath
+                let decision = VXDiagExportPolicy.decide(request: accumulated,
+                                                         capabilityPath: path,
+                                                         alreadyServed: self.transferGate.blocksNewClaim || path.isEmpty)
+                let claim = decision == .serve ? self.transferGate.claim() : nil
+                self.stateLock.unlock()
+                if let claim {
+                    self.serve(connection, claim: claim)
+                } else {
+                    NSLog("[diag] export: rejected a request")
+                    connection.cancel()
+                }
                 return
             }
-            if isComplete || accumulated.count > 64_000 {
+            if isComplete || accumulated.count > VXDiagExportPolicy.maxRequestLineBytes {
                 deadline.cancel()
                 connection.cancel()
                 return
@@ -193,9 +265,12 @@ final class VXDiagExport {
 
     /// Write the current diagnostic log as a text/plain attachment, then close. Any read failure yields an
     /// empty body rather than an error so the phone still gets a (harmless) file.
-    private func serve(_ connection: NWConnection) {
-        var body = (try? Data(contentsOf: VXProbe.logFileURL)) ?? Data("(diagnostic log is empty)\n".utf8)
-        body.append(Self.serverSection())
+    private func serve(
+        _ connection: NWConnection,
+        claim: VXDiagExportPolicy.TransferClaim
+    ) {
+        let payload = Self.exportPayload()
+        let body = payload.body
         let head = """
         HTTP/1.1 200 OK\r
         Content-Type: text/plain; charset=utf-8\r
@@ -206,62 +281,155 @@ final class VXDiagExport {
 
         """
         NSLog("[diag] export: sending log (%d bytes)", body.count)
-        var payload = Data(head.utf8)
-        payload.append(body)
-        connection.send(content: payload, completion: .contentProcessed { [weak self] _ in
-            // The log has now been handed to the phone: mark it served so `stop()` clears the buffer for a
-            // fresh next export. Serialized on `queue` (same queue the connection + stop() run on).
-            self?.queue.async { self?.didServe = true }
-            connection.cancel()
+        let ranges = VXDiagExportPolicy.chunkRanges(bodyBytes: body.count)
+        connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            if error != nil {
+                self.finishTransfer(
+                    connection, claim: claim, success: false
+                )
+                return
+            }
+            self.sendBodyChunks(
+                body,
+                ranges: ranges,
+                index: 0,
+                connection: connection,
+                claim: claim
+            )
         })
+    }
+
+    private func sendBodyChunks(
+        _ body: Data,
+        ranges: [Range<Int>],
+        index: Int,
+        connection: NWConnection,
+        claim: VXDiagExportPolicy.TransferClaim
+    ) {
+        guard ranges.indices.contains(index) else {
+            finishTransfer(
+                connection, claim: claim, success: true
+            )
+            return
+        }
+        let chunk = body.subdata(in: ranges[index])
+        let isFinalChunk = index == ranges.index(before: ranges.endIndex)
+        connection.send(
+            content: chunk,
+            contentContext: isFinalChunk
+                ? NWConnection.ContentContext.finalMessage
+                : NWConnection.ContentContext.defaultMessage,
+            isComplete: true,
+            completion: .contentProcessed { [weak self] error in
+                guard let self else { return }
+                if error != nil {
+                    self.finishTransfer(
+                        connection, claim: claim, success: false
+                    )
+                    return
+                }
+                self.sendBodyChunks(
+                    body,
+                    ranges: ranges,
+                    index: index + 1,
+                    connection: connection,
+                    claim: claim
+                )
+            }
+        )
+    }
+
+    private func finishTransfer(
+        _ connection: NWConnection,
+        claim: VXDiagExportPolicy.TransferClaim,
+        success: Bool
+    ) {
+        stateLock.lock()
+        let completion = transferGate.complete(claim, success: success)
+        stateLock.unlock()
+        switch completion {
+        case .deliveredPreservingLog:
+            NSLog("[diag] export: LAN send completed; preserved rolling log because receiver did not ACK")
+        case .retryableFailure:
+            NSLog("[diag] export: transfer failed; preserved log for retry")
+        case .stale:
+            break
+        }
+        switch completion.connectionCleanup {
+        case .waitForPeerClose:
+            waitForPeerClose(connection)
+        case .cancelImmediately:
+            connection.cancel()
+        }
+    }
+
+    /// `contentProcessed` only means Network.framework accepted the final send locally. `finalMessage`
+    /// performs the TCP write-close, so cancelling at that callback can truncate buffered body bytes or FIN.
+    /// Keep the connection alive until the peer closes its side, with a fixed upper bound for cleanup.
+    private static let peerCloseTimeout: TimeInterval = 30
+
+    private func waitForPeerClose(_ connection: NWConnection) {
+        let timeout = DispatchWorkItem {
+            NSLog("[diag] export: peer-close timeout; preserved rolling log")
+            connection.cancel()
+        }
+        queue.asyncAfter(deadline: .now() + Self.peerCloseTimeout, execute: timeout)
+        receiveUntilPeerClose(connection, timeout: timeout)
+    }
+
+    private func receiveUntilPeerClose(
+        _ connection: NWConnection,
+        timeout: DispatchWorkItem
+    ) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1_024) {
+            [weak self] _, _, isComplete, error in
+            guard !timeout.isCancelled else { return }
+            if isComplete || error != nil {
+                timeout.cancel()
+                connection.cancel()
+                return
+            }
+            guard let self else {
+                timeout.cancel()
+                connection.cancel()
+                return
+            }
+            self.receiveUntilPeerClose(connection, timeout: timeout)
+        }
     }
 
     // MARK: - Helpers
 
-    /// The embedded streaming-server section appended to every diagnostics export (F4): the server's current
-    /// one-line status plus a bounded tail (~100 lines) of its OWN log (`stremio-server.log`). The rolling
-    /// probe log alone never carried the node's log, so a server death/stall was invisible in the file the
-    /// owner actually sends. Target-safe via ServerDiagnostics: on a build with no server (the Lite tvOS app)
-    /// the provider is nil and this returns an empty section. Never throws.
-    private static func serverSection() -> Data {
-        guard let status = ServerDiagnostics.status() else { return Data() }
-        let tail = ServerDiagnostics.logTail(100)
-        var section = "\n\n===== streaming server =====\nstatus: \(status)\n"
-        if tail.isEmpty {
-            section += "(server log empty or unavailable)\n"
-        } else {
-            section += "--- stremio-server.log (last \(tail.count) lines) ---\n"
-            section += tail.map(scrubURLs).joined(separator: "\n")
-            section += "\n"
-        }
-        return Data(section.utf8)
+    /// The COMPLETE bytes of one export, built AT EXPORT TIME from whatever is on disk right now: the
+    /// rolling probe log plus the embedded streaming server's status and a bounded tail (~100 lines) of its
+    /// OWN log (`stremio-server.log`). Every line of both is re-run through the current redaction rules by
+    /// `VXDiagExportPolicy.exportBody`.
+    ///
+    /// Why re-run rules over bytes that were supposedly scrubbed on the way in: because they were not, or
+    /// not by these rules. `Caches/vortx-diag.log` and `Caches/stremio-server.log` both survive app updates,
+    /// so a build that scrubs on write still exports whatever an older build wrote. The server log is worse
+    /// than legacy: it is written by bundled JavaScript we do not own, which logs RAW TORRENT HASHES on
+    /// engine created/destroyed/idle/inactive/error/invalid-piece, and no write-path fix of ours reaches it.
+    ///
+    /// Target-safe via ServerDiagnostics: on a build with no server (the Lite tvOS app) the provider is nil
+    /// and the server section is omitted. Never throws.
+    private static func exportPayload() -> ExportPayload {
+        let snapshot = VXProbe.logSnapshot()
+        let status = ServerDiagnostics.status()
+        let tail = status == nil ? [] : ServerDiagnostics.logTail(100)
+        let body = VXDiagExportPolicy.exportBody(
+            logContents: snapshot.contents,
+            serverStatus: status,
+            serverTailLines: tail
+        )
+        return ExportPayload(body: body, logSnapshot: snapshot)
     }
 
-    /// Reduces every http(s) URL embedded in a server log line to `scheme://host/path`, dropping the query
-    /// string and fragment entirely, mirroring the redaction `MPVMetalViewController.loadFile` applies to
-    /// its own `mpvLog` line (`"\(playURL.scheme ?? "?")://\(playURL.host ?? "?")\(playURL.path)"`): debrid
-    /// and direct-CDN URLs carry API tokens / signed queries that must not leave the device in the exported
-    /// log tail. Adapted here (rather than reused directly) because that call site redacts one known URL
-    /// value, while this one has to find and replace URLs embedded anywhere inside a free-text log line.
-    /// Fails soft: a line with no URL, or a matched substring that fails to parse as a URL, passes through
-    /// unchanged.
-    private static let urlPattern = try? NSRegularExpression(pattern: #"https?://[^\s"'<>()\[\]]+"#)
-
-    private static func scrubURLs(_ line: String) -> String {
-        guard let urlPattern else { return line }
-        let nsLine = line as NSString
-        let matches = urlPattern.matches(in: line, range: NSRange(location: 0, length: nsLine.length))
-        guard !matches.isEmpty else { return line }
-
-        var result = line
-        // Replace back-to-front so each earlier match's NSRange (computed against the original line) still
-        // lines up with `result`: only text AFTER the current match has been touched by prior iterations.
-        for match in matches.reversed() {
-            let raw = nsLine.substring(with: match.range)
-            guard let url = URL(string: raw), let range = Range(match.range, in: result) else { continue }
-            result.replaceSubrange(range, with: "\(url.scheme ?? "?")://\(url.host ?? "?")\(url.path)")
-        }
-        return result
+    /// Materialize a sanitized point-in-time body for the native share-sheet and Finder export paths. The
+    /// caller decides whether a receiver acknowledgement exists and therefore whether consumption is safe.
+    static func exportBody() -> Data {
+        exportPayload().body
     }
 
     /// The device's LAN IPv4 for the Wi-Fi interface (`en0`), or nil when not on Wi-Fi. Uses getifaddrs so
@@ -323,29 +491,37 @@ extension VXDiagExport {
     /// the owner grabs and sends the file directly. Returns the destination path to show the user, or nil if
     /// the log could not be materialised anywhere.
     @MainActor func revealInFinder() -> String? {
-        let src = VXProbe.logFileURL
         let fm = FileManager.default
         // Prefer Downloads (user-visible); fall back to the temp dir if it is not resolvable.
         let destDir = (try? fm.url(for: .downloadsDirectory, in: .userDomainMask, appropriateFor: nil, create: false))
             ?? fm.temporaryDirectory
         let dest = destDir.appendingPathComponent("vortx-diag.log")
-        // Copy the current log (overwriting any stale copy). If the source is missing/empty, still write a
-        // placeholder so the reveal is not a dead file.
-        var data = (try? Data(contentsOf: src)) ?? Data("(diagnostic log is empty)\n".utf8)
-        data.append(Self.serverSection())   // F4: fold in the streaming server's status + log tail
+        // Write the SANITISED export body (overwriting any stale copy) rather than copying the live file:
+        // the live file holds whatever every previous build wrote, and this is an export path like any
+        // other. If the source is missing/empty the body is a placeholder, so the reveal is not a dead file.
+        let payload = Self.exportPayload()
+        let data = payload.body
         do {
             try data.write(to: dest, options: .atomic)
             NSWorkspace.shared.activateFileViewerSelecting([dest])
-            // The Downloads copy is an independent file, so it is safe to clear the live rolling log now: the
-            // next export starts fresh (owner request "once exported, clear it").
-            VXProbe.clearLog()
-            NSLog("[diag] export: revealed %@ in Finder + cleared live log", dest.path)
+            // Consume only the point-in-time prefix copied above. Lines appended while the atomic write or
+            // Finder reveal was in flight remain in the live log for the next export.
+            VXProbe.consumeLogSnapshot(payload.logSnapshot)
+            NSLog("[diag] export: revealed %@ in Finder + consumed exported snapshot", dest.path)
             return dest.path
         } catch {
-            // Downloads not writable (unexpected on an unsandboxed Mac): reveal the log in place instead.
-            NSWorkspace.shared.activateFileViewerSelecting([src])
-            NSLog("[diag] export: copy to Downloads failed (%@), revealed source in place", String(describing: error))
-            return src.path
+            // Downloads not writable (unexpected on an unsandboxed Mac): fall back to the temp dir, still
+            // with the sanitised body. Revealing the LIVE file in place was the old fallback and it is an
+            // export path that skips the sanitiser, which is exactly the hole this change closes.
+            let temp = fm.temporaryDirectory.appendingPathComponent("vortx-diag.log")
+            guard (try? data.write(to: temp, options: .atomic)) != nil else {
+                NSLog("[diag] export: could not materialise the log anywhere (%@)", String(describing: error))
+                return nil
+            }
+            NSWorkspace.shared.activateFileViewerSelecting([temp])
+            VXProbe.consumeLogSnapshot(payload.logSnapshot)
+            NSLog("[diag] export: Downloads not writable (%@), revealed the temp copy + consumed exported snapshot", String(describing: error))
+            return temp.path
         }
     }
 }

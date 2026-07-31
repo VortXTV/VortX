@@ -8,6 +8,7 @@ import { actionOf, escapeHtml, httpUrl } from "../lib/dom";
 // to bring in stream sources. Adding validates the manifest before persisting (see store.addAddon).
 
 let onChanged: (() => void) | null = null;
+const delegatedHosts = new WeakSet<HTMLElement>();
 
 /** The add-on's configuration page (Stremio convention): strip the trailing /manifest.json from the
  *  transport URL and point at /configure. Shown only when the manifest declares behaviorHints.configurable. */
@@ -154,6 +155,8 @@ export function wireAddons(host: HTMLElement): void {
     }
   });
 
+  if (delegatedHosts.has(host)) return;
+  delegatedHosts.add(host);
   host.addEventListener("click", (ev) => {
     const hit = actionOf(ev.target);
     if (!hit) return;

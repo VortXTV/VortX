@@ -9,7 +9,7 @@ import Combine
 /// for every episode of a show, while the player's invisible auto-failover can still hop OFF a pinned
 /// source the moment it goes dead: a pin is a *preference* expressed as a large ranking bonus, never a
 /// hard lock. See `StreamRanking.pinBonus` and `PlayerScreen.hopToNextSource`.
-struct SourcePin: Codable, Equatable {
+struct SourcePin: Codable, Equatable, Sendable {
     /// The source group's add-on name (e.g. "Torrentio"). The only field a `global` (provider) pin needs.
     var addon: String
     /// Resolution label as `StreamRanking.qualityLabel` prints it: "4K" / "1080p" / "720p" / "Best".
@@ -30,11 +30,11 @@ struct SourcePin: Codable, Equatable {
 
 /// Where a pin applies. `entry` = this one movie or this one show (keyed by the meta id, so every episode
 /// of a series shares it); `global` = every title (a plain provider preference).
-enum SourcePinScope: String, Codable, CaseIterable { case entry, global }
+enum SourcePinScope: String, Codable, CaseIterable, Sendable { case entry, global }
 
 /// A resolved pin plus the scope it came from, handed to the ranker. Scope changes match strictness:
 /// `global` matches on add-on alone; `entry` matches on bingeGroup (exact) or add-on + resolution.
-struct ResolvedPin: Equatable {
+struct ResolvedPin: Equatable, Sendable {
     let pin: SourcePin
     let scope: SourcePinScope
 }

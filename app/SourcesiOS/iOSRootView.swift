@@ -113,7 +113,7 @@ struct iOSRootView: View {
     @ObservedObject private var updates = UpdateChecker.shared
     #if !os(tvOS)
     /// Offline downloads (#30), observed so the Library tab can carry a live count badge of in-flight
-    /// downloads — the persistent "downloads are running, find them here" signal away from the detail page.
+    /// downloads, the persistent "downloads are running, find them here" signal away from the detail page.
     @ObservedObject private var downloads = DownloadStore.shared
     #endif
     /// Live connectivity (#120): drives the quiet "You're offline" strip and the one-shot offline
@@ -191,7 +191,7 @@ struct iOSRootView: View {
             ZStack {
                 // `isActive` gates each browse screen's `.principal` wordmark: on macOS a principal
                 // toolbar item is hoisted into the shared window titlebar, and every mounted
-                // NavigationStack would otherwise stamp its own — tiling "StremioX" once per screen.
+                // NavigationStack would otherwise stamp its own, tiling "StremioX" once per screen.
                 // Only the visible tab contributes its wordmark (#46 regression).
                 iOSHomeView(isActive: tab == .home).opacity(tab == .home ? 1 : 0)
                 // Hidden tabs UNMOUNT, mirroring Live's long-standing gate (#117): a tab hidden in
@@ -292,7 +292,11 @@ struct iOSRootView: View {
         // Phase-0 seeding nag for the com.vortx move (see MoveSeeding): once per launch, only while this
         // device still owes its first VortX-account sync. armLaunchNag waits out the splashless iOS launch
         // + the profile picker, so the sheet never fights a modal; always dismissible, never blocks use.
-        .sheet(isPresented: $showSeedingNag) { MoveSeedingNagView() }
+        .sheet(isPresented: $showSeedingNag, onDismiss: {
+            // Swipe-down, successful setup, Done, and Not now all close the same launch reminder.
+            // Persist at the sheet boundary so every dismissal stays quiet for this build.
+            MoveSeeding.recordLaunchNagDismissal()
+        }) { MoveSeedingNagView() }
         .task { await armSeedingNag() }
         .onChange(of: hideLiveTab) { hidden in
             if hidden, tab == .live { tab = .home }   // never leave the bar pointing at a hidden screen
@@ -447,7 +451,7 @@ struct iOSRootView: View {
     /// MAC NAV MOVE (CEO greenlit): the macOS navigation shell, restructured from the old bottom bar
     /// into a top-center floating glass pill (the Mac mockup): the VortX mark, then the SAME tab items
     /// as the bar (`tabButton`, `visibleTabs`), so tab identity / selection / scroll-to-top / the
-    /// macOS keyboard focus-ring wiring carry over UNCHANGED — only the pill's position and the
+    /// macOS keyboard focus-ring wiring carry over UNCHANGED; only the pill's position and the
     /// wordmark move. Structural on macOS ONLY (see the `#if os(macOS)` gate around this whole
     /// extension and around its call site in `body`); iOS/iPadOS keep `customTabBar` at the bottom.
     private var macNavPill: some View {
@@ -760,8 +764,35 @@ private extension View {
 /// Home: Continue Watching + each installed catalog as a horizontal poster rail, from the shared
 /// engine, under the interactive featured hero. Signed-out shows a sign-in prompt; the rails populate
 /// as the engine hydrates.
+private struct iOSCWDetailTarget: Hashable {
+    let item: FeaturedHeroItem
+    let resumeSeconds: Double?
+    let videoID: String?
+    let traktSessionID: TraktSessionID?
+}
+
+private struct iOSCWProducerProvenance: Sendable {
+    let source: TraktPlaybackShadow.ContinueWatchingSource
+    let traktSessionID: TraktSessionID?
+
+    func isCurrent(traktSessionID currentSessionID: TraktSessionID?) -> Bool {
+        switch source {
+        case .local:
+            return traktSessionID == nil
+        case .trakt:
+            guard let traktSessionID else { return false }
+            return currentSessionID == traktSessionID
+        }
+    }
+}
+
+private struct iOSCWRenderSnapshot {
+    let items: [RailItem]
+    let provenance: iOSCWProducerProvenance
+}
+
 struct iOSHomeView: View {
-    /// True only when this is the visible tab — gates the macOS window-titlebar wordmark (#46).
+    /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
@@ -783,10 +814,15 @@ struct iOSHomeView: View {
     @ObservedObject private var imported = ImportedCatalogs.shared   // user-imported list catalogs, rendered as Home rows
     @ObservedObject private var railPrefs = HomeRailPreferences.shared   // user's Home row order + hidden set (Continue Watching stays pinned first)
     @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
+    @AppStorage(ExternalSyncToggle.traktContinueWatching) private var useTraktContinueWatching = false
+    @State private var traktContinueWatchingRevision = 0
     @State private var path = NavigationPath()
     @State private var showCustomizeHome = false   // presents the Home rows reorder/hide editor
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
     @State private var player: iOSPlayerLaunch?
+    /// Owns the post-playback source contribution started by a direct resume.
+    /// Cancellation must follow Home teardown instead of escaping in a detached task.
+    @State private var resumeHoardTask: Task<Void, Never>?
     #if os(macOS)
     /// macOS keyboard browse: which Home poster card is focused. Passed to each rail so its cards become
     /// `.focusable()` and join native arrow traversal; nil on iOS (this whole member is macOS-only).
@@ -801,19 +837,42 @@ struct iOSHomeView: View {
     /// carry their in-progress `video_id` so a direct resume can confirm the remembered link
     /// still matches the episode the engine is parked on. The owner profile rides the account's
     /// engine history; an overlay profile rides its own private synced overlay (never the account).
-    private var continueWatchingItems: [RailItem] {
-        let source = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
-        return source.map {
+    private var continueWatchingSelection: TraktPlaybackShadow.ContinueWatchingSelection {
+        if profiles.activeUsesEngineHistory {
+            _ = traktContinueWatchingRevision
+            return TraktPlaybackShadow.shared.continueWatchingSelection(
+                fallback: core.continueWatching
+            )
+        }
+        return .init(items: profiles.cwItems, source: .local, sessionID: nil)
+    }
+
+    private var continueWatchingRenderSnapshot: iOSCWRenderSnapshot {
+        let selection = continueWatchingSelection
+        let items = selection.items.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress,
                      cwVideoId: $0.state.videoId, resumeSeconds: $0.resumeSeconds)
         }
+        return iOSCWRenderSnapshot(
+            items: items,
+            provenance: iOSCWProducerProvenance(
+                source: selection.source,
+                traktSessionID: selection.sessionID
+            )
+        )
+    }
+
+    private var continueWatchingItems: [RailItem] {
+        continueWatchingRenderSnapshot.items
     }
 
     #if os(macOS)
     /// Every Home rail item flattened, for the keyboard-browse hero coupling: a focused card id resolves
     /// to its `RailItem` so the hero can feature it. Mirrors the same sources the rails render from.
     private var allRailItems: [RailItem] {
-        var out = continueWatchingItems
+        // A remote Trakt row stays keyboard-focusable, but never enters the generic hero enrichment pool.
+        let continueWatching = continueWatchingRenderSnapshot
+        var out = continueWatching.provenance.source == .trakt ? [] : continueWatching.items
         out += topPicks.items.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
         out += core.boardRows.flatMap { $0.items }.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
@@ -897,7 +956,7 @@ struct iOSHomeView: View {
     /// catalog row, capped by the model. These are the titles a Home visitor sees first.
     private var heroCandidates: [FeaturedHeroItem] {
         // A Continue-Watching entry carries only name + poster (no rating / year / genres), so a
-        // CW-sourced hero is bare until the slow background HTTP enrichment lands — and when that fetch
+        // CW-sourced hero is bare until the slow background HTTP enrichment lands, and when that fetch
         // is unreliable, the hero's meta row stays empty (the reported "no metadata on the backdrop").
         // If the same title is ALSO in a loaded catalog row, seed from that CoreMeta instead: it carries
         // the links-derived rating/year/genres (and a synopsis), so the hero shows its meta immediately,
@@ -917,11 +976,12 @@ struct iOSHomeView: View {
     }
 
     var body: some View {
+        let renderedContinueWatching = continueWatchingRenderSnapshot
         NavigationStack(path: $path) {
             // The hero is the first scrolling element (an ambient billboard header), not a
             // behind-the-scroll backdrop: that keeps its Play / Trailer buttons + the tappable poster
             // cards reachable (a ScrollView layered over a hero would otherwise eat the hero's taps).
-            // Its bottom fades cleanly into canvas with a small gap before the first rail (#52) — the
+            // Its bottom fades cleanly into canvas with a small gap before the first rail (#52), the
             // old negative-overlap tuck made the hero bleed into Continue Watching.
             ScrollView {
                 // In-flow hero: the band is the FIRST scrolling child of the column (not a pinned section
@@ -951,16 +1011,39 @@ struct iOSHomeView: View {
                     }
                     .padding(.horizontal, Theme.Space.md)
                     #endif
-                    if !continueWatchingItems.isEmpty {
+                    if !renderedContinueWatching.items.isEmpty {
                         // Continue Watching is PINNED first (not part of HomeRailPreferences): it is a resume
                         // queue stepped through in recency order, not a browse surface. A CW card tap resumes
                         // the exact last-played stream straight into the player (#11), falling back to opening
                         // detail when no remembered link fits. Long-press offers "Remove from Continue Watching".
                         homeRail(PosterRail(title: String(localized: "Continue Watching"),
-                                            eyebrow: String(localized: "Pick up where you left off"),
-                                            items: continueWatchingItems,
-                                            onTap: handleContinueWatchingTap, menu: .continueWatching,
-                                            onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) }))
+                                            eyebrow: renderedContinueWatching.provenance.source == .trakt
+                                                ? String(localized: "From Trakt")
+                                                : String(localized: "Pick up where you left off"),
+                                            items: renderedContinueWatching.items,
+                                            onTap: {
+                                                handleContinueWatchingTap(
+                                                    $0,
+                                                    provenance: renderedContinueWatching.provenance
+                                                )
+                                            },
+                                            // Trakt-sourced rows are read-only. Their dismiss action targets
+                                            // the local engine, not Trakt, so omit it until remote delete is
+                                            // separately designed and authorized.
+                                            menu: renderedContinueWatching.provenance.source == .trakt
+                                                ? .none
+                                                : .continueWatching,
+                                            onDetails: {
+                                                guard let target = cwDetailTarget(
+                                                    for: $0,
+                                                    provenance: renderedContinueWatching.provenance
+                                                ) else { return }
+                                                path.append(target)
+                                            },
+                                            accessibilityProvenance:
+                                                renderedContinueWatching.provenance.source == .trakt
+                                                ? String(localized: "From Trakt")
+                                                : nil))
                     }
                     // Every other Home section renders in the user's arranged order, minus the hidden ones
                     // (HomeRailPreferences). Default order + nothing hidden == today's Home exactly, so this is
@@ -972,13 +1055,13 @@ struct iOSHomeView: View {
                     }
                     // Use the profile-aware CW source so an overlay profile WITH history never reads as
                     // empty, and one with none still shows the empty state honestly.
-                    if core.boardRows.isEmpty && continueWatchingItems.isEmpty {
+                    if core.boardRows.isEmpty && renderedContinueWatching.items.isEmpty {
                         emptyState
                     }
                 }
                 .padding(.bottom, Theme.Space.md)
             }
-            // A scroll gesture quiets the ambient hero rotation (resumes after inactivity) — the
+            // A scroll gesture quiets the ambient hero rotation (resumes after inactivity), the
             // billboard never yanks the page while the user is browsing (#53).
             .scrollDismissesHeroRotation(model: hero)
             // Re-tapping the active Home tab scrolls back to the top anchor above the hero.
@@ -1056,6 +1139,21 @@ struct iOSHomeView: View {
                 iOSDetailView(id: item.id, type: item.type, title: item.name,
                               seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
+            .navigationDestination(for: iOSCWDetailTarget.self) { target in
+                if target.traktSessionID == nil
+                    || TraktAuth.storedSessionID == target.traktSessionID {
+                    iOSDetailView(
+                        id: target.item.id,
+                        type: target.item.type,
+                        title: target.item.name,
+                        seedBackdrop: target.item.backdrop,
+                        seedLogo: target.item.logo,
+                        initialResumeSeconds: target.resumeSeconds,
+                        initialVideoID: target.videoID,
+                        initialTraktSessionID: target.traktSessionID
+                    )
+                }
+            }
             .navigationDestination(for: HubTarget.self) { target in
                 iOSCategoryBrowse(target: target, path: $path)
             }
@@ -1078,11 +1176,12 @@ struct iOSHomeView: View {
         // by routine engine re-emits.
         .onAppear {
             // Populate the board on appear (mirrors Discover/Library) so the default Cinemeta catalogs
-            // fill Home even when SIGNED OUT — the landing screen shows a real backdrop hero + rails
+            // fill Home even when SIGNED OUT; the landing screen shows a real backdrop hero + rails
             // instead of a bare empty state. The Sign In button stays in the toolbar. Guarded on empty
             // so a signed-in session (board already loaded at bootstrap) isn't re-fetched.
             if core.boardRows.isEmpty { core.loadBoard() }
             FeaturedHeroModel.configureMetaSources(core.addons)
+            TraktPlaybackShadow.shared.refreshIfStale()
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
             refreshTopPicks()
             refreshReleaseCalendar()
@@ -1128,6 +1227,16 @@ struct iOSHomeView: View {
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
         }
         .onChange(of: profiles.activeID) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks() }
+        .onChange(of: useTraktContinueWatching) { on in
+            if on { TraktPlaybackShadow.shared.refreshNow() }
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+            refreshTopPicks()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TraktPlaybackShadow.changedNote)) { _ in
+            traktContinueWatchingRevision &+= 1
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+            refreshTopPicks()
+        }
         // Library membership drives both Top Picks (its seed set includes the library) and Upcoming Episodes.
         // Unbounded, so keyed on catalog.count with the same-count-swap bound documented above.
         .onChange(of: core.library?.catalog.count ?? 0) { _ in refreshTopPicks(); refreshReleaseCalendar() }
@@ -1138,7 +1247,7 @@ struct iOSHomeView: View {
         // catalogs I can't remove from Home" report). The render + hero pool are gated on the same flag.
         .onChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: the render is already gated on showCollectionsHub, and clear() blanked the shared hub for the OTHER surface (Home vs Discover)
-        // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
+        // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
         // installed meta add-on, and rebuild Upcoming Episodes (its sweep also needs the meta add-ons).
@@ -1150,7 +1259,11 @@ struct iOSHomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: SIMKLRailsModel.disconnectedNote)) { _ in simklRails.clear() }
         // A watchlist bookmark toggle feeds the Upcoming rails (refreshUpcoming folds it in), so rebuild them now.
         .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in refreshReleaseCalendar() }
-        .onDisappear { hero.stop() }
+        .onDisappear {
+            hero.stop()
+            resumeHoardTask?.cancel()
+            resumeHoardTask = nil
+        }
     }
 
     /// Render one reorderable Home section. Each case is the section's ORIGINAL block, unchanged, moved
@@ -1316,7 +1429,7 @@ struct iOSHomeView: View {
         #endif
     }
 
-    /// Tapping a poster opens that title's detail through normal navigation — it does NOT "feature" it
+    /// Tapping a poster opens that title's detail through normal navigation; it does NOT "feature" it
     /// in the hero. The hero is a decoupled ambient billboard (#53); the only side effect of a tap is
     /// quieting its rotation for a beat.
     private func handleTap(_ item: RailItem) {
@@ -1336,7 +1449,7 @@ struct iOSHomeView: View {
         mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none
     }
 
-    /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases — derived
+    /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases, derived
     /// EXACTLY like the new-episode notification sweep (series-typed library ids + names, `providesMeta`
     /// add-on base URLs). The model no-ops when the series set is unchanged, so this is cheap to re-call.
     private func refreshReleaseCalendar() {
@@ -1358,22 +1471,59 @@ struct iOSHomeView: View {
     /// when one is remembered for this title/episode; otherwise fall back to opening the detail page so
     /// the user picks a source. (Direct resume needs a remembered link, which the player records as it
     /// plays; the first watch from the detail page seeds it.)
-    private func handleContinueWatchingTap(_ item: RailItem) {
+    private func handleContinueWatchingTap(
+        _ item: RailItem,
+        provenance: iOSCWProducerProvenance
+    ) {
         hero.noteInteraction()
+        guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
         // Computing the resume offset may await the account, so resolve the direct-resume launch in a
         // Task; fall back to opening detail when no remembered link fits.
         Task {
-            if let launch = await iOSDirectResume(for: item, core: core, account: account) {
+            if let launch = await iOSDirectResume(
+                for: item,
+                core: core,
+                account: account,
+                expectedTraktSession: provenance.traktSessionID
+            ) {
+                guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
                 player = launch
-            } else {
-                path.append(FeaturedHeroItem.from(rail: item))
+                resumeHoardTask?.cancel()
+                if let contentID = launch.resumeHoardContentID,
+                   let streamID = launch.resumeHoardStreamID {
+                    resumeHoardTask = Task(priority: .utility) {
+                        await SourceIndexClient.hoardResumedGroupsAfterPlayback(
+                            contentID: contentID
+                        ) {
+                            CoreBridge.shared.streamGroups(forStreamId: streamID)
+                        }
+                    }
+                } else {
+                    resumeHoardTask = nil
+                }
+            } else if let target = cwDetailTarget(for: item, provenance: provenance) {
+                path.append(target)
             }
         }
     }
 
+    private func cwDetailTarget(
+        for item: RailItem,
+        provenance: iOSCWProducerProvenance
+    ) -> iOSCWDetailTarget? {
+        guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return nil }
+        let carriesTraktResume = provenance.source == .trakt
+        return iOSCWDetailTarget(
+            item: FeaturedHeroItem.from(rail: item),
+            resumeSeconds: carriesTraktResume ? item.resumeSeconds : nil,
+            videoID: carriesTraktResume ? item.cwVideoId : nil,
+            traktSessionID: provenance.traktSessionID
+        )
+    }
+
     @ViewBuilder private var emptyState: some View {
         // Route through the shared compat empty state for one consistent layout (#44). Signed-out gets
-        // a primary Sign In CTA (the in-house PrimaryActionStyle, not the stock .borderedProminent — #42);
+        // a primary Sign In CTA (the in-house PrimaryActionStyle, not the stock .borderedProminent, #42);
         // signed-in is the bare loading line while catalogs hydrate.
         if account.isSignedIn || vortxSync.isSignedIn {
             ContentUnavailableViewCompat(title: "Loading your catalogs…", systemImage: "popcorn",
@@ -1467,7 +1617,7 @@ struct HomeRailEditorView: View {
 
 /// Client-side type segmentation for the Library (Movies / TV / Anime). The engine's own type filter
 /// only knows movie vs. series and cannot surface Anime, so the type row is derived here from each saved
-/// title's meta type — a pure presentation grouping that leaves the engine's SORT chips and every
+/// title's meta type, a pure presentation grouping that leaves the engine's SORT chips and every
 /// per-item action (open / remove / watched) untouched.
 private enum LibrarySegment: String, CaseIterable, Identifiable {
     case all, movies, tv, anime
@@ -1534,7 +1684,7 @@ private enum LibrarySmartFilter: String, CaseIterable, Identifiable {
 /// hero. Refreshes as the library changes; reloads while empty since it syncs asynchronously after
 /// sign-in.
 struct iOSLibraryView: View {
-    /// True only when this is the visible tab — gates the macOS window-titlebar wordmark (#46).
+    /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
@@ -1581,7 +1731,7 @@ struct iOSLibraryView: View {
         }
     }
 
-    /// True when there is at least one offline download — keeps the empty-Library placeholder from
+    /// True when there is at least one offline download; keeps the empty-Library placeholder from
     /// showing when a user has downloads but no saved titles. Always false on tvOS (downloads deferred).
     private var hasDownloads: Bool {
         #if os(tvOS)
@@ -1653,7 +1803,7 @@ struct iOSLibraryView: View {
                     // can report an over-wide ideal that the LazyVStack adopts, shifting the column left.
                     .frame(maxWidth: .infinity, alignment: .leading)
                 } else if !hasDownloads {
-                    // Only show the "Library empty" placeholder when there are ALSO no downloads — a user
+                    // Only show the "Library empty" placeholder when there are ALSO no downloads, a user
                     // with downloads but no saved titles still sees their offline section above.
                     ContentUnavailableViewCompat(title: "Library", systemImage: "books.vertical",
                         message: "Titles you add to your library in Stremio show up here.")
@@ -1715,7 +1865,7 @@ struct iOSLibraryView: View {
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
         }
         .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
-        // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
+        // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
         // installed meta add-on. tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
@@ -1736,7 +1886,7 @@ struct iOSLibraryView: View {
     @ViewBuilder private func sortChips(_ selectable: CoreLibrarySelectable) -> some View {
         // Route through the shared ChipButtonStyle (like Search's link button): a selected chip is a
         // soft-accent pill with accent ink, so on-chip text follows onAccent and stays legible on
-        // light accents (#39) — the old solid-accent + hardcoded-white chip went invisible.
+        // light accents (#39); the old solid-accent + hardcoded-white chip went invisible.
         chipScroll { ForEach(selectable.sorts) { s in
             Button(AddonTerms.localize(s.label)) { core.selectLibrary(s.request) }
                 .buttonStyle(ChipButtonStyle(selected: s.selected)) } }
@@ -1744,7 +1894,7 @@ struct iOSLibraryView: View {
 
     /// The client-side type segment chips (All / Movies / TV / Anime), rendered with the shared
     /// `ChipButtonStyle` so they match every other filter chip. Shown only when the library actually
-    /// spans two or more buckets — a single-type library keeps the flat grid with no redundant control.
+    /// spans two or more buckets, a single-type library keeps the flat grid with no redundant control.
     @ViewBuilder private func segmentBar(_ items: [RailItem]) -> some View {
         let segs = availableSegments(items)
         if !segs.isEmpty {
@@ -2079,7 +2229,7 @@ struct DownloadsView: View {
     /// Play a completed download from its LOCAL file. Rebuilds the engine `PlaybackMeta` so progress /
     /// Continue Watching record exactly as for a streamed source; `isTorrent: false` because a finished
     /// file plays directly (never back through the loopback torrent server). Fail-soft if the file is
-    /// missing (purged out from under us) — drop the row.
+    /// missing (purged out from under us); drop the row.
     private func play(_ record: DownloadRecord) {
         guard record.state == .completed, store.fileExists(for: record) else {
             if record.state == .completed { manager.cancel(id: record.id) }   // file gone → clean up the stale row
@@ -2197,7 +2347,7 @@ struct iOSDownloadsScreen: View {
 /// engine's `CoreBridge.search` hard-gates at 2 chars, so a single-char query would otherwise read as
 /// a misleading empty state).
 struct iOSSearchView: View {
-    /// True only when this is the visible tab — gates the macOS window-titlebar wordmark (#46).
+    /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount   // passed to the lifted paste-a-link player
@@ -2343,17 +2493,20 @@ struct iOSSearchView: View {
         }
     }
 
-    /// Group results into Movies / Series / Other, dropping empty sections — the tvOS `resultSections`.
+    /// Group results into Movies / Series / Other, dropping empty sections, the tvOS `resultSections`.
     private var resultSections: [(title: String, items: [CoreMeta])] {
         let movies = core.searchResults.filter { $0.type == "movie" }
         let series = core.searchResults.filter { $0.type == "series" }
         let other = core.searchResults.filter { $0.type != "series" && $0.type != "movie" }
-        return [("Movies", movies), ("Series", series), ("Other", other)].filter { !$0.items.isEmpty }
+        return [(String(localized: "Movies"), movies),
+                (String(localized: "Series"), series),
+                (String(localized: "Other"), other)]
+            .filter { !$0.items.isEmpty }
     }
 
     private var suggestionTitles: [String] { core.searchSuggestionTitles(for: query) }
 
-    /// Recent searches (per profile, sync-backed) shown when the field is empty — the touch/Mac twin of
+    /// Recent searches (per profile, sync-backed) shown when the field is empty, the touch/Mac twin of
     /// the tvOS SearchView history row (#90). Tap a chip to re-run it; Clear wipes the list.
     private var historySection: some View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
@@ -2415,10 +2568,10 @@ struct iOSSearchView: View {
 }
 
 /// Discover, driven by the stremio-core engine (CatalogWithFilters): type, catalog, and genre
-/// chips carrying the engine's own request, dispatched back on tap, over a poster grid — under the
+/// chips carrying the engine's own request, dispatched back on tap, over a poster grid, under the
 /// interactive featured hero (shown once a catalog has loaded).
 struct iOSDiscoverView: View {
-    /// True only when this is the visible tab — gates the macOS window-titlebar wordmark (#46).
+    /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
@@ -2457,11 +2610,11 @@ struct iOSDiscoverView: View {
         NavigationStack(path: $path) {
             ScrollView {
                 // LazyVStack (not VStack): a vertical ScrollView proposes the viewport width, but a
-                // plain VStack sizes to its WIDEST child — and the nested horizontal chip ScrollViews
+                // plain VStack sizes to its WIDEST child, and the nested horizontal chip ScrollViews
                 // below let it adopt their (wider-than-screen) content width, pushing the whole column
                 // off-axis so the hero + chips + grid render shifted-left and clipped on both edges
                 // (the intermittent beta7 "weird viewport" on Discover/Library). LazyVStack is greedy
-                // on the cross axis — it always takes the full viewport width — so it can't overflow.
+                // on the cross axis; it always takes the full viewport width, so it can't overflow.
                 // Home already uses LazyVStack and never exhibited the shift.
                 // S4: Discover stacks its rails at lg (32) so its vertical rhythm matches Home / Library /
                 // Search; it was the lone surface at md (20), reading as a tighter, inconsistent column.
@@ -2471,7 +2624,7 @@ struct iOSDiscoverView: View {
                     // pinned section header: pinning put it on top on macOS and ate every tap.
                     Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Discover tab -> scroll here
                     // Merged mode: an inline search field sits above the Discover browse so the two surfaces
-                    // share one tab (owner: less clutter on mobile). Fail-soft — the flag defaults OFF, so the
+                    // share one tab (owner: less clutter on mobile). Fail-soft; the flag defaults OFF, so the
                     // field is absent and Discover is byte-for-byte unchanged unless the user opts in.
                     if mergeDiscoverSearch { mergedSearchField }
                     if mergeDiscoverSearch, hasSearchQuery {
@@ -2516,7 +2669,7 @@ struct iOSDiscoverView: View {
                 .padding(.bottom, Theme.Space.md)
                 // Pin the column to the viewport width. The adaptive PosterGrid can report an over-wide
                 // ideal that the LazyVStack adopts (LazyVStack is NOT inherently viewport-pinned as the
-                // note above assumed), shifting the hero/chips/grid off the left edge — the Discover
+                // note above assumed), shifting the hero/chips/grid off the left edge, the Discover
                 // clipping report. Home has only self-bounding horizontal rails, so it never needed this.
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -2568,10 +2721,10 @@ struct iOSDiscoverView: View {
             if showCollectionsHub { collectionsHub.load() }
         }
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: the render is already gated on showCollectionsHub, and clear() blanked the shared hub for the OTHER surface (Home vs Discover)
-        // The grid changes whenever a different type/catalog/genre is selected, which bumps revision —
+        // The grid changes whenever a different type/catalog/genre is selected, which bumps revision;
         // reseed so the hero pool tracks the visible catalog.
         .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
-        // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
+        // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
         // installed meta add-on. tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
@@ -2650,7 +2803,10 @@ struct iOSDiscoverView: View {
             let movies = core.searchResults.filter { $0.type == "movie" }
             let series = core.searchResults.filter { $0.type == "series" }
             let other = core.searchResults.filter { $0.type != "series" && $0.type != "movie" }
-            let sections = [("Movies", movies), ("Series", series), ("Other", other)].filter { !$0.1.isEmpty }
+            let sections = [(String(localized: "Movies"), movies),
+                            (String(localized: "Series"), series),
+                            (String(localized: "Other"), other)]
+                .filter { !$0.1.isEmpty }
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 ForEach(sections, id: \.0) { section in
                     PosterRail(title: section.0,
@@ -2958,7 +3114,7 @@ struct iOSDiscoverFilterPanel: View {
 
 /// One catalog row's tappable poster. Beyond the poster + progress the card needs, it carries the
 /// catalog preview fields (`background`, `description`, `releaseInfo`, `imdbRating`, `genres`) so the
-/// detail route opened on tap arrives with rich seed data — they're present on `CoreMeta` but were
+/// detail route opened on tap arrives with rich seed data; they're present on `CoreMeta` but were
 /// previously dropped at the `.map`. Continue Watching / Library entries lack a `background`, so the
 /// hero derives 16:9 art from metahub-by-IMDB-id (see `FeaturedHeroItem.from`).
 /// Keep the first occurrence of each meta id, dropping later duplicates. Paginated catalogs can repeat a
@@ -3041,6 +3197,10 @@ struct iOSPlayerLaunch: Identifiable {
     /// same in-player Next / Prev / episode-list as the detail page. Empty/nil for movies + paste-a-link.
     var episodes: [PlayerEpisodeRef] = []
     var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
+    /// A Continue-Watching launch carries the identity needed for one owned,
+    /// deferred source contribution after the player exits.
+    var resumeHoardContentID: String? = nil
+    var resumeHoardStreamID: String? = nil
     /// yt-direct adaptive pair (pasted YouTube links): the separate AUDIO stream mpv mounts alongside the
     /// video-only `url` (`--audio-file` sidecar). Forces the libmpv engine in PlayerScreen.
     var audioSidecarURL: URL? = nil
@@ -3087,13 +3247,16 @@ extension View {
 }
 
 /// Resume the EXACT link a Continue-Watching title last played, straight into the player, instead of
-/// routing through the detail page and re-resolving sources — the touch/Mac twin of the tvOS
+/// routing through the detail page and re-resolving sources, the touch/Mac twin of the tvOS
 /// `CoreContinueWatchingRow.directResume`. Returns nil (caller then opens detail) when no remembered
 /// link fits: never played on this device, the link is a torrent while torrents are disabled, or the
 /// engine moved the series on to a different episode than the one we remembered.
 @MainActor
 private func iOSDirectResume(for item: RailItem, core: CoreBridge,
-                             account: StremioAccount) async -> iOSPlayerLaunch? {
+                             account: StremioAccount,
+                             expectedTraktSession: TraktSessionID?) async -> iOSPlayerLaunch? {
+    guard expectedTraktSession == nil
+            || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     let pid = ProfileStore.shared.activeID
     guard let entry = LastStreamStore.entry(for: item.id, profileID: pid) else {
         LastStreamStore.logResume("noEntry", libraryId: item.id, profileID: pid); return nil
@@ -3120,22 +3283,28 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     // (the common case), so those playbacks seeded nothing. Fire-and-forget, deduped per content, gated inside
     // SourceIndexClient (consent + fleet flag). No-op when the library id is not a real imdb id or no groups
     // assemble.
-    if let cid = SourceIndexClient.contentID(imdbId: item.id, season: entry.season, episode: entry.episode) {
-        let streamId = entry.videoId
-        Task.detached {
-            // Read groups off the shared bridge (not the captured `core`) so the detached task never captures a
-            // non-Sendable reference; there is one engine bridge, so this is the same state the resume loads.
-            await SourceIndexClient.hoardResumedGroups(contentID: cid) {
-                CoreBridge.shared.streamGroups(forStreamId: streamId)
-            }
-        }
-    }
+    // IDENTITY FENCE (REQ-260721-38): the key is built from the library item id while the groups below are
+    // polled by the STORED entry's videoId, and those are two independent ids. The old guard compared episode
+    // NUMBERS, which cannot catch a title mismatch: item tt1375666 with a stored video tt0903747:1:1 published
+    // the latter's groups under tt1375666:1:1. `resumeContentID` compares canonical TITLE HEADS and returns nil
+    // when they disagree, which SKIPS the pool contribution only. Playback below is untouched: a mismatch never
+    // blocks the user's own resume.
+    let resumeHoardContentID = expectedTraktSession == nil
+        ? SourceIndexClient.resumeContentID(
+            itemID: item.id,
+            videoID: entry.videoId,
+            season: entry.season,
+            episode: entry.episode
+        )
+        : nil
     // Reresolve the EXACT stored source FIRST (same debrid file, fresh link) so the card tap resumes the source
     // the user chose instead of replaying a stale, expired URL and dead-ending into the cross-source auto-pick
     // ("Tried N sources / this source didn't load"). CWResume mints a fresh link for the SAME file when the
     // entry carries debrid provenance; a non-debrid entry returns the stored url unchanged (refreshed == false),
     // so torrent / plain-direct resumes are byte-identical to before.
     let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
+    guard expectedTraktSession == nil
+            || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     let playURL = refreshed ? resolvedURL : url
     if hasEpisodicPhysicalIdentity, entry.torrent == true, entry.fileIdx == nil, !refreshed {
         LastStreamStore.logResume("episodeTorrentMissingFileIdx", libraryId: item.id, profileID: pid)
@@ -3166,14 +3335,18 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
                             name: entry.name, poster: entry.poster,
                             season: entry.season, episode: entry.episode)
-    // Resume where the user left off, not 0:00 (#11). The iOS PlayerScreen seeks ONLY to the passed
-    // `resume`, so the offset must be computed here — mirroring iOSDetailView.resume(_:):
-    // the engine's own offset for engine-history profiles, else the account/overlay offset.
+    // Resume at the offset printed on the tapped card. This is load-bearing for a Trakt-sourced row:
+    // consulting the engine/account instead would display one remote offset and play from another.
+    // Older/non-CW callers with no card offset retain the existing engine/account fallback.
     let resume: Double
-    if let engine = core.engineResumeSeconds(for: meta) {
+    if let displayed = item.resumeSeconds, displayed.isFinite, displayed > 0 {
+        resume = displayed
+    } else if let engine = core.engineResumeSeconds(for: meta) {
         resume = engine
     } else {
         resume = await account.resumeOffset(for: meta)
+        guard expectedTraktSession == nil
+                || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     }
     // For a MOVIE, kick off loading the title's streams in the background so a stale stored link (debrid URLs
     // are time-limited and expire between sessions) can AUTO-HOP to a freshly-resolved source instead of
@@ -3195,7 +3368,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     if usesSeriesLifecycle {
         // Load the series meta (for the episode list) AND the CURRENT episode's streams, so the in-player
         // Sources button has this episode's alternates. Loading meta-only here had wiped the resident
-        // episode streams the Sources list relied on — the "Sources button gone from CW resume" regression.
+        // episode streams the Sources list relied on, the "Sources button gone from CW resume" regression.
         // Both stream surfaces count as resident: an episode whose sources are meta-embedded (metaStreams,
         // the HTTP/HLS add-on shape, #122) must not force a redundant re-dispatch here.
         let hasEpStreams = core.metaDetails?.allStreamGroups.contains { $0.request.path.id == entry.videoId } ?? false
@@ -3216,10 +3389,23 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                 )
             }
             loadEpisode = { vid in
-                await iOSResolveEpisodeStream(videoId: vid, in: allSeriesVideos, seriesId: item.id,
-                                              seriesName: entry.name, defaultSeason: season,
-                                              fallbackPoster: entry.poster, continuity: entry.qualityText,
-                                              binge: entry.bingeGroup, core: core, account: account)
+                guard expectedTraktSession == nil
+                        || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
+                let resolved = await iOSResolveEpisodeStream(
+                    videoId: vid,
+                    in: allSeriesVideos,
+                    seriesId: item.id,
+                    seriesName: entry.name,
+                    defaultSeason: season,
+                    fallbackPoster: entry.poster,
+                    continuity: entry.qualityText,
+                    binge: entry.bingeGroup,
+                    core: core,
+                    account: account
+                )
+                guard expectedTraktSession == nil
+                        || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
+                return resolved
             }
         }
     }
@@ -3255,6 +3441,8 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
             )
         }
     }
+    guard expectedTraktSession == nil
+            || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     return iOSPlayerLaunch(url: playURL, title: entry.title, headers: entry.headers,
                            resume: resume, meta: meta,
                            qualityText: entry.qualityText, bingeGroup: entry.bingeGroup,
@@ -3262,7 +3450,9 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                            debridRef: explicitDebridRef, sourceStream: launchSource,
                            enginePlayerVideoId: enginePlayerVideoId,
                            wasExplicitPick: wasExplicitPick, wasResume: true,
-                           episodes: episodes, loadEpisode: loadEpisode)
+                           episodes: episodes, loadEpisode: loadEpisode,
+                           resumeHoardContentID: resumeHoardContentID,
+                           resumeHoardStreamID: resumeHoardContentID == nil ? nil : entry.videoId)
 }
 
 private func iOSDirectStream(url: URL, name: String) -> CoreStream? {
@@ -3281,7 +3471,7 @@ private func iOSRawTorrentStream(infoHash: String, fileIdx: Int, name: String) -
     return try? JSONDecoder().decode(CoreStream.self, from: data)
 }
 
-/// Stremio's "paste a link" feature on touch / Mac (#16) — the twin of the tvOS `OpenLinkView`. Plays
+/// Stremio's "paste a link" feature on touch / Mac (#16), the twin of the tvOS `OpenLinkView`. Plays
 /// a direct video URL or a magnet: magnets ride the embedded torrent engine (the `/create` call blocks
 /// until the torrent's metadata arrives, then the largest video file plays). The tvOS `OpenLinkView`
 /// and its `LinkOpener` live in the tvOS-only target (they depend on `PlayerPresenter`), so this brings
@@ -3715,11 +3905,11 @@ private enum OpenLinkMagnet {
 
 /// A poster grid (Library, Search, Discover) of tappable cards. Cards are `Button`s wired to an
 /// `onTap(item)` router (instead of pushing a `NavigationLink` directly), so the SCREEN decides what a
-/// tap means — across all three surfaces it now opens the title's detail (the hero is a decoupled
+/// tap means: across all three surfaces it now opens the title's detail (the hero is a decoupled
 /// ambient billboard, #53), so there is no featured ring here.
 ///
 /// Centering (#47): the adaptive columns are CENTER-aligned and the grid is constrained to the same
-/// row width that gives even, balanced columns — a `.leading`-aligned adaptive grid bunched cards to
+/// row width that gives even, balanced columns; a `.leading`-aligned adaptive grid bunched cards to
 /// the left and left a ragged right gutter, which read as "left-aligned". Centering the columns and
 /// the trailing remainder keeps the grid even across the width at every breakpoint (iPhone → Mac).
 struct PosterGrid: View {
@@ -3825,6 +4015,9 @@ private struct PosterRail: View {
     var menu: iOSPosterMenu = .none
     /// Opens a card's detail page (used by the Continue Watching menu's Details item, since a CW tap resumes).
     var onDetails: ((RailItem) -> Void)? = nil
+    /// Remote row provenance repeated in VoiceOver so account-private rows are never mistaken for
+    /// local engine history.
+    var accessibilityProvenance: String? = nil
     /// #111 (iOS mirror of tvOS): show the per-profile watched check badge + 55% dim on each card. Opt-in so
     /// only catalog/discovery rails badge, exactly as tvOS scopes it; Continue Watching keeps it off (its
     /// cards carry the resume timecode + progress stripe, not a watched badge).
@@ -3899,14 +4092,17 @@ private struct PosterRail: View {
             PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, caption: item.caption, imdbRating: item.imdbRating,
                           progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
                           isWatched: showWatchedBadges && watchedIndex.ids.contains(item.id),
-                          onDetails: onDetails.map { od in { od(item) } })
+                          onDetails: onDetails.map { od in { od(item) } },
+                          privateArtwork: accessibilityProvenance != nil)
         }
         // S3: shared card treatment (resting shadow, Mac hover lift, designed press, Reduce-Motion aware),
         // matching the browse grid and tvOS poster cards. scale 1.04 is touch-tuned.
         .buttonStyle(CardFocusStyle(scale: 1.04))
         .id(item.id)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(item.name)
+        .accessibilityLabel(
+            accessibilityProvenance.map { "\(item.name), \($0)" } ?? item.name
+        )
         .accessibilityHint("Opens details")
         .accessibilityValue(item.progress > 0 ? "\(Int(item.progress * 100)) percent watched" : "")
 
@@ -4033,6 +4229,35 @@ struct CachedPosterImage: View {
     }
 }
 
+/// Privacy-preserving image for account-private remote rows. It paints only an already-decoded local
+/// poster and never starts a request or writes the shared artwork caches.
+private struct WarmCachedPosterImage: View {
+    let url: String?
+
+    private var image: VXPosterImage? {
+        guard let url, let parsed = URL(string: url) else { return nil }
+        return PosterImageLoader.cached(parsed)
+    }
+
+    var body: some View {
+        Group {
+            if let image {
+                #if canImport(UIKit)
+                Image(uiImage: image).resizable().scaledToFill()
+                #else
+                Image(nsImage: image).resizable().scaledToFill()
+                #endif
+            } else {
+                Theme.Palette.surface1.overlay(
+                    Image(systemName: "film")
+                        .font(.system(size: 28))
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                )
+            }
+        }
+    }
+}
+
 /// iOS/Mac cinematic landscape (16:9) catalog art, the touch twin of tvOS `LandscapeArt`: a clean
 /// TEXTLESS TMDB backdrop resolved by id via `LandscapeBackdropCache`. With no TMDB backdrop (no key
 /// set, or none on TMDB) it does NOT crop a 2:3 poster into an ugly slab: it fills with a heavily
@@ -4066,7 +4291,21 @@ private struct LandscapeArtiOS: View {
                 Theme.Palette.surface1
             }
         }
+        .overlay(alignment: .topLeading) { ratingBadge }
         .task(id: id) { await load() }
+    }
+
+    /// The clean 16:9 backdrop carries NO baked rating (unlike the portrait poster the service bakes), so
+    /// when "Show ratings on posters" is on, surface it as a client badge fed by the keyless VortX ratings
+    /// service. Suppressed only when a genuinely BAKED poster is on screen (the rare no-backdrop fallback for
+    /// a renderable id), so a rating is never double-drawn. Top-LEADING to clear the watched checkmark (which
+    /// owns top-trailing) and the outer PosterCardiOS portrait rating badge (also top-trailing).
+    @ViewBuilder private var ratingBadge: some View {
+        let bakedPosterShown = !usedBackdrop && PosterArtwork.bakesRatings(forID: id)
+        CardRatingBadge(id: id, type: type,
+                        active: PosterArtwork.bakesRatings && !bakedPosterShown,
+                        glyphSize: 8, textSize: 10, maxScores: 2)
+            .padding(6)
     }
 
     /// The title ON the backdrop: the clean TMDB clearlogo when one resolves, else styled text, over a
@@ -4147,6 +4386,9 @@ struct PosterCardiOS: View {
     var isWatched: Bool = false
     /// Per-card "open details" action, wired into the Continue Watching menu's Details item.
     var onDetails: (() -> Void)? = nil
+    /// Account-private remote rows may reuse only already-warm local art. They must not enrich, resolve,
+    /// fetch, or persist artwork based on private playback history.
+    var privateArtwork = false
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized title/poster override
@@ -4154,13 +4396,13 @@ struct PosterCardiOS: View {
     @Environment(\.horizontalSizeClass) private var hSize
 
     /// The title to show: the pooled localized title in the user's language when available, else the add-on's.
-    private var displayName: String { l10n.title(for: id) ?? name }
+    private var displayName: String { privateArtwork ? name : (l10n.title(for: id) ?? name) }
     /// The poster to show: the pooled localized (language-matched) poster when available, else the add-on's.
-    private var displayPoster: String? { l10n.poster(for: id) ?? poster }
+    private var displayPoster: String? { privateArtwork ? poster : (l10n.poster(for: id) ?? poster) }
 
     /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
     /// a TMDB key so keyless users keep the clean portrait grid (no backdrop = degraded composite).
-    private var landscape: Bool { catalogPrefs.landscapeCards && apiKeys.hasTMDB }
+    private var landscape: Bool { !privateArtwork && catalogPrefs.landscapeCards && apiKeys.hasTMDB }
     // Card WIDTH comes from the user's Poster Style preset (default `.balanced` = today's 224 / 116). The
     // grid derives its adaptive column width from the SAME preset (iOSPillMetrics.gridPosterWidth), so grid
     // + cards stay in lockstep and the responsive column count recomputes from the chosen width. The height
@@ -4193,6 +4435,8 @@ struct PosterCardiOS: View {
                 Group {
                     if landscape {
                         LandscapeArtiOS(id: id, type: type, title: displayName, poster: displayPoster ?? fallbackArt)
+                    } else if privateArtwork {
+                        WarmCachedPosterImage(url: displayPoster ?? fallbackArt)
                     } else {
                         CachedPosterImage(url: PosterArtwork.poster(id: id, fallback: displayPoster ?? fallbackArt))
                     }
@@ -4204,7 +4448,7 @@ struct PosterCardiOS: View {
                         // When a poster service bakes the rating into the image (VortX/XRDB or ERDB), skip
                         // the native overlay to avoid a double badge. Also skipped on a watched card, whose
                         // topTrailing corner carries the check badge instead (mirror of tvOS PosterCard).
-                        if !isWatched, let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings {
+                        if !isWatched, let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings(forID: id) {
                             HStack(spacing: 2) {
                                 Image(systemName: "star.fill").font(.system(size: 8))
                                 Text(rating).font(.system(size: 10, weight: .semibold))
@@ -4304,7 +4548,7 @@ private struct PosterContextMenu: ViewModifier {
     let menu: iOSPosterMenu
     /// Opens the title's detail page. On a Continue Watching card a tap RESUMES the remembered stream,
     /// so the menu offers "Details" to reach the detail page instead (to pick a different episode or
-    /// source) — the touch/Mac twin of what the user expects from a long-press on the tvOS row.
+    /// source), the touch/Mac twin of what the user expects from a long-press on the tvOS row.
     var onDetails: (() -> Void)? = nil
 
     func body(content: Content) -> some View {
@@ -4369,8 +4613,8 @@ private struct PosterContextMenu: ViewModifier {
 // MARK: - Browse-screen chrome helpers (#46 wordmark, #53 scroll quiets the ambient hero)
 
 extension View {
-    /// The accent-tinted brand wordmark in the navigation bar's principal slot — warm-white "Stremio"
-    /// with an ember "X", in the serif wordmark face — replacing the plain stock `.navigationTitle`
+    /// The accent-tinted brand wordmark in the navigation bar's principal slot, warm-white "Stremio"
+    /// with an ember "X", in the serif wordmark face, replacing the plain stock `.navigationTitle`
     /// that fell back to flat white in dark mode (#46). Mirrors the tvOS `HomeView.header` wordmark.
     /// The `pageTitle` is kept only as the bar's inline accessibility identity (and back-button
     /// context); the visible principal item is always the wordmark, applied across Home / Discover /
@@ -4378,7 +4622,7 @@ extension View {
     /// `isActive` is the macOS guard: a `.principal` item is hoisted into the shared window titlebar,
     /// and all seven tab screens stay mounted at once (opacity-switched to preserve state), so without
     /// this gate every browse screen stamps its own wordmark and they tile ("StremioX"×4). The
-    /// conditional lives *inside* `@ToolbarContentBuilder` — branching the whole view instead would
+    /// conditional lives *inside* `@ToolbarContentBuilder`, branching the whole view instead would
     /// change the NavigationStack's structural identity and reset its scroll/path on every tab switch.
     @ViewBuilder
     func stremioWordmarkTitle(_ pageTitle: String, isActive: Bool = true) -> some View {

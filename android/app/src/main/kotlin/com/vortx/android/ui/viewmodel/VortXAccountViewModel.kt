@@ -38,6 +38,9 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     /// "am I signed in" flag, so a session restored at process start reflects immediately.
     val account: StateFlow<VortXSyncManager.Account?> = sync.account
 
+    /** Persistence truth for rendering unavailable separately from a definitive signed-out session. */
+    val sessionUiState: StateFlow<VortXSyncManager.SessionUiState> = sync.sessionUiState
+
     private val _mode = MutableStateFlow(VortXAccountMode.SIGN_IN)
     val mode: StateFlow<VortXAccountMode> = _mode.asStateFlow()
 
@@ -97,6 +100,10 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     fun onTotpChange(value: String) { _totp.value = value }
     fun onRecoveryInputChange(value: String) { _recoveryInput.value = value }
 
+    fun retrySessionRestore() {
+        sync.retrySessionRestore()
+    }
+
     /// Submit whichever flow [mode] is showing. One submit in flight at a time.
     fun submit() {
         if (_formState.value == VortXAccountFormState.Submitting) return
@@ -152,12 +159,16 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
 
     private suspend fun register() {
         val result = sync.register(_login.value.trim(), _username.value.trim(), _password.value)
+        result.recoveryCode?.let {
+            _recoveryCode.value = it
+            _password.value = ""
+        }
         when (val auth = result.result) {
-            VortXSyncManager.AuthResult.Ok -> {
-                _recoveryCode.value = result.recoveryCode   // shown once, on the signed-in screen
-                onAuthed()
+            VortXSyncManager.AuthResult.Ok -> onAuthed()
+            is VortXSyncManager.AuthResult.Failed -> {
+                if (result.recoveryCode != null) _mode.value = VortXAccountMode.SIGN_IN
+                _formState.value = VortXAccountFormState.Error(auth.message)
             }
-            is VortXSyncManager.AuthResult.Failed -> _formState.value = VortXAccountFormState.Error(auth.message)
             VortXSyncManager.AuthResult.TotpRequired -> // register never asks for TOTP; treat as failure
                 _formState.value = VortXAccountFormState.Error("Could not create the account.")
         }
@@ -240,7 +251,11 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     }
 
     fun signOut() {
-        sync.signOut()             // stops realtime + clears the persisted session inside the manager
+        if (!sync.signOut()) {
+            _syncNotice.value =
+                "Secure storage is unavailable. Your VortX session was not changed. Please try again."
+            return
+        }
         _showReconcile.value = false
         _recoveryCode.value = null
         _syncNotice.value = null

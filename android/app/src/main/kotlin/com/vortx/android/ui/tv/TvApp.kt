@@ -9,6 +9,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.MaterialTheme as TvMaterialTheme
@@ -17,9 +18,13 @@ import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
+import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.player.PlayerScreen
+import com.vortx.android.profile.ProfileStore
+import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
@@ -41,8 +46,16 @@ import kotlinx.coroutines.launch
 fun TvApp(
     repo: CatalogRepository = PreviewCatalogRepository(),
     auth: AuthRepository = PreviewAuthRepository(),
+    syncManager: VortXSyncManager? = null,
 ) {
-    VortXTheme {
+    val profileStore = ProfileStore.sharedOrNull()
+    val activeProfile by (profileStore?.activeProfile?.collectAsStateWithLifecycle()
+        ?: remember { mutableStateOf(null) })
+
+    VortXTheme(
+        accentId = activeProfile?.accentID ?: VortXAccents.default.id,
+        oled = activeProfile?.oled ?: false,
+    ) {
         // The title currently open in Detail; null = the Home browse wall.
         var detail by remember { mutableStateOf<MetaItem?>(null) }
         // The resolved source currently playing; null = not in the player. The DETAIL page resolves a
@@ -51,6 +64,16 @@ fun TvApp(
         var playing by remember { mutableStateOf<Playable?>(null) }
 
         val appContext = LocalContext.current.applicationContext
+        val debridKeys = remember(appContext) { DebridKeys(appContext) }
+        // Collect session truth so an account-generation transition recreates the title ViewModel and drops
+        // account-derived cache badges/resume refs on TV just as it does in the phone shell.
+        val sessionUiState by (
+            syncManager?.sessionUiState?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) }
+        )
+        val debridOwnerEpoch = remember(sessionUiState) {
+            debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
+        }
         // A scope tied to the whole shell (not the player layer), so the end-of-playback engine write (final
         // progress tick + Player unload) still completes after the player leaves composition -- the same
         // reason the phone shell uses an app-scoped coroutine for this.
@@ -98,7 +121,7 @@ fun TvApp(
                 // detail page respect the active profile's Kids source guard for free (the guard lives in
                 // DetailViewModel.buildContext).
                 val detailVm: DetailViewModel = viewModel(
-                    key = "tv-detail-${current.id}",
+                    key = "tv-detail-${current.id}-$debridOwnerEpoch",
                     factory = StremioXViewModelFactory(
                         repo = repo,
                         detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),

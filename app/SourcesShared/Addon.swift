@@ -76,7 +76,7 @@ struct Stream: Identifiable, Decodable, Hashable {
 }
 
 /// A stream-providing addon (base URL + display name), so streams can be tagged + filtered by source.
-struct StreamSource: Hashable { let base: String; let name: String }
+struct StreamSource: Hashable, Sendable { let base: String; let name: String }
 
 private struct MetasResponse: Decodable { let metas: [MetaPreview] }
 private struct MetaResponse: Decodable { let meta: MetaItem }
@@ -124,7 +124,7 @@ struct AddonClient {
 
     /// Fetches items similar to a given title. Runs genre-filtered top catalogs (up to 3 genres)
     /// and, when the title looks like a series member (subtitle after a colon, or trailing number),
-    /// a keyword search for the series name — all in parallel. Results are merged, deduplicated,
+    /// a keyword search for the series name, all in parallel. Results are merged, deduplicated,
     /// and sorted by an effective popularity that gives franchise keyword matches a 3× boost so
     /// related entries in the same series surface above equally-popular genre-only results.
     /// In the future, if we add a TMDB API key or similar, we could use the Recommendations API.

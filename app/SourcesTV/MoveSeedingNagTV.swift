@@ -80,6 +80,7 @@ struct MoveSeedingNagTV: View {
             .buttonStyle(ChipButtonStyle(selected: false))
 
             Button {
+                MoveSeeding.recordLaunchNagDismissal()
                 dismiss()
             } label: {
                 Text("Not now").frame(width: 560)
@@ -87,7 +88,7 @@ struct MoveSeedingNagTV: View {
             .buttonStyle(ChipButtonStyle(selected: false))
         }
 
-        Text("This reminder returns on the next launch until this Apple TV has synced once.")
+        Text("This reminder may return after the app updates if this Apple TV still has not synced.")
             .font(Theme.Typography.label)
             .foregroundStyle(Theme.Palette.textTertiary)
             .multilineTextAlignment(.center)

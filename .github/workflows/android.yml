@@ -18,9 +18,26 @@ name: Build Android APK
 # fetch, no secrets in the job), out of scope here. Do not re-add `pull_request` -- and never
 # `pull_request_target` -- to THIS workflow.
 
+# PRIVILEGED-LANE TRIGGER SURFACE. This job holds ENGINE_REPO_TOKEN plus the Trakt and SIMKL
+# secrets, so the push trigger is constrained to the EXACT integration branches, main and beta, and
+# nothing else. The former "android/**" glob is REMOVED: it let a push to ANY android/* feature
+# branch reach the token-bearing job, which means unreviewed branch code executing next to the
+# credential (gradle and cargo build scripts run in the same job that reads the token). That token
+# grants access to the PRIVATE engine repositories, so the blast radius was the engine source, not
+# just this build. Feature-branch build feedback belongs to a future SECRETLESS workflow (no engine
+# fetch, no secrets in the job), not this lane.
+#
+# This closes the WORKFLOW half only. The REPO-SETTINGS half is the owner's and is still open:
+#   - `workflow_dispatch` below can be launched from ANY ref. Only an `engine-ci` environment with a
+#     deployment-branch policy stops a dispatch from an unlisted ref reaching the token. That
+#     environment must exist and list only main, beta and the release tag lane.
+#   - main and beta need branch protection with required review. A direct push to beta today is
+#     unreviewed code running beside the secret.
+#   - ENGINE_REPO_TOKEN should live INSIDE the `engine-ci` environment (value re-entry) so no job
+#     that has not passed the environment gate can read it.
 on:
   push:
-    branches: [main, beta, "android/**"]
+    branches: [main, beta]
     paths:
       - "android/**"
       - ".github/workflows/android.yml"
@@ -94,7 +111,10 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: VortXTV/stremiox-core
-          ref: 8bfdf1f0dcbf929b4634af24acf7ec54f97c3388
+          # Same engine ref as release-tvos.yml (fix/meta-imdb-link-preserve): keep both surfaces
+          # on one engine. Same push gate applies: flip the stremio-core path patch to a git rev
+          # pin on the private mirror before this ref can build in CI.
+          ref: 4d5ae6371cc9e4031f787cf1c7adf7a535474b0c
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false

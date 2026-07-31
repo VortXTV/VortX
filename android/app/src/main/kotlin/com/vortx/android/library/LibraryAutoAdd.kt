@@ -13,7 +13,7 @@ import org.json.JSONArray
  * the ~60s watch tick that also marks progress), add it to the Library automatically so it is one tap away
  * later. Android port of `app/SourcesShared/LibraryAutoAdd.swift`.
  *
- * Invariants (CLAUDE.md "Never write app data into libraryItem"):
+ * Invariants (the repository guide "Never write app data into libraryItem"):
  *   - Adds go through the ENGINE's AddToLibrary dispatch ONLY ([CatalogRepository.addToLibrary]), which
  *     syncs to the account exactly like the manual Library button. NEVER an app-side libraryItem write; the
  *     idempotency ledger below lives in its OWN SharedPreferences file, not any engine/library schema.

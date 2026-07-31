@@ -141,40 +141,74 @@ export function settingsPatchFromDoc(doc: Obj): Partial<Settings> {
  *  settings object, preserving keys the webapp does not model (avatar, isKids, subSize, keywordsAreRegex,
  *  etc.) so a web write never drops an app/dashboard value. Returns the new settings object to store at
  *  doc.profileEdits.roster[main].settings (dashboard-compatible shape: `accent` + nested `playback`). */
-export function mergeWebappSettingsIntoProfile(existing: unknown, sIn: Settings): Obj {
+const SYNCED_PROFILE_SETTING_KEYS: readonly (keyof Settings)[] = [
+  "accentID",
+  "background",
+  "textScale",
+  "audioLang",
+  "subtitleLang",
+  "subtitlesMode",
+  "subtitleScale",
+  "useAddonOrder",
+  "sourceOrder",
+  "safetyFilter",
+  "instantOnly",
+  "hideDeadTorrents",
+  "hdrOnly",
+  "hideAV1",
+  "hideWords",
+  "requireWords",
+  "maxQuality",
+  "maxFileSizeGB",
+  "subtitleFont",
+  "subtitleColor",
+  "subtitleEdge",
+];
+
+export function mergeWebappSettingsPatchIntoProfile(
+  existing: unknown,
+  sIn: Settings,
+  changedKeys: readonly (keyof Settings)[],
+): Obj {
   const base = obj(existing);
   // Canonicalize AT THE BOUNDARY. getSettings() already heals what it loads, but this is the one function
   // that puts web values into the account doc, and the app reads those values raw. Gating here means no
   // future caller (a test, an importer, a restored backup) can push a foreign id into someone's account.
   const s = canonicalizeSettings(sIn);
-  return {
-    ...base,
-    // Write BOTH accent (dashboard key) and accentID (app key) to the same value so neither reader, nor
-    // the webapp's own read-down (which prefers accentID), is masked by a stale value left in the base.
-    accent: s.accentID,
-    accentID: s.accentID,
-    oled: s.background === "oled",
-    textScale: s.textScale,
-    playback: {
-      ...obj(base.playback),
-      audioLang: s.audioLang,
-      subtitleLang: s.subtitleLang,
-      forced: s.subtitlesMode,
-      subFont: s.subtitleFont,
-      subColor: s.subtitleColor,
-      subBackground: s.subtitleEdge,
-      subSizeScale: s.subtitleScale,
-      useAddonOrder: s.useAddonOrder,
-      sourceTypeOrder: s.sourceOrder,
-      safetyMode: s.safetyFilter,
-      instantOnly: s.instantOnly,
-      hideDeadTorrents: s.hideDeadTorrents,
-      hdrOnly: s.hdrOnly,
-      excludeAV1: s.hideAV1,
-      excludeKeywords: s.hideWords,
-      includeKeywords: s.requireWords,
-      maxResolution: s.maxQuality,
-      maxFileSizeGB: s.maxFileSizeGB,
-    },
-  };
+  const changed = new Set(changedKeys);
+  const next: Obj = { ...base };
+  const playback: Obj = { ...obj(base.playback) };
+
+  // Write BOTH accent spellings together so neither reader is masked by a stale sibling value.
+  if (changed.has("accentID")) {
+    next.accent = s.accentID;
+    next.accentID = s.accentID;
+  }
+  if (changed.has("background")) next.oled = s.background === "oled";
+  if (changed.has("textScale")) next.textScale = s.textScale;
+  if (changed.has("audioLang")) playback.audioLang = s.audioLang;
+  if (changed.has("subtitleLang")) playback.subtitleLang = s.subtitleLang;
+  if (changed.has("subtitlesMode")) playback.forced = s.subtitlesMode;
+  if (changed.has("subtitleFont")) playback.subFont = s.subtitleFont;
+  if (changed.has("subtitleColor")) playback.subColor = s.subtitleColor;
+  if (changed.has("subtitleEdge")) playback.subBackground = s.subtitleEdge;
+  if (changed.has("subtitleScale")) playback.subSizeScale = s.subtitleScale;
+  if (changed.has("useAddonOrder")) playback.useAddonOrder = s.useAddonOrder;
+  if (changed.has("sourceOrder")) playback.sourceTypeOrder = [...s.sourceOrder];
+  if (changed.has("safetyFilter")) playback.safetyMode = s.safetyFilter;
+  if (changed.has("instantOnly")) playback.instantOnly = s.instantOnly;
+  if (changed.has("hideDeadTorrents")) playback.hideDeadTorrents = s.hideDeadTorrents;
+  if (changed.has("hdrOnly")) playback.hdrOnly = s.hdrOnly;
+  if (changed.has("hideAV1")) playback.excludeAV1 = s.hideAV1;
+  if (changed.has("hideWords")) playback.excludeKeywords = s.hideWords;
+  if (changed.has("requireWords")) playback.includeKeywords = s.requireWords;
+  if (changed.has("maxQuality")) playback.maxResolution = s.maxQuality;
+  if (changed.has("maxFileSizeGB")) playback.maxFileSizeGB = s.maxFileSizeGB;
+
+  next.playback = playback;
+  return next;
+}
+
+export function mergeWebappSettingsIntoProfile(existing: unknown, sIn: Settings): Obj {
+  return mergeWebappSettingsPatchIntoProfile(existing, sIn, SYNCED_PROFILE_SETTING_KEYS);
 }

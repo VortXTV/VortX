@@ -78,8 +78,8 @@ struct CoreCWItem: Decodable, Identifiable {
     }
 
     /// The engine's own "has been watched" predicate (upstream `LibraryItem::watched()`:
-    /// `times_watched > 0`), driving the Library poster badge (DESIGN.md "PosterCard —
-    /// Watched state"). `LibraryItemMarkAsWatched` and every finished play/episode bump
+    /// `times_watched > 0`), driving the Library poster badge (docs/DESIGN-SYSTEM.md section 3,
+    /// "Poster card": watched is dim plus a check badge). `LibraryItemMarkAsWatched` and every finished play/episode bump
     /// `timesWatched`; unmark resets it to 0. `flaggedWatched` is deliberately NOT consulted:
     /// upstream documents it as a per-video "watched event sent" latch, not the indicator.
     /// Distinct from `isFinished`, which answers the Continue-Watching prune question.
@@ -249,7 +249,7 @@ enum CoreLoadable<T: Decodable>: Decodable {
         // terminal (.err, which streamLoadProgress already counts as settled) and log the
         // surprise so an engine tag rename is visible instead of silent.
         default:
-            NSLog("%@", "[core] CoreLoadable unknown tag '\(tag)' — treating as terminal (.err)")
+            NSLog("%@", "[core] CoreLoadable unknown tag '\(tag)'; treating as terminal (.err)")
             self = .err
         }
     }
@@ -264,7 +264,7 @@ struct CoreMeta: Decodable, Identifiable {
     let name: String
     let poster: String?
     let posterShape: String?
-    /// The channel mark on live (tv/channel/events) catalog previews — channels publish a `logo`
+    /// The channel mark on live (tv/channel/events) catalog previews; channels publish a `logo`
     /// instead of box-art, so the Live surface's `ChannelTile` prefers it over `poster`. Optional;
     /// VOD previews omit it and decode fine.
     let logo: String?
@@ -277,7 +277,7 @@ struct CoreMeta: Decodable, Identifiable {
     /// carries the rating in its name; category "Genres" carries each genre), NOT as top-level fields.
     /// The engine never emits a top-level `imdbRating`/`genres` for a preview, so the old stored
     /// properties decoded nil every time and the featured hero never showed a rating. Read them from
-    /// `links` instead — the same place CoreMetaItem (the full detail meta) reads them.
+    /// `links` instead, the same place CoreMetaItem (the full detail meta) reads them.
     let links: [CoreLink]?
 
     var imdbRating: String? {
@@ -326,6 +326,19 @@ struct CoreDescriptor: Decodable, Identifiable {
     var providesStreams: Bool { (manifest.resources ?? []).contains { $0.name == "stream" } }
     var providesMeta: Bool { (manifest.resources ?? []).contains { $0.name == "meta" } }
     var providesSubtitles: Bool { (manifest.resources ?? []).contains { $0.name == "subtitles" } }
+    /// True when this add-on can resolve a raw `tmdb:` catalog id to meta: it exposes a `meta` resource AND
+    /// declares an id-prefix that a `tmdb:` id starts with (per-resource idPrefixes on the `meta` resource,
+    /// or manifest-level idPrefixes). This is the gate for keeping a `tt`-less India title as a `tmdb:` tile:
+    /// the engine resolves `tmdb:` meta ONLY through such an add-on, so without one a `tmdb:` tile dead-taps
+    /// (no meta, and imdb-keyed stream add-ons never match a `tmdb:` id). Rule lives in CatalogRowResolution
+    /// (pure, tested); here we just gather the prefixes it judges.
+    var providesTMDBMeta: Bool {
+        let metaResourcePrefixes = (manifest.resources ?? [])
+            .filter { $0.name == "meta" }
+            .flatMap { $0.idPrefixes ?? [] }
+        let prefixes = metaResourcePrefixes + (manifest.idPrefixes ?? [])
+        return CatalogRowResolution.metaHandlesTMDB(providesMeta: providesMeta, idPrefixes: prefixes)
+    }
     /// Base URL for resource requests: the transport URL minus the trailing `/manifest.json` (mirrors
     /// `AddonDescriptor.baseUrl`). The engine's installed add-ons became the source of truth once VortX went
     /// account-primary, so the subtitle fetch hits `\(baseUrl)/subtitles/…` off this.
@@ -356,10 +369,30 @@ struct CoreDescriptor: Decodable, Identifiable {
     }
 }
 
+/// A thread-safe, launch-persistent flag for "is a `tmdb:`-capable metadata add-on installed", so the
+/// off-main catalog resolvers can gate the `tmdb:` provider fallback without hopping to the MainActor
+/// `CoreBridge`. `CoreBridge.refreshAddons` (the SINGLE publish point for the installed add-on set) writes
+/// it from the final published descriptors; `TMDBClient`'s resolve loop reads it. Backed by UserDefaults so
+/// it is already correct on the first fetch after launch (from the last known state) and then kept current
+/// on every ctx cycle. Mirrors the nonisolated UserDefaults pattern `selectedProviders()` uses.
+enum AddonMetaGate {
+    private static let key = "vortx.addons.tmdbMetaInstalled"
+    nonisolated static func publish(_ installed: Bool) {
+        UserDefaults.standard.set(installed, forKey: key)
+    }
+    nonisolated static func tmdbMetaInstalled() -> Bool {
+        UserDefaults.standard.bool(forKey: key)
+    }
+}
+
 struct CoreManifest: Decodable {
     let name: String
     let catalogs: [CoreManifestCatalog]
     let resources: [CoreManifestResource]?
+    /// Manifest-level `idPrefixes` (Stremio convention): the id-prefix set the add-on serves when a resource
+    /// does not carry its own. Read by `CoreDescriptor.providesTMDBMeta` to detect a `tmdb:`-capable meta
+    /// add-on (a TMDB add-on typically declares `["tmdb:"]` here with bare-string resources). Optional.
+    let idPrefixes: [String]?
     /// Manifest-level behaviorHints; `configurable` means the add-on exposes a web configuration page.
     let behaviorHints: CoreManifestBehaviorHints?
     /// The add-on's logo URL (Stremio `manifest.logo`). AIOManager bakes a user's custom logo here, so
@@ -375,14 +408,23 @@ struct CoreManifestBehaviorHints: Decodable {
 }
 
 /// `ManifestResource` is `#[serde(untagged)]`: either a bare string ("stream") or an object
-/// ({ name: "stream", types: [...] }). Decode either into the resource name.
+/// ({ name: "stream", types: [...], idPrefixes: [...] }). Decode either into the resource name, plus the
+/// optional per-resource `types` / `idPrefixes` an object form may carry (a `meta` resource often scopes its
+/// own `tmdb:` id-prefix here rather than at manifest level).
 struct CoreManifestResource: Decodable {
     let name: String
+    let types: [String]?
+    let idPrefixes: [String]?
     init(from decoder: Decoder) throws {
-        if let short = try? decoder.singleValueContainer().decode(String.self) { name = short; return }
-        name = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .name)
+        if let short = try? decoder.singleValueContainer().decode(String.self) {
+            name = short; types = nil; idPrefixes = nil; return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        types = try? container.decode([String].self, forKey: .types)
+        idPrefixes = try? container.decode([String].self, forKey: .idPrefixes)
     }
-    enum CodingKeys: String, CodingKey { case name }
+    enum CodingKeys: String, CodingKey { case name, types, idPrefixes }
 }
 
 struct CoreDescriptorFlags: Decodable {
@@ -429,7 +471,15 @@ enum LiveTypes {
 
 // MARK: meta_details
 
+/// The engine selection that owns the current `metaItems` payload. A detail page must fence terminal
+/// empty/error state to this ID, just as it already fences ready metadata, or title A can trigger
+/// title B's fallback while the shared bridge slot is changing pages.
+struct CoreMetaSelection: Decodable {
+    let metaPath: CoreResourcePath
+}
+
 struct CoreMetaDetails: Decodable {
+    let selected: CoreMetaSelection?
     let metaItems: [CoreMetaEntry]
     let streams: [CoreStreamGroup]
     /// Streams EMBEDDED in the meta itself (`MetaDetails.meta_streams`): the engine lifts the selected
@@ -482,6 +532,34 @@ struct CoreMetaDetails: Decodable {
         }
         return best?.meta ?? first.meta
     }
+
+    var selectedMetaID: String? { selected?.metaPath.id }
+
+    private var metaEntryStates: [DetailMetaRecoveryPolicy.EntryState] {
+        metaItems.map { entry in
+            switch entry.content {
+            case .ready?:      return .ready
+            case .loading?:    return .loading
+            case .err?:        return .failed
+            case .none:        return .notStarted
+            }
+        }
+    }
+
+    /// Unscoped state used by CoreBridge to notice pending-to-terminal transitions. Detail surfaces
+    /// must call `metaResolution(for:)` so a stale selected title cannot drive the current page.
+    var metaResolution: DetailMetaRecoveryPolicy.Resolution {
+        DetailMetaRecoveryPolicy.resolution(entries: metaEntryStates)
+    }
+
+    func metaResolution(for requestedID: String) -> DetailMetaRecoveryPolicy.Resolution? {
+        DetailMetaRecoveryPolicy.resolution(
+            selectedID: selectedMetaID,
+            requestedID: requestedID,
+            entries: metaEntryStates
+        )
+    }
+
     var watchedIds: Set<String> { Set(watchedVideoIds ?? []) }
 }
 
@@ -587,7 +665,7 @@ struct CoreMetaItem: Decodable {
         return trailerLink.flatMap { Self.youTubeID(from: $0.name) }
     }
 
-    /// All episodes ordered (season, then episode, then id) across EVERY season — the list handed to the
+    /// All episodes ordered (season, then episode, then id) across EVERY season, the list handed to the
     /// player so in-player Next / auto-advance rolls past the season boundary into the next season's first
     /// episode (was per-season, so it dead-ended at the last episode of a season).
     var orderedEpisodes: [CoreVideo] { (videos ?? []).orderedBySeasonEpisode }
@@ -684,13 +762,18 @@ struct CoreVideo: Decodable, Identifiable {
     let episode: Int?
 
     /// Display helpers used by the player's episode list and Prev/Next buttons.
+    ///
+    /// DISPLAY ONLY. `episode ?? 0` collapses "not resolved yet" and "explicitly episode 0" (specials are
+    /// legitimately numbered E0) into the same value, so this must never enter a fetch, cache, pool, or
+    /// publication identity. Identity paths read the optional `episode` directly and treat absence as absence;
+    /// see `SourceIndexIdentity.contentKey`, which rejects a PARTIAL coordinate pair rather than widening it.
     var episodeNumber: Int { episode ?? 0 }
     var episodeTitle: String {
         if let title, !title.isEmpty { return title }
         return "Episode \(episode ?? 0)"
     }
 
-    /// The `released` string parsed as a `Date` (non-breaking — display still uses the raw string).
+    /// The `released` string parsed as a `Date` (non-breaking; display still uses the raw string).
     /// Live/EPG schedules carry an ISO-8601 UTC timestamp here; try the plain form first, then the
     /// fractional-seconds variant some add-ons emit. Returns nil when absent or unparseable.
     var releasedDate: Date? {
@@ -716,7 +799,7 @@ extension Array where Element == CoreVideo {
 }
 
 extension ISO8601DateFormatter {
-    /// Shared formatters for parsing `CoreVideo.released` — `static let` so the EPG now/next pass
+    /// Shared formatters for parsing `CoreVideo.released`, `static let` so the EPG now/next pass
     /// reuses one instance per form instead of allocating a formatter per video (they're costly).
     static let epg = ISO8601DateFormatter()
     static let epgFractional: ISO8601DateFormatter = {
@@ -1117,7 +1200,7 @@ enum EpisodePlaybackIdentity {
 
 /// A playable stream. `StreamSource` is `#[serde(untagged)]` + flattened, so the source fields
 /// (url / ytId / infoHash / externalUrl) sit at the top level, decode them all optionally.
-struct CoreStream: Decodable, Identifiable, Equatable {
+struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
     let url: String?
     let ytId: String?
     let infoHash: String?
@@ -1130,7 +1213,7 @@ struct CoreStream: Decodable, Identifiable, Equatable {
     /// Native Stremio USENET source fields (part of the stream spec, alongside url / ytId / infoHash):
     /// `nzbUrl` is an http(s) link to an `.nzb`, and `fileMustInclude` is an optional regex that picks the
     /// video inside the (potentially multi-file) usenet download. A stream with a non-nil `nzbUrl` is a
-    /// USENET stream — it resolves through the user's own usenet-capable debrid account (TorBox), never a
+    /// USENET stream; it resolves through the user's own usenet-capable debrid account (TorBox), never a
     /// torrent swarm. All optional so a stream without them (every torrent/direct/YouTube source) still
     /// decodes byte-identically to before.
     let nzbUrl: String?
@@ -1147,14 +1230,14 @@ struct CoreStream: Decodable, Identifiable, Equatable {
     var isTorrent: Bool { url == nil && infoHash != nil && nzbUrl == nil }
 
     /// A USENET stream: no direct `url` yet, but an `.nzb` link to resolve through a usenet-capable debrid
-    /// account. Like a raw torrent, it needs resolution before it is playable — the usenet analogue of
+    /// account. Like a raw torrent, it needs resolution before it is playable, the usenet analogue of
     /// `isTorrent`. Kept mutually exclusive from `isTorrent` (which now also checks `nzbUrl == nil`) so a
     /// stream is classified as exactly one of torrent / usenet / direct.
     var isUsenet: Bool { url == nil && (nzbUrl.map { !$0.isEmpty } ?? false) }
 
     /// A bare YouTube source (`ytId`, no direct `url`): a trailer/clip from a trailer add-on like
     /// Streailer, not a full feature stream. Playable (via the `/yt` route in `playableURL`) so the
-    /// user can tap it, but excluded from quality RANKING and the one-press auto-pick — otherwise an
+    /// user can tap it, but excluded from quality RANKING and the one-press auto-pick; otherwise an
     /// unscored "🎬 Trailer" row could become `StreamRanking.best` and play the trailer in place of
     /// the movie (and a trailer must never be recorded as Continue Watching).
     var isYouTubeTrailer: Bool { url == nil && infoHash == nil && (ytId.map { !$0.isEmpty } ?? false) }
@@ -1163,7 +1246,7 @@ struct CoreStream: Decodable, Identifiable, Equatable {
     ///
     /// A `ytId`-only stream is a YouTube source (e.g. a trailer add-on like Streailer returns
     /// `{ "ytId": "…" }` streams, no `url`/`infoHash`): play it through the remote resolver's
-    /// `/yt/{id}` route — the same path the Trailer button uses (`TrailerRequest`). The remote
+    /// `/yt/{id}` route, the same path the Trailer button uses (`TrailerRequest`). The remote
     /// resolver needs no embedded server, so this is playable on every scheme including Lite.
     /// Without this, every Streailer stream rendered as an inert lock-icon row.
     var playableURL: URL? { playableURL(isEpisode: false) }
@@ -1221,7 +1304,7 @@ struct CoreStream: Decodable, Identifiable, Equatable {
     }
 }
 
-struct CoreStreamBehaviorHints: Decodable, Equatable {
+struct CoreStreamBehaviorHints: Decodable, Equatable, Sendable {
     let notWebReady: Bool?
     let bingeGroup: String?
     let filename: String?
@@ -1229,12 +1312,12 @@ struct CoreStreamBehaviorHints: Decodable, Equatable {
 }
 
 /// `behaviorHints.proxyHeaders`: per-stream HTTP headers, `request` applied on the way out.
-struct CoreProxyHeaders: Decodable, Equatable {
+struct CoreProxyHeaders: Decodable, Equatable, Sendable {
     let request: [String: String]?
 }
 
 /// Streams grouped by source addon, for the per-addon filter + source labels.
-struct CoreStreamSourceGroup: Identifiable, Equatable {
+struct CoreStreamSourceGroup: Identifiable, Equatable, Sendable {
     let id: String
     let addon: String
     let streams: [CoreStream]
@@ -1326,8 +1409,8 @@ struct CoreLibSort: Decodable, Identifiable {
     var label: String {
         switch sort {
         case "lastwatched": return "Recent"
-        case "name": return "Name A–Z"
-        case "namereverse": return "Name Z–A"
+        case "name": return "Name A-Z"
+        case "namereverse": return "Name Z-A"
         case "timeswatched": return "Most watched"
         case "watched": return "Watched"
         case "notwatched": return "Unwatched"

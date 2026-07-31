@@ -244,15 +244,19 @@ final class SourceIndexLifecycleScope {
 ///
 ///   1. HOARD (default ON, anonymous): whenever the app assembles a title's stream results from its add-ons /
 ///      debrid / usenet / torrent sources, it reports the source DESCRIPTORS -- NOT the media, NOT any account
-///      token or user id. Torrent-only v1 sends { kind, id, quality, sizeBytes, seeders? }, where `id` is an
-///      exact 40-hex infohash. Raw HTTP and usenet URLs are never uploaded. Fire-and-forget, batched, deduped
-///      by infohash.
+///      token or user id. Every link kind is contributed as a re-resolvable FACT (DEC-260723-D1):
+///      { kind, id, quality, sizeBytes, seeders?, provider? } where kind is torrent (id = 40-hex infohash),
+///      http (id = a credential-stripped public link), or usenet (id = a credential-stripped nzb link). A
+///      debrid-resolved row contributes the underlying torrent HASH (+ an optional provider fact), never the
+///      personal, expiring CDN link. Fire-and-forget, batched, deduped by (kind, id).
 ///
 ///   2. SERVE (opt-in): when the user turns the Singularity toggle ON AND is signed in, the detail / stream
-///      screen reads the corroborated pooled sources for the title and MERGES them into the stream list as
-///      community torrent sources. Each returned infohash is resolved by the user's own debrid pipeline.
-///      HTTP and usenet have no v1 consumer contract and are dropped. Empty on any miss; signed-out disables
-///      the read entirely (hard login gate, matching the worker).
+///      screen reads the corroborated pooled sources for ALL kinds and MERGES them into the stream list. Rows
+///      are filtered by what the REQUESTER can consume: torrent rows are shown to everyone (self-verifying,
+///      resolved via the requester's OWN debrid cache-check), http rows are shown as public direct links, and
+///      usenet rows are shown ONLY when the requester has a usenet-capable service. No user's personal link or
+///      credential is ever replayed to another user. Empty on any miss; signed-out disables the read entirely
+///      (hard login gate, matching the worker).
 ///
 /// GIVE-TO-GET: every method is additionally gated on `MoatConsent.contributeAndConsume`. If the user has
 /// opted out of the anonymized-data pool, this client neither contributes nor consumes.
@@ -263,16 +267,31 @@ enum SourceIndexClient {
 
     // MARK: - Public models
 
-    /// Torrent-only v1 has one wire kind.
-    enum Kind: String { case torrent }
+    /// The three wire kinds, matching the worker contract: a torrent infohash, a public http(s) direct link,
+    /// and a usenet nzb link. Every kind re-resolves through the REQUESTER's OWN debrid / usenet account; no
+    /// personal link or credential is ever pooled (see the descriptor path and the client-side strip).
+    enum Kind: String { case torrent, http, usenet }
 
     /// One anonymized source descriptor for the HOARD upload. Carries ONLY public, non-personal fields.
     struct Descriptor: Encodable, Sendable {
         let kind: String
-        let id: String            // normalized 40-hex torrent infohash
+        let id: String            // torrent: 40-hex infohash. http/usenet: the credential-stripped public link.
         let quality: String       // e.g. "4K", "1080p", "Other" (from StreamRanking.qualityLabel)
         let sizeBytes: Int64      // 0 when the add-on advertised no size
-        let seeders: Int?         // when advertised
+        let seeders: Int?         // torrent only, when advertised
+        /// Optional debrid provider fact (rd/tb/pm/ad): which provider THIS device confirmed had the source
+        /// cached. A media fact, never a user identity. nil (the common case) is omitted from the wire body by
+        /// the synthesized `encodeIfPresent`, so a provider-less torrent descriptor is byte-identical to v1.
+        let provider: String?
+
+        init(kind: String, id: String, quality: String, sizeBytes: Int64, seeders: Int?, provider: String? = nil) {
+            self.kind = kind
+            self.id = id
+            self.quality = quality
+            self.sizeBytes = sizeBytes
+            self.seeders = seeders
+            self.provider = provider
+        }
     }
 
     /// One corroborated source the pool returns for SERVE. `id` matches the descriptor id space.
@@ -281,8 +300,28 @@ enum SourceIndexClient {
         let id: String?
         let quality: String?
         let sizeBytes: Int64?
+        /// An optional display tag the worker stores (`source_tag`). Sanitized, display-only, and empty for
+        /// every row current fleets contribute (the client Descriptor carries no tag). Decoded so a future
+        /// tag is not silently dropped and so `streams(from:)` can fold any quality token it carries into the
+        /// row's parse text. Never rendered as a visible name -- the row's shown label stays neutral.
+        let sourceTag: String?
         let seeders: Int?
         let corroboration: Int?   // number of distinct witnesses; the worker only returns >= its quarantine floor
+        /// The debrid providers (rd/tb/pm/ad) confirmed to have this source cached. Used to boost/badge a row
+        /// only for a requester who has that provider. Absent on legacy responses -> nil.
+        let providers: [String]?
+
+        init(kind: String?, id: String?, quality: String?, sizeBytes: Int64?, seeders: Int?,
+             corroboration: Int?, providers: [String]? = nil, sourceTag: String? = nil) {
+            self.kind = kind
+            self.id = id
+            self.quality = quality
+            self.sizeBytes = sizeBytes
+            self.sourceTag = sourceTag
+            self.seeders = seeders
+            self.corroboration = corroboration
+            self.providers = providers
+        }
     }
 
     private struct ContributionBody: Encodable {
@@ -290,35 +329,172 @@ enum SourceIndexClient {
         let sources: [Descriptor]
     }
 
+    enum ContributionOutcome: Equatable, Sendable {
+        case deferred
+        case acceptedByProcess
+    }
+
     // MARK: - Content id (colon form: imdb[:season:episode])
 
     /// The pool `content_id` for a title, in the worker's colon form (`tt0903747` for a movie, `tt…:S:E` for an
-    /// episode). nil when the id is not a real imdb `tt…` id (ad-hoc paste-a-link plays have no shareable id).
+    /// episode). nil when the value carries no canonical title id (ad-hoc paste-a-link plays have no shareable
+    /// id), and nil for a PARTIAL coordinate pair -- see `SourceIndexIdentity.contentKey` for why widening a
+    /// half-resolved episode context to the show-wide key is a data-mixing bug, not a graceful fallback.
+    ///
+    /// Reduction to the TITLE id happens inside the shared resolver, which every caller now goes through:
+    /// series call sites pass `behaviorHints.defaultVideoId`, which is often already "tt...:1:1", and appending
+    /// this episode's :S:E to that produced "tt...:1:1:3:5", failed the canonical regex, and silently removed
+    /// every episode of every such show from the pool (no contribute, no serve).
+    ///
+    /// IMDb ONLY (decision REQ-260721-33). A tmdb value canonicalizes to a title head here but is refused by
+    /// `canonicalContentID` at the end, so it never becomes a key; see that function for why.
+    ///
+    /// SCOPE: this is the LOW-LEVEL entry, for shared code that has already resolved a single title id. View
+    /// and coordinator code must not call it -- those callers state ROLES via `contentID(roles:)` or, for a
+    /// Continue-Watching card, `resumeContentID`. `IdentityCallerGateTests` fails if that is violated.
     static func contentID(imdbId: String?, season: Int? = nil, episode: Int? = nil) -> String? {
-        guard let imdbId,
-              SourceIndexContract.canonicalContentID(imdbId) == imdbId else { return nil }
-        if let season, let episode {
-            return SourceIndexContract.canonicalContentID("\(imdbId):\(season):\(episode)")
+        guard let bounded = SourceIndexIdentity.boundedIdentityInput(imdbId),
+              let titleID = SourceIndexContract.canonicalTitleID(bounded) else {
+            diag(.contentIDSkip, reason: .notATitleID,
+                 counts: [(.rawLen, SourceIndexDiag.identityLength(imdbId))])
+            return nil
         }
-        return imdbId
+        guard let composed = SourceIndexIdentity.contentKey(titleID: titleID, season: season, episode: episode) else {
+            diag(.contentIDSkip, reason: .nonCanonicalEpisodeKey,
+                 counts: [(.hasSeason, season == nil ? 0 : 1), (.hasEpisode, episode == nil ? 0 : 1)])
+            return nil
+        }
+        return composed
+    }
+
+    /// The pool `content_id` for a SCREEN, from its named identity roles.
+    ///
+    /// This is the entry point every view and coordinator uses. It exists so that no screen ever picks which
+    /// of its several ids "is" the title: it declares what each id IS (catalog, default-video, current-video)
+    /// and what the page is (movie / series / live), and the shared resolver applies the one authority rule.
+    /// The previous shape took an ordered array, and the ORDER decided authority, which is how an add-on's
+    /// episode-shaped `defaultVideoId` came to outrank the catalog id of the page the user was on.
+    static func contentID(
+        roles: SourceIndexIdentity.Roles,
+        season: Int? = nil,
+        episode: Int? = nil
+    ) -> String? {
+        contentID(imdbId: SourceIndexIdentity.resolve(roles).titleID, season: season, episode: episode)
+    }
+
+    /// The pool `content_id` for a Continue-Watching DIRECT RESUME, which has no page to arbitrate between its
+    /// two ids: the library item id and the stored last-played video id.
+    ///
+    /// Returns nil when those two disagree on the canonical TITLE HEAD. That is the check that catches the
+    /// worked failure (`item tt1375666` + stored video `tt0903747:1:1` published Game-of-Thrones groups under
+    /// `tt1375666:1:1`); the old guard compared episode NUMBERS, which matched, so it caught nothing.
+    ///
+    /// A nil return means ONLY "contribute nothing to the pool". It is never a playback gate: both resume
+    /// paths continue to resume the user's own stored link on a mismatch, unchanged.
+    static func resumeContentID(
+        itemID: String?,
+        videoID: String?,
+        season: Int? = nil,
+        episode: Int? = nil
+    ) -> String? {
+        guard let key = SourceIndexIdentity.resumeKey(
+            itemID: itemID, videoID: videoID, season: season, episode: episode
+        ) else {
+            diag(.contentIDSkip, reason: .resumeIdentityMismatch,
+                 counts: [(.rawLen, SourceIndexDiag.identityLength(itemID)),
+                          (.contentLen, SourceIndexDiag.identityLength(videoID))])
+            return nil
+        }
+        return key
+    }
+
+    // MARK: - Diagnostics (bounded categories only)
+
+    /// Sink seam for the bounded diagnostics. Production writes to the exportable diag log; the standalone
+    /// contract harness swaps in a capture so it can PROVE that no rejected add-on text and no catalog id ever
+    /// reaches the output, including newline-bearing and very long inputs.
+    nonisolated(unsafe) private static var diagnosticSinkStorage: @Sendable (String) -> Void = {
+        VXProbe.log("sing", $0)
+    }
+    private static let diagnosticSinkLock = NSLock()
+
+    static var diagnosticSink: @Sendable (String) -> Void {
+        get { diagnosticSinkLock.withLock { diagnosticSinkStorage } }
+        set { diagnosticSinkLock.withLock { diagnosticSinkStorage = newValue } }
+    }
+
+    /// Process-wide playback pressure gate for contribution work. The provider is
+    /// replaceable only for deterministic contract tests; production reads the
+    /// main-actor player depth maintained by every player host.
+    nonisolated(unsafe) private static var playbackActiveProviderStorage:
+        @Sendable () async -> Bool = {
+            await MainActor.run { CoreBridge.shared.playerActive }
+        }
+    private static let playbackActiveProviderLock = NSLock()
+
+    static var playbackActiveProvider: @Sendable () async -> Bool {
+        get {
+            playbackActiveProviderLock.withLock {
+                playbackActiveProviderStorage
+            }
+        }
+        set {
+            playbackActiveProviderLock.withLock {
+                playbackActiveProviderStorage = newValue
+            }
+        }
+    }
+
+    static func contributionAllowedNow() async -> Bool {
+        let provider = playbackActiveProvider
+        return !(await provider())
+    }
+
+    /// The ONLY way this file emits a diagnostic. Every textual part of a line -- the event label, the bail
+    /// reason, the pool outcome, and each count's KEY -- is a case of a closed enum declared in
+    /// SourceIndexIdentity.swift. There is no `String` parameter left, so free text genuinely cannot be
+    /// interpolated in from a call site.
+    ///
+    /// The previous version of this comment claimed exactly that while `event` and the count keys were both
+    /// plain `String`, and a verifier compiled a call that interpolated a raw identifier straight into the
+    /// event label. The claim is now enforced by the type rather than asserted by the comment.
+    ///
+    /// What this does NOT constrain, stated precisely instead of glossed: a count VALUE is an `Int`, so a call
+    /// site can still put a number derived from an identifier on a line. That is why the only identity-derived
+    /// number emitted anywhere here comes from `SourceIndexDiag.identityLength`, which is capped and bucketed.
+    static func diag(
+        _ event: SourceIndexDiag.Event,
+        reason: SourceIndexDiag.Reason? = nil,
+        outcome: SourceIndexDiag.Outcome? = nil,
+        counts: [(SourceIndexDiag.Count, Int)] = []
+    ) {
+        diagnosticSink(SourceIndexDiag.line(event, reason: reason, outcome: outcome, counts: counts))
     }
 
     // MARK: - Descriptor extraction (pure; no user data)
 
     /// Build the anonymized descriptor set for a title's assembled source groups. Uses `StreamRanking` as the
-    /// single source of truth for quality / size / seeders / classification, so the pool's view matches the
-    /// app's. Skips YouTube trailers and every stream without an exact 40-hex torrent infohash. Deduped by
-    /// normalized infohash.
+    /// single source of truth for quality / size / classification, so the pool's view matches the app's. Skips
+    /// YouTube trailers. Deduped by (kind, id).
     ///
-    /// PRIVACY: the debrid-resolved `url` of a torrent that a service already unlocked is a personal link, so it
-    /// is never sent. Only the public torrent infohash crosses this boundary. HTTP and usenet identifiers have
-    /// no v1 contract and are ignored. No account token, user id, filename, or provider tag is included.
-    static func descriptors(from groups: [CoreStreamSourceGroup]) -> [Descriptor] {
+    /// PER-USER RESOLVE (DEC-260723-D1): EVERY link kind is contributed as a re-resolvable FACT: a torrent
+    /// infohash, a public http(s) direct link, or a usenet nzb link. `providerByHash` optionally tags a torrent
+    /// with the debrid provider THIS device confirmed had it cached (a media fact, never a user identity).
+    ///
+    /// PRIVACY: a debrid-resolved `url` produced FROM a hash is never sent as an http link -- the underlying
+    /// torrent hash + provider tag is contributed instead (hash-first precedence below), because a personal
+    /// debrid CDN link is user-bound and expires. A genuine public http(s) link (no recoverable hash) is
+    /// contributed only after the client-side credential strip. No account token, user id, or filename crosses
+    /// this boundary.
+    static func descriptors(from groups: [CoreStreamSourceGroup],
+                            providerByHash: [String: String] = [:]) -> [Descriptor] {
         var seen = Set<String>()
         var out: [Descriptor] = []
         for group in groups {
+            guard !Task.isCancelled else { return [] }
             for stream in group.streams where !stream.isYouTubeTrailer {
-                guard let d = descriptor(for: stream) else { continue }
+                guard !Task.isCancelled else { return [] }
+                guard let d = descriptor(for: stream, providerByHash: providerByHash) else { continue }
                 guard seen.insert(d.kind + "|" + d.id).inserted else { continue }
                 out.append(d)
             }
@@ -326,18 +502,84 @@ enum SourceIndexClient {
         return out
     }
 
-    /// One descriptor for one stream, or nil when it carries no public identity.
-    private static func descriptor(for stream: CoreStream) -> Descriptor? {
+    /// Stable fingerprint of the exact normalized descriptor snapshot. Order does not matter, so add-on
+    /// republishing or reranking the same rows cannot launch another full contribution walk.
+    static func descriptorFingerprint(_ descriptors: [Descriptor]) -> String {
+        let normalizedKeys = uploadableDescriptors(descriptors).map { descriptor in
+            "\(descriptor.kind)|\(descriptor.id)|\(descriptor.quality)|\(descriptor.sizeBytes)|\(descriptor.seeders ?? -1)|\(descriptor.provider ?? "")"
+        }.sorted()
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for key in normalizedKeys {
+            guard !Task.isCancelled else { return "" }
+            for byte in key.utf8 {
+                hash ^= UInt64(byte)
+                hash &*= 1_099_511_628_211
+            }
+            hash ^= 0xff
+            hash &*= 1_099_511_628_211
+        }
+        return String(format: "%016llx", hash)
+    }
+
+    /// One descriptor for one stream, or nil when it carries no poolable public identity.
+    private static func descriptor(for stream: CoreStream, providerByHash: [String: String] = [:]) -> Descriptor? {
         let sizeGB = StreamRanking.sizeForSort(stream)               // GB (0 when unknown)
         let sizeBytes = sizeGB > 0 ? Int64((sizeGB * 1024 * 1024 * 1024).rounded()) : 0
         let quality = StreamRanking.qualityLabel(stream)
 
-        // A resolved torrent may also carry a personal URL. Only its public infohash crosses this boundary.
-        // Non-torrent streams have no accepted v1 descriptor and are a clean no-op.
-        guard let hash = SourceIndexContract.normalizeInfoHash(stream.infoHash) else { return nil }
-        let seeders = StreamRanking.seedersForSort(stream)
-        return Descriptor(kind: Kind.torrent.rawValue, id: hash, quality: quality,
-                          sizeBytes: sizeBytes, seeders: seeders >= 0 ? seeders : nil)
+        // TORRENT (hash-first, most authoritative). A resolved torrent may also carry a personal URL; only its
+        // public infohash crosses this boundary. A DEBRID-mode add-on returns a resolved `url` row with NO
+        // `infoHash`; the public 40-hex then lives only in `sources` as the documented `dht:<40hex>` entry.
+        // The resolved `url` is DELIBERATELY not scanned as a torrent: it carries a personal debrid token.
+        //
+        // PRECEDENCE IS SEMANTIC, most-authoritative first. The explicit `infoHash` field IS the identity;
+        // `dht:<40hex>` is the one exactly-specified place a debrid row republishes it. Hash-first is also what
+        // makes a debrid-resolved row contribute the underlying HASH (+ provider tag) rather than the ephemeral
+        // personal CDN link: when a hash is recoverable, the `url` is never considered as an http descriptor.
+        // EXACT-SCHEMA ONLY (`infoHashFromSourceEntry` requires a whole-token match), so a private tracker
+        // passkey embedded in a `tracker:` URL is never mistaken for an infohash (REQ-260721-05).
+        let declaredHash = SourceIndexContract.normalizeInfoHash(stream.infoHash)
+            ?? stream.sources?.lazy.compactMap({ SourceIndexContract.infoHashFromSourceEntry($0) }).first
+        if let hash = declaredHash {
+            let seeders = StreamRanking.seedersForSort(stream)
+            return Descriptor(kind: Kind.torrent.rawValue, id: hash, quality: quality,
+                              sizeBytes: sizeBytes, seeders: seeders >= 0 ? seeders : nil,
+                              provider: SourceIndexContract.normalizeProviderTag(providerByHash[hash]))
+        }
+
+        // HTTP (genuine public direct link only). A `url` on a stream that shows TORRENT LINEAGE (a `dht:` or
+        // `tracker:` sources marker, or a hash-shaped bingeGroup token) is a debrid-RESOLVED personal CDN link:
+        // it is user-bound and expires, so contributing it is useless + risky, and its underlying hash was
+        // either recovered above (via `dht:`) or is unrecoverable (only a tracker passkey / bingeGroup token,
+        // which must NEVER be pooled). So the http path fires ONLY for a stream with no torrent lineage at all,
+        // i.e. a real public direct link. The client-side strip then drops any credential/config material
+        // BEFORE the network boundary; the worker re-screens.
+        if let rawURL = stream.url, !rawURL.isEmpty, !hasTorrentLineage(stream),
+           let stripped = SourceIndexContract.normalizePooledNonTorrentID(kind: Kind.http.rawValue, raw: rawURL) {
+            return Descriptor(kind: Kind.http.rawValue, id: stripped, quality: quality,
+                              sizeBytes: sizeBytes, seeders: nil)
+        }
+
+        // USENET (nzb link, no direct url). Contribute the credential-stripped public nzb link so a requester
+        // with a usenet-capable service can resolve it through their OWN account.
+        if let rawNZB = stream.nzbUrl, !rawNZB.isEmpty,
+           let stripped = SourceIndexContract.normalizePooledNonTorrentID(kind: Kind.usenet.rawValue, raw: rawNZB) {
+            return Descriptor(kind: Kind.usenet.rawValue, id: stripped, quality: quality,
+                              sizeBytes: sizeBytes, seeders: nil)
+        }
+
+        return nil
+    }
+
+    /// Whether a stream carries TORRENT/DEBRID lineage, meaning any `url` it holds is a debrid-resolved personal
+    /// link (never poolable as http) rather than a genuine public direct link. Lineage = a `dht:`/`tracker:`
+    /// entry in `sources`, or a 40-hex-shaped token in the unconstrained `bingeGroup`. Deliberately conservative:
+    /// a debrid CDN link is excluded from the http path even when the strip would not catch its signed path.
+    private static func hasTorrentLineage(_ stream: CoreStream) -> Bool {
+        if (stream.sources ?? []).contains(where: { $0.hasPrefix("dht:") || $0.hasPrefix("tracker:") }) { return true }
+        if let bingeGroup = stream.behaviorHints?.bingeGroup,
+           bingeGroup.range(of: #"[0-9a-fA-F]{40}"#, options: .regularExpression) != nil { return true }
+        return false
     }
 
     // MARK: - HOARD: POST /sources/contribute (signed, fire-and-forget)
@@ -349,27 +591,88 @@ enum SourceIndexClient {
     /// globally spaced start time, including overlapping detached detail/resume call sites. Each POST is
     /// fire-and-forget from the caller. A started POST has one attempt; any non-2xx or transport failure stops
     /// the current title's remaining batches and extends the shared pacing boundary by one interval.
-    static func contribute(contentID: String, descriptors: [Descriptor]) async {
-        guard isEnabled, SourceIndexContract.canonicalContentID(contentID) == contentID else { return }
+    @discardableResult
+    static func contribute(
+        contentID: String,
+        descriptors: [Descriptor]
+    ) async -> ContributionOutcome {
+        var acceptedByProcess = false
+
+        // Every bail below used to be SILENT. A give-to-get pool whose "give" half fails invisibly is why this
+        // shipped dead in the field: a full day of playback produced zero contributions and left no trace.
+        // Each exit now names its reason exactly once, so the next diag log answers "why" without a code read.
+        guard isEnabled else {
+            // The consent VALUE is still not printed. What IS printed is WHICH of the two gates is shut,
+            // because they are not the same kind of fact and one combined reason made them indistinguishable:
+            // the fleet kill switch is server-side config (something WE did to everyone) while consent is user
+            // state. A support reader who cannot tell "we disabled it fleet-wide" from "this user opted out"
+            // cannot answer the only question this line exists for. The by-elimination consequence of the
+            // split is documented on SourceIndexDiag.Reason.gateOff rather than left to be discovered.
+            diag(.contributeSkip, reason: closedGateReason, counts: [(.candidates, descriptors.count)])
+            return .deferred
+        }
+        guard SourceIndexContract.canonicalContentID(contentID) == contentID else {
+            diag(.contributeSkip, reason: .nonCanonicalContentID,
+                 counts: [(.contentLen, SourceIndexDiag.identityLength(contentID))])
+            return .deferred
+        }
+        guard await contributionAllowedNow() else {
+            diag(.contributeStop, reason: .playbackActive)
+            return .deferred
+        }
         // Revalidate at the network boundary. Descriptor is intentionally a simple value type, so a caller
         // can construct one without going through descriptors(from:); no such value reaches the encoder unless
         // it is torrent-only and carries an exact normalizable 40-hex infohash.
         let uploadable = uploadableDescriptors(descriptors)
-        guard !uploadable.isEmpty else { return }
+        guard !uploadable.isEmpty else {
+            diag(.contributeSkip, reason: .nothingUploadable, counts: [(.candidates, descriptors.count)])
+            return .deferred
+        }
+        diag(.contributeBegin, counts: [(.candidates, descriptors.count), (.uploadable, uploadable.count)])
+        // Read every remote-tunable pacing value ONCE, up front. A config swap partway through this loop would
+        // otherwise slice with one batch size and re-validate the encoder against another (dropping the batch),
+        // or pace prepareLaunch and finishAttempt on two different intervals for the same POST.
+        let perTitleCap = maxDescriptorsPerTitle
+        let chunkSize = batchSize
+        let intervalNanoseconds = interBatchDelayMs * 1_000_000
+        let timeout = requestTimeout
         // Bound the whole title: a pathological title still never sends an unbounded number of batches.
-        let all = Array(uploadable.prefix(maxDescriptorsPerTitle))
+        let all = Array(uploadable.prefix(perTitleCap))
         // batchSize MUST stay <= the worker's MAX_SOURCES_PER_CONTRIBUTE or the whole batch is rejected.
         // Slice into <= batchSize chunks.
-        let batches = uploadBatches(all)
+        let batches = uploadBatches(all, batchSize: chunkSize, perTitleCap: perTitleCap)
 
+        // EVERY exit below now names itself. They were silent, which is the same defect the reasons above
+        // were added to cure one level up: a contribute that stopped after two of five batches, or whose POST
+        // was rejected, left a trace identical to one that completed, so "the pool is not filling" had no
+        // answer in the log.
         for (i, candidates) in batches.enumerated() {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else {
+                diag(.contributeStop, reason: .cancelled, counts: [(.batch, i + 1), (.batches, batches.count)])
+                return acceptedByProcess ? .acceptedByProcess : .deferred
+            }
+            guard await contributionAllowedNow() else {
+                diag(.contributeStop, reason: .playbackActive,
+                     counts: [(.batch, i + 1), (.batches, batches.count)])
+                return acceptedByProcess ? .acceptedByProcess : .deferred
+            }
             guard let reservation = await SourceUploadCoordinator.shared.reserve(
                 contentID: contentID,
                 descriptors: candidates
-            ) else { continue }
-            guard let data = contributionBody(contentID: contentID, descriptors: reservation.descriptors) else {
+            ) else {
+                // Not a failure: every descriptor in this batch is already claimed by this process. Named
+                // anyway, so a whole title contributing nothing on a re-open is legible as dedupe, not loss.
+                diag(.contributeSkip, reason: .alreadyClaimed,
+                     counts: [(.batch, i + 1), (.batches, batches.count), (.descriptors, candidates.count)])
+                acceptedByProcess = true
+                continue
+            }
+            guard let data = contributionBody(contentID: contentID,
+                                              descriptors: reservation.descriptors,
+                                              batchSize: chunkSize) else {
                 await SourceUploadCoordinator.shared.release(reservation)
+                diag(.contributeSkip, reason: .bodyEncodingFailed,
+                     counts: [(.batch, i + 1), (.batches, batches.count)])
                 continue
             }
 
@@ -377,29 +680,44 @@ enum SourceIndexClient {
             while committed == nil {
                 guard !Task.isCancelled else {
                     await SourceUploadCoordinator.shared.release(reservation)
-                    return
+                    diag(.contributeStop, reason: .cancelled,
+                         counts: [(.batch, i + 1), (.batches, batches.count)])
+                    return acceptedByProcess ? .acceptedByProcess : .deferred
+                }
+                guard await contributionAllowedNow() else {
+                    await SourceUploadCoordinator.shared.release(reservation)
+                    diag(.contributeStop, reason: .playbackActive,
+                         counts: [(.batch, i + 1), (.batches, batches.count)])
+                    return acceptedByProcess ? .acceptedByProcess : .deferred
                 }
                 switch await SourceUploadCoordinator.shared.prepareLaunch(
                     reservation,
                     nowNanoseconds: DispatchTime.now().uptimeNanoseconds,
-                    intervalNanoseconds: interBatchDelayMs * 1_000_000,
+                    intervalNanoseconds: intervalNanoseconds,
                     gate: { SourceIndexClient.isEnabled }
                 ) {
                 case let .wait(delayNanoseconds):
                     do { try await Task<Never, Never>.sleep(nanoseconds: delayNanoseconds) }
                     catch {
                         await SourceUploadCoordinator.shared.release(reservation)
-                        return
+                        diag(.contributeStop, reason: .cancelled,
+                             counts: [(.batch, i + 1), (.batches, batches.count)])
+                        return acceptedByProcess ? .acceptedByProcess : .deferred
                     }
                 case let .launch(descriptors):
                     committed = descriptors
+                    acceptedByProcess = true
                 case .unavailable:
-                    return
+                    // The live gate closed while this batch waited for its pacing slot, or the reservation is
+                    // already gone. Distinct from the pre-loop gate check: this one happened MID-TITLE.
+                    diag(.contributeStop, reason: closedGateReason,
+                         counts: [(.batch, i + 1), (.batches, batches.count)])
+                    return acceptedByProcess ? .acceptedByProcess : .deferred
                 }
             }
 
             var req = URLRequest(url: baseURL.appendingPathComponent("sources").appendingPathComponent("contribute"),
-                                 timeoutInterval: 8)
+                                 timeoutInterval: timeout)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "content-type")
             req.httpBody = data
@@ -407,43 +725,75 @@ enum SourceIndexClient {
             let request = req
             let chunk = committed ?? []
             guard !chunk.isEmpty else { continue }
-            VXProbe.log("sing", "contribute POST content=\(contentID) batch=\(i + 1)/\(batches.count) descriptors=\(chunk.count)")
+            diag(.contributePost, counts: [(.batch, i + 1), (.batches, batches.count),
+                                           (.descriptors, chunk.count)])
             // Detached from caller cancellation after commit: once the at-most-once claim is held, exactly one
             // network attempt is launched. The response is ignored and never buffered.
+            let transport = contributionTransport
             let succeeded = await runCancellationIndependentAttempt {
-                try await sourceIndexTransport.discardResponse(for: request)
+                try await transport(request)
             }
+            // The POST OUTCOME. Without this a failed POST and a successful POST left byte-identical traces,
+            // so an endpoint rejecting every contribution read exactly like a healthy one.
+            diag(.contributePostResult, counts: [(.batch, i + 1), (.batches, batches.count),
+                                                 (.succeeded, succeeded ? 1 : 0)])
             guard await SourceUploadCoordinator.shared.finishAttempt(
                 succeeded: succeeded,
                 nowNanoseconds: DispatchTime.now().uptimeNanoseconds,
-                intervalNanoseconds: interBatchDelayMs * 1_000_000
-            ) else { return }
+                intervalNanoseconds: intervalNanoseconds
+            ) else {
+                diag(.contributeStop, reason: .postFailed,
+                     counts: [(.batch, i + 1), (.batches, batches.count)])
+                return .acceptedByProcess
+            }
         }
+        return acceptedByProcess ? .acceptedByProcess : .deferred
     }
 
-    /// Revalidate and normalize arbitrary descriptor values immediately before upload, deduped by canonical
-    /// infohash. This is the final confidentiality boundary used by both the POST path and deterministic tests.
+    /// Revalidate and normalize arbitrary descriptor values immediately before upload, deduped by (kind, id).
+    /// This is the final confidentiality boundary used by both the POST path and deterministic tests. Each kind
+    /// re-runs its own canonicalizer here so a caller that built a `Descriptor` by hand (bypassing
+    /// `descriptors(from:)`) still cannot push a non-canonical torrent hash or a credential-bearing http/usenet
+    /// link across the boundary. seeders and the provider tag are torrent-only signals.
     static func uploadableDescriptors(_ descriptors: [Descriptor]) -> [Descriptor] {
         var seen: Set<String> = []
         return descriptors.compactMap { descriptor in
-            guard descriptor.kind == Kind.torrent.rawValue,
-                  let hash = SourceIndexContract.normalizeInfoHash(descriptor.id),
-                  seen.insert(hash).inserted else { return nil }
-            return Descriptor(
-                kind: Kind.torrent.rawValue,
-                id: hash,
-                quality: SourceIndexContract.normalizeQuality(descriptor.quality),
-                sizeBytes: min(max(0, descriptor.sizeBytes), SourceIndexContract.maxSafeSizeBytes),
-                seeders: descriptor.seeders.flatMap {
-                    (0...SourceIndexContract.maxSeeders).contains($0) ? $0 : nil
-                }
-            )
+            let quality = SourceIndexContract.normalizeQuality(descriptor.quality)
+            let sizeBytes = min(max(0, descriptor.sizeBytes), SourceIndexContract.maxSafeSizeBytes)
+            switch descriptor.kind {
+            case Kind.torrent.rawValue:
+                guard let hash = SourceIndexContract.normalizeInfoHash(descriptor.id),
+                      seen.insert(Kind.torrent.rawValue + "|" + hash).inserted else { return nil }
+                return Descriptor(
+                    kind: Kind.torrent.rawValue, id: hash, quality: quality, sizeBytes: sizeBytes,
+                    seeders: descriptor.seeders.flatMap {
+                        (0...SourceIndexContract.maxSeeders).contains($0) ? $0 : nil
+                    },
+                    provider: SourceIndexContract.normalizeProviderTag(descriptor.provider)
+                )
+            case Kind.http.rawValue, Kind.usenet.rawValue:
+                guard let id = SourceIndexContract.normalizePooledNonTorrentID(kind: descriptor.kind, raw: descriptor.id),
+                      seen.insert(descriptor.kind + "|" + id).inserted else { return nil }
+                return Descriptor(
+                    kind: descriptor.kind, id: id, quality: quality, sizeBytes: sizeBytes,
+                    seeders: nil,
+                    provider: SourceIndexContract.normalizeProviderTag(descriptor.provider)
+                )
+            default:
+                return nil
+            }
         }
     }
 
     /// The actual POST encoder. It applies the same final boundary itself so a future caller cannot bypass
     /// filtering by invoking the encoder directly.
     static func contributionBody(contentID: String, descriptors: [Descriptor]) -> Data? {
+        contributionBody(contentID: contentID, descriptors: descriptors, batchSize: batchSize)
+    }
+
+    /// The encoder against an EXPLICIT batch size, so one POST is sliced and re-validated against the same
+    /// number even if a RemoteConfig swap lands between those two steps.
+    static func contributionBody(contentID: String, descriptors: [Descriptor], batchSize: Int) -> Data? {
         guard SourceIndexContract.canonicalContentID(contentID) == contentID,
               !descriptors.isEmpty,
               descriptors.count <= batchSize else { return nil }
@@ -454,17 +804,26 @@ enum SourceIndexClient {
 
     /// Final upload normalization followed by worker-sized chunks. Exposed to the standalone contract harness.
     static func uploadBatches(_ descriptors: [Descriptor]) -> [[Descriptor]] {
-        let all = Array(uploadableDescriptors(descriptors).prefix(maxDescriptorsPerTitle))
-        return stride(from: 0, to: all.count, by: batchSize).map {
-            Array(all[$0 ..< min($0 + batchSize, all.count)])
+        uploadBatches(descriptors, batchSize: batchSize, perTitleCap: maxDescriptorsPerTitle)
+    }
+
+    /// Chunking against EXPLICIT bounds, for the same reason the encoder takes one: the whole title must be
+    /// sliced with a single consistent pair of values.
+    static func uploadBatches(_ descriptors: [Descriptor], batchSize: Int, perTitleCap: Int) -> [[Descriptor]] {
+        let step = max(1, batchSize)
+        let all = Array(uploadableDescriptors(descriptors).prefix(max(1, perTitleCap)))
+        return stride(from: 0, to: all.count, by: step).map {
+            Array(all[$0 ..< min($0 + step, all.count)])
         }
     }
 
     /// Convenience: extract descriptors from `groups` and contribute them for `contentID`. The HOARD entry the
-    /// detail screens call.
-    static func hoard(contentID: String, groups: [CoreStreamSourceGroup]) async {
-        guard isEnabled else { return }
-        let descriptors = descriptors(from: groups)
+    /// detail screens call. `providerByHash` optionally tags each torrent hash with the debrid provider this
+    /// device confirmed had it cached (from the per-view cache-check), so the pool learns provider facts.
+    static func hoard(contentID: String, groups: [CoreStreamSourceGroup],
+                      providerByHash: [String: String] = [:]) async {
+        guard isEnabled, await contributionAllowedNow() else { return }
+        let descriptors = descriptors(from: groups, providerByHash: providerByHash)
         await contribute(contentID: contentID, descriptors: descriptors)
     }
 
@@ -502,11 +861,14 @@ enum SourceIndexClient {
     /// no-op, and the eventual `hoard` is itself consent + fleet-flag gated. Deduped per exact (content,hash)
     /// by the shared coordinator so torrents arriving in later resume waves remain eligible. `resolveGroups` is called
     /// on the main actor (it reads `CoreBridge`'s published state); nothing here blocks the resume/playback.
+    /// The two poll bounds default to the resolved RemoteConfig values (baked 5000 / 250, identical to the
+    /// literals they replace) because the production call sites pass neither: a cold-network resume whose meta
+    /// settles late is the case this budget exists for, and it has no other backend lever.
     static func hoardResumedGroups(contentID: String,
-                                   maxWaitMs: Int = 5000,
-                                   pollIntervalMs: Int = 250,
+                                   maxWaitMs: Int = RemoteConfig.snapshot.sourceIndexResumeHoardMaxWaitMs,
+                                   pollIntervalMs: Int = RemoteConfig.snapshot.sourceIndexResumeHoardPollIntervalMs,
                                    resolveGroups: @MainActor @Sendable @escaping () -> [CoreStreamSourceGroup]) async {
-        guard isEnabled else { return }
+        guard isEnabled, await contributionAllowedNow() else { return }
         let candidateDescriptors = await resumedDescriptors(
             maxWaitMs: maxWaitMs,
             pollIntervalMs: pollIntervalMs,
@@ -514,6 +876,41 @@ enum SourceIndexClient {
         )
         guard !candidateDescriptors.isEmpty else { return }
         await contribute(contentID: contentID, descriptors: candidateDescriptors)
+    }
+
+    /// Continue-Watching launches this owned task beside player presentation. It
+    /// observes the mount, remains asleep throughout playback, then performs the
+    /// bounded group poll after the player releases the device. A failed mount
+    /// abandons after 30 seconds, and caller cancellation stops every wait.
+    static func hoardResumedGroupsAfterPlayback(
+        contentID: String,
+        resolveGroups: @MainActor @Sendable @escaping () -> [CoreStreamSourceGroup]
+    ) async {
+        let pollNanoseconds: UInt64 = 250_000_000
+        var deferral = ContinueWatchingHoardDeferral(
+            activationCheckLimit: 120
+        )
+        while !Task.isCancelled {
+            let active = await playbackActiveProvider()
+            switch deferral.observe(playerActive: active) {
+            case .run:
+                await hoardResumedGroups(
+                    contentID: contentID,
+                    resolveGroups: resolveGroups
+                )
+                return
+            case .abandon:
+                return
+            case .wait:
+                do {
+                    try await Task<Never, Never>.sleep(
+                        nanoseconds: pollNanoseconds
+                    )
+                } catch {
+                    return
+                }
+            }
+        }
     }
 
     /// Descriptor-first resume polling, split from the network submission so the late-arrival decision surface
@@ -524,11 +921,20 @@ enum SourceIndexClient {
         pollIntervalMs: Int,
         resolveGroups: @MainActor @Sendable @escaping () -> [CoreStreamSourceGroup]
     ) async -> [Descriptor] {
-        let deadline = max(1, maxWaitMs / max(1, pollIntervalMs))
+        // The attempt count is DERIVED from two independently clamped values, so it gets its own ceiling: each
+        // attempt resolves groups on the MainActor during playback start, and a wide wait over a short interval
+        // would otherwise multiply into far more of that than either value alone looks like it buys. The baked
+        // pair derives 20 attempts, well under the cap, so this changes nothing today.
+        // The CAP, not the resolved count: this function is handed caller-supplied wait/interval values, which
+        // need not be the resolved pair, so the ceiling has to be applied here rather than trusted from a
+        // precomputed number. (Those were one field and disagreed between `.baked` and `validate({})`.)
+        let deadline = min(RemoteConfig.snapshot.sourceIndexResumeHoardAttemptCap,
+                           max(1, maxWaitMs / max(1, pollIntervalMs)))
         return await SourceIndexContract.firstNonEmpty(
             attempts: deadline,
             pollIntervalNanoseconds: UInt64(max(1, pollIntervalMs)) * 1_000_000
         ) {
+            guard !CoreBridge.shared.playerActive else { return [] }
             let groups = resolveGroups()
             return descriptors(from: groups)
         }
@@ -571,18 +977,24 @@ enum SourceIndexClient {
     ) async -> [PooledSource] {
         // Validate before logging or constructing a request. A caller-controlled or user-shaped value must not
         // enter telemetry or a query string even if a future call site bypasses contentID(...).
-        guard let url = serveURL(contentID: contentID) else { return [] }
+        guard let url = serveURL(contentID: contentID) else {
+            diag(.fetchPooledSkip, reason: .malformedServeURL,
+                 counts: [(.contentLen, SourceIndexDiag.identityLength(contentID))])
+            return []
+        }
         // SERVE opt-in gate: toggle on/off + signed-in state + master enable, with the decision logged. Sign-in
         // IS required (owner decision 2026-07-04: keep Singularity results a VortX-user-only benefit; the worker
         // enforces the same login gate and serves an empty list to a tokenless caller). Contribute stays open.
         let initiallyOpen = await gate()
-        VXProbe.log("sing", "fetchPooled GATE contentID=\(contentID) open=\(initiallyOpen ? "yes" : "no") isSignedIn=\(isSignedIn ? "yes" : "no")")
+        // Neither the content id nor the sign-in state is loggable: one is viewing history, the other is
+        // account state. The open/closed decision is carried by which of the two lines below is emitted.
+        diag(.fetchPooledGate)
         guard initiallyOpen else {
-            VXProbe.log("sing", "fetchPooled GATE CLOSED contentID=\(contentID) -> [] (gate off / not signed in)")
+            diag(.fetchPooledGateClosed, reason: .gateClosed)
             return []
         }
 
-        var req = URLRequest(url: url, timeoutInterval: 8)
+        var req = URLRequest(url: url, timeoutInterval: requestTimeout)
         req.httpMethod = "GET"
         req.setValue("application/json", forHTTPHeaderField: "accept")
         VortXEdgeAuth.sign(&req)
@@ -591,45 +1003,222 @@ enum SourceIndexClient {
         // signature. Fail-soft: no current token returns empty before transport.
         let currentMoat = await moatProvider()
         guard await gate(), let currentMoat, !currentMoat.isEmpty else {
-            VXProbe.log("sing", "fetchPooled GATE CLOSED contentID=\(contentID) -> [] (gate changed / no current moat)")
+            diag(.fetchPooledGateClosed, reason: .gateChangedOrNoMoat)
             return []
         }
         req.setValue(currentMoat, forHTTPHeaderField: MoatToken.header)
-        VXProbe.log("sing", "fetchPooled GET \(url.absoluteString) contentID=\(contentID) edgeSigned=\(signed ? "yes" : "no") moatToken=present")
+        // The URL is NOT logged: its query string is the content id. Only whether the request got stamped.
+        diag(.fetchPooledGet, counts: [(.edgeSigned, signed ? 1 : 0), (.moatToken, 1)])
 
         do {
-            guard await gate() else { return [] }
+            // Both mid-flight gate checks were SILENT returns. F4 requires every bail path to stay
+            // distinguishable, and these two are not the same event: one means the gate shut before we spent a
+            // request, the other means it shut while the response was already in the air.
+            guard await gate() else {
+                diag(.fetchPooledGateClosed, reason: .gateClosedBeforeTransport)
+                return []
+            }
             let (data, resp) = try await transport(req)
-            guard await gate() else { return [] }
+            guard await gate() else {
+                diag(.fetchPooledGateClosed, reason: .gateClosedAfterTransport)
+                return []
+            }
             guard let http = resp as? HTTPURLResponse, isSuccessfulHTTPStatus(http.statusCode) else {
                 let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
-                VXProbe.log("sing", "fetchPooled HTTP non-2xx contentID=\(contentID) status=\(status) -> []")
+                diag(.fetchPooledHTTP, reason: .httpNon2xx, counts: [(.status, status)])
                 return []
             }
             let decoded = try? JSONDecoder().decode(SourcesResponse.self, from: data)
             let sources = Array((decoded?.sources ?? []).prefix(SourceIndexContract.maxServedSources))
-            VXProbe.log("sing", "fetchPooled HTTP OK contentID=\(contentID) status=\(http.statusCode) corroboratedSources=\(sources.count) reason=\(decoded?.reason ?? "-")")
+            // The worker `reason` is server-authored text and is still never echoed. It is MAPPED, through a
+            // closed client-side enum, onto one of a fixed handful of outcomes.
+            //
+            // Dropping it outright was a regression, and the reason given for dropping it ("the row count
+            // already distinguishes an empty login_required read from a real empty pool") is false: both
+            // bodies decode to zero rows, so both emitted this line byte for byte. SERVE is deliberately
+            // login-gated, so login_required is the most common correct explanation for an empty pool.
+            diag(.fetchPooledHTTPOK,
+                 outcome: SourceIndexDiag.Outcome(worker: decoded?.reason),
+                 counts: [(.status, http.statusCode), (.corroboratedSources, sources.count)])
             return sources
         } catch {
-            VXProbe.log("sing", "fetchPooled HTTP ERROR contentID=\(contentID) error=\(error.localizedDescription) -> []")
+            // `localizedDescription` embeds the failing URL (hence the content id) on URLError, so only the
+            // transport error CODE crosses into the log.
+            diag(.fetchPooledHTTP, reason: .httpError,
+                 counts: [(.code, (error as? URLError)?.errorCode ?? 0)])
             return []
         }
     }
 
-    /// Turn canonical pooled torrent infohashes into playable `CoreStream`s. Every non-torrent or malformed row
-    /// is dropped before it can enter the user's existing debrid pipeline. Fail-soft.
-    static func streams(from pooled: [PooledSource]) -> [CoreStream] {
-        let built: [CoreStream] = pooled.prefix(SourceIndexContract.maxServedSources).compactMap { src -> CoreStream? in
-            guard let kind = src.kind, let id = src.id, !id.isEmpty else { return nil }
-            // Name/desc both say "Singularity" so the source ROW is visibly a Singularity source (the group
-            // label is discarded by the quality re-grouping, but this per-stream text survives and renders).
-            guard kind == Kind.torrent.rawValue,
-                  (src.corroboration ?? 0) >= SourceIndexContract.minimumCorroboration,
-                  let hash = SourceIndexContract.canonicalStoredInfoHash(id) else { return nil }
-            return make(name: "Other · Singularity", description: "Singularity source", infoHash: hash)
+    /// What the REQUESTER can actually consume, so SERVE only builds rows this user can play or resolve through
+    /// their OWN account (DEC-260723-D1). Torrent rows are self-verifying and shown to everyone (resolved via
+    /// the requester's own debrid cache-check, exactly as today). A public http link is playable by anyone. A
+    /// usenet nzb needs a usenet-capable service, so it is built ONLY when the requester has one configured.
+    struct ServeCapabilities: Sendable {
+        let canPlayDirectHTTP: Bool
+        let hasUsenet: Bool
+        /// The debrid providers THIS requester has configured, in the pool's code space (rd/tb/pm/ad). Used
+        /// ONLY to surface a provider hint for a source the user can actually reach through their own account;
+        /// the pool's provider claim never fabricates a cached badge (the live own-key cache-check is the
+        /// authority). Empty by default so the torrent-only path stays byte-identical.
+        let debridProviders: Set<String>
+
+        init(canPlayDirectHTTP: Bool, hasUsenet: Bool, debridProviders: Set<String> = []) {
+            self.canPlayDirectHTTP = canPlayDirectHTTP
+            self.hasUsenet = hasUsenet
+            self.debridProviders = debridProviders
         }
-        VXProbe.log("sing", "streams(from:) reconstruct pooled=\(pooled.count) -> playable=\(built.count) (torrent-only)")
+
+        /// The v1 behaviour: torrent-only. Kept as the default so pure-torrent reconstruction (and the
+        /// deterministic contract tests) stay byte-identical to before this change.
+        static let torrentOnly = ServeCapabilities(canPlayDirectHTTP: false, hasUsenet: false)
+    }
+
+    /// Turn canonical pooled rows into playable `CoreStream`s, filtered by what the requester can consume, and
+    /// carrying the pool's real display metadata so a Singularity row renders like any other source (resolution
+    /// badge, size, seeders) through the SAME `StreamRanking` text parse the whole app uses. http rows become
+    /// direct-link streams only when the requester can play raw http; usenet rows become nzb streams only when
+    /// the requester has a usenet-capable service. Every row re-runs the client-side strip so a served link is
+    /// re-verified as public before it enters the user's pipeline. Fail-soft.
+    ///
+    /// EVERY pooled field is UNTRUSTED contributor data. Quality is forced through the closed vocabulary, size
+    /// and seeders are clamped, the source tag is charset-stripped, and the provider hint is shown only for a
+    /// provider THIS requester has -- so an adversarial response can never inject arbitrary text into a row and
+    /// the pool's provider claim never fabricates a cached badge (the own-key cache-check stays the authority).
+    ///
+    /// ANONYMOUS-TAIL BOUND: rows that carry no usable metadata at all (legacy entries with no resolution, size,
+    /// seeders, provider fact, or tag) are the wall of undifferentiated "Other" rows the pool used to spam. They
+    /// rank last at the worker already; here their remainder is capped so a metadata-poor pool cannot fill the
+    /// list with anonymous duplicates. Rich rows are all kept.
+    static func streams(from pooled: [PooledSource],
+                        capabilities: ServeCapabilities = .torrentOnly) -> [CoreStream] {
+        var rich: [CoreStream] = []
+        var anonymous: [CoreStream] = []
+        for src in pooled.prefix(SourceIndexContract.maxServedSources) {
+            guard let kind = src.kind, let id = src.id, !id.isEmpty,
+                  // MIRROR the worker's serve floor; never exceed it (the worker already applied its kind-aware
+                  // floor before sending). Retained purely as defence against a malformed/absent count so real
+                  // policy stays backend-tunable with no app release.
+                  (src.corroboration ?? 0) >= SourceIndexContract.minimumServedCorroboration else { continue }
+            let display = pooledDisplay(for: src, requesterProviders: capabilities.debridProviders)
+            let stream: CoreStream?
+            switch kind {
+            case Kind.torrent.rawValue:
+                // Shown to every requester; their OWN debrid cache-check badges + resolves it (a provider tag
+                // from the pool never fabricates a cached badge -- the own-key check is the authority).
+                guard let hash = SourceIndexContract.canonicalStoredInfoHash(id) else { continue }
+                stream = make(name: display.name, description: display.description, infoHash: hash)
+            case Kind.http.rawValue:
+                guard capabilities.canPlayDirectHTTP,
+                      let link = SourceIndexContract.playableRemoteURL(kind: kind, id: id) else { continue }
+                stream = make(name: display.name, description: display.description, url: link)
+            case Kind.usenet.rawValue:
+                guard capabilities.hasUsenet,
+                      let link = SourceIndexContract.playableRemoteURL(kind: kind, id: id) else { continue }
+                stream = make(name: display.name, description: display.description, nzbUrl: link)
+            default:
+                continue
+            }
+            guard let stream else { continue }
+            if display.hasMetadata { rich.append(stream) } else { anonymous.append(stream) }
+        }
+        let built = rich + anonymous.prefix(SourceIndexContract.maxAnonymousServedSources)
+        diag(.streamsReconstruct, counts: [(.pooled, pooled.count), (.playable, built.count)])
         return built
+    }
+
+    /// One served row's DISPLAY, composed from normalized + bounded pooled metadata. Returns the parse text the
+    /// row renders through (`name` is the human title line, `description` carries the parse tokens), plus whether
+    /// the row carries any usable metadata (drives the anonymous-tail bound). All fields are untrusted:
+    ///   - resolution is `normalizeQuality`'d to the closed vocabulary, so an odd/hostile quality string (a link,
+    ///     free text) becomes "Other" and is simply omitted -- it is never echoed into the row,
+    ///   - size is clamped to the same ceiling `StreamRanking` itself applies and printed in a form its size
+    ///     parser reads back ("2.35 GB" / "850 MB"),
+    ///   - seeders (torrent only) are clamped and printed as the "👤 N" token the ranker parses,
+    ///   - the provider hint lists only debrid SERVICE codes (rd/tb/pm/ad -- never an add-on name) the requester
+    ///     actually has configured, so it can never claim a source the user cannot reach,
+    ///   - the source tag is charset-stripped, length-bounded, and folded ONLY into the parse text, never shown
+    ///     as a visible name (the row's shown label stays the neutral "Singularity").
+    static func pooledDisplay(for src: PooledSource,
+                              requesterProviders: Set<String>) -> (name: String, description: String, hasMetadata: Bool) {
+        let resolution = pooledResolutionToken(src.quality)
+        let size = pooledSizeText(src.sizeBytes)
+        let seeders = pooledSeedersText(kind: src.kind, seeders: src.seeders)
+        let providerHint = pooledProviderHint(providers: src.providers, requester: requesterProviders)
+        let tag = pooledSourceTag(src.sourceTag)
+
+        let hasMetadata = resolution != nil || size != nil || seeders != nil
+            || providerHint != nil || tag != nil
+
+        // Visible title line: neutral brand plus, when present, the requester-reachable provider hint. Never the
+        // untrusted tag or the raw pooled quality string.
+        let name = providerHint.map { "Singularity · \($0)" } ?? "Singularity"
+        // Parse-only text StreamRanking reads for the resolution badge, size line, and seeder-aware ranking. The
+        // sanitized tag is folded in here (parse layer only) so any quality token it carries still classifies.
+        let description = ([resolution, size, seeders, tag].compactMap { $0 } + ["Singularity source"])
+            .joined(separator: " ")
+        return (name, description, hasMetadata)
+    }
+
+    /// The closed-vocabulary resolution label for a pooled quality string, or nil when the pool carries no
+    /// recognizable resolution (so the row honestly shows no resolution rather than a fabricated one). Untrusted
+    /// input collapses to "Other" -> nil, so a hostile quality value is never echoed.
+    static func pooledResolutionToken(_ quality: String?) -> String? {
+        let normalized = SourceIndexContract.normalizeQuality(quality ?? "")
+        return normalized == "Other" ? nil : normalized
+    }
+
+    /// A bounded, human size string StreamRanking's own size parser reads back ("2.35 GB" / "850 MB"), or nil
+    /// when the size is absent or below a meaningful floor. The byte count is clamped to the SAME ceiling
+    /// `StreamRanking.sizeGB` applies (100000 GB), so an adversarial MAX size can only ever print a bounded value.
+    static func pooledSizeText(_ sizeBytes: Int64?) -> String? {
+        guard let raw = sizeBytes, raw > 0 else { return nil }
+        let bytes = Double(min(max(0, raw), SourceIndexContract.maxSafeSizeBytes))
+        let gb = min(bytes / 1_073_741_824, 100_000)          // 1024^3, clamped like StreamRanking
+        if gb >= 1 { return String(format: "%.2f GB", gb) }
+        let mb = bytes / 1_048_576                            // 1024^2
+        return mb >= 1 ? String(format: "%.0f MB", mb) : nil
+    }
+
+    /// The "👤 N" seeder token StreamRanking parses, for a TORRENT row with a positive advertised swarm, clamped
+    /// to the parse boundary. Absent/zero seeders yield nil (unknown, not an explicitly dead swarm).
+    static func pooledSeedersText(kind: String?, seeders: Int?) -> String? {
+        guard kind == Kind.torrent.rawValue, let s = seeders, s > 0 else { return nil }
+        return "👤 \(min(s, SourceIndexContract.maxSeeders))"
+    }
+
+    /// A neutral provider hint (uppercased debrid SERVICE codes: RD/TB/PM/AD) for the intersection of the row's
+    /// pooled provider facts with the providers THIS requester has configured. Empty intersection -> nil, so the
+    /// row never advertises a provider the user cannot reach, and no add-on name is ever surfaced.
+    static func pooledProviderHint(providers: [String]?, requester: Set<String>) -> String? {
+        guard let providers, !requester.isEmpty else { return nil }
+        let matched = Set(providers.compactMap { SourceIndexContract.normalizeProviderTag($0) })
+            .intersection(requester)
+        guard !matched.isEmpty else { return nil }
+        return matched.sorted().map { $0.uppercased() }.joined(separator: " · ")
+    }
+
+    /// A sanitized, length-bounded source tag, or nil when empty. Charset-stripped to the stored vocabulary the
+    /// worker uses, so no punctuation, emoji, or credential-shaped text survives into the parse layer.
+    static func pooledSourceTag(_ tag: String?) -> String? {
+        guard let trimmed = tag?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        let safe = trimmed
+            .replacingOccurrences(of: "[^A-Za-z0-9 ._-]", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        guard !safe.isEmpty else { return nil }
+        return String(safe.prefix(48))
+    }
+
+    /// The requester's configured debrid providers, mapped to the pool's provider codes (rd/tb/pm/ad). Used only
+    /// to surface a provider hint for a source THIS user can reach -- never to fabricate a cached badge.
+    @MainActor
+    static func configuredDebridProviders() -> Set<String> {
+        var set: Set<String> = []
+        if DebridKeys.shared.isConfigured(.realDebrid) { set.insert("rd") }
+        if DebridKeys.shared.isConfigured(.torBox) { set.insert("tb") }
+        if DebridKeys.shared.isConfigured(.premiumize) { set.insert("pm") }
+        if DebridKeys.shared.isConfigured(.allDebrid) { set.insert("ad") }
+        return set
     }
 
     /// Deterministic decode boundary used by the live GET path's contract tests. Invalid JSON is empty and a
@@ -653,8 +1242,20 @@ enum SourceIndexClient {
     /// The master gate for the whole client: consent (give-to-get) AND the fleet feature flag. When off, HOARD
     /// and SERVE are both hard no-ops that never touch the network.
     static var isEnabled: Bool {
-        MoatConsent.contributeAndConsume
-            && RemoteConfig.snapshot.isFeatureOn("sourceIndex", default: RemoteConfigDefaults.featureSourceIndex)
+        MoatConsent.contributeAndConsume && fleetEnabled
+    }
+
+    /// The RemoteConfig fleet kill switch on its own. Split out of `isEnabled` so a closed gate can name WHICH
+    /// half is shut without a call site having to recompute either half.
+    static var fleetEnabled: Bool {
+        RemoteConfig.snapshot.isFeatureOn("sourceIndex", default: RemoteConfigDefaults.featureSourceIndex)
+    }
+
+    /// Which reason a closed master gate reports. The fleet flag is server-side config and is named outright;
+    /// otherwise the user-level gate is what is shut and the neutral spelling is used (the consequence of the
+    /// split is documented on `SourceIndexDiag.Reason.gateOff`).
+    static var closedGateReason: SourceIndexDiag.Reason {
+        fleetEnabled ? .gateOff : .fleetOff
     }
 
     /// The per-user SERVE opt-in (the "Singularity" Settings toggle). Default ON, absent key reads as true
@@ -683,13 +1284,20 @@ enum SourceIndexClient {
 
     /// The overall per-title cap on descriptors uploaded. Far above real fan-out (a title with more unique
     /// sources than this drops the tail, which is acceptable). At `batchSize` per POST this is at most 125 POSTs.
-    private static let maxDescriptorsPerTitle = 2000
+    /// RemoteConfig can only lower it (clamp 16...2000, baked 2000), so the fleet can shed the tail on a
+    /// pathological title without a build but can never buy itself more background POSTs.
+    private static var maxDescriptorsPerTitle: Int { RemoteConfig.snapshot.sourceIndexMaxDescriptorsPerTitle }
     /// Descriptors per POST. Sixteen sources produce 49 D1 statements (3 each plus one retention prune), under
-    /// Cloudflare D1's 50-query Free-plan invocation limit. Keep this equal to the worker maximum.
-    static let batchSize = 16
+    /// Cloudflare D1's 50-query Free-plan invocation limit. Keep this equal to the worker maximum: the clamp
+    /// (1...16, baked 16) pins the ceiling there because a larger POST is rejected whole.
+    static var batchSize: Int { RemoteConfig.snapshot.sourceIndexBatchSize }
     /// Delay between sequential batch POST starts. Just over one second keeps each process near 55/minute,
     /// leaving headroom within the worker's 240/minute per-IP limit for several devices behind one NAT.
-    private static let interBatchDelayMs: UInt64 = 1100
+    /// RemoteConfig can only lengthen it (clamp 1100...30000, baked 1100), never crowd the worker faster.
+    private static var interBatchDelayMs: UInt64 { UInt64(RemoteConfig.snapshot.sourceIndexInterBatchDelayMs) }
+    /// Per-request budget for both the contribute POST and the serve GET. Shorten-only from remote
+    /// (clamp 3...8, baked 8) so a slow worker fails fast instead of stacking attempts against itself.
+    private static var requestTimeout: TimeInterval { RemoteConfig.snapshot.sourceIndexRequestTimeout }
 
     /// Source Index has one confidentiality origin. A RemoteConfig value is accepted only when it is an exact
     /// spelling of that HTTPS root; every scheme, host-case, userinfo, port, path, query, or fragment variation
@@ -710,9 +1318,47 @@ enum SourceIndexClient {
 
     /// One dedicated no-redirect session is shared by both signed GET and POST paths.
     private static let sourceIndexTransport = SourceIndexHTTPTransport.shared
+    nonisolated(unsafe) private static var contributionTransportStorage:
+        @Sendable (URLRequest) async throws -> Void = { request in
+            try await sourceIndexTransport.discardResponse(for: request)
+        }
+    private static let contributionTransportLock = NSLock()
+
+    /// Replaceable only by the standalone contract harness. Production always
+    /// uses the shared bounded, no-redirect transport above.
+    static var contributionTransport:
+        @Sendable (URLRequest) async throws -> Void {
+        get {
+            contributionTransportLock.withLock {
+                contributionTransportStorage
+            }
+        }
+        set {
+            contributionTransportLock.withLock {
+                contributionTransportStorage = newValue
+            }
+        }
+    }
+
+    /// Whether an id is already in its canonical pooled form for its kind, used by the upload coordinator's
+    /// at-most-once reservation. Torrent requires the exact stored 40-hex; http/usenet require only that the
+    /// client-side strip accepts the value (idempotency quirks of URL re-serialization must not silently drop a
+    /// legitimate contribution, and the dedup key is the id string either way).
+    static func isCanonicalPoolID(kind: String, id: String) -> Bool {
+        switch kind {
+        case Kind.torrent.rawValue:
+            return SourceIndexContract.canonicalStoredInfoHash(id) == id
+        case Kind.http.rawValue, Kind.usenet.rawValue:
+            return SourceIndexContract.normalizePooledNonTorrentID(kind: kind, raw: id) != nil
+        default:
+            return false
+        }
+    }
 
     /// Pure SERVE request builder shared with standalone tests. Invalid title keys return nil before telemetry
-    /// or network work, and the torrent-only kind is always explicit.
+    /// or network work. NO `kind` filter: the client asks for ALL kinds (DEC-260723-D1) and filters client-side
+    /// by the requester's configured services, so the worker applies its per-row corroboration floor across
+    /// torrent / http / usenet in one read.
     static func serveURL(contentID: String) -> URL? {
         guard SourceIndexContract.canonicalContentID(contentID) == contentID,
               var components = URLComponents(
@@ -721,7 +1367,6 @@ enum SourceIndexClient {
               ) else { return nil }
         components.queryItems = [
             URLQueryItem(name: "content_id", value: contentID),
-            URLQueryItem(name: "kind", value: Kind.torrent.rawValue),
         ]
         return components.url
     }
@@ -741,9 +1386,14 @@ enum SourceIndexClient {
     }
 
     /// Build a `CoreStream` via JSON decode (the all-optional field set has no memberwise init), mirroring
-    /// `TorBoxSearch.make`.
-    private static func make(name: String, description: String, infoHash: String) -> CoreStream? {
-        decodeStream(["name": name, "description": description, "infoHash": infoHash])
+    /// `TorBoxSearch.make`. Exactly one of infoHash / url / nzbUrl identifies the served row's kind.
+    private static func make(name: String, description: String,
+                             infoHash: String? = nil, url: String? = nil, nzbUrl: String? = nil) -> CoreStream? {
+        var json: [String: Any] = ["name": name, "description": description]
+        if let infoHash { json["infoHash"] = infoHash }
+        if let url { json["url"] = url }
+        if let nzbUrl { json["nzbUrl"] = nzbUrl }
+        return decodeStream(json)
     }
     private static func decodeStream(_ json: [String: Any]) -> CoreStream? {
         guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
@@ -904,8 +1554,7 @@ actor SourceUploadCoordinator {
         var keys: [String] = []
         var local = Set<String>()
         for descriptor in descriptors {
-            guard descriptor.kind == SourceIndexClient.Kind.torrent.rawValue,
-                  SourceIndexContract.canonicalStoredInfoHash(descriptor.id) == descriptor.id else { continue }
+            guard SourceIndexClient.isCanonicalPoolID(kind: descriptor.kind, id: descriptor.id) else { continue }
             let key = contentID + "|" + descriptor.kind + "|" + descriptor.id
             guard !seen.contains(key), !pending.contains(key), local.insert(key).inserted else { continue }
             guard seen.count + pending.count + keys.count < maxEntries else { break }
@@ -1074,9 +1723,11 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     typealias FetchPooled = @Sendable (String, Bool) async throws -> [SourceIndexClient.PooledSource]
     typealias ServeGate = @Sendable () -> Bool
     typealias AccountGate = @MainActor @Sendable () -> Bool
+    typealias CapabilitiesProvider = @MainActor @Sendable () -> SourceIndexClient.ServeCapabilities
     private let fetchPooled: FetchPooled
     private let serveGate: ServeGate
     private let accountGate: AccountGate
+    private let capabilities: CapabilitiesProvider
     private let coalescer: SourceIndexFetchCoalescer
     private var refreshGeneration: UInt64 = 0
 
@@ -1090,11 +1741,24 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         accountGate: @escaping AccountGate = {
             VortXSyncManager.shared.isSignedIn
         },
+        capabilities: @escaping CapabilitiesProvider = {
+            // A public http(s) direct link is playable by anyone (no embedded server needed, plays on Lite
+            // too), so http rows are shown to every requester. A usenet nzb needs a usenet-capable service, so
+            // it is built only when the requester has TorBox configured (the one usenet backend among the four).
+            // The requester's configured debrid providers are snapshotted here so an off-main reconstruction can
+            // show a provider hint for a source THIS user can reach without touching main-actor state later.
+            SourceIndexClient.ServeCapabilities(
+                canPlayDirectHTTP: true,
+                hasUsenet: DebridKeys.shared.isConfigured(.torBox),
+                debridProviders: SourceIndexClient.configuredDebridProviders()
+            )
+        },
         coalescer: SourceIndexFetchCoalescer = .shared
     ) {
         self.fetchPooled = fetchPooled
         self.serveGate = serveGate
         self.accountGate = accountGate
+        self.capabilities = capabilities
         self.coalescer = coalescer
         SourceIndexLifecycleScope.shared.register(self)
     }
@@ -1124,22 +1788,26 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         let serveGate = self.serveGate
         let accountGate = self.accountGate
         let coalescer = self.coalescer
+        // Snapshot the requester's capabilities on the main actor now, so the off-main reconstruction filters
+        // http/usenet rows by what THIS user can consume without reaching the main-actor DebridKeys later.
+        let serveCapabilities = capabilities()
         task = Task { [weak self] in
             guard accountGate(), SourceIndexLifecycleClock.snapshot() == lifecycle else { return }
             let pooled = await coalescer.fetch(contentID: contentID, isSignedIn: true, lifecycle: lifecycle) {
                 try await fetchPooled(contentID, true)
             }
-            let built = SourceIndexClient.streams(from: pooled)
+            let built = SourceIndexClient.streams(from: pooled, capabilities: serveCapabilities)
             guard !Task.isCancelled, let self,
                   self.refreshGeneration == generation,
                   self.lastContentID == contentID,
                   SourceIndexLifecycleClock.snapshot() == lifecycle,
                   serveGate(),
                   accountGate() else {
-                VXProbe.log("sing", "refresh publish SKIPPED contentID=\(contentID) (stale, cancelled, or gate closed) built=\(built.count)")
+                SourceIndexClient.diag(.refreshPublishSkipped, reason: .staleOrCancelled,
+                                       counts: [(.built, built.count)])
                 return
             }
-            VXProbe.log("sing", "refresh publish contentID=\(contentID) streams=\(built.count) (now merge-ready)")
+            SourceIndexClient.diag(.refreshPublish, counts: [(.streams, built.count)])
             self.streams = built
         }
     }
@@ -1175,10 +1843,11 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
 
     /// Merge the community sources into `groups` as its OWN named source group, exactly like any other add-on.
     /// Singularity's corroborated sources appear under the "Singularity" label whenever the pool has any for this
-    /// title, EVEN when one of your own add-ons also returns the same release: add-ons are never deduped against
-    /// one another, so Singularity is not either (that is what made it invisible on titles your add-ons already
-    /// cover). We drop only internal duplicates within Singularity's own list, by infoHash. Empty pool (SERVE off
-    /// / not signed in / fleet-off / nothing corroborated) is a pure pass-through, so the list is unchanged.
+    /// title. A pooled TORRENT whose infohash is ALREADY surfaced by one of the user's own add-ons is dropped
+    /// here: it corroborates a row the list already shows (with that add-on's fuller metadata) rather than
+    /// rendering a second identical row, so only hashes the add-ons did NOT surface become new Singularity rows.
+    /// Internal duplicates within Singularity's own list are dropped too. Empty pool (SERVE off / not signed in /
+    /// fleet-off / nothing corroborated) is a pure pass-through, so the list is unchanged.
     func merged(into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         Self.merge(streams, into: groups)
     }
@@ -1193,17 +1862,37 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     /// `SourceListModel.rebuild`, once per coalesced rebuild, where its frequency is the metric.
     nonisolated static func merge(_ extra: [CoreStream], into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         guard !extra.isEmpty else { return groups }
+        // Torrent infohashes the user's OWN add-ons already surfaced (any case). A pooled torrent that matches
+        // one is corroboration of a row the list already shows, not a new source, so it is dropped below. The
+        // Singularity group itself is skipped so a re-merge of an already-merged list never eats its own rows.
+        var addonHashes: Set<String> = []
+        for group in groups where group.id != SourceIndexClient.groupID {
+            for s in group.streams {
+                if let hash = SourceIndexContract.normalizeInfoHash(s.infoHash) { addonHashes.insert(hash) }
+            }
+        }
         var seen: Set<String> = []
         var own: [CoreStream] = []
         for s in extra {
-            // Torrent-only v1 keys each pooled source by its canonical 40-hex infohash.
-            guard let hash = SourceIndexContract.canonicalStoredInfoHash(s.infoHash) else { continue }
-            let key = "t:" + hash
+            // Each pooled source is keyed by its kind's natural id: torrent by canonical infohash, http by its
+            // direct url, usenet by its nzb link. The rows were already screened + built by
+            // `streams(from:capabilities:)`.
+            let key: String?
+            if let hash = SourceIndexContract.normalizeInfoHash(s.infoHash) {
+                // Dedupe/merge against the add-on list: a pooled torrent the add-ons already return does not get
+                // a duplicate Singularity row.
+                if addonHashes.contains(hash) { continue }
+                key = "t:" + hash
+            } else if let url = s.url, !url.isEmpty {
+                key = "h:" + url
+            } else if let nzb = s.nzbUrl, !nzb.isEmpty {
+                key = "u:" + nzb
+            } else {
+                key = nil
+            }
+            guard let key else { continue }
             if seen.insert(key).inserted { own.append(s) }
         }
-        // NOTE: `own` is deduped ONLY within Singularity's own list by torrent infohash. It is deliberately NOT
-        // deduped against the user's add-on groups, so a
-        // release your add-ons already return still appears under the Singularity label.
         guard !own.isEmpty else { return groups }
         return groups + [CoreStreamSourceGroup(id: SourceIndexClient.groupID, addon: SourceIndexClient.groupAddon, streams: own)]
     }

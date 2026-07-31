@@ -32,7 +32,7 @@ enum SeriesWatched {
 
     /// True when EVERY required (aired, regular-season) episode is in `watched`. Guarded on a non-empty
     /// requirement, so a series with no aired regular episodes (or no parseable air dates at all) never
-    /// reads watched — the badge only ever falls back to its existing engine/overlay signal, never a false
+    /// reads watched; the badge only ever falls back to its existing engine/overlay signal, never a false
     /// positive.
     static func isFullyWatched(videos: [CoreVideo], watched: Set<String>, asOf now: Date = Date()) -> Bool {
         let required = requiredEpisodeIDs(in: videos, asOf: now)

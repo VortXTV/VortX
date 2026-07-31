@@ -14,4 +14,20 @@
     <string name="downloads_channel_name">Downloads</string>
     <string name="downloads_channel_description">Progress for titles you save for offline viewing.</string>
     <string name="downloads_notification_title">Downloading</string>
+
+    <!-- Android TV debrid-key settings. Credentials remain masked and only status is shown. -->
+    <string name="tv_settings_section_services">Services</string>
+    <string name="tv_debrid_services_title">Debrid services</string>
+    <string name="tv_debrid_services_navigation_description">Add or replace API keys using the TV keyboard.</string>
+    <string name="tv_debrid_services_description">Add a provider API key to play cached torrents through your own debrid account.</string>
+    <string name="tv_debrid_action_back">Back</string>
+    <string name="tv_debrid_api_key">API key</string>
+    <string name="tv_debrid_replacement_api_key">Replacement API key</string>
+    <string name="tv_debrid_action_save">Save</string>
+    <string name="tv_debrid_action_replace">Replace</string>
+    <string name="tv_debrid_action_clear">Clear</string>
+    <string name="tv_debrid_status_not_set">Not set</string>
+    <string name="tv_debrid_status_set">Set</string>
+    <string name="tv_debrid_status_cleared">Cleared</string>
+    <string name="tv_debrid_status_storage_unavailable">Secure storage unavailable</string>
 </resources>

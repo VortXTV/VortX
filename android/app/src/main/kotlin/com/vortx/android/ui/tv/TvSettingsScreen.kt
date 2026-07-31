@@ -1,5 +1,6 @@
 package com.vortx.android.ui.tv
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
@@ -23,15 +25,20 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -39,6 +46,8 @@ import androidx.tv.material3.Border
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
+import com.vortx.android.R
+import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.PerformanceMode
@@ -66,13 +75,19 @@ import com.vortx.android.ui.theme.VortXTheme
 ///
 /// SCOPE, honestly: this ships the primary 10-foot toggles a viewer changes from the couch plus profile
 /// SWITCHING. Creating / renaming / deleting a profile stays on the phone/tablet app for now (text entry is a
-/// touch job); the deep phone-only surfaces (Account sign-in, Add-ons, Integrations, Media servers, subtitle
-/// styling, Sources ranking, Downloads, Library transfer) are likewise named at the foot of the list rather
-/// than reproduced. Binding a profile to its own separate account is not wired on Android yet, so a
+/// touch job); debrid API keys have their own nested TV route, while the remaining deep phone-only surfaces
+/// (Account sign-in, Add-ons, Integrations, Media servers, subtitle styling, Sources ranking, Downloads,
+/// Library transfer) are named at the foot of the list rather than reproduced. Binding a profile to its own
+/// separate account is not wired on Android yet, so a
 /// [ProfileStore.select] returning `SwitchAccount` / `NeedsSignIn` is surfaced as a note.
 @Composable
 fun TvSettingsScreen(modifier: Modifier = Modifier) {
     val appContext = LocalContext.current.applicationContext
+    val debridKeys = remember(appContext) { DebridKeys(appContext) }
+    var route by remember { mutableStateOf(TvSettingsRoute.ROOT) }
+    val settingsListState = rememberLazyListState()
+    val debridServicesFocus = remember { FocusRequester() }
+    var restoreFocusTarget by remember { mutableStateOf<TvDebridFocusTarget?>(null) }
 
     // Seed each control from its store once; write through on every change. There is no reactive prefs stream
     // in these modules and none is needed -- the values are read at player load, so a write-through keeps the
@@ -86,8 +101,27 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
     var refresh by remember { mutableStateOf(0) }
     val roster = remember(refresh) { store?.profiles ?: emptyList() }
     val activeId = remember(refresh) { store?.activeID }
+    val debridAccountIdentity = remember(refresh) {
+        store?.activeKeychainAccount ?: ProfileStore.PRIMARY_TOKEN_ACCOUNT
+    }
     var pinTarget by remember { mutableStateOf<UserProfile?>(null) }
     var status by remember { mutableStateOf<String?>(null) }
+
+    fun returnToSettingsRoot() {
+        route = route.back()
+        restoreFocusTarget = tvDebridFocusTarget(TvDebridFocusEvent.BACK_TO_SETTINGS)
+    }
+
+    if (route == TvSettingsRoute.DEBRID) {
+        BackHandler { returnToSettingsRoot() }
+        TvDebridKeysScreen(
+            keys = debridKeys,
+            accountIdentity = debridAccountIdentity,
+            onBack = ::returnToSettingsRoot,
+            modifier = modifier,
+        )
+        return
+    }
 
     fun commitSwitch(profile: UserProfile) {
         if (store == null) return
@@ -107,6 +141,7 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
     Box(modifier = modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
+            state = settingsListState,
             contentPadding = PaddingValues(TvDimens.edge),
             verticalArrangement = Arrangement.spacedBy(TvDimens.rowGap),
         ) {
@@ -158,6 +193,17 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
             }
 
             item {
+                TvSettingsSection(stringResource(R.string.tv_settings_section_services)) {
+                    TvSettingsNavigationRow(
+                        label = stringResource(R.string.tv_debrid_services_title),
+                        detail = stringResource(R.string.tv_debrid_services_navigation_description),
+                        onClick = { route = TvSettingsRoute.DEBRID },
+                        focusRequester = debridServicesFocus,
+                    )
+                }
+            }
+
+            item {
                 TvSettingsSection("Audio output") {
                     AudioOutputMode.entries.forEach { mode ->
                         TvOptionRow(
@@ -200,6 +246,26 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
             )
         }
     }
+
+    LaunchedEffect(restoreFocusTarget) {
+        if (restoreFocusTarget == TvDebridFocusTarget.DEBRID_SERVICES) {
+            var restored = false
+            repeat(3) {
+                if (!restored) {
+                    restored = runCatching { debridServicesFocus.requestFocus() }.getOrDefault(false)
+                    if (!restored) withFrameNanos { }
+                }
+            }
+            if (restored) restoreFocusTarget = null
+        }
+    }
+}
+
+internal enum class TvSettingsRoute {
+    ROOT,
+    DEBRID;
+
+    internal fun back(): TvSettingsRoute = if (this == DEBRID) ROOT else this
 }
 
 /// The active profile, shown large above the switcher (avatar + name + a Kids marker), so "who is watching"
@@ -424,6 +490,56 @@ private fun TvToggleRow(label: String, detail: String?, checked: Boolean, onTogg
                     checkedTrackColor = colors.accent,
                     uncheckedTrackColor = colors.surface3,
                 ),
+            )
+        }
+    }
+}
+
+/// A focusable nested-settings destination. The entire surface is one D-pad target.
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun TvSettingsNavigationRow(
+    label: String,
+    detail: String,
+    onClick: () -> Unit,
+    focusRequester: FocusRequester? = null,
+) {
+    val colors = VortXTheme.colors
+    Surface(
+        onClick = onClick,
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                if (focusRequester != null) {
+                    Modifier.focusRequester(focusRequester)
+                } else {
+                    Modifier
+                },
+            ),
+        shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = colors.surface1,
+            contentColor = colors.textPrimary,
+            focusedContainerColor = colors.surface3,
+            focusedContentColor = colors.textPrimary,
+        ),
+        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.02f),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(
+                border = BorderStroke(2.dp, colors.accentBright),
+                shape = VortXShapes.control,
+            ),
+        ),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 14.dp),
+        ) {
+            Text(label, style = VortXTheme.type.body.copy(fontWeight = FontWeight.SemiBold))
+            Text(
+                detail,
+                style = VortXTheme.type.label.copy(color = colors.textTertiary),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }

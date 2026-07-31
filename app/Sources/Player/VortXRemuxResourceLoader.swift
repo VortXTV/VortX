@@ -46,11 +46,21 @@ final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
 
     /// Convenience: wrap a debrid URL + headers into a stream + loader + the `vortxremux://` asset URL.
     /// Returns nil if the URL can't be rewritten to the custom scheme.
-    static func make(input: URL, headers: [String: String]?) -> (loader: VortXRemuxResourceLoader, assetURL: URL)? {
+    static func make(input: URL,
+                     headers: [String: String]?,
+                     selectedAudioStreamIndex: Int? = nil,
+                     preferredAudioLanguages: [String]? = nil,
+                     audioRejectTerms: [String]? = nil)
+        -> (loader: VortXRemuxResourceLoader, assetURL: URL)? {
         guard var comps = URLComponents(url: input, resolvingAgainstBaseURL: false) else { return nil }
         comps.scheme = scheme
         guard let assetURL = comps.url else { return nil }
-        let stream = VortXMKVRemuxStream(input: input.absoluteString, headers: headers)
+        let stream = VortXMKVRemuxStream(
+            input: input.absoluteString,
+            headers: headers,
+            selectedAudioStreamIndex: selectedAudioStreamIndex,
+            preferredAudioLanguages: preferredAudioLanguages,
+            audioRejectTerms: audioRejectTerms)
         return (VortXRemuxResourceLoader(stream: stream), assetURL)
     }
 

@@ -1,5 +1,6 @@
 package com.vortx.android.ui.screens
 
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -20,6 +21,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
@@ -31,6 +33,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -224,7 +228,7 @@ fun SearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifie
 /// [onVortxAccountClick]); the Stremio row below it is real too (S03): it reflects the live engine
 /// [AuthState] and opens [AccountScreen] via
 /// [onAccountClick]. The Add-ons row (S04) opens the add-on management screen via [onAddonsClick]. In
-/// debug builds only, one extra row opens the S02 design-system gallery for visual review — the boundary
+/// debug builds only, one extra row opens the S02 design-system gallery for visual review; the boundary
 /// is [BuildConfig.DEBUG], not a build variant, so it never ships in a release build.
 ///
 /// The Playback row opens [PlaybackSettingsScreen]. It REPLACES two hardcoded rows ("Audio output / Auto"
@@ -249,6 +253,8 @@ fun SettingsScreen(
     vortxAccountValue: String?,
     onVortxAccountClick: () -> Unit,
     onProfilesClick: () -> Unit,
+    onAppearanceScreenClick: () -> Unit,
+    onTabBarScreenClick: () -> Unit,
     onAccountClick: () -> Unit,
     onAddonsClick: () -> Unit,
     onIntegrationsClick: () -> Unit,
@@ -256,8 +262,11 @@ fun SettingsScreen(
     onLiveTvClick: () -> Unit,
     onPlaybackClick: () -> Unit,
     onSourcesClick: () -> Unit,
+    onDebridKeysScreenClick: () -> Unit,
     onDownloadsClick: () -> Unit,
     onLibraryClick: () -> Unit,
+    settingsScrollState: ScrollState,
+    debridServicesFocusRequester: FocusRequester,
     modifier: Modifier = Modifier,
     onOpenGallery: (() -> Unit)? = null,
 ) {
@@ -294,12 +303,27 @@ fun SettingsScreen(
     val activeProfile = ProfileStore.sharedOrNull()?.active
     val profilesValue = activeProfile?.let { if (it.isKids) "${it.name}  ·  Kids" else it.name } ?: "Default"
     Column(
-        modifier = modifier.fillMaxSize().padding(VortXTheme.spacing.edge),
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(settingsScrollState)
+            .padding(VortXTheme.spacing.edge),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
     ) {
         // Profiles first: it answers "who is watching" and is the entry to the "Who's watching?" switcher that
         // makes the whole multi-profile subsystem reachable.
         SettingRow(VortXIcons.profiles, "Profiles", profilesValue, onClick = onProfilesClick)
+        SettingRow(
+            VortXIcons.settings,
+            "Appearance",
+            "Theme, text size",
+            onClick = onAppearanceScreenClick,
+        )
+        SettingRow(
+            VortXIcons.listBullet,
+            "Tab bar",
+            "Choose visible tabs",
+            onClick = onTabBarScreenClick,
+        )
         // VortX Account above the Stremio row: the VortX account is the primary login (sign in /
         // create / recover + cross-device sync); Stremio below is the optional engine import.
         if (vortxAccountValue != null) {
@@ -314,6 +338,13 @@ fun SettingsScreen(
         SettingRow(VortXIcons.playRectangle, "Live TV", "IPTV", onClick = onLiveTvClick)
         SettingRow(VortXIcons.audioOutput, "Playback", playbackValue, onClick = onPlaybackClick)
         SettingRow(VortXIcons.sources, "Sources", sourcesValue, onClick = onSourcesClick)
+        SettingRow(
+            VortXIcons.lock,
+            "Debrid services",
+            "API keys",
+            onClick = onDebridKeysScreenClick,
+            modifier = Modifier.focusRequester(debridServicesFocusRequester),
+        )
         // The Downloads summary reads the live index, so the row can never disagree with the screen it opens
         // (the same rule the Playback row above follows). "None" rather than a byte count when empty: "0 B" reads
         // like a broken measurement, not like an empty list.
@@ -335,10 +366,16 @@ fun SettingsScreen(
 }
 
 @Composable
-private fun SettingRow(icon: ImageVector, title: String, value: String, onClick: (() -> Unit)? = null) {
+private fun SettingRow(
+    icon: ImageVector,
+    title: String,
+    value: String,
+    onClick: (() -> Unit)? = null,
+    modifier: Modifier = Modifier,
+) {
     val colors = VortXTheme.colors
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(vertical = VortXTheme.spacing.sm),

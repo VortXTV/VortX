@@ -2,7 +2,7 @@ import type Hls from "hls.js";
 import type { ErrorData } from "hls.js";
 import { el } from "./dom";
 import { cwPosition, recordProgress } from "./store";
-import { getSettings } from "./settings";
+import { getSettings, type SubtitlesMode } from "./settings";
 import type { SubtitleTrack } from "./addon";
 import { mountControls, type PlayerController, type SkipSegment } from "./playerControls";
 
@@ -463,11 +463,36 @@ function wireKeyboard(video: HTMLVideoElement): void {
   document.addEventListener("keydown", keyHandler);
 }
 
+type SelectableSubtitleTrack = Pick<TextTrack, "language" | "mode">;
+
+function primaryLanguage(value: string): string {
+  return value.trim().toLowerCase().split(/[-_]/, 1)[0] ?? "";
+}
+
+/** Apply the persisted subtitle policy after tracks have been attached to the video. */
+function applySubtitlePreference(
+  tracks: ArrayLike<SelectableSubtitleTrack>,
+  mode: SubtitlesMode,
+  preferredLanguage: string,
+): void {
+  const available = Array.from(tracks);
+  for (const track of available) track.mode = "disabled";
+  if (mode !== "always") return;
+
+  const preferred = primaryLanguage(preferredLanguage);
+  const selected =
+    (preferred
+      ? available.find((track) => primaryLanguage(track.language) === preferred)
+      : undefined) ?? available[0];
+  if (selected) selected.mode = "showing";
+}
+
 /** Add subtitle <track>s to the video; the player's CC menu then exposes them to pick one. */
 async function addSubtitleTracks(video: HTMLVideoElement, subs: SubtitleTrack[]): Promise<void> {
   // Convert all in parallel so one slow source does not hold up the rest (sequential awaits could take
   // up to ~12s x N before the user's language appears). Promise.all preserves the original order.
   const resolved = await Promise.all(subs.map(async (sub) => ({ sub, url: await toVttUrl(sub) })));
+  const appended: TextTrack[] = [];
   for (const { sub, url } of resolved) {
     if (!url) continue;
     const track = document.createElement("track");
@@ -476,8 +501,13 @@ async function addSubtitleTracks(video: HTMLVideoElement, subs: SubtitleTrack[])
     track.label = sub.lang.toUpperCase();
     track.src = url;
     video.appendChild(track);
+    appended.push(track.track);
   }
+  const settings = getSettings();
+  applySubtitlePreference(appended, settings.subtitlesMode, settings.subtitleLang);
 }
+
+export const __playerTestHooks = { addSubtitleTracks, applySubtitlePreference };
 
 /** Fetch a subtitle file, convert SRT to WebVTT if needed, and return a blob: URL for a <track>. */
 async function toVttUrl(sub: SubtitleTrack): Promise<string | null> {

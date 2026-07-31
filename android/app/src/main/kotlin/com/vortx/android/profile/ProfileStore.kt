@@ -7,6 +7,8 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.model.TrackPreferences
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.sources.SourceType
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 
 /**
@@ -19,7 +21,7 @@ import org.json.JSONArray
  *
  * This is the LINCHPIN foundation the sync engine, realtime, and Trakt mirrors (next waves) build on,
  * and that per-profile watch / prefs / ranking key off. It ports the hard-won roster-merge guards
- * (union-never-shrink, owner-singleton, dup-Main / delete-resurrection) faithfully — see the WHY
+ * (union-never-shrink, owner-singleton, dup-Main / delete-resurrection) faithfully; see the WHY
  * comments; do NOT simplify them.
  *
  * SINGLETON: Apple has `ProfileStore.shared`; Android needs a `Context` for [SharedPreferences], so
@@ -31,7 +33,7 @@ import org.json.JSONArray
  * (resolve a per-profile token slot), plus the [WatchOverlayStore] push seams.
  *
  * RELOAD HOOKS: on every profile switch / sync fold, [notifySwitchListeners] fires the registered
- * listeners — `EngineStremioRepository` registers `{ SourcePreferences.reload(); SourcePin.reload() }`,
+ * listeners; `EngineStremioRepository` registers `{ SourcePreferences.reload(); SourcePin.reload() }`,
  * and `SourcePinStore` reads [activeProfileId] for its per-profile key, so per-profile source-ranking
  * isolation becomes real the moment a switch happens.
  */
@@ -48,6 +50,9 @@ class ProfileStore private constructor(context: Context) {
         private set
     var activeID: String? = null
         private set
+
+    private val _activeProfile = MutableStateFlow<UserProfile?>(null)
+    val activeProfile = _activeProfile.asStateFlow()
 
     /** The launch picker shows once per cold start, and only when there is a real choice to make. */
     var pickedThisLaunch: Boolean = false
@@ -67,6 +72,11 @@ class ProfileStore private constructor(context: Context) {
 
     /** Push a profile's appearance (accent, OLED, text scale) into the theme layer. Wired by the theme wave. */
     var onApplyTheme: (UserProfile) -> Unit = {}
+
+    private fun publishActiveProfile() {
+        _activeProfile.value = active
+        _activeProfile.value?.let(onApplyTheme)
+    }
 
     /** Resolve the token stored in a per-profile keychain/keystore slot. Wired by the auth wave. */
     var tokenProvider: (slot: String) -> String? = { null }
@@ -108,7 +118,7 @@ class ProfileStore private constructor(context: Context) {
 
     /**
      * The token slot for [profile]. The owner IS the primary account (always the primary slot, whatever
-     * `usesOwnAccount` says — a synced roster once flipped that flag on the owner and "signed out" every
+     * `usesOwnAccount` says; a synced roster once flipped that flag on the owner and "signed out" every
      * device). Mirrors Apple `keychainAccount(for:)`.
      */
     fun keychainAccount(profile: UserProfile): String = keychainAccount(profile.isOwner, profile.usesOwnAccount, profile.id)
@@ -172,10 +182,7 @@ class ProfileStore private constructor(context: Context) {
         normalizeOwner()
         if (activeID == null || profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
         if (profiles != before) persist(touch = false)
-        active?.let {
-            onApplyTheme(it)
-            writeAddonKidsMirror(it)
-        }
+        active?.let(::writeAddonKidsMirror)
         // One-time seed: pre-feature rosters share one flat set of playback preferences, so copying it into
         // every profile preserves today's behavior exactly; from then on each profile diverges.
         if (profiles.any { it.playback == null }) {
@@ -184,12 +191,15 @@ class ProfileStore private constructor(context: Context) {
             persist(touch = false)
         }
         overlay.activate(active?.id, activeUsesEngineHistory)
+        publishActiveProfile()
     }
 
     // ---- Selection / CRUD ----
 
-    /** Make [profile] active: applies its prefs immediately and reports the account work left. Apple `select`. */
-    fun select(profile: UserProfile): SwitchOutcome {
+    /** Make [candidate] active: applies its prefs immediately and reports the account work left. Apple `select`. */
+    fun select(candidate: UserProfile): SwitchOutcome {
+        val profile =
+            profiles.firstOrNull { it.id == candidate.id } ?: return SwitchOutcome.SameAccount
         // FIRST, before activeID moves: fold the live flat-key state into the OUTGOING profile, so a
         // viewer's Settings filter edits (which bind straight to the flat keys) are not overwritten by the
         // resetUnset apply below. The equality guard keeps this a no-op when the roster already matches.
@@ -198,10 +208,10 @@ class ProfileStore private constructor(context: Context) {
         activeID = profile.id
         pickedThisLaunch = true
         persist(touch = false)   // selection is per-device, not a roster edit
-        onApplyTheme(profile)
         applyPlayback(profile, resetUnset = true)   // a switch resets unset filters to defaults, never inherits
         notifySwitchListeners()   // SourcePreferences.reload() + SourcePinStore.reload()
         overlay.activate(profile.id, profile.usesEngineHistory)
+        publishActiveProfile()
         val nowAccount = keychainAccount(profile)
         if (nowAccount == beforeAccount) return SwitchOutcome.SameAccount
         val token = tokenProvider(nowAccount)
@@ -219,8 +229,8 @@ class ProfileStore private constructor(context: Context) {
         profiles = profiles.toMutableList().also { it[idx] = profile }
         persist()
         if (profile.id == activeID) {
-            onApplyTheme(profile)
             applyPlayback(profile)
+            publishActiveProfile()
         }
     }
 
@@ -267,7 +277,7 @@ class ProfileStore private constructor(context: Context) {
             subtitleLang = base?.subtitleLang ?: lang,
             forcedPolicy = base?.forcedPolicy ?: "forced",
             // Subtitle style: carry a synced value, else seed Apple's documented SubtitleStyle.default*
-            // (modern / m / white / outline), NOT "" — an empty string synced to Apple blanks its styling.
+            // (modern / m / white / outline), NOT "": an empty string synced to Apple blanks its styling.
             subFont = base?.subFont ?: DEFAULT_SUB_FONT,
             subSize = base?.subSize ?: DEFAULT_SUB_SIZE,
             subColor = base?.subColor ?: DEFAULT_SUB_COLOR,
@@ -399,7 +409,14 @@ class ProfileStore private constructor(context: Context) {
         val email = prefs.getString(EMAIL_KEY, null)
         // Mirror Apple's `.capitalized` on the local part for the common single-token case.
         val name = email?.substringBefore("@")?.lowercase()?.replaceFirstChar { it.uppercase() } ?: "Main"
-        val first = UserProfile(id = UserProfile.OWNER_ID, name = name, avatar = "🍿", email = email, isOwner = true)
+        val first = UserProfile(
+            id = UserProfile.OWNER_ID,
+            name = name,
+            avatar = "🍿",
+            accentID = "vortx",
+            email = email,
+            isOwner = true,
+        )
         profiles = listOf(first)
         activeID = first.id
         persist(touch = false)   // migration isn't an edit; don't race a remote roster pull
@@ -489,9 +506,10 @@ class ProfileStore private constructor(context: Context) {
         profiles = profiles.filterNot { deletedProfileIDs.contains(it.id) && !it.isOwner }
         if (profiles == before) return
         if (activeID == null || profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
-        active?.let { onApplyTheme(it); applyPlayback(it) }
+        active?.let { applyPlayback(it) }
         persist(touch = false)
         overlay.activate(active?.id, activeUsesEngineHistory)
+        publishActiveProfile()
     }
 
     /** Apply the LOCAL delete tombstones to the live roster (called after EVERY sync pull). Apple `applyLocalTombstones`. */
@@ -519,13 +537,14 @@ class ProfileStore private constructor(context: Context) {
             profiles.none { it.id == activeID } -> profiles.firstOrNull()?.id
             else -> activeID
         }
-        active?.let { onApplyTheme(it); applyPlayback(it); notifySwitchListeners() }
+        active?.let { applyPlayback(it); notifySwitchListeners() }
         persist(touch = false)
         overlay.activate(active?.id, activeUsesEngineHistory)
+        publishActiveProfile()
     }
 
     /**
-     * UNION the live roster with [incoming] by profile id — the core cross-device safety guarantee: a
+     * UNION the live roster with [incoming] by profile id, the core cross-device safety guarantee: a
      * profile present on only ONE side is ALWAYS kept, so a cloud blob carrying fewer profiles can never
      * delete a richer local roster, and vice versa. For an id on BOTH sides, the newer roster (by
      * [incomingModified] vs [rosterModified], both epoch-SECONDS) wins the fields; either way the id is retained. Delete
@@ -572,9 +591,10 @@ class ProfileStore private constructor(context: Context) {
     private fun afterRosterFold() {
         normalizeOwner()
         if (profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
-        active?.let { onApplyTheme(it); applyPlayback(it); notifySwitchListeners() }
+        active?.let { applyPlayback(it); notifySwitchListeners() }
         persist(touch = false)
         overlay.activate(active?.id, activeUsesEngineHistory)
+        publishActiveProfile()
     }
 
     // ---- Owner normalization + duplicate collapse (the hard-won guards) ----
@@ -582,7 +602,7 @@ class ProfileStore private constructor(context: Context) {
     /**
      * The owner profile can never be an own-account profile; scrub the flag. Then enforce the owner
      * SINGLETON: one account, one owner, with a STABLE id. A restore/merge can leave more than one (the
-     * account owner adopted alongside a leftover local placeholder minted with a random id — the
+     * account owner adopted alongside a leftover local placeholder minted with a random id, the
      * duplicate-"Main" bug). Collapse to ONE direction-independently: keep the genuine account owner
      * (identified by its account email), DROP the duplicates (an owner reads the account history and
      * carries no private overlay, so a clone has nothing unique to lose). Then re-key the survivor onto
@@ -607,8 +627,8 @@ class ProfileStore private constructor(context: Context) {
             if (activeID != null && dropIDs.contains(activeID)) activeID = keepID
         }
 
-        // Re-key the surviving owner onto the stable id (skip if it carries a PIN — its hash is salted with
-        // the current id, so re-keying would silently break the PIN — or if some other profile already
+        // Re-key the surviving owner onto the stable id (skip if it carries a PIN because its hash is salted with
+        // the current id, so re-keying would silently break the PIN, or if some other profile already
         // holds the stable id).
         val survivor = list.indexOfFirst { it.isOwner }
         if (survivor >= 0) {
@@ -628,7 +648,7 @@ class ProfileStore private constructor(context: Context) {
     /**
      * Collapse ACCIDENTAL duplicate secondaries: when two or more non-owner profiles share the same name
      * (trimmed, case-insensitive), an EMPTY one (no watch overlay) is almost always a cross-device sync
-     * artifact — the same person's profile re-created with a fresh id on another device — so the union
+     * artifact, the same person's profile re-created with a fresh id on another device, so the union
      * keeps both and the user sees a second "Daksh" a delete cannot clear. Drop AND tombstone the empty
      * duplicate. A profile that carries its OWN watch history is NEVER auto-removed. Mirrors Apple
      * `collapseEmptyDuplicateSecondaries`.

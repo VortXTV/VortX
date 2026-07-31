@@ -45,6 +45,7 @@ import java.util.UUID
 class MpvPlayer private constructor(
     private val mpv: MPVLib,
     private val appContext: Context,
+    caBundlePath: String,
 ) : PlayerEngine {
 
     private val _state = MutableStateFlow(PlayerState())
@@ -153,6 +154,12 @@ class MpvPlayer private constructor(
         for ((name, value) in AudioOutputMode.current(appContext).mpvOptions()) {
             mpv.setOptionString(name, value)
         }
+        // Apply the trust policy last and fail closed if this packaged libmpv rejects any part of it.
+        // create() catches the exception, destroys this libmpv instance, and returns null so the router
+        // can use the platform player rather than continue with unknown certificate behavior.
+        for ((name, value) in MpvConfig.requiredSecurityOptions(caBundlePath)) {
+            requireMpvSecurityOption(name, mpv.setOptionString(name, value))
+        }
         mpv.init()
 
         mpv.observeProperty(PROP_TIME_POS, MPVLib.Format.DOUBLE)
@@ -171,25 +178,12 @@ class MpvPlayer private constructor(
         playbackStarted = false
         _state.value = _state.value.copy(hasEnded = false, hasError = false, isBuffering = true)
 
-        // Per-stream HTTP headers (behaviorHints.proxyHeaders). Set http-header-fields as a comma-joined
-        // "Name: value" list, exactly like the Apple loadFile splits UA/Referer out and joins the rest.
-        // Set as a property before loadfile so the request that opens the stream carries them.
-        if (playable.headers.isNotEmpty()) {
-            val fields = playable.headers.entries.joinToString(",") { "${it.key}: ${it.value}" }
-            mpv.setOptionString(OPT_HTTP_HEADER_FIELDS, fields)
-        }
-
-        // Trailer UA/URL lockstep (mirrors Apple loadFile's googlevideo branch). A client-resolved YouTube
-        // trailer's [url]/[audioUrl] were minted by a specific InnerTube client (ANDROID_VR / ANDROID / IOS /
-        // TVHTML5); googlevideo 403s a replay with any other UA. So OVERRIDE mpv's default UA with the minting
-        // UA BEFORE loadfile (it applies to the video URL AND the audio-add sidecar this load opens), and clear
-        // any per-stream header set so a reused engine instance never bleeds a prior stream's UA/Referer onto
-        // the trailer. Non-trailer streams (userAgent == null) keep the base [MpvConfig.USER_AGENT]. When the
-        // legs are already proxied to 127.0.0.1 this UA simply will not match that host (the proxy replays the
-        // real UA upstream itself), exactly as on Apple; it is the fallback for an unproxied raw googlevideo URL.
-        playable.userAgent?.let { ua ->
-            mpv.setPropertyString(PROP_USER_AGENT, ua)
-            mpv.setPropertyString(OPT_HTTP_HEADER_FIELDS, "")
+        // Every file starts from the known network-identity baseline. This player instance is reused across
+        // `loadfile replace`, so conditional SET-only writes would leak a prior source's Referer / custom UA
+        // into a later source that omitted them. Apply the reset first, then this file's values, all as runtime
+        // properties because mpv is already initialized.
+        for ((name, value) in streamHttpPropertyWrites(playable)) {
+            mpv.setPropertyString(name, value)
         }
 
         // Device-scaled forward cache cap, applied per file as a property (the Apple loadFile split).
@@ -541,15 +535,43 @@ class MpvPlayer private constructor(
         private const val READ_AHEAD_LOCAL = "96MiB"
         private const val READ_AHEAD_REMOTE = "128MiB"
 
+        /// Runtime HTTP-property writes for one file, in application order. The first two writes always clear
+        /// the previous file's identity; later writes apply only this file's headers / trailer-bound UA.
+        /// Kept pure and internal so hostile transition tests can prove a reused engine never carries stale
+        /// network identity without constructing the native mpv handle.
+        internal fun streamHttpPropertyWrites(playable: Playable): List<Pair<String, String>> = buildList {
+            add(OPT_HTTP_HEADER_FIELDS to "")
+            add(PROP_USER_AGENT to MpvConfig.USER_AGENT)
+            if (playable.headers.isNotEmpty()) {
+                val fields = playable.headers.entries.joinToString(",") { "${it.key}: ${it.value}" }
+                add(OPT_HTTP_HEADER_FIELDS to fields)
+            }
+            playable.userAgent?.let { ua ->
+                add(PROP_USER_AGENT to ua)
+                // A client-resolved trailer's UA applies to both googlevideo legs. Do not also replay an
+                // unrelated add-on header map against those URLs.
+                add(OPT_HTTP_HEADER_FIELDS to "")
+            }
+        }
+
         /// Build an [MpvPlayer], applying config + init. Returns null if [MPVLib.create] fails (missing
         /// native `.so` for the running ABI / OOM), so [com.vortx.android.player.MpvEngineFactory]
         /// can fall back to ExoPlayer. Never throws.
         fun create(context: Context): MpvPlayer? {
-            val lib = MPVLib.create(context) ?: return null
-            return runCatching { MpvPlayer(lib, context.applicationContext) }.getOrElse {
+            val appContext = context.applicationContext
+            if (!MpvConfig.ensureSystemTrustStoreObserver(appContext)) return null
+            val caBundlePath = MpvConfig.provisionSystemCaBundle(appContext) ?: return null
+            val lib = MPVLib.create(appContext) ?: return null
+            return runCatching { MpvPlayer(lib, appContext, caBundlePath) }.getOrElse {
                 runCatching { lib.destroy() }
                 null
             }
         }
+    }
+}
+
+internal fun requireMpvSecurityOption(name: String, result: Int) {
+    check(result >= 0) {
+        "required libmpv security option rejected: $name ($result)"
     }
 }

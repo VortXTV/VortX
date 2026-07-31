@@ -1,19 +1,28 @@
 import SwiftUI
 
-/// "Install by QR — pair once, add many." The TV/phone/Mac shows a QR that opens a phone page; the
-/// user pastes add-on manifest URLs there, and this view polls the relay session, shows the live
-/// incoming list, and installs each one THROUGH THE APP'S OWN hardened path (`CoreBridge.installAddon`)
-/// after an on-device confirm.
+/// "Install by QR - pair once, add many." The TV/phone/Mac shows a QR that opens a phone page; the user
+/// pastes add-on manifest URLs there, and this view polls the relay session and AUTO-INSTALLS each accepted
+/// submission THROUGH THE APP'S OWN hardened path (`CoreBridge.installAddon`), then publishes an explicit
+/// on-device success / failure.
 ///
-/// SAFETY MODEL: the relay (`add.vortx.tv`) is a dumb pipe that only carries URL strings between the
-/// phone and this device. Nothing installs silently: every incoming URL is fetched + validated by
-/// `CoreBridge` (the same manifest validation the paste-a-URL flow uses) and shown as an explicit
-/// "Install <name>?" row, so a QR scanned by the wrong person cannot push an add-on onto the TV. The
-/// view stays open so the user can keep adding on the phone and installing here.
+/// ARCHITECTURE: every DECISION lives in `AddonPairingReducer` (a pure, Foundation-only state machine that is
+/// compiled directly into `AddonPairingReducerTests`); this view owns only I/O - creating / polling / rotating
+/// the relay session, rendering the QR, and executing the reducer's effects (`resolve` / `install`) against
+/// `CoreBridge`, reporting each result back as an event. So the "auto-install on ready, install exactly once,
+/// fail honestly" contract is verified against the SHIPPED reducer, not a copy.
+///
+/// SAFETY MODEL (why auto-install is safe): the relay (`add.vortx.tv`) is a dumb pipe that only carries URL
+/// strings, scoped to ONE one-time TV pairing session. A submission is acted on only when its token is THIS
+/// device's CURRENT live session (`Event.delivered(liveToken:)`), so only a phone that scanned the QR now on
+/// screen can push a URL here. Every accepted URL is still fetched + validated by `CoreBridge`
+/// (`previewAddonManifest` then `installAddon`, the SAME validation + SSRF guard the paste-a-URL flow uses); a
+/// malformed URL or a manifest that fails validation lands `.invalid` and is NEVER installed or counted as
+/// success. Auto-install replaces the old "walk back to the TV and tap Install per row" step; a focusable
+/// manual Install / Retry stays as recovery for a skipped or failed auto-install.
 struct AddonPairingView: View {
-    // The engine bridge is a singleton (`CoreBridge.shared`) referenced directly across the app; use it
-    // here too so the install + validation path works regardless of how this view is presented (a sheet
-    // on tvOS / macOS does not always carry the presenter's `@EnvironmentObject`s).
+    // The engine bridge is a singleton (`CoreBridge.shared`) referenced directly across the app; use it here
+    // too so the install + validation path works regardless of how this view is presented (a sheet on tvOS /
+    // macOS does not always carry the presenter's `@EnvironmentObject`s).
     private let core = CoreBridge.shared
     @Environment(\.dismiss) private var dismiss
 
@@ -23,28 +32,14 @@ struct AddonPairingView: View {
     @State private var creating = false
     @State private var createFailed = false
 
-    // Live incoming list, keyed by normalized URL, with per-row install state.
-    @State private var rows: [Row] = []
+    // The whole pairing decision state lives in the reducer; the view never mutates rows directly.
+    @State private var pairing = AddonPairingReducer.State()
 
-    // Long-lived tasks: one creates + rotates the session, one polls it.
+    // Long-lived task: creates + rotates the session and polls it.
     @State private var pollTask: Task<Void, Never>?
 
-    /// One incoming manifest URL and where it is in the install lifecycle on THIS device.
-    private struct Row: Identifiable, Equatable {
-        let url: String                 // the raw URL the phone added (relay-provided)
-        var name: String?               // resolved add-on name once the manifest validates
-        var state: State = .pending
-        var id: String { url }
-
-        enum State: Equatable {
-            case pending       // not yet resolved
-            case resolving     // fetching + validating the manifest
-            case ready         // valid manifest, awaiting the user's Install tap
-            case invalid       // manifest failed validation (not installable)
-            case installing
-            case installed
-            case failed(String)
-        }
+    private var batch: AddonPairingReducer.BatchStatus {
+        AddonPairingReducer.batchStatus(pairing.rows.map(\.state))
     }
 
     private static let pollInterval: Duration = .seconds(2)
@@ -72,10 +67,7 @@ struct AddonPairingView: View {
                 qrCard
                 instructions
                 incomingSection
-                Button("Done") { dismiss() }
-                    .buttonStyle(.bordered)
-                    .tint(Theme.Palette.textPrimary)
-                    .foregroundStyle(Theme.Palette.textPrimary)
+                doneButton
             }
             .padding(Theme.Space.xl)
             .frame(maxWidth: 820)
@@ -87,6 +79,17 @@ struct AddonPairingView: View {
         #else
         .background(Theme.Palette.canvas.ignoresSafeArea())
         #endif
+    }
+
+    /// Done reflects the batch: disabled + "Installing…" while a valid submission is still resolving /
+    /// installing (never silently exits it), enabled + "Done" once every row is terminal.
+    private var doneButton: some View {
+        let state = AddonPairingReducer.doneState(batch)
+        return Button(state.title) { dismiss() }
+            .buttonStyle(.bordered)
+            .tint(Theme.Palette.textPrimary)
+            .foregroundStyle(Theme.Palette.textPrimary)
+            .disabled(!state.enabled)
     }
 
     private var header: some View {
@@ -136,7 +139,7 @@ struct AddonPairingView: View {
             }
         } else {
             VStack(spacing: Theme.Space.sm) {
-                Text("Scan with your phone to add add-ons by URL. Paste each add-on's manifest link on the page, then install it here.")
+                Text("Scan with your phone to add add-ons by URL. Paste each add-on's manifest link on the page - it installs here automatically.")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
                     .multilineTextAlignment(.center)
@@ -162,8 +165,8 @@ struct AddonPairingView: View {
     }
 
     @ViewBuilder private var incomingSection: some View {
-        if rows.isEmpty, session != nil {
-            // Live-poll indicator: makes it visible that adds from the phone will land here.
+        if pairing.rows.isEmpty, session != nil {
+            // Live-poll indicator: makes it visible that adds from the phone will land + install here.
             HStack(spacing: Theme.Space.sm) {
                 ProgressView().tint(Theme.Palette.accent)
                 Text("Waiting for add-ons added on your phone…")
@@ -171,26 +174,70 @@ struct AddonPairingView: View {
                     .foregroundStyle(Theme.Palette.textSecondary)
             }
         }
-        if !rows.isEmpty {
-            VStack(alignment: .leading, spacing: Theme.Space.md) {
-                HStack {
+        if !pairing.rows.isEmpty {
+            let section = VStack(alignment: .leading, spacing: Theme.Space.md) {
+                HStack(alignment: .firstTextBaseline) {
                     Text("From your phone")
                         .font(Theme.Typography.cardTitle)
                         .foregroundStyle(Theme.Palette.textPrimary)
                     Spacer()
-                    if rows.contains(where: { $0.state == .ready }) {
-                        Button("Install all") { installAll() }
-                            .buttonStyle(ChipButtonStyle(selected: true))
-                            .fixedSize()
+                    // Batch-level manual recovery: install every not-yet-installed / failed row in one hit.
+                    // Focus-reachable on tvOS (ChipButtonStyle), so an auto-install that stalled or failed is
+                    // always recoverable without the removed per-row walk-back.
+                    if pairing.rows.contains(where: { $0.state.isManualActionable }) {
+                        Button { installActionable() } label: {
+                            Label("Install all", systemImage: "square.and.arrow.down")
+                        }
+                        .buttonStyle(ChipButtonStyle(selected: true))
+                        .fixedSize()
                     }
                 }
-                ForEach(rows) { row in incomingRow(row) }
+                batchBanner
+                ForEach(pairing.rows) { row in incomingRow(row) }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            // One focus section for the whole incoming region (NOT per-row: stacked sibling focus sections
+            // make tvOS skip rows - the Collections-hub region-jump lesson). This makes the region reliably
+            // enterable so the manual Install / Retry buttons are reachable.
+            #if os(tvOS)
+            section.focusSection()
+            #else
+            section
+            #endif
         }
     }
 
-    private func incomingRow(_ row: Row) -> some View {
+    /// Explicit on-device success / failure line for the batch (the "publish TV success OR failure" the phone's
+    /// Done never gave). Invalid + failed are surfaced as non-success.
+    @ViewBuilder private var batchBanner: some View {
+        switch batch {
+        case .empty:
+            EmptyView()
+        case .working:
+            Label("Installing add-ons from your phone…", systemImage: "arrow.triangle.2.circlepath")
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+        case .allInstalled(let n):
+            Label(n == 1 ? "1 add-on installed." : "\(n) add-ons installed.", systemImage: "checkmark.circle.fill")
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.ok)
+        case .partial(let installed, let failed, let invalid):
+            Label(partialSummary(installed: installed, failed: failed, invalid: invalid),
+                  systemImage: "exclamationmark.triangle.fill")
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.danger)
+        }
+    }
+
+    private func partialSummary(installed: Int, failed: Int, invalid: Int) -> String {
+        var parts: [String] = []
+        if installed > 0 { parts.append("\(installed) installed") }
+        if failed > 0 { parts.append("\(failed) failed") }
+        if invalid > 0 { parts.append("\(invalid) invalid") }
+        return parts.joined(separator: " · ")
+    }
+
+    private func incomingRow(_ row: AddonPairingReducer.Row) -> some View {
         HStack(alignment: .top, spacing: Theme.Space.md) {
             Image(systemName: iconName(for: row.state))
                 .font(.system(size: 28))
@@ -216,14 +263,16 @@ struct AddonPairingView: View {
         .vortxSettingsCard()
     }
 
-    @ViewBuilder private func trailingControl(for row: Row) -> some View {
+    @ViewBuilder private func trailingControl(for row: AddonPairingReducer.Row) -> some View {
         switch row.state {
         case .ready:
-            Button { install(url: row.url) } label: { Label("Install", systemImage: "square.and.arrow.down") }
+            // Manual recovery: auto-install normally beats the user to this, but if it was skipped (offline,
+            // race) the button stays here, focusable + actionable.
+            Button { dispatch(.manualInstall(rowId: row.id)) } label: { Label("Install", systemImage: "square.and.arrow.down") }
                 .buttonStyle(ChipButtonStyle(selected: false))
                 .fixedSize()
         case .failed:
-            Button { retry(url: row.url) } label: { Label("Retry", systemImage: "arrow.clockwise") }
+            Button { dispatch(.manualInstall(rowId: row.id)) } label: { Label("Retry", systemImage: "arrow.clockwise") }
                 .buttonStyle(ChipButtonStyle(selected: false))
                 .fixedSize()
         case .resolving, .installing:
@@ -231,6 +280,53 @@ struct AddonPairingView: View {
         default:
             EmptyView()
         }
+    }
+
+    // MARK: - Reducer plumbing
+
+    /// Feed one event through the reducer and perform whatever effects it emits. The reducer is the ONLY thing
+    /// that mutates `pairing`; the view just performs I/O and reports results back as more events.
+    private func dispatch(_ event: AddonPairingReducer.Event) {
+        var next = pairing
+        let effects = AddonPairingReducer.reduce(&next, event, normalize: core.normalizedAddonURL)
+        pairing = next   // one @State write per event; effect results feed back as later events
+        for effect in effects { perform(effect) }
+    }
+
+    private func perform(_ effect: AddonPairingReducer.Effect) {
+        switch effect {
+        case let .resolve(rowId, url):
+            Task { @MainActor in
+                guard let preview = await core.previewAddonManifest(urlString: url) else {
+                    dispatch(.resolved(rowId: rowId, outcome: .invalid))
+                    return
+                }
+                let outcome: AddonPairingReducer.ResolveOutcome = preview.alreadyInstalled
+                    ? .alreadyInstalled(name: preview.name)
+                    : .ready(name: preview.name)
+                dispatch(.resolved(rowId: rowId, outcome: outcome))
+            }
+        case let .install(rowId, url):
+            Task { @MainActor in
+                // The ONE installer: fetches + validates + dispatches into the engine's add-on collection
+                // (idempotent - an already-present add-on is a no-op).
+                let error = await core.installAddon(urlString: url)
+                if error == nil {
+                    dispatch(.installFinished(rowId: rowId, outcome: .installed))
+                } else if let identity = pairing.rows.first(where: { $0.id == rowId })?.identity,
+                          core.addons.contains(where: { $0.transportUrl == identity }) {
+                    // Idempotent: the add-on is present anyway (already-installed / concurrent duplicate) → success.
+                    dispatch(.installFinished(rowId: rowId, outcome: .installed))
+                } else {
+                    dispatch(.installFinished(rowId: rowId, outcome: .failed(error ?? String(localized: "Could not install."))))
+                }
+            }
+        }
+    }
+
+    /// Manual batch recovery: install every row the user can still act on (ready or failed).
+    private func installActionable() {
+        for row in pairing.rows where row.state.isManualActionable { dispatch(.manualInstall(rowId: row.id)) }
     }
 
     // MARK: - Session lifecycle
@@ -247,19 +343,20 @@ struct AddonPairingView: View {
         }
     }
 
-    /// Create a session, render its QR, then poll it. If the session expires (or the relay reports it
-    /// gone / closed), rotate to a fresh one so the QR on screen is always live.
+    /// Create a session, render its QR, then poll it. If the session expires (or the relay reports it gone /
+    /// closed), rotate to a fresh one so the QR on screen is always live.
     private func createAndPollLoop() async {
-        // Resume the persisted session FIRST, if the relay still knows it: a manifest the phone added
-        // after this sheet was last closed is sitting unread in that session, and minting a fresh QR
-        // here would orphan it forever. One poll decides; a dead token falls through to a new session.
+        // Resume the persisted session FIRST, if the relay still knows it: a manifest the phone added after
+        // this sheet was last closed is sitting unread in that session, and minting a fresh QR here would
+        // orphan it forever. One poll decides; a dead token falls through to a new session.
         if let saved = AddonPairingClient.persistedSession() {
             if case .ok(let poll) = await AddonPairingClient.poll(token: saved.token) {
                 session = saved
                 qrImage = QRCodeImage.make(saved.pageUrl)
                 creating = false
                 createFailed = false
-                merge(incoming: poll.manifests)
+                dispatch(.sessionRotated(liveToken: saved.token))
+                dispatch(.delivered(urls: poll.manifests.map(\.url), sessionToken: saved.token, liveToken: session?.token))
                 if !poll.closed {
                     let ended = await pollSession(token: saved.token, expiresAt: poll.expiresAt)
                     if !ended { return }   // cancelled (view dismissed)
@@ -279,20 +376,22 @@ struct AddonPairingView: View {
             creating = false
             createFailed = false
             AddonPairingClient.persist(created)   // survives sheet close, so a late add still arrives
+            // A fresh session token means any not-yet-terminal row from a PRIOR session can never complete (its
+            // phone page is dead); drop those so a wrong-session submission leaves no stuck state and Done is
+            // not pinned "Installing…" forever. Terminal rows stay as visible history.
+            dispatch(.sessionRotated(liveToken: created.token))
 
-            // Poll THIS session until it dies, then loop to mint a new one. NOTE the polarity:
-            // pollSession returns true when the session ENDED (expired / gone / closed) and a fresh
-            // one should be minted; false means the task was cancelled (view dismissed). The old
-            // `if !stillAlive { continue }` read it backwards, so an expired/closed session stopped
-            // polling entirely and left a dead QR on screen instead of rotating.
+            // Poll THIS session until it dies, then loop to mint a new one. NOTE the polarity: pollSession
+            // returns true when the session ENDED (expired / gone / closed) and a fresh one should be minted;
+            // false means the task was cancelled (view dismissed).
             let ended = await pollSession(token: created.token, expiresAt: created.expiresAt)
             if ended { continue }
             return   // cancelled
         }
     }
 
-    /// Poll one session. Returns true if the session ended (expired / gone / closed) and the caller
-    /// should rotate to a new one; returns false when the task was cancelled (view dismissed).
+    /// Poll one session. Returns true if the session ended (expired / gone / closed) and the caller should
+    /// rotate to a new one; returns false when the task was cancelled (view dismissed).
     private func pollSession(token: String, expiresAt: Date) async -> Bool {
         var deadline = expiresAt
         while !Task.isCancelled {
@@ -301,9 +400,9 @@ struct AddonPairingView: View {
             case .gone:
                 return true                          // unknown / expired token → rotate
             case .ok(let poll):
-                // Merge BEFORE the closed check: a URL the phone adds in the same poll window as its
-                // "Done" tap arrives with closed == true and must not be dropped by the rotation.
-                merge(incoming: poll.manifests)
+                // Deliver BEFORE the closed check: a URL the phone adds in the same poll window as its "Done"
+                // tap arrives with closed == true and must not be dropped by the rotation.
+                dispatch(.delivered(urls: poll.manifests.map(\.url), sessionToken: token, liveToken: session?.token))
                 if poll.closed { return true }       // phone closed it → rotate
                 deadline = poll.expiresAt            // keep the deadline fresh from the relay
             case .failed:
@@ -317,74 +416,13 @@ struct AddonPairingView: View {
     private func stop() {
         pollTask?.cancel()
         pollTask = nil
-        // The session is deliberately LEFT ALIVE on the relay (it self-expires): a manifest the phone
-        // adds after this sheet closes is picked up by the persisted-session resume on the next open.
-    }
-
-    // MARK: - List merge + resolution
-
-    /// Fold the relay's list into our rows: add any new URL (and kick off its manifest resolution),
-    /// keeping the install state of URLs we already track. Never removes a row the user has acted on.
-    private func merge(incoming: [AddonPairingClient.IncomingManifest]) {
-        let known = Set(rows.map(\.url))
-        var appended: [String] = []
-        for item in incoming where !known.contains(item.url) {
-            rows.append(Row(url: item.url))
-            appended.append(item.url)
-        }
-        for url in appended { resolve(url: url) }
-    }
-
-    /// Validate a URL's manifest through `CoreBridge.previewAddonManifest` (the same fetch + validation
-    /// the install path uses) to get its name and installable/already-installed state.
-    private func resolve(url: String) {
-        updateRow(url) { $0.state = .resolving }
-        Task { @MainActor in
-            guard let preview = await core.previewAddonManifest(urlString: url) else {
-                updateRow(url) { $0.state = .invalid }
-                return
-            }
-            updateRow(url) { row in
-                row.name = preview.name
-                row.state = preview.alreadyInstalled ? .installed : .ready
-            }
-        }
-    }
-
-    // MARK: - Install (through the app's own hardened path only)
-
-    private func install(url: String) {
-        updateRow(url) { $0.state = .installing }
-        Task { @MainActor in
-            // The ONE installer: fetches + validates + dispatches into the engine's add-on collection.
-            let error = await core.installAddon(urlString: url)
-            if let error {
-                updateRow(url) { $0.state = .failed(error) }
-            } else {
-                updateRow(url) { $0.state = .installed }
-            }
-        }
-    }
-
-    private func installAll() {
-        for row in rows where row.state == .ready { install(url: row.url) }
-    }
-
-    private func retry(url: String) {
-        // Re-validate from scratch, then it becomes installable again.
-        resolve(url: url)
-    }
-
-    private func updateRow(_ url: String, _ mutate: (inout Row) -> Void) {
-        guard let idx = rows.firstIndex(where: { $0.url == url }) else { return }
-        var row = rows[idx]
-        mutate(&row)
-        rows[idx] = row
+        // The session is deliberately LEFT ALIVE on the relay (it self-expires): a manifest the phone adds
+        // after this sheet closes is picked up by the persisted-session resume on the next open.
     }
 
     // MARK: - Row presentation
 
-    private func iconName(for state: Row.State) -> String {
+    private func iconName(for state: AddonPairingReducer.RowState) -> String {
         switch state {
         case .installed:        return "checkmark.circle.fill"
         case .invalid, .failed: return "exclamationmark.triangle.fill"
@@ -392,7 +430,7 @@ struct AddonPairingView: View {
         }
     }
 
-    private func iconColor(for state: Row.State) -> Color {
+    private func iconColor(for state: AddonPairingReducer.RowState) -> Color {
         switch state {
         case .installed:        return Theme.Palette.ok
         case .invalid, .failed: return Theme.Palette.danger
@@ -400,10 +438,10 @@ struct AddonPairingView: View {
         }
     }
 
-    private func statusText(for row: Row) -> String {
+    private func statusText(for row: AddonPairingReducer.Row) -> String {
         switch row.state {
-        case .pending, .resolving: return String(localized: "Checking add-on…")
-        case .ready:               return row.url
+        case .resolving:           return String(localized: "Checking add-on…")
+        case .ready:               return String(localized: "Installing…")
         case .invalid:             return String(localized: "That URL did not return a valid add-on manifest.")
         case .installing:          return String(localized: "Installing…")
         case .installed:           return String(localized: "Installed")
@@ -411,7 +449,7 @@ struct AddonPairingView: View {
         }
     }
 
-    private func statusColor(for state: Row.State) -> Color {
+    private func statusColor(for state: AddonPairingReducer.RowState) -> Color {
         switch state {
         case .installed:        return Theme.Palette.ok
         case .invalid, .failed: return Theme.Palette.danger

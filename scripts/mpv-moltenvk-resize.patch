@@ -1,0 +1,118 @@
+VortX patch 0004: let the moltenvk render context notice that its layer resized.
+
+WHY THIS EXISTS
+---------------
+video/out/vulkan/context_moltenvk.m is NOT an upstream mpv file. It is 96 lines invented by
+MPVKit's own 0001-player-add-moltenvk-context.patch, and it is the render context every Apple
+device on the libmpv lane draws through. It shipped as the thinnest thing that compiles:
+`struct ra_ctx_params params = {0}` (all seven capability hooks null) and a `control` that
+answers VO_NOTIMPL to every request.
+
+The cost of that stub landed in the app. Because nothing could tell mpv the CAMetalLayer had
+changed size, a device rotation, a macOS window resize or a background/foreground cycle left the
+swapchain and vo->dwidth/dheight on the OLD geometry, and the video stayed small in a corner.
+The only lever the host app had was to destroy and rebuild the entire decode plus VO chain
+(`vid=no` then `vid=auto`) on every single layout change. This patch removes the need for that.
+
+WHAT IT DOES
+------------
+Handles VOCTRL_CHECK_EVENTS, which mpv's vo thread already polls once per loop iteration
+(video/out/vo.c). It compares the layer's drawableSize against the size the swapchain was last
+built for, and on a real change resizes the swapchain and raises VO_EVENT_RESIZE. vo_gpu_next
+then recomputes the source/destination rects and the OSD resolution from the fresh
+vo->dwidth/dheight and requests a redraw.
+
+The resize is done in the control itself, matching context_mac.m, and that is not a style
+choice: vo_gpu_next's reaction to VO_EVENT_RESIZE is gpu_ctx_resize(), which is an explicit
+no-op on the Vulkan path ("vulkan RA handles this by itself"), so raising the event without
+resizing here would change nothing at all.
+
+Deliberately NOT in this patch: set_color / preferred_csp (P2), get_vsync (P3), check_visible
+and preferred_ref_luma (P4). Those are separate, larger, and P2 in particular rests on an
+unproven hypothesis about the target-colorspace-hint double free. Kept small so it is provable.
+
+CONFLICT RISK
+-------------
+Structurally near zero. Upstream mpv ships no file at this path, so no upstream bump can
+conflict with it. It does depend on MPVKit's 0001 patch having created the file, so it must
+sort AFTER 0001 in Sources/BuildScripts/patch/libmpv/ (SpikeGit.applyPatches applies that
+directory in sorted order).
+
+--- a/video/out/vulkan/context_moltenvk.m
++++ b/video/out/vulkan/context_moltenvk.m
+@@ -26,6 +26,12 @@
+ struct priv {
+     struct mpvk_ctx vk;
+     CAMetalLayer *layer;
++    // VortX: the drawableSize we last sized the swapchain against, in pixels. moltenvk_control
++    // compares the layer against THIS rather than against ctx->vo->dwidth/dheight, because
++    // pl_swapchain_resize is allowed to clamp the size it is handed and write the clamped value
++    // back into vo->dwidth. Comparing against a clamped value would never match the layer again,
++    // so every VOCTRL_CHECK_EVENTS would raise a resize and spin the vo thread at 100%.
++    int last_width, last_height;
+ };
+ 
+ static void moltenvk_uninit(struct ra_ctx *ctx)
+@@ -73,16 +79,61 @@
+     return false;
+ }
+ 
++// VortX: single place that resizes the swapchain and remembers what it was sized to, so
++// moltenvk_reconfig and moltenvk_control can never disagree about the current size.
++static bool moltenvk_resize(struct ra_ctx *ctx, int width, int height)
++{
++    struct priv *p = ctx->priv;
++    p->last_width = width;
++    p->last_height = height;
++    return ra_vk_ctx_resize(ctx, width, height);
++}
++
+ static bool moltenvk_reconfig(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
+     CGSize s = p->layer.drawableSize;
+-    ra_vk_ctx_resize(ctx, s.width, s.height);
++    moltenvk_resize(ctx, (int)s.width, (int)s.height);
+     return true;
+ }
+ 
+ static int moltenvk_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+ {
++    struct priv *p = ctx->priv;
++
++    switch (request) {
++    // VortX: this context has no windowing backend to deliver events, so nothing ever told mpv
++    // that the CAMetalLayer changed size. A device rotation or a window resize left the swapchain
++    // (and vo->dwidth/dheight, which feed vo_get_src_dst_rects) on the OLD geometry, and the video
++    // stayed small in a corner. The only way the host app could make mpv notice was to destroy and
++    // rebuild the whole decode plus VO chain (vid=no then vid=auto). Poll the layer here instead:
++    // it is the same size source moltenvk_reconfig already trusts, and it is the idiom
++    // context_mac.m uses (raise VO_EVENT_RESIZE, then resize the swapchain from the control).
++    //
++    // The resize must happen HERE. vo_gpu_next's own resize() reacts to VO_EVENT_RESIZE by calling
++    // gpu_ctx_resize(), which is an explicit no-op on the Vulkan path ("vulkan RA handles this by
++    // itself", video/out/gpu_next/context.c), so raising the event alone would change nothing.
++    case VOCTRL_CHECK_EVENTS: {
++        CGSize s = p->layer.drawableSize;
++        int w = (int)s.width, h = (int)s.height;
++        // MoltenVK momentarily forces drawableSize to 1x1 to complete a presentation (mpv PR
++        // 13651). Never rebuild the swapchain against that transient value: the host app's
++        // CAMetalLayer subclass rejects it on the way in for the same reason.
++        if (w <= 1 || h <= 1)
++            return VO_TRUE;
++        if (w == p->last_width && h == p->last_height)
++            return VO_TRUE;
++        if (!moltenvk_resize(ctx, w, h))
++            return VO_ERROR;
++        // Deliberate: this is the only externally observable proof that the poll fired, and the
++        // host app already forwards mpv log messages at verbose level, so it is also the field
++        // evidence that a rotation was handled without rebuilding the video chain.
++        MP_VERBOSE(ctx, "moltenvk: layer resized to %dx%d\n", w, h);
++        *events |= VO_EVENT_RESIZE;
++        return VO_TRUE;
++    }
++    }
++
+     return VO_NOTIMPL;
+ }
+ 

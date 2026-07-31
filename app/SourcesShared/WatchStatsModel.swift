@@ -5,15 +5,26 @@ import Combine
 /// watch signal. This never dispatches an engine action, never writes an engine / profile / library
 /// document, and never mutates watched state: it only READS what is already persisted.
 ///
+/// The deterministic aggregation (records -> stats) and record normalization live in the pure,
+/// dependency-free `WatchStatsAggregation.swift` (`WatchStats.compute`, `WatchStats.record(fromBucketItem:)`,
+/// and the small helpers). This type owns only the ENGINE-COUPLED orchestration: which sources to read and
+/// how to keep the screen from going empty for a user who has real history.
+///
 /// Sources, honoring the per-profile history invariant (the same split `WatchedIndex` uses):
-///  - OWNER profile (`ProfileStore.activeUsesEngineHistory`): the engine's own persisted library buckets
-///    (`library_recent.json` / `library.json` in `CoreBridge.storageDirURL`), which carry the whole library
-///    plus each title's `state.overallTimeWatched` (the engine's authoritative total watch time in ms),
-///    `timesWatched`, and `lastWatched`. A bucket is consumed only when its `uid` matches the live ctx uid
-///    (`CoreBridge.currentUID()`), mirroring the engine's own `LibraryBucket::merge_bucket` uid refusal, so a
-///    stale bucket from a previous account can never leak into the new account's numbers. The live published
-///    `library` / `continueWatching` models fill in any freshly touched title whose bucket persist has not
-///    landed yet.
+///  - OWNER profile (`ProfileStore.activeUsesEngineHistory`): the engine's OWN current-account history. The
+///    precise time comes from the engine's persisted library buckets (`library_recent.json` / `library.json`
+///    in `CoreBridge.storageDirURL`), which carry the whole library plus each title's
+///    `state.overallTimeWatched` (the engine's authoritative total watch time in ms), `timesWatched`, and
+///    `lastWatched`. A bucket is consumed when its `uid` matches the live ctx uid (`CoreBridge.currentUID()`)
+///    -- mirroring the engine's own `LibraryBucket::merge_bucket` uid refusal so a PREVIOUS account's bucket
+///    never leaks into a DIFFERENT signed-in account's numbers -- OR when signed OUT (no live uid), where the
+///    on-disk history is the user's own with no other account to leak from. On TOP of the buckets, the engine's
+///    LIVE `library` model (loaded on demand, always the current account) and the Continue-Watching preview are
+///    unioned in. That live union is what keeps the screen from going empty when the persisted bucket file is
+///    skipped by the uid gate or simply has not been written to disk yet on this device (the engine persists
+///    the bucket as an async effect AFTER the library lands in memory) -- it is the SAME engine-owned history
+///    that already powers Continue Watching and the watched badges. Watch time for a live-only title is
+///    estimated from its live state, since the published `CoreCWItem` carries no `overallTimeWatched`.
 ///  - OVERLAY profile: only that profile's private overlay (`ProfileStore.watch`), NEVER the account/engine
 ///    set. The overlay carries a per-title `durationMs` + watched-episode list, from which watch time is
 ///    estimated.
@@ -48,10 +59,6 @@ final class WatchStatsModel: ObservableObject {
     /// metaId (and, where known, the title's imdb video id) -> genres, joined from in-memory `CoreMeta`.
     private var genresByID: [String: [String]] = [:]
 
-    /// How many titles to surface in the "most watched" list and the internal work caps.
-    private static let topTitlesLimit = 8
-    private static let topGenresLimit = 6
-
     // MARK: Load
 
     /// Read the active profile's watch history (read only) and compute stats. Safe to call repeatedly;
@@ -67,24 +74,34 @@ final class WatchStatsModel: ObservableObject {
             return
         }
 
-        // Owner profile. Capture the live state on main, then parse the persisted buckets off-main.
-        let expectedUID = CoreBridge.shared.currentUID()
-        let liveLibrary = CoreBridge.shared.library?.catalog ?? []
-        let liveCW = CoreBridge.shared.continueWatching
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let bucket = Self.bucketRecords(expectedUID: expectedUID)
-            let merged = Self.mergeLive(into: bucket, library: liveLibrary, continueWatching: liveCW)
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.records = merged
-                self.finishLoad()
+        // Owner profile. Make sure the engine's OWN current-account library is loaded BEFORE we snapshot the
+        // live state: it is the authoritative, account-scoped history that also powers Continue Watching and
+        // the watched badges, and it is the fallback that keeps this screen from going empty when the persisted
+        // bucket file is skipped by the uid gate (signed out / just-switched account) or has not been written
+        // to disk yet on this device. `loadLibraryAndAwait` is idempotent and READ ONLY -- it no-ops when the
+        // library is already loaded and never mutates the account. `isLoading` stays true across the await, so
+        // the view shows the loader rather than a false "no history" frame.
+        Task { @MainActor [weak self] in
+            await CoreBridge.shared.loadLibraryAndAwait()
+            guard let self else { return }
+            let expectedUID = CoreBridge.shared.currentUID()
+            let liveLibrary = CoreBridge.shared.library?.catalog ?? []
+            let liveCW = CoreBridge.shared.continueWatching
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let bucket = Self.bucketRecords(expectedUID: expectedUID)
+                let merged = Self.mergeLive(into: bucket, library: liveLibrary, continueWatching: liveCW)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.records = merged
+                    self.finishLoad()
+                }
             }
         }
     }
 
     /// Common tail of both load paths: derive the scope years and compute the selected scope.
     private func finishLoad() {
-        let years = Set(records.compactMap { $0.lastWatched.map { Self.calendar.component(.year, from: $0) } })
+        let years = Set(records.compactMap { $0.lastWatched.map { WatchStats.calendar.component(.year, from: $0) } })
         availableYears = years.sorted(by: >)
         // Drop a stale selection that no longer exists in this profile's data.
         if let year = selectedYear, !availableYears.contains(year) { selectedYear = nil }
@@ -98,22 +115,29 @@ final class WatchStatsModel: ObservableObject {
         if let year = selectedYear {
             scoped = records.filter { r in
                 guard let d = r.lastWatched else { return false }
-                return Self.calendar.component(.year, from: d) == year
+                return WatchStats.calendar.component(.year, from: d) == year
             }
         } else {
             scoped = records
         }
         let label = selectedYear.map(String.init) ?? String(localized: "All time")
         stats = WatchStats.compute(records: scoped, genresByID: genresByID, scopeLabel: label,
-                                   topTitles: Self.topTitlesLimit, topGenres: Self.topGenresLimit)
+                                   topTitles: WatchStats.topTitlesLimit, topGenres: WatchStats.topGenresLimit)
     }
 
     // MARK: Owner path (engine buckets, read only)
 
-    /// Full watch records from BOTH persisted engine buckets, gated on `expectedUID` exactly like
+    /// Full watch records from BOTH persisted engine buckets, gated on `expectedUID` like
     /// `WatchedIndex.bucketWatchedIDs`. `library.json` (the whole library) is read first, then
-    /// `library_recent.json` (the fresher subset) overwrites shared ids. Fail-soft: an absent / unreadable /
-    /// uid-mismatched file contributes nothing. READ ONLY.
+    /// `library_recent.json` (the fresher subset) overwrites shared ids. Fail-soft: an absent / unreadable
+    /// file contributes nothing. READ ONLY.
+    ///
+    /// UID GATE: a bucket persists `{ uid, items }`, where `uid` is the auth user id (null when signed out).
+    /// A file whose uid does not match `expectedUID` is skipped so a PREVIOUS account's bucket can never leak
+    /// into a DIFFERENT signed-in account's numbers (the engine's own `LibraryBucket::merge_bucket` refusal,
+    /// #111). The one relaxation: when signed OUT (`expectedUID == nil`) the on-disk bucket is the user's OWN
+    /// last-synced history with no other account to leak from -- and it is the same history the app already
+    /// shows in Continue Watching and the watched badges -- so it is accepted rather than dropped.
     private static func bucketRecords(expectedUID: String?) -> [String: WatchRecord] {
         var out: [String: WatchRecord] = [:]
         let dir = CoreBridge.storageDirURL
@@ -121,47 +145,29 @@ final class WatchStatsModel: ObservableObject {
             guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
                   let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let items = root["items"] as? [String: Any] else { continue }
-            // Absent / null uid decodes to nil and matches only the signed-out state, the engine's own
-            // equality semantics.
-            guard (root["uid"] as? String) == expectedUID else { continue }
+            let bucketUID = root["uid"] as? String
+            guard bucketUID == expectedUID || expectedUID == nil else { continue }
             for (id, value) in items {
                 guard let item = value as? [String: Any],
-                      let record = makeRecord(fromBucketItem: id, item) else { continue }
+                      let record = WatchStats.record(fromBucketItem: id, item) else { continue }
                 out[id] = record
             }
         }
         return out
     }
 
-    /// Normalize one persisted `LibraryItem` JSON into a `WatchRecord`, or nil to skip it (internal docs,
-    /// non VOD types, nothing watched). Never throws.
-    private static func makeRecord(fromBucketItem id: String, _ item: [String: Any]) -> WatchRecord? {
-        let type = (item["type"] as? String) ?? ""
-        guard isVODType(type), !isInternalID(id) else { return nil }
-        let state = (item["state"] as? [String: Any]) ?? [:]
-        let overallMs = doubleValue(state["overallTimeWatched"])
-        let timesWatched = intValue(state["timesWatched"])
-        let flaggedWatched = intValue(state["flaggedWatched"])
-        // Keep only titles the user has actually engaged with: real watch time, a finished play / watched
-        // episode, or a watched-from-catalog mark. A bare library add (never played) contributes nothing.
-        guard overallMs > 0 || timesWatched > 0 || flaggedWatched > 0 else { return nil }
-        let name = (item["name"] as? String) ?? id
-        let poster = item["poster"] as? String
-        let last = parseISODate(state["lastWatched"] as? String)
-        return WatchRecord(id: id, type: type, name: name, poster: poster,
-                           watchSeconds: clampSeconds(overallMs / 1000),
-                           plays: timesWatched, lastWatched: last)
-    }
-
-    /// Union in any live library / Continue-Watching title MISSING from the persisted buckets (a fresh mark
-    /// whose async bucket persist has not landed). Watch time is estimated from the live state, since the
-    /// published `CoreCWItem` carries no `overallTimeWatched`. Titles already in the buckets are left on the
-    /// authoritative bucket value.
+    /// Union in any live library / Continue-Watching title MISSING from the persisted buckets. This is both
+    /// the fresh-mark catch-up (a title whose async bucket persist has not landed) AND the whole-history
+    /// fallback when the buckets were skipped by the uid gate or never written on this device: the live
+    /// `library` model is the engine's current account, so unioning it keeps the screen showing the same
+    /// history that powers Continue Watching and the watched badges. Watch time is estimated from the live
+    /// state, since the published `CoreCWItem` carries no `overallTimeWatched`. Titles already in the buckets
+    /// are left on the authoritative bucket value.
     private static func mergeLive(into bucket: [String: WatchRecord],
                                   library: [CoreCWItem], continueWatching: [CoreCWItem]) -> [WatchRecord] {
         var out = bucket
         for item in (library + continueWatching) {
-            guard out[item.id] == nil, isVODType(item.type), !isInternalID(item.id) else { continue }
+            guard out[item.id] == nil, WatchStats.isVODType(item.type), !WatchStats.isInternalID(item.id) else { continue }
             guard item.isWatched || item.state.timeOffset > 0 else { continue }
             let isSeries = item.type == "series"
             let durationS = item.state.duration / 1000
@@ -169,7 +175,7 @@ final class WatchStatsModel: ObservableObject {
                 ? durationS * Double(max(item.state.timesWatched, 1))       // episodes * per-episode duration
                 : (item.isWatched ? durationS : item.resumeSeconds)         // finished movie vs in-progress
             out[item.id] = WatchRecord(id: item.id, type: item.type, name: item.name, poster: item.poster,
-                                       watchSeconds: clampSeconds(seconds), plays: item.state.timesWatched,
+                                       watchSeconds: WatchStats.clampSeconds(seconds), plays: item.state.timesWatched,
                                        lastWatched: nil)
         }
         return Array(out.values)
@@ -184,7 +190,7 @@ final class WatchStatsModel: ObservableObject {
     private static func overlayRecords(_ watch: [String: WatchEntry]) -> [WatchRecord] {
         var out: [WatchRecord] = []
         for (metaId, entry) in watch {
-            guard isVODType(entry.type), !isInternalID(metaId) else { continue }
+            guard WatchStats.isVODType(entry.type), !WatchStats.isInternalID(metaId) else { continue }
             let isSeries = entry.type == "series"
             let durationS = Double(entry.durationMs) / 1000
             let episodes = entry.watchedVideoIds.count
@@ -200,8 +206,8 @@ final class WatchStatsModel: ObservableObject {
             }
             guard seconds > 0 || plays > 0 else { continue }
             out.append(WatchRecord(id: metaId, type: entry.type, name: entry.name, poster: entry.poster,
-                                   watchSeconds: clampSeconds(seconds), plays: plays,
-                                   lastWatched: parseISODate(entry.lastWatched)))
+                                   watchSeconds: WatchStats.clampSeconds(seconds), plays: plays,
+                                   lastWatched: WatchStats.parseISODate(entry.lastWatched)))
         }
         return out
     }
@@ -229,185 +235,5 @@ final class WatchStatsModel: ObservableObject {
             add(meta.behaviorHints?.defaultVideoId, meta.genres)
         }
         return index
-    }
-
-    // MARK: Small helpers
-
-    /// A shared calendar for year bucketing (UTC so a title's year matches its stored `lastWatched` day
-    /// regardless of the device time zone).
-    private static let calendar: Calendar = {
-        var c = Calendar(identifier: .gregorian)
-        c.timeZone = TimeZone(identifier: "UTC") ?? .current
-        return c
-    }()
-
-    /// The VOD content types this screen counts. Live TV / channels and the internal "other" docs are
-    /// excluded (they are not "titles watched").
-    private static func isVODType(_ type: String) -> Bool { type == "movie" || type == "series" }
-
-    /// The app's own internal library docs (e.g. the `stremiox:profiles` sync doc) must never count.
-    private static func isInternalID(_ id: String) -> Bool { id.hasPrefix("stremiox:") || id.hasPrefix("vortx:") }
-
-    /// Corruption guard: keep a finite, non-negative value and cap it at an absurdly high ceiling so a single
-    /// bad accumulator can never dominate the total. Real values sit far below this.
-    private static func clampSeconds(_ seconds: Double) -> Double {
-        guard seconds.isFinite, seconds > 0 else { return 0 }
-        return min(seconds, 500_000 * 3600)
-    }
-
-    private static func doubleValue(_ any: Any?) -> Double {
-        if let d = any as? Double { return d }
-        if let i = any as? Int { return Double(i) }
-        if let n = any as? NSNumber { return n.doubleValue }
-        return 0
-    }
-
-    private static func intValue(_ any: Any?) -> Int {
-        if let i = any as? Int { return i }
-        if let d = any as? Double { return Int(d) }
-        if let n = any as? NSNumber { return n.intValue }
-        return 0
-    }
-
-    /// Tolerant ISO-8601 parse for a stored `lastWatched`. The engine writes up to nanosecond fractional
-    /// seconds (e.g. "2026-05-13T05:50:02.786798226Z"), which the standard fractional formatter rejects, so
-    /// try both ISO forms first and finally fall back to the leading calendar day. Only the year is load-
-    /// bearing here (year-in-review scoping), so pinning a UTC day when the full timestamp is over-precise is
-    /// enough; nil when absent / unparseable. Mirrors `SeriesWatched.airDate`.
-    private static func parseISODate(_ raw: String?) -> Date? {
-        guard let raw, !raw.isEmpty else { return nil }
-        if let d = ISO8601DateFormatter.epgFractional.date(from: raw) { return d }
-        if let d = ISO8601DateFormatter.epg.date(from: raw) { return d }
-        guard raw.count >= 10 else { return nil }
-        let f = DateFormatter()
-        f.calendar = Calendar(identifier: .iso8601)
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd"
-        return f.date(from: String(raw.prefix(10)))
-    }
-}
-
-// MARK: - Value types
-
-/// One title's normalized, read-only watch record. Pure value type.
-struct WatchRecord {
-    let id: String
-    let type: String          // "movie" | "series"
-    let name: String
-    let poster: String?
-    /// Total time spent watching this title, in seconds (engine `overallTimeWatched` for the owner, an
-    /// estimate for overlay / live-only titles).
-    let watchSeconds: Double
-    /// Finished plays for a movie, or watched-episode count for a series.
-    let plays: Int
-    /// The last time this title was watched, for year-in-review scoping (nil when unknown).
-    let lastWatched: Date?
-
-    var isSeries: Bool { type == "series" }
-    var isMovie: Bool { type == "movie" }
-}
-
-/// One genre's share of watch time within the current scope.
-struct GenreStat: Identifiable {
-    let name: String
-    let seconds: Double
-    var id: String { name }
-}
-
-/// The single title the user sank the most into (the "longest binge").
-struct BingeStat {
-    let name: String
-    let type: String
-    let seconds: Double
-    let episodes: Int
-}
-
-/// One row of the "most watched" list.
-struct TitleStat: Identifiable {
-    let id: String
-    let name: String
-    let type: String
-    let poster: String?
-    let seconds: Double
-    let plays: Int
-}
-
-/// The fully computed stats for one scope (all time, or one year). Pure output; the view only formats it.
-struct WatchStats {
-    let scopeLabel: String
-    let totalWatchSeconds: Double
-    let titlesCount: Int
-    let moviesCount: Int
-    let seriesCount: Int
-    let episodesCount: Int
-    let topGenres: [GenreStat]
-    /// How many scoped titles had a locally known genre (so the view can caption the genre card honestly).
-    let genreCoverage: Int
-    let longestBinge: BingeStat?
-    let topTitles: [TitleStat]
-
-    /// True when there is anything at all to show.
-    var hasData: Bool { titlesCount > 0 }
-
-    /// Compute the stats over already-scoped records. Pure and deterministic (no I/O), so it is trivially
-    /// testable and cheap enough to run on every scope change.
-    static func compute(records: [WatchRecord], genresByID: [String: [String]],
-                        scopeLabel: String, topTitles: Int, topGenres: Int) -> WatchStats {
-        let movies = records.filter(\.isMovie)
-        let series = records.filter(\.isSeries)
-        let totalSeconds = records.reduce(0) { $0 + $1.watchSeconds }
-        let episodes = series.reduce(0) { $0 + max($1.plays, 0) }
-
-        // Top genres, weighted by watch time so a genre the user spent more hours on ranks higher.
-        var genreSeconds: [String: Double] = [:]
-        var covered = 0
-        for record in records {
-            guard let genres = genresByID[record.id], !genres.isEmpty else { continue }
-            covered += 1
-            // Split the title's time evenly across its genres so a 3-genre title does not triple-count.
-            let share = record.watchSeconds / Double(genres.count)
-            for genre in genres { genreSeconds[genre, default: 0] += share }
-        }
-        let genres = genreSeconds
-            .map { GenreStat(name: $0.key, seconds: $0.value) }
-            .filter { $0.seconds > 0 }
-            .sorted { $0.seconds > $1.seconds }
-            .prefix(topGenres)
-
-        // Longest binge: the series with the most watched episodes (tiebreak on time). With no series, the
-        // movie with the most watch time stands in.
-        let binge: BingeStat?
-        if let topSeries = series.max(by: { ($0.plays, $0.watchSeconds) < ($1.plays, $1.watchSeconds) }),
-           topSeries.plays > 0 {
-            binge = BingeStat(name: topSeries.name, type: topSeries.type,
-                              seconds: topSeries.watchSeconds, episodes: topSeries.plays)
-        } else if let topMovie = movies.max(by: { $0.watchSeconds < $1.watchSeconds }), topMovie.watchSeconds > 0 {
-            binge = BingeStat(name: topMovie.name, type: topMovie.type,
-                              seconds: topMovie.watchSeconds, episodes: 0)
-        } else {
-            binge = nil
-        }
-
-        // Most watched, ranked by time spent.
-        let ranked = records
-            .filter { $0.watchSeconds > 0 || $0.plays > 0 }
-            .sorted { ($0.watchSeconds, Double($0.plays)) > ($1.watchSeconds, Double($1.plays)) }
-            .prefix(topTitles)
-            .map { TitleStat(id: $0.id, name: $0.name, type: $0.type, poster: $0.poster,
-                             seconds: $0.watchSeconds, plays: $0.plays) }
-
-        return WatchStats(
-            scopeLabel: scopeLabel,
-            totalWatchSeconds: totalSeconds,
-            titlesCount: records.count,
-            moviesCount: movies.count,
-            seriesCount: series.count,
-            episodesCount: episodes,
-            topGenres: Array(genres),
-            genreCoverage: covered,
-            longestBinge: binge,
-            topTitles: Array(ranked)
-        )
     }
 }

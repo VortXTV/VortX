@@ -1,5 +1,43 @@
 import SwiftUI
 
+/// The clip the built-in playback selftests play (`-tv-selftest` mounts the player directly,
+/// `-tv-playertest` exercises the root-replacement path). Both read it from here so a dead default
+/// can never rot in two places again, which is exactly what happened: the previous default,
+/// Blender's `BigBuckBunny_320x180.mp4`, started returning 404 and every selftest run landed on the
+/// "source never started" screen instead of playing, making the smoke check useless.
+///
+/// Override it to point a run at a local HTTP server (an offline machine, or to exercise a specific
+/// container) with either:
+///   -tv-selftest-url https://host/clip.mp4     launch argument, wins
+///   defaults write <bundle-id> tv.selftest.url https://host/clip.mp4
+/// A malformed or non-http(s) override is ignored in favour of the default, so a typo degrades to a
+/// working selftest rather than the failure screen the override was meant to diagnose.
+enum SelftestSource {
+    /// Verified 2026-07-25: HTTP 200, no redirects, H.264 640x360, 10s, 0.94 MB. Kept deliberately
+    /// small so a cold simulator start reaches first frame quickly.
+    static let defaultURLString = "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4"
+    static let argumentName = "-tv-selftest-url"
+    static let defaultsKey = "tv.selftest.url"
+
+    static var url: URL { resolve(override: overrideString) ?? URL(string: defaultURLString)! }
+
+    /// The raw override from the launch argument (preferred) or the defaults key, whichever is present.
+    static var overrideString: String? {
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: argumentName), i + 1 < args.count { return args[i + 1] }
+        return UserDefaults.standard.string(forKey: defaultsKey)
+    }
+
+    /// Accept only a well-formed http(s) URL; anything else falls back to the default. Pure, so the
+    /// rule is testable without launching the app.
+    static func resolve(override: String?) -> URL? {
+        guard let raw = override?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+              let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https", url.host?.isEmpty == false else { return nil }
+        return url
+    }
+}
+
 @main
 struct VortXTVApp: App {
     @StateObject private var account = StremioAccount()
@@ -44,7 +82,7 @@ struct VortXTVApp: App {
         // default shared cache cannot hold a catalog page of posters, so posters re-fetch on every scroll.
         PosterImageLoader.configureSharedCache()
         // Safety sweep: clear any leftover libmpv on-disk streaming cache from a previous run. The
-        // player wipes it on a genuine exit, but a crash mid-playback could leave bytes behind — this
+        // player wipes it on a genuine exit, but a crash mid-playback could leave bytes behind; this
         // guarantees a fresh, bounded start so the configurable cache can never accumulate unbounded.
         // Detached so the directory scan + delete (multi-GB after a crash) never blocks launch.
         Task.detached(priority: .utility) { DiskCacheSetting.clearCache() }
@@ -58,7 +96,7 @@ struct VortXTVApp: App {
         WindowGroup {
             Group {
                 if ProcessInfo.processInfo.arguments.contains("-tv-selftest") {
-                    TVPlayerView(url: URL(string: "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4")!, title: "Player Test, Oceans")
+                    TVPlayerView(url: SelftestSource.url, title: "Player Test, Oceans")
                 } else {
                     RootView()   // player OR shell, never both, the only reliable tvOS focus isolation
                 }
@@ -88,6 +126,14 @@ struct VortXTVApp: App {
                 DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
                 if phase == .active {
                     UpdateChecker.shared.checkIfStale()
+                    // RemoteConfig had NO foreground pull: `refreshIfForegroundDue` existed with zero call
+                    // sites anywhere in the repo, so the only refreshes were the cold-launch fetch and the
+                    // 6-hourly periodic Task. That Task's sleep does not advance while tvOS has the process
+                    // suspended, and an Apple TV app is often never fully quit, so a device could hold a
+                    // stale config (and therefore a stale KILL SWITCH) for a very long time. Throttled to
+                    // once per 30 minutes inside the actor, detached so it cannot delay this hook, and
+                    // fail-soft by construction (refresh never throws and keeps last-good on any error).
+                    Task.detached(priority: .utility) { await RemoteConfig.shared.refreshIfForegroundDue() }
                     #if !VORTX_NO_EMBEDDED_SERVER
                     // #130: after a suspension (Home, app switch, screensaver exit) tvOS can tear down the
                     // server's bound listener while node keeps ticking, so the server reads Offline until a
@@ -175,8 +221,7 @@ struct VortXTVApp: App {
                 // DIAGNOSTIC (-tv-playertest): exercise the real root-replacement path without an account.
                 guard ProcessInfo.processInfo.arguments.contains("-tv-playertest") else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    presenter.request = PlaybackRequest(
-                        url: URL(string: "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4")!, title: "Player Test")
+                    presenter.request = PlaybackRequest(url: SelftestSource.url, title: "Player Test")
                 }
             }
         }

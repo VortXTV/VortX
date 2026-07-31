@@ -19,8 +19,9 @@ struct HomeView: View {
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared   // Collections hub (shared singleton): Discover cards + Streaming-service tiles + Genre tiles
     @ObservedObject private var imported = ImportedCatalogs.shared   // user-imported list catalogs, rendered as Home rows
     @ObservedObject private var railPrefs = HomeRailPreferences.shared   // user's Home row order + hidden set (Continue Watching stays pinned first)
-    @State private var showCustomize = false   // presents the Home rows reorder/hide manage screen
     @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
+    @AppStorage(ExternalSyncToggle.traktContinueWatching) private var useTraktContinueWatching = false
+    @State private var traktContinueWatchingRevision = 0
     @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared   // #105: rails vs poster-wall Home layout
@@ -28,9 +29,15 @@ struct HomeView: View {
 
     /// The owner profile rides the account's Continue Watching; overlay profiles ride their own
     /// private synced history.
-    private var continueWatching: [CoreCWItem] {
-        profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
+    private var continueWatchingSelection: TraktPlaybackShadow.ContinueWatchingSelection {
+        guard profiles.activeUsesEngineHistory else {
+            return .init(items: profiles.cwItems, source: .local, sessionID: nil)
+        }
+        _ = traktContinueWatchingRevision
+        return TraktPlaybackShadow.shared.continueWatchingSelection(fallback: core.continueWatching)
     }
+
+    private var continueWatching: [CoreCWItem] { continueWatchingSelection.items }
 
     /// The profile-aware library, used (with Continue Watching) to seed + exclude in Top Picks.
     private var libraryItems: [CoreCWItem] {
@@ -90,7 +97,18 @@ struct HomeView: View {
                             // queue the user steps through in recency order, not a browse surface, so the
                             // poster-wall option never reshapes it. It is PINNED first (not part of
                             // HomeRailPreferences), so "Customize Home" never moves or hides it.
-                            CoreContinueWatchingRow(items: continueWatching, focusModel: focusModel)
+                            CoreContinueWatchingRow(
+                                items: continueWatching,
+                                // Private remote rows never seed generic hero enrichment, trailer, or
+                                // artwork caches. The rail remains actionable and visibly sourced.
+                                focusModel: continueWatchingSelection.source == .trakt ? nil : focusModel,
+                                // A Trakt row is read-only here. Its local-engine dismiss would delete the
+                                // wrong store, and remote playback deletion is outside this feature's scope.
+                                menu: continueWatchingSelection.source == .trakt
+                                    ? .none
+                                    : .continueWatching,
+                                traktSessionID: continueWatchingSelection.sessionID
+                            )
                         }
                         // Every other Home section renders in the user's arranged order, minus the hidden ones
                         // (HomeRailPreferences). Default order + nothing hidden == today's Home exactly, so this
@@ -118,7 +136,6 @@ struct HomeView: View {
                     .ignoresSafeArea()   // absolute top-left, clear of the hero title below
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
-            .fullScreenCover(isPresented: $showCustomize) { TVHomeRailEditorView() }
         }
     }
 
@@ -130,7 +147,14 @@ struct HomeView: View {
     /// First pass: initial seed on appear, plus the row / Continue Watching / profile re-seed triggers.
     private var homeSeedHandlers: some View {
         homeShell
-        .onAppear { configureMetaSources(); seed(); refreshTopPicks(); refreshReleaseCalendar(); if showCollectionsHub { collectionsHub.load() } }
+        .onAppear {
+            configureMetaSources()
+            TraktPlaybackShadow.shared.refreshIfStale()
+            seed()
+            refreshTopPicks()
+            refreshReleaseCalendar()
+            if showCollectionsHub { collectionsHub.load() }
+        }
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Discover too
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
@@ -138,13 +162,23 @@ struct HomeView: View {
         // plays must also re-seed the hero and Top Picks (the engine-CW onChange above never fires for them).
         .onChange(of: profiles.cwItems.first?.id) { seed(); refreshTopPicks() }
         .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
+        .onChange(of: useTraktContinueWatching) { on in
+            if on { TraktPlaybackShadow.shared.refreshNow() }
+            seed()
+            refreshTopPicks()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TraktPlaybackShadow.changedNote)) { _ in
+            traktContinueWatchingRevision &+= 1
+            seed()
+            refreshTopPicks()
+        }
     }
 
     /// Second pass: the release-calendar / meta-source triggers and the focus-settled hero trailer.
     private var homeChangeHandlers: some View {
         homeSeedHandlers
-        // Rebuild "Upcoming Episodes" when the library changes (a new follow) or the meta add-ons hydrate
-        // — the same two inputs the model sweeps over. The bases come from `account.addons`, which loads
+        // Rebuild "Upcoming Episodes" when the library changes (a new follow) or the meta add-ons hydrate,
+        // the same two inputs the model sweeps over. The bases come from `account.addons`, which loads
         // async after sign-in, so key on its count too (matching the notification sweep's input set).
         .onChange(of: core.library?.catalog.count ?? 0) { refreshReleaseCalendar() }
         .onChange(of: account.addons.count) { refreshReleaseCalendar() }
@@ -163,14 +197,15 @@ struct HomeView: View {
     /// Recompute the "Top Picks for you" rail from the profile-aware Continue Watching + library.
     /// The model no-ops when the seed set is unchanged, so this is cheap to call on every re-emit.
     private func refreshTopPicks() {
-        topPicks.refresh(profileID: profiles.activeID, cw: continueWatching, library: libraryItems)
-        becauseYouWatched.refresh(profileID: profiles.activeID, cw: continueWatching, library: libraryItems)   // "Because you watched <title>" rail; no-ops on an unchanged seed set
+        let localHistory = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
+        topPicks.refresh(profileID: profiles.activeID, cw: localHistory, library: libraryItems)
+        becauseYouWatched.refresh(profileID: profiles.activeID, cw: localHistory, library: libraryItems)   // "Because you watched <title>" rail; no-ops on an unchanged seed set
         traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
         simklRails.refresh()   // SIMKL plan-to-watch rail; internally throttled + dormant with empty creds
         mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none
     }
 
-    /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases — derived
+    /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases, derived
     /// EXACTLY like the new-episode notification sweep (series-typed library ids + names, `providesMeta`
     /// add-on base URLs). The model no-ops when the series set is unchanged, so this is cheap to re-call.
     private func refreshReleaseCalendar() {
@@ -198,9 +233,10 @@ struct HomeView: View {
     /// First render shows the page's actual first item, and Continue Watching pre-fetches its
     /// details so heroes are rich on first focus.
     private func seed() {
-        focusModel.seedIfEmpty(continueWatching.first?.focusedHero
+        let localHistory = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
+        focusModel.seedIfEmpty(localHistory.first?.focusedHero
                                ?? core.boardRows.first?.items.first?.focusedHero)
-        focusModel.warm(continueWatching.map(\.focusedHero))
+        focusModel.warm(localHistory.map(\.focusedHero))
         // Mirror Continue Watching onto the tvOS Home screen's Top Shelf. Hooked HERE because `seed()`
         // is already the point every input the shelf cares about converges on: it runs on appear and on
         // each of the Continue Watching / overlay-profile-history / active-profile changes, so the shelf
@@ -323,17 +359,15 @@ struct HomeView: View {
         }
     }
 
-    /// The brand lockup: serif "Vort" + the gold vortex mark as the "X" (the mark follows the theme accent),
-    /// plus a trailing "Customize Home" action that opens the rows manage screen.
+    /// The brand lockup: serif "Vort" + the gold vortex mark as the "X" (the mark follows the theme accent).
+    /// The old trailing "Customize Home" control was removed (INS-260722-02): it lived inside this header,
+    /// which is drawn as a `.topLeading` overlay that `.ignoresSafeArea()`, so it sat outside every
+    /// focusable container and the tvOS focus engine could never route the remote to it (a dead,
+    /// unfocusable affordance). The Home rows editor now lives as a focusable row under
+    /// Settings > Appearance ("Customize Home"), reached through the normal tvOS navigation model.
     private var header: some View {
-        HStack(spacing: 0) {
-            VortXWordmark(fontSize: 42)
-            Spacer()
-            Button { showCustomize = true } label: { Image(systemName: "slider.horizontal.3") }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .accessibilityLabel(Text("Customize Home"))
-        }
-        .padding(.horizontal, Theme.Space.screenEdge)
+        VortXWordmark(fontSize: 42)
+            .padding(.horizontal, Theme.Space.screenEdge)
     }
 }
 
@@ -489,7 +523,7 @@ struct RailHeader: View {
 }
 
 /// The BIG header for a nested collection GROUP (Streaming / Genres / Top New / New): reuses `RailHeader`'s
-/// eyebrow + title styling but a visual tier UP — the screen-title font with an accent rule beneath — so a
+/// eyebrow + title styling but a visual tier UP, the screen-title font with an accent rule beneath, so a
 /// group reads as a section ABOVE its child rails, distinct from an individual rail's `RailHeader`.
 struct GroupHeader: View {
     var eyebrow: String? = nil
@@ -529,7 +563,13 @@ struct CollectionGroupSection: View {
 }
 
 /// Target for opening a full detail page from a Continue Watching card's long-press menu.
-struct CWDetailTarget: Identifiable, Hashable { let id: String; let type: String }
+struct CWDetailTarget: Identifiable, Hashable {
+    let id: String
+    let type: String
+    let resumeSeconds: Double?
+    let videoID: String?
+    let traktSessionID: TraktSessionID?
+}
 
 /// "Continue Watching" rail from the engine (`continue_watching_preview`), newest first, with a
 /// resume-progress stripe on each poster.
@@ -537,14 +577,22 @@ struct CoreContinueWatchingRow: View {
     let items: [CoreCWItem]
     var focusModel: FocusedItemModel? = nil
     var menu: PosterMenu = .continueWatching   // .none on overlay-profile rails (engine menu doesn't apply)
+    var traktSessionID: TraktSessionID?
     @EnvironmentObject private var theme: ThemeManager   // observe so the rail's cards repaint on a theme change
     @EnvironmentObject private var presenter: PlayerPresenter
     @EnvironmentObject private var profiles: ProfileStore
+    @EnvironmentObject private var core: CoreBridge
     @State private var detailTarget: CWDetailTarget?
+    @State private var resumeHoardTask: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            RailHeader(eyebrow: String(localized: "Pick up where you left off"), title: String(localized: "Continue Watching"))
+            RailHeader(
+                eyebrow: traktSessionID == nil
+                    ? String(localized: "Pick up where you left off")
+                    : String(localized: "From Trakt"),
+                title: String(localized: "Continue Watching")
+            )
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(items) { item in
@@ -552,11 +600,28 @@ struct CoreContinueWatchingRow: View {
                                    type: item.type, id: item.id, progress: item.progress,
                                    resumeSeconds: item.resumeSeconds,
                                    menu: menu,
+                                   privateArtwork: traktSessionID != nil,
                                    onFocus: focusModel.map { model in
                                        { model.focus(item.focusedHero) }
                                    },
                                    directPlay: directResume(item),
-                                   onDetails: { detailTarget = CWDetailTarget(id: item.id, type: item.type) })
+                                   onDetails: {
+                                       guard traktSessionID == nil
+                                                || TraktAuth.storedSessionID == traktSessionID else { return }
+                                       detailTarget = CWDetailTarget(
+                                           id: item.id,
+                                           type: item.type,
+                                           resumeSeconds: traktSessionID == nil ? nil : item.resumeSeconds,
+                                           videoID: traktSessionID == nil ? nil : item.state.videoId,
+                                           traktSessionID: traktSessionID
+                                       )
+                                   })
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel(
+                                traktSessionID == nil
+                                    ? item.name
+                                    : "\(item.name), From Trakt"
+                            )
                     }
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
@@ -564,7 +629,22 @@ struct CoreContinueWatchingRow: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .navigationDestination(item: $detailTarget) { DetailView(type: $0.type, id: $0.id) }
+        .navigationDestination(item: $detailTarget) {
+            if $0.traktSessionID == nil
+                || TraktAuth.storedSessionID == $0.traktSessionID {
+                DetailView(
+                    type: $0.type,
+                    id: $0.id,
+                    initialResumeSeconds: $0.resumeSeconds,
+                    initialVideoID: $0.videoID,
+                    initialTraktSessionID: $0.traktSessionID
+                )
+            }
+        }
+        .onDisappear {
+            resumeHoardTask?.cancel()
+            resumeHoardTask = nil
+        }
     }
 
     /// Continue Watching resumes the exact link that was playing last time, straight
@@ -592,6 +672,8 @@ struct CoreContinueWatchingRow: View {
         }
         LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
         return {
+            guard traktSessionID == nil
+                    || TraktAuth.storedSessionID == traktSessionID else { return }
             let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
                                     name: entry.name, poster: entry.poster,
                                     season: entry.season, episode: entry.episode)
@@ -607,10 +689,21 @@ struct CoreContinueWatchingRow: View {
             // debrid/direct resumes (the common case), so those playbacks seeded nothing. Fire-and-forget,
             // deduped per content, gated inside SourceIndexClient (consent + fleet flag). No-op when the library
             // id is not a real imdb id or no groups assemble.
-            if let cid = SourceIndexClient.contentID(imdbId: item.id, season: entry.season, episode: entry.episode) {
+            // IDENTITY FENCE (REQ-260721-38): the key is built from the library item id, but the groups
+            // below are polled by the STORED entry's videoId, and those are two independent ids. The old
+            // guard compared episode NUMBERS, which cannot catch a title mismatch: item tt1375666 with a
+            // stored video tt0903747:1:1 published the latter's groups under tt1375666:1:1. `resumeContentID`
+            // compares canonical TITLE HEADS and returns nil when they disagree, which SKIPS the pool
+            // contribution only. Playback below is untouched: a mismatch never blocks the user's own resume.
+            if traktSessionID == nil,
+               let cid = SourceIndexClient.resumeContentID(itemID: item.id, videoID: entry.videoId,
+                                                           season: entry.season, episode: entry.episode) {
                 let streamId = entry.videoId
-                Task.detached {
-                    await SourceIndexClient.hoardResumedGroups(contentID: cid) {
+                resumeHoardTask?.cancel()
+                resumeHoardTask = Task(priority: .utility) {
+                    await SourceIndexClient.hoardResumedGroupsAfterPlayback(
+                        contentID: cid
+                    ) {
                         CoreBridge.shared.streamGroups(forStreamId: streamId)
                     }
                 }
@@ -618,6 +711,8 @@ struct CoreContinueWatchingRow: View {
             Task { @MainActor in
                 let hashShort = (entry.infoHash?.prefix(8)).map(String.init) ?? "-"
                 let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
+                guard traktSessionID == nil
+                        || TraktAuth.storedSessionID == traktSessionID else { return }
                 let bridge = CoreBridge.shared   // this row has no `core` env-object; use the shared engine bridge
                 if hasEpisodicPhysicalIdentity, entry.torrent == true,
                    entry.fileIdx == nil, !refreshed {
@@ -637,6 +732,8 @@ struct CoreContinueWatchingRow: View {
                                     streamType: requestType, streamId: entry.videoId)
                     let eps = await prefetchEpisodes(bridge, itemID: item.id,
                                                      usesSeriesLifecycle: usesSeriesLifecycle)
+                    guard traktSessionID == nil
+                            || TraktAuth.storedSessionID == traktSessionID else { return }
                     let groups = bridge.streamGroups(forStreamId: entry.videoId)
                     let source = resumeSource(entry: entry, url: resolvedURL, groups: groups,
                                               forceDirect: true)
@@ -654,7 +751,10 @@ struct CoreContinueWatchingRow: View {
                         bingeGroup: entry.bingeGroup, headers: entry.headers,
                         debridRef: ref, sourceStream: source,
                         enginePlayerVideoId: engineVideoID,
-                        wasExplicitPick: true, wasResume: true)
+                        wasExplicitPick: true, wasResume: true,
+                        // Resume at the exact offset printed on this card. For Trakt-sourced cards this
+                        // deliberately overrides the unrelated local/account position for this one play.
+                        startAtSeconds: item.resumeSeconds)
                     return
                 }
                 // No fresh link (non-debrid entry, or the source is genuinely gone): replay the stored url as
@@ -673,6 +773,8 @@ struct CoreContinueWatchingRow: View {
                 }
                 let eps = await prefetchEpisodes(bridge, itemID: item.id,
                                                  usesSeriesLifecycle: usesSeriesLifecycle)
+                guard traktSessionID == nil
+                        || TraktAuth.storedSessionID == traktSessionID else { return }
                 let groups = bridge.streamGroups(forStreamId: entry.videoId)
                 let source = resumeSource(entry: entry, url: resolvedURL, groups: groups)
                 let engineVideoID = source.flatMap {
@@ -685,7 +787,8 @@ struct CoreContinueWatchingRow: View {
                     url: resolvedURL, title: entry.title, meta: meta,
                     episodes: eps, sourceHint: entry.qualityText, torrent: entry.torrent ?? false,
                     headers: entry.headers, sourceStream: source,
-                    enginePlayerVideoId: engineVideoID, wasResume: true)
+                    enginePlayerVideoId: engineVideoID, wasResume: true,
+                    startAtSeconds: item.resumeSeconds)
             }
         }
     }
@@ -965,7 +1068,7 @@ struct StreamingRow: View {
 }
 
 /// "Upcoming Episodes": the next-airing episode of each series in the library within the next 45 days,
-/// soonest first (see `ReleaseCalendarModel`). Mirrors `TopPicksRow`/`StreamingRow` — each card is the
+/// soonest first (see `ReleaseCalendarModel`). Mirrors `TopPicksRow`/`StreamingRow`, each card is the
 /// series' `PosterCard` (so it routes to the series `DetailView` like any catalog card and resolves its
 /// poster through `PosterArtwork`), with a small "S2E5 · Jun 30" caption under it. Series-only.
 struct UpcomingEpisodesRow: View {
@@ -1042,7 +1145,7 @@ struct LoadingRail: View {
 /// tvOS manage screen to reorder + hide the Home rows. No drag on tvOS, so each row carries Up / Down and a
 /// Show/Hide toggle (the same pattern as `TVReorderServicesView`), each row its own `.focusSection()`. Writes
 /// straight to `HomeRailPreferences`, so the live Home re-lays out on dismiss. Continue Watching is pinned
-/// first and is intentionally not listed. Presented as a full-screen cover; the remote's Menu button (or the
+/// first and is intentionally not listed. Pushed as a focusable Settings destination via NavigationLink (Settings > Appearance > Customize Home) under INS-260722-02; the remote's Menu button (or the
 /// Done chip) closes it.
 struct TVHomeRailEditorView: View {
     @Environment(\.dismiss) private var dismiss
@@ -1080,7 +1183,7 @@ struct TVHomeRailEditorView: View {
             .padding(.vertical, Theme.Space.lg)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .onExitCommand { dismiss() }   // remote Menu button closes the cover
+        .onExitCommand { dismiss() }   // remote Menu button pops back to Settings (INS-260722-02: pushed, not a cover)
     }
 
     private func row(index: Int, rail: HomeRail, count: Int) -> some View {

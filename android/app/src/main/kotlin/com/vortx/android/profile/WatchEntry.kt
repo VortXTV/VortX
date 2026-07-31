@@ -18,7 +18,7 @@ import org.json.JSONObject
  * There are no floating-point fields, so the encoding is fully deterministic. A doc written by either
  * platform therefore decodes losslessly on the other and re-encodes to the same shape.
  *
- * INVARIANT (CLAUDE.md): the overlay is the profile's private store. It must NEVER be written into a
+ * INVARIANT (the repository guide): the overlay is the profile's private store. It must NEVER be written into a
  * `libraryItem` or any account/engine-parsed schema field — an early build corrupted official-app
  * library sync that way. This type is serialized only into the app-owned overlay caches + the app-owned
  * datastore collection, never the library.

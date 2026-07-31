@@ -28,6 +28,8 @@ struct BackupExportView: View {
     private enum Status: Equatable { case starting, waiting, saving, backedUp, failed }
 
     private static let qrSize: CGFloat = 320
+    // A real page on the account site (vortx-site, src/pages/approve.astro), which reads `c` and `k` out of
+    // location.search. Kept identical to the sign-in joiner's approveBase; see the long note there (#153).
     private static let approveBase = "https://vortx.tv/approve"
     private static let pollInterval: UInt64 = 2_000_000_000   // 2s
 
@@ -118,8 +120,8 @@ struct BackupExportView: View {
             try? await Task.sleep(nanoseconds: Self.pollInterval)
             if Task.isCancelled { return }
             switch await VortXSyncManager.shared.qrPoll(s) {
-            case .pending:
-                continue
+            case .pending, .transportError:
+                continue                             // reachable-but-idle, or a retriable relay blip; keep polling
             case .expired:
                 start(); return                      // the code aged out; mint a fresh one
             case .failed:

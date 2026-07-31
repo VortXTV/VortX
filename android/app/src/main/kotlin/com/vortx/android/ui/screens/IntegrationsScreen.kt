@@ -30,9 +30,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.vortx.android.integrations.CredentialConnectionState
 import com.vortx.android.integrations.SIMKLAuth
+import com.vortx.android.integrations.SIMKLException
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.integrations.TraktAuth
+import com.vortx.android.integrations.TraktAuthException
 import com.vortx.android.ui.components.PrimaryButton
 import com.vortx.android.ui.components.SurfaceCard
 import com.vortx.android.ui.theme.VortXIcons
@@ -61,8 +64,14 @@ fun IntegrationsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     // Reflect the persisted connection + toggle state on open (both are synchronous reads).
     LaunchedEffect(Unit) {
         ScrobbleService.init(appContext)
-        if (TraktAuth.isSignedIn) traktState = ConnectUi.Connected
-        if (SIMKLAuth.isSignedIn) simklState = ConnectUi.Connected
+        traktState = initialProviderState(
+            TraktAuth.connectionState,
+            TraktAuthException.SecureStorage.message ?: "Secure storage is unavailable.",
+        )
+        simklState = initialProviderState(
+            SIMKLAuth.connectionState,
+            SIMKLException.SecureStorage.message ?: "Secure storage is unavailable.",
+        )
         traktScrobble = ScrobbleService.isTraktScrobbleEnabled()
         simklScrobble = ScrobbleService.isSimklScrobbleEnabled()
     }
@@ -121,8 +130,14 @@ fun IntegrationsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     )
                 },
                 onDisconnect = {
-                    TraktAuth.signOut()
-                    traktState = ConnectUi.Idle
+                    traktState = disconnectProvider(TraktAuth::signOut)
+                },
+                onRetryStorage = {
+                    traktState = retryStorageUnavailable(
+                        connectionState = { TraktAuth.connectionState },
+                        storageUnavailableMessage =
+                            TraktAuthException.SecureStorage.message ?: "Secure storage is unavailable.",
+                    )
                 },
             )
 
@@ -154,8 +169,14 @@ fun IntegrationsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     )
                 },
                 onDisconnect = {
-                    SIMKLAuth.signOut()
-                    simklState = ConnectUi.Idle
+                    simklState = disconnectProvider(SIMKLAuth::signOut)
+                },
+                onRetryStorage = {
+                    simklState = retryStorageUnavailable(
+                        connectionState = { SIMKLAuth.connectionState },
+                        storageUnavailableMessage =
+                            SIMKLException.SecureStorage.message ?: "Secure storage is unavailable.",
+                    )
                 },
             )
         }
@@ -164,7 +185,7 @@ fun IntegrationsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 
 /// One connect flow's two async steps, kept together so [runConnect] can drive request -> await -> connected
 /// uniformly for both providers (Trakt device code, SIMKL PIN).
-private class ConnectStep(
+internal class ConnectStep(
     val userCode: String,
     val verificationUrl: String,
     val awaitAuthorized: suspend () -> Any?,
@@ -179,19 +200,48 @@ private fun runConnect(
     requestCode: suspend () -> ConnectStep,
 ) {
     scope.launch {
-        onState(ConnectUi.Requesting)
-        try {
-            val step = requestCode()
-            onState(ConnectUi.Awaiting(step.userCode, step.verificationUrl))
-            step.awaitAuthorized()
-            onState(ConnectUi.Connected)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            onState(ConnectUi.Error(e.message ?: "Could not connect. Please try again."))
-        }
+        driveConnect(onState, requestCode)
     }
 }
+
+internal suspend fun driveConnect(
+    onState: (ConnectUi) -> Unit,
+    requestCode: suspend () -> ConnectStep,
+) {
+    onState(ConnectUi.Requesting)
+    try {
+        val step = requestCode()
+        onState(ConnectUi.Awaiting(step.userCode, step.verificationUrl))
+        step.awaitAuthorized()
+        onState(ConnectUi.Connected())
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        onState(ConnectUi.Error(e.message ?: "Could not connect. Please try again."))
+    }
+}
+
+internal fun disconnectProvider(signOut: () -> Unit): ConnectUi = try {
+    signOut()
+    ConnectUi.Idle
+} catch (error: Exception) {
+    ConnectUi.Connected(error.message ?: "Could not disconnect. Please try again.")
+}
+
+internal fun initialProviderState(
+    connectionState: CredentialConnectionState,
+    storageUnavailableMessage: String,
+): ConnectUi = when (connectionState) {
+    CredentialConnectionState.CONNECTED -> ConnectUi.Connected()
+    CredentialConnectionState.DISCONNECTED -> ConnectUi.Idle
+    CredentialConnectionState.STORAGE_UNAVAILABLE ->
+        ConnectUi.StorageUnavailable(storageUnavailableMessage)
+}
+
+internal fun retryStorageUnavailable(
+    connectionState: () -> CredentialConnectionState,
+    storageUnavailableMessage: String,
+): ConnectUi = initialProviderState(connectionState(), storageUnavailableMessage)
 
 @Composable
 private fun ProviderCard(
@@ -204,6 +254,7 @@ private fun ProviderCard(
     onOpenUrl: (String) -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
+    onRetryStorage: () -> Unit,
 ) {
     val colors = VortXTheme.colors
     SurfaceCard(modifier = Modifier.fillMaxWidth()) {
@@ -228,6 +279,9 @@ private fun ProviderCard(
                     ) {
                         Icon(VortXIcons.checkmarkCircle, contentDescription = null, tint = colors.accent)
                         Text("Connected", style = VortXTheme.type.cardTitle, modifier = Modifier.fillMaxWidth(0.6f))
+                    }
+                    state.status?.let {
+                        Text(it, style = VortXTheme.type.body.copy(color = colors.danger))
                     }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -279,6 +333,18 @@ private fun ProviderCard(
                     Text("Requesting a code…", style = VortXTheme.type.body.copy(color = colors.textSecondary))
                 }
 
+                state is ConnectUi.StorageUnavailable -> {
+                    Text(
+                        state.message,
+                        style = VortXTheme.type.body.copy(color = colors.danger),
+                    )
+                    PrimaryButton(
+                        text = "Retry secure storage",
+                        onClick = onRetryStorage,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+
                 else -> {
                     (state as? ConnectUi.Error)?.let {
                         Text(it.message, style = VortXTheme.type.body.copy(color = colors.danger))
@@ -292,10 +358,11 @@ private fun ProviderCard(
 
 /// The per-provider connect UI state. Kept local to this screen (the auth objects hold the real token
 /// truth); mirrors the Apple settings view's connect/awaiting/connected states.
-private sealed interface ConnectUi {
+internal sealed interface ConnectUi {
     data object Idle : ConnectUi
     data object Requesting : ConnectUi
     data class Awaiting(val userCode: String, val verificationUrl: String) : ConnectUi
-    data object Connected : ConnectUi
+    data class Connected(val status: String? = null) : ConnectUi
+    data class StorageUnavailable(val message: String) : ConnectUi
     data class Error(val message: String) : ConnectUi
 }

@@ -50,6 +50,17 @@ enum VXProbe {
     /// On-disk URL of the rolling diagnostic log, exposed so the export helper can serve it.
     static var logFileURL: URL { VXProbeFileLog.shared.fileURL }
 
+    /// Flush every queued writer and return one coherent export snapshot. Export runs off the playback path,
+    /// so this bounded synchronous hop cannot stall rendering and it prevents a QR opened immediately after
+    /// an event from reading an older on-disk prefix.
+    static func logSnapshot() -> VXProbeLogSnapshot { VXProbeFileLog.shared.snapshot() }
+
+    /// Consume only the bytes represented by a successfully delivered snapshot. Any lines appended while
+    /// the phone downloaded that snapshot stay in the rolling log for the next export.
+    static func consumeLogSnapshot(_ snapshot: VXProbeLogSnapshot) {
+        VXProbeFileLog.shared.consume(snapshot)
+    }
+
     /// Empty the rolling diagnostic log (used by a "clear" action or before a fresh capture).
     static func clearLog() { VXProbeFileLog.shared.clear() }
 
@@ -68,6 +79,11 @@ enum VXProbe {
         guard result == KERN_SUCCESS else { return nil }
         return Double(info.resident_size) / (1024.0 * 1024.0)
     }
+}
+
+struct VXProbeLogSnapshot: Sendable {
+    let contents: String
+    fileprivate let bytes: Data
 }
 
 /// Rolling on-disk mirror of the probe log. Every enabled `log`/`event` line is written here (with a
@@ -116,8 +132,19 @@ final class VXProbeFileLog {
         let now = Date()
         queue.async { [weak self] in
             guard let self else { return }
-            NSLog("[%@] %@", category, message)
-            let line = "\(self.formatter.string(from: now)) [\(category)] \(message)\n"
+            // FORM THE WHOLE LINE THROUGH THE SHARED FORMATTER, then use those same bytes for both sinks, so
+            // there is exactly ONE place where a probe line becomes durable and it is downstream of the
+            // scrubber. NSLog gets the identical text (a device console log is shared just as casually as the
+            // file). Category is scrubbed too, and the cap covers the COMPLETE line rather than the message
+            // alone, so nothing can be appended after the cap to exceed it.
+            //
+            // This is a BACKSTOP, not the fix: the producers that build identifier-bearing strings are
+            // corrected at their own call sites. It is here because the producer set is open, and a new one
+            // must not be able to reintroduce the class. See VXProbeRedaction for what it does and, more
+            // importantly, what it cannot do.
+            let line = VXProbeRedaction.durableLine(timestamp: self.formatter.string(from: now),
+                                                    category: category, message: message)
+            NSLog("%@", String(line.dropLast()))
             guard let data = line.data(using: .utf8) else { return }
             self.write(data)
         }
@@ -172,6 +199,51 @@ final class VXProbeFileLog {
         handle = try? FileHandle(forWritingTo: fileURL)
         _ = try? handle?.seekToEnd()
         bytesWritten = tail.count
+    }
+
+    /// Serialize behind every pending async record, flush the persistent handle, then read one coherent file
+    /// image for export. The queue is never a caller queue for export, so queue.sync cannot recurse.
+    func snapshot() -> VXProbeLogSnapshot {
+        queue.sync {
+            try? handle?.synchronize()
+            let bytes = (try? Data(contentsOf: fileURL)) ?? Data()
+            return VXProbeLogSnapshot(
+                contents: String(decoding: bytes, as: UTF8.self),
+                bytes: bytes
+            )
+        }
+    }
+
+    /// Remove a delivered snapshot without erasing lines written after snapshot creation. If front trimming
+    /// or an external replacement changed the prefix while the transfer was in flight, preserve the complete
+    /// current file because there is no safe correspondence to consume.
+    func consume(_ snapshot: VXProbeLogSnapshot) {
+        queue.async { [weak self] in
+            guard let self, !snapshot.bytes.isEmpty else { return }
+            try? self.handle?.synchronize()
+            try? self.handle?.close()
+            self.handle = nil
+            let current = (try? Data(contentsOf: self.fileURL)) ?? Data()
+            guard let remaining = VXDiagExportPolicy.remainingLogAfterSuccessfulSnapshot(
+                snapshot: snapshot.bytes,
+                current: current
+            ) else {
+                self.reopenForAppend(byteCount: current.count)
+                return
+            }
+            do {
+                try remaining.write(to: self.fileURL, options: .atomic)
+                self.reopenForAppend(byteCount: remaining.count)
+            } catch {
+                self.reopenForAppend(byteCount: current.count)
+            }
+        }
+    }
+
+    private func reopenForAppend(byteCount: Int) {
+        handle = try? FileHandle(forWritingTo: fileURL)
+        _ = try? handle?.seekToEnd()
+        bytesWritten = byteCount
     }
 
     /// Empty the log file. Enqueued on the queue so it serializes with writes.

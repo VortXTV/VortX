@@ -31,12 +31,12 @@ import java.io.File
  *
  * Apple's store is `@MainActor`-isolated and every mutation hops to the main actor. Android has no such ambient
  * isolation and the [DownloadWorker] writes progress from a WorkManager background thread, so the record list is
- * guarded by [lock] instead and published through a [StateFlow] for Compose. The lock is held only for in-memory
- * list math plus the index write, never across a network or file transfer.
+ * guarded by [hydrationGate] instead and published through a [StateFlow] for Compose. The lock is held only for
+ * in-memory list math plus the index read/write, never across a network or media transfer.
  */
 object DownloadStore {
 
-    private val lock = Any()
+    private val hydrationGate = OneTimeHydrationGate()
 
     /** Newest-first, matching Apple's `records` ordering, for direct consumption by the downloads list. */
     private val _records = MutableStateFlow<List<DownloadRecord>>(emptyList())
@@ -45,17 +45,13 @@ object DownloadStore {
     @Volatile
     private var appContext: Context? = null
 
-    /**
-     * Hydrate the index from disk. Idempotent (a second call re-reads, which is harmless), so
-     * [com.vortx.android.VortXApplication] can call it at process start and the [DownloadWorker] can call it
-     * defensively: WorkManager can run a worker in a process whose Application.onCreate already ran, but a
-     * defensive init costs one cheap file read and rules out an un-hydrated store writing an empty index over
-     * a good one.
-     */
+    /** Hydrate exactly once per process, under the same lock used by every live mutation. */
     fun init(context: Context) {
-        appContext = context.applicationContext
-        ensureDownloadsDirectoryExists()
-        load()
+        hydrationGate.hydrate {
+            appContext = context.applicationContext
+            ensureDownloadsDirectoryExists()
+            loadLocked()
+        }
     }
 
     // MARK: Locations
@@ -118,14 +114,14 @@ object DownloadStore {
 
     // MARK: Persistence
 
-    private fun load() {
+    private fun loadLocked() {
         val file = indexFile()
         if (!file.isFile) return
         val decoded = runCatching {
             val array = JSONArray(file.readText())
             (0 until array.length()).mapNotNull { i -> recordFromJson(array.optJSONObject(i) ?: return@mapNotNull null) }
         }.getOrNull() ?: return
-        synchronized(lock) { _records.value = decoded.sortedByDescending { it.addedAt } }
+        _records.value = decoded.sortedByDescending { it.addedAt }
     }
 
     /** Encode + write the index atomically (write to a temp then rename), matching Apple's `.atomic` write. */
@@ -158,7 +154,7 @@ object DownloadStore {
         _records.value.any { it.videoId == videoId && it.state != DownloadState.FAILED }
 
     fun upsert(record: DownloadRecord) {
-        synchronized(lock) {
+        hydrationGate.withLock {
             val current = _records.value
             val index = current.indexOfFirst { it.id == record.id }
             _records.value = if (index >= 0) {
@@ -179,13 +175,26 @@ object DownloadStore {
      * second. State transitions keep the default and persist.
      */
     fun update(id: String, persistIndex: Boolean = true, mutate: (DownloadRecord) -> DownloadRecord) {
-        synchronized(lock) {
-            val current = _records.value
-            val index = current.indexOfFirst { it.id == id }
-            if (index < 0) return
-            _records.value = current.toMutableList().also { it[index] = mutate(it[index]) }
-            if (persistIndex) persistLocked()
-        }
+        updateIf(id, persistIndex, predicate = { true }, mutate = mutate)
+    }
+
+    /**
+     * Atomically mutate only when the current row still satisfies [predicate]. Returns the published row, or null
+     * when the id disappeared or its ownership changed before this callback arrived.
+     */
+    internal fun updateIf(
+        id: String,
+        persistIndex: Boolean = true,
+        predicate: (DownloadRecord) -> Boolean,
+        mutate: (DownloadRecord) -> DownloadRecord,
+    ): DownloadRecord? = hydrationGate.withLock {
+        val current = _records.value
+        val index = current.indexOfFirst { it.id == id }
+        if (index < 0 || !predicate(current[index])) return@withLock null
+        val updated = mutate(current[index])
+        _records.value = current.toMutableList().also { it[index] = updated }
+        if (persistIndex) persistLocked()
+        updated
     }
 
     /**
@@ -197,9 +206,9 @@ object DownloadStore {
      * left to ever reference or clean it up.
      */
     fun remove(id: String) {
-        synchronized(lock) {
+        hydrationGate.withLock {
             val current = _records.value
-            val record = current.firstOrNull { it.id == id } ?: return
+            val record = current.firstOrNull { it.id == id } ?: return@withLock
             runCatching { fileFor(record).delete() }
             runCatching { partFileFor(record).delete() }
             _records.value = current.filterNot { it.id == id }
@@ -298,7 +307,7 @@ object DownloadStore {
 
     // MARK: JSON
 
-    private fun recordToJson(record: DownloadRecord): JSONObject = JSONObject().apply {
+    internal fun recordToJson(record: DownloadRecord): JSONObject = JSONObject().apply {
         put("id", record.id)
         put("contentId", record.contentId)
         put("videoId", record.videoId)
@@ -309,22 +318,28 @@ object DownloadStore {
         record.episode?.let { put("episode", it) }
         record.sourceName?.let { put("sourceName", it) }
         record.qualityText?.let { put("qualityText", it) }
+        record.isDolbyVision?.let { put("isDolbyVision", it) }
+        record.isAtmos?.let { put("isAtmos", it) }
         put("isTorrent", record.isTorrent)
         record.headers?.takeIf { it.isNotEmpty() }?.let { headers ->
             put("headers", JSONObject().apply { headers.forEach { (k, v) -> put(k, v) } })
         }
         put("remoteURL", record.remoteURL)
+        record.debridOwnerIdentity?.let { put("debridOwnerIdentity", it) }
+        record.debridOwnerGeneration?.let { put("debridOwnerGeneration", it) }
         put("localFilename", record.localFilename)
         put("bytesTotal", record.bytesTotal)
         put("bytesDone", record.bytesDone)
         put("state", record.state.wireValue)
+        record.transferGeneration?.let { put("transferGeneration", it) }
+        record.representationETag?.let { put("representationETag", it) }
         put("addedAt", record.addedAt)
         record.errorText?.let { put("errorText", it) }
         record.retryNote?.let { put("retryNote", it) }
         record.taskIdentifier?.let { put("taskIdentifier", it) }
     }
 
-    private fun recordFromJson(json: JSONObject): DownloadRecord? {
+    internal fun recordFromJson(json: JSONObject): DownloadRecord? {
         val id = json.optString("id").takeIf { it.isNotEmpty() } ?: return null
         val headers = json.optJSONObject("headers")?.let { obj ->
             obj.keys().asSequence().associateWith { obj.optString(it) }
@@ -340,13 +355,25 @@ object DownloadStore {
             episode = if (json.has("episode")) json.optInt("episode") else null,
             sourceName = json.optStringOrNull("sourceName"),
             qualityText = json.optStringOrNull("qualityText"),
+            // Old index rows contain only display quality such as "4K", not codec capabilities.
+            // Absence is therefore unknown and must be established from the completed local file.
+            isDolbyVision = json.optBooleanOrNull("isDolbyVision"),
+            isAtmos = json.optBooleanOrNull("isAtmos"),
             isTorrent = json.optBoolean("isTorrent", false),
             headers = headers,
             remoteURL = json.optString("remoteURL"),
+            debridOwnerIdentity = json.optStringOrNull("debridOwnerIdentity"),
+            debridOwnerGeneration = if (json.has("debridOwnerGeneration")) {
+                json.optLong("debridOwnerGeneration")
+            } else {
+                null
+            },
             localFilename = json.optString("localFilename"),
             bytesTotal = json.optLong("bytesTotal", 0L),
             bytesDone = json.optLong("bytesDone", 0L),
             state = DownloadState.fromWire(json.optString("state")),
+            transferGeneration = json.optStringOrNull("transferGeneration"),
+            representationETag = json.optStringOrNull("representationETag"),
             // Read as LONG, never optInt: this is epoch millis and exceeds 2^31, which an Int read would
             // truncate (the same trap the sync engine documents for its document `version`). A truncated
             // addedAt would silently scramble the newest-first ordering + the episode tie-break.
@@ -360,6 +387,31 @@ object DownloadStore {
     /** `optString` returns "" for an absent key, which would turn a null poster/error into an empty string. */
     private fun JSONObject.optStringOrNull(key: String): String? =
         if (has(key) && !isNull(key)) optString(key).takeIf { it.isNotEmpty() } else null
+
+    private fun JSONObject.optBooleanOrNull(key: String): Boolean? =
+        if (has(key) && !isNull(key)) optBoolean(key) else null
+}
+
+/**
+ * One-shot hydration barrier. The load-and-publish block and every later mutation share this lock, so a delayed disk
+ * read must publish before a live mutation and can never run again to resurrect stale state.
+ */
+internal class OneTimeHydrationGate {
+    private val lock = Any()
+    private var hydrated = false
+
+    fun hydrate(loadAndPublish: () -> Unit) {
+        synchronized(lock) {
+            if (hydrated) return
+            loadAndPublish()
+            hydrated = true
+        }
+    }
+
+    fun <T> withLock(block: () -> T): T = synchronized(lock) {
+        check(hydrated) { "DownloadStore must hydrate before mutation" }
+        block()
+    }
 }
 
 /**

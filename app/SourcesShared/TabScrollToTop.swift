@@ -87,7 +87,7 @@ extension View {
 
 /// Re-tapping the active tab also POPS its NavigationStack to root (then the scroll-to-top above lands
 /// on the root screen's anchor). Only a RE-TAP bumps the token, so switching to a tab that has a pushed
-/// detail keeps its stack intact — routine navigation is untouched. Two shapes because the tab screens
+/// detail keeps its stack intact; routine navigation is untouched. Two shapes because the tab screens
 /// keep their paths as either an untyped `NavigationPath` or a typed `[Element]` array.
 struct PopToRootOnBump: ViewModifier {
     let key: String

@@ -12,6 +12,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeoutOrNull
 
+internal fun torrentResolveService(
+    confirmedCachedService: DebridService?,
+    configuredServices: List<DebridService>,
+): DebridService? =
+    if (confirmedCachedService != null) {
+        confirmedCachedService.takeIf { it in configuredServices }
+    } else {
+        configuredServices.firstOrNull()
+    }
+
 /// Drives cache-check + playback resolution across the user's configured debrid providers. This is the
 /// Kotlin port of the Apple `DebridCoordinator` (app/SourcesShared/DebridResolver.swift): the per-provider
 /// resolve/cache-check legs live in [DebridResolver] (which dispatches by service); this layer adds the
@@ -36,7 +46,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 /// synchronously (EncryptedSharedPreferences reads are cheap and thread-safe), so no warm/reload dance and no
 /// actor isolation are needed. Callers (the source-list assembly wave, the CW resume path) construct one and
 /// invoke its suspend methods from any dispatcher.
-class DebridCoordinator(
+internal class DebridCoordinator(
     private val resolver: DebridResolver,
     private val keys: DebridKeys,
 ) {
@@ -61,10 +71,12 @@ class DebridCoordinator(
     data class DebridPlaybackRef(
         val url: String,
         val service: DebridService,
+        val owner: DebridOwnerToken,
         val infoHash: String,
         val torrentId: Int?,
         val fileId: Int?,
         val fileIdx: Int?,
+        val episode: DebridResolver.Episode? = null,
     )
 
     /// A resolvable source the failover race operates on. The source-list assembly wave maps each ranked
@@ -74,10 +86,10 @@ class DebridCoordinator(
     /// direct/debrid link (skipped: nothing to resolve). Mirrors the `CoreStream` fields the Apple
     /// `resolveFirstPlayable` reads.
     ///
-    /// [source] is the [StreamSource] this candidate was mapped from, carried ONLY so the label-authoritative
-    /// gate in [resolveFirstPlayable] can rank a race winner's resolution via [StreamRanking.resolutionRank]
-    /// (the Android analogue of Apple's `CoreStream` candidates carrying their own resolution). Null when the
-    /// caller has no source to attach (the gate then treats the candidate as always acceptable).
+    /// [source] is the [StreamSource] this candidate was mapped from, carried so the label-authoritative gate
+    /// in [resolveFirstPlayable] can rank a race winner's resolution via [StreamRanking.resolutionRank] and the
+    /// caller can preserve the exact winner. [confirmedCachedService] binds a torrent candidate to the provider
+    /// whose cache check proved its hash cached; it is null for unprobed torrents and TorBox-only usenet.
     data class DebridCandidate(
         val infoHash: String? = null,
         val magnet: String? = null,
@@ -88,6 +100,7 @@ class DebridCoordinator(
         val fileIdx: Int? = null,
         val hasDirectUrl: Boolean = false,
         val source: StreamSource? = null,
+        val confirmedCachedService: DebridService? = null,
     )
 
     /// A cache-check hit: which provider has the hash cached, plus the cached file list. Mirrors the Apple
@@ -116,9 +129,6 @@ class DebridCoordinator(
     /// TorBox key every usenet path is inert.
     val hasUsenetResolver: Boolean get() = keys.isConfigured(DebridService.TOR_BOX)
 
-    private fun pickService(service: DebridService?): DebridService? =
-        service?.takeIf(keys::isConfigured) ?: keys.configuredServices().firstOrNull()
-
     // ------------------------------------------------------------------------------------------------
     // Cache-check (concurrent fan-out)
     // ------------------------------------------------------------------------------------------------
@@ -131,15 +141,20 @@ class DebridCoordinator(
     /// additionally wrapped so even an unexpected throw hides only that provider and never cancels its
     /// siblings ([supervisorScope]). Real-Debrid contributes nothing (it removed its instant cache-check).
     /// Empty with no key. Mirrors the Apple `DebridCoordinator.cacheCheck` `withTaskGroup` + priority merge.
-    suspend fun cacheCheck(hashes: List<String>): Map<String, CacheHit> {
-        val services = keys.configuredServices()
+    suspend fun cacheCheck(
+        hashes: List<String>,
+        expectedOwner: DebridOwnerToken? = keys.ownerToken(),
+    ): Map<String, CacheHit> {
+        val owner = expectedOwner ?: return emptyMap()
+        if (!keys.isCurrent(owner)) return emptyMap()
+        val services = keys.configuredServices(owner)
         if (services.isEmpty() || hashes.isEmpty()) return emptyMap()
 
         val maps: Map<DebridService, Map<String, List<DebridResolver.DebridFile>>> = supervisorScope {
             val deferreds = services.map { service ->
                 service to async(Dispatchers.IO) {
                     try {
-                        resolver.checkCache(service, hashes)
+                        resolver.checkCache(service, hashes, owner)
                     } catch (cancel: CancellationException) {
                         throw cancel
                     } catch (error: Exception) {
@@ -161,16 +176,19 @@ class DebridCoordinator(
                 if (files.isNotEmpty() && !out.containsKey(hash)) out[hash] = CacheHit(service, files)
             }
         }
-        return out
+        return out.takeIf { keys.isCurrent(owner) }.orEmpty()
     }
 
     /// Which of [nzbMd5s] the user's TorBox usenet account has cached (drives the usenet cache badge). The
     /// keys are the lowercased md5 identifiers, matching [DebridResolver.usenetIdentifier]. Empty with no
     /// TorBox key. Mirrors the Apple `usenetCacheCheck`.
     suspend fun usenetCacheCheck(nzbMd5s: List<String>): Set<String> {
-        if (!hasUsenetResolver || nzbMd5s.isEmpty()) return emptySet()
-        val map = resolver.usenetCheckCache(nzbMd5s)
+        val owner = keys.ownerToken() ?: return emptySet()
+        if (!keys.isConfigured(DebridService.TOR_BOX, owner) || nzbMd5s.isEmpty()) return emptySet()
+        val map = resolver.usenetCheckCache(nzbMd5s, owner)
         return map.filterValues { it.isNotEmpty() }.keys
+            .takeIf { keys.isCurrent(owner) }
+            .orEmpty()
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -188,8 +206,20 @@ class DebridCoordinator(
         episode: DebridResolver.Episode? = null,
         trackers: List<String> = emptyList(),
     ): Pair<DebridResolver.ResolvedLink, DebridService> {
-        val chosen = pickService(service) ?: throw DebridResolver.DebridException.NoKey
-        val link = resolver.resolveWithIds(chosen, infoHash, magnet, fileIdx, episode, trackers)
+        val owner = keys.ownerToken() ?: throw DebridResolver.DebridException.NoKey
+        val chosen = service?.takeIf { keys.isConfigured(it, owner) }
+            ?: keys.configuredServices(owner).firstOrNull()
+            ?: throw DebridResolver.DebridException.NoKey
+        val link = resolver.resolveWithIds(
+            chosen,
+            infoHash,
+            magnet,
+            fileIdx,
+            episode,
+            trackers,
+            owner,
+        )
+        if (!keys.isCurrent(owner)) throw DebridResolver.DebridException.OwnerChanged
         return link to chosen
     }
 
@@ -201,9 +231,24 @@ class DebridCoordinator(
         torrentId: Int?,
         fileId: Int?,
         fileIdx: Int?,
+        episode: DebridResolver.Episode?,
+        expectedOwner: DebridOwnerToken? = null,
     ): String {
-        if (!keys.isConfigured(service)) throw DebridResolver.DebridException.NoKey
-        return resolver.reresolveLink(service, infoHash, torrentId, fileId, fileIdx)
+        val owner = expectedOwner ?: keys.ownerToken() ?: throw DebridResolver.DebridException.NoKey
+        if (!keys.isCurrent(owner)) throw DebridResolver.DebridException.OwnerChanged
+        if (!keys.isConfigured(service, owner)) throw DebridResolver.DebridException.NoKey
+        return resolver.reresolveLink(
+            service,
+            infoHash,
+            torrentId,
+            fileId,
+            fileIdx,
+            episode,
+            owner,
+        )
+            .also {
+                if (!keys.isCurrent(owner)) throw DebridResolver.DebridException.OwnerChanged
+            }
     }
 
     /// Resolve a usenet stream (nzb link) to a direct HTTPS URL via the TorBox usenet backend. Throws
@@ -216,8 +261,23 @@ class DebridCoordinator(
         fileIdx: Int? = null,
         episode: DebridResolver.Episode? = null,
     ): String {
-        if (!hasUsenetResolver) throw DebridResolver.DebridException.NoKey
-        return resolver.resolveUsenet(nzbUrl, knownHash, fileMustInclude, fileIdx, episode)
+        val owner = keys.ownerToken() ?: throw DebridResolver.DebridException.NoKey
+        if (!keys.isConfigured(DebridService.TOR_BOX, owner)) {
+            throw DebridResolver.DebridException.NoKey
+        }
+        return resolver.resolveUsenet(
+            nzbUrl,
+            knownHash,
+            fileMustInclude,
+            fileIdx,
+            episode,
+            owner,
+        )
+            .also {
+                if (!keys.isCurrent(owner)) {
+                    throw DebridResolver.DebridException.OwnerChanged
+                }
+            }
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -232,25 +292,40 @@ class DebridCoordinator(
     ///
     /// NO-KEY / CACHE GATE: with no resolver this returns null immediately (no network). When [confirmedCachedHashes]
     /// (or [confirmedUsenetURLs]) is non-null, a not-confirmed pick returns null with ZERO network so the
-    /// caller falls straight through to the embedded path; a null set keeps the pre-gate behaviour. Mirrors
-    /// the Apple `resolvedPlaybackRef`.
+    /// caller falls straight through to the embedded path. A confirmed torrent must also carry the provider
+    /// that supplied the hit, preventing a different first-configured provider from receiving the resolve.
+    /// A null set keeps the pre-gate behaviour. Mirrors the Apple `resolvedPlaybackRef`.
     suspend fun resolvePlaybackRef(
         candidate: DebridCandidate,
         episode: DebridResolver.Episode? = null,
         confirmedCachedHashes: Set<String>? = null,
         confirmedUsenetURLs: Set<String>? = null,
+        expectedOwner: DebridOwnerToken? = null,
     ): DebridPlaybackRef? {
+        val owner = expectedOwner ?: keys.ownerToken() ?: return null
+        if (!keys.isCurrent(owner)) return null
         // USENET first: a stream with an .nzb link (and no direct url) resolves through the TorBox usenet
         // backend, gated on a TorBox key. NOT a torrent: the minted URL is a plain direct stream (no infoHash).
         if (!candidate.hasDirectUrl && !candidate.nzbUrl.isNullOrBlank()) {
-            if (!hasUsenetResolver) return null
+            if (!keys.isConfigured(DebridService.TOR_BOX, owner)) return null
             if (confirmedUsenetURLs != null && candidate.nzbUrl !in confirmedUsenetURLs) return null
             return withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
                 try {
                     val url = resolver.resolveUsenet(
                         candidate.nzbUrl, candidate.usenetKnownHash, candidate.fileMustInclude, candidate.fileIdx, episode,
+                        owner,
                     )
-                    DebridPlaybackRef(url, DebridService.TOR_BOX, infoHash = "", torrentId = null, fileId = null, fileIdx = candidate.fileIdx)
+                    if (!keys.isCurrent(owner)) return@withTimeoutOrNull null
+                    DebridPlaybackRef(
+                        url = url,
+                        service = DebridService.TOR_BOX,
+                        owner = owner,
+                        infoHash = "",
+                        torrentId = null,
+                        fileId = null,
+                        fileIdx = candidate.fileIdx,
+                        episode = episode,
+                    )
                 } catch (cancel: CancellationException) {
                     throw cancel
                 } catch (error: Exception) {
@@ -263,15 +338,36 @@ class DebridCoordinator(
         // infoHash isn't ours to resolve. Branch out before any provider work.
         if (candidate.hasDirectUrl) return null
         val hash = candidate.infoHash?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
-        if (!hasAnyResolver) return null
         if (confirmedCachedHashes != null && hash !in confirmedCachedHashes) return null
-        val service = pickService(null) ?: return null
+        if (confirmedCachedHashes != null && candidate.confirmedCachedService == null) return null
+        val service = torrentResolveService(
+            candidate.confirmedCachedService,
+            keys.configuredServices(owner),
+        ) ?: return null
         val magnet = candidate.magnet?.takeIf { it.isNotBlank() } ?: resolver.magnet(hash, candidate.trackers)
 
         return withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
             try {
-                val link = resolver.resolveWithIds(service, hash, magnet, candidate.fileIdx, episode, candidate.trackers)
-                DebridPlaybackRef(link.url, service, hash, link.torrentId, link.fileId, candidate.fileIdx)
+                val link = resolver.resolveWithIds(
+                    service,
+                    hash,
+                    magnet,
+                    candidate.fileIdx,
+                    episode,
+                    candidate.trackers,
+                    owner,
+                )
+                if (!keys.isCurrent(owner)) return@withTimeoutOrNull null
+                DebridPlaybackRef(
+                    url = link.url,
+                    service = service,
+                    owner = owner,
+                    infoHash = hash,
+                    torrentId = link.torrentId,
+                    fileId = link.fileId,
+                    fileIdx = candidate.fileIdx,
+                    episode = episode,
+                )
             } catch (cancel: CancellationException) {
                 throw cancel
             } catch (error: Exception) {
@@ -320,9 +416,12 @@ class DebridCoordinator(
         cachedUsenetURLs: Set<String> = emptySet(),
         max: Int = 4,
         labeledBest: StreamSource? = null,
+        expectedOwner: DebridOwnerToken? = keys.ownerToken(),
     ): PlayableWinner? {
+        val owner = expectedOwner ?: return null
+        if (!keys.isCurrent(owner)) return null
         // No-key / nothing-to-race guarantee: return before any provider contact so the caller's fallback runs.
-        if (!hasAnyResolver && !hasUsenetResolver) return null
+        if (keys.configuredServices(owner).isEmpty()) return null
         if (cachedHashes.isEmpty() && cachedUsenetURLs.isEmpty()) return null
 
         // Keep only the confirmed-cached, resolvable candidates, in the caller's rank order.
@@ -364,8 +463,14 @@ class DebridCoordinator(
         // labeled best instead.
         if (racing.size == 1) {
             if (!acceptable(racing[0])) return null
-            val ref = resolvePlaybackRef(racing[0], episode, cachedHashes, cachedUsenetURLs) ?: return null
-            return PlayableWinner(ref, racing[0])
+            val ref = resolvePlaybackRef(
+                racing[0],
+                episode,
+                cachedHashes,
+                cachedUsenetURLs,
+                owner,
+            ) ?: return null
+            return PlayableWinner(ref, racing[0]).takeIf { keys.isCurrent(owner) }
         }
 
         return supervisorScope {
@@ -376,7 +481,13 @@ class DebridCoordinator(
                 launch(Dispatchers.IO) {
                     var result: PlayableWinner? = null
                     try {
-                        result = resolvePlaybackRef(candidate, episode, cachedHashes, cachedUsenetURLs)
+                        result = resolvePlaybackRef(
+                            candidate,
+                            episode,
+                            cachedHashes,
+                            cachedUsenetURLs,
+                            owner,
+                        )
                             ?.let { PlayableWinner(it, candidate) }
                     } catch (cancel: CancellationException) {
                         throw cancel   // real cancellation: propagate (the finally still emits its sentinel)
@@ -407,7 +518,7 @@ class DebridCoordinator(
             // Cancel the remaining in-flight legs (idempotent on already-completed ones). The supervisorScope
             // then awaits their prompt, cancellation-honoring exit before returning.
             legs.forEach { it.cancel() }
-            winner
+            winner.takeIf { keys.isCurrent(owner) }
         }
     }
 
@@ -439,29 +550,56 @@ class DebridCoordinator(
     ): ResumeResolution {
         // No debrid provenance: the stored link is all we have. (Usenet refs carry an empty infoHash, so they
         // also take this path: usenet has no reresolve id, exactly as on Apple.)
-        if (ref == null || ref.infoHash.isEmpty()) {
+        if (ref == null) {
             return ResumeResolution(storedUrl.orEmpty(), refreshed = false)
+        }
+        // A direct link minted for a different account generation is never replayed, even inside the fresh
+        // window. This catches A -> signed out -> A as well as A -> B because generation is mutation-based.
+        if (!keys.isCurrent(ref.owner)) {
+            return ResumeResolution("", refreshed = false)
+        }
+        if (ref.infoHash.isEmpty()) {
+            return if (keys.isCurrent(ref.owner)) {
+                ResumeResolution(storedUrl.orEmpty(), refreshed = false)
+            } else {
+                ResumeResolution("", refreshed = false)
+            }
         }
         // INSTANT RESUME: still inside the fresh window -> replay the stored link directly (fresh-window check
         // is independent of whether the key is still configured, matching Apple's ordering).
         if (!storedUrl.isNullOrEmpty() && linkSavedAtMillis != null) {
             val age = System.currentTimeMillis() - linkSavedAtMillis
-            if (age in 0 until FRESH_LINK_WINDOW_MS) return ResumeResolution(storedUrl, refreshed = true)
+            if (age in 0 until FRESH_LINK_WINDOW_MS) {
+                return if (keys.isCurrent(ref.owner)) {
+                    ResumeResolution(storedUrl, refreshed = true)
+                } else {
+                    ResumeResolution("", refreshed = false)
+                }
+            }
         }
         // Key removed since the entry was recorded: skip the doomed reresolve and fall back to the stored link
         // (Apple's reresolve throws .noKey here, caught to the same fallback).
-        if (!keys.isConfigured(ref.service)) {
+        if (!keys.isConfigured(ref.service, ref.owner)) {
             return ResumeResolution(storedUrl.orEmpty(), refreshed = false)
         }
         // Older than the window (or no mint timestamp): mint a FRESH link for the SAME file, SAME provider.
         val fresh = try {
-            reresolve(ref.service, ref.infoHash, ref.torrentId, ref.fileId, ref.fileIdx)
+            reresolve(
+                ref.service,
+                ref.infoHash,
+                ref.torrentId,
+                ref.fileId,
+                ref.fileIdx,
+                ref.episode,
+                ref.owner,
+            )
         } catch (cancel: CancellationException) {
             throw cancel
         } catch (error: Exception) {
             Log.d(TAG, "CW resume reresolve failed for ${ref.service.displayName}: ${error.message}")
             null
         }
+        if (!keys.isCurrent(ref.owner)) return ResumeResolution("", refreshed = false)
         if (fresh != null) return ResumeResolution(fresh, refreshed = true)
         // Same source genuinely unavailable: fall back to the possibly-stale stored link.
         return ResumeResolution(storedUrl.orEmpty(), refreshed = false)

@@ -141,6 +141,8 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private fun encodeTrackId(group: Int, track: Int): Int = group * 1000 + track
 
     override fun load(playable: Playable) {
+        lastPlayable = playable
+
         // yt-direct ADAPTIVE trailer: the InnerTube answer is a video-only leg + a separate audio-only leg
         // (not a single .mpd). Merge them with a [MergingMediaSource] of two [ProgressiveMediaSource]s over a
         // [DefaultHttpDataSource] whose UA is the MINTING client's UA -- the UA/URL lockstep googlevideo

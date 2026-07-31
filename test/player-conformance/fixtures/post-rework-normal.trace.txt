@@ -1,0 +1,26 @@
+2026-07-22 04:00:00.000 [dv] hls server listening on 127.0.0.1:59999
+2026-07-22 04:00:00.010 [avplayer] dv-remux mount host=192.168.1.5 -> http
+2026-07-22 04:00:00.050 [dv] hls signaling codecs=avc1.64001F,mp4a.40.2 supplemental=none range=none fps=24.000 bw=3000000 dv=false
+2026-07-22 04:00:00.100 [dv] hls req /master.m3u8
+2026-07-22 04:00:00.101 [dv] hls resp /master.m3u8 variants=1 audio=1 audioTags=1 subs=0 320B
+2026-07-22 04:00:00.700 [dv] hls media segment 0 published +0.7s after mount (1400000B, 6.00s media)
+2026-07-22 04:00:01.400 [dv] hls media segment 1 published +1.4s after mount (1400000B, 6.00s media)
+2026-07-22 04:00:01.850 [dv] hls req /media.m3u8
+2026-07-22 04:00:01.851 [dv] hls resp /media.m3u8 seq=0 segs=2 ended=false 210B
+2026-07-22 04:00:01.900 [dv] hls req /init.mp4
+2026-07-22 04:00:01.901 [dv] hls resp /init.mp4 1309B
+2026-07-22 04:00:01.950 [dv] hls req /seg0.m4s
+2026-07-22 04:00:01.951 [dv] hls resp /seg0.m4s 1400000B
+2026-07-22 04:00:01.955 [dv] hls req /audio0.m3u8
+2026-07-22 04:00:01.956 [dv] hls resp /audio0.m3u8 seq=0 segs=2
+2026-07-22 04:00:01.960 [dv] hls req /audio0-seg0.m4s
+2026-07-22 04:00:01.961 [dv] hls resp /audio0-seg0.m4s 90000B
+2026-07-22 04:00:02.010 [avplayer] readyToPlay -> play() rate=1.0 tcs=2 waitReason=none
+2026-07-22 04:00:05.000 [dv] hls req /media.m3u8
+2026-07-22 04:00:05.001 [dv] hls resp /media.m3u8 seq=0 segs=6 ended=false 470B
+2026-07-22 04:00:05.100 [dv] hls req /seg1.m4s
+2026-07-22 04:00:05.101 [dv] hls resp /seg1.m4s 1400000B
+2026-07-22 04:01:20.000 [dv] hls req /media.m3u8
+2026-07-22 04:01:20.001 [dv] hls resp /media.m3u8 seq=8 segs=6 ended=false 470B
+2026-07-22 04:01:20.100 [dv] hls req /seg9.m4s
+2026-07-22 04:01:20.101 [dv] hls resp /seg9.m4s 1400000B

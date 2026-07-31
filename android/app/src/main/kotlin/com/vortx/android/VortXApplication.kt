@@ -17,12 +17,20 @@ import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.downloads.DownloadStore
+import com.vortx.android.debrid.DebridAccountOwnerState
+import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.engine.EngineStremioRepository
+import com.vortx.android.iptv.IPTVCleanupCoordinator
+import com.vortx.android.iptv.IPTVPlaylists
+import com.vortx.android.iptv.iptvCleanupActions
+import com.vortx.android.iptv.launchIPTVStartupCleanup
 import com.vortx.android.mediaserver.MediaServerRepository
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.sync.SessionOwnerSnapshot
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 /// Owns the ONE [EngineStremioRepository] instance for the process's lifetime.
@@ -50,6 +58,10 @@ import kotlinx.coroutines.launch
 /// Watching/sign-in restore themselves with no extra code (see `EngineStremioRepository.start`).
 class VortXApplication : Application(), SingletonImageLoader.Factory {
 
+    /// Process-owned recovery work. A failed cleanup cannot cancel another startup child, and IO keeps
+    /// encrypted preference reads, engine add-on inspection, and Worker revocation off the main thread.
+    private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     /// Null only if native init genuinely failed (missing/incompatible `libstremiox_core.so`, an
     /// engine-side throw). Built once, lazily, on first access (not `onCreate`) so a
     /// [android.content.ContentProvider] or test harness that never touches the engine never pays the
@@ -71,6 +83,9 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     /// touches the network here. The settings screen calls the same idempotent init defensively.
     override fun onCreate() {
         super.onCreate()
+        // Fail closed until the encrypted session store has produced a definitive account or sign-out.
+        // This process-wide binding precedes every lazy repository, resolver, and settings consumer.
+        DebridKeys.bindAccountOwnerSource { DebridAccountOwnerState.UnknownOrUnavailable }
         // Stand up the multi-profile core once, before anything touches the engine (the engine is built
         // lazily on first catalog/auth access, after this). ProfileStore.init hydrates the roster, heals
         // the owner singleton, and makes ProfileStore.shared/activeProfileId available to the source-pin
@@ -83,7 +98,25 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         wireAccountSync()
         runCatching { MediaServerRepository.init(this) }
             .onFailure { Log.w(TAG, "Media-server store init failed; the feature stays dormant", it) }
+        startIPTVCleanupReplay()
         initDownloads()
+    }
+
+    private fun startIPTVCleanupReplay() {
+        launchIPTVStartupCleanup(
+            scope = applicationScope,
+            initialize = { IPTVPlaylists.init(this) },
+            resumeAll = {
+                val repo = catalogRepository
+                IPTVCleanupCoordinator(
+                    store = IPTVPlaylists.cleanupStore(),
+                    actions = iptvCleanupActions(repo),
+                ).resumeAll()
+            },
+            onFailure = {
+                Log.w(TAG, "IPTV cleanup replay failed; its durable journal remains retryable")
+            },
+        )
     }
 
     /**
@@ -158,7 +191,24 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
      */
     private fun wireAccountSync() {
         val store = ProfileStore.sharedOrNull() ?: return   // ProfileStore init failed: leave sync dormant
-        val manager = runCatching { VortXSyncManager(this).also { it.attachSyncSeams(store) } }
+        val manager = runCatching {
+            VortXSyncManager(this).also { manager ->
+                // Bind account ownership before either launcher can create a repository, resolver, settings
+                // screen, or view model. The snapshot distinguishes an unreadable session store from a
+                // definitive sign-out, so local legacy keys are never adopted while restore identity is unknown.
+                DebridKeys.bindAccountOwnerSource {
+                    when (val owner = manager.sessionOwnerSnapshot()) {
+                        is SessionOwnerSnapshot.Account ->
+                            DebridAccountOwnerState.Account(owner.id, owner.generation)
+                        is SessionOwnerSnapshot.SignedOutLocal ->
+                            DebridAccountOwnerState.SignedOutLocal(owner.generation)
+                        is SessionOwnerSnapshot.UnknownOrUnavailable ->
+                            DebridAccountOwnerState.UnknownOrUnavailable
+                    }
+                }
+                manager.attachSyncSeams(store)
+            }
+        }
             .getOrElse {
                 Log.w(TAG, "Account sync unavailable; cross-device sync stays dormant this launch", it)
                 return

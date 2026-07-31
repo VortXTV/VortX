@@ -8,7 +8,12 @@ name: Build Desktop (Tauri)
 
 on:
   push:
-    branches: [main]
+    branches: [main, beta]
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    branches: [main, beta]
     paths:
       - "desktop/**"
       - ".github/workflows/desktop.yml"
@@ -23,19 +28,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             bundles: "deb,appimage"
-          - os: windows-latest
+          - os: windows-2025
             bundles: "nsis"
-          - os: macos-latest
+          - os: macos-26
             bundles: "app,dmg"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Linux build dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -47,23 +52,27 @@ jobs:
             libssl-dev \
             pkg-config
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          # Node 22 (current LTS). Node 20 is EOL (April 2026), and vite 8 requires
-          # ^20.19.0 || >=22.12.0, so 22 is the clean floor.
-          node-version: "22"
+          # Exact Node 22 LTS patch. Node 20 is EOL (April 2026), and vite 8 requires
+          # ^20.19.0 || >=22.12.0.
+          node-version: "22.18.0"
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+        with:
+          toolchain: 1.97.1
+          components: clippy, rustfmt
 
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: "desktop/src-tauri -> target"
 
-      - name: Install frontend dependencies
+      - name: Stage embedded server runtime
         working-directory: desktop
-        run: npm ci
+        shell: bash
+        run: scripts/fetch-server-deps.sh
 
       # Stage Linux mpv as an extracted AppImage (AppDir): linuxdeploy bundles the distro mpv plus its
       # full .so closure, then we extract it so the app spawns AppRun directly at runtime - no system
@@ -71,7 +80,7 @@ jobs:
       # tauri.linux.conf.json bundles the AppDir as a directory resource. Inputs are static (distro
       # package + pinned tool), no untrusted event data.
       - name: Stage Linux mpv (extracted AppDir)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           set -euxo pipefail
           sudo apt-get update
@@ -81,6 +90,12 @@ jobs:
             https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           curl -fsSL -o linuxdeploy-plugin-appimage \
             https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage
+          printf '%s  %s\n' \
+            e87ee0815d109282fdda73e34c2361d64d02b0ffaea3674b18f1fd1f6a687dcf \
+            linuxdeploy.AppImage | sha256sum -c -
+          printf '%s  %s\n' \
+            1da16a46fa5e058ae740e7c35ed0d36d86cb869ac9cc8a5fd9a1847d7978d99a \
+            linuxdeploy-plugin-appimage | sha256sum -c -
           chmod +x linuxdeploy.AppImage linuxdeploy-plugin-appimage
           export APPIMAGE_EXTRACT_AND_RUN=1
           export PATH="$work:$PATH"
@@ -106,19 +121,154 @@ jobs:
           test -x "$dest/AppRun"
           echo "staged Linux mpv AppDir at $dest"
 
+      - name: Verify staged runtime resources
+        working-directory: desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          resources=src-tauri/resources
+          test -s "$resources/server.cjs"
+          case "${{ matrix.os }}" in
+            ubuntu-24.04)
+              node_bin="$resources/node-linux-x64"
+              mpv_bin="$resources/mpv-linux-x64/AppRun"
+              ;;
+            windows-2025)
+              node_bin="$resources/node-win-x64.exe"
+              mpv_bin="$resources/mpv-win-x64.exe"
+              ;;
+            macos-26)
+              node_bin="$resources/node-darwin-arm64"
+              mpv_bin="$resources/mpv-darwin-arm64.app/Contents/MacOS/mpv"
+              ;;
+            *)
+              echo "::error::No runtime contract for ${{ matrix.os }}"
+              exit 1
+              ;;
+          esac
+          test -x "$node_bin"
+          test -x "$mpv_bin"
+          test "$("$node_bin" --version)" = "v20.18.1"
+
+      - name: Install frontend dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Audit frontend dependencies
+        working-directory: desktop
+        run: npm audit --audit-level=high
+
+      - name: Build frontend
+        working-directory: desktop
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --all -- --check
+
+      - name: Check Rust targets
+        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml --locked --all-targets
+
+      - name: Lint Rust targets
+        run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+
+      - name: Test Rust targets
+        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --all-targets
+
       - name: Build the app
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         with:
           projectPath: desktop
           args: --bundles ${{ matrix.bundles }}
 
+      - name: Verify every requested desktop bundle
+        env:
+          REQUESTED_BUNDLES: ${{ matrix.bundles }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_root=desktop/src-tauri/target/release/bundle
+
+          fail() {
+            echo "::error::$*"
+            exit 1
+          }
+
+          require_file_bundle() {
+            local bundle="$1"
+            local root="$2"
+            local pattern="$3"
+            local artifact
+            local artifacts=()
+
+            [ -d "$root" ] || fail "Requested $bundle bundle directory is missing: $root"
+            while IFS= read -r -d '' artifact; do
+              artifacts+=("$artifact")
+            done < <(find "$root" -maxdepth 1 -type f -name "$pattern" -print0)
+            [ "${#artifacts[@]}" -gt 0 ] || fail "Requested $bundle bundle is missing under $root"
+            for artifact in "${artifacts[@]}"; do
+              [ -s "$artifact" ] || fail "Requested $bundle artifact is empty: $artifact"
+            done
+          }
+
+          require_app_bundle() {
+            local root="$1"
+            local app
+            local binary
+            local executable_found
+            local apps=()
+
+            [ -d "$root" ] || fail "Requested app bundle directory is missing: $root"
+            while IFS= read -r -d '' app; do
+              apps+=("$app")
+            done < <(find "$root" -maxdepth 1 -type d -name '*.app' -print0)
+            [ "${#apps[@]}" -gt 0 ] || fail "Requested app bundle is missing under $root"
+            for app in "${apps[@]}"; do
+              [ -s "$app/Contents/Info.plist" ] || fail "Requested app bundle has no nonempty Info.plist: $app"
+              [ -d "$app/Contents/MacOS" ] || fail "Requested app bundle has no executable directory: $app"
+              executable_found=
+              while IFS= read -r -d '' binary; do
+                if [ -s "$binary" ] && [ -x "$binary" ]; then
+                  executable_found=1
+                  break
+                fi
+              done < <(find "$app/Contents/MacOS" -maxdepth 1 -type f -print0)
+              [ -n "$executable_found" ] || fail "Requested app bundle has no nonempty executable: $app"
+            done
+          }
+
+          IFS=',' read -r -a requested_bundles <<< "$REQUESTED_BUNDLES"
+          [ "${#requested_bundles[@]}" -gt 0 ] || fail "No desktop bundles were requested"
+          for bundle in "${requested_bundles[@]}"; do
+            case "$bundle" in
+              deb)
+                require_file_bundle deb "$bundle_root/deb" '*.deb'
+                ;;
+              appimage)
+                require_file_bundle appimage "$bundle_root/appimage" '*.AppImage'
+                ;;
+              nsis)
+                require_file_bundle nsis "$bundle_root/nsis" '*.exe'
+                ;;
+              app)
+                require_app_bundle "$bundle_root/macos"
+                ;;
+              dmg)
+                require_file_bundle dmg "$bundle_root/dmg" '*.dmg'
+                ;;
+              *)
+                fail "No artifact-presence contract exists for requested bundle: $bundle"
+                ;;
+            esac
+          done
+
       - name: Upload desktop bundles
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-desktop-${{ matrix.os }}
           path: |
             desktop/src-tauri/target/release/bundle/deb/*.deb
             desktop/src-tauri/target/release/bundle/appimage/*.AppImage
             desktop/src-tauri/target/release/bundle/nsis/*.exe
+            desktop/src-tauri/target/release/bundle/macos/*.app
             desktop/src-tauri/target/release/bundle/dmg/*.dmg
-          if-no-files-found: warn
+          if-no-files-found: error

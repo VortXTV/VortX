@@ -3,10 +3,23 @@ import Foundation
 /// Picks the audio and subtitle track to auto-select from the available tracks and the user's
 /// preferences. Pure and side-effect free, so it is unit-testable. Shared by both players.
 enum TrackSelector {
+    /// Selection setters may have side effects even when the requested row is already active (MPV arms a
+    /// cache hold; AVPlayer's source-audio lane can remount). Make that no-op executable for both engines.
+    static func shouldApplyAudioSelection(_ id: Int, to tracks: [MPVTrack]) -> Bool {
+        !tracks.contains { $0.id == id && $0.selected }
+    }
+
+    /// A remux has already made its primary audio choice before AVPlayer can load its track inventory.
+    /// Suppress only the automatic setter in that case; explicit picker actions call the engine directly.
+    static func automaticAudioSelection(_ id: Int?,
+                                        remuxOwnsInitialSelection: Bool) -> Int? {
+        remuxOwnsInitialSelection ? nil : id
+    }
+
     /// The audio and subtitle track ids to select. A subtitle id of -1 means "off"; a nil audio id
     /// means "leave the engine's default" (neither the user's chain nor the English fallback matched).
     static func select(audio: [MPVTrack], subtitles: [MPVTrack], preferences p: TrackPreferences) -> (audio: Int?, subtitle: Int?) {
-        let chainPick = firstMatch(audio, languages: p.audioLanguages, reject: p.rejectTerms)
+        let chainPick = firstAudioMatch(audio, languages: p.audioLanguages, reject: p.rejectTerms)
         // No track matches the user's language chain (#76, ozdek's report): do NOT leave the pick to the
         // engine default. Unpicked, both engines defer to the container's default/first audio track, which
         // on multi-language European releases is frequently the local dub, so a Turkish-only preference
@@ -16,7 +29,7 @@ enum TrackSelector {
         // A file with neither a chain match nor an English track still leaves the engine default.
         // The subtitle policy keys off the CHAIN match, not the fallback: English-fallback audio counts as
         // foreign-language content, so full subtitles in the user's language still auto-enable.
-        let audioPick = chainPick ?? firstMatch(audio, languages: ["en"], reject: p.rejectTerms)
+        let audioPick = chainPick ?? firstAudioMatch(audio, languages: ["en"], reject: p.rejectTerms)
         let subtitle = selectSubtitle(subtitles, preferences: p, gotPreferredAudio: chainPick != nil)
         return (audioPick?.id, subtitle)
     }
@@ -34,25 +47,46 @@ enum TrackSelector {
         return firstMatch(subtitles, languages: p.subtitleLanguages, reject: p.rejectTerms) == nil
     }
 
+    /// Audio rows within one language tier are otherwise ordered only by the engine/container. Keep the row
+    /// already playing so an automatic pass cannot turn a no-op into a source-audio remount.
+    private static func firstAudioMatch(_ tracks: [MPVTrack], languages: [String], reject: [String]) -> MPVTrack? {
+        for lang in languages {
+            var firstEligible: MPVTrack?
+            for track in tracks where track.isSelectable
+                && matches(track.lang, lang)
+                && !isRejected(track, reject) {
+                if track.selected { return track }
+                if firstEligible == nil { firstEligible = track }
+            }
+            if let firstEligible { return firstEligible }
+        }
+        return nil
+    }
+
     /// First track whose language matches the priority list and whose title isn't rejected.
     private static func firstMatch(_ tracks: [MPVTrack], languages: [String], reject: [String]) -> MPVTrack? {
         for lang in languages {
-            if let t = tracks.first(where: { matches($0.lang, lang) && !isRejected($0, reject) }) { return t }
+            if let t = tracks.first(where: {
+                $0.isSelectable
+                    && matches($0.lang, lang)
+                    && !isRejected($0, reject)
+            }) { return t }
         }
         return nil
     }
 
     private static func selectSubtitle(_ subs: [MPVTrack], preferences p: TrackPreferences, gotPreferredAudio: Bool) -> Int? {
-        guard !subs.isEmpty else { return -1 }
+        let selectable = subs.filter(\.isSelectable)
+        guard !selectable.isEmpty else { return -1 }
         // Foreign-language content (no preferred audio matched): show full subtitles so you can follow.
         if !gotPreferredAudio {
-            return firstMatch(subs, languages: p.subtitleLanguages, reject: p.rejectTerms)?.id ?? -1
+            return firstMatch(selectable, languages: p.subtitleLanguages, reject: p.rejectTerms)?.id ?? -1
         }
         switch p.forcedPolicy {
         case .off:
             return -1
         case .always:
-            return firstMatch(subs, languages: p.subtitleLanguages, reject: p.rejectTerms)?.id ?? -1
+            return firstMatch(selectable, languages: p.subtitleLanguages, reject: p.rejectTerms)?.id ?? -1
         case .forced:
             // Match by the container's FORCED disposition flag FIRST: real forced tracks are flagged
             // (AV_DISPOSITION_FORCED / mpv track-list forced), not labelled "forced" in the title, so the old
@@ -61,15 +95,15 @@ enum TrackSelector {
             // of language), then fall back to the legacy title-contains-"forced" heuristic for the rare
             // container that only labels forced in its title. Off if nothing qualifies.
             for lang in p.subtitleLanguages {
-                if let t = subs.first(where: { $0.forced && matches($0.lang, lang) && !isRejected($0, p.rejectTerms) }) {
+                if let t = selectable.first(where: { $0.forced && matches($0.lang, lang) && !isRejected($0, p.rejectTerms) }) {
                     return t.id
                 }
             }
-            if let t = subs.first(where: { $0.forced && !isRejected($0, p.rejectTerms) }) {
+            if let t = selectable.first(where: { $0.forced && !isRejected($0, p.rejectTerms) }) {
                 return t.id
             }
             for lang in p.subtitleLanguages {
-                if let t = subs.first(where: { matches($0.lang, lang) && $0.title.lowercased().contains("forced") && !isRejected($0, p.rejectTerms) }) {
+                if let t = selectable.first(where: { matches($0.lang, lang) && $0.title.lowercased().contains("forced") && !isRejected($0, p.rejectTerms) }) {
                     return t.id
                 }
             }
@@ -105,30 +139,8 @@ enum TrackSelector {
         }
     }
 
-    /// Reduce a language code to a canonical 2-letter form (eng → en, en-US → en, ja → ja).
+    /// Reduce a language code to its canonical base identity (eng → en, en-US → en, ja → ja).
     static func canonical(_ code: String) -> String {
-        let base = code.lowercased().split(separator: "-").first.map(String.init) ?? ""
-        if base.count == 3, let two = alpha3to2[base] { return two }
-        return String(base.prefix(2))
+        AudioLanguagePolicy.canonical(code)
     }
-
-    /// 3-letter codes whose 2-letter form is NOT their first two letters, in both ISO 639-2/T and /B
-    /// spellings (Matroska muxers write the B codes: "rum", "slo", "per", ...), plus the legacy
-    /// OpenSubtitles codes add-ons still send ("pob" = Brazilian Portuguese, "scc"/"scr" = Serbian/
-    /// Croatian). Without an entry the prefix(2) fallback can cross languages entirely: "est"
-    /// (Estonian) would match an "es" (Spanish) preference and "rum" (Romanian) a "ru" (Russian) one.
-    private static let alpha3to2: [String: String] = [
-        "eng": "en", "spa": "es", "fra": "fr", "fre": "fr", "deu": "de", "ger": "de",
-        "ita": "it", "por": "pt", "rus": "ru", "jpn": "ja", "kor": "ko", "zho": "zh",
-        "chi": "zh", "ara": "ar", "hin": "hi", "nld": "nl", "dut": "nl", "swe": "sv",
-        "nor": "no", "dan": "da", "fin": "fi", "pol": "pl", "tur": "tr", "tha": "th",
-        "vie": "vi", "ind": "id", "heb": "he", "ell": "el", "gre": "el", "ces": "cs", "cze": "cs",
-        "ron": "ro", "rum": "ro", "bul": "bg", "slk": "sk", "slo": "sk", "fas": "fa",
-        "per": "fa", "est": "et", "lav": "lv", "lit": "lt", "isl": "is", "ice": "is",
-        "mkd": "mk", "mac": "mk", "sqi": "sq", "alb": "sq", "hye": "hy", "arm": "hy",
-        "kat": "ka", "geo": "ka", "eus": "eu", "baq": "eu", "cym": "cy", "wel": "cy",
-        "msa": "ms", "may": "ms", "ben": "bn", "mal": "ml", "mar": "mr", "kan": "kn",
-        "mya": "my", "bur": "my", "khm": "km", "lao": "lo", "kaz": "kk", "bos": "bs",
-        "mlt": "mt", "gle": "ga", "fil": "tl", "tgl": "tl", "pob": "pt", "scc": "sr", "scr": "hr",
-    ]
 }

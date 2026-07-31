@@ -12,6 +12,7 @@ import com.vortx.android.debrid.DebridResolver
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
+import com.vortx.android.model.Episode
 import com.vortx.android.model.InstalledAddon
 import com.vortx.android.model.LibraryItemInfo
 import com.vortx.android.model.LibraryPortability
@@ -51,10 +52,28 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
 import java.net.URI
 import kotlin.time.Duration.Companion.seconds
+
+internal data class DebridResolveTarget(
+    val infoHash: String,
+    val episode: DebridResolver.Episode?,
+    val fileIdx: Int?,
+)
+
+internal fun StreamSource.debridResolveTarget(
+    fallbackHandle: String,
+    selectedEpisode: Episode?,
+): DebridResolveTarget = DebridResolveTarget(
+    infoHash = infoHash ?: fallbackHandle,
+    episode = selectedEpisode?.let {
+        DebridResolver.Episode(
+            season = it.season,
+            episode = it.episode,
+        )
+    },
+    fileIdx = fileIdx,
+)
 
 /// The real engine implementation of the UI seams. Drop-in replacement for `PreviewCatalogRepository`
 /// AND `PreviewAuthRepository`: it satisfies the SAME [CatalogRepository] (alias `StremioRepository`)
@@ -88,6 +107,7 @@ class EngineStremioRepository(
 ) : CatalogRepository, AuthRepository {
 
     private val appContext = context.applicationContext
+    private val addonManifestFetcher = AddonManifestFetcher(MANIFEST_FETCH_TIMEOUT_MS)
 
     /// Native in-client debrid resolver: turns a raw-torrent infoHash into a DIRECT, playable HTTPS URL
     /// through the user's own debrid account (keys in EncryptedSharedPreferences). Built lazily so no
@@ -620,13 +640,6 @@ class EngineStremioRepository(
     override suspend fun installAddon(url: String): Result<Unit> = runCatching {
         val normalized = normalizeAddonUrl(url)
             ?: throw IllegalArgumentException("Enter a valid add-on URL (https://…/manifest.json).")
-        // Same SSRF-shaped guard Apple's AddonURLGuard applies before ever fetching a pasted URL: never
-        // let an install form turn the app into a private-network prober. Not a full parity port (no
-        // DNS-rebinding / redirect-hop re-validation), but blocks the obvious loopback/RFC1918/link-
-        // local targets a pasted or shared URL could carry.
-        if (isPrivateNetworkHost(normalized)) {
-            throw IllegalArgumentException("That URL points to a private network address and can't be installed.")
-        }
         // The engine has no HTTP-fetch action for a bare add-on URL (mirrors Apple: CoreBridge.installAddon
         // fetches client-side too) -- fetch + validate the manifest here, then hand the engine the fully
         // resolved Descriptor. InstallAddon upserts by transportUrl (stremio-core update_profile.rs), so
@@ -651,39 +664,11 @@ class EngineStremioRepository(
         return if (trimmed.lowercase().endsWith("manifest.json")) trimmed else trimmed.trimEnd('/') + "/manifest.json"
     }
 
-    /// True for loopback / RFC1918 / link-local hosts (see [installAddon]'s doc comment for scope).
-    private fun isPrivateNetworkHost(urlString: String): Boolean {
-        val host = runCatching { URI(urlString).host }.getOrNull()?.lowercase() ?: return true
-        if (host == "localhost" || host == "::1" || host.startsWith("127.")) return true
-        if (host.startsWith("10.") || host.startsWith("192.168.") || host.startsWith("169.254.")) return true
-        val octets = host.split(".")
-        if (octets.size == 4 && octets[0] == "172") {
-            val second = octets[1].toIntOrNull()
-            if (second != null && second in 16..31) return true
-        }
-        return false
-    }
-
     /// Fetch a manifest.json body and validate it looks like an add-on manifest (`id` + `name` present,
     /// mirroring Apple `CoreBridge.installAddon`'s validation). Runs on [Dispatchers.IO]; fail-soft to
     /// null on any network/parse error so [installAddon] can surface one clear user-facing message.
     private suspend fun fetchAddonManifest(url: String): JSONObject? = withContext(Dispatchers.IO) {
-        runCatching {
-            val connection = URL(url).openConnection() as HttpURLConnection
-            try {
-                connection.requestMethod = "GET"
-                connection.connectTimeout = MANIFEST_FETCH_TIMEOUT_MS
-                connection.readTimeout = MANIFEST_FETCH_TIMEOUT_MS
-                connection.instanceFollowRedirects = true
-                connection.setRequestProperty("User-Agent", "VortX-Android/1.0")
-                if (connection.responseCode !in 200..299) return@runCatching null
-                val body = connection.inputStream.bufferedReader().use { it.readText() }
-                val manifest = JSONObject(body)
-                if (manifest.has("id") && manifest.has("name")) manifest else null
-            } finally {
-                connection.disconnect()
-            }
-        }.getOrNull()
+        addonManifestFetcher.fetch(url)
     }
 
     override suspend fun search(query: String): Result<List<MetaItem>> = withContext(Dispatchers.Default) { runCatching {
@@ -763,7 +748,10 @@ class EngineStremioRepository(
         StreamRanking.rankedGroups(groups, prefs = snapshot, pin = pin)
     } }
 
-    override suspend fun resolve(source: StreamSource): Result<Playable> = runCatching {
+    override suspend fun resolve(
+        source: StreamSource,
+        episode: Episode?,
+    ): Result<Playable> = runCatching {
         // A stream id encodes its handle (see EngineState.parseStream: id = handle#name#desc, handle is
         // url/externalUrl/infoHash). Direct URLs are playable as-is. A raw torrent (handle = infoHash)
         // resolves through the user's own debrid account when a key is configured (native in-client
@@ -802,7 +790,12 @@ class EngineStremioRepository(
             // cached, no playable file, provider/network error). With no key it never opens the key
             // store. On null the raw torrent falls through to the in-process streaming server below,
             // so a debrid-configured user keeps the exact direct path they have today.
-            val resolved = debridResolver.resolve(infoHash = handle)
+            val target = source.debridResolveTarget(handle, episode)
+            val resolved = debridResolver.resolve(
+                infoHash = target.infoHash,
+                episode = target.episode,
+                fileIdx = target.fileIdx,
+            )
             if (resolved != null) {
                 Playable(url = resolved, title = source.title, viaStreamingServer = false, isTorrent = false, isDolbyVision = isDolbyVision, isAtmos = isAtmos)
             } else {

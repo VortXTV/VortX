@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// StremioX design system. One source of truth for color, type, spacing, motion, and the focus
-/// treatment, so every tvOS screen reads as one product at ten feet. See DESIGN.md for the rationale.
+/// treatment, so every tvOS screen reads as one product at ten feet. See docs/DESIGN-SYSTEM.md for the rationale.
 /// Direction: editorial cinema. Warm near-black chrome so poster art is the only color on screen,
 /// one ember accent that means focus / selection / primary / progress, nothing decorative colored.
 enum Theme {
@@ -23,13 +23,13 @@ enum Theme {
         static var glassVeil: Color { ThemeManager.shared.glassVeil }
         static let textPrimary   = rgb(0.965, 0.945, 0.914) // #F6F1E9
         static let textSecondary = rgb(0.737, 0.694, 0.631) // #BCB1A1
-        static let textTertiary  = rgb(0.620, 0.580, 0.520) // #9E9485 — raised from #8C8273 so 10-11pt text clears 4.5:1 on the warm canvas across all 8 accents
+        static let textTertiary  = rgb(0.620, 0.580, 0.520) // #9E9485, raised from #8C8273 so 10-11pt text clears 4.5:1 on the warm canvas across all 8 accents
         // Accent is user-themeable via ThemeManager (8 curated accents). accentSoft / onAccent follow it.
         static var accent: Color { ThemeManager.shared.accent }             // focus / selection / primary / progress
         static var accentBright: Color { ThemeManager.shared.accentBright } // focus glow highlight
         static var accentSoft: Color { accent.opacity(0.18) }
         static var onAccent: Color { ThemeManager.shared.onAccent } // accent-adaptive ink (was a fixed warm-brown that read orange on every accent)
-        static let danger = rgb(0.871, 0.282, 0.337)            // #DE4856 destructive (log out, remove) — a cooler red so it doesn't read as "leftover orange" next to a non-warm accent
+        static let danger = rgb(0.871, 0.282, 0.337)            // #DE4856 destructive (log out, remove), a cooler red so it doesn't read as "leftover orange" next to a non-warm accent
         static let ok    = rgb(0.298, 0.769, 0.451)             // #4CC473 healthy/online status (add-on reachable), distinct from the gold accent
         static let warn  = rgb(0.949, 0.659, 0.231)            // #F2A83B caution/slow status, an amber that is not the brand gold
     }
@@ -44,7 +44,7 @@ enum Theme {
         static let xl: CGFloat = 48
         static let xxl: CGFloat = 72
         // 10-foot tvOS screen inset. Do NOT use this directly as horizontal padding on shared views
-        // that also render on iPhone — 60pt eats ~120pt of a 390pt phone and clips content off the
+        // that also render on iPhone; 60pt eats ~120pt of a 390pt phone and clips content off the
         // edges (the beta7 server-config / add-ons clipping). Use `screenInset` instead.
         static let screenEdge: CGFloat = 60
         // Readable prose column cap for hero synopsis / credits / language chips on the shared iOS/Mac
@@ -66,7 +66,7 @@ enum Theme {
         static let contentColumn: CGFloat = 900
         #endif
         // Width above which the detail body caps its source / episode column at `contentColumn` (centered)
-        // instead of filling the full width — the iPad/Mac regular-width cutover. One token keeps the body
+        // instead of filling the full width, the iPad/Mac regular-width cutover. One token keeps the body
         // and the pushed episode-streams view agreeing on when they widen.
         static let wideLayoutMinWidth: CGFloat = 700
         // Platform-aware screen inset: the tvOS 10-foot value on TV, an arm's-length value on
@@ -83,7 +83,7 @@ enum Theme {
         static let card: CGFloat = 16
         static let chip: CGFloat = 12
         static let control: CGFloat = 14
-        /// The big, soft radius for the full-width hero Play button and continue-watching cards — the
+        /// The big, soft radius for the full-width hero Play button and continue-watching cards, the
         /// cinematic media-app look (a pronounced pill, not a subtle control corner).
         static let hero: CGFloat = 30
     }
@@ -112,7 +112,7 @@ enum Theme {
     /// ThemeManager (Settings → Appearance → App text size). Because each screen observes
     /// ThemeManager (`@EnvironmentObject theme`), changing the scale fires the manager's
     /// `objectWillChange`, those screens re-evaluate `body`, and these getters re-run against the
-    /// new `textScale` — so the app repaints instantly, the same way the accent does, no relaunch.
+    /// new `textScale`, so the app repaints instantly, the same way the accent does, no relaunch.
     ///
     /// IMPORTANT reactivity contract: reading `Theme.Typography.*` does NOT by itself subscribe a
     /// view to text-size changes (the read goes through `ThemeManager.shared`, not the view's

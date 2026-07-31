@@ -35,27 +35,64 @@ actor TraktService {
     /// "watching" and auto-expires it after the remaining runtime, so there is no need to repeat
     /// this for the same item while it keeps playing.
     @discardableResult
-    func scrobbleStart(item: TraktScrobbleItem, progress: Double) async throws -> TraktScrobbleResponse {
-        try await scrobble(path: "/scrobble/start", item: item, progress: progress)
+    func scrobbleStart(
+        item: TraktScrobbleItem,
+        progress: Double,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktScrobbleResponse {
+        try await scrobble(
+            path: "/scrobble/start",
+            item: item,
+            progress: progress,
+            expectedSession: expectedSession
+        )
     }
 
     /// Call when playback pauses. Trakt saves the progress so the item can resume later.
     @discardableResult
-    func scrobblePause(item: TraktScrobbleItem, progress: Double) async throws -> TraktScrobbleResponse {
-        try await scrobble(path: "/scrobble/pause", item: item, progress: progress)
+    func scrobblePause(
+        item: TraktScrobbleItem,
+        progress: Double,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktScrobbleResponse {
+        try await scrobble(
+            path: "/scrobble/pause",
+            item: item,
+            progress: progress,
+            expectedSession: expectedSession
+        )
     }
 
     /// Call when playback stops or finishes. Above 80% progress Trakt records a watch (action
     /// `.scrobble`, with a history `id`); between 1% and 79% it records a pause. Below 1% Trakt
     /// answers HTTP 422 and the call throws `.ignored`.
     @discardableResult
-    func scrobbleStop(item: TraktScrobbleItem, progress: Double) async throws -> TraktScrobbleResponse {
-        try await scrobble(path: "/scrobble/stop", item: item, progress: progress)
+    func scrobbleStop(
+        item: TraktScrobbleItem,
+        progress: Double,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktScrobbleResponse {
+        try await scrobble(
+            path: "/scrobble/stop",
+            item: item,
+            progress: progress,
+            expectedSession: expectedSession
+        )
     }
 
-    private func scrobble(path: String, item: TraktScrobbleItem, progress: Double) async throws -> TraktScrobbleResponse {
+    private func scrobble(
+        path: String,
+        item: TraktScrobbleItem,
+        progress: Double,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktScrobbleResponse {
         let body = ScrobbleBody(item: item, progress: clampProgress(progress))
-        let (data, status) = try await send(path: path, method: "POST", body: body)
+        let (data, status) = try await sendSessionBound(
+            path: path,
+            method: "POST",
+            body: body,
+            expectedSession: expectedSession
+        )
         if status == 422 { throw TraktServiceError.ignored }
         try expectSuccess(status)
         return try decode(TraktScrobbleResponse.self, from: data)
@@ -64,20 +101,39 @@ actor TraktService {
     // MARK: - Watchlist (library "want to watch")
 
     /// Add movies/shows/episodes to the user's Trakt watchlist (`POST /sync/watchlist`).
+    /// The captured account identity is held through the provider write.
     @discardableResult
-    func addToWatchlist(_ items: TraktSyncItems) async throws -> TraktSyncResponse {
-        try await syncWrite(path: "/sync/watchlist", items: items)
+    func addToWatchlist(
+        _ items: TraktSyncItems,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktSyncResponse {
+        try await syncWrite(
+            path: "/sync/watchlist",
+            items: items,
+            expectedSession: expectedSession
+        )
     }
 
     /// Remove items from the watchlist (`POST /sync/watchlist/remove`).
+    /// The captured account identity is held through the provider write.
     @discardableResult
-    func removeFromWatchlist(_ items: TraktSyncItems) async throws -> TraktSyncResponse {
-        try await syncWrite(path: "/sync/watchlist/remove", items: items)
+    func removeFromWatchlist(
+        _ items: TraktSyncItems,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktSyncResponse {
+        try await syncWrite(
+            path: "/sync/watchlist/remove",
+            items: items,
+            expectedSession: expectedSession
+        )
     }
 
     /// The user's full watchlist (`GET /sync/watchlist`).
-    func watchlist() async throws -> [TraktWatchlistEntry] {
-        let (data, status) = try await send(path: "/sync/watchlist", method: "GET")
+    func watchlist(expectedSession: TraktSessionID) async throws -> [TraktWatchlistEntry] {
+        let (data, status) = try await sendSessionBoundRead(
+            path: "/sync/watchlist",
+            expectedSession: expectedSession
+        )
         try expectSuccess(status)
         return try decode([TraktWatchlistEntry].self, from: data)
     }
@@ -87,27 +143,56 @@ actor TraktService {
     /// Mark items watched by adding them to history (`POST /sync/history`). Pass `watchedAt` to
     /// backdate; the default lets Trakt stamp "now".
     @discardableResult
-    func markWatched(_ items: TraktSyncItems) async throws -> TraktSyncResponse {
-        try await syncWrite(path: "/sync/history", items: items)
+    func markWatched(
+        _ items: TraktSyncItems,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktSyncResponse {
+        try await syncWrite(
+            path: "/sync/history",
+            items: items,
+            expectedSession: expectedSession
+        )
     }
 
     /// Remove items from watch history (`POST /sync/history/remove`).
     @discardableResult
-    func removeFromHistory(_ items: TraktSyncItems) async throws -> TraktSyncResponse {
-        try await syncWrite(path: "/sync/history/remove", items: items)
+    func removeFromHistory(
+        _ items: TraktSyncItems,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktSyncResponse {
+        try await syncWrite(
+            path: "/sync/history/remove",
+            items: items,
+            expectedSession: expectedSession
+        )
     }
 
     // MARK: - Collection (library "owned")
 
     /// The user's collection (`GET /sync/collection`). `type` is "movies" or "shows".
-    func collection(type: TraktCollectionType) async throws -> [TraktCollectionEntry] {
-        let (data, status) = try await send(path: "/sync/collection/\(type.rawValue)", method: "GET")
+    func collection(
+        type: TraktCollectionType,
+        expectedSession: TraktSessionID
+    ) async throws -> [TraktCollectionEntry] {
+        let (data, status) = try await sendSessionBoundRead(
+            path: "/sync/collection/\(type.rawValue)",
+            expectedSession: expectedSession
+        )
         try expectSuccess(status)
         return try decode([TraktCollectionEntry].self, from: data)
     }
 
-    private func syncWrite(path: String, items: TraktSyncItems) async throws -> TraktSyncResponse {
-        let (data, status) = try await send(path: path, method: "POST", body: items)
+    private func syncWrite(
+        path: String,
+        items: TraktSyncItems,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktSyncResponse {
+        let (data, status) = try await sendSessionBound(
+            path: path,
+            method: "POST",
+            body: items,
+            expectedSession: expectedSession
+        )
         try expectSuccess(status)
         return try decode(TraktSyncResponse.self, from: data)
     }
@@ -116,18 +201,31 @@ actor TraktService {
 
     /// Set ratings (`POST /sync/ratings`). Trakt treats a re-post of the same title as an UPDATE, so
     /// there is no separate edit call. Pass `ratedAt` on each item to preserve when the user actually
-    /// rated (an offline rating drains later but must keep its original stamp, or the local shadow's
-    /// newer-wins merge would see Trakt's drain time as the newer edit and flap).
+    /// rated. The captured account identity is held through the provider write.
     @discardableResult
-    func addRatings(_ items: TraktRatingItems) async throws -> TraktSyncResponse {
-        try await ratingsWrite(path: "/sync/ratings", items: items)
+    func addRatings(
+        _ items: TraktRatingItems,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktSyncResponse {
+        try await ratingsWrite(
+            path: "/sync/ratings",
+            items: items,
+            expectedSession: expectedSession
+        )
     }
 
     /// Clear ratings (`POST /sync/ratings/remove`). The ids alone identify the title; the `rating`
-    /// value is not required and is left off by the callers.
+    /// value is not required. The captured account identity is held through the provider write.
     @discardableResult
-    func removeRatings(_ items: TraktRatingItems) async throws -> TraktSyncResponse {
-        try await ratingsWrite(path: "/sync/ratings/remove", items: items)
+    func removeRatings(
+        _ items: TraktRatingItems,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktSyncResponse {
+        try await ratingsWrite(
+            path: "/sync/ratings/remove",
+            items: items,
+            expectedSession: expectedSession
+        )
     }
 
     /// The user's ratings (`GET /sync/ratings/{type}`). `type` is "movies" or "shows".
@@ -136,14 +234,29 @@ actor TraktService {
     /// `TraktRatingsStore` decides what (if anything) a returned row is allowed to change; see the
     /// merge rules there. In particular a title's ABSENCE from this response means nothing and must
     /// never be read as "the user cleared it".
-    func ratings(type: TraktCollectionType) async throws -> [TraktRatingEntry] {
-        let (data, status) = try await send(path: "/sync/ratings/\(type.rawValue)", method: "GET")
+    func ratings(
+        type: TraktCollectionType,
+        expectedSession: TraktSessionID
+    ) async throws -> [TraktRatingEntry] {
+        let (data, status) = try await sendSessionBoundRead(
+            path: "/sync/ratings/\(type.rawValue)",
+            expectedSession: expectedSession
+        )
         try expectSuccess(status)
         return try decode([TraktRatingEntry].self, from: data)
     }
 
-    private func ratingsWrite(path: String, items: TraktRatingItems) async throws -> TraktSyncResponse {
-        let (data, status) = try await send(path: path, method: "POST", body: items)
+    private func ratingsWrite(
+        path: String,
+        items: TraktRatingItems,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktSyncResponse {
+        let (data, status) = try await sendSessionBound(
+            path: path,
+            method: "POST",
+            body: items,
+            expectedSession: expectedSession
+        )
         try expectSuccess(status)
         return try decode(TraktSyncResponse.self, from: data)
     }
@@ -163,8 +276,16 @@ actor TraktService {
     /// record of something the user genuinely watched. Eviction is `cancelCheckIn()`, and only a person
     /// gets to ask for it.
     @discardableResult
-    func checkIn(item: TraktScrobbleItem) async throws -> TraktCheckinResponse {
-        let (data, status) = try await send(path: "/checkin", method: "POST", body: CheckinBody(item: item))
+    func checkIn(
+        item: TraktScrobbleItem,
+        expectedSession: TraktSessionID
+    ) async throws -> TraktCheckinResponse {
+        let (data, status) = try await sendSessionBound(
+            path: "/checkin",
+            method: "POST",
+            body: CheckinBody(item: item),
+            expectedSession: expectedSession
+        )
         if status == 409 {
             // A malformed/absent conflict body must not turn a known 409 into a generic server error:
             // fall through with a nil expiry so the caller still reports the right thing ("already
@@ -179,39 +300,104 @@ actor TraktService {
     /// Delete the account's active check-in (`DELETE /checkin`, HTTP 204 on success). Trakt answers 404
     /// when nothing is checked in; that is treated as SUCCESS, because the caller's intent ("leave no
     /// active check-in") already holds and surfacing an error for it would only invite a pointless retry.
-    func cancelCheckIn() async throws {
-        let (_, status) = try await send(path: "/checkin", method: "DELETE")
+    func cancelCheckIn(expectedSession: TraktSessionID) async throws {
+        let (_, status) = try await sendSessionBound(
+            path: "/checkin",
+            method: "DELETE",
+            expectedSession: expectedSession
+        )
         if status == 404 { return }
         try expectSuccess(status)
     }
 
     // MARK: - HTTP plumbing
 
-    /// Authenticated request: pulls a live bearer from `TraktAuth` (refreshing if needed) and sets
-    /// the three headers Trakt requires on every call.
-    private func makeRequest(path: String, method: String) async throws -> URLRequest {
+    /// Exact-session read. Account replacement may proceed while the request is in flight, but its
+    /// response is rejected before publication if the session no longer matches.
+    private func sendSessionBoundRead(
+        path: String,
+        expectedSession: TraktSessionID
+    ) async throws -> (Data, Int) {
         guard let url = URL(string: TraktAuth.apiBase + path) else { throw TraktServiceError.badURL }
-        let token = try await auth.validToken()
+        let token = try await auth.validToken(for: expectedSession)
         var request = URLRequest(url: url)
-        request.httpMethod = method
+        request.httpMethod = "GET"
         request.timeoutInterval = 20
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("2", forHTTPHeaderField: "trakt-api-version")
         request.setValue(TraktAuth.clientID, forHTTPHeaderField: "trakt-api-key")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        return request
+        let result = try await perform(request)
+        guard await auth.sessionID == expectedSession else { throw TraktAuthError.sessionChanged }
+        if result.1 == 401 {
+            await auth.signOut(ifCurrent: expectedSession)
+        }
+        return result
     }
 
-    private func send(path: String, method: String) async throws -> (Data, Int) {
-        let request = try await makeRequest(path: path, method: method)
-        return try await perform(request)
+    /// Final lifecycle and retry write boundary. The auth actor keeps `expectedSession` and its bearer
+    /// leased until `URLSession.data` returns, so credentials cannot switch in the validation-to-use gap.
+    private func sendSessionBound<Body: Encodable>(
+        path: String,
+        method: String,
+        body: Body,
+        expectedSession: TraktSessionID
+    ) async throws -> (Data, Int) {
+        try await sendSessionBound(
+            path: path,
+            method: method,
+            bodyData: try JSONEncoder().encode(body),
+            expectedSession: expectedSession
+        )
     }
 
-    private func send<Body: Encodable>(path: String, method: String, body: Body) async throws -> (Data, Int) {
-        var request = try await makeRequest(path: path, method: method)
-        request.httpBody = try JSONEncoder().encode(body)
-        return try await perform(request)
+    private func sendSessionBound(
+        path: String,
+        method: String,
+        expectedSession: TraktSessionID
+    ) async throws -> (Data, Int) {
+        try await sendSessionBound(
+            path: path,
+            method: method,
+            bodyData: nil,
+            expectedSession: expectedSession
+        )
+    }
+
+    private func sendSessionBound(
+        path: String,
+        method: String,
+        bodyData: Data?,
+        expectedSession: TraktSessionID
+    ) async throws -> (Data, Int) {
+        let urlSession = session
+        let result: (Data, Int) = try await auth.performSessionBoundWrite(
+            expectedSession: expectedSession
+        ) { token in
+            guard let url = URL(string: TraktAuth.apiBase + path) else {
+                throw TraktServiceError.badURL
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = method
+            request.timeoutInterval = 20
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("2", forHTTPHeaderField: "trakt-api-version")
+            request.setValue(TraktAuth.clientID, forHTTPHeaderField: "trakt-api-key")
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.httpBody = bodyData
+            do {
+                let (data, response) = try await urlSession.data(for: request)
+                return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+            } catch {
+                throw TraktServiceError.transport(error.localizedDescription)
+            }
+        }
+        if result.1 == 401 {
+            await auth.signOut(ifCurrent: expectedSession)
+        }
+        return result
     }
 
     private func perform(_ request: URLRequest) async throws -> (Data, Int) {
@@ -333,25 +519,28 @@ enum TraktServiceError: LocalizedError, Sendable, Equatable {
 // 1. Player progress -> scrobble. In the libmpv player core (`Sources/Player/`), where playback
 //    state transitions are already observed (the same place that feeds Continue Watching /
 //    `reportProgress`), call:
-//       - on play/resume:  `await TraktService.shared.scrobbleStart(item:progress:)`
-//       - on pause:        `await TraktService.shared.scrobblePause(item:progress:)`
-//       - on stop/finish:  `await TraktService.shared.scrobbleStop(item:progress:)`
+//       - on play/resume:  `await TraktService.shared.scrobbleStart(
+//                              item: item, progress: progress, expectedSession: sessionID)`
+//       - on pause:        `await TraktService.shared.scrobblePause(
+//                              item: item, progress: progress, expectedSession: sessionID)`
+//       - on stop/finish:  `await TraktService.shared.scrobbleStop(
+//                              item: item, progress: progress, expectedSession: sessionID)`
 //    Build the `TraktScrobbleItem` from the playing meta's imdb id:
 //       movie:   `.movie(TraktMovie(ids: .imdb(imdbID)))`
 //       episode: `.episodeInShow(show: TraktShow(ids: .imdb(showImdbID)),
 //                                episode: TraktEpisode(season: s, number: e))`
 //    `progress` is the 0...100 percentage the player already computes for resume points.
-//    Gate every call on `await TraktAuth.shared.isSignedIn` so it no-ops when Trakt is not connected,
-//    and only fire for the MAIN profile (mirror `ProfileStore.activeUsesEngineHistory`) so overlay
-//    profiles never push to a shared Trakt account. Wrap in `try?` so a Trakt outage never blocks
-//    playback.
+//    Capture `TraktAuth.storedSessionID` before any await and pass that value through the final write.
+//    Also fire only for the MAIN profile (mirror `ProfileStore.activeUsesEngineHistory`) so overlay
+//    profiles never push to a shared Trakt account.
 //
 // 2. Library add -> watchlist. Where the app adds a title to the library (the DetailView "add" action
 //    that dispatches the engine `AddToLibrary`), also call, behind the sign-in gate:
 //       `try? await TraktService.shared.addToWatchlist(
-//            TraktSyncItems(movies: [TraktMovie(ids: .imdb(imdbID))]))`
+//            TraktSyncItems(movies: [TraktMovie(ids: .imdb(imdbID))]),
+//            expectedSession: sessionID)`
 //    For a series use `shows:` instead. Mirror the library "remove" action to `removeFromWatchlist`.
-//    Marking an episode/movie watched in the app can additionally call `markWatched(_:)`.
+//    Marking an episode/movie watched can call `markWatched(_:expectedSession:)`.
 //
 // 3. "Connect Trakt" Settings entry. Add a row to the settings/account surface (alongside the
 //    existing Stremio sign-in and sync rows in `SyncSettingsView` / the iOS settings screen):

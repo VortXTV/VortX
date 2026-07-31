@@ -8,7 +8,7 @@ import AppKit
 // Trailer playback (iOS/iPad/Mac):
 //   • A non-YouTube (direct) trailer stream plays in the native mpv `PlayerScreen`.
 //   • A YouTube trailer plays via the keyless YouTube IFrame embed (`YouTubeEmbedView`) in the
-//     `TrailerEmbedCover` below — the same mechanism the official Stremio client uses.
+//     `TrailerEmbedCover` below, the same mechanism the official Stremio client uses.
 // The earlier embed attempt (YouTubeWebView / AutoplayTrailerWebView) was removed because it navigated
 // the WKWebView straight TO `youtube.com/embed/<id>` as a top-level document with no controllable
 // origin/Referer, which YouTube rejected with "Error 153". A later attempt hosted the IFrame player via
@@ -37,7 +37,7 @@ enum TrailerOpener {
 /// Trailer button (hero + detail). A cold clip returns an INSTANT 404 (`x-vortx-reason: clip_warming`,
 /// CDN-cached ~2 min) while the worker extracts in the background; handing that 404 to libmpv dead-ends
 /// on the full source-error screen ("Trailer unavailable."), so callers probe first and fall back to the
-/// YouTube IFrame embed on a miss. HEAD keeps the probe to headers only — the worker ignores `Range`, so
+/// YouTube IFrame embed on a miss. HEAD keeps the probe to headers only; the worker ignores `Range`, so
 /// a ranged GET would pull the entire mp4 just to learn it exists (verified: HEAD returns 200 on an
 /// R2 hit, 404 clip_warming on a miss, and still triggers the worker's background extract).
 /// Fail-soft: any transport error reads as not-ready (the caller falls back).

@@ -32,7 +32,14 @@ import Foundation
 /// never an engine watched-mark dispatch.
 final class ScrobbleCoordinator {
     static let shared = ScrobbleCoordinator()
-    private init() {}
+    private init() {
+        TraktAuthBoundary.observe(key: "scrobble-coordinator") { [weak self] _ in
+            self?.invalidateTraktSession()
+        }
+        SIMKLAuthBoundary.observe(key: "scrobble-coordinator") { [weak self] _ in
+            self?.invalidateSIMKLSession()
+        }
+    }
 
     /// Progress at/above which a stop is a completion (Trakt records a watch at >=80; the app's own
     /// watched marker is 90, so 90 keeps the two in step). The definitive-watch record is always sent at
@@ -42,16 +49,17 @@ final class ScrobbleCoordinator {
     // MARK: - Session latch state (guarded by `lock`)
 
     private let lock = NSLock()
-    /// The active session's item key. A different key on any entry opens a fresh session.
-    private var currentKey = ""
-    /// The active playback's token (a per-playback id the player supplies at `playbackStarted`). A NEW
-    /// token on the SAME key (a genuine rewatch in a fresh player instance) opens a new session; an
-    /// UNCHANGED token on the same key (a same-title recovery reload) does not, so a recovery re-entry
-    /// after the watch was already recorded can never send a duplicate history record.
-    private var sessionToken = ""
+    /// The exact provider sessions captured when this item+player-token lifecycle began. Boundaries clear
+    /// only the affected owner, so a later event from an account-A playback can never adopt account B.
+    private var sessionOwnership =
+        PlaybackScrobbleSessionOwnership<TraktSessionID, SIMKLSessionID>()
     private var startSent = false
     private var stopSent = false
-    private var completed = false
+    private var traktCompleted = false
+    private var simklCompleted = false
+    /// One network lane for Trakt's stateful start/pause/stop lifecycle. In particular, a slow initial
+    /// start must finish before a later pause/stop, or its late arrival would erase the saved pause point.
+    private let lifecycleQueue = TraktScrobbleLifecycleQueue()
 
     /// A stable per-item key. Series episodes key by show+season+episode so an episode switch is a new
     /// session (fresh latches); movies key by the library id.
@@ -65,23 +73,36 @@ final class ScrobbleCoordinator {
     /// sends the live scrobble start) ONLY when the item or the playback `token` changed; a same-title
     /// recovery re-entry (same key + token) keeps the latches so a completion recorded before the reload
     /// is not re-sent. `token` is the player's per-playback id (a genuine rewatch supplies a fresh one).
-    /// When duration is not known yet, progress is 0 and the real percentage is deferred to later ticks /
-    /// the stop.
+    /// When duration is not known yet, progress is 0 and the real percentage is deferred to a later
+    /// pause/resume/stop transition. Routine progress ticks never emit `start`.
     func playbackStarted(_ meta: PlaybackMeta, position: Double, duration: Double, sessionToken token: String) {
         guard passesOwnerGate() else { return }
+        let currentTraktSessionID = TraktAuth.storedSessionID
+        let currentSIMKLSessionID = SIMKLAuth.storedSessionID
         lock.lock()
         let key = sessionKey(meta)
-        if key != currentKey || token != sessionToken {
-            currentKey = key; sessionToken = token
-            startSent = false; stopSent = false; completed = false
+        let isFreshPlayback = sessionOwnership.beginPlayback(
+            itemKey: key,
+            playbackToken: token,
+            traktSessionID: currentTraktSessionID,
+            simklSessionID: currentSIMKLSessionID
+        )
+        if isFreshPlayback {
+            startSent = false; stopSent = false
+            traktCompleted = false; simklCompleted = false
         }
         let sendStart = !startSent
         startSent = true
+        let providerSessions = sessionOwnership.snapshot
         lock.unlock()
         guard sendStart else { return }   // same-session re-entry: the start already fired, do not repeat it
-        dispatch(meta, progress: percent(position, duration)) { ref, provider in
+        dispatchLifecycle(
+            meta,
+            progress: percent(position, duration),
+            providerSessions: providerSessions
+        ) { ref, provider, session in
             guard provider.capabilities.liveScrobble, provider.scrobbleEnabled else { return }
-            await provider.scrobbleStart(ref)
+            await provider.scrobbleStart(ref, session: session)
         }
     }
 
@@ -89,20 +110,28 @@ final class ScrobbleCoordinator {
     /// guard, so a pause never reaches a history endpoint.
     func playbackPaused(_ meta: PlaybackMeta, position: Double, duration: Double) {
         guard passesOwnerGate() else { return }
-        attachSession(meta)
-        dispatch(meta, progress: percent(position, duration)) { ref, provider in
+        let providerSessions = attachSession(meta)
+        dispatchLifecycle(
+            meta,
+            progress: percent(position, duration),
+            providerSessions: providerSessions
+        ) { ref, provider, session in
             guard provider.capabilities.liveScrobble, provider.scrobbleEnabled else { return }
-            await provider.scrobblePause(ref)
+            await provider.scrobblePause(ref, session: session)
         }
     }
 
     /// Playback resumed from pause. In Trakt's model a resume is a fresh scrobble start.
     func playbackResumed(_ meta: PlaybackMeta, position: Double, duration: Double) {
         guard passesOwnerGate() else { return }
-        attachSession(meta)
-        dispatch(meta, progress: percent(position, duration)) { ref, provider in
+        let providerSessions = attachSession(meta)
+        dispatchLifecycle(
+            meta,
+            progress: percent(position, duration),
+            providerSessions: providerSessions
+        ) { ref, provider, session in
             guard provider.capabilities.liveScrobble, provider.scrobbleEnabled else { return }
-            await provider.scrobbleStart(ref)
+            await provider.scrobbleStart(ref, session: session)
         }
     }
 
@@ -112,10 +141,10 @@ final class ScrobbleCoordinator {
     /// only), never a bogus completion.
     func playbackStopped(_ meta: PlaybackMeta, position: Double, duration: Double) {
         guard passesOwnerGate() else { return }
-        attachSession(meta)
+        let providerSessions = attachSession(meta)
         let progress = percent(position, duration)
         if duration > 0, progress >= Self.completionThreshold {
-            recordCompletion(meta)
+            recordCompletion(meta, providerSessions: providerSessions)
             return
         }
         // Sub-completion exit: save a resume/pause point once (live scrobble only).
@@ -124,9 +153,13 @@ final class ScrobbleCoordinator {
         stopSent = true
         lock.unlock()
         guard !alreadyStopped else { return }
-        dispatch(meta, progress: progress) { ref, provider in
+        dispatchLifecycle(
+            meta,
+            progress: progress,
+            providerSessions: providerSessions
+        ) { ref, provider, session in
             guard provider.capabilities.liveScrobble, provider.scrobbleEnabled else { return }
-            await provider.scrobbleStop(ref)
+            await provider.scrobbleStop(ref, session: session)
         }
     }
 
@@ -134,8 +167,8 @@ final class ScrobbleCoordinator {
     /// a manual in-player mark. Records the definitive watch exactly once per session.
     func watched(_ meta: PlaybackMeta) {
         guard passesOwnerGate() else { return }
-        attachSession(meta)
-        recordCompletion(meta)
+        let providerSessions = attachSession(meta)
+        recordCompletion(meta, providerSessions: providerSessions)
     }
 
     // MARK: - Library actions (called from the shared detail add/remove chokepoints)
@@ -144,18 +177,18 @@ final class ScrobbleCoordinator {
     /// watchlist. Whole-title intent (movie or show), gated on the watchlist toggle.
     func addedToLibrary(_ meta: PlaybackMeta) {
         guard passesOwnerGate() else { return }
-        dispatch(meta, progress: 0) { ref, provider in
+        dispatch(meta, progress: 0) { ref, provider, session in
             guard provider.capabilities.watchlist, provider.watchlistEnabled else { return }
-            await provider.addToWatchlist(ref)
+            await provider.addToWatchlist(ref, session: session)
         }
     }
 
     /// A title was removed from the library from a detail page: remove it from each provider's watchlist.
     func removedFromLibrary(_ meta: PlaybackMeta) {
         guard passesOwnerGate() else { return }
-        dispatch(meta, progress: 0) { ref, provider in
+        dispatch(meta, progress: 0) { ref, provider, session in
             guard provider.capabilities.watchlist, provider.watchlistEnabled else { return }
-            await provider.removeFromWatchlist(ref)
+            await provider.removeFromWatchlist(ref, session: session)
         }
     }
 
@@ -167,26 +200,55 @@ final class ScrobbleCoordinator {
 
     /// Ensure a session exists for `meta` without resetting a matching one. If the key differs from the
     /// active session (an entry arriving with no prior start), open a fresh session so its latches apply.
-    private func attachSession(_ meta: PlaybackMeta) {
+    private func attachSession(
+        _ meta: PlaybackMeta
+    ) -> PlaybackProviderSessionSnapshot<TraktSessionID, SIMKLSessionID> {
         let key = sessionKey(meta)
         lock.lock()
-        if currentKey != key {
-            currentKey = key
-            startSent = false; stopSent = false; completed = false
+        if sessionOwnership.attach(itemKey: key) {
+            startSent = false; stopSent = false
+            traktCompleted = false; simklCompleted = false
         }
+        let providerSessions = sessionOwnership.snapshot
+        lock.unlock()
+        return providerSessions
+    }
+
+    /// Boundaries invalidate only that provider's owner. Latches and the item+token identity survive, so
+    /// same-player recovery cannot rebind to the replacement account or duplicate the unaffected provider.
+    private func invalidateTraktSession() {
+        lock.lock()
+        sessionOwnership.invalidateTrakt()
+        lock.unlock()
+    }
+
+    private func invalidateSIMKLSession() {
+        lock.lock()
+        sessionOwnership.invalidateSIMKL()
         lock.unlock()
     }
 
     /// Claim the completion latch and, if won, fan out the definitive watch record at 100% progress.
-    private func recordCompletion(_ meta: PlaybackMeta) {
+    private func recordCompletion(
+        _ meta: PlaybackMeta,
+        providerSessions: PlaybackProviderSessionSnapshot<TraktSessionID, SIMKLSessionID>
+    ) {
         lock.lock()
-        let alreadyDone = completed
-        completed = true
+        let sendTrakt = !traktCompleted
+        let sendSIMKL = !simklCompleted
+        traktCompleted = true
+        simklCompleted = true
         lock.unlock()
-        guard !alreadyDone else { return }
-        dispatch(meta, progress: 100) { ref, provider in
+        guard sendTrakt || sendSIMKL else { return }
+        dispatchLifecycle(
+            meta,
+            progress: 100,
+            providerSessions: providerSessions
+        ) { ref, provider, session in
             guard provider.capabilities.history, provider.scrobbleEnabled else { return }
-            await provider.recordWatched(ref)
+            if provider.id == "trakt", !sendTrakt { return }
+            if provider.id == "simkl", !sendSIMKL { return }
+            await provider.recordWatched(ref, session: session)
         }
     }
 
@@ -199,31 +261,119 @@ final class ScrobbleCoordinator {
     /// Resolve the neutral media ref (identity resolution: tt directly, tmdb: via the cached/async
     /// resolver, else the numeric tmdb fallback) and run `op` for every provider, off the main thread.
     /// A ref with no usable id (kitsu-only / pasted magnet) is dropped. Fully fail-soft.
+    private struct DispatchContext: Sendable {
+        let isSeries: Bool
+        let libraryId: String
+        let season: Int?
+        let episode: Int?
+        let title: String?
+        /// Captured synchronously when the operation is enqueued. nil is a fail-closed Trakt operation.
+        let traktSessionID: TraktSessionID?
+        /// Captured synchronously for SIMKL, preventing a delayed account-A intent from using account B.
+        let simklSessionID: SIMKLSessionID?
+    }
+
+    private func dispatchContext(
+        _ meta: PlaybackMeta,
+        providerSessions: PlaybackProviderSessionSnapshot<TraktSessionID, SIMKLSessionID>
+    ) -> DispatchContext {
+        DispatchContext(
+            isSeries: meta.usesSeriesLifecycle,
+            libraryId: meta.libraryId,
+            season: meta.season,
+            episode: meta.episode,
+            title: meta.name,
+            traktSessionID: providerSessions.traktSessionID,
+            simklSessionID: providerSessions.simklSessionID
+        )
+    }
+
+    private func currentProviderSessions(
+    ) -> PlaybackProviderSessionSnapshot<TraktSessionID, SIMKLSessionID> {
+        PlaybackProviderSessionSnapshot(
+            traktSessionID: TraktAuth.storedSessionID,
+            simklSessionID: SIMKLAuth.storedSessionID
+        )
+    }
+
     private func dispatch(_ meta: PlaybackMeta, progress: Double,
-                          _ op: @escaping @Sendable (ExternalMediaRef, ExternalScrobbleProvider) async -> Void) {
+                          _ op: @escaping @Sendable (
+                            ExternalMediaRef,
+                            ExternalScrobbleProvider,
+                            ExternalProviderSession?
+                          ) async -> Void) {
         // DORMANCY (no-keys build): bail synchronously, before spawning any task or resolving any id, when
         // NEITHER provider is configured. `makeRef` can do up to two HTTP lookups to turn a tmdb: id into a
         // tt id, so without this a tmdb-catalog play on the shipped credential-less build would emit resolver
         // traffic. `isConfigured` is a synchronous constant check.
         guard TraktAuth.isConfigured || SIMKLAuth.isConfigured else { return }
-        // Snapshot the plain value fields on the caller thread (PlaybackMeta is a Sendable-safe value).
-        let isSeries = meta.usesSeriesLifecycle
-        let libraryId = meta.libraryId
-        let season = meta.season, episode = meta.episode
-        let title = meta.name
+        let context = dispatchContext(meta, providerSessions: currentProviderSessions())
         Task.detached(priority: .utility) {
-            // Resolve ids only once at least one provider is actually CONNECTED (configured AND signed in):
-            // a configured-but-signed-out provider must not trigger `makeRef`'s network lookups on a routine
-            // catalog play. Collect the connected providers here so `op` runs against exactly those.
-            var connected: [ExternalScrobbleProvider] = []
-            for provider in ExternalScrobbleRegistry.providers where await provider.isConnected() {
-                connected.append(provider)
+            await Self.performDispatch(context, progress: progress, op)
+        }
+    }
+
+    /// Enqueue a stateful playback transition. Unlike library/watchlist writes, these operations may not
+    /// overtake one another: Trakt `start` clears a paused-playback record, so a late start after pause/stop
+    /// would destroy the position the later transition just saved.
+    private func dispatchLifecycle(
+        _ meta: PlaybackMeta,
+        progress: Double,
+        providerSessions: PlaybackProviderSessionSnapshot<TraktSessionID, SIMKLSessionID>,
+        _ op: @escaping @Sendable (
+            ExternalMediaRef,
+            ExternalScrobbleProvider,
+            ExternalProviderSession?
+        ) async -> Void
+    ) {
+        guard TraktAuth.isConfigured || SIMKLAuth.isConfigured else { return }
+        let context = dispatchContext(meta, providerSessions: providerSessions)
+        lifecycleQueue.enqueue {
+            await Self.performDispatch(context, progress: progress, op)
+        }
+    }
+
+    private static func performDispatch(
+        _ context: DispatchContext,
+        progress: Double,
+        _ op: @escaping @Sendable (
+            ExternalMediaRef,
+            ExternalScrobbleProvider,
+            ExternalProviderSession?
+        ) async -> Void
+    ) async {
+        // Resolve ids only once at least one provider is actually CONNECTED (configured AND signed in):
+        // a configured-but-signed-out provider must not trigger `makeRef`'s network lookups on a routine
+        // catalog play. Collect the connected providers here so `op` runs against exactly those.
+        var connected: [(ExternalScrobbleProvider, ExternalProviderSession)] = []
+        for provider in ExternalScrobbleRegistry.providers {
+            if provider.id == "trakt" {
+                guard let captured = context.traktSessionID,
+                      TraktAuth.storedSessionID == captured else { continue }
+                guard await provider.isConnected(),
+                      TraktAuth.storedSessionID == captured else { continue }
+                connected.append((provider, .trakt(captured)))
+                continue
             }
-            guard !connected.isEmpty else { return }
-            guard let ref = await Self.makeRef(libraryId: libraryId, isSeries: isSeries,
-                                               season: season, episode: episode,
-                                               title: title, progress: progress) else { return }
-            for provider in connected { await op(ref, provider) }
+            if provider.id == "simkl" {
+                guard let captured = context.simklSessionID,
+                      SIMKLAuth.storedSessionID == captured else { continue }
+                guard await provider.isConnected(),
+                      SIMKLAuth.storedSessionID == captured else { continue }
+                connected.append((provider, .simkl(captured)))
+            }
+        }
+        guard !connected.isEmpty else { return }
+        guard let ref = await makeRef(
+            libraryId: context.libraryId,
+            isSeries: context.isSeries,
+            season: context.season,
+            episode: context.episode,
+            title: context.title,
+            progress: progress
+        ) else { return }
+        for (provider, session) in connected {
+            await op(ref, provider, session)
         }
     }
 

@@ -6,6 +6,9 @@ import SwiftUI
 struct DetailView: View {
     let type: String
     let id: String
+    var initialResumeSeconds: Double? = nil
+    var initialVideoID: String? = nil
+    var initialTraktSessionID: TraktSessionID? = nil
     var client: AddonClient = AddonClient()   // kept for call-site compatibility (Search)
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
@@ -57,9 +60,44 @@ struct DetailView: View {
     /// instead of flat canvas. nil (no art / not computed) keeps today's canvas exactly.
     @State private var dominantTint: Color?
 
+    /// The route/catalog ID remains `id`. Only engine metadata and stream requests move to this recovered
+    /// IMDb ID, so existing catalog/source identity roles continue to receive the raw ID they require.
+    @State private var recoveredIMDbID: String?
+    @State private var metaRecoveryAttempted = false
+    @State private var metaRecoveryInFlight = false
+    @State private var metaWatchdogExpired = false
+    @State private var metaAttempt = 0
+    private static let metaWatchdogSeconds = 12
+
+    /// The ONLY read of the engine's shared meta slot in this screen, id-fenced.
+    ///
+    /// THE DEFECT THIS CLOSES: `core.metaDetails` is one published slot on a singleton, and this view rendered
+    /// whatever was resident in it with no `id == self.id` check. Navigating A -> back -> B therefore PAINTED
+    /// title A's hero art, name, synopsis, and cast under title B's route until B's meta landed, and the same
+    /// unfenced value fed the ratings id and the movie stream-request id, so B could also DISPATCH A's default
+    /// video id. The iPhone/iPad screen had the fence; this one did not.
+    ///
+    /// Every resident-meta read below goes through this property. `IdentityCallerGateTests` fails if the raw
+    /// `core.metaDetails?.meta` token reappears anywhere else in this file.
+    private var fencedMeta: CoreMetaItem? {
+        ResidentMeta.fenced(core.metaDetails?.meta, pageID: metaRequestID) { $0.id }
+    }
+
+    /// Navigation-carried Trakt state is private to the credential session that created it. Revalidate at
+    /// every use because the detail page can remain mounted across sign-out or an account replacement.
+    private var validInitialResumeSeconds: Double? {
+        guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
+        return initialResumeSeconds
+    }
+
+    private var validInitialVideoID: String? {
+        guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
+        return initialVideoID
+    }
+
     var body: some View {
         Group {
-            if let meta = core.metaDetails?.meta {
+            if let meta = fencedMeta {
                 // Live (tv / channel / events) gets its own stripped-down page BEFORE the movie
                 // fallback (today live falls through to moviePage): backdrop + name + a red LIVE
                 // badge + the channel source list, with NO VOD chrome: no trailer chip, no movie
@@ -76,14 +114,16 @@ struct DetailView: View {
                 } else {
                     moviePage(meta)
                 }
-            } else if !LiveTypes.contains(type), type != "series", id.hasPrefix("tt"),
-                      let placeholder = CoreMetaItem.placeholder(id: id, type: type, name: "") {
+            } else if !LiveTypes.contains(type), type != "series", metaRequestID.hasPrefix("tt"),
+                      let placeholder = CoreMetaItem.placeholder(id: metaRequestID, type: type, name: "") {
                 // Cinemeta meta is nil for this tt (a new/unreleased title: tt at TMDB, not yet in Cinemeta).
                 // The page is meta-driven, so without this it sat on a spinner forever AND the streams guard
                 // never passed -> "No sources found". Render moviePage from a metahub-by-tt placeholder so the
                 // hero paints and the sources list shows; the relaxed streams guard fires on the tt directly.
                 // When the real meta later arrives, onChange swaps to it.
                 moviePage(placeholder)
+            } else if metaUnavailable {
+                metaUnavailablePage
             } else {
                 // Focusable so Back pops this view instead of exiting the app while it loads.
                 ScrollView {
@@ -98,6 +138,10 @@ struct DetailView: View {
         // Compute the tint from the SAME art the hero backdrop paints (background, else poster), so tint
         // and art always agree; recomputes when the meta hydrates or the page repoints to another title.
         .task(id: tintArtURL) { await recomputeTint() }
+        .task(id: metaWatchdogTaskID) {
+            await runMetaWatchdog(requestID: metaRequestID, attempt: metaAttempt)
+        }
+        .task(id: metaRecoveryTaskID) { await recoverMetaIfNeeded() }
         // NO ignoresSafeArea on the content: tvOS's safe-area insets exist to keep UI out of
         // TV overscan, and pushing the whole page into them clipped the top of the detail page
         // on TVs that crop (field report). The backdrops self-bleed (FullBleedBackdrop ignores
@@ -110,11 +154,11 @@ struct DetailView: View {
             // the meta loads, so load meta FIRST then dispatch streams on meta-ready (loadMovieStreamsIfNeeded).
             // Series load streams per-episode (CoreEpisodeStreams), so a series detail loads meta only.
             if effectiveType == "series" {
-                core.loadMeta(type: effectiveType, id: id)
-            } else if core.metaDetails?.meta?.id == id {
+                core.loadMeta(type: effectiveType, id: metaRequestID)
+            } else if fencedMeta != nil {
                 loadMovieStreamsIfNeeded()
             } else {
-                core.loadMeta(type: effectiveType, id: id)
+                core.loadMeta(type: effectiveType, id: metaRequestID)
                 // An imdb tt whose Cinemeta meta may never arrive (new/unreleased) would never reach the
                 // onChange(meta?.id) that dispatches streams: fire the tt-keyed streams now so the sources
                 // list populates regardless of the meta race. No-op'd by hasStreams once they land.
@@ -123,7 +167,7 @@ struct DetailView: View {
             captureHero()
             loadCredits()
             loadCollection()
-            if let m = core.metaDetails?.meta, m.id == id {
+            if let m = fencedMeta {
                 loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates()
             } else {
                 // Meta not resident (and it may NEVER arrive for a title Cinemeta doesn't know): fill
@@ -142,8 +186,8 @@ struct DetailView: View {
         }
         // Re-dispatch streams under the AUTHORITATIVE meta.type once it arrives (Collections-hub fix): if the
         // hub's TMDB guess was wrong, meta.type corrects it and the request re-fires under the type add-ons use.
-        .onChange(of: core.metaDetails?.meta?.type) { loadMovieStreamsIfNeeded() }
-        .onChange(of: core.metaDetails?.meta?.id) {
+        .onChange(of: fencedMeta?.type) { loadMovieStreamsIfNeeded() }
+        .onChange(of: fencedMeta?.id) {
             captureHero()
             langChips = []; langChipsKey = ""   // new title: reset the language chips before recomputing
             castMembers = []; creditsKey = nil  // new title: reset the cast rail before refetching (H16)
@@ -151,7 +195,7 @@ struct DetailView: View {
             if effectiveType != "series" { loadMovieStreamsIfNeeded() }
             loadCredits()
             loadCollection()
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates() }
+            if let m = fencedMeta { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates() }
             refreshLanguageChips()
         }
         .onChange(of: core.streamLoadProgress().loaded) { _ in
@@ -159,11 +203,173 @@ struct DetailView: View {
         }
     }
 
+    // MARK: Metadata recovery
+
+    /// The engine request identity may move to a recovered IMDb ID. The route identity remains `id`
+    /// and continues to feed source catalog roles and TMDB-number extraction.
+    private var metaRequestID: String { recoveredIMDbID ?? id }
+
+    private var currentMetaResolution: DetailMetaRecoveryPolicy.Resolution? {
+        core.detailMetaResolution(for: metaRequestID)
+    }
+
+    /// Some catalog add-ons select a raw `tmdb:`/`tvdb:` path but return a canonical IMDb meta item.
+    /// The selected-ID fence proves the ready item belongs to this request before its different ID is
+    /// adopted, so the A-back-B residency guard remains intact.
+    private var canonicalReadyMetaTarget: (id: String, type: String)? {
+        guard !metaRequestID.hasPrefix("tt"),
+              let target = core.canonicalReadyMetaTarget(for: metaRequestID) else { return nil }
+        return target
+    }
+
+    private var metaIsTerminalOrStalled: Bool {
+        currentMetaResolution == .unresolved || metaWatchdogExpired
+    }
+
+    private var metaWatchdogTaskID: String {
+        "\(metaRequestID)#\(metaAttempt)"
+    }
+
+    private var metaRecoveryTaskID: String {
+        "\(metaRequestID)#\(metaAttempt)#\(currentMetaResolution?.rawValue ?? "none")#\(metaWatchdogExpired)"
+    }
+
+    private var metaUnavailable: Bool {
+        guard !LiveTypes.contains(type), fencedMeta == nil, metaIsTerminalOrStalled else { return false }
+        if metaRequestID.hasPrefix("tt") { return true }
+        return metaRecoveryAttempted && !metaRecoveryInFlight
+    }
+
+    private var metaUnavailablePage: some View {
+        ScrollView {
+            VStack(spacing: Theme.Space.lg) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 54, weight: .semibold))
+                    .foregroundStyle(Theme.Palette.accent)
+                Text("Details unavailable")
+                    .font(Theme.Typography.screenTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text("This catalog item could not be matched to metadata your installed add-ons can load.")
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 720)
+                Button("Try Again") { retryMeta() }
+                    .buttonStyle(PrimaryActionStyle())
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, Theme.Space.screenEdge)
+            .padding(.vertical, 120)
+        }
+    }
+
+    private func runMetaWatchdog(requestID: String, attempt: Int) async {
+        guard !LiveTypes.contains(type) else { return }
+        metaWatchdogExpired = false
+        guard fencedMeta == nil else { return }
+        try? await Task.sleep(for: .seconds(Self.metaWatchdogSeconds))
+        guard !Task.isCancelled,
+              requestID == metaRequestID,
+              attempt == metaAttempt,
+              fencedMeta == nil else { return }
+        VXProbe.log(
+            "detail",
+            "meta watchdog expired id=\(VXProbeRedaction.identityToken(requestID))"
+        )
+        metaWatchdogExpired = true
+    }
+
+    private func recoverMetaIfNeeded() async {
+        guard !LiveTypes.contains(type),
+              fencedMeta == nil,
+              !metaRequestID.hasPrefix("tt"),
+              !metaRecoveryAttempted else { return }
+
+        metaRecoveryAttempted = true
+        if let target = canonicalReadyMetaTarget {
+            adoptRecoveredIMDbID(target.id, requestType: target.type)
+            return
+        }
+
+        guard metaIsTerminalOrStalled else {
+            metaRecoveryAttempted = false
+            return
+        }
+
+        metaRecoveryInFlight = true
+        defer { metaRecoveryInFlight = false }
+
+        let rawID = id
+        let requestType = effectiveType
+        guard let imdb = await TMDBClient.imdbID(forCatalogID: rawID, type: requestType),
+              !Task.isCancelled,
+              imdb != rawID else {
+            if !Task.isCancelled {
+                VXProbe.log(
+                    "detail",
+                    "meta recovery unresolved id=\(VXProbeRedaction.identityToken(rawID))"
+                )
+            }
+            return
+        }
+
+        VXProbe.log(
+            "detail",
+            "meta recovery mapped catalog=\(VXProbeRedaction.identityToken(rawID)) request=\(VXProbeRedaction.identityToken(imdb))"
+        )
+        adoptRecoveredIMDbID(imdb, requestType: requestType)
+    }
+
+    private func adoptRecoveredIMDbID(_ imdb: String, requestType: String) {
+        recoveredIMDbID = imdb
+        metaWatchdogExpired = false
+        core.loadMeta(type: requestType, id: imdb)
+        if requestType != "series" { loadMovieStreamsIfNeeded() }
+        loadCredits()
+        loadCollection()
+        loadRatings()
+        loadWatchProviders()
+        loadSimilarFallback()
+    }
+
+    private func retryMeta() {
+        recoveredIMDbID = nil
+        metaRecoveryAttempted = false
+        metaRecoveryInFlight = false
+        metaWatchdogExpired = false
+        metaAttempt &+= 1
+        core.loadMeta(type: type, id: id)
+        if type != "series" { loadMovieStreamsIfNeeded() }
+    }
+
     /// The IMDb id to fetch MDBList ratings for: prefer the meta's imdb `defaultVideoId` (tt...) when the
     /// catalog id is non-imdb (tmdb:/kitsu:), else the catalog id when it is itself an imdb id.
+    ///
+    /// SCOPE, because this value used to be handed to the source paths as well and that was the residual of
+    /// the inline-resolution defect: MDBList, credits, financials, and the collection rail are all IMDb-keyed
+    /// services, so a tt-only shape is CORRECT here and this reads `defaultVideoId` raw on purpose. It is not
+    /// correct for the pool, which is why the source paths now read `sourceIndexIdentityID` below.
     private var ratingsImdbID: String? {
-        if let dv = core.metaDetails?.meta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
-        return id.hasPrefix("tt") ? id : nil
+        if let dv = fencedMeta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
+        return metaRequestID.hasPrefix("tt") ? metaRequestID : nil
+    }
+
+    /// The identity ROLES this page hands to the SOURCE paths (Singularity pool + the IMDb-keyed TorBox
+    /// index). The page states what each id IS and lets the ONE shared resolver rank them; it does not pick.
+    ///
+    /// The catalog id is `self.id` (what the user opened) and the default-video id comes from the ID-FENCED
+    /// meta, so a still-resident previous title can neither supply an identity nor outrank this page's own.
+    /// Movie and live pages have no episode, so `currentVideoID` is nil here by construction.
+    ///
+    /// WHY IT IS NOT `ratingsImdbID`: that value is tt-only and nil for a TMDB-keyed catalog entry, which used
+    /// to leave a tmdb-opened title contributing nothing at all on tvOS.
+    private var sourceIndexRoles: SourceIndexIdentity.Roles {
+        SourceIndexIdentity.Roles(
+            catalogID: id,
+            defaultVideoID: fencedMeta?.behaviorHints?.defaultVideoId,
+            currentVideoID: nil,
+            kind: SourceIndexIdentity.ContentKind.from(type: effectiveType, liveTypes: LiveTypes.all)
+        )
     }
 
     /// The numeric TMDB id when this page was opened from a TMDB-keyed catalog ("tmdb:123",
@@ -181,6 +387,9 @@ struct DetailView: View {
     /// credential-less build. Series rate at the SHOW level, matching the title-level watchlist writes.
     @ViewBuilder private var ratingChip: some View {
         TraktRatingChip(imdb: ratingsImdbID, tmdb: ratingTMDBID, isSeries: effectiveType == "series")
+        // SIMKL's own rating chip (SourcesShared/SIMKLRatingControl.swift), each gated on its own service, so a
+        // SIMKL-only user finally gets a rating control and a both-connected user sees each score. Self-hiding.
+        SIMKLRatingChip(imdb: ratingsImdbID, tmdb: ratingTMDBID, isSeries: effectiveType == "series")
     }
 
     /// The pool `content_key` for this title (P1). Movies/series key on the imdb id (no season/episode here,
@@ -353,9 +562,16 @@ struct DetailView: View {
     /// the catalog id is non-imdb (tmdb:/kitsu:), else the catalog id. Falls back to the catalog id before
     /// the meta loads. Matches official Stremio (and the engine's guess_stream), which key movie streams on
     /// default_video_id so imdb add-ons match.
+    /// ID-FENCED (REQ-260721-30): it reads the meta only when that meta's own id is this page's id. It used
+    /// to read the shared singleton directly, AROUND the residency guard, so title B could dispatch title A's
+    /// still-resident default video id.
+    ///
+    /// It is deliberately NOT the pool identity. The pool key is a canonical title head; a stream request must
+    /// carry the add-on's OWN video id verbatim, coordinates included, or imdb-keyed add-ons stop matching.
+    /// Same title, different required shape: do not "unify" these two by canonicalizing this one.
     private var movieStreamId: String {
-        if let dv = core.metaDetails?.meta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != id { return dv }
-        return id
+        if let dv = fencedMeta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != metaRequestID { return dv }
+        return metaRequestID
     }
 
     /// The AUTHORITATIVE type for the stream request + series/movie render: the loaded meta's type once
@@ -365,7 +581,7 @@ struct DetailView: View {
     /// title worked from an add-on catalog carrying the engine's authoritative type). Keying off meta.type
     /// fixes both directions; falling back to `type` keeps behavior unchanged until meta loads.
     private var effectiveType: String {
-        if core.metaDetails?.meta?.id == id, let t = core.metaDetails?.meta?.type, !t.isEmpty { return t }
+        if let t = fencedMeta?.type, !t.isEmpty { return t }
         return type
     }
 
@@ -380,15 +596,20 @@ struct DetailView: View {
         // the catalog id when it is itself an imdb tt (the hub-card case). Non-imdb ids without meta still
         // wait (their stream id only resolves from the meta). hasStreams keys on the effective id, so no
         // re-dispatch loop forms once the streams arrive.
-        let metaResident = core.metaDetails?.meta?.id == id
-        guard metaResident || id.hasPrefix("tt") else { return }
+        let metaResident = fencedMeta != nil
+        guard metaResident || metaRequestID.hasPrefix("tt") else { return }
         let streamId = movieStreamId
         // Either surface counts as resident: meta-embedded streams (metaStreams, #122) are keyed by the
         // same stream path id, and their presence means the engine already selected this id.
         let hasStreams = core.metaDetails?.allStreamGroups.contains { $0.request.path.id == streamId } ?? false
         guard !hasStreams else { return }
-        if effectiveType != type { NSLog("[detail] stream type corrected: hub-guess=%@ -> meta=%@ id=%@", type, effectiveType, id) }
-        core.loadMeta(type: effectiveType, id: id, streamType: effectiveType, streamId: streamId)
+        if effectiveType != type {
+            VXProbe.log(
+                "detail",
+                "stream type corrected guess=\(type) meta=\(effectiveType) id=\(VXProbeRedaction.identityToken(metaRequestID))"
+            )
+        }
+        core.loadMeta(type: effectiveType, id: metaRequestID, streamType: effectiveType, streamId: streamId)
     }
 
     /// H16 tvOS cast rail: a focusable horizontal rail of every cast member (photo circle + actor + character),
@@ -397,7 +618,7 @@ struct DetailView: View {
     /// Identifiable without colliding with real TMDB person ids. Same focus pattern as the other rails.
     private var railCastMembers: [TMDBClient.CastMember] {
         if !castMembers.isEmpty { return castMembers }
-        let names = core.metaDetails?.meta?.cast ?? []
+        let names = fencedMeta?.cast ?? []
         return names.enumerated().map {
             TMDBClient.CastMember(id: -1 - $0.offset, name: $0.element, character: nil, profileURL: nil)
         }
@@ -468,9 +689,10 @@ struct DetailView: View {
             let items = await AddonClient.similar(type: type, excludingId: id, genres: meta.genres, title: meta.name)
             var merged = items
             // When a TMDB key is set, prepend TMDB recommendations (deduped) for richer "more like this".
-            if ApiKeys.tmdbKey() != nil, id.hasPrefix("tt") {
+            if ApiKeys.tmdbKey() != nil, let imdb = ratingsImdbID {
                 let existing = Set(items.map(\.id))
-                let recs = await AddonClient.tmdbSimilar(type: type, imdbID: id).filter { $0.id != id && !existing.contains($0.id) }
+                let recs = await AddonClient.tmdbSimilar(type: type, imdbID: imdb)
+                    .filter { $0.id != id && $0.id != imdb && !existing.contains($0.id) }
                 merged = recs + items
             }
             // Never clobber an already-filled rail (the #29 fallback) with an empty meta-seeded result.
@@ -484,9 +706,11 @@ struct DetailView: View {
     /// them directly. Fail-soft, and it only fills while the rail is still empty, so a later richer
     /// meta-seeded result is never clobbered.
     private func loadSimilarFallback() {
-        guard !LiveTypes.contains(type), similarItems.isEmpty, id.hasPrefix("tt"), ApiKeys.tmdbKey() != nil else { return }
+        guard !LiveTypes.contains(type), similarItems.isEmpty,
+              let imdb = ratingsImdbID, ApiKeys.tmdbKey() != nil else { return }
         Task {
-            let recs = await AddonClient.tmdbSimilar(type: effectiveType, imdbID: id).filter { $0.id != id }
+            let recs = await AddonClient.tmdbSimilar(type: effectiveType, imdbID: imdb)
+                .filter { $0.id != id && $0.id != imdb }
             guard !recs.isEmpty else { return }
             await MainActor.run { if similarItems.isEmpty { similarItems = recs } }
         }
@@ -530,9 +754,9 @@ struct DetailView: View {
     /// Legal streaming availability for the title in the viewer's region (TMDB watch/providers). Only
     /// runs with a TMDB key + an IMDb id; a nil result simply hides the section.
     private func loadWatchProviders() {
-        guard !LiveTypes.contains(type), id.hasPrefix("tt") else { return }
+        guard !LiveTypes.contains(type), let imdb = ratingsImdbID else { return }
         Task {
-            let avail = await TMDBClient.watchProviders(imdbID: id, type: type)
+            let avail = await TMDBClient.watchProviders(imdbID: imdb, type: type)
             await MainActor.run { watchAvail = avail }
         }
     }
@@ -540,7 +764,7 @@ struct DetailView: View {
     /// Feed the browse pages' hero cache with what this page knows. The engine resolved this meta
     /// through the add-on system, so it works for every id scheme (tt, tmdb:, tvdb:, anything).
     private func captureHero() {
-        guard let m = core.metaDetails?.meta, m.id == id else { return }
+        guard let m = fencedMeta else { return }
         FocusedItemModel.noteMeta(id: m.id, type: type, title: m.name,
                                   backdrop: m.background ?? m.poster,
                                   releaseInfo: m.releaseInfo, imdbRating: m.imdbRating,
@@ -560,6 +784,12 @@ struct DetailView: View {
             TraktEpisodeShadow.watchedVideoIDs(showIdentity: meta.id, videos: videos))
         let primary = seriesPrimaryEpisode(videos, watched: watched, localWatched: localWatched, metaID: meta.id)
         let primaryProgress = primary.map { episodeProgress($0.video, metaID: meta.id) } ?? 0
+        let primaryResumeSeconds = primary.flatMap {
+            if $0.video.id == validInitialVideoID, let validInitialResumeSeconds {
+                return validInitialResumeSeconds
+            }
+            return $0.isResume ? primaryEpisodeResumeSeconds($0.video, metaID: meta.id) : nil
+        }
         // FIX (build 137): the series/season hero was chopped at the top + not full-bleed because the
         // backdrop lived INSIDE hero(), i.e. inside the VStack inside the ScrollView, so its
         // .ignoresSafeArea() could not escape the top nav-bar safe-area inset. Hoist FullBleedBackdrop +
@@ -577,6 +807,7 @@ struct DetailView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.xl) {
                         hero(meta, primaryEpisode: primary?.video, primaryIsResume: primary?.isResume == true,
+                             primaryResumeSeconds: primaryResumeSeconds,
                              primaryProgress: primaryProgress,
                              scrollToContent: { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } })
                         CoreSeasonedEpisodes(meta: meta, videos: videos,
@@ -643,7 +874,6 @@ struct DetailView: View {
                         VStack(alignment: .leading, spacing: Theme.Space.sm) {
                             titleOrLogo(m)
                             metaRow(m)
-                            ratingsRow()
                             financialsRow()
                             releaseDatesRow()
                             if let d = m.description, !d.isEmpty {
@@ -670,7 +900,9 @@ struct DetailView: View {
                                                               type: m.type.isEmpty ? effectiveType : m.type,
                                                               name: m.name, poster: m.poster,
                                                               season: nil, episode: nil),
-                                           imdbId: ratingsImdbID)
+                                           identityRoles: sourceIndexRoles,
+                                           initialStartAtSeconds: validInitialResumeSeconds,
+                                           initialTraktSessionID: initialTraktSessionID)
                         }
                     }
                     .padding(.horizontal, Theme.Space.screenEdge)
@@ -718,7 +950,7 @@ struct DetailView: View {
     /// The art the tint derives from: the SAME background-else-poster pick the hero backdrop paints. Also
     /// the `.task(id:)` key, so a late meta hydrate (or a repoint to another title) recomputes.
     private var tintArtURL: String? {
-        core.metaDetails?.meta?.background ?? core.metaDetails?.meta?.poster
+        fencedMeta?.background ?? fencedMeta?.poster
     }
 
     /// Canvas with the dominant-color wash ramping in BELOW the hero (clear at the top, so the hero's
@@ -768,7 +1000,7 @@ struct DetailView: View {
                                    meta: PlaybackMeta(libraryId: m.id, videoId: m.id, type: type,
                                                       name: m.name, poster: m.poster,
                                                       season: nil, episode: nil),
-                                   imdbId: ratingsImdbID)
+                                   identityRoles: sourceIndexRoles)
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
                 .padding(.bottom, Theme.Space.xl)
@@ -856,6 +1088,7 @@ struct DetailView: View {
     /// Full-bleed backdrop with a canvas-blended gradient and the title / metadata / synopsis on the
     /// lower band. The serif title is the editorial signature.
     private func hero(_ m: CoreMetaItem, primaryEpisode: CoreVideo? = nil, primaryIsResume: Bool = false,
+                      primaryResumeSeconds: Double? = nil,
                       primaryProgress: Double = 0,
                       scrollToContent: @escaping () -> Void) -> some View {
         // FIX (build 137): the backdrop + trailer layer are now hoisted to the seriesPage page-root ZStack
@@ -871,7 +1104,6 @@ struct DetailView: View {
                     .lineLimit(2).minimumScaleFactor(0.6)
                     .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
                 metaRow(m)
-                ratingsRow()
                 financialsRow()
                 releaseDatesRow()
                 if let d = m.description, !d.isEmpty {
@@ -890,10 +1122,12 @@ struct DetailView: View {
                                 NavigationLink {
                                     CoreEpisodeStreams(meta: m, video: primaryEpisode,
                                                        season: primaryEpisode.season ?? 0,
-                                                       episodes: sortedEpisodes(m.videos ?? []))   // ALL seasons ordered → auto-advance crosses the season boundary
+                                                       episodes: sortedEpisodes(m.videos ?? []),
+                                                       initialStartAtSeconds: primaryResumeSeconds,
+                                                       initialTraktSessionID: initialTraktSessionID)   // ALL seasons ordered → auto-advance crosses the season boundary
                                 } label: {
                                     Label(primaryEpisodeLabel(primaryEpisode, isResume: primaryIsResume,
-                                                              resumeSeconds: primaryIsResume ? primaryEpisodeResumeSeconds(primaryEpisode, metaID: m.id) : nil),
+                                                              resumeSeconds: primaryResumeSeconds),
                                           systemImage: "play.fill")
                                 }
                                 .buttonStyle(PrimaryActionStyle())
@@ -1116,12 +1350,7 @@ struct DetailView: View {
 
     private func metaRow(_ m: CoreMetaItem) -> some View {
         HStack(spacing: Theme.Space.md) {
-            if let imdb = m.imdbRating {
-                HStack(spacing: 6) {
-                    Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
-                    Text(imdb)
-                }
-            }
+            primaryRatings(m)
             if let r = m.releaseInfo { Text(r) }
             if let rt = m.runtime { Text(rt) }
             let genres = m.genres
@@ -1131,26 +1360,31 @@ struct DetailView: View {
         .foregroundStyle(Theme.Palette.textSecondary)
     }
 
-    /// Compact cross-provider ratings row ("IMDb 8.5  ·  RT 92%  ·  MC 81  ·  TMDB 78%"), fed by the VortX
-    /// ratings service (no user key needed), with the user's MDBList key filling any gap. Shown only when
-    /// ratings came back; renders nothing otherwise (no error UI). Non-focusable, same typography as metaRow
-    /// so it reads as a second fact line under the title and never disturbs the first-screen focus chain.
-    @ViewBuilder private func ratingsRow() -> some View {
-        if let text = mdbRatings.flatMap(Self.ratingsText), !text.isEmpty {
-            Text(text)
-                .font(Theme.Typography.label)
-                .foregroundStyle(Theme.Palette.textSecondary)
+    /// The PRIMARY rating position on the tvOS hero. VortX hosts the ratings backend, so this shows the FULL
+    /// cross-provider set (IMDb star + RT / MC / TMDB, formatted once in `RatingsFormat`) once the keyless
+    /// VortX ratings service resolves, and the engine metadata's IMDb rating INSTANTLY until then so the row
+    /// never blanks. Both branches lead with the same accent star, so the extra scores fade in beside it with
+    /// no reflow. Per-score fail-soft: a title with only IMDb keeps showing only IMDb.
+    @ViewBuilder private func primaryRatings(_ m: CoreMetaItem) -> some View {
+        if let r = mdbRatings, case let tokens = RatingsFormat.tokens(r), !tokens.isEmpty {
+            HStack(spacing: Theme.Space.md) {
+                ForEach(Array(tokens.enumerated()), id: \.offset) { _, token in
+                    HStack(spacing: 5) {
+                        if token.isIMDb {
+                            Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
+                        } else {
+                            Text(token.label).foregroundStyle(Theme.Palette.textTertiary)
+                        }
+                        Text(token.value).foregroundStyle(Theme.Palette.textPrimary)
+                    }
+                }
+            }
+        } else if let imdb = m.imdbRating {
+            HStack(spacing: 6) {
+                Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
+                Text(imdb).foregroundStyle(Theme.Palette.textPrimary)
+            }
         }
-    }
-
-    /// Build the joined ratings string from the decoded model, or nil when nothing is present.
-    private static func ratingsText(_ r: MDBListRatings) -> String? {
-        var parts: [String] = []
-        if let v = r.imdb { parts.append("IMDb \(imdbFmt.string(from: NSNumber(value: v)) ?? String(v))") }
-        if let v = r.rottenTomatoes { parts.append("RT \(v)%") }
-        if let v = r.metacritic { parts.append("MC \(v)") }
-        if let v = r.tmdb { parts.append("TMDB \(v)%") }
-        return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
     }
 
     /// Movie budget + box office (+ profit multiple), a third fact line under the ratings. Opt-out via the
@@ -1190,20 +1424,16 @@ struct DetailView: View {
         return parts.joined(separator: "  ·  ")
     }
 
-    /// One-decimal IMDb formatter (8.5, not 8.50). `static let` to avoid per-row allocation.
-    private static let imdbFmt: NumberFormatter = {
-        let f = NumberFormatter()
-        f.minimumFractionDigits = 1
-        f.maximumFractionDigits = 1
-        return f
-    }()
-
     /// The season of the episode the viewer was LAST on (from the resume videoId), decoupled from the
     /// watched-gate seriesPrimaryEpisode applies. Opening Details from Continue Watching should land on the
     /// season you were last in, even if that episode is now marked watched (seriesPrimaryEpisode would jump to
     /// the next-unwatched season instead). nil when there is no resume position, so the caller falls back to the
     /// primary/next-unwatched season. seriesPrimaryEpisode still drives the Resume/Play button unchanged.
     private func resumeSeasonHint(_ videos: [CoreVideo], metaID: String) -> Int? {
+        if let validInitialVideoID,
+           let season = sortedEpisodes(videos).first(where: { $0.id == validInitialVideoID })?.season {
+            return season
+        }
         let videoId: String? = profiles.activeUsesEngineHistory
             ? core.metaDetails?.libraryItem?.state.videoId
             : profiles.watch[metaID]?.videoId
@@ -1218,6 +1448,12 @@ struct DetailView: View {
     private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>,
                                       localWatched: Set<String>, metaID: String) -> (video: CoreVideo, isResume: Bool)? {
         let sorted = sortedEpisodes(videos)
+        if let validInitialVideoID,
+           let validInitialResumeSeconds,
+           validInitialResumeSeconds > 0,
+           let video = sorted.first(where: { $0.id == validInitialVideoID }) {
+            return (video, true)
+        }
         // Resume position: the engine's library entry is account level, so overlay
         // profiles resolve theirs from the profile overlay instead (the same
         // invariant as the ticks and the progress stripes).
@@ -1337,7 +1573,19 @@ struct CoreSeasonedEpisodes: View {
     /// episodes), read from the same source as resumeSeasonHint: the engine library for the main profile,
     /// the per-profile overlay otherwise. This is where Back should land after continuous play (#7).
     private var resumeVideoId: String? {
-        profiles.activeUsesEngineHistory ? core.metaDetails?.libraryItem?.state.videoId : profiles.watch[meta.id]?.videoId
+        resolvedResumeVideoID(committed: nil)
+    }
+
+    private func resolvedResumeVideoID(committed: PlaybackMeta?) -> String? {
+        EpisodeReturnIdentityPolicy.resolve(
+            libraryID: meta.id,
+            isVideoAvailable: { id in videos.contains { $0.id == id } },
+            committedLibraryID: committed?.libraryId,
+            committedVideoID: committed?.videoId,
+            engineVideoID: profiles.activeUsesEngineHistory
+                ? core.metaDetails?.libraryItem?.state.videoId
+                : profiles.watch[meta.id]?.videoId
+        )
     }
     private var resumeSeason: Int? { resumeVideoId.flatMap { id in videos.first { $0.id == id }?.season } }
 
@@ -1404,7 +1652,7 @@ struct CoreSeasonedEpisodes: View {
         // then focus that row (tvOS auto-scrolls focus into view) so Back returns to the CURRENT episode, not
         // the one originally launched. Async so the row exists after a season switch and the shell is frontmost.
         .onChange(of: presenter.request == nil) {
-            reanchorGridToEngineEpisode()
+            reanchorGridToEngineEpisode(preferPlaybackCloseReceipt: true)
         }
         // Binge-desync fix #4: ALSO re-derive on app foreground, not just player dismissal. This page can
         // sit in the nav stack across a background boundary with no dismissal event (the player is not
@@ -1412,7 +1660,7 @@ struct CoreSeasonedEpisodes: View {
         // it launched from. Same guarded re-point as the dismissal path; a live player keeps input focus
         // (the guard inside skips while the cover is up - dismissal then re-points as before).
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
-            reanchorGridToEngineEpisode()
+            reanchorGridToEngineEpisode(preferPlaybackCloseReceipt: false)
         }
         .onChange(of: season) {
             // A manual tap or the programmatic preferred-season apply locks the auto-pick, so a later
@@ -1434,9 +1682,13 @@ struct CoreSeasonedEpisodes: View {
     /// auto-scrolls focus into view) so Back returns to the CURRENT episode, not the one originally
     /// launched. Guarded on the player being down (never steal focus from a live player; the dismissal
     /// trigger re-points the moment it closes) and on the engine naming a known episode.
-    private func reanchorGridToEngineEpisode() {
-        guard presenter.request == nil, let id = resumeVideoId, videos.contains(where: { $0.id == id }) else { return }
-        if let s = resumeSeason, s != season, seasons.contains(s) { season = s }
+    private func reanchorGridToEngineEpisode(preferPlaybackCloseReceipt: Bool) {
+        let committed = preferPlaybackCloseReceipt ? presenter.playbackCloseReceipt : nil
+        guard presenter.request == nil,
+              let id = resolvedResumeVideoID(committed: committed),
+              videos.contains(where: { $0.id == id }) else { return }
+        if let s = videos.first(where: { $0.id == id })?.season,
+           s != season, seasons.contains(s) { season = s }
         DispatchQueue.main.async { focusedEpisode = id }
     }
 
@@ -1591,6 +1843,8 @@ struct CoreEpisodeStreams: View {
     let video: CoreVideo
     let season: Int
     var episodes: [CoreVideo] = []
+    var initialStartAtSeconds: Double? = nil
+    var initialTraktSessionID: TraktSessionID? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore   // per-profile engine-history gate (activeUsesEngineHistory)
@@ -1605,11 +1859,20 @@ struct CoreEpisodeStreams: View {
     @State private var currentVideo: CoreVideo
     @State private var episodeTargetGeneration = 0
 
-    init(meta: CoreMetaItem, video: CoreVideo, season: Int, episodes: [CoreVideo] = []) {
+    init(
+        meta: CoreMetaItem,
+        video: CoreVideo,
+        season: Int,
+        episodes: [CoreVideo] = [],
+        initialStartAtSeconds: Double? = nil,
+        initialTraktSessionID: TraktSessionID? = nil
+    ) {
         self.meta = meta
         self.video = video
         self.season = season
         self.episodes = episodes
+        self.initialStartAtSeconds = initialStartAtSeconds
+        self.initialTraktSessionID = initialTraktSessionID
         _currentVideo = State(initialValue: video)
     }
 
@@ -1617,7 +1880,19 @@ struct CoreEpisodeStreams: View {
     /// episodes): the account-level engine library for the main profile, the per-profile overlay otherwise.
     /// Same source the grid's #7 signal reads. With fix 2 the engine's `state.videoId` is trustworthy input.
     private var resumeVideoId: String? {
-        profiles.activeUsesEngineHistory ? core.metaDetails?.libraryItem?.state.videoId : profiles.watch[meta.id]?.videoId
+        resolvedResumeVideoID(committed: nil)
+    }
+
+    private func resolvedResumeVideoID(committed: PlaybackMeta?) -> String? {
+        EpisodeReturnIdentityPolicy.resolve(
+            libraryID: meta.id,
+            isVideoAvailable: { id in episodes.contains { $0.id == id } },
+            committedLibraryID: committed?.libraryId,
+            committedVideoID: committed?.videoId,
+            engineVideoID: profiles.activeUsesEngineHistory
+                ? core.metaDetails?.libraryItem?.state.videoId
+                : profiles.watch[meta.id]?.videoId
+        )
     }
 
     /// The season the page shows: follows `currentVideo` so a cross-season binge advance re-labels correctly.
@@ -1657,10 +1932,20 @@ struct CoreEpisodeStreams: View {
                                    episodeTargetIsCurrent: { videoID, generation in
                                        videoID == currentVideo.id && generation == episodeTargetGeneration
                                    },
-                                   imdbId: {
-                                       if let dv = meta.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
-                                       return meta.id.hasPrefix("tt") ? meta.id : nil
-                                   }())
+                                   // Roles, not an ordered candidate list: this page states what each id IS
+                                   // and the ONE shared resolver ranks them. The catalog id outranks the
+                                   // add-on's episode-shaped defaultVideoId, and the FIELD CASE survives --
+                                   // a TMDB-identified series with no defaultVideoId ("tmdb:94997") holds its
+                                   // IMDb identity only on the EPISODE video id ("tt0460649:3:6"), which the
+                                   // series kind still admits as the last role.
+                                   identityRoles: SourceIndexIdentity.Roles(
+                                       catalogID: meta.id,
+                                       defaultVideoID: meta.behaviorHints?.defaultVideoId,
+                                       currentVideoID: currentVideo.id,
+                                       kind: .series
+                                   ),
+                                   initialStartAtSeconds: initialStartAtSeconds,
+                                   initialTraktSessionID: initialTraktSessionID)
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
                 .padding(.bottom, Theme.Space.xl)
@@ -1674,7 +1959,7 @@ struct CoreEpisodeStreams: View {
         // resolves + plays THAT episode's streams. Guarded on a real move to a known episode, so a no-op close
         // (paused, same episode) leaves the page untouched.
         .onChange(of: presenter.request == nil) {
-            reanchorPageToEngineEpisode()
+            reanchorPageToEngineEpisode(preferPlaybackCloseReceipt: true)
         }
         // Binge-desync fix #4: ALSO re-derive on app foreground, not just player dismissal. This pushed
         // page stays mounted behind the player across a background boundary (no dismissal event fires),
@@ -1682,7 +1967,7 @@ struct CoreEpisodeStreams: View {
         // episode. Guarded inside: while the player cover is still up nothing moves (its dismissal
         // re-points as before), so the live player's engine slot is never reloaded from under it.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
-            reanchorPageToEngineEpisode()
+            reanchorPageToEngineEpisode(preferPlaybackCloseReceipt: false)
         }
     }
 
@@ -1692,8 +1977,11 @@ struct CoreEpisodeStreams: View {
     /// episode's streams. Guarded on the player being down (a foreground with the cover still up leaves
     /// the live player's engine slot alone) and on a real move to a known episode, so a no-op close
     /// (paused, same episode) leaves the page untouched.
-    private func reanchorPageToEngineEpisode() {
-        guard presenter.request == nil, let id = resumeVideoId, id != currentVideo.id,
+    private func reanchorPageToEngineEpisode(preferPlaybackCloseReceipt: Bool) {
+        let committed = preferPlaybackCloseReceipt ? presenter.playbackCloseReceipt : nil
+        guard presenter.request == nil,
+              let id = resolvedResumeVideoID(committed: committed),
+              id != currentVideo.id,
               let moved = episodes.first(where: { $0.id == id }) else { return }
         episodeTargetGeneration &+= 1
         currentVideo = moved
@@ -1782,10 +2070,23 @@ struct CoreStreamList: View {
     var episodeStreamId: String? = nil
     var episodeTargetGeneration = 0
     var episodeTargetIsCurrent: ((String?, Int) -> Bool)? = nil
-    /// The title's imdb id (tt...) for the TorBox search-as-a-source lookup, when known. nil = no search
-    /// contribution (also the no-imdb-id case, e.g. a live channel). The feature is further gated on a
-    /// TorBox key inside `TorBoxSearchSource.refresh`.
-    var imdbId: String? = nil
+    /// The identity ROLES of the title this list belongs to, stated by the page that mounts it. The list
+    /// never derives an identity of its own: it forwards these to the ONE shared resolver, so the pool key,
+    /// the TorBox key, and the publication token are the same identity by construction rather than by three
+    /// call sites agreeing. A live channel typically resolves to nothing, which disables both contributors.
+    var identityRoles = SourceIndexIdentity.Roles(
+        catalogID: nil, defaultVideoID: nil, currentVideoID: nil, kind: .movie
+    )
+    /// One navigation-carried resume offset, consumed by the first content play only.
+    var initialStartAtSeconds: Double? = nil
+    /// Exact Trakt session that owns `initialStartAtSeconds`. nil means the offset is local, not remote.
+    var initialTraktSessionID: TraktSessionID? = nil
+
+    /// The title's resolved IMDb identity. ONE value: the pool and the IMDb-keyed TorBox index take the same
+    /// IMDb-only key (decision REQ-260721-33), so there is no second field for a caller to pick wrongly.
+    private var titleIdentity: SourceIndexIdentity.Resolved {
+        SourceIndexIdentity.resolve(identityRoles)
+    }
 
     /// The title's numeric TMDB id when this page came from a TMDB-keyed catalog ("tmdb:123",
     /// "tmdb:movie:123"). Same extraction rule as `DetailView.ratingTMDBID`, applied to the library id, so
@@ -1803,17 +2104,27 @@ struct CoreStreamList: View {
     /// most wanted. It is declared here rather than borrowed from `DetailView` because this is a separate
     /// struct: the identifier is not in scope across the type boundary, however adjacent the two rows look.
     ///
-    /// `imdbId` is already the SHOW-level tt id at EVERY call site (the episode page deliberately passes the
-    /// show's id, not the episode's), which is the exact level ratings are recorded at, so an episode page
-    /// rates its show and matches the title-level intent of the watchlist writes.
+    /// The resolved identity is the SHOW-level title id (the episode page states the show as its catalog role,
+    /// not the episode), which is the exact level ratings are recorded at, so an episode page rates its show
+    /// and matches the title-level intent of the watchlist writes. It is a bare "tt..." or nothing, which is
+    /// also what `TraktRatingChip` needs: the previous property could carry a tmdb value straight into a
+    /// parameter labelled `imdb`.
     @ViewBuilder private var ratingChip: some View {
-        TraktRatingChip(imdb: imdbId, tmdb: ratingTMDBID, isSeries: (meta?.type ?? "") == "series")
+        TraktRatingChip(imdb: titleIdentity.titleID, tmdb: ratingTMDBID,
+                        isSeries: (meta?.type ?? "") == "series")
+        // SIMKL's own rating chip (SourcesShared/SIMKLRatingControl.swift), so the episode/sources row rates on
+        // SIMKL too while bingeing. Each chip is gated on its own service and self-hides otherwise.
+        SIMKLRatingChip(imdb: titleIdentity.titleID, tmdb: ratingTMDBID,
+                        isSeries: (meta?.type ?? "") == "series")
     }
 
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @State private var sourceFilter: String? = nil
     @State private var sourceRefreshDebounce: Task<Void, Never>? = nil
+    @State private var sourceContributionTask: Task<Void, Never>? = nil
+    @State private var sourceContributionPolicy = SourceContributionWorkPolicy()
+    @State private var sourceRefreshPlaybackGate = SourceRefreshPlaybackGate()
     private static let sourceRefreshDebounceMs = 400   // trailing settle for the add-on load storm, mirrors coalesceMs intent
     @State private var showAllSources = false   // the full ranked list is revealed on demand (Watch-Now first)
     // Render only the top N ranked rows at a time; a popular title returns 4000+ sources and instantiating
@@ -1869,6 +2180,7 @@ struct CoreStreamList: View {
     /// Smart Source Selection (Lane A) auto-pick guard. Set once when the auto-pick fires so it never
     /// re-triggers; a viewer who backs out of the player lands on the full source list (the escape hatch).
     @State private var didAutoPick = false
+    @State private var initialStartGate = OneShotResumeAdmissionGate<TraktSessionID>()
 
     /// Pin context derived from the title being shown - a movie pin or a show pin, both keyed by the
     /// library (meta) id. A series episode list passes a `type: "series"` PlaybackMeta, so every episode
@@ -1895,18 +2207,18 @@ struct CoreStreamList: View {
     /// (`state.duration` is milliseconds, like `state.timeOffset`.)
     private var traktDurationSeconds: Double? {
         if let d = core.metaDetails?.libraryItem?.state.duration, d > 0 { return d / 1000.0 }
-        return core.metaDetails?.meta?.runtimeSeconds
+        return ResidentMeta.fenced(core.metaDetails?.meta, pageID: meta?.libraryId ?? "") { $0.id }?.runtimeSeconds
     }
 
     /// A position Trakt holds from ANOTHER device worth offering, or nil. Read-only and advisory: it is NOT
     /// consulted by `resumeSeconds` or by the primary Watch/Resume button, which keep reading VortX's own
     /// authority. All policy lives in `TraktPlaybackShadow`, shared with iOS so the two cannot drift.
     /// Suppressed for live channels, which have no resume point to offer.
-    private var traktSuggestionSeconds: Double? {
+    private var traktSuggestion: AccountBoundResumeSuggestion<TraktSessionID>? {
         guard let meta, !isLive else { return nil }
-        return TraktPlaybackShadow.shared.suggestionSeconds(for: meta,
-                                                            localSeconds: resumeSeconds,
-                                                            durationSeconds: traktDurationSeconds)
+        return TraktPlaybackShadow.shared.suggestion(for: meta,
+                                                     localSeconds: resumeSeconds,
+                                                     durationSeconds: traktDurationSeconds)
     }
 
     /// Owns the source-list assembly + ranking OFF the SwiftUI render path (see `SourceListModel`):
@@ -2033,8 +2345,14 @@ struct CoreStreamList: View {
                     // begins (the same seam "Play from start" uses, via playBest's exact-source path, so it
                     // never re-picks the source either). Nothing here writes engine state, the account, or
                     // Trakt. Hidden unless the user opted in. Mirrors iOS iOSDetailView.
-                    if let suggestion = traktSuggestionSeconds, let stamp = resumeTimecode(suggestion) {
-                        Button { playBest(best, in: groups, startAt: suggestion) } label: {
+                    if let suggestion = traktSuggestion, let stamp = resumeTimecode(suggestion.seconds) {
+                        Button {
+                            playBest(
+                                best,
+                                in: groups,
+                                resumeSuggestion: suggestion
+                            )
+                        } label: {
                             Label("Resume from \(stamp)", systemImage: "arrow.triangle.branch")
                         }
                         .buttonStyle(ChipButtonStyle())
@@ -2214,19 +2532,34 @@ struct CoreStreamList: View {
         .onAppear {
             sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
                             mediaServers: mediaServers, debridCache: debridCache)
-            torboxSearch.refresh(imdbId: imdbId, season: meta?.season, episode: meta?.episode)
-            mediaServers.refresh(imdb: imdbId, season: meta?.season, episode: meta?.episode,
+            torboxSearch.refresh(imdbId: titleIdentity.titleID, season: meta?.season, episode: meta?.episode)
+            mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
                                  title: meta?.name, publicationTarget: mediaServerTargetID)
             refreshSourceIndex()
         }
         .onChange(of: mediaServerTargetID) { _ in
-            torboxSearch.refresh(imdbId: imdbId, season: meta?.season, episode: meta?.episode)
-            mediaServers.refresh(imdb: imdbId, season: meta?.season, episode: meta?.episode,
+            torboxSearch.refresh(imdbId: titleIdentity.titleID, season: meta?.season, episode: meta?.episode)
+            mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
                                  title: meta?.name, publicationTarget: mediaServerTargetID)
             refreshSourceIndex()
             scheduleSourceRefresh()
         }
-        .onDisappear { sourceRefreshDebounce?.cancel() }
+        .onChange(of: core.playerActive) { active in
+            if active {
+                sourceRefreshPlaybackGate.playbackStarted()
+                sourceRefreshDebounce?.cancel()
+                sourceRefreshDebounce = nil
+                cancelSourceContribution(reason: "playback started")
+            } else if sourceRefreshPlaybackGate.playbackEnded() {
+                scheduleSourceRefresh()
+            }
+        }
+        .onDisappear {
+            sourceRefreshDebounce?.cancel()
+            sourceRefreshDebounce = nil
+            sourceRefreshPlaybackGate.reset()
+            cancelSourceContribution(reason: "detail disappeared")
+        }
         // First-download storage-eviction warning (#30). Apple TV has no user-visible file system and the
         // OS can reclaim app storage under pressure, so a saved download may be removed by the system. Show
         // this once; on confirm we remember the ack and run the queued download, on cancel we drop it.
@@ -2411,12 +2744,12 @@ struct CoreStreamList: View {
     /// The pool `content_id` for this list: the title's imdb id, plus `:S:E` when the `PlaybackMeta` carries
     /// a season + episode (a series episode list). nil when no imdb id is known (e.g. a live channel).
     private var sourceContentID: String? {
-        SourceIndexClient.contentID(imdbId: imdbId, season: meta?.season, episode: meta?.episode)
+        SourceIndexClient.contentID(roles: identityRoles, season: meta?.season, episode: meta?.episode)
     }
 
     private var mediaServerTargetID: String {
         if let sourceContentID { return sourceContentID }
-        let libraryID = meta?.libraryId ?? imdbId ?? "unknown"
+        let libraryID = meta?.libraryId ?? titleIdentity.titleID ?? "unknown"
         let videoID = episodeStreamId ?? meta?.videoId ?? "title"
         return "meta:\(libraryID)|video:\(videoID)"
     }
@@ -2429,33 +2762,171 @@ struct CoreStreamList: View {
     /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
-    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
+    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil,
+                                    providerByHash: [String: String] = [:]) {
+        guard sourceRefreshPlaybackGate.permitsRefresh(
+            playerActive: core.playerActive
+        ) else { return }
         let contentID = sourceContentID
         let vortxSignedIn = VortXSyncManager.shared.isSignedIn
         sourceIndex.refresh(contentID: contentID, isSignedIn: vortxSignedIn)
         guard let contentID else { return }
         // Pool-EXCLUDED hoard set: the caller's torbox-base when it already merged one (avoids a second walk),
         // else self-merge. NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into
-        // itself would be wrong.
+        // itself would be wrong. `providerByHash` tags each cached torrent with the provider the user's OWN
+        // cache-check confirmed.
         let groups = torboxMerged ?? torboxSearch.merged(into: targetCoreGroups)
         guard !groups.isEmpty else { return }
-        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
+        requestSourceContribution(
+            contentID: contentID, groups: groups, providerByHash: providerByHash
+        )
+    }
+
+    /// One contribution owner for the detail page. A source-load storm marks the owner dirty instead of
+    /// launching another full descriptor extraction. When the owner finishes, one newest-snapshot refresh
+    /// catches any rows that arrived meanwhile. Covered detail pages do no contribution work during playback.
+    private func requestSourceContribution(
+        contentID: String,
+        groups: [CoreStreamSourceGroup],
+        providerByHash: [String: String]
+    ) {
+        guard !core.playerActive else { return }
+        guard case .launch(let claim) = sourceContributionPolicy.request() else { return }
+        VXProbe.log(
+            "perf",
+            "source contribution start target=\(VXProbeRedaction.identityToken(contentID)) claim=\(claim.generation) groups=\(groups.count)"
+        )
+        sourceContributionTask = Task.detached(priority: .utility) {
+            guard await SourceIndexClient.contributionAllowedNow() else {
+                await MainActor.run {
+                    finishSourceContribution(
+                        claim: claim,
+                        target: nil,
+                        acceptedByProcess: false
+                    )
+                }
+                return
+            }
+            let descriptors = SourceIndexClient.descriptors(
+                from: groups, providerByHash: providerByHash
+            )
+            guard !Task.isCancelled else { return }
+            guard !descriptors.isEmpty else {
+                await MainActor.run {
+                    finishSourceContribution(
+                        claim: claim,
+                        target: nil,
+                        acceptedByProcess: false
+                    )
+                }
+                return
+            }
+            let fingerprint = SourceIndexClient.descriptorFingerprint(descriptors)
+            guard !Task.isCancelled else { return }
+            guard !fingerprint.isEmpty else {
+                await MainActor.run {
+                    finishSourceContribution(
+                        claim: claim,
+                        target: nil,
+                        acceptedByProcess: false
+                    )
+                }
+                return
+            }
+            let target = SourceContributionWorkPolicy.Target(
+                contentID: contentID, descriptorFingerprint: fingerprint
+            )
+            let shouldSubmit = await MainActor.run {
+                !CoreBridge.shared.playerActive
+                    && sourceContributionPolicy.shouldSubmit(target, for: claim)
+            }
+            guard shouldSubmit else {
+                await MainActor.run {
+                    finishSourceContribution(
+                        claim: claim,
+                        target: target,
+                        acceptedByProcess: false
+                    )
+                }
+                return
+            }
+            let outcome = await SourceIndexClient.contribute(
+                contentID: contentID,
+                descriptors: descriptors
+            )
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                finishSourceContribution(
+                    claim: claim,
+                    target: target,
+                    acceptedByProcess: outcome == .acceptedByProcess
+                )
+            }
+        }
+    }
+
+    private func finishSourceContribution(
+        claim: SourceContributionWorkPolicy.Claim,
+        target: SourceContributionWorkPolicy.Target?,
+        acceptedByProcess: Bool
+    ) {
+        let completion = sourceContributionPolicy.complete(
+            claim,
+            target: target,
+            acceptedByProcess: acceptedByProcess
+        )
+        guard case .current(let needsNewestSnapshot) = completion else {
+            return
+        }
+        sourceContributionTask = nil
+        VXProbe.log(
+            "perf",
+            "source contribution end claim=\(claim.generation) accepted=\(acceptedByProcess ? "true" : "false") deferred=\(needsNewestSnapshot ? "true" : "false")"
+        )
+        if needsNewestSnapshot, !core.playerActive {
+            scheduleSourceRefresh()
+        }
+    }
+
+    private func cancelSourceContribution(reason: String) {
+        let wasActive = sourceContributionTask != nil
+        sourceContributionTask?.cancel()
+        sourceContributionTask = nil
+        sourceContributionPolicy.cancel()
+        if wasActive {
+            VXProbe.log("perf", "source contribution cancel reason=\(reason)")
+        }
     }
 
     /// Trailing-debounced driver for the add-on load storm: the raw `.onChange` fired per add-on completion,
     /// each doing full O(N) merge walks on main. Coalesce to one pass ~400 ms after the burst settles, and
     /// compute the torbox-base ONCE so the debrid (pool-inclusive) and hoard (pool-excluded) sets share it.
     private func scheduleSourceRefresh() {
+        guard sourceRefreshPlaybackGate.permitsRefresh(
+            playerActive: core.playerActive
+        ) else {
+            sourceRefreshDebounce?.cancel()
+            sourceRefreshDebounce = nil
+            return
+        }
         sourceRefreshDebounce?.cancel()
         sourceRefreshDebounce = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
             guard !Task.isCancelled else { return }
+            guard sourceRefreshPlaybackGate.permitsRefresh(
+                playerActive: core.playerActive
+            ) else {
+                sourceRefreshDebounce = nil
+                return
+            }
             let torboxBase = torboxSearch.merged(into: targetCoreGroups)   // pool-EXCLUDED (hoard set)
             // Pool-INCLUDED: cache awareness needs raw torrents and TorBox-search NZBs that the Direct-links-only
             // filter would drop, plus Singularity's torrent-only pool sources. Torrents resolve through debrid;
             // TorBox-search NZBs resolve through TorBox. This remains orthogonal to the display filter.
             debridCache.refresh(from: sourceIndex.merged(into: torboxBase))
-            refreshSourceIndex(torboxMerged: torboxBase)   // reuse the same base; no second merge walk
+            refreshSourceIndex(torboxMerged: torboxBase,
+                               providerByHash: debridCache.cachedProviderByHash) // reuse the base; tag cached facts
+            sourceRefreshDebounce = nil
         }
     }
 
@@ -2477,7 +2948,14 @@ struct CoreStreamList: View {
             Task { @MainActor in await playTrailerStream(stream) }
             return
         }
-        Task { await playResolving(stream, explicit: true) }   // a tapped source row / quality pick: honor it in the player
+        let proposedStart = proposedInitialStart(fromStart: false)
+        Task {
+            await playResolving(
+                stream,
+                explicit: true,
+                startProposal: proposedStart
+            )
+        }   // a tapped source row / quality pick: honor it in the player
     }
 
     /// #95: play a source-list TRAILER row (an `isYouTubeTrailer` `ytId` stream) the SAME reliable way the
@@ -2519,17 +2997,69 @@ struct CoreStreamList: View {
     /// race yields nothing (no confirmed-cached row, or every leg failed) it falls straight through to today's
     /// single-resolve `play(best)`, so the no-key / no-cache path is unchanged. A MANUAL row tap still calls
     /// `play(_:)` directly (`streamRow`), resolving exactly the row the user chose.
-    /// `startAt` is "Play from start" generalized past 0:00: begin at an explicit second, still WITHOUT
+    /// `resumeSuggestion` is "Play from start" generalized past 0:00: begin at an explicit second, still WITHOUT
     /// re-picking the source and still WITHOUT touching the stored resume point. It carries the Trakt
     /// "Resume from <time>" chip's offer down to the player and is the ONLY way that feature reaches
-    /// playback. Nothing on this path reads Trakt. Mirrors iOS `playMovie(fromStart:startAt:)`.
-    private func playBest(_ best: CoreStream, in groups: [CoreStreamSourceGroup], fromStart: Bool = false,
-                          startAt: Double? = nil) {
-        Task { await playBestResolving(best, in: groups, fromStart: fromStart, startAt: startAt) }
+    /// playback. Nothing on this path reads Trakt. Mirrors iOS `playMovie(fromStart:resumeSuggestion:)`.
+    private func playBest(
+        _ best: CoreStream,
+        in groups: [CoreStreamSourceGroup],
+        fromStart: Bool = false,
+        resumeSuggestion: AccountBoundResumeSuggestion<TraktSessionID>? = nil
+    ) {
+        let proposedStart = proposedInitialStart(
+            fromStart: fromStart,
+            resumeSuggestion: resumeSuggestion
+        )
+        Task {
+            await playBestResolving(
+                best,
+                in: groups,
+                fromStart: fromStart,
+                startProposal: proposedStart
+            )
+        }
     }
 
-    @MainActor private func playBestResolving(_ best: CoreStream, in groups: [CoreStreamSourceGroup],
-                                              fromStart: Bool = false, startAt: Double? = nil) async {
+    private func proposedInitialStart(
+        fromStart: Bool,
+        resumeSuggestion: AccountBoundResumeSuggestion<TraktSessionID>? = nil
+    ) -> AccountBoundResumeProposal<TraktSessionID> {
+        if fromStart {
+            return AccountBoundResumeProposal(
+                seconds: nil,
+                expectedSessionID: nil,
+                consumesInitial: true
+            )
+        }
+        if let resumeSuggestion {
+            return resumeSuggestion.proposal
+        }
+        guard !initialStartGate.isConsumed,
+              initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID,
+              let initialStartAtSeconds,
+              initialStartAtSeconds.isFinite,
+              initialStartAtSeconds > 0 else {
+            return AccountBoundResumeProposal(
+                seconds: nil,
+                expectedSessionID: nil,
+                consumesInitial: false
+            )
+        }
+        return AccountBoundResumeProposal(
+            seconds: initialStartAtSeconds,
+            expectedSessionID: initialTraktSessionID,
+            consumesInitial: true,
+            requiresUnconsumedInitial: true
+        )
+    }
+
+    @MainActor private func playBestResolving(
+        _ best: CoreStream,
+        in groups: [CoreStreamSourceGroup],
+        fromStart: Bool = false,
+        startProposal: AccountBoundResumeProposal<TraktSessionID>
+    ) async {
         let targetVideoID = episodeStreamId
         let targetGeneration = episodeTargetGeneration
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
@@ -2570,13 +3100,17 @@ struct CoreStreamList: View {
                 guard targetIsCurrent(
                     videoID: targetVideoID, generation: targetGeneration
                 ) else { return }
+                guard let admittedStart = initialStartGate.admit(
+                    startProposal,
+                    currentSessionID: TraktAuth.storedSessionID
+                ) else { return }
                 presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
                                                     sourceHint: entry.qualityText, torrent: false,
                                                     bingeGroup: entry.bingeGroup, headers: entry.headers,
                                                     debridRef: ref, sourceStream: resumeSource,
                                                     enginePlayerVideoId: engineVideoID,
                                                     wasExplicitPick: true, wasResume: true, startFromZero: fromStart,
-                                                    startAtSeconds: startAt)
+                                                    startAtSeconds: admittedStart.seconds)
                 return
             }
         }
@@ -2595,25 +3129,38 @@ struct CoreStreamList: View {
             guard targetIsCurrent(
                 videoID: targetVideoID, generation: targetGeneration
             ) else { return }
+            guard let admittedStart = initialStartGate.admit(
+                startProposal,
+                currentSessionID: TraktAuth.storedSessionID
+            ) else { return }
             presenter.request = PlaybackRequest(url: win.ref.url, title: title, meta: meta, episodes: episodes,
                                                 sourceHint: StreamRanking.signature(win.stream), torrent: false,
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
                                                 headers: win.stream.requestHeaders, debridRef: win.ref,
                                                 sourceStream: win.stream,
                                                 enginePlayerVideoId: engineVideoID, startFromZero: fromStart,
-                                                startAtSeconds: startAt)
+                                                startAtSeconds: admittedStart.seconds)
             return
         }
         // No parallel-cached winner: today's single-resolve path on the ranked best, unchanged. This is an
         // AUTO pick (the Watch-Now fallback), so it may hop normally on a start-timeout.
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
-        await playResolving(best, explicit: false, fromStart: fromStart, startAt: startAt)
+        await playResolving(
+            best,
+            explicit: false,
+            fromStart: fromStart,
+            startProposal: startProposal
+        )
     }
 
     /// `explicit`: true when the user tapped this exact source row / quality (honor it in the player, no
     /// silent hop on a start-timeout); false when it is the auto Watch-Now single-resolve fallback.
-    @MainActor private func playResolving(_ stream: CoreStream, explicit: Bool, fromStart: Bool = false,
-                                          startAt: Double? = nil) async {
+    @MainActor private func playResolving(
+        _ stream: CoreStream,
+        explicit: Bool,
+        fromStart: Bool = false,
+        startProposal: AccountBoundResumeProposal<TraktSessionID>
+    ) async {
         let targetVideoID = episodeStreamId
         let targetGeneration = episodeTargetGeneration
         let targetHint = episodeHint
@@ -2642,13 +3189,18 @@ struct CoreStreamList: View {
             guard targetIsCurrent(
                 videoID: targetVideoID, generation: targetGeneration
             ) else { return }
+            guard let admittedStart = initialStartGate.admit(
+                startProposal,
+                currentSessionID: TraktAuth.storedSessionID
+            ) else { return }
             presenter.request = PlaybackRequest(url: ref.url, title: title, meta: meta, episodes: episodes,
                                                 sourceHint: StreamRanking.signature(stream), torrent: false,
                                                 bingeGroup: stream.behaviorHints?.bingeGroup,
                                                 headers: stream.requestHeaders, debridRef: ref,
                                                 sourceStream: stream,
                                                 enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
-                                                startFromZero: fromStart, startAtSeconds: startAt)
+                                                startFromZero: fromStart,
+                                                startAtSeconds: admittedStart.seconds)
             return
         }
         // A raw NZB URL is a descriptor for the resolver, never media bytes for the player.
@@ -2660,13 +3212,18 @@ struct CoreStreamList: View {
         let engineVideoID = bindEngine(to: stream)
         prepareTorrent(stream)
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
+        guard let admittedStart = initialStartGate.admit(
+            startProposal,
+            currentSessionID: TraktAuth.storedSessionID
+        ) else { return }
         presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
                                             sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             headers: stream.requestHeaders, sourceStream: stream,
                                             enginePlayerVideoId: engineVideoID,
                                             wasExplicitPick: explicit,
-                                            startFromZero: fromStart, startAtSeconds: startAt)
+                                            startFromZero: fromStart,
+                                            startAtSeconds: admittedStart.seconds)
     }
 
     private func filterBar(_ groups: [CoreStreamSourceGroup], total: Int) -> some View {
@@ -2889,7 +3446,7 @@ struct LibraryChip: View {
     }
 }
 
-/// Add / remove the open title from the local "want to watch" watchlist (`LibraryAutoAdd`) — a pure app-side
+/// Add / remove the open title from the local "want to watch" watchlist (`LibraryAutoAdd`), a pure app-side
 /// bookmark separate from the engine Library, engine-safe ids only (tt / tmdb). Reads the open title from the
 /// engine detail meta exactly like `LibraryChip` reads `core.detailInLibrary`, so it needs no call-site
 /// plumbing; a synthetic magnet / paste-a-link title (no tt / tmdb id) hides the chip since it can't be

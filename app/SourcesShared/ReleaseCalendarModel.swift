@@ -3,7 +3,7 @@ import SwiftUI
 /// One series' full meta, fetched directly over the add-on protocol from the first meta add-on that
 /// answers. Never touches the engine, so the open detail page's engine meta slot is untouched. nil if
 /// none decode. OS-agnostic (pure URLSession + Codable) so it lives in SourcesShared and is reachable by
-/// EVERY target — both the iOS new-episode notification sweep (`NewEpisodeNotifications.fetchSeriesMeta`,
+/// EVERY target, both the iOS new-episode notification sweep (`NewEpisodeNotifications.fetchSeriesMeta`,
 /// a thin shim over this) and the shared `ReleaseCalendarModel`, including the tvOS targets that don't
 /// compile the SourcesiOS notifications file. Single implementation, identical behavior on both surfaces.
 enum SeriesMetaFetcher {
@@ -58,7 +58,7 @@ enum MovieMetaFetcher {
 /// "Upcoming Episodes": a Home rail of the next-airing episode of each SERIES in the user's library that
 /// drops within the next 45 days, soonest first. It reuses the SAME meta fetch the new-episode
 /// notification sweep runs (`SeriesMetaFetcher.fetch`), so a show you follow surfaces its next episode
-/// here whether or not you ever reopen its page — no engine call, the meta comes straight off the
+/// here whether or not you ever reopen its page; no engine call, the meta comes straight off the
 /// installed meta add-ons (never `CoreBridge`, so the open detail page's meta slot is untouched).
 ///
 /// Everything fails soft: an empty library, no meta add-ons, or a flaky network all leave `upcoming`
@@ -95,10 +95,25 @@ final class ReleaseCalendarModel: ObservableObject {
     /// with the same library doesn't refetch every series' meta over the network.
     private var lastSignature: String?
     private var loadTask: Task<Void, Never>?
+    private let simklBoundaryObserverKey = "release-calendar-model-\(UUID().uuidString)"
+
+    init() {
+        simklSeedSessionID = SIMKLAuth.storedSessionID
+        SIMKLAuthBoundary.observe(key: simklBoundaryObserverKey) { [weak self] sessionID in
+            Task { @MainActor [weak self] in
+                self?.handleSIMKLBoundary(sessionID)
+            }
+        }
+    }
 
     /// Cancel any in-flight sweep when the owning Home view is torn down, so a slow fetch can't keep the
     /// model (and its captured state) alive for up to the per-series timeout after the view disappears.
-    deinit { loadTask?.cancel(); movieLoadTask?.cancel() }
+    deinit {
+        loadTask?.cancel()
+        movieLoadTask?.cancel()
+        simklSeedTask?.cancel()
+        SIMKLAuthBoundary.removeObserver(key: simklBoundaryObserverKey)
+    }
 
     /// Build the rail from the series library + installed meta add-on bases, derived by the caller the SAME
     /// way `NewEpisodeNotifications.sweepLibrary`'s caller does (series-typed library ids + names, and the
@@ -135,21 +150,24 @@ final class ReleaseCalendarModel: ObservableObject {
 
     /// Clear when the library empties or the meta add-ons go away.
     func clear() {
-        loadTask?.cancel(); movieLoadTask?.cancel()
+        loadTask?.cancel(); movieLoadTask?.cancel(); simklSeedTask?.cancel()
         upcoming = []; upcomingMovies = []
         lastSignature = nil; lastMovieSignature = nil
+        simklSeedGeneration &+= 1
+        simklSeeds = []; simklSeedSessionID = SIMKLAuth.storedSessionID
+        lastSIMKLSeedRefresh = nil; lastUpcomingInputs = nil
     }
 
     /// Walk each series' meta off the main thread (reusing the shared `SeriesMetaFetcher` that also backs
     /// the notification sweep), take the SOONEST not-yet-aired episode within the horizon, and return them
-    /// sorted by air date. Pure transform + network, no main-actor state — runs entirely off the caller's actor.
+    /// sorted by air date. Pure transform + network, no main-actor state, runs entirely off the caller's actor.
     private static func build(seriesIDs: [String], seriesNames: [String: String],
                               metaBases: [String], reference: Date) async -> [UpcomingEpisode] {
         let horizon = reference.addingTimeInterval(Self.horizonDays * 86_400)
         var out: [UpcomingEpisode] = []
         for id in seriesIDs {
             guard let meta = await SeriesMetaFetcher.fetch(id: id, bases: metaBases) else { continue }
-            // The SOONEST not-yet-aired dated episode within the 45-day horizon — the exact filter the
+            // The SOONEST not-yet-aired dated episode within the 45-day horizon, the exact filter the
             // notification sweep uses (`releasedDate > now && < now + 45d`, earliest wins).
             let next = (meta.videos ?? [])
                 .compactMap { v -> (CoreVideo, Date)? in v.releasedDate.map { (v, $0) } }
@@ -264,9 +282,148 @@ final class ReleaseCalendarModel: ObservableObject {
             if moviePosters[entry.id] == nil, let p = entry.poster, !p.isEmpty { moviePosters[entry.id] = p }
         }
 
-        refresh(seriesIDs: seriesIDs, seriesNames: seriesNames, metaBases: metaBases, reference: reference)
-        refreshMovies(movieIDs: movieIDs, movieNames: movieNames, moviePosters: moviePosters,
-                      metaBases: metaBases, reference: reference)
+        // Remember the base (library + local watchlist) seeds so a later SIMKL plan-to-watch resolve can re-fold
+        // and rebuild without the host re-deriving anything, then kick that throttled SIMKL fetch.
+        lastUpcomingInputs = UpcomingInputs(seriesIDs: seriesIDs, seriesNames: seriesNames, movieIDs: movieIDs,
+                                            movieNames: movieNames, moviePosters: moviePosters,
+                                            metaBases: metaBases, reference: reference)
+        buildUpcoming(from: lastUpcomingInputs!)
+        refreshSIMKLSeeds()
+    }
+
+    // MARK: - SIMKL plan-to-watch fold (air dates for the shows a SIMKL user follows)
+
+    /// The base seeds of the last `refreshUpcoming`, so a SIMKL resolve that lands later can re-fold + rebuild.
+    private struct UpcomingInputs {
+        let seriesIDs: [String]
+        let seriesNames: [String: String]
+        let movieIDs: [String]
+        let movieNames: [String: String]
+        let moviePosters: [String: String]
+        let metaBases: [String]
+        let reference: Date
+    }
+
+    private var lastUpcomingInputs: UpcomingInputs?
+    /// SIMKL plan-to-watch titles resolved to catalog tt ids, cached between refreshes. Folded into every build.
+    private var simklSeeds: [SIMKLUpcomingSeeds.Seed] = []
+    /// Exact credential session that owns `simklSeeds` and its throttle. A mismatch fails closed even before
+    /// the main-actor observer gets its turn to clear the published rails.
+    private var simklSeedSessionID: SIMKLSessionID?
+    private var simklSeedGeneration: UInt64 = 0
+    private var lastSIMKLSeedRefresh: Date?
+    private var simklSeedTask: Task<Void, Never>?
+    /// Matches the plan-to-watch rail's own interval, so a connected user does at most a few SIMKL GETs per
+    /// interval across the rail, the watched shadow, and this fold combined.
+    private static let simklRefreshInterval: TimeInterval = 5 * 60
+
+    /// Build both rails from the base seeds folded with whatever SIMKL seeds are currently cached.
+    private func buildUpcoming(from inputs: UpcomingInputs) {
+        let currentSession = SIMKLAuth.storedSessionID
+        let readableSIMKLSeeds = currentSession != nil && simklSeedSessionID == currentSession
+            ? simklSeeds
+            : []
+        let folded = SIMKLUpcomingSeeds.fold(baseSeriesIDs: inputs.seriesIDs, baseSeriesNames: inputs.seriesNames,
+                                             baseMovieIDs: inputs.movieIDs, baseMovieNames: inputs.movieNames,
+                                             simkl: readableSIMKLSeeds)
+        refresh(seriesIDs: folded.seriesIDs, seriesNames: folded.seriesNames,
+                metaBases: inputs.metaBases, reference: inputs.reference)
+        refreshMovies(movieIDs: folded.movieIDs, movieNames: folded.movieNames, moviePosters: inputs.moviePosters,
+                      metaBases: inputs.metaBases, reference: inputs.reference)
+    }
+
+    /// Pull the SIMKL plan-to-watch list, resolve each entry to a tt id (reusing the proven, persistently cached
+    /// `CommunityTrickplay.resolveIMDbID`, exactly as `SIMKLRailsModel` does), and if the seed set changed,
+    /// re-fold + rebuild. Throttled to `simklRefreshInterval`. Fully fail-soft: unconfigured / not-signed-in /
+    /// flaky network clears the seeds (dropping SIMKL titles from Upcoming) or leaves the last set, never errors.
+    private func refreshSIMKLSeeds() {
+        guard SIMKLAuth.isConfigured, let sessionID = SIMKLAuth.storedSessionID else {
+            handleSIMKLBoundary(nil)
+            return
+        }
+        if simklSeedSessionID != sessionID {
+            handleSIMKLBoundary(sessionID)
+        }
+        if let last = lastSIMKLSeedRefresh, Date().timeIntervalSince(last) < Self.simklRefreshInterval { return }
+        guard simklSeedTask == nil else { return }
+        lastSIMKLSeedRefresh = Date()
+        simklSeedGeneration &+= 1
+        let generation = simklSeedGeneration
+        simklSeedTask = Task { [weak self] in
+            defer { self?.simklSeedTask = nil }
+            let resolved: [SIMKLUpcomingSeeds.Seed]
+            do {
+                resolved = try await Self.resolveSIMKLSeeds(expectedSession: sessionID)
+            } catch {
+                guard let self,
+                      self.simklSeedGeneration == generation,
+                      self.simklSeedSessionID == sessionID else { return }
+                self.lastSIMKLSeedRefresh = nil
+                return
+            }
+            guard let self,
+                  !Task.isCancelled,
+                  self.simklSeedGeneration == generation,
+                  self.simklSeedSessionID == sessionID,
+                  SIMKLAuth.storedSessionID == sessionID else { return }
+            guard resolved != self.simklSeeds else { return }
+            self.simklSeeds = resolved
+            self.rebuildAfterSIMKLChange()
+        }
+    }
+
+    /// Invalidate the old session's seeds, throttle, and resolver generation as soon as the auth boundary
+    /// reaches the main actor. Every read also checks the Keychain session synchronously, so the short actor
+    /// handoff window is fail closed rather than exposing old-account seeds.
+    private func handleSIMKLBoundary(_ sessionID: SIMKLSessionID?) {
+        let hadSeeds = !simklSeeds.isEmpty
+        simklSeedTask?.cancel()
+        simklSeedTask = nil
+        simklSeedGeneration &+= 1
+        simklSeeds = []
+        simklSeedSessionID = sessionID
+        lastSIMKLSeedRefresh = nil
+        if hadSeeds { rebuildAfterSIMKLChange() }
+    }
+
+    /// Re-run the last build with the updated SIMKL seeds (a no-op when no `refreshUpcoming` has run yet).
+    private func rebuildAfterSIMKLChange() {
+        guard let inputs = lastUpcomingInputs else { return }
+        buildUpcoming(from: inputs)
+    }
+
+    /// Off-main: fetch the plan-to-watch list and resolve every entry to a tt id. A signed-out account yields an
+    /// empty set (so SIMKL titles drop out of Upcoming on disconnect). Mirrors `SIMKLRailsModel.fetch`'s resolve.
+    private static func resolveSIMKLSeeds(
+        expectedSession sessionID: SIMKLSessionID
+    ) async throws -> [SIMKLUpcomingSeeds.Seed] {
+        guard SIMKLAuth.storedSessionID == sessionID else {
+            throw SIMKLError.sessionChanged
+        }
+        let entries = try await SIMKLService.shared.planToWatch(expectedSession: sessionID)
+        let resolved: [(Int, SIMKLUpcomingSeeds.Seed)] = await withTaskGroup(of: (Int, SIMKLUpcomingSeeds.Seed?).self) { group in
+            for (index, entry) in entries.enumerated() {
+                group.addTask {
+                    if let imdb = entry.imdb, !imdb.isEmpty {
+                        return (index, SIMKLUpcomingSeeds.Seed(id: imdb, type: entry.type, name: entry.title))
+                    }
+                    guard let tmdb = entry.tmdb,
+                          let tt = await CommunityTrickplay.resolveIMDbID(rawId: "tmdb:\(tmdb)",
+                                                                          seriesHint: entry.type == "series")
+                    else { return (index, nil) }
+                    return (index, SIMKLUpcomingSeeds.Seed(id: tt, type: entry.type, name: entry.title))
+                }
+            }
+            var out: [(Int, SIMKLUpcomingSeeds.Seed)] = []
+            for await (i, seed) in group { if let seed { out.append((i, seed)) } }
+            return out
+        }
+        // Restore list order and de-duplicate on the resolved tt (two entries can resolve to one title).
+        guard SIMKLAuth.storedSessionID == sessionID else {
+            throw SIMKLError.sessionChanged
+        }
+        var seen = Set<String>()
+        return resolved.sorted { $0.0 < $1.0 }.compactMap { seen.insert($0.1.id).inserted ? $0.1 : nil }
     }
 }
 

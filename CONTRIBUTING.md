@@ -48,6 +48,17 @@ fix(ios): stop the player straddling the previous title
 chore: bump the fetch script pins
 ```
 
+### Engine source never reaches this repo
+
+The engine layer is proprietary and lives in a private repository. A `pre-push`
+hook blocks any push to a public remote whose commits carry engine source, and a
+nightly CI sweep re-checks every branch and tag here for the same thing. Both use
+one detector, `scripts/scan-proprietary-engine.sh`, which reads the trees of the
+commits being pushed rather than the branch or tag name.
+
+`./scripts/fetch-server-deps.sh` installs the hook, so a fresh clone is covered by
+the normal setup. Confirm it any time with `scripts/install-git-hooks.sh --check`.
+
 ### No em dashes
 
 Do not use em dashes in any prose, including code comments, commit messages,

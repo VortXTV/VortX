@@ -4,10 +4,10 @@ import SwiftUI
 //
 // ProfilesView now lives in SourcesShared, so it compiles into the iOS, macOS and tvOS targets.
 // A few modifiers it uses are not available everywhere:
-//   • `.focusSection()`        — tvOS / macOS 13+ / iOS 17+. The iOS target deploys to 16, so it
+//   • `.focusSection()`:         tvOS / macOS 13+ / iOS 17+. The iOS target deploys to 16, so it
 //                                 must be gated. On tvOS it shapes directional-focus traversal;
 //                                 on iOS/macOS there is no remote focus engine, so it is a no-op.
-//   • `.fullScreenCover(...)`  — iOS / tvOS only. macOS has no full-screen cover, so it falls back
+//   • `.fullScreenCover(...)`:   iOS / tvOS only. macOS has no full-screen cover, so it falls back
 //                                 to a sheet there.
 // These helpers keep the tvOS behaviour byte-for-byte identical while letting the file build on
 // iOS and macOS. `PlatformModifiers.swift` has equivalents but lives in SourcesiOS (not compiled
@@ -480,7 +480,7 @@ struct ProfileEditorView: View {
                             .disabled(!canSave)
                         Button("Cancel") { dismiss() }
                             .buttonStyle(ChipButtonStyle(selected: false))
-                        if !isNew && store.profiles.count > 1 {
+                        if canDeleteProfile {
                             Button("Delete Profile", role: .destructive) { confirmDelete = true }
                                 .buttonStyle(ChipButtonStyle(selected: false))
                         }
@@ -500,7 +500,10 @@ struct ProfileEditorView: View {
                             isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
                 store.remove(original)
-                dismiss()
+                // `remove` authorizes against the current stored record and returns nil both for an
+                // inactive successful deletion and for a rejected deletion. Confirm disappearance before
+                // dismissing so a stale/spoofed owner editor never closes as if destructive work succeeded.
+                if !store.profiles.contains(where: { $0.id == original.id }) { dismiss() }
             }
         }
         .profileCover(isPresented: $signInNeeded) {
@@ -512,6 +515,14 @@ struct ProfileEditorView: View {
             iOSSignInView()
             #endif
         }
+    }
+
+    /// The store is the authorization source, not the editable draft or the caller's original copy. Hide the
+    /// destructive control for both owner identities and when the target has already disappeared.
+    private var canDeleteProfile: Bool {
+        guard !isNew, store.profiles.count > 1,
+              let target = store.profiles.first(where: { $0.id == original.id }) else { return false }
+        return !target.isOwner && target.id != UserProfile.ownerID
     }
 
     /// Shown instead of the form for a non-active profile: editing is only allowed from within that

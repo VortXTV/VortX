@@ -13,7 +13,7 @@ import Combine
 /// iOS/tvOS only: macOS keeps the libmpv path (its out-of-process server can transcode HLS itself).
 ///
 /// #76 Phase 1: on iOS the surface is an `AVPlayer` + `AVPlayerLayer` (NOT `AVPlayerViewController`) so VortX
-/// owns the chrome — a SwiftUI controls overlay matching the libmpv `PlayerScreen` look (transport, scrubber,
+/// owns the chrome, a SwiftUI controls overlay matching the libmpv `PlayerScreen` look (transport, scrubber,
 /// skip, close, title, buffering spinner, PiP) sits over the layer, exactly as that player's overlay sits over
 /// the Metal layer. tvOS deliberately keeps the bare `AVPlayerViewController`: a focusable custom overlay would
 /// fight the Siri-remote focus engine (the documented tvOS player-focus risk), so there AVKit keeps the screen
@@ -546,7 +546,7 @@ extension HLSPlayerView {
             vc.allowsPictureInPicturePlayback = true
             // #46: in-player chrome. AVKit owns the focus engine for customInfoViewControllers (the Info panel
             // revealed by swiping down on the Siri remote), so these add the episode + source chrome without a
-            // custom overlay fighting the remote — the reason this HLS / DV player stays bare.
+            // custom overlay fighting the remote, the reason this HLS / DV player stays bare.
             var panels: [UIViewController] = []
             let ordered = episodes.orderedBySeasonEpisode
             if ordered.count > 1 {

@@ -180,20 +180,19 @@ enum StremioServer {
             "peerSearch": ["sources": sources, "min": 40, "max": 150],
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = data
         // Fire-and-forget, but read the response so a failed torrent-create is not silently masked
         // (a peerless engine surfaces later as the "sources didn't load" red triangle). We do not
         // retry here -- the file endpoint blocks until ready and /create is idempotent -- we just log.
-        URLSession.shared.dataTask(with: req) { _, resp, err in
-            if let err = err {
-                NSLog("[create-probe] prepare %@: %@", ih, err.localizedDescription)
-            } else if let code = (resp as? HTTPURLResponse)?.statusCode, code / 100 != 2 {
-                NSLog("[create-probe] prepare %@: HTTP %d", ih, code)
+        Task(priority: .utility) {
+            do {
+                let code = try await TorrentCreateTransport.shared.create(url: url, jsonBody: data)
+                if code / 100 != 2 {
+                    NSLog("[create-probe] prepare %@: HTTP %d", ih, code)
+                }
+            } catch {
+                NSLog("[create-probe] prepare %@: %@", ih, error.localizedDescription)
             }
-        }.resume()
+        }
     }
 
     /// (Re)prime the embedded torrent engine for a KNOWN INFO HASH (not a full Stream), injecting the
@@ -210,20 +209,19 @@ enum StremioServer {
         let body: [String: Any] = ["torrent": ["infoHash": hash],
                                    "peerSearch": ["sources": sources, "min": 40, "max": 150]]
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = data
         // Fire-and-forget, but read the response so a failed prime is not silently masked (an
         // unprimed CW resume surfaces later as the "sources didn't load" red triangle). No retry:
         // /create is idempotent and the player's warm-up polling is the real readiness gate.
-        URLSession.shared.dataTask(with: req) { _, resp, err in
-            if let err = err {
-                NSLog("[create-probe] primeTorrent %@: %@", hash, err.localizedDescription)
-            } else if let code = (resp as? HTTPURLResponse)?.statusCode, code / 100 != 2 {
-                NSLog("[create-probe] primeTorrent %@: HTTP %d", hash, code)
+        Task(priority: .utility) {
+            do {
+                let code = try await TorrentCreateTransport.shared.create(url: url, jsonBody: data)
+                if code / 100 != 2 {
+                    NSLog("[create-probe] primeTorrent %@: HTTP %d", hash, code)
+                }
+            } catch {
+                NSLog("[create-probe] primeTorrent %@: %@", hash, error.localizedDescription)
             }
-        }.resume()
+        }
     }
 
     /// Cap the embedded server's torrent cache once it's reachable. The server defaults to a
@@ -249,7 +247,7 @@ enum StremioServer {
         #endif
         // cacheSize bounds the ON-DISK piece cache. It does NOT bound the engine's in-memory
         // piece map: the disk storage backend writes each completed 512KB piece into a native
-        // Buffer (off-heap, so it never shows in the JS heap — the "heap flat at 27MB, RSS to
+        // Buffer (off-heap, so it never shows in the JS heap, the "heap flat at 27MB, RSS to
         // 1.5GB" signature) and only frees it once the piece's verification group is whole AND
         // the SINGLE-worker disk writer (bagpipe(1)) has drained it. With 55 default connections
         // feeding pieces out-of-order, partial verify-groups pile up faster than they drain and

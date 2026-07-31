@@ -26,7 +26,7 @@ enum MacBrowseFocus: Hashable {
 extension View {
     /// A visible focus ring for the keyboard-focused poster / tab, using only Theme accent tokens and
     /// compositor-friendly properties (transform + opacity + a stroked overlay, never layout), per
-    /// DESIGN.md. Applied only on macOS and only when `isFocused`, so touch / VoiceOver never sees a ring.
+    /// docs/DESIGN-SYSTEM.md. Applied only on macOS and only when `isFocused`, so touch / VoiceOver never sees a ring.
     @ViewBuilder func macFocusRing(_ isFocused: Bool, cornerRadius: CGFloat = Theme.Radius.card) -> some View {
         let ringed = self
             .overlay {

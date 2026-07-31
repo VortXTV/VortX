@@ -51,6 +51,17 @@ data class DownloadRecord(
     val sourceName: String? = null,
     /** Quality signature shown on the row + re-recorded on play, so a CW resume keeps quality continuity. */
     val qualityText: String? = null,
+    /**
+     * Preserve the streamed source's routing decision when the completed file is opened offline.
+     * Null is reserved for legacy index rows that predate capability persistence and therefore need
+     * a one-time probe of the completed file before playback.
+     */
+    val isDolbyVision: Boolean? = null,
+    /**
+     * Preserve the streamed source's passthrough routing decision when the completed file is opened offline.
+     * Null means unknown, not false. Successful local probing replaces it with an evidence-backed value.
+     */
+    val isAtmos: Boolean? = null,
 
     /**
      * True when this was a torrent-to-disk download. A *finished* download always plays from the LOCAL file;
@@ -64,12 +75,29 @@ data class DownloadRecord(
     /** The resolved remote URL the download fetched. Kept for diagnostics; playback never uses it once completed. */
     val remoteURL: String,
 
+    /**
+     * Owner of a native-debrid capability URL. Both fields are null for direct/local and legacy records.
+     * Identity is the opaque account/local scope, never an API key or token.
+     */
+    val debridOwnerIdentity: String? = null,
+    val debridOwnerGeneration: Long? = null,
+
     /** On-disk filename (`<id>.<ext>`), relative to the Downloads directory. The absolute path is rebuilt on demand. */
     val localFilename: String,
 
     val bytesTotal: Long = 0,
     val bytesDone: Long = 0,
     val state: DownloadState = DownloadState.QUEUED,
+    /**
+     * Opaque ownership token for the currently scheduled transfer. Every worker callback must present this exact
+     * value; pause and terminal transitions clear it so delayed work from an older generation becomes inert.
+     */
+    val transferGeneration: String? = null,
+    /**
+     * Strong HTTP ETag for the bytes in the partial file. A Range continuation is allowed only when the response
+     * presents this exact validator; absent or weak validators force a zero-byte restart.
+     */
+    val representationETag: String? = null,
     /** Creation time, epoch millis (device-local; never cross-platform-synced). */
     val addedAt: Long = System.currentTimeMillis(),
     /** Human-readable failure reason when [state] == [DownloadState.FAILED]; null otherwise. */
@@ -86,4 +114,18 @@ data class DownloadRecord(
     /** 0..1 download progress; 0 until a total is known (a torrent's total is unknown up front). */
     val fractionComplete: Double
         get() = if (bytesTotal > 0) (bytesDone.toDouble() / bytesTotal.toDouble()).coerceIn(0.0, 1.0) else 0.0
+
+    /**
+     * Rebuild the local playback handle without losing known source capabilities. Unknown legacy
+     * capabilities fail closed to false here; [com.vortx.android.downloads.DownloadedMediaCapabilityResolver]
+     * probes them before this function is called and leaves them unknown when probing fails.
+     */
+    fun localPlayable(localURL: String): Playable = Playable(
+        url = localURL,
+        title = displayTitle,
+        viaStreamingServer = false,
+        isTorrent = false,
+        isDolbyVision = isDolbyVision == true,
+        isAtmos = isAtmos == true,
+    )
 }

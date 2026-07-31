@@ -99,6 +99,35 @@ struct PosterArt: View {
     }
 }
 
+/// Privacy-preserving poster for account-private remote rows. It may reuse an image already decoded by
+/// a local surface, but never starts a request or writes the shared artwork caches from a private row.
+struct WarmPosterArt: View {
+    let poster: String?
+    var width: CGFloat = kPosterWidth
+    var radius: CGFloat = Theme.Radius.card
+
+    private var image: UIImage? {
+        guard let poster, let url = URL(string: poster) else { return nil }
+        return PosterImageLoader.cached(url)
+    }
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
+            } else {
+                Theme.Palette.surface2.overlay(
+                    Image(systemName: "film")
+                        .font(.system(size: 40))
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                )
+            }
+        }
+        .frame(width: width, height: width * 1.5)
+        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+    }
+}
+
 /// Which long-press (context) menu a `PosterCard` shows. `.continueWatching` offers a dismiss; `.catalog`
 /// offers add-to-library plus mark watched / unwatched; `.library` swaps add for remove-from-library;
 /// `.none` attaches no menu at all.
@@ -571,7 +600,24 @@ struct LandscapeArt: View {
         }
         .frame(width: width, height: height)
         .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        .overlay(alignment: .topLeading) { ratingBadge }
         .task(id: id ?? poster ?? "") { await load() }
+    }
+
+    /// The clean 16:9 backdrop these cards show carries NO baked rating (unlike the portrait poster the
+    /// service bakes), so when "Show ratings on posters" is on, surface the rating as a client badge fed by
+    /// the keyless VortX ratings service. Suppressed only when a genuinely BAKED poster is on screen (the
+    /// rare no-backdrop fallback for a renderable id), so a rating is never double-drawn. Top-LEADING to
+    /// clear the watched checkmark, which owns the top-trailing corner. Placed in `PosterCard` at the same
+    /// corner would work too, but `id` and `usedBackdrop` live here.
+    @ViewBuilder private var ratingBadge: some View {
+        if let id {
+            let bakedPosterShown = !usedBackdrop && PosterArtwork.bakesRatings(forID: id)
+            CardRatingBadge(id: id, type: type,
+                            active: PosterArtwork.bakesRatings && !bakedPosterShown,
+                            glyphSize: 12, textSize: 15, maxScores: 4)
+                .padding(Theme.Space.sm)
+        }
     }
 
     /// The title ON the cinematic backdrop: the title's clean TMDB clearlogo when one resolves, else the
@@ -628,7 +674,7 @@ struct PosterCard: View {
     /// (alongside the progress stripe) so Continue Watching cards say where playback resumes. Nil on
     /// every non-CW card, so their tiles are unchanged.
     var resumeSeconds: Double? = nil
-    /// Watched state (DESIGN.md "PosterCard, Watched state: 55% opacity plus a check badge").
+    /// Watched state (docs/DESIGN-SYSTEM.md section 3, "Poster card": dim plus a check badge; 55% opacity is our value for "dim").
     /// Mirrors the DetailView episode-thumbnail treatment. Data-bearing callers pass it: the
     /// Library grid (its own per-profile helper) and, since #111, the Home catalog rails and
     /// category grids (via the shared per-profile `WatchedIndex` set). The default keeps every
@@ -645,6 +691,9 @@ struct PosterCard: View {
     /// tiles overlapped (#28). Nil = the rail-standard kLandscapeCardWidth.
     var landscapeWidth: CGFloat? = nil
     var menu: PosterMenu = .none
+    /// Account-private remote rows may reuse only already-warm local art. They must not enrich, resolve,
+    /// fetch, or persist artwork based on private playback history.
+    var privateArtwork = false
     var onFocus: (() -> Void)? = nil   // browse pages report focus to drive the hero backdrop
     var directPlay: (() -> Void)? = nil   // Continue Watching: resume the same link straight into the player
     var onDetails: (() -> Void)? = nil    // Continue Watching: open the full detail page from the long-press menu
@@ -653,14 +702,14 @@ struct PosterCard: View {
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized title/poster override
 
     /// The title to show: the pooled localized title in the user's language when available, else the caller's.
-    private var displayTitle: String { l10n.title(for: id) ?? title }
+    private var displayTitle: String { privateArtwork ? title : (l10n.title(for: id) ?? title) }
     /// The poster to show: the pooled localized (language-matched) poster when available, else the caller's.
-    private var displayPoster: String? { l10n.poster(for: id) ?? poster }
+    private var displayPoster: String? { privateArtwork ? poster : (l10n.poster(for: id) ?? poster) }
 
     /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
     /// a TMDB key: without one every backdrop falls back to the blurred-poster composite, so keyless
     /// users keep the clean portrait grid until they add a key (Settings > API keys).
-    private var landscape: Bool { catalogPrefs.landscapeCards && apiKeys.hasTMDB }
+    private var landscape: Bool { !privateArtwork && catalogPrefs.landscapeCards && apiKeys.hasTMDB }
     /// Landscape cards use one cinematic width (or the caller's explicit grid-cell width); portrait cards
     /// honor an EXPLICIT caller width (a fixed grid cell) when given, else the user's Poster Style width
     /// preset (#105). Self-sizing rails/surfaces pass nothing (`width == nil`), so the preset drives their
@@ -681,6 +730,9 @@ struct PosterCard: View {
         if let directPlay {
             Button(action: directPlay) { cardLabel }
                 .buttonStyle(CardFocusStyle())
+        } else if let onDetails {
+            Button(action: onDetails) { cardLabel }
+                .buttonStyle(CardFocusStyle())
         } else {
             NavigationLink { DetailView(type: type, id: id) } label: { cardLabel }
                 .buttonStyle(CardFocusStyle())
@@ -697,6 +749,8 @@ struct PosterCard: View {
                 Group {
                     if landscape {
                         LandscapeArt(id: id, type: type, title: displayTitle, poster: PosterArtwork.poster(id: id, fallback: displayPoster), width: cardWidth, radius: catalogPrefs.posterRadius.radius)
+                    } else if privateArtwork {
+                        WarmPosterArt(poster: displayPoster, width: cardWidth, radius: catalogPrefs.posterRadius.radius)
                     } else {
                         PosterArt(PosterArtwork.poster(id: id, fallback: displayPoster), width: cardWidth, radius: catalogPrefs.posterRadius.radius)
                     }

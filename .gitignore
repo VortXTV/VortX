@@ -28,7 +28,18 @@ app/*.xcodeproj
 reference/
 
 # --- vendored nodejs-mobile (downloaded by scripts; ~51MB) ---
-app/Vendor/
+# Listed as `app/Vendor/*` rather than `app/Vendor/` so the MPVKit-DVFEL package MANIFEST below
+# can be re-included: git cannot un-ignore anything inside an excluded directory, only inside an
+# excluded path listed with a wildcard.
+app/Vendor/*
+
+# --- our own MPVKit build (Dolby Vision Profile 7 enhancement layer) ---
+# The Package.swift + umbrella target sources are SOURCE and must be committed: app/project.yml
+# points `packages: MPVKit` at this directory, so without the manifest a fresh clone cannot
+# resolve the package at all. The xcframeworks under artifacts/ are build OUTPUT (~205 MB) and
+# stay ignored; regenerate them with scripts/build-mpvkit-dvfel.sh.
+!app/Vendor/MPVKit-DVFEL/
+app/Vendor/MPVKit-DVFEL/artifacts/
 
 # --- bundled streaming server (extracted from Stremio's macOS app; proprietary) ---
 app/Resources/server.js
@@ -79,3 +90,12 @@ app/*.entitlements
 # runtime poster URLCache (PosterImageLoader diskPath)
 app/vortx-images/
 vortx-images/
+
+# Internal coordination docs and history snapshots; never committed
+/dept/
+# Local agent standing orders; never committed
+/AGENTS.md
+
+# Rust build output must never be tracked (IR-03: 1.08GB private-engine artifacts were tracked)
+core/target/
+**/target/

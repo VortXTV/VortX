@@ -98,7 +98,11 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: VortXTV/stremiox-core
-          ref: 8bfdf1f0dcbf929b4634af24acf7ec54f97c3388
+          # fix/meta-imdb-link-preserve: engine keeps addon-supplied imdbRating when the addon
+          # also sends its own links. PUSH GATE: this ref carries a path patch on stremio-core;
+          # publish the patched stremio-core to the private mirror and swap the patch for a git
+          # rev pin (see the engine repo's Cargo.toml note), then update this ref to that commit.
+          ref: 4d5ae6371cc9e4031f787cf1c7adf7a535474b0c
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false
@@ -318,6 +322,29 @@ jobs:
         env:
           VORTX_ENGINE_DIR: vortx-core
         run: ./scripts/build-ffi-xcframework.sh
+
+      # The self-built player stack. `app/Vendor/MPVKit-DVFEL/artifacts/` is gitignored and reproducing it
+      # needs a multi-hour nine-slice source build, so CI fetches the prebuilt xcframeworks the same way it
+      # fetches NodeMobile. Beta 9's release run failed without this: SwiftPM reported "does not contain a
+      # binary artifact" for all nine local binary targets, and it failed at the SIMULATOR smoke test, which
+      # runs BEFORE the build, so nothing was produced at all.
+      - name: Fetch the MPVKit-DVFEL artifacts (pinned, sha256-verified)
+        run: |
+          set -euo pipefail
+          DEST="app/Vendor/MPVKit-DVFEL"
+          EXPECTED="6b22848743a9744dc4d61edadf6ae82eac583ea6802e2d154f4a6fbc9aa03fc1"
+          curl -sfL -o /tmp/mpvkit.zip \
+            "https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-1/mpvkit-dvfel-artifacts.zip"
+          ACTUAL="$(shasum -a 256 /tmp/mpvkit.zip | cut -d' ' -f1)"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::MPVKit artifact checksum mismatch. expected $EXPECTED got $ACTUAL"
+            exit 1
+          fi
+          rm -rf "$DEST/artifacts"
+          unzip -q /tmp/mpvkit.zip -d "$DEST"
+          test -d "$DEST/artifacts/Libmpv-GPL.xcframework/tvos-arm64_x86_64-simulator" \
+            || { echo "::error::tvOS simulator slice missing after unpack"; exit 1; }
+          echo "MPVKit-DVFEL artifacts in place: $(ls "$DEST/artifacts" | wc -l | tr -d ' ') xcframeworks"
 
       - name: Generate the Xcode project
         run: cd app && xcodegen generate
@@ -693,6 +720,19 @@ jobs:
             "app/build/ci/Build/Products/Release-appletvos/VortXTV.app/PlugIns/VortXTopShelf.appex/VortXTopShelf"
           echo "tvOS artifact metadata verified for Full, Lite, and Top Shelf"
 
+      # Fail closed on unsafe symlinks in the SHIPPED bundles. These are the exact .app trees that
+      # get zipped into the IPAs and the DMG below, so this is where the check has to run; a
+      # local-only checker protects nobody. It rejects any symlink that is absolute, dangling, or
+      # escapes its bundle (the shipped `fonts/fonts -> /Users/daksh/...` link was all three on CI),
+      # while allowing the legitimate RELATIVE framework symlinks that VortXMac's bundle contains.
+      - name: Audit bundle symlinks (fail closed)
+        run: |
+          bash scripts/audit-bundle-symlinks.sh \
+            "app/build/ci/Build/Products/Release-appletvos/VortXTV.app" \
+            "app/build/ci-lite/Build/Products/Release-appletvos/VortXTVLite.app" \
+            "app/build/ci-ios/Build/Products/Release-iphoneos/VortXiOSNative.app" \
+            "app/build/ci-mac/Build/Products/Release/VortX.app"
+
       - name: Package the IPAs
         run: |
           mkdir -p out/full/Payload out/lite/Payload out/ios/Payload
@@ -780,6 +820,9 @@ jobs:
       - name: Verify the release tag points at the built commit (fail closed)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh runs in a job with NO repo checkout, so it cannot infer the repository from git;
+          # without this the upload dies with "fatal: not a git repository" (beta.7 attach failure).
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           set -euo pipefail
@@ -840,6 +883,9 @@ jobs:
       - name: Attach the CI builds to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh runs in a job with NO repo checkout, so it cannot infer the repository from git;
+          # without this the upload dies with "fatal: not a git repository" (beta.7 attach failure).
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           set -euo pipefail

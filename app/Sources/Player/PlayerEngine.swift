@@ -1,13 +1,45 @@
 import AVFoundation
 import Foundation
 
+/// Low-rate, read-only playback evidence. Engines leave unsupported properties
+/// nil so diagnostics can fail soft without changing playback behavior.
+struct PlaybackDiagnostics: Sendable {
+    var frameDropCount: Int?
+    var decoderFrameDropCount: Int?
+    var mistimedFrameCount: Int?
+    var delayedFrameCount: Int?
+    var avSync: Double?
+    var totalAVSyncChange: Double?
+    var pausedForCache: Bool?
+    var cacheUnderrun: Bool?
+    var cacheIdle: Bool?
+    var cacheBufferingPercent: Int?
+    var cacheDuration: Double?
+    var hardwareDecoder: String?
+    var estimatedVideoFPS: Double?
+    var containerFPS: Double?
+    var displayFPS: Double?
+    var videoSyncMode: String?
+    var videoSpeedCorrection: Double?
+    var audioSpeedCorrection: Double?
+    var audioOutput: String?
+    var framePresentation: FramePresentationDiagnosticsSnapshot?
+
+    var hasValues: Bool {
+        frameDropCount != nil || decoderFrameDropCount != nil
+            || mistimedFrameCount != nil || delayedFrameCount != nil
+            || avSync != nil || cacheUnderrun != nil || hardwareDecoder != nil
+            || framePresentation != nil
+    }
+}
+
 /// The finite surface the player chrome drives playback through. Today the chrome (`PlayerScreen` on
 /// iOS/Mac, `TVPlayerView` on tvOS) talks to the engine exclusively via `coordinator.player?.<method>`
 /// plus an inbound string-keyed property-event bus (`MPVPlayerDelegate`). Every member below is something
-/// the chrome already calls — this protocol just names that contract so a SECOND engine can satisfy it.
+/// the chrome already calls; this protocol just names that contract so a SECOND engine can satisfy it.
 ///
 /// Why this exists: libmpv (`MPVMetalViewController`, vo=gpu-next/MoltenVK) cannot do true Dolby Vision
-/// passthrough — it only tone-maps DV to SDR, and mpv's `target-colorspace-hint` double-frees MoltenVK
+/// passthrough; it only tone-maps DV to SDR, and mpv's `target-colorspace-hint` double-frees MoltenVK
 /// (see `MPVMetalViewController.syncDisplayDynamicRange`). AVFoundation (`AVPlayer`/`AVPlayerLayer`) does
 /// native DV (Profile 5 / 8.x) and HDR EDR. So an AVPlayer-backed conformer plays DV + HTTP/HLS streams
 /// through the SAME chrome, while libmpv stays the engine for torrents and everything AVFoundation can't
@@ -31,12 +63,19 @@ protocol PlayerEngine: AnyObject {
     /// the engine is between requests, was invalidated, or has stopped.
     var activeLoadToken: PlayerLoadToken? { get }
     func invalidateLoadToken()
+    /// Configure the SOURCE-timeline second at which the next logical load should begin. AVPlayer consumes
+    /// this before a remux mount is constructed; engines without a remux-origin path use the no-op default.
+    /// The value is one-shot so an unrelated later title can never inherit an earlier resume point.
+    func configureResumeOrigin(seconds: Double)
     /// The launch site sets this from the stream's Dolby Vision flag BEFORE `loadFile`. The AVPlayer lane
     /// (true DV) uses it to switch the Apple TV into Dolby Vision mode before the item attaches; the libmpv
     /// lane renders DV as a tone-mapped PQ base layer, so it requests only HDR10 (a decoded-pixel pipeline
     /// cannot present true DV; flipping the panel to DV over tone-mapped PQ is the "fake DV" other players
     /// are criticized for).
     var contentIsDolbyVision: Bool { get set }
+    /// True only for the app's full playback chrome. Embedded hero/trailer players leave
+    /// this false, so a frame-presentation mitigation can never alter their renderer.
+    var isFullPlayerPresentation: Bool { get set }
     func play()
     func pause()
     func togglePause()
@@ -55,6 +94,9 @@ protocol PlayerEngine: AnyObject {
     func setSubtitleTrack(_ id: Int)
     func addExternalSubtitle(url: String, title: String, lang: String,
                              timeout: TimeInterval, completion: ((Bool) -> Void)?)
+    /// Whether the currently selected subtitle path can apply `setSubDelay` live. libmpv supports this for
+    /// every selected subtitle; AVPlayer supports it only while the VortX external-cue overlay is active.
+    var subtitleDelayAvailable: Bool { get }
     func setSubDelay(_ seconds: Double)
     func setAudioDelay(_ seconds: Double)
     func applySubtitleStyle()
@@ -68,8 +110,9 @@ protocol PlayerEngine: AnyObject {
 
     // Chapters + media info
     func chapters() -> [MPVChapter]
-    func mediaSummary() -> (width: Int, height: Int, audioCodec: String)
+    func mediaSummary() -> (width: Int, height: Int, audioCodec: String, audioChannels: Int)
     func playbackStats() -> [(String, String)]
+    func playbackDiagnostics() -> PlaybackDiagnostics
 
     // Decode + audio routing
     func setHardwareDecoding(_ on: Bool)
@@ -98,8 +141,16 @@ protocol PlayerEngine: AnyObject {
 }
 
 extension PlayerEngine {
+    /// libmpv already receives its resume as an ordinary post-load seek. Only the AVPlayer remux lane needs a
+    /// pre-mount origin, so other engines intentionally ignore this one-shot configuration call.
+    func configureResumeOrigin(seconds: Double) {}
+
+    /// libmpv is the established full-capability path. The AVPlayer conformer overrides this with its
+    /// current-track external-overlay state, so adding the capability does not widen every concrete engine.
+    var subtitleDelayAvailable: Bool { true }
+
     /// The chrome calls `addExternalSubtitle(url:title:lang:)` (the rest defaulted). Protocol requirements
-    /// can't carry default values, so this convenience forwards to the full requirement — needed once the
+    /// can't carry default values, so this convenience forwards to the full requirement, needed once the
     /// chrome holds the engine as `any PlayerEngine`. `MPVMetalViewController`'s own defaulted overload still
     /// wins when the engine is referenced as the concrete type.
     func addExternalSubtitle(url: String, title: String, lang: String) {
@@ -128,6 +179,7 @@ extension PlayerEngine {
     func containerFrameRate() -> Double { 0 }
     func mediaDurationSeconds() -> Double { 0 }
     func currentSubDelaySeconds() -> Double { 0 }
+    func playbackDiagnostics() -> PlaybackDiagnostics { PlaybackDiagnostics() }
 
     /// Default 0 for any engine that doesn't override (the wall-clock capture driver falls back to the
     /// chrome's own `currentTime` when this is 0). Both concrete engines override with the real position.
@@ -138,6 +190,9 @@ extension PlayerEngine {
     /// tone-mapped DV output), and `AVPlayerEngineController` reads it in `loadFile` to switch the Apple TV
     /// into Dolby Vision mode BEFORE the item is attached (covers native DV MP4/MOV/HLS, not just the remux).
     var contentIsDolbyVision: Bool { get { false } set { } }
+
+    /// Engines without the libmpv/Metal presentation lane intentionally ignore this hint.
+    var isFullPlayerPresentation: Bool { get { false } set { } }
 }
 
 /// `MPVMetalViewController` already implements every `PlayerEngine` member, so this is a pure conformance

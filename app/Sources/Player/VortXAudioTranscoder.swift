@@ -8,11 +8,12 @@ import Libswresample
 /// to an AVPlayer-decodable codec inside the Dolby Vision fMP4 remux, so the AVPlayer DV lane no longer bails
 /// to libmpv (HDR10) just because AVPlayer cannot decode the source audio codec.
 ///
-/// CODEC-AGNOSTIC BY DESIGN: the encoder is picked EAC3-first, else AAC. Today's bundled FFmpeg (MPVKit
-/// `--enable-encoder=aac`, no ac3/eac3 encoder) resolves that to AAC 5.1/7.1, which AVPlayer decodes natively
-/// and the system routes to the receiver as multichannel PCM. The day a rebuilt MPVKit with
-/// `--enable-encoder=eac3` lands, the same line resolves to EAC3 and AVPlayer BITSTREAMS Dolby Digital Plus to
-/// the receiver, with zero app-code change.
+/// CODEC-AGNOSTIC BY DESIGN: the encoder is picked EAC3-first, else AAC. That fallback used to fire every
+/// single time, because upstream MPVKit's FFmpeg allowlist contained neither an eac3 nor an ac3 encoder, so
+/// a TrueHD or DTS-HD MA source reached the receiver as AAC (decoded to multichannel PCM, no Dolby badge).
+/// Our own MPVKit build adds `--enable-encoder=eac3`, so the same line now resolves to EAC3 and AVPlayer
+/// BITSTREAMS Dolby Digital Plus to the receiver, with zero app-code change. AAC remains the honest fallback
+/// for any build that lacks the encoder. Proven end to end by test/eac3-transcode.
 ///
 /// WHY TRANSCODE AT ALL: pre-tvOS-26 the platform cannot bitstream lossless TrueHD / DTS-HD MA to a receiver
 /// (the reference players all decode these to PCM too), so decoded multichannel is the real ceiling. A DV file
@@ -61,8 +62,8 @@ final class VortXAudioTranscoder {
         dctx.pointee.pkt_timebase = sourceTimeBase   // parameters_to_context may reset it; re-assert
         guard avcodec_open2(dctx, decoder, nil) >= 0 else { encoderName = "?"; cleanup(); return nil }
 
-        // EAC3-first, else AAC. With today's bundled binaries this resolves to AAC; a rebuilt MPVKit with
-        // `--enable-encoder=eac3` flips the receiver badge to Dolby Digital Plus with no app-code change.
+        // EAC3-first, else AAC. With our own MPVKit build (`--enable-encoder=eac3`) this resolves to EAC3
+        // and the receiver badge reads Dolby Digital Plus; AAC stays as the fallback for a build without it.
         guard let encoder = avcodec_find_encoder(AV_CODEC_ID_EAC3) ?? avcodec_find_encoder(AV_CODEC_ID_AAC),
               let ectx = avcodec_alloc_context3(encoder) else { encoderName = "?"; cleanup(); return nil }
         self.enc = ectx
@@ -72,8 +73,12 @@ final class VortXAudioTranscoder {
         let srcChannels = dctx.pointee.ch_layout.nb_channels > 0 ? dctx.pointee.ch_layout.nb_channels : 2
         // AAC tops out at 7.1; FFmpeg's eac3 encoder tops out at 5.1 (a 7.1 TrueHD source folds to 5.1 there).
         encChannels = min(max(srcChannels, 1), isEAC3 ? 6 : 8)
-        // EAC3 caps at 48 kHz; hi-res TrueHD/DTS-HD (96/192 kHz) resamples down. AAC keeps the source rate.
-        let encRate = isEAC3 ? min(srcRate, 48_000) : srcRate
+        // #148: snap the encoder rate to what the encoder actually opens with. The old "AAC keeps the
+        // source rate" passed 192/176.4 kHz hi-res TrueHD/DTS-HD straight to avcodec_open2, which rejects
+        // anything above 96 kHz (rc=-22), so init? failed and the whole DV session demoted to the libmpv
+        // HDR10 tone-map: the "TrueHD reverts to HDR" field report. The resampler below already converts
+        // whatever rate delta this produces (it always did for the EAC3 48 kHz cap).
+        let encRate = VortXAudioTranscodePolicy.encoderSampleRate(source: srcRate, isEAC3: isEAC3)
         ectx.pointee.sample_rate = encRate
         ectx.pointee.sample_fmt = AV_SAMPLE_FMT_FLTP          // both encoders' native planar-float input
         av_channel_layout_default(&ectx.pointee.ch_layout, encChannels)

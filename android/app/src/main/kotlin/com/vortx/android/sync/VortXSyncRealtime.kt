@@ -101,6 +101,8 @@ internal class VortXSyncRealtime(
         }
     }
 
+    fun isActive(): Boolean = synchronized(this) { active }
+
     private fun connect() {
         val token = manager.currentSession()?.token ?: return
         val request = Request.Builder()

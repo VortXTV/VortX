@@ -43,6 +43,9 @@ final class CoreBridge: ObservableObject {
     /// updates but only once per burst. Touched only on the main actor.
     private var boardRebuildWork: DispatchWorkItem?
     private static let boardRebuildDebounce: TimeInterval = 0.08
+    /// Raw catalog count from the engine board. Hidden, disabled, empty, and failed rows are filtered
+    /// out of `boardRows`, so their visible count cannot decide whether vertical pagination is finished.
+    private var boardCatalogTotal = 0
     /// Coalesces the `meta_details` re-decode+publish. Source search for a high-source title emits a BURST
     /// of `meta_details` events as stream batches land (GoT: ~11 re-emits of the same 1757-row payload as it
     /// grows), and each used to run a full off-main decode + a main-thread republish, invalidating every
@@ -163,6 +166,16 @@ final class CoreBridge: ObservableObject {
     /// so the URL leaves the set before the engine re-emits ctx and is therefore NOT suppressed here.
     private func refreshAddons() {
         let typed = decode(CoreCtx.self, field: "ctx")?.profile.addons ?? []
+        // A synced order can arrive before OR after the final add-on hydrate. Keep the full-range intent
+        // alive across both sequences: if an explicit order already exists when ctx grows, widen only when
+        // the new raw manifest count exceeds the range already requested. This is a LoadRange, not a full
+        // board Load; stremio-core has already replanned the board on ProfileChanged.
+        if !CatalogPrefsStore.order().isEmpty {
+            let installedCatalogTotal = typed.reduce(0) { $0 + $1.manifest.catalogs.count }
+            DispatchQueue.main.async { [weak self] in
+                self?.ensureCatalogOrderRangeLoaded(installedCatalogTotal: installedCatalogTotal)
+            }
+        }
         var raw: [String: [String: Any]] = [:]
         if let data = stateData("ctx"),
            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -208,12 +221,16 @@ final class CoreBridge: ObservableObject {
                     }
                 }
             }
+            // Publish the tmdb:-meta gate from the FINAL surviving set (thread-safe UserDefaults write, no
+            // self needed) so the off-main catalog resolvers gate the tmdb: fallback on real installed state.
+            AddonMetaGate.publish(survivingTyped.contains { $0.providesTMDBMeta })
             DispatchQueue.main.async { [weak self] in
                 self?.addons = survivingTyped
                 self?.rawAddonsByUrl = publishedRaw
             }
             return
         }
+        AddonMetaGate.publish(typed.contains { $0.providesTMDBMeta })
         DispatchQueue.main.async { [weak self] in
             self?.addons = typed
             self?.rawAddonsByUrl = raw
@@ -420,7 +437,7 @@ final class CoreBridge: ObservableObject {
     /// logged-out / degraded Stremio session show the account's add-ons + sources instead of zero.
     ///
     /// Uses the EXACT `InstallAddon` descriptor shape `installAddon` sends (`{transportUrl, manifest,
-    /// flags}`, camelCase) — the engine mutates `ctx.profile.addons` LOCALLY with no api.strem.io call.
+    /// flags}`, camelCase), the engine mutates `ctx.profile.addons` LOCALLY with no api.strem.io call.
     /// A lowercase-key mismatch silently no-ops in the engine, so `VortXOwnedAddon.installDescriptor`
     /// keeps the keys aligned with `installAddon`. Targets the account/engine add-on set ONLY; it never
     /// touches a per-profile overlay and never `disabledAddons` (which stays a render-layer filter).
@@ -526,8 +543,8 @@ final class CoreBridge: ObservableObject {
                 self.loadBoard()
             }
             // Still surface the default addons' catalogs (Cinemeta et al. ship in the engine's default
-            // profile) so a signed-out Home is a real, browsable landing screen — backdrop hero + rails
-            // — not an empty "please sign in" page. Discover already loads signed-out; Home should too.
+            // profile) so a signed-out Home is a real, browsable landing screen (backdrop hero + rails),
+            // not an empty "please sign in" page. Discover already loads signed-out; Home should too.
             loadBoard()
             return
         }
@@ -548,7 +565,7 @@ final class CoreBridge: ObservableObject {
     ///    add-on, so every title reports "no sources" until a manual logout/login. This is the
     ///    user-reported "force close → lost all my addons but still shows logged in" bug.
     /// If, a while after launch, the stored token says we're signed in but the engine has no account
-    /// data OR no stream add-on, re-establish the session from the token — the engine then pulls
+    /// data OR no stream add-on, re-establish the session from the token; the engine then pulls
     /// add-ons + the full library fresh. Runs once per launch and never fights an in-flight auth/switch.
     private func scheduleSessionRepair() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
@@ -573,10 +590,10 @@ final class CoreBridge: ObservableObject {
                 // In that case (or when genuinely logged out), the VortX doc hydration above is the whole recovery.
                 // Never call switchAccount with an empty token.
                 if hasStremioToken, let key, !self.importedAwayFromStremio {
-                    NSLog("%@", "[CoreBridge] degraded session (\(noStreamAddon ? "no stream add-on" : "no account data")) with a stored token — hydrated account add-ons, now re-authenticating to reconcile from Stremio")
+                    NSLog("%@", "[CoreBridge] degraded session (\(noStreamAddon ? "no stream add-on" : "no account data")) with a stored token; hydrated account add-ons, now re-authenticating to reconcile from Stremio")
                     self.switchAccount(token: key)
                 } else {
-                    NSLog("[CoreBridge] degraded session with no Stremio token — recovered from the VortX account doc")
+                    NSLog("[CoreBridge] degraded session with no Stremio token; recovered from the VortX account doc")
                     self.loadBoard()
                 }
             }
@@ -591,7 +608,7 @@ final class CoreBridge: ObservableObject {
 
     /// Reconcile the engine's library copy with api.strem.io NOW. The tvOS player writes watch progress
     /// directly to the account API (StremioAccount.saveProgress), which the engine cannot see until its
-    /// next library sync — and nothing scheduled one after playback, so the Home dashboard's Continue
+    /// next library sync, and nothing scheduled one after playback, so the Home dashboard's Continue
     /// Watching card kept the pre-playback timestamp (and fed a stale resume) until a detail-page load
     /// happened to trigger a sync (the "have to long-press → Details to refresh the timestamp" report).
     /// Called by the player's exit path AFTER its final save has landed on the API, so the pull can
@@ -663,7 +680,18 @@ final class CoreBridge: ObservableObject {
     /// Load the Home board: every catalog of every installed addon, then fetch the first `rows`.
     /// (Targets the `board` field specifically, `search` is also a CatalogsWithExtra.)
     func loadBoard(rows: Int = 30) {
-        boardRowsLoaded = rows
+        let installedCatalogTotal = installedCatalogs(
+            includeTombstoned: true,
+            includeDisabled: true
+        ).count
+        let requestedRows = CatalogPrefsStore.order().isEmpty
+            ? rows
+            : HomeCatalogLoadPolicy.fullLoadDepth(
+                current: rows,
+                engineCatalogTotal: boardCatalogTotal,
+                installedCatalogTotal: installedCatalogTotal
+            )
+        boardRowsLoaded = requestedRows
         boardPageInFlight = false
         boardRowPageInFlight = [:]   // catalogs reload from page 1, so engine indices reset (#95)
         boardRowExhausted = []
@@ -672,7 +700,7 @@ final class CoreBridge: ObservableObject {
                                    "args": ["type": NSNull(), "extra": []]]],
                  field: "board")
         dispatch(action: ["action": "CatalogsWithExtra",
-                          "args": ["action": "LoadRange", "args": ["start": 0, "end": rows]]],
+                          "args": ["action": "LoadRange", "args": ["start": 0, "end": requestedRows]]],
                  field: "board")
     }
 
@@ -692,9 +720,15 @@ final class CoreBridge: ObservableObject {
     private var boardRowPageInFlight: [Int: Int] = [:]   // engineIndex -> item count when the load was dispatched
     private var boardRowExhausted: Set<Int> = []          // engine indices whose last settled load added nothing
 
-    /// True while the last board load filled its requested window, so there may be more catalogs to show.
-    /// Once the engine returns fewer rows than asked, every catalog is on screen and this goes false.
-    var boardHasNextPage: Bool { boardRows.count >= boardRowsLoaded }
+    /// True while the requested range has not covered the engine's raw catalog count. The visible
+    /// `boardRows` count is intentionally irrelevant: hidden, disabled, empty, and failed rows are
+    /// filtered out but still occupy engine board indices.
+    var boardHasNextPage: Bool {
+        HomeCatalogLoadPolicy.hasNextPage(
+            loaded: boardRowsLoaded,
+            engineCatalogTotal: boardCatalogTotal
+        )
+    }
 
     /// Load the next page of Home catalogs (the vertical infinite scroll). Re-dispatches a wider LoadRange
     /// so more catalog rows hydrate; no-op at the end or while a page is already in flight. Without this
@@ -736,6 +770,40 @@ final class CoreBridge: ObservableObject {
             let count = pages.compactMap { $0.content?.ready }.flatMap { $0 }.count
             boardRowPageInFlight[index] = nil
             if count <= dispatchedCount { boardRowExhausted.insert(index) }
+        }
+    }
+
+    /// Apply a catalog presentation-order change to Home. The stored order only sorts populated rows after
+    /// the engine board is decoded; it does not change engine indices. A catalog moved to the top can still
+    /// sit at raw index 121, so hydrate the full raw range before rebuilding the visible order. This covers
+    /// local moves/grouping and a synced or backup-restored order through `CatalogPreferences`.
+    func catalogOrderDidChange() {
+        guard !CatalogPrefsStore.order().isEmpty else {
+            rebuildBoardRows()
+            return
+        }
+        let installedCatalogTotal = installedCatalogs(
+            includeTombstoned: true,
+            includeDisabled: true
+        ).count
+        ensureCatalogOrderRangeLoaded(installedCatalogTotal: installedCatalogTotal)
+        rebuildBoardRows()
+    }
+
+    /// Widen, but never restart, the board model. Kept separate so a late ctx hydrate can finish an order
+    /// restoration that ran against an interim add-on roster.
+    private func ensureCatalogOrderRangeLoaded(installedCatalogTotal: Int) {
+        let needed = HomeCatalogLoadPolicy.fullLoadDepth(
+            current: boardRowsLoaded,
+            engineCatalogTotal: boardCatalogTotal,
+            installedCatalogTotal: installedCatalogTotal
+        )
+        if needed > boardRowsLoaded {
+            boardRowsLoaded = needed
+            boardPageInFlight = true
+            dispatch(action: ["action": "CatalogsWithExtra",
+                              "args": ["action": "LoadRange", "args": ["start": 0, "end": needed]]],
+                     field: "board")
         }
     }
 
@@ -818,7 +886,7 @@ final class CoreBridge: ObservableObject {
 
     /// Load the next page of the current Discover catalog (infinite scroll). The engine appends the
     /// page to `discover.catalog` and clears `next_page` at the end. No-op at the end or while a page
-    /// is already in flight. Previously missing entirely — the catalog stopped at its first page, which
+    /// is already in flight. Previously missing entirely, the catalog stopped at its first page, which
     /// add-on authors saw as "next page / next catalog not loading."
     func loadDiscoverNextPage() {
         guard discoverHasNextPage, !discoverPageInFlight else { return }
@@ -913,6 +981,23 @@ final class CoreBridge: ObservableObject {
     }
 
     // MARK: Meta details
+
+    /// Scoped observations for detail recovery. Keeping these behind the bridge preserves the detail
+    /// screens' one-read identity contract while still fencing terminal and canonical-ready state to
+    /// the engine selection that owns it.
+    func detailMetaResolution(for requestedID: String) -> DetailMetaRecoveryPolicy.Resolution? {
+        metaDetails?.metaResolution(for: requestedID)
+    }
+
+    func canonicalReadyMetaTarget(for requestedID: String) -> (id: String, type: String)? {
+        guard let details = metaDetails,
+              details.selectedMetaID == requestedID,
+              let readyMeta = details.meta,
+              case .imdb(let imdb) = DetailMetaRecoveryPolicy.catalogIDShape(readyMeta.id) else {
+            return nil
+        }
+        return (imdb, readyMeta.type)
+    }
 
     /// Load a title's meta + streams. For a series episode, pass the episode's video id as the stream
     /// path so the engine fetches that episode's streams.
@@ -1128,7 +1213,7 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Flatten stremio-core's `ResourceError` / `EnvError` JSON into a short human string. Returns nil
-    /// for `EmptyContent` (the add-on returned an empty list — not an error). Tagged-enum shapes:
+    /// for `EmptyContent` (the add-on returned an empty list, not an error). Tagged-enum shapes:
     /// `{"type":"Fetch","content":"…"}`, `{"type":"Env","content":{"type":"Fetch","content":"…"}}`, or a bare string.
     private static func describeResourceError(_ content: Any?) -> String? {
         if let s = content as? String { return s }
@@ -1309,7 +1394,7 @@ final class CoreBridge: ObservableObject {
             return vortxOwnedResumeSeconds(for: meta) ?? 0
         }
         let engine = max(0, item.state.timeOffset / 1000.0)
-        if engine > 0 { return engine }                                    // freshest local play wins
+        if engine > 0 { return flooredResumeSeconds(engine: engine, for: meta) }   // freshest local play wins
         // engine reports 0: only fall back to the VortX cache for the BARE re-add signature (timeOffset == 0 AND
         // duration == 0, a recovered item the engine could not be given an offset). A genuine finished / rewound
         // 0 keeps duration > 0 and is REAL, so trust it and never offer a stale resume for a just-finished title.
@@ -1348,7 +1433,7 @@ final class CoreBridge: ObservableObject {
             return vortxOwnedResumeSeconds(for: meta) ?? 0
         }
         let engine = max(0, item.state.timeOffset / 1000.0)
-        if engine > 0 { return engine }                                    // freshest local play wins
+        if engine > 0 { return flooredResumeSeconds(engine: engine, for: meta) }   // freshest local play wins
         // Engine reports 0: only fall back to the VortX cache for the BARE re-add signature (timeOffset == 0 AND
         // duration == 0). A genuine finished / rewound 0 keeps duration > 0 and is REAL, so trust it.
         if item.state.duration == 0 { return vortxOwnedResumeSeconds(for: meta) ?? 0 }
@@ -1370,6 +1455,21 @@ final class CoreBridge: ObservableObject {
             requestedVideoID: meta.videoId
         ) { return nil }
         return entry.t
+    }
+
+    /// Apply the Continue Watching FLOOR to a POSITIVE engine-held resume position.
+    ///
+    /// With a live Stremio session and "Mirror Continue Watching from Stremio" OFF, the engine's offset may have
+    /// been authored by an official Stremio client, so a copy that sits BEHIND VortX's own saved position must
+    /// not drag the resume point backwards. Returns the engine value untouched in every other case: mirror ON,
+    /// no live Stremio session (the default and every VortX-only device), a locally-finished title, an overlay
+    /// profile, or no cached VortX position that is actually ahead. `vortxOwnedResumeSeconds` does the owner
+    /// gate and the episode-identity match, so a series never resumes another episode's position through here.
+    private func flooredResumeSeconds(engine: Double, for meta: PlaybackMeta) -> Double {
+        guard !MirrorSettings.stremioMayReplaceContinueWatching(stremioSessionLive: isLoggedIn()),
+              !LocalRewindLog.contains(meta.libraryId),
+              let owned = vortxOwnedResumeSeconds(for: meta), owned > engine else { return engine }
+        return owned
     }
 
     // MARK: Library / Continue Watching mutations (Ctx actions; CW + library refresh live via events)
@@ -1473,15 +1573,58 @@ final class CoreBridge: ObservableObject {
     /// the caller's thread (the Rust worker thread on the event path) to keep the JSON parse off main, then
     /// synthesizes + publishes on main.
     func rebuildContinueWatching() {
-        let engine = Self.pruneFinished(decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? [])
+        // "Mirror Continue Watching from Stremio": with a live Stremio session and the toggle OFF, a
+        // Stremio-sourced position must not drag the RAIL backwards either, not just the account doc. Resolved
+        // here off-main (a UserDefaults read plus the ctx auth probe, both thread-safe) and applied BEFORE
+        // `pruneFinished`, because a title Stremio reports as finished would otherwise be pruned away before
+        // the floor could restore VortX's own in-progress position.
+        let mayReplaceCW = MirrorSettings.stremioMayReplaceContinueWatching(stremioSessionLive: isLoggedIn())
+        let preview = decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
         let library = decode(CoreLibrary.self, field: "library")?.catalog ?? []
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            let items = ProfileStore.shared.activeUsesEngineHistory
+            // Owner profile only: the floor and the union are both owner-library concepts, and an overlay
+            // profile rides `profiles.cwItems` and ignores this published value entirely.
+            let ownerProfile = ProfileStore.shared.activeUsesEngineHistory
+            let engine = Self.pruneFinished(ownerProfile
+                ? Self.applyOwnedContinueWatchingFloor(preview, mayReplace: mayReplaceCW)
+                : preview)
+            let items = ownerProfile
                 ? Self.unionOwnerContinueWatching(engine: engine, library: library)
                 : engine
             VXProbe.log("engine", "continueWatching rebuilt n=\(items.count) (engine=\(engine.count))")
             self.continueWatching = items
+        }
+    }
+
+    /// FLOOR each engine Continue Watching item against the VortX-owned position cached in `OwnerResumeStore`.
+    ///
+    /// A pass-through when `mayReplace` (mirror ON, or no live Stremio session), which is the default path for
+    /// every VortX-only / imported-away device, so this changes nothing for them. Owner-profile only; the caller
+    /// gates. The decision itself is pure and lives in `MirrorSettings.resolveContinueWatching`.
+    static func applyOwnedContinueWatchingFloor(_ items: [CoreCWItem], mayReplace: Bool) -> [CoreCWItem] {
+        guard !mayReplace else { return items }
+        return items.map { item in
+            let owned = OwnerResumeStore.entry(forId: item.id)
+            let enginePosition = MirrorSettings.CWPosition(t: item.state.timeOffset / 1000,
+                                                          d: item.state.duration / 1000,
+                                                          v: item.state.videoId)
+            let resolved = MirrorSettings.resolveContinueWatching(
+                engine: enginePosition,
+                owned: owned.map { MirrorSettings.CWPosition(t: $0.t, d: $0.d, v: $0.v) },
+                mayReplace: false,
+                locallyRewound: LocalRewindLog.contains(item.id))
+            // Unchanged position: hand back the ORIGINAL item so the engine's watched bookkeeping
+            // (flaggedWatched / timesWatched, which `pruneFinished` reads) is preserved untouched. Compared
+            // against the NORMALIZED engine position, not the raw fields: `CWPosition` folds an empty video id
+            // to nil, so comparing raw would read "changed" for every item the engine spells with `""` and
+            // would silently strip the watched counters off titles the floor never touched.
+            guard resolved != enginePosition else { return item }
+            // Floored: the VortX position won, so the title is in progress by VortX's own truth and must not
+            // carry the engine's Stremio-sourced watched flags into `pruneFinished`.
+            let state = CoreLibState(timeOffset: resolved.t * 1000, duration: resolved.d * 1000, videoId: resolved.v)
+            return CoreCWItem(id: item.id, type: item.type, name: item.name, poster: item.poster, state: state,
+                              removed: item.removed, temp: item.temp)
         }
     }
 
@@ -1525,6 +1668,12 @@ final class CoreBridge: ObservableObject {
             ProfileStore.shared.finishedWatching(metaId: libraryId)   // overlay profile
             return
         }
+        // Stamp the LOCAL rewind before the dispatch. This is the app's single `RewindLibraryItem` site, and a
+        // finish is indistinguishable by value from a Stremio rollback (t drops to 0), so the Continue Watching
+        // FLOOR would otherwise refuse this device's own finish and pin the title in the rail whenever a Stremio
+        // session is live and "Mirror Continue Watching from Stremio" is OFF. `vortxSummary` clears the stamp as
+        // soon as the account doc carries the zero, which the immediate push below normally makes the next round.
+        LocalRewindLog.stamp(libraryId)
         dispatchCtx(["action": "RewindLibraryItem", "args": libraryId])
         // A rewind is NOT a removal (the library entry stays), so no tombstone applies; but its pushed
         // t/d=0 must survive an imminent sideload-update process kill, or the title comes back with stale
@@ -1744,7 +1893,7 @@ final class CoreBridge: ObservableObject {
             streamRequest = firstReadyRequest
         }
         guard let rawStream, let streamRequest, let metaRequest else {
-            DiagnosticsLog.log("cw", "loadEnginePlayer no-op (meta_details/stream/metaRequest missing) — CW + progress will not track for this item")
+            DiagnosticsLog.log("cw", "loadEnginePlayer no-op (meta_details/stream/metaRequest missing); CW + progress will not track for this item")
             return
         }
         let selected: [String: Any] = [
@@ -2160,7 +2309,7 @@ final class CoreBridge: ObservableObject {
                         // actually ARRIVED (not just that meta_details re-emitted). On a non-zero arrival
                         // also stamp the heartbeat via note("streams N"). Ready-only pass, no per-item log.
                         let readyStreams = (details?.allStreamGroups ?? []).reduce(0) { $0 + ($1.content?.ready?.count ?? 0) }
-                        VXProbe.log("engine", "metaDetails changed meta=\(details?.meta?.id ?? "nil") streamGroups=\(details?.allStreamGroups.count ?? 0) streams=\(readyStreams)")
+                        VXProbe.log("engine", "metaDetails changed meta=\(VXProbeRedaction.identityToken(details?.meta?.id)) streamGroups=\(details?.allStreamGroups.count ?? 0) streams=\(readyStreams)")
                         if readyStreams > 0 { VXProbeState.shared.note("streams \(readyStreams)") }
                     }
                     DispatchQueue.main.async { [weak self] in
@@ -2184,13 +2333,18 @@ final class CoreBridge: ObservableObject {
 
     /// True when the newly decoded meta_details differs from the stored one in a way the UI or the
     /// in-player episode-switch path (which reads `streamGroups(forStreamId:)` off the stored value)
-    /// would observe: the loaded meta id, the per-group ready-stream signature (so a new episode's
-    /// streams or newly landed sources always republish), or the library/watched bits behind the
-    /// In-Library button and watched dots. A pure re-emit of the identical loaded payload returns false,
-    /// which is what drops the ~11 redundant source-search republishes for a high-source title.
+    /// would observe: the selected request id, metadata resolution, loaded meta id, per-group
+    /// ready-stream signature (so a new episode's streams or newly landed sources always republish),
+    /// or the library/watched bits behind the In-Library button and watched dots. A pure re-emit of
+    /// the identical loaded payload returns false, which drops the redundant source-search republishes.
     private static func metaDetailsNeedsRepublish(current: CoreMetaDetails?, next: CoreMetaDetails?) -> Bool {
         // Presence flips always republish (spinner -> loaded, or unload).
         guard let current, let next else { return (current != nil) != (next != nil) }
+        // `meta` is nil while an add-on is loading and after every add-on has failed. Publish both
+        // the selection change and pending-to-unresolved transition so detail recovery sees the
+        // terminal state even when the ready meta and stream signatures remain empty.
+        if current.selectedMetaID != next.selectedMetaID { return true }
+        if current.metaResolution != next.metaResolution { return true }
         if current.meta?.id != next.meta?.id { return true }
         if current.libraryItem?.id != next.libraryItem?.id
             || current.libraryItem?.removed != next.libraryItem?.removed
@@ -2219,6 +2373,7 @@ final class CoreBridge: ObservableObject {
     /// save while the stream set is unchanged.
     private static func metaDetailsStreamsChanged(current: CoreMetaDetails?, next: CoreMetaDetails?) -> Bool {
         guard let current, let next else { return (current != nil) != (next != nil) }
+        if current.selectedMetaID != next.selectedMetaID { return true }
         if current.meta?.id != next.meta?.id { return true }
         // Both surfaces, matching metaDetailsNeedsRepublish: a metaStreams arrival must bump streamsEpoch.
         return streamSetSignature(current.allStreamGroups) != streamSetSignature(next.allStreamGroups)
@@ -2269,8 +2424,14 @@ final class CoreBridge: ObservableObject {
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
                         self.reconcileBoardRowPagination(boardState)   // #95: settle per-row horizontal pagination
+                        self.boardCatalogTotal = boardState?.catalogs.count ?? 0
                         self.boardRows = rows
                         self.boardPageInFlight = false
+                        // The board emit is the authoritative raw total. If an explicit order is
+                        // already stored, close any gap left by an interim ctx manifest count.
+                        if !CatalogPrefsStore.order().isEmpty {
+                            self.ensureCatalogOrderRangeLoaded(installedCatalogTotal: 0)
+                        }
                     }
                 }
             }

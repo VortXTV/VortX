@@ -28,16 +28,30 @@ enum DiagnosticsLog {
     /// breadcrumbs around suspect statements, where an async write would still be
     /// sitting in the queue when the process dies.
     static func logSync(_ category: String, _ message: String) {
-        let line = "\(stamp.string(from: Date())) [\(category)] \(message)\n"
-        queue.sync { append(line) }
+        queue.sync { append(durableLine(category, message)) }
         mirrorToProbe(category, message)
     }
 
     /// Append one line. Safe from any thread; never throws, never blocks the caller.
     static func log(_ category: String, _ message: String) {
-        let line = "\(stamp.string(from: Date())) [\(category)] \(message)\n"
+        let line = durableLine(category, message)
         queue.async { append(line) }
         mirrorToProbe(category, message)
+    }
+
+    /// This channel is ALWAYS ON. Unlike `VXProbe` there is no launch flag and no Settings toggle in front
+    /// of it: `log`/`logSync` append for every user of every build, ~512 KiB durable in Caches, from 152
+    /// call sites across 25 files carrying library ids, catalog ids, video ids, stream names, URL
+    /// components, imported list titles and localized errors. Only the `mirrorToProbe` hop below is gated.
+    ///
+    /// So BOTH fields go through the shared bounded formatter before this file's own disk append, rather
+    /// than only the ones that happen to be mirrored into the probe log. `category` is included because it
+    /// is a free-form `String` from those same 152 call sites: an unguarded parameter means there is no
+    /// chokepoint, and this is the chokepoint. The formatter also caps the COMPLETE line (timestamp,
+    /// brackets, category, spacing and newline included) and neutralises control characters, so a message
+    /// containing a newline can no longer forge a second entry with an attacker-chosen timestamp.
+    private static func durableLine(_ category: String, _ message: String) -> String {
+        VXProbeRedaction.durableLine(timestamp: stamp.string(from: Date()), category: category, message: message)
     }
 
     /// Mirror into the EXPORTABLE probe log (Caches/vortx-diag.log). The in-app log export serves ONLY

@@ -88,6 +88,7 @@ private struct TraktConnectCard: View {
     @AppStorage(ExternalSyncToggle.traktWatchlist) private var watchlist = true
     @AppStorage(ExternalSyncToggle.traktImportWatched) private var importWatched = false
     @AppStorage(ExternalSyncToggle.traktResumeSuggestion) private var resumeSuggestion = false
+    @AppStorage(ExternalSyncToggle.traktContinueWatching) private var traktContinueWatching = false
     // Defaults MUST match the `default:` each key is read with at runtime (see ExternalSyncToggle.isOn),
     // so a never-touched switch and the code behind it agree. Ratings default ON, like scrobble/watchlist.
     @AppStorage(ExternalSyncToggle.traktRatings) private var ratings = true
@@ -103,7 +104,16 @@ private struct TraktConnectCard: View {
                 Toggle("Add to watchlist when you add to Library", isOn: $watchlist).tint(Theme.Palette.accent)
                 Toggle("Show titles watched on Trakt as watched here", isOn: $importWatched)
                     .tint(Theme.Palette.accent)
-                    .onChange(of: importWatched) { _ in WatchedIndex.shared.externalShadowChanged() }
+                    .onChange(of: importWatched) { on in
+                        // Turning import ON must pull the Trakt watched history NOW. An earlier import-off
+                        // refresh already armed TraktSyncEngine's staleness throttle (it stamps on every
+                        // refresh, even the ones whose pull no-op'd while the toggle was off), so a plain
+                        // rebuild's refreshIfStale would early-return and the badges would not appear until an
+                        // unrelated engine event fired minutes later. refreshNow clears that throttle so the
+                        // just-enabled watched titles import immediately.
+                        if on { TraktSyncEngine.shared.refreshNow() }
+                        WatchedIndex.shared.externalShadowChanged()
+                    }
                 // Gates the detail page's rating chip AND its mirror. Turning it off never deletes a
                 // rating: they live in the local shadow, so turning it back on brings them all back.
                 Toggle("Rate titles and sync your ratings", isOn: $ratings)
@@ -116,8 +126,22 @@ private struct TraktConnectCard: View {
                         // Turning it off drops the cached positions now rather than leaving them on disk for
                         // a feature the user just declined. Turning it on lets the next pre-play open pull
                         // (refreshIfStale's own toggle gate blocked every earlier attempt).
-                        if !on { TraktPlaybackShadow.shared.reset() }
+                        if !on, !traktContinueWatching {
+                            TraktPlaybackShadow.shared.reset()
+                        }
                     }
+                Toggle("Use Trakt for Continue Watching", isOn: $traktContinueWatching)
+                    .tint(Theme.Palette.accent)
+                    .onChange(of: traktContinueWatching) { on in
+                        if on {
+                            TraktPlaybackShadow.shared.refreshNow()
+                        } else if !resumeSuggestion {
+                            TraktPlaybackShadow.shared.reset()
+                        }
+                    }
+                Text("When selected, the owner profile's Home rail follows paused items from Trakt. VortX stays visible until the first complete Trakt snapshot arrives.")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
                 // Adds an "I'm watching this" action to detail pages, for a cinema or someone else's TV.
                 // Never fires on its own: what you play in VortX is already scrobbled, so this is only
                 // for viewing VortX cannot see, and it always takes a deliberate tap.
@@ -147,7 +171,10 @@ private struct TraktConnectCard: View {
             }
         }
         .task { connected = await TraktAuth.shared.isSignedIn }
-        .onDisappear { pollTask?.cancel() }
+        .onDisappear {
+            pollTask?.cancel()
+            Task { await TraktAuth.shared.cancelLoginAttempt() }
+        }
     }
 
     private func connect() {
@@ -159,6 +186,9 @@ private struct TraktConnectCard: View {
                 let image = QRCodeImage.make(dc.verificationURL)
                 await MainActor.run { code = dc; qr = image; working = false; status = "Waiting for you to authorize…" }
                 _ = try await TraktAuth.shared.pollForToken(deviceCode: dc.deviceCode, interval: dc.interval, expiresIn: dc.expiresIn)
+                // Authentication is a new account boundary. Supersede any signed-out no-op/in-flight pull
+                // and fetch the enabled playback surface immediately instead of inheriting its stale throttle.
+                TraktPlaybackShadow.shared.refreshNow()
                 await MainActor.run { connected = true; code = nil; qr = nil; status = "" }
             } catch is CancellationError {
                 return
@@ -171,6 +201,7 @@ private struct TraktConnectCard: View {
 
     private func cancel() {
         pollTask?.cancel(); pollTask = nil
+        Task { await TraktAuth.shared.cancelLoginAttempt() }
         code = nil; qr = nil; status = ""; working = false; errorMessage = nil
     }
 
@@ -214,6 +245,12 @@ private struct SIMKLConnectCard: View {
 
     @AppStorage(ExternalSyncToggle.simklScrobble) private var scrobble = true
     @AppStorage(ExternalSyncToggle.simklWatchlist) private var watchlist = true
+    // Default OFF, matching Trakt's importWatched: importing another service's history into the read path is
+    // opt-in. Its default here MUST match the `default: false` every ExternalSyncToggle.isOn call site passes.
+    @AppStorage(ExternalSyncToggle.simklImportWatched) private var importWatched = false
+    // Default ON, the SIMKL peer of Trakt's ratings toggle, like scrobble/watchlist. Gates the detail page's
+    // SIMKL rating chip AND its mirror; turning it off never deletes a rating (they live in the local shadow).
+    @AppStorage(ExternalSyncToggle.simklRatings) private var ratings = true
 
     var body: some View {
         ProviderCard {
@@ -222,6 +259,25 @@ private struct SIMKLConnectCard: View {
                 Text("Connected").font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                 Toggle("Mark watched when you finish", isOn: $scrobble).tint(Theme.Palette.accent)
                 Toggle("Add to watchlist when you add to Library", isOn: $watchlist).tint(Theme.Palette.accent)
+                Toggle("Show titles watched on SIMKL as watched here", isOn: $importWatched)
+                    .tint(Theme.Palette.accent)
+                    .onChange(of: importWatched) { on in
+                        // Turning import ON must pull the SIMKL completed history NOW rather than on the next
+                        // unrelated rebuild tick. refreshNow forces the schedule past the staleness throttle
+                        // (see SIMKLWatchedShadow.refreshNow), so the just-enabled watched titles badge
+                        // immediately. Mirrors the Trakt import toggle.
+                        if on { SIMKLWatchedShadow.shared.refreshNow() }
+                        WatchedIndex.shared.externalShadowChanged()
+                    }
+                // Gates the detail page's SIMKL rating chip AND its mirror. Turning it off never deletes a
+                // rating: they live in SIMKLRatingsStore's local shadow, so turning it back on brings them back.
+                Toggle("Rate titles and sync your ratings", isOn: $ratings)
+                    .tint(Theme.Palette.accent)
+                    .onChange(of: ratings) { on in
+                        // Turning it ON converges the user's existing SIMKL ratings now (drain any unpushed
+                        // local edits, then pull the read-back) rather than on the next detail-page open.
+                        if on { SIMKLRatingsStore.shared.refreshNow() }
+                    }
                 Button("Disconnect") { disconnect() }
                     .buttonStyle(ChipButtonStyle(selected: false))
             } else if let pin {
@@ -246,7 +302,10 @@ private struct SIMKLConnectCard: View {
             }
         }
         .task { connected = await SIMKLAuth.shared.isSignedIn }
-        .onDisappear { pollTask?.cancel() }
+        .onDisappear {
+            pollTask?.cancel()
+            Task { await SIMKLAuth.shared.cancelLoginAttempt() }
+        }
     }
 
     private func connect() {
@@ -258,6 +317,10 @@ private struct SIMKLConnectCard: View {
                 let image = QRCodeImage.make(p.verificationUrl)
                 await MainActor.run { pin = p; qr = image; working = false; status = "Waiting for you to authorize…" }
                 _ = try await SIMKLAuth.shared.pollForToken(userCode: p.userCode, interval: p.interval, expiresIn: p.expiresIn)
+                // Converge the just-connected account's existing SIMKL ratings into the local shadow now, so a
+                // detail page shows "SIMKL rating · N" for titles already rated on SIMKL. Gated downstream on the
+                // ratings toggle; no-op when it is off.
+                SIMKLRatingsStore.shared.refreshNow()
                 await MainActor.run { connected = true; pin = nil; qr = nil; status = "" }
             } catch is CancellationError {
                 return
@@ -270,14 +333,23 @@ private struct SIMKLConnectCard: View {
 
     private func cancel() {
         pollTask?.cancel(); pollTask = nil
+        Task { await SIMKLAuth.shared.cancelLoginAttempt() }
         pin = nil; qr = nil; status = ""; working = false; errorMessage = nil
     }
 
     private func disconnect() {
         Task {
             await SIMKLAuth.shared.signOut()
+            // Wipe the local SIMKL watched shadow so the imported badges drop now and one account's SIMKL
+            // history can never badge covers for the next account that connects on this device (the same
+            // cross-account contamination rule as the Trakt disconnect wipe).
+            SIMKLWatchedShadow.shared.reset()
+            // And the SIMKL ratings shadow: one person's SIMKL scores must not show as the next account's
+            // "SIMKL rating", nor drain to their SIMKL from this device. Same contamination rule as Trakt.
+            SIMKLRatingsStore.shared.reset()
             await MainActor.run {
                 connected = false; pin = nil; qr = nil
+                WatchedIndex.shared.externalShadowChanged()   // rebuild the read path without the shadow set
                 NotificationCenter.default.post(name: SIMKLRailsModel.disconnectedNote, object: nil)   // clear the Home plan-to-watch rail now
             }
         }

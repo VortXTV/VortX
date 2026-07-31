@@ -3,6 +3,7 @@ package com.vortx.android.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,6 +26,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -33,13 +35,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -48,6 +54,7 @@ import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
+import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.library.LibraryAutoAdd
 import com.vortx.android.model.Episode
@@ -59,10 +66,18 @@ import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.DefaultEmber
 import com.vortx.android.player.PlayerScreen
+import com.vortx.android.profile.ProfileStore
 import com.vortx.android.ui.components.Wordmark
 import com.vortx.android.ui.gallery.GalleryScreen
+import com.vortx.android.ui.prefs.AppearancePrefs
+import com.vortx.android.ui.prefs.TabBarPrefs
+import com.vortx.android.ui.prefs.TabSlot
+import com.vortx.android.ui.prefs.isVisible
+import com.vortx.android.ui.prefs.resolveSelected
 import com.vortx.android.ui.screens.AccountScreen
 import com.vortx.android.ui.screens.AddonsScreen
+import com.vortx.android.ui.screens.AppearanceScreen
+import com.vortx.android.ui.screens.DebridKeysScreen
 import com.vortx.android.ui.screens.DetailScreen
 import com.vortx.android.ui.screens.DiscoverScreen
 import com.vortx.android.ui.screens.DownloadsScreen
@@ -75,6 +90,7 @@ import com.vortx.android.ui.screens.PlaybackSettingsScreen
 import com.vortx.android.ui.screens.ProfilesScreen
 import com.vortx.android.ui.screens.SearchScreen
 import com.vortx.android.ui.screens.SettingsScreen
+import com.vortx.android.ui.screens.TabBarScreen
 import com.vortx.android.iptv.IPTVSettingsScreen
 import com.vortx.android.ui.screens.SourcesSettingsScreen
 import com.vortx.android.ui.screens.VortXAccountScreen
@@ -101,17 +117,21 @@ import kotlinx.coroutines.launch
 /// TVPlayerView.swift:810. Expressed in ms because Android reports position in ms.
 private const val AUTO_ADD_AFTER_MS = 60_000L
 
-private enum class Tab(val label: String, val icon: ImageVector) {
-    HOME("Home", VortXIcons.home),
-    DISCOVER("Discover", VortXIcons.discover),
-    LIBRARY("Library", VortXIcons.library),
-    SEARCH("Search", VortXIcons.search),
-    SETTINGS("Settings", VortXIcons.settings),
+private enum class Tab(
+    val label: String,
+    val icon: ImageVector,
+    val slot: TabSlot,
+) {
+    HOME("Home", VortXIcons.home, TabSlot.HOME),
+    DISCOVER("Discover", VortXIcons.discover, TabSlot.DISCOVER),
+    LIBRARY("Library", VortXIcons.library, TabSlot.LIBRARY),
+    SEARCH("Search", VortXIcons.search, TabSlot.SEARCH),
+    SETTINGS("Settings", VortXIcons.settings, TabSlot.SETTINGS),
 }
 
 /// The whole app: a five-tab shell matching the iOS and Apple TV structure, with a detail overlay.
 /// [repo] defaults to the offline preview source; the real stremio-core engine is injected here (from
-/// `VortXApplication`), with no change to any screen — every screen consumes a ViewModel, and every
+/// `VortXApplication`), with no change to any screen; every screen consumes a ViewModel, and every
 /// ViewModel depends only on [CatalogRepository] (or, for the account screen, [AuthRepository]).
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -123,8 +143,55 @@ fun StremioXApp(
     // hidden and everything else is unchanged -- sync is off the critical path by design.
     syncManager: VortXSyncManager? = null,
 ) {
-    VortXTheme {
-        var tab by remember { mutableStateOf(Tab.HOME) }
+    val appContext = LocalContext.current.applicationContext
+    // VortXApplication binds the persistence-backed owner before either the phone or TV launcher creates
+    // consumers. Compose only reads the shared binding; it must never redefine process ownership.
+    val debridKeys = remember(appContext) { DebridKeys(appContext) }
+    val vortxSessionUi by (
+        syncManager?.sessionUiState?.collectAsStateWithLifecycle()
+            ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) }
+    )
+    val profileStore = ProfileStore.sharedOrNull()
+    val activeProfile by (
+        profileStore?.activeProfile?.collectAsStateWithLifecycle()
+            ?: remember { mutableStateOf(null) }
+    )
+    // Reading the bound identity after collecting account makes Compose reset the debrid editor at the same
+    // account transition that every resolver/coordinator/view-model DebridKeys instance observes.
+    val debridAccountIdentity = debridKeys.ownerIdentity()
+    val debridOwnerEpoch = debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
+    val appearancePrefs = remember(appContext) { AppearancePrefs(appContext) }
+    val tabBarPrefs = remember(appContext) { TabBarPrefs(appContext) }
+    val appearance by appearancePrefs.state.collectAsStateWithLifecycle()
+    val hiddenTabs by tabBarPrefs.state.collectAsStateWithLifecycle()
+
+    LaunchedEffect(activeProfile) {
+        appearancePrefs.applyProfile(activeProfile)
+    }
+
+    val accentId = activeProfile?.accentID ?: appearance.accentId
+    val oled = activeProfile?.oled ?: appearance.oled
+    val textScale = (activeProfile?.textScale ?: appearance.textScale)
+        .takeIf { it.isFinite() }
+        ?.coerceIn(AppearancePrefs.TEXT_SCALE_MIN, AppearancePrefs.TEXT_SCALE_MAX)
+        ?: AppearancePrefs.TEXT_SCALE_DEFAULT
+    val deviceDensity = LocalDensity.current
+
+    CompositionLocalProvider(
+        LocalDensity provides Density(
+            density = deviceDensity.density,
+            fontScale = deviceDensity.fontScale * textScale.toFloat(),
+        ),
+    ) {
+        VortXTheme(
+            accentId = accentId,
+            oled = oled,
+        ) {
+            var tab by remember { mutableStateOf(Tab.HOME) }
+            val visibleTabs = Tab.entries.filter { hiddenTabs.isVisible(it.slot) }
+            LaunchedEffect(tab, hiddenTabs) {
+                if (hiddenTabs.resolveSelected(tab.slot) != tab.slot) tab = Tab.HOME
+            }
         var detail by remember { mutableStateOf<MetaItem?>(null) }
         var playing by remember { mutableStateOf<Playable?>(null) }
         // The catalog meta of the title currently in [playing], captured at the moment play starts. This is
@@ -144,11 +211,16 @@ fun StremioXApp(
         var showDownloads by remember { mutableStateOf(false) }
         var showPlayback by remember { mutableStateOf(false) }
         var showSources by remember { mutableStateOf(false) }
+        var showDebridKeys by remember { mutableStateOf(false) }
+        var restoreDebridServicesFocus by remember { mutableStateOf(false) }
+        val settingsScrollState = rememberScrollState()
+        val debridServicesFocusRequester = remember { FocusRequester() }
         var showLiveTv by remember { mutableStateOf(false) }
         var showLibraryTransfer by remember { mutableStateOf(false) }
         var showProfiles by remember { mutableStateOf(false) }
+        var showAppearance by remember { mutableStateOf(false) }
+        var showTabBar by remember { mutableStateOf(false) }
         val onItem: (MetaItem) -> Unit = { detail = it }
-        val appContext = LocalContext.current.applicationContext
         // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
         // (final progress tick + Player unload) still runs after the player leaves composition.
         val appScope = rememberCoroutineScope()
@@ -156,9 +228,28 @@ fun StremioXApp(
         // Settings' Account row summary and the AccountScreen overlay both read the SAME live
         // authState, so a sign-in on one immediately reflects on the other with no extra plumbing.
         val accountVm: AccountViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo, auth = auth))
+        val closeDebridKeys: () -> Unit = {
+            showDebridKeys = false
+            restoreDebridServicesFocus = true
+        }
+
+        LaunchedEffect(showDebridKeys, restoreDebridServicesFocus, tab) {
+            if (!showDebridKeys && restoreDebridServicesFocus && tab == Tab.SETTINGS) {
+                var focused = false
+                repeat(3) {
+                    if (!focused) {
+                        withFrameNanos { }
+                        focused = runCatching {
+                            debridServicesFocusRequester.requestFocus()
+                        }.getOrDefault(false)
+                    }
+                }
+                if (focused) restoreDebridServicesFocus = false
+            }
+        }
 
         // The debug-only design-system gallery (S02) is the topmost overlay when open, above even the
-        // detail/player layers below — it is a review tool, not part of the product navigation graph.
+        // detail/player layers below; it is a review tool, not part of the product navigation graph.
         if (showGallery) {
             // Hardware/gesture Back dismisses the overlay instead of exiting the app. Every overlay layer
             // in this shell installs its own BackHandler the same way: with none, the system back (which
@@ -166,6 +257,24 @@ fun StremioXApp(
             // finishes it, so Back on any overlay quit the whole app (the device-audit finding).
             BackHandler { showGallery = false }
             GalleryScreen(onBack = { showGallery = false })
+            return@VortXTheme
+        }
+
+        if (showAppearance) {
+            BackHandler { showAppearance = false }
+            AppearanceScreen(
+                prefs = appearancePrefs,
+                onBack = { showAppearance = false },
+            )
+            return@VortXTheme
+        }
+
+        if (showTabBar) {
+            BackHandler { showTabBar = false }
+            TabBarScreen(
+                prefs = tabBarPrefs,
+                onBack = { showTabBar = false },
+            )
             return@VortXTheme
         }
 
@@ -204,7 +313,7 @@ fun StremioXApp(
             val advanceVm: DetailViewModel? =
                 if (showForNext != null && !playable.isTrailer) {
                     viewModel(
-                        key = "detail-${showForNext.id}",
+                        key = "detail-${showForNext.id}-$debridOwnerEpoch",
                         factory = StremioXViewModelFactory(
                             repo = repo,
                             detailArgs = StremioXViewModelFactory.DetailArgs(showForNext.type, showForNext.id),
@@ -459,6 +568,16 @@ fun StremioXApp(
             return@VortXTheme
         }
 
+        if (showDebridKeys) {
+            BackHandler(onBack = closeDebridKeys)
+            DebridKeysScreen(
+                keys = debridKeys,
+                accountIdentity = debridAccountIdentity,
+                onBack = closeDebridKeys,
+            )
+            return@VortXTheme
+        }
+
         if (showLiveTv) {
             // Settings > Live TV (IPTV): add / remove M3U + Xtream playlists. UNLIKE the self-contained
             // settings overlays it takes [repo], the same way LibraryTransferScreen does: adding installs the
@@ -495,7 +614,7 @@ fun StremioXApp(
         if (current != null) {
             // A ViewModel keyed to this title's id, fed type+id through the factory's DetailArgs.
             val detailVm: DetailViewModel = viewModel(
-                key = "detail-${current.id}",
+                key = "detail-${current.id}-$debridOwnerEpoch",
                 factory = StremioXViewModelFactory(
                     repo = repo,
                     detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),
@@ -543,7 +662,7 @@ fun StremioXApp(
                     tonalElevation = 0.dp,
                     modifier = Modifier.vortxGlassStrip(),
                 ) {
-                    Tab.entries.forEach { t ->
+                    visibleTabs.forEach { t ->
                         NavigationBarItem(
                             selected = t == tab,
                             onClick = { tab = t },
@@ -566,12 +685,26 @@ fun StremioXApp(
                     // account flow. Null manager (preview / keystore failure) hides the row entirely.
                     // The conditional collect is safe: [syncManager] is process-constant, so the
                     // composition never flips between the two branches.
-                    vortxAccountValue = syncManager?.let { manager ->
-                        val vortxAccount by manager.account.collectAsStateWithLifecycle()
-                        vortxAccount?.let { it.username.ifEmpty { it.email } } ?: "Not signed in"
+                    vortxAccountValue = syncManager?.let {
+                        when (val session = vortxSessionUi) {
+                            is VortXSyncManager.SessionUiState.SignedIn ->
+                                session.account.username.ifEmpty { session.account.email }
+                            VortXSyncManager.SessionUiState.SignedOut -> "Not signed in"
+                            VortXSyncManager.SessionUiState.UnknownOrUnavailable ->
+                                "Secure session unavailable · Tap to retry"
+                            null -> "Secure session unavailable · Tap to retry"
+                        }
                     },
-                    onVortxAccountClick = { showVortxAccount = true },
+                    onVortxAccountClick = {
+                        if (vortxSessionUi == VortXSyncManager.SessionUiState.UnknownOrUnavailable) {
+                            syncManager?.retrySessionRestore()
+                        } else {
+                            showVortxAccount = true
+                        }
+                    },
                     onProfilesClick = { showProfiles = true },
+                    onAppearanceScreenClick = { showAppearance = true },
+                    onTabBarScreenClick = { showTabBar = true },
                     onAccountClick = { showAccount = true },
                     onAddonsClick = { showAddons = true },
                     onIntegrationsClick = { showIntegrations = true },
@@ -580,12 +713,19 @@ fun StremioXApp(
                     onDownloadsClick = { showDownloads = true },
                     onPlaybackClick = { showPlayback = true },
                     onSourcesClick = { showSources = true },
+                    onDebridKeysScreenClick = {
+                        restoreDebridServicesFocus = false
+                        showDebridKeys = true
+                    },
                     onLibraryClick = { showLibraryTransfer = true },
+                    settingsScrollState = settingsScrollState,
+                    debridServicesFocusRequester = debridServicesFocusRequester,
                     modifier = content,
                     onOpenGallery = { showGallery = true },
                 )
             }
         }
+    }
     }
 }
 

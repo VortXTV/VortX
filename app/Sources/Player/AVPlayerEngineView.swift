@@ -15,6 +15,11 @@ import AVFoundation
 /// remote input stays on `TVPlayerView`'s UIKit `RemoteCatcher`, never a focusable SwiftUI overlay.
 struct AVPlayerEngineView: PlatformViewRepresentable {
     @ObservedObject var coordinator: MPVMetalPlayerView.Coordinator
+    private var resumeOriginSeconds = 0.0
+
+    init(coordinator: MPVMetalPlayerView.Coordinator) {
+        self.coordinator = coordinator
+    }
 
     /// `isDolbyVision` mirrors MPVMetalPlayerView.play: the launching stream's DV flag, copied onto the
     /// engine before the initial loadFile so the Apple TV display-mode switch fires for the FIRST mount too
@@ -26,6 +31,13 @@ struct AVPlayerEngineView: PlatformViewRepresentable {
         return self
     }
     func live(_ live: Bool) -> Self { coordinator.playLive = live; return self }
+    /// Configure the source-timeline origin before the initial synchronous `loadFile` in `makeHostView`.
+    /// A later SwiftUI `onAppear` is too late: by then a remux mount has already consumed its one-shot origin.
+    func resumeOrigin(_ seconds: Double?) -> Self {
+        var copy = self
+        copy.resumeOriginSeconds = seconds ?? 0
+        return copy
+    }
     func onPropertyChange(_ handler: @escaping (any PlayerEngine, String, Any?, PlayerLoadToken) -> Void) -> Self {
         coordinator.onPropertyChange = handler
         return self
@@ -53,6 +65,7 @@ struct AVPlayerEngineView: PlatformViewRepresentable {
         engine.attachSubtitleOverlay(view.subtitleOverlay)   // draw external srt/vtt subs above the video
         engine.contentIsDolbyVision = coordinator.contentIsDolbyVision   // BEFORE loadFile (pre-attach DV switch)
         if let url = coordinator.playUrl {
+            engine.configureResumeOrigin(seconds: resumeOriginSeconds)
             engine.loadFile(url, headers: coordinator.playHeaders, live: coordinator.playLive)
         }
         return view

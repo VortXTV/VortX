@@ -26,7 +26,13 @@ import Foundation
 final class TraktCheckinModel: ObservableObject {
     static let shared = TraktCheckinModel()
 
-    private init() {}
+    private init() {
+        TraktAuthBoundary.observe(key: "trakt-checkin-model") { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.active = nil
+            }
+        }
+    }
 
     // MARK: - State
 
@@ -45,6 +51,8 @@ final class TraktCheckinModel: ObservableObject {
     @Published private(set) var working = false
 
     struct Active: Equatable, Sendable {
+        /// Auth session that owns this local receipt. It never leaves memory.
+        let sessionID: TraktSessionID
         /// The item this instance checked into, so a detail page for a DIFFERENT title does not show a
         /// "cancel" affordance for something else.
         let key: String
@@ -58,7 +66,10 @@ final class TraktCheckinModel: ObservableObject {
     }
 
     /// True when `key` is the item this instance currently believes it is checked into.
-    func isActive(_ key: String) -> Bool { active?.key == key }
+    func isActive(_ key: String) -> Bool {
+        guard let sessionID = TraktAuth.storedSessionID else { return false }
+        return active?.sessionID == sessionID && active?.key == key
+    }
 
     // MARK: - Gates
 
@@ -90,11 +101,18 @@ final class TraktCheckinModel: ObservableObject {
     /// the user, told what is in the way and when it clears, may choose `replaceActive`.
     func checkIn(id: String, isSeries: Bool, season: Int?, episode: Int?, title: String?) async -> TraktCheckinOutcome {
         guard Self.canOffer(isSeries: isSeries, season: season, episode: episode) else { return .unavailable }
-        guard await TraktAuth.shared.isSignedIn else { return .unavailable }
+        guard let sessionID = TraktAuth.storedSessionID else { return .unavailable }
         guard !working else { return .unavailable }
         working = true
         defer { working = false }
-        return await send(id: id, isSeries: isSeries, season: season, episode: episode, title: title)
+        return await send(
+            id: id,
+            isSeries: isSeries,
+            season: season,
+            episode: episode,
+            title: title,
+            sessionID: sessionID
+        )
     }
 
     /// Cancel whatever holds the slot, then check into this title. ONLY ever called from an explicit user
@@ -102,26 +120,45 @@ final class TraktCheckinModel: ObservableObject {
     /// watch record, and it exists so that decision is always a person's, never a heuristic's.
     func replaceActive(id: String, isSeries: Bool, season: Int?, episode: Int?, title: String?) async -> TraktCheckinOutcome {
         guard Self.canOffer(isSeries: isSeries, season: season, episode: episode) else { return .unavailable }
-        guard await TraktAuth.shared.isSignedIn else { return .unavailable }
+        guard let sessionID = TraktAuth.storedSessionID else { return .unavailable }
         guard !working else { return .unavailable }
         working = true
         defer { working = false }
-        do { try await TraktService.shared.cancelCheckIn() }
-        catch { return .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription) }
+        do {
+            try await TraktService.shared.cancelCheckIn(expectedSession: sessionID)
+        }
+        catch {
+            guard TraktAuth.storedSessionID == sessionID else { return .unavailable }
+            return .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
+        guard TraktAuth.storedSessionID == sessionID else { return .unavailable }
         active = nil
-        return await send(id: id, isSeries: isSeries, season: season, episode: episode, title: title)
+        return await send(
+            id: id,
+            isSeries: isSeries,
+            season: season,
+            episode: episode,
+            title: title,
+            sessionID: sessionID
+        )
     }
 
     /// Cancel the active check-in (`DELETE /checkin`). Returns false when Trakt refused, so the caller can
     /// leave the button alone rather than lie about the state.
     @discardableResult
     func cancelActive() async -> Bool {
-        guard TraktAuth.isConfigured, await TraktAuth.shared.isSignedIn else { return false }
+        guard TraktAuth.isConfigured,
+              let sessionID = TraktAuth.storedSessionID else { return false }
+        guard active?.sessionID == sessionID else {
+            active = nil
+            return false
+        }
         guard !working else { return false }
         working = true
         defer { working = false }
         do {
-            try await TraktService.shared.cancelCheckIn()
+            try await TraktService.shared.cancelCheckIn(expectedSession: sessionID)
+            guard TraktAuth.storedSessionID == sessionID else { return false }
             active = nil
             return true
         } catch {
@@ -132,17 +169,35 @@ final class TraktCheckinModel: ObservableObject {
     // MARK: - Internals
 
     /// Resolve identity through the shared resolver, map it the same way the scrobble path does, and post.
-    private func send(id: String, isSeries: Bool, season: Int?, episode: Int?, title: String?) async -> TraktCheckinOutcome {
+    private func send(
+        id: String,
+        isSeries: Bool,
+        season: Int?,
+        episode: Int?,
+        title: String?,
+        sessionID: TraktSessionID
+    ) async -> TraktCheckinOutcome {
+        guard TraktAuth.storedSessionID == sessionID else { return .unavailable }
         guard let ref = await ScrobbleCoordinator.makeRef(libraryId: id, isSeries: isSeries,
                                                           season: season, episode: episode,
                                                           title: title, progress: 0),
               let item = TraktProvider.scrobbleItem(ref) else { return .unavailable }
+        guard TraktAuth.storedSessionID == sessionID else { return .unavailable }
         do {
-            let response = try await TraktService.shared.checkIn(item: item)
+            let response = try await TraktService.shared.checkIn(
+                item: item,
+                expectedSession: sessionID
+            )
+            guard TraktAuth.storedSessionID == sessionID else { return .unavailable }
             let expires = TraktDate.parse(response.expiresAt)
-            active = Active(key: Self.key(id: id, season: season, episode: episode), expiresAt: expires)
+            active = Active(
+                sessionID: sessionID,
+                key: Self.key(id: id, season: season, episode: episode),
+                expiresAt: expires
+            )
             return .checkedIn(until: expires)
         } catch let error as TraktServiceError {
+            guard TraktAuth.storedSessionID == sessionID else { return .unavailable }
             if case .alreadyCheckedIn(let until) = error {
                 // `active` is deliberately left alone. A 409 says the slot is held; it does NOT say by
                 // what. The incumbent is quite often this instance's OWN earlier check-in still running,
@@ -152,6 +207,7 @@ final class TraktCheckinModel: ObservableObject {
             }
             return .failed(error.errorDescription ?? "\(error)")
         } catch {
+            guard TraktAuth.storedSessionID == sessionID else { return .unavailable }
             return .failed(error.localizedDescription)
         }
     }

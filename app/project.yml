@@ -121,9 +121,43 @@ options:
     - zh-Hant
     - zu
 packages:
+  # MPVKit, built BY US from pinned upstream refs, for Dolby Vision Profile 7 enhancement-layer
+  # (FEL) support. Was: url https://github.com/mpvkit/MPVKit, exactVersion "0.41.0-n8.1.2".
+  #
+  # LICENSING (fixed by this change). The old 0.41.0-n8.1.2 pin passed `--enable-nonfree` in
+  # MPVKit's common FFmpeg configure array (its main.swift:652 at that tag), so the FFmpeg we
+  # shipped self-reported "libavutil license: nonfree and unredistributable" while README.md and
+  # THIRD-PARTY-NOTICES.md both declare this project GPL-3.0. Upstream removed the flag in
+  # MPVKit 5e94d4a9 "Remove nonfree FFmpeg configure flag (#78)" on 2026-07-11, which POSTDATES
+  # that pin, so we never got it. The previous comment here claimed the opposite: it credited #78
+  # as an "Atmos/eARC fix" and cited a PR #101 that does not exist, which is most likely why the
+  # defect went unnoticed. Our fork bases on MPVKit 2103893 (post-#78), so the flag is gone and
+  # the built artifacts now report "libavutil license: GPL version 3 or later". The flag-array
+  # diff between the two revisions is exactly one line removed (`--enable-nonfree`) and nothing
+  # else, so no codec we rely on was dropped.
+  #
+  # For the record, the tvOS avfoundation AO that the old comment was reaching for is MPVKit
+  # PR #73, and it is carried here by patch 0003-enable-avfoundation-ao-tvos.patch, which we
+  # verified still applies cleanly at the pinned mpv master SHA.
+  #
+  # Why a local package and not a version bump: the FEL feature needs BOTH mpv master and a
+  # libplacebo newer than any release. mpv gates every line of its FEL code behind
+  # `#if PL_API_VER >= 367`, and upstream MPVKit links a PREBUILT libplacebo 7.360.1, which is
+  # PL_API_VER 360. Bumping only mpv would compile the whole feature out SILENTLY, with a green
+  # build, and would be a straight regression (the EL decoder runs, its output is discarded).
+  # So we build libplacebo from source too. Pinned refs, never a moving master:
+  #   mpv        8c67647b50059406c5c0444903597281b81516cf  (master, 2026-07-24)
+  #   libplacebo 4c426e466814536def653cb23f1d1c287ea7a7f5  (master, 2026-07-24, PL_API_VER 371)
+  #   FFmpeg     6e85193417f898868f04f8f6fc30db92a874a8cf  (release/9.0 tip, 2026-07-25)
+  # FFmpeg moved off n8.1.2 because that release had no `dovi_split` bitstream filter, so mpv could
+  # only render the base layer for single-track interleaved Profile 7. The pinned release/9.0 commit
+  # includes the splitter and hvcE extradata support. It is a maintenance branch rather than a tag,
+  # so the exact SHA is detached after cloning that branch. FFmpeg removed `--enable-libshaderc`;
+  # shaderc remains built and shipped for libplacebo, but is no longer passed to FFmpeg configure.
+  #
+  # `artifacts/` is gitignored build output. Regenerate with scripts/build-mpvkit-dvfel.sh.
   MPVKit:
-    url: https://github.com/mpvkit/MPVKit
-    exactVersion: "0.41.0-n8.1.2"   # n8.1.2 includes MPVKit PR #73 (avfoundation AO built for tvOS) - the #78/#101 Atmos/eARC fix
+    path: Vendor/MPVKit-DVFEL
 # Project-wide defaults. VORTX_EDGE_SECRET is the build-time HMAC key for the hardened VortX edge
 # workers; it is EMPTY here so the build never fails when the gitignored Config/VortXEdge.xcconfig
 # is absent (e.g. a fresh clone, or CI before the secret is injected). When that xcconfig is present
@@ -161,6 +195,10 @@ targets:
       # self-contained like the two files above, so include just this one so the web-host target still
       # builds without pulling the rest of SourcesShared.
       - path: SourcesShared/ServerDiagnostics.swift
+      # VXProbe's single write path now scrubs each line through VXProbeRedaction before NSLog and the
+      # file mirror, so this target needs it for the same reason it needs VXProbe itself. Foundation +
+      # CryptoKit only and self-contained, matching the three single-file includes above.
+      - path: SourcesShared/VXProbeRedaction.swift
       - Resources/Assets.xcassets
       - path: Resources/server.js
         buildPhase: resources
@@ -185,7 +223,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "187"
+        CURRENT_PROJECT_VERSION: "204"
         # Web-host target ONLY: this is the WKWebView app (ContentView/StremioWebView). The shared
         # NodeServer preload starts an 11471 reverse-proxy of web.stremio.com solely so that webview can
         # load the UI from a loopback origin. The native targets (VortXiOSNative, VortXTV) have no
@@ -223,7 +261,13 @@ targets:
         com.apple.developer.kernel.increased-memory-limit: true
     sources:
       - SourcesiOS # touch UI
-      - SourcesShared # shared engine bridge, models, account, ranking, profiles, themes
+      # Tooling hook logs land inside the source tree and XcodeGen otherwise sweeps them in as bundle
+      # resources, which fails the build with "Multiple commands produce .../hook-log.jsonl" because the
+      # same basename appears under several roots. They are generated artifacts, never sources.
+      - path: SourcesShared
+        excludes: [".claude/**"]
+        # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      # shared engine bridge, models, account, ranking, profiles, themes
       - Sources/Player # libmpv player core (shared with tvOS)
       - Sources/NodeServer.swift # embedded streaming server
       - Sources/PlayerScreen.swift # full native touch player (controls, tracks, resume), reused by the native UI
@@ -295,7 +339,7 @@ targets:
         # cross-compile).
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "187"
+        CURRENT_PROJECT_VERSION: "204"
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
@@ -320,8 +364,15 @@ targets:
     deploymentTarget: "14.0" # MPVKit's macOS slices (Libuavs3d) require macOS 14
     sources:
       - SourcesiOS # the native SwiftUI UI also runs on macOS
-      - SourcesShared # includes MacNodeServer.swift (the child-process node server)
-      - Sources/Player
+      # Tooling hook logs land inside the source tree and XcodeGen otherwise sweeps them in as bundle
+      # resources, which fails the build with "Multiple commands produce .../hook-log.jsonl" because the
+      # same basename appears under several roots. They are generated artifacts, never sources.
+      - path: SourcesShared
+        excludes: [".claude/**"]
+        # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      # includes MacNodeServer.swift (the child-process node server)
+      - path: Sources/Player
+        excludes: [".claude/**"]
       - Sources/PlayerScreen.swift
       - Sources/ShareSheet.swift
       - Sources/ExternalPlayer.swift
@@ -383,7 +434,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "187"
+        CURRENT_PROJECT_VERSION: "204"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
         # Base plist (merged under the generated keys) carrying the ATS arbitrary-loads exception +
@@ -421,8 +472,15 @@ targets:
       - path: SourcesTV
         excludes:
           - TopShelfExtension/**
-      - SourcesShared # OS-agnostic layer: engine bridge, models, account, ranking, themes
-      - Sources/Player
+      # Tooling hook logs land inside the source tree and XcodeGen otherwise sweeps them in as bundle
+      # resources, which fails the build with "Multiple commands produce .../hook-log.jsonl" because the
+      # same basename appears under several roots. They are generated artifacts, never sources.
+      - path: SourcesShared
+        excludes: [".claude/**"]
+        # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      - path: Sources/Player
+        excludes: [".claude/**"]
       - Sources/NodeServer.swift
       - ResourcesTV/Assets.xcassets
       - Resources/Localizable.xcstrings # shared String Catalog (en + translations)
@@ -492,7 +550,7 @@ targets:
         # condition set, the tvOS Settings toggle renders (VortxNativeServerFlag.isSupported).
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "187"
+        CURRENT_PROJECT_VERSION: "204"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
@@ -535,7 +593,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.topshelf
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "187"
+        CURRENT_PROJECT_VERSION: "204"
         # BASE plist carrying the NSExtension dict (the extension point + principal class), which has no
         # INFOPLIST_KEY_* equivalent and so cannot be expressed as build settings. Xcode merges its
         # GENERATED keys on top, exactly as ResourcesTV/Info-tvOS.plist does for the app: that merge is
@@ -567,8 +625,15 @@ targets:
       - path: SourcesTV
         excludes:
           - TopShelfExtension/**
-      - SourcesShared # OS-agnostic layer: engine bridge, models, account, ranking, themes
-      - Sources/Player
+      # Tooling hook logs land inside the source tree and XcodeGen otherwise sweeps them in as bundle
+      # resources, which fails the build with "Multiple commands produce .../hook-log.jsonl" because the
+      # same basename appears under several roots. They are generated artifacts, never sources.
+      - path: SourcesShared
+        excludes: [".claude/**"]
+        # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      - path: Sources/Player
+        excludes: [".claude/**"]
       - ResourcesTV/Assets.xcassets
       - Resources/Localizable.xcstrings # shared String Catalog (en + translations)
       # Same full font set as the Full build. Lite briefly dropped the CJK face, but libass's
@@ -609,7 +674,7 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_NO_EMBEDDED_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "187"
+        CURRENT_PROJECT_VERSION: "204"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist

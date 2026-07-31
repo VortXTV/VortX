@@ -50,9 +50,10 @@ import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VortXAccountScreen(viewModel: VortXAccountViewModel, onBack: () -> Unit, modifier: Modifier = Modifier) {
-    val account by viewModel.account.collectAsStateWithLifecycle()
+    val sessionUiState by viewModel.sessionUiState.collectAsStateWithLifecycle()
     val recoveryCode by viewModel.recoveryCode.collectAsStateWithLifecycle()
     val showReconcile by viewModel.showReconcile.collectAsStateWithLifecycle()
+    val formState by viewModel.formState.collectAsStateWithLifecycle()
 
     Scaffold(
         topBar = {
@@ -74,14 +75,50 @@ fun VortXAccountScreen(viewModel: VortXAccountViewModel, onBack: () -> Unit, mod
                 .padding(VortXTheme.spacing.edge),
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
         ) {
-            val acct = account
             val code = recoveryCode
-            when {
-                acct == null -> AuthCard(viewModel)
-                code != null -> RecoveryCodeCard(code, onSaved = viewModel::dismissRecoveryCode)
-                showReconcile -> ReconcileCard(viewModel)
-                else -> SignedInCard(acct, viewModel)
+            if (code != null) {
+                RecoveryCodeCard(
+                    code = code,
+                    warning = (formState as? VortXAccountFormState.Error)?.message,
+                    onSaved = viewModel::dismissRecoveryCode,
+                )
+            } else {
+                when (val session = sessionUiState) {
+                    VortXSyncManager.SessionUiState.UnknownOrUnavailable ->
+                        SessionUnavailableCard(viewModel::retrySessionRestore)
+                    VortXSyncManager.SessionUiState.SignedOut -> AuthCard(viewModel)
+                    is VortXSyncManager.SessionUiState.SignedIn -> {
+                        if (showReconcile) {
+                            ReconcileCard(viewModel)
+                        } else {
+                            SignedInCard(session.account, viewModel)
+                        }
+                    }
+                }
             }
+        }
+    }
+}
+
+@Composable
+private fun SessionUnavailableCard(onRetry: () -> Unit) {
+    val colors = VortXTheme.colors
+    SurfaceCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(VortXTheme.spacing.lg),
+            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+        ) {
+            Text("Secure session unavailable", style = VortXTheme.type.cardTitle)
+            Text(
+                "VortX could not confirm whether this device is signed in. Your account has not been treated as " +
+                    "signed out. Unlock secure storage, then retry.",
+                style = VortXTheme.type.body.copy(color = colors.textSecondary),
+            )
+            PrimaryButton(
+                text = "Retry",
+                onClick = onRetry,
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
     }
 }
@@ -90,7 +127,7 @@ fun VortXAccountScreen(viewModel: VortXAccountViewModel, onBack: () -> Unit, mod
 /// it. The code is the ONLY data-preserving way back in after a forgotten password (the account is
 /// end-to-end encrypted; there is no server-side reset), so the warning is explicit.
 @Composable
-private fun RecoveryCodeCard(code: String, onSaved: () -> Unit) {
+private fun RecoveryCodeCard(code: String, warning: String?, onSaved: () -> Unit) {
     val colors = VortXTheme.colors
     SurfaceCard(modifier = Modifier.fillMaxWidth()) {
         Column(
@@ -109,6 +146,9 @@ private fun RecoveryCodeCard(code: String, onSaved: () -> Unit) {
                 style = VortXTheme.type.cardTitle.copy(fontFamily = FontFamily.Monospace),
                 modifier = Modifier.fillMaxWidth(),
             )
+            warning?.let {
+                Text(it, style = VortXTheme.type.body.copy(color = colors.danger))
+            }
             PrimaryButton(
                 text = "I saved my recovery code",
                 onClick = onSaved,

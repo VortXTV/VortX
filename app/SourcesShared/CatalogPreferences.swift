@@ -1,4 +1,26 @@
+#if PORTRAIT_ADAPTIVE_LAYOUT_CONTRACT_ONLY
+import Foundation
+#else
 import SwiftUI
+#endif
+
+/// Pure mutation seam used by the real catalog controls and compiled directly into the portrait contract.
+/// Returning nil for an invalid move keeps the production caller fail-soft without duplicating the rules.
+enum CatalogRowMutationContract {
+    static func moving(_ keys: [String], from: Int, to: Int) -> [String]? {
+        guard keys.indices.contains(from), keys.indices.contains(to) else { return nil }
+        var next = keys
+        let item = next.remove(at: from)
+        next.insert(item, at: to)
+        return next
+    }
+
+    static func toggledHidden(_ isHidden: Bool) -> Bool {
+        !isHidden
+    }
+}
+
+#if !PORTRAIT_ADAPTIVE_LAYOUT_CONTRACT_ONLY
 
 /// Per-device catalog customization (#0.3.8 add-on manager): which catalog rows show on Home and in
 /// what order. Keyed by the same `base|type|id` string CoreBridge.catalogKey builds. The read helpers
@@ -24,7 +46,7 @@ enum PosterWidthPreset: String, CaseIterable, Identifiable {
     }
 
     /// The card/track width in points on a REGULAR width class (iPad / Mac), tuned so `.balanced` equals
-    /// today's `iOSPillMetrics.cardWidth` (224) — the shipping look. The compact-iPhone widths are derived
+    /// today's `iOSPillMetrics.cardWidth` (224), the shipping look. The compact-iPhone widths are derived
     /// separately (`compactWidth`) so a phone still fits ~3 across at the default.
     var regularWidth: CGFloat {
         switch self {
@@ -293,8 +315,10 @@ final class CatalogPreferences: ObservableObject {
     /// never fires a redundant hub reload). Call on the main thread.
     func reloadFromDefaults() {
         let savedHidden = CatalogPrefsStore.hidden()
+        let hiddenChanged = hidden != savedHidden
         if hidden != savedHidden { hidden = savedHidden }
         let savedOrder = CatalogPrefsStore.order()
+        let orderChanged = order != savedOrder
         if order != savedOrder { order = savedOrder }
         let savedCategories = CatalogPrefsStore.hiddenCategories()
         if hiddenCategories != savedCategories { hiddenCategories = savedCategories }
@@ -312,6 +336,16 @@ final class CatalogPreferences: ObservableObject {
         if regionOverride != savedRegion { regionOverride = savedRegion }
         let savedFilters = CatalogPrefsStore.discoverFilters()
         if discoverFilters != savedFilters { discoverFilters = savedFilters }
+        // Mutation channels for Home catalog presentation are intentionally closed here:
+        // 1. Local move, drag, and group-by-add-on all route through `reorder`.
+        // 2. Cloud sync and backup restore write UserDefaults directly, then route through this reload.
+        // 3. Local visibility changes route through `setHidden` and only need a row rebuild.
+        // A restored order can promote an unloaded raw engine index, so it must widen before rebuilding.
+        if orderChanged {
+            CoreBridge.shared.catalogOrderDidChange()
+        } else if hiddenChanged {
+            CoreBridge.shared.rebuildBoardRows()
+        }
     }
 
     func isHidden(_ key: String) -> Bool { hidden.contains(key) }
@@ -335,7 +369,7 @@ final class CatalogPreferences: ObservableObject {
     func reorder(_ keys: [String]) {
         order = keys
         CatalogPrefsStore.setOrder(keys)
-        CoreBridge.shared.rebuildBoardRows()
+        CoreBridge.shared.catalogOrderDidChange()
     }
 }
 
@@ -343,7 +377,24 @@ final class CatalogPreferences: ObservableObject {
 /// (cross-platform; tvOS has no drag-to-reorder, so explicit buttons work on every target).
 struct CatalogManagerView: View {
     @EnvironmentObject private var core: CoreBridge
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    #endif
     @ObservedObject private var prefs = CatalogPreferences.shared
+
+    /// iPhone portrait is compact horizontally and regular vertically. The vertical check keeps the
+    /// established landscape row unchanged while narrow portrait receives the wrapped action surface.
+    private var usesCompactPortraitLayout: Bool {
+        #if os(iOS)
+        PortraitAdaptiveLayoutContract.usesCompactPortrait(
+            horizontalIsCompact: horizontalSizeClass == .compact,
+            verticalIsCompact: verticalSizeClass == .compact
+        )
+        #else
+        false
+        #endif
+    }
 
     private var ordered: [CoreBridge.CatalogInfo] {
         // Fall back to the LIVE Home order (boardRows) when the user hasn't set an explicit order, so the
@@ -379,10 +430,20 @@ struct CatalogManagerView: View {
             if !ordered.isEmpty {
                 // One-tap: group every add-on's catalogs together, in add-on (priority) order.
                 Button { groupByAddonOrder() } label: {
-                    Label("Group by add-on order", systemImage: "rectangle.3.group")
+                    // Use an explicit title instead of Label's adaptive icon-only presentation. Keeping
+                    // horizontal sizing flexible lets the title wrap inside a narrow List proposal without
+                    // turning the chip into the all-axis fixed, full-height pill seen on iPhone portrait.
+                    HStack(alignment: .firstTextBaseline, spacing: Theme.Space.xs) {
+                        Image(systemName: "rectangle.3.group")
+                            .accessibilityHidden(true)
+                        Text("Group by add-on order")
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
-                .fixedSize()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel("Group by add-on order")
             }
         }
     }
@@ -449,36 +510,16 @@ struct CatalogManagerView: View {
     @ViewBuilder
     private func row(_ info: CoreBridge.CatalogInfo, index: Int, total: Int, keys: [String]) -> some View {
         let isHidden = prefs.isHidden(info.key)
-        HStack(spacing: Theme.Space.md) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(info.title)
-                    .font(Theme.Typography.cardTitle)
-                    .foregroundStyle(isHidden ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
-                    .lineLimit(1)
-                Text(info.addonName)
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(Theme.Palette.textTertiary)
-                    .lineLimit(1)
+        Group {
+            #if os(iOS)
+            if usesCompactPortraitLayout {
+                compactCatalogRow(info, index: index, total: total, keys: keys, isHidden: isHidden)
+            } else {
+                regularCatalogRow(info, index: index, total: total, keys: keys, isHidden: isHidden)
             }
-            Spacer(minLength: Theme.Space.sm)
-            // Move to top -> up -> down -> bottom, then the show/hide eye. Send-to-top / send-to-bottom
-            // are the fast path on a long catalog list (and the only practical reorder on Apple TV).
-            Button { move(keys, from: index, to: 0) } label: { Image(systemName: "arrow.up.to.line") }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .disabled(index == 0)
-            Button { move(keys, from: index, to: index - 1) } label: { Image(systemName: "chevron.up") }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .disabled(index == 0)
-            Button { move(keys, from: index, to: index + 1) } label: { Image(systemName: "chevron.down") }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .disabled(index == total - 1)
-            Button { move(keys, from: index, to: total - 1) } label: { Image(systemName: "arrow.down.to.line") }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .disabled(index == total - 1)
-            Button { prefs.setHidden(info.key, !isHidden) } label: {
-                Image(systemName: isHidden ? "eye.slash" : "eye")
-            }
-            .buttonStyle(ChipButtonStyle(selected: !isHidden))
+            #else
+            regularCatalogRow(info, index: index, total: total, keys: keys, isHidden: isHidden)
+            #endif
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -493,11 +534,96 @@ struct CatalogManagerView: View {
         #endif
     }
 
+    /// The established wide and landscape composition, with the same identity/action order and spacing.
+    private func regularCatalogRow(_ info: CoreBridge.CatalogInfo, index: Int, total: Int,
+                                   keys: [String], isHidden: Bool) -> some View {
+        HStack(spacing: Theme.Space.md) {
+            catalogIdentity(info, isHidden: isHidden, lineLimit: 1)
+            Spacer(minLength: Theme.Space.sm)
+            HStack(spacing: Theme.Space.md) {
+                moveToTopButton(keys, index: index)
+                moveUpButton(keys, index: index)
+                moveDownButton(keys, index: index, total: total)
+                moveToBottomButton(keys, index: index, total: total)
+                visibilityButton(info, isHidden: isHidden)
+            }
+        }
+    }
+
+    /// Compact portrait gives catalog identity the full row, then lays every action out as an individual
+    /// FlowLayout child. Nothing is hidden: all four reorder commands and visibility remain reachable and
+    /// preserve their existing actions, while a second line absorbs intrinsic control width when needed.
+    #if os(iOS)
+    private func compactCatalogRow(_ info: CoreBridge.CatalogInfo, index: Int, total: Int,
+                                   keys: [String], isHidden: Bool) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            catalogIdentity(info, isHidden: isHidden, lineLimit: 2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            FlowLayout(spacing: Theme.Space.sm) {
+                moveToTopButton(keys, index: index)
+                moveUpButton(keys, index: index)
+                moveDownButton(keys, index: index, total: total)
+                moveToBottomButton(keys, index: index, total: total)
+                visibilityButton(info, isHidden: isHidden)
+            }
+        }
+    }
+    #endif
+
+    private func catalogIdentity(_ info: CoreBridge.CatalogInfo, isHidden: Bool,
+                                 lineLimit: Int) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(info.title)
+                .font(Theme.Typography.cardTitle)
+                .foregroundStyle(isHidden ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
+                .lineLimit(lineLimit)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(info.addonName)
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textTertiary)
+                .lineLimit(lineLimit)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func moveToTopButton(_ keys: [String], index: Int) -> some View {
+        Button { move(keys, from: index, to: 0) } label: { Image(systemName: "arrow.up.to.line") }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            .disabled(index == 0)
+            .accessibilityLabel("Move to top")
+    }
+
+    private func moveUpButton(_ keys: [String], index: Int) -> some View {
+        Button { move(keys, from: index, to: index - 1) } label: { Image(systemName: "chevron.up") }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            .disabled(index == 0)
+            .accessibilityLabel("Move up")
+    }
+
+    private func moveDownButton(_ keys: [String], index: Int, total: Int) -> some View {
+        Button { move(keys, from: index, to: index + 1) } label: { Image(systemName: "chevron.down") }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            .disabled(index == total - 1)
+            .accessibilityLabel("Move down")
+    }
+
+    private func moveToBottomButton(_ keys: [String], index: Int, total: Int) -> some View {
+        Button { move(keys, from: index, to: total - 1) } label: { Image(systemName: "arrow.down.to.line") }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            .disabled(index == total - 1)
+            .accessibilityLabel("Move to bottom")
+    }
+
+    private func visibilityButton(_ info: CoreBridge.CatalogInfo, isHidden: Bool) -> some View {
+        Button { prefs.setHidden(info.key, CatalogRowMutationContract.toggledHidden(isHidden)) } label: {
+            Image(systemName: isHidden ? "eye.slash" : "eye")
+        }
+        .buttonStyle(ChipButtonStyle(selected: !isHidden))
+        .accessibilityLabel(isHidden ? "Show catalog" : "Hide catalog")
+    }
+
     private func move(_ keys: [String], from: Int, to: Int) {
-        guard to >= 0, to < keys.count else { return }
-        var next = keys
-        let item = next.remove(at: from)
-        next.insert(item, at: to)
+        guard let next = CatalogRowMutationContract.moving(keys, from: from, to: to) else { return }
         prefs.reorder(next)
     }
 
@@ -788,17 +914,21 @@ struct ImportedListCatalog: Codable, Hashable, Identifiable {
     /// linger on-device into the next account that connects here, the same cross-account contamination rule
     /// `TraktSyncEngine.reset()` already enforces for the watched shadow set.
     ///
-    /// Optional on purpose: blobs written before this field existed decode to nil, which reads as "public,
-    /// never purge" and leaves every already-imported public row exactly as it was.
+    /// Optional on purpose: blobs written before this field existed decode to nil. Public rows remain
+    /// public through `requiresConnection`; a legacy private row has no session proof and is removed.
     var requiresConnection: Bool? = nil
+    /// Exact Trakt credential session that was allowed to read a private row. Legacy private rows have
+    /// no proof and are hidden and removed fail closed.
+    var connectionSessionID: TraktSessionID? = nil
 
     /// The row's cards, ready for the same poster-rail path the curated/add-on rows use.
     var previews: [MetaPreview] { items.map(\.preview) }
     var isEmpty: Bool { items.isEmpty }
 }
 
-/// On-device persistence for imported list catalogs (JSON in UserDefaults). Plain statics so a launch-time
-/// read can build the rows off the main actor, mirroring `CatalogPrefsStore`.
+/// On-device persistence for public imported list catalogs (JSON in UserDefaults). Connection-scoped private
+/// lists stay memory-only for the authenticated session that fetched them, so their titles, source URL, and
+/// contents never enter an unprotected preferences backup.
 enum ImportedCatalogsStore {
     static let key = "vortx.catalog.importedLists"
     /// Ceiling on stored lists, so the persisted blob (each list up to `ListImport.maxItems` small records)
@@ -808,13 +938,23 @@ enum ImportedCatalogsStore {
     static func load() -> [ImportedListCatalog] {
         guard let data = UserDefaults.standard.data(forKey: key),
               let decoded = try? JSONDecoder().decode([ImportedListCatalog].self, from: data) else { return [] }
-        return decoded
+        let durable = durableCatalogs(decoded)
+        if durable.count != decoded.count { save(durable) }
+        return durable
     }
 
     static func save(_ catalogs: [ImportedListCatalog]) {
-        let capped = Array(catalogs.prefix(maxCatalogs))
+        let capped = Array(durableCatalogs(catalogs).prefix(maxCatalogs))
         guard let data = try? JSONEncoder().encode(capped) else { return }
         UserDefaults.standard.set(data, forKey: key)
+    }
+
+    /// Private/friends-only rows contain account data. They remain in `ImportedCatalogs.storedCatalogs`
+    /// for the live session but are never eligible for UserDefaults persistence.
+    static func durableCatalogs(_ catalogs: [ImportedListCatalog]) -> [ImportedListCatalog] {
+        catalogs.filter {
+            ImportedCatalogPersistencePolicy.isDurable(requiresConnection: $0.requiresConnection)
+        }
     }
 }
 
@@ -824,8 +964,31 @@ enum ImportedCatalogsStore {
 @MainActor
 final class ImportedCatalogs: ObservableObject {
     static let shared = ImportedCatalogs()
-    @Published private(set) var catalogs: [ImportedListCatalog] = ImportedCatalogsStore.load()
-    private init() {}
+    @Published private var storedCatalogs: [ImportedListCatalog]
+
+    var catalogs: [ImportedListCatalog] {
+        storedCatalogs.filter { catalog in
+            guard catalog.provider == .trakt,
+                  catalog.requiresConnection == true else { return true }
+            guard let sessionID = catalog.connectionSessionID else { return false }
+            return TraktAuth.storedSessionID == sessionID
+        }
+    }
+
+    private init() {
+        let currentSession = TraktAuth.storedSessionID
+        storedCatalogs = ImportedCatalogsStore.load().filter { catalog in
+            guard catalog.provider == .trakt,
+                  catalog.requiresConnection == true else { return true }
+            return catalog.connectionSessionID == currentSession && currentSession != nil
+        }
+        ImportedCatalogsStore.save(storedCatalogs)
+        TraktAuthBoundary.observe(key: "imported-catalogs") { _ in
+            Task { @MainActor in
+                ImportedCatalogs.shared.removeConnectionScoped(provider: .trakt)
+            }
+        }
+    }
 
     /// Whether a list from this exact source URL is already imported (drives the paste screen's "already
     /// added" hint and lets it offer refresh instead of a duplicate).
@@ -838,13 +1001,17 @@ final class ImportedCatalogs: ObservableObject {
     @discardableResult
     func register(_ catalog: ImportedListCatalog) -> Bool {
         guard !catalog.isEmpty else { return false }
-        var next = catalogs.filter { $0.id != catalog.id && $0.sourceURL != catalog.sourceURL }
+        if catalog.provider == .trakt, catalog.requiresConnection == true {
+            guard let sessionID = catalog.connectionSessionID,
+                  TraktAuth.storedSessionID == sessionID else { return false }
+        }
+        var next = storedCatalogs.filter { $0.id != catalog.id && $0.sourceURL != catalog.sourceURL }
         next.insert(catalog, at: 0)
         persist(next)
         return true
     }
 
-    func remove(id: String) { persist(catalogs.filter { $0.id != id }) }
+    func remove(id: String) { persist(storedCatalogs.filter { $0.id != id }) }
 
     /// Drop every row from `provider` whose titles were only readable while signed in to it (a private or
     /// friends-only list). Called on disconnect. Public rows from the same provider survive: they were
@@ -852,8 +1019,8 @@ final class ImportedCatalogs: ObservableObject {
     /// row the user built for themselves. Returns the number of rows dropped (0 is the common case).
     @discardableResult
     func removeConnectionScoped(provider: ImportedListProvider) -> Int {
-        let next = catalogs.filter { !($0.provider == provider && $0.requiresConnection == true) }
-        let dropped = catalogs.count - next.count
+        let next = storedCatalogs.filter { !($0.provider == provider && $0.requiresConnection == true) }
+        let dropped = storedCatalogs.count - next.count
         if dropped > 0 { persist(next) }
         return dropped
     }
@@ -862,7 +1029,7 @@ final class ImportedCatalogs: ObservableObject {
     func rename(id: String, to title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        persist(catalogs.map { entry in
+        persist(storedCatalogs.map { entry in
             guard entry.id == id else { return entry }
             var updated = entry
             updated.title = trimmed
@@ -874,7 +1041,8 @@ final class ImportedCatalogs: ObservableObject {
     func reorder(_ ordered: [ImportedListCatalog]) { persist(ordered) }
 
     private func persist(_ next: [ImportedListCatalog]) {
-        catalogs = next
+        storedCatalogs = next
         ImportedCatalogsStore.save(next)
     }
 }
+#endif

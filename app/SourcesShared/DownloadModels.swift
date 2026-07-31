@@ -27,10 +27,10 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
     /// being persisted (paths move between app-container relocations; a relative stem does not).
     let id: UUID
 
-    /// `PlaybackMeta.libraryId` — the movie/series id (the libraryItem `_id`). For a movie this equals
+    /// `PlaybackMeta.libraryId`, the movie/series id (the libraryItem `_id`). For a movie this equals
     /// `videoId`; for an episode it is the series id.
     let contentId: String
-    /// `PlaybackMeta.videoId` — the movie id, or `imdbId:season:episode` for an episode.
+    /// `PlaybackMeta.videoId`, the movie id, or `imdbId:season:episode` for an episode.
     let videoId: String
     /// The original `PlaybackMeta.type`. The beta lifecycle fence derives behavior without rewriting this
     /// persisted value or migrating the download index.
@@ -53,7 +53,7 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
     /// only records HOW it was fetched.
     let isTorrent: Bool
 
-    /// `behaviorHints.proxyHeaders.request` the source declared — applied to the download request, since
+    /// `behaviorHints.proxyHeaders.request` the source declared, applied to the download request, since
     /// some CDNs 403 without a specific Referer / User-Agent (the player applies the same headers).
     let headers: [String: String]?
 
@@ -130,7 +130,7 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
     }
 
     /// Rebuild the `PlaybackMeta` for play-from-local. Identical to the meta the streaming play path
-    /// builds, so the engine + account record progress against the same library item — Continue
+    /// builds, so the engine + account record progress against the same library item, Continue
     /// Watching / resume keep working offline.
     var playbackMeta: PlaybackMeta {
         PlaybackMeta(libraryId: contentId, videoId: videoId, type: type,

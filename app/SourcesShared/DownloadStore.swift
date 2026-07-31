@@ -8,7 +8,7 @@ import Foundation
 ///
 /// This store is intentionally NOT synced (no VortX-account / E2E write): a download is a physical file
 /// on one device, and syncing the LIST to a device that lacks the file is misleading. It also NEVER
-/// touches `libraryItem` documents — a download is a local file plus this local index, nothing more.
+/// touches `libraryItem` documents; a download is a local file plus this local index, nothing more.
 @MainActor
 final class DownloadStore: ObservableObject {
     static let shared = DownloadStore()
@@ -125,7 +125,7 @@ final class DownloadStore: ObservableObject {
 
     func record(id: UUID) -> DownloadRecord? { records.first { $0.id == id } }
 
-    /// True when a completed (or in-flight) download already exists for this exact video — drives the
+    /// True when a completed (or in-flight) download already exists for this exact video; drives the
     /// "Downloaded" / "Downloading" state on a source row so a user can't queue a title twice.
     func hasDownload(videoId: String) -> Bool {
         records.contains { $0.videoId == videoId && $0.state != .failed }

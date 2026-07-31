@@ -169,6 +169,71 @@ final class VortXSyncManager: ObservableObject {
         get { Set(UserDefaults.standard.stringArray(forKey: settingsBaselineKey(for: account?.id)) ?? []) }
         set { UserDefaults.standard.set(Array(newValue), forKey: settingsBaselineKey(for: account?.id)) }
     }
+    /// LOCAL-WINS dirty set: syncable settings keys the user changed on THIS device that have NOT been confirmed
+    /// onto the account yet, as `key -> dirtyAt` (epoch). Keyed PER ACCOUNT exactly like the gates above and
+    /// under the `vortx.sync.` prefix so `SettingsBackup.deviceLocalKeyPrefixes` already keeps it out of every
+    /// synced blob and backup file. The PULL path (syncDown) skips these keys when applying the account's
+    /// settings blob, so a just-made local change is never clobbered by the account's older value before this
+    /// device pushes it; the mark clears only after a CONFIRMED push (see `clearPushedDirtySettings`). Per-account
+    /// keying is what satisfies "a device switching accounts must not carry another account's dirty set": account
+    /// B reads its own (empty) slot and applies B's values normally. Not reset on signOut (per-account keying
+    /// isolates accounts), matching lastSyncedVersion / appliedSettingsBaseline above; that also protects a
+    /// sign-out / re-login for the SAME account, whose reconcile pull would otherwise re-clobber the unpushed edit.
+    private func dirtySettingsKey(for accountId: String?) -> String { "vortx.sync.dirtySettings." + (accountId ?? "") }
+    private var dirtySettings: [String: Double] {
+        get { (UserDefaults.standard.dictionary(forKey: dirtySettingsKey(for: account?.id)) as? [String: Double]) ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: dirtySettingsKey(for: account?.id)) }
+    }
+    /// The last SYNCABLE defaults snapshot the differ reconciled. In-memory only: it tracks the physical
+    /// `UserDefaults` domain (account-independent), while the dirty SET above is per-account. Seeded at init and
+    /// re-baselined after every remote-apply / housekeeping window (so a suppressed non-user write is never
+    /// mis-attributed to a later user edit). There is no per-key UserDefaults change signal, so a change is
+    /// detected by diffing this shadow against the live domain in the global didChange observer.
+    private var settingsShadow: [String: Any] = [:]
+
+    /// The app's OWN syncable defaults right now (the exact set `SettingsBackup` pushes), used as both the
+    /// differ input and the shadow baseline. Mirrors `makeBackup` / `mergedSyncBlob`'s domain read.
+    private func currentSyncableDomain() -> [String: Any] {
+        let bundleID = Bundle.main.bundleIdentifier ?? "unknown"
+        return (UserDefaults.standard.persistentDomain(forName: bundleID) ?? [:])
+            .filter { SettingsBackup.isSyncable($0.key) }
+    }
+    /// Re-baseline the differ shadow to the live domain. Called after a remote apply / suppressed housekeeping
+    /// window so those non-user writes become the baseline, never a future user edit's phantom diff.
+    private func refreshSettingsShadow() { settingsShadow = currentSyncableDomain() }
+    /// A genuine LOCAL settings write landed (the global didChange observer, already gated on !isApplyingRemote,
+    /// so a remote-apply / housekeeping write never reaches here). Diff the live domain against the shadow, mark
+    /// any changed syncable key dirty, and re-baseline the shadow. No-op when signed out (nothing to protect).
+    private func noteLocalSettingsChange() {
+        guard isSignedIn else { return }
+        let current = currentSyncableDomain()
+        let changed = SettingsDirtyKeys.changedSyncableKeys(from: settingsShadow, to: current,
+                                                            isSyncable: SettingsBackup.isSyncable)
+        settingsShadow = current
+        guard !changed.isEmpty else { return }
+        var dirty = dirtySettings
+        SettingsDirtyKeys.mark(changed, at: Date().timeIntervalSince1970, into: &dirty)
+        dirtySettings = dirty
+    }
+    /// Clear the keys a CONFIRMED push carried up, guarded by the stamp `snapshot` taken when that push began so a
+    /// key re-edited mid-push stays protected (see `SettingsDirtyKeys.clearPushed`). Under the suppression window:
+    /// it is a `vortx.sync.` UserDefaults write and must not arm a self-echo push.
+    private func clearPushedDirtySettings(_ snapshot: [String: Double]) {
+        guard !snapshot.isEmpty else { return }
+        withRemoteApplySuppressed {
+            var dirty = dirtySettings
+            SettingsDirtyKeys.clearPushed(snapshot, from: &dirty)
+            dirtySettings = dirty
+        }
+    }
+    /// After a startup pull, a still-dirty settings key (a change made in a previous session whose debounced push
+    /// never landed) needs a push so the account and the rest of the fleet heal. syncUp reads local, so the dirty
+    /// value (local wins) rides up and the confirmed push clears the dirty mark. Debounced via requestSyncSoon so
+    /// it coalesces with any other pending change. No-op when there is nothing unpushed.
+    private func flushDirtySettingsIfNeeded() {
+        guard isSignedIn, !dirtySettings.isEmpty else { return }
+        requestSyncSoon()
+    }
     /// Last shared add-on ORDER applied from the account (Bug B). Persisted normalized transportUrls in the
     /// converged priority order. Read by ownedAddons(from:) as the ordering spine when a pulled doc does not
     /// itself carry addonOrder, so a device that hydrates after (but not during) an order change still lands
@@ -231,7 +296,7 @@ final class VortXSyncManager: ObservableObject {
     /// Set while syncDown is applying a remote pull (the SettingsBackup.restore + apiKeys + overlays +
     /// tombstones region) and while ProfileStore is doing touch:false launch housekeeping. The global
     /// UserDefaults.didChangeNotification observer early-returns while this is true, so applying a pull
-    /// (which rewrites every stremiox.* key) no longer self-echoes into requestSyncSoon() — which would
+    /// (which rewrites every stremiox.* key) no longer self-echoes into requestSyncSoon(), which would
     /// re-arm hasPendingPush and push the just-applied peer values straight back, starving syncDown's
     /// guard at line ~471 so a receiving device never applies a peer's settings. A genuine user edit
     /// (touch:true) is NEVER wrapped in this, so real settings toggles still push and sync.
@@ -259,9 +324,17 @@ final class VortXSyncManager: ObservableObject {
         // the receiving device's syncDown re-arms hasPendingPush (self-echo) and starves its own pull guard,
         // so peer settings never apply (the Beta 8/9 settings-sync regression). The notification is delivered
         // on the main queue, so reading the @MainActor flag here is safe.
+        // Seed the LOCAL-WINS differ baseline from the current domain BEFORE the observer is armed, so the first
+        // real user edit diffs against a true snapshot rather than an empty one (which would mark every existing
+        // key dirty). Refreshed after every remote-apply / housekeeping window (see withRemoteApplySuppressed).
+        refreshSettingsShadow()
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
                 guard let self, !self.isApplyingRemote else { return }
+                // Record which syncable key(s) the user just changed (durable, per-key, survives a relaunch) so a
+                // later pull cannot clobber an unpushed local edit; THEN arm the debounced push. Both are gated on
+                // !isApplyingRemote, so a remote apply's writes never mark dirty or arm a push.
+                self.noteLocalSettingsChange()
                 self.requestSyncSoon()
             }
         }
@@ -295,6 +368,10 @@ final class VortXSyncManager: ObservableObject {
               let dk = Data(base64Encoded: p.dataKey) else { return }
         SourceIndexLifecycleScope.shared.sessionWillMutate()
         token = p.token; account = p.account; dataKey = dk; isSignedIn = true
+        // Point the debrid credential store at THIS account before anything can read a key. Restoring a
+        // session is the earliest moment the device's real owner is known, and it is also where the one-time
+        // adoption of the old unscoped entries happens, so an existing user keeps their keys without a re-paste.
+        DebridKeys.shared.bind(owner: p.account.id)
         reloadLastSyncStamp()   // show this account's persisted "last synced" immediately on relaunch
         // A Keychain-restored session (app relaunch / reinstall) sets isSignedIn WITHOUT going through
         // adopt(), so nothing would open the sync channel until the first scenePhase foreground transition.
@@ -313,6 +390,11 @@ final class VortXSyncManager: ObservableObject {
         token = nil; account = nil; dataKey = nil; isSignedIn = false
         lastSyncAt = nil   // the persisted per-account stamp stays (keyed by account id), the live value clears
         Keychain.set(nil, for: kcAccount)
+        // Release the debrid credentials with the session. They are NOT deleted: they stay in this account's
+        // own Keychain scope and return if the same account signs back in. What must not happen is the next
+        // account on this device inheriting them, which is exactly what used to happen when these entries were
+        // global and sign-out left them behind.
+        DebridKeys.shared.bind(owner: DebridKeys.signedOutOwner)
         // The shared add-on ORDER is a global static with no account context, so a switched-in account would
         // otherwise inherit the previous account's order until its own pull lands. Clear it here so the next
         // account starts from the descriptor spine and converges on its own doc.addonOrder. The per-account
@@ -351,6 +433,9 @@ final class VortXSyncManager: ObservableObject {
             username: acct["username"] as? String ?? "",
             twoFactorEnabled: acct["twoFactorEnabled"] as? Bool ?? false)
         self.isSignedIn = true
+        // Rebind debrid credentials to the account that just signed in. Without this a switched-in account
+        // would keep reading the previous owner's keys out of memory even though the Keychain is now scoped.
+        DebridKeys.shared.bind(owner: self.account?.id ?? DebridKeys.signedOutOwner)
         reloadLastSyncStamp()   // a re-sign-in to a known account restores its persisted "last synced"
         persist()
         // A fresh sign-in is a foreground action, so open the real-time channel immediately (if the app
@@ -384,11 +469,13 @@ final class VortXSyncManager: ObservableObject {
     // MARK: - Flows
 
     func register(email: String, username: String, password: String) async -> (result: AuthResult, recoveryCode: String?) {
-        let kdfSalt = VortXSyncCrypto.randomBytes(16)
+        guard let kdfSalt = VortXSecureEntropy.randomBytes(16),
+              let dataKey = VortXSecureEntropy.randomBytes(32),
+              let recoveryCode = VortXSecureEntropy.makeRecoveryCode() else {
+            return (.failed("Could not create secure encryption keys. Try again."), nil)
+        }
         let iters = VortXSyncCrypto.defaultIters
         let masterKey = VortXSyncCrypto.masterKey(password: password, kdfSalt: kdfSalt, iters: iters)
-        let dataKey = VortXSyncCrypto.randomBytes(32)
-        let recoveryCode = VortXSyncCrypto.makeRecoveryCode()
         let recoveryKey = VortXSyncCrypto.recoveryKey(recoveryCode: recoveryCode, kdfSalt: kdfSalt, iters: iters)
         guard let wrappedPw = VortXSyncCrypto.seal(key: masterKey, dataKey),
               let wrappedRec = VortXSyncCrypto.seal(key: recoveryKey, dataKey) else {
@@ -689,6 +776,7 @@ final class VortXSyncManager: ObservableObject {
                     "forced": pb.forcedPolicy, "subFont": pb.subFont, "subSize": pb.subSize,
                     "subColor": pb.subColor, "subBackground": pb.subBackground]
                 if let s = pb.subSizeScale { playback["subSizeScale"] = s }
+                if let b = pb.subBrightness { playback["subBrightness"] = b }
                 if let o = pb.sourceTypeOrder { playback["sourceTypeOrder"] = o }
                 if let u = pb.useAddonOrder { playback["useAddonOrder"] = u }
                 if let v = pb.safetyMode { playback["safetyMode"] = v }
@@ -741,9 +829,9 @@ final class VortXSyncManager: ObservableObject {
             }
         // FLOOR vs MIRROR for the owner library, per the "Mirror library from Stremio" toggle. FLOOR (OFF,
         // default) = UNION the account's already-owned `doc.vortx.library` with the engine library, so a
-        // Stremio removal never removes from VortX and an empty/degraded engine can never SHRINK it. The
-        // `mirror CW` toggle, when OFF, is what keeps a prior in-progress item's t/d from being zeroed by a
-        // Stremio drop (the union preserves it). MIRROR (ON) = REPLACE: the live Stremio set is authoritative
+        // Stremio removal never removes from VortX and an empty/degraded engine can never SHRINK it. This
+        // toggle governs MEMBERSHIP; the per-item resume POSITION (t / d / v) is governed separately by the
+        // "Mirror Continue Watching" floor below. MIRROR (ON) = REPLACE: the live Stremio set is authoritative
         // so removals propagate - but ONLY with a live Stremio session AND a non-empty engine library, so a
         // logged-out / mid-pull shrunken set can never propagate the shrink to every device (the add-on
         // guard's clobber fix; the library has no official-defaults concept, so no `!engineIsDefaultOnly`).
@@ -751,6 +839,30 @@ final class VortXSyncManager: ObservableObject {
         let mirrorReplaceLibrary = MirrorSettings.mirrorLibrary && !engineLibrary.isEmpty && CoreBridge.shared.isLoggedIn()
         if !mirrorReplaceLibrary, let prior = (existingVortx?["library"] as? [[String: Any]]) {
             for entry in prior { if let id = entry["id"] as? String, !id.isEmpty { libraryByID[id] = entry } }
+        }
+        // FLOOR vs MIRROR for the owner's RESUME POSITIONS, per the "Mirror Continue Watching from Stremio"
+        // toggle. Read the prior doc positions into their OWN map rather than reusing `libraryByID`, because the
+        // two toggles are independent categories: with "Mirror library" ON the membership map is deliberately
+        // empty (REPLACE), and the CW floor must still be able to compare against VortX's owned position. This
+        // map is used for POSITIONS ONLY and never re-adds prior-only membership.
+        //
+        // The gate is inert without a live Stremio session (see ContinueWatchingMirror.swift): the engine's
+        // library bucket carries this device's own playback as well as a Stremio pull, so with no session there
+        // is nothing to floor and every entry below takes the engine value exactly as it does today.
+        var priorPositions: [String: [String: Any]] = [:]
+        for entry in (existingVortx?["library"] as? [[String: Any]]) ?? [] {
+            if let id = entry["id"] as? String, !id.isEmpty { priorPositions[id] = entry }
+        }
+        let stremioMayReplaceCW = MirrorSettings.stremioMayReplaceContinueWatching(
+            stremioSessionLive: CoreBridge.shared.isLoggedIn())
+        // Retire local-rewind exemptions the account doc has already absorbed. An id is stamped by
+        // `CoreBridge.finishedWatching` and is only needed until the doc carries its zero; once the doc says
+        // t == 0 (or has no entry for the title at all, in which case the floor cannot engage for it anyway)
+        // the stamp is dead weight. UNCONDITIONAL, deliberately: a device that never has a live Stremio session
+        // never enters the floor branch below, so a retire that only ran there would let the log grow by one id
+        // per finished title forever.
+        for id in LocalRewindLog.all() where Self.libSeconds(priorPositions[id]?["t"]) == 0 {
+            LocalRewindLog.forget(id)
         }
         for entry in engineLibrary {
             guard let id = entry["id"] as? String else { continue }
@@ -766,6 +878,27 @@ final class VortXSyncManager: ObservableObject {
                (Self.libSeconds(prior["t"]) > 0 || Self.libSeconds(prior["d"]) > 0) {
                 var merged = entry
                 merged["t"] = prior["t"]; merged["d"] = prior["d"]; merged["v"] = prior["v"]
+                libraryByID[id] = merged
+                continue
+            }
+            // The Continue Watching FLOOR. Only engages with a live Stremio session and the toggle OFF, and even
+            // then only when the engine's position moves BACKWARDS from the VortX-owned one (a stale Stremio
+            // copy, a title finished on an official Stremio client, a Stremio rewind). Local playback always
+            // moves the position forward, so it passes through untouched; a local FINISH also zeroes it, so
+            // `finishedWatching` stamps `LocalRewindLog` and the resolver lets that zero through.
+            if !stremioMayReplaceCW, let prior = priorPositions[id] {
+                let locallyRewound = LocalRewindLog.contains(id)
+                let resolved = MirrorSettings.resolveContinueWatching(
+                    engine: MirrorSettings.CWPosition(t: Double(Self.libSeconds(entry["t"])),
+                                                      d: Double(Self.libSeconds(entry["d"])),
+                                                      v: entry["v"] as? String),
+                    owned: MirrorSettings.CWPosition(t: Double(Self.libSeconds(prior["t"])),
+                                                     d: Double(Self.libSeconds(prior["d"])),
+                                                     v: prior["v"] as? String),
+                    mayReplace: false,
+                    locallyRewound: locallyRewound)
+                var merged = entry     // keep the engine's fresh name / poster / type; only the position is floored
+                merged["t"] = Int(resolved.t); merged["d"] = Int(resolved.d); merged["v"] = resolved.v ?? ""
                 libraryByID[id] = merged
                 continue
             }
@@ -955,12 +1088,19 @@ final class VortXSyncManager: ObservableObject {
                 return false
             }
         }
+        // Snapshot the LOCAL-WINS dirty stamps BEFORE building the push blob. mergeLocalIntoDoc reads the local
+        // domain (local wins), so every currently-dirty key's value rides up in this push. On a CONFIRMED push we
+        // clear exactly these keys (unless re-edited since: clearPushed guards on the stamp), so the dirty mark is
+        // released only once the value is safely on the account and a later pull may apply account values again.
+        let dirtyAtPushStart = dirtySettings
         // Build the merged doc from the current account base, then push with optimistic-concurrency
         // recovery: if a concurrent write wins the race, re-run this exact merge onto the winner's doc and
         // retry (bounded). The rebuild closure re-pulls a fresh base each attempt so the recovered push
         // never clobbers the winner; it returns nil on a failed pull so the retry aborts safely.
         guard let initial = await mergeLocalIntoDoc(base: nil) else { return false }
-        return await pushDerivedDoc(initial, rebuild: { await self.mergeLocalIntoDoc(base: nil) })
+        let pushed = await pushDerivedDoc(initial, rebuild: { await self.mergeLocalIntoDoc(base: nil) })
+        if pushed { clearPushedDirtySettings(dirtyAtPushStart) }
+        return pushed
     }
 
     /// Build the doc to push by MERGING this device's profiles + settings + keys + add-on order onto a
@@ -1221,7 +1361,13 @@ final class VortXSyncManager: ObservableObject {
             // a richer local profile (the data-loss bug). Restore, re-read the cloud roster, then UNION
             // the captured local roster back in so no local-only profile is ever dropped by this pull.
             let localRosterBefore = ProfileStore.shared.profiles
-            if ((try? SettingsBackup.restore(from: data)) ?? 0) > 0 {
+            // LOCAL-WINS: skip any syncable key the user changed on THIS device and has not pushed yet, so the
+            // account's OLDER value cannot overwrite a just-made local edit before this device's push carries it
+            // up (the durable, per-key successor to the in-memory hasPendingPush guard; see SettingsDirtyKeys and
+            // the "would not stay" interplay at :1175-1182). A restored/fresh device has an empty set, so a full
+            // restore is unchanged. The skipped keys keep their local value, which flushDirtySettingsIfNeeded then
+            // pushes so the account heals.
+            if ((try? SettingsBackup.restore(from: data, skipping: Set(dirtySettings.keys))) ?? 0) > 0 {
                 restored = true
                 // Stamp the applied-blob BASELINE (#145 resurrection fix): the syncable keys this pulled doc just
                 // wrote, in the SAME migrated form restore used. mergedSyncBlob reads it on the next push so a
@@ -1475,6 +1621,9 @@ final class VortXSyncManager: ObservableObject {
         // spurious push of the just-applied doc (the same self-echo class this region exists to prevent).
         stampSyncSuccess()
         }   // end withRemoteApplySuppressed
+        // OwnerResumeStore changed without an engine event, so publish its new resume positions now. This stays
+        // unconditional because refreshOwnerResumeCache does not contribute to `restored`.
+        CoreBridge.shared.rebuildContinueWatching()
         return restored
     }
 
@@ -1485,7 +1634,7 @@ final class VortXSyncManager: ObservableObject {
     /// zero (the "post-update: 0 sources / 0 add-ons" fix). This is the load-bearing new capability.
     ///
     /// NEVER-ZERO INVARIANT: a `.failed` or `.empty` account pull does NOTHING (we never hydrate-then-
-    /// empty). Only a real `.doc` triggers hydration. Not gated by the mirror toggles — the VortX-owned
+    /// empty). Only a real `.doc` triggers hydration. Not gated by the mirror toggles; the VortX-owned
     /// set always hydrates when the engine is empty/degraded; the toggles only control the snapshot
     /// DIRECTION (Stremio -> VortX), not the floor.
     ///
@@ -1898,7 +2047,7 @@ final class VortXSyncManager: ObservableObject {
     // public key travels with the sealed key: {"claim": <b64url holder pubkey>, "wrapped": <b64url iv‖ct‖tag>}.
     // Both the app holder (qrApprove) and the web holder (vortx-site vault.ts qrApprove) MUST emit this exact
     // envelope, and both joiners MUST parse it. Crypto contract: PairingCrypto (salt vortx-pairing-salt-v1,
-    // info vortx-pairing-v1, base64url, iv‖ct‖tag) — identical across app + web.
+    // info vortx-pairing-v1, base64url, iv‖ct‖tag), identical across app + web.
 
     /// A live joiner pairing: the id to poll, the human code to show, and our ephemeral key kept in memory
     /// only (never persisted) until the handoff completes. `devicePublicKey` is embedded in the shown QR.
@@ -1909,7 +2058,24 @@ final class VortXSyncManager: ObservableObject {
         let ephemeral: Curve25519.KeyAgreement.PrivateKey
     }
 
-    enum QrJoinResult: Equatable { case pending, expired, failed, signedIn(email: String) }
+    enum QrJoinResult: Equatable { case pending, transportError, expired, failed, signedIn(email: String) }
+
+    /// Pure disposition of a `/v1/qr/status` poll from its HTTP status and whether the body already
+    /// carries an approval. Split out (no crypto, no network) so the joiner's poll loop is unit-testable
+    /// off device; VortX's Apple app has no XCTest bundle (see app/Tests/QRJoinerFlowTests.swift):
+    ///  - 404 / 410           -> the pairing aged out server-side; the joiner re-mints a fresh code.
+    ///  - 0 / 429 / >= 500    -> transport or relay trouble (offline, DNS/TLS, timeout, rate-limit, 5xx).
+    ///                           RETRIABLE: the joiner keeps polling, but must stop pretending it is merely
+    ///                           "waiting for approval" once it recurs, so the screen is never silently stuck.
+    ///  - 200 + approval      -> ready to unwrap the data key and adopt.
+    ///  - anything else       -> still pending (keep polling).
+    enum QrPollDisposition: Equatable { case ready, pending, expired, retriableError }
+    static func qrPollDisposition(status: Int, hasApproval: Bool) -> QrPollDisposition {
+        if status == 404 || status == 410 { return .expired }
+        if status == 0 || status == 429 || status >= 500 { return .retriableError }
+        if status == 200 && hasApproval { return .ready }
+        return .pending
+    }
 
     /// JOINER (TV): open a pairing. Returns the session to poll, or nil on a transport failure.
     func qrStart() async -> QrJoinSession? {
@@ -1925,21 +2091,28 @@ final class VortXSyncManager: ObservableObject {
     /// session with no decryptable data key can never leave a half-signed-in device.
     func qrPoll(_ session: QrJoinSession) async -> QrJoinResult {
         let (code, json) = await request("GET", "/v1/qr/status?id=\(session.pairingID)")
-        if code == 404 || code == 410 { return .expired }
-        guard code == 200 else { return .pending }
-        if json?["pending"] as? Bool == true { return .pending }
-        guard let token = json?["token"] as? String, let payloadStr = json?["payload"] as? String else { return .pending }
-        // Parse the {"claim","wrapped"} envelope and unwrap the sync data key with our ephemeral private key.
-        guard let pData = payloadStr.data(using: .utf8),
-              let env = (try? JSONSerialization.jsonObject(with: pData)) as? [String: Any],
-              let claim = env["claim"] as? String, let wrapped = env["wrapped"] as? String,
-              let dk = PairingCrypto.unwrapDataKey(wrapped: wrapped, holderPublicKey: claim, using: session.ephemeral)
-        else { return .failed }
-        // Fetch the account this session belongs to, authing with the freshly issued token (not yet adopted).
-        let (mc, mj) = await request("GET", "/v1/auth/me", bearer: token)
-        guard mc == 200, let acct = mj?["account"] as? [String: Any] else { return .failed }
-        adopt(token: token, account: acct, dataKey: dk)
-        return .signedIn(email: acct["email"] as? String ?? "")
+        let token = json?["token"] as? String
+        let payloadStr = json?["payload"] as? String
+        let isPending = (json?["pending"] as? Bool) == true
+        let hasApproval = token != nil && payloadStr != nil && !isPending
+        switch Self.qrPollDisposition(status: code, hasApproval: hasApproval) {
+        case .expired:        return .expired
+        case .retriableError: return .transportError   // relay unreachable / 5xx / rate-limited; keep polling
+        case .pending:        return .pending
+        case .ready:
+            guard let token, let payloadStr else { return .pending }
+            // Parse the {"claim","wrapped"} envelope and unwrap the sync data key with our ephemeral private key.
+            guard let pData = payloadStr.data(using: .utf8),
+                  let env = (try? JSONSerialization.jsonObject(with: pData)) as? [String: Any],
+                  let claim = env["claim"] as? String, let wrapped = env["wrapped"] as? String,
+                  let dk = PairingCrypto.unwrapDataKey(wrapped: wrapped, holderPublicKey: claim, using: session.ephemeral)
+            else { return .failed }
+            // Fetch the account this session belongs to, authing with the freshly issued token (not yet adopted).
+            let (mc, mj) = await request("GET", "/v1/auth/me", bearer: token)
+            guard mc == 200, let acct = mj?["account"] as? [String: Any] else { return .failed }
+            adopt(token: token, account: acct, dataKey: dk)
+            return .signedIn(email: acct["email"] as? String ?? "")
+        }
     }
 
     /// HOLDER (a signed-in device, and the shared shape the web holder mirrors): approve a joining device's
@@ -1998,7 +2171,14 @@ final class VortXSyncManager: ObservableObject {
         body()
         // If we were already inside an outer suppression window, let the outer one clear it.
         guard !wasSuppressing else { return }
-        DispatchQueue.main.async { [weak self] in self?.isApplyingRemote = false }
+        DispatchQueue.main.async { [weak self] in
+            // Re-baseline the LOCAL-WINS differ shadow to the just-applied domain BEFORE clearing the flag, so
+            // none of the suppressed writes (a remote apply, or touch:false housekeeping) is ever mis-read as a
+            // user edit by the next real didChange diff. A key that was SKIPPED as dirty kept its local value, so
+            // the snapshot captures the user's value for it and it stays dirty until its own push confirms.
+            self?.refreshSettingsShadow()
+            self?.isApplyingRemote = false
+        }
     }
 
     /// ProfileStore entry point: wrap a touch:false housekeeping persist so its UserDefaults writes do not
@@ -2034,6 +2214,10 @@ final class VortXSyncManager: ObservableObject {
         Task {
             await self.restoreAccountDocIfNeeded()
             await self.syncDown()
+            // A settings change from a PREVIOUS session whose debounced push never landed (relaunch, offline, or a
+            // crash before the 2.5s push) is still marked dirty and survived the pull above untouched. Arm a push
+            // now so the account and the rest of the fleet converge on it. No-op when nothing is unpushed.
+            self.flushDirtySettingsIfNeeded()
         }
     }
 

@@ -4,6 +4,171 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 9 - 2026-07-27
+
+The biggest release since 0.3.14 opened. A Mac can now do the heavy work for an Apple TV, the built-in player finally reads the second picture layer of a 4K Blu-ray rip, Dolby Vision plays through to the end instead of falling to HDR10, Atmos reaches your receiver, and Blu-ray subtitles work for the first time.
+
+### Let a Mac be the engine
+
+**Turn on the engine on a Mac, pair an Apple TV to it with a six digit code, and the Mac does the container and file work while the Apple TV spends its whole chip decoding and showing the picture.** Video is copied across untouched, never re-encoded, so Dolby Vision stays true Dolby Vision and the picture is identical. Because the Mac has room to hold the whole film instead of a small moving window, you can seek anywhere, backwards as well as forwards, which the Apple TV cannot do alone. VortX finds the Mac on your network by itself, or you can type its address for setups like Tailscale, and nothing is shared until you pair. If the Mac sleeps, quits, or leaves the network mid-film, playback carries on where it was. The Mac can run the engine with no window open. Off by default, and nothing changes for anyone without a Mac.
+
+The protocol underneath is plain HTTP and JSON with a bearer token and no Apple-specific types in it, so the Android and desktop clients can implement the same thing later.
+
+### Dolby Vision
+
+**Dolby Vision plays, and keeps playing.** Alongside the Dolby Vision picture the app publishes a plain HDR one as a safety net. That safety net had its Dolby Vision configuration stripped out but kept the Dolby Vision brand in its header, so it announced a format it was not carrying, and the player threw it out within milliseconds every time it loaded it. It was also advertised as the cheaper of the two, so the player actively preferred the broken one over the working one. Nine times out of nine that safety net was loaded, playback died before a single frame was requested. The header is corrected, the two are no longer offered side by side inside one stream, and once a real Dolby Vision picture is on screen the player is held to it.
+
+**Profile 7 files keep their second picture layer on the built-in player.** Most 4K Blu-ray Dolby Vision rips carry the picture as a base track plus an enhancement layer holding the detail in the brightest highlights and deepest shadows. On the built-in player that second track was thrown away unread and the picture was flattened to ordinary HDR with no Dolby Vision information at all. We now build our own player engine from pinned upstream sources, and it pairs the two tracks and combines them the way the format intends.
+
+**A title that needs a moment is no longer killed at ten seconds.** The startup check asked whether the file was ready once, before it could have been, then fell into a blind ten second countdown with no further checking. Two of every eight titles were ended that way, one a tenth of a second after its first piece of video was already prepared and waiting.
+
+**Dolby Vision no longer flickers before it settles, and starts at the beginning.** Repeated identical display-mode requests are ignored, so the HDMI link renegotiates once instead of several times. Titles also start where you asked instead of about fourteen seconds in.
+
+### Audio
+
+**Dolby Atmos reaches your receiver.** On a file whose audio is Dolby Digital Plus with Atmos, the Atmos data is carried through untouched. On a file whose only audio is TrueHD, Apple TV cannot pass that through at any quality, so it is converted and the badge honestly says surround rather than Atmos.
+
+**Dolby Digital Plus is actually produced now.** A Dolby Vision file with TrueHD or DTS-HD MA audio has to be converted before that lane can play it. The converter always asked for Dolby Digital Plus and settled for AAC when it could not have it, and that encoder had never been built into the app, so it settled every single time. It is in the build now.
+
+**Every audio track in the file is offered.** The rule for alternate audio demanded a different language from the main track, so a file with seven English tracks qualified none of them and the audio menu had nothing to pick.
+
+### Subtitles
+
+**Blu-ray subtitles work for the first time.** Blu-ray discs store subtitles as pictures rather than text, and nothing in the subtitle path could read a picture, so a Blu-ray remux offered no subtitles of its own at all. Those pictures are now read on the device and turned into ordinary subtitles, appearing in the normal list with the normal styling. This is a first pass and it shows: recognition is bounded so it can never slow playback, which brings real limits worth reading in Known issues below. It is not flawless on stylised or non-Latin type, and a file carrying its own text subtitles still uses those first.
+
+**Every subtitle track in the file is offered.** A file carrying thirty-nine subtitle languages used to show one.
+
+### We build our own player engine now
+
+This is the piece of the release we are proudest of, and it is what made everything above possible.
+
+VortX used to take the player engine as a prebuilt package, which meant taking whatever version that package happened to ship and waiting for someone else when it lagged. It no longer does. We build the whole stack ourselves from pinned upstream sources: mpv, libplacebo and FFmpeg, nine slices across Apple TV, iPhone, iPad and Mac, with two patches of our own on top.
+
+**Our mpv is 895 commits ahead of the last upstream release.** Not a fork that drifted, a deliberate pin to master because the Dolby Vision enhancement-layer work we needed lives there and has not been released yet. Waiting for it would have meant waiting months.
+
+**libplacebo is built from source at API 371 rather than the 360 the prebuilt package carried.** That one matters more than it looks: mpv's enhancement-layer support is compiled out entirely below API 367, silently, with a perfectly green build. Bumping mpv alone would have produced a build that looked correct and did nothing. Both had to move together, and finding that out cost real time.
+
+**FFmpeg stays where it was, deliberately.** We audited every one of the 67 FFmpeg functions VortX calls against the newer line and found none of them removed or changed, so the move is safe on our side. What we have not done yet is rebase the player package's own FFmpeg patches onto it, and until that is measured we are not moving. The bounded cost of standing still is one file type: a Profile 7 Dolby Vision file that packs both picture layers into a single interleaved track needs a splitter the current version does not carry, so those files play from the base layer alone. Files that carry the two layers as separate tracks, which is most of them, work.
+
+**Two patches are ours.** One carries the Dolby Vision enhancement-layer work through the packaging our Apple builds need. The other makes the render surface notice when it has been resized, which is why rotating a phone no longer tears down and rebuilds the entire video pipeline.
+
+We also turned on the Dolby Digital Plus encoder, which had never been compiled in, so the converter that always asked for it stopped silently settling for AAC.
+
+The cost of owning this is real and worth being honest about: nine slices to rebuild, upstream to track, and the two patches to carry forward every time either moves.
+
+### Moving the app into the backend
+
+A sideloaded app is a pain to update. Unsigned IPAs expire, re-signing is a chore, and every fix we make is worthless until you go through that again. So we are steadily moving VortX's behaviour out of the app and onto our own servers.
+
+The goal is blunt: **as close to 99 percent of what VortX does should be changeable without you installing anything.** When something breaks, we fix it once on our side and every device picks it up, usually within a few minutes of opening the app.
+
+A lot of it already works this way. Ratings, posters and artwork, the skip-intro database, source pooling, the add-on and catalog behaviour, and a growing set of feature switches all come from our own services rather than being baked into the build. This release wired up several more of those switches and made the app pick up changes when you bring it back to the front rather than only after a full quit. It also made a bad setting unable to keep the app shut: after three failed launches it discards what we sent and starts on the settings built into the app.
+
+What cannot move is the part that has to run on your device: the player, the decoder, Dolby Vision, and the engine. Those still need a build. Everything else is heading server-side, and each release moves more of it.
+
+### Everywhere else
+
+**Apple TV tells the system what you are watching, and the same card is fixed on iPhone, iPad and Mac.** Playback registered nothing with tvOS, so the Now Playing card sat empty and no system transport reached VortX. The card now carries the title, show and episode, poster and position, and play, pause, skip and scrubbing all work. On iPhone, iPad and Mac the card gains the poster, the series details and a working position bar, and an explicit Play sent from Control Center no longer pauses a playing title, which it used to because play, pause and toggle all ran the same toggle. The position it reports at the first frame is the real one rather than zero.
+
+**Turning subtitles off no longer loses your subtitle for the rest of the session.** Switching an add-on or external subtitle off used to discard it outright, so turning subtitles back on left you with nothing to turn back on. It is kept now, and external subtitles sit in the list as proper rows alongside the file's own.
+
+**The Mirror Continue Watching from Stremio setting does what it says.** The toggle existed but was not wired to anything, so turning it on changed nothing. It now genuinely mirrors, and the settings text on every platform was rewritten to describe what actually happens rather than what was intended.
+
+**Rewinding goes back.** The player was only offered a few seconds of film behind wherever it had downloaded to, and it downloads a long way ahead of what you are watching, so the earliest point it would return to was often already ahead of you. It now holds two and a half minutes of playing time behind you.
+
+**Coming back from an episode returns you to that episode.** The page trusted whatever Continue Watching had got round to saving rather than what actually played.
+
+**Signing in with the QR code works.** The code pointed at a link that opens the home page, so scanning appeared to do nothing. It now opens the approve page, and that page no longer loses your request when you sign in.
+
+**Settings we send reach you, and a bad one cannot keep the app shut.** Several of the switches we use to turn a feature off without shipping a build were never read by the app. They are read now, they refresh when you bring the app back to the front, and a setting that stops the app opening is discarded after three attempts.
+
+**Ratings sit on the artwork like they belong there.** On landscape cards the badge is one piece of the app's own frosted glass, with the score leading and the other services following a hairline rule.
+
+**Rotating your phone no longer restarts the picture.** Our own build of the player engine notices the new shape and redraws instead of tearing the whole pipeline down. Resizing the Mac player window gets the same fix.
+
+In-place update over Beta 8, nothing resets.
+
+### Known issues
+
+- **Play from start, from inside the player, does not work.** The button on the detail page is fine; the one in the player controls is not.
+- **Recognised Blu-ray subtitles render larger than they should.** They read correctly; a sizing pass is next.
+- **Recognised Blu-ray subtitles stop partway through a film.** Reading the pictures costs real time, so it is given a fixed budget to guarantee it can never stall playback. A feature-length disc carries well over a thousand lines per language and exhausts that budget long before the credits, and once it is spent no further lines are produced for the rest of the session. Lines already recognised keep showing; new ones stop appearing. This is the limitation we most want to remove.
+- **On the Dolby Vision lane, only the first four Blu-ray subtitle languages actually produce text, but every language is still listed.** Picking any of the others gives you an entry that stays permanently blank rather than an honest "not available". The cap exists so recognition can never slow playback; listing the ones it will never fill is our bug, not a design decision, and the menu should show only what it can deliver. The built-in player reads the disc's pictures directly and is not affected.
+- **Recognised Blu-ray subtitles cannot be time-shifted.** The subtitle delay control does not apply to them, because they travel a different path from the subtitles it was built for. A file's own text subtitles and add-on subtitles still adjust normally.
+
+### Android
+
+**A fully functional Android app matching the Apple app feature for feature is landing this August.**
+
+Android is a separate, from-scratch app on the same Rust engine, not a port. Today it is roughly a third of the way there: about 42,000 lines against the Apple app's 153,000, with 5 of 15 build sessions finished.
+
+**Done:** the foundation, and it is real. The engine runs natively with the same catalogs, library, search, discover and account sync the Apple app uses. Add-ons install and manage. Titles, series, seasons, episodes, watched state and Continue Watching all work. The design system is in place across phones, tablets and foldables, and appearance, tab-bar, debrid-key and remote-config layers landed this cycle.
+
+**Next, and it is the one that matters:** the player. Source ranking, then ExoPlayer, then mpv as the primary engine, then torrents. Until that lands Android browses everything and plays very little, which is why it is not promoted alongside the Apple builds yet.
+
+**Then:** settings and profiles, Live TV, backup and import, and Android TV shipping as the same APK rather than a separate one.
+
+The published Android build remains Beta 6 and is unchanged by this release. The August target is the whole thing at parity, not a staged trickle.
+
+## 0.3.14 Beta 8 - 2026-07-23
+
+The same-day hotfix for Beta 7's field reports, every one reproduced before it was fixed. Dolby Vision plays again: the player rework shipped a thirty-six second startup requirement against a ten second watchdog, rejected the timestamps a resume produces, and killed its own stream when the memory spool filled a few seconds into 4K, so titles hung, failed instantly, or died mid-play and fell to HDR10; all of it is fixed and proven against a real pipeline harness, with fresh starts answering in about four seconds. The Dolby Vision player's audio and subtitle menus name their tracks instead of showing one Unknown entry. Community (Singularity) sources show their real resolution, size, and seeders, and merge with what your add-ons already found instead of stacking a wall of identical rows. Ratings show all four scores on cards, the detail page, and freshly baked posters, add-on posters that arrive pre-baked with their own scores pass through untouched, and turning on ERDB artwork can no longer blank your art. The diagnostic-log export shows its QR on the first open. In-place update, nothing resets.
+
+### Fixed
+
+- **Dolby Vision plays again, starts fast, resumes, and survives long plays.** Seven distinct causes, each matched to a field diagnostic and reproduced red-then-green against the real remux pipeline: a thirty-six second startup floor versus the ten second watchdog, segment cuts that rejected open-GOP HEVC and every resume landing on one, resume timestamps the muxer refused as non-monotonic, a memory spool that killed the stream when it filled, an advertised alternate track failure that took the whole session down, an audio playlist that advertised nothing for mixed-codec files, and silent failure paths that logged no reason. Every failure now logs its cause. Apple TV.
+- **The Dolby Vision audio menu names its tracks.** The muxed main track is properly named with honest channel and Atmos labeling, alternates appear, and built-in text subtitles keep their names. Apple TV.
+- **Community (Singularity) rows carry their real metadata and merge with add-on sources.** Resolution, size, seeders, a provider mark only when your own configured service was seen to have it cached, duplicates merged away, unlabeled legacy rows bounded. Apple TV, iPhone, iPad, and Mac.
+- **All four ratings everywhere, and add-on poster art is respected.** Cards, the detail page's primary rating line, and newly baked portrait posters carry IMDb, Rotten Tomatoes, Metacritic, and TMDB together; posters an add-on supplies pre-baked pass through untouched. Apple TV, iPhone, iPad, and Mac.
+- **ERDB artwork fails soft.** A miss now falls back to the art the app already had instead of blanking the slot. Apple TV, iPhone, iPad, and Mac.
+- **The diagnostic-log export shows its QR on first open.** A brief spinner covers the cold start of the one-time local link. Apple TV.
+
+## 0.3.14 Beta 7 - 2026-07-23
+
+The big one. Signing in by QR works for the first time, the community (Singularity) source pool is collecting and serving again for every kind of source, Dolby Vision stops flickering and starts at the beginning, hi-res TrueHD titles keep true Dolby Vision, watched history flows in from Trakt and SIMKL the moment you switch them on, JioHotstar and ZEE5 catalogs fill, Picture-in-Picture works on ordinary files on iPhone and iPad, and a setting you change now stays changed. The diagnostic log you send us carries far less about you, and only you can fetch it.
+
+This wave also reworks the Dolby Vision lane on Apple TV: a title's alternate audio tracks and its own built-in text subtitles are now selectable in true Dolby Vision, and titles start more cleanly. Home customization on Apple TV is reachable again, from a proper Settings row the remote can focus; on iPhone, the Add-on Discover and Catalog customize screens fit portrait instead of clipping; and the Apple release workflow now rejects unsafe app-bundle symlinks before packaging.
+
+### Added
+
+- **Dolby Vision: choose a title's audio track.** A Dolby Vision title that carries more than one audio track, a surround or Atmos bed alongside a stereo downmix, a commentary, or another language, now offers all of them in the player's audio menu on the true Dolby Vision lane, instead of being fixed to whichever track happened to come first. The picture stays real Dolby Vision throughout. Apple TV.
+- **Dolby Vision: a title's built-in subtitles appear in the menu.** Text subtitles carried inside the file (SubRip, ASS, and the like) are now served alongside the Dolby Vision stream and can be turned on from the subtitle menu, the same as any other subtitle. Image-based subtitles, which are pictures rather than text, are not among them, exactly as before. Apple TV.
+
+- **Add an add-on by QR, and it installs itself.** Scan the code on the TV with your phone, paste the add-on's link on the page that opens, and the add-on installs on the TV with no further taps; the Install button remains only as a retry if an install fails, and sending the same link twice can never install it twice. Apple TV.
+- **Reorder your add-ons on Apple TV.** Move add-ons up and down with the remote, exactly as on iPhone and Mac; the order belongs to your account, syncs to your other devices, and decides which add-on answers first for a title's details. Apple TV.
+- **Titles watched on Trakt or SIMKL show as watched here.** Turn on the import for either service and its watched history appears on your covers within seconds, including titles that are not in your library; turning the import off, or disconnecting, removes only that service's marks. SIMKL import is new; the Trakt import used to wait several minutes before its first pull and now runs the moment you ask. Apple TV, iPhone, iPad, and Mac.
+- **Rate titles on SIMKL, and see your plan-to-watch in Upcoming.** The detail page gains a SIMKL rating control beside the Trakt one, your scores sync both ways, and shows on your SIMKL plan-to-watch surface their next air dates on the Upcoming screen. Apple TV, iPhone, iPad, and Mac.
+- **A grey subtitle colour and a subtitle brightness control.** For OLED screens where bright white subtitles glare on dark scenes: pick the new Grey, or dim any colour to 80, 60, or 40 percent. Applies on both player engines, syncs with your profile, and changes nothing unless you touch it. Apple TV, iPhone, iPad, and Mac.
+
+### Fixed
+
+- **Add-on catalog ratings show again.** A catalog add-on that sends its own rating alongside its own links row used to lose the rating on the way into the app: the engine kept the add-on's links and dropped the separate rating, which only ever reaches the app as one of those links. The engine now folds the rating into the links it keeps, so titles from community catalogs show their scores. Apple TV, iPhone, iPad, and Mac.
+- **Dolby Vision titles start at the beginning instead of about fourteen seconds in.** The player was never told where to begin, so it applied the rule meant for live streams and skipped ahead by three segment lengths before the first frame you asked for. It now starts where it should. Apple TV.
+- **Dolby Vision no longer flickers several times before it settles.** Starting a title could ask the TV to change display mode repeatedly, and every one of those requests renegotiates the HDMI link, which is the flash you saw. Identical requests are now ignored, so the mode changes once; anything that genuinely differs, a different frame rate or resolution, still switches as it should. Apple TV.
+- **Community (Singularity) sources are collecting and appearing again.** Nothing was being contributed to the shared pool at all, for four separate reasons: episode sources were filed under a malformed identifier the pool rejected, debrid results carrying no direct hash were skipped even though their hash could be recovered, results the pool had deliberately sent were then discarded again by the app before you saw them, and the two platforms disagreed about a title's identity so the same show could be filed twice. Identity now resolves through one shared helper on every platform. Contribution happens whether or not you are signed in, exactly as before; results are shown when you are signed in. Apple TV, iPhone, iPad, and Mac.
+- **The diagnostic log you send us carries far less about you, and only you can fetch it.** Every line is now cleaned as it is written and cleaned again when you export it, so what leaves your device no longer carries the titles you watched, the identifiers behind them, torrent hashes, or any key or token that appeared in a link. That second cleaning also covers logs that older builds already wrote and left on your device, and the streaming server's own log, which we do not write ourselves. The Apple TV export used to hand the log to anything on your Wi-Fi that connected to it, as many times as it liked: it now serves your one scanned link once, and turns away everything else. Apple TV, iPhone, iPad, and Mac.
+- **Dolby Vision titles resume where you left off.** The true-Dolby-Vision lane now rebuilds from your resume point rather than only from the start, so a partly-watched title continues in real Dolby Vision with its Atmos or surround intact; if a title cannot resume it falls back to the built-in player within about ten seconds and logs the reason, and your resume point is always kept safe. Apple TV.
+- **Dolby Vision titles start more cleanly.** The Dolby Vision lane republishes the video as it rebuilds it, and it now sizes each piece to the title's own keyframes and proves each cut lands on one before serving it, so the stream opens and settles with less fuss at the start. Apple TV.
+- **Home customization is reachable again on Apple TV.** The control that opened Home customization sat in a corner overlay the tvOS focus engine could never land on, so the remote could not reach it. Home customization now lives as a proper row in Settings, under Appearance, reachable with the remote and by search. Apple TV.
+- **The Add-on Discover and Catalog customize screens fit portrait on iPhone.** Both screens could run off the side of the screen in portrait and clip their content, because a row of type chips and a fixed action sat together on one inflexible line wider than a narrow phone. The chips now wrap and the action is set apart, so both screens fit. iPhone.
+- **Release packaging now rejects unsafe app-bundle links.** An absolute build-machine symlink had been copied into release bundles and blocked simulator installation. The Apple release workflow now audits the tvOS, iOS, and macOS app bundles before packaging and stops if a symlink is absolute, dangling, or escapes its bundle.
+
+- **Landscape cards show every rating, not just the star.** The cinematic 16:9 cards carried a single IMDb star even though the ratings service returns IMDb, Rotten Tomatoes, Metacritic, and TMDB; the card badge only read the IMDb field and drew one number. It now renders the full set as one clean badge from the same keyless service, sized to the card (two scores on a small tile, all four on a larger one), never doubled on art that is already baked, and a title with only one score shows only that one. Apple TV, iPhone, iPad, and Mac.
+- **A title's page leads with all of its scores.** The prominent rating on the details screen showed only the engine's single IMDb number while the full cross-provider set sat below it as a faint secondary line that read as invisible. Since the ratings backend is ours, the primary spot now upgrades to IMDb, Rotten Tomatoes, Metacritic, and TMDB together the moment they load, with the engine IMDb shown instantly and the rest fading in beside the same star so nothing blanks or jumps; each score appears only when it exists. Apple TV, iPhone, iPad, and Mac.
+- **Posters that already show ratings keep them.** A catalog whose artwork arrived with its own scores baked in was routed through our poster service, which re-rendered our own art with a single rating and discarded theirs. Artwork that is not one of the raw, id-derivable forms we source ourselves is now passed through untouched, so those posters keep every score they came with, while art we do source still gets the rating added. Apple TV, iPhone, iPad, and Mac.
+- **Turning on the richer poster renderer never blanks a poster.** When the optional poster/logo renderer could not map an id or had no art for a type, it returned a tiny error the app then tried to decode, leaving that slot empty; the app now hands it the original artwork so it falls back to that instead of nothing. Apple TV, iPhone, iPad, and Mac.
+- **Ratings show on the cinematic landscape cards too.** Show ratings on posters used to bake the star only onto portrait posters, and the default landscape look quietly skipped it, which read as ratings that had stopped working. Landscape cards now carry the rating as a clean badge from the same keyless service, only when the toggle is on, never doubled on art that is already baked, and a title with no rating shows none. Apple TV, iPhone, iPad, and Mac.
+- **Signing in with the QR code works, and the correction Beta 7 shipped for it did not.** Beta 7 and Beta 8 said this was fixed. It was not, and we are sorry: those builds pointed the code at a link that opens the VortX home page with the sign-in request stranded in the address, so scanning appeared to do nothing at all. The code now opens the approve page itself. The fault behind the original report was a different one and is fixed as well: the approve page asked you to sign in and then dropped the request on the way, so you arrived signed in on your dashboard while the device carried on waiting. Signing in now returns you to the approval with the device still waiting, and the site also recognises the codes Beta 7 and Beta 8 produced, so a code from any build resolves. The TV still says when it is having trouble reaching us instead of waiting silently, and a stale code still refreshes itself. Fixes #153. Apple TV, iPhone, iPad, and Mac.
+- **A setting you change stays changed.** Flipping a setting and then relaunching could silently revert it: the relaunch pulled your account's older value over the change before the change had synced up. A local change now survives every pull until it has been pushed, then your account and your other devices follow it. The poster-ratings switch that would not stay on was this. Apple TV, iPhone, iPad, and Mac.
+- **JioHotstar, ZEE5, and other regional services fill their catalogs.** A service you select now also looks in the regions that service actually operates in, not only your own, so an India-only service shows its real catalog wherever you are; nothing is hardcoded to any country, and an empty page now says why it is empty instead of always blaming your region. Apple TV, iPhone, iPad, and Mac.
+- **Hi-res TrueHD titles keep true Dolby Vision.** A Dolby Vision file with 192 or 176.4 kHz TrueHD or DTS-HD audio failed a conversion step and silently fell back to HDR10; the conversion now handles hi-res rates, proven end to end against real files, so those titles play true Dolby Vision with their full surround sound. Apple TV.
+- **Caching no longer dies about forty seconds in.** On memory pressure the player used to clamp its cache to a sliver for the rest of the title, which read as caching that just stopped; it now halves the cache first and only clamps fully if pressure continues, so long titles keep buffering ahead. Apple TV especially.
+- **Downloads cannot loop forever on a save failure.** A download whose save kept failing for a reason other than a locked device used to re-download from scratch on every app open, silently burning data; it now retries a bounded number of times and then fails honestly, with the exact cause named in the diagnostic log. A download that completes while the device is locked still saves itself the moment you unlock. iPhone and iPad.
+- **Contribute skip times from the Dolby Vision player.** The skip editor could not submit on the Dolby Vision lane because that lane does not report a conventional duration; the editor now reads the title's own runtime, so a fresh episode's intro can be contributed from any player. Apple TV, iPhone, iPad, and Mac.
+- **Picture-in-Picture works on ordinary files.** Plain MKV and MP4 sources on iPhone and iPad now play through the player that supports Picture-in-Picture and AirPlay by default, with an automatic fallback that keeps anything unusual playing exactly as before; your own engine choice always wins. iPhone and iPad.
+- **Community sources for every kind of source, resolved as your own.** The pool now carries torrents, direct links, and usenet alongside the provider that was seen to have each one cached; you are shown only what your own services can play, and everything resolves through your own account and keys, never anyone else's link. Apple TV, iPhone, iPad, and Mac.
+- **Watch Stats fills in from your real history.** The Watch Stats screen (Settings, Watch Stats) could sit empty even for someone with a full watch history, because it drew its numbers from a single persisted library file and dropped that file whenever its stored account id did not match the one signed in right now, which happens when you are signed out, have just switched accounts, or are on a device that has not written the file yet. It now reads from your account's own live watch history as well, the same history that already powers Continue Watching and the watched checks on your covers, so your hours watched, titles, movies, series, episodes, top genres, and longest binge appear whenever that history is present. Time for a title only the live history knows about is estimated from its length and play count; the exact per-title time still comes from the engine's own record when it is available. iPhone, iPad, and Mac.
+
 ## 0.3.14 Beta 6 - 2026-07-20
 
 A hotfix over Beta 5. Beta 5 could not launch on Apple TV: the Settings screen had accumulated enough sections that its compiled view type grew too large for the tvOS runtime to construct at launch, and the release build (produced on a regressed CI toolchain lane) emitted it in a form the device runtime rejected, so the app crashed within a fraction of a second of starting and returned to the Home screen. Two-layer fix: the Settings screen is restructured so its type stays small regardless of how many sections it holds, and the release pipeline is pinned to the verified known-good toolchain with fail-closed minimum-OS assertions and an automatic launch-smoke check, so a build that does not open can no longer ship. Everything in Beta 5 is carried forward unchanged; iPhone, iPad, Mac, and Android were never affected.
@@ -18,13 +183,13 @@ The correctness beta. (Beta 4 exists as a tag and release page but never carried
 
 ### Added
 
-- **Android: VortX account sign-in with realtime profile sync.** Sign in on Android and your profiles, other members' watch overlays, and profile deletions sync live with your other devices, on the same account and encryption as everywhere else; library, settings, and API-key sync are still being ported. Android phone and TV.
+- **Android: VortX account sign-in with realtime profile sync.** Sign in on your Android phone and your profiles, other members' watch overlays, and profile deletions sync live with your other devices, on the same account and encryption as everywhere else; library, settings, and API-key sync are still being ported. Android phone. TV sign-in and TV account binding are not wired yet; they arrive in a later wave.
 - **Android: raw torrents play.** An in-process streaming server now runs inside the app, so torrent sources play directly, on the same engine lane the Apple apps use. Android phone and TV.
 - **Android TV: a real 10-foot experience.** Home, Detail, and playback plus Discover, Library, Search, and Settings on a proper TV navigation shell. Android TV.
 - **Android: profiles with per-profile watch isolation.** The profile picker arrives on phone and TV; one household member's progress never bleeds into another's. Android phone and TV.
 - **Android: preference-driven source ranking.** Sources rank by your quality and provider preferences on phone and TV; Smart Source auto-pick and source pins are managed on the phone. Android.
 - **Android: offline downloads.** The downloads path is reachable, with a real queue, storage policy, and pause and resume semantics. Android phone and tablet.
-- **Android: IPTV playlists.** Add M3U and Xtream playlists with XMLTV guide data in Settings and play your live channels. Android phone and TV.
+- **Android: IPTV playlists.** Add M3U and Xtream playlists with XMLTV guide data in Settings and play your live channels. Android phone. The TV IPTV lane lands in a later wave.
 - **Android: Picture-in-Picture, gesture controls, and system media integration.** PiP, swipe gestures for brightness, volume, and seeking, lock-screen and notification-shade media controls, and audio-focus, headset, and assistant handling. Android phone.
 - **Android: 1080p trailers, subtitle fetching, and add-on management.** Full-HD client-side YouTube trailers and automatic subtitle add-on fetching on phone and TV; add-on reorder and toggle and mark-watched from a card on phone and tablet; plus a player lock. Android.
 - **Apple: a touch lock for the player.** Lock the on-screen controls so a stray touch cannot pause, seek, or exit. iPhone and iPad.
@@ -94,11 +259,11 @@ A fix beta on top of 0.3.14 Beta 1, with the same feature set. It sharpens the D
 - **Decade catalog shelves load their cover art.** Apple TV, iPhone, iPad, and Mac.
 - **Trakt sign-in troubleshooting.** Clearer diagnostics so a failed connect records exactly where it failed. Apple TV, iPhone, iPad, and Mac.
 
-## 0.3.13 - 2026-07-11
+## 0.3.14 builds 175 to 178 - 2026-07-14
 
-The community release, and the roll-up of the whole 0.3.12 test line (builds 167 to 174). Its headline is a player reliability series contributed by jbecker-it, his second contribution to VortX and his biggest yet, field-tested on real hardware: the pause-shortly-after-start crash is gone, watch progress saves on streams that never report a length, heavy scrubbing can no longer lose your place or falsely mark an episode watched, audio no longer distorts after big seeks or track changes, and Continue Watching updates the moment you stop watching. Alongside it, the Dolby Vision recovery line from builds 167 to 173, the launch profile picker and Liquid Glass from build 173, and a set of community-reported fixes: add-on HTTP and HLS streams now appear (#122), removed add-ons no longer ghost the Home customize list (#121), the diagnostic log saves without a QR code (#113), stream rows fit narrow iPhones (#118), and where-to-watch logos are legible everywhere (#95). In-place update, nothing resets.
+The test builds between 0.3.13 and the first 0.3.14 beta, recorded here in their own section; an earlier edit had filed them under 0.3.13.
 
-### Added (pending next build)
+### Added (builds 177 and 178)
 
 - **VortX becomes the front door.** Sign-in now leads with the VortX account on every platform (Apple TV already did; iPhone, iPad, and Mac now match), and every tab treats a VortX sign-in as signed in, so a VortX-only user no longer hits "Sign in" on Home, Discover, Library, Live, Search, or Add-ons. In Settings the VortX account sits at the top and a new Integrations screen holds Stremio, Trakt, SIMKL, and Nuvio as optional imports; VortX keeps its own account, add-ons, and library. Apple TV, iPhone, iPad, and Mac.
 - **Trakt and SIMKL are live.** Device-code sign-in (no password entered in the app), scrobble on play, pause, and stop, watchlist and history sync, and your Trakt and SIMKL lists as catalogs. Token handling is hardened against Trakt's shortened token lifetime (a real early refresh, single-flight, no self-signout) and SIMKL's required params, User-Agent, and one-write-per-second rate. Apple TV, iPhone, iPad, and Mac.
@@ -165,6 +330,10 @@ The community release, and the roll-up of the whole 0.3.12 test line (builds 167
 - **The Home section headers are localized in every app language (build 175).** Sixteen header strings (Continue Watching, Top Picks for you, Upcoming Episodes, Streaming, Genres, Top New, and the rest) were defined as raw English and rendered verbatim; they are now defined through the localization catalog with translations in all 106 app languages, reconciled against the terms the app already uses (the Continue Watching shelf keeps its established name in every language), and the Discover hub headers took the same fix. Part of #95. Apple TV, iPhone, iPad, and Mac.
 - **A native Dolby Vision title that plays audio over a black screen now falls back to the built-in player (build 175).** A watchdog on the Dolby Vision lane demotes after 8 seconds of advancing audio with zero video frames, corroborated by the player layer's own displayed-frame signal so a slow first frame can never false-trigger, once per title, and the next episode always gets a fresh shot at true Dolby Vision. The demote records its evidence in the exportable diagnostics log. Part of #76. Apple TV, iPhone, and iPad.
 - **Audio no longer defaults to a random dub when your language is missing (build 175).** A title with no audio track in your chosen languages now falls back to English before giving up to the container's first-listed track, on both player engines; commentary tracks are excluded from the fallback, and subtitles still auto-enable in your language over the fallback audio. From an Apple TV field report. Apple TV, iPhone, iPad, and Mac.
+
+## 0.3.13 - 2026-07-11
+
+The community release, and the roll-up of the whole 0.3.12 test line (builds 167 to 174). Its headline is a player reliability series contributed by jbecker-it, his second contribution to VortX and his biggest yet, field-tested on real hardware: the pause-shortly-after-start crash is gone, watch progress saves on streams that never report a length, heavy scrubbing can no longer lose your place or falsely mark an episode watched, audio no longer distorts after big seeks or track changes, and Continue Watching updates the moment you stop watching. Alongside it, the Dolby Vision recovery line from builds 167 to 173, the launch profile picker and Liquid Glass from build 173, and a set of community-reported fixes: add-on HTTP and HLS streams now appear (#122), removed add-ons no longer ghost the Home customize list (#121), the diagnostic log saves without a QR code (#113), stream rows fit narrow iPhones (#118), and where-to-watch logos are legible everywhere (#95). In-place update, nothing resets.
 
 ### Fixed (build 174)
 

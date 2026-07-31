@@ -68,12 +68,27 @@ struct PlaybackRequest: Identifiable {
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.
 final class PlayerPresenter: ObservableObject {
+    /// One close-scoped first-frame receipt. It is published only when its exact request closes and is cleared
+    /// when a newer request begins, so trailers, profile changes and later visits cannot reuse stale identity.
+    @Published private(set) var playbackCloseReceipt: PlaybackMeta?
+    private var receiptState = EpisodeReturnReceiptState<UUID, PlaybackMeta>()
+
     @Published var request: PlaybackRequest? {
         didSet {
             if request?.torrent == true && PlaybackSettings.torrentsDisabled {
                 request = nil
             }
+            if let request {
+                receiptState.begin(requestID: request.id)
+                playbackCloseReceipt = nil
+            } else if let closing = oldValue {
+                playbackCloseReceipt = receiptState.close(requestID: closing.id)
+            }
         }
+    }
+
+    func recordCommittedPlayback(_ meta: PlaybackMeta, requestID: UUID) {
+        _ = receiptState.record(meta, requestID: requestID)
     }
 }
 
@@ -136,6 +151,9 @@ struct RootView: View {
                              initialEnginePlayerVideoId: req.enginePlayerVideoId,
                              startedFromExplicitPick: req.wasExplicitPick, startedFromResume: req.wasResume,
                              startFromZero: req.startFromZero, startAtSeconds: req.startAtSeconds,
+                             onPlaybackIdentityCommitted: {
+                                 presenter.recordCommittedPlayback($0, requestID: req.id)
+                             },
                              // Tear down the engine Player on a genuine exit so a stale Player from this session
                              // cannot absorb the next title's TimeChanged ticks (matches iOS onClose). onClose is
                              // the single user-exit choke point (leavePlayback routes through it); a request-id
@@ -306,8 +324,8 @@ struct RootTabView: View {
                 DiscoverView().id(resetTokens[1])
                     .tabItem { Label("Discover", systemImage: "safari.fill") }.tag(1)
             }
-            // Live TV sits after Discover. Tags 0–5 were already taken (Search uses 4, Add-ons 3),
-            // so Live takes the next free tag 6 and reset slot 6 — the selection-reset .onChange
+            // Live TV sits after Discover. Tags 0-5 were already taken (Search uses 4, Add-ons 3),
+            // so Live takes the next free tag 6 and reset slot 6, the selection-reset .onChange
             // below stays in bounds against the resized 7-slot array.
             if !hideLiveTab {
                 LiveView().id(resetTokens[6])
@@ -373,7 +391,12 @@ struct RootTabView: View {
         // Apple TV still owes its first VortX-account sync. armLaunchNag waits out the splash + the
         // profile picker so the sheet never fights a modal; skipped while something is playing. Always
         // dismissible, never blocks the app.
-        .sheet(isPresented: $showSeedingNag) { MoveSeedingNagTV() }
+        .sheet(isPresented: $showSeedingNag, onDismiss: {
+            // Menu/back, successful setup, Done, and Not now all close the same launch reminder.
+            // Persist the receipt at the sheet boundary so no dismissal path can make it return on
+            // every launch of this build. Settings still keys only on the first real sync.
+            MoveSeeding.recordLaunchNagDismissal()
+        }) { MoveSeedingNagTV() }
         .task { await armSeedingNag() }
         .onAppear {
             applyTabBarAccent()

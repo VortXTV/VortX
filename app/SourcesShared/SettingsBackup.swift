@@ -13,9 +13,10 @@ import Foundation
 /// What it deliberately does NOT capture: the account token, which comes back by signing in again (and with
 /// it the synced library, add-ons, and history). This used to be justified with "the token lives in the
 /// Keychain, not UserDefaults, so it never lands in the backup file". That reasoning was WRONG, and its
-/// wrongness is why the token leaked for as long as it did: `Keychain` on iOS/tvOS falls back to UserDefaults
-/// when the Keychain refuses it, so "it is in the Keychain" was never a property this file could assume, only
-/// one it could ENFORCE. It is now enforced, by `secretKeyPrefixes` below. Do not restore the old claim.
+/// wrongness is why the token leaked for as long as it did: older `Keychain` implementations on iOS/tvOS
+/// fell back to UserDefaults when the Keychain refused them. Current code fails closed, while
+/// `secretKeyPrefixes` still filters and self-heals plaintext written by an older build. Do not restore the
+/// old claim.
 ///
 /// 0.4 is FREE to rename the `@AppStorage` keys to `vortx.*`: restore runs every key through
 /// `migratedKey(_:)`, so a backup written by an older StremioX build still applies. The only place the old
@@ -45,6 +46,9 @@ enum SettingsBackup {
         "stremiox.dvRemux",          // Settings -> Dolby Vision for MKV (per-device: depends on THIS device's DV
                                      // display + decode). Was syncing, so a pull kept reverting a freshly-toggled
                                      // device back to a peer's OFF value, which is why enabling it never "took".
+        "vortx.pgsSubtitleOCR",      // on-device Vision workload escape hatch. A weaker device may need this
+                                     // off while another device keeps it on, so profile/cloud restore must not
+                                     // overwrite the local choice.
         "vortx.downloads.queueOrder",    // an array of download UUIDs whose FILES are device-local, so a peer's
                                          // queue order can never apply here: the UUIDs it names do not exist on
                                          // this device. Was syncing, so a pull replaced this device's real order
@@ -53,6 +57,8 @@ enum SettingsBackup {
                                          // on an iPhone on cellular is actively harmful. Same class as
                                          // diskCacheBytes above: a number that is only correct for the hardware
                                          // that chose it.
+        "vortx.moveSeeding.launchNagDismissedBuild", // acknowledgement of a launch reminder on THIS device;
+                                                     // never suppress another device's migration reminder
         // DELIBERATELY NOT HERE: "vortx.downloads.autoDeleteWatched". It looks like it belongs with the two
         // above, and it does not. It is a real cross-device POLICY preference ("I do not want to keep watched
         // downloads"), which is true of the user rather than of the hardware, so it must keep syncing. The test
@@ -78,7 +84,10 @@ enum SettingsBackup {
     /// `vortx.sync.appliedAddonOrder` is deliberately covered too, and this costs no sync behavior: the
     /// shared add-on order's real carrier is the doc's own top-level `addonOrder` key, which
     /// VortXSyncManager writes on push and applies on pull. The blob was never its transport.
-    static let deviceLocalKeyPrefixes: [String] = ["vortx.sync."]
+    static let deviceLocalKeyPrefixes: [String] = [
+        "vortx.sync.",
+        Keychain.invalidationKeyPrefix, // non-secret record of an unconfirmed Keychain mutation on this device
+    ]
 
     /// SECRETS, which must never leave this device in any form. Kept as its OWN list rather than folded into
     /// `deviceLocalKeyPrefixes` on purpose: that list answers a per-device TUNING question (cache size, DV
@@ -86,16 +95,10 @@ enum SettingsBackup {
     /// there is one careless "this does not need to be device-local any more" away from deletion. This is not
     /// a preference at all, and its name should say so.
     ///
-    /// WHAT LEAKED. `Keychain` (iOS/tvOS) falls back to writing a secret into UserDefaults under
-    /// "kcfallback.<account>" when `SecItemAdd` fails, a fallback its own comment attributes to an unsigned
-    /// Simulator or an entitlement mismatch. VortX ships UNSIGNED SIDELOADED IPAs, and re-signing is exactly
-    /// that named trigger. Those keys are the app's own and look nothing like OS state, so `isAppPref` passed
-    /// them, and `deviceLocalKeyPrefixes` did NOT catch them: the key is "kcfallback.vortx.sync.session.v1",
-    /// which starts with "kcfallback.", not "vortx.sync.". So `isSyncable` returned true and the ACCOUNT TOKEN
-    /// plus the E2E dataKey (VortXSyncManager persists { token, account, dataKey } as ONE blob in ONE slot)
-    /// were carried into both `doc.settings` and the user-facing export this very file calls "portable,
-    /// human-inspectable JSON". That breaks the standing invariant that the token is Keychain-only and never
-    /// enters preferences or backups.
+    /// WHAT LEAKED. Older `Keychain` code (iOS/tvOS) wrote a secret into UserDefaults under
+    /// "kcfallback.<account>" when `SecItemAdd` failed. Those keys passed `isAppPref`, so the account token plus
+    /// E2E dataKey were carried into `doc.settings` and the user-facing export. Current Keychain code never
+    /// writes that fallback, but this filter remains necessary for stale slots and old synced documents.
     ///
     /// A PREFIX, not an exact-match entry, because the slot names are open-ended by construction: the fallback
     /// wraps EVERY Keychain account (per-profile authKeys, Trakt access/refresh, the API keys), so no set of
@@ -315,10 +318,19 @@ enum SettingsBackup {
     /// app owns is dotted (`stremiox.*`, `vortx.*`). So the write lands but no live view or store re-reads it.
     /// Callers MUST follow a successful restore with `reloadLiveStores()` on the main actor, or the restored
     /// values stay invisible until a relaunch AND the stale in-memory copies get flushed back over them.
+    ///
+    /// `skipping` is the LOCAL-WINS set (empty by default). The cross-device PULL path (VortXSyncManager.syncDown)
+    /// passes the account's locally-dirty settings keys here so a value the user just changed on THIS device but
+    /// has not yet pushed is NOT overwritten by the account's older value (`SettingsDirtyKeys`, and the "would not
+    /// stay" interplay at VortXSyncManager.swift:1175-1182). The set is compared in MIGRATED form (matching how
+    /// VortXSyncManager stamps its dirty set and its appliedSettingsBaseline), so it stays correct once the 0.4
+    /// rename seam opens. The user-facing backup-FILE import path passes nothing: an explicit "restore from file"
+    /// is a deliberate overwrite and honors every key. The count returned is of keys ACTUALLY applied.
     @discardableResult
     @MainActor
-    static func restore(from data: Data) throws -> Int {
+    static func restore(from data: Data, skipping dirtyKeys: Set<String> = []) throws -> Int {
         let pairs = try decodeDomain(from: data)
+            .filter { dirtyKeys.isEmpty || !dirtyKeys.contains(migratedKey($0.key)) }
         var restoredConsent: Bool?
         var restoredServe: Bool?
         for (key, value) in pairs {

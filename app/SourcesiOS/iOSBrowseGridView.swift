@@ -394,6 +394,9 @@ struct iOSCategoryBrowse: View {
     @State private var page = 1
     @State private var loading = false
     @State private var done = false
+    /// Why the grid is empty once `done`, so the empty-state tells the truth (region / offline / 429 / add-on)
+    /// instead of always blaming the region. Set from the first empty page's `CatalogPage.cause`.
+    @State private var emptyCause: CatalogRowResolution.CatalogEmptyCause?
     @State private var loadTask: Task<Void, Never>?
     /// Push debounce: a sticky Bool reset in onAppear died when pop-back did not re-fire onAppear in
     /// the 7-tab opacity-ZStack architecture, eating every tap after the first (owner report). Time-based
@@ -422,7 +425,9 @@ struct iOSCategoryBrowse: View {
                 pills
                 if items.isEmpty {
                     if done {
-                        Text("Nothing here yet.").font(Theme.Typography.label)
+                        Text(LocalizedStringKey(CatalogRowResolution.emptyGridMessage(cause: emptyCause ?? .region, isServiceTarget: target.isService)))
+                            .font(Theme.Typography.label)
+                            .multilineTextAlignment(.center)
                             .foregroundStyle(Theme.Palette.textSecondary).frame(maxWidth: .infinity).padding(Theme.Space.xxl)
                     } else {
                         ProgressView().frame(maxWidth: .infinity).padding(Theme.Space.xxl)
@@ -501,7 +506,7 @@ struct iOSCategoryBrowse: View {
         // `await sub.load(page)` with loading==true when the new task starts. Without this reset the new task
         // hits `guard !loading` and bails, and when the old task finally resumes it only sets loading=false and
         // returns (id mismatch) - leaving items empty, no task running, and a PERMANENT spinner on the new pill.
-        items = []; seen = []; page = 1; done = false; loading = false
+        items = []; seen = []; page = 1; done = false; loading = false; emptyCause = nil
         loadTask?.cancel()
         loadTask = Task { await loadNext() }
     }
@@ -510,13 +515,13 @@ struct iOSCategoryBrowse: View {
         guard !loading, !done, let sub = subs.first(where: { $0.id == selectedID }) else { return }
         loading = true
         let requested = selectedID
-        let metas = await sub.load(page)
+        let next = await sub.load(page)
         guard requested == selectedID else { loading = false; return }
         loading = false
-        if metas.isEmpty { done = true; return }
+        if next.items.isEmpty { emptyCause = next.cause; done = true; return }
         page += 1
         let firstPage = (page == 2)   // page was 1 before this increment -> these are the pill's top items
-        let fresh = metas.filter { seen.insert($0.id).inserted }
+        let fresh = next.items.filter { seen.insert($0.id).inserted }
             .map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
         items.append(contentsOf: fresh)
         // Seed (and on a pill switch, re-seed) the hero from the top of the freshly loaded catalog so the
@@ -651,7 +656,7 @@ struct iOSReorderServicesView: View {
 // MARK: - Discover personalization (region + category on/off)
 
 /// Settings screen (iOS / iPad / Mac) for the Discover pack: a REGION picker (device region by default,
-/// overridable — orders + scopes hub content to a chosen country) plus per-category / per-section show/hide
+/// overridable, orders + scopes hub content to a chosen country) plus per-category / per-section show/hide
 /// toggles for the Discover cards, the Streaming-Services section, and each genre tile. Everything binds to
 /// the shared `CatalogPreferences`, persists per-profile via UserDefaults, and republishes so the live hub
 /// re-lays out immediately. Defaults reproduce today's behavior (device region, nothing hidden).

@@ -2,7 +2,7 @@
 // ranking rules: the Prefer boost, the Avoid "hide" vs "rank" behavior, the Only (Require) hard require, and
 // the HARD junk / Kids drops that no chip may override.
 //
-// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per CLAUDE.md), so,
+// VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repository guide), so,
 // exactly like app/Tests/HouseholdCryptoTests.swift, this is a self-contained Swift executable that runs
 // directly with the system toolchain:
 //

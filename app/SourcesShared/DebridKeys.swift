@@ -17,6 +17,17 @@ enum DebridService: String, CaseIterable, Identifiable {
         }
     }
 
+    /// The Singularity pool provider tag for this service (the closed rd/tb/pm/ad enum the source-index worker
+    /// validates). Used to contribute the FACT "this provider had the source cached" alongside a torrent hash.
+    var poolProviderTag: String {
+        switch self {
+        case .realDebrid: return "rd"
+        case .allDebrid:  return "ad"
+        case .premiumize: return "pm"
+        case .torBox:     return "tb"
+        }
+    }
+
     /// Where to get the key, shown as a hint under the field.
     var hint: String {
         switch self {
@@ -27,8 +38,18 @@ enum DebridService: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Keychain account this service's key is stored under (credentials, never UserDefaults).
-    var keychainAccount: String { "vortx.debrid." + rawValue }
+    /// Keychain account this service's key is stored under (credentials, never UserDefaults), SCOPED TO ONE
+    /// VortX account.
+    ///
+    /// The scope is the fix for a real cross-account leak: this used to be one global entry per service, and
+    /// sign-out cleared the VortX token without clearing these, so the next account to sign in on the device
+    /// inherited the previous account's debrid credentials and could spend them. Keying by owner means one
+    /// account can never read another's, while each account keeps its own keys across a sign-out and back in.
+    func keychainAccount(owner: String) -> String { "vortx.debrid." + rawValue + "." + owner }
+
+    /// The pre-scoping global entry. Read once so an existing user does not have to re-paste, then removed.
+    /// Never written.
+    var legacyGlobalKeychainAccount: String { "vortx.debrid." + rawValue }
 }
 
 /// The user's debrid API keys. Keychain-backed (they are credentials) and synced end-to-end to the
@@ -41,12 +62,70 @@ final class DebridKeys: ObservableObject {
     /// resolver UI react to changes.
     @Published private(set) var keys: [String: String] = [:]
 
-    private init() {
+    /// Owner scope for a device with nobody signed in. Its keys are real and usable (debrid does not require a
+    /// VortX account), they simply belong to the signed-out device rather than to any account.
+    static let signedOutOwner = "local"
+
+    /// The account these in-memory keys belong to. Every Keychain read and write goes through it, so a stale
+    /// value cannot leak one account's credentials to another.
+    private(set) var owner: String = DebridKeys.signedOutOwner
+
+    /// Legacy adoption happens exactly once, at the FIRST binding, and never again. Deliberately not at init:
+    /// at init the signed-in account is not yet restored, so adopting then would file an existing user's keys
+    /// under the signed-out scope and make them vanish the moment their session restored. The first binding is
+    /// the earliest point at which the device's real owner is known.
+    private var hasConsideredLegacy = false
+
+    /// Loads the CURRENT scope only. It must never adopt legacy state, because the singleton is constructed
+    /// before `VortXSyncManager.restore()` has bound the restored account, so at this moment `owner` is still
+    /// `signedOutOwner`. An earlier version adopted here and did precisely the damage the comment above warns
+    /// about: an upgrading signed-in user's key was filed under the signed-out scope, their account then saw
+    /// nothing, and the credential stayed readable by anyone using the device signed out. Adoption is now the
+    /// sole responsibility of `bind(owner:)`, which is the first point an explicit owner exists.
+    private init() { loadScope() }
+
+    /// Point the store at an account (or at `signedOutOwner`). Call on sign-in, sign-out and account switch.
+    /// Republishes and rebuilds the resolvers, so a switched-in account never keeps the previous one's keys
+    /// in memory either.
+    func bind(owner newOwner: String) {
+        let resolved = newOwner.isEmpty ? Self.signedOutOwner : newOwner
+        guard resolved != owner || !hasConsideredLegacy else { return }
+        owner = resolved
+        adoptLegacyIfNeeded()
+        loadScope()
+        let snapshot = self.snapshot
+        Task { await DebridCoordinator.shared.reload(keys: snapshot) }
+    }
+
+    /// Move the pre-scoping global entries into the CURRENT owner's scope, once per process, and only where
+    /// that owner has no key of its own so an adoption can never overwrite one the account already had. The
+    /// legacy entry is deleted as it is moved, so a second account cannot inherit the same credential.
+    ///
+    /// Called ONLY from `bind(owner:)`. That is the invariant: adoption requires an explicitly bound owner, so
+    /// a credential can never be filed under a scope that merely happens to be the default at construction.
+    private func adoptLegacyIfNeeded() {
+        guard !hasConsideredLegacy else { return }
+        hasConsideredLegacy = true
         for service in DebridService.allCases {
-            if let k = Keychain.string(service.keychainAccount), !k.isEmpty {
-                keys[service.rawValue] = k
+            let scoped = service.keychainAccount(owner: owner)
+            guard Keychain.string(scoped)?.isEmpty != false,
+                  let legacy = Keychain.string(service.legacyGlobalKeychainAccount), !legacy.isEmpty
+            else { continue }
+            Keychain.set(legacy, for: scoped)
+            Keychain.set(nil, for: service.legacyGlobalKeychainAccount)
+        }
+    }
+
+    /// Read the current owner's keys into memory. Pure load: it adopts nothing and writes nothing, so calling
+    /// it before an owner is bound cannot consume state belonging to an account that has not restored yet.
+    private func loadScope() {
+        var next: [String: String] = [:]
+        for service in DebridService.allCases {
+            if let k = Keychain.string(service.keychainAccount(owner: owner)), !k.isEmpty {
+                next[service.rawValue] = k
             }
         }
+        keys = next
     }
 
     func key(for service: DebridService) -> String { keys[service.rawValue] ?? "" }
@@ -71,10 +150,10 @@ final class DebridKeys: ObservableObject {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             keys.removeValue(forKey: service.rawValue)
-            Keychain.set(nil, for: service.keychainAccount)
+            Keychain.set(nil, for: service.keychainAccount(owner: owner))
         } else {
             keys[service.rawValue] = trimmed
-            Keychain.set(trimmed, for: service.keychainAccount)
+            Keychain.set(trimmed, for: service.keychainAccount(owner: owner))
         }
         // Rebuild the debrid resolvers so a CHANGED key takes effect: the coordinator's lazy warm only
         // builds on first use, so it would otherwise keep using the OLD key (resolvers already non-empty).

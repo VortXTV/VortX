@@ -185,7 +185,7 @@ private struct IPAddress {
         return nil
     }
 
-    /// True when this address is loopback / private / link-local / CGNAT / ULA / unspecified — anything that
+    /// True when this address is loopback / private / link-local / CGNAT / ULA / unspecified, anything that
     /// must NOT be reachable from a pasted add-on URL. IPv4-mapped IPv6 (::ffff:0:0/96) and NAT64
     /// (64:ff9b::/96) both embed a v4 that is unwrapped and tested with the v4 rules.
     var isBlocked: Bool {
@@ -214,9 +214,9 @@ private struct IPAddress {
         case 0:   return true                                   // 0.0.0.0/8 (this-network / unspecified)
         case 10:  return true                                   // 10.0.0.0/8
         case 127: return true                                   // 127.0.0.0/8 (loopback)
-        case 100: return (b[1] & 0xC0) == 0x40                  // 100.64.0.0/10 (CGNAT: 100.64–100.127)
+        case 100: return (b[1] & 0xC0) == 0x40                  // 100.64.0.0/10 (CGNAT: 100.64-100.127)
         case 169: return b[1] == 254                            // 169.254.0.0/16 (link-local)
-        case 172: return (b[1] & 0xF0) == 0x10                  // 172.16.0.0/12 (172.16–172.31)
+        case 172: return (b[1] & 0xF0) == 0x10                  // 172.16.0.0/12 (172.16-172.31)
         case 192: return b[1] == 168                            // 192.168.0.0/16
         default:  return false
         }

@@ -19,6 +19,15 @@ typealias PlatformViewController = UIViewController
 typealias PlatformViewController = NSViewController
 #endif
 
+/// Narrows mpv's floating-point duration to the integer probe format without allowing malformed,
+/// non-finite, or out-of-range media metadata to trap the event queue.
+enum MPVDurationProbePolicy {
+    static func integerSeconds(_ value: Double) -> Int? {
+        guard value.isFinite else { return nil }
+        return Int(exactly: value.rounded(.towardZero))
+    }
+}
+
 // warning: metal API validation has been disabled to ignore crash when playing HDR videos.
 // Edit Scheme -> Run -> Diagnostics -> Metal API Validation -> Turn it off
 // https://github.com/KhronosGroup/MoltenVK/issues/2226
@@ -31,6 +40,55 @@ private final class WakeupRelay {
     weak var controller: MPVMetalViewController?
     init(_ controller: MPVMetalViewController) { self.controller = controller }
 }
+
+/// Mutable Core Image and receipt state confined to one explicit serial capture queue.
+/// The precondition turns an accidental future cross-queue access into a development failure.
+private final class CaptureQueueState: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private var ciContext: CIContext?
+    private var ciContextDevice: ObjectIdentifier?
+    private var receiptKey: String?
+
+    init(queue: DispatchQueue) {
+        self.queue = queue
+    }
+
+    func prepare(for texture: MTLTexture) -> (context: CIContext, shouldEmitReceipt: Bool) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        let deviceID = ObjectIdentifier(texture.device)
+        let context: CIContext
+        if let existing = ciContext, ciContextDevice == deviceID {
+            context = existing
+        } else {
+            let replacement = CIContext(mtlDevice: texture.device)
+            ciContext = replacement
+            ciContextDevice = deviceID
+            receiptKey = nil
+            context = replacement
+        }
+
+        let nextReceiptKey = "\(texture.width)x\(texture.height)-\(texture.pixelFormat.rawValue)"
+        let shouldEmitReceipt = receiptKey != nextReceiptKey
+        receiptKey = nextReceiptKey
+        return (context, shouldEmitReceipt)
+    }
+}
+
+#if os(tvOS)
+/// Thread-safe admission gate between mpv's serial event queue and the main-actor memory policy.
+private final class TVOSMemorySampleThrottle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastSample: TimeInterval = 0
+
+    func shouldSchedule(now: TimeInterval, interval: TimeInterval) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard now - lastSample >= interval else { return false }
+        lastSample = now
+        return true
+    }
+}
+#endif
 
 final class MPVMetalViewController: PlatformViewController {
     var metalLayer = MetalLayer()
@@ -49,13 +107,10 @@ final class MPVMetalViewController: PlatformViewController {
         return loadProvenance.activeToken
     }
     private lazy var captureQueue = DispatchQueue(label: "com.stremiox.trickplay.capture", qos: .utility)
-    // Initialized on first capture using the same MTLDevice mpv renders into. Always accessed from
-    // captureQueue (serial), so no lock is needed.
-    private var ciContext: CIContext?
-    // Tracks the last drawable size and format for which captureTexture was created, so that
-    // updateCapturePipeline() is a no-op when called from captureFrameJPEGData every 10 s.
-    private var capturePipelineSize: CGSize = .zero
-    private var capturePipelineFormat: MTLPixelFormat = .invalid
+    private lazy var captureQueueState = CaptureQueueState(queue: captureQueue)
+    // Tracks the Metal device for which the capture queue/scaler were built. Drawable size and format
+    // are handled lazily inside MetalLayer because the bounded target follows each capture request.
+    private var capturePipelineDevice: ObjectIdentifier?
     var playUrl: URL?
     var playHeaders: [String: String]?
     var playUrlLive = false
@@ -75,6 +130,11 @@ final class MPVMetalViewController: PlatformViewController {
     var loopPlayback = false
     private let mpvLog = Logger(subsystem: "com.stremiox.app", category: "mpv")
     private var configuredLiveMode = false
+    /// Restrict Lavf to media formats whose nested-resource behavior is covered by VortX's TLS
+    /// policy. In particular, MLV opens numbered sidecar files without an option dictionary, so
+    /// allowing it would bypass the mandatory `tls_verify=1` inherited by normal child opens.
+    private static let secureLavfOptions =
+        "tls_verify=1,format_whitelist=\"matroska,mov,hls,dash,mpegts,mpegtsraw,mpeg,mpegvideo,avi,flv,asf,ogg,rm,mxf,h264,hevc,vvc,aac,ac3,eac3,truehd,dts,mp3,wav,flac,ape,ass,srt,webvtt,subviewer,subviewer1,microdvd,sami\""
     /// The forward-cache cap (`demuxer-max-bytes`, option-string form) loadFile applied for the CURRENT
     /// file, so the paused-cache clamp can restore it on resume. nil until the first load.
     private var activeReadAheadCap: String?
@@ -94,10 +154,17 @@ final class MPVMetalViewController: PlatformViewController {
     private var pausedCacheClampWork: DispatchWorkItem?
     /// True while the paused clamp holds `demuxer-max-bytes` at the small floor (restored on resume).
     private var pausedCacheClamped = false
-    /// True once a system memory warning forced the cache floor for the REST of this file — a resume must
+    /// True once a system memory warning forced the cache floor for the REST of this file; a resume must
     /// not re-raise the cap, because the pressure that fired the warning is usually still there. Reset on
     /// the next loadFile (a new file starts with its buffers freed and gets its normal budget back).
     private var memoryCacheClamped = false
+    #if os(tvOS)
+    /// Nonisolated because the locked helper is the boundary between mpv's event queue and main actor.
+    private nonisolated let proactiveMemorySampleThrottle = TVOSMemorySampleThrottle()
+    /// Main-thread transition state. A pressure clamp is one-way for this file, so cache size never flaps.
+    private var proactiveMemoryCacheClamped = false
+    private var lastProactiveMemoryReceipt: TimeInterval = 0
+    #endif
     /// The dynamic range currently applied to the output chain (mpv transfer curve, Metal layer
     /// colorspace, and on tvOS the display mode), or nil = "unknown, force a fresh apply". Reset to nil on
     /// every file load and teardown so the FIRST re-evaluation of a new file always applies (the guard
@@ -114,17 +181,48 @@ final class MPVMetalViewController: PlatformViewController {
     /// does on a decoded MKV. tvOS-only effect (the display-mode request is tvOS); harmless elsewhere.
     var contentIsDolbyVision = false
 
+    /// Set only by the full playback chrome. Embedded hero/trailer controllers keep the
+    /// default false and therefore cannot arm the tvOS chroma mitigation or diagnostics.
+    var isFullPlayerPresentation = false {
+        didSet {
+            #if os(tvOS)
+            if isFullPlayerPresentation {
+                startFramePresentationDiagnosticsIfReady()
+                updateFramePresentationPolicy()
+            } else {
+                stopFramePresentationDiagnostics()
+                restoreFramePresentationCscale()
+            }
+            #endif
+        }
+    }
+
+    #if os(tvOS)
+    private let framePresentationDiagnostics = FramePresentationDiagnosticsAccumulator()
+    private var framePresentationGeneration: UInt64 = 0
+    private var framePresentationLoadedGeneration: UInt64?
+    private var framePresentationStartedGeneration: UInt64?
+    private var framePresentationPriorCscale: String?
+    private var framePresentationMitigationApplied = false
+    private var framePresentationRestorePending = false
+    private var framePresentationVOPassesWork: DispatchWorkItem?
+    private static let framePresentationVOPassesCooldown: TimeInterval = 2
+    #endif
+
     override func viewDidLoad() {
         super.viewDidLoad()
         
         metalLayer.frame = view.bounds
         metalLayer.framebufferOnly = false  // must be false for MoltenVK internal blits (e.g. format resolve)
         // Insurance against render-thread/main-thread deadlocks: the drawable present must never wait
-        // on the main run loop's CATransaction commit (presentsWithTransaction = false, the default —
+        // on the main run loop's CATransaction commit (presentsWithTransaction = false, the default,
         // made explicit), and nextDrawable() must be able to time out instead of blocking the vo thread
         // forever if drawables can't be recycled while the main thread is busy.
         metalLayer.presentsWithTransaction = false
         metalLayer.allowsNextDrawableTimeout = true
+        #if os(tvOS)
+        metalLayer.presentationDiagnostics = framePresentationDiagnostics
+        #endif
         #if canImport(UIKit)
         metalLayer.contentsScale = UIScreen.main.nativeScale
         metalLayer.backgroundColor = UIColor.black.cgColor
@@ -247,17 +345,48 @@ final class MPVMetalViewController: PlatformViewController {
             didBuildInitialVideoOutput = true
             reconfigureVideoOutput()
         } else if didResize {
-            // libmpv sets the video output up for whatever size it STARTS at but doesn't refill the
-            // surface after a live resize (the video ends up tiny in a corner after rotating). Rebuild
-            // the video output (vid no -> auto) at the new size.
-            reconfigureVideoOutput()
+            // A live resize (rotation, macOS window drag) no longer needs the VO rebuilt. Our mpv
+            // build carries scripts/mpv-moltenvk-resize.patch, which makes the moltenvk render
+            // context answer VOCTRL_CHECK_EVENTS by re-reading the layer's drawableSize, resizing
+            // its own swapchain and raising VO_EVENT_RESIZE. mpv therefore refills the surface by
+            // itself, and the old `vid=no` then `vid=auto` teardown (which threw away the decoder
+            // and the whole video chain on every single rotation) is gone.
+            applyVideoSize { self.setString($0, $1) }
+            wakeVideoOutputThread()
         }
     }
 
+    /// Kick mpv's video-output thread so it polls the layer size NOW rather than whenever it next
+    /// happens to run. That thread's loop checks events once per iteration and then parks for a very
+    /// long time whenever it has nothing to render (video/out/vo.c), so a rotation performed while
+    /// PAUSED would otherwise not be picked up until playback resumed, leaving the last frame
+    /// stretched to the new bounds. Measured, not assumed: test/moltenvk-resize probes a paused
+    /// rotation with no follow-up, with the size properties re-applied, and with this call.
+    ///
+    /// Re-applying the size properties is NOT sufficient on its own. mpv only notifies option
+    /// listeners when a value actually changes (options/m_config_core.c), and `keepaspect` and
+    /// `panscan` do not change across a rotation, so those writes are inert.
+    ///
+    /// `display-names` is read purely for the dispatch: its getter is one of the few property reads
+    /// that goes through vo_control(), which hands work to the video-output thread and therefore
+    /// wakes it. The value is discarded, and this lane answers VO_NOTIMPL anyway. Async so nothing
+    /// on the calling thread can ever block on the video-output thread finishing a frame; this runs
+    /// from a layout callback on the main thread, and that thread must never wait on the renderer
+    /// (see the MetalLayer EDR note for what that costs when it goes wrong).
+    private func wakeVideoOutputThread() {
+        guard mpv != nil else { return }
+        mpv_get_property_async(mpv, 0, "display-names", MPV_FORMAT_STRING)
+    }
+
+    /// One-shot VO rebuild for the zero-size-at-init case only (see didBuildInitialVideoOutput). Live
+    /// resizes no longer come through here: mpv's own render context now notices a layer resize, so
+    /// layoutDrawable just re-applies the size mode. This remains because a VO that was configured
+    /// against a surface with NO size never built a presentable context at all, which no amount of
+    /// resizing after the fact can repair.
     private func reconfigureVideoOutput() {
         guard mpv != nil else { return }
-        // Runtime rebuild after a live resize/rotation: `vid` must be set as a PROPERTY. mpv_set_option_string
-        // is a silent no-op after mpv_initialize, so the option-string form never actually rebuilt the VO.
+        // `vid` must be set as a PROPERTY. mpv_set_option_string is a silent no-op after
+        // mpv_initialize, so the option-string form never actually rebuilt the VO.
         checkError(mpv_set_property_string(mpv, "vid", "no"))
         DispatchQueue.main.async { [weak self] in
             guard let self, self.mpv != nil else { return }
@@ -462,7 +591,7 @@ final class MPVMetalViewController: PlatformViewController {
 
         // Do NOT apply mpv's "fast" profile by default. It overrides gpu-next/libplacebo's sharp default
         // upscaler (lanczos) with bilinear and disables debanding/dither, which made upscaled video look
-        // soft/blurry — the "player size/quality is pathetic vs the 0.1.6 IPA" report. v0.1.6 left this
+        // soft/blurry, the "player size/quality is pathetic vs the 0.1.6 IPA" report. v0.1.6 left this
         // OFF and looked sharp. Apple-Silicon's gpu-next + VideoToolbox defaults are already performant;
         // re-enable per-device ONLY if a constrained GPU stutters on 4K (the original reason it was added).
         // checkError(mpv_set_option_string(mpv, "profile", "fast"))
@@ -514,6 +643,26 @@ final class MPVMetalViewController: PlatformViewController {
         // HDR compatibility toggle forces SDR output for displays that show DV P7
         // remuxes as green/purple garbage). Harmless for native SDR content.
         checkError(mpv_set_option_string(mpv, "tone-mapping", "bt.2446a"))
+        // Dolby Vision Profile 7 enhancement layer (FEL). For a dual-track P7 MKV (a separate base and
+        // enhancement video track, i.e. ~every UHD-BluRay DV rip), libmpv now pairs the two tracks and
+        // libplacebo composites the EL's residual detail onto the base layer, instead of us decoding the
+        // base alone and throwing the enhancement layer away. It also means such a title finally carries
+        // real DV metadata rather than none. This engages AUTOMATICALLY once the pairing succeeds, so the
+        // only control we need is the OFF switch: `enhancement-layer=no` makes the format filter discard
+        // the paired EL frame, which is exactly the pre-FEL behaviour. Baked ON, fleet-flippable, so a
+        // field problem is a same-day remote revert instead of an emergency build. `vf` is set nowhere
+        // else in the app, so owning the whole chain here is safe.
+        if !RemoteConfig.snapshot.isFeatureOn("dvEnhancementLayer", default: true) {
+            checkError(mpv_set_option_string(mpv, "vf", "format=enhancement-layer=no"))
+            mpvLog.log("dv enhancement layer DISABLED by remote config")
+        }
+        // Keep the enhancement-layer track VISIBLE in `track-list`. Upstream hides dependent tracks by
+        // default, which would make the FEL diagnostic below a permanent false negative: it could never
+        // tell "paired and compositing" from "never found, base layer only", and that silent no-op is
+        // the exact failure this feature is prone to. `tracks(ofType:)` re-hides them, so the user-facing
+        // audio/subtitle pickers are byte-for-byte unchanged, and mpv's own track-preference comparator
+        // ranks non-dependent tracks first, so the base layer still wins auto-selection.
+        checkError(mpv_set_option_string(mpv, "show-dependent-tracks", "yes"))
         // Apply the saved video-size mode up front so the first frame is sized correctly + uniformly.
         applyVideoSize { self.checkError(mpv_set_option_string(self.mpv, $0, $1)) }
 
@@ -524,10 +673,6 @@ final class MPVMetalViewController: PlatformViewController {
         checkError(mpv_set_option_string(mpv, "user-agent",
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"))
         checkError(mpv_set_option_string(mpv, "network-timeout", "30"))
-        // Reconnect on dropped/stalled HTTP (debrid CDNs sometimes reset mid-stream); without this
-        // a hiccup looks like an infinite buffer. Followed by hard failure → MPV_EVENT_END_FILE.
-        checkError(mpv_set_option_string(mpv, "stream-lavf-o",
-            "reconnect=1,reconnect_streamed=1,reconnect_delay_max=7"))
 
         // Read-ahead cache: buffer past the play head so transient network dips on big 4K streams
         // don't stall playback. These are the exact values proven on-device for weeks (0.2.5 to
@@ -553,12 +698,12 @@ final class MPVMetalViewController: PlatformViewController {
         // big forward buffer is backed by a Caches subdirectory instead of RAM, so a viewer can pick a
         // large cache (seek minutes ahead with no re-buffer, pre-cache) WITHOUT spending the jetsam-bound
         // in-process RAM budget. The actual byte budget is the clamped `demuxer-max-bytes` applied per
-        // file in loadFile (DiskCacheSetting.resolvedMaxBytes — always bounded by free disk, never
+        // file in loadFile (DiskCacheSetting.resolvedMaxBytes, always bounded by free disk, never
         // unlimited). The hero-preview (#44) is a tiny silent loop, so it stays on the in-memory cache.
         //
         // `cache-on-disk` is a stable libmpv option (mpv 0.30+, present in MPVKit 0.41); if a future
         // build ever drops it, these lines no-op and mpv falls back to the in-memory cache that the same
-        // clamped `demuxer-max-bytes` already bounds — so the safety guarantee holds either way.
+        // clamped `demuxer-max-bytes` already bounds, so the safety guarantee holds either way.
         if !startMuted, DiskCacheSetting.diskCacheEnabled, let cacheDir = DiskCacheSetting.ensureCacheDirectory() {
             checkError(mpv_set_option_string(mpv, "cache-on-disk", "yes"))
             checkError(mpv_set_option_string(mpv, "cache-dir", cacheDir))
@@ -569,7 +714,7 @@ final class MPVMetalViewController: PlatformViewController {
         // Post-seek/track-change smoothing for the tvOS avfoundation AO. Every scrub commit empties the
         // forward cache and every audio/subtitle track change triggers a demuxer refresh-seek that
         // discards + re-reads it; playback then resumed instantly on a near-empty cache while the refill
-        // burst saturated the network + demuxer + decoder — so the audio output underran repeatedly,
+        // burst saturated the network + demuxer + decoder, so the audio output underran repeatedly,
         // heard as several seconds of crackly/distorted audio with video lagging until the cache caught
         // up. The avfoundation AO is also known upstream to drop 30+ frames each time it resumes from an
         // underrun (mpv-player/mpv#16346), which compounds the visible lag. Only the deeper `audio-buffer`
@@ -589,7 +734,7 @@ final class MPVMetalViewController: PlatformViewController {
 
         // HLS: pick the HIGHEST-bandwidth variant of an adaptive master playlist. mpv's documented
         // default is already `max`, but add-ons that serve a single adaptive master (e.g. KhmerHub's
-        // OK.ru streams) were starting at the lowest rendition — the "144p instead of 720p" report —
+        // OK.ru streams) were starting at the lowest rendition (the "144p instead of 720p" report),
         // so set it explicitly and unambiguously before init. (If a stream is proxied through the
         // embedded server, the playlist rewrite must preserve all variants for this to take effect.)
         checkError(mpv_set_option_string(mpv, "hls-bitrate", "max"))
@@ -700,13 +845,21 @@ final class MPVMetalViewController: PlatformViewController {
         }
         mpvLog.log("video upscaling preset = \(upscaling.rawValue, privacy: .public)")
 
-        // Power-user custom mpv options. Applied LAST, after every VortX baseline option above, so an
-        // advanced viewer can override the defaults (the "mpv conf" setting). Each option is set with
-        // its own fail-safe: a bad key/value logs and is skipped, it must never abort the baseline
-        // config or crash playback. Set here (before mpv_initialize) so options that are pre-init-only
-        // also take effect; properties that only apply at runtime would need the property API instead,
-        // a known limitation documented in the setting hint.
+        // Power-user custom mpv options. Applied after ordinary VortX baseline options so an advanced
+        // viewer can override playback tuning, but never the app-owned TLS trust policy. In particular,
+        // stream-lavf-o is protected as a whole: libmpv applies that dictionary after tls-verify while
+        // constructing FFmpeg's network options, so a nested tls_verify=0 would otherwise win even when
+        // the top-level option below is reasserted. Each ordinary custom option keeps its own fail-safe:
+        // a bad key/value logs and is skipped, it must never abort the baseline config or crash playback.
         for (key, value) in PlaybackSettings.parsedCustomMpvOptions {
+            if key.utf8.contains(0) || value.utf8.contains(0) {
+                mpvLog.error("custom mpv option blocked because it contains a NUL byte")
+                continue
+            }
+            if isProtectedTLSOption(key) {
+                mpvLog.error("custom mpv option blocked by TLS trust policy: \(key, privacy: .public)")
+                continue
+            }
             let err = mpv_set_option_string(mpv, key, value)
             if err < 0 {
                 mpvLog.error("custom mpv option rejected: \(key, privacy: .public)=\(value, privacy: .public) (\(String(cString: mpv_error_string(err)), privacy: .public))")
@@ -715,6 +868,29 @@ final class MPVMetalViewController: PlatformViewController {
             }
         }
 
+        // Security invariants are applied after every user-controlled option. Failure is fatal to this
+        // context: continuing would silently start a player whose HTTPS trust behavior is unknown.
+        // libmpv otherwise lets a custom `config=yes` defer-load a file during mpv_initialize, after
+        // these assignments, and that file could replace the app-owned trust options.
+        requireMpvOption("config", "no")
+        // Auto-loaded Lua/JavaScript scripts can mutate options after initialization. VortX does not
+        // ship an mpv script bundle, so disabling that late code-loading channel has no playback cost.
+        requireMpvOption("load-scripts", "no")
+        // VortX owns resume. libmpv watch-later files are general option files and load per title after
+        // initialization, so allowing them would create another late trust-policy override channel.
+        requireMpvOption("resume-playback", "no")
+        requireMpvOption("tls-verify", "yes")
+        // Reconnect on dropped/stalled HTTP while keeping the entire FFmpeg protocol dictionary under
+        // app control. A custom stream-lavf-o is blocked above because it can override tls_verify.
+        requireMpvOption(
+            "stream-lavf-o",
+            "reconnect=1,reconnect_streamed=1,reconnect_delay_max=7"
+        )
+        // demuxer-lavf-o is the dictionary inherited by HLS/DASH child opens. Keep verification
+        // explicit there as well as at the top-level stream, and require libmpv to propagate it.
+        requireMpvOption("demuxer-lavf-o", Self.secureLavfOptions)
+        requireMpvOption("demuxer-lavf-propagate-opts", "yes")
+
         checkError(mpv_initialize(mpv))
 
         mpv_observe_property(mpv, 0, MPVProperty.videoParamsSigPeak, MPV_FORMAT_DOUBLE)
@@ -722,6 +898,13 @@ final class MPVMetalViewController: PlatformViewController {
         // sig-peak observer alone never flips it to HDR. A late gamma settle (pq/hlg arriving after the
         // first sig-peak event on an in-place switch) re-drives the dynamic-range apply.
         mpv_observe_property(mpv, 0, MPVProperty.videoParamsGamma, MPV_FORMAT_STRING)
+        #if os(tvOS)
+        // Sparse counter/cue events feed one lock-backed aggregate. `sub-start` is numeric,
+        // so repeated property notifications can be deduplicated without reading subtitle text.
+        mpv_observe_property(mpv, 0, MPVProperty.frameDropCount, MPV_FORMAT_INT64)
+        mpv_observe_property(mpv, 0, MPVProperty.decoderFrameDropCount, MPV_FORMAT_INT64)
+        mpv_observe_property(mpv, 0, MPVProperty.subtitleStart, MPV_FORMAT_DOUBLE)
+        #endif
         mpv_observe_property(mpv, 0, MPVProperty.pausedForCache, MPV_FORMAT_FLAG)
         mpv_observe_property(mpv, 0, MPVProperty.timePos, MPV_FORMAT_DOUBLE)
         mpv_observe_property(mpv, 0, MPVProperty.duration, MPV_FORMAT_DOUBLE)
@@ -902,13 +1085,23 @@ final class MPVMetalViewController: PlatformViewController {
     /// prevents it from firing into a deallocated controller (the crash on close), and
     /// destruction is serialized onto the event queue so it can't race `readEvents`.
     func stop() {
+        #if os(tvOS)
+        stopFramePresentationDiagnostics()
+        restoreFramePresentationCscale()
+        #endif
         invalidateLoadToken()
         NotificationCenter.default.removeObserver(self)
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
 #if os(tvOS)
         // Hand the TV back its default display mode; the view can already be
         // detached here, so HDRDisplayMode falls back to the app's window.
-        HDRDisplayMode.reset(in: viewIfLoaded?.window)
+        // Ambient hero previews (#44, startMuted) never requested a mode, and their teardown runs on
+        // every hero change while scrolling (and right as full-screen playback starts), so a preview
+        // reset here cleared the MAIN player's criteria and wiped the request ledger: one more HDMI
+        // renegotiation per scroll step. Only non-preview instances reset the panel.
+        if !startMuted {
+            HDRDisplayMode.reset(in: viewIfLoaded?.window)
+        }
 #endif
         appliedDynamicRange = nil
         guard let handle = mpv else { return }
@@ -973,9 +1166,17 @@ final class MPVMetalViewController: PlatformViewController {
         // Teardown nils the handle; a loadFile racing close must not hand a NULL mpv to the raw
         // mpv_set_property_string calls below (the setString/command helpers self-guard, these do not).
         guard mpv != nil else { return issuedToken }
+        // Every app-owned stream enters as direct HTTP(S) or a local file. Reject libmpv wrapper
+        // protocols here because concat/lavf/subfile/archive/edl can open child URLs through a
+        // separate FFmpeg option path that does not inherit the app's required TLS policy.
+        guard Self.isAllowedMediaURL(url),
+              audioSidecar.map(Self.isAllowedMediaURL) ?? true else {
+            mpvLog.error("loadFile rejected a non-direct media URL")
+            return issuedToken
+        }
         // Re-arm HDR detection for THIS file. appliedDynamicRange otherwise persists from the previous
         // file, so an in-place episode / source switch left it stale and the guard SKIPPED re-applying the
-        // colorspace — the new (HDR) episode then kept rendering in the previous SDR output (dull) until a
+        // colorspace; the new (HDR) episode then kept rendering in the previous SDR output (dull) until a
         // full replay rebuilt the player. Resetting to the nil SENTINEL (not .sdr) means the next
         // re-evaluation ALWAYS applies the new file's true range (nil != any real range), so an HDR->HDR,
         // HDR->SDR, or SDR->HDR switch all re-tag correctly. The re-evaluation no longer depends on the
@@ -1110,13 +1311,20 @@ final class MPVMetalViewController: PlatformViewController {
             #if os(macOS)
             readAhead = isLocalStream ? "128MiB" : "512MiB"
             #else
-            // iOS/tvOS run the streaming server IN-PROCESS and are jetsam-bound. Crucially, on iOS the node
-            // server's reported RSS INCLUDES this mpv demuxer cache (same process), so a big read-ahead is
-            // counted twice toward the jetsam ceiling AND grows even on DEBRID (direct CDN) playback — which
-            // is why the server "dies" on debrid, not just torrents. A 128 MiB read-ahead (down from 256)
-            // is still ample for a fast debrid link and shaves ~128 MiB off the peak; the Mac (out-of-process
-            // server + swap) keeps the larger buffer for slow-CDN resilience.
-            readAhead = isLocalStream ? "96MiB" : "256MiB"   // owner-raised remote base 128 -> 256 (ATV 4K has headroom); Streaming-cache lifts it further
+            // iOS/tvOS run the streaming server IN-PROCESS and are jetsam-bound. Crucially, the node
+            // server's reported RSS INCLUDES this mpv demuxer cache (same process), so a big read-ahead
+            // contributes directly to the process ceiling even on DEBRID playback. tvOS uses 128 MiB
+            // below; iOS keeps its existing 256 MiB baseline. The Mac keeps a larger buffer because its
+            // server and swap model are different.
+            #if os(tvOS)
+            // Build 199/200 field logs reached about 1.0-1.2 GiB RSS with a 256 MiB remote cache while
+            // libmpv was also decoding and capturing 4K frames. Keep useful read-ahead, but return tvOS
+            // to the 128 MiB baseline. The applied-cap policy below keeps this ceiling even when the
+            // disk-cache setting is enabled.
+            readAhead = isLocalStream ? "96MiB" : "128MiB"
+            #else
+            readAhead = isLocalStream ? "96MiB" : "256MiB"
+            #endif
             #endif
         }
         // With the on-disk cache armed (Settings → Streaming cache) we lift `demuxer-max-bytes` for a
@@ -1125,23 +1333,22 @@ final class MPVMetalViewController: PlatformViewController {
         // reliably move it to the Caches dir on this MPVKit build, so the budget is held in RAM. Setting
         // it to the full disk budget (hundreds of MB to GBs) jetsam-killed the Apple TV ~47s in, with the
         // buffer ~800s / ~700MB ahead, even on the 3 GB ATV 4K. So clamp the APPLIED value to a device-safe
-        // RAM ceiling: the chosen cache size can lift the buffer above the proven default, but never past
-        // what the device survives. demuxer-max-bytes is a hard byte cap, so it bounds RAM regardless of
-        // bitrate or whether cache-on-disk offloads. (A LOCAL torrent buffers into the embedded server's
-        // own disk cache, and live owns its tight buffers, so those keep the RAM-safe read-ahead above.)
+        // RAM ceiling: iOS and macOS may lift above their baseline within their platform ceiling. tvOS
+        // remains bounded to its 128 MiB normal or 96 MiB reduced baseline because its server and mpv
+        // share one jetsam-limited process. demuxer-max-bytes is a hard byte cap, so it bounds RAM
+        // regardless of bitrate or whether cache-on-disk offloads. A LOCAL torrent buffers into the
+        // embedded server's own disk cache, and live owns its tight buffers, so those retain readAhead.
         let appliedCap: String
         if DiskCacheSetting.diskCacheEnabled, !live, !isLocalStream {
-            // DEVICE-SOAK ITEM: the prior flat 256 MiB ceiling masked the Settings slider and starved the
-            // read-ahead to ~25-30s on debrid (the owner had 120-200s before). The ATV 4K (4 GB + memory
-            // entitlement) holds ~75-90s at 4K within 768 MiB, ~3x runway, which also resolves the lag and
-            // ~7 dropped frames (the buffer was draining on CDN dips). 768 MiB is deliberately BELOW the
-            // ~700 MB+ unclamped level that jetsam-killed the device; keep ATV HD (reduced) tight at 128 MiB;
-            // the Mac (out-of-process server + swap) gets the generous 1 GiB ceiling.
-            // The player-teardown straddle that caused the earlier whole-device hang is fixed separately, so
-            // this is the buffer's first real restore. If it jetsams on soak, step 768 -> 512 MiB.
+            // DIAG-12 RECEIPT: restoring the tvOS ceiling to 768 MiB was not device-safe. The embedded
+            // Node heartbeat rose from about 422 MiB to 1.2 GiB immediately after libmpv opened a debrid
+            // stream while the JS heap stayed at 26 MiB. That native RSS delta matches the 768 MiB cap.
+            // tvOS is further bounded below to 128 MiB normal or 96 MiB reduced. iOS retains its
+            // 256 MiB normal and 128 MiB reduced ceilings, and macOS retains 1 GiB because its server
+            // and swap model are different.
             //
             // THE RECURRING JETSAM KNOB: these ceilings are now the RemoteConfig `player.readAhead.*` dials
-            // (debrid 64..900, reduced 64..192, mac 128..1536, floor fixed 64). Baked fallbacks (768/128/1024)
+            // (debrid 64..256, reduced 64..192, mac 128..1536, floor fixed 64). Baked fallbacks (256/128/1024)
             // equal the shipping literals, so a null / absent remote config is behaviorally identical to today;
             // a bad value clamps to the baked default and can never breach the jetsam-safe range.
             #if os(macOS)
@@ -1151,9 +1358,43 @@ final class MPVMetalViewController: PlatformViewController {
             #endif
             let ramCeiling = Int64(RemoteConfig.snapshot.readAheadDebridCeilingBytes(reduced: PerformanceMode.reduced, isMac: isMac))
             let applied = min(DiskCacheSetting.resolvedMaxBytes(), ramCeiling)
+            #if os(tvOS)
+            let baselineBytes = Int64(
+                VortXCacheShedPolicy.capBytes(readAhead)
+                    ?? (PerformanceMode.reduced ? 96 << 20 : 128 << 20)
+            )
+            let tvOSApplied = TVOSProactiveMemoryPressurePolicy.remoteVODCapBytes(
+                diskCacheEnabled: true,
+                baselineBytes: baselineBytes,
+                configuredDiskCacheBytes: applied,
+                performanceReduced: PerformanceMode.reduced,
+                enforceTVOSLimit: true
+            )
+            appliedCap = String(tvOSApplied)
+            #else
             appliedCap = String(applied)
+            #endif
         } else {
+            #if os(tvOS)
+            if !live, !isLocalStream {
+                let baselineBytes = Int64(
+                    VortXCacheShedPolicy.capBytes(readAhead)
+                        ?? (PerformanceMode.reduced ? 96 << 20 : 128 << 20)
+                )
+                let tvOSApplied = TVOSProactiveMemoryPressurePolicy.remoteVODCapBytes(
+                    diskCacheEnabled: false,
+                    baselineBytes: baselineBytes,
+                    configuredDiskCacheBytes: baselineBytes,
+                    performanceReduced: PerformanceMode.reduced,
+                    enforceTVOSLimit: true
+                )
+                appliedCap = String(tvOSApplied)
+            } else {
+                appliedCap = readAhead
+            }
+            #else
             appliedCap = readAhead
+            #endif
         }
         mpv_set_property_string(mpv, "demuxer-max-bytes", appliedCap)
         activeReadAheadCap = appliedCap
@@ -1163,6 +1404,9 @@ final class MPVMetalViewController: PlatformViewController {
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
         pausedCacheClamped = false
         memoryCacheClamped = false
+        #if os(tvOS)
+        proactiveMemoryCacheClamped = false
+        #endif
         // Restore the back-buffer for the new file too. shedForMemoryPressure dropped
         // `demuxer-max-back-bytes` to 8MiB and, unlike the forward cap re-applied above, nothing put it
         // back for later files on this instance (configureLiveMode(false) skips its write when
@@ -1201,6 +1445,11 @@ final class MPVMetalViewController: PlatformViewController {
             entryID: entryID,
             token: issuedToken
         )
+        #if os(tvOS)
+        if commandResult >= 0 {
+            beginFramePresentationLoad()
+        }
+        #endif
         loadTokenLock.unlock()
         return issuedToken
     }
@@ -1234,7 +1483,9 @@ final class MPVMetalViewController: PlatformViewController {
         if live {
             mpv_set_property_string(mpv, "demuxer-readahead-secs", "18")
             mpv_set_property_string(mpv, "demuxer-max-back-bytes", "8MiB")
-            mpv_set_property_string(mpv, "demuxer-lavf-o", "live_start_index=-3")
+            mpv_set_property_string(
+                mpv, "demuxer-lavf-o", Self.secureLavfOptions + ",live_start_index=-3"
+            )
             // The VOD/debrid reconnect settings are hostile to HLS live: normal
             // playlist/segment EOFs trigger ffmpeg's exponential "reconnect at 0"
             // delay (1s, 3s, 7s), which is exactly the recurring live stall.
@@ -1243,7 +1494,7 @@ final class MPVMetalViewController: PlatformViewController {
         } else {
             mpv_set_property_string(mpv, "demuxer-readahead-secs", "300")
             mpv_set_property_string(mpv, "demuxer-max-back-bytes", "64MiB")
-            mpv_set_property_string(mpv, "demuxer-lavf-o", "")
+            mpv_set_property_string(mpv, "demuxer-lavf-o", Self.secureLavfOptions)
             mpv_set_property_string(mpv, "stream-lavf-o",
                                     "reconnect=1,reconnect_streamed=1,reconnect_delay_max=7")
         }
@@ -1258,12 +1509,12 @@ final class MPVMetalViewController: PlatformViewController {
     //
     // mpv keeps FILLING the forward demuxer cache to `demuxer-max-bytes` while PAUSED, so a viewer who
     // starts a stream and immediately pauses parks the app at its peak cache footprint (256 MiB default
-    // remote; up to 768 MiB with the Streaming-cache setting) for the whole pause. On tvOS the pause also
+    // remote; up to 256 MiB with the Streaming-cache setting) for the whole pause. On tvOS the pause also
     // re-enables the idle timer, so a few minutes in the SCREENSAVER (its own 4K video pipeline) starts on
-    // top — exactly when this app is at its fattest — and jetsam reaps the app: the "start a video, pause
+    // top, exactly when this app is at its fattest, and jetsam reaps the app: the "start a video, pause
     // for some minutes, app is suddenly gone" crash. Two defenses, both engine-local and reset per load:
     //  1. Paused clamp: after `pausedClampGraceSeconds` of continuous pause, drop the forward cap to a
-    //     small floor and FREE the already-buffered read-ahead (`drop-buffers` — shrinking the cap alone
+    //     small floor and FREE the already-buffered read-ahead (`drop-buffers`, shrinking the cap alone
     //     stops growth but releases nothing). Restored on resume; a healthy link refills in seconds.
     //  2. Memory warning: the system's last call before jetsam. Clamp to the floor immediately and keep
     //     it there for the rest of this file; playback survives fine on the small rolling buffer.
@@ -1271,27 +1522,39 @@ final class MPVMetalViewController: PlatformViewController {
     private static let pausedClampGraceSeconds: TimeInterval = 60
     private static let clampedCacheCap = "48MiB"
 
+    /// This file's CURRENT forward-cache budget in bytes: `activeReadAheadCap` as applied by loadFile,
+    /// permanently reduced by each memory-warning shed. Falls back to the floor when the stored spelling
+    /// is unparseable (never happens with the two spellings loadFile writes; defensive only).
+    private var currentReadAheadBudgetBytes: Int {
+        activeReadAheadCap.flatMap(VortXCacheShedPolicy.capBytes) ?? VortXCacheShedPolicy.floorBytes
+    }
+
     /// Main-thread mirror of mpv's pause property (posted from the event drain). Arms the paused clamp
     /// after the grace period, and restores the per-file cache cap on resume.
     private func pausedStateChanged(_ paused: Bool) {
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
         if paused {
-            // Live keeps its own tight buffers, and once a memory warning clamped this file the floor is
-            // already in force; nothing to arm in either case.
-            guard mpv != nil, !configuredLiveMode, !memoryCacheClamped, !pausedCacheClamped else { return }
+            // Live keeps its own tight buffers, and a budget already at the shed floor has nothing left to
+            // clamp. #148: a memory-warning shed no longer disarms this - after a first-warning step-down the
+            // file keeps a real (halved) budget, and a parked viewer must still drop to the paused floor.
+            guard mpv != nil, !configuredLiveMode, !pausedCacheClamped,
+                  currentReadAheadBudgetBytes > VortXCacheShedPolicy.floorBytes else { return }
             let work = DispatchWorkItem { [weak self] in self?.applyPausedCacheClamp() }
             pausedCacheClampWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.pausedClampGraceSeconds, execute: work)
         } else if pausedCacheClamped {
             pausedCacheClamped = false
-            guard mpv != nil, !memoryCacheClamped, let cap = activeReadAheadCap else { return }
+            // Restore the file's CURRENT budget: the loadFile cap, or the memory-warning-reduced budget
+            // (activeReadAheadCap tracks the shed, so a resume can never re-raise past what pressure allowed).
+            guard mpv != nil, let cap = activeReadAheadCap else { return }
             setString("demuxer-max-bytes", cap)
             mpvLog.log("resumed: paused cache clamp released, demuxer-max-bytes back to \(cap, privacy: .public)")
         }
     }
 
     private func applyPausedCacheClamp() {
-        guard mpv != nil, !pausedCacheClamped, !memoryCacheClamped else { return }
+        guard mpv != nil, !pausedCacheClamped,
+              currentReadAheadBudgetBytes > VortXCacheShedPolicy.floorBytes else { return }
         guard getFlag(MPVProperty.pause) else { return }   // belt-and-suspenders; resume cancels the work item
         pausedCacheClamped = true
         setString("demuxer-max-bytes", Self.clampedCacheCap)
@@ -1303,11 +1566,11 @@ final class MPVMetalViewController: PlatformViewController {
     /// Free the demuxer cache WITHOUT moving the play head. `drop-buffers` alone is the wrong tool on a
     /// seekable stream: it discards the cached packets but leaves the demuxer's READ position at the
     /// buffered edge (it exists for live streams, where skipping to the edge is the point), so playback
-    /// silently continued from minutes ahead of where the viewer paused — the "jumps forward after a
+    /// silently continued from minutes ahead of where the viewer paused, the "jumps forward after a
     /// minute of pause" regression reported on the first cut of this clamp. Drop, then EXACT-seek back
     /// to the recorded play head: the RAM is freed and demuxing re-anchors at the right byte offset,
     /// with the refill bounded by the (already lowered) cap. The exact flag re-decodes to the same
-    /// frame, so the paused picture does not visibly move. Seekable streams only — a non-seekable
+    /// frame, so the paused picture does not visibly move. Seekable streams only, a non-seekable
     /// stream cannot re-read, so it keeps its buffers rather than corrupting playback; and a not-yet
     /// known position (time-pos <= 0) skips too rather than risk re-anchoring at 0.
     private func flushDemuxerCachePreservingPosition() {
@@ -1325,36 +1588,393 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     private func shedForMemoryPressure() {
-        guard mpv != nil, !memoryCacheClamped else { return }
+        guard mpv != nil else { return }
+        // #148 ("caches then stops caching ~40s in"): the old handler answered the FIRST warning by
+        // slamming the forward cap to the 48 MiB floor for the rest of the file. On the Apple TV the big
+        // read-ahead fills at link speed, so a warning arrived ~40s into every mpv mount (six in one field
+        // log) and caching visibly died for the whole film. The real relief is the buffer DROP below,
+        // which frees the resident bytes immediately either way; the refill budget only sets the next
+        // peak. So step DOWN instead of slamming: first warning halves the budget (256 -> 128 MiB;
+        // caching stays alive), any later warning floors it (the old terminal state).
+        // The reduced budget is written back to activeReadAheadCap so pause/resume and later warnings all
+        // key off it; loadFile still resets a NEW file to its full budget.
+        let newCapBytes = VortXCacheShedPolicy.forwardCapAfterWarning(
+            currentBytes: currentReadAheadBudgetBytes, previouslyShed: memoryCacheClamped)
         memoryCacheClamped = true
-        pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
-        setString("demuxer-max-bytes", Self.clampedCacheCap)
+        let newCap = String(newCapBytes)
+        activeReadAheadCap = newCap
+        if pausedCacheClamped {
+            // Parked at the paused floor already: keep the live cap there (raising it under pressure would
+            // be backwards); the shrunken budget takes over on resume via pausedStateChanged.
+        } else {
+            setString("demuxer-max-bytes", newCap)
+        }
         setString("demuxer-max-back-bytes", "8MiB")
         flushDemuxerCachePreservingPosition()   // NOT bare drop-buffers: that moves the play head (see above)
-        mpvLog.log("memory warning: demuxer cache clamped to \(Self.clampedCacheCap, privacy: .public) for the rest of this file")
-        DiagnosticsLog.log("player", "memory warning: mpv cache clamped to \(Self.clampedCacheCap) + buffers dropped")
+        let mib = newCapBytes >> 20
+        mpvLog.log("memory warning: demuxer cache stepped down to \(mib, privacy: .public)MiB for the rest of this file")
+        DiagnosticsLog.log("player", "memory warning: mpv cache stepped down to \(mib)MiB + buffers dropped")
     }
+
+    #if os(tvOS)
+    /// Called from the mpv event queue. It posts at most one main-thread evaluation per sample interval.
+    private nonisolated func maybeScheduleProactiveMemoryCheck(now: TimeInterval) {
+        guard proactiveMemorySampleThrottle.shouldSchedule(
+            now: now,
+            interval: TVOSProactiveMemoryPressurePolicy.sampleInterval
+        ) else { return }
+        DispatchQueue.main.async { [weak self] in self?.evaluateProactiveMemoryPressure() }
+    }
+
+    /// Proactive tvOS headroom check using Apple's public dirty-memory-limit snapshot.
+    /// It only lowers a cache once per file and never disables caching or restores under pressure.
+    private func evaluateProactiveMemoryPressure() {
+        guard mpv != nil, !configuredLiveMode else { return }
+        let available = UInt64(os_proc_available_memory())
+        let physical = ProcessInfo.processInfo.physicalMemory
+        let threshold = TVOSProactiveMemoryPressurePolicy.pressureThresholdBytes(
+            physicalMemoryBytes: physical
+        )
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastProactiveMemoryReceipt
+                >= TVOSProactiveMemoryPressurePolicy.receiptInterval {
+            lastProactiveMemoryReceipt = now
+            DiagnosticsLog.log(
+                "player",
+                "tvOS memory headroom \(available >> 20)MiB, threshold \(threshold >> 20)MiB, mpv cache \(currentReadAheadBudgetBytes >> 20)MiB, proactive=\(proactiveMemoryCacheClamped)"
+            )
+        }
+
+        guard let target = TVOSProactiveMemoryPressurePolicy.clampTargetBytes(
+            availableMemoryBytes: available,
+            physicalMemoryBytes: physical,
+            currentCapBytes: currentReadAheadBudgetBytes,
+            floorBytes: VortXCacheShedPolicy.floorBytes,
+            alreadyClamped: proactiveMemoryCacheClamped
+        ) else { return }
+
+        proactiveMemoryCacheClamped = true
+        let targetString = String(target)
+        activeReadAheadCap = targetString
+        if !pausedCacheClamped {
+            setString("demuxer-max-bytes", targetString)
+        }
+        flushDemuxerCachePreservingPosition()
+        let targetMiB = target >> 20
+        mpvLog.log(
+            "proactive memory pressure: demuxer cache clamped to \(targetMiB, privacy: .public)MiB for this file"
+        )
+        DiagnosticsLog.log(
+            "player",
+            "proactive memory clamp: available \(available >> 20)MiB below \(threshold >> 20)MiB, mpv cache -> \(targetMiB)MiB + buffers dropped"
+        )
+    }
+    #endif
     #endif
 
     private func updateCapturePipeline() {
         guard let device = metalLayer.device else { return }
-        let size = metalLayer.drawableSize
-        let fmt = metalLayer.pixelFormat
-        guard size.width > 1, size.height > 1 else { return }
-        guard size != capturePipelineSize || fmt != capturePipelineFormat else { return }
+        let deviceID = ObjectIdentifier(device)
+        guard deviceID != capturePipelineDevice else { return }
 
         guard let queue = device.makeCommandQueue() else { return }
         metalLayer.setupCaptureQueue(queue)
-
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: fmt, width: Int(size.width), height: Int(size.height), mipmapped: false)
-        desc.usage = .shaderRead
-        desc.storageMode = .shared
-        guard let tex = device.makeTexture(descriptor: desc) else { return }
-        metalLayer.updateCaptureTexture(tex)
-        capturePipelineSize = size
-        capturePipelineFormat = fmt
+        capturePipelineDevice = deviceID
     }
+
+    #if os(tvOS)
+    /// A successful replacement owns a fresh diagnostics generation. The old cscale is
+    /// restored before any new file can become eligible, including in-place episode loads.
+    private func beginFramePresentationLoad() {
+        restoreFramePresentationCscale()
+        framePresentationVOPassesWork?.cancel()
+        framePresentationVOPassesWork = nil
+        framePresentationDiagnostics.end()
+        framePresentationGeneration &+= 1
+        framePresentationLoadedGeneration = nil
+        framePresentationStartedGeneration = nil
+    }
+
+    private func framePresentationFileLoaded(loadToken: PlayerLoadToken) {
+        guard PlayerLoadProvenanceState.accepts(
+            callbackToken: loadToken,
+            activeToken: activeLoadToken
+        ) else { return }
+        framePresentationLoadedGeneration = framePresentationGeneration
+        startFramePresentationDiagnosticsIfReady()
+        updateFramePresentationPolicy()
+    }
+
+    private func startFramePresentationDiagnosticsIfReady() {
+        guard isFullPlayerPresentation,
+              mpv != nil,
+              framePresentationLoadedGeneration == framePresentationGeneration,
+              framePresentationStartedGeneration != framePresentationGeneration else {
+            return
+        }
+        framePresentationDiagnostics.begin(
+            generation: framePresentationGeneration,
+            now: ProcessInfo.processInfo.systemUptime,
+            frameDropRaw: diagnosticInt(MPVProperty.frameDropCount),
+            decoderDropRaw: diagnosticInt(MPVProperty.decoderFrameDropCount)
+        )
+        framePresentationStartedGeneration = framePresentationGeneration
+    }
+
+    private func stopFramePresentationDiagnostics() {
+        framePresentationVOPassesWork?.cancel()
+        framePresentationVOPassesWork = nil
+        framePresentationStartedGeneration = nil
+        framePresentationLoadedGeneration = nil
+        framePresentationDiagnostics.end()
+    }
+
+    private func scheduleFramePresentationTerminalCleanup(
+        generation: UInt64,
+        loadToken: PlayerLoadToken
+    ) {
+        guard framePresentationStartedGeneration == generation,
+              framePresentationDiagnostics.currentGeneration() == generation,
+              PlayerLoadProvenanceState.accepts(
+                callbackToken: loadToken,
+                activeToken: activeLoadToken
+              ) else {
+            return
+        }
+        stopFramePresentationDiagnostics()
+        restoreFramePresentationCscale()
+    }
+
+    private func restoreFramePresentationCscale() {
+        guard !framePresentationRestorePending else { return }
+        guard framePresentationMitigationApplied,
+              let prior = framePresentationPriorCscale else {
+            // `mpv` is set to nil only when this controller permanently tears its
+            // handle down. Until then, keep any incomplete state available for a
+            // later retry rather than claiming an unverified restoration.
+            guard mpv == nil else { return }
+            framePresentationPriorCscale = nil
+            framePresentationMitigationApplied = false
+            return
+        }
+        guard mpv != nil else {
+            framePresentationPriorCscale = nil
+            framePresentationMitigationApplied = false
+            return
+        }
+
+        framePresentationRestorePending = true
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard let handle = self.mpv else {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.framePresentationRestorePending = false
+                    guard self.mpv == nil else { return }
+                    self.framePresentationPriorCscale = nil
+                    self.framePresentationMitigationApplied = false
+                }
+                return
+            }
+
+            let status = mpv_set_property_string(handle, "cscale", prior)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.framePresentationRestorePending = false
+                guard self.framePresentationMitigationApplied,
+                      self.framePresentationPriorCscale == prior else {
+                    return
+                }
+                if self.mpv == nil {
+                    // stop() has permanently retired the handle. There is no live
+                    // property left to restore and no future retry to preserve.
+                    self.framePresentationPriorCscale = nil
+                    self.framePresentationMitigationApplied = false
+                    return
+                }
+                // A result belongs only to the exact handle on which the setter ran.
+                // If a future controller lifecycle ever replaces the live handle,
+                // keep the state fail-closed instead of crediting the replacement
+                // with an old handle's result.
+                guard self.mpv == handle else { return }
+                guard status >= 0 else {
+                    self.mpvLog.error(
+                        "tvOS frame presentation cscale restore failed: \(String(cString: mpv_error_string(status)), privacy: .public)"
+                    )
+                    return
+                }
+
+                self.framePresentationPriorCscale = nil
+                self.framePresentationMitigationApplied = false
+                DiagnosticsLog.log(
+                    "perf",
+                    "tvOS frame presentation restored cscale=\(prior)"
+                )
+                // A new file can finish loading while the serialized restore is in
+                // flight. Re-evaluate it now that the previous state is truly gone.
+                self.updateFramePresentationPolicy()
+            }
+        }
+    }
+
+    /// Applies only the single requested runtime property. Every other scaler and
+    /// renderer option stays untouched, and an unreadable prior value fails closed.
+    private func updateFramePresentationPolicy() {
+        guard mpv != nil,
+              isFullPlayerPresentation,
+              framePresentationLoadedGeneration == framePresentationGeneration,
+              framePresentationStartedGeneration == framePresentationGeneration else {
+            restoreFramePresentationCscale()
+            return
+        }
+        let input = TVOSFramePresentationPolicy.Input(
+            fullPlayer: isFullPlayerPresentation,
+            standardQuality: PlaybackSettings.videoUpscaling == .standard,
+            videoWidth: getInt("video-params/w"),
+            videoHeight: getInt("video-params/h"),
+            gamma: getString(MPVProperty.videoParamsGamma) ?? "",
+            dolbyVision: contentIsDolbyVision,
+            signalPeak: getDouble(MPVProperty.videoParamsSigPeak),
+            customOptionKeys: PlaybackSettings.parsedCustomMpvOptions.map { $0.key }
+        )
+        let shouldApply = TVOSFramePresentationPolicy.shouldUseBilinearChroma(input)
+        if !shouldApply {
+            restoreFramePresentationCscale()
+            return
+        }
+        guard !framePresentationMitigationApplied,
+              let prior = diagnosticString("cscale")
+                ?? diagnosticString("options/cscale"),
+              let handle = mpv else {
+            return
+        }
+        let status = mpv_set_property_string(handle, "cscale", "bilinear")
+        guard status >= 0 else {
+            mpvLog.error(
+                "tvOS frame presentation cscale apply failed: \(String(cString: mpv_error_string(status)), privacy: .public)"
+            )
+            return
+        }
+        framePresentationPriorCscale = prior
+        framePresentationMitigationApplied = true
+        DiagnosticsLog.log(
+            "perf",
+            "tvOS frame presentation armed gate=production-4k-hdr size=\(input.videoWidth)x\(input.videoHeight) gamma=\(input.gamma) sigPeak=\(input.signalPeak) priorCscale=\(prior)"
+        )
+    }
+
+    private func scheduleFramePresentationVOPassesSnapshot(
+        generation: UInt64,
+        loadToken: PlayerLoadToken
+    ) {
+        guard isFullPlayerPresentation,
+              framePresentationStartedGeneration == generation,
+              PlayerLoadProvenanceState.accepts(
+                callbackToken: loadToken,
+                activeToken: activeLoadToken
+              ),
+              framePresentationVOPassesWork == nil,
+              !framePresentationDiagnostics.hasVOPasses(generation: generation) else {
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            // stop() nils mpv before enqueueing destruction on this same serial queue.
+            // One local handle therefore stays valid for every read in this work item.
+            guard let self,
+                  let handle = self.mpv,
+                  self.framePresentationDiagnostics.currentGeneration() == generation,
+                  PlayerLoadProvenanceState.accepts(
+                    callbackToken: loadToken,
+                    activeToken: self.callbackLoadToken(requiresLoadedFile: true)
+                  ) else {
+                return
+            }
+            self.captureFramePresentationVOPasses(
+                handle: handle,
+                generation: generation
+            )
+        }
+        framePresentationVOPassesWork = work
+        queue.asyncAfter(
+            deadline: .now() + Self.framePresentationVOPassesCooldown,
+            execute: work
+        )
+    }
+
+    /// One bounded snapshot shortly after a generation's first drop. Raw sample arrays
+    /// and perf-info are intentionally not read.
+    private func captureFramePresentationVOPasses(
+        handle: OpaquePointer,
+        generation: UInt64
+    ) {
+        guard framePresentationDiagnostics.currentGeneration() == generation,
+              !framePresentationDiagnostics.hasVOPasses(generation: generation) else {
+            return
+        }
+        let passCount = min(max(
+            diagnosticInt("vo-passes/fresh/count", handle: handle) ?? 0,
+            0
+        ), 16)
+        var totalAverageNanoseconds = 0
+        var peakNanoseconds = 0
+        var slowestPass: String?
+        for index in 0..<passCount {
+            let average = max(
+                0,
+                diagnosticInt(
+                    "vo-passes/fresh/\(index)/avg",
+                    handle: handle
+                ) ?? 0
+            )
+            let peak = max(
+                0,
+                diagnosticInt(
+                    "vo-passes/fresh/\(index)/peak",
+                    handle: handle
+                ) ?? 0
+            )
+            totalAverageNanoseconds += average
+            if peak > peakNanoseconds {
+                peakNanoseconds = peak
+                slowestPass = diagnosticString(
+                    "vo-passes/fresh/\(index)/desc",
+                    handle: handle
+                ).map { String($0.prefix(48)) }
+            }
+        }
+        framePresentationDiagnostics.recordVOPasses(
+            FramePresentationVOPassesSnapshot(
+                count: passCount,
+                averageMilliseconds: Double(totalAverageNanoseconds) / 1_000_000,
+                peakMilliseconds: Double(peakNanoseconds) / 1_000_000,
+                slowest: slowestPass
+            ),
+            generation: generation
+        )
+    }
+
+    private func selectedSubtitleFramePresentationInfo()
+        -> (codec: String?, source: String) {
+        let selectedID = getInt(MPVProperty.sid)
+        guard selectedID > 0 else { return (nil, "off") }
+        let count = getInt("track-list/count")
+        guard count > 0 else { return (nil, "unknown") }
+        for index in 0..<count {
+            guard getString("track-list/\(index)/type") == "sub",
+                  getInt("track-list/\(index)/id") == selectedID else {
+                continue
+            }
+            let source = diagnosticFlag("track-list/\(index)/external")
+                .map { $0 ? "external" : "embedded" }
+                ?? "unknown"
+            return (
+                diagnosticString("track-list/\(index)/codec"),
+                source
+            )
+        }
+        return (nil, "unknown")
+    }
+    #endif
 
     /// Re-derive the dynamic range from the CURRENTLY decoded video params and apply it. Used by the
     /// gamma observer and MPV_EVENT_VIDEO_RECONFIG, neither of which carries a sig-peak value, so it
@@ -1395,6 +2015,9 @@ final class MPVMetalViewController: PlatformViewController {
     private func syncDisplayDynamicRange(sigPeak: Double) {
         guard let handle = mpv else { return }
         let gamma = getString(MPVProperty.videoParamsGamma) ?? ""
+        #if os(tvOS)
+        updateFramePresentationPolicy()
+        #endif
         var range: ContentDynamicRange
         if gamma == "hlg" {
             range = .hlg
@@ -1480,11 +2103,21 @@ final class MPVMetalViewController: PlatformViewController {
         DiagnosticsLog.log("mpv", "output range → \(range.rawValue) (gamma=\(gamma) sigPeak=\(sigPeak))")
 
 #if os(tvOS)
-        HDRDisplayMode.request(range,
-                               fps: getDouble("container-fps"),
-                               width: getInt("video-params/w"),
-                               height: getInt("video-params/h"),
-                               in: view.window)
+        // Ambient hero previews (#44, startMuted) must NEVER drive the panel's display mode: assigning
+        // preferredDisplayCriteria renegotiates the HDMI link and blanks the screen, so a Home/Detail
+        // scroll that mounts one preview after another read as constant flicker on device. The preview
+        // keeps its layer colorspace tagging above (per-layer compositing, no HDMI effect); only genuine
+        // full-screen playback may switch the display. The main player never sets startMuted, so real
+        // HDR10/HLG output on the mpv lane is unchanged.
+        if startMuted {
+            DiagnosticsLog.log("hdr", "display switch suppressed: muted hero preview never drives the panel mode")
+        } else {
+            HDRDisplayMode.request(range,
+                                   fps: getDouble("container-fps"),
+                                   width: getInt("video-params/w"),
+                                   height: getInt("video-params/h"),
+                                   in: view.window)
+        }
 #endif
     }
     
@@ -1579,9 +2212,79 @@ final class MPVMetalViewController: PlatformViewController {
         return Int(data)
     }
 
+    /// Optional property reads used only by the low-rate performance receipt.
+    /// Unlike the player-facing helpers, these preserve "unsupported" as nil.
+    private func diagnosticDouble(_ name: String) -> Double? {
+        guard mpv != nil else { return nil }
+        var value = Double()
+        guard mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &value) >= 0,
+              value.isFinite else { return nil }
+        return value
+    }
+
+    private func diagnosticInt(_ name: String) -> Int? {
+        guard let handle = mpv else { return nil }
+        return diagnosticInt(name, handle: handle)
+    }
+
+    private func diagnosticInt(_ name: String, handle: OpaquePointer) -> Int? {
+        var value = Int64()
+        guard mpv_get_property(handle, name, MPV_FORMAT_INT64, &value) >= 0 else { return nil }
+        return Int(value)
+    }
+
+    private func diagnosticFlag(_ name: String) -> Bool? {
+        guard mpv != nil else { return nil }
+        var value = Int32()
+        guard mpv_get_property(mpv, name, MPV_FORMAT_FLAG, &value) >= 0 else { return nil }
+        return value > 0
+    }
+
+    private func diagnosticString(_ name: String) -> String? {
+        guard let handle = mpv else { return nil }
+        return diagnosticString(name, handle: handle)
+    }
+
+    private func diagnosticString(_ name: String, handle: OpaquePointer) -> String? {
+        guard let cString = mpv_get_property_string(handle, name) else { return nil }
+        defer { mpv_free(cString) }
+        let value = String(cString: cString)
+        return value.isEmpty ? nil : value
+    }
+
     private func setString(_ name: String, _ value: String) {
         guard mpv != nil else { return }
         mpv_set_property_string(mpv, name, value)
+    }
+
+    /// Positive evidence that Dolby Vision Profile 7 FEL pairing actually engaged.
+    ///
+    /// This exists because upstream mpv logs NOTHING on the success path: `f_output_chain` only warns
+    /// when pairing FAILS, so "no warning" is indistinguishable from "the enhancement layer was never
+    /// found and we silently rendered the base layer alone". `track-list/N/dependent` is the one
+    /// property that proves the demuxer paired a base and enhancement video track, so we read it and
+    /// state the outcome plainly in the probe trail.
+    ///
+    /// Note this reports the DEMUXER pairing. A "paired" line plus no "Failed to set up
+    /// enhancement-layer" warning from mpv means the EL decoder came up and libplacebo is
+    /// compositing it. Single-track interleaved Profile 7 uses mpv's splitter instead of track
+    /// pairing, backed by `dovi_split` in the pinned FFmpeg release/9.0 build.
+    private func probeEnhancementLayer() {
+        guard mpv != nil else { return }
+        let count = getInt("track-list/count")
+        guard count > 0 else { return }
+        var videoTracks = 0
+        var dependentIDs: [Int] = []
+        for i in 0..<count where (getString("track-list/\(i)/type") ?? "") == "video" {
+            videoTracks += 1
+            if getFlag("track-list/\(i)/dependent") { dependentIDs.append(getInt("track-list/\(i)/id")) }
+        }
+        guard videoTracks > 1 || !dependentIDs.isEmpty else { return }   // ordinary single-layer source
+        if dependentIDs.isEmpty {
+            VXProbe.log("dv", "FEL not paired: \(videoTracks) video tracks, none marked dependent (EL discarded, base layer only)")
+        } else {
+            VXProbe.log("dv", "FEL paired: enhancement-layer track(s) \(dependentIDs) of \(videoTracks) video tracks")
+        }
     }
 
     /// Read the current audio/subtitle/video tracks from mpv's `track-list`.
@@ -1591,6 +2294,12 @@ final class MPVMetalViewController: PlatformViewController {
         guard count > 0 else { return [] }
         var result: [MPVTrack] = []
         for i in 0..<count where (getString("track-list/\(i)/type") ?? "") == type {
+            // We ask mpv for `--show-dependent-tracks=yes` so the DV enhancement-layer track stays
+            // observable for the FEL diagnostic. Dependent tracks are not independently decodable and
+            // upstream hides them from `track-list` for exactly that reason, so re-hide them here and
+            // keep the pickers identical to stock behaviour. Today this only ever matches a video EL
+            // (never listed anyway), but it also pre-empts things like IAMF audio element layers.
+            if getFlag("track-list/\(i)/dependent") { continue }
             result.append(MPVTrack(
                 id: getInt("track-list/\(i)/id"),
                 type: type,
@@ -1616,6 +2325,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func setAudioTrack(_ id: Int) {
+        guard TrackSelector.shouldApplyAudioSelection(id, to: tracks(ofType: "audio")) else { return }
         #if os(tvOS)
         armSeekCacheHold()   // an aid change triggers a demuxer refresh-seek that discards + re-reads the forward cache
         #endif
@@ -1839,18 +2549,20 @@ final class MPVMetalViewController: PlatformViewController {
     /// Manual audio sync, in seconds. Maps to mpv `audio-delay`.
     func setAudioDelay(_ seconds: Double) { setString("audio-delay", String(format: "%.2f", seconds)) }
 
-    /// Current media summary for the player's metadata line: encoded video height (e.g. 2160) and the
-    /// active audio codec (e.g. "eac3"). Both can be 0/"" early in load, before the first frame.
-    func mediaSummary() -> (width: Int, height: Int, audioCodec: String) {
-        guard mpv != nil else { return (0, 0, "") }
-        return (getInt("video-params/w"), getInt("video-params/h"), getString("audio-codec-name") ?? "")
+    /// Current media summary for the player's metadata line: encoded video size and active audio codec.
+    /// The channel field stays zero on this unchanged libmpv lane; produced-channel truth is currently owned
+    /// only by the AVPlayer remux, where source and encoded output can differ.
+    func mediaSummary() -> (width: Int, height: Int, audioCodec: String, audioChannels: Int) {
+        guard mpv != nil else { return (0, 0, "", 0) }
+        return (getInt("video-params/w"), getInt("video-params/h"),
+                getString("audio-codec-name") ?? "", 0)
     }
 
     /// Persisted video-size mode, read at startup so the first frame already uses it.
     private(set) var videoSizeMode = UserDefaults.standard.string(forKey: "stremiox.videoSize") ?? MPVMetalViewController.defaultVideoSizeMode
 
     /// Default sizing per device. iPhone fills the screen (crop) so a 16:9 stream doesn't leave thick side
-    /// bars on a tall phone in landscape — the "thick bezels, fill it like this" report. iPad / Mac / Apple
+    /// bars on a tall phone in landscape, the "thick bezels, fill it like this" report. iPad / Mac / Apple
     /// TV keep "original" (whole frame, letterboxed): their larger screens make bars fine, and cropping a
     /// 2.39:1 film on a TV would lose too much of the picture. The user can still change it in the player's
     /// Aspect control, which persists the override.
@@ -1918,7 +2630,7 @@ final class MPVMetalViewController: PlatformViewController {
 
     /// Switch the audio output policy (Auto / Stereo / Surround / Passthrough) on the playing file.
     /// Persists the choice, then re-applies the channel layout and the spdif bitstream list live so it
-    /// takes effect without a reload — mpv re-opens the audio output when these properties change.
+    /// takes effect without a reload; mpv re-opens the audio output when these properties change.
     /// `channelPolicy` reads `AudioOutputMode.current`, so persisting first makes it reflect `mode`.
     /// Setting `audio-spdif` to "" (when leaving Passthrough) tells mpv to decode to PCM again.
     func setAudioOutputMode(_ mode: AudioOutputMode) {
@@ -1982,6 +2694,51 @@ final class MPVMetalViewController: PlatformViewController {
         return rows
     }
 
+    /// Read a larger mpv evidence set once per receipt interval. No property is
+    /// observed and no playback option is changed, so unsupported builds simply
+    /// report nil for that field.
+    func playbackDiagnostics() -> PlaybackDiagnostics {
+        let framePresentation: FramePresentationDiagnosticsSnapshot?
+        #if os(tvOS)
+        updateFramePresentationPolicy()
+        let subtitle = selectedSubtitleFramePresentationInfo()
+        framePresentation = framePresentationDiagnostics.takeSnapshot(
+            now: ProcessInfo.processInfo.systemUptime,
+            subtitleCodec: subtitle.codec,
+            subtitleSource: subtitle.source,
+            activeCscale: diagnosticString("cscale")
+                ?? diagnosticString("options/cscale"),
+            mitigationPriorCscale: framePresentationPriorCscale,
+            mitigationApplied: framePresentationMitigationApplied,
+            mitigationGate: "production-4k-hdr"
+        )
+        #else
+        framePresentation = nil
+        #endif
+        return PlaybackDiagnostics(
+            frameDropCount: diagnosticInt(MPVProperty.frameDropCount),
+            decoderFrameDropCount: diagnosticInt(MPVProperty.decoderFrameDropCount),
+            mistimedFrameCount: diagnosticInt("mistimed-frame-count"),
+            delayedFrameCount: diagnosticInt("vo-delayed-frame-count"),
+            avSync: diagnosticDouble("avsync"),
+            totalAVSyncChange: diagnosticDouble("total-avsync-change"),
+            pausedForCache: diagnosticFlag("paused-for-cache"),
+            cacheUnderrun: diagnosticFlag("demuxer-cache-state/underrun"),
+            cacheIdle: diagnosticFlag("demuxer-cache-state/idle"),
+            cacheBufferingPercent: diagnosticInt("cache-buffering-state"),
+            cacheDuration: diagnosticDouble("demuxer-cache-duration"),
+            hardwareDecoder: diagnosticString("hwdec-current"),
+            estimatedVideoFPS: diagnosticDouble("estimated-vf-fps"),
+            containerFPS: diagnosticDouble("container-fps"),
+            displayFPS: diagnosticDouble("display-fps"),
+            videoSyncMode: diagnosticString("video-sync"),
+            videoSpeedCorrection: diagnosticDouble("video-speed-correction"),
+            audioSpeedCorrection: diagnosticDouble("audio-speed-correction"),
+            audioOutput: diagnosticString("current-ao"),
+            framePresentation: framePresentation
+        )
+    }
+
     /// Re-apply the current subtitle appearance to a running player (used after a settings change).
     func applySubtitleStyle() {
         for (name, value) in SubtitleStyle.mpvOptions { setString(name, value) }
@@ -2033,34 +2790,60 @@ final class MPVMetalViewController: PlatformViewController {
 
     func captureFrameJPEGData(maxWidth: CGFloat, completion: @escaping (Data?) -> Void) {
         guard mpv != nil else { completion(nil); return }
-        // Build or rebuild the pipeline lazily — at VIDEO_RECONFIG time the device/drawableSize may
+        let captureQueue = captureQueue
+        let captureQueueState = captureQueueState
+        // Build or rebuild the pipeline lazily; at VIDEO_RECONFIG time the device/drawableSize may
         // not be set yet (especially on tvOS); calling here retries until everything is ready.
-        // updateCapturePipeline is a no-op once the pipeline matches the current resolution/format.
+        // updateCapturePipeline is a no-op once the queue matches the current Metal device.
         updateCapturePipeline()
-        // requestCapture schedules a blit for the next nextDrawable() call on mpv's VO thread.
-        // handler(nil) is called immediately by MetalLayer if the blit cannot be submitted, so
+        // requestCapture schedules a bounded GPU scale for the next nextDrawable() call on mpv's VO thread.
+        // handler(nil) is called immediately by MetalLayer if the scale cannot be submitted, so
         // the caller's in-flight guard is always released even when the pipeline isn't ready yet.
-        metalLayer.requestCapture { [weak self] texture in
-            guard let self, let texture else { completion(nil); return }
-            self.captureQueue.async {
-                // CIImage(mtlTexture:) wraps the texture lazily. Metal textures have (0,0) at
-                // top-left; CIImage has (0,0) at bottom-left — flip y while scaling to 480px wide.
-                guard let raw = CIImage(mtlTexture: texture,
-                                        options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]) else {
-                    completion(nil); return
+        metalLayer.requestCapture(maxWidth: max(1, Int(maxWidth.rounded(.down)))) { [weak self] lease in
+            guard let lease else { completion(nil); return }
+            guard self != nil else {
+                lease.release()
+                completion(nil)
+                return
+            }
+            captureQueue.async {
+                let texture = lease.texture
+                let prepared = captureQueueState.prepare(for: texture)
+                let ctx = prepared.context
+                if prepared.shouldEmitReceipt {
+                    DiagnosticsLog.log(
+                        "player",
+                        "GPU capture \(texture.label ?? "bounded target"), format \(texture.pixelFormat.rawValue), requested max \(Int(maxWidth))px"
+                    )
                 }
-                let tw = CGFloat(texture.width), th = CGFloat(texture.height)
-                let s = min(maxWidth, tw) / tw   // never upscale: trickplay passes 480, frame-grab passes full
-                let image = raw.transformed(by: CGAffineTransform(a: s, b: 0, c: 0, d: -s, tx: 0, ty: th * s))
-                if self.ciContext == nil { self.ciContext = CIContext(mtlDevice: texture.device) }
-                guard let ctx = self.ciContext,
-                      let sRGB = CGColorSpace(name: CGColorSpace.sRGB),
-                      let jpeg = ctx.jpegRepresentation(
-                          of: image, colorSpace: sRGB,
-                          options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.7]
-                      ) else {
-                    completion(nil); return
-                }
+                let jpeg: Data? = {
+                    // CIImage(mtlTexture:) wraps the texture lazily. Metal textures have (0,0) at
+                    // top-left; CIImage has (0,0) at bottom-left; flip y while scaling to 480px wide.
+                    guard let raw = CIImage(
+                        mtlTexture: texture,
+                        options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]
+                    ) else {
+                        return nil
+                    }
+                    let tw = CGFloat(texture.width), th = CGFloat(texture.height)
+                    let s = min(maxWidth, tw) / tw
+                    let image = raw.transformed(
+                        by: CGAffineTransform(a: s, b: 0, c: 0, d: -s, tx: 0, ty: th * s)
+                    )
+                    guard let sRGB = CGColorSpace(name: CGColorSpace.sRGB) else {
+                        return nil
+                    }
+                    return ctx.jpegRepresentation(
+                        of: image,
+                        colorSpace: sRGB,
+                        options: [
+                            kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.7
+                        ]
+                    )
+                }()
+                // CI/JPEG has fully materialized the Data. Release the reusable GPU target before
+                // invoking arbitrary caller work so thumbnail decoding cannot hold the next capture.
+                lease.release()
                 completion(jpeg)
             }
         }
@@ -2156,6 +2939,56 @@ final class MPVMetalViewController: PlatformViewController {
                                       ) else { return }
                                 self.reapplyDynamicRange()
                             }
+                        #if os(tvOS)
+                        case MPVProperty.frameDropCount:
+                            guard let loadToken = self.callbackLoadToken(
+                                    requiresLoadedFile: true
+                                  ),
+                                  let raw = UnsafePointer<Int64>(
+                                    OpaquePointer(property.data)
+                                  )?.pointee,
+                                  let sample = self.framePresentationDiagnostics
+                                    .recordDrop(raw: Int(raw), decoder: false) else {
+                                break
+                            }
+                            if sample.delta > 0 {
+                                DispatchQueue.main.async { [weak self] in
+                                    self?.scheduleFramePresentationVOPassesSnapshot(
+                                        generation: sample.generation,
+                                        loadToken: loadToken
+                                    )
+                                }
+                            }
+                        case MPVProperty.decoderFrameDropCount:
+                            guard let loadToken = self.callbackLoadToken(
+                                    requiresLoadedFile: true
+                                  ),
+                                  let raw = UnsafePointer<Int64>(
+                                    OpaquePointer(property.data)
+                                  )?.pointee,
+                                  let sample = self.framePresentationDiagnostics
+                                    .recordDrop(raw: Int(raw), decoder: true) else {
+                                break
+                            }
+                            if sample.delta > 0 {
+                                DispatchQueue.main.async { [weak self] in
+                                    self?.scheduleFramePresentationVOPassesSnapshot(
+                                        generation: sample.generation,
+                                        loadToken: loadToken
+                                    )
+                                }
+                            }
+                        case MPVProperty.subtitleStart:
+                            guard self.callbackLoadToken(requiresLoadedFile: true) != nil else {
+                                break
+                            }
+                            let start = property.format == MPV_FORMAT_DOUBLE
+                                ? UnsafePointer<Double>(
+                                    OpaquePointer(property.data)
+                                  )?.pointee
+                                : nil
+                            self.framePresentationDiagnostics.recordSubtitleStart(start)
+                        #endif
                         case MPVProperty.pausedForCache:
                             let buffering = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee ?? true
                             VXProbeState.shared.setPlayer(buffering: buffering)
@@ -2170,8 +3003,9 @@ final class MPVMetalViewController: PlatformViewController {
                             }
                             #endif
                         case MPVProperty.duration:
-                            if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
-                                VXProbeState.shared.setPlayer(dur: Int(value))
+                            if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee,
+                               let duration = MPVDurationProbePolicy.integerSeconds(value) {
+                                VXProbeState.shared.setPlayer(dur: duration)
                                 self.emit(propertyName, value)
                             }
                         case MPVProperty.seekable:
@@ -2182,6 +3016,9 @@ final class MPVMetalViewController: PlatformViewController {
                             // couple of Hz so the grey scrubber band updates smoothly without churn.
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 let now = ProcessInfo.processInfo.systemUptime
+                                #if os(tvOS)
+                                self.maybeScheduleProactiveMemoryCheck(now: now)
+                                #endif
                                 if now - self.lastCacheTimeEmit >= 0.5 {
                                     self.lastCacheTimeEmit = now
                                     self.emit(propertyName, value)
@@ -2190,6 +3027,9 @@ final class MPVMetalViewController: PlatformViewController {
                         case MPVProperty.timePos:
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 let now = ProcessInfo.processInfo.systemUptime
+                                #if os(tvOS)
+                                self.maybeScheduleProactiveMemoryCheck(now: now)
+                                #endif
                                 // Coalesce the play head (mpv fires this per decoded frame). 4 Hz on
                                 // capable hardware for a smooth progress bar; 2 Hz on a constrained
                                 // Apple TV (A8) so the play-head re-render stops competing with decode
@@ -2238,6 +3078,12 @@ final class MPVMetalViewController: PlatformViewController {
                         ?? self.playUrl?.host ?? "?"
                     VXProbeState.shared.setPlayer(state: "playing", source: loadedHost, engine: "mpv")
                     VXProbe.event("player", "loaded \(loadedHost)")
+                    self.probeEnhancementLayer()
+                    #if os(tvOS)
+                    DispatchQueue.main.async { [weak self] in
+                        self?.framePresentationFileLoaded(loadToken: loadedToken)
+                    }
+                    #endif
                     // One-shot audio-negotiation diagnostic: what mpv DECODED vs what the AO actually OPENED
                     // (the negotiated output layout, e.g. 5.1 vs a silent stereo downmix). Delayed so the AO
                     // has opened; libmpv property reads are thread-safe and the handle is guarded on main.
@@ -2255,7 +3101,7 @@ final class MPVMetalViewController: PlatformViewController {
                 case MPV_EVENT_VIDEO_RECONFIG:
                     // The video output was (re)configured for the now-current file/params. This EVENT is
                     // not value-coalesced like the sig-peak property observer, so it fires reliably on
-                    // every in-place episode switch even when two HDR episodes share a mastering peak —
+                    // every in-place episode switch even when two HDR episodes share a mastering peak,
                     // exactly the case that left ~2 of 3 switches dull. Re-derive + re-apply HDR from the
                     // freshly settled params (the nil sentinel set in loadFile guarantees it isn't swallowed).
                     guard let loadToken = self.callbackLoadToken() else { break }
@@ -2279,11 +3125,29 @@ final class MPVMetalViewController: PlatformViewController {
                         }
                         guard let loadToken = self.loadToken(forEntryID: ef.playlist_entry_id) else { break }
                         if ef.reason == MPV_END_FILE_REASON_ERROR {
+                            #if os(tvOS)
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self,
+                                      let generation = self.framePresentationDiagnostics.currentGeneration()
+                                else { return }
+                                self.scheduleFramePresentationTerminalCleanup(
+                                    generation: generation, loadToken: loadToken)
+                            }
+                            #endif
                             let msg = String(cString: mpv_error_string(ef.error))
                             self.mpvLog.error("end-file error: \(msg, privacy: .public)")
                             VXProbe.event("player", "endfile error \(msg)")
                             self.emit(MPVProperty.endFileError, msg, loadToken: loadToken)
                         } else if ef.reason == MPV_END_FILE_REASON_EOF {
+                            #if os(tvOS)
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self,
+                                      let generation = self.framePresentationDiagnostics.currentGeneration()
+                                else { return }
+                                self.scheduleFramePresentationTerminalCleanup(
+                                    generation: generation, loadToken: loadToken)
+                            }
+                            #endif
                             VXProbe.event("player", "endfile eof")
                             self.emit(MPVProperty.endFileEof, nil, loadToken: loadToken)
                         }
@@ -2302,6 +3166,11 @@ final class MPVMetalViewController: PlatformViewController {
                         // so keep the message body private; prefix + level stay public for log filtering.
                         if !text.isEmpty { self.mpvLog.log("[\(prefix, privacy: .public)/\(level, privacy: .public)] \(text, privacy: .private)") }
                     }
+                case MPV_EVENT_GET_PROPERTY_REPLY:
+                    // wakeVideoOutputThread reads a property purely to hand work to the
+                    // video-output thread. The reply carries nothing anyone wants; swallow it here
+                    // so a rotation does not print a puzzling event line in debug builds.
+                    break
                 default:
                     #if DEBUG
                     let eventName = mpv_event_name(event!.pointee.event_id)
@@ -2315,6 +3184,72 @@ final class MPVMetalViewController: PlatformViewController {
     }
     
     
+    private func isProtectedTLSOption(_ key: String) -> Bool {
+        let normalized = key
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+        switch normalized {
+        case "tls-verify", "no-tls-verify", "tls-ca-file", "tls-cert-file", "tls-key-file",
+             "include", "config", "config-dir", "use-filedir-conf", "resume-playback",
+             "no-resume-playback", "save-position-on-quit", "load-scripts", "script", "scripts",
+             "input-commands", "input-conf", "input-ipc-server", "input-ipc-client",
+             "ytdl-raw-options", "external-files", "external-file", "audio-files", "audio-file",
+             "sub-files", "sub-file", "cover-art-files", "cover-art-file", "chapters-file",
+             "ordered-chapters-files", "ordered-chapters-file", "playlist", "load-unsafe-playlists",
+             "vf", "af", "lavfi-complex", "o", "stream-record",
+             "demuxer-lavf-propagate-opts", "demuxer-lavf-format",
+             "demuxer-lavf-hacks", "no-demuxer-lavf-hacks":
+            return true
+        default:
+            // Key-value-list options also expose generated append/remove aliases. Protect the complete
+            // network namespaces so none can smuggle a TLS override into FFmpeg's final protocol dictionary.
+            // Local config includes can define a protocol auto-profile that applies after initialization,
+            // and custom scripts are arbitrary local code, so neither is accepted through this text field.
+            return normalized == "stream-lavf-o"
+                || normalized.hasPrefix("stream-lavf-o-")
+                || normalized == "demuxer-lavf-o"
+                || normalized.hasPrefix("demuxer-lavf-o-")
+                || normalized.hasPrefix("demuxer-lavf-propagate-opts-")
+                || normalized.hasPrefix("demuxer-lavf-format-")
+                || normalized.hasPrefix("demuxer-lavf-hacks-")
+                || normalized.hasPrefix("watch-later-")
+                || normalized.hasPrefix("script-")
+                || normalized.hasPrefix("scripts-")
+                || normalized.hasPrefix("input-commands-")
+                || normalized.hasPrefix("ytdl-raw-options-")
+                || normalized.hasPrefix("external-file")
+                || normalized.hasPrefix("audio-file")
+                || normalized.hasPrefix("sub-file")
+                || normalized.hasPrefix("cover-art-file")
+                || normalized.hasPrefix("chapters-file")
+                || normalized.hasPrefix("ordered-chapters-file")
+                || normalized.hasPrefix("playlist-")
+                || normalized.hasPrefix("vf-")
+                || normalized.hasPrefix("af-")
+                || normalized.hasPrefix("lavfi-complex-")
+                || normalized.hasPrefix("stream-record-")
+        }
+    }
+
+    private static func isAllowedMediaURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return false }
+        return scheme == "file" || scheme == "http" || scheme == "https"
+    }
+
+    private func requireMpvOption(_ key: String, _ value: String) {
+        let status = mpv_set_option_string(mpv, key, value)
+        guard status >= 0 else {
+            mpvLog.fault(
+                "required mpv security option rejected: \(key, privacy: .public) (\(String(cString: mpv_error_string(status)), privacy: .public)); aborting player initialization"
+            )
+            let handle = mpv
+            mpv = nil
+            if let handle { mpv_destroy(handle) }
+            exit(1)
+        }
+    }
+
     private func checkError(_ status: CInt) {
         if status < 0 {
             mpvLog.error("MPV API error: \(String(cString: mpv_error_string(status)), privacy: .public)")

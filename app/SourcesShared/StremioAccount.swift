@@ -97,7 +97,7 @@ struct LibraryItem: Identifiable, Decodable, Hashable {
     }
     /// In the Continue Watching shelf? Matches Stremio: keep anything you've actually watched, and
     /// for a SERIES keep it even when the current episode is finished, the *next* episode is what
-    /// you continue (the old "must be mid-progress" test dropped these, leaving only the 1–2 titles
+    /// you continue (the old "must be mid-progress" test dropped these, leaving only the 1-2 titles
     /// you were literally paused inside). Only a finished MOVIE is excluded.
     var inProgress: Bool {
         guard !isRemoved else { return false }
@@ -167,7 +167,7 @@ final class StremioAccount: ObservableObject {
         email = Self.displayEmail()
         // Only publish when the value actually changes. `@Published` re-fires its publisher on every
         // assignment (even true→true), so an unconditional write here can re-enter any
-        // `.onReceive($isSignedIn)` sink that calls back into this method — the loop that froze the
+        // `.onReceive($isSignedIn)` sink that calls back into this method, the loop that froze the
         // iOS sign-in. Assigning only on change keeps this method safe for any observer.
         let signedIn = authKey != nil
         if isSignedIn != signedIn { isSignedIn = signedIn }

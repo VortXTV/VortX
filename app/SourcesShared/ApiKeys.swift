@@ -48,7 +48,32 @@ final class ApiKeys: ObservableObject {
     /// VortX's own TMDB read key, used ONLY as the last-resort fallback when the keyless edge
     /// (catalogs.vortx.tv, which holds this key server-side) is unreachable. A free public read key, so
     /// shipping it costs little; the edge is the primary keyless path and keeps it off the wire normally.
-    nonisolated static let bundledTMDBKey = "d131017ccc6e5462a81c9304d21476de"
+    ///
+    /// Stored MASKED (XOR of two byte arrays), not as a plaintext string literal, so the key is not a
+    /// `strings`/grep hit in the shipped binary. It is reassembled at runtime by
+    /// `assembleBundledTMDBKey()` and is byte-for-byte identical to the original key. This is
+    /// obfuscation-at-rest, not secrecy (the value is a free public read key); the primary keyless path
+    /// is still the edge. BundledTMDBKeyAssemblyTests.swift asserts SHA256(assembled) matches the
+    /// committed hash, proving the arrays reassemble the exact key.
+    nonisolated static let bundledTMDBKey = assembleBundledTMDBKey()
+
+    private static let maskedTMDBCipher: [UInt8] = [
+        0xcd, 0x22, 0xa2, 0x7d, 0x55, 0x8d, 0x67, 0xd2, 0x92, 0xc6, 0x30, 0xa2, 0x68, 0xa4, 0x0f, 0x78, 0xd0, 0x13, 0xab, 0x65, 0x21, 0x17, 0xd6, 0x39, 0x06, 0x12, 0xa8, 0xcc, 0x60, 0xfb, 0xe1, 0xe0
+    ]
+    private static let maskedTMDBPad: [UInt8] = [
+        0xa9, 0x13, 0x91, 0x4c, 0x65, 0xbc, 0x50, 0xb1, 0xf1, 0xa5, 0x06, 0xc7, 0x5d, 0x90, 0x39, 0x4a, 0xb1, 0x2b, 0x9a, 0x06, 0x18, 0x24, 0xe6, 0x0d, 0x62, 0x20, 0x99, 0xf8, 0x57, 0xcd, 0x85, 0x85
+    ]
+
+    /// Reassemble the bundled TMDB key by XORing the two masked byte arrays. `@inline(never)` stops the
+    /// optimizer from constant-folding the result back into a plaintext literal in the binary.
+    @inline(never)
+    nonisolated static func assembleBundledTMDBKey() -> String {
+        let cipher = maskedTMDBCipher, pad = maskedTMDBPad
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(cipher.count)
+        for i in cipher.indices { bytes.append(cipher[i] ^ pad[i]) }
+        return String(decoding: bytes, as: UTF8.self)
+    }
 
     /// The key TMDB calls build their `api_key=` with: the user's key when set, else VortX's bundled key
     /// so the catalogs/hub work with NO user key. `TMDBClient.get` decides the ROUTE from `tmdbKey()`

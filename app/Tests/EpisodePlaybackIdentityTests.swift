@@ -2,6 +2,8 @@
 // VortX has no Xcode test bundle, so compile the real production model file with minimal dependency stubs:
 //
 //   xcrun swiftc -o /tmp/episode-playback-identity-test \
+//     app/SourcesShared/DetailMetaRecoveryPolicy.swift \
+//     app/SourcesShared/CatalogRowResolution.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //     app/Tests/EpisodePlaybackIdentityTests.swift && \
@@ -123,6 +125,46 @@ private func usesAllSeasonDirectResume(_ rootSource: String) -> Bool {
         && !episodeList.contains(".filter { ($0.season ?? 1) == season }")
 }
 
+private func usesGenerationOwnedRetryResume(_ playerSource: String) -> Bool {
+    let helper = slice(
+        playerSource, from: "private func loadRetryIntoPlayer(",
+        to: "/// A pre-playback failure"
+    )
+    let sameSource = slice(
+        playerSource, from: "private func retryResumeSameSource()",
+        to: "private func handleLoadFailure("
+    )
+    let retryLoad = slice(
+        playerSource, from: "private func retryLoad(",
+        to: "/// REQ-260721-78 option A"
+    )
+    let foreground = slice(
+        playerSource, from: "private func reconcileAdvanceOnForeground()",
+        to: "private var bufferingOverlay"
+    )
+    return containsInOrder(helper, [
+        "loadIntoPlayer(",
+        "resumeOrigin: resumeTarget",
+        "if !live && resumeTarget > 5",
+        "nudgeResume(to: resumeTarget)",
+    ])
+        && containsInOrder(sameSource, [
+            "guard let retryLoadToken = coordinator.player?.activeLoadToken else { return false }",
+            "let retryResume = retryResumeTarget()",
+            "coordinator.player?.activeLoadToken == retryLoadToken",
+            "loadRetryIntoPlayer(",
+        ])
+        && containsInOrder(retryLoad, [
+            "let resume = retryResumeTarget()",
+            "loadRetryIntoPlayer(",
+        ])
+        && containsInOrder(foreground, [
+            "PlayerLoadProvenanceState.accepts(",
+            "let resume = retryResumeTarget()",
+            "loadRetryIntoPlayer(",
+        ])
+}
+
 private func stream(hash: String, fileIdx: Int?) -> CoreStream {
     var json: [String: Any] = ["infoHash": hash, "name": "Season pack"]
     if let fileIdx { json["fileIdx"] = fileIdx }
@@ -180,6 +222,10 @@ private struct EpisodeTransactionHarness {
     var savedVideoIDs: [String] = []
 
     mutating func beginResolve(_ videoID: String) -> Int {
+        if let pending, pending.issued, !pending.terminal {
+            superseded = pending
+            self.pending = nil
+        }
         generation += 1
         resolvingVideoID = videoID
         return generation
@@ -194,20 +240,10 @@ private struct EpisodeTransactionHarness {
             capturedVideoID: videoID, currentVideoID: resolvingVideoID
         ) else { return false }
 
-        if let pending, pending.issued {
-            superseded = pending
-            self.pending = nil
-        }
         resolvingVideoID = nil
 
         guard commandAccepted else {
-            if let superseded, !superseded.terminal, superseded.token == activeToken {
-                pending = superseded
-                physicalSource = superseded.source
-                boundEngineVideoID = superseded.source.engineVideoID
-                self.superseded = nil
-            }
-            persistenceBlocked = pending?.issued == true || self.superseded?.issued == true
+            restoreSupersededIfHealthy()
             return false
         }
 
@@ -226,9 +262,24 @@ private struct EpisodeTransactionHarness {
             capturedVideoID: videoID, currentVideoID: resolvingVideoID
         ) else { return }
         resolvingVideoID = nil
-        if pending?.terminal == true || superseded?.terminal == true {
-            persistenceBlocked = true
+        restoreSupersededIfHealthy()
+    }
+
+    mutating func timeoutResolve(videoID: String, generation capturedGeneration: Int) {
+        resolveNil(videoID: videoID, generation: capturedGeneration)
+    }
+
+    private mutating func restoreSupersededIfHealthy() {
+        let terminalSeen = pending?.terminal == true || superseded?.terminal == true
+        if let superseded, !superseded.terminal, superseded.token == activeToken {
+            pending = superseded
+            physicalSource = superseded.source
+            boundEngineVideoID = superseded.source.engineVideoID
         }
+        superseded = nil
+        persistenceBlocked = persistenceBlocked
+            || terminalSeen
+            || pending?.issued == true
     }
 
     mutating func handleTerminal(_ callbackToken: PlayerLoadToken) -> EpisodePlaybackIdentity.TerminalEventRoute {
@@ -359,6 +410,11 @@ private struct EpisodePlaybackIdentityTests {
             currentEpisodeIndex: s1FinaleIndex,
             episodeCount: fullSeries.count
         ), "S1 finale is not terminal when the resident direct-resume list includes S2E1")
+        let playerScreenSource = source("Sources/PlayerScreen.swift")
+        expect(
+            usesGenerationOwnedRetryResume(playerScreenSource),
+            "PlayerScreen retries and foreground reissue all use generation-owned deferred resume delivery"
+        )
         let rootSource = source("SourcesiOS/iOSRootView.swift")
         expect(usesAllSeasonDirectResume(rootSource),
                "iOS direct resume wires the full all-season list into labels and resolver")
@@ -533,6 +589,9 @@ private struct EpisodePlaybackIdentityTests {
         expect(!PlayerLoadProvenanceState.accepts(
             callbackToken: queuedOutgoingCallback, activeToken: mpvState.activeToken
         ), "queued mpv callback from the invalidated load is rejected")
+        expect(!PlayerLoadProvenanceState.accepts(
+            callbackToken: nil, activeToken: nil
+        ), "foreground reconcile cannot treat two absent load tokens as ownership")
         expect(PlayerLoadProvenanceState.canCommit(
             callbackToken: incomingToken, activeToken: mpvState.activeToken,
             pendingToken: incomingToken
@@ -969,15 +1028,16 @@ private struct EpisodePlaybackIdentityTests {
             source: transactionE3Source, token: terminalE3Token, commandAccepted: true
         )
         let terminalE4Generation = terminalPending.beginResolve(e4ID)
-        expect(terminalPending.handleEOF(terminalE3Token) == .pending,
-               "transaction: E3 terminal during E4 resolve routes to exact pending E3")
-        terminalPending.resolveNil(videoID: e4ID, generation: terminalE4Generation)
+        expect(terminalPending.handleEOF(terminalE3Token) == .superseded,
+               "transaction: E3 terminal during E4 resolve routes to its one superseded owner")
+        terminalPending.timeoutResolve(videoID: e4ID, generation: terminalE4Generation)
         expect(!terminalPending.commitFirstFrame(terminalE3Token)
-               && terminalPending.pending?.terminal == true
+               && terminalPending.pending == nil
+               && terminalPending.superseded == nil
                && terminalPending.completedVideoIDs.isEmpty
                && terminalPending.publishedVideoID == e2ID
                && terminalPending.persistenceBlocked,
-               "transaction: E4 nil cannot revive terminal E3 or persist mixed E2/E3 state")
+               "transaction: E4 timeout cannot revive terminal E3 or persist mixed E2/E3 state")
 
         // E4 resolves but its player command is rejected. Restore every source field of healthy physical E3,
         // retain the exact E3 token, and keep persistence blocked until E3 really first-frames.

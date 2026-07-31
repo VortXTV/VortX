@@ -5,7 +5,7 @@ import UIKit
 /// The in-player episode list for the bare tvOS AVPlayer (#46). It is hosted inside
 /// `AVPlayerViewController.customInfoViewControllers`, the Info-panel tab AVKit reveals when the viewer
 /// swipes down on the Siri remote. AVKit owns the focus engine for that panel, so this focusable list never
-/// competes with the remote the way a custom overlay would — which is exactly why the tvOS HLS / Dolby-Vision
+/// competes with the remote the way a custom overlay would, which is exactly why the tvOS HLS / Dolby-Vision
 /// path stays a bare `AVPlayerViewController` instead of routing through `TVPlayerView` (the focus invariant).
 ///
 /// This delivers the "Prefer AVPlayer + in-player episode list" experience the redditors asked for: pick any
@@ -77,7 +77,7 @@ struct TVPlayerEpisodePanel: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
 
-        /// "S2E5" / "E5" — numeric, not localized (episode numbering is universal).
+        /// "S2E5" / "E5", numeric, not localized (episode numbering is universal).
         private var label: String {
             if let season = episode.season, season > 0 { return "S\(season)E\(episode.episodeNumber)" }
             return "E\(episode.episodeNumber)"
@@ -173,6 +173,7 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
     var groups: [CoreStreamSourceGroup] = []
     var firstPlayableAt: Date?
     for _ in 0 ..< 80 {                                    // ~20s ceiling, matching the episode page
+        guard !Task.isCancelled else { return nil }
         groups = core.streamGroups(forStreamId: v.id)
         let hasCandidate = groups.contains { group in
             group.streams.contains { stream in
@@ -187,8 +188,13 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
         let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
         if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
                                         secondsSinceFirstPlayable: elapsed, rememberedQuality: continuity) { break }
-        try? await Task.sleep(for: .milliseconds(250))
+        do {
+            try await Task.sleep(for: .milliseconds(250))
+        } catch {
+            return nil
+        }
     }
+    guard !Task.isCancelled else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
     let candidates = StreamRanking.rankedCandidates(
         groups, continuity: continuity, binge: binge, pin: pin
@@ -235,7 +241,7 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
 }
 
 /// Tell the embedded server to create the torrent engine (POST /{hash}/create) before the player opens its
-/// loopback URL — a self-contained copy of `TVPlayerView.prepareTorrent`, since the re-present path resolves
+/// loopback URL, a self-contained copy of `TVPlayerView.prepareTorrent`, since the re-present path resolves
 /// the episode/source outside any player view. Stateless and fire-and-forget; a no-op for direct / debrid
 /// streams. File-internal (not private) so the Sources-panel switch in RootTabView can prime too.
 func tvPrimeTorrentStream(_ stream: CoreStream) {

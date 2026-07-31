@@ -1,3 +1,7 @@
+import CryptoKit
+import Foundation
+
+#if !POSTER_NEGATIVE_CACHE_POLICY_TESTING
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
@@ -8,7 +12,145 @@ public typealias VXPosterImage = NSImage
 #endif
 import ImageIO
 import CoreGraphics
+#endif
 
+/// Failure identity for poster bytes. The normalized URL is retained only as a SHA-256 digest so signed
+/// query values or title identifiers never become long-lived diagnostic or cache metadata.
+struct PosterImageNegativeCacheKey: Hashable, Sendable {
+    enum Variant: String, Sendable {
+        case poster
+        case averageColor
+    }
+
+    let normalizedURLDigest: String
+    let variant: Variant
+    let maxPixel: Int
+
+    init(url: URL, variant: Variant, maxPixel: Int) {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        if var resolved = components {
+            resolved.scheme = resolved.scheme?.lowercased()
+            resolved.host = resolved.host?.lowercased()
+            resolved.fragment = nil
+            if (resolved.scheme == "http" && resolved.port == 80)
+                || (resolved.scheme == "https" && resolved.port == 443) {
+                resolved.port = nil
+            }
+            components = resolved
+        }
+        let normalized = components?.string ?? url.absoluteString
+        let digest = SHA256.hash(data: Data(normalized.utf8))
+        normalizedURLDigest = digest.map { String(format: "%02x", $0) }.joined()
+        self.variant = variant
+        self.maxPixel = maxPixel
+    }
+}
+
+enum PosterImageNegativeCacheFailure: Sendable {
+    case transient
+    case terminal
+}
+
+enum PosterImageNegativeCachePolicy {
+    static let transientTTL: TimeInterval = 5
+    static let terminalTTL: TimeInterval = 10 * 60
+
+    static func ttl(for failure: PosterImageNegativeCacheFailure) -> TimeInterval {
+        switch failure {
+        case .transient: transientTTL
+        case .terminal: terminalTTL
+        }
+    }
+
+    /// A response that cannot become an image without the resource changing gets the longer expiry.
+    /// Authentication, throttling, timeouts, and server failures retry after the short backoff.
+    static func failure(forHTTPStatus status: Int) -> PosterImageNegativeCacheFailure? {
+        guard !(200..<300).contains(status) else { return nil }
+        switch status {
+        case 400, 404, 405, 406, 410, 411, 413, 414, 415, 416, 422:
+            return .terminal
+        default:
+            return .transient
+        }
+    }
+
+    static func failure(
+        forNetworkError error: Error,
+        taskIsCancelled: Bool
+    ) -> PosterImageNegativeCacheFailure? {
+        if taskIsCancelled { return nil }
+        if let urlError = error as? URLError, urlError.code == .cancelled { return nil }
+        return .transient
+    }
+}
+
+/// Small actor-isolated expiry map. It has no timer or persistence: expired entries are removed lazily,
+/// and insertion order provides deterministic bounded eviction when many distinct artwork hosts fail.
+actor PosterImageNegativeCache {
+    private struct Entry: Sendable {
+        let expiresAt: TimeInterval
+        let sequence: UInt64
+    }
+
+    private let capacity: Int
+    private var entries: [PosterImageNegativeCacheKey: Entry] = [:]
+    private var nextSequence: UInt64 = 0
+
+    init(capacity: Int) {
+        self.capacity = max(1, capacity)
+    }
+
+    func shouldSuppress(
+        _ key: PosterImageNegativeCacheKey,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> Bool {
+        guard let entry = entries[key] else { return false }
+        if entry.expiresAt <= now {
+            entries.removeValue(forKey: key)
+            return false
+        }
+        return true
+    }
+
+    func record(
+        _ key: PosterImageNegativeCacheKey,
+        failure: PosterImageNegativeCacheFailure,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
+        purgeExpired(now: now)
+        let sequence = nextSequence
+        nextSequence &+= 1
+        entries[key] = Entry(
+            expiresAt: now + PosterImageNegativeCachePolicy.ttl(for: failure),
+            sequence: sequence
+        )
+        if entries.count > capacity,
+           let oldest = entries.min(by: { $0.value.sequence < $1.value.sequence })?.key {
+            entries.removeValue(forKey: oldest)
+        }
+    }
+
+    func clear(_ key: PosterImageNegativeCacheKey) {
+        entries.removeValue(forKey: key)
+    }
+
+    func entryCount(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Int {
+        purgeExpired(now: now)
+        return entries.count
+    }
+
+    private func purgeExpired(now: TimeInterval) {
+        var expired: [PosterImageNegativeCacheKey] = []
+        for (key, entry) in entries where entry.expiresAt <= now {
+            expired.append(key)
+        }
+        for key in expired {
+            entries.removeValue(forKey: key)
+        }
+    }
+}
+
+#if !POSTER_NEGATIVE_CACHE_POLICY_TESTING
 /// The single poster / catalog-art byte loader shared by every native Apple surface (iPhone, iPad, Mac,
 /// tvOS). It exists because the app was decoding poster bytes ON the main actor and fetching every poster
 /// through `URLSession.shared`, whose default `URLCache` is far too small to hold a catalog page. The result
@@ -29,6 +171,7 @@ import CoreGraphics
 /// retried on the next appear (a scroll-away cancel is not a failure), so a transient miss never latches a
 /// permanently blank card. Callers keep their own frame / crop / clip; this only returns the decoded image.
 enum PosterImageLoader {
+    private static let negativeCache = PosterImageNegativeCache(capacity: 512)
 
     // MARK: dedicated poster URLCache (built once, owned by this loader's session only)
 
@@ -63,6 +206,13 @@ enum PosterImageLoader {
         return host
     }
 
+    private static func probeError(_ error: Error) -> String {
+        if let urlError = error as? URLError {
+            return "url-\(urlError.code.rawValue)"
+        }
+        return String(describing: type(of: error))
+    }
+
     // MARK: bounded-concurrency image session
 
     /// A dedicated session for image bytes so poster fetches share a connection pool sized for many small
@@ -77,6 +227,43 @@ enum PosterImageLoader {
         cfg.requestCachePolicy = .returnCacheDataElseLoad
         return URLSession(configuration: cfg)
     }()
+
+    /// Fetch bytes and own the shared response/error policy for both poster and tint variants.
+    private static func fetchData(
+        for request: URLRequest,
+        key: PosterImageNegativeCacheKey,
+        rawURL: String
+    ) async -> Data? {
+        do {
+            let (data, response) = try await session.data(for: request)
+            if Task.isCancelled { return nil }
+            if let http = response as? HTTPURLResponse,
+               let failure = PosterImageNegativeCachePolicy.failure(forHTTPStatus: http.statusCode) {
+                cache.removeCachedResponse(for: request)
+                await negativeCache.record(key, failure: failure)
+                VXProbe.log(
+                    "poster",
+                    "fetch HTTP host=\(probeHost(rawURL)) status=\(http.statusCode) -> negative-cache"
+                )
+                return nil
+            }
+            return data
+        } catch {
+            if let failure = PosterImageNegativeCachePolicy.failure(
+                forNetworkError: error,
+                taskIsCancelled: Task.isCancelled
+            ) {
+                await negativeCache.record(key, failure: failure)
+            }
+            if !Task.isCancelled {
+                VXProbe.log(
+                    "poster",
+                    "fetch ERROR host=\(probeHost(rawURL)) error=\(probeError(error)) -> nil-because-failed"
+                )
+            }
+            return nil
+        }
+    }
 
     /// Caps how many poster fetches run at once. A grid appearing enqueues dozens of loads; without a cap they
     /// all hit the network simultaneously and starve each other (the blank-poster symptom). 6 in flight keeps
@@ -161,58 +348,62 @@ enum PosterImageLoader {
     /// real failure OR on cancellation (the caller treats nil-from-cancel as "retry next appear", so a
     /// scroll-away never latches a blank card). `maxPixel` downsamples very large art to a sane on-card size.
     static func load(_ urlString: String?, maxPixel: CGFloat = 900) async -> VXPosterImage? {
-        VXProbe.log("poster", "load ENTRY host=\(probeHost(urlString)) maxPixel=\(Int(maxPixel))")
         guard let raw = urlString, !raw.isEmpty, let url = URL(string: raw) else {
             VXProbe.log("poster", "load BAIL bad/empty host=\(probeHost(urlString)) -> nil")
             return nil
         }
         if let hit = memory.object(forKey: url as NSURL) {
-            VXProbe.log("poster", "memory-cache HIT host=\(probeHost(raw)) -> returning cached")
             return hit
         }
-        VXProbe.log("poster", "memory-cache MISS host=\(probeHost(raw))")
+        let key = PosterImageNegativeCacheKey(
+            url: url,
+            variant: .poster,
+            maxPixel: Int(maxPixel)
+        )
+        if await negativeCache.shouldSuppress(key) {
+            return nil
+        }
 
         // A cancelled acquire holds NO permit, so return without releasing (releasing here would free a permit
         // we never took and let `active` drift below zero, over-admitting loads). Only release when granted.
         guard await gate.acquire() else {
-            VXProbe.log("poster", "gate ACQUIRE cancelled host=\(probeHost(raw)) -> nil (no permit held)")
             return nil
         }
-        VXProbe.log("poster", "gate ACQUIRE granted host=\(probeHost(raw))")
         defer { Task { await gate.release() } }
         // A cancel between acquiring the gate and starting the fetch: bail without a network hit.
         if Task.isCancelled {
-            VXProbe.log("poster", "cancelled after gate, before fetch host=\(probeHost(raw)) -> nil-because-cancelled")
+            return nil
+        }
+        // A queued request may have waited behind an identical failure or success. Recheck after acquiring
+        // so the queue does not immediately repeat work that completed while this task was suspended.
+        if let hit = memory.object(forKey: url as NSURL) {
+            return hit
+        }
+        if await negativeCache.shouldSuppress(key) {
             return nil
         }
 
-        do {
-            var req = URLRequest(url: url)
-            req.cachePolicy = .returnCacheDataElseLoad   // poster art is immutable; prefer the (now large) disk cache
-            // Sign via HEADERS (not a query signature) for our gated art hosts (poster.vortx.tv / erdb.vortx.tv):
-            // this path owns the URLRequest, and headers are NOT part of the URLCache key, so the large disk
-            // cache above stays warm. A query-signed URL would carry a per-second `vts` and change the cache key
-            // every second, reintroducing the "re-fetch every poster" thrash this loader exists to fix. No-op
-            // (fail-open) for any non-gated host (tmdb / metahub / add-on art) and for an unprovisioned build.
-            VortXEdgeAuth.sign(&req)
-            let (data, _) = try await session.data(for: req)
-            VXProbe.log("poster", "fetch OK host=\(probeHost(raw)) bytes=\(data.count)")
-            if Task.isCancelled {
-                VXProbe.log("poster", "cancelled after fetch, before decode host=\(probeHost(raw)) -> nil-because-cancelled")
-                return nil
-            }
-            // Decode + downsample OFF the main thread so scrolling never blocks on a poster decode.
-            guard let image = decode(data, maxPixel: maxPixel) else {
-                VXProbe.log("poster", "decode FAILED host=\(probeHost(raw)) bytes=\(data.count) -> nil-because-failed")
-                return nil
-            }
-            memory.setObject(image, forKey: url as NSURL)
-            VXProbe.log("poster", "load SUCCESS host=\(probeHost(raw)) image=\(Int(image.size.width))x\(Int(image.size.height))")
-            return image
-        } catch {
-            VXProbe.log("poster", "fetch ERROR host=\(probeHost(raw)) error=\(error.localizedDescription) -> nil-because-failed (or cancel; caller retries)")
-            return nil   // includes URLError.cancelled; the caller retries on the next appear
+        var req = URLRequest(url: url)
+        req.cachePolicy = .returnCacheDataElseLoad   // poster art is immutable; prefer the (now large) disk cache
+        // Sign via HEADERS (not a query signature) for our gated art hosts (poster.vortx.tv / erdb.vortx.tv):
+        // this path owns the URLRequest, and headers are NOT part of the URLCache key, so the large disk
+        // cache above stays warm. A query-signed URL would carry a per-second `vts` and change the cache key
+        // every second, reintroducing the "re-fetch every poster" thrash this loader exists to fix. No-op
+        // (fail-open) for any non-gated host (tmdb / metahub / add-on art) and for an unprovisioned build.
+        VortXEdgeAuth.sign(&req)
+        guard let data = await fetchData(for: req, key: key, rawURL: raw) else {
+            return nil
         }
+        // Decode + downsample OFF the main thread so scrolling never blocks on a poster decode.
+        guard let image = decode(data, maxPixel: maxPixel) else {
+            cache.removeCachedResponse(for: req)
+            await negativeCache.record(key, failure: .terminal)
+            VXProbe.log("poster", "decode FAILED host=\(probeHost(raw)) bytes=\(data.count) -> nil-because-failed")
+            return nil
+        }
+        await negativeCache.clear(key)
+        memory.setObject(image, forKey: url as NSURL)
+        return image
     }
 
     // MARK: dominant (average) color for the hero / detail backdrop tint
@@ -240,19 +431,32 @@ enum PosterImageLoader {
         if let hit = tintCache.object(forKey: url as NSURL) {
             return Color(red: hit.red, green: hit.green, blue: hit.blue)
         }
+        let key = PosterImageNegativeCacheKey(url: url, variant: .averageColor, maxPixel: 32)
+        if await negativeCache.shouldSuppress(key) {
+            return nil
+        }
         var req = URLRequest(url: url)
         req.cachePolicy = .returnCacheDataElseLoad   // art is immutable; the big poster disk cache serves repeats
         VortXEdgeAuth.sign(&req)                      // headers only, so the cache key stays stable (see load())
-        guard let (data, _) = try? await session.data(for: req), !Task.isCancelled,
-              let image = decode(data, maxPixel: 32) else { return nil }
+        guard let data = await fetchData(for: req, key: key, rawURL: raw) else {
+            return nil
+        }
+        guard let image = decode(data, maxPixel: 32) else {
+            cache.removeCachedResponse(for: req)
+            await negativeCache.record(key, failure: .terminal)
+            return nil
+        }
         #if canImport(UIKit)
         let cg = image.cgImage
         #elseif canImport(AppKit)
         let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
         #endif
-        guard let cg, let tint = averageColor(of: cg) else { return nil }
+        guard let cg, let tint = averageColor(of: cg) else {
+            await negativeCache.record(key, failure: .terminal)
+            return nil
+        }
+        await negativeCache.clear(key)
         tintCache.setObject(TintBox(red: tint.red, green: tint.green, blue: tint.blue), forKey: url as NSURL)
-        VXProbe.log("poster", "averageColor host=\(probeHost(raw)) r=\(Int(tint.red * 255)) g=\(Int(tint.green * 255)) b=\(Int(tint.blue * 255))")
         return Color(red: tint.red, green: tint.green, blue: tint.blue)
     }
 
@@ -299,7 +503,6 @@ enum PosterImageLoader {
             VXProbe.log("poster", "decode ImageIO thumbnail FAILED bytes=\(data.count) -> platform-decoder fallback=\(fallback != nil ? "ok" : "nil")")
             return fallback
         }
-        VXProbe.log("poster", "decode ImageIO ok pixels=\(cg.width)x\(cg.height)")
         #if canImport(UIKit)
         return UIImage(cgImage: cg)
         #elseif canImport(AppKit)
@@ -307,3 +510,4 @@ enum PosterImageLoader {
         #endif
     }
 }
+#endif

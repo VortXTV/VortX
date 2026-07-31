@@ -8,7 +8,7 @@ import Darwin   // getifaddrs / ifaddrs / getnameinfo for LAN IP discovery
 /// iOS/tvOS embed `nodejs-mobile` (node as a *library*, started in-process via `node_start`).
 /// nodejs-mobile has no macOS slice, so the Mac can't do that. Instead we bundle the ordinary
 /// standalone `node` executable (Resources/node-darwin-arm64, fetched by scripts/fetch-node-macos.sh)
-/// and spawn it with `Process`. This works because the Mac app is NOT sandboxed — it may launch
+/// and spawn it with `Process`. This works because the Mac app is NOT sandboxed; it may launch
 /// child processes and bind loopback ports.
 ///
 /// This deliberately exposes the SAME API surface as the iOS/tvOS `NodeServer`
@@ -40,7 +40,7 @@ enum NodeServer {
     private static let queue = DispatchQueue(label: "com.stremiox.mac.nodeserver")
 
     /// Set by `stop()` so the terminationHandler treats the kill as an intentional app-exit
-    /// shutdown — NOT a crash to surface in Settings. A `restart()` does NOT set this (it nils the
+    /// shutdown, NOT a crash to surface in Settings. A `restart()` does NOT set this (it nils the
     /// handler before terminating, so the handler never fires for a restart). Once set, the server
     /// is considered down for good for this process lifetime.
     private static var shutdownRequested = false
@@ -57,7 +57,7 @@ enum NodeServer {
 
     /// When ON, the bundled server binds 0.0.0.0 (all interfaces) so other devices on the LAN
     /// (your Apple TV / phone) can use this Mac as their Stremio streaming server. When OFF
-    /// (the default), it binds loopback only (127.0.0.1) — the original behaviour, invisible to
+    /// (the default), it binds loopback only (127.0.0.1), the original behaviour, invisible to
     /// the network. Changing this restarts the node process so the new bind takes effect.
     static var sharedOnLAN: Bool {
         get { UserDefaults.standard.bool(forKey: shareKey) }
@@ -282,7 +282,7 @@ enum NodeServer {
             proc.terminationHandler = nil
             guard proc.isRunning else { return }
 
-            proc.terminate()                // SIGTERM — ask node to exit cleanly
+            proc.terminate()                // SIGTERM: ask node to exit cleanly
             // Escalate to SIGKILL if it ignores SIGTERM, so the port is always released and nothing
             // is reparented to launchd. `waitUntilExit()` then reaps the child (no zombie).
             let deadline = Date().addingTimeInterval(terminateGrace)
@@ -314,13 +314,13 @@ enum NodeServer {
     // MARK: - Stale-port reclaim
 
     /// Reclaim port 11470 if a STALE copy of OUR OWN streaming server (node or native) is still
-    /// holding it — e.g. a prior run that was force-killed / crashed before `stop()` could fire,
+    /// holding it, e.g. a prior run that was force-killed / crashed before `stop()` could fire,
     /// leaving the child reparented to launchd (PPID 1). The node preload's parent-death watchdog
     /// stops new node orphans from forming; this clears any that predate it (or slipped through its
     /// ~1s poll window) plus any native-server orphan (which has no watchdog). We match "ours"
-    /// narrowly — argv referencing the `stremiox-preload.js` we inject or the
-    /// `vortx-streaming-server` binary name, markers nothing else uses
-    /// — so an unrelated process that merely happens to hold the port is left untouched (we log it and
+    /// narrowly, argv referencing the `stremiox-preload.js` we inject or the
+    /// `vortx-streaming-server` binary name, markers nothing else uses,
+    /// so an unrelated process that merely happens to hold the port is left untouched (we log it and
     /// let server.js fail to bind, surfacing the exit in Settings, rather than killing a stranger).
     /// SIGTERM first, escalate to SIGKILL, mirroring `stop()`. Cheap on the common path: a free port
     /// costs one `lsof` that returns nothing.
@@ -356,7 +356,7 @@ enum NodeServer {
     private static func pidIsAlive(_ pid: pid_t) -> Bool { kill(pid, 0) == 0 }
 
     /// Run a short helper tool to completion and return its stdout (nil on launch failure). Used only
-    /// for the small, bounded `lsof`/`ps` probes above — output is tiny, so reading then waiting can't
+    /// for the small, bounded `lsof`/`ps` probes above; output is tiny, so reading then waiting can't
     /// deadlock on a full pipe.
     private static func runTool(_ launchPath: String, _ args: [String]) -> String? {
         let proc = Process()
@@ -395,7 +395,7 @@ enum NodeServer {
         // on a CLEAN quit; on a crash / Force Quit / SIGKILL the app dies without it, and Foundation
         // does NOT signal this child, so it gets reparented to launchd and keeps holding 11470 forever
         // (the orphaned-:11470 leak). The watchdog records our parent pid and exits the child the
-        // moment it changes — i.e. once we've been reparented — releasing the port within ~1s.
+        // moment it changes, i.e. once we've been reparented, releasing the port within ~1s.
         let bindHost = sharedOnLAN ? "0.0.0.0" : "127.0.0.1"
         let preloadPath = (home as NSString).appendingPathComponent("stremiox-preload.js")
         let preload = """

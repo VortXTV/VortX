@@ -14,15 +14,30 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ENGINE_DIR="${VORTX_ENGINE_DIR:-$HOME/vortx-engine/vortx-core}"
+REPO_ROOT="$(pwd)"
+# Resolve the engine workspace the same way build-ffi-xcframework.sh does: an explicit override, then
+# a candidate list. A private monorepo cloned to $HOME/vortx-engine contains the engine workspace
+# at $HOME/vortx-engine/vortx-core; the monorepo root itself is not a workspace candidate.
+ENGINE_DIR="${VORTX_ENGINE_DIR:-}"
+if [ -z "$ENGINE_DIR" ]; then
+    for cand in "$REPO_ROOT/vortx-core" "$REPO_ROOT/../vortx-engine/vortx-core" "$HOME/vortx-engine/vortx-core"; do
+        if [ -f "$cand/crates/streaming-server/Cargo.toml" ]; then ENGINE_DIR="$cand"; break; fi
+    done
+fi
 TARGET="aarch64-apple-darwin"
 OUT="app/Vendor/vortx-streaming-server"
 
-if [ ! -f "$ENGINE_DIR/crates/streaming-server/Cargo.toml" ]; then
-    echo "ERROR: engine checkout not found at $ENGINE_DIR (set VORTX_ENGINE_DIR)" >&2
-    echo "       The native server builds from the engine workspace, like the core xcframework." >&2
+if [ -z "$ENGINE_DIR" ] || [ ! -f "$ENGINE_DIR/crates/streaming-server/Cargo.toml" ]; then
+    echo "ERROR: engine workspace not found. The native server builds from it, like the core xcframework." >&2
+    echo "       Looked at: \$VORTX_ENGINE_DIR, $REPO_ROOT/vortx-core," >&2
+    echo "       $REPO_ROOT/../vortx-engine/vortx-core, $HOME/vortx-engine/vortx-core" >&2
+    echo "" >&2
+    echo "       The engine is PROPRIETARY and lives in the private repo VortXTV/vortx-core." >&2
+    echo "       Clone it OUTSIDE this repo (never as a worktree of the public one):" >&2
+    echo "         git clone https://github.com/VortXTV/vortx-core.git ~/vortx-engine" >&2
     exit 1
 fi
+echo "engine workspace: $ENGINE_DIR"
 
 source "$HOME/.cargo/env" 2>/dev/null || true
 

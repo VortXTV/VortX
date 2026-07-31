@@ -1,8 +1,8 @@
 import Foundation
 
-/// Cross-surface carriage for the five Trakt / SIMKL toggles declared in `ExternalSyncToggle`
-/// (ExternalScrobbleProvider.swift:92-108): trakt scrobble / watchlist / importWatched, simkl scrobble /
-/// watchlist. Plus the per-service connection mirror the dashboard needs to render them honestly.
+/// Cross-surface carriage for the six Trakt / SIMKL toggles declared in `ExternalSyncToggle`: trakt
+/// scrobble / watchlist / importWatched, simkl scrobble / watchlist / importWatched. Plus the per-service
+/// connection mirror the dashboard needs to render them honestly.
 ///
 /// WHAT WAS ACTUALLY BROKEN (read this before "fixing" the sync again). These toggles were NOT missing from
 /// sync, and they DO survive a reinstall on Apple. They are plain `UserDefaults` keys under the app's own
@@ -35,10 +35,17 @@ import Foundation
 ///     doc.vortx.integrations = { "protocol": 1,
 ///                                "trakt": { "connected": Bool, "scrobble": Bool, "watchlist": Bool,
 ///                                           "importWatched": Bool },
-///                                "simkl": { "connected": Bool, "scrobble": Bool, "watchlist": Bool } }
+///                                "simkl": { "connected": Bool, "scrobble": Bool, "watchlist": Bool,
+///                                           "importWatched": Bool } }
 ///     doc.integrations       = { "editedAt": <epoch ms>,
 ///                                "trakt": { "scrobble": Bool, "watchlist": Bool, "importWatched": Bool },
-///                                "simkl": { "scrobble": Bool, "watchlist": Bool } }
+///                                "simkl": { "scrobble": Bool, "watchlist": Bool, "importWatched": Bool } }
+///
+/// SIMKL gained its OWN watched import (`SIMKLWatchedShadow`) so it now carries `importWatched` too, on the
+/// same wire name and default (OFF) as Trakt's. The emit is additive and degrades gracefully ahead of the
+/// dashboard: `vault.ts` does not yet read/write `simkl.importWatched`, so an app-emitted value is ignored
+/// there until the matching one-line vault.ts addition lands, and no dashboard edit ever sends it back
+/// meanwhile (union-safe). Across Apple devices it already converges through `doc.settings` like the rest.
 ///
 /// A flat `traktScrobble` vocabulary here instead of the nested per-service one there would be the SAME
 /// class of defect as the `playback.safetyMode` app/web enum drift: two surfaces writing different words
@@ -84,11 +91,13 @@ enum ExternalSyncToggleSync {
     static let toggles: [Toggle] = [
         Toggle(service: .trakt, wire: "scrobble",  key: ExternalSyncToggle.traktScrobble,  defaultOn: true),
         Toggle(service: .trakt, wire: "watchlist", key: ExternalSyncToggle.traktWatchlist, defaultOn: true),
-        // Default OFF, unlike the other four: importing another service's history into the read path is
-        // opt-in. Only Trakt has it; SIMKL has no such toggle and the key is never invented there.
+        // Default OFF, unlike the scrobble/watchlist four: importing another service's history into the read
+        // path is opt-in. BOTH services now carry it (SIMKL gained its own watched import via
+        // SIMKLWatchedShadow), so the key is emitted on both blocks, same wire name and same default.
         Toggle(service: .trakt, wire: "importWatched", key: ExternalSyncToggle.traktImportWatched, defaultOn: false),
         Toggle(service: .simkl, wire: "scrobble",  key: ExternalSyncToggle.simklScrobble,  defaultOn: true),
         Toggle(service: .simkl, wire: "watchlist", key: ExternalSyncToggle.simklWatchlist, defaultOn: true),
+        Toggle(service: .simkl, wire: "importWatched", key: ExternalSyncToggle.simklImportWatched, defaultOn: false),
     ]
 
     static func toggles(for service: Service) -> [Toggle] { toggles.filter { $0.service == service } }

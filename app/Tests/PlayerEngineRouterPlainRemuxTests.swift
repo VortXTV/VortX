@@ -10,10 +10,17 @@
 //         app/Tests/PlayerEngineRouterPlainRemuxTests.swift \
 //     && /tmp/vortx-router-tests
 //
-// The ONE mirrored piece is `loadFileMountLane`, a faithful copy of AVPlayerEngine.loadFile's
-// wantsDVRemux / wantsPlainRemux resolution (the engine file needs AVFoundation and cannot compile
-// standalone). It MUST stay in lockstep with AVPlayerEngine.loadFile; the compile/link proof for the
-// shipped engine code is the 2-scheme Xcode build gate, as for every script in this folder.
+// TWO mirrored pieces (each MUST stay in lockstep with its production twin; the compile/link proof
+// for the shipped code is the 2-scheme Xcode build gate, as for every script in this folder):
+//   - `loadFileMountLane`: AVPlayerEngine.loadFile's wantsDVRemux / wantsPlainRemux resolution (the
+//     engine file needs AVFoundation and cannot compile standalone).
+//   - `surfaceIsAVPlayer`: PlayerScreen.useAVPlayerEngine's fail-soft surface decision (the chrome
+//     needs SwiftUI), proving the rule-4b default's demote contract: once `avEngineFailed` latches,
+//     the surface is libmpv regardless of what the router chose.
+//
+// Rule (4b) is platform-gated OFF on macOS via the `nonDVAVPlayerDefaultPlatform` parameter default;
+// this harness IS a macOS binary, so flip-path checks pass `platformAllowsNonDVDefault: true` to
+// execute the shipped rule, and one check pins the macOS default itself to false.
 
 import Foundation
 
@@ -68,7 +75,20 @@ func resetFlags() {
     UserDefaults.standard.removeObject(forKey: PlayerEngineRouter.plainRemuxKey)
     UserDefaults.standard.removeObject(forKey: PlayerEngineRouter.dvRemuxKey)
     UserDefaults.standard.removeObject(forKey: PlayerEngineRouter.overrideKey)
+    UserDefaults.standard.removeObject(forKey: PlayerEngineRouter.avPlayerDefaultKey)
     RemoteConfig.snapshot = ResolvedConfig()
+}
+
+// MARK: - Lockstep mirror of PlayerScreen.useAVPlayerEngine (the rule-4b fail-soft contract)
+
+/// MUST match PlayerScreen.useAVPlayerEngine (TVPlayerView's surface pick demotes through the same
+/// avEngineFailed latch): a latched AVPlayer failure ALWAYS lands on the libmpv surface, a manual pick
+/// beats the launch route otherwise, and the seeded route decides the rest.
+func surfaceIsAVPlayer(avEngineFailed: Bool, manualEngineAVPlayer: Bool?,
+                       engineLatch: Bool?, routedToAVPlayer: Bool) -> Bool {
+    if avEngineFailed { return false }
+    if let forced = manualEngineAVPlayer { return forced }
+    return engineLatch ?? routedToAVPlayer
 }
 
 @main
@@ -85,10 +105,114 @@ let extensionless = url("https://debrid.example.com/download/8371aa02")
 let loopbackMKV = url("http://127.0.0.1:11470/local/file.mkv")
 let hlsManifest = url("https://cdn.example.com/live/master.m3u8")
 
-// 1. AUTO routing is UNTOUCHED: a non-DV MKV still routes to libmpv (no PiP intent, no behavior change).
+let plainAVI = url("https://cdn.example.com/dl/Old.Movie.1998.DVDRip.XviD.avi")
+let plainWebM = url("https://cdn.example.com/dl/Clip.2026.1080p.VP9.webm")
+let plainTS = url("https://iptv.example.com/live/channel/4821.ts")
+
+// 1. THE #147 DEFAULT FLIP (rule 4b): under Auto, non-DV content AVPlayer can serve routes to AVPlayer
+//    BY DEFAULT on iOS/tvOS, so Picture in Picture works for ordinary MKV/MP4 debrid content.
+//    (platformAllowsNonDVDefault: true executes the shipped rule on this macOS test host; see header.)
+check(PlayerEngineRouter.engine(for: konrepoMKV, isTorrent: false, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .avfoundation,
+      "auto default flip: non-DV MKV routes to AVPlayer (the #147 field case gains PiP)")
+check(loadFileMountLane(url: konrepoMKV, contentIsDolbyVision: false) == .plainRemux,
+      "auto default flip: that MKV mounts the PLAIN remux lane, never a raw doomed mount")
+check(PlayerEngineRouter.engine(for: plainMP4, isTorrent: false, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .avfoundation,
+      "auto default flip: non-DV MP4 routes to AVPlayer (native raw mount, PiP, no remux)")
+
+// 1b. EXPLICIT USER CHOICE STILL WINS: the Always-libmpv override beats the flip for every container
+//     (rule 2 runs before rule 4b).
+check(PlayerEngineRouter.engine(for: konrepoMKV, isTorrent: false, isDolbyVision: false,
+                                override: .mpv, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "explicit Always-libmpv beats the default flip (MKV)")
+check(PlayerEngineRouter.engine(for: plainMP4, isTorrent: false, isDolbyVision: false,
+                                override: .mpv, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "explicit Always-libmpv beats the default flip (MP4)")
+
+// 1c. PROBE GATE: a container neither raw AVPlayer nor the plain remux can serve NEVER attempts AVPlayer
+//     (no wasted mount, no demote bounce); extensionless links with no container hint stay conservative.
+check(PlayerEngineRouter.engine(for: plainAVI, isTorrent: false, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "probe gate: .avi stays on libmpv (unsupported, no wasted attempt)")
+check(PlayerEngineRouter.engine(for: plainWebM, isTorrent: false, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "probe gate: .webm stays on libmpv (unsupported, no wasted attempt)")
+check(PlayerEngineRouter.engine(for: plainTS, isTorrent: false, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "probe gate: live .ts stays on libmpv (unsupported, no wasted attempt)")
+check(PlayerEngineRouter.engine(for: extensionless, isTorrent: false, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "probe gate: extensionless link with no container hint stays on libmpv")
+
+// 1d. LANE-AVAILABILITY GATES: each half of the flip only fires when its machinery can really mount.
+check(PlayerEngineRouter.engine(for: konrepoMKV, isTorrent: false, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                plainRemuxDelivery: false,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "delivery rolled back: the MKV half of the flip is off, no doomed AVPlayer mount")
+check(PlayerEngineRouter.engine(for: plainMP4, isTorrent: false, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                plainRemuxDelivery: false,
+                                platformAllowsNonDVDefault: true) == .avfoundation,
+      "delivery rollback does not touch the native MP4 flip (a raw mount needs no remux)")
+UserDefaults.standard.set(false, forKey: PlayerEngineRouter.plainRemuxKey)
+check(PlayerEngineRouter.engine(for: konrepoMKV, isTorrent: false, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "plain lane disabled: the MKV half of the flip is off")
+resetFlags()
+
+// 1e. ROLLBACK SWITCH: avPlayerDefault off (fleet or local) restores the ENTIRE pre-flip Auto routing.
+RemoteConfig.snapshot.features["avPlayerDefault"] = false
+check(PlayerEngineRouter.engine(for: konrepoMKV, isTorrent: false, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "fleet kill-switch: rule 4b off restores non-DV MKV -> libmpv")
+check(PlayerEngineRouter.engine(for: plainMP4, isTorrent: false, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "fleet kill-switch: rule 4b off restores non-DV MP4 -> libmpv")
+check(PlayerEngineRouter.avPlayerDefaultEnabled() == false, "flag: RemoteConfig false is the fleet kill-switch")
+resetFlags()
+check(PlayerEngineRouter.avPlayerDefaultEnabled(), "flag: avPlayerDefault baked default is ON")
+UserDefaults.standard.set(false, forKey: PlayerEngineRouter.avPlayerDefaultKey)
+check(!PlayerEngineRouter.avPlayerDefaultEnabled(), "flag: explicit local OFF beats the baked ON")
+resetFlags()
+
+// 1f. PLATFORM GATE: macOS keeps its existing routing. This harness IS a macOS binary, so the shipped
+//     parameter default is directly observable, and with it the flip never fires.
+check(!PlayerEngineRouter.nonDVAVPlayerDefaultPlatform,
+      "platform gate: macOS ships with the flip OFF (rule 4b never fires there)")
 check(PlayerEngineRouter.engine(for: konrepoMKV, isTorrent: false, isDolbyVision: false,
                                 override: .auto, dvDisplayCapable: true) == .mpv,
-      "auto: non-DV MKV still routes to libmpv (unchanged)")
+      "macOS default routing unchanged: non-DV MKV still routes to libmpv")
+
+// 1g. TORRENT/LOOPBACK UNTOUCHED: rule 1 still runs first.
+check(PlayerEngineRouter.engine(for: loopbackMKV, isTorrent: true, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "torrent/loopback MKV always stays on libmpv (rule 1 unchanged)")
+
+// 1h. FAIL-SOFT CONTRACT (lockstep mirror of PlayerScreen.useAVPlayerEngine): once the chrome latches an
+//     AVPlayer failure, the surface is libmpv no matter what rule 4b routed; a manual pick wins otherwise.
+check(surfaceIsAVPlayer(avEngineFailed: false, manualEngineAVPlayer: nil,
+                        engineLatch: nil, routedToAVPlayer: true),
+      "fail-soft: the rule-4b route mounts AVPlayer while nothing failed")
+check(!surfaceIsAVPlayer(avEngineFailed: true, manualEngineAVPlayer: nil,
+                         engineLatch: true, routedToAVPlayer: true),
+      "fail-soft: a latched AVPlayer failure ALWAYS lands on libmpv (demote beats route + latch)")
+check(!surfaceIsAVPlayer(avEngineFailed: false, manualEngineAVPlayer: false,
+                         engineLatch: true, routedToAVPlayer: true),
+      "fail-soft: a manual libmpv pick beats the rule-4b route")
 
 // 2. The #147 fix: AVPlayer intent (the Prefer-AVPlayer override) on a non-DV MKV resolves to the PLAIN
 //    remux lane, NOT a raw mount (which cannot demux Matroska) and NOT a libmpv demote.

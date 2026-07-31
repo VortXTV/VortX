@@ -38,6 +38,9 @@ struct SettingsView: View {
     // Clear Continue Watching (Advanced): a durable, tombstoned bulk clear needs an explicit confirm.
     @State private var showClearCWConfirm = false
     @State private var diagExport: (url: String, qr: Image)?
+    // True while the LAN listener + QR are being generated: the sheet shows a spinner instead of a blank
+    // screen, then publishes the QR when startAsync() resolves (fixes the first-open-blank race).
+    @State private var diagExportGenerating = false
     // Per-tab bar visibility (#117): the four hideable tabs, one key each (TabBarPrefs). Home,
     // Add-ons, and Settings have no toggle so the app can never lose its anchor or this screen.
     @AppStorage(TabBarPrefs.hideLive) private var hideLiveTab = false
@@ -60,11 +63,13 @@ struct SettingsView: View {
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
+    @AppStorage(SubtitleStyle.Key.brightness) private var subBrightness = SubtitleStyle.defaultBrightness
     @AppStorage(SubtitleStyle.Key.background) private var subBackground = SubtitleStyle.defaultBackground
     @AppStorage(TrackPreferences.Key.forced) private var prefForced = TrackPreferences.ForcedPolicy.forced.rawValue
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subOnlyPreferred) private var subOnlyPreferred = false
+    @AppStorage(PGSOCRPolicy.overrideKey) private var recogniseImageSubtitles = true
     // When "1", the audio language chain mirrors the subtitle chain (the audio pickers hide); "0" = independent.
     @AppStorage("stremiox.matchAudioSub") private var matchAudioSubRaw = "0"
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
@@ -168,6 +173,7 @@ struct SettingsView: View {
         .fullScreenCover(isPresented: $showDiagExport, onDismiss: {
             VXDiagExport.shared.stop()
             diagExport = nil
+            diagExportGenerating = false
         }) {
             diagExportSheet
         }
@@ -182,6 +188,7 @@ struct SettingsView: View {
         .onChange(of: subFont) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subSize) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subColor) { ProfileStore.shared.capturePlayback() }
+        .onChange(of: subBrightness) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subBackground) { ProfileStore.shared.capturePlayback() }
         // Source-ranking taste AND the 13 stream filters are per-profile, but they bind DIRECTLY to
         // the SourcePreferences singleton (no @AppStorage mirror), so without a capture a filter
@@ -463,7 +470,7 @@ struct SettingsView: View {
                           selection: Binding(get: { mirrorLibrary ? "1" : "0" }, set: { mirrorLibrary = ($0 == "1") }))
                 choiceRow(String(localized: "Mirror Continue Watching from Stremio"), [("0", "Off"), ("1", "On")],
                           selection: Binding(get: { mirrorCW ? "1" : "0" }, set: { mirrorCW = ($0 == "1") }))
-                Text("Off (recommended) is one-way: VortX pulls in your Stremio add-ons but never edits your Stremio account, so removing an add-on in VortX hides it here only and leaves your Stremio account untouched. On is two-way: adding or removing an add-on in VortX also adds or removes it in your Stremio account. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
+                Text("Off (recommended) is one-way: VortX pulls your Stremio add-ons, library, and Continue Watching in, but never lets Stremio take them back out. Removing an add-on in VortX hides it here only and leaves your Stremio account untouched, your library keeps titles Stremio no longer has, and a resume position never rolls back to an older or finished Stremio copy. On makes VortX track Stremio for that category, so a removal, a rewind, or a finish there applies here too. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -502,6 +509,8 @@ struct SettingsView: View {
             choiceRow(String(localized: "Dolby Vision for MKV (Beta)"), [("0", "Off"), ("1", "On")],
                       selection: Binding(get: { dvRemux ? "1" : "0" }, set: { dvRemux = ($0 == "1") }))
             Text("Plays Dolby Vision .mkv from debrid via an in-app remux. Experimental; falls back automatically if it fails.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            Text("Using a Mac for this lives under Streaming Server.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Skip step"), [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
             choiceRow(String(localized: "Auto-skip intro & credits"), [("0", "Off"), ("1", "On")],
@@ -789,6 +798,14 @@ struct SettingsView: View {
                     .buttonStyle(RowFocusStyle())
                 }
             }
+            // EXTERNAL ENGINE MODE, client side. Keep this beside the server rows because people
+            // looking for a Mac that serves this Apple TV will look under Streaming Server first.
+            NavigationLink { ExternalEngineSettingsView() } label: {
+                Label("Use a Mac as the engine", systemImage: "desktopcomputer")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            Text("A Mac on your network can unpack the file, rewrite the Dolby Vision layer and hold the stream on its disk, so this Apple TV spends its whole chip decoding and showing the picture. Nothing is re-encoded. Off until you pair a Mac.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
     }
 
@@ -900,6 +917,17 @@ struct SettingsView: View {
                       selection: Binding(get: { showHubDiscover ? "1" : "0" }, set: { showHubDiscover = ($0 == "1") }))
             choiceRow(String(localized: "Refresh collections"), [("daily", "Daily"), ("twiceDaily", "Twice"), ("fourTimesDaily", "4x")],
                       selection: $hubCadence)
+            // Home rows editor (INS-260722-02): the focusable entry point the remote can actually reach.
+            // The old customize control lived as an unfocusable overlay on the Home header; it was removed
+            // and re-homed here. Pushes the SAME TVHomeRailEditorView (which writes straight to
+            // HomeRailPreferences), through this NavigationStack, so reorder/hide edits persist and drive
+            // the Home layout exactly as before.
+            NavigationLink { TVHomeRailEditorView() } label: {
+                Label("Customize Home", systemImage: "slider.horizontal.3")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            Text("Reorder or hide the rows on your Home screen, like Top Picks and collections. Continue Watching always stays pinned at the top.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             NavigationLink { TVReorderServicesView() } label: {
                 Label("Streaming services", systemImage: "rectangle.stack.badge.plus")
             }
@@ -1109,7 +1137,13 @@ struct SettingsView: View {
             }
             .toggleStyle(.switch)
             .tint(Theme.Palette.accent)
-            Text("The player auto-picks these when a title starts. Each language falls back to your second choice when a title has none in the first. Turn on Match audio to subtitle languages to drive both from one list. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow. Only show subtitles in my languages hides add-on and community subtitles in other languages from the in-player list (untagged-language subtitles always stay).")
+            Toggle(isOn: $recogniseImageSubtitles) {
+                Text("Recognize image subtitles")
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            }
+            .toggleStyle(.switch)
+            .tint(Theme.Palette.accent)
+            Text("The player auto-picks these when a title starts. Each language falls back to your second choice when a title has none in the first. Turn on Match audio to subtitle languages to drive both from one list. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow. Only show subtitles in my languages hides add-on and community subtitles in other languages from the in-player list (untagged-language subtitles always stay). Recognize image subtitles uses on-device text recognition to make PGS subtitles selectable during Dolby Vision playback. Turn it off if recognition affects performance. This setting stays on this device.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
     }
@@ -1178,6 +1212,7 @@ struct SettingsView: View {
                        onMinus: { adjustSubScale(-1) },
                        onPlus: { adjustSubScale(1) })
             choiceRow(String(localized: "Color"), SubtitleStyle.colors.map { ($0.id, $0.label) }, selection: $subColor)
+            choiceRow(String(localized: "Brightness"), SubtitleStyle.brightnessLevels.map { ($0.id, $0.label) }, selection: $subBrightness)
             choiceRow("Background", SubtitleStyle.backgrounds.map { ($0.id, $0.label) }, selection: $subBackground)
             Text("Styles the built-in player's subtitles. Pick which subtitle track to show from the player while watching.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
@@ -1205,7 +1240,11 @@ struct SettingsView: View {
             // Apple TV has no share sheet, so the diagnostic log is exported over the LAN: this stands up a
             // tiny local server and shows a QR the owner scans with their phone to download the log file.
             Button {
-                diagExport = VXDiagExport.shared.start()
+                // Present immediately with a spinner, then generate off the main thread: the cold LAN
+                // listener can take a beat to come up, so a synchronous start() here left the first open
+                // blank until a re-entry warmed it. The sheet's .task publishes the QR when it is ready.
+                diagExport = nil
+                diagExportGenerating = true
                 showDiagExport = true
             } label: { Text("Export diagnostic log") }
                 .buttonStyle(ChipButtonStyle(selected: false))
@@ -1245,6 +1284,14 @@ struct SettingsView: View {
                 Text("Scan with your phone on the same Wi-Fi to download the log, then send it over.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                     .multilineTextAlignment(.center)
+            } else if diagExportGenerating {
+                // Never a silently blank screen: the cold listener bring-up shows a spinner until the QR
+                // is ready, at which point the .task below publishes it and this branch is replaced.
+                ProgressView()
+                    .frame(width: 420, height: 420)
+                Text("Preparing the download link…")
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
             } else {
                 Text("Connect this device to Wi-Fi to export the diagnostic log.")
                     .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
@@ -1254,12 +1301,21 @@ struct SettingsView: View {
                 showDiagExport = false
                 VXDiagExport.shared.stop()
                 diagExport = nil
+                diagExportGenerating = false
             } label: { Text("Done") }
                 .buttonStyle(ChipButtonStyle(selected: true))
         }
         .padding(Theme.Space.xl)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        // Generate once when the sheet appears, off the main thread; publish the payload back so the QR
+        // renders on this first open as soon as the listener is ready, not only on a warm re-entry.
+        .task {
+            guard diagExportGenerating else { return }
+            let result = await VXDiagExport.shared.startAsync()
+            diagExport = result
+            diagExportGenerating = false
+        }
     }
 
     private func choiceRow(_ label: String, _ options: [(id: String, label: String)],
@@ -1470,7 +1526,9 @@ private enum SettingsSearchSection: CaseIterable {
                                "safety filter", "regex", "max quality", "minimum quality", "max file size",
                                "compact source rows", "pinned sources", "resolution"]
         case .community: return ["contribute", "anonymized data", "singularity", "privacy"]
-        case .server: return ["server", "configure server", "restart", "embedded", "node"]
+        case .server: return ["server", "configure server", "restart", "embedded", "node",
+                              "external engine", "use a mac", "mac as engine", "engine host",
+                              "seek anywhere", "pair a mac"]
         case .tabBar: return ["tab", "discover tab", "live tv tab", "library tab", "search tab"]
         case .appearance: return ["accent", "background", "oled", "app language", "language",
                                   "cinematic catalog cards", "hide poster labels", "poster style",
@@ -1478,7 +1536,10 @@ private enum SettingsSearchSection: CaseIterable {
                                   "streaming services", "discover & region", "budget & box office", "spoiler",
                                   "blur", "dolby vision", "hdr", "match frame rate", "frame rate", "judder",
                                   "24p", "refresh rate", "text size", "performance",
-                                  "top shelf", "tv home screen", "home screen", "continue watching"]
+                                  "top shelf", "tv home screen", "home screen", "continue watching",
+                                  // INS-260722-02: the re-homed Home rows editor ("Customize Home"),
+                                  // so search reaches it under Appearance.
+                                  "customize home", "home rows", "top picks", "collections", "order", "hide"]
         case .audioSubtitle: return ["audio language", "fallback audio", "subtitle language", "fallback subtitle",
                                      "subtitles", "forced", "match audio to subtitle"]
         case .subtitle: return ["font", "size", "fine size", "color", "background", "subtitle style"]

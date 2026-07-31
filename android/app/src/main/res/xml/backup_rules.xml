@@ -13,4 +13,18 @@
     <!-- Download queue-manager state (concurrency cap, drain order, the parked-for-unlock set). Meaningless
          without the files above, so it travels with them. -->
     <exclude domain="sharedpref" path="vortx.downloads.xml" />
+    <exclude domain="sharedpref" path="vortx_sync_session.xml" />
+    <exclude domain="sharedpref" path="vortx_sync_session_plain.xml" />
+    <exclude domain="sharedpref" path="vortx_debrid_keys.xml" />
+    <exclude domain="sharedpref" path="vortx_debrid_keys_plain.xml" />
+    <exclude domain="sharedpref" path="vortx_auth_identity.xml" />
+    <exclude domain="sharedpref" path="vortx_auth_identity_plain.xml" />
+    <exclude domain="sharedpref" path="vortx_trakt_tokens.xml" />
+    <exclude domain="sharedpref" path="vortx_trakt_tokens_plain.xml" />
+    <exclude domain="sharedpref" path="vortx_simkl_tokens.xml" />
+    <exclude domain="sharedpref" path="vortx_simkl_tokens_plain.xml" />
+    <exclude domain="sharedpref" path="vortx_mediaserver_tokens.xml" />
+    <exclude domain="sharedpref" path="vortx_mediaserver_tokens_plain.xml" />
+    <exclude domain="sharedpref" path="vortx_iptv_creds.xml" />
+    <exclude domain="sharedpref" path="vortx_iptv_creds_plain.xml" />
 </full-backup-content>

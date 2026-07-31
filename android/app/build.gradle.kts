@@ -142,8 +142,8 @@ dependencies {
     // EncryptedSharedPreferences, so debrid API keys (credentials) are stored AES-encrypted at rest,
     // never in plain SharedPreferences. This is the Android analogue of the Apple Keychain the debrid
     // keys live in (app/SourcesShared/DebridKeys.swift). It resolves from mavenCentral() (already in
-    // settings.gradle.kts) and pulls Tink transitively. DebridKeys reads it reflectively and falls
-    // back to plain prefs if the artifact is ever absent, so the boundary never hard-fails the build.
+    // settings.gradle.kts) and pulls Tink transitively. If Keystore cannot open, credential stores remain
+    // memory-only for that process and never fall back to disk plaintext.
     // NOTE: Google deprecated this artifact's APIs in 1.1.0 in favor of using Android Keystore
     // directly; we're staying on it for S01 (out of scope to migrate DebridKeys here), flagged for a
     // future session.
