@@ -31,11 +31,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.error
+import androidx.compose.ui.semantics.isTraversalGroup
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
@@ -47,6 +49,7 @@ import androidx.compose.ui.unit.dp
 import androidx.tv.material3.Border
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
+import androidx.tv.material3.LocalContentColor
 import androidx.tv.material3.Surface
 import com.vortx.android.R
 import com.vortx.android.debrid.DebridKeys
@@ -76,7 +79,7 @@ internal fun TvDebridKeysScreen(
                 onClick = onBack,
                 modifier = Modifier.width(180.dp),
                 focusRequester = backFocus,
-                icon = { Icon(VortXIcons.back, contentDescription = null) },
+                icon = VortXIcons.back,
             )
         }
         item {
@@ -151,6 +154,9 @@ internal fun tvDebridFocusTarget(event: TvDebridFocusEvent): TvDebridFocusTarget
     TvDebridFocusEvent.SCREEN_ENTRY -> TvDebridFocusTarget.BACK
     TvDebridFocusEvent.BACK_TO_SETTINGS -> TvDebridFocusTarget.DEBRID_SERVICES
 }
+
+internal fun tvDebridControlAccessibilityLabel(service: DebridService, control: String): String =
+    "${service.displayName}: $control"
 
 internal enum class TvDebridStatus(@get:StringRes val textResource: Int) {
     NOT_SET(R.string.tv_debrid_status_not_set),
@@ -322,16 +328,33 @@ private fun TvDebridKeySection(
     }
 
     val statusColor = when (editor.status) {
-        TvDebridStatus.SET -> colors.accent
-        TvDebridStatus.STORAGE_UNAVAILABLE -> colors.danger
+        TvDebridStatus.SET -> colors.accentBright
+        TvDebridStatus.STORAGE_UNAVAILABLE -> colors.textPrimary
         TvDebridStatus.NOT_SET, TvDebridStatus.CLEARED -> colors.textTertiary
     }
     val statusText = stringResource(editor.status.textResource)
+    val statusAccessibilityText = tvDebridControlAccessibilityLabel(service, statusText)
+    val keyFieldLabel = stringResource(
+        if (editor.hasValue) {
+            R.string.tv_debrid_replacement_api_key
+        } else {
+            R.string.tv_debrid_api_key
+        },
+    )
+    val saveActionLabel = stringResource(
+        if (editor.hasValue) {
+            R.string.tv_debrid_action_replace
+        } else {
+            R.string.tv_debrid_action_save
+        },
+    )
+    val clearActionLabel = stringResource(R.string.tv_debrid_action_clear)
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(colors.surface1, RoundedCornerShape(18.dp))
+            .semantics { isTraversalGroup = true }
             .padding(VortXTheme.spacing.md),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
     ) {
@@ -346,9 +369,9 @@ private fun TvDebridKeySection(
                 style = VortXTheme.type.label.copy(color = statusColor),
                 modifier = Modifier.semantics {
                     liveRegion = LiveRegionMode.Polite
-                    stateDescription = statusText
+                    stateDescription = statusAccessibilityText
                     if (editor.status.isAccessibilityError) {
-                        error(statusText)
+                        error(statusAccessibilityText)
                     }
                 },
             )
@@ -356,18 +379,13 @@ private fun TvDebridKeySection(
         OutlinedTextField(
             value = editor.pendingKey,
             onValueChange = { editor = editor.copy(pendingKey = it) },
-            modifier = Modifier.fillMaxWidth().focusRequester(keyFieldFocus),
-            label = {
-                Text(
-                    stringResource(
-                        if (editor.hasValue) {
-                            R.string.tv_debrid_replacement_api_key
-                        } else {
-                            R.string.tv_debrid_api_key
-                        },
-                    ),
-                )
-            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .semantics {
+                    contentDescription = tvDebridControlAccessibilityLabel(service, keyFieldLabel)
+                }
+                .focusRequester(keyFieldFocus),
+            label = { Text(keyFieldLabel) },
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(
@@ -388,12 +406,10 @@ private fun TvDebridKeySection(
             horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
         ) {
             TvDebridAction(
-                label = stringResource(
-                    if (editor.hasValue) {
-                        R.string.tv_debrid_action_replace
-                    } else {
-                        R.string.tv_debrid_action_save
-                    },
+                label = saveActionLabel,
+                accessibilityLabel = tvDebridControlAccessibilityLabel(
+                    service,
+                    "$saveActionLabel API key",
                 ),
                 onClick = { save(TvDebridMutationTrigger.DPAD) },
                 enabled = editor.pendingKey.isNotBlank(),
@@ -401,7 +417,11 @@ private fun TvDebridKeySection(
                 focusRequester = saveFocus,
             )
             TvDebridAction(
-                label = stringResource(R.string.tv_debrid_action_clear),
+                label = clearActionLabel,
+                accessibilityLabel = tvDebridControlAccessibilityLabel(
+                    service,
+                    "$clearActionLabel API key",
+                ),
                 onClick = {
                     applyMutation(
                         TvDebridMutation.CLEAR,
@@ -427,7 +447,8 @@ private fun TvDebridAction(
     enabled: Boolean = true,
     danger: Boolean = false,
     focusRequester: FocusRequester? = null,
-    icon: (@Composable () -> Unit)? = null,
+    accessibilityLabel: String = label,
+    icon: ImageVector? = null,
 ) {
     val colors = VortXTheme.colors
     val baseColor = when {
@@ -443,19 +464,21 @@ private fun TvDebridAction(
     Surface(
         onClick = onClick,
         enabled = enabled,
-        modifier = modifier.then(
-            if (focusRequester != null) {
-                Modifier.focusRequester(focusRequester)
-            } else {
-                Modifier
-            },
-        ),
+        modifier = modifier
+            .semantics { contentDescription = accessibilityLabel }
+            .then(
+                if (focusRequester != null) {
+                    Modifier.focusRequester(focusRequester)
+                } else {
+                    Modifier
+                },
+            ),
         shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = baseColor,
             contentColor = contentColor,
-            focusedContainerColor = if (danger) colors.danger else colors.accent,
-            focusedContentColor = if (danger) Color.White else colors.onAccent,
+            focusedContainerColor = colors.surface3,
+            focusedContentColor = colors.textPrimary,
         ),
         scale = ClickableSurfaceDefaults.scale(focusedScale = 1.04f),
         border = ClickableSurfaceDefaults.border(
@@ -470,9 +493,15 @@ private fun TvDebridAction(
             horizontalArrangement = Arrangement.Center,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            icon?.invoke()
+            if (icon != null) {
+                Icon(icon, contentDescription = null, tint = LocalContentColor.current)
+            }
             if (icon != null) Spacer(Modifier.width(VortXTheme.spacing.xs))
-            Text(label, style = VortXTheme.type.body.copy(fontWeight = FontWeight.SemiBold))
+            Text(
+                label,
+                style = VortXTheme.type.body.copy(fontWeight = FontWeight.SemiBold),
+                color = LocalContentColor.current,
+            )
         }
     }
 }

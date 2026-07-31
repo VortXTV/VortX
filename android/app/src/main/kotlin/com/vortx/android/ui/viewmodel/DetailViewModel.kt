@@ -9,6 +9,7 @@ import com.vortx.android.debrid.DebridCoordinator
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridOwnerToken
 import com.vortx.android.debrid.DebridResolver
+import com.vortx.android.debrid.DebridService
 import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.engine.SourceListModel
 import com.vortx.android.engine.StreamRanking
@@ -52,12 +53,90 @@ internal fun Episode.debridEpisodeForResolve(): DebridResolver.Episode? {
 
 internal data class DebridCacheEvidence(
     val owner: DebridOwnerToken,
-    val hashes: Set<String>,
+    val torrentServices: Map<String, DebridService>,
     val usenetUrls: Set<String>,
-)
+) {
+    val hashes: Set<String> get() = torrentServices.keys
+}
+
+internal fun torrentServicesFromCacheHits(
+    hits: Map<String, DebridCoordinator.CacheHit>,
+): Map<String, DebridService> =
+    hits.entries.associate { (hash, hit) -> hash.trim().lowercase() to hit.service }
 
 internal fun DebridCacheEvidence?.forOwner(owner: DebridOwnerToken?): DebridCacheEvidence? =
     this?.takeIf { owner != null && it.owner == owner }
+
+/// Map one ranked stream into the failover candidate that carries both its source identity and, for torrents,
+/// the exact provider whose account cache check confirmed the hash. Usenet deliberately carries no torrent
+/// provider because its resolve path remains TorBox-only.
+internal fun debridCandidateFor(
+    source: StreamSource,
+    torrentServices: Map<String, DebridService> = emptyMap(),
+): DebridCoordinator.DebridCandidate? {
+    if (source.url != null) return null
+    return when {
+        source.isUsenet -> DebridCoordinator.DebridCandidate(
+            nzbUrl = source.nzbUrl,
+            fileMustInclude = source.fileMustInclude,
+            fileIdx = source.fileIdx,
+            source = source,
+        )
+        !source.infoHash.isNullOrEmpty() -> {
+            val hash = source.infoHash.trim().lowercase()
+            DebridCoordinator.DebridCandidate(
+                infoHash = source.infoHash,
+                fileIdx = source.fileIdx,
+                source = source,
+                confirmedCachedService = torrentServices[hash],
+            )
+        }
+        else -> null
+    }
+}
+
+/// In-session native-debrid resume provenance. The winning source rides with the provider/file ref so every
+/// later playable is rebuilt from that exact source rather than whichever source currently ranks best.
+internal data class NativeDebridResumeRef(
+    val targetId: String,
+    val ref: DebridCoordinator.DebridPlaybackRef,
+    val source: StreamSource,
+    val url: String,
+    val savedAtMs: Long,
+) {
+    fun playable(
+        resolvedUrl: String,
+        resumeMs: Long,
+        mediaRef: MediaRef?,
+        expectedDurationMs: Long,
+    ): Playable = Playable(
+        url = resolvedUrl,
+        title = source.title,
+        viaStreamingServer = false,
+        isTorrent = false,
+        isDolbyVision = StreamRanking.isDolbyVision(source),
+        isAtmos = StreamRanking.isAtmos(source),
+        startPositionMs = resumeMs,
+        mediaRef = mediaRef,
+        expectedDurationMs = expectedDurationMs,
+    )
+}
+
+internal fun nativeDebridResumeRef(
+    targetId: String,
+    winner: DebridCoordinator.PlayableWinner,
+    fallbackSource: StreamSource,
+    savedAtMs: Long,
+): NativeDebridResumeRef {
+    val source = winner.candidate.source ?: fallbackSource
+    return NativeDebridResumeRef(
+        targetId = targetId,
+        ref = winner.ref,
+        source = source,
+        url = winner.ref.url,
+        savedAtMs = savedAtMs,
+    )
+}
 
 internal suspend fun <T> ownerBoundResult(
     expectedOwner: DebridOwnerToken?,
@@ -126,7 +205,7 @@ class DetailViewModel(
     /// id), so a re-play of the SAME target within [DebridCoordinator.FRESH_LINK_WINDOW_MS] replays the exact
     /// stored link (or reresolves it) via [DebridCoordinator.resumePlaybackURL] instead of re-running source
     /// selection. Lost on process death (no cross-launch persistence yet), which is the safe first cut.
-    private var resumeRef: ResumeRef? = null
+    private var resumeRef: NativeDebridResumeRef? = null
 
     private val _meta = MutableStateFlow<UiState<MetaDetail>>(UiState.Loading)
     val meta: StateFlow<UiState<MetaDetail>> = _meta.asStateFlow()
@@ -410,9 +489,14 @@ class DetailViewModel(
                 .filter { it.isUsenet && StreamRanking.isCachedSource(it) }
                 .mapNotNull { it.nzbUrl }
                 .toSet()
-            debridCacheEvidence = DebridCacheEvidence(owner, hits.keys, cachedUsenetUrls)
+            val torrentServices = torrentServicesFromCacheHits(hits)
+            debridCacheEvidence = DebridCacheEvidence(
+                owner = owner,
+                torrentServices = torrentServices,
+                usenetUrls = cachedUsenetUrls,
+            )
             // Badge + rank up any account-cached add-on torrent the add-on itself did not tag.
-            val decorated = decorateCached(raw, hits.keys)
+            val decorated = decorateCached(raw, torrentServices.keys)
             if (
                 decorated !== raw &&
                 episodeId == _selectedEpisodeId.value &&
@@ -701,7 +785,10 @@ class DetailViewModel(
                         url = resumed.url,
                         savedAtMs = if (resumed.url != stored.url) System.currentTimeMillis() else stored.savedAtMs,
                     )
-                    _playback.value = Playback.Ready(playableFrom(best, resumed.url, resumeMs, ref))
+                    lastPlayedSource = stored.source
+                    _playback.value = Playback.Ready(
+                        stored.playable(resumed.url, resumeMs, ref, expectedRuntimeMs()),
+                    )
                     return@launch
                 }
             }
@@ -712,9 +799,17 @@ class DetailViewModel(
                 return@launch
             }
             if (winner != null) {
-                val source = winner.candidate.source ?: best
-                resumeRef = ResumeRef(targetId, winner.ref, winner.ref.url, System.currentTimeMillis())
-                _playback.value = Playback.Ready(playableFrom(source, winner.ref.url, resumeMs, ref))
+                val stored = nativeDebridResumeRef(
+                    targetId = targetId,
+                    winner = winner,
+                    fallbackSource = best,
+                    savedAtMs = System.currentTimeMillis(),
+                )
+                resumeRef = stored
+                lastPlayedSource = stored.source
+                _playback.value = Playback.Ready(
+                    stored.playable(winner.ref.url, resumeMs, ref, expectedRuntimeMs()),
+                )
                 return@launch
             }
             // 3) Fall back to the single-source resolve of the labeled best (direct / media-server / single
@@ -757,7 +852,7 @@ class DetailViewModel(
         // Rank the candidates EXACTLY as the labeled best is picked (score + pin), de-duplicated by handle, so
         // the failover order matches the visible list.
         val ranked = StreamRanking.rankedCandidates(groups, continuity = null, pin = currentPin())
-        val candidates = ranked.mapNotNull { toCandidate(it) }
+        val candidates = ranked.mapNotNull { debridCandidateFor(it, evidence.torrentServices) }
         if (candidates.isEmpty()) return null
         return debrid.resolveFirstPlayable(
             candidates = candidates,
@@ -783,48 +878,11 @@ class DetailViewModel(
         repo.resolve(source, episode)
     }
 
-    /// Map a ranked [StreamSource] to a resolvable [DebridCoordinator.DebridCandidate], or null when it is not
-    /// ours to resolve (already carries a direct/debrid [StreamSource.url], or is neither a raw torrent nor a
-    /// usenet stream). The source rides along so the failover's quality gate can rank it.
-    private fun toCandidate(s: StreamSource): DebridCoordinator.DebridCandidate? {
-        if (s.url != null) return null
-        return when {
-            s.isUsenet -> DebridCoordinator.DebridCandidate(
-                nzbUrl = s.nzbUrl,
-                fileMustInclude = s.fileMustInclude,
-                fileIdx = s.fileIdx,
-                source = s,
-            )
-            !s.infoHash.isNullOrEmpty() -> DebridCoordinator.DebridCandidate(
-                infoHash = s.infoHash,
-                fileIdx = s.fileIdx,
-                source = s,
-            )
-            else -> null
-        }
-    }
-
     private fun currentModelEpisode(): Episode? {
         if (type != MediaType.SERIES) return null
         val detail = (_meta.value as? UiState.Success)?.data ?: return null
         return detail.episodeForResolve(_selectedEpisodeId.value)
     }
-
-    /// Build the [Playable] for a natively-resolved debrid [url] off its winning [source]: the DV/Atmos routing
-    /// flags parsed from the source tags (same as the engine repo's resolve), the resume offset, and the
-    /// external-sync identity. The url is a plain direct stream, so it plays without the streaming-server bridge.
-    private fun playableFrom(source: StreamSource, url: String, resumeMs: Long, ref: MediaRef?): Playable =
-        Playable(
-            url = url,
-            title = source.title,
-            viaStreamingServer = false,
-            isTorrent = false,
-            isDolbyVision = StreamRanking.isDolbyVision(source),
-            isAtmos = StreamRanking.isAtmos(source),
-            startPositionMs = resumeMs,
-            mediaRef = ref,
-            expectedDurationMs = expectedRuntimeMs(),
-        )
 
     /// The title's expected runtime (ms) from the loaded catalog metadata, riding every resolved
     /// [Playable] as [Playable.expectedDurationMs] so the player's bad-source (runtime-mismatch)
@@ -1116,15 +1174,6 @@ class DetailViewModel(
         torbox.close()
         singularity.close()
     }
-
-    /// An in-session native-debrid resolve for one play target, feeding the [DebridCoordinator.resumePlaybackURL]
-    /// fresh-link replay: [ref] regenerates the SAME source, [url]/[savedAtMs] gate the instant-replay window.
-    private data class ResumeRef(
-        val targetId: String,
-        val ref: DebridCoordinator.DebridPlaybackRef,
-        val url: String,
-        val savedAtMs: Long,
-    )
 
     private companion object {
         const val OWNER_CHANGED_MESSAGE = "The active VortX account changed. Try again."

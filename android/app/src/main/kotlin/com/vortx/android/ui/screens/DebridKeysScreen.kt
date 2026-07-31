@@ -27,6 +27,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.error
+import androidx.compose.ui.semantics.isTraversalGroup
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -71,7 +78,10 @@ internal data class DebridKeyEditorState(
             pendingKey = attemptedKey.takeIf { status.storageUnavailable }.orEmpty(),
         )
 
-    fun afterClear(status: DebridKeyStatus): DebridKeyEditorState = from(status)
+    fun afterClear(status: DebridKeyStatus): DebridKeyEditorState =
+        from(status).copy(
+            pendingKey = pendingKey.takeIf { status.storageUnavailable }.orEmpty(),
+        )
 
     companion object {
         fun from(status: DebridKeyStatus): DebridKeyEditorState =
@@ -101,6 +111,11 @@ internal fun debridMutationStatus(saved: Boolean, reread: DebridKeyStatus): Debr
             storageUnavailable = true,
         )
     }
+
+internal fun debridControlAccessibilityLabel(service: DebridService, control: String): String =
+    "${service.displayName}: $control"
+
+internal fun DebridKeyEditorState.shouldClearMutationFocus(): Boolean = !storageUnavailable
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -172,19 +187,25 @@ private fun DebridKeySection(
     fun save() {
         if (editor.pendingKey.isBlank()) return
         val attemptedKey = editor.pendingKey
-        editor = editor.afterSave(attemptedKey, onSave(attemptedKey))
-        focusManager.clearFocus()
+        val updated = editor.afterSave(attemptedKey, onSave(attemptedKey))
+        editor = updated
+        if (updated.shouldClearMutationFocus()) focusManager.clearFocus()
     }
 
     val statusColor = when {
-        editor.storageUnavailable -> colors.danger
-        editor.durablyConfigured -> colors.accent
+        editor.storageUnavailable -> colors.textPrimary
+        editor.durablyConfigured -> colors.accentBright
         else -> colors.textTertiary
     }
+    val statusAccessibilityText = debridControlAccessibilityLabel(service, editor.statusText)
+    val fieldLabel = if (editor.hasValue) "Replacement API key" else "API key"
+    val saveLabel = if (editor.hasValue) "Replace" else "Save"
 
     SurfaceCard {
         Column(
-            modifier = Modifier.padding(VortXTheme.spacing.md),
+            modifier = Modifier
+                .semantics { isTraversalGroup = true }
+                .padding(VortXTheme.spacing.md),
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
         ) {
             Row(
@@ -193,13 +214,36 @@ private fun DebridKeySection(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(service.displayName, style = VortXTheme.type.cardTitle)
-                Text(editor.statusText, style = VortXTheme.type.label.copy(color = statusColor))
+                Text(
+                    editor.statusText,
+                    style = VortXTheme.type.label.copy(color = statusColor),
+                    modifier = Modifier.semantics {
+                        liveRegion = LiveRegionMode.Polite
+                        stateDescription = statusAccessibilityText
+                        if (editor.storageUnavailable) {
+                            error(statusAccessibilityText)
+                        }
+                    },
+                )
             }
             OutlinedTextField(
                 value = editor.pendingKey,
                 onValueChange = { editor = editor.copy(pendingKey = it) },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text(if (editor.hasValue) "Replacement API key" else "API key") },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics {
+                        contentDescription = debridControlAccessibilityLabel(service, fieldLabel)
+                        if (editor.storageUnavailable) {
+                            error(statusAccessibilityText)
+                        }
+                    },
+                label = { Text(fieldLabel) },
+                supportingText = if (editor.storageUnavailable) {
+                    { Text(statusAccessibilityText, color = colors.textPrimary) }
+                } else {
+                    null
+                },
+                isError = editor.storageUnavailable,
                 singleLine = true,
                 visualTransformation = debridKeyVisualTransformation(),
                 keyboardOptions = debridKeyKeyboardOptions,
@@ -215,16 +259,27 @@ private fun DebridKeySection(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 PrimaryButton(
-                    text = if (editor.hasValue) "Replace" else "Save",
+                    text = saveLabel,
                     onClick = { save() },
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier
+                        .weight(1f)
+                        .semantics {
+                            contentDescription = debridControlAccessibilityLabel(
+                                service,
+                                "$saveLabel API key",
+                            )
+                        },
                     enabled = editor.pendingKey.isNotBlank(),
                 )
                 TextButton(
                     enabled = editor.hasValue || editor.storageUnavailable,
+                    modifier = Modifier.semantics {
+                        contentDescription = debridControlAccessibilityLabel(service, "Clear API key")
+                    },
                     onClick = {
-                        editor = editor.afterClear(onClear())
-                        focusManager.clearFocus()
+                        val updated = editor.afterClear(onClear())
+                        editor = updated
+                        if (updated.shouldClearMutationFocus()) focusManager.clearFocus()
                     },
                 ) {
                     Text(

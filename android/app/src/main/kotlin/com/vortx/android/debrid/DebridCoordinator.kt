@@ -12,6 +12,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeoutOrNull
 
+internal fun torrentResolveService(
+    confirmedCachedService: DebridService?,
+    configuredServices: List<DebridService>,
+): DebridService? =
+    if (confirmedCachedService != null) {
+        confirmedCachedService.takeIf { it in configuredServices }
+    } else {
+        configuredServices.firstOrNull()
+    }
+
 /// Drives cache-check + playback resolution across the user's configured debrid providers. This is the
 /// Kotlin port of the Apple `DebridCoordinator` (app/SourcesShared/DebridResolver.swift): the per-provider
 /// resolve/cache-check legs live in [DebridResolver] (which dispatches by service); this layer adds the
@@ -76,10 +86,10 @@ internal class DebridCoordinator(
     /// direct/debrid link (skipped: nothing to resolve). Mirrors the `CoreStream` fields the Apple
     /// `resolveFirstPlayable` reads.
     ///
-    /// [source] is the [StreamSource] this candidate was mapped from, carried ONLY so the label-authoritative
-    /// gate in [resolveFirstPlayable] can rank a race winner's resolution via [StreamRanking.resolutionRank]
-    /// (the Android analogue of Apple's `CoreStream` candidates carrying their own resolution). Null when the
-    /// caller has no source to attach (the gate then treats the candidate as always acceptable).
+    /// [source] is the [StreamSource] this candidate was mapped from, carried so the label-authoritative gate
+    /// in [resolveFirstPlayable] can rank a race winner's resolution via [StreamRanking.resolutionRank] and the
+    /// caller can preserve the exact winner. [confirmedCachedService] binds a torrent candidate to the provider
+    /// whose cache check proved its hash cached; it is null for unprobed torrents and TorBox-only usenet.
     data class DebridCandidate(
         val infoHash: String? = null,
         val magnet: String? = null,
@@ -90,6 +100,7 @@ internal class DebridCoordinator(
         val fileIdx: Int? = null,
         val hasDirectUrl: Boolean = false,
         val source: StreamSource? = null,
+        val confirmedCachedService: DebridService? = null,
     )
 
     /// A cache-check hit: which provider has the hash cached, plus the cached file list. Mirrors the Apple
@@ -117,13 +128,6 @@ internal class DebridCoordinator(
     /// True when a usenet resolve is possible (a TorBox key is configured; usenet is TorBox-only). With no
     /// TorBox key every usenet path is inert.
     val hasUsenetResolver: Boolean get() = keys.isConfigured(DebridService.TOR_BOX)
-
-    private fun pickService(
-        service: DebridService?,
-        owner: DebridOwnerToken,
-    ): DebridService? =
-        service?.takeIf { keys.isConfigured(it, owner) }
-            ?: keys.configuredServices(owner).firstOrNull()
 
     // ------------------------------------------------------------------------------------------------
     // Cache-check (concurrent fan-out)
@@ -288,8 +292,9 @@ internal class DebridCoordinator(
     ///
     /// NO-KEY / CACHE GATE: with no resolver this returns null immediately (no network). When [confirmedCachedHashes]
     /// (or [confirmedUsenetURLs]) is non-null, a not-confirmed pick returns null with ZERO network so the
-    /// caller falls straight through to the embedded path; a null set keeps the pre-gate behaviour. Mirrors
-    /// the Apple `resolvedPlaybackRef`.
+    /// caller falls straight through to the embedded path. A confirmed torrent must also carry the provider
+    /// that supplied the hit, preventing a different first-configured provider from receiving the resolve.
+    /// A null set keeps the pre-gate behaviour. Mirrors the Apple `resolvedPlaybackRef`.
     suspend fun resolvePlaybackRef(
         candidate: DebridCandidate,
         episode: DebridResolver.Episode? = null,
@@ -334,7 +339,11 @@ internal class DebridCoordinator(
         if (candidate.hasDirectUrl) return null
         val hash = candidate.infoHash?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
         if (confirmedCachedHashes != null && hash !in confirmedCachedHashes) return null
-        val service = pickService(null, owner) ?: return null
+        if (confirmedCachedHashes != null && candidate.confirmedCachedService == null) return null
+        val service = torrentResolveService(
+            candidate.confirmedCachedService,
+            keys.configuredServices(owner),
+        ) ?: return null
         val magnet = candidate.magnet?.takeIf { it.isNotBlank() } ?: resolver.magnet(hash, candidate.trackers)
 
         return withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {

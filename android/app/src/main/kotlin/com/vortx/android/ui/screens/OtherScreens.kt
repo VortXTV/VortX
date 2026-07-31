@@ -1,5 +1,6 @@
 package com.vortx.android.ui.screens
 
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -32,6 +33,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -262,6 +265,8 @@ fun SettingsScreen(
     onDebridKeysScreenClick: () -> Unit,
     onDownloadsClick: () -> Unit,
     onLibraryClick: () -> Unit,
+    settingsScrollState: ScrollState,
+    debridServicesFocusRequester: FocusRequester,
     modifier: Modifier = Modifier,
     onOpenGallery: (() -> Unit)? = null,
 ) {
@@ -300,7 +305,7 @@ fun SettingsScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
+            .verticalScroll(settingsScrollState)
             .padding(VortXTheme.spacing.edge),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
     ) {
@@ -333,7 +338,13 @@ fun SettingsScreen(
         SettingRow(VortXIcons.playRectangle, "Live TV", "IPTV", onClick = onLiveTvClick)
         SettingRow(VortXIcons.audioOutput, "Playback", playbackValue, onClick = onPlaybackClick)
         SettingRow(VortXIcons.sources, "Sources", sourcesValue, onClick = onSourcesClick)
-        SettingRow(VortXIcons.lock, "Debrid services", "API keys", onClick = onDebridKeysScreenClick)
+        SettingRow(
+            VortXIcons.lock,
+            "Debrid services",
+            "API keys",
+            onClick = onDebridKeysScreenClick,
+            modifier = Modifier.focusRequester(debridServicesFocusRequester),
+        )
         // The Downloads summary reads the live index, so the row can never disagree with the screen it opens
         // (the same rule the Playback row above follows). "None" rather than a byte count when empty: "0 B" reads
         // like a broken measurement, not like an empty list.
@@ -355,10 +366,16 @@ fun SettingsScreen(
 }
 
 @Composable
-private fun SettingRow(icon: ImageVector, title: String, value: String, onClick: (() -> Unit)? = null) {
+private fun SettingRow(
+    icon: ImageVector,
+    title: String,
+    value: String,
+    onClick: (() -> Unit)? = null,
+    modifier: Modifier = Modifier,
+) {
     val colors = VortXTheme.colors
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(vertical = VortXTheme.spacing.sm),

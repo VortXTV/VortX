@@ -5,11 +5,14 @@ import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.StreamSource
-import com.vortx.android.ui.viewmodel.episodeForResolve
 import com.vortx.android.ui.viewmodel.DebridCacheEvidence
+import com.vortx.android.ui.viewmodel.debridCandidateFor
 import com.vortx.android.ui.viewmodel.debridEpisodeForResolve
+import com.vortx.android.ui.viewmodel.episodeForResolve
 import com.vortx.android.ui.viewmodel.forOwner
+import com.vortx.android.ui.viewmodel.nativeDebridResumeRef
 import com.vortx.android.ui.viewmodel.ownerBoundResult
+import com.vortx.android.ui.viewmodel.torrentServicesFromCacheHits
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -121,10 +124,149 @@ class DebridPlaybackProvenanceTest {
     fun accountCacheEvidenceIsReadableOnlyByItsOwnerGeneration() {
         val ownerA = DebridOwnerToken(DebridOwnerScope.Account("account-a"), generation = 1)
         val ownerB = DebridOwnerToken(DebridOwnerScope.Account("account-b"), generation = 2)
-        val evidence = DebridCacheEvidence(ownerA, setOf("hash-a"), setOf("nzb-a"))
+        val evidence = DebridCacheEvidence(
+            ownerA,
+            mapOf("hash-a" to DebridService.PREMIUMIZE),
+            setOf("nzb-a"),
+        )
 
         assertEquals(evidence, evidence.forOwner(ownerA))
         assertNull(evidence.forOwner(ownerB))
+    }
+
+    @Test
+    fun lowerRankedFailoverWinnerRetainsExactSourceOnSecondPlayResume() {
+        val owner = DebridOwnerToken(DebridOwnerScope.Account("account-a"), generation = 1)
+        val labeledBest = StreamSource(
+            id = "best",
+            addon = "Best add-on",
+            title = "Labeled best 4K HDR",
+            quality = "2160p HDR",
+            isTorrent = true,
+            infoHash = "best-hash",
+        )
+        val failoverWinner = StreamSource(
+            id = "winner",
+            addon = "Failover add-on",
+            title = "Actual winner 1080p Dolby Vision Atmos",
+            quality = "1080p Dolby Vision Atmos",
+            isTorrent = true,
+            infoHash = "winner-hash",
+        )
+        val playbackRef = DebridCoordinator.DebridPlaybackRef(
+            url = "https://example.invalid/first",
+            service = DebridService.PREMIUMIZE,
+            owner = owner,
+            infoHash = failoverWinner.infoHash!!,
+            torrentId = 3,
+            fileId = 8,
+            fileIdx = 1,
+        )
+        val stored = nativeDebridResumeRef(
+            targetId = "movie",
+            winner = DebridCoordinator.PlayableWinner(
+                ref = playbackRef,
+                candidate = DebridCoordinator.DebridCandidate(
+                    infoHash = failoverWinner.infoHash,
+                    source = failoverWinner,
+                ),
+            ),
+            fallbackSource = labeledBest,
+            savedAtMs = 1L,
+        )
+
+        val firstPlay = stored.playable(
+            resolvedUrl = stored.url,
+            resumeMs = 0L,
+            mediaRef = null,
+            expectedDurationMs = 7_200_000L,
+        )
+        val secondPlay = stored.copy(url = "https://example.invalid/resumed").playable(
+            resolvedUrl = "https://example.invalid/resumed",
+            resumeMs = 42_000L,
+            mediaRef = null,
+            expectedDurationMs = 7_200_000L,
+        )
+
+        assertFalse(labeledBest == failoverWinner)
+        assertEquals(failoverWinner, stored.source)
+        assertEquals(failoverWinner.title, firstPlay.title)
+        assertEquals(failoverWinner.title, secondPlay.title)
+        assertTrue(firstPlay.isDolbyVision)
+        assertTrue(firstPlay.isAtmos)
+        assertEquals(firstPlay.isDolbyVision, secondPlay.isDolbyVision)
+        assertEquals(firstPlay.isAtmos, secondPlay.isAtmos)
+        assertFalse(secondPlay.viaStreamingServer)
+        assertEquals(42_000L, secondPlay.startPositionMs)
+    }
+
+    @Test
+    fun cacheConfirmedTorrentUsesTheProviderThatProvedTheHit() {
+        val hash = "abcdef0123456789"
+        val owner = DebridOwnerToken(DebridOwnerScope.Account("account-a"), generation = 1)
+        val cacheHits = mapOf(
+            hash to DebridCoordinator.CacheHit(
+                service = DebridService.PREMIUMIZE,
+                files = listOf(
+                    DebridResolver.DebridFile(
+                        id = 1,
+                        name = "Movie.mkv",
+                        shortName = "Movie.mkv",
+                        size = 1_000L,
+                    ),
+                ),
+            ),
+        )
+        val evidence = DebridCacheEvidence(
+            owner = owner,
+            torrentServices = torrentServicesFromCacheHits(cacheHits),
+            usenetUrls = emptySet(),
+        )
+        val candidate = debridCandidateFor(
+            source = StreamSource(
+                id = "torrent",
+                addon = "Test",
+                title = "Movie",
+                isTorrent = true,
+                infoHash = hash.uppercase(),
+            ),
+            torrentServices = evidence.torrentServices,
+        )!!
+
+        assertEquals(DebridService.PREMIUMIZE, candidate.confirmedCachedService)
+        assertEquals(
+            DebridService.PREMIUMIZE,
+            torrentResolveService(
+                confirmedCachedService = candidate.confirmedCachedService,
+                configuredServices = listOf(
+                    DebridService.REAL_DEBRID,
+                    DebridService.PREMIUMIZE,
+                ),
+            ),
+        )
+        assertNull(
+            torrentResolveService(
+                confirmedCachedService = DebridService.PREMIUMIZE,
+                configuredServices = listOf(DebridService.REAL_DEBRID),
+            ),
+        )
+    }
+
+    @Test
+    fun usenetCandidateRemainsTorBoxOnlyAndDoesNotInheritTorrentProviderEvidence() {
+        val nzbUrl = "https://example.invalid/release.nzb"
+        val candidate = debridCandidateFor(
+            source = StreamSource(
+                id = "usenet",
+                addon = "Test",
+                title = "Usenet release",
+                nzbUrl = nzbUrl,
+            ),
+            torrentServices = mapOf("unrelated" to DebridService.PREMIUMIZE),
+        )!!
+
+        assertEquals(nzbUrl, candidate.nzbUrl)
+        assertNull(candidate.confirmedCachedService)
     }
 
     @Test

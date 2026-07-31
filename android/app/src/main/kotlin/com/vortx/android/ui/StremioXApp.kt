@@ -3,6 +3,7 @@ package com.vortx.android.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,8 +35,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -209,6 +212,9 @@ fun StremioXApp(
         var showPlayback by remember { mutableStateOf(false) }
         var showSources by remember { mutableStateOf(false) }
         var showDebridKeys by remember { mutableStateOf(false) }
+        var restoreDebridServicesFocus by remember { mutableStateOf(false) }
+        val settingsScrollState = rememberScrollState()
+        val debridServicesFocusRequester = remember { FocusRequester() }
         var showLiveTv by remember { mutableStateOf(false) }
         var showLibraryTransfer by remember { mutableStateOf(false) }
         var showProfiles by remember { mutableStateOf(false) }
@@ -222,6 +228,25 @@ fun StremioXApp(
         // Settings' Account row summary and the AccountScreen overlay both read the SAME live
         // authState, so a sign-in on one immediately reflects on the other with no extra plumbing.
         val accountVm: AccountViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo, auth = auth))
+        val closeDebridKeys: () -> Unit = {
+            showDebridKeys = false
+            restoreDebridServicesFocus = true
+        }
+
+        LaunchedEffect(showDebridKeys, restoreDebridServicesFocus, tab) {
+            if (!showDebridKeys && restoreDebridServicesFocus && tab == Tab.SETTINGS) {
+                var focused = false
+                repeat(3) {
+                    if (!focused) {
+                        withFrameNanos { }
+                        focused = runCatching {
+                            debridServicesFocusRequester.requestFocus()
+                        }.getOrDefault(false)
+                    }
+                }
+                if (focused) restoreDebridServicesFocus = false
+            }
+        }
 
         // The debug-only design-system gallery (S02) is the topmost overlay when open, above even the
         // detail/player layers below; it is a review tool, not part of the product navigation graph.
@@ -544,11 +569,11 @@ fun StremioXApp(
         }
 
         if (showDebridKeys) {
-            BackHandler { showDebridKeys = false }
+            BackHandler(onBack = closeDebridKeys)
             DebridKeysScreen(
                 keys = debridKeys,
                 accountIdentity = debridAccountIdentity,
-                onBack = { showDebridKeys = false },
+                onBack = closeDebridKeys,
             )
             return@VortXTheme
         }
@@ -688,8 +713,13 @@ fun StremioXApp(
                     onDownloadsClick = { showDownloads = true },
                     onPlaybackClick = { showPlayback = true },
                     onSourcesClick = { showSources = true },
-                    onDebridKeysScreenClick = { showDebridKeys = true },
+                    onDebridKeysScreenClick = {
+                        restoreDebridServicesFocus = false
+                        showDebridKeys = true
+                    },
                     onLibraryClick = { showLibraryTransfer = true },
+                    settingsScrollState = settingsScrollState,
+                    debridServicesFocusRequester = debridServicesFocusRequester,
                     modifier = content,
                     onOpenGallery = { showGallery = true },
                 )

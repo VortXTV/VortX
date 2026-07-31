@@ -1,7 +1,9 @@
 package com.vortx.android.ui.tv
 
+import androidx.compose.ui.graphics.Color
 import com.vortx.android.debrid.DebridService
 import java.io.File
+import kotlin.math.pow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -257,9 +259,9 @@ class TvDebridSettingsContractTest {
 
         val mutations = listOf(
             "liveRegion = LiveRegionMode.Polite" to "liveRegion = LiveRegionMode.None",
-            "stateDescription = statusText" to "stateDescription = \"\"",
+            "stateDescription = statusAccessibilityText" to "stateDescription = \"\"",
             "if (editor.status.isAccessibilityError)" to "if (false)",
-            "error(statusText)" to "stateDescription = statusText",
+            "error(statusAccessibilityText)" to "stateDescription = statusAccessibilityText",
         )
         mutations.forEachIndexed { index, (before, after) ->
             assertFalse(
@@ -267,6 +269,70 @@ class TvDebridSettingsContractTest {
                 statusAccessibilityContract(source.replace(before, after)),
             )
         }
+    }
+
+    @Test
+    fun `focused action label and icon consume the TV Surface content color`() {
+        val source = readProjectFile(
+            "src/main/kotlin/com/vortx/android/ui/tv/TvDebridKeysScreen.kt",
+        )
+
+        assertTrue(focusedActionContentColorContract(source))
+        val mutations = listOf(
+            "color = LocalContentColor.current" to "color = colors.textSecondary",
+            "tint = LocalContentColor.current" to "tint = colors.textSecondary",
+            "focusedContainerColor = colors.surface3" to "focusedContainerColor = colors.accent",
+            "focusedContentColor = colors.textPrimary" to "focusedContentColor = colors.onAccent",
+        )
+        mutations.forEachIndexed { index, (before, after) ->
+            assertFalse(
+                "focused content-color mutation $index survived",
+                focusedActionContentColorContract(source.replace(before, after)),
+            )
+        }
+    }
+
+    @Test
+    fun `focused action token pair clears normal text contrast across every surface variant`() {
+        // Non-OLED surface3 is HSV value 0.225, so neutral #393939 is the highest-luminance
+        // possible surface at that value. Every accent-tinted surface3 is no brighter; OLED is darker.
+        val textPrimary = Color(0xFFF6F1E9)
+        val worstCaseNonOledSurface3 = Color(0xFF393939)
+        val oledSurface3 = Color(0xFF242426)
+
+        assertTrue(contrastRatio(textPrimary, worstCaseNonOledSurface3) >= 4.5)
+        assertTrue(contrastRatio(textPrimary, oledSurface3) >= 4.5)
+    }
+
+    @Test
+    fun `provider fields and actions have unique service names and traversal groups`() {
+        val labels = DebridService.entries.map {
+            tvDebridControlAccessibilityLabel(it, "Save API key")
+        }
+        val source = readProjectFile(
+            "src/main/kotlin/com/vortx/android/ui/tv/TvDebridKeysScreen.kt",
+        )
+
+        assertEquals(DebridService.entries.size, labels.toSet().size)
+        assertTrue(labels.contains("TorBox: Save API key"))
+        assertTrue(providerAccessibilityContract(source))
+    }
+
+    @Test
+    fun `secure storage failure uses the high contrast theme text token`() {
+        val source = readProjectFile(
+            "src/main/kotlin/com/vortx/android/ui/tv/TvDebridKeysScreen.kt",
+        )
+
+        assertTrue(dangerStatusContrastContract(source))
+        assertFalse(
+            dangerStatusContrastContract(
+                source.replace(
+                    "TvDebridStatus.STORAGE_UNAVAILABLE -> colors.textPrimary",
+                    "TvDebridStatus.STORAGE_UNAVAILABLE -> colors.danger",
+                ),
+            ),
+        )
     }
 
     @Test
@@ -319,9 +385,44 @@ class TvDebridSettingsContractTest {
 
     private fun statusAccessibilityContract(source: String): Boolean =
         source.contains("liveRegion = LiveRegionMode.Polite") &&
-            source.contains("stateDescription = statusText") &&
+            source.contains("stateDescription = statusAccessibilityText") &&
             source.contains("if (editor.status.isAccessibilityError)") &&
-            source.contains("error(statusText)")
+            source.contains("error(statusAccessibilityText)")
+
+    private fun focusedActionContentColorContract(source: String): Boolean =
+        source.contains("color = LocalContentColor.current") &&
+            source.contains("tint = LocalContentColor.current") &&
+            source.contains("focusedContainerColor = colors.surface3") &&
+            source.contains("focusedContentColor = colors.textPrimary")
+
+    private fun providerAccessibilityContract(source: String): Boolean =
+        source.contains("isTraversalGroup = true") &&
+            source.contains("tvDebridControlAccessibilityLabel(service, keyFieldLabel)") &&
+            source.contains("accessibilityLabel = tvDebridControlAccessibilityLabel(") &&
+            source.contains("contentDescription = accessibilityLabel")
+
+    private fun dangerStatusContrastContract(source: String): Boolean =
+        source.contains("TvDebridStatus.STORAGE_UNAVAILABLE -> colors.textPrimary")
+
+    private fun contrastRatio(foreground: Color, background: Color): Double {
+        val lighter = maxOf(relativeLuminance(foreground), relativeLuminance(background))
+        val darker = minOf(relativeLuminance(foreground), relativeLuminance(background))
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
+    private fun relativeLuminance(color: Color): Double {
+        fun linear(channel: Float): Double {
+            val value = channel.toDouble()
+            return if (value <= 0.04045) {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).pow(2.4)
+            }
+        }
+        return 0.2126 * linear(color.red) +
+            0.7152 * linear(color.green) +
+            0.0722 * linear(color.blue)
+    }
 
     private fun readProjectFile(relativePath: String): String {
         val candidates = listOf(
