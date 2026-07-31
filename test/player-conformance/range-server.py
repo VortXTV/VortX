@@ -148,4 +148,4 @@ sys.stderr.flush()
 try:
     server.serve_forever()
 except KeyboardInterrupt:
-    pass
+    pass  # Ctrl-C stops the fixture server; there is nothing to clean up.

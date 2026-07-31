@@ -42,7 +42,8 @@ def walk_boxes(buf, start, end, depth=0, path=""):
         pos += size
 
 def check_init(path):
-    buf = open(path, "rb").read()
+    with open(path, "rb") as handle:
+        buf = handle.read()
     boxes = list(walk_boxes(buf, 0, len(buf)))
     names = {p.split("/")[-1] for p, *_ in boxes}
     ok = True
@@ -118,7 +119,8 @@ def check_init(path):
     return ok
 
 def check_master(path):
-    text = open(path).read()
+    with open(path) as handle:
+        text = handle.read()
     infs = re.findall(r"#EXT-X-STREAM-INF:([^\n]+)\n([^\n]+)", text)
     ok = True
     print(f"{len(infs)} variants")
