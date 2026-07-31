@@ -22,6 +22,14 @@ set -uo pipefail
 PATTERN='\bclaude\b|\bcodex\b|\banthropic\b|\bopenai\b|\bchatgpt\b|\bcopilot\b'
 ALLOWED_PATHS='^(\.gitignore|app/project\.yml|scripts/tooling-reference-guard\.sh)$'
 PATTERN_NOB='claude|codex|anthropic|openai|chatgpt|copilot'
+# Commit-message exceptions, by FULL sha. These two commits reached the public beta branch on
+# 2026-07-22 with an assistant name in their message body (review attribution). They predate this
+# guard and are already public for good; per the accept-disclosure decision they are NOT
+# history-rewritten. They are allowlisted so that merging beta's full history into main (which
+# re-scans them in the pushed range) does not fail forever on already-public content. This exempts
+# ONLY these exact commits; every other message, identity, path, and file stays checked. Add a new
+# entry here only for a commit that is already public and cannot be rewritten, with the reason.
+ALLOWED_COMMITS='87d595545c43fbc615b0e0aa6a85c826899c8b60 72816ecd08380a8c78909c663d7d2235debe9add'
 FAIL=0
 
 say() { printf '%s\n' "$*" >&2; }
@@ -62,6 +70,8 @@ fi
 if [ -n "$RANGE" ]; then
     while IFS= read -r h; do
         [ -z "$h" ] && continue
+        # already-public, un-rewritable commits (see ALLOWED_COMMITS above)
+        case " $ALLOWED_COMMITS " in *" $h "*) continue ;; esac
         if git log -1 --format='%B%n%an%n%ae%n%cn%n%ce' "$h" 2>/dev/null | grep -qiE "$PATTERN"; then
             say "TOOLING REFERENCE in commit: $(git log -1 --format='%h %s' "$h" 2>/dev/null)"
             FAIL=1
