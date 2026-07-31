@@ -6,7 +6,7 @@ The latest release only. Sideloaded builds have no auto-update, so check Setting
 
 ## Reporting a vulnerability
 
-Use GitHub's private vulnerability reporting (Security tab > Report a vulnerability) rather than a public issue, especially for anything touching:
+Report privately at **https://github.com/VortXTV/VortX/security/advisories/new** (GitHub's private vulnerability reporting) rather than opening a public issue, especially for anything touching:
 
 - the embedded streaming server or its localhost surface
 - account tokens and the keychain

@@ -15,6 +15,10 @@ on:
   schedule:
     - cron: "0 6 * * 1"   # weekly, Mondays 06:00 UTC
 
+# Least privilege at the top; the analyze job widens only what it needs.
+permissions:
+  contents: read
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
