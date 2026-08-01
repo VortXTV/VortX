@@ -19,6 +19,15 @@
       "versions": [
         {
           "version": "0.3.14",
+          "buildVersion": "207",
+          "date": "2026-08-01",
+          "localizedDescription": "0.3.14 Beta 12. Two hotfixes over Beta 10. The app opens again: a keychain locking deadlock that froze the splash screen on signed-in installs (worst on Apple TV) is fixed. External debrid playback works again: a TLS enforcement shipped with no certificate trust store, which blocked every Real-Debrid and TorBox source while local torrents played, is removed. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.12/VortX-iOS-v0.3.14-beta.12-ci.ipa",
+          "size": 63340937,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
           "buildVersion": "204",
           "date": "2026-07-31",
           "localizedDescription": "0.3.14 Beta 10. Fresh episodes now start at 0:00 (fixes the few-seconds-in start), remux playback and seeking are hardened, a large Android and web settings-sync pass lands, and trusted media transport is enforced at the app layer. In-place update over Beta 9, nothing resets.",
@@ -57,6 +66,15 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.3.14",
+          "buildVersion": "207",
+          "date": "2026-08-01",
+          "localizedDescription": "0.3.14 Beta 12. Two hotfixes over Beta 10. The app opens again: a keychain locking deadlock that froze the splash screen on signed-in installs (worst on Apple TV) is fixed. External debrid playback works again: a TLS enforcement shipped with no certificate trust store, which blocked every Real-Debrid and TorBox source while local torrents played, is removed. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.12/VortX-tvOS-v0.3.14-beta.12-ci.ipa",
+          "size": 62894628,
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.3.14",
           "buildVersion": "204",
