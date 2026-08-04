@@ -109,7 +109,16 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     }
     guard !Task.isCancelled else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
+    // The SAME sticky + provider-health terms the player and the preload rank with (diag-21). This is the lane
+    // a viewer actually hits by tapping an episode (and the one a Continue-Watching resume uses), so ranking it
+    // without them would hand that tap to whichever provider answers fastest while the player, one episode
+    // later, ranked by the remembered pick - the exact "it switched my source again" report. `seriesId` is the
+    // show id, the same key `pin` above uses, and this whole function is series-only by construction
+    // (`loadMeta(type: "series", …)`). @MainActor, so reading the main-actor store here needs no snapshot.
+    let sticky = SeriesSourceSticky.preference(for: seriesId)
     guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge, pin: pin,
+                                        sticky: sticky,
+                                        providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
                                         debridCachedHashes: cachedHashes) else { return nil }
     let targetSeason = v.season ?? defaultSeason
     // PRESENCE, not truthiness: `episodeNumber` is the DISPLAY helper (`episode ?? 0`), so using it here

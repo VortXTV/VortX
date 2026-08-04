@@ -25,6 +25,15 @@ enum StreamRanking {
     /// cannot overflow or trap from adversarial add-on text, and every realistic value scores exactly as before.
     static let seederTiebreakCap = 180
 
+    /// Magnitude of BOTH the sticky-source bonus and the provider-failure penalty, deliberately the same
+    /// number so they are exact mirrors: a remembered source that has just stalled nets zero and ranks on its
+    /// own merit again instead of being re-picked purely because it answers fastest. 6000 sits above the binge
+    /// (2500) and continuity (max 1600) hints AND above the max within-tier quality spread (4313), so a
+    /// remembered provider holds the pick against a slightly better-tagged release from another add-on, and
+    /// STRICTLY under the 15000 source-type tier step, so it can never cross the user's explicit source-type
+    /// order (the anti-regression invariant documented in `computeScore`).
+    static let stickyWeight = 6000
+
     // MARK: - Caches
 
     /// `String.range(of:options:.regularExpression)` recompiles the ICU pattern on EVERY call,
@@ -110,6 +119,60 @@ enum StreamRanking {
         return 1_000_000
     }
 
+    /// The source the viewer last chose BY HAND for this show, remembered across episodes and launches
+    /// (`SeriesSourceSticky`). Either signal earns the bonus ONCE: the add-on name - the app-owned identity,
+    /// matched the same case-insensitive way a pin matches it - or the add-on's own bingeGroup id. A stream
+    /// carrying both is not paid twice; the point is "same source", not "how many ways it looks the same".
+    /// Strictly a bonus: stickiness must never become a filter, or the episode the remembered add-on has
+    /// nothing for strands the viewer (MIS-260731-03).
+    static func stickyBonus(_ s: CoreStream, addon: String, sticky: (addon: String?, bingeGroup: String?)?) -> Int {
+        guard let sticky else { return 0 }
+        if let a = sticky.addon, !a.isEmpty, addon.caseInsensitiveCompare(a) == .orderedSame { return stickyWeight }
+        if let g = sticky.bingeGroup, !g.isEmpty, s.behaviorHints?.bingeGroup == g { return stickyWeight }
+        return 0
+    }
+
+    /// Demote an add-on that JUST failed (`ProviderHealth.penaltyActive`), so auto-next stops handing the next
+    /// episode to a provider that has just true-stalled. A penalty, never an exclusion: the least-bad provider
+    /// still wins when it is the only one that answers. Taken as a closure over the add-on name so the ranker
+    /// stays free of the health store and tests can drive it, and applied by the callers BELOW rather than
+    /// inside `computeScore`, whose memo is keyed only by stream fields plus a cached bit and has no time
+    /// dimension - baked in there, a ten-minute penalty would outlive the failure for the life of the cache.
+    static func healthPenalty(addon: String, isUnhealthy: ((String) -> Bool)?) -> Int {
+        isUnhealthy?(addon) == true ? -stickyWeight : 0
+    }
+
+    /// Ceiling on the SUM of the caller-applied POSITIVE bonuses (continuity + binge + sticky).
+    ///
+    /// Each term is individually sized under the 15000 source-type tier step, but they ADD: continuity (max
+    /// 1600) + binge (2500) + sticky (6000) is 10100 on one stream, and on top of `computeScore`'s own 14993
+    /// that is 25093 against a 15000 step - enough for three hints to carry a stream across TWO steps of the
+    /// user's explicit source-type order. That order is the anti-regression invariant `computeScore` documents,
+    /// so the sum gets a ceiling rather than each term getting a smaller weight (shrinking the terms would
+    /// weaken exactly the sticky signal diag-21 needs).
+    ///
+    /// 8000 keeps the OVERSHOOT bounded at 7993 (14993 + 8000 - 15000), which is under one step: a stream can
+    /// still out-rank a slightly better-placed rival within the neighbouring step, exactly as the pre-existing
+    /// continuity+binge pair already could (its overshoot was 4093, retained here by design - narrowing it
+    /// would be a silent ranking change nobody asked for), but it can never reach two steps up.
+    static let callerBonusCeiling = 8000
+
+    /// The clamped caller-applied bonus block, used IDENTICALLY by `best` and `rankedCandidates` so the two
+    /// cannot drift: the failover and the batch auto-retry both rely on `rankedCandidates.first` being exactly
+    /// the stream `best` would have auto-picked.
+    ///
+    /// `pinBonus` is deliberately NOT in the sum: a pin is the user's explicit "play THIS" and is sized
+    /// (1000000) to dominate every tier. `healthPenalty` is deliberately NOT in it either: it is negative, and
+    /// clamping a sum that includes it would let the ceiling silently cancel a demotion - it is applied by the
+    /// callers AFTER this, unclamped, so a penalized provider always loses exactly its `stickyWeight`.
+    static func callerBonuses(_ s: CoreStream, addon: String, hint: String?, binge: String?,
+                              sticky: (addon: String?, bingeGroup: String?)?) -> Int {
+        let sum = continuityBonus(s, hint: hint)
+            + bingeBonus(s, group: binge)
+            + stickyBonus(s, addon: addon, sticky: sticky)
+        return min(sum, callerBonusCeiling)
+    }
+
     /// Coarse release flavor for a pin's human label only: Remux > BluRay > WEB, "" when none is tagged.
     static func releaseFlavor(_ s: CoreStream) -> String {
         let text = qualityText(s)
@@ -122,8 +185,18 @@ enum StreamRanking {
     /// best() with the continuity and bingeGroup bonuses applied on top of the base
     /// score. bingeGroup (exact, from the add-on) outweighs the quality-signature
     /// heuristic; both fall back to the plain best when absent.
+    ///
+    /// `sticky` is the source the viewer chose by hand for this show (`SeriesSourceSticky.preference`) and
+    /// `providerPenalty` answers "has this add-on just failed" (`ProviderHealth.penaltyActive`). Both are
+    /// optional and default to nil, so every existing caller ranks exactly as before, and both are applied
+    /// HERE rather than inside the memoized `computeScore`, which is keyed only by stream fields.
+    /// The user's explicit add-on-order mode is untouched by either: there, only a pin overrides the order.
+    /// The positive hints go through `callerBonuses`, whose ceiling is what keeps their SUM from crossing more
+    /// than one step of the user's source-type order.
     static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
-                     pin: ResolvedPin? = nil, debridCachedHashes: Set<String> = []) -> CoreStream? {
+                     pin: ResolvedPin? = nil, sticky: (addon: String?, bingeGroup: String?)? = nil,
+                     providerPenalty: ((String) -> Bool)? = nil,
+                     debridCachedHashes: Set<String> = []) -> CoreStream? {
         let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
         if SourcePreferences.reading.useAddonOrder {
             // Add-on order is the user's explicit "don't re-rank" choice, but a pin is an even more
@@ -133,22 +206,38 @@ enum StreamRanking {
         }
         let hasHint = hint?.isEmpty == false
         let hasBinge = binge?.isEmpty == false
-        guard hasHint || hasBinge || pin != nil else { return best(groups, pin: pin, debridCachedHashes: debridCachedHashes) }
+        // The sticky record and the health penalty are ranking signals in their own right, so either one
+        // alone must keep this scoring path instead of falling through to the plain best().
+        let hasSticky = sticky?.addon?.isEmpty == false || sticky?.bingeGroup?.isEmpty == false
+        guard hasHint || hasBinge || pin != nil || hasSticky || providerPenalty != nil else {
+            return best(groups, pin: pin, debridCachedHashes: debridCachedHashes)
+        }
         let candidates = playablePairs(groups)
         return candidates.max { lhs, rhs in
-            (score(lhs.stream, debridCachedHashes: debridCachedHashes) + continuityBonus(lhs.stream, hint: hint) + bingeBonus(lhs.stream, group: binge) + pinBonus(lhs.stream, addon: lhs.addon, pin: pin)) <
-            (score(rhs.stream, debridCachedHashes: debridCachedHashes) + continuityBonus(rhs.stream, hint: hint) + bingeBonus(rhs.stream, group: binge) + pinBonus(rhs.stream, addon: rhs.addon, pin: pin))
+            (score(lhs.stream, debridCachedHashes: debridCachedHashes)
+                + callerBonuses(lhs.stream, addon: lhs.addon, hint: hint, binge: binge, sticky: sticky)
+                + pinBonus(lhs.stream, addon: lhs.addon, pin: pin)
+                + healthPenalty(addon: lhs.addon, isUnhealthy: providerPenalty)) <
+            (score(rhs.stream, debridCachedHashes: debridCachedHashes)
+                + callerBonuses(rhs.stream, addon: rhs.addon, hint: hint, binge: binge, sticky: sticky)
+                + pinBonus(rhs.stream, addon: rhs.addon, pin: pin)
+                + healthPenalty(addon: rhs.addon, isUnhealthy: providerPenalty))
         }?.stream
     }
 
-    /// The full playable candidate list ranked EXACTLY as `best(_:continuity:binge:pin:)` picks its winner
-    /// (score + continuity + binge + pin), best-first, de-duplicated by playable URL. Feeds the batch-download
+    /// The full playable candidate list ranked EXACTLY as `best(_:continuity:binge:pin:sticky:providerPenalty:)`
+    /// picks its winner (score + the `callerBonuses` block + pin + health penalty), best-first, de-duplicated
+    /// by playable URL. Feeds the batch-download
     /// auto-retry (#119 remainder): on a failed episode it drops the winning source and queues the NEXT distinct
     /// source with the identical ranking the batch used. Returns [] when nothing is playable. In the user's
     /// explicit add-on-order mode the list keeps add-on/list order (the "don't re-rank" choice) but still fronts
     /// an applicable pin, matching best()'s add-on-order branch, so candidates.first is best()'s winner.
+    /// Every term above must stay in lockstep with best(): the failover and auto-retry rely on
+    /// candidates.first being exactly the stream best() would have auto-picked.
     static func rankedCandidates(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
-                                 pin: ResolvedPin? = nil, debridCachedHashes: Set<String> = []) -> [CoreStream] {
+                                 pin: ResolvedPin? = nil, sticky: (addon: String?, bingeGroup: String?)? = nil,
+                                 providerPenalty: ((String) -> Bool)? = nil,
+                                 debridCachedHashes: Set<String> = []) -> [CoreStream] {
         let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
         let pairs = playablePairs(groups)
         let ordered: [CoreStream]
@@ -166,9 +255,10 @@ enum StreamRanking {
                 .map { (offset: $0.offset,
                         stream: $0.element.stream,
                         score: score($0.element.stream, debridCachedHashes: debridCachedHashes)
-                            + continuityBonus($0.element.stream, hint: hint)
-                            + bingeBonus($0.element.stream, group: binge)
-                            + pinBonus($0.element.stream, addon: $0.element.addon, pin: pin)) }
+                            + callerBonuses($0.element.stream, addon: $0.element.addon,
+                                            hint: hint, binge: binge, sticky: sticky)
+                            + pinBonus($0.element.stream, addon: $0.element.addon, pin: pin)
+                            + healthPenalty(addon: $0.element.addon, isUnhealthy: providerPenalty)) }
                 .sorted { $0.score != $1.score ? $0.score > $1.score : $0.offset < $1.offset }   // stable within ties
                 .map { $0.stream }
         }

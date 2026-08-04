@@ -204,6 +204,22 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         let tombstones = AddonTombstones.all()
         let cachedHashes = debridCache.cachedHashes
 
+        // The remembered manual pick + the just-failed-provider demotion, snapshotted HERE on the main actor
+        // (diag-21). `SeriesSourceSticky.preference` reads main-actor state and so cannot be called from the
+        // detached rank below, and without these two terms this list ranked by up to `stickyWeight` (6000)
+        // differently from the player and the preload, which DO apply them: the row the list showed first was
+        // then not the one Watch-Now played. Same discipline as `prefsSnapshot` further down.
+        //
+        // Keyed on `metaId` - the show id, exactly what `pin` is scoped to - and only for an EPISODIC context
+        // (`streamId != nil`), the same gate the tvOS detail page uses to scope its groups. Nothing writes a
+        // sticky record for a non-series key (the player gates its write on `type == "series"`), so a
+        // franchise/collection page routed through the same lane simply reads nil.
+        let sticky: (addon: String?, bingeGroup: String?)? = ctx.streamId != nil && !ctx.metaId.isEmpty
+            ? SeriesSourceSticky.preference(for: ctx.metaId)
+            : nil
+        // Capture-free and lock-guarded inside, so it is safe to call from the detached rank.
+        let providerPenalty: @Sendable (String) -> Bool = { ProviderHealth.penaltyActive(addonName: $0) }
+
         // O(1)-ish signature: three epochs + one fold of the small inputs. No per-stream work.
         var hasher = Hasher()
         hasher.combine(ctx.metaId)
@@ -218,6 +234,10 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         hasher.combine(ctx.disabledAddons)
         hasher.combine(cachedHashes)
         hasher.combine(tombstones)
+        // A pick made in the player changes the rank without changing any epoch, so it has to be in the
+        // signature or the list would keep serving the pre-pick order until something else moved.
+        hasher.combine(sticky?.addon)
+        hasher.combine(sticky?.bingeGroup)
         let signature = Signature(streamsEpoch: core.streamsEpoch,
                                   torboxEpoch: torbox.epoch,
                                   singularityEpoch: singularity.epoch,
@@ -275,6 +295,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                 SourcePreferences.$readingOverride.withValue(prefsSnapshot) {
                     let groups = StreamRanking.rankedGroups(assembled, pin: ctx.pin, debridCachedHashes: cachedHashes)
                     let best = StreamRanking.best(groups, continuity: ctx.continuity, pin: ctx.pin,
+                                                  sticky: sticky, providerPenalty: providerPenalty,
                                                   debridCachedHashes: cachedHashes)
                     return (groups, best, StreamRanking.tiers(groups), StreamRanking.resolutionOptions(groups))
                 }

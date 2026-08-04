@@ -200,6 +200,18 @@ final class RankingBlocker: @unchecked Sendable {
     }
 }
 
+/// Stub of the diag-21 sticky store. The lifecycle properties under test are about ORDERING and generation
+/// fencing, not about which stream wins, so "no remembered pick" is the right stand-in: the production model
+/// snapshots this on the main actor before its detached rank, and this harness only has to let that compile.
+enum SeriesSourceSticky {
+    static func preference(for _: String) -> (addon: String?, bingeGroup: String?)? { nil }
+}
+
+/// Stub of the diag-21 provider-failure demotion. Nothing has failed in this harness.
+enum ProviderHealth {
+    static func penaltyActive(addonName _: String?) -> Bool { false }
+}
+
 enum StreamRanking {
     static func rankedGroups(
         _ groups: [CoreStreamSourceGroup],
@@ -214,6 +226,8 @@ enum StreamRanking {
         _ groups: [CoreStreamSourceGroup],
         continuity: String?,
         pin: ResolvedPin?,
+        sticky: (addon: String?, bingeGroup: String?)? = nil,
+        providerPenalty: ((String) -> Bool)? = nil,
         debridCachedHashes: Set<String>
     ) -> CoreStream? {
         groups.first?.streams.first
