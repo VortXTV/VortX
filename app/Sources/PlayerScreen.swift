@@ -593,6 +593,49 @@ struct PlayerScreen: View {
     /// True once a resume has already re-selected its SAME source (re-resolved a fresh link for the same file)
     /// after a stale-link failure, so a second failure hops to a DIFFERENT source instead of looping on it.
     @State private var resumeSourceReresolved = false
+    /// When the app was last suspended while this player stayed mounted, so the foreground hook knows HOW LONG
+    /// it was away. Nothing on-device can tell a live debrid link from an expired one, and re-minting a healthy
+    /// one would cost the viewer a reload for nothing, so the suspension length is the only honest gate.
+    /// Mirrors TVPlayerView.
+    @State private var suspendedAt: Date?
+    /// The play head at that same moment. `keepPlayingInBackground` defaults ON, so the audio really does keep
+    /// running while backgrounded and a position that MOVED across the suspension proves the mount survived it -
+    /// the only cheap, honest evidence that a revalidation would cost the viewer a reload for nothing. nil (no
+    /// stamp) is "in doubt": revalidate. Mirrors TVPlayerView.
+    @State private var suspendedTimePos: Double?
+    /// A suspension shorter than this leaves the mount alone: the stored debrid link is almost certainly still
+    /// valid and today's recovery ladder covers the rare miss. Past it the link has plausibly expired, and
+    /// re-minting here saves the stall-watchdog wait that used to precede it (diag-21).
+    private let mountRevalidationSuspensionSeconds: TimeInterval = 60
+    /// How far the play head must have moved across a suspension to count as "it kept playing".
+    private let healthyForegroundProgressSeconds: Double = 1
+    /// True once this foreground has already booked its one delayed loopback re-check, so a foreground can never
+    /// queue more than one (no busy loop). Cleared on every foreground entry.
+    @State private var foregroundMountRecheckArmed = false
+    /// How long the delayed re-check waits. `VortxNativeServer` clears `publishedPort` on background and only
+    /// restarts at scenePhase `.active`, which lands AFTER `willEnterForeground`, so at revalidation time
+    /// `StremioServer.base` still names the dead port and the heal below can prove nothing. One re-check past
+    /// the restart is what makes the heal reachable at all.
+    private let foregroundMountRecheckDelay: TimeInterval = 2.0
+    /// The load the mid-play failure handler has already claimed. `PlayerLoadToken` changes on every (re)load,
+    /// so recording it makes a SECOND mid-play error on the same mount inert while a genuinely new mount can
+    /// still fail - the once-per-load latch that keeps the handler from ping-ponging with the stall watchdog.
+    @State private var midPlayFailureOwner: PlayerLoadToken?
+    /// Where the viewer actually was when a MID-PLAY failure handed the load to the recovery ladder. tvOS keeps
+    /// a writable `resumeSeconds` @State and simply moves it; here `resumeSeconds` is an immutable view input,
+    /// so without this the ladder - which runs with `hasStartedPlaying` already cleared - would resume at THIS
+    /// load's origin and restart the episode from the beginning. Read by `retryResumeTarget()` and the failover
+    /// hop, and cleared the moment the next mount either first-frames or is replaced.
+    @State private var midPlayFailureResume: Double?
+    /// Mid-play recoveries handed to the ladder on THIS mount. Deliberately NOT cleared by the first frame:
+    /// `autoRetryCount` and `recoveryDeadline` are, so a source that frames for a tick and re-dies replenished
+    /// every budget it had just spent and looped at roughly a reload a second, forever (a truncated file; a
+    /// debrid link that 403s after its first range). Cleared only where the mount genuinely changes: a manual
+    /// source pick, and a successful hop to a DIFFERENT source. Mirrors TVPlayerView.
+    @State private var midPlayRecoveryCount = 0
+    /// After this many mid-play recoveries on one mount, the source itself is the problem: stop re-loading it
+    /// and hop, which is bounded by `sourceHops` and ends on the error overlay.
+    private let maxMidPlayRecoveries = 3
     // First-buffer grace for a big 4K remux on slow debrid: a start-timeout that fires while bytes are
     // still arriving (the demuxer-cache edge advanced since the last watchdog arm) extends the wait
     // rather than declaring the source dead. Bounded by the number of extensions and the overall
@@ -1033,8 +1076,21 @@ struct PlayerScreen: View {
         // advance the published episode and the loaded file agree by construction, so only a pending
         // advance needs reconciling on return to foreground. Pairs with (never replaces) the mpv seam's
         // enterForeground, which restores video decode + play state. macOS never suspends: not wired there.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            suspendedAt = Date()   // only read on the way back in; see revalidateMountOnForeground
+            suspendedTimePos = currentTime   // ... paired with the play head, so a mount that kept playing is provable
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            let suspended = suspendedAt.map { Date().timeIntervalSince($0) } ?? 0
+            let playHead = suspendedTimePos
+            suspendedAt = nil
+            suspendedTimePos = nil
+            foregroundMountRecheckArmed = false   // one delayed re-check per foreground, never a queue of them
             reconcileAdvanceOnForeground()
+            // The advance reconcile owns a straddled episode switch; this owns the mount underneath a playback
+            // that never moved. They are mutually exclusive by their own guards (a re-issued advance clears
+            // hasStartedPlaying, which is exactly what this one requires).
+            revalidateMountOnForeground(suspendedFor: suspended, playHeadAtSuspension: playHead)
         }
         #endif
         .confirmationDialog("Play in another app", isPresented: $showExternalChooser,
@@ -1429,6 +1485,7 @@ struct PlayerScreen: View {
                     // then cleared here, not a real failure.
                     srcProbe("FIRST FRAME at pos=\(String(format: "%.1f", d))s (playback started, clearing overlays)")
                     hasStartedPlaying = true
+                    midPlayFailureResume = nil   // a mount that is playing owns its own position again
                     // FIRST-FRAME COMMIT (binge-desync fix): the incoming episode's file actually
                     // rendered, so publish an in-flight advance NOW, before anything below
                     // (recordLastStream, the scrobble start) reads curMeta/curTitle - the store record
@@ -1714,8 +1771,10 @@ struct PlayerScreen: View {
             if !hasStartedPlaying {                  // only flag failures BEFORE playback
                 srcProbe("endFileError -> handleLoadFailure reason=\((data as? String) ?? "-")")
                 handleLoadFailure((data as? String) ?? "")
+            } else if !isLive {
+                handleMidPlayFailure((data as? String) ?? "", loadToken: loadToken)
             } else {
-                srcProbe("endFileError IGNORED (already playing) reason=\((data as? String) ?? "-")")
+                srcProbe("endFileError IGNORED (live stream owns its own reconnect) reason=\((data as? String) ?? "-")")
             }
         case MPVProperty.endFileEof:
             let completionOnly: Bool
@@ -2294,8 +2353,11 @@ struct PlayerScreen: View {
             isLive: isLive,
             hasStartedPlaying: hasStartedPlaying,
             currentTimeSeconds: currentTime,
-            activeRequestedResumeSeconds: activeRequestedResume,
-            fallbackResumeSeconds: resumeSeconds,
+            // A MID-PLAY failure hands the ladder a load that had already reached the viewer's position, so the
+            // position - not this load's origin - is what its retry must resume at (see midPlayFailureResume).
+            // nil in every other case, which is every case that existed before, so the policy is unchanged there.
+            activeRequestedResumeSeconds: midPlayFailureResume ?? activeRequestedResume,
+            fallbackResumeSeconds: midPlayFailureResume ?? resumeSeconds,
             persistenceFloorSeconds: suppressedResumeFloor
         )
     }
@@ -2402,6 +2464,57 @@ struct PlayerScreen: View {
             }
         }
         return true
+    }
+
+    /// MID-PLAY libmpv FAILURE (diag-21). This case used to only log "IGNORED": `handleLoadFailure` is gated on
+    /// `!hasStartedPlaying`, and so are the start watchdog and the recovery deadline, so the only owner left was
+    /// the stall watchdog - several frozen ticks before it reloaded, and it reloaded the same URL verbatim. A
+    /// background-resume death, an expired debrid link mid-episode and a server that moved port all land here,
+    /// and all of them have a real recovery behind `handleLoadFailure` (auto-retry -> same-source re-resolve ->
+    /// failover hop -> fresh-sources wait). Preserve where the viewer was, clear the started flag so the ladder
+    /// can admit, and hand it over.
+    ///
+    /// BOUNDED PER MOUNT by `midPlayRecoveryCount`, because `handleLoadFailure`'s own budgets cannot bound this
+    /// lane: a retry that reaches even one frame clears `autoRetryCount` AND `recoveryDeadline` at first frame,
+    /// so a source that frames for a tick and re-dies replenishes everything it just spent and loops at roughly
+    /// a reload a second, forever. Past the cap the SOURCE is the problem rather than the load, so hop instead -
+    /// bounded in turn by `sourceHops`, and ending on the error overlay.
+    ///
+    /// Live streams never reach here: their reconnect lane is owned by `scheduleReconnect` off the EOF path,
+    /// and widening this into it is not the fix. Mirrors TVPlayerView.handleMidPlayFailure.
+    private func handleMidPlayFailure(_ failureMessage: String, loadToken: PlayerLoadToken?) {
+        // Once per load, and FAIL-CLOSED on a missing token: with no token this cannot tell a second error on
+        // the same mount from a first one on a fresh mount, and doing nothing is exactly the pre-wave-1
+        // behavior for a mid-play error, so the unprovable case costs no regression.
+        guard let failureOwner = loadToken ?? coordinator.player?.activeLoadToken,
+              midPlayFailureOwner != failureOwner else { return }
+        midPlayFailureOwner = failureOwner
+        // Park the play head BEFORE clearing the started flag: every lane below (`retryResumeTarget`,
+        // `hopToNextSource`) reads the load's ORIGIN once `hasStartedPlaying` is false, which would restart
+        // the episode from the beginning. See `midPlayFailureResume`.
+        let resume = max(currentTime, suppressedResumeFloor ?? 0)
+        midPlayRecoveryCount += 1
+        midPlayFailureResume = resume
+        hasStartedPlaying = false
+        guard midPlayRecoveryCount <= maxMidPlayRecoveries else {
+            DiagnosticsLog.log(
+                "player",
+                "mid-play failure x\(midPlayRecoveryCount) on one mount -> hop instead of another reload, at \(Int(resume))s"
+            )
+            srcProbe("mid-play failure budget spent (\(midPlayRecoveryCount)/\(maxMidPlayRecoveries)) -> hopToNextSource")
+            loadErrorMsg = failureMessage
+            reconnecting = false
+            if !hopToNextSource(reason: "mid-play failure budget spent", resumeOverride: resume) {
+                presentTerminalLoadFailure()
+            }
+            return
+        }
+        DiagnosticsLog.log(
+            "player",
+            "mid-play failure -> recovery ladder at \(Int(resume))s (\(midPlayRecoveryCount)/\(maxMidPlayRecoveries))"
+        )
+        srcProbe("mid-play endFileError -> handleLoadFailure reason=\(failureMessage.isEmpty ? "-" : failureMessage)")
+        handleLoadFailure(failureMessage)
     }
 
     private func handleLoadFailure(_ msg: String) {
@@ -2519,6 +2632,7 @@ struct PlayerScreen: View {
         buffering = true; hasStartedPlaying = false; isSeekable = true; appliedSize = false; loadErrorMsg = ""
         subtitleLoadingURL = nil   // self-heal: a subtitle load stranded by the old engine must not gate the reload's picks
         srcProbeLoadStart = Date()   // [src-probe] a reload is a fresh attempt: re-anchor the elapsed clock
+        curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
         loadRetryIntoPlayer(
             curURL ?? url, headers: curHeaders, live: isLive, resumeTarget: resume
         )
@@ -2734,6 +2848,136 @@ struct PlayerScreen: View {
         return (hash.count == 40 && hash.allSatisfy(\.isHexDigit)) ? hash : nil
     }
 
+    /// The URL to (re)mount for the CURRENTLY playing source. Normally that is exactly what is already
+    /// loaded - but a loopback mount can go stale WITHOUT the source changing: the in-process engine server is
+    /// stopped on background and rebinds a FRESH ephemeral port on every foreground start, while
+    /// `CoreStream.playableURL` builds its loopback URL from `StremioServer.base` AT CALL TIME. After one
+    /// background cycle the stored `curURL` therefore names a port nothing is listening on, and every reload
+    /// path that replayed it verbatim re-failed forever (diag-21). Re-deriving here self-heals that.
+    ///
+    /// Deliberately narrow, and FAIL-OPEN in every other case (MIS-260731-03 - a control that cannot prove its
+    /// precondition must fall through to today's behavior, never to a new dead end):
+    ///  - `StremioServer.isCustom` means the viewer pointed the app at their own remote server; its base must
+    ///    never be rewritten under a playing stream.
+    ///  - Both the current and the re-derived URL must be loopback AND share the same path, so this can only
+    ///    ever move the AUTHORITY of one identical route. A header-gated stream keeps its raw URL in `curURL`
+    ///    (`loadIntoPlayer` re-derives the `/proxy/` wrapper through `playback(for:)` on every load, so that
+    ///    lane already self-heals), and swapping a proxied URL for a raw one here would strip the server-side
+    ///    header injection.
+    /// Returns `curURL` untouched (nil included) whenever it cannot prove a better mount, so callers keep their
+    /// existing `curURL ?? url` shape and no control flow changes. Mirrors TVPlayerView.liveMountURL.
+    private func liveMountURL() -> URL? {
+        guard let current = curURL, !StremioServer.isCustom, isLoopback(current),
+              let stream = currentStream,
+              let derived = playableURL(for: stream),
+              isLoopback(derived), derived != current,
+              derived.path == current.path else { return curURL }
+        // Exported, not just NSLog'd: `srcProbe` never reaches a diagnostics export, and this line is the one
+        // that says the heal fired at all. No raw identifiers (G5) - the shape, never the URL.
+        DiagnosticsLog.log("player", "mount re-derived: the embedded server moved port under the playing source")
+        srcProbe("mount re-derived: the embedded server moved port under the playing source")
+        return derived
+    }
+
+    /// A URL served by this device's own streaming server. Host-based, NOT port-based: the port is exactly
+    /// what drifts across a background cycle, so comparing it is what went stale in the first place.
+    private func isLoopback(_ u: URL) -> Bool {
+        guard let host = u.host?.lowercased() else { return false }
+        return host == "127.0.0.1" || host == "localhost" || host == "::1"
+    }
+
+    #if canImport(UIKit)
+    /// FOREGROUND MOUNT REVALIDATION (diag-21). The player is deliberately NOT torn down on background, so the
+    /// same engine stays mounted across a suspension - but what it is mounted ON can die underneath it: the
+    /// embedded server restarts on a fresh port, and a debrid link expires. Nothing revalidated either, so the
+    /// dead mount only surfaced through the stall watchdog, which then replayed the SAME dead URL verbatim and
+    /// looped. Heal it here instead, before the mpv seam's `enterForeground` play() hits a dead socket.
+    ///
+    /// This is a re-mount of the SAME source, never a failover: `sourceHops` and `exhaustedURLs` stay untouched,
+    /// so it neither claims a source failed nor burns the hop budget the viewer needs for one that really did.
+    /// Every branch that cannot prove a better mount returns and leaves exactly today's behavior in place
+    /// (MIS-260731-03). Mirrors TVPlayerView.revalidateMountOnForeground; macOS never suspends, so it is not
+    /// wired there (same reason the foreground reconcile is UIKit-only).
+    private func revalidateMountOnForeground(suspendedFor seconds: TimeInterval,
+                                             playHeadAtSuspension stamp: Double?) {
+        guard hasStartedPlaying, !loadFailed, !playbackExited, pendingAdvance == nil else { return }
+        // DEMONSTRABLY HEALTHY playback is left alone. `keepPlayingInBackground` defaults ON, so the audio
+        // really does keep running while backgrounded, and a play head that MOVED across the suspension proves
+        // the mount survived it. Re-minting a live debrid link then costs the viewer a reload plus a re-seek of
+        // a stream that was fine, and it is what made the double-recovery race routine (the in-flight
+        // re-resolve the identity guard silently drops). Every signal must agree, and with no stamp nothing is
+        // proven, so the unprovable case keeps the revalidation below exactly as it is (MIS-260731-03).
+        if let stamp, !isPaused, !buffering, !reconnecting,
+           currentTime - stamp >= healthyForegroundProgressSeconds {
+            DiagnosticsLog.log(
+                "player",
+                "foreground: playback kept running across the \(Int(seconds))s suspension (+\(Int(currentTime - stamp))s), mount left alone"
+            )
+            return
+        }
+        if let ref = curDebridRef, !ref.infoHash.isEmpty {
+            guard seconds >= mountRevalidationSuspensionSeconds else { return }
+            // `retryResumeSameSource()` already targets the play head through `retryResumeTarget()` (which
+            // folds in `hasStartedPlaying`, `currentTime` and the suppressed-resume floor), so unlike the tvOS
+            // twin nothing has to be moved before the call.
+            resumeSourceReresolved = false   // one re-resolve per suspension, not one per playback
+            if retryResumeSameSource() {
+                DiagnosticsLog.log("player", "foreground: re-resolving the debrid mount after \(Int(seconds))s suspended")
+                srcProbe("foreground: re-resolving the debrid mount after \(Int(seconds))s suspended")
+            }
+            return
+        }
+        healLoopbackMountOnForeground(allowRecheck: true)
+    }
+
+    /// The loopback half of the foreground revalidation, split out so the ONE delayed re-check below can re-run
+    /// exactly it and nothing else.
+    ///
+    /// The re-check is what makes this lane reachable at all: `VortxNativeServer.stopOnBackground()` clears
+    /// `publishedPort`, and the restart happens at scenePhase `.active`, which lands AFTER
+    /// `willEnterForeground`. At first call `StremioServer.base` therefore still names the dead port, so the
+    /// re-derived URL is either nil or identical to the stale one and the heal proves nothing. One re-check
+    /// past the restart sees the republished port. Bounded to a single re-arm per foreground - a watcher, not
+    /// a poll - and every path still returns to today's behavior when it cannot prove a better mount.
+    private func healLoopbackMountOnForeground(allowRecheck: Bool) {
+        guard hasStartedPlaying, !loadFailed, !playbackExited, pendingAdvance == nil else { return }
+        guard let healed = liveMountURL(), healed != curURL else {
+            guard allowRecheck, !foregroundMountRecheckArmed else { return }
+            foregroundMountRecheckArmed = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + foregroundMountRecheckDelay) {
+                healLoopbackMountOnForeground(allowRecheck: false)
+            }
+            return
+        }
+        DiagnosticsLog.log("player", "foreground: embedded server moved port, re-mounting the same source in place")
+        srcProbe("foreground: embedded server moved port, re-mounting the same source in place")
+        curURL = healed
+        let resume = retryResumeTarget()
+        reconnectMsg = "Recovering…"
+        withAnimation { reconnecting = true }
+        appliedSize = false; hasStartedPlaying = false; isSeekable = true; buffering = true
+        srcProbeLoadStart = Date()
+        let issuedToken = loadRetryIntoPlayer(
+            curURL ?? url, headers: curHeaders, live: isLive, resumeTarget: resume
+        )
+        // Arm the watchdog ONLY for a load the engine actually took. A refused load leaves the OLD mount in
+        // place, and the cleared flags above would then strand the viewer on a spinner nothing owns: no
+        // watchdog, `hasStartedPlaying` false so no tick clears it, and `reconnecting` true forever. Put the
+        // playing state back instead and let the stall watchdog - the owner this whole lane exists to pre-empt -
+        // have it, which is exactly today's behavior (MIS-260731-03). `curURL` deliberately keeps the healed
+        // value: the old port is provably dead, so the next reload down any path should use the re-derived one.
+        guard issuedToken != nil else {
+            DiagnosticsLog.log("player", "foreground re-mount was not issued; restoring the playing state")
+            srcProbe("foreground re-mount NOT ISSUED -> restoring hasStartedPlaying/buffering/reconnecting")
+            hasStartedPlaying = true
+            buffering = false
+            reconnecting = false
+            return
+        }
+        startLoadTimeout()
+    }
+    #endif
+
     /// One wall-clock cap over the WHOLE pre-start recovery sequence (30s timeout × retries × 4 hops
     /// would otherwise chain into minutes of spinner on a dead title). Idempotent; reset on a fresh
     /// deliberate pick and on playback actually starting. Mirrors tvOS `startRecoveryDeadline`.
@@ -2821,6 +3065,7 @@ struct PlayerScreen: View {
         // Resume where it froze: reload in place, the seek lands once duration is known again.
         let resume = currentTime
         appliedSize = false; hasStartedPlaying = false; isSeekable = true; buffering = true
+        curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
         let issuedToken = loadIntoPlayer(
             curURL ?? url, headers: curHeaders, live: isLive, resumeOrigin: resume
         )
@@ -3145,6 +3390,23 @@ struct PlayerScreen: View {
         return SourcePinStore.shared.effectivePin(SourcePinContext(metaId: m.libraryId, isSeries: m.type == "series"))
     }
 
+    /// The key a remembered manual source pick is stored and looked up under (`SeriesSourceSticky`). It is the
+    /// SAME identity `sourcePin` above uses - `libraryId`, the SHOW's id, which every episode of a series shares
+    /// (the per-episode identity is `videoId`, which would give a "sticky" that reset every episode and defeat
+    /// the whole point). Series only: the durable per-show memory is what the binge loop needs, and keying
+    /// movies here would spend the store's per-profile cap on titles that never get a next episode.
+    /// Mirrors TVPlayerView.seriesStickyKey (which reads `curMeta ?? meta`, the same launch/live pair that
+    /// `sourcePin` reads on each surface).
+    private var seriesStickyKey: String? {
+        guard let m = curMeta, m.type == "series" else { return nil }
+        return m.libraryId
+    }
+
+    /// The remembered manual pick for this show, in the shape `StreamRanking.best` / `rankedCandidates` take.
+    private var seriesSticky: (addon: String?, bingeGroup: String?)? {
+        seriesStickyKey.flatMap { SeriesSourceSticky.preference(for: $0) }
+    }
+
     /// The best playable stream not yet tried for this title / episode, honouring the user's source
     /// ordering + continuity / binge hints + any pin. Returns nil when nothing untried remains.
     ///
@@ -3168,11 +3430,15 @@ struct PlayerScreen: View {
                     StreamRanking.resolutionTierStep(StreamRanking.resolutionRank(s)) >= floorStep
                 })
             }
-            if let hit = StreamRanking.best(capped, continuity: recordQualityText, binge: nil, pin: sourcePin) {
+            if let hit = StreamRanking.best(capped, continuity: recordQualityText, binge: nil, pin: sourcePin,
+                                            sticky: seriesSticky,
+                                            providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) }) {
                 return hit
             }
         }
-        return StreamRanking.best(remaining, continuity: recordQualityText, binge: nil, pin: sourcePin)
+        return StreamRanking.best(remaining, continuity: recordQualityText, binge: nil, pin: sourcePin,
+                                  sticky: seriesSticky,
+                                  providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) })
     }
 
     /// The playing source is dead (retry / stall budget ran out): mark it exhausted and hop to the
@@ -3202,6 +3468,15 @@ struct PlayerScreen: View {
         let srcProbeCandidateCount = currentSourceGroups.reduce(0) {
             $0 + $1.streams.filter { playableURL(for: $0) != nil }.count
         }
+        // The playing source is being abandoned for FAILURE, whatever the caller's reason: this is the one
+        // choke point every failure lane funnels through. Remember the PROVIDER, not just the URL:
+        // `exhaustedURLs` is keyed by exact URL and is wiped on every source switch and every episode advance,
+        // so a provider that true-stalled on episode N was fully re-eligible on N+1 - and, answering fastest,
+        // was re-picked (diag-21). Recorded HERE rather than at the failure sites so a source that recovers in
+        // place is never demoted; the penalty decays on its own and is a demotion, never an exclusion.
+        if let dying = currentStream, let dyingAddon = addonName(for: dying) {
+            ProviderHealth.noteFailure(addonName: dyingAddon)
+        }
         let srcProbeUntried = nextUntriedStream()
         guard (allowBeyondFailureBudget || sourceHops < maxSourceHops),
               let stream = srcProbeUntried,
@@ -3211,8 +3486,10 @@ struct PlayerScreen: View {
         }
         var tried = exhaustedURLs
         if let dead = curURL { tried.insert(dead) }
+        // `midPlayFailureResume` carries the play head of a source that died MID-PLAY, whose handler had to
+        // clear `hasStartedPlaying` for the ladder to admit; without it this hop would restart the episode.
         let resume: Double = resumeOverride
-            ?? (hasStartedPlaying ? currentTime : resumeSeconds)
+            ?? (hasStartedPlaying ? currentTime : (midPlayFailureResume ?? resumeSeconds))
         srcProbe("hopToNextSource(\(reason)) HOP \(sourceHops)->\(sourceHops + 1) to host=\(newURL.host ?? "-") torrent=\(stream.isTorrent ? "Y" : "N") (candidates=\(srcProbeCandidateCount))")
         guard switchStream(
             to: stream, url: newURL, userInitiated: false,
@@ -3223,6 +3500,7 @@ struct PlayerScreen: View {
         }
         exhaustedURLs = tried
         sourceHops += 1
+        midPlayRecoveryCount = 0   // a DIFFERENT source is a different mount: it earns its own mid-play budget
         return true
     }
 
@@ -3238,11 +3516,16 @@ struct PlayerScreen: View {
         if userInitiated {
             sourceHops = 0; exhaustedURLs = []
             recoveryDeadline?.cancel(); recoveryDeadline = nil
+            // A mount the viewer asked for (a manual pick, or the next episode) gets a fresh mid-play budget.
+            // The automatic lane deliberately does NOT reset here - `hopToNextSource` clears it only once its
+            // switch is actually issued, so a hop that is refused keeps counting toward the overlay.
+            midPlayRecoveryCount = 0
         }
         appliedSize = false; appliedAutoTracks = false; autoAddonSubTried = false
         userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false
         pendingSubtitleReapply = nil; suppressedResumeFloor = nil
         hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
+        midPlayFailureResume = nil   // consumed by this switch's resumeOverride; it must not leak to the next load
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false
         torrentWarmupsUsed = 0; torrentStatus = nil
         subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
@@ -3270,9 +3553,12 @@ struct PlayerScreen: View {
     /// Switch the playing source in place: reload the picked stream's URL and resume at the current
     /// position, so a buffering or low-quality source can be swapped without leaving the player. A
     /// deliberate pick resets the failover budget; an automatic hop restores it in `hopToNextSource`.
+    /// `addon` is the NAME of the add-on a MANUAL pick came from, carried through so the choice can be
+    /// remembered for the rest of the series (`SeriesSourceSticky`); the panels have it in hand already.
     @discardableResult
     private func switchStream(to stream: CoreStream, url newURL: URL, userInitiated: Bool,
-                              explicitPick: Bool = false, resumeOverride: Double? = nil,
+                              explicitPick: Bool = false, addon: String? = nil,
+                              resumeOverride: Double? = nil,
                               debridRef: DebridPlaybackRef? = nil, engineAlreadyBound: Bool = false,
                               engineAddonBaseOverride: String? = nil,
                               mediaGenerationAlreadyClaimed: Bool = false) -> Bool {
@@ -3313,7 +3599,11 @@ struct PlayerScreen: View {
         // so a same-hash episode switch keeps the live engine. currentTorrentHash reads curURL, so it must be
         // evaluated before curURL is overwritten just below. No-op for a direct/debrid source (no hash).
         let oldHash = currentTorrentHash
-        let resume = resumeOverride ?? (hasStartedPlaying ? currentTime : resumeSeconds)
+        // `midPlayFailureResume` carries the play head of a source that died MID-PLAY, whose handler had to
+        // clear `hasStartedPlaying` before the recovery ladder would admit. Without it a switch taken from
+        // that state (the viewer picking another source off the error overlay) would restart the episode.
+        let resume = resumeOverride
+            ?? (hasStartedPlaying ? currentTime : (midPlayFailureResume ?? resumeSeconds))
         let priorPending = pendingAdvance
         // A source switch DURING a pending advance (the auto-hop lane when the incoming episode's first
         // source is dead) swaps WHICH FILE will first-frame, not which episode: keep the pending record
@@ -3366,6 +3656,17 @@ struct PlayerScreen: View {
         curHeaders = nextHeaders
         curSourceStream = stream
         curIsTorrent = nextIsTorrent
+        // REMEMBER A MANUAL PICK (diag-21). The in-session binge group is add-on-authored text worth +2500 and
+        // loses to the cached (+8000) and source-type (15000) terms on the very next rank, so the viewer
+        // re-picked the same provider every single episode. Record the choice durably here, the one place a
+        // picked stream and its add-on are both in hand. Gated on `explicitPick`, NOT on `userInitiated`: an
+        // episode advance also passes `userInitiated: true` (it closes panels and resets the failover budget
+        // the same way), and only the sources and quality panels set `explicitPick`. Recording an auto-hop or
+        // an advance would teach the store the failure, not the taste.
+        if explicitPick, let key = seriesStickyKey {
+            SeriesSourceSticky.record(seriesKey: key, addon: addon,
+                                      bingeGroup: stream.behaviorHints?.bingeGroup)
+        }
         if pendingAdvance == nil { curDebridRef = debridRef }
         curHint = nextHint
         if let oldHash, oldHash != stream.infoHash?.lowercased() { closeTorrent(hash: oldHash) }
@@ -5529,7 +5830,8 @@ struct PlayerScreen: View {
                 Row(label: opt.label, detail: StreamRanking.sizeText(opt.stream) ?? "",
                     selected: playableURL(for: opt.stream) == curURL) {
                     if let url = playableURL(for: opt.stream) {
-                        switchStream(to: opt.stream, url: url, userInitiated: true, explicitPick: true)
+                        switchStream(to: opt.stream, url: url, userInitiated: true, explicitPick: true,
+                                     addon: addonName(for: opt.stream))
                     }
                 }
             }
@@ -5719,6 +6021,14 @@ struct PlayerScreen: View {
         return id
     }
 
+    /// The add-on NAME that supplied `stream` - the app-owned identity `StreamRanking` matches a pin, the
+    /// sticky record and the provider-health penalty on (`manifest.name`), as opposed to `engineAddonBase`'s
+    /// base URL, which the engine uses for attribution. nil when the stream is not in the loaded groups
+    /// (a pasted link, or a Continue-Watching resume whose sources have not arrived yet). Mirrors tvOS.
+    private func addonName(for stream: CoreStream) -> String? {
+        currentSourceGroups.first { $0.streams.contains(stream) }?.addon
+    }
+
     /// True when more than one playable source is loaded for the current title / episode.
     private var hasAlternateSources: Bool {
         currentSourceGroups.reduce(0) { $0 + $1.streams.filter { playableURL(for: $0) != nil }.count } > 1
@@ -5798,7 +6108,8 @@ struct PlayerScreen: View {
                 let name = String(sourceLabel(stream).prefix(40))
                 rs.append(Row(label: "\(info.tags)   \(name)", detail: info.size ?? "",
                               selected: sURL == curURL) {
-                    switchStream(to: stream, url: sURL, userInitiated: true, explicitPick: true)
+                    switchStream(to: stream, url: sURL, userInitiated: true, explicitPick: true,
+                                 addon: group.addon)
                 })
             }
         }
