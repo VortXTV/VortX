@@ -97,6 +97,10 @@ struct TVInHeroTrailerView: View {
                     // mpv's built-in inf loop. Muted either way: a silent ambient clip.
                     .muted(true, loop: window == nil)
                     .videoFill(true)   // fill the WHOLE hero band, never a small letterboxed box (owner ask)
+                    // Ambient, decorative clip: log under [trailer], never [player]. Its buffering /
+                    // playing / endfile lines interleaved with the real player's in an exported device
+                    // log and read as extra phantom playbacks.
+                    .probeChannel("trailer")
                     .onPropertyChange { engine, name, data in handleProperty(engine, name, data) }
                     .allowsHitTesting(false)   // ambient: never in the focus / hit path
                     .opacity(showClip ? 1 : 0)

@@ -371,7 +371,7 @@ private func productionWiring() {
             name: "end-file EOF cleanup dispatch",
             file: "MPVMetalViewController.swift",
             start: "} else if ef.reason == MPV_END_FILE_REASON_EOF {",
-            end: #"VXProbe.event("player", "endfile eof")"#,
+            end: #"VXProbe.event(self.probeChannel, "endfile eof")"#,
             exactSection: """
                 } else if ef.reason == MPV_END_FILE_REASON_EOF {
                     #if os(tvOS)

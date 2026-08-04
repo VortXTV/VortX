@@ -98,6 +98,7 @@ struct InHeroTrailerView: View {
                     // mpv's built-in inf loop. Muted either way: a silent ambient clip.
                     .muted(true, loop: window == nil)
                     .videoFill(true)   // fill the WHOLE hero band, never a small letterboxed box (owner ask)
+                    .probeChannel("trailer")   // diag-21: the hero trailer must not impersonate [player] in the diag log
                     .onPropertyChange { engine, name, data in handleProperty(engine, name, data) }
                     .allowsHitTesting(false)   // ambient: never in the tap path
                     .opacity(showClip ? 1 : 0)

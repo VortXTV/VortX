@@ -128,11 +128,30 @@ final class MPVMetalViewController: PlatformViewController {
     /// disturbs the main player's audio session.
     var startMuted = false
     var loopPlayback = false
+    /// The VXProbe channel this instance narrates under. The real playback surface keeps `"player"`, which
+    /// every existing diagnostic and export tool greps for; the ambient hero trailer sets `"trailer"` so its
+    /// buffering / playing / endfile lines cannot be misread as the main player's. A muted decorative clip
+    /// impersonating `[player]` produced phantom overlapping playbacks in an exported device log and cost a
+    /// diagnosis. `StaticString` because a VXProbe category is a compile-time literal, never runtime text.
+    var probeChannel: StaticString = "player"
+    /// True only for the real playback surface. `VXProbeState.shared` holds ONE player line that the heartbeat
+    /// prints, so an ambient trailer writing into it overwrites the real player's position, duration, buffering
+    /// and state with a muted decorative clip's - which is exactly the phantom-playback confusion `probeChannel`
+    /// was added to end, left half-fixed because the narration moved channel but the shared STATE writes did
+    /// not. Compared through `description` because `StaticString` is not `Equatable`; every call site below is
+    /// an event (load, pause, buffering, duration) or already coalesced to a few Hz, so the cost is noise.
+    private var ownsSharedProbeState: Bool { probeChannel.description == "player" }
     private let mpvLog = Logger(subsystem: "com.stremiox.app", category: "mpv")
     private var configuredLiveMode = false
     /// The forward-cache cap (`demuxer-max-bytes`, option-string form) loadFile applied for the CURRENT
     /// file, so the paused-cache clamp can restore it on resume. nil until the first load.
     private var activeReadAheadCap: String?
+    /// The SAME cap as loadFile applied it, kept untouched by every clamp so a recovery has a ceiling to
+    /// walk back toward (`activeReadAheadCap` is overwritten by each shed and therefore cannot serve as
+    /// one). This is the only safe ceiling: DIAG-12 proved a recomputed or larger tvOS cap is not
+    /// device-safe, and this value already passed the platform limit and the RemoteConfig clamp, so a
+    /// restore may reach it and never exceed it. nil until the first load.
+    private var baselineReadAheadCap: String?
     /// The back-buffer cap (`demuxer-max-back-bytes`) every file starts with on this platform: the
     /// setupMpv pre-load default. shedForMemoryPressure drops the live option to 8MiB for the rest of the
     /// CURRENT file, and nothing else re-applied it for LATER files on the same instance (loadFile's clamp
@@ -149,16 +168,30 @@ final class MPVMetalViewController: PlatformViewController {
     private var pausedCacheClampWork: DispatchWorkItem?
     /// True while the paused clamp holds `demuxer-max-bytes` at the small floor (restored on resume).
     private var pausedCacheClamped = false
-    /// True once a system memory warning forced the cache floor for the REST of this file; a resume must
-    /// not re-raise the cap, because the pressure that fired the warning is usually still there. Reset on
-    /// the next loadFile (a new file starts with its buffers freed and gets its normal budget back).
+    /// True once a system memory warning stepped this file's cache down, which sends the NEXT warning
+    /// straight to the floor: a resume must not re-raise the cap, because the pressure that fired the
+    /// warning is usually still there. Reset on the next loadFile (a new file starts with its buffers
+    /// freed and gets its normal budget back), and on tvOS also by a sustained-headroom restore that gets
+    /// all the way back to the load budget, at which point this file's state is what a fresh load's is.
     private var memoryCacheClamped = false
     #if os(tvOS)
     /// Nonisolated because the locked helper is the boundary between mpv's event queue and main actor.
     private nonisolated let proactiveMemorySampleThrottle = TVOSMemorySampleThrottle()
-    /// Main-thread transition state. A pressure clamp is one-way for this file, so cache size never flaps.
+    /// Main-thread transition state: true while a proactive clamp holds this file below its load budget.
+    /// It makes the clamp one-shot, so pressure cannot ratchet the cache down sample after sample; a
+    /// sustained-headroom restore clears it again, which is what re-arms the clamp for the raised cap.
     private var proactiveMemoryCacheClamped = false
     private var lastProactiveMemoryReceipt: TimeInterval = 0
+    /// Consecutive proactive samples that saw restore-grade headroom (twice the clamp threshold). Any
+    /// sample below it resets the run, and applying a restore resets it too, so every rung of the way
+    /// back up costs a fresh sustained window instead of letting the cap chatter around one boundary.
+    private var proactiveRecoveredSampleCount = 0
+    /// Restores this file has been granted. Capped at `TVOSProactiveMemoryPressurePolicy
+    /// .maxRestoreCyclesPerFile`, after which the clamp is one-way for the rest of the file exactly as it was
+    /// before recovery existed: a restore re-arms the clamp, so under external pressure oscillating around the
+    /// threshold an uncapped ladder would keep paying the clamp's drop-buffers + exact re-anchor seek. Reset
+    /// in loadFile with the rest of the per-file cache state.
+    private var restoreCyclesThisFile = 0
     #endif
     /// The dynamic range currently applied to the output chain (mpv transfer curve, Metal layer
     /// colorspace, and on tvOS the display mode), or nil = "unknown, force a fresh apply". Reset to nil on
@@ -1358,6 +1391,7 @@ final class MPVMetalViewController: PlatformViewController {
         }
         mpv_set_property_string(mpv, "demuxer-max-bytes", appliedCap)
         activeReadAheadCap = appliedCap
+        baselineReadAheadCap = appliedCap
         // New file: the old file's buffers are freed by the load, so clear any paused/memory cache clamp
         // from the previous file and start this one on its normal budget (recorded above for the paused
         // clamp to restore on resume).
@@ -1366,6 +1400,8 @@ final class MPVMetalViewController: PlatformViewController {
         memoryCacheClamped = false
         #if os(tvOS)
         proactiveMemoryCacheClamped = false
+        proactiveRecoveredSampleCount = 0
+        restoreCyclesThisFile = 0
         #endif
         // Restore the back-buffer for the new file too. shedForMemoryPressure dropped
         // `demuxer-max-back-bytes` to 8MiB and, unlike the forward cap re-applied above, nothing put it
@@ -1584,10 +1620,16 @@ final class MPVMetalViewController: PlatformViewController {
         DispatchQueue.main.async { [weak self] in self?.evaluateProactiveMemoryPressure() }
     }
 
-    /// Proactive tvOS headroom check using Apple's public dirty-memory-limit snapshot.
-    /// It only lowers a cache once per file and never disables caching or restores under pressure.
+    /// Proactive tvOS headroom check using Apple's public dirty-memory-limit snapshot. It lowers the cache
+    /// the moment headroom dips, and raises it one rung at a time only after headroom has stayed at twice
+    /// the clamp threshold for a sustained run of samples. It never restores under pressure and never
+    /// exceeds the cap loadFile applied for this file.
     private func evaluateProactiveMemoryPressure() {
-        guard mpv != nil, !configuredLiveMode else { return }
+        // Ambient hero previews (#44, `startMuted`) are excluded exactly as they are from the audio session,
+        // the disk cache and the display mode: a decorative clip must neither run the clamp/restore ladder on
+        // its own tiny buffers nor narrate "[player] mpv cache restored…" into the diagnostics of the real
+        // playback surface, which is not even the instance being measured.
+        guard mpv != nil, !configuredLiveMode, !startMuted else { return }
         let available = UInt64(os_proc_available_memory())
         let physical = ProcessInfo.processInfo.physicalMemory
         let threshold = TVOSProactiveMemoryPressurePolicy.pressureThresholdBytes(
@@ -1601,6 +1643,60 @@ final class MPVMetalViewController: PlatformViewController {
                 "player",
                 "tvOS memory headroom \(available >> 20)MiB, threshold \(threshold >> 20)MiB, mpv cache \(currentReadAheadBudgetBytes >> 20)MiB, proactive=\(proactiveMemoryCacheClamped)"
             )
+        }
+
+        // FAIL-260804-04: every path in this lane could only LOWER the budget, so a file that shed once
+        // stayed at the reduced cap for its whole runtime, underrunning a 4K stream while the sampler
+        // logged hundreds of free MiB every minute. Track the recovered run first (any sample short of the
+        // restore threshold breaks it), then step back up one rung. Deliberately NOT a jump to baseline
+        // and NOT a buffer flush: raising `demuxer-max-bytes` is enough, mpv refills on its own, and
+        // flushDemuxerCachePreservingPosition exists for the drop path (its exact seek would be a
+        // gratuitous re-anchor here, the "jumps forward after a pause" regression surface).
+        if available >= TVOSProactiveMemoryPressurePolicy.restoreThresholdBytes(
+            physicalMemoryBytes: physical
+        ) {
+            proactiveRecoveredSampleCount += 1
+        } else {
+            proactiveRecoveredSampleCount = 0
+        }
+        if let baseline = baselineReadAheadCap.flatMap(VortXCacheShedPolicy.capBytes),
+           let restored = TVOSProactiveMemoryPressurePolicy.restoreTargetBytes(
+                availableMemoryBytes: available,
+                physicalMemoryBytes: physical,
+                currentCapBytes: currentReadAheadBudgetBytes,
+                baselineCapBytes: baseline,
+                consecutiveRecoveredSamples: proactiveRecoveredSampleCount,
+                completedRestoreCycles: restoreCyclesThisFile
+           ) {
+            // The next rung must re-earn its own two minutes, which is what bounds how often this file can
+            // pay for a raise-then-reclamp cycle; the cycle count is the hard stop behind that (past it the
+            // policy returns nil for the rest of the file and the clamp is one-way again).
+            proactiveRecoveredSampleCount = 0
+            restoreCyclesThisFile += 1
+            let restoredString = String(restored)
+            activeReadAheadCap = restoredString
+            // Same discipline as the clamp below: a PAUSED player keeps the paused floor on the live
+            // property (re-inflating a parked player's read-ahead is the jetsam case the paused clamp
+            // exists to prevent); pausedStateChanged picks the raised budget up on resume.
+            if !pausedCacheClamped {
+                setString("demuxer-max-bytes", restoredString)
+            }
+            // Re-arm the one-shot proactive clamp on EVERY rung, including partial ones: a raise that left
+            // the shrink control disabled would be a control that cannot answer the pressure the raise
+            // itself creates. `memoryCacheClamped` is the harsher flag (it makes the next system warning
+            // floor instead of halve) and is cleared only on a FULL return to baseline, where this file's
+            // budget is once again exactly what a fresh load would have given it.
+            proactiveMemoryCacheClamped = false
+            if restored >= baseline { memoryCacheClamped = false }
+            let restoredMiB = restored >> 20
+            mpvLog.log(
+                "proactive memory recovery: demuxer cache restored to \(restoredMiB, privacy: .public)MiB"
+            )
+            DiagnosticsLog.log(
+                "player",
+                "mpv cache restored to \(restoredMiB)MiB after sustained headroom (available \(available >> 20)MiB, ceiling \(baseline >> 20)MiB)"
+            )
+            return
         }
 
         guard let target = TVOSProactiveMemoryPressurePolicy.clampTargetBytes(
@@ -2949,8 +3045,10 @@ final class MPVMetalViewController: PlatformViewController {
                         #endif
                         case MPVProperty.pausedForCache:
                             let buffering = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee ?? true
-                            VXProbeState.shared.setPlayer(buffering: buffering)
-                            VXProbe.event("player", "buffering \(buffering ? "start" : "end")")
+                            if self.ownsSharedProbeState {
+                                VXProbeState.shared.setPlayer(buffering: buffering)
+                            }
+                            VXProbe.event(self.probeChannel, "buffering \(buffering ? "start" : "end")")
                             self.emit(propertyName, buffering)
                             #if os(tvOS)
                             // Seek cache hold: buffering just ended, so the held seek's refill reached
@@ -2963,7 +3061,7 @@ final class MPVMetalViewController: PlatformViewController {
                         case MPVProperty.duration:
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee,
                                let duration = MPVDurationProbePolicy.integerSeconds(value) {
-                                VXProbeState.shared.setPlayer(dur: duration)
+                                if self.ownsSharedProbeState { VXProbeState.shared.setPlayer(dur: duration) }
                                 self.emit(propertyName, value)
                             }
                         case MPVProperty.seekable:
@@ -2996,7 +3094,7 @@ final class MPVMetalViewController: PlatformViewController {
                                 let minInterval = PerformanceMode.reduced ? 0.5 : 0.25
                                 if now - self.lastTimePosEmit >= minInterval {
                                     self.lastTimePosEmit = now
-                                    VXProbeState.shared.setPlayer(pos: Int(value))
+                                    if self.ownsSharedProbeState { VXProbeState.shared.setPlayer(pos: Int(value)) }
                                     if let loadToken = self.callbackLoadToken(requiresLoadedFile: true) {
                                         self.emit(
                                             propertyName,
@@ -3008,8 +3106,10 @@ final class MPVMetalViewController: PlatformViewController {
                             }
                         case MPVProperty.pause:
                             let paused = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee ?? false
-                            VXProbeState.shared.setPlayer(state: paused ? "paused" : "playing")
-                            VXProbe.log("player", paused ? "paused" : "playing")
+                            if self.ownsSharedProbeState {
+                                VXProbeState.shared.setPlayer(state: paused ? "paused" : "playing")
+                            }
+                            VXProbe.log(self.probeChannel, paused ? "paused" : "playing")
                             self.emit(propertyName, paused)
                             #if canImport(UIKit)
                             // Jetsam relief: arm/release the paused-cache clamp (main thread; this drain
@@ -3034,8 +3134,10 @@ final class MPVMetalViewController: PlatformViewController {
                     // heartbeat names what is playing, and mark the engine as mpv + state playing.
                     let loadedHost = self.getString("path").flatMap { URL(string: $0)?.host }
                         ?? self.playUrl?.host ?? "?"
-                    VXProbeState.shared.setPlayer(state: "playing", source: loadedHost, engine: "mpv")
-                    VXProbe.event("player", "loaded \(loadedHost)")
+                    if self.ownsSharedProbeState {
+                        VXProbeState.shared.setPlayer(state: "playing", source: loadedHost, engine: "mpv")
+                    }
+                    VXProbe.event(self.probeChannel, "loaded \(loadedHost)")
                     self.probeEnhancementLayer()
                     #if os(tvOS)
                     DispatchQueue.main.async { [weak self] in
@@ -3054,7 +3156,7 @@ final class MPVMetalViewController: PlatformViewController {
                         let out = "\(self.getString("audio-out-params/hr-channels") ?? self.getString("audio-out-params/channel-count") ?? "?")@\(self.getString("audio-out-params/samplerate") ?? "?")"
                         let ao = self.getString("current-ao") ?? "?"
                         NSLog("%@", "[#78 audio] negotiated decode=\(dec) out=\(out) ao=\(ao)")
-                        VXProbe.log("player", "audio negotiated decode=\(dec) out=\(out) ao=\(ao)")
+                        VXProbe.log(self.probeChannel, "audio negotiated decode=\(dec) out=\(out) ao=\(ao)")
                     }
                 case MPV_EVENT_VIDEO_RECONFIG:
                     // The video output was (re)configured for the now-current file/params. This EVENT is
@@ -3094,7 +3196,7 @@ final class MPVMetalViewController: PlatformViewController {
                             #endif
                             let msg = String(cString: mpv_error_string(ef.error))
                             self.mpvLog.error("end-file error: \(msg, privacy: .public)")
-                            VXProbe.event("player", "endfile error \(msg)")
+                            VXProbe.event(self.probeChannel, "endfile error \(msg)")
                             self.emit(MPVProperty.endFileError, msg, loadToken: loadToken)
                         } else if ef.reason == MPV_END_FILE_REASON_EOF {
                             #if os(tvOS)
@@ -3106,7 +3208,7 @@ final class MPVMetalViewController: PlatformViewController {
                                     generation: generation, loadToken: loadToken)
                             }
                             #endif
-                            VXProbe.event("player", "endfile eof")
+                            VXProbe.event(self.probeChannel, "endfile eof")
                             self.emit(MPVProperty.endFileEof, nil, loadToken: loadToken)
                         }
                     }

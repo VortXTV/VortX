@@ -10,6 +10,10 @@
 // #148 field report "caches then stops caching ~40s in": the first memory warning must leave a USEFUL cache
 // budget (half, not the 48 MiB floor), later warnings must land exactly where the old handler always ended (the
 // floor), and the parser feeding the ladder must read both cap spellings the controller actually writes.
+//
+// The recovery section adds the other direction (FAIL-260804-04, a shed cap that stayed at the floor for the
+// remaining 66 minutes of a film): the way back UP must be gated on headroom well clear of the clamp threshold,
+// held for a sustained run of samples, must climb one rung at a time, and must never pass the per-file baseline.
 
 import Foundation
 
@@ -117,6 +121,123 @@ for budget in [64 * mib, 96 * mib, 128 * mib, 256 * mib, 512 * mib] {
     check("proactive target for \(budget >> 20)MiB stays within [floor, current)",
           isWithinBounds)
 }
+
+// MARK: - Hysteresis-gated recovery (FAIL-260804-04: a shed cap never came back)
+
+func proactiveRestore(
+    available: UInt64,
+    current: Int,
+    baseline: Int,
+    samples: Int = Proactive.restoreSustainedSamples,
+    cycles: Int = 0
+) -> Int? {
+    Proactive.restoreTargetBytes(
+        availableMemoryBytes: available,
+        physicalMemoryBytes: twoGiB,
+        currentCapBytes: current,
+        baselineCapBytes: baseline,
+        consecutiveRecoveredSamples: samples,
+        completedRestoreCycles: cycles
+    )
+}
+
+let restoreThreshold = Proactive.restoreThresholdBytes(physicalMemoryBytes: twoGiB)
+
+check("restore threshold sits at twice the clamp threshold so the two can never share a boundary",
+      restoreThreshold == threshold * 2)
+check("the sustained window is two minutes of samples",
+      Double(Proactive.restoreSustainedSamples) * Proactive.sampleInterval == 120)
+
+// Headroom gate: merely clearing the CLAMP threshold is not enough to raise anything.
+
+check("headroom just past the clamp threshold does not restore",
+      proactiveRestore(available: threshold + 1, current: P.floorBytes, baseline: 128 * mib) == nil)
+check("headroom one byte below the restore threshold does not restore",
+      proactiveRestore(available: restoreThreshold - 1, current: P.floorBytes, baseline: 128 * mib) == nil)
+check("zero available memory never restores (strongest pressure signal, same as the clamp)",
+      proactiveRestore(available: 0, current: P.floorBytes, baseline: 128 * mib) == nil)
+check("headroom exactly at the restore threshold restores",
+      proactiveRestore(available: restoreThreshold, current: P.floorBytes, baseline: 128 * mib) == 96 * mib)
+
+// Sustained-run gate: a lucky sample cannot raise the cap.
+
+check("no restore before the sustained run completes",
+      proactiveRestore(available: restoreThreshold, current: P.floorBytes, baseline: 128 * mib,
+                       samples: Proactive.restoreSustainedSamples - 1) == nil)
+check("no restore on the very first recovered sample",
+      proactiveRestore(available: restoreThreshold, current: P.floorBytes, baseline: 128 * mib,
+                       samples: 1) == nil)
+check("no restore with no recovered run at all",
+      proactiveRestore(available: restoreThreshold, current: P.floorBytes, baseline: 128 * mib,
+                       samples: 0) == nil)
+check("a longer run than required still restores exactly one rung",
+      proactiveRestore(available: restoreThreshold, current: P.floorBytes, baseline: 128 * mib,
+                       samples: 100) == 96 * mib)
+
+// One rung at a time, and the per-file baseline is a hard ceiling (the DIAG-12 device-safe cap).
+
+check("restore doubles 48 MiB to 96 MiB rather than jumping to the baseline",
+      proactiveRestore(available: restoreThreshold, current: P.floorBytes, baseline: 256 * mib) == 96 * mib)
+check("restore doubles 64 MiB to 128 MiB",
+      proactiveRestore(available: restoreThreshold, current: 64 * mib, baseline: 256 * mib) == 128 * mib)
+check("a rung that would overshoot lands exactly on the baseline",
+      proactiveRestore(available: restoreThreshold, current: 96 * mib, baseline: 128 * mib) == 128 * mib)
+check("a cap already at the baseline never restores",
+      proactiveRestore(available: restoreThreshold, current: 128 * mib, baseline: 128 * mib) == nil)
+check("a cap somehow above the baseline is never raised further",
+      proactiveRestore(available: restoreThreshold, current: 256 * mib, baseline: 128 * mib) == nil)
+
+// The ladder terminates: walking up from the floor converges on the baseline and then stops.
+
+for baseline in [96 * mib, 128 * mib, 256 * mib, 512 * mib] {
+    var walked = P.floorBytes
+    var rungs = 0
+    while let next = proactiveRestore(available: restoreThreshold, current: walked, baseline: baseline),
+          rungs < 16 {
+        check("baseline \(baseline >> 20)MiB: rung \(rungs) stays within (current, baseline]",
+              next > walked && next <= baseline)
+        walked = next
+        rungs += 1
+    }
+    check("baseline \(baseline >> 20)MiB: the restore ladder converges on the baseline and stops",
+          walked == baseline && rungs < 16)
+}
+
+// Clamp and restore compose without oscillating: a restored rung under renewed pressure sheds again to a
+// value the restore ladder can only climb back from one rung at a time, never past the baseline.
+
+let restoredRung = proactiveRestore(available: restoreThreshold, current: P.floorBytes, baseline: 128 * mib)
+check("a restored rung is still clampable when pressure returns",
+      restoredRung.flatMap { proactiveTarget(available: 0, current: $0) } == P.floorBytes)
+
+// MARK: - Per-file restore cap: the clamp goes back to one-way once the budget is spent
+//
+// A restore RE-ARMS the one-shot clamp, so without a cap, external pressure oscillating around the threshold
+// (another app allocating and freeing) turns one clamp into an endless clamp/restore ladder - and every rung
+// down pays a drop-buffers plus an exact re-anchor seek, the "jumps forward after a pause" regression surface.
+
+check("the per-file restore budget is two", Proactive.maxRestoreCyclesPerFile == 2)
+check("cycles default to zero, so a caller that does not track them ranks exactly as before",
+      proactiveRestore(available: restoreThreshold, current: P.floorBytes, baseline: 128 * mib)
+        == proactiveRestore(available: restoreThreshold, current: P.floorBytes, baseline: 128 * mib,
+                            cycles: 0))
+for spent in 0 ..< Proactive.maxRestoreCyclesPerFile {
+    check("restore \(spent + 1) of \(Proactive.maxRestoreCyclesPerFile) is still granted",
+          proactiveRestore(available: restoreThreshold, current: P.floorBytes, baseline: 128 * mib,
+                           cycles: spent) == 96 * mib)
+}
+check("the restore past the cap is refused: the clamp is one-way again for this file",
+      proactiveRestore(available: restoreThreshold, current: P.floorBytes, baseline: 128 * mib,
+                       cycles: Proactive.maxRestoreCyclesPerFile) == nil)
+check("a cap-spent file is refused however long headroom holds",
+      proactiveRestore(available: restoreThreshold * 8, current: P.floorBytes, baseline: 512 * mib,
+                       samples: 10_000, cycles: Proactive.maxRestoreCyclesPerFile) == nil)
+check("a cap-spent file stays refused as the cycle count grows further",
+      proactiveRestore(available: restoreThreshold, current: P.floorBytes, baseline: 128 * mib,
+                       cycles: Proactive.maxRestoreCyclesPerFile + 7) == nil)
+// The cap bounds restores, never clamps: shedding under real pressure must keep working for the whole file.
+check("a cap-spent file can still be clamped when pressure returns",
+      proactiveTarget(available: 0, current: 128 * mib) == 64 * mib)
 
 // MARK: - tvOS remote VOD cap survives disk-cache selection
 

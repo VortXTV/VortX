@@ -28,6 +28,7 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         mpv.contentIsDolbyVision = coordinator.contentIsDolbyVision
         mpv.startMuted = coordinator.muted
         mpv.loopPlayback = coordinator.loops
+        mpv.probeChannel = coordinator.probeChannel
         mpv.forceFillVideo = coordinator.forceFill
         let coord = context.coordinator
         mpv.onSingleTap = { [weak coord] in coord?.onTap?() }
@@ -74,6 +75,14 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         return self
     }
 
+    /// Ambient hero clip only: narrate this instance's probe lines under its own channel, so a decorative
+    /// trailer's buffering / playing / endfile events are never read as the real player's. The main player
+    /// never calls this and keeps the "player" channel every existing diagnostic already greps for.
+    func probeChannel(_ channel: StaticString) -> Self {
+        coordinator.probeChannel = channel
+        return self
+    }
+
     /// Hero-preview only (#44): crop-to-fill so the ambient clip fills the whole hero band instead of a small
     /// letterboxed box. Never called by the main player, so real playback aspect is unchanged.
     func videoFill(_ fill: Bool) -> Self {
@@ -116,6 +125,8 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         var loops = false
         /// Ambient hero clip only (#44): crop-to-fill so the clip fills the whole hero band, never letterboxed.
         var forceFill = false
+        /// The VXProbe channel the controller narrates under; "player" is the real playback surface.
+        var probeChannel: StaticString = "player"
         var onPropertyChange: ((any PlayerEngine, String, Any?, PlayerLoadToken) -> Void)?
         var onTap: (() -> Void)?
 
