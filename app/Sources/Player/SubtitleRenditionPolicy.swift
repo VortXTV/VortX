@@ -270,7 +270,11 @@ enum SubtitleRenditionPolicy {
 
     /// The URI of a rendition's media playlist, relative to the master. Flat on purpose: the server routes on
     /// exact path shapes, and a flat name needs no directory semantics.
-    static func playlistURI(_ rendition: Rendition) -> String { "subs\(rendition.id).m3u8" }
+    static func playlistURI(_ rendition: Rendition) -> String { playlistURI(renditionID: rendition.id) }
+
+    /// Same URI from a bare rendition id, for the serve path (which has routed an id, not a Rendition) and
+    /// its diagnostic line. One owner of the shape, matching `segmentURI(renditionID:segmentID:)`.
+    static func playlistURI(renditionID: Int) -> String { "subs\(renditionID).m3u8" }
 
     /// The URI of one WebVTT segment of a rendition, relative to the master.
     static func segmentURI(renditionID: Int, segmentID: Int) -> String { "subs\(renditionID)-\(segmentID).vtt" }

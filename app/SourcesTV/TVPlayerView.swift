@@ -1009,9 +1009,10 @@ struct TVPlayerView: View {
         // in PlayerScreen.routedToAVPlayer already redacts it; this one did not, which is the whole reason
         // "the sink will catch it" is not a plan.
         let routeLine = "route file=\(VXProbeRedaction.identityToken(url.lastPathComponent)) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(candidacy.candidate) [\(candidacy.reason)] container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)"
-        VXProbe.log("dv", routeLine)
-        // ALWAYS-ON breadcrumb: user builds must record the engine choice + DV flag even with probe
-        // logging off. Deduped, so the handful of pre-latch evaluations write one line.
+        // ONE emitter (b210). This used to be a `VXProbe.log` immediately followed by the breadcrumb, and
+        // since DiagnosticsLog mirrors into the SAME probe file when probing is on, every pre-latch render
+        // pass wrote the identical text to the export twice (diag-21: the decision logged 3-4x per load).
+        // The breadcrumb alone already reaches both channels, and it deduplicates.
         DVRouteBreadcrumb.log(routeLine)
         return chosen == .avfoundation
     }
@@ -7400,23 +7401,6 @@ struct TVPlayerView: View {
         guard t.isFinite, t >= 0 else { return "0:00" }
         let s = Int(t), h = s / 3600, m = (s % 3600) / 60, sec = s % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
-    }
-}
-
-// MARK: - Always-on DV route breadcrumb
-
-/// Deduplicated DiagnosticsLog for the engine-route line: `routedToAVPlayer` runs on the few pre-latch
-/// render passes (engineLatch caps it, #76 b163), so an unconditional DiagnosticsLog there would still
-/// write a handful of identical lines. This records the line only when it CHANGES (a new title / route
-/// decision), giving user builds an always-on route -> mount -> demote trail without the VXProbe gate.
-/// Plain static state, not SwiftUI state, so writing it during a render pass is safe (it is not observed).
-@MainActor
-private enum DVRouteBreadcrumb {
-    private static var last = ""
-    static func log(_ message: String) {
-        guard message != last else { return }
-        last = message
-        DiagnosticsLog.log("dv", message)
     }
 }
 

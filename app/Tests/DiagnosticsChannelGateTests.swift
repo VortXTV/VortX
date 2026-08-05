@@ -231,6 +231,7 @@ let rules: [Rule] = [
         name: "G5 no named producer builds an identifier-bearing diagnostic line in the clear",
         files: [
             "app/SourcesTV/TVPlayerView.swift",
+            "app/Sources/PlayerScreen.swift",
             "app/SourcesShared/CommunityTrickplay.swift",
             "app/SourcesShared/CoreBridge.swift",
             "app/SourcesShared/LastStreamStore.swift"
@@ -249,6 +250,13 @@ let rules: [Rule] = [
                 found += forbidding(tv, "advance load for \\(pending.meta.videoId)", why: "logs a raw video id")
                 found += forbidding(tv, "pending url \\(u.lastPathComponent)", why: "logs a raw file name")
             }
+            if let screen = files["app/Sources/PlayerScreen.swift"] {
+                // The iOS/macOS twin of the tvOS route line. It used to write only to the opt-in probe log;
+                // since b210 it goes through DVRouteBreadcrumb, which logs on the ALWAYS-ON channel - the
+                // exact condition that put the tvOS line under this rule, now true on the touch screens too.
+                found += forbidding(screen, "route file=\\(url.lastPathComponent)",
+                                    why: "logs a raw file name to the ALWAYS-ON breadcrumb as well as the probe log")
+            }
             if let store = files["app/SourcesShared/LastStreamStore.swift"] {
                 found += forbidding(store, "id=\\(libraryId)", why: "logs a raw library id on the always-on channel")
             }
@@ -265,6 +273,9 @@ let rules: [Rule] = [
         revertedFixture: [
             "app/SourcesTV/TVPlayerView.swift": """
             VXProbe.log("tp", "provisional key MISS (tvOS): playing=\\(m.libraryId) done")
+            """,
+            "app/Sources/PlayerScreen.swift": """
+            DVRouteBreadcrumb.log("route file=\\(url.lastPathComponent) isDV=\\(isDV) -> engine=\\(chosen.rawValue)")
             """,
             "app/SourcesShared/CommunityTrickplay.swift": """
             VXProbe.log("tp", "POST \\(url.absoluteString) httpStatus=\\(code)")

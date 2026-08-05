@@ -804,10 +804,14 @@ struct PlayerScreen: View {
                                                dvDisplayCapable: DVDisplaySupport.isCapable,
                                                plainRemuxDelivery: VortXRemuxHLSServer.deliveryEnabled)
         // [dv] routing probe: the first line of the DV trail (route -> mount -> classify -> fallback -> demote).
-        // Gated (no-op unless probing is on), so it is free in shipping builds. If engine is AVPlayer on a DV
-        // source it is the true-DV lane (VideoToolbox); if it is mpv here the DV source tone-maps to HDR10.
+        // If engine is AVPlayer on a DV source it is the true-DV lane (VideoToolbox); if it is mpv here the DV
+        // source tone-maps to HDR10. Emitted through the shared DEDUPLICATED breadcrumb (b210): this property
+        // is re-evaluated on every render pass before `engineLatch` is seeded in onAppear, which wrote the same
+        // decision 3-4x per load into the rolling export, and the breadcrumb also gives iOS/macOS the same
+        // always-on route trail tvOS already had (DiagnosticsLog still mirrors into the probe log when
+        // probing is on, so nothing an export used to carry is lost).
         let candidacy = PlayerEngineRouter.dvRemuxCandidacy(url)
-        VXProbe.log("dv", "route file=\(VXProbeRedaction.identityToken(url.lastPathComponent)) ext=\(url.pathExtension) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(candidacy.candidate) [\(candidacy.reason)] container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)")
+        DVRouteBreadcrumb.log("route file=\(VXProbeRedaction.identityToken(url.lastPathComponent)) ext=\(url.pathExtension) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(candidacy.candidate) [\(candidacy.reason)] container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)")
         return chosen == .avfoundation
     }
     #endif

@@ -116,6 +116,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private let deadlineLock = NSLock()
     private var mountDeadline = VortXHLSMountDeadlineState()
     private var mountDeadlineWorkItem: DispatchWorkItem?
+    /// Rate limit for the per-fetch `hls req` / `hls resp` lines. Playlist bodies, failures and the session
+    /// lifecycle do NOT pass through it; see `VortXHLSServeLogThrottle` for why the per-fetch stream does.
+    private let serveLog = VortXHLSServeLogThrottle()
 
     /// The remux producer's first terminal reason. The AVPlayer error surface reads this instead of reducing a
     /// typed source or storage failure to CoreMedia's generic "URL not found" string.
@@ -481,6 +484,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         stream.cancel()
         listener?.cancel()
         open.forEach { $0.cancel() }
+        // Flush the fetches folded since the last 30s boundary, so an ORDERLY teardown does not silently
+        // understate its own tail. This is reached on `invalidate()` only: a crash or a jetsam kill never
+        // runs it and loses up to one interval of folded counts. What a post-mortem still reads either way
+        // is what was written as it happened rather than folded - the verbatim first-of-kind lines, every
+        // playlist response, and every failure.
+        if let summary = serveLog.drain() { DiagnosticsLog.log("dv", summary) }
         if listener == nil { retireListenerOnce() }
     }
 
@@ -626,10 +635,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         }
         switch VortXEngineHostPolicy.route(header: text, capability: hosting?.capability) {
         case .legacy(let path):
-            DiagnosticsLog.log("dv", "hls req \(path)")
+            logServeRequest(path, "hls req \(path)")
             dispatch(connection, path: path, delivery: .legacy)
         case .guarded(let method, let path, let range):
-            DiagnosticsLog.log("dv", "hls req \(path) [hosted \(method.rawValue)\(range == nil ? "" : " ranged")]")
+            logServeRequest(path,
+                            "hls req \(path) [hosted \(method.rawValue)\(range == nil ? "" : " ranged")]")
             dispatch(connection, path: path, delivery: Delivery(method: method, range: range))
         case .reject(let status):
             if let status {
@@ -972,6 +982,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         DiagnosticsLog.log(
             "dv",
             "hls resp \(masterPath) variants=1 mode=\(videoVariant == .primary ? "primary" : "hdr-recovery") audio=\(audioPlan == nil ? 0 : 1) audioTags=\(audioTags.count) subs=\(subtitleRenditions.count) \(body.count)B elapsedMs=\(stream.startupElapsedMilliseconds)")
+        countServeResponse(masterPath, bytes: body.count)
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl", delivery: delivery)
     }
 
@@ -1412,6 +1423,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             "hls resp \(path) seq=\(publication.videoWindow.mediaSequence) "
                 + "segs=\(publication.videoWindow.segments.count) ended=\(publication.ended) "
                 + "\(body.count)B elapsedMs=\(stream.startupElapsedMilliseconds)")
+        countServeResponse(path, bytes: body.count)
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl", delivery: delivery)
     }
 
@@ -1438,6 +1450,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             return
         }
         DiagnosticsLog.log("dv", "hls resp \(path) \(initData.count)B")
+        countServeResponse(path, bytes: initData.count)
         respond(connection, body: initData, contentType: "video/mp4", delivery: delivery)
     }
 
@@ -1479,6 +1492,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             isEvent: retainsFullTimeline)
         let body = Data(lines.joined(separator: "\n").utf8)
         DiagnosticsLog.log("dv", "hls resp /audio\(renditionID).m3u8 seq=\(window.mediaSequence) segs=\(window.segments.count)\(publication.audioTerminated ? " [terminated]" : "")")
+        countServeResponse("/audio\(renditionID).m3u8", bytes: body.count)
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl", delivery: delivery)
     }
 
@@ -1495,6 +1509,10 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
+        // This route writes no line at all (it answers once per session), but its REQUEST is folded into the
+        // `init` bucket like every other route's, so leaving it uncounted would understate that bucket's
+        // answers by exactly one for every session that carries an alternate audio rendition.
+        countServeResponse("/audio\(renditionID)-init.mp4", bytes: data.count)
         respond(connection, body: data, contentType: "audio/mp4", delivery: delivery)
     }
 
@@ -1534,8 +1552,20 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             ended: publication.ended,
             targetDuration: startupReadiness.frozenTarget.seconds,
             isEvent: retainsFullTimeline)
+        let body = Data(lines.joined(separator: "\n").utf8)
+        // Playlist RESPONSES are written unconditionally, like /media.m3u8 and /audio{N}.m3u8: one per client
+        // reload, and each one carries the only per-reload receipt a reader has (sequence + window size).
+        // This was the one playlist route with a request line and no response line, which is what made the
+        // subtitle lane read as "120 requests, 0 answers" in the diag-21 export and led the FAIL-260804-07
+        // subtitle-stacking hunt down a false trail.
+        DiagnosticsLog.log(
+            "dv",
+            "hls resp /\(SubtitleRenditionPolicy.playlistURI(renditionID: renditionID)) "
+                + "seq=\(window.mediaSequence) segs=\(window.segments.count) ended=\(publication.ended)")
+        countServeResponse("/" + SubtitleRenditionPolicy.playlistURI(renditionID: renditionID),
+                           bytes: body.count)
         respond(connection,
-                body: Data(lines.joined(separator: "\n").utf8),
+                body: body,
                 contentType: "application/vnd.apple.mpegurl",
                 delivery: delivery)
     }
@@ -1554,7 +1584,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         serveSpoolResource(
             connection,
             key: .subtitle(renditionID: renditionID, segmentID: segmentID),
-            path: SubtitleRenditionPolicy.segmentURI(
+            // `path` here is the DIAGNOSTIC label only (serveSpoolResource resolves bytes from `key`), and
+            // `segmentURI` is a master-RELATIVE URI, so the response line read `hls resp subs0-12.vtt` while
+            // its own request line read `hls req /subs0-12.vtt` - the same resource that does not grep as
+            // one. Every other route already passes an absolute path; this one now matches them.
+            path: "/" + SubtitleRenditionPolicy.segmentURI(
                 renditionID: renditionID, segmentID: segmentID),
             contentType: "text/vtt",
             delivery: delivery)
@@ -1579,6 +1613,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 let length = lease.length
                 lease.close()
                 DiagnosticsLog.log("dv", "hls head \(path) \(length)B")
+                // A HEAD is an answered fetch and its request was folded like any other, so it is counted -
+                // with no size, because no body was written and the band states what was transferred.
+                countServeResponse(path, bytes: -1)
                 let head = "HTTP/1.1 200 OK\r\nContent-Type: \(contentType)\r\nContent-Length: \(length)\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
                 connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in
                     connection.cancel()
@@ -1606,6 +1643,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 }
                 DiagnosticsLog.log(
                     "dv", "hls resp \(path) 206 \(resolved.lowerBound)-\(resolved.upperBound)/\(total)")
+                // The partial return leaves before `logServeResponse`, so without this the hosted recovery
+                // lane's answers were invisible to the summary while its requests were not.
+                countServeResponse(path, bytes: resolved.count)
                 let head = "HTTP/1.1 206 Partial Content\r\nContent-Type: \(contentType)\r\nContent-Length: \(resolved.count)\r\nContent-Range: bytes \(resolved.lowerBound)-\(resolved.upperBound)/\(total)\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
                 response.start(
                     header: Data(head.utf8),
@@ -1627,7 +1667,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
-        DiagnosticsLog.log("dv", "hls resp \(path) \(lease.length)B")
+        logServeResponse(path, bytes: lease.length, "hls resp \(path) \(lease.length)B")
         // `Accept-Ranges` is advertised only on a hosted session. Adding a header to the loopback response
         // would be a behaviour change on the lane that must not move, and CoreMedia over loopback has never
         // asked for one.
@@ -1666,6 +1706,220 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in
             connection.cancel()
         })
+    }
+
+    // MARK: - Serve-log volume policy
+
+    /// Emit one per-fetch REQUEST line under the volume policy: verbatim for the first fetch of its kind,
+    /// otherwise folded into the periodic summary. The line is an `@autoclosure` so a folded fetch does not
+    /// even pay for its own string interpolation on the serve path.
+    private func logServeRequest(_ path: String, _ line: @autoclosure () -> String) {
+        emitServeLog(serveLog.recordRequest(path: path), line())
+    }
+
+    /// Emit one per-fetch RESPONSE line under the same policy, contributing `bytes` to the size band.
+    private func logServeResponse(_ path: String, bytes: Int, _ line: @autoclosure () -> String) {
+        emitServeLog(serveLog.recordResponse(path: path, bytes: bytes), line())
+    }
+
+    /// Count one response this server writes UNCONDITIONALLY - every playlist, every init segment, and the
+    /// hosted HEAD/206 early returns - so the summary's `Nreq/Nresp` states what those lanes actually did
+    /// rather than "N asked, none answered". Those lines stay verbatim and unthrottled: this call takes no
+    /// log decision and emits nothing, it only makes the counters honest. Pass a negative `bytes` when no
+    /// body was written (HEAD).
+    private func countServeResponse(_ path: String, bytes: Int) {
+        serveLog.countResponse(path: path, bytes: bytes)
+    }
+
+    private func emitServeLog(_ verdict: VortXHLSServeLogThrottle.Verdict, _ line: @autoclosure () -> String) {
+        if verdict.emitVerbatim { DiagnosticsLog.log("dv", line()) }
+        if let summary = verdict.summary { DiagnosticsLog.log("dv", summary) }
+    }
+}
+
+// MARK: - Serve-log rate limit
+
+/// Volume policy for this server's per-fetch serve log.
+///
+/// WHY THIS EXISTS. The exportable diagnostic file is a ~3 MiB rolling buffer (`VXProbeFileLog` caps at
+/// 3 MiB and trims back to 2 MiB), and this server wrote TWO lines for every single fetch: an `hls req` in
+/// `route` and an `hls resp` in `serveSpoolResource`. At the frozen 12s target a 2h10m feature is roughly
+/// 650 video segments, an aligned audio rendition triples the segment traffic when a subtitle rendition is
+/// advertised too, and each of those routes reloads its playlist behind them. One film therefore wrote
+/// several thousand near-identical lines and evicted every earlier day from the buffer - which is exactly
+/// why a crash the owner reported three days before an export had no trail left inside it. An always-on
+/// diagnostic export has to hold DAYS.
+///
+/// WHAT IS KEPT VERBATIM, because it is what a reader actually uses: every playlist RESPONSE (it carries
+/// the sequence and window size, the evidence behind the producer-falls-behind diagnosis), every failure
+/// (404 / 416), the session lifecycle, and the FIRST fetch of each kind in each direction - the line that
+/// proves the route answered at all. Everything after that is folded, because the only information the
+/// repeated lines ever carried was the RATE and the size band, which is precisely what the summary states.
+///
+/// THREAD SAFETY. Every caller runs on the CONCURRENT serve queue: `readRequest` hands the parsed header
+/// to `route` through `serveQueue.async`, so `route` does NOT answer on the listener queue, and
+/// `serveSpoolResource` is downstream of that same hop. Several fetches can therefore fold at once, which
+/// is why every field sits behind one lock, held for counter arithmetic only and never across a write.
+private final class VortXHLSServeLogThrottle: @unchecked Sendable {
+
+    /// At most one summary line per this many seconds, covering every fetch folded since the previous one.
+    /// WHY 30s: a producer stall or a client that stops fetching is still visible at this resolution (as a
+    /// gap in the summary cadence, and as a collapsed count in the summary that does land), while a 2h10m
+    /// session costs a couple of hundred summary lines instead of the several thousand verbatim ones it
+    /// used to - hours of retained history become days.
+    static let summarySeconds: TimeInterval = 30
+
+    /// Request classes. Only the CLASS is remembered, never the path: these paths are server-minted and
+    /// index-only by construction (`/seg37.m4s`, `/subs0-12.vtt`), and the summary reduces them further to
+    /// counts and byte bounds, so no summary line can carry an identifier.
+    enum Kind: Int, CaseIterable {
+        case videoSegment, audioSegment, subtitleSegment, playlist, initialization, other
+
+        var label: String {
+            switch self {
+            case .videoSegment:    return "seg"
+            case .audioSegment:    return "audioseg"
+            case .subtitleSegment: return "vtt"
+            case .playlist:        return "playlist"
+            case .initialization:  return "init"
+            case .other:           return "other"
+            }
+        }
+    }
+
+    /// Pure classification of a server-minted request path. Suffix is tested FIRST because `/audio0.m3u8`
+    /// is a playlist, not an audio fetch; the `/audio` prefix only separates the two `.m4s` families.
+    static func kind(forPath path: String) -> Kind {
+        let component = path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? path
+        if component.hasSuffix(".m3u8") { return .playlist }
+        if component.hasSuffix(".vtt") { return .subtitleSegment }
+        if component.hasSuffix(".mp4") { return .initialization }
+        if component.hasSuffix(".m4s") {
+            return component.hasPrefix("/audio") ? .audioSegment : .videoSegment
+        }
+        return .other
+    }
+
+    /// What the caller should write for one fetch.
+    struct Verdict {
+        /// Write the caller's own line unchanged. True only for the FIRST fetch of this kind in this
+        /// direction, which is the one line that proves the route answers.
+        let emitVerbatim: Bool
+        /// A completed summary for everything folded since the previous one, ready to write, or nil.
+        let summary: String?
+    }
+
+    private struct Bucket {
+        var requests = 0
+        var responses = 0
+        var lowBytes = Int.max
+        var highBytes = -1
+        var isEmpty: Bool { requests == 0 && responses == 0 }
+    }
+
+    private let interval: TimeInterval
+    private let lock = NSLock()
+    private var buckets: [Bucket]
+    private var sawRequest: [Bool]
+    private var sawResponse: [Bool]
+    private var lastSummary: TimeInterval
+
+    init(interval: TimeInterval = VortXHLSServeLogThrottle.summarySeconds,
+         now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        self.interval = interval
+        self.buckets = Array(repeating: Bucket(), count: Kind.allCases.count)
+        self.sawRequest = Array(repeating: false, count: Kind.allCases.count)
+        self.sawResponse = Array(repeating: false, count: Kind.allCases.count)
+        self.lastSummary = now
+    }
+
+    /// Fold one request. Counted whether or not it is written, so the summary states the TRUE rate rather
+    /// than "everything except the one line you can already see".
+    func recordRequest(path: String,
+                       now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Verdict {
+        let index = Self.kind(forPath: path).rawValue
+        lock.lock()
+        buckets[index].requests += 1
+        let first = !sawRequest[index]
+        sawRequest[index] = true
+        let summary = dueSummaryLocked(now: now)
+        lock.unlock()
+        return Verdict(emitVerbatim: first, summary: summary)
+    }
+
+    /// Fold one served response body, contributing its length to that kind's size band.
+    func recordResponse(path: String, bytes: Int,
+                        now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Verdict {
+        let index = Self.kind(forPath: path).rawValue
+        lock.lock()
+        buckets[index].responses += 1
+        if bytes >= 0 {
+            buckets[index].lowBytes = min(buckets[index].lowBytes, bytes)
+            buckets[index].highBytes = max(buckets[index].highBytes, bytes)
+        }
+        let first = !sawResponse[index]
+        sawResponse[index] = true
+        let summary = dueSummaryLocked(now: now)
+        lock.unlock()
+        return Verdict(emitVerbatim: first, summary: summary)
+    }
+
+    /// Fold one response the caller writes UNCONDITIONALLY, and do nothing else. The playlists, the init
+    /// segments and the hosted HEAD/206 early returns are verbatim BY POLICY, so they never consult a
+    /// verdict - but their REQUESTS all pass through `recordRequest`, and before this existed their
+    /// responses reached the throttle nowhere at all. Every summary therefore reported `playlist Nreq/0resp`
+    /// and `init Nreq/0resp` for lanes that had in fact answered every single fetch: the precise misreading
+    /// this policy exists to end, produced by the policy itself.
+    ///
+    /// It deliberately returns nothing, because it takes no log decision. It does not spend a first-of-kind
+    /// slot (that would suppress the one verbatim line a throttled route of the same kind still owes a
+    /// reader) and it does not release a due summary (the next request of any kind does that, and `drain`
+    /// covers the tail). `bytes` below zero contributes nothing to the size band, which is how a HEAD - a
+    /// response with no body - is counted without overstating what was transferred.
+    func countResponse(path: String, bytes: Int) {
+        let index = Self.kind(forPath: path).rawValue
+        lock.lock()
+        buckets[index].responses += 1
+        if bytes >= 0 {
+            buckets[index].lowBytes = min(buckets[index].lowBytes, bytes)
+            buckets[index].highBytes = max(buckets[index].highBytes, bytes)
+        }
+        lock.unlock()
+    }
+
+    /// Final summary for the tail that never reached a boundary, written at teardown. Returns nil when
+    /// nothing is pending, so an idle session does not write a line saying nothing happened.
+    func drain(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return summaryLocked(now: now)
+    }
+
+    private func dueSummaryLocked(now: TimeInterval) -> String? {
+        guard now - lastSummary >= interval else { return nil }
+        return summaryLocked(now: now)
+    }
+
+    /// Render and reset. Reports the ACTUAL elapsed span rather than the nominal interval, so a gap caused
+    /// by a stall (or by a suspension, across which `systemUptime` does not advance) reads honestly.
+    private func summaryLocked(now: TimeInterval) -> String? {
+        let parts = Kind.allCases.compactMap { kind -> String? in
+            let bucket = buckets[kind.rawValue]
+            guard !bucket.isEmpty else { return nil }
+            return "\(kind.label) \(bucket.requests)req/\(bucket.responses)resp"
+                + Self.sizeRange(low: bucket.lowBytes, high: bucket.highBytes)
+        }
+        guard !parts.isEmpty else { return nil }
+        let elapsed = max(0, Int((now - lastSummary).rounded()))
+        buckets = Array(repeating: Bucket(), count: Kind.allCases.count)
+        lastSummary = now
+        return "hls serve summary \(elapsed)s: " + parts.joined(separator: ", ")
+    }
+
+    /// Byte bounds in whole units, so no locale-dependent float formatting can reach a durable line.
+    private static func sizeRange(low: Int, high: Int) -> String {
+        guard high >= 0, low <= high else { return "" }
+        if high < 4096 { return " \(low)-\(high)B" }
+        return " \(low / 1024)-\(high / 1024)KiB"
     }
 }
 #endif

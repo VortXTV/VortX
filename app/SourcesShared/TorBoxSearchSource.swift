@@ -275,7 +275,17 @@ final class TorBoxSearchSource: ObservableObject {
         // H9 diagnostic (terminal-run repro): confirm refresh actually fires with a key. Logs the id + whether
         // a non-empty TorBox key is present (never the key itself). If this line never appears, the gate above
         // no-op'd; if it appears but the count line below is 0, the index returned nothing for the id.
-        VXProbe.log("torbox-search", "refresh id=\(VXProbeRedaction.identityToken(imdbId)) s=\(season ?? -1) e=\(episode ?? -1) hasKey=\(key.isEmpty ? "no" : "yes")")
+        //
+        // SCOPE, not sentinels. This used to render `s=\(season ?? -1) e=\(episode ?? -1)`, so the MOVIE case
+        // (nil/nil, which is the correct movie-level query and the only thing a movie screen ever passes)
+        // printed as `s=-1 e=-1`. In the diag-21 export that read as a malformed series search fired during a
+        // movie teardown; it is neither. `scope=movie` says what the request is, and the episode form still
+        // prints its real coordinates, so a genuinely wrong coordinate pair is now distinguishable from the
+        // movie case instead of hiding behind the same two numbers.
+        let scope = season == nil && episode == nil
+            ? "scope=movie"
+            : "scope=episode s=\(season.map(String.init) ?? "-") e=\(episode.map(String.init) ?? "-")"
+        VXProbe.log("torbox-search", "refresh id=\(VXProbeRedaction.identityToken(imdbId)) \(scope) hasKey=\(key.isEmpty ? "no" : "yes")")
         task = Task { [weak self] in
             let result = await TorBoxSearch.streams(imdbId: imdbId, season: season, episode: episode, apiKey: key)
             guard !Task.isCancelled, let self else { return }
