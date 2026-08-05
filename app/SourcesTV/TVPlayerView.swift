@@ -206,6 +206,10 @@ struct TVPlayerView: View {
     @State private var embeddedUploadDone = false
     @State private var langContributeDone = false      // the container language-index contribute ran once this session
     @State private var offsetCaptureTask: Task<Void, Never>?
+    /// Debounced persist of the manual subtitle offset (W2-B FIX 2). One write per nudge burst instead of one
+    /// per press; `pendingSubOffsetSave` carries the value the task will write so a teardown can flush it.
+    @State private var subOffsetSaveTask: Task<Void, Never>?
+    @State private var pendingSubOffsetSave: (delay: Double, contentKey: String?)?
     @State private var subFingerprint: String?
     @State private var subFingerprintKey = ""
     @State private var showOptions = false             // options panel (audio / subtitles / aspect / episodes)
@@ -287,6 +291,15 @@ struct TVPlayerView: View {
     // longer mounted) endFileError swallows it so it never cancels the fresh mpv load's watchdog or burns the
     // retry budget. iOS port of PlayerScreen.avDemotedAt.
     @State private var engineSwitchedAt: Date?
+    // ENGINE OF ORIGIN for that grace window (W2-A item 3a). `endFileError` is a SHARED channel: the AVPlayer
+    // engine emits on it and so does libmpv, so "the AV engine is no longer mounted" alone cannot tell the
+    // outgoing engine's stale error from the INCOMING engine's own honest, fast failure - and swallowing the
+    // latter silently costs the whole post-demote timeout before anything recovers. The demote captures the
+    // dismounted AVPlayer's load token here (PlayerLoadToken is UUID-backed, so it can never collide with the
+    // mpv load that follows); the swallow then applies only to that exact load. Untagged events keep the old
+    // behaviour: an event we cannot attribute is still assumed to be the outgoing engine's, which is the
+    // fail-open direction (the grace exists because a stale KVO .failed used to burn the fresh load's budget).
+    @State private var demotedEngineLoadToken: PlayerLoadToken?
     // An explicit in-session subtitle pick captured before an engine switch (#76, mandated check 8), re-applied
     // on the new engine's first trackList instead of the preference-derived auto pick. Consumed in
     // autoSelectTracks; only read while userPickedSubtitle is true. Mirror of PlayerScreen.
@@ -338,6 +351,14 @@ struct TVPlayerView: View {
     // HLS 404 -> AVPlayer .failed path demotes in ~1s, independent of this watchdog.
     private let avRemuxStallDemoteSeconds: Double = 15
     private let avRemuxStartHardCeilingSeconds: Double = 120
+    /// Post-demote start budget for the libmpv leg (W2-A item 3b). A demote disarms the fast progress-aware
+    /// watchdog by construction (`startAVStartWatchdog` early-returns once `avEngineFailed` is set), so the ONLY
+    /// owner of the mpv re-load used to be the plain 30s `startLoadTimeout` timer: 15s of stall plus 30s of mpv
+    /// on the very same URL before any code marked the source dead and hopped. 12s is the same order as the
+    /// stall window that just expired and is safe to shorten because it is not a wall: `handleStartTimeout`
+    /// EXTENDS by 20s whenever the buffered edge has advanced since it armed, so an mpv leg that is genuinely
+    /// pulling bytes keeps its long budget and only a second silent leg on the same dead URL pays the 12s.
+    private let avPostDemoteStartTimeoutSeconds: Double = 12
     /// When the AVPlayer start watchdog was armed for the current mount; drives the [dv] time-to-first-frame
     /// line when the timePos handler disarms it. Cleared (one-shot) by that handler.
     @State private var avWatchdogArmedAt: Date?
@@ -404,6 +425,14 @@ struct TVPlayerView: View {
     @State private var lastBufferedAtWatchdog = -1.0
     @State private var bufferGraceUsed = 0
     private let maxBufferGraceExtensions = 3           // up to ~3×20s extra on top of the 30s watchdog, deadline-capped
+    /// EVIDENCE, not a control: true only while the demote about to run followed POSITIVE dead-input proof
+    /// (`MountProgress.inputProvablyDead` at the start-watchdog branch), as opposed to a renderer-only failure
+    /// (AVFoundation cannot demux a source libmpv handles). Only that first case earns the shortened
+    /// `avPostDemoteStartTimeoutSeconds` budget; #76 says a healthy-source renderer demote MUST keep the full 30s,
+    /// because libmpv legitimately needs more than 12s to first-frame a cold 4K DV url. Set immediately before
+    /// the demote call and consumed (cleared) as the first statement of `demoteAVPlayerToMPV`, so it can never
+    /// leak into an unrelated later demote.
+    @State private var demoteFollowedDeadInput = false
     // Overall wall-clock cap on PRE-START recovery. The per-budget counters (30s load timeout x
     // retries, 2 torrent warm-ups, 4 source hops, stall reloads) are independent, so on a fully
     // dead title they could chain into minutes of spinner before the error overlay. This single
@@ -804,6 +833,10 @@ struct TVPlayerView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             suspendedAt = Date()   // only read on the way back in; see revalidateMountOnForeground
             suspendedTimePos = currentTime   // ... paired with the play head, so a mount that kept playing is provable
+            // A backgrounded app can be killed outright (jetsam, or the user swiping it away) with no further
+            // callback, and `leavePlayback` would then never run. Flush the debounced sync offset here too, so
+            // the last window in which a write is still possible is the one that takes it.
+            flushPendingSubOffsetSave()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             let suspended = suspendedAt.map { Date().timeIntervalSince($0) } ?? 0
@@ -1661,10 +1694,27 @@ struct TVPlayerView: View {
             // the fresh mpv load's watchdog) when the AV engine is no longer the mounted one, so it never burns
             // the retry budget, hops sources, or kills the load timeout while the user's chosen mpv engine is
             // loading fine. Mirrors iOS PlayerScreen's avDemotedAt grace.
+            // W2-A item 3a: `endFileError` is a SHARED channel (AVPlayerEngine emits on it, so does libmpv), so
+            // the two conditions above cannot separate the outgoing engine's stale error from the INCOMING
+            // engine's own fast, honest failure - and eating the latter costs the whole post-demote timeout on a
+            // url libmpv already rejected. Only an event PROVEN to come from a different load than the dismounted
+            // AVPlayer's escapes the grace. Untagged events, or a demote whose outgoing token we never captured,
+            // keep today's swallow: that is the fail-open direction this grace was added for.
+            let provenFromIncomingEngine: Bool = {
+                guard let loadToken, let outgoing = demotedEngineLoadToken else { return false }
+                return loadToken != outgoing
+            }()
             if let t = engineSwitchedAt, Date().timeIntervalSince(t) < 2,
-               !(coordinator.player is AVPlayerEngineController) {
+               !(coordinator.player is AVPlayerEngineController),
+               !provenFromIncomingEngine {
                 DiagnosticsLog.log("dv", "endFileError swallowed (stale post-switch grace <2s; AV engine no longer mounted) reason=\((data as? String) ?? "-")")
                 break
+            }
+            if provenFromIncomingEngine, let t = engineSwitchedAt, Date().timeIntervalSince(t) < 2 {
+                DiagnosticsLog.log(
+                    "dv",
+                    "endFileError inside the post-switch grace but from the INCOMING engine's own load "
+                        + "(not the dismounted AVPlayer) -> handled, not swallowed reason=\((data as? String) ?? "-")")
             }
             loadTimeout?.cancel()
             if !hasStartedPlaying {
@@ -3319,6 +3369,10 @@ struct TVPlayerView: View {
         // so a provider that true-stalled on episode N was fully re-eligible on N+1 - and, answering fastest,
         // was re-picked (diag-21). Recorded HERE rather than at the failure sites so a source that recovers in
         // place is never demoted; the penalty decays on its own and is a demotion, never an exclusion.
+        // DELIBERATELY BEFORE the hop-budget guard below: the penalty is a verdict on the SOURCE, not on
+        // whether we still have a hop left to spend. A source that just died with the budget exhausted is
+        // exactly as guilty as one that died with hops to spare, and the penalty is a decaying demotion (never
+        // an exclusion), so booking it on the way to the error overlay is the point, not a leak.
         if let dying = currentStream, let dyingAddon = addonName(for: dying) {
             ProviderHealth.noteFailure(addonName: dyingAddon)
         }
@@ -3358,7 +3412,40 @@ struct TVPlayerView: View {
         coordinator.player?.setSubDelay(subDelay)
         VXProbe.event("subs", "subs sync \(subDelay)s")
         captureSubOffset()   // P3: pool the user-corrected offset (debounced, gated, fail-soft)
-        SubtitleOffsetMemory.save(subDelay, forContentKey: communityContentKey)   // remember this title's manual offset (device-local, exact)
+        scheduleSubOffsetSave()   // remember this title's manual offset (debounced: one write per burst)
+    }
+
+    /// Persist the manual subtitle offset ONCE per nudge burst instead of once per press (W2-B FIX 2). Each
+    /// press used to run `SubtitleOffsetMemory.save` synchronously on the main actor, and a burst on the remote
+    /// is easily a dozen presses a second; the save is a UserDefaults write plus the settings-changed fan-out it
+    /// triggers, all on the same actor the player's own start-up work runs on. Coalescing to one write ~1s after
+    /// the LAST press keeps the identical stored value (the last one wins either way) at a fraction of the cost.
+    /// `setSubDelay` stays immediate: the picture must move on every press.
+    private func scheduleSubOffsetSave() {
+        subOffsetSaveTask?.cancel()
+        let pending = subDelay
+        let contentKey = communityContentKey
+        pendingSubOffsetSave = (pending, contentKey)
+        subOffsetSaveTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(1000))
+            // No content-key recheck: the key was captured WITH the value, so this write is correct even if the
+            // session has since advanced to another episode - it stores the offset against the title it was
+            // dialled in on. Only cancellation (a newer press) may suppress it.
+            guard !Task.isCancelled else { return }
+            SubtitleOffsetMemory.save(pending, forContentKey: contentKey)
+            pendingSubOffsetSave = nil
+        }
+    }
+
+    /// Write a debounced offset immediately. Debouncing trades durability for cost, so the exit path flushes
+    /// first: a viewer who nudges sync and then presses Back must not lose the offset they just dialled in.
+    /// Nothing else needs a flush - the pending write carries its own content key, so an in-session source or
+    /// episode switch still lands it against the title it was dialled in on.
+    private func flushPendingSubOffsetSave() {
+        subOffsetSaveTask?.cancel(); subOffsetSaveTask = nil
+        guard let pending = pendingSubOffsetSave else { return }
+        pendingSubOffsetSave = nil
+        SubtitleOffsetMemory.save(pending.delay, forContentKey: pending.contentKey)
     }
     private func adjustAudioDelay(_ delta: Double) {
         audioDelay = ((audioDelay + delta) * 10).rounded() / 10
@@ -3898,7 +3985,13 @@ struct TVPlayerView: View {
         )
     }
 
-    private func startLoadTimeout() {
+    /// The ordinary 30s start budget. Every caller uses this one except the post-demote mpv leg.
+    private func startLoadTimeout() { startLoadTimeout(seconds: 30) }
+
+    /// `seconds` is the ordinary 30s start budget for every caller except the post-demote mpv leg, which passes
+    /// the shorter `avPostDemoteStartTimeoutSeconds` (W2-A item 3b). Everything else about the timer - the
+    /// generation/token ownership guards and the handleStartTimeout ladder it falls into - is identical.
+    private func startLoadTimeout(seconds: Double) {
         loadTimeout?.cancel()
         startRecoveryDeadline()   // first call arms the overall cap; later calls (hops) leave it running
         startAVStartWatchdog()    // AVPlayer-only fast fallback to libmpv when it mounts but never plays
@@ -3908,7 +4001,7 @@ struct TVPlayerView: View {
         let capturedResumeGeneration = resumeRetryGeneration
         let capturedLoadToken = coordinator.player?.activeLoadToken
         loadTimeout = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(30))
+            try? await Task.sleep(for: .seconds(seconds))
             // A cancelled watchdog (superseded by a hop / reload / new load) must NOT fire: Task.sleep throws
             // CancellationError on cancel and `try?` swallows it, so without this guard the cancelled timer runs
             // handleStartTimeout immediately, and each hop arms+cancels the next, cascading through every source
@@ -4004,6 +4097,10 @@ struct TVPlayerView: View {
     /// false when AVPlayer is not the active engine and the caller should run its normal failure path.
     @discardableResult
     private func demoteAVPlayerToMPV() -> Bool {
+        // Consume the one-shot dead-input evidence FIRST, before the guard: a refused demote must not leave a
+        // stale true behind for the next one. See `demoteFollowedDeadInput`.
+        let followedDeadInput = demoteFollowedDeadInput
+        demoteFollowedDeadInput = false
         guard useAVPlayerEngine, isAVPlayerActive else { return false }
         resumeRetryGeneration &+= 1
         let reissueEpisodeGeneration = episodeSwitchGeneration
@@ -4013,6 +4110,9 @@ struct TVPlayerView: View {
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         let engineRequestedResume =
             (coordinator.player as? AVPlayerEngineController)?.pendingRequestedSourcePositionSeconds
+        // Engine of origin for the 2s post-switch grace (W2-A item 3a). Captured BEFORE stop(), which clears the
+        // engine's active token: this is the exact load whose queued .failed the grace exists to swallow.
+        demotedEngineLoadToken = (coordinator.player as? AVPlayerEngineController)?.activeLoadToken
         // Always-on [dv] breadcrumb: the demotion edge, recorded in the exportable log (the VXProbe lines
         // around it are gated off in user builds). After this line the session is libmpv = HDR10 tone-map
         // + decoded multichannel PCM; true DV/Atmos for this play is over.
@@ -4052,7 +4152,25 @@ struct TVPlayerView: View {
         // re-open would rewind to the original launch offset instead of where the failure struck.
         resumeSeconds = reconcileResume
         avEngineFailed = true
-        startLoadTimeout()
+        // RE-BASELINE the first-buffer grace for the mpv leg. `handleStartTimeout` only extends while
+        // `bufferedTime > lastBufferedAtWatchdog + 0.25`, and both of those carry the OUTGOING AVPlayer leg's
+        // numbers across the demote: a stale high-water edge (and a grace count already spent on the AV leg)
+        // makes the +20s extension unreachable, which is precisely the safety valve the shortened budget below
+        // depends on. Same reset the other re-arm sites do (retryLoad, resetRuntimeForIssuedSourceSwitch).
+        bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
+        bufferedTime = 0   // fresh mount: clear the buffered-ahead band until mpv's demuxer re-reports
+        // The mpv leg gets its own SHORTER deadline (W2-A item 3b) ONLY when this demote followed positive
+        // dead-input evidence: setting avEngineFailed above is exactly what disarms the re-armed progress-aware
+        // watchdog (`startAVStartWatchdog` guards on it), so without this the only owner of the post-demote load
+        // is the plain 30s timer, and 15s of stall plus 30s of mpv on a url that never delivered a byte is the
+        // wait worth cutting. A renderer-only demote (#76: AVFoundation cannot demux a source libmpv plays, and
+        // libmpv needs well past 12s to first-frame a cold 4K DV url) keeps the full 30s budget.
+        // See avPostDemoteStartTimeoutSeconds and `demoteFollowedDeadInput`.
+        if followedDeadInput {
+            startLoadTimeout(seconds: avPostDemoteStartTimeoutSeconds)
+        } else {
+            startLoadTimeout()
+        }
         // R10 (ports iOS PlayerScreen.demoteAVPlayerToMPV): flipping avEngineFailed re-renders the mpv surface,
         // which auto-loads the immutable LAUNCH url (initialPlayback.url). If this session switched source or
         // episode IN PLACE, curURL moved off the launch url, so the flip alone would play the WRONG stream.
@@ -4113,6 +4231,10 @@ struct TVPlayerView: View {
         // Preserve an explicit in-session subtitle pick across the switch (mandated check 8): capture it NOW,
         // before the reset below, so the new engine re-applies it instead of the preference-derived auto pick.
         pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
+        // Engine of origin for the grace window below (W2-A item 3a). Captured before stop() clears it, and for
+        // WHICHEVER engine is outgoing here: leaving a stale token from an earlier demote in place would make the
+        // grace treat this switch's own stale error as "from the incoming engine" and stop swallowing it.
+        demotedEngineLoadToken = coordinator.player?.activeLoadToken
         coordinator.player?.stop()          // straddle invariant: old engine fully down before the surface swap
         clearCachedAudioOutputTruth()
         avSurfaceResumeOrigin = reconcileResume
@@ -4390,15 +4512,47 @@ struct TVPlayerView: View {
                     last = cur
                 }
                 let stalled = now.timeIntervalSince(lastProgressAt)
-                let state = "produced=\(last?.producedBytes ?? -1)B segs=\(last?.segmentCount ?? -1) init=\(last?.initPublished ?? false) classify=\(last?.signalingPublished ?? false) failed=\(last?.failed ?? false)"
+                // W2-A: the input-side receipts ride the same line as the output counters, so the exportable
+                // trail shows WHY a stall was called dead (or not) instead of only that it was called.
+                let inBytes: String = {
+                    guard let bytes = last.flatMap({ $0.inputBytesRead }) else { return "-" }
+                    return "\(bytes)"
+                }()
+                let state = "produced=\(last?.producedBytes ?? -1)B segs=\(last?.segmentCount ?? -1) init=\(last?.initPublished ?? false) classify=\(last?.signalingPublished ?? false) failed=\(last?.failed ?? false) inBytes=\(inBytes) inOpen=\(last?.inputOpened ?? false) inOpening=\(last?.inputOpenInFlight ?? false)"
                 if stalled >= avRemuxStallDemoteSeconds || elapsed >= avRemuxStartHardCeilingSeconds {
                     let why = stalled >= avRemuxStallDemoteSeconds
                         ? "TRUE STALL, no remux progress for \(Int(stalled))s"
                         : "hard ceiling \(Int(avRemuxStartHardCeilingSeconds))s with no playable frame"
+                    // W2-A item 2: a demote is an ENGINE-level fallback that re-loads the SAME url on libmpv. It
+                    // is the right answer when AVFoundation cannot demux a healthy source, and the WRONG one when
+                    // the shared upstream fetch delivered nothing at all: libmpv cannot help with bytes that were
+                    // never sent, so the session pays another full timeout before anything hops. Branch to a
+                    // SOURCE-level failure only on the narrow, positively-evidenced case (`inputProvablyDead`:
+                    // zero input bytes, no completed open, no open attempt still running). Every other shape -
+                    // any input byte, an open that succeeded, a warm retry still in flight, a delivery that
+                    // reports no input receipts at all - keeps today's demote. MIS-260731-03: any doubt fails
+                    // open, because a hop is strictly more destructive than a demote (it spends one of four
+                    // source hops, writes the url into exhaustedURLs and books a provider penalty).
+                    // hopToNextSource is the single choke point that already does all of that bookkeeping.
+                    let inputDead = stalled >= avRemuxStallDemoteSeconds && last?.inputProvablyDead == true
+                    if inputDead {
+                        DiagnosticsLog.log(
+                            "dv",
+                            "remux input dead (no input bytes, no open, none in flight) -> source hop instead of "
+                                + "an engine demote (\(state))")
+                        if hopToNextSource(reason: "remux input dead") { return }
+                        DiagnosticsLog.log(
+                            "dv",
+                            "remux input dead but no source hop was issued; falling back to the engine demote")
+                    }
                     DiagnosticsLog.log("player", "AVPlayer start watchdog demoting (remux mounted=true, \(why), elapsed=\(Int(elapsed))s, \(state)), falling back to libmpv")
                     // The [dv] demote reason for the exportable trail: this is the exact edge that turns a DV
                     // + Atmos session into HDR10 + multichannel PCM, so name it explicitly.
                     DiagnosticsLog.log("dv", "remux demoted: \(why) -> libmpv HDR10")
+                    // Carry the dead-input verdict INTO the demote: only a leg whose upstream provably delivered
+                    // nothing pays the shortened post-demote budget (this is the hop-was-refused fallback, so the
+                    // same url is about to be handed to libmpv). Every other demote keeps the full 30s.
+                    demoteFollowedDeadInput = inputDead
                     demoteAVPlayerToMPV()
                     return
                 }
@@ -6698,6 +6852,7 @@ struct TVPlayerView: View {
         let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: exitLoadToken)
         exitAcceptedLoadToken = assetSanityAccepted ? exitLoadToken : nil
         leftPlayback = true   // FIRST: a pending EOF last-chance backfill must never resurrect a player the user left
+        flushPendingSubOffsetSave()   // a debounced sync nudge must survive the viewer pressing Back immediately
         invalidateEpisodeResolution()
         invalidateNextEpisodePreparation(reason: "playback exit")
         invalidateLocalTrickplayCapture()
