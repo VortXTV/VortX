@@ -1509,9 +1509,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
-        // This route writes no line at all (it answers once per session), but its REQUEST is folded into the
-        // `init` bucket like every other route's, so leaving it uncounted would understate that bucket's
-        // answers by exactly one for every session that carries an alternate audio rendition.
+        // Answered once per session, but a route that answers once is exactly the one whose absence is
+        // ambiguous in a log: without this line an alternate-audio session that never mounted its audio and one
+        // that served the init fine read identically. Same shape as `serveInit`, so a diagnostics export can
+        // pair the video and audio init receipts. The REQUEST is folded into the `init` bucket like every other
+        // route's, so leaving it uncounted would understate that bucket's answers by exactly one per session
+        // carrying an alternate audio rendition.
+        DiagnosticsLog.log("dv", "hls resp /audio\(renditionID)-init.mp4 \(data.count)B")
         countServeResponse("/audio\(renditionID)-init.mp4", bytes: data.count)
         respond(connection, body: data, contentType: "audio/mp4", delivery: delivery)
     }

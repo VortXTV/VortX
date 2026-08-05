@@ -57,12 +57,34 @@ enum SeriesSourceSticky {
         if cachedProfile == profile, let hit = cache { lock.unlock(); return (profile, hit) }
         lock.unlock()
         var decoded: [String: Choice] = [:]
-        if let data = UserDefaults.standard.data(forKey: key(profile)),
-           let blob = try? JSONDecoder().decode([String: Choice].self, from: data) {
-            decoded = blob
+        if let data = UserDefaults.standard.data(forKey: key(profile)) {
+            if let blob = try? JSONDecoder().decode([String: Choice].self, from: data) {
+                decoded = blob
+            } else {
+                quarantineUndecodableBlob(data, profile: profile)
+            }
         }
         lock.lock(); cachedProfile = profile; cache = decoded; lock.unlock()
         return (profile, decoded)
+    }
+
+    /// A blob that does not decode leaves the in-memory view empty, and the very next `record()` ENCODES that
+    /// empty dictionary straight back over it: one unreadable byte silently discards every remembered pick (up
+    /// to `maxSeries` of them) with nothing left to recover from. Copy the raw bytes aside ONCE, before any
+    /// write can land, so a later migration or a support export still has them.
+    ///
+    /// Fail-open by construction: the session still runs on the empty view (a sticky record is a preference, so
+    /// losing it costs a re-pick, never playback), and a copy that cannot be written changes nothing. One-time
+    /// per profile - a second failure must not overwrite the first, still-original copy with post-wipe bytes.
+    /// The log line carries no series key, add-on, or profile id, only that it happened and how big it was.
+    ///
+    /// NOTE for whoever fixes the same shape elsewhere: `SourcePinStore` and `LastStreamStore` decode the same
+    /// way and have the same wipe-on-next-write behavior. They are deliberately NOT touched here.
+    private static func quarantineUndecodableBlob(_ data: Data, profile: String) {
+        let quarantineKey = key(profile) + ".undecodable"
+        guard UserDefaults.standard.data(forKey: quarantineKey) == nil else { return }
+        UserDefaults.standard.set(data, forKey: quarantineKey)
+        DiagnosticsLog.log("app", "series sticky store did not decode; \(data.count) raw bytes kept aside before rewrite")
     }
 
     /// Remember the source the viewer just chose by hand for `seriesKey` (the show's meta id, so every episode

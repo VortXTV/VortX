@@ -3005,6 +3005,13 @@ struct PlayerScreen: View {
         let resume = retryResumeTarget()
         reconnectMsg = "Recovering…"
         withAnimation { reconnecting = true }
+        // Preserve an explicit in-session subtitle pick across the re-mount, the same way switchPlayerEngine
+        // does for an engine switch. The reload drops external subtitle tracks and resets the embedded
+        // selection, but `appliedAutoTracks` stayed set here, so nothing re-selected anything and the viewer's
+        // subtitles silently vanished on every port-move re-mount. Re-arm the latch ONLY when there is a pick to
+        // restore, so a mount with no explicit choice keeps exactly today's behavior.
+        pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
+        if pendingSubtitleReapply != nil { appliedAutoTracks = false }
         appliedSize = false; hasStartedPlaying = false; isSeekable = true; buffering = true
         srcProbeLoadStart = Date()
         let issuedToken = loadRetryIntoPlayer(
@@ -3022,8 +3029,17 @@ struct PlayerScreen: View {
             hasStartedPlaying = true
             buffering = false
             reconnecting = false
+            // The OLD mount is still live and still carries the viewer's pick, so drop the snapshot and put the
+            // latch back: re-applying it would re-add an external subtitle that was never removed.
+            if pendingSubtitleReapply != nil { appliedAutoTracks = true }
+            pendingSubtitleReapply = nil
             return
         }
+        // The load was issued, so this is a FRESH mount that carries no external subtitles: drop the added-set
+        // tracking so the picker is honest and the reapply above can re-add cleanly (same clear, same reason, as
+        // switchPlayerEngine). Deliberately after the guard - the refused-load branch keeps the OLD mount alive,
+        // and its rows are still real.
+        addedSubURLs = []; addedPooledIDs = []
         startLoadTimeout()
     }
     #endif

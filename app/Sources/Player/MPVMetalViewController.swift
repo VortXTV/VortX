@@ -997,6 +997,19 @@ final class MPVMetalViewController: PlatformViewController {
         // is a silent no-op after mpv_initialize (see applyChannelPolicy), so the option-string form left the
         // background "drop video decode" doing nothing.
         checkError(mpv_set_property_string(mpv, "vid", "no"))
+        // Clamp the read-ahead NOW rather than after the 60s grace. The grace exists for a FOREGROUND pause,
+        // where the viewer may resume at any second and a refill would be visible; a backgrounded pause has no
+        // picture to buffer for, and the timer could not fire there anyway: `pausedStateChanged` arms it on the
+        // main queue, main-queue timers do not run while the process is suspended, and the overdue work item
+        // then bails on its own `pause` guard once foregrounding has already resumed playback. So the clamp
+        // written for exactly this case never applied to it.
+        // Guarded by applyPausedCacheClamp's own `pause` read, which is what makes the iOS background-AUDIO
+        // case fail open: with keepPlayingInBackground on and audio still playing we are NOT paused, the
+        // demuxer is still feeding the AO, and clamping would starve it. Only a title actually paused at
+        // background time (every tvOS background, and iOS either without the keep-alive or paused by the
+        // viewer) is clamped.
+        pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
+        applyPausedCacheClamp(reason: "backgrounded while paused")
     }
 
     @objc public func enterForeground() {
@@ -1533,7 +1546,8 @@ final class MPVMetalViewController: PlatformViewController {
             // file keeps a real (halved) budget, and a parked viewer must still drop to the paused floor.
             guard mpv != nil, !configuredLiveMode, !pausedCacheClamped,
                   currentReadAheadBudgetBytes > VortXCacheShedPolicy.floorBytes else { return }
-            let work = DispatchWorkItem { [weak self] in self?.applyPausedCacheClamp() }
+            let graceReason = "paused \(Int(Self.pausedClampGraceSeconds))s"
+            let work = DispatchWorkItem { [weak self] in self?.applyPausedCacheClamp(reason: graceReason) }
             pausedCacheClampWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.pausedClampGraceSeconds, execute: work)
         } else if pausedCacheClamped {
@@ -1546,15 +1560,17 @@ final class MPVMetalViewController: PlatformViewController {
         }
     }
 
-    private func applyPausedCacheClamp() {
-        guard mpv != nil, !pausedCacheClamped,
+    /// `reason` only labels the log line; the decision is identical on both paths. `configuredLiveMode` is
+    /// re-checked here (not only in pausedStateChanged) because enterBackground calls this directly.
+    private func applyPausedCacheClamp(reason: String = "long pause") {
+        guard mpv != nil, !configuredLiveMode, !pausedCacheClamped,
               currentReadAheadBudgetBytes > VortXCacheShedPolicy.floorBytes else { return }
         guard getFlag(MPVProperty.pause) else { return }   // belt-and-suspenders; resume cancels the work item
         pausedCacheClamped = true
         setString("demuxer-max-bytes", Self.clampedCacheCap)
         flushDemuxerCachePreservingPosition()
-        mpvLog.log("paused \(Int(Self.pausedClampGraceSeconds), privacy: .public)s: demuxer cache clamped to \(Self.clampedCacheCap, privacy: .public) until resume")
-        DiagnosticsLog.log("player", "long pause: mpv read-ahead clamped to \(Self.clampedCacheCap) until resume")
+        mpvLog.log("\(reason, privacy: .public): demuxer cache clamped to \(Self.clampedCacheCap, privacy: .public) until resume")
+        DiagnosticsLog.log("player", "\(reason): mpv read-ahead clamped to \(Self.clampedCacheCap) until resume")
     }
 
     /// Free the demuxer cache WITHOUT moving the play head. `drop-buffers` alone is the wrong tool on a

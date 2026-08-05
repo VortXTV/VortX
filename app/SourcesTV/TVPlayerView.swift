@@ -419,6 +419,14 @@ struct TVPlayerView: View {
     /// After this many mid-play recoveries on one mount, the source itself is the problem: stop re-loading it
     /// and hop, which is bounded by `sourceHops` and ends on the error overlay.
     private let maxMidPlayRecoveries = 3
+    /// PROVENANCE of the value currently in `resumeSeconds`: true only while it is the LIVE PLAY HEAD carried
+    /// across a mid-play recovery (`handleMidPlayFailure`, and the hop it spawns), rather than a stored resume
+    /// offset from the library. `maybeResume` reads it to skip the near-end guard, which exists to stop a FRESH
+    /// play of a nearly-finished title from starting in the credits - a rule that turns a source dying eight
+    /// seconds from the end into a restart of the whole episode. One-shot: `maybeResume` clears it as it
+    /// consumes the value, and any freshly issued source switch clears it too, so it can never make a stored
+    /// near-end offset seek.
+    @State private var resumeIsMidPlayRecovery = false
     // First-buffer grace for a big 4K remux on slow debrid: a start-timeout that fires while bytes are
     // still arriving (the demuxer-cache edge advanced since the watchdog armed) extends the wait rather
     // than declaring the source dead. Bounded by the extension count and the overall recovery deadline.
@@ -1303,6 +1311,7 @@ struct TVPlayerView: View {
             hasStartedPlaying = false
             currentTime = 0
             resumeSeconds = requestedResume
+            resumeIsMidPlayRecovery = false   // the ORIGINAL stored resume, not a play head: keep the near-end guard
             if hopToNextSource(
                 reason: "source returned a short audio-less preview",
                 resumeOverride: requestedResume,
@@ -3157,6 +3166,9 @@ struct TVPlayerView: View {
         }
         torrentWarmupsUsed = 0; torrentStatus = nil; stallRecoveries = 0
         appliedResume = false
+        // The incoming load owns its own resume provenance; switchStream re-states it (carriedPlayHead) right
+        // after this reset, so a stale marker can never survive into a load that resumes from a stored offset.
+        resumeIsMidPlayRecovery = false
         bufferedTime = 0
         buffering = true; hasStartedPlaying = false; appliedAutoTracks = false
         autoAddonSubTried = false; userPickedSubtitle = false
@@ -3209,6 +3221,12 @@ struct TVPlayerView: View {
         let oldHash = currentTorrentHash
         let resume = resumeOverride
             ?? (hasStartedPlaying ? currentTime : (resumeSeconds ?? 0))
+        // Is `resume` a LIVE PLAY HEAD rather than a stored library offset? Captured HERE, before the reset
+        // below clears both inputs. True for a mid-title switch (currentTime) and for the hop a mid-play
+        // failure spawns (which cleared `hasStartedPlaying` before calling, so only the marker still says so).
+        // Carried into `resumeIsMidPlayRecovery` after the reset so maybeResume keeps a near-the-credits
+        // position instead of restarting the title.
+        let carriedPlayHead = hasStartedPlaying || resumeIsMidPlayRecovery
         // A source switch DURING a pending advance (the auto-hop lane when the incoming episode's first
         // source is dead) swaps WHICH FILE will first-frame, not which episode: keep the pending record
         // pointed at the live URL (and issued - this loads synchronously below) so the first-frame commit
@@ -3281,6 +3299,7 @@ struct TVPlayerView: View {
             configureCommunityTrickplayProvisional()
         }
         resumeSeconds = resume
+        resumeIsMidPlayRecovery = carriedPlayHead
         if let target {
             enginePlayerVideoId = bindEngine(
                 to: stream, meta: target, resolvedURL: debridRef?.url
@@ -3881,6 +3900,7 @@ struct TVPlayerView: View {
             // rather than the play head (it was only ever called before the first frame). Move it first, or a
             // proactive re-mount would restart the episode where it began.
             resumeSeconds = resume
+            resumeIsMidPlayRecovery = true   // a live play head carried across the re-mount, not a stored offset
             resumeSourceReresolved = false   // one re-resolve per suspension, not one per playback
             if retryResumeSameSource() {
                 DiagnosticsLog.log("player", "foreground: re-resolving the debrid mount after \(Int(seconds))s suspended")
@@ -3913,8 +3933,15 @@ struct TVPlayerView: View {
         curURL = healed
         let resume = max(currentTime, suppressedResumeFloor ?? 0)   // R9 floor: never re-mount below where the viewer was
         resumeSeconds = resume
+        resumeIsMidPlayRecovery = true   // a live play head carried across the re-mount, not a stored offset
+        // Preserve an explicit in-session subtitle pick across the re-mount, exactly as switchPlayerEngine does
+        // for an engine switch: snapshot it BEFORE the reset and leave `userPickedSubtitle` SET, so
+        // autoSelectTracks re-applies the viewer's choice on the fresh mount. Clearing the flag here traded a
+        // manual Off / language pick for the preference-derived auto pick on every port-move re-mount, which the
+        // viewer never asked for and could not tell from the app losing their subtitles.
+        pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
         appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false
-        userPickedSubtitle = false; addonSubsResolveTried = false
+        addonSubsResolveTried = false
         buffering = true
         hasStartedPlaying = false
         let issuedToken = loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
@@ -3931,8 +3958,16 @@ struct TVPlayerView: View {
             buffering = false
             reconnecting = false
             appliedResume = true
+            // The OLD mount is still live and still carries the viewer's pick, so drop the snapshot: re-applying
+            // it would re-add an external subtitle that was never removed (a duplicate row in the picker).
+            pendingSubtitleReapply = nil
             return
         }
+        // The load was issued, so this is a FRESH mount that carries no external subtitles: drop the added-set
+        // tracking so the picker is honest and the reapply above can re-add cleanly (same clear, same reason, as
+        // switchPlayerEngine). Deliberately after the guard - the refused-load branch keeps the OLD mount alive,
+        // and its rows are still real.
+        addedSubURLs = []; addedPooledIDs = []
         startLoadTimeout()
     }
 
@@ -3952,6 +3987,7 @@ struct TVPlayerView: View {
         plog.info("mid-playback stall, reloading at \(currentTime, privacy: .public)")
         DiagnosticsLog.log("player", "mid-playback stall \(stallRecoveries), reloading at \(Int(currentTime))s")
         resumeSeconds = currentTime
+        resumeIsMidPlayRecovery = true   // the live play head of the stalled mount, not a stored offset
         appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false
         buffering = true
         hasStartedPlaying = false
@@ -4143,6 +4179,15 @@ struct TVPlayerView: View {
         } else {
             reconcileResume = resumeSeconds ?? suppressedResumeFloor
         }
+        // Same provenance question switchStream asks, captured before the flags below clear the answer: a
+        // mid-play demote carries the live play head, a pre-start one carries the stored offset unchanged.
+        // `engineRequestedResume` is deliberately NOT part of that answer, even though the VALUE selection
+        // above prefers it: pre-first-sample the intent's sourceSeconds IS the stored library offset (the
+        // engine reports the remux timeline origin, AVPlayerEngine.swift), and an intent survives an
+        // intent-bearing remount (HDR fallback, audio replacement). Counting it here would stamp a fresh
+        // Continue-Watching launch's STORED offset as a live play head on a pre-start demote, and maybeResume
+        // would then bypass its near-end guard and auto-resume a fresh play straight into the credits.
+        let carriedPlayHead = hasStartedPlaying || resumeIsMidPlayRecovery
         hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false; loadErrorMsg = ""
         subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the AVPlayer engine; a stranded latch would gate every later pick
         inFlightSeekTarget = nil   // any seek in flight died with the AVPlayer engine; mpv's fresh ticks are authoritative
@@ -4152,6 +4197,7 @@ struct TVPlayerView: View {
         // .failed) on the LAUNCH url: the curURL!=url branch below never runs there, so without this the mpv
         // re-open would rewind to the original launch offset instead of where the failure struck.
         resumeSeconds = reconcileResume
+        resumeIsMidPlayRecovery = carriedPlayHead
         avEngineFailed = true
         // RE-BASELINE the first-buffer grace for the mpv leg. `handleStartTimeout` only extends while
         // `bufferedTime > lastBufferedAtWatchdog + 0.25`, and both of those carry the OUTGOING AVPlayer leg's
@@ -4229,6 +4275,8 @@ struct TVPlayerView: View {
         // and the floor clears naturally, on another remux target maybeResume re-suppresses it.
         let carried = max(currentTime, suppressedResumeFloor ?? 0)
         let reconcileResume: Double? = hasStartedPlaying ? carried : (resumeSeconds ?? suppressedResumeFloor)
+        // Provenance of that value, captured before the reset below clears `hasStartedPlaying` (see switchStream).
+        let carriedPlayHead = hasStartedPlaying || resumeIsMidPlayRecovery
         // Preserve an explicit in-session subtitle pick across the switch (mandated check 8): capture it NOW,
         // before the reset below, so the new engine re-applies it instead of the preference-derived auto pick.
         pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
@@ -4250,6 +4298,7 @@ struct TVPlayerView: View {
         addedSubURLs = []; addedPooledIDs = []
         inFlightSeekTarget = nil
         resumeSeconds = reconcileResume
+        resumeIsMidPlayRecovery = carriedPlayHead
         startLoadTimeout()
         if toAVPlayer { startAVStartWatchdog() }   // arm the AV no-frame demote on the new mount
         // The fresh mount auto-loads the immutable LAUNCH url; re-point at the ACTIVE source if this session
@@ -4803,6 +4852,7 @@ struct TVPlayerView: View {
         let resume = max(currentTime, suppressedResumeFloor ?? 0)   // R9 floor: never restart below the play head
         midPlayRecoveryCount += 1
         resumeSeconds = resume
+        resumeIsMidPlayRecovery = true   // a live play head, not a stored offset: maybeResume must honor it near the end
         hasStartedPlaying = false
         guard midPlayRecoveryCount <= maxMidPlayRecoveries else {
             DiagnosticsLog.log(
@@ -5843,6 +5893,10 @@ struct TVPlayerView: View {
         curIsTorrent = source.isTorrent
         curIsLive = source.isLive
         resumeSeconds = source.resumeSeconds
+        // A snapshot resume is a STORED offset, never a live play head, so retire the recovery marker with it:
+        // this restore is reachable with the marker still set (handleMidPlayFailure -> hopToNextSource ->
+        // switchStream bails before its own clear), and leaving it true lets maybeResume skip the near-end guard.
+        resumeIsMidPlayRecovery = false
         if let stream = source.stream {
             let succeeded = core.loadEnginePlayer(
                 for: stream, videoId: pending.meta.videoId,
@@ -5886,6 +5940,8 @@ struct TVPlayerView: View {
         clearCachedAudioOutputTruth()
         buffering = true; hasStartedPlaying = false; appliedResume = false
         loadFailed = false; resumeSeconds = nil
+        // A DIFFERENT episode resumes from ITS stored offset, so the near-end guard applies again.
+        resumeIsMidPlayRecovery = false
         appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false
         addonSubsResolveTried = false; appliedVolume = false
         inFlightSeekTarget = nil
@@ -6934,13 +6990,21 @@ struct TVPlayerView: View {
         guard !isCurrentLiveStream else { return }
         guard !appliedResume, duration > 0, let r = resumeSeconds else { return }
         appliedResume = true
-        guard r > 5, r < duration - 10 else {
+        // One-shot: the marker describes THIS value, and this is the moment it is spent.
+        let midPlayRecovery = resumeIsMidPlayRecovery
+        resumeIsMidPlayRecovery = false
+        // The near-end rule exists for a FRESH play: a stored offset in the credits should start the title at 0
+        // rather than drop the viewer into the last few seconds. A mid-play recovery is the opposite case - the
+        // value is the live play head of a mount that just died - so applying it there restarted the whole
+        // episode for a source that failed eight seconds from the end. The trivial-position floor still applies
+        // either way.
+        guard r > 5, midPlayRecovery || r < duration - 10 else {
             DiagnosticsLog.log(
                 "playback",
                 String(format: "resume decision=no-seek value=%.3fs duration=%.3fs", r, duration)
             )
             return
-        }   // ignore trivial / near-end positions
+        }   // ignore trivial / (fresh-play) near-end positions
         // A remux resume is fulfilled before mount by rebuilding from the configured source origin. Do not seek
         // AVPlayer into a forward-only playlist after mount. Verify the achieved keyframe origin instead; only
         // a genuinely unreachable request needs the progress floor and an unavailable notice.
@@ -6964,7 +7028,7 @@ struct TVPlayerView: View {
         DiagnosticsLog.log(
             "playback",
             String(format: "resume decision=seek value=%.3fs duration=%.3fs", r, duration)
-                + " lane=\(resumeLane)"
+                + " lane=\(resumeLane) recovery=\(midPlayRecovery ? "Y" : "N")"
         )
         coordinator.player?.seek(to: r)
         currentTime = r
