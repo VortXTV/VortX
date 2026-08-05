@@ -402,9 +402,15 @@ final class VXDiagExport: @unchecked Sendable {
     // MARK: - Helpers
 
     /// The COMPLETE bytes of one export, built AT EXPORT TIME from whatever is on disk right now: the
-    /// rolling probe log plus the embedded streaming server's status and a bounded tail (~100 lines) of its
+    /// rolling probe log plus the embedded streaming server's status and a bounded tail (~400 lines) of its
     /// OWN log (`stremio-server.log`). Every line of both is re-run through the current redaction rules by
     /// `VXDiagExportPolicy.exportBody`.
+    ///
+    /// The tail is 400 rather than 100 because 100 could not span an event. The server writes a heartbeat
+    /// plus its ordinary request chatter, so 100 lines was a couple of minutes of wall clock: an export
+    /// taken after a suspension carried only the post-wake side, and the before/after comparison was gone
+    /// before anyone could ask for it (FAIL-260804-10). Every line still passes through the same redaction,
+    /// so a longer tail widens the window, not the disclosure.
     ///
     /// Why re-run rules over bytes that were supposedly scrubbed on the way in: because they were not, or
     /// not by these rules. `Caches/vortx-diag.log` and `Caches/stremio-server.log` both survive app updates,
@@ -417,7 +423,7 @@ final class VXDiagExport: @unchecked Sendable {
     private static func exportPayload() -> ExportPayload {
         let snapshot = VXProbe.logSnapshot()
         let status = ServerDiagnostics.status()
-        let tail = status == nil ? [] : ServerDiagnostics.logTail(100)
+        let tail = status == nil ? [] : ServerDiagnostics.logTail(400)
         let body = VXDiagExportPolicy.exportBody(
             logContents: snapshot.contents,
             serverStatus: status,

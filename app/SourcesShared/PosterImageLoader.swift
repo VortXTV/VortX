@@ -333,11 +333,55 @@ enum PosterImageLoader {
 
     /// In-memory decoded cache on top of the URLCache (bytes). Keyed by the resolved URL so a poster shown in
     /// several rails decodes once; evicted under memory pressure by `NSCache`.
+    ///
+    /// Bounded by BOTH count and bytes, because a count alone bounds nothing that matters. 500 entries of
+    /// decoded bitmap is a memory figure only if every entry is the same size, and they are not: `maxPixel`
+    /// is per-call (a hero backdrop is far larger than a rail card), so the same 500 entries can be tens of
+    /// MB or, at the largest sizes this loader hands out, on the order of a gigabyte. A cache whose worst
+    /// case is that far from its typical case is not a bound. `totalCostLimit` makes the byte figure the
+    /// real ceiling and leaves `countLimit` as the cheap guard on tiny images.
+    ///
+    /// NSCache's own memory-pressure eviction is not a substitute: it reacts after the fact, and a jetsam
+    /// kill does not wait for it.
     private static let memory: NSCache<NSURL, VXPosterImage> = {
         let c = NSCache<NSURL, VXPosterImage>()
         c.countLimit = 500
+        c.totalCostLimit = 256 * 1024 * 1024
         return c
     }()
+
+    /// Bytes one decoded poster occupies: 4 bytes per pixel of the backing bitmap. Read from the CGImage
+    /// (the true decoded dimensions) and not from `size`, which is in points and would undercount a Retina
+    /// image by its scale squared. Falls back to the point size scaled up when no CGImage is reachable, and
+    /// never returns 0: a 0 cost is exempt from `totalCostLimit`, which would silently reopen the hole this
+    /// bound exists to close.
+    private static func decodedCost(_ image: VXPosterImage) -> Int {
+        #if canImport(UIKit)
+        if let cg = image.cgImage { return max(1, cg.width * cg.height * 4) }
+        let scale = image.scale
+        return pointCost(width: image.size.width * scale, height: image.size.height * scale)
+        #elseif canImport(AppKit)
+        if let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            return max(1, cg.width * cg.height * 4)
+        }
+        return pointCost(width: image.size.width, height: image.size.height)
+        #else
+        return 1
+        #endif
+    }
+
+    /// The point-size fallback, guarded. `Int(Double)` TRAPS on a non-finite or out-of-range value, and this
+    /// path runs only when no CGImage was reachable - exactly the degenerate-image case where a NaN or infinite
+    /// `size` is plausible. Falling back to the floor of 1 keeps the entry countable (a 0 cost would be exempt
+    /// from `totalCostLimit`, reopening the hole this bound exists to close) instead of crashing on it.
+    private static func pointCost(width: Double, height: Double) -> Int {
+        guard width.isFinite, height.isFinite, width > 0, height > 0 else { return 1 }
+        // Clamp before converting: the product (and its 4-byte multiply) must not overflow either. A million
+        // points a side is orders of magnitude past any real poster and keeps both well inside Int.
+        let pixelsWide = Int(min(width, 1_000_000))
+        let pixelsHigh = Int(min(height, 1_000_000))
+        return max(1, pixelsWide * pixelsHigh * 4)
+    }
 
     /// A synchronous decoded-cache peek so a view can paint instantly on a cache hit without a task hop.
     static func cached(_ url: URL) -> VXPosterImage? { memory.object(forKey: url as NSURL) }
@@ -402,7 +446,7 @@ enum PosterImageLoader {
             return nil
         }
         await negativeCache.clear(key)
-        memory.setObject(image, forKey: url as NSURL)
+        memory.setObject(image, forKey: url as NSURL, cost: decodedCost(image))
         return image
     }
 

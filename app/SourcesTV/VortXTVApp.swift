@@ -51,6 +51,15 @@ struct VortXTVApp: App {
         // A sideloaded Apple TV cannot hand its .ips reports to the owner, so the app writes its own: a
         // crash records a marker, the next launch folds it into the exportable log. See VortXCrashReporter.
         VortXCrashReporter.install()
+        // Gated diagnostic logging: starts the once-a-second heartbeat only when VORTX_PROBE=1 or the
+        // Settings toggle is on, then narrates the boot. No-op (and no cost) otherwise. tvOS was the ONE
+        // target that never armed it (iOS/macOS both did), so a tvOS probe log had no per-second record of
+        // screen / player / memory at all: the Settings toggle started the heartbeat only from the moment it
+        // was flipped, and an already-running session that later showed a memory spike could not say whether
+        // the app was sitting on Home or holding a live mount. That is the line the FAIL-260804-10 review
+        // wanted and did not have.
+        VXProbeHeartbeat.start()
+        VXProbe.log("boot", "VortX launched probe=\(VXProbe.enabled)")
         // Offline mode (#120): start the process-wide connectivity monitor before the shell mounts, so
         // its FIRST verdict (launchOffline) is ready to land an offline launch on the Library tab (where
         // Downloads live) and the shell's "You're offline" chip tracks the live (debounced) state.

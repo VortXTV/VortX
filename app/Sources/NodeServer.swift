@@ -352,20 +352,36 @@ enum NodeServer {
         }
 
         // Event-loop heartbeat: the decisive instrument for the "server froze / went
-        // offline" symptom. Every second, log the loop lag (how late this tick fired vs
+        // offline" symptom. Every second the loop measures its lag (how late this tick fired vs
         // the 1s schedule) plus RSS/heap. If the loop FREEZES, these [hb] lines stop dead
         // and the gap + last lag pinpoint the moment; if it's MEMORY, rss climbs before
         // the process dies. Either way the next device run names the cause instead of us
-        // guessing. ~60 lines/min, fine for a short repro. It also carries the #130 rebind
-        // triggers: a >30s lag spike is the wake-from-suspension event, and REBINDF is the
-        // Swift one-shot signal -- both funnel through the REFUSED-only __selfCheck gate.
+        // guessing. It also carries the #130 rebind triggers: a >30s lag spike is the
+        // wake-from-suspension event, and REBINDF is the Swift one-shot signal -- both
+        // funnel through the REFUSED-only __selfCheck gate.
+        //
+        // The tick still runs every second; only the WRITE is throttled, to one line per 5s. At one line a
+        // second this log self-erased: the bounded tail carried under two minutes, so an export taken after
+        // a suspension held only the post-wake side and the before-and-after comparison the FAIL-260804-10
+        // investigation actually needed did not exist. Throttling stretches the same tail to ~10 minutes.
+        // A burst must never be lost to the throttle, so a >32MB rss move since the last WRITTEN line emits
+        // immediately regardless: the throttle drops flat stretches, never a change worth seeing. The SAME
+        // argument covers lag: a >2s stall is the single most diagnostic tick the loop ever produces (it is the
+        // freeze this instrument exists to catch), and at one written line per 5s a spike that struck mid-window
+        // was averaged away into a flat neighbour and never appeared at all. Both escapes emit as burst=1.
         (function(){
-          var last = Date.now();
+          var last = Date.now(), lastEmit = 0, lastRss = -1;
           setInterval(function(){
             try {
               var now = Date.now(), lag = now - last - 1000; last = now;
               var m = process.memoryUsage();
-              w('[hb]', ['lag=' + lag + 'ms rss=' + Math.round(m.rss/1048576) + 'MB heap=' + Math.round(m.heapUsed/1048576) + 'MB']);
+              var rssMB = Math.round(m.rss/1048576);
+              var jumped = lastRss >= 0 && Math.abs(rssMB - lastRss) > 32;
+              var stalled = lag > 2000;
+              if(jumped || stalled || now - lastEmit >= 5000){
+                lastEmit = now; lastRss = rssMB;
+                w('[hb]', ['lag=' + lag + 'ms rss=' + rssMB + 'MB heap=' + Math.round(m.heapUsed/1048576) + 'MB' + (jumped || stalled ? ' burst=1' : '')]);
+              }
               // A lag spike past 30s means the process was frozen (suspended) and just thawed: this is a
               // fresh resume, so reset the per-resume attempt budget and, after a short settle, self-check.
               if(lag>30000){ __rb.attempts=0; setTimeout(function(){ __selfCheck('wake-lag='+lag+'ms'); },2000); }

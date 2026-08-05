@@ -1,4 +1,5 @@
 import Foundation
+import os   // os_proc_available_memory (the jetsam-headroom reading in the heartbeat)
 
 /// Unified, gated diagnostic-logging facility. When enabled it lets a Terminal-launched (or
 /// Settings-toggled) run narrate what the app is doing: point-in-time events plus a once-a-second
@@ -78,6 +79,25 @@ enum VXProbe {
         }
         guard result == KERN_SUCCESS else { return nil }
         return Double(info.resident_size) / (1024.0 * 1024.0)
+    }
+
+    /// Remaining memory this process may allocate before the OS kills it, in MB, or nil where the platform
+    /// cannot answer. THIS is the number that predicts a jetsam kill; `residentMemoryMB()` alone does not.
+    /// A resident figure has no meaning without the limit it is measured against, and that limit is not a
+    /// constant: it varies by device model and by whether the app is foreground, so "800 MB resident" is
+    /// alarming on one Apple TV and unremarkable on another. `os_proc_available_memory()` reports the
+    /// headroom directly, so a log line can be read on its own without knowing the hardware.
+    ///
+    /// nil on macOS (the SDK marks the call `API_UNAVAILABLE(macos)`) and on a 0 answer, which is what the
+    /// call returns when no app memory limit is in force.
+    static func availableMemoryMB() -> Double? {
+        #if os(macOS)
+        return nil
+        #else
+        let bytes = os_proc_available_memory()
+        guard bytes > 0 else { return nil }
+        return Double(bytes) / (1024.0 * 1024.0)
+        #endif
     }
 }
 
@@ -336,11 +356,17 @@ enum VXProbeHeartbeat {
         let uptime = Int(ProcessInfo.processInfo.systemUptime - start0)
         let mem = VXProbe.residentMemoryMB()
         let memText = mem.map { String(format: "%.0f", $0) } ?? "?"
+        // Jetsam headroom, alongside (never instead of) resident size. A resident-only heartbeat cannot say
+        // whether a spike was dangerous: FAIL-260804-10 spent the investigation arguing about how close an
+        // RSS figure was to a kill, which is unanswerable without the per-device limit. `avail` answers it
+        // directly. Absent (the field is omitted) on macOS and wherever no app memory limit is in force, so
+        // the line never carries a fake zero that would read as "about to die".
+        let availText = VXProbe.availableMemoryMB().map { String(format: " avail=%.0fMB", $0) } ?? ""
         // Stamp the embedded streaming server's state (running / exited rc=N / stalled-loop age) into every
         // heartbeat so a device log shows exactly when the node server died or froze relative to memory and
         // player state. ServerDiagnostics is nil on builds with no server (the Lite tvOS app), in which case
         // the server field is omitted.
         let serverText = ServerDiagnostics.status().map { " server=[\($0)]" } ?? ""
-        VXProbe.log("heartbeat", "up=\(uptime)s mem=\(memText)MB \(VXProbeState.shared.snapshot())\(serverText)")
+        VXProbe.log("heartbeat", "up=\(uptime)s mem=\(memText)MB\(availText) \(VXProbeState.shared.snapshot())\(serverText)")
     }
 }
