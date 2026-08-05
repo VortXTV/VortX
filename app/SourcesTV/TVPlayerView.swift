@@ -540,6 +540,20 @@ struct TVPlayerView: View {
     @State private var episodeResolutionOwner: EpisodeResolutionOwner?
     @State private var episodeResolutionAdmitted = false
     private static let episodeResolutionDeadlineSeconds: Double = 30
+    // Bounded terminal (EOF) fallback (diag-22). When the EOF handler cannot advance or exit because the
+    // requested next target is still resolving (`.persistOutgoingCompletionOnly` / `.markSupersededTerminal`),
+    // it arms this deadline instead of trusting an unbounded external resolve - a dead TorBox otherwise froze
+    // S7E1 ~15 min on its final frame. `eofFrozenAtTerminal` also un-blinds the stall watchdog, which stands
+    // down while mpv reports paused-for-cache (mapped to `buffering`) on that final frame. On expiry - or when
+    // the watchdog sees the frame frozen at pos ~= duration - the session advances (if the next load already
+    // took, via loadIntoPlayer) or clean-exits, exactly like the last-episode finish path. Retired on any real
+    // new load (`loadIntoPlayer`) or exit (`leavePlayback`). 20s: at the binge auto-next resolution's own ~20s
+    // hard cap (see BingeSourceMemoryRaceContractTests), so a next source the binge loop can still commit will
+    // have issued its load (clearing the flag) before this fires; it sits below the 30s episodeResolution-
+    // deadline so the graceful clean-exit pre-empts the harsher "No playable source" error overlay.
+    @State private var eofFrozenAtTerminal = false
+    @State private var terminalAdvanceDeadlineTask: Task<Void, Never>?
+    private static let terminalAdvanceDeadlineSeconds: Double = 20
     @State private var uncommittedIdentityBlocked = false
     @State private var persistenceBlockedForExit = false
     private var hasUncommittedIssuedMedia: Bool {
@@ -871,7 +885,7 @@ struct TVPlayerView: View {
             invalidateNextEpisodePreparation(reason: "player view disappeared")
             invalidateLocalTrickplayCapture()
             cancelAssetSanityObservationDeadline()
-            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel()
+            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel(); terminalAdvanceDeadlineTask?.cancel()
             invalidateEpisodeResolution()
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
             // (first-writer-wins, background, gated; no-op if the community already had a set). Both engines
@@ -1765,8 +1779,15 @@ struct TVPlayerView: View {
                 handleMidPlayFailure((data as? String) ?? "", loadToken: loadToken)
             }
         case MPVProperty.endFileEof:
+            let terminalEOFAction = terminalAction(for: loadToken, kind: .eof)
+            // A terminal action that persists a completion or parks a superseded terminal cannot advance or
+            // exit here: it waits on the requested next target to resolve. NEVER trust that resolve to be
+            // bounded (diag-22). This pure policy names exactly those routes; the branches below enforce it by
+            // arming the bounded EOF fallback so the session advances-or-exits either way.
+            let armsTerminalDeadline =
+                EpisodePlaybackIdentity.terminalActionRequiresBoundedDeadline(terminalEOFAction)
             let completionOnly: Bool
-            switch terminalAction(for: loadToken, kind: .eof) {
+            switch terminalEOFAction {
             case .handleCommitted:
                 completionOnly = false
             case .handlePending:
@@ -1778,6 +1799,7 @@ struct TVPlayerView: View {
             case .markSupersededTerminal:
                 supersededAdvance?.pending.terminal = true
                 uncommittedIdentityBlocked = true
+                if armsTerminalDeadline { armTerminalAdvanceDeadline(reason: "superseded terminal EOF") }
                 return
             case .persistOutgoingCompletionOnly:
                 completionOnly = true
@@ -1819,7 +1841,14 @@ struct TVPlayerView: View {
             // gated + once-latched inside the coordinator (dedupes against the watched record above), no-op with
             // empty creds. Fired for the finishing episode before any in-place advance opens a new session.
             if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: duration) }
-            if completionOnly { return }
+            if completionOnly {
+                // Route was .outgoingCommittedWhileResolving: the outgoing completion is now persisted +
+                // scrobbled, but we cannot advance or exit while the requested next target resolves. Arm the
+                // bounded fallback instead of trusting that resolve to land (diag-22: a dead TorBox hung this
+                // ~15 min). If the next source resolves in time, its load clears the flag and cancels this.
+                if armsTerminalDeadline { armTerminalAdvanceDeadline(reason: "persist-completion, next target resolving") }
+                return
+            }
             autoAdvance()                                // episode finished → play next, else exit
         default: break
         }
@@ -3077,6 +3106,14 @@ struct TVPlayerView: View {
             )
         }
         let issuedToken = candidateToken == player.activeLoadToken ? candidateToken : nil
+        if issuedToken != nil {
+            // A real new load took: no longer frozen on the previous session's final frame. Retire the bounded
+            // terminal (EOF) fallback - the fresh load's own start watchdog / load timeout owns recovery now. A
+            // REFUSED load (issuedToken == nil) leaves the old mount in place, so the freeze stays covered.
+            eofFrozenAtTerminal = false
+            terminalAdvanceDeadlineTask?.cancel()
+            terminalAdvanceDeadlineTask = nil
+        }
         if let issuedToken {
             beginAssetSanityAttemptIfNeeded(
                 loadToken: issuedToken,
@@ -3306,6 +3343,13 @@ struct TVPlayerView: View {
             )
         }
         startLoadTimeout()
+        // Re-arm the next-episode preload against the source that JUST won. The invalidation at the top of
+        // switchStream cancelled the preparation snapshotted from the OUTGOING source; kicking preload here -
+        // AFTER the sticky record + curHint/curBinge are updated above, so it warms the NEW preference, not
+        // the old one - stops a late source re-pick (or an automatic failover hop) from leaving the seamless
+        // lane cold until the next halfway tick. Fail-open: preloadNextIfNeeded no-ops unless we are already
+        // past the preload commit gate, so an early re-pick simply warms on the normal halfway tick instead.
+        preloadNextIfNeeded()
         return true
     }
 
@@ -3813,22 +3857,72 @@ struct TVPlayerView: View {
         stallWatchdog = Task { @MainActor in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(6))
-                guard hasStartedPlaying, !isPaused, !buffering, !loadFailed, duration > 0 else {
+                // A terminal freeze - the play head parked on the FINAL frame at EOF while the next target
+                // resolves - reports paused-for-cache=true (mapped to `buffering`), so the normal `!buffering`
+                // stand-down just below would wait on it forever (diag-22). It is NOT a mid-stream rebuffer:
+                // treat it as recoverable regardless of buffering and drive it into the SAME bounded advance-
+                // or-exit as the LAYER-1 deadline (idempotent, so the two can never double-fire).
+                let atEOFFrozen = TerminalPlaybackWatchdogPolicy.eofFreezeIsRecoverable(
+                    atEOF: eofFrozenAtTerminal, currentTime: currentTime, duration: duration,
+                    hasStartedPlaying: hasStartedPlaying, loadFailed: loadFailed
+                )
+                guard atEOFFrozen
+                    || (hasStartedPlaying && !isPaused && !buffering && !loadFailed && duration > 0) else {
                     lastObservedTime = currentTime; stalledTicks = 0; continue
                 }
                 if lastObservedTime >= 0, abs(currentTime - lastObservedTime) < 0.25 {
                     stalledTicks += 1
-                    if stalledTicks >= 3 {            // ~18s frozen with no buffering -> recover
+                    if stalledTicks >= 3 {            // ~18s frozen -> recover in place (or advance-or-exit at EOF)
                         stalledTicks = 0
-                        recoverFromStall()
+                        if atEOFFrozen { resolveTerminalAdvanceOrExit(reason: "stall watchdog at EOF") }
+                        else { recoverFromStall() }
                     }
                 } else {
                     stalledTicks = 0
-                    stallRecoveries = 0               // sustained good playback clears the budget
+                    if !atEOFFrozen { stallRecoveries = 0 }   // sustained good playback clears the budget
                 }
                 lastObservedTime = currentTime
             }
         }
+    }
+
+    /// Arm the bounded terminal (EOF) fallback. The outgoing episode reached true end-of-file but the EOF
+    /// handler cannot advance or exit yet because the requested next target is still resolving. NEVER trust
+    /// that resolve to be bounded (diag-22: a dead TorBox left an episode frozen ~15 min on its final frame).
+    /// Also raises `eofFrozenAtTerminal`, which un-blinds the stall watchdog (it otherwise stands down while
+    /// mpv reports paused-for-cache on the final frame). Retired on any real new load (`loadIntoPlayer`) or
+    /// exit (`leavePlayback`); re-arming is safe (it cancels any prior deadline first).
+    private func armTerminalAdvanceDeadline(reason: String) {
+        eofFrozenAtTerminal = true
+        terminalAdvanceDeadlineTask?.cancel()
+        DiagnosticsLog.log("player", "EOF terminal deadline armed (\(reason)); bounded \(Int(Self.terminalAdvanceDeadlineSeconds))s advance-or-exit")
+        terminalAdvanceDeadlineTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(Self.terminalAdvanceDeadlineSeconds))
+            guard !Task.isCancelled else { return }
+            resolveTerminalAdvanceOrExit(reason: "bounded EOF deadline")
+        }
+    }
+
+    /// Fail-safe resolution of a frozen terminal (EOF). A genuine advance issues its next load through
+    /// `loadIntoPlayer`, which clears `eofFrozenAtTerminal` and cancels the deadline, so reaching here proves
+    /// the requested next target never became playable within the bounded window. Clean-exit exactly like the
+    /// last-episode finish path: the outgoing episode is already marked watched + scrobbled (persist-completion
+    /// ran before the return that armed this), so Continue Watching rolls forward to the next episode and the
+    /// viewer lands back on the detail page. Idempotent - the `eofFrozenAtTerminal` latch plus the
+    /// `leftPlayback` guard make a second caller a no-op - so the LAYER-1 deadline and the LAYER-2 stall
+    /// watchdog can both drive it without racing.
+    private func resolveTerminalAdvanceOrExit(reason: String) {
+        guard eofFrozenAtTerminal, !leftPlayback else { return }
+        eofFrozenAtTerminal = false
+        terminalAdvanceDeadlineTask?.cancel()
+        terminalAdvanceDeadlineTask = nil
+        if pendingAdvance?.issued == true {
+            // Defensive: a next load is already in flight; its own start watchdog / load timeout owns recovery.
+            return
+        }
+        DiagnosticsLog.log("player", "EOF terminal fallback (\(reason)): next source unresolved within \(Int(Self.terminalAdvanceDeadlineSeconds))s -> clean exit")
+        saveProgress(at: currentTime)
+        leavePlayback()
     }
 
     /// The URL to (re)mount for the CURRENTLY playing source. Normally that is exactly what is already
@@ -6163,6 +6257,8 @@ struct TVPlayerView: View {
             // add-ons: either every add-on has answered, or the first playable landed a few seconds
             // ago and we stop waiting for stragglers.
             var firstPlayableAt: Date?
+            var loggedBingeSourceWait = false
+            let wantedAddon = seriesSticky?.addon               // the source the viewer picked BY HAND for this show
             for _ in 0..<200 {                                          // ~20s (the wanted-quality debrid can land ~10-12s in)
                 guard episodeSwitchIsCurrent(
                     generation: episodeGeneration, sourceGeneration: sourceGeneration,
@@ -6172,12 +6268,29 @@ struct TVPlayerView: View {
                 let progress = core.streamLoadProgress(forStreamId: v.id)
                 let hasPlayable = groups.contains { !$0.streams.isEmpty }
                 if hasPlayable, firstPlayableAt == nil { firstPlayableAt = Date() }
-                // Settle gate (see StreamRanking.resolveSettled): wait for the SAME quality the last episode
-                // played (non-torrent unless the user ranks torrents first) so auto-next stays on the user's
-                // source instead of grabbing the first torrent that answers.
+                // Settle gate (see StreamRanking.resolveSettled): when the viewer has a remembered manual
+                // source, hold for IT (bounded) instead of committing off whichever provider answers fastest -
+                // the diag-22 race where a fast comet 1080p opened the gate before the user's aggregator loaded.
+                // No remembered source keeps the original quality-only behavior.
                 let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
-                if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                                secondsSinceFirstPlayable: elapsed, rememberedQuality: curHint) {
+                let settled = StreamRanking.resolveSettled(
+                    groups, loaded: progress.loaded, total: progress.total,
+                    secondsSinceFirstPlayable: elapsed, rememberedQuality: curHint,
+                    wantedAddon: wantedAddon
+                )
+                if let wanted = wantedAddon, !wanted.isEmpty {
+                    let wantedPresent = groups.contains { g in
+                        g.addon.caseInsensitiveCompare(wanted) == .orderedSame
+                            && g.streams.contains { $0.playableURL != nil && !$0.isYouTubeTrailer }
+                    }
+                    if settled {
+                        DiagnosticsLog.log("binge", "auto-next gate OPEN wanted=\(wanted) present=\(wantedPresent ? "Y" : "N") elapsed=\(Int(elapsed))s loaded=\(progress.loaded)/\(progress.total)")
+                    } else if !loggedBingeSourceWait {
+                        loggedBingeSourceWait = true
+                        DiagnosticsLog.log("binge", "auto-next gate WAIT holding for wanted=\(wanted) elapsed=\(Int(elapsed))s loaded=\(progress.loaded)/\(progress.total)")
+                    }
+                }
+                if settled {
                     // Same sticky + provider-health terms the preload ranks with, so the fallback lane cannot
                     // quietly pick a different provider than the preload would have for the same episode.
                     let candidates = StreamRanking.rankedCandidates(
@@ -6495,15 +6608,26 @@ struct TVPlayerView: View {
             stride: NextEpisodePreloadPolicy.providerRotationStride
         )
         let rotatedSources = providerOrder.map { sources[$0] }
+        let wantedAddonName = sticky?.addon               // the source the viewer picked BY HAND for this show
         let rotatedFetched: [CoreStreamSourceGroup?] = await BoundedPreloadWorkPool.map(
             rotatedSources,
             limit: NextEpisodePreloadPolicy.addonConcurrencyLimit,
             timeoutNanoseconds: UInt64(
                 NextEpisodePreloadPolicy.addonFetchBudget * 1_000_000_000
             ),
-            operationTimeoutNanoseconds: UInt64(
-                NextEpisodePreloadPolicy.addonRequestTimeout * 1_000_000_000
-            )
+            operationTimeoutFor: { source in
+                // Give the remembered manual source the longer per-request window (it answers ~9s in) and
+                // every other add-on the short 2s cap. Matched by add-on name, case-insensitively, exactly as
+                // stickyBonus / the fallback gate match it, so the seamless lane warms the SAME provider the
+                // wait would otherwise fall back to. Capped under attemptTimeout, so it cannot starve the rest.
+                let isWanted = wantedAddonName.map {
+                    !$0.isEmpty && source.name.caseInsensitiveCompare($0) == .orderedSame
+                } ?? false
+                let seconds = isWanted
+                    ? NextEpisodePreloadPolicy.stickyAddonRequestTimeout
+                    : NextEpisodePreloadPolicy.addonRequestTimeout
+                return UInt64(seconds * 1_000_000_000)
+            }
         ) { source in
             await Self.fetchStreams(
                 base: source.base,
@@ -6911,6 +7035,7 @@ struct TVPlayerView: View {
         leftPlayback = true   // FIRST: a pending EOF last-chance backfill must never resurrect a player the user left
         flushPendingSubOffsetSave()   // a debounced sync nudge must survive the viewer pressing Back immediately
         invalidateEpisodeResolution()
+        eofFrozenAtTerminal = false; terminalAdvanceDeadlineTask?.cancel(); terminalAdvanceDeadlineTask = nil
         invalidateNextEpisodePreparation(reason: "playback exit")
         invalidateLocalTrickplayCapture()
         cancelAssetSanityObservationDeadline()

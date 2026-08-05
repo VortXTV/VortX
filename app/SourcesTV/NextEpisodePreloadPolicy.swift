@@ -9,6 +9,7 @@ enum BoundedPreloadWorkPool {
         limit: Int,
         timeoutNanoseconds: UInt64,
         operationTimeoutNanoseconds: UInt64? = nil,
+        operationTimeoutFor: (@Sendable (Input) -> UInt64?)? = nil,
         operation: @escaping @Sendable (Input) async -> Output?
     ) async -> [Output?] {
         guard !inputs.isEmpty else { return [] }
@@ -20,12 +21,16 @@ enum BoundedPreloadWorkPool {
 
             func launch(_ index: Int) {
                 let input = inputs[index]
+                // A per-input override lets ONE input (the series-sticky add-on) get a longer per-request
+                // cap while the rest keep the short uniform one; nil override falls back to the uniform cap,
+                // so every existing caller that passes only `operationTimeoutNanoseconds` is byte-identical.
+                let perOperationTimeout = operationTimeoutFor?(input) ?? operationTimeoutNanoseconds
                 group.addTask {
                     guard !Task.isCancelled else { return (index, nil) }
                     return (
                         index,
                         await valueBeforeTimeout(
-                            operationTimeoutNanoseconds,
+                            perOperationTimeout,
                             operation: { await operation(input) }
                         )
                     )
@@ -177,10 +182,27 @@ struct NextEpisodePreloadPolicy: Equatable {
     static let retryDelays: [TimeInterval] = [20, 60]
     static let attemptTimeout: TimeInterval = 15
     static let addonConcurrencyLimit = 5
-    static let addonFetchBudget: TimeInterval = 9
+    /// Whole-batch budget. Lifted 9 -> 12 to match the ~9-12s the stream list actually takes to settle
+    /// (diag-22): at 9s the slow aggregator was still being cut off before it could contribute a group.
+    /// Stays under the per-attempt `attemptTimeout` (15) so a full batch cannot blow the attempt budget.
+    static let addonFetchBudget: TimeInterval = 12
+    /// General per-request cap for a preload add-on fetch. The remembered manual source overrides this with
+    /// `stickyAddonRequestTimeout`; every OTHER add-on keeps this short 2s cap so one slow provider cannot
+    /// stall the concurrent window.
     static let addonRequestTimeout: TimeInterval = 2
-    static let providerRotationStride = addonConcurrencyLimit
-        * max(1, Int(addonFetchBudget / addonRequestTimeout))
+    /// Per-request cap for the WANTED (series-sticky) add-on only. The aggregator the viewer picked by hand
+    /// (aiostreams/debridio) answers ~9s in - the 2s general cap was timing it OUT of preload entirely, so
+    /// the seamless lane never had the user's own source and the fallback wait did all the work. 7s clears
+    /// the aggregator tail yet stays STRICTLY under `attemptTimeout` (15) and the `addonFetchBudget` (12), so
+    /// a slow wanted source can never blow the whole attempt budget and starve the other add-ons.
+    static let stickyAddonRequestTimeout: TimeInterval = 7
+    /// How far each bounded retry advances the provider window: the provider REACH of one attempt, concurrency
+    /// (5) times the ~4 request waves a bounded attempt completes. Pinned to 5 x 4 = 20 (its long-standing
+    /// value) rather than re-derived from `addonFetchBudget`, because the budget now ALSO has to cover the
+    /// longer sticky-add-on request timeout, and the fair-rotation contract (NextEpisodePreloadPolicyTests) is
+    /// tuned to this reach; re-deriving it from the lifted budget would silently change retry coverage, which
+    /// the diag-22 source-memory fix has no reason to touch.
+    static let providerRotationStride = addonConcurrencyLimit * 4
 
     private(set) var target: Target?
     private(set) var activeAttempt: Attempt?
