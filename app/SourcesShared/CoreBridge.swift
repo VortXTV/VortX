@@ -934,12 +934,36 @@ final class CoreBridge: ObservableObject {
                  field: "library")
     }
 
+    /// The last catalog index this app asks the engine to actually fetch for a search, and the app's own
+    /// record of it. The engine's `Load` PLANS one catalog per searchable add-on catalog with no upper
+    /// bound, then `LoadRange` decides which of those get requested: `catalogs_update` fetches exactly the
+    /// indices where `range.start <= index && index <= range.end` (INCLUSIVE at both ends, so `0...30` is
+    /// 31 catalogs) and leaves every later index parked at a nil content, permanently. Nothing ever
+    /// revisits them: a later re-plan (ProfileChanged) only reuses a catalog whose page already has a
+    /// content, so a nil-content one is simply re-created nil.
+    ///
+    /// The cap is deliberate. Every requested catalog is one live add-on HTTP request per keystroke-settled
+    /// query, so searching a large profile unbounded would fan out to dozens of add-ons at once; widening
+    /// it is a product/cost decision, filed separately, NOT something to change while fixing a spinner.
+    /// What must hold here is only that the app tells the truth about it: a catalog past this end will
+    /// never be fetched, so it is settled-and-skipped, not in flight. Both the dispatch below and the
+    /// loading derivation in the `search` field handler read this one constant, so they cannot drift.
+    private static let searchLoadRangeEnd = 30
+
     /// Search across the installed addons (engine `search` field = CatalogsWithExtra with a search
     /// extra). Results land in `searchResults`, flattened and de-duplicated into one grid.
     func search(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         setSearchLoading(trimmed.count >= 2)
         guard trimmed.count >= 2 else {
+            // Tell the ENGINE the search is over, not just the UI. Clearing `searchResults` alone left the
+            // engine's CatalogsWithExtra holding the last query's full result set for the life of the
+            // process, and because it re-announces `search` as changed on every LibraryChanged, that dead
+            // result set was re-serialized and re-published on the next library tick: the results the user
+            // just cleared reappeared in the grid, in the suggestion titles, and in the genre stats. Unload
+            // drops both the selection and the pages engine-side, so the re-announce carries nothing.
+            // Mirrors `unloadMeta` / `unloadEnginePlayer`; the `field` scopes it to this model alone.
+            dispatch(action: ["action": "Unload"], field: "search")
             DispatchQueue.main.async { [weak self] in self?.searchResults = [] }
             return
         }
@@ -948,7 +972,8 @@ final class CoreBridge: ObservableObject {
                                    "args": ["type": NSNull(), "extra": [["search", trimmed]]]]],
                  field: "search")
         dispatch(action: ["action": "CatalogsWithExtra",
-                          "args": ["action": "LoadRange", "args": ["start": 0, "end": 30]]],
+                          "args": ["action": "LoadRange",
+                                   "args": ["start": 0, "end": Self.searchLoadRangeEnd]]],
                  field: "search")
     }
 
@@ -2257,10 +2282,42 @@ final class CoreBridge: ObservableObject {
         }
         if fields.contains("search") {
             let board = decode(CoreBoardState.self, field: "search")
-            let pages = board?.catalogs.flatMap { $0 } ?? []
-            let hasLoadingPages = pages.isEmpty || pages.contains { page in
-                guard let content = page.content else { return true }
-                return content.isLoading
+            let catalogs = board?.catalogs ?? []
+            let pages = catalogs.flatMap { $0 }
+            // GATE ON `selected` FIRST. The engine re-announces `search` as changed on every
+            // LibraryChanged whether or not anything ever searched, and a field with NO search loaded
+            // (never searched, or Unloaded by the clear path in `search`) decodes to zero catalogs.
+            // Without this gate an emptiness test reads that idle field as "loading". That is the
+            // permanent `results=0 loading=true` line in the log, and it is sticky: every later
+            // re-announce re-asserts it, so a 1-character query, which deliberately never dispatches a
+            // Load, parked the screens on "Searching..." with nothing whatsoever in flight.
+            //
+            // ITERATE CATALOGS, NOT FLATTENED PAGES. `catalogs` is one inner array per PLANNED catalog,
+            // so the outer index is the catalog index the engine's LoadRange range-checks; flattening
+            // throws that index away. Two things ride on keeping it:
+            //
+            //   * Zero planned catalogs (no installed add-on offers a searchable catalog) is SETTLED, not
+            //     in flight. The engine plans `selected` and `catalogs` inside the SAME `Load` update, so
+            //     a non-nil `selected` with an empty plan can never be a half-built one: there is nothing
+            //     to search and the UI must be allowed to say "No results" instead of spinning forever.
+            //   * A catalog past `searchLoadRangeEnd` was planned but deliberately never requested (see
+            //     the constant), so the engine parks it at a nil content for the life of the search. In
+            //     range, a nil content means "seeded by Load, fetch still pending" and IS loading; past
+            //     the range it means "will never be fetched" and is not. `wasRequested` is that
+            //     distinction, and it is the app's own knowledge of what it dispatched, not a cached copy
+            //     of engine state. A past-range page that somehow carries an explicit `Loading` is still
+            //     counted, so the engine widening its own fetching cannot make us report settled early.
+            //
+            // The `selected` gate and the per-catalog walk are only correct together: `selected` stays
+            // non-nil for the WHOLE in-flight window (set by the same `Load` that seeds the pages, before
+            // the LoadRange that fetches them), so the seeded-but-unfetched instant still reports loading
+            // and no "No results" flashes.
+            let hasLoadingPages = board?.selected != nil && catalogs.indices.contains { index in
+                let wasRequested = index <= Self.searchLoadRangeEnd
+                return catalogs[index].contains { page in
+                    guard let content = page.content else { return wasRequested }
+                    return content.isLoading
+                }
             }
             let items = pages.compactMap { $0.content?.ready }.flatMap { $0 }
             var seen = Set<String>(); var unique: [CoreMeta] = []

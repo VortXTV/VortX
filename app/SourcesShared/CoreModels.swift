@@ -208,7 +208,31 @@ enum CWResume {
 // MARK: board (catalogs_with_extra)
 
 struct CoreBoardState: Decodable {
+    /// The engine's `Option<Selected>` for this CatalogsWithExtra field. It is set synchronously by the
+    /// same `Load` that starts a search and cleared by `Unload`, so a field that was never loaded (or was
+    /// unloaded) serializes `"selected": null`.
+    ///
+    /// This is the ONLY thing in the payload that separates "never searched" from "searching": `catalogs`
+    /// is `[]` in both cases, so a page-count test alone reads an idle field as an in-flight one. Callers
+    /// deriving a loading flag must gate on `selected != nil` first.
+    let selected: CoreSearchSelected?
     let catalogs: [[CoreCatalogPage]]
+}
+
+/// Presence marker for `CatalogsWithExtra.selected`. Nothing app-side needs the selection's CONTENTS (the
+/// query and type are already app-side state), only whether a selection exists at all, so this decodes
+/// nothing and accepts any payload the engine emits: the object it sends today
+/// (`{"type":...,"extra":[["search","..."]]}`), and any future reshape of it.
+///
+/// The tolerance is load-bearing, not defensive dressing. A throw here would fail the enclosing
+/// `CoreBoardState` decode, and a failed decode is read downstream as zero pages, which is the same shape
+/// as an idle field. An engine-side rename of `Selected`'s members would then silently turn a real
+/// in-flight search into "No results". Decoding nothing cannot throw, so only the key's presence matters.
+///
+/// JSON `null` never reaches this initializer: `decodeIfPresent`, which the synthesized decoder uses for
+/// the optional property above, resolves both a null value and a missing key to `nil` before calling it.
+struct CoreSearchSelected: Decodable {
+    init(from _: Decoder) throws {}
 }
 
 struct CoreCatalogPage: Decodable {
