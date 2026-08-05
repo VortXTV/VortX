@@ -11,6 +11,32 @@ typealias ScrubImage = NSImage
 typealias ScrubImage = UIImage
 #endif
 
+/// Pure, platform-independent size-floor rule for a captured trickplay frame (task 3). A real detailed frame
+/// JPEG-compresses to tens of KB, while a black or unrendered frame compresses to ~2-4 KB, so the encoded byte
+/// count alone separates them with no pixel decode. Extracted from `decodeCapturedFrame` so the keep decision is
+/// unit testable without decoding an image, and so both platform branches read the exact same floor constant.
+enum TrickplayFrameByteFloor {
+    /// A frame at or above this encoded size is treated as definitely real (not black) on every platform.
+    static let nonBlackByteFloor = 8000
+
+    /// Non-sampler platforms (tvOS/iOS): the size test IS the whole keep decision. A ~2-4 KB black or unrendered
+    /// tile is dropped; a real tens-of-KB frame is kept.
+    static func keepBySize(byteCount: Int) -> Bool {
+        byteCount >= nonBlackByteFloor
+    }
+
+    /// macOS: a large frame is kept even when the crude pixel sampler misfires and reports black; otherwise the
+    /// sampler verdict decides. The only case that drops is a small frame the sampler also calls black.
+    static func keep(byteCount: Int, samplerBlack: Bool) -> Bool {
+        byteCount >= nonBlackByteFloor || !samplerBlack
+    }
+}
+
+// The pure `TrickplayFrameByteFloor` above has no dependencies; the store below pulls in the engine bridge,
+// RemoteConfig, VXProbe, and Combine. TRICKPLAY_BYTEFLOOR_TESTING (defined only by the standalone byte-floor test
+// harness, never by any real build) drops the store so the pure floor rule compiles and is unit-tested in
+// isolation. This mirrors CommunityTrickplay.swift's TRICKPLAY_E2E_POLICY_TESTING seam; production never sets it.
+#if !TRICKPLAY_BYTEFLOOR_TESTING
 /// Provides scrub-preview thumbnails from locally captured frames.
 /// When no server storyboard is available the player captures a frame every ~10 s of playback
 /// and stores it via `recordCapturedFrameData`. During scrubbing `show(time:)` serves the
@@ -254,6 +280,11 @@ final class ScrubThumbnailsStore: ObservableObject {
             VXProbe.log("tp", "dropping frame at \(Int(time))s: JPEG decode failed")
             return nil
         }
+        // SIZE-BASED FLOOR (shared by both platform branches, task 3): see TrickplayFrameByteFloor. A real
+        // detailed frame JPEG-compresses to tens of KB, while a black or unrendered frame compresses to ~2-4 KB,
+        // so the encoded byte count alone separates them with no pixel decode. macOS additionally runs a crude
+        // pixel sampler and keeps a large frame even when that sampler misfires; the non-AppKit path (tvOS/iOS)
+        // has no sampler, so its keep decision is purely this size test. Both branches read the one shared floor.
         #if canImport(AppKit)
         // macOS-only unrendered-frame guard. This USED to silently drop the frame with no log, which made it a
         // prime suspect for the owner-device zero-contribution bug: a libmpv 4K/HDR/DV frame can JPEG-decode to a
@@ -264,26 +295,32 @@ final class ScrubThumbnailsStore: ObservableObject {
         // valid frame is never discarded on a format we can't sample), and the drop is logged so it is traceable.
         //
         // SIZE-BASED OVERRIDE (task 3): a real detailed frame JPEG-compresses to tens of KB, while a truly black /
-        // unrendered frame compresses to ~2-4 KB. So a frame whose encoded JPEG is >= nonBlackByteFloor is DEFINITELY
+        // unrendered frame compresses to ~2-4 KB. So a frame whose encoded JPEG is >= the floor is DEFINITELY
         // not black no matter what the pixel sampler reads (the sampler misfires on 10-bit/HDR frames). We only drop
         // as near-black when BOTH the sampler says black AND the encoded size is small. The probe below logs the
         // encoded size + sampler verdict + keep decision so every frame's fate is visible in the terminal log.
-        let nonBlackByteFloor = 8000
         var samplerBlack = false
         if let cgImage = decoded.cgImage(forProposedRect: nil, context: nil, hints: nil) {
             samplerBlack = isBlackImage(cgImage)
         }
-        let bigEnoughToBeReal = data.count >= nonBlackByteFloor
-        let kept = bigEnoughToBeReal || !samplerBlack
+        let kept = TrickplayFrameByteFloor.keep(byteCount: data.count, samplerBlack: samplerBlack)
         VXProbe.log("tp", "frame at \(Int(time))s bytes=\(data.count) samplerBlack=\(samplerBlack ? "true" : "false") kept=\(kept ? "true" : "false")")
         if !kept {
             VXProbe.log("tp", "dropping frame at \(Int(time))s: near-black (unrendered) bytes=\(data.count)")
             return nil
         }
         #else
-        // Non-AppKit platforms have no pixel sampler here, so nothing is dropped as near-black; still emit the probe
-        // so the log shows the size verdict for every captured frame on every platform.
-        VXProbe.log("tp", "frame at \(Int(time))s bytes=\(data.count) samplerBlack=n/a kept=true")
+        // Non-AppKit platforms (tvOS/iOS, the platforms most users are on) have no pixel sampler, so the keep
+        // decision is purely the size floor above: a black or unrendered ~2-4 KB tile is dropped, a real
+        // tens-of-KB frame is kept. Without this, every captured frame was kept unconditionally, so tiny
+        // black/unrendered tiles were accepted into the shared community pool (and, because session retention
+        // pins the timeline endpoints, an un-evictable black tile 0). No sampler here, so kept = size >= floor.
+        let kept = TrickplayFrameByteFloor.keepBySize(byteCount: data.count)
+        VXProbe.log("tp", "frame at \(Int(time))s bytes=\(data.count) samplerBlack=n/a kept=\(kept ? "true" : "false") floor=\(TrickplayFrameByteFloor.nonBlackByteFloor)")
+        if !kept {
+            VXProbe.log("tp", "dropping frame at \(Int(time))s: near-black (unrendered) bytes=\(data.count) floor=\(TrickplayFrameByteFloor.nonBlackByteFloor)")
+            return nil
+        }
         #endif
         return decoded
     }
@@ -327,6 +364,15 @@ final class ScrubThumbnailsStore: ObservableObject {
         guard CommunityTrickplay.isEnabled,
               let key = communityKey,
               let imdb = communityImdb else { return }
+        // Fix C: once this key can do no more progressive work, stop the per-capture recompute and gate log that
+        // otherwise fire about every 10s (roughly 1000 lines over a 3h film) on @MainActor for no effect. A
+        // progressive attempt is one-shot per key and a terminal key uploads nothing further, so the
+        // uploadPolicy.request below would return nil regardless, and skipping it changes no upload behavior; it
+        // only silences the redundant log and recompute once the outcome is settled. Finals ride the teardown and
+        // retirement paths, never this one. uploadPolicy.key is kept aligned with communityKey (configureCommunity
+        // resets it on every re-key), so these read the CURRENT key's state, and early captures before the
+        // progressive attempt still log, keeping the gate diagnosable until nothing more can upload.
+        if uploadPolicy.isTerminal || uploadPolicy.progressiveAttempted { return }
         let coverageReady = CommunityTrickplay.uploadCanStore(
             frameCount: sessionFrames.count, intervalS: sessionNominalInterval,
             durationBucket: communityDurationBucket)
@@ -616,3 +662,4 @@ private final class LocalTrickplayFrameCache {
     }
 
 }
+#endif
