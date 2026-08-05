@@ -275,8 +275,8 @@ enum SearchIdleStateContractTests {
         ]), "source: a nil content is loading only for a catalog the app actually requested")
         expect(bridge.contains("private static let searchLoadRangeEnd = 30"),
                "source: the dispatched range end is 30, inclusive engine-side, so 31 catalogs are fetched")
-        expect(searchFunc.contains(#""end": Self.searchLoadRangeEnd"#),
-               "source: the dispatched LoadRange and the loading derivation read the SAME constant")
+        expect(bridge.contains(#""end": Self.searchLoadRangeEnd"#) && searchFunc.contains("loadSearchRange()"),
+               "source: the dispatched LoadRange (now in the shared loadSearchRange, called by search) and the loading derivation read the SAME constant")
         expect(containsInOrder(searchFunc, [
             "guard trimmed.count >= 2 else {",
             #"dispatch(action: ["action": "Unload"], field: "search")"#,
@@ -284,10 +284,11 @@ enum SearchIdleStateContractTests {
             #""action": "Load""#,
         ]), "source: the clear path Unloads the engine search before returning, ahead of the Load path")
 
-        // The discover/board surface has the same defect and its own ticket. This contract must not be
-        // read as covering it, so assert only that the board reader was left alone.
+        // The discover surface had the same free-re-announce defect; its no-op-suppression fix is pinned
+        // separately by DiscoverCoalesceContractTests. The Home BOARD reader is a third surface, untouched
+        // by both, so assert only that it was left alone.
         expect(!boardReconcile.isEmpty && !boardReconcile.contains("selected"),
-               "scope: the board/discover reader is untouched by this fix")
+               "scope: the board reader is untouched by this fix")
 
         print(failures == 0 ? "\nALL PASS" : "\n\(failures) FAILURE(S)")
         exit(failures == 0 ? 0 : 1)

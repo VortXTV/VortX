@@ -672,6 +672,9 @@ final class CoreBridge: ObservableObject {
             self.continueWatching = []
             self.boardRows = []
             self.discover = nil
+            // Drop the no-op-suppression fingerprint alongside the state it guards: a fresh discover load
+            // after this clear must never be suppressed by a stale fingerprint from the previous account.
+            self.discoverPublishedFingerprint = nil
             self.library = nil
             self.metaDetails = nil
         }
@@ -883,6 +886,19 @@ final class CoreBridge: ObservableObject {
     /// Item count captured when a next-page load is dispatched, to detect whether the settled load grew the
     /// list (more pages) or not (end of a cursorless catalog).
     private var discoverCountAtLoad = 0
+    /// Fingerprint of the last `discover` payload actually published to `self.discover`. The engine
+    /// re-announces `discover` as changed on every LibraryChanged FOR FREE (`catalog_with_filters.rs`
+    /// returns `Effects::none()` for `LibraryChanged`, so `has_changed` is set with nothing actually
+    /// different), so the discover branch fires on every ~20-90s library tick. Comparing this fingerprint
+    /// against the RAW field bytes before decoding lets that branch skip the large-payload JSONDecoder
+    /// pass and the main-queue republish whenever the bytes are byte-identical to the last publish. It is
+    /// a change-detection fingerprint, NOT a parallel copy of engine-owned state: it covers every byte, so
+    /// any real change to `selected` or any catalog item always differs and always republishes. Reset to
+    /// nil wherever `self.discover` is cleared so a fresh load after a clear is never suppressed. Touched
+    /// on the engine worker thread inside `handleEvent`; the lone cross-thread reset in `clearUserState`
+    /// is a benign nil-write (worst case one redundant republish, never a dropped change), matching the
+    /// file's existing tolerance for cross-thread reads of these optimization flags (see `playerActive`).
+    private var discoverPublishedFingerprint: Int?
 
     /// Load the next page of the current Discover catalog (infinite scroll). The engine appends the
     /// page to `discover.catalog` and clears `next_page` at the end. No-op at the end or while a page
@@ -950,12 +966,36 @@ final class CoreBridge: ObservableObject {
     /// loading derivation in the `search` field handler read this one constant, so they cannot drift.
     private static let searchLoadRangeEnd = 30
 
+    /// The app's own record of whether a search is currently LOADED in the engine: set when `search`
+    /// dispatches its `Load`, cleared when the clear path `Unload`s it. This is the app knowing what it
+    /// itself dispatched (a `Load` it has not yet `Unload`ed), NOT a mirror of engine state, so re-issuing
+    /// the query off it stays app-initiated and inside the CoreBridge invariant. Read on the engine worker
+    /// thread in the `ctx` branch to decide whether a profile/addon change must re-fetch the re-planned
+    /// search catalogs; a `Bool` is word-atomic on 64-bit, so the cross-thread read is benign (a stale
+    /// read at worst skips one re-dispatch that the next ctx change catches, or fires one harmless no-op
+    /// `LoadRange`), matching the file's `playerActive` convention.
+    private var searchLoaded = false
+
+    /// Fetch the planned search catalogs the app actually wants: indices `0...searchLoadRangeEnd`,
+    /// inclusive engine-side. Shared by the initial `search()` and the mid-search re-dispatch in the `ctx`
+    /// branch so the two can never drift on the range. `catalogs_update` reuses any catalog that already
+    /// has content untouched and only issues a fetch for the in-range indices still parked at a nil
+    /// content, so a re-dispatch is idempotent: it fills the re-seeded holes without re-loading settled
+    /// results.
+    private func loadSearchRange() {
+        dispatch(action: ["action": "CatalogsWithExtra",
+                          "args": ["action": "LoadRange",
+                                   "args": ["start": 0, "end": Self.searchLoadRangeEnd]]],
+                 field: "search")
+    }
+
     /// Search across the installed addons (engine `search` field = CatalogsWithExtra with a search
     /// extra). Results land in `searchResults`, flattened and de-duplicated into one grid.
     func search(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         setSearchLoading(trimmed.count >= 2)
         guard trimmed.count >= 2 else {
+            searchLoaded = false
             // Tell the ENGINE the search is over, not just the UI. Clearing `searchResults` alone left the
             // engine's CatalogsWithExtra holding the last query's full result set for the life of the
             // process, and because it re-announces `search` as changed on every LibraryChanged, that dead
@@ -967,14 +1007,12 @@ final class CoreBridge: ObservableObject {
             DispatchQueue.main.async { [weak self] in self?.searchResults = [] }
             return
         }
+        searchLoaded = true
         dispatch(action: ["action": "Load",
                           "args": ["model": "CatalogsWithExtra",
                                    "args": ["type": NSNull(), "extra": [["search", trimmed]]]]],
                  field: "search")
-        dispatch(action: ["action": "CatalogsWithExtra",
-                          "args": ["action": "LoadRange",
-                                   "args": ["start": 0, "end": Self.searchLoadRangeEnd]]],
-                 field: "search")
+        loadSearchRange()
     }
 
     private func setSearchLoading(_ loading: Bool) {
@@ -2160,6 +2198,19 @@ final class CoreBridge: ObservableObject {
         return decoder
     }()
 
+    /// A cheap content fingerprint over EVERY byte of a raw engine-state field (length folded in first as
+    /// a fast discriminator). Used to suppress a redundant decode + republish when the engine re-announces
+    /// a field whose serialized bytes are byte-identical to the last publish. Because it hashes the whole
+    /// payload, any real change to the field changes the fingerprint, so a comparison against it can only
+    /// drop a genuine no-op, never a real change. `Hasher` is seeded per process, which is all this needs:
+    /// a fingerprint is only ever compared against another taken in the same run.
+    private static func fieldFingerprint(_ data: Data) -> Int {
+        var hasher = Hasher()
+        hasher.combine(data.count)
+        data.withUnsafeBytes { hasher.combine(bytes: $0) }
+        return hasher.finalize()
+    }
+
     // MARK: Event callback (invoked from a Rust worker thread)
 
     fileprivate func handleEvent(_ data: Data) {
@@ -2209,6 +2260,17 @@ final class CoreBridge: ObservableObject {
             VXProbe.log("engine", "ctx/settings changed addons=\(decode(CoreCtx.self, field: "ctx")?.profile.addons.count ?? 0)")
             DispatchQueue.main.async { [weak self] in self?.addonNamesCache = nil }   // addon set changed → rebuild name map
             refreshAddons()
+            // MID-SEARCH RE-PLAN. A profile/addon change mid-search runs `Internal::ProfileChanged`, which
+            // in `catalogs_with_extra.rs` calls `catalogs_update(..., range: None, ...)`: every planned
+            // catalog still parked at a nil content is re-seeded to a nil content again WITH NO fetch
+            // effect. A newly planned catalog at an in-range index then sits at nil forever and holds the
+            // search spinner (`hasLoadingPages` counts an in-range nil content as loading) until the next
+            // user keystroke. Re-dispatch the SAME `LoadRange` search() uses so those re-seeded catalogs
+            // get fetched. `catalogs_update` reuses any catalog that already has content untouched, so this
+            // only fills the holes: no re-load of settled results, no flicker. Gated on `searchLoaded` so
+            // it never fires with no search loaded, and idempotent (a settled range emits nothing via the
+            // engine's `eq_update`). The app is re-issuing its OWN query, not mirroring engine state.
+            if searchLoaded { loadSearchRange() }
         }
         if fields.contains("meta_details") {
             // Coalesce a source-search burst into one trailing decode+diff (see metaDetailsWork). The heavy
@@ -2217,29 +2279,59 @@ final class CoreBridge: ObservableObject {
             scheduleMetaDetailsRepublish()
         }
         if fields.contains("discover") {
-            let value = decode(CoreDiscover.self, field: "discover")
-            VXProbe.log("engine", "discover changed items=\(value?.items.count ?? 0)")
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                // End-stop (#95): a next-page load that has FULLY settled (no page still loading) without
-                // growing the list means there are no more pages, whether the catalog was cursorless or its
-                // cursor went nil mid-catalog. Gate on !isLoadingPage so the interim "Loading" emit (same
-                // count, more coming) never latches exhausted early.
-                if self.discoverPageInFlight, let v = value, !v.isLoadingPage, v.items.count <= self.discoverCountAtLoad {
-                    self.discoverExhausted = true
+            // NO-OP SUPPRESSION. The engine re-announces `discover` as changed on every LibraryChanged for
+            // free (`catalog_with_filters.rs`: `LibraryChanged(_) => Effects::none()`, changed-but-nothing-
+            // different), so this branch fires on every ~20-90s library tick. Unlike `meta_details` (which
+            // decodes then diffs) and `library` (eq-guarded after decode), `discover` had NO guard: it
+            // re-decoded its full catalog and re-wrote the `@Published` var every tick, changing nothing.
+            // Fingerprint the RAW field bytes and skip the decode + republish when they are byte-identical
+            // to the last publish. `get_state` has already paid the serde serialize (unavoidable, the bytes
+            // are the comparison input), but the large-payload JSONDecoder pass and the main-queue write
+            // are pure waste on a no-op. The fingerprint covers `selected` and every catalog item, so a
+            // genuine change always re-publishes; it is a change-detection fingerprint, not a cached copy
+            // of engine state. `stateData` is called once and the decode reads that same buffer, so a real
+            // change still costs exactly one `get_state`, same as before.
+            if let data = stateData("discover") {
+                let fingerprint = Self.fieldFingerprint(data)
+                // NEVER suppress while a next-page load is in flight. The settle that clears
+                // `discoverPageInFlight` (and latches `discoverExhausted` for a cursorless catalog) can
+                // arrive with bytes byte-identical to the last publish and WITHOUT an intervening
+                // isLoadingPage=true emit; swallowing it would wedge `discoverPageInFlight` true (further
+                // paging blocked) and never latch exhausted. `discoverPageInFlight` is the exact flag this
+                // branch clears on settle, so gating on it makes the paging path provably safe rather than
+                // relying on the interim "Loading" emit differing. Read here on the worker thread; it is a
+                // plain Bool written on main/UI well before the engine round-trips a page emit back, so the
+                // read is benign (matches the `playerActive` cross-thread convention in this file). The
+                // ordinary idle re-announce (in flight false) is still suppressed, which is the whole point.
+                if fingerprint != discoverPublishedFingerprint || discoverPageInFlight {
+                    discoverPublishedFingerprint = fingerprint
+                    let value: CoreDiscover?
+                    do { value = try Self.decoder.decode(CoreDiscover.self, from: data) }
+                    catch { NSLog("%@", "[CoreBridge] decode discover failed: \(error)"); value = nil }
+                    VXProbe.log("engine", "discover changed items=\(value?.items.count ?? 0)")
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        // End-stop (#95): a next-page load that has FULLY settled (no page still loading)
+                        // without growing the list means there are no more pages, whether the catalog was
+                        // cursorless or its cursor went nil mid-catalog. Gate on !isLoadingPage so the
+                        // interim "Loading" emit (same count, more coming) never latches exhausted early.
+                        if self.discoverPageInFlight, let v = value, !v.isLoadingPage, v.items.count <= self.discoverCountAtLoad {
+                            self.discoverExhausted = true
+                        }
+                        self.discover = value
+                        // Clear the in-flight flag only once the load has settled, so onAppear bursts during
+                        // the page fetch can't fire a duplicate load (the interim "Loading" emit keeps it set).
+                        if value?.isLoadingPage != true { self.discoverPageInFlight = false }
+                    }
+                    // A null first load derives the default catalog before the selectable is refreshed from
+                    // addons, so it can land with catalogs available but nothing selected (Discover stuck on
+                    // the spinner). If so, load the first catalog to unstick it.
+                    if let value, value.items.isEmpty,
+                       !value.selectable.types.contains(where: { $0.selected }),
+                       let first = value.selectable.types.first {
+                        selectDiscover(first.request)
+                    }
                 }
-                self.discover = value
-                // Clear the in-flight flag only once the load has settled, so onAppear bursts during the
-                // page fetch can't fire a duplicate load (the interim "Loading" emit keeps it set).
-                if value?.isLoadingPage != true { self.discoverPageInFlight = false }
-            }
-            // A null first load derives the default catalog before the selectable is refreshed from
-            // addons, so it can land with catalogs available but nothing selected (Discover stuck on
-            // the spinner). If so, load the first catalog to unstick it.
-            if let value, value.items.isEmpty,
-               !value.selectable.types.contains(where: { $0.selected }),
-               let first = value.selectable.types.first {
-                selectDiscover(first.request)
             }
         }
         if fields.contains("library") {
