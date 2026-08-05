@@ -99,3 +99,6 @@ vortx-images/
 # Rust build output must never be tracked (IR-03: 1.08GB private-engine artifacts were tracked)
 core/target/
 **/target/
+
+# Compiled test-harness binaries (produced by .harness/run-suites.sh)
+.harness/bin/

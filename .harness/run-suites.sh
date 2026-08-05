@@ -18,6 +18,7 @@ run() {
 
 run multi-audio-policy \
   app/Sources/Player/VortXRemuxBuffer.swift \
+  app/Sources/Player/AudioLanguagePolicy.swift \
   app/Sources/Player/MultiAudioPolicy.swift \
   app/Tests/MultiAudioPolicyTests.swift
 
@@ -40,6 +41,9 @@ run remux-resume-policy \
 run player-live-contract \
   app/Sources/Player/DVPlaybackPolicy.swift \
   app/Sources/Player/VortXRemuxBuffer.swift \
+  app/Sources/Player/PlayerStallPolicy.swift \
+  app/Sources/Player/VortXHLSSeekAnchorState.swift \
+  app/Sources/Player/AudioLanguagePolicy.swift \
   app/Sources/Player/MultiAudioPolicy.swift \
   app/Sources/Player/SubtitleRenditionPolicy.swift \
   app/Tests/PlayerLiveContractTests.swift
