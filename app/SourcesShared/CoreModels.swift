@@ -960,6 +960,26 @@ struct PlayerLoadProvenanceState {
     }
 }
 
+/// Pure watchdog discrimination for the tvOS player's terminal (end-of-file) freeze. Kept outside the view so
+/// its boundary cases are unit-testable without the full player, mirroring `TVAVStartWatchdogPolicy`.
+enum TerminalPlaybackWatchdogPolicy {
+    /// The stall watchdog must NOT be blinded by `buffering` when the player is frozen on the FINAL frame at
+    /// end-of-file. At the EOF boundary mpv reports paused-for-cache=true, which the app maps to buffering, so
+    /// the watchdog's normal `!buffering` stand-down would wait on it forever when the next source never
+    /// resolves (diag-22: a dead TorBox hung the final frame ~15 min). A terminal freeze - the play head at
+    /// pos ~= duration with the EOF event already delivered (`atEOF`) - is recoverable REGARDLESS of buffering
+    /// and is driven into the bounded advance-or-exit fallback. A genuine mid-stream rebuffer (play head still
+    /// short of the duration) is NOT this case: it returns false and stays owned by the normal buffering path,
+    /// exactly as before. `buffering` is deliberately absent from the signature - the whole point is that the
+    /// classification does not depend on it.
+    static func eofFreezeIsRecoverable(atEOF: Bool, currentTime: Double, duration: Double,
+                                       hasStartedPlaying: Bool, loadFailed: Bool,
+                                       tolerance: Double = 1.5) -> Bool {
+        guard atEOF, hasStartedPlaying, !loadFailed, duration > 0 else { return false }
+        return currentTime >= duration - tolerance
+    }
+}
+
 /// Small, pure identity decisions shared by the engine bridge, episode play paths, and native-debrid
 /// file selection. Keeping these decisions together prevents one surface from treating a torrent as
 /// hash-only while another treats `(infoHash,fileIdx)` as the actual media identity.
@@ -1109,6 +1129,25 @@ enum EpisodePlaybackIdentity {
             return kind == .eof ? .persistOutgoingCompletionOnly : .ignoreOutgoingError
         case .stale:
             return .ignoreStale
+        }
+    }
+
+    /// Whether a terminal EOF action leaves the session waiting on an EXTERNAL resolve with no advance or exit
+    /// of its own, so the call site MUST cover it with a bounded terminal deadline. `.persistOutgoing-
+    /// CompletionOnly` records the outgoing completion but, by contract, "cannot advance or exit while the
+    /// requested target is resolving"; `.markSupersededTerminal` parks a superseded terminal the same way. In
+    /// diag-22 both hung indefinitely when the requested next source never resolved (a dead TorBox left an
+    /// episode frozen ~15 min on its final frame). The other actions each own their follow-through:
+    /// `.handleCommitted` advances, `.handlePending` fails the load, and `.ignoreOutgoingError` /
+    /// `.ignoreStale` belong to a stale or superseded physical load whose current session is a different, live
+    /// one, so they need no deadline here. This is a pure classification only: the route logic above is
+    /// unchanged and the bound is ENFORCED entirely at the TVPlayerView call site.
+    static func terminalActionRequiresBoundedDeadline(_ action: TerminalEventAction) -> Bool {
+        switch action {
+        case .persistOutgoingCompletionOnly, .markSupersededTerminal:
+            return true
+        case .handleCommitted, .handlePending, .ignoreOutgoingError, .ignoreStale:
+            return false
         }
     }
 
