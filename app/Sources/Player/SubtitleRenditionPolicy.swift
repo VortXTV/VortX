@@ -402,6 +402,14 @@ enum SubtitleRenditionPolicy {
     /// A cue may not outlast this. A malformed duration field (seen as multi-hour values on badly muxed rips)
     /// would otherwise pin one line on screen for the rest of the film.
     static let maxCueDuration = 30.0
+    /// The most cues this policy will leave on screen at one instant.
+    ///
+    /// `webVTTDocument` writes no cue settings (no `line:`/`position:`/`align:`, because ASS positioning is
+    /// stripped long before it reaches here), so AVFoundation draws every simultaneously active cue at the same
+    /// default bottom-centre position and they stack. Three is deliberately generous: two-speaker dialogue plus
+    /// one forced-narrative line is real content, and past that a stack is an authoring artefact (layered
+    /// typesetting, animation steps) that no viewer could read anyway.
+    static let maxSimultaneousCues = 3
     /// Seven days is far beyond any supported playback asset while keeping millisecond conversion safely
     /// inside `Int` on every product architecture.
     static let maximumTimelineSeconds = 7.0 * 24 * 60 * 60
@@ -570,6 +578,81 @@ enum SubtitleRenditionPolicy {
                       totalSeconds / 3600, (totalSeconds / 60) % 60, totalSeconds % 60, millis)
     }
 
+    /// Resolve duplicated and stacked cues on one rendition's timeline, in start order.
+    ///
+    /// The producer appends every converted packet unconditionally and nothing downstream compares a cue with
+    /// its neighbours, so two shapes that are normal in real rips reach the screen as a wall of text:
+    ///   - an ASS animation, karaoke or fade run, authored as many short events carrying IDENTICAL text, all
+    ///     of which collapse to the same string once the override blocks are stripped (and each becomes a
+    ///     `fallbackCueDuration` cue when the container reports no duration, so they all overlap);
+    ///   - layered typesetting authored to sit at different screen positions, which all lands on the one
+    ///     position a cue-setting-free WebVTT document has.
+    /// Both are answered with pure interval work: identical text that overlaps or touches becomes ONE cue
+    /// spanning the run, and beyond `maxSimultaneousCues` the OLDEST cues are truncated to the newcomer's start.
+    ///
+    /// Truncation rather than deletion is what keeps this fail-soft: a clipped cue is still shown, just not
+    /// past the point where the stack made it unreadable, so genuine two-speaker dialogue and forced narrative
+    /// survive intact. The single exception is a cue left with less than `minCueDuration` to run, which is not
+    /// displayable at all and would only emit a degenerate range.
+    ///
+    /// Cross-segment repetition of a straddling cue is NOT touched here: RFC 8216 section 3.5 requires it, and
+    /// this function never sees a segment boundary.
+    ///
+    /// Idempotent by construction, which matters because the caller runs it once per served segment over the
+    /// same array: the result holds no identical-text cues that overlap or touch, and no instant with more than
+    /// `maxSimultaneousCues` active, so a second pass finds nothing to do.
+    static func normalizedCues(_ all: [Cue]) -> [Cue] {
+        guard all.count > 1 else { return all }
+        // A TOTAL order, not merely by start: equal starts must not depend on whether the sort happens to be
+        // stable, or two runs over one array could produce two different documents for the same segment.
+        let ordered = all.sorted {
+            if $0.start != $1.start { return $0.start < $1.start }
+            if $0.end != $1.end { return $0.end < $1.end }
+            return $0.text < $1.text
+        }
+
+        // Pass 1, coalesce identical text across the whole run it spans. `open` holds only the cues that can
+        // still reach the next start, which is what keeps this linear in practice rather than a scan of
+        // everything stored so far. Ends only grow here, so the array stays start-ordered.
+        var merged: [Cue] = []
+        merged.reserveCapacity(ordered.count)
+        var open: [Int] = []
+        for cue in ordered {
+            open.removeAll { merged[$0].end < cue.start }
+            if let slot = open.first(where: { merged[$0].text == cue.text }) {
+                merged[slot] = Cue(start: merged[slot].start,
+                                   end: max(merged[slot].end, cue.end),
+                                   text: merged[slot].text)
+                continue
+            }
+            merged.append(cue)
+            open.append(merged.count - 1)
+        }
+
+        // Pass 2, cap simultaneity. The active count can only RISE at a cue's start, so checking every start is
+        // a complete check of the timeline, and a truncation written here is visible to every later start.
+        var dropped = Set<Int>()
+        var active: [Int] = []
+        for index in merged.indices {
+            let start = merged[index].start
+            active.removeAll { merged[$0].end <= start }
+            if active.count >= maxSimultaneousCues {
+                let excess = active.count - (maxSimultaneousCues - 1)
+                for slot in active.prefix(excess) {
+                    if start - merged[slot].start < minCueDuration {
+                        dropped.insert(slot)
+                    } else {
+                        merged[slot] = Cue(start: merged[slot].start, end: start, text: merged[slot].text)
+                    }
+                }
+                active.removeFirst(excess)
+            }
+            active.append(index)
+        }
+        guard !dropped.isEmpty else { return merged }
+        return merged.indices.filter { !dropped.contains($0) }.map { merged[$0] }
+    }
+
     /// The cues that fall inside `start..<end`, in start order.
     ///
     /// OVERLAP, not containment: a cue straddling a segment boundary belongs to BOTH segments, because a
@@ -577,9 +660,70 @@ enum SubtitleRenditionPolicy {
     /// nothing. Duplicating it is exactly what the HLS spec expects, and identical cues in adjacent segments
     /// are the normal case, not an error. A cue is included when it is still on screen after `start` and
     /// appeared before `end`.
+    ///
+    /// Normalization runs on the FULL array BEFORE the window filter, not after, for two reasons: a run of
+    /// identical cues can begin before this segment, and a stack can only be resolved against the cues on both
+    /// sides of the boundary. This is the one funnel every served document passes through, so normalizing here
+    /// covers every rendition and every segment.
     static func cues(_ all: [Cue], overlapping start: Double, end: Double) -> [Cue] {
+        normalizedCues(normalizedCues(all), overlapping: start, end: end)
+    }
+
+    /// The window filter over an ALREADY-normalized array, so a caller serving many segments off one cue array
+    /// pays the normalization once instead of once per segment (see `NormalizedCueCache`). Split out rather than
+    /// duplicated: the boundary predicate that decides which cues straddle a segment has exactly ONE definition,
+    /// and `cues(_:overlapping:end:)` is this plus the normalization.
+    static func normalizedCues(_ normalized: [Cue], overlapping start: Double, end: Double) -> [Cue] {
         guard end > start else { return [] }
-        return all.filter { $0.end > start && $0.start < end }.sorted { $0.start < $1.start }
+        return normalized.filter { $0.end > start && $0.start < end }
+    }
+
+    /// A caller-owned memo over `normalizedCues(_:)`.
+    ///
+    /// The served path renders one WebVTT document per (rendition, segment), and each one normalized the FULL
+    /// cue array: on a 20k-cue title that is a sort plus two array copies PER SEGMENT, on the producer thread
+    /// (FAIL-260804-06, which is exactly the thread that must not be spending time on repeated work).
+    ///
+    /// `(count, last cue's interval)` is a SUFFICIENT identity for that array, checked against every way the
+    /// collector actually mutates it: an append moves the count; extending a run's LAST cue in place (the one
+    /// in-place edit that exists - identical text whose end grows) strictly raises `lastEnd`; a reset empties it.
+    /// Nothing rewrites a cue in the middle, which is the only shape these two terms would miss. The interval
+    /// term doubles as cross-rendition safety, so a same-count array from a different timeline misses too.
+    ///
+    /// `normalizedCues` itself stays pure and independently tested; this only decides when to call it.
+    struct NormalizedCueCache {
+        /// How many times the pure function actually ran. Exposed for the memo's own test (and cheap enough to
+        /// keep in production, where it is the one number that says whether the memo is working).
+        private(set) var recomputeCount = 0
+
+        private struct Fingerprint: Equatable {
+            let count: Int
+            let lastStart: Double
+            let lastEnd: Double
+        }
+
+        private var fingerprint: Fingerprint?
+        private var cached: [Cue] = []
+
+        init() {}
+
+        /// `normalizedCues(all)`, computed at most once per distinct input.
+        mutating func normalized(_ all: [Cue]) -> [Cue] {
+            let mark = Fingerprint(count: all.count,
+                                   lastStart: all.last?.start ?? -1,
+                                   lastEnd: all.last?.end ?? -1)
+            if let fingerprint, fingerprint == mark { return cached }
+            recomputeCount += 1
+            fingerprint = mark
+            cached = SubtitleRenditionPolicy.normalizedCues(all)
+            return cached
+        }
+
+        /// `cues(all, overlapping: start, end: end)` with the normalization memoized. Same result by
+        /// construction: both compose the same two pure steps.
+        mutating func cues(_ all: [Cue], overlapping start: Double, end: Double) -> [Cue] {
+            SubtitleRenditionPolicy.normalizedCues(normalized(all), overlapping: start, end: end)
+        }
     }
 
     // MARK: - Global demux settlement

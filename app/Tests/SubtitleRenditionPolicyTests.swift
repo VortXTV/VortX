@@ -67,6 +67,15 @@ func parseVTT(_ document: String) -> (header: String, cues: [(time: String, body
     return (blocks.first ?? "", cues)
 }
 
+/// The largest number of cues that are on screen together at any instant of `cues`. Simultaneity can only rise
+/// where a cue starts, so probing every start is a complete answer, and stating it this way means the cap
+/// assertions test the PROPERTY rather than a particular array the implementation happened to produce.
+func maxSimultaneous(_ cues: [Cue]) -> Int {
+    cues.reduce(0) { peak, probe in
+        max(peak, cues.filter { $0.start <= probe.start && $0.end > probe.start }.count)
+    }
+}
+
 // Compiling several files together means only a `main.swift` may carry top-level expressions, so the run body
 // is a function invoked from `@main`, matching the other standalone suites in this directory.
 @main
@@ -497,6 +506,110 @@ check("window: results are start-ordered",
       Policy.cues([Cue(start: 9, end: 10, text: "b"), Cue(start: 7, end: 8, text: "a")],
                   overlapping: 0, end: 20).map(\.text) == ["a", "b"])
 
+// MARK: - Cue normalization
+
+// The shape that produced the report: an ASS animation run re-authored as short steps with IDENTICAL text,
+// every one of which overlaps its neighbour once the override blocks are stripped.
+let animationRun = (0..<10).map { Cue(start: Double($0) * 0.5, end: Double($0) * 0.5 + 2, text: "SIGN") }
+check("normalize: a run of identical overlapping cues becomes ONE cue spanning the run",
+      Policy.normalizedCues(animationRun) == [Cue(start: 0, end: 6.5, text: "SIGN")])
+check("normalize: identical text that only TOUCHES is still coalesced",
+      Policy.normalizedCues([Cue(start: 0, end: 2, text: "A"), Cue(start: 2, end: 4, text: "A")])
+        == [Cue(start: 0, end: 4, text: "A")])
+check("normalize: identical text with a real gap between it stays two cues",
+      Policy.normalizedCues([Cue(start: 0, end: 2, text: "A"), Cue(start: 2.5, end: 4, text: "A")])
+        == [Cue(start: 0, end: 2, text: "A"), Cue(start: 2.5, end: 4, text: "A")])
+check("normalize: coalescing bridges a run through an interleaved different line",
+      Policy.normalizedCues([Cue(start: 0, end: 2, text: "A"),
+                             Cue(start: 0.5, end: 1.5, text: "B"),
+                             Cue(start: 1, end: 3, text: "A")])
+        == [Cue(start: 0, end: 3, text: "A"), Cue(start: 0.5, end: 1.5, text: "B")])
+check("normalize: a lone cue is returned untouched",
+      Policy.normalizedCues([Cue(start: 4, end: 9, text: "only")]) == [Cue(start: 4, end: 9, text: "only")])
+check("normalize: an empty track normalizes to nothing rather than trapping",
+      Policy.normalizedCues([]).isEmpty)
+
+check("normalize: the simultaneity cap is above one, so overlap is allowed at all",
+      Policy.maxSimultaneousCues >= 2)
+let twoSpeakers = [Cue(start: 0, end: 3, text: "A"), Cue(start: 1, end: 4, text: "B")]
+check("normalize: two overlapping speakers are preserved exactly",
+      Policy.normalizedCues(twoSpeakers) == twoSpeakers)
+let threeUpCap = twoSpeakers + [Cue(start: 2, end: 5, text: "C")]
+check("normalize: a third simultaneous line is still under the cap and survives whole",
+      Policy.normalizedCues(threeUpCap) == threeUpCap)
+
+let stack = [
+    Cue(start: 0, end: 20, text: "one"),
+    Cue(start: 1, end: 20, text: "two"),
+    Cue(start: 2, end: 20, text: "three"),
+    Cue(start: 3, end: 20, text: "four"),
+]
+let capped = Policy.normalizedCues(stack)
+check("normalize: a fourth simultaneous cue TRUNCATES the oldest instead of deleting it",
+      capped.count == 4 && capped[0] == Cue(start: 0, end: 3, text: "one"))
+check("normalize: the newest cue is never the one clipped",
+      capped.last == Cue(start: 3, end: 20, text: "four"))
+check("normalize: no instant of the capped result exceeds the cap",
+      maxSimultaneous(capped) == Policy.maxSimultaneousCues)
+check("normalize: the same fixture really was over the cap before normalization",
+      maxSimultaneous(stack) > Policy.maxSimultaneousCues)
+check("normalize: each further overlap clips the next oldest in turn",
+      Policy.normalizedCues(stack + [Cue(start: 4, end: 20, text: "five")]).map(\.end)
+        == [3, 4, 20, 20, 20])
+
+let simultaneous = (0..<4).map { Cue(start: 0, end: 5, text: "layer\($0)") }
+let survivors = Policy.normalizedCues(simultaneous)
+check("normalize: a cue with no room left to truncate is dropped, not emitted zero-length",
+      survivors.count == 3 && !survivors.contains(where: { $0.text == "layer0" }))
+check("normalize: every surviving cue still clears the minimum displayable duration",
+      survivors.allSatisfy { $0.end - $0.start >= Policy.minCueDuration })
+check("normalize: a remnant that still clears the minimum is kept rather than dropped",
+      Policy.normalizedCues([Cue(start: 0, end: 5, text: "a"), Cue(start: 0, end: 5, text: "b"),
+                             Cue(start: 0, end: 5, text: "c"),
+                             Cue(start: Policy.minCueDuration, end: 5, text: "d")])
+        .count == 4)
+
+let messy = animationRun + stack + simultaneous + twoSpeakers
+let normalizedOnce = Policy.normalizedCues(messy)
+check("normalize: normalizing twice equals normalizing once",
+      Policy.normalizedCues(normalizedOnce) == normalizedOnce)
+check("normalize: a mixed track ends up inside the cap everywhere",
+      maxSimultaneous(normalizedOnce) <= Policy.maxSimultaneousCues)
+check("normalize: normalization never empties a track that had cues",
+      !normalizedOnce.isEmpty)
+check("normalize: input order does not change the result",
+      Policy.normalizedCues(Array(messy.reversed())) == normalizedOnce)
+
+// MARK: - Normalization memo (the served-path integration)
+
+// The served path renders one document per (rendition, segment) off ONE cue array, so the normalization must
+// run once per distinct array, not once per segment. These assert the memo's two obligations - never serve a
+// stale result, never recompute a result it already holds - and that its output is the pure function's, so a
+// memo that silently diverged (or one that never actually caches) fails here rather than in the field.
+var memo = Policy.NormalizedCueCache()
+let memoFirst = memo.normalized(messy)
+check("memo: the first call runs the pure normalization and returns exactly its result",
+      memo.recomputeCount == 1 && memoFirst == normalizedOnce)
+let memoSegments = (0..<8).map { _ in memo.cues(messy, overlapping: 0, end: 3) }
+check("memo: eight served segments off the same array recompute nothing",
+      memo.recomputeCount == 1)
+check("memo: a served window through the memo equals the un-memoized funnel",
+      memoSegments.allSatisfy { $0 == Policy.cues(messy, overlapping: 0, end: 3) })
+let appended = messy + [Cue(start: 900, end: 902, text: "late line")]
+check("memo: an APPEND recomputes rather than serving the stale array",
+      memo.normalized(appended) == Policy.normalizedCues(appended) && memo.recomputeCount == 2)
+check("memo: the recomputed result is then itself cached",
+      memo.normalized(appended) == Policy.normalizedCues(appended) && memo.recomputeCount == 2)
+// Same COUNT, different content: the fingerprint carries the last cue's interval precisely so a same-length
+// array from another rendition (or a re-created collector) misses instead of serving the wrong timeline.
+let sameCountDifferentTail = messy + [Cue(start: 900, end: 903, text: "late line")]
+check("memo: a same-count array with a different last cue is not treated as a hit",
+      memo.normalized(sameCountDifferentTail) == Policy.normalizedCues(sameCountDifferentTail)
+        && memo.recomputeCount == 3)
+var emptyMemo = Policy.NormalizedCueCache()
+check("memo: an empty track is memoized like any other, without trapping on the missing last cue",
+      emptyMemo.normalized([]).isEmpty && emptyMemo.normalized([]).isEmpty && emptyMemo.recomputeCount == 1)
+
 // MARK: - Global demux settlement
 
 let absoluteVideoWindow = VortXHLSWindow(segments: [
@@ -681,6 +794,27 @@ check("doc: a cue-less stretch still serves a valid document",
         && Policy.webVTTDocument(cues: []).hasPrefix("WEBVTT"))
 check("doc: a zero-length cue is not written",
       parseVTT(Policy.webVTTDocument(cues: [Cue(start: 2, end: 2, text: "x")])).cues.isEmpty)
+
+// MARK: - Served documents, end to end
+
+// A 14-step animation run straddling the segment boundary at 6s, with one real line of dialogue over it.
+let animatedTrack = (0..<14).map { Cue(start: Double($0) * 0.5, end: Double($0) * 0.5 + 2, text: "STOP") }
+    + [Cue(start: 5, end: 9, text: "Dialogue")]
+check("served: the fixture really is a stack before normalization",
+      animatedTrack.filter { $0.end > 0 && $0.start < 6 }.count == 13)
+let firstServed = parseVTT(Policy.webVTTDocument(cues: Policy.cues(animatedTrack, overlapping: 0, end: 6)))
+check("served: the animation run reaches the document as ONE cue over the dialogue",
+      firstServed.cues.map(\.body) == ["STOP", "Dialogue"])
+check("served: the coalesced cue carries the whole run's span",
+      firstServed.cues.first?.time == "00:00:00.000 --> 00:00:08.500")
+let secondServed = parseVTT(Policy.webVTTDocument(cues: Policy.cues(animatedTrack, overlapping: 6, end: 12)))
+check("served: straddling cues are still repeated in the next segment (RFC 8216 section 3.5)",
+      secondServed.cues.map(\.body) == ["STOP", "Dialogue"])
+check("served: a segment served twice serves the same document",
+      Policy.webVTTDocument(cues: Policy.cues(animatedTrack, overlapping: 0, end: 6))
+        == Policy.webVTTDocument(cues: Policy.cues(animatedTrack, overlapping: 0, end: 6)))
+check("served: no served document draws more than the cap at one instant",
+      maxSimultaneous(Policy.cues(messy, overlapping: 0, end: 30)) <= Policy.maxSimultaneousCues)
 
 print(failures == 0 ? "\nALL PASS" : "\n\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)
