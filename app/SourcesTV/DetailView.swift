@@ -301,15 +301,26 @@ struct DetailView: View {
 
         let rawID = id
         let requestType = effectiveType
-        guard let imdb = await TMDBClient.imdbID(forCatalogID: rawID, type: requestType),
-              !Task.isCancelled,
-              imdb != rawID else {
-            if !Task.isCancelled {
-                VXProbe.log(
-                    "detail",
-                    "meta recovery unresolved id=\(VXProbeRedaction.identityToken(rawID))"
-                )
-            }
+        // RE-ARM ON A PRE-NETWORK CANCEL. `metaRecoveryAttempted` is the one-attempt-per-page latch that
+        // `metaUnavailable` reads to decide the page is dead, and it is claimed BEFORE the lookup below.
+        // This task is keyed on `metaRecoveryTaskID`, so any engine republish that moves the resolution
+        // (an add-on answering late, a republished meta) cancels and restarts it - and the restart used to
+        // find the latch already consumed and bail, permanently showing "Details unavailable" even though
+        // NO lookup had ever completed. Give the latch back whenever the attempt is cancelled before it
+        // produced an answer; a completed attempt (resolved or not) keeps it, so the one-attempt rule and
+        // the Try Again button behave exactly as before.
+        var lookupCompleted = false
+        defer { if !lookupCompleted && Task.isCancelled { metaRecoveryAttempted = false } }
+
+        let resolved = await TMDBClient.imdbID(forCatalogID: rawID, type: requestType)
+        guard !Task.isCancelled else { return }
+        lookupCompleted = true
+
+        guard let imdb = resolved, imdb != rawID else {
+            VXProbe.log(
+                "detail",
+                "meta recovery unresolved id=\(VXProbeRedaction.identityToken(rawID))"
+            )
             return
         }
 
@@ -782,7 +793,13 @@ struct DetailView: View {
             : profiles.watchedVideoIds(forMeta: meta.id)
         let watched = localWatched.union(
             TraktEpisodeShadow.watchedVideoIDs(showIdentity: meta.id, videos: videos))
-        let primary = seriesPrimaryEpisode(videos, watched: watched, localWatched: localWatched, metaID: meta.id)
+        // The (season, episode, id) ordering of EVERY video, sorted ONCE per page evaluation and then handed
+        // to everything that needs it. It used to be re-derived per consumer - `seriesPrimaryEpisode` and
+        // `resumeSeasonHint` each sorted, the hero's play link sorted again, and `CoreSeasonedEpisodes` read
+        // the computed `meta.orderedEpisodes` inside EVERY episode row's NavigationLink destination, which on
+        // a 2000-video series meant one full sort per row per D-pad press. One array, computed here.
+        let ordered = videos.orderedBySeasonEpisode
+        let primary = seriesPrimaryEpisode(ordered: ordered, watched: watched, localWatched: localWatched, metaID: meta.id)
         let primaryProgress = primary.map { episodeProgress($0.video, metaID: meta.id) } ?? 0
         let primaryResumeSeconds = primary.flatMap {
             if $0.video.id == validInitialVideoID, let validInitialResumeSeconds {
@@ -809,10 +826,12 @@ struct DetailView: View {
                         hero(meta, primaryEpisode: primary?.video, primaryIsResume: primary?.isResume == true,
                              primaryResumeSeconds: primaryResumeSeconds,
                              primaryProgress: primaryProgress,
+                             orderedEpisodes: ordered,
                              scrollToContent: { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } })
                         CoreSeasonedEpisodes(meta: meta, videos: videos,
+                                             orderedEpisodes: ordered,
                                              watched: watched,
-                                             initialSeason: resumeSeasonHint(videos, metaID: meta.id) ?? primary?.video.season)
+                                             initialSeason: resumeSeasonHint(ordered: ordered, metaID: meta.id) ?? primary?.video.season)
                             .id("detailContent")
                         castSection
                         whereToWatchSection
@@ -1090,6 +1109,7 @@ struct DetailView: View {
     private func hero(_ m: CoreMetaItem, primaryEpisode: CoreVideo? = nil, primaryIsResume: Bool = false,
                       primaryResumeSeconds: Double? = nil,
                       primaryProgress: Double = 0,
+                      orderedEpisodes: [CoreVideo] = [],
                       scrollToContent: @escaping () -> Void) -> some View {
         // FIX (build 137): the backdrop + trailer layer are now hoisted to the seriesPage page-root ZStack
         // (so they bleed under the nav bar at the top + to the bottom overscan, like moviePage). hero() is
@@ -1122,7 +1142,7 @@ struct DetailView: View {
                                 NavigationLink {
                                     CoreEpisodeStreams(meta: m, video: primaryEpisode,
                                                        season: primaryEpisode.season ?? 0,
-                                                       episodes: sortedEpisodes(m.videos ?? []),
+                                                       episodes: orderedEpisodes,
                                                        initialStartAtSeconds: primaryResumeSeconds,
                                                        initialTraktSessionID: initialTraktSessionID)   // ALL seasons ordered → auto-advance crosses the season boundary
                                 } label: {
@@ -1429,29 +1449,30 @@ struct DetailView: View {
     /// season you were last in, even if that episode is now marked watched (seriesPrimaryEpisode would jump to
     /// the next-unwatched season instead). nil when there is no resume position, so the caller falls back to the
     /// primary/next-unwatched season. seriesPrimaryEpisode still drives the Resume/Play button unchanged.
-    private func resumeSeasonHint(_ videos: [CoreVideo], metaID: String) -> Int? {
+    /// `ordered` is the caller's already-sorted (season, episode, id) list, so the page sorts once instead of
+    /// twice more inside this one helper.
+    private func resumeSeasonHint(ordered: [CoreVideo], metaID: String) -> Int? {
         if let validInitialVideoID,
-           let season = sortedEpisodes(videos).first(where: { $0.id == validInitialVideoID })?.season {
+           let season = ordered.first(where: { $0.id == validInitialVideoID })?.season {
             return season
         }
         let videoId: String? = profiles.activeUsesEngineHistory
             ? core.metaDetails?.libraryItem?.state.videoId
             : profiles.watch[metaID]?.videoId
         guard let videoId else { return nil }
-        return sortedEpisodes(videos).first { $0.id == videoId }?.season
+        return ordered.first { $0.id == videoId }?.season
     }
 
     /// The hero's Resume/Play target. `watched` is the DISPLAY set (VortX ∪ the optional Trakt episode
     /// mirror) and picks the next unstarted episode; `localWatched` is VortX's OWN set and is the only
     /// thing allowed to veto a resume. Keeping them apart is what stops an optional mirror from overriding
     /// the account that owns the data (see the resume comment below). Twin of iOSDetailView's version.
-    private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>,
+    private func seriesPrimaryEpisode(ordered: [CoreVideo], watched: Set<String>,
                                       localWatched: Set<String>, metaID: String) -> (video: CoreVideo, isResume: Bool)? {
-        let sorted = sortedEpisodes(videos)
         if let validInitialVideoID,
            let validInitialResumeSeconds,
            validInitialResumeSeconds > 0,
-           let video = sorted.first(where: { $0.id == validInitialVideoID }) {
+           let video = ordered.first(where: { $0.id == validInitialVideoID }) {
             return (video, true)
         }
         // Resume position: the engine's library entry is account level, so overlay
@@ -1475,14 +1496,14 @@ struct DetailView: View {
         // record of at all.
         if resume.timeOffset > 0,
            let videoId = resume.videoId,
-           let video = sorted.first(where: { $0.id == videoId }),
+           let video = ordered.first(where: { $0.id == videoId }),
            !localWatched.contains(video.id) {
             return (video, true)
         }
-        if let next = sorted.first(where: { !watched.contains($0.id) }) {
+        if let next = ordered.first(where: { !watched.contains($0.id) }) {
             return (next, false)
         }
-        return sorted.first.map { ($0, false) }
+        return ordered.first.map { ($0, false) }
     }
 
     private func primaryEpisodeLabel(_ video: CoreVideo, isResume: Bool, resumeSeconds: Double? = nil) -> String {
@@ -1512,21 +1533,9 @@ struct DetailView: View {
         return saved.timeOffsetMs / 1000
     }
 
-    private func seasonEpisodes(videos: [CoreVideo], season: Int) -> [CoreVideo] {
-        sortedEpisodes(videos).filter { ($0.season ?? 0) == season }
-    }
-
-    private func sortedEpisodes(_ videos: [CoreVideo]) -> [CoreVideo] {
-        videos.sorted {
-            let leftSeason = $0.season ?? 0
-            let rightSeason = $1.season ?? 0
-            if leftSeason != rightSeason { return leftSeason < rightSeason }
-            let leftEpisode = $0.episode ?? 0
-            let rightEpisode = $1.episode ?? 0
-            if leftEpisode != rightEpisode { return leftEpisode < rightEpisode }
-            return $0.id < $1.id
-        }
-    }
+    // `seasonEpisodes` / `sortedEpisodes` used to live here. Both were byte-identical re-implementations of
+    // the shared `Array<CoreVideo>.orderedBySeasonEpisode` (CoreModels), and `seriesPage` now sorts ONCE and
+    // passes the result down, so nothing called them any more.
 
     private func episodeProgress(_ video: CoreVideo, metaID: String) -> Double {
         guard profiles.activeUsesEngineHistory else {
@@ -1545,6 +1554,12 @@ struct DetailView: View {
 struct CoreSeasonedEpisodes: View {
     let meta: CoreMetaItem
     let videos: [CoreVideo]
+    /// EVERY video ordered (season, episode, id), sorted ONCE by the parent page and handed down. Each row's
+    /// player link needs the cross-season list, and it used to read the COMPUTED `meta.orderedEpisodes` inline
+    /// inside its `NavigationLink` destination - a destination SwiftUI builds eagerly, for every row, on every
+    /// body evaluation. A 2000-video series therefore re-sorted 2000 videos once per row per D-pad press,
+    /// because `focusedEpisode` is `@FocusState` on this very view. Passed in, it is sorted once per page.
+    var orderedEpisodes: [CoreVideo] = []
     var watched: Set<String> = []
     var initialSeason: Int?
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true   // observed so a Settings toggle redraws; effective value via SpoilerBlurSetting (user wins over the RemoteConfig fleet default)
@@ -1563,6 +1578,11 @@ struct CoreSeasonedEpisodes: View {
     @State private var didApplyInitial = false   // once the initial-season hint lands (or the user taps a season), stop re-applying it
     @State private var seasonClampPending = false   // the next season change is the programmatic validity clamp, not a real pick, so it must not lock the hint
     @FocusState private var focusedEpisode: String?   // drives focus (and tvOS auto-scroll) to the current episode
+    /// A programmatic focus request that must SCROLL before it can land. The episode list is a `LazyVStack`,
+    /// so a row far down the season does not exist until it is scrolled near; assigning `focusedEpisode`
+    /// straight to it would silently do nothing. Setting this instead scrolls the row into existence first
+    /// (see the `ScrollViewReader` in `body`), then seats focus on the next runloop turn.
+    @State private var pendingFocusEpisode: String?
     // Cached so a re-render (watch-state updates arrive often) does not re-filter and
     // re-sort the episode list every time. seasons depends only on the immutable
     // `videos`; episodes additionally on `season`.
@@ -1640,10 +1660,51 @@ struct CoreSeasonedEpisodes: View {
                 }
             }
 
-            VStack(spacing: Theme.Space.sm) {
-                ForEach(episodes) { v in episodeRow(v).focused($focusedEpisode, equals: v.id) }
+            // LAZY, not eager (FAIL-260804-09): this was a plain `VStack`, so opening a large series' detail
+            // page materialized EVERY row of the selected season at once - thumbnail decode, blur, focus node
+            // and all. A 256-episode season allocated hundreds of megabytes in a few seconds and the OS
+            // jetsam-killed the app before the list ever appeared. `LazyVStack` builds only the on-screen
+            // window, matching every other rail on this page (the poster rails and the source list already
+            // cap or lazily build). Spacing, padding and per-row focus binding are unchanged; the `.id` is
+            // added so a programmatic focus request can scroll its row into existence first.
+            ScrollViewReader { rows in
+                LazyVStack(spacing: Theme.Space.sm) {
+                    ForEach(episodes) { v in
+                        episodeRow(v).focused($focusedEpisode, equals: v.id).id(v.id)
+                    }
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
+                // Lazy rows make focus-then-scroll impossible, so invert it: scroll the target row into the
+                // built window, then seat focus one runloop later, once it exists. tvOS keeps the row centred
+                // from there exactly as focus auto-scroll used to.
+                .onChange(of: pendingFocusEpisode) {
+                    guard let target = pendingFocusEpisode else { return }
+                    rows.scrollTo(target, anchor: .center)
+                    DispatchQueue.main.async {
+                        focusedEpisode = target
+                        // VERIFY, then retry ONCE. Seating focus is a REQUEST: tvOS refuses it for a row the
+                        // lazy stack has not built yet (a far-off season jump can need more than one turn to
+                        // realize the target), and the refusal is silent - it leaves focus wherever it was and
+                        // used to clear the request anyway, so the row you asked for never got focus and Back
+                        // returned to the wrong episode. Check on the FOLLOWING turn, because the framework
+                        // reconciles the request after this one. Bounded at a single retry, never a loop.
+                        DispatchQueue.main.async {
+                            // A newer request owns the seat now: leave it alone.
+                            guard pendingFocusEpisode == target else { return }
+                            if focusedEpisode == target { pendingFocusEpisode = nil; return }
+                            rows.scrollTo(target, anchor: .center)
+                            DispatchQueue.main.async {
+                                guard pendingFocusEpisode == target else { return }
+                                focusedEpisode = target
+                                // Fail-open (MIS-260731-03): give up here whatever happens. Focus stays wherever
+                                // tvOS put it - the grid is still fully usable - rather than looping on a row
+                                // that, for whatever reason, will not take focus.
+                                pendingFocusEpisode = nil
+                            }
+                        }
+                    }
+                }
             }
-            .padding(.horizontal, Theme.Space.screenEdge)
         }
         .onAppear { applyPreferredSeason() }
         // #7: when the player closes, continuous-play may have advanced to a LATER episode (even a later
@@ -1689,7 +1750,11 @@ struct CoreSeasonedEpisodes: View {
               videos.contains(where: { $0.id == id }) else { return }
         if let s = videos.first(where: { $0.id == id })?.season,
            s != season, seasons.contains(s) { season = s }
-        DispatchQueue.main.async { focusedEpisode = id }
+        // Route through the pending-focus request rather than assigning `focusedEpisode` directly: the list
+        // is lazy now, so episode 200 of a season is not built until it is scrolled to, and a focus binding
+        // pointed at a row that does not exist is dropped on the floor. The async hop still lets the season
+        // switch above rebuild `episodes` first.
+        DispatchQueue.main.async { pendingFocusEpisode = id }
     }
 
     /// Resolve and apply the preferred season, re-applying the Continue-Watching `initialSeason` hint until it
@@ -1737,7 +1802,9 @@ struct CoreSeasonedEpisodes: View {
         let isWatched = watched.contains(v.id)
         let progress = episodeProgress(v)
         return NavigationLink {
-            CoreEpisodeStreams(meta: meta, video: v, season: v.season ?? season, episodes: meta.orderedEpisodes)   // ALL seasons → cross-season auto-advance
+            // `orderedEpisodes` (sorted once by the page), NOT the computed `meta.orderedEpisodes`: this
+            // destination is built eagerly for every row on every body evaluation. ALL seasons → cross-season auto-advance.
+            CoreEpisodeStreams(meta: meta, video: v, season: v.season ?? season, episodes: orderedEpisodes)
         } label: {
             HStack(alignment: .top, spacing: Theme.Space.md) {
                 thumbnail(v, isWatched: isWatched, progress: progress)
@@ -1787,13 +1854,11 @@ struct CoreSeasonedEpisodes: View {
         // behaving exactly as shipped (blurred regardless of focus) when the new mode is off.
         let revealed = isWatched || (spoilerSafe && focusedEpisode == v.id)
         let blurArt = !revealed && (spoilerSafe || SpoilerBlurSetting.isEnabled)
-        return AsyncImage(url: URL(string: v.thumbnail ?? "")) { phase in
-            switch phase {
-            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
-            default: Theme.Palette.surface2.overlay(
-                Image(systemName: "play.rectangle.fill").font(.title).foregroundStyle(Theme.Palette.textTertiary))
-            }
-        }
+        // Was a bare `AsyncImage`, which decodes the add-on's FULL-SIZE still (commonly 780x439, ~1.4 MB
+        // uncompressed) on the main thread and keeps it at full resolution behind a 300x170 frame. Shared
+        // through PosterImageLoader instead: bounded concurrency, its own big URLCache, and an off-main
+        // ImageIO downsample straight to the on-screen size, so only the pixels actually drawn are resident.
+        return EpisodeThumbImage(url: v.thumbnail)
         .frame(width: 300, height: 170)
         .blur(radius: blurArt ? 20 : 0)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
@@ -1835,6 +1900,49 @@ struct CoreSeasonedEpisodes: View {
         return title.isEmpty ? "Episode \(v.episode ?? 0)" : title
     }
     private func seasonLabel(_ s: Int) -> String { s == 0 ? "Specials" : "Season \(s)" }
+}
+
+/// One episode still, decoded through the shared `PosterImageLoader` (bounded concurrency, dedicated
+/// URLCache, off-main ImageIO downsample) instead of `AsyncImage`. Add-ons commonly serve 780x439 stills;
+/// `AsyncImage` decodes and retains all of that behind a 300x170 frame, so a long season's worth of rows
+/// held megabytes of pixels nobody could see. Mirrors `UpcomingPosterThumb` / `AddonLogoIcon`: a warm-cache
+/// peek so a revisit never flashes blank, a glyph placeholder while it loads, and a `.task(id:)` load.
+private struct EpisodeThumbImage: View {
+    let url: String?
+
+    /// 600 px for a 300 pt-wide still: covers the 2x render scale with room to spare while keeping roughly
+    /// half the decoded bytes of the raw asset. Only what is drawn stays resident.
+    private static let maxPixel: CGFloat = 600
+
+    private var warmCache: VXPosterImage? {
+        guard let url, let parsed = URL(string: url) else { return nil }
+        return PosterImageLoader.cached(parsed)
+    }
+
+    @State private var image: VXPosterImage?
+
+    var body: some View {
+        Group {
+            if let img = image ?? warmCache {
+                imageView(img).resizable().aspectRatio(contentMode: .fill)
+            } else {
+                Theme.Palette.surface2.overlay(
+                    Image(systemName: "play.rectangle.fill").font(.title).foregroundStyle(Theme.Palette.textTertiary))
+            }
+        }
+        .task(id: url) {
+            guard image == nil, let url, !url.isEmpty else { return }
+            if let img = await PosterImageLoader.load(url, maxPixel: Self.maxPixel) { image = img }
+        }
+    }
+
+    private func imageView(_ img: VXPosterImage) -> Image {
+        #if canImport(UIKit)
+        Image(uiImage: img)
+        #else
+        Image(nsImage: img)
+        #endif
+    }
 }
 
 /// Loads + shows the streams for one episode (engine `meta_details` with the episode as stream path).

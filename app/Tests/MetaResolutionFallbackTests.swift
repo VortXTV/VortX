@@ -113,7 +113,22 @@ enum MetaResolutionFallbackTests {
             "unknown TMDB media is rejected"
         )
         check(Policy.catalogIDShape("tvdb:foo:81189") == .unsupported, "malformed TVDB ID is rejected")
-        check(Policy.catalogIDShape("kitsu:42") == .unsupported, "unknown scheme is not guessed")
+        // Kitsu ids get a shape of their own (anime add-ons hand them out constantly, and they used to have
+        // no recovery path at all). They are NOT folded onto the bare-number TMDB rule: a Kitsu id and a TMDB
+        // id that happen to share a number are unrelated titles.
+        check(Policy.catalogIDShape("kitsu:460") == .kitsu(460), "Kitsu ID parses")
+        check(Policy.catalogIDShape("KITSU:460") == .kitsu(460), "Kitsu scheme is case-insensitive")
+        check(Policy.catalogIDShape("kitsu:460") != .tmdb(460, media: nil), "Kitsu ID is not guessed as TMDB")
+        check(Policy.catalogIDShape("kitsu:foo") == .unsupported, "malformed Kitsu ID is rejected")
+        check(
+            Policy.catalogIDShape("kitsu:460:1:2") == .unsupported,
+            "episode-qualified Kitsu ID is not a detail route and stays unsupported"
+        )
+        check(
+            Policy.catalogIDShape("kitsu:tt0069576") == .imdb("tt0069576"),
+            "an embedded IMDb component still wins over the Kitsu scheme"
+        )
+        check(Policy.catalogIDShape("anidb:1078") == .unsupported, "unknown scheme is not guessed")
 
         let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath)
         let models = source("app/SourcesShared/CoreModels.swift", root: root)
@@ -152,6 +167,26 @@ enum MetaResolutionFallbackTests {
             tv.contains("guard !LiveTypes.contains(type)")
                 && ios.contains("guard !LiveTypes.contains(type)"),
             "metadata recovery remains disabled for live types"
+        )
+        let tmdb = source("app/SourcesShared/TMDBClient.swift", root: root)
+        check(
+            tmdb.contains("case .kitsu(let kitsuID) = shape")
+                && tmdb.contains("kitsuMappedShape(forKitsuID:"),
+            "the Kitsu shape is mapped to a TMDB-answerable shape before resolution"
+        )
+        // Both surfaces must offer a way OUT of a terminal metadata failure. tvOS has had one since the
+        // recovery work landed; iOS/Mac used to spin on the skeleton hero forever.
+        check(
+            tv.contains("metaUnavailablePage") && tv.contains("retryMeta()")
+                && ios.contains("metaUnavailableScreen") && ios.contains("retryMeta()"),
+            "both detail surfaces render a terminal page with a retry"
+        )
+        // The one-attempt latch must survive a cancel that happened BEFORE the lookup ran, or an engine
+        // republish permanently latches "Details unavailable" with no lookup having ever completed.
+        check(
+            tv.contains("if !lookupCompleted && Task.isCancelled { metaRecoveryAttempted = false }")
+                && ios.contains("if !lookupCompleted && Task.isCancelled { metaRecoveryAttempted = false }"),
+            "a pre-network cancel re-arms the recovery attempt on both surfaces"
         )
 
         if failures == 0 {

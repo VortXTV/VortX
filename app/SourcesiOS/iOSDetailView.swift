@@ -329,15 +329,24 @@ struct iOSDetailView: View {
         defer { metaRecoveryInFlight = false }
         let rawID = id
         let requestType = effectiveType
-        guard let imdb = await TMDBClient.imdbID(forCatalogID: rawID, type: requestType),
-              !Task.isCancelled,
-              imdb != rawID else {
-            if !Task.isCancelled {
-                VXProbe.log(
-                    "detail",
-                    "meta recovery unresolved id=\(VXProbeRedaction.identityToken(rawID))"
-                )
-            }
+        // RE-ARM ON A PRE-NETWORK CANCEL (twin of the tvOS fix). `metaRecoveryAttempted` is the
+        // one-attempt-per-page latch the terminal page reads, and it is claimed BEFORE the lookup. This task
+        // is keyed on `metaRecoveryTaskID`, so an engine republish that moves the resolution cancels and
+        // restarts it - and the restart used to find the latch consumed and bail with no lookup having ever
+        // completed. Hand the latch back when the attempt is cancelled before it answered; a completed
+        // attempt keeps it, so the one-attempt rule and Try Again behave exactly as before.
+        var lookupCompleted = false
+        defer { if !lookupCompleted && Task.isCancelled { metaRecoveryAttempted = false } }
+
+        let resolved = await TMDBClient.imdbID(forCatalogID: rawID, type: requestType)
+        guard !Task.isCancelled else { return }
+        lookupCompleted = true
+
+        guard let imdb = resolved, imdb != rawID else {
+            VXProbe.log(
+                "detail",
+                "meta recovery unresolved id=\(VXProbeRedaction.identityToken(rawID))"
+            )
             return
         }
 
@@ -360,6 +369,59 @@ struct iOSDetailView: View {
         loadFinancials()
         loadReleaseDates()
         loadSimilarFallback()
+    }
+
+    /// The terminal state for a catalog id nothing can resolve. This surface received the recovery machinery
+    /// but never a terminal STATE, so when recovery ran out of options the page sat on its skeleton hero
+    /// forever with no way out: no message, no retry, just a permanent load. tvOS has shown a
+    /// "Details unavailable" page with a Try Again button since the recovery work landed; this is its twin.
+    ///
+    /// DELIBERATELY NARROWER THAN tvOS: it never fires for a `tt` id. tvOS routes an unresolvable IMDb id
+    /// through a metahub placeholder page before this state, while this surface renders the hero and the
+    /// source list straight from the raw id, so a brand-new title Cinemeta has no meta for still plays here.
+    /// Claiming "unavailable" for those would take away a page that works today.
+    private var metaUnavailable: Bool {
+        !LiveTypes.contains(type)
+            && meta == nil
+            && !metaRequestID.hasPrefix("tt")
+            && metaIsTerminalOrStalled
+            && metaRecoveryAttempted
+            && !metaRecoveryInFlight
+    }
+
+    /// Same wording as the tvOS page, laid out for touch: centered in the viewport with the standard screen
+    /// margins and the shared primary button, so it reads as part of this surface rather than a ported panel.
+    private var metaUnavailableScreen: some View {
+        VStack(spacing: Theme.Space.lg) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 44, weight: .semibold))
+                .foregroundStyle(Theme.Palette.accent)
+            Text("Details unavailable")
+                .font(Theme.Typography.screenTitle)
+                .foregroundStyle(Theme.Palette.textPrimary)
+            Text("This catalog item could not be matched to metadata your installed add-ons can load.")
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: Theme.Space.contentColumn)
+            Button("Try Again") { retryMeta() }
+                .buttonStyle(PrimaryActionStyle())
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, Theme.Space.screenEdge)
+    }
+
+    /// Re-arm every recovery latch and ask the engine for the ORIGINAL route id again (not the recovered
+    /// one), so Try Again is a genuine second attempt rather than a repeat of the failed lookup. Twin of the
+    /// tvOS `retryMeta`; `metaAttempt` re-keys both the watchdog and the recovery task.
+    private func retryMeta() {
+        recoveredIMDbID = nil
+        metaRecoveryAttempted = false
+        metaRecoveryInFlight = false
+        metaWatchdogExpired = false
+        metaAttempt &+= 1
+        core.loadMeta(type: type, id: id)
+        if type != "series" { loadMovieStreamsIfNeeded() }
     }
 
     /// True for series AND for a COLLECTION/franchise meta: a non-series meta that carries MULTIPLE entries
@@ -625,56 +687,62 @@ struct iOSDetailView: View {
         // overflow, which is why this only bit iOS.
         GeometryReader { geo in
             ScrollViewReader { proxy in
-                #if os(macOS)
-                // macOS pinned-hero scroll model: for a VOD / series page, the cinematic banner is a FIXED
-                // layer and only the content beneath (action row, synopsis, credits, and the episode / source
-                // list) scrolls, as its own independent region. This is a fixed hero LAYER + an inner
-                // ScrollView, NEVER a scroll section-header pin (that mechanism triggered the
-                // NSToolbar/section-header crash class banned in architecture.md). Live keeps the single
-                // scroll (its backdrop is a short fixed band, not a near-fullscreen hero).
-                if LiveTypes.contains(type) {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: Theme.Space.lg) { livePage }
-                            .padding(.bottom, Theme.Space.xl)
-                            .frame(width: geo.size.width, alignment: .leading)
-                    }
+                // Terminal metadata failure short-circuits the whole page (both scroll models): there is no
+                // title, no art and no source path to render, so the skeleton would just spin forever.
+                if metaUnavailable {
+                    metaUnavailableScreen.frame(width: geo.size.width, height: geo.size.height)
                 } else {
-                    macDetailBody(geo: geo, proxy: proxy)
-                }
-                #else
-                ScrollView {
-                    VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                        // Live (tv / channel / events) gets its own stripped-down page BEFORE the movie
-                        // fallback: backdrop + name + LIVE badge + the channel's source list, with no VOD
-                        // chrome (no trailer chip, no movie synopsis framing, no skip/chapter UI). It still
-                        // builds the player launch with the meta `type` preserved so the player's live path
-                        // engages (see PlayerScreen + MPVMetalViewController.configureLiveMode).
-                        if LiveTypes.contains(type) {
-                            livePage
-                        } else {
-                            // The Sources action in the hero row scrolls to this anchor.
-                            hero(width: geo.size.width, height: geo.size.height) { withAnimation { proxy.scrollTo(Self.sourcesAnchor, anchor: .top) } }
-                            // #9: on a wide iPad/Mac window keep the hero full-bleed but cap the
-                            // source-heavy content to a readable column and center it (long lines hurt
-                            // readability). iPhone (and any narrow width) stays full-width as before.
-                            Group {
-                                if isEpisodic {
-                                    episodeList
-                                } else {
-                                    sourceSection.id(Self.sourcesAnchor)
-                                }
-                            }
-                            .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
-                            .frame(maxWidth: .infinity)
-                            whereToWatchSection
-                            collectionSection
-                            moreLikeThisSection
+                    #if os(macOS)
+                    // macOS pinned-hero scroll model: for a VOD / series page, the cinematic banner is a FIXED
+                    // layer and only the content beneath (action row, synopsis, credits, and the episode / source
+                    // list) scrolls, as its own independent region. This is a fixed hero LAYER + an inner
+                    // ScrollView, NEVER a scroll section-header pin (that mechanism triggered the
+                    // NSToolbar/section-header crash class banned in architecture.md). Live keeps the single
+                    // scroll (its backdrop is a short fixed band, not a near-fullscreen hero).
+                    if LiveTypes.contains(type) {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: Theme.Space.lg) { livePage }
+                                .padding(.bottom, Theme.Space.xl)
+                                .frame(width: geo.size.width, alignment: .leading)
                         }
+                    } else {
+                        macDetailBody(geo: geo, proxy: proxy)
                     }
-                    .padding(.bottom, Theme.Space.xl)
-                    .frame(width: geo.size.width, alignment: .leading)
+                    #else
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                            // Live (tv / channel / events) gets its own stripped-down page BEFORE the movie
+                            // fallback: backdrop + name + LIVE badge + the channel's source list, with no VOD
+                            // chrome (no trailer chip, no movie synopsis framing, no skip/chapter UI). It still
+                            // builds the player launch with the meta `type` preserved so the player's live path
+                            // engages (see PlayerScreen + MPVMetalViewController.configureLiveMode).
+                            if LiveTypes.contains(type) {
+                                livePage
+                            } else {
+                                // The Sources action in the hero row scrolls to this anchor.
+                                hero(width: geo.size.width, height: geo.size.height) { withAnimation { proxy.scrollTo(Self.sourcesAnchor, anchor: .top) } }
+                                // #9: on a wide iPad/Mac window keep the hero full-bleed but cap the
+                                // source-heavy content to a readable column and center it (long lines hurt
+                                // readability). iPhone (and any narrow width) stays full-width as before.
+                                Group {
+                                    if isEpisodic {
+                                        episodeList
+                                    } else {
+                                        sourceSection.id(Self.sourcesAnchor)
+                                    }
+                                }
+                                .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
+                                .frame(maxWidth: .infinity)
+                                whereToWatchSection
+                                collectionSection
+                                moreLikeThisSection
+                            }
+                        }
+                        .padding(.bottom, Theme.Space.xl)
+                        .frame(width: geo.size.width, alignment: .leading)
+                    }
+                    #endif
                 }
-                #endif
             }
         }
         // Dynamic dominant-color backdrop: canvas stays the base, with the art's average color washed in
@@ -3149,7 +3217,13 @@ struct iOSDetailView: View {
                 if selectingEpisodes { episodeSelectionBar(videos) }
                 #endif
 
-                VStack(spacing: Theme.Space.sm) {
+                // LAZY, not eager (FAIL-260804-09; tvOS twin in DetailView): this was a plain `VStack`, so
+                // opening a large series' detail page materialized EVERY row of the selected season at once -
+                // thumbnail decode, blur and all. A 256-episode season allocated hundreds of megabytes in a few
+                // seconds and the OS jetsam-killed the app before the list appeared. `LazyVStack` builds only
+                // the on-screen window; spacing, padding and row content are unchanged. Nothing on this surface
+                // scrolls to a specific episode row, so unlike tvOS there is no focus-then-scroll to invert.
+                LazyVStack(spacing: Theme.Space.sm) {
                     ForEach(episodes(videos), id: \.id) { v in
                         episodeRow(v, isWatched: watched.contains(v.id), progress: episodeProgress(v))
                     }
@@ -3480,14 +3554,11 @@ struct iOSDetailView: View {
         // row, tracked in revealedEpisodeIds) clears it, so revealing an episode always shows its art.
         let revealed = revealedEpisodeIds.contains(v.id)
         let blurArt = !isWatched && !revealed && (spoilerSafe || SpoilerBlurSetting.isEnabled)
-        return AsyncImage(url: URL(string: v.thumbnail ?? "")) { phase in
-            switch phase {
-            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
-            default:
-                Theme.Palette.surface2.overlay(
-                    Image(systemName: "play.rectangle.fill").font(.title2).foregroundStyle(Theme.Palette.textTertiary))
-            }
-        }
+        // Was a bare `AsyncImage`, which decodes the add-on's FULL-SIZE still (commonly 780x439, ~1.4 MB
+        // uncompressed) on the main thread and keeps it at full resolution behind a 132x74 frame. Shared
+        // through PosterImageLoader instead: bounded concurrency, its own big URLCache, and an off-main
+        // ImageIO downsample straight to the on-screen size (tvOS twin: EpisodeThumbImage in DetailView).
+        return iOSEpisodeThumbImage(url: v.thumbnail)
         .frame(width: 132, height: 74)
         .blur(radius: blurArt ? 14 : 0)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
@@ -4697,6 +4768,50 @@ private struct iOSProgressStripe: View {
             }
         }
         .frame(height: 5)
+    }
+}
+
+/// One episode still, decoded through the shared `PosterImageLoader` (bounded concurrency, dedicated URLCache,
+/// off-main ImageIO downsample) instead of `AsyncImage`. Add-ons commonly serve 780x439 stills; `AsyncImage`
+/// decodes and retains all of that behind a 132x74 frame, so a long season's worth of rows held megabytes of
+/// pixels nobody could see (FAIL-260804-09). Twin of the tvOS `EpisodeThumbImage`, sized for this surface: a
+/// warm-cache peek so a revisit never flashes blank, a glyph placeholder while it loads, and a `.task(id:)` load.
+private struct iOSEpisodeThumbImage: View {
+    let url: String?
+
+    /// ~300 px for a 132 pt-wide still: past 2x on every phone and iPad, and a fraction of the raw asset's
+    /// pixels. Only what is drawn stays resident.
+    private static let maxPixel: CGFloat = 300
+
+    private var warmCache: VXPosterImage? {
+        guard let url, let parsed = URL(string: url) else { return nil }
+        return PosterImageLoader.cached(parsed)
+    }
+
+    @State private var image: VXPosterImage?
+
+    var body: some View {
+        Group {
+            if let img = image ?? warmCache {
+                imageView(img).resizable().aspectRatio(contentMode: .fill)
+            } else {
+                Theme.Palette.surface2.overlay(
+                    Image(systemName: "play.rectangle.fill").font(.title2)
+                        .foregroundStyle(Theme.Palette.textTertiary))
+            }
+        }
+        .task(id: url) {
+            guard image == nil, let url, !url.isEmpty else { return }
+            if let img = await PosterImageLoader.load(url, maxPixel: Self.maxPixel) { image = img }
+        }
+    }
+
+    private func imageView(_ img: VXPosterImage) -> Image {
+        #if canImport(UIKit)
+        Image(uiImage: img)
+        #else
+        Image(nsImage: img)
+        #endif
     }
 }
 

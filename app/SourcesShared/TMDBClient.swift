@@ -1299,7 +1299,16 @@ enum TMDBClient {
         var mediaOrder = [guessedPrimary, guessedSecondary]
         let tmdbID: Int
 
-        switch DetailMetaRecoveryPolicy.catalogIDShape(cid) {
+        // A Kitsu id names nothing TMDB can look up, so map it to a shape that does FIRST and resolve that
+        // shape below unchanged. Verified end to end on kitsu:460: mappings -> thetvdb/series 252696 ->
+        // /find -> tv 57911 -> external_ids -> tt0069576.
+        var shape = DetailMetaRecoveryPolicy.catalogIDShape(cid)
+        if case .kitsu(let kitsuID) = shape {
+            guard let mapped = await kitsuMappedShape(forKitsuID: kitsuID) else { return nil }
+            shape = mapped
+        }
+
+        switch shape {
         case .imdb(let imdb):
             return imdb
         case .tmdb(let id, let explicitMedia):
@@ -1315,6 +1324,8 @@ enum TMDBClient {
             ) else { return nil }
             tmdbID = match.id
             mediaOrder = [match.media, match.media == .tv ? .movie : .tv]
+        case .kitsu:
+            return nil   // unreachable: mapped to a TMDB-answerable shape above, or already bailed
         case .unsupported:
             return nil
         }
@@ -1324,6 +1335,61 @@ enum TMDBClient {
                let imdb = ext["imdb_id"] as? String, imdb.hasPrefix("tt") {
                 return imdb
             }
+        }
+        return nil
+    }
+
+    /// Kitsu's own mappings endpoint (`kitsu.io`, keyless, the same public API `AniSkipService` already uses
+    /// to turn a `kitsu:` id into a MAL id) rewritten as a catalog-ID shape TMDB can answer. Preference order
+    /// is most-direct-first: a straight IMDb mapping when one exists, then TMDB, then TheTVDB (which then
+    /// takes the identical `/find` hop a native `tvdb:` catalog id takes).
+    ///
+    /// Fail-soft in every branch: an unmapped anime, a 404, or a network error yields nil and recovery ends
+    /// exactly where it does today, so this can only ever add resolutions.
+    private static func kitsuMappedShape(
+        forKitsuID kitsuID: Int
+    ) async -> DetailMetaRecoveryPolicy.CatalogIDShape? {
+        // JSON:API paginates, and its DEFAULT page size is 10. A popular title carries more mapping rows than
+        // that (every tracker site plus per-season entries), and the imdb/tmdb/thetvdb rows are not guaranteed
+        // to be on the first page, so an unpaginated request could truthfully answer 200 with the mapping we
+        // need missing. 20 covers the observed row counts in one request; anything past it stays unresolved
+        // exactly as it does today (fail-soft, so this can still only ever add resolutions).
+        // The brackets are written PRE-ENCODED: `page[limit]` is the JSON:API spelling, but a bare `[` is not a
+        // legal query character, and how leniently `URL(string:)` treats one has changed across OS versions.
+        // `%5B`/`%5D` parses identically everywhere and reaches Kitsu as the same parameter, so the request can
+        // never turn into a nil url (which would silently disable this whole recovery hop).
+        guard let url = URL(string: "https://kitsu.io/api/edge/anime/\(kitsuID)/mappings?page%5Blimit%5D=20")
+        else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 8
+        request.setValue("application/vnd.api+json", forHTTPHeaderField: "Accept")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = obj["data"] as? [[String: Any]] else { return nil }
+
+        var sites: [String: String] = [:]
+        for row in rows {
+            guard let attrs = row["attributes"] as? [String: Any],
+                  let site = (attrs["externalSite"] as? String)?.lowercased(),
+                  let external = attrs["externalId"] as? String,
+                  !external.isEmpty,
+                  sites[site] == nil else { continue }   // first mapping per site wins
+            sites[site] = external
+        }
+
+        if let imdb = sites["imdb"],
+           case .imdb(let value) = DetailMetaRecoveryPolicy.catalogIDShape(imdb) {
+            return .imdb(value)
+        }
+        if let movie = sites["themoviedb/movie"], let id = Int(movie) { return .tmdb(id, media: .movie) }
+        if let tv = sites["themoviedb/tv"], let id = Int(tv) { return .tmdb(id, media: .tv) }
+        // Kitsu publishes BOTH "thetvdb/series" (a bare series id) and "thetvdb" (a "series/season" pair);
+        // take the leading component so either form resolves to the series id.
+        if let tvdb = sites["thetvdb/series"] ?? sites["thetvdb"],
+           let leading = tvdb.split(separator: "/").first,
+           let id = Int(leading) {
+            return .tvdb(id)
         }
         return nil
     }
