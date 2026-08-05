@@ -352,7 +352,10 @@ private struct NonSeriesEpisodeLifecycleContractTests {
                "profile Continue Watching prune uses the lifecycle fence")
         expect(profilesSource.contains("usesSeriesLifecycle: meta.usesSeriesLifecycle"),
                "profile resume uses the lifecycle fence")
-        expect(scrobbleSource.contains("let isSeries = meta.usesSeriesLifecycle"),
+        // 8faf9f4 moved the per-dispatch locals into a Sendable `DispatchContext` captured synchronously at
+        // enqueue time, so the fence read moved from a local `let isSeries` to the context's stored property.
+        // Same seam, same fence: the pin follows the value, not the old variable name.
+        expect(scrobbleSource.contains("isSeries: meta.usesSeriesLifecycle"),
                "external scrobble dispatch uses the lifecycle fence")
         expect(shadowSource.contains("if meta.usesSeriesLifecycle"),
                "Trakt playback shadow uses the lifecycle fence")

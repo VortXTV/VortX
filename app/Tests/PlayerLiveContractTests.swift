@@ -2660,9 +2660,11 @@ enum PlayerLiveContractTests {
             server,
             from: "var publishedPlayerWindowSeconds: ClosedRange<Double>?",
             to: "/// Stop everything")
+        // 6277116 renamed latchOriginFromFallbackIfNeeded -> latchTimelineShiftFromFallbackIfNeeded when the
+        // fallback latch started serving fresh mounts too. The section it opens is unchanged.
         let validatedResumeLanding = sourceSection(
             stream,
-            from: "if !latchOriginFromFallbackIfNeeded()",
+            from: "if !latchTimelineShiftFromFallbackIfNeeded()",
             to: "let convertP7")
         let hdrFallbackRetry = sourceSection(
             engine,
@@ -3461,8 +3463,11 @@ enum PlayerLiveContractTests {
                   && stream?.contains("av_seek_frame(") == true
                   && stream?.contains("refusing zero restart") == true
                   && stream?.contains("RemuxResumePolicy.canEstablishOrigin(") == true
-                  && stream?.contains("rebaseFromOrigin(p, timeBase:") == true
-                  && stream?.contains("rebaseFromOrigin(pkt, timeBase:") == true
+                  // 6277116 generalized the resume-only origin rebase into one shared timeline shift that also
+                  // zeroes a fresh HLS mount, renaming rebaseFromOrigin -> rebaseFromTimelineShift. Both call
+                  // sites (pre-scan buffer drain and mux loop) survive, so the pin follows the rename.
+                  && stream?.contains("rebaseFromTimelineShift(p, timeBase:") == true
+                  && stream?.contains("rebaseFromTimelineShift(pkt, timeBase:") == true
                   && engine?.contains("remuxHLSServer?.timelineOriginSeconds") == true
                   && resumePolicy?.contains("static let isEnabledByDefault = true") == true)
         check("wiring: a false-success input seek fails before remux output setup",
@@ -3996,9 +4001,26 @@ enum PlayerLiveContractTests {
                 "PlayerMidPlaybackStallPolicy.shouldResetRecoveryBudget(",
                 "stallRecoveries = 0",
               ]))
-        check("release: Beta 7 is the first parseable changelog version",
-              changelog?.range(of: "## 0.3.14 Beta 7")?.lowerBound
-                  == changelog?.range(of: "## ")?.lowerBound)
+        // ChangelogParser.parse skips every line above the first `## ` heading, so that heading is what the
+        // in-app What's New screen opens on. 87d5955 pinned the literal "Beta 7" because it was the newest
+        // release that day; the pin rotted the moment Beta 8 shipped, while the property it guards never
+        // changed. CHANGELOG.md declares itself newest-first in its own preamble, so the durable form of the
+        // rule is: the topmost parseable heading names the SHIPPED marketing version. That still catches a
+        // non-version heading (an "## Unreleased" block) or a changelog left behind a version bump, without
+        // needing a rewrite every beta.
+        let shippedVersion = whatsNew
+            .flatMap { $0.range(of: "static let version = \"") }
+            .map { String(whatsNew![$0.upperBound...].prefix(while: { $0 != "\"" })) }
+        // Line-anchored exactly like ChangelogParser.parse: a raw `range(of: "## ")` also matches inside a
+        // `### ` subhead, so scanning lines is what the real reader does and what this rule must mirror.
+        let firstChangelogHeading = changelog?
+            .components(separatedBy: "\n")
+            .lazy
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { $0.hasPrefix("## ") }
+        check("release: the shipped marketing version is the first parseable changelog version",
+              shippedVersion.map { !$0.isEmpty } == true
+                  && firstChangelogHeading?.hasPrefix("## \(shippedVersion!) ") == true)
         check("release: fallback copy names the resident playlist fix",
               whatsNew?.contains("playlists no longer point at discarded video") == true)
         check("release: rejected start and one-switch claims are gone",
