@@ -262,17 +262,17 @@ private struct StartupWiringRule {
             mutationReplacement: "_ = index"),
         StartupWiringRule(
             name: "actual playhead receipt", usesServer: false,
-            start: "let position = RemuxResumePolicy.presented(",
-            end: "self.emit(\n                    MPVProperty.timePos,",
+            start: "playheadObserver = player.addPeriodicTimeObserver(",
+            end: "NotificationCenter.default.addObserver(self, selector: #selector(didPlayToEnd(_:)),",
             exactSection: """
-            let position = RemuxResumePolicy.presented(
-                playerSeconds: time.seconds,
-                origin: self.remuxTimelineOrigin)
-            self.remuxHLSServer?.reportPlaybackPosition(playerSeconds: time.seconds)
+            playheadObserver = player.addPeriodicTimeObserver(
+                forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: playheadQueue
+            ) { [weak remuxServer = remuxHLSServer] time in
+                remuxServer?.reportPlaybackPosition(playerSeconds: time.seconds)
+            }
             """,
-            mutationTarget:
-                "self.remuxHLSServer?.reportPlaybackPosition(playerSeconds: time.seconds)",
-            mutationReplacement: "_ = time.seconds"),
+            mutationTarget: "queue: playheadQueue",
+            mutationReplacement: "queue: .main"),
         StartupWiringRule(
             name: "publication slides behind playhead", usesServer: true,
             start: "if consumptionAnchored {\n                    let playbackSegmentID",

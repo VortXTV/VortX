@@ -172,6 +172,15 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// A recovery item must not turn a deliberate pause into autoplay.
     private var playbackRequested = true
     private var timeObserver: Any?
+    /// SECOND periodic observer, delivered OFF the main queue, whose only job is the DV/remux playhead receipt.
+    /// The receipt is the single input that lets the local HLS server slide its published window and reclaim
+    /// spool bytes; while it is missing the window PINS and the remux producer parks on the spool ceiling
+    /// (VortXRemuxHLSServer.swift:1206-1209), which drains AVPlayer's buffer and stalls playback. Delivering it
+    /// on .main made any main-actor stall (a settings-sync burst, a heavy SwiftUI re-render) able to cause that,
+    /// so it now rides a dedicated serial queue and is immune to main-thread pressure. Torn down in lockstep
+    /// with `timeObserver`.
+    private var playheadObserver: Any?
+    private let playheadQueue = DispatchQueue(label: "vortx.dvremux.playhead")
     /// Throttle marks for the two EXPENSIVE per-tick side effects, mirroring the libmpv path
     /// (MPVMetalViewController.swift lastTimePosEmit / lastCacheTimeEmit). The periodic observer still
     /// fires at 0.25s, but the probe write (NSLock) and the loadedTimeRanges scan are gated behind the same
@@ -2387,7 +2396,6 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 let position = RemuxResumePolicy.presented(
                     playerSeconds: time.seconds,
                     origin: self.remuxTimelineOrigin)
-                self.remuxHLSServer?.reportPlaybackPosition(playerSeconds: time.seconds)
                 self.emit(
                     MPVProperty.timePos,
                     PlayerTimePositionEvent(seconds: position, loadToken: loadToken),
@@ -2435,6 +2443,18 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                     }
                 }
             }
+        }
+        // The DV/remux playhead receipt, on its own serial queue. `reportPlaybackPosition` is a lock-guarded
+        // (VortXRemuxHLSServer.swift:387-391) write of one Double into a struct that itself refuses samples
+        // while a seek is pending (VortXHLSSeekAnchorState.swift:16-22), so it is safe off the main actor and
+        // cannot reorder ahead of a seek destination. The server is bound weakly HERE rather than read through
+        // `self` each tick because `self` is @MainActor-isolated: `remuxHLSServer` is assigned exactly once per
+        // load (in load(), before this attach point), so the binding is the same object the main-queue block
+        // used to reach. A no-remux mount captures nil and the block is a no-op, matching the old `?.` behaviour.
+        playheadObserver = player.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: playheadQueue
+        ) { [weak remuxServer = remuxHLSServer] time in
+            remuxServer?.reportPlaybackPosition(playerSeconds: time.seconds)
         }
         NotificationCenter.default.addObserver(self, selector: #selector(didPlayToEnd(_:)),
                                                name: .AVPlayerItemDidPlayToEndTime, object: item)
@@ -3359,6 +3379,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         remuxSubtitleInventoryRefreshTask = nil
         if let timeObserver { player.removeTimeObserver(timeObserver) }
         timeObserver = nil
+        if let playheadObserver { player.removeTimeObserver(playheadObserver) }
+        playheadObserver = nil
         observations.forEach { $0.invalidate() }
         observations.removeAll()
         NotificationCenter.default.removeObserver(self)
@@ -3368,6 +3390,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // stop() is the normal teardown; this is a safety net if the engine is released without it.
         remuxSubtitleInventoryRefreshTask?.cancel()
         if let timeObserver { player.removeTimeObserver(timeObserver) }
+        if let playheadObserver { player.removeTimeObserver(playheadObserver) }
         observations.forEach { $0.invalidate() }
         NotificationCenter.default.removeObserver(self)   // matches teardownObservers(): drop AVPlayerItem note observers before dealloc
         remuxLoader?.invalidate()
