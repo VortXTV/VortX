@@ -75,11 +75,31 @@ final class SourcePinStore: ObservableObject {
     func reload() {
         let profile = Self.activeProfileKey
         loadedProfile = profile
-        guard let data = UserDefaults.standard.data(forKey: Self.key(profile)),
-              let blob = try? JSONDecoder().decode(Blob.self, from: data) else {
+        guard let data = UserDefaults.standard.data(forKey: Self.key(profile)) else {
             entry = [:]; global = nil; return
         }
-        entry = blob.entry; global = blob.global
+        if let blob = try? JSONDecoder().decode(Blob.self, from: data) {
+            entry = blob.entry; global = blob.global
+        } else {
+            Self.quarantineUndecodableBlob(data, profile: profile)
+            entry = [:]; global = nil
+        }
+    }
+
+    /// A blob that does not decode currently leaves the pins empty, and the very next `persist()` (any pin,
+    /// unpin, or clearAll) ENCODES that empty state straight back over it: one unreadable byte silently
+    /// discards every pinned source with nothing left to recover from. Copy the raw bytes aside ONCE, before
+    /// any write can land, so a later migration or a support export still has them.
+    ///
+    /// Fail-open by construction: the session still runs on the empty view (a pin is a preference, so losing
+    /// it costs a re-pin, never playback), and a copy that cannot be written changes nothing. One-time per
+    /// profile - a second failure must not overwrite the first, still-original copy with post-wipe bytes.
+    /// The log line carries no meta id, add-on, or profile id, only that it happened and how big it was.
+    private static func quarantineUndecodableBlob(_ data: Data, profile: String) {
+        let quarantineKey = key(profile) + ".undecodable"
+        guard UserDefaults.standard.data(forKey: quarantineKey) == nil else { return }
+        UserDefaults.standard.set(data, forKey: quarantineKey)
+        DiagnosticsLog.log("app", "source pin store did not decode; \(data.count) raw bytes kept aside before rewrite")
     }
 
     private func persist() {

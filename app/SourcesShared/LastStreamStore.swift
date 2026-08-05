@@ -49,12 +49,32 @@ enum LastStreamStore {
     private static func load(_ profileID: UUID) -> [String: Entry] {
         if let cached = cache[profileID] { return cached }
         var dict: [String: Entry] = [:]
-        if let data = UserDefaults.standard.data(forKey: key(profileID)),
-           let decoded = try? JSONDecoder().decode([String: Entry].self, from: data) {
-            dict = decoded
+        if let data = UserDefaults.standard.data(forKey: key(profileID)) {
+            if let decoded = try? JSONDecoder().decode([String: Entry].self, from: data) {
+                dict = decoded
+            } else {
+                quarantineUndecodableBlob(data, profileID: profileID)
+            }
         }
         cache[profileID] = dict
         return dict
+    }
+
+    /// A blob that does not decode leaves the in-memory view empty, and the very next `record()` ENCODES
+    /// that empty dictionary straight back over it: one unreadable byte silently discards every remembered
+    /// resume stream (up to the per-profile cap) with nothing left to recover from. Copy the raw bytes aside
+    /// ONCE, before any write can land, so a later migration or a support export still has them.
+    ///
+    /// Fail-open by construction: the session still runs on the empty view (a missing entry costs the slow
+    /// re-resolve resume the player already falls back to, never playback), and a copy that cannot be
+    /// written changes nothing. One-time per profile - a second failure must not overwrite the first,
+    /// still-original copy with post-wipe bytes. The log line carries no library id, url, or profile id,
+    /// only that it happened and how big it was.
+    private static func quarantineUndecodableBlob(_ data: Data, profileID: UUID) {
+        let quarantineKey = key(profileID) + ".undecodable"
+        guard UserDefaults.standard.data(forKey: quarantineKey) == nil else { return }
+        UserDefaults.standard.set(data, forKey: quarantineKey)
+        DiagnosticsLog.log("app", "last stream store did not decode; \(data.count) raw bytes kept aside before rewrite")
     }
 
     static func entry(for libraryId: String, profileID: UUID?) -> Entry? {

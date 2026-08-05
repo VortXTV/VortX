@@ -35,12 +35,32 @@ enum SavedLinksStore {
     private static func load(_ profileID: UUID) -> [Entry] {
         if let cached = cache[profileID] { return cached }
         var list: [Entry] = []
-        if let data = UserDefaults.standard.data(forKey: key(profileID)),
-           let decoded = try? JSONDecoder().decode([Entry].self, from: data) {
-            list = decoded
+        if let data = UserDefaults.standard.data(forKey: key(profileID)) {
+            if let decoded = try? JSONDecoder().decode([Entry].self, from: data) {
+                list = decoded
+            } else {
+                quarantineUndecodableBlob(data, profileID: profileID)
+            }
         }
         cache[profileID] = list
         return list
+    }
+
+    /// A blob that does not decode leaves the in-memory view empty, and the very next `persist()` (any save,
+    /// remove, or played-file bind) ENCODES that empty list straight back over it: one unreadable byte
+    /// silently discards every saved magnet and pasted link (up to the per-profile cap) with nothing left to
+    /// recover from. Copy the raw bytes aside ONCE, before any write can land, so a later migration or a
+    /// support export still has them.
+    ///
+    /// Fail-open by construction: the session still runs on the empty view (a lost saved link costs a re-save,
+    /// never playback), and a copy that cannot be written changes nothing. One-time per profile - a second
+    /// failure must not overwrite the first, still-original copy with post-wipe bytes. The log line carries no
+    /// link, name, or profile id, only that it happened and how big it was.
+    private static func quarantineUndecodableBlob(_ data: Data, profileID: UUID) {
+        let quarantineKey = key(profileID) + ".undecodable"
+        guard UserDefaults.standard.data(forKey: quarantineKey) == nil else { return }
+        UserDefaults.standard.set(data, forKey: quarantineKey)
+        DiagnosticsLog.log("app", "saved links store did not decode; \(data.count) raw bytes kept aside before rewrite")
     }
 
     /// All saved entries for the profile, newest first.
