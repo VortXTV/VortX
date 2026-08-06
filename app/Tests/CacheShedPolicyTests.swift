@@ -309,6 +309,87 @@ check("iOS and macOS baseline selection is unchanged when disk cache is off",
         enforceTVOSLimit: false
       ) == Int64(512 * mib))
 
+// MARK: - Guarded flush-defer on a soft warning (diag-23 FIX-C)
+//
+// The shed's cap step-down is unconditional; only the immediate drop-buffers + exact re-anchor seek (the
+// frame-drop burst diag-23 blamed) is gated. shouldDeferFlushOnWarning returns true - skip that flush -
+// ONLY when free memory is provably ample (restore-grade headroom, twice the clamp threshold) AND the live
+// cache already fits the reduced cap the warning applies, so the drop would free nothing the cap does not
+// already bound. Any weaker headroom, or a cache that overflows the reduced cap, keeps the drastic path.
+
+func deferFlush(
+    available: UInt64,
+    currentCap: Int,
+    fill: Int,
+    previouslyShed: Bool = false
+) -> Bool {
+    P.shouldDeferFlushOnWarning(
+        availableBytes: available,
+        physicalBytes: twoGiB,
+        currentCapBytes: currentCap,
+        cacheFillBytes: fill,
+        previouslyShed: previouslyShed
+    )
+}
+
+// The reduced cap the first warning applies to a 256 MiB budget is 128 MiB (halve); a later warning floors.
+let reducedFirst = P.forwardCapAfterWarning(currentBytes: 256 * mib, previouslyShed: false)   // 128 MiB
+let reducedLater = P.forwardCapAfterWarning(currentBytes: 256 * mib, previouslyShed: true)     // 48 MiB floor
+check("defer setup: first-warning reduced cap is 128 MiB", reducedFirst == 128 * mib)
+check("defer setup: later-warning reduced cap is the 48 MiB floor", reducedLater == P.floorBytes)
+
+// (a) Ample headroom AND the live cache already fits the reduced cap -> defer the flush (it would drop nothing).
+check("(a) ample headroom + fill below reduced cap defers the flush",
+      deferFlush(available: restoreThreshold, currentCap: 256 * mib, fill: 100 * mib) == true)
+check("(a) fill exactly at the reduced cap still defers (nothing to free)",
+      deferFlush(available: restoreThreshold, currentCap: 256 * mib, fill: reducedFirst) == true)
+check("(a) headroom well past the restore bar still defers",
+      deferFlush(available: restoreThreshold * 4, currentCap: 256 * mib, fill: 100 * mib) == true)
+
+// (b) Low headroom -> the drastic shed+flush fires, jetsam protection unchanged.
+check("(b) one byte below the restore bar does NOT defer (drastic flush fires)",
+      deferFlush(available: restoreThreshold - 1, currentCap: 256 * mib, fill: 100 * mib) == false)
+check("(b) merely clearing the CLAMP threshold is not enough to defer",
+      deferFlush(available: threshold, currentCap: 256 * mib, fill: 100 * mib) == false)
+check("(b) zero available memory (strongest pressure signal) never defers",
+      deferFlush(available: 0, currentCap: 256 * mib, fill: 100 * mib) == false)
+
+// (c) Ample headroom but the cache overflows the reduced cap -> the flush WOULD free real bytes, so do NOT defer.
+check("(c) ample headroom + fill above the reduced cap does NOT defer (flush is doing real work)",
+      deferFlush(available: restoreThreshold, currentCap: 256 * mib, fill: 200 * mib) == false)
+check("(c) one byte over the reduced cap does not defer",
+      deferFlush(available: restoreThreshold, currentCap: 256 * mib, fill: reducedFirst + 1) == false)
+check("(c) an unreadable fill (Int.max sentinel) never defers, however ample the headroom",
+      deferFlush(available: restoreThreshold * 8, currentCap: 256 * mib, fill: Int.max) == false)
+
+// A later (previouslyShed) warning gates against the FLOOR, not the halved cap.
+check("later warning: fill within the floor defers under ample headroom",
+      deferFlush(available: restoreThreshold, currentCap: 256 * mib, fill: 40 * mib, previouslyShed: true) == true)
+check("later warning: fill above the floor does not defer",
+      deferFlush(available: restoreThreshold, currentCap: 256 * mib, fill: 60 * mib, previouslyShed: true) == false)
+
+// (d) The cap the warning applies (forwardCapAfterWarning) stays NON-INCREASING in every branch: the defer
+// query is orthogonal to it, so skipping the flush never lets the cap grow. The drastic and deferred paths
+// apply the exact same reduced cap; only the flush differs.
+for budget in [64 * mib, 96 * mib, 128 * mib, 256 * mib, 512 * mib, 768 * mib] {
+    for previouslyShed in [false, true] {
+        let reduced = P.forwardCapAfterWarning(currentBytes: budget, previouslyShed: previouslyShed)
+        check("(d) budget \(budget >> 20)MiB shed=\(previouslyShed): reduced cap within [floor, budget]",
+              reduced >= P.floorBytes && reduced <= max(budget, P.floorBytes))
+        check("(d) budget \(budget >> 20)MiB shed=\(previouslyShed): reduced cap never exceeds a >=floor budget",
+              budget < P.floorBytes || reduced <= budget)
+        // Evaluate both branches, then re-derive the cap: it must be identical, proving the guard cannot
+        // perturb the applied (non-increasing) cap regardless of whether the flush is deferred.
+        let deferredBranch = deferFlush(available: restoreThreshold, currentCap: budget, fill: 0,
+                                        previouslyShed: previouslyShed)                       // ample + empty -> true
+        let drasticBranch = deferFlush(available: 0, currentCap: budget, fill: 0,
+                                       previouslyShed: previouslyShed)                        // no headroom -> false
+        let reducedAgain = P.forwardCapAfterWarning(currentBytes: budget, previouslyShed: previouslyShed)
+        check("(d) budget \(budget >> 20)MiB shed=\(previouslyShed): applied cap is branch-independent",
+              reducedAgain == reduced && deferredBranch == true && drasticBranch == false)
+    }
+}
+
 // MARK: - Result
 
 print("")

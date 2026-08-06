@@ -1608,8 +1608,10 @@ final class MPVMetalViewController: PlatformViewController {
         // caching stays alive), any later warning floors it (the old terminal state).
         // The reduced budget is written back to activeReadAheadCap so pause/resume and later warnings all
         // key off it; loadFile still resets a NEW file to its full budget.
+        let currentCapBytes = currentReadAheadBudgetBytes
+        let previouslyShed = memoryCacheClamped
         let newCapBytes = VortXCacheShedPolicy.forwardCapAfterWarning(
-            currentBytes: currentReadAheadBudgetBytes, previouslyShed: memoryCacheClamped)
+            currentBytes: currentCapBytes, previouslyShed: previouslyShed)
         memoryCacheClamped = true
         let newCap = String(newCapBytes)
         activeReadAheadCap = newCap
@@ -1620,10 +1622,28 @@ final class MPVMetalViewController: PlatformViewController {
             setString("demuxer-max-bytes", newCap)
         }
         setString("demuxer-max-back-bytes", "8MiB")
-        flushDemuxerCachePreservingPosition()   // NOT bare drop-buffers: that moves the play head (see above)
+        // diag-23 FIX-C: the cap step-down above is unconditional and non-increasing - the jetsam-safe
+        // part - and always runs. The DROP below (drop-buffers + exact re-anchor seek) is what frees
+        // resident bytes NOW, but it also causes a visible frame-drop burst. Skip it ONLY when free memory
+        // is provably ample (restore-grade headroom) AND the live cache already fits the reduced cap, so
+        // the drop would free nothing the cap does not already bound: the diag-23 case (a soft warning at
+        // ~940 MiB free, no jetsam). A failed fill read passes Int.max, which overflows any reduced cap, so
+        // low/uncertain headroom, an unreadable fill, or a cache above the reduced cap all keep the drop.
+        let availableBytes = UInt64(os_proc_available_memory())
+        let cacheFillBytes = diagnosticInt("demuxer-cache-state/fw-bytes") ?? Int.max
+        let deferFlush = VortXCacheShedPolicy.shouldDeferFlushOnWarning(
+            availableBytes: availableBytes,
+            physicalBytes: ProcessInfo.processInfo.physicalMemory,
+            currentCapBytes: currentCapBytes,
+            cacheFillBytes: cacheFillBytes,
+            previouslyShed: previouslyShed)
+        if !deferFlush {
+            flushDemuxerCachePreservingPosition()   // NOT bare drop-buffers: that moves the play head (see above)
+        }
         let mib = newCapBytes >> 20
+        let dropNote = deferFlush ? "flush deferred (ample headroom, cache within reduced cap)" : "buffers dropped"
         mpvLog.log("memory warning: demuxer cache stepped down to \(mib, privacy: .public)MiB for the rest of this file")
-        DiagnosticsLog.log("player", "memory warning: mpv cache stepped down to \(mib)MiB + buffers dropped")
+        DiagnosticsLog.log("player", "memory warning: mpv cache stepped down to \(mib)MiB + \(dropNote)")
     }
 
     #if os(tvOS)

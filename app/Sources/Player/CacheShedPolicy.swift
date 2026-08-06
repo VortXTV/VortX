@@ -27,6 +27,46 @@ enum VortXCacheShedPolicy {
         return max(floorBytes, currentBytes / 2)
     }
 
+    /// diag-23 FIX-C: should a SOFT memory warning SKIP the immediate buffer flush the shed otherwise
+    /// performs (`flushDemuxerCachePreservingPosition`, a drop-buffers plus an exact re-anchor seek)?
+    ///
+    /// That flush is the JETSAM tool: it frees the resident forward buffer NOW, the last line of defence
+    /// before tvOS/iOS kills the app. It is also the source of a visible frame-drop burst - drop-buffers
+    /// discards the decoded/demuxed packets and the exact seek re-anchors playback. diag-23 (00:51, the
+    /// biggest sustained frame-drop cluster) caught it firing on a SOFT warning with roughly 940 MiB free
+    /// against a 384 MiB pressure threshold: no jetsam anywhere near, so the cure (the burst) was worse
+    /// than the disease.
+    ///
+    /// Return true (defer the flush) ONLY when BOTH hold, so the guard can never weaken jetsam relief:
+    ///  1. `availableBytes` is at the RESTORE-grade bar (`restoreThresholdBytes`, twice the pressure
+    ///     threshold) - the exact headroom the recovery path already trusts enough to GROW the cache, so
+    ///     a kill is provably not imminent; and
+    ///  2. the live forward cache (`cacheFillBytes`) already fits inside the reduced cap this warning
+    ///     applies (`forwardCapAfterWarning`), so dropping it would free nothing that simply lowering the
+    ///     cap does not already bound - the flush would be pure cost.
+    ///
+    /// Whenever headroom is not provably ample, or the cache overflows the reduced cap (the flush WOULD
+    /// free real resident bytes), this returns false and the drastic shed+flush fires unchanged. The
+    /// caller lowers the forward cap either way (non-increasing, the jetsam-safe part); only the immediate
+    /// DROP is gated. The controller passes `cacheFillBytes = Int.max` when it cannot read the live fill,
+    /// so an unknown cache also fails condition 2 and keeps the drastic path.
+    ///
+    /// The threshold is reused from `TVOSProactiveMemoryPressurePolicy` deliberately: "provably ample"
+    /// here means exactly what it means to the recovery path, one definition, no drift.
+    static func shouldDeferFlushOnWarning(
+        availableBytes: UInt64,
+        physicalBytes: UInt64,
+        currentCapBytes: Int,
+        cacheFillBytes: Int,
+        previouslyShed: Bool
+    ) -> Bool {
+        let reducedCapBytes = forwardCapAfterWarning(currentBytes: currentCapBytes, previouslyShed: previouslyShed)
+        guard availableBytes >= TVOSProactiveMemoryPressurePolicy.restoreThresholdBytes(
+            physicalMemoryBytes: physicalBytes
+        ) else { return false }
+        return cacheFillBytes <= reducedCapBytes
+    }
+
     /// Parse the two cap spellings the controller actually applies to mpv: plain byte counts
     /// ("268435456", the Streaming-cache branch) and MiB-suffixed ("256MiB", the static tiers).
     /// nil for anything else, so a surprise never silently becomes a 0-byte cache.
