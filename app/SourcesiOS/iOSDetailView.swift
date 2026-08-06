@@ -89,18 +89,26 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
     var groups: [CoreStreamSourceGroup] = []
     var firstPlayableAt: Date? = nil
+    // The source the viewer picked BY HAND for this show (`SeriesSourceSticky`, keyed on the show id `seriesId`).
+    // PlayerScreen also drives its binge auto-next through THIS resolver (a Continue-Watching resume launch), so
+    // like the detail-page `loadEpisodeStream` and tvOS it must honor the pick on BOTH halves: the gate waits
+    // until that source is present (`wantedAddon`), and `best` below prefers it (`sticky` + provider-health). nil
+    // when the viewer never chose a source (a fresh play): both stay byte-identical to before.
+    let sticky = SeriesSourceSticky.preference(for: seriesId)
+    let wantedAddon = sticky?.addon
     for _ in 0 ..< 80 {                                // ~20s ceiling, matching the episode page
         guard !Task.isCancelled else { return nil }
         groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
         if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
-        // Settle gate (see StreamRanking.resolveSettled): for a resume, hold out until the SAME quality the
-        // user last played has loaded (and, unless they rank torrents on top, a non-torrent one), because
-        // torrents answer in ~4s while the user's debrid of that quality lands ~10-12s later, a flat 4s
-        // cutoff auto-picked the fast torrent, so the CW resume "tried a torrent first".
+        // Settle gate (see StreamRanking.resolveSettled): with a remembered manual source, hold for IT (bounded)
+        // instead of committing off whichever provider answers fastest; otherwise, for a resume, hold until the
+        // SAME quality the user last played has loaded (and, unless they rank torrents on top, a non-torrent
+        // one), because torrents answer in ~4s while the user's debrid of that quality lands ~10-12s later.
         let progress = core.streamLoadProgress(forStreamId: v.id)
         let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
         if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                        secondsSinceFirstPlayable: elapsed, rememberedQuality: continuity) { break }
+                                        secondsSinceFirstPlayable: elapsed, rememberedQuality: continuity,
+                                        wantedAddon: wantedAddon) { break }
         do {
             try await Task.sleep(for: .milliseconds(250))
         } catch {
@@ -109,13 +117,12 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     }
     guard !Task.isCancelled else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
-    // The SAME sticky + provider-health terms the player and the preload rank with (diag-21). This is the lane
-    // a viewer actually hits by tapping an episode (and the one a Continue-Watching resume uses), so ranking it
-    // without them would hand that tap to whichever provider answers fastest while the player, one episode
-    // later, ranked by the remembered pick - the exact "it switched my source again" report. `seriesId` is the
-    // show id, the same key `pin` above uses, and this whole function is series-only by construction
+    // The SAME sticky (read above) + provider-health terms the player and the preload rank with (diag-21). This
+    // is the lane a viewer actually hits by tapping an episode (and the one a Continue-Watching resume uses), so
+    // ranking it without them would hand that tap to whichever provider answers fastest while the player, one
+    // episode later, ranked by the remembered pick - the exact "it switched my source again" report. `seriesId`
+    // is the show id, the same key `pin` above uses, and this whole function is series-only by construction
     // (`loadMeta(type: "series", …)`). @MainActor, so reading the main-actor store here needs no snapshot.
-    let sticky = SeriesSourceSticky.preference(for: seriesId)
     guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge, pin: pin,
                                         sticky: sticky,
                                         providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
@@ -4636,18 +4643,29 @@ struct iOSEpisodeStreams: View {
         core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: v.id)
         var groups: [CoreStreamSourceGroup] = []
         var firstPlayableAt: Date? = nil
+        // The source the viewer picked BY HAND for this show (`SeriesSourceSticky`, keyed on `meta.id`, the SAME
+        // show id the pin uses and every episode shares). This is the binge auto-next lane (`goToEpisode` calls
+        // it through `loadEpisode`), so BOTH halves must honor it, exactly like tvOS: the settle gate below waits
+        // until that source is PRESENT (`wantedAddon`), and `StreamRanking.best` then PREFERS it (`sticky` +
+        // provider-health), so a higher-scoring rival that also landed cannot win. nil when the viewer has never
+        // chosen a source (a fresh play): both stay byte-identical to before.
+        let sticky = SeriesSourceSticky.preference(for: meta.id)
+        let wantedAddon = sticky?.addon
         for _ in 0 ..< 80 {                                // ~20s ceiling, matching the page's settle timeout
             guard !Task.isCancelled else { return nil }
             // Target-engine groups only. The page-owned auxiliary contributors are scoped to shownVideo and
             // must not leak into a different episode being resolved behind the player.
             groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
             if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
-            // Settle gate (see StreamRanking.resolveSettled): hold out for the remembered quality (non-torrent
-            // unless the user ranks torrents first) so a resume lands on the user's stream, not the first torrent.
+            // Settle gate (see StreamRanking.resolveSettled): with a remembered manual source, hold for IT
+            // (bounded) instead of committing off whichever provider answers fastest (the diag-22 race where a
+            // fast 1080p opened the gate before the user's aggregator loaded); otherwise hold for the remembered
+            // quality (non-torrent unless the user ranks torrents first) so a resume lands on the user's stream.
             let progress = core.streamLoadProgress(forStreamId: v.id)
             let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
             if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                            secondsSinceFirstPlayable: elapsed, rememberedQuality: rememberedQuality) { break }
+                                            secondsSinceFirstPlayable: elapsed, rememberedQuality: rememberedQuality,
+                                            wantedAddon: wantedAddon) { break }
             do {
                 try await Task.sleep(for: .milliseconds(250))
             } catch {
@@ -4656,6 +4674,8 @@ struct iOSEpisodeStreams: View {
         }
         guard !Task.isCancelled else { return nil }
         guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
+                                            sticky: sticky,
+                                            providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
                                             debridCachedHashes: debridCache.cachedHashes) else { return nil }
         let targetSeason = v.season ?? season
         // PRESENCE, not truthiness: the display helper cannot tell absence from an explicit E0.

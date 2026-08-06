@@ -305,8 +305,9 @@ enum StreamRanking {
     /// it is known, the gate holds for THAT provider specifically rather than for quality-from-any-provider:
     /// a fast comet|torbox 1080p can match the remembered quality ~1-2s after EOF while the user's aggregator
     /// (~9s to answer) is still loading, and the sticky +6000 bonus cannot bonus an ABSENT stream, so the old
-    /// quality-only gate committed auto-next off the rival (diag-22). Default nil keeps EVERY other caller
-    /// (iOS auto-pick/resume, batch retry, live failover) byte-identical to before. The wait is bounded three
+    /// quality-only gate committed auto-next off the rival (diag-22). Both binge auto-next paths pass it (tvOS
+    /// TVPlayerView, and iOS iOSDetailView loadEpisodeStream + iOSResolveEpisodeStream). Default nil keeps the
+    /// non-binge callers (the batch download picker, live failover) byte-identical to before. The wait is bounded three
     /// ways and can never hang: the wanted source arriving, everyone answering (the `loaded >= total`
     /// short-circuit above), or `wantedSourceDeadline` elapsing.
     static func resolveSettled(_ groups: [CoreStreamSourceGroup], loaded: Int, total: Int,
