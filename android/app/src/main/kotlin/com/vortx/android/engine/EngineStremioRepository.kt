@@ -75,6 +75,47 @@ internal fun StreamSource.debridResolveTarget(
     fileIdx = fileIdx,
 )
 
+internal data class UsenetResolveTarget(
+    val nzbUrl: String,
+    val knownHash: String?,
+    val fileMustInclude: String?,
+    val episode: DebridResolver.Episode?,
+    val fileIdx: Int?,
+)
+
+internal fun StreamSource.usenetResolveTarget(
+    selectedEpisode: Episode?,
+): UsenetResolveTarget = UsenetResolveTarget(
+    nzbUrl = requireNotNull(nzbUrl) { "Usenet source is missing its NZB URL." },
+    knownHash = usenetKnownHash,
+    fileMustInclude = fileMustInclude,
+    episode = selectedEpisode?.let {
+        DebridResolver.Episode(
+            season = it.season,
+            episode = it.episode,
+        )
+    },
+    fileIdx = fileIdx,
+)
+
+internal fun usenetPlaybackFailure(error: Throwable): Throwable = when (error) {
+    DebridResolver.DebridException.NoKey ->
+        UnsupportedOperationException("Usenet playback needs a TorBox debrid key.", error)
+    DebridResolver.DebridException.InvalidKey ->
+        IllegalStateException("TorBox rejected the configured debrid key.", error)
+    DebridResolver.DebridException.NoMatchingFile ->
+        IllegalStateException("No playable video matched this Usenet source.", error)
+    DebridResolver.DebridException.NotReady ->
+        IllegalStateException("This Usenet source is still preparing in TorBox.", error)
+    DebridResolver.DebridException.NotCached ->
+        IllegalStateException("This Usenet source is not available in TorBox yet.", error)
+    DebridResolver.DebridException.OwnerChanged ->
+        IllegalStateException("The debrid account changed while resolving this Usenet source.", error)
+    is DebridResolver.DebridException.Provider ->
+        IllegalStateException("TorBox could not resolve this Usenet source: ${error.message}.", error)
+    else -> error
+}
+
 /// The real engine implementation of the UI seams. Drop-in replacement for `PreviewCatalogRepository`
 /// AND `PreviewAuthRepository`: it satisfies the SAME [CatalogRepository] (alias `StremioRepository`)
 /// and [AuthRepository] contracts the Compose screens were built against, so wiring it in is a
@@ -765,7 +806,28 @@ class EngineStremioRepository(
         // Atmos passthrough); a text parse is the only pre-play signal, same as Apple.
         val isDolbyVision = StreamRanking.isDolbyVision(source)
         val isAtmos = StreamRanking.isAtmos(source)
-        if (!source.isTorrent && (handle.startsWith("http://") || handle.startsWith("https://"))) {
+        if (source.isUsenet) {
+            val target = source.usenetResolveTarget(episode)
+            val resolved = try {
+                debridResolver.resolveUsenet(
+                    nzbUrl = target.nzbUrl,
+                    knownHash = target.knownHash,
+                    fileMustInclude = target.fileMustInclude,
+                    fileIdx = target.fileIdx,
+                    episode = target.episode,
+                )
+            } catch (error: Throwable) {
+                throw usenetPlaybackFailure(error)
+            }
+            Playable(
+                url = resolved,
+                title = source.title,
+                viaStreamingServer = false,
+                isTorrent = false,
+                isDolbyVision = isDolbyVision,
+                isAtmos = isAtmos,
+            )
+        } else if (!source.isTorrent && (handle.startsWith("http://") || handle.startsWith("https://"))) {
             // The stream's declared proxyHeaders ride onto the Playable so a header-gated CDN (a
             // Referer / User-Agent requirement) actually plays: both engines already apply
             // [Playable.headers] (mpv http-header-fields, ExoPlayer data-source factory), and the

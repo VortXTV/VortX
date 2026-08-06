@@ -886,6 +886,7 @@ object StreamRanking {
     /// (the Android analogue of the Apple `vortxProvider != nil` check), regardless of the text below.
     private fun sourceType(source: StreamSource, text: String): SourceType {
         if (source.isMediaServer) return SourceType.MEDIA_SERVER
+        if (source.isUsenet) return SourceType.USENET
         if (text.contains("usenet") || text.contains("nzb") || text.contains("easynews") || text.contains("📰")) return SourceType.USENET
         // Resolved torrent = debrid/cached, detected STRUCTURALLY (add-on-agnostic). A RAW torrent has an
         // infoHash and NO url; once a debrid/cached service resolves it, the stream gains a direct url while
