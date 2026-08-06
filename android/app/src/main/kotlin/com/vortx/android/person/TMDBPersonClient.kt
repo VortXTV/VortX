@@ -4,6 +4,11 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
 import com.vortx.android.net.VortXEdgeAuth
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.IOException
@@ -38,6 +43,42 @@ object TMDBPersonClient {
 
     private const val TIMEOUT_MS = 20_000
     private const val IMAGE_BASE = "https://image.tmdb.org/t/p"
+    private val recommendationSlots = Semaphore(8)
+
+    /// IMDb ids recommended for [imdbId], ordered with the seed title's original language first.
+    /// The edge supplies the TMDB key; each candidate is mapped back to IMDb concurrently so every
+    /// returned id opens the normal engine-backed detail and stream path.
+    suspend fun recommendations(imdbId: String, type: MediaType): List<String> {
+        if (!imdbId.startsWith("tt")) return emptyList()
+        val media = mediaPath(type)
+        val found = getJson("/find/$imdbId?external_source=imdb_id") ?: return emptyList()
+        val resultsKey = if (media == "tv") "tv_results" else "movie_results"
+        val seed = found.optJSONArray(resultsKey)?.optJSONObject(0) ?: return emptyList()
+        val tmdbId = seed.optInt("id", 0).takeIf { it > 0 } ?: return emptyList()
+        val seedLanguage = seed.optStringOrNull("original_language")
+        val results = getJson("/$media/$tmdbId/recommendations")?.optJSONArray("results")
+            ?: return emptyList()
+        val ranked = buildList {
+            for (index in 0 until results.length()) {
+                val item = results.optJSONObject(index) ?: continue
+                val id = item.optInt("id", 0).takeIf { it > 0 } ?: continue
+                add(Triple(index, item.optStringOrNull("original_language") == seedLanguage, id))
+            }
+        }.sortedWith(compareByDescending<Triple<Int, Boolean, Int>> { it.second }.thenBy { it.first })
+            .take(MAX_RECOMMENDATIONS)
+
+        return coroutineScope {
+            ranked.mapIndexed { outputIndex, (_, _, id) ->
+                async {
+                    recommendationSlots.withPermit {
+                        val external = getJson("/$media/$id/external_ids")
+                        val imdb = external?.optStringOrNull("imdb_id")
+                        if (imdb?.startsWith("tt") == true) outputIndex to imdb else null
+                    }
+                }
+            }.awaitAll().filterNotNull().sortedBy { it.first }.map { it.second }
+        }
+    }
 
     /// Full cast with character names + headshots for the detail page's cast rail, resolved from an IMDb
     /// id. Series use `aggregate_credits` so recurring roles across seasons resolve; movies use
@@ -192,4 +233,6 @@ object TMDBPersonClient {
         if (!has(key) || isNull(key)) return null
         return optString(key).ifBlank { null }
     }
+
+    private const val MAX_RECOMMENDATIONS = 12
 }

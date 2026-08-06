@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
+import com.vortx.android.home.TOP_PICKS_CATALOG_ID
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.HomeViewModel
@@ -176,7 +177,11 @@ private fun TvCatalogRow(
 ) {
     val visibleItems = remember(catalog.items) { tvHomeItems(catalog.items) }
     Column {
-        val eyebrow = if (catalog.id == "continue") "Pick up where you left off" else null
+        val eyebrow = when (catalog.id) {
+            "continue" -> "Pick up where you left off"
+            TOP_PICKS_CATALOG_ID -> "Based on what you watch"
+            else -> null
+        }
         Column(modifier = Modifier.padding(start = TvDimens.edge, bottom = VortXTheme.spacing.sm)) {
             if (eyebrow != null) {
                 Text(text = eyebrow.uppercase(), style = VortXTheme.type.eyebrow)

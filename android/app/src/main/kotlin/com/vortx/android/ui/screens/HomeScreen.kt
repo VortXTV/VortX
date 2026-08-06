@@ -28,6 +28,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
+import com.vortx.android.home.TOP_PICKS_CATALOG_ID
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.EmptyState
 import com.vortx.android.ui.components.ErrorState
@@ -81,7 +82,11 @@ private fun HomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, mod
         }
         items(catalogs, key = { it.id }) { catalog ->
             // The leading Continue Watching rail carries the editorial kicker, like tvOS.
-            val eyebrow = if (catalog.id == "continue") "Pick up where you left off" else null
+            val eyebrow = when (catalog.id) {
+                "continue" -> "Pick up where you left off"
+                TOP_PICKS_CATALOG_ID -> "Based on what you watch"
+                else -> null
+            }
             PosterRail(catalog = catalog, onItem = onItem, eyebrow = eyebrow)
         }
     }

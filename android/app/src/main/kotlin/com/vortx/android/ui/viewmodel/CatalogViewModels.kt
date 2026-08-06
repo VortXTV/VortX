@@ -6,6 +6,8 @@ import androidx.lifecycle.viewModelScope
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
+import com.vortx.android.home.TopPicksModel
+import com.vortx.android.home.withTopPicksRail
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryResult
@@ -22,8 +24,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
@@ -56,13 +60,25 @@ class HomeViewModel(
     val state: StateFlow<UiState<List<Catalog>>> = _state.asStateFlow()
 
     private var collectJob: Job? = null
+    private var topPicksJob: Job? = null
+    private var baseRows: List<Catalog> = emptyList()
+    private var topPicksItems: List<MetaItem> = emptyList()
+    private var sourceHasRows = false
+    private val topPicks = TopPicksModel()
 
     init {
         load()
+        viewModelScope.launch {
+            repo.ctxUpdates().drop(1).collectLatest { refreshTopPicks() }
+        }
     }
 
     fun load() {
         collectJob?.cancel()
+        topPicksJob?.cancel()
+        baseRows = emptyList()
+        topPicksItems = emptyList()
+        sourceHasRows = false
         _state.value = UiState.Loading
         collectJob = viewModelScope.launch {
             // Watchdog: an engine that produces no rails at all (no network AND no cache) must show
@@ -75,8 +91,8 @@ class HomeViewModel(
                 }
             }
             val homeUpdates = railPreferences?.let { preferences ->
-                repo.homeUpdates().combine(preferences.state) { rows, layout ->
-                    rows.isNotEmpty() to preferences.arrange(rows, railSurface, layout)
+                repo.homeUpdates().combine(preferences.state) { rows, _ ->
+                    rows.isNotEmpty() to rows
                 }
             } ?: repo.homeUpdates().map { rows -> rows.isNotEmpty() to rows }
             homeUpdates
@@ -88,9 +104,41 @@ class HomeViewModel(
                     // shimmer (or the previous Success) rather than rendering an empty Home. A non-empty
                     // source that becomes empty only after the user's visibility filter is still a real
                     // settled result, so publish it instead of leaving the now-hidden rows on screen.
-                    if (sourceHasRows) _state.value = UiState.Success(rows)
+                    if (sourceHasRows) {
+                        this@HomeViewModel.sourceHasRows = true
+                        baseRows = rows
+                        publishHome()
+                        refreshTopPicks()
+                    }
                 }
         }
+    }
+
+    private fun refreshTopPicks() {
+        val rows = baseRows
+        if (rows.isEmpty()) return
+        topPicksJob?.cancel()
+        topPicksJob = viewModelScope.launch {
+            val library = repo.library().getOrNull()?.items.orEmpty()
+            val continueWatching = rows.firstOrNull { it.id == "continue" }?.items.orEmpty()
+            val refreshed = topPicks.refresh(continueWatching, library) {
+                topPicksItems = emptyList()
+                publishHome()
+            }
+            if (refreshed.changed) {
+                topPicksItems = refreshed.items
+                publishHome()
+            }
+        }
+    }
+
+    private fun publishHome() {
+        if (!sourceHasRows) return
+        val enriched = withTopPicksRail(baseRows, topPicksItems)
+        val rows = railPreferences?.let { preferences ->
+            preferences.arrange(enriched, railSurface, preferences.state.value)
+        } ?: enriched
+        _state.value = UiState.Success(rows)
     }
 
     private companion object {
