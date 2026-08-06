@@ -43,6 +43,52 @@ class RosterClockRegressionTest {
             requireNotNull(decodeStoredRosterClock(Double.NaN.toRawBits(), legacySeconds = 7L)),
             0.0,
         )
+        assertEquals(
+            200.0,
+            requireNotNull(decodeStoredRosterClock(100.75.toRawBits(), legacySeconds = 200L)),
+            0.0,
+        )
+        assertEquals(
+            200.75,
+            requireNotNull(decodeStoredRosterClock(200.75.toRawBits(), legacySeconds = 100L)),
+            0.0,
+        )
+    }
+
+    @Test
+    fun localTouchAdvancesPastAFutureWatermark() {
+        val prior = 2_000_000_000.75
+        val next = nextLocalRosterClock(nowSeconds = 1_900_000_000.0, priorModified = prior)
+
+        assertEquals(Math.nextUp(prior), next, 0.0)
+        assertTrue(next > prior)
+    }
+
+    @Test
+    fun repeatedAndRollbackWallClocksStayStrictlyMonotonicAndKeepTheLocalEdit() {
+        val first = nextLocalRosterClock(nowSeconds = 50.0, priorModified = 50.0)
+        val second = nextLocalRosterClock(nowSeconds = 40.0, priorModified = first)
+        assertEquals(60.0, nextLocalRosterClock(nowSeconds = 60.0, priorModified = second), 0.0)
+        assertTrue(first > 50.0)
+        assertTrue(second > first)
+
+        val localEdit = UserProfile(
+            id = "44000000-0000-0000-0000-000000000004",
+            name = "Local edit",
+            avatar = "L",
+        )
+        val oldCloud = localEdit.copy(name = "Old cloud")
+        val transition = rosterPullMergeTransition(
+            local = listOf(localEdit),
+            incoming = listOf(oldCloud),
+            deletedProfileIDs = emptySet(),
+            localModified = second,
+            incomingModified = first,
+        )
+
+        assertEquals(listOf(localEdit), transition.profiles)
+        assertFalse(transition.contentChanged)
+        assertEquals(second, transition.effectiveModified, 0.0)
     }
 
     @Test

@@ -458,7 +458,12 @@ class ProfileStore private constructor(context: Context) {
         if (touch) {
             // Fractional epoch SECONDS, matching Apple's `Date().timeIntervalSince1970` Double. Integer
             // seconds collapsed every edit within the same second into a tie and truncated Apple clocks.
-            writeRosterClock(System.currentTimeMillis() / 1000.0)
+            writeRosterClock(
+                nextLocalRosterClock(
+                    nowSeconds = System.currentTimeMillis() / 1000.0,
+                    priorModified = rosterModified,
+                ),
+            )
             onRosterPush(profiles)
         }
     }
@@ -476,12 +481,14 @@ class ProfileStore private constructor(context: Context) {
             } else {
                 null
             }
-            decodeStoredRosterClock(exactBits, null)?.let { return it }
-            decodeStoredRosterClock(null, legacyRosterClock())?.let { migrated ->
-                writeRosterClock(migrated)
-                return migrated
+            val legacySeconds = legacyRosterClock()
+            val resolved = decodeStoredRosterClock(exactBits, legacySeconds) ?: return 0.0
+            // An older app updates only the canonical Long and leaves our exact-bits key behind. Heal both
+            // representations from the newest valid value so returning to this build cannot revive that stale key.
+            if (exactBits != resolved.toRawBits() || legacySeconds != resolved.toLong()) {
+                writeRosterClock(resolved)
             }
-            return 0.0
+            return resolved
         }
 
     private fun legacyRosterClock(): Long? =
@@ -771,10 +778,24 @@ internal fun rosterClockDecision(localModified: Double, incomingModified: Double
 
 /** Exact SharedPreferences representation with a legacy whole-second migration path. */
 internal fun decodeStoredRosterClock(exactBits: Long?, legacySeconds: Long?): Double? {
-    exactBits?.let { bits ->
-        Double.fromBits(bits).takeIf { it.isFinite() && it >= 0.0 }?.let { return it }
+    val exact = exactBits?.let(Double::fromBits)?.takeIf { it.isFinite() && it >= 0.0 }
+    val legacy = legacySeconds?.toDouble()?.takeIf { it >= 0.0 }
+    return when {
+        exact == null -> legacy
+        legacy == null -> exact
+        else -> maxOf(exact, legacy)
     }
-    return legacySeconds?.toDouble()?.takeIf { it >= 0.0 }
+}
+
+/**
+ * A local edit is a Lamport-style advance over both wall time and the persisted roster watermark. This
+ * keeps it newer than a future peer clock, survives a wall-clock rollback, and prevents same-millisecond ties.
+ */
+internal fun nextLocalRosterClock(nowSeconds: Double, priorModified: Double): Double {
+    val prior = priorModified.takeIf { it.isFinite() && it >= 0.0 } ?: 0.0
+    val now = nowSeconds.takeIf { it.isFinite() && it >= 0.0 } ?: 0.0
+    val successor = Math.nextUp(prior)
+    return if (successor.isFinite()) maxOf(now, successor) else prior
 }
 
 /**

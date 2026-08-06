@@ -344,7 +344,19 @@ object SettingsBackup {
         if (value !is Number) return false
         val integer = runCatching { BigDecimal(value.toString()).toBigIntegerExact() }.getOrNull()
             ?: return false
-        return integer >= SWIFT_INT_MIN && integer <= SWIFT_INT_MAX
+        if (integer < SWIFT_INT_MIN || integer > SWIFT_INT_MAX) return false
+        // Foundation rejects floating-form Int.min itself and positive values whose Double rounds onto 2^63.
+        // It still accepts negative Int.min + 1 decimal/exponent forms even though their Double also rounds to
+        // -2^63, so keep the lower check exact rather than applying symmetric floating bounds.
+        if (value is BigDecimal || value is Double || value is Float) {
+            val floating = value.toDouble()
+            if (!floating.isFinite() ||
+                integer == SWIFT_INT_MIN || floating >= SWIFT_INT_EXCLUSIVE_BOUND
+            ) {
+                return false
+            }
+        }
+        return true
     }
 
     /**
@@ -368,6 +380,7 @@ object SettingsBackup {
     private val APPLE_ISO8601 =
         Regex("""^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}(?::?\d{2})?)$""")
     private val COMPACT_ISO8601_OFFSET = Regex("""([+-]\d{2})(\d{2})$""")
+    private const val SWIFT_INT_EXCLUSIVE_BOUND = 9_223_372_036_854_775_808.0
     private val SWIFT_INT_MIN: BigInteger = BigInteger.valueOf(Long.MIN_VALUE)
     private val SWIFT_INT_MAX: BigInteger = BigInteger.valueOf(Long.MAX_VALUE)
 }

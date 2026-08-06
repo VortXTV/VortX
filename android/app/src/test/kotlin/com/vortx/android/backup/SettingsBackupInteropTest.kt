@@ -312,6 +312,37 @@ class SettingsBackupInteropTest {
             assertNull("out-of-range Swift Int", SettingsBackup.decodeDomain(outOfRange.toString().toByteArray()))
             assertNull("out-of-range Swift Int must not be rewritten", rewriteMalformedEnvelope(outOfRange))
         }
+
+        for (compatibleSwiftInt in listOf(
+            "9223372036854775807",
+            "-9223372036854775808",
+            "9223372036854774784.0",
+            "-9223372036854775807.0",
+            "-9.223372036854775807e18",
+            "1.0",
+            "1e3",
+        )) {
+            assertTrue(
+                "Foundation-compatible Swift Int $compatibleSwiftInt",
+                SettingsBackup.decodeDomain(withRawSchema(valid, compatibleSwiftInt)) != null,
+            )
+        }
+        for (foundationRejectedBoundary in listOf(
+            "9223372036854775807.0",
+            "9.223372036854775807e18",
+            "-9223372036854775808.0",
+            "-9.223372036854775808e18",
+        )) {
+            val rawEnvelope = withRawSchema(valid, foundationRejectedBoundary)
+            assertNull(
+                "Foundation rejects decimal/exponent Int64 boundary $foundationRejectedBoundary",
+                SettingsBackup.decodeDomain(rawEnvelope),
+            )
+            assertNull(
+                "Foundation-rejected boundary must not be rewritten $foundationRejectedBoundary",
+                rewriteMalformedEnvelope(rawEnvelope),
+            )
+        }
     }
 
     @Test
@@ -446,12 +477,22 @@ class SettingsBackupInteropTest {
     }
 
     private fun rewriteMalformedEnvelope(envelope: JSONObject): String? =
+        rewriteMalformedEnvelope(envelope.toString().toByteArray())
+
+    private fun rewriteMalformedEnvelope(envelope: ByteArray): String? =
         SettingsBackup.settingsBlobFor(
-            pulledBlob = Base64.getEncoder().encodeToString(envelope.toString().toByteArray()),
+            pulledBlob = Base64.getEncoder().encodeToString(envelope),
             roster = listOf(profile(name = "Local")),
             rosterModifiedSeconds = 1.0,
             bundleId = "com.vortx.android",
         )
+
+    private fun withRawSchema(envelope: JSONObject, rawNumber: String): ByteArray {
+        val source = envelope.toString()
+        val replaced = source.replace(Regex("\\\"schema\\\"\\s*:\\s*1(?=,|})"), "\"schema\":$rawNumber")
+        require(replaced != source)
+        return replaced.toByteArray(Charsets.UTF_8)
+    }
 
     private fun profile(
         id: String = UserProfile.newId(),
