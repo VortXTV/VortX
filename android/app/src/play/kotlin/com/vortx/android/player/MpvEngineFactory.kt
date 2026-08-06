@@ -8,5 +8,7 @@ import android.content.Context
 /// (contract-only) in [PlayerEngine]; keeping it here means the `play` variant has no reference to any
 /// libmpv class and compiles clean without the AAR.
 object MpvEngineFactory {
+    const val isBundled: Boolean = false
+
     fun create(context: Context): PlayerEngine? = null
 }

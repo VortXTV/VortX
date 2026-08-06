@@ -42,6 +42,7 @@ import com.vortx.android.model.VideoUpscaling
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.DiskCacheSetting
+import com.vortx.android.player.MpvEngineFactory
 import com.vortx.android.player.PlaybackBehaviorSettings
 import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.SubtitleStyle
@@ -254,21 +255,23 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 }
             }
 
-            SettingsSection(
-                title = "Video quality",
-                footer = "Applied by the built-in libmpv player on the next load. Anime4K is not implemented " +
-                    "on Android; it requires both packaged shaders and application wiring.",
-            ) {
-                VideoUpscaling.androidChoices.forEach { preset ->
-                    OptionRow(
-                        label = preset.label,
-                        detail = preset.detail,
-                        selected = preset == videoUpscaling,
-                        onClick = {
-                            videoUpscaling = preset
-                            trackStore.videoUpscaling = preset
-                        },
-                    )
+            if (MpvEngineFactory.isBundled) {
+                SettingsSection(
+                    title = "Video quality",
+                    footer = "Applied by the built-in libmpv player on the next load. Anime4K is not implemented " +
+                        "on Android; it requires both packaged shaders and application wiring.",
+                ) {
+                    VideoUpscaling.androidChoices.forEach { preset ->
+                        OptionRow(
+                            label = preset.label,
+                            detail = preset.detail,
+                            selected = preset == videoUpscaling,
+                            onClick = {
+                                videoUpscaling = preset
+                                trackStore.videoUpscaling = preset
+                            },
+                        )
+                    }
                 }
             }
 
