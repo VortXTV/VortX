@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -505,12 +506,38 @@ private fun Backdrop(m: MetaDetail) {
                 modifier = Modifier.align(Alignment.BottomStart).padding(VortXTheme.spacing.md),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                Text(text = m.name, style = VortXTheme.type.hero, color = Color.White, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                DetailTitle(m)
                 MetaRow(m)
             }
         }
     }
 }
+
+@Composable
+private fun DetailTitle(m: MetaDetail) {
+    var logoFailed by remember(m.logo) { mutableStateOf(false) }
+    val logo = detailLogoUrl(m.logo, logoFailed)
+    if (logo != null) {
+        AsyncImage(
+            model = logo,
+            contentDescription = m.name,
+            contentScale = ContentScale.Fit,
+            onError = { logoFailed = true },
+            modifier = Modifier.widthIn(max = 320.dp).fillMaxWidth().height(110.dp),
+        )
+    } else {
+        Text(
+            text = m.name,
+            style = VortXTheme.type.hero,
+            color = Color.White,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+internal fun detailLogoUrl(raw: String?, failed: Boolean): String? =
+    raw?.trim()?.takeIf { it.isNotEmpty() && !failed }
 
 /// The hero banner's height for a given measured [width]: the true 16:9-of-width height, clamped to
 /// the S03 260dp cap -- computed directly instead of via `.heightIn(max = …).aspectRatio(…)`, whose
