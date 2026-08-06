@@ -94,6 +94,7 @@ import com.vortx.android.ui.screens.TabBarScreen
 import com.vortx.android.iptv.IPTVSettingsScreen
 import com.vortx.android.ui.screens.SourcesSettingsScreen
 import com.vortx.android.ui.screens.VortXAccountScreen
+import com.vortx.android.ui.screens.WhatsNewScreen
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
@@ -220,6 +221,7 @@ fun StremioXApp(
         var showProfiles by remember { mutableStateOf(false) }
         var showAppearance by remember { mutableStateOf(false) }
         var showTabBar by remember { mutableStateOf(false) }
+        var showWhatsNew by remember { mutableStateOf(false) }
         val onItem: (MetaItem) -> Unit = { detail = it }
         // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
         // (final progress tick + Player unload) still runs after the player leaves composition.
@@ -275,6 +277,11 @@ fun StremioXApp(
                 prefs = tabBarPrefs,
                 onBack = { showTabBar = false },
             )
+            return@VortXTheme
+        }
+
+        if (showWhatsNew) {
+            WhatsNewScreen(onBack = { showWhatsNew = false })
             return@VortXTheme
         }
 
@@ -718,6 +725,7 @@ fun StremioXApp(
                         showDebridKeys = true
                     },
                     onLibraryClick = { showLibraryTransfer = true },
+                    onWhatsNewClick = { showWhatsNew = true },
                     settingsScrollState = settingsScrollState,
                     debridServicesFocusRequester = debridServicesFocusRequester,
                     modifier = content,

@@ -6,6 +6,12 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val generatedChangelogAssets = layout.buildDirectory.dir("generated/changelogAssets")
+val copyChangelogAsset by tasks.registering(Copy::class) {
+    from(rootProject.file("../CHANGELOG.md"))
+    into(generatedChangelogAssets)
+}
+
 // External sync provider credentials (Trakt device-code OAuth, SIMKL PIN flow). Injected into BuildConfig
 // from a GITIGNORED gradle property (local.properties) or a CI env var of the same name -- mirroring the
 // Apple release CI, which feeds $(TRAKT_CLIENT_ID)/$(TRAKT_CLIENT_SECRET)/$(SIMKL_CLIENT_ID) into the
@@ -114,6 +120,14 @@ android {
         // Local JVM tests exercise pure source-index seams that still share files with fail-soft Android logs.
         unitTests.isReturnDefaultValues = true
     }
+
+    sourceSets.named("main") {
+        assets.srcDir(generatedChangelogAssets)
+    }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn(copyChangelogAsset)
 }
 
 kotlin {
