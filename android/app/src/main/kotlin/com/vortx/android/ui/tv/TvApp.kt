@@ -27,6 +27,7 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.player.PlayerScreen
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.detailViewModelKey
 import com.vortx.android.ui.theme.VortXAccents
@@ -91,6 +92,9 @@ fun TvApp(
         val debridOwnerEpoch = remember(sessionUiState) {
             debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
         }
+        val debridCredentialRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
+        val sourceSettingsRevision by SourceSettingsRevision.observe(appContext).collectAsStateWithLifecycle()
+        val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
         // A scope tied to the whole shell (not the player layer), so the end-of-playback engine write (final
         // progress tick + Player unload) still completes after the player leaves composition -- the same
         // reason the phone shell uses an app-scoped coroutine for this.
@@ -143,7 +147,7 @@ fun TvApp(
                             prefix = "tv-detail",
                             typeId = current.type.id,
                             mediaId = current.id,
-                            ownerEpoch = debridOwnerEpoch,
+                            ownerEpoch = detailSourceEpoch,
                         ),
                         factory = StremioXViewModelFactory(
                             repo = repo,

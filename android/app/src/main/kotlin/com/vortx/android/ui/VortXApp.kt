@@ -70,6 +70,7 @@ import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.DefaultEmber
 import com.vortx.android.player.PlayerScreen
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.ui.components.Wordmark
 import com.vortx.android.ui.gallery.GalleryScreen
 import com.vortx.android.ui.prefs.AppearancePrefs
@@ -173,6 +174,9 @@ fun VortXApp(
     // account transition that every resolver/coordinator/view-model DebridKeys instance observes.
     val debridAccountIdentity = debridKeys.ownerIdentity()
     val debridOwnerEpoch = debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
+    val debridCredentialRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
+    val sourceSettingsRevision by SourceSettingsRevision.observe(appContext).collectAsStateWithLifecycle()
+    val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
     val appearancePrefs = remember(appContext) { AppearancePrefs(appContext) }
     val tabBarPrefs = remember(appContext) { TabBarPrefs(appContext) }
     val appearance by appearancePrefs.state.collectAsStateWithLifecycle()
@@ -376,7 +380,7 @@ fun VortXApp(
                             prefix = "detail",
                             typeId = showForNext.type.id,
                             mediaId = showForNext.id,
-                            ownerEpoch = debridOwnerEpoch,
+                            ownerEpoch = detailSourceEpoch,
                         ),
                         factory = StremioXViewModelFactory(
                             repo = repo,
@@ -686,7 +690,7 @@ fun VortXApp(
                         prefix = "detail",
                         typeId = current.type.id,
                         mediaId = current.id,
-                        ownerEpoch = debridOwnerEpoch,
+                        ownerEpoch = detailSourceEpoch,
                     ),
                     factory = StremioXViewModelFactory(
                         repo = repo,

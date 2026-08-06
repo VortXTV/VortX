@@ -61,6 +61,9 @@ class VortXAppDebridOwnerContractTest {
     }
 
     private fun ownerScopedKeyViolations(source: String): List<String> = buildList {
+        if (!source.contains(DETAIL_SOURCE_EPOCH)) {
+            add("The detail epoch must include owner, credential, and source-setting revisions")
+        }
         if (!source.contains(PLAYER_OWNER_SCOPED_KEY)) {
             add("The active-player DetailViewModel key must include the current debrid owner epoch")
         }
@@ -102,9 +105,11 @@ class VortXAppDebridOwnerContractTest {
     private companion object {
         const val PLAYER_OWNER_SCOPED_KEY =
             """mediaId = showForNext.id,
-                            ownerEpoch = debridOwnerEpoch"""
+                            ownerEpoch = detailSourceEpoch"""
         const val DETAIL_OWNER_SCOPED_KEY =
             """mediaId = current.id,
-                        ownerEpoch = debridOwnerEpoch"""
+                        ownerEpoch = detailSourceEpoch"""
+        const val DETAIL_SOURCE_EPOCH =
+            """val detailSourceEpoch = "${'$'}debridOwnerEpoch:${'$'}debridCredentialRevision:${'$'}sourceSettingsRevision""""
     }
 }

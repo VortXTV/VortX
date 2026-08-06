@@ -6,6 +6,7 @@ import com.vortx.android.debrid.DebridService
 import com.vortx.android.engine.SourceContributorSettlement
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.sources.CanonicalContentIdentity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -303,19 +304,23 @@ object TorBoxSearch {
 /// class): `@Published streams` becomes a [StateFlow], the SwiftUI `Task` becomes a coroutine [Job] on an
 /// owned scope, and the session cache / cooldown / in-flight bookkeeping is preserved field-for-field.
 class TorBoxSearchSource private constructor(
-    private val torBoxConfigured: () -> Boolean,
-    private val torBoxKey: () -> String,
+    private val torBoxCredential: () -> Credential,
     private val scope: CoroutineScope,
     private val fetchStreams: suspend (String, Int?, Int?, String) -> TorBoxSearch.Result,
 ) {
+    internal data class Credential(val key: String, val revision: Long)
+
     constructor(
         debridKeys: DebridKeys,
         /// The scope the fetch coroutines run on. Owned + cancellable via [close]; defaults to an IO scope so
         /// a caller that never provides one still works standalone (matching Apple's self-owned `Task`).
         scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     ) : this(
-        { debridKeys.isConfigured(DebridService.TOR_BOX) },
-        { debridKeys.key(DebridService.TOR_BOX) },
+        {
+            debridKeys.credentialSnapshot(DebridService.TOR_BOX).let {
+                Credential(it.key, it.revision)
+            }
+        },
         scope,
         TorBoxSearch::streams,
     )
@@ -325,11 +330,9 @@ class TorBoxSearchSource private constructor(
     internal constructor(
         scope: CoroutineScope,
         fetchStreams: suspend (String, Int?, Int?, String) -> TorBoxSearch.Result,
-        torBoxConfigured: () -> Boolean = { true },
-        torBoxKey: () -> String = { "test-key" },
+        torBoxCredential: () -> Credential = { Credential("test-key", 0L) },
     ) : this(
-        torBoxConfigured,
-        torBoxKey,
+        torBoxCredential,
         scope,
         fetchStreams,
     )
@@ -361,6 +364,7 @@ class TorBoxSearchSource private constructor(
     private val cache = HashMap<String, List<StreamSource>>()
     private var cooldownUntilMs: Long? = null
     private var job: Job? = null
+    private var activeCredentialRevision: Long? = null
 
     /// Fetch search results for [imdbId] if the user has a TorBox key. Fail-soft, session-cached, and backed
     /// off during a scraper cooldown. Safe to call on every meta change. Pass [season]/[episode] from an
@@ -372,20 +376,21 @@ class TorBoxSearchSource private constructor(
         episode: Int? = null,
         requestGeneration: Long = 0L,
     ) {
-        if (imdbId == null || !imdbId.startsWith("tt") || !torBoxConfigured()) {
-            reset(requestGeneration)
-            return
-        }
-        val fetchKey = "$imdbId|${season ?: -1}|${episode ?: -1}"
-        val contentId = if (season != null && episode != null) "$imdbId:$season:$episode" else imdbId
-        val key = torBoxKey()
+        val credential = torBoxCredential()
+        val key = credential.key
         if (key.isEmpty()) {
-            // The key can be cleared between the configured check and this read. Treat that race as the same
-            // closed lifecycle instead of launching a request with an empty credential.
-            reset(requestGeneration)
+            closeGate(credential.revision, requestGeneration)
             return
         }
+        val contentId = CanonicalContentIdentity.imdb(imdbId, season, episode)
+        if (contentId == null) {
+            closeGate(credential.revision, requestGeneration)
+            return
+        }
+        val canonicalImdbId = contentId.substringBefore(':')
+        val fetchKey = contentId
         val launched = synchronized(stateLock) {
+            replaceCredentialRevisionLocked(credential.revision)
             // New title: publish its cached results (or clear), so the prior title's streams never linger.
             if (fetchKey != shownKey || requestGeneration != shownGeneration) {
                 job?.cancel()
@@ -417,7 +422,7 @@ class TorBoxSearchSource private constructor(
             scope.launch(start = CoroutineStart.LAZY) {
                 val ownerJob = coroutineContext[Job]
                 try {
-                    val result = fetchStreams(imdbId, season, episode, key)
+                    val result = fetchStreams(canonicalImdbId, season, episode, key)
                     if (!isActive) return@launch
                     synchronized(stateLock) {
                         // A newer refresh may have canceled this fetch and claimed the slot. A late blocking
@@ -434,7 +439,12 @@ class TorBoxSearchSource private constructor(
                         // A credential mutation while the request was in flight retires this result. This is
                         // the completion-side half of the gate fence; a cleared or replaced key cannot publish
                         // streams fetched under the prior credential.
-                        if (!torBoxConfigured() || torBoxKey() != key) {
+                        val currentCredential = torBoxCredential()
+                        if (
+                            currentCredential.revision != credential.revision ||
+                            currentCredential.key != key
+                        ) {
+                            replaceCredentialRevisionLocked(currentCredential.revision)
                             shownKey = null
                             publishedContentId = null
                             if (_streams.value.isNotEmpty()) publishLocked(emptyList())
@@ -444,13 +454,13 @@ class TorBoxSearchSource private constructor(
                             // Over the TorBox scraper allowance. Back off ~15 min before re-probing; do NOT
                             // cache the empty result, so it re-fetches once the cooldown lifts.
                             cooldownUntilMs = System.currentTimeMillis() + COOLDOWN_MS
-                            Log.i(TAG, "rate-limited (scraper cooldown) for id=$imdbId, backing off ~15m")
+                            Log.i(TAG, "rate-limited (scraper cooldown) for id=$canonicalImdbId, backing off ~15m")
                         } else if (result.transportError) {
                             // The request never completed (offline / network failure). Do NOT cache the empty
                             // result and do NOT set a cooldown, so the next meta change re-fetches.
-                            Log.i(TAG, "transport error for id=$imdbId, not caching, will retry")
+                            Log.i(TAG, "transport error for id=$canonicalImdbId, not caching, will retry")
                         } else {
-                            Log.i(TAG, "fetched ${result.streams.size} stream(s) for id=$imdbId")
+                            Log.i(TAG, "fetched ${result.streams.size} stream(s) for id=$canonicalImdbId")
                             cache[fetchKey] = result.streams
                             if (shownKey == fetchKey) publishLocked(result.streams)
                         }
@@ -479,16 +489,36 @@ class TorBoxSearchSource private constructor(
 
     /// Close the configured-key lifecycle synchronously. A detail target installs its new generation only
     /// after [refresh] returns, so clearing the prior target here prevents its streams from being relabeled as
-    /// the new target when the key gate is closed. The session cache and cooldown survive for a later reopen.
-    private fun closeGate() {
+    /// the new target when the key gate is closed. A new credential revision also retires cache and cooldown.
+    private fun closeGate(credentialRevision: Long, requestGeneration: Long) {
         synchronized(stateLock) {
+            replaceCredentialRevisionLocked(credentialRevision)
             job?.cancel()
             job = null
             inFlightKey = null
+            inFlightGeneration = -1L
             shownKey = null
+            shownGeneration = -1L
             publishedContentId = null
             if (_streams.value.isNotEmpty()) publishLocked(emptyList())
+            _settlement.value = SourceContributorSettlement(requestGeneration, settled = true)
         }
+    }
+
+    /** Caller holds [stateLock]. Credential changes retire every result and cooldown from the prior key. */
+    private fun replaceCredentialRevisionLocked(revision: Long) {
+        if (activeCredentialRevision == revision) return
+        activeCredentialRevision = revision
+        job?.cancel()
+        job = null
+        inFlightKey = null
+        inFlightGeneration = -1L
+        shownKey = null
+        shownGeneration = -1L
+        publishedContentId = null
+        cache.clear()
+        cooldownUntilMs = null
+        if (_streams.value.isNotEmpty()) publishLocked(emptyList())
     }
 
     data class Snapshot(val streams: List<StreamSource>, val epoch: Int)

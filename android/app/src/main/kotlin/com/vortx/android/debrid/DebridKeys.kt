@@ -10,7 +10,11 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.io.FileNotFoundException
+import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.CRC32
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /// A debrid service VortX can hold an API key for. A debrid key turns cached torrents into instant
 /// direct links, so cached torrents play straight from the user's own debrid account without a debrid
@@ -61,6 +65,13 @@ internal data class DebridOwnerToken(
 ) {
     val identity: String get() = scope.uiIdentity
 }
+
+/** A key and its process-monotonic mutation revision, captured as one credential-state read. */
+internal data class DebridCredentialSnapshot(
+    val key: String,
+    val revision: Long,
+    val owner: DebridOwnerToken?,
+)
 
 /**
  * One process-wide binding from the restored VortX account to every debrid reader. An absent binding or an
@@ -316,6 +327,36 @@ class DebridKeys private constructor(
     /// True when [service] has a non-empty key configured.
     fun isConfigured(service: DebridService): Boolean = key(service).isNotEmpty()
 
+    /**
+     * Capture a credential and its revision under the same process lock used by successful mutations. A
+     * caller can therefore bind caches and network evidence to [DebridCredentialSnapshot.revision] without
+     * ever pairing a new key with an old revision.
+     */
+    internal fun credentialSnapshot(service: DebridService): DebridCredentialSnapshot =
+        synchronized(CREDENTIAL_STATE_LOCK) {
+            val owner = currentOwner()
+            observeOwnerLocked(owner)
+            if (owner == null) {
+                DebridCredentialSnapshot("", credentialRevisionCounter.get(), null)
+            } else {
+                adoptLegacyForFirstOwner(owner)
+                val value = key(service, owner)
+                val stableOwner = currentOwner()
+                if (stableOwner != owner) {
+                    observeOwnerLocked(stableOwner)
+                    DebridCredentialSnapshot("", credentialRevisionCounter.get(), stableOwner)
+                } else {
+                    DebridCredentialSnapshot(value, credentialRevisionCounter.get(), owner)
+                }
+            }
+        }
+
+    /** Current revision after observing any account-owner transition. */
+    internal fun currentCredentialRevision(): Long = synchronized(CREDENTIAL_STATE_LOCK) {
+        observeOwnerLocked(currentOwner())
+        credentialRevisionCounter.get()
+    }
+
     /// True only when the current account has a non-empty key whose latest mutation reached encrypted
     /// storage. Settings uses this instead of treating a process-memory fallback as a saved credential.
     @Synchronized
@@ -350,47 +391,58 @@ class DebridKeys private constructor(
     /// the process migration lock, matching every other two-lock path, and neither lock spans suspension.
     @Synchronized
     fun setKey(service: DebridService, value: String): Boolean {
-        val owner = currentOwner() ?: return false
-        adoptLegacyForFirstOwner(owner)
-        if (!isCurrent(owner)) return false
-        val trimmed = value.trim()
-        val storageKey = service.storageKey(owner.scope)
-        return synchronized(LEGACY_ADOPTION_LOCK) {
-            val legacyMutation = legacyMutationModeLocked(owner)
-            if (legacyMutation == LegacyMutationMode.BLOCKED) return@synchronized false
-            if (!isCurrent(owner)) return@synchronized false
-            val values = linkedMapOf<String, String?>(
-                storageKey to trimmed.takeIf(String::isNotEmpty),
-            )
-            if (legacyMutation == LegacyMutationMode.MIRROR) {
-                values[service.legacyStorageKey] = trimmed.takeIf(String::isNotEmpty)
-            }
-            val persisted = store.write(values)
-            val readback = store.snapshot(*values.keys.toTypedArray())
-            val verified =
-                persisted &&
-                    readback.availability == DebridStorageAvailability.AVAILABLE &&
-                    values.all { (key, expected) -> readback.values[key] == expected }
-            val ownerStillCurrent = isCurrent(owner)
-            if (!ownerStillCurrent && legacyMutation == LegacyMutationMode.MIRROR) {
-                val tombstoned = tombstoneLegacyRollbackSlots()
-                if (!tombstoned) {
-                    currentOwner()?.let { replacement ->
-                        failLegacyCopies(
-                            store.adoptionDomain,
-                            replacement,
-                            ownerStorageKeys(replacement),
-                        )
-                    } ?: markStorageFailure(storageKey)
+        return synchronized(CREDENTIAL_STATE_LOCK) credentialState@{
+            val owner = currentOwner() ?: return@credentialState false
+            observeOwnerLocked(owner)
+            adoptLegacyForFirstOwner(owner)
+            if (!isCurrent(owner)) return@credentialState false
+            val previous = key(service, owner)
+            val trimmed = value.trim()
+            val storageKey = service.storageKey(owner.scope)
+            val success = synchronized(LEGACY_ADOPTION_LOCK) credentialMutation@{
+                val legacyMutation = legacyMutationModeLocked(owner)
+                if (legacyMutation == LegacyMutationMode.BLOCKED) return@credentialMutation false
+                if (!isCurrent(owner)) return@credentialMutation false
+                val values = linkedMapOf<String, String?>(
+                    storageKey to trimmed.takeIf(String::isNotEmpty),
+                )
+                if (legacyMutation == LegacyMutationMode.MIRROR) {
+                    values[service.legacyStorageKey] = trimmed.takeIf(String::isNotEmpty)
                 }
+                val persisted = store.write(values)
+                val readback = store.snapshot(*values.keys.toTypedArray())
+                val verified =
+                    persisted &&
+                        readback.availability == DebridStorageAvailability.AVAILABLE &&
+                        values.all { (key, expected) -> readback.values[key] == expected }
+                val ownerStillCurrent = isCurrent(owner)
+                if (!ownerStillCurrent && legacyMutation == LegacyMutationMode.MIRROR) {
+                    val tombstoned = tombstoneLegacyRollbackSlots()
+                    if (!tombstoned) {
+                        currentOwner()?.let { replacement ->
+                            failLegacyCopies(
+                                store.adoptionDomain,
+                                replacement,
+                                ownerStorageKeys(replacement),
+                            )
+                        } ?: markStorageFailure(storageKey)
+                    }
+                }
+                if (verified) {
+                    clearStorageFailure(storageKey)
+                    clearPendingLegacyCopyFailure(owner, storageKey)
+                } else {
+                    markStorageFailure(storageKey)
+                }
+                verified && ownerStillCurrent
             }
-            if (verified) {
-                clearStorageFailure(storageKey)
-                clearPendingLegacyCopyFailure(owner, storageKey)
-            } else {
-                markStorageFailure(storageKey)
+            val finalOwner = currentOwner()
+            observeOwnerLocked(finalOwner)
+            if (finalOwner == owner) {
+                val current = key(service, owner)
+                if (previous != current) advanceCredentialRevisionLocked()
             }
-            verified && ownerStillCurrent
+            success
         }
     }
 
@@ -419,8 +471,12 @@ class DebridKeys private constructor(
     internal fun ownerIdentity(): String =
         ownerToken()?.identity ?: UNKNOWN_OWNER_IDENTITY
 
-    internal fun ownerToken(): DebridOwnerToken? =
-        currentOwner()?.also(::adoptLegacyForFirstOwner)
+    internal fun ownerToken(): DebridOwnerToken? = synchronized(CREDENTIAL_STATE_LOCK) {
+        currentOwner().also { owner ->
+            observeOwnerLocked(owner)
+            owner?.let(::adoptLegacyForFirstOwner)
+        }
+    }
 
     internal fun isCurrent(owner: DebridOwnerToken): Boolean = currentOwner() == owner
 
@@ -826,12 +882,38 @@ class DebridKeys private constructor(
             CLAIM_HEADER_BYTES + MAX_CLAIM_OWNER_BYTES + Long.SIZE_BYTES
         internal const val LEGACY_OWNER_KEY = "vortx.debrid.legacyOwner"
         private val LEGACY_ADOPTION_LOCK = Any()
+        private val CREDENTIAL_STATE_LOCK = Any()
         private val PROCESS_OWNER_BINDING = DebridAccountOwnerBinding()
         private val FAILED_LEGACY_ADOPTIONS = mutableMapOf<Any, FailedLegacyAdoption>()
         private val FAILED_STORAGE_KEYS = mutableMapOf<Any, MutableSet<String>>()
+        private val credentialRevisionCounter = AtomicLong(0L)
+        private val _credentialRevision = MutableStateFlow(0L)
+        private var observedCredentialOwner: DebridOwnerToken? = null
+        private var didObserveCredentialOwner = false
+
+        /** Successful key mutations and observed owner transitions publish one process-wide revision. */
+        internal val credentialRevision: StateFlow<Long> = _credentialRevision.asStateFlow()
+
+        private fun advanceCredentialRevisionLocked() {
+            val next = credentialRevisionCounter.incrementAndGet()
+            _credentialRevision.value = next
+        }
+
+        private fun observeOwnerLocked(owner: DebridOwnerToken?) {
+            if (!didObserveCredentialOwner) {
+                didObserveCredentialOwner = true
+                observedCredentialOwner = owner
+            } else if (observedCredentialOwner != owner) {
+                observedCredentialOwner = owner
+                advanceCredentialRevisionLocked()
+            }
+        }
 
         internal fun bindAccountOwnerSource(source: (() -> DebridAccountOwnerState)?) {
-            PROCESS_OWNER_BINDING.bind(source)
+            synchronized(CREDENTIAL_STATE_LOCK) {
+                PROCESS_OWNER_BINDING.bind(source)
+                observeOwnerLocked(PROCESS_OWNER_BINDING.currentOwner())
+            }
         }
     }
 }

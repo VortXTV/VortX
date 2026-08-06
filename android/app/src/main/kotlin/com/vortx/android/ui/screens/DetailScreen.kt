@@ -53,6 +53,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil3.compose.AsyncImage
 import com.vortx.android.VortXApplication
+import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.library.WatchlistStore
 import com.vortx.android.model.Episode
@@ -69,6 +70,7 @@ import com.vortx.android.ratings.MdbListRatings
 import com.vortx.android.ratings.VortXRatingsClient
 import com.vortx.android.sources.SourcePinScope
 import com.vortx.android.sources.SourcePinStore
+import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.DefaultEpisodeThumb
@@ -153,8 +155,12 @@ fun DetailScreen(
     // without threading a new callback through the app shell. System back closes it back to the Person page.
     titleTarget?.let { target ->
         val app = LocalContext.current.applicationContext as VortXApplication
+        val nestedDebridKeys = remember(app) { DebridKeys(app) }
+        val nestedCredentialRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
+        val nestedSourceRevision by SourceSettingsRevision.observe(app).collectAsStateWithLifecycle()
+        val nestedOwner = nestedDebridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
         val nestedVm: DetailViewModel = viewModel(
-            key = "detail-nested-${target.type.id}-${target.id}",
+            key = "detail-nested-${target.type.id}-${target.id}-$nestedOwner:$nestedCredentialRevision:$nestedSourceRevision",
             factory = StremioXViewModelFactory(
                 repo = app.catalogRepository,
                 detailArgs = StremioXViewModelFactory.DetailArgs(target.type, target.id),

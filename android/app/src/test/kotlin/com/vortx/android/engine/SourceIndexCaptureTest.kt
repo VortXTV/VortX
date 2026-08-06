@@ -367,6 +367,11 @@ class SourceIndexCaptureTest {
     @Test
     fun `content ids reject trailing junk overlong imdb and user shaped values`() {
         assertEquals("tt1234567:1:2", SourceIndexClient.contentId("tt1234567", 1, 2))
+        assertEquals("tt1234567:0:0", SourceIndexClient.contentId("tt1234567", 0, 0))
+        assertEquals(null, SourceIndexClient.contentId("tt1234567", 0, null))
+        assertEquals(null, SourceIndexClient.contentId("tt1234567", null, 0))
+        assertEquals(null, SourceIndexClient.contentId("tt1234567", -1, 0))
+        assertEquals(null, SourceIndexClient.contentId("tt1234567", 0, -1))
         assertEquals(null, SourceIndexClient.contentId("tt1234567junk"))
         assertEquals(null, SourceIndexClient.contentId("tt12345678901"))
         assertEquals(null, SourceIndexClient.contentId("user@example.com"))

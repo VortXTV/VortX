@@ -30,11 +30,11 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.model.orderedBySeasonEpisode
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.PlaybackBehaviorSettings
-import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.singularity.SourceIndexServeSource
 import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.ResolvedPin
+import com.vortx.android.sources.CanonicalContentIdentity
 import com.vortx.android.sources.ProviderHealth
 import com.vortx.android.sources.SeriesSourceSticky
 import com.vortx.android.sources.SourceRequestFence
@@ -64,6 +64,7 @@ internal fun Episode.debridEpisodeForResolve(): DebridResolver.Episode? {
 
 internal data class DebridCacheEvidence(
     val owner: DebridOwnerToken,
+    val credentialRevision: Long,
     val torrentServices: Map<String, DebridService>,
     val usenetUrls: Set<String>,
 ) {
@@ -75,8 +76,13 @@ internal fun torrentServicesFromCacheHits(
 ): Map<String, DebridService> =
     hits.entries.associate { (hash, hit) -> hash.trim().lowercase() to hit.service }
 
-internal fun DebridCacheEvidence?.forOwner(owner: DebridOwnerToken?): DebridCacheEvidence? =
-    this?.takeIf { owner != null && it.owner == owner }
+internal fun DebridCacheEvidence?.forOwner(
+    owner: DebridOwnerToken?,
+    credentialRevision: Long,
+): DebridCacheEvidence? =
+    this?.takeIf {
+        owner != null && it.owner == owner && it.credentialRevision == credentialRevision
+    }
 
 /// Map one ranked stream into the failover candidate that carries both its source identity and, for torrents,
 /// the exact provider whose account cache check confirmed the hash. Usenet deliberately carries no torrent
@@ -468,20 +474,28 @@ class DetailViewModel(
         val detail = (_meta.value as? UiState.Success)?.data
         val imdb = id.takeIf { it.startsWith("tt") }
         val ep = episodeId?.let { eid -> detail?.videos?.firstOrNull { it.id == eid } }
-        val season = if (type == MediaType.SERIES) ep?.season?.takeIf { it > 0 } else null
-        val episodeNum = if (type == MediaType.SERIES) ep?.episode?.takeIf { it > 0 } else null
+        val season = if (type == MediaType.SERIES) ep?.season else null
+        val episodeNum = if (type == MediaType.SERIES) ep?.episode else null
+        val contentId = when {
+            type == MediaType.SERIES && ep == null -> null
+            else -> CanonicalContentIdentity.imdb(imdb, season, episodeNum)
+        }
 
         // Kick the contributor lanes + install the ranking context BEFORE the raw feed, so the first coalesced
         // rebuild ranks against the real user prefs/pin (never the empty default, which would clobber the
         // globally-installed reading) and merges every lane in one pass.
         val advanceHint = pendingAdvanceHint
-        torbox.refresh(imdb, season, episodeNum, request.generation)
+        if (contentId != null) {
+            torbox.refresh(imdb, season, episodeNum, request.generation)
+        } else {
+            torbox.reset(request.generation)
+        }
         singularity.refresh(
-            SourceIndexClient.contentId(imdb, season, episodeNum),
+            contentId,
             isSignedIn(),
             request.generation,
         )
-        val ctx = buildContext(episodeId, imdb, season, episodeNum, request, advanceHint)
+        val ctx = buildContext(episodeId, contentId, request, advanceHint)
         lastCtx = ctx
         sourceModel.setContext(ctx)
         _pinUi.value = readPinUi()
@@ -579,9 +593,7 @@ class DetailViewModel(
     /// canonical [SourceListModel.Context.contentId] that owns TorBox rows and seeds the Singularity hoard.
     private fun buildContext(
         episodeId: String?,
-        imdb: String?,
-        season: Int?,
-        episodeNum: Int?,
+        contentId: String?,
         request: SourceRequestFence.Token,
         advanceHint: Pair<String?, String?>?,
     ): SourceListModel.Context =
@@ -600,7 +612,7 @@ class DetailViewModel(
             ),
             directLinksOnly = PlaybackBehaviorSettings.directLinksOnly(app),
             pin = currentPin(),
-            contentId = SourceIndexClient.contentId(imdb, season, episodeNum),
+            contentId = contentId,
         )
 
     /// Query the user's debrid account for which of the loaded torrents it has CACHED, then use the result to
@@ -618,6 +630,7 @@ class DetailViewModel(
     ) {
         if (!debrid.hasAnyResolver && !debrid.hasUsenetResolver) return
         val owner = debridKeys.ownerToken() ?: return
+        val credentialRevision = debridKeys.currentCredentialRevision()
         viewModelScope.launch {
             // Gather over the CURRENT lanes for this title (raw add-on groups + whatever the TorBox / Singularity
             // contributors have already published), never a possibly-stale prior assembly. Late-arriving TorBox
@@ -631,7 +644,8 @@ class DetailViewModel(
             if (
                 episodeId != _selectedEpisodeId.value ||
                 !sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) ||
-                !debridKeys.isCurrent(owner)
+                !debridKeys.isCurrent(owner) ||
+                debridKeys.currentCredentialRevision() != credentialRevision
             ) {
                 return@launch
             }
@@ -644,6 +658,7 @@ class DetailViewModel(
             val torrentServices = torrentServicesFromCacheHits(hits)
             debridCacheEvidence = DebridCacheEvidence(
                 owner = owner,
+                credentialRevision = credentialRevision,
                 torrentServices = torrentServices,
                 usenetUrls = cachedUsenetUrls,
             )
@@ -653,7 +668,8 @@ class DetailViewModel(
                 decorated !== raw &&
                 episodeId == _selectedEpisodeId.value &&
                 sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) &&
-                debridKeys.isCurrent(owner)
+                debridKeys.isCurrent(owner) &&
+                debridKeys.currentCredentialRevision() == credentialRevision
             ) {
                 sourceModel.setRawGroups(decorated)
             }
@@ -1021,7 +1037,10 @@ class DetailViewModel(
         episode: DebridResolver.Episode?,
         actionOwner: DebridOwnerToken?,
     ): DebridCoordinator.PlayableWinner? {
-        val evidence = debridCacheEvidence.forOwner(actionOwner)
+        val evidence = debridCacheEvidence.forOwner(
+            actionOwner,
+            debridKeys.currentCredentialRevision(),
+        )
         if (
             actionOwner == null ||
             evidence == null ||

@@ -36,7 +36,9 @@ class TorBoxSearchSourceConcurrencyTest {
                     transportError = false,
                 )
             },
-            torBoxConfigured = configured::get,
+            torBoxCredential = {
+                TorBoxSearchSource.Credential(if (configured.get()) "test-key" else "", 0L)
+            },
         )
 
         try {
@@ -90,7 +92,9 @@ class TorBoxSearchSourceConcurrencyTest {
                 withContext(NonCancellable) { releaseFirst.await() }
                 TorBoxSearch.Result(listOf(stream("a".repeat(40))), false, false)
             },
-            torBoxConfigured = configured::get,
+            torBoxCredential = {
+                TorBoxSearchSource.Credential(if (configured.get()) "test-key" else "", 0L)
+            },
         )
 
         try {
@@ -120,6 +124,7 @@ class TorBoxSearchSourceConcurrencyTest {
         val executor = Executors.newSingleThreadExecutor()
         val fetchDispatcher = executor.asCoroutineDispatcher()
         val key = AtomicReference("key-a")
+        val revision = java.util.concurrent.atomic.AtomicLong(1L)
         val firstStarted = CompletableDeferred<Unit>()
         val releaseFirst = CompletableDeferred<Unit>()
         val fetchedKeys = CopyOnWriteArrayList<String>()
@@ -134,8 +139,7 @@ class TorBoxSearchSourceConcurrencyTest {
                 val hash = if (requestKey == "key-a") "a".repeat(40) else "b".repeat(40)
                 TorBoxSearch.Result(listOf(stream(hash)), false, false)
             },
-            torBoxConfigured = { key.get().isNotEmpty() },
-            torBoxKey = key::get,
+            torBoxCredential = { TorBoxSearchSource.Credential(key.get(), revision.get()) },
         )
 
         try {
@@ -143,6 +147,7 @@ class TorBoxSearchSourceConcurrencyTest {
             withTimeout(5_000) { firstStarted.await() }
 
             key.set("key-b")
+            revision.incrementAndGet()
             releaseFirst.complete(Unit)
             withContext(fetchDispatcher) { Unit }
 
@@ -158,6 +163,55 @@ class TorBoxSearchSourceConcurrencyTest {
             assertEquals(listOf("key-a", "key-b"), fetchedKeys)
         } finally {
             releaseFirst.complete(Unit)
+            source.close()
+            fetchDispatcher.close()
+        }
+    }
+
+    @Test
+    fun `same target cached under key A cannot cross into key B`() = runBlocking {
+        val fetchDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+        val credential = AtomicReference(TorBoxSearchSource.Credential("key-a", 1L))
+        val fetchedKeys = CopyOnWriteArrayList<String>()
+        val keyBStarted = CompletableDeferred<Unit>()
+        val releaseKeyB = CompletableDeferred<Unit>()
+        val source = TorBoxSearchSource(
+            scope = CoroutineScope(SupervisorJob() + fetchDispatcher),
+            fetchStreams = { _, _, _, requestKey ->
+                fetchedKeys += requestKey
+                if (requestKey == "key-b") {
+                    keyBStarted.complete(Unit)
+                    releaseKeyB.await()
+                }
+                val hash = if (requestKey == "key-a") "a".repeat(40) else "b".repeat(40)
+                TorBoxSearch.Result(listOf(stream(hash)), false, false)
+            },
+            torBoxCredential = credential::get,
+        )
+
+        try {
+            source.refresh("tt1234567", season = 0, episode = 0)
+            withTimeout(5_000) {
+                while (source.streamsFor("tt1234567:0:0").singleOrNull()?.infoHash != "a".repeat(40)) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+
+            credential.set(TorBoxSearchSource.Credential("key-b", 2L))
+            source.refresh("tt1234567", season = 0, episode = 0)
+
+            assertTrue(source.streams.value.isEmpty())
+            assertTrue(source.streamsFor("tt1234567:0:0").isEmpty())
+            withTimeout(5_000) { keyBStarted.await() }
+            releaseKeyB.complete(Unit)
+            withTimeout(5_000) {
+                while (source.streamsFor("tt1234567:0:0").singleOrNull()?.infoHash != "b".repeat(40)) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            assertEquals(listOf("key-a", "key-b"), fetchedKeys)
+        } finally {
+            releaseKeyB.complete(Unit)
             source.close()
             fetchDispatcher.close()
         }

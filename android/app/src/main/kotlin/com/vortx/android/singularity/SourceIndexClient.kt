@@ -6,6 +6,7 @@ import com.vortx.android.engine.StreamRanking
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.net.VortXEdgeAuth
+import com.vortx.android.sources.CanonicalContentIdentity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -96,10 +97,7 @@ object SourceIndexClient {
     /// The pool `content_id` for a title, in the worker's colon form (`tt0903747` for a movie, `tt…:S:E` for an
     /// episode). null when the id is not a real imdb `tt…` id. Mirrors Apple `contentID`.
     fun contentId(imdbId: String?, season: Int? = null, episode: Int? = null): String? {
-        if (imdbId == null) return null
-        if (!Regex("""^tt[0-9]{6,10}$""").matches(imdbId)) return null
-        val contentId = if (season != null && episode != null) "$imdbId:$season:$episode" else imdbId
-        return canonicalContentId(contentId)
+        return CanonicalContentIdentity.imdb(imdbId, season, episode)
     }
 
     // MARK: - Descriptor extraction (pure; no user data)

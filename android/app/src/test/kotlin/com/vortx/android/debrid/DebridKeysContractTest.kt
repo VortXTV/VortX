@@ -569,6 +569,27 @@ class DebridKeysContractTest {
     }
 
     @Test
+    fun credentialSnapshotAdvancesOnlyWithConfirmedCredentialMutation() {
+        val store = FakeDebridKeyValueStore()
+        val keys = accountKeys(store, "account-revision")
+        val initial = keys.credentialSnapshot(DebridService.TOR_BOX)
+
+        assertTrue(keys.setKey(DebridService.TOR_BOX, "key-a"))
+        val keyA = keys.credentialSnapshot(DebridService.TOR_BOX)
+        assertEquals("key-a", keyA.key)
+        assertTrue(keyA.revision > initial.revision)
+
+        assertTrue(keys.setKey(DebridService.TOR_BOX, "key-a"))
+        assertEquals(keyA.revision, keys.credentialSnapshot(DebridService.TOR_BOX).revision)
+
+        store.writeSucceeds = false
+        assertFalse(keys.setKey(DebridService.TOR_BOX, "key-b"))
+        val unavailable = keys.credentialSnapshot(DebridService.TOR_BOX)
+        assertEquals("", unavailable.key)
+        assertTrue(unavailable.revision > keyA.revision)
+    }
+
+    @Test
     fun ownerClaimCodecRejectsPartialOversizedAndCorruptRecords() {
         val encoded = LegacyOwnerClaimCodec.encode("account:account-a")
         assertEquals(
