@@ -124,7 +124,7 @@ fun DetailScreen(
         }
     }
 
-    // Detail-local navigation for the cast/person feature, kept OUT of StremioXApp's own nav graph and
+    // Detail-local navigation for the cast/person feature, kept OUT of VortXApp's own nav graph and
     // out of DetailViewModel (the media-servers wave owns those): a tapped cast tile opens the Person
     // page ([personTarget]); a Person-page filmography tile opens that title's own detail ([titleTarget]).
     // Both are plain overlay state on this screen, so no top-level route is added and neither wave collides.

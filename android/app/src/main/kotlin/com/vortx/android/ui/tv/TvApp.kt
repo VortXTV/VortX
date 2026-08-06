@@ -31,7 +31,7 @@ import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import kotlinx.coroutines.launch
 
 /// The Android TV shell: a three-state D-pad flow (Home browse -> Detail -> Player) that is the 10-foot
-/// analogue of the phone [com.vortx.android.ui.StremioXApp], reusing the exact same seams underneath.
+/// analogue of the phone [com.vortx.android.ui.VortXApp], reusing the exact same seams underneath.
 ///
 /// This is the FIRST TV slice. It deliberately covers Home + Detail + Play only; the phone shell's Discover
 /// / Library / Search / Settings tabs, the source long-press / pin menu, the episode+season browser, and
@@ -40,7 +40,7 @@ import kotlinx.coroutines.launch
 /// [DetailViewModel], and playback runs on the same [PlayerScreen].
 ///
 /// [repo]/[auth] default to the offline preview so a Compose @Preview / test can drive the TV shell without
-/// the engine, exactly like [com.vortx.android.ui.StremioXApp].
+/// the engine, exactly like [com.vortx.android.ui.VortXApp].
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 fun TvApp(
@@ -81,7 +81,7 @@ fun TvApp(
 
         // Player is the topmost layer. When a source resolves to a [Playable] it covers Home/Detail and back
         // returns to the detail page underneath. The begin/report/end-playback-session calls mirror
-        // StremioXApp exactly, so Continue Watching + resume track on TV the same way they do on the phone.
+        // VortXApp exactly, so Continue Watching + resume track on TV the same way they do on the phone.
         val playable = playing
         if (playable != null) {
             // Freshest reported position/duration (ms) for the save-on-exit write: [0] = position,

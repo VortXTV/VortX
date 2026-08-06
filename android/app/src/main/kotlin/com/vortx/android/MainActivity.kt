@@ -12,10 +12,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.vortx.android.player.PlayerPipBridge
-import com.vortx.android.ui.StremioXApp
+import com.vortx.android.ui.VortXApp
 import com.vortx.android.ui.theme.isAnimatorScaleZero
 
-/// Android + Android TV entry point. The five-tab Compose shell in [StremioXApp] matches the iOS and
+/// Android + Android TV entry point. The five-tab Compose shell in [VortXApp] matches the iOS and
 /// Apple TV structure. It now runs on the shared stremio-core engine (over JNI, the same engine the
 /// iOS/tvOS apps use) via [com.vortx.android.engine.EngineStremioRepository]; the libmpv player
 /// drops in behind the same seam. The repository itself is owned by [VortXApplication] (constructed
@@ -35,7 +35,7 @@ class MainActivity : ComponentActivity() {
         // recedes behind content). VortXTheme forces the dark scheme regardless of the system
         // setting (ui/theme/Theme.kt), so both system bars get light icons unconditionally instead of
         // the OS's light/dark auto-resolution, which would otherwise mismatch a light system theme.
-        // The Compose shell consumes the resulting insets via Scaffold's contentPadding (StremioXApp).
+        // The Compose shell consumes the resulting insets via Scaffold's contentPadding (VortXApp).
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
@@ -62,7 +62,7 @@ class MainActivity : ComponentActivity() {
         // here -- see VortXApplication's doc comment for why an Activity-scoped instance is unsafe.
         val app = application as VortXApplication
         setContent {
-            StremioXApp(
+            VortXApp(
                 repo = app.catalogRepository,
                 auth = app.authRepository,
                 // The VortX account + cross-device sync engine (nullable: sync is off the critical

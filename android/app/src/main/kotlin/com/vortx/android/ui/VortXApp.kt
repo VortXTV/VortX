@@ -137,7 +137,7 @@ private enum class Tab(
 /// ViewModel depends only on [CatalogRepository] (or, for the account screen, [AuthRepository]).
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun StremioXApp(
+fun VortXApp(
     repo: CatalogRepository = PreviewCatalogRepository(),
     auth: AuthRepository = PreviewAuthRepository(),
     // The app-process VortX account + sync engine (VortXApplication.syncManager). Null in @Previews and

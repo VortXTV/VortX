@@ -42,7 +42,7 @@
         android:dataExtractionRules="@xml/data_extraction_rules">
 
         <!-- PHONE / touch entry. MainActivity keeps the ordinary MAIN + LAUNCHER filter (the touch shell,
-             com.vortx.android.ui.StremioXApp). It NO LONGER carries LEANBACK_LAUNCHER: the 10-foot D-pad
+             com.vortx.android.ui.VortXApp). It NO LONGER carries LEANBACK_LAUNCHER: the 10-foot D-pad
              surface is a distinct activity (TvActivity, below) so the two entrypoints can diverge in
              layout/focus while sharing one process, one repository, and the same ViewModels. On a phone
              only LAUNCHER activities appear; on a TV only LEANBACK_LAUNCHER ones do, so a single APK still

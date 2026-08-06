@@ -65,7 +65,7 @@ import kotlin.math.roundToInt
 ///   - Audio/subtitle languages + forced policy -> TrackSelector via PlayerScreen.kt:137.
 ///   - Skip segments     -> SkipTimestampService.kt:55 (the crowd-provider branch), reached from the live
 ///                          skip read path at PlayerScreen.kt:163.
-///   - Auto-add to Library -> StremioXApp.kt's 60s playback tick (LibraryAutoAdd.addIfNeeded `enabled`).
+///   - Auto-add to Library -> VortXApp.kt's 60s playback tick (LibraryAutoAdd.addIfNeeded `enabled`).
 ///                          Apple offers this on BOTH its settings surfaces (iOSSettingsView.swift:594,
 ///                          SourcesTV/SettingsView.swift:92); Android read the key but shipped no control,
 ///                          so the behaviour was pinned to its default and could not be turned off.

@@ -513,7 +513,7 @@ object PerformanceMode {
  *
  * Apple surfaces this as a Toggle on BOTH of its settings surfaces (iOSSettingsView.swift:594 and
  * SourcesTV/SettingsView.swift:92). Android READ this key at the 60s tick
- * ([com.vortx.android.ui.StremioXApp]) while offering no control to write it, so the behaviour was
+ * ([com.vortx.android.ui.VortXApp]) while offering no control to write it, so the behaviour was
  * permanently pinned to its default and a viewer could not turn it off. That is a settings-parity break,
  * hence this object plus the Library toggle on [com.vortx.android.ui.screens.PlaybackSettingsScreen].
  *

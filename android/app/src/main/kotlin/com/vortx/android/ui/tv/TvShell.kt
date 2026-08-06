@@ -44,7 +44,7 @@ import com.vortx.android.ui.viewmodel.LibraryViewModel
 import com.vortx.android.ui.viewmodel.SearchViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 
-/// The five 10-foot top-level surfaces, the couch analogue of the phone [com.vortx.android.ui.StremioXApp]'s
+/// The five 10-foot top-level surfaces, the couch analogue of the phone [com.vortx.android.ui.VortXApp]'s
 /// bottom-nav [Tab] set. Kept in the exact same order and with the same glyphs so the two form factors read
 /// as one product.
 enum class TvDestination(val label: String, val icon: ImageVector) {
@@ -86,7 +86,7 @@ fun TvShell(
     BackHandler(enabled = destination != TvDestination.HOME) { destination = TvDestination.HOME }
 
     // One factory for the shell, carrying the app Context so SearchViewModel's history store resolves --
-    // the same construction the phone shell uses at StremioXApp.kt. Home/Discover/Library ignore the Context.
+    // the same construction the phone shell uses at VortXApp.kt. Home/Discover/Library ignore the Context.
     val factory = StremioXViewModelFactory(
         repo = repo,
         auth = auth,

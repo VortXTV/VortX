@@ -5,7 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class StremioXAppDebridOwnerContractTest {
+class VortXAppDebridOwnerContractTest {
 
     @Test
     fun playerOverlayAndDetailLayerUseTheSameOwnerScopedViewModelKey() {
@@ -71,12 +71,12 @@ class StremioXAppDebridOwnerContractTest {
 
     private fun readSource(): String {
         val candidates = listOf(
-            File("src/main/kotlin/com/vortx/android/ui/StremioXApp.kt"),
-            File("app/src/main/kotlin/com/vortx/android/ui/StremioXApp.kt"),
-            File("android/app/src/main/kotlin/com/vortx/android/ui/StremioXApp.kt"),
+            File("src/main/kotlin/com/vortx/android/ui/VortXApp.kt"),
+            File("app/src/main/kotlin/com/vortx/android/ui/VortXApp.kt"),
+            File("android/app/src/main/kotlin/com/vortx/android/ui/VortXApp.kt"),
         )
         return candidates.firstOrNull(File::isFile)?.readText()
-            ?: error("Could not locate StremioXApp.kt from ${File(".").absolutePath}")
+            ?: error("Could not locate VortXApp.kt from ${File(".").absolutePath}")
     }
 
     private fun readOtherScreensSource(): String {
