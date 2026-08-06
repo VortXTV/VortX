@@ -34,6 +34,7 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -86,7 +87,12 @@ fun TvShell(
 
     // One factory for the shell, carrying the app Context so SearchViewModel's history store resolves --
     // the same construction the phone shell uses at StremioXApp.kt. Home/Discover/Library ignore the Context.
-    val factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = appContext)
+    val factory = StremioXViewModelFactory(
+        repo = repo,
+        auth = auth,
+        appContext = appContext,
+        homeSurface = HomeRailSurface.TV,
+    )
 
     Row(modifier = modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
         TvNavRail(selected = destination, onSelect = { destination = it })

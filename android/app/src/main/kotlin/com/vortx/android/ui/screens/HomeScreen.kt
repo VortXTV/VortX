@@ -52,10 +52,8 @@ fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: M
             // (the S03 device-round symptom) must be unrepresentable here.
             if (s.data.isEmpty()) {
                 EmptyState(
-                    "No catalogs yet. Check your connection, or sign in from Settings.",
+                    "No Home rows are visible. Turn rows back on in Settings > Appearance > Customize Home.",
                     modifier,
-                    actionLabel = "Retry",
-                    onAction = viewModel::load,
                 )
             } else {
                 HomeContent(s.data, onItem, modifier)

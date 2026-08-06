@@ -77,6 +77,7 @@ import com.vortx.android.ui.prefs.resolveSelected
 import com.vortx.android.ui.screens.AccountScreen
 import com.vortx.android.ui.screens.AddonsScreen
 import com.vortx.android.ui.screens.AppearanceScreen
+import com.vortx.android.ui.screens.CustomizeHomeScreen
 import com.vortx.android.ui.screens.DebridKeysScreen
 import com.vortx.android.ui.screens.DetailScreen
 import com.vortx.android.ui.screens.DiscoverScreen
@@ -220,6 +221,7 @@ fun StremioXApp(
         var showLibraryTransfer by remember { mutableStateOf(false) }
         var showProfiles by remember { mutableStateOf(false) }
         var showAppearance by remember { mutableStateOf(false) }
+        var showCustomizeHome by remember { mutableStateOf(false) }
         var showTabBar by remember { mutableStateOf(false) }
         var showWhatsNew by remember { mutableStateOf(false) }
         val onItem: (MetaItem) -> Unit = { detail = it }
@@ -262,10 +264,19 @@ fun StremioXApp(
             return@VortXTheme
         }
 
+        if (showCustomizeHome) {
+            CustomizeHomeScreen(
+                preferences = remember(appContext) { com.vortx.android.home.HomeRailPreferences.shared(appContext) },
+                onBack = { showCustomizeHome = false },
+            )
+            return@VortXTheme
+        }
+
         if (showAppearance) {
             BackHandler { showAppearance = false }
             AppearanceScreen(
                 prefs = appearancePrefs,
+                onCustomizeHome = { showCustomizeHome = true },
                 onBack = { showAppearance = false },
             )
             return@VortXTheme
