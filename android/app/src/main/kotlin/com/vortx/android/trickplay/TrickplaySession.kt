@@ -214,9 +214,14 @@ class TrickplaySession(context: Context) {
                 // handle is a segfault, which no runCatching can save. A frame we hold is proof the engine
                 // was alive and rendering when this height was read.
                 if (videoHeight > 0) srcHeight = videoHeight
-                // Bound the buffer; the worker caps at 600 tiles anyway (CommunityTrickplay.MAX_FRAMES).
-                if (frames.size >= MAX_SESSION_FRAMES) return@launch
-                frames += CommunityTrickplay.CapturedFrame(time = timeSeconds, jpeg = jpeg)
+                // Keep a bounded sample across the whole observed timeline. Once full, every later
+                // capture is admitted and the most temporally redundant interior frame is evicted, so
+                // long titles retain both their opening and current endpoint instead of freezing at the
+                // first 100 minutes.
+                val candidates = frames + CommunityTrickplay.CapturedFrame(time = timeSeconds, jpeg = jpeg)
+                val retained = TrickplayTimeline.retainedIndices(candidates.map { it.time }, MAX_SESSION_FRAMES)
+                frames.clear()
+                frames += retained.map { candidates[it] }
                 uploadDecision(progressive = true)
             }
             push?.let { pushUpload(it) }

@@ -199,17 +199,28 @@ object CommunityTrickplay {
         val intervalS: Double,
         val frameCount: Int,
         val cols: Int,
+        /** null is legacy metadata with no VTT; empty is an advertised VTT with no valid coverage. */
+        val cues: List<TrickplayTimelineCue>?,
     ) {
-        /** The cropped tile nearest [time] (seconds), drawn from the sheet sub-rect. null if out of range. */
+        /** The cropped tile covering [time]. Parsed VTT gaps and both outer bounds return null. */
         fun crop(time: Double): Bitmap? {
-            if (frameCount <= 0 || cols <= 0 || intervalS <= 0.0) return null
-            val idx = maxOf(0, minOf(frameCount - 1, floor(time / intervalS).toInt()))
-            val col = idx % cols
-            val row = idx / cols
-            val x = col * tileW
-            val y = row * tileH
-            if (x + tileW > bitmap.width || y + tileH > bitmap.height) return null
-            return runCatching { Bitmap.createBitmap(bitmap, x, y, tileW, tileH) }.getOrNull()
+            val cue = TrickplayTimeline.cue(
+                time = time,
+                parsedCues = cues,
+                frameCount = frameCount,
+                legacyInterval = intervalS,
+                cols = cols,
+                tileW = tileW,
+                tileH = tileH,
+            ) ?: return null
+            if (cue.x < 0 || cue.y < 0 || cue.x + cue.width > bitmap.width ||
+                cue.y + cue.height > bitmap.height
+            ) {
+                return null
+            }
+            return runCatching {
+                Bitmap.createBitmap(bitmap, cue.x, cue.y, cue.width, cue.height)
+            }.getOrNull()
         }
     }
 
@@ -221,6 +232,7 @@ object CommunityTrickplay {
     suspend fun fetch(key: String): Sheet? = withContext(Dispatchers.IO) {
         var metaConn: HttpURLConnection? = null
         var spriteConn: HttpURLConnection? = null
+        var vttConn: HttpURLConnection? = null
         try {
             // 1) Signed metadata GET off the gated trickplay host.
             metaConn = (URL("$BASE_URL/tp/$key").openConnection() as HttpURLConnection).apply {
@@ -241,9 +253,30 @@ object CommunityTrickplay {
             val intervalS = meta.optDouble("interval_s", 0.0)
             val frameCount = meta.optInt("frame_count", 0)
             val cols = meta.optInt("cols", 0)
-            if (frameCount <= 0 || cols <= 0 || tileW <= 0 || tileH <= 0 || intervalS <= 0.0 || spriteUrl.isEmpty()) {
+            if (frameCount <= 0 || cols <= 0 || tileW <= 0 || tileH <= 0 ||
+                !intervalS.isFinite() || intervalS <= 0.0 || spriteUrl.isEmpty()
+            ) {
                 return@withContext null
             }
+
+            val cues: List<TrickplayTimelineCue>? = if (meta.has("vtt") && !meta.isNull("vtt")) {
+                val vttUrl = meta.optString("vtt", "")
+                // A declared VTT must establish real coverage. If it is unavailable or invalid, retain an
+                // empty index so crop falls through instead of inventing uniform timestamps.
+                runCatching {
+                    if (vttUrl.isBlank()) return@runCatching emptyList()
+                    vttConn = (URL(vttUrl).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        connectTimeout = 8_000
+                        readTimeout = 8_000
+                        useCaches = false
+                    }
+                    if (vttConn?.responseCode != 200) return@runCatching emptyList()
+                    val vtt = vttConn?.inputStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                        ?: return@runCatching emptyList()
+                    TrickplayTimeline.parseVtt(vtt, frameCount, cols, tileW, tileH) ?: emptyList()
+                }.getOrElse { emptyList() }
+            } else null
 
             // 2) The sprite is on the R2 public asset host, NOT a gated *.vortx.tv service host, so it stays
             // UNSIGNED (that route is exempt), matching Apple.
@@ -257,12 +290,21 @@ object CommunityTrickplay {
             val bytes = spriteConn.inputStream.use { it.readBytes() }
             val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@withContext null
 
-            Sheet(bitmap = bitmap, tileW = tileW, tileH = tileH, intervalS = intervalS, frameCount = frameCount, cols = cols)
+            Sheet(
+                bitmap = bitmap,
+                tileW = tileW,
+                tileH = tileH,
+                intervalS = intervalS,
+                frameCount = frameCount,
+                cols = cols,
+                cues = cues,
+            )
         } catch (_: IOException) {
             null
         } finally {
             metaConn?.disconnect()
             spriteConn?.disconnect()
+            vttConn?.disconnect()
         }
     }
 
@@ -282,7 +324,13 @@ object CommunityTrickplay {
     }
 
     /** The picked, decimated, encoded sheet buildAndUpload will POST. */
-    private data class PickedSheet(val jpeg: ByteArray, val count: Int, val cols: Int, val interval: Double)
+    private data class PickedSheet(
+        val jpeg: ByteArray,
+        val frames: List<CapturedFrame>,
+        val cueEndFences: List<Double?>,
+        val cols: Int,
+        val interval: Double,
+    )
 
     /**
      * Build a sprite-sheet + WEBVTT index from the device's captured frames and POST it (first-writer-wins).
@@ -305,7 +353,15 @@ object CommunityTrickplay {
         // [context] exists solely for this gate: the setting is now a real stored value, not a constant,
         // so the last line of defence before a POST has to read it.
         if (!isEnabled(context)) return@withContext UploadOutcome.Failed
-        val sorted = frames.sortedBy { it.time }
+        val retainedIndices = TrickplayTimeline.retainedIndices(
+            captureTimes = frames.map { it.time },
+            limit = maxOf(1, frames.size),
+        )
+        val sorted = retainedIndices.map { frames[it] }
+        val retainedInterval = TrickplayTimeline.nominalCadence(
+            captureTimes = sorted.map { it.time },
+            fallbackInterval = intervalS,
+        )
 
         // The sheet builder needs >= 2 tiles; clamp the effective lower bound to 2 so a 1-frame set is
         // rejected up front instead of failing later at the floor with a misleading log.
@@ -324,8 +380,18 @@ object CommunityTrickplay {
         var picked: PickedSheet? = null
         while (budget >= 2) {
             val stride = if (sorted.size > budget) ceil(sorted.size.toDouble() / budget.toDouble()).toInt() else 1
-            val effective = if (stride > 1) sorted.filterIndexed { i, _ -> i % stride == 0 } else sorted
-            val effectiveInterval = intervalS * stride.toDouble()
+            val targetCount = ceil(sorted.size.toDouble() / stride.toDouble()).toInt()
+            val effectiveIndices = TrickplayTimeline.evenlySpacedIndices(sorted.size, targetCount)
+            val effective = effectiveIndices.map { sorted[it] }
+            val effectiveInterval = retainedInterval * stride.toDouble()
+            val cueEndFences = TrickplayTimeline.selectedCueEndFences(
+                retainedCaptureTimes = sorted.map { it.time },
+                selectedIndices = effectiveIndices,
+                retainedCadence = retainedInterval,
+            ) ?: run {
+                Log.d(TAG, "buildAndUpload could not propagate retained timeline gaps -> dropped")
+                return@withContext UploadOutcome.Failed
+            }
             val cols = maxOf(1, ceil(sqrt(effective.size.toDouble())).toInt())
             val rows = ceil(effective.size.toDouble() / cols.toDouble()).toInt()
 
@@ -343,7 +409,7 @@ object CommunityTrickplay {
             }
             composed.recycle()
             if (fit != null) {
-                picked = PickedSheet(fit, effective.size, cols, effectiveInterval)
+                picked = PickedSheet(fit, effective, cueEndFences, cols, effectiveInterval)
                 break
             }
             Log.d(TAG, "buildAndUpload over 3MB at q40 tiles=${effective.size} cols=$cols rows=$rows budget=$budget -> re-decimate")
@@ -355,13 +421,24 @@ object CommunityTrickplay {
             return@withContext UploadOutcome.Failed
         }
 
-        val vtt = buildVtt(sheet.count, sheet.cols, TILE_W, TILE_H, sheet.interval)
+        val vtt = TrickplayTimeline.makeVtt(
+            captureTimes = sheet.frames.map { it.time },
+            nominalInterval = sheet.interval,
+            gapFenceInterval = retainedInterval,
+            cueEndFences = sheet.cueEndFences,
+            cols = sheet.cols,
+            tileW = TILE_W,
+            tileH = TILE_H,
+        ) ?: run {
+            Log.d(TAG, "buildAndUpload could not build a valid timestamp VTT -> dropped")
+            return@withContext UploadOutcome.Failed
+        }
         val meta = JSONObject()
             .put("imdb", imdbId)
             .put("season", season ?: 0)
             .put("episode", episode ?: 0)
             .put("durationBucket", durationBucket)
-            .put("frame_count", sheet.count)
+            .put("frame_count", sheet.frames.size)
             .put("tile_w", TILE_W)
             .put("tile_h", TILE_H)
             .put("interval_s", sheet.interval)
@@ -400,37 +477,6 @@ object CommunityTrickplay {
     private fun encodeJpeg(bitmap: Bitmap, quality: Int): ByteArray? {
         val out = ByteArrayOutputStream()
         return if (bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)) out.toByteArray() else null
-    }
-
-    /**
-     * WEBVTT mapping each tile window [t, t+interval) to `sprite#xywh=x,y,w,h` (Jellyfin/Plex web
-     * convention; the app crops the sub-rect itself). Row-major, cols per row. Mirrors Apple `buildVTT`.
-     */
-    private fun buildVtt(frameCount: Int, cols: Int, tileW: Int, tileH: Int, intervalS: Double): String {
-        val lines = ArrayList<String>(frameCount * 3 + 2)
-        lines.add("WEBVTT")
-        lines.add("")
-        for (i in 0 until frameCount) {
-            val start = i * intervalS
-            val end = (i + 1) * intervalS
-            val col = i % cols
-            val row = i / cols
-            val x = col * tileW
-            val y = row * tileH
-            lines.add("${vttTime(start)} --> ${vttTime(end)}")
-            lines.add("sprite#xywh=$x,$y,$tileW,$tileH")
-            lines.add("")
-        }
-        return lines.joinToString("\n")
-    }
-
-    private fun vttTime(seconds: Double): String {
-        val total = seconds.toInt()
-        val ms = ((seconds - total) * 1000).toInt()
-        val h = total / 3600
-        val m = (total % 3600) / 60
-        val s = total % 60
-        return "%02d:%02d:%02d.%03d".format(h, m, s, ms)
     }
 
     /**
