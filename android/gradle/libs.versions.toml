@@ -90,6 +90,7 @@ work = "2.10.0"
 okhttp = "4.12.0"
 junit = "4.13.2"
 jsonJvm = "20240303"
+zxing = "3.5.4"
 
 [libraries]
 compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
@@ -126,6 +127,7 @@ okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhtt
 work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "work" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 json-jvm = { group = "org.json", name = "json", version.ref = "jsonJvm" }
+zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

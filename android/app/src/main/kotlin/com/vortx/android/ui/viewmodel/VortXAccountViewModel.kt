@@ -3,10 +3,15 @@ package com.vortx.android.ui.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vortx.android.sync.VortXSyncManager
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.net.URLEncoder
 
 /// Which auth flow the signed-out form is showing. All three land in the same signed-in state.
 enum class VortXAccountMode { SIGN_IN, REGISTER, RECOVER }
@@ -19,6 +24,54 @@ sealed interface VortXAccountFormState {
     data object Submitting : VortXAccountFormState
     data class Error(val message: String) : VortXAccountFormState
 }
+
+sealed interface VortXQrJoinState {
+    data object Idle : VortXQrJoinState
+    data object Starting : VortXQrJoinState
+    data class Waiting(
+        val code: String,
+        val approvalUrl: String,
+        val reachTrouble: Boolean,
+    ) : VortXQrJoinState
+    data class SignedIn(val email: String) : VortXQrJoinState
+    data object Failed : VortXQrJoinState
+}
+
+internal sealed interface QrJoinerAction {
+    data class KeepWaiting(val reachTrouble: Boolean) : QrJoinerAction
+    data object Remint : QrJoinerAction
+    data class SignedIn(val email: String) : QrJoinerAction
+    data object Failed : QrJoinerAction
+}
+
+internal class QrJoinerReducer(
+    private val errorNoticeThreshold: Int = 4,
+    private val codeMaxAgeMs: Long = 240_000L,
+) {
+    private var consecutiveErrors = 0
+
+    fun onResult(result: VortXSyncManager.QrJoinResult, codeAgeMs: Long): QrJoinerAction = when (result) {
+        is VortXSyncManager.QrJoinResult.SignedIn -> QrJoinerAction.SignedIn(result.email)
+        VortXSyncManager.QrJoinResult.Failed -> QrJoinerAction.Failed
+        VortXSyncManager.QrJoinResult.Expired -> {
+            consecutiveErrors = 0
+            QrJoinerAction.Remint
+        }
+        VortXSyncManager.QrJoinResult.TransportError -> {
+            consecutiveErrors += 1
+            QrJoinerAction.KeepWaiting(consecutiveErrors >= errorNoticeThreshold)
+        }
+        VortXSyncManager.QrJoinResult.Pending -> {
+            consecutiveErrors = 0
+            if (codeAgeMs >= codeMaxAgeMs) QrJoinerAction.Remint else QrJoinerAction.KeepWaiting(false)
+        }
+    }
+}
+
+internal fun vortxApprovalUrl(code: String, devicePublicKey: String): String =
+    "https://vortx.tv/approve?c=${urlEncode(code.trim().uppercase())}&k=${urlEncode(devicePublicKey)}"
+
+private fun urlEncode(value: String): String = URLEncoder.encode(value, Charsets.UTF_8.name())
 
 /// Drives the VortX account screen against the app-wide [VortXSyncManager] -- the E2E-encrypted
 /// VortX account (NOT the engine's Stremio [com.vortx.android.data.AuthRepository], which keeps its
@@ -64,6 +117,10 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     private val _formState = MutableStateFlow<VortXAccountFormState>(VortXAccountFormState.Idle)
     val formState: StateFlow<VortXAccountFormState> = _formState.asStateFlow()
 
+    private val _qrJoinState = MutableStateFlow<VortXQrJoinState>(VortXQrJoinState.Idle)
+    val qrJoinState: StateFlow<VortXQrJoinState> = _qrJoinState.asStateFlow()
+    private var qrJoinJob: Job? = null
+
     /// True once sign-in answered TotpRequired: the form reveals the 6-digit field and resubmits with it.
     private val _totpRequired = MutableStateFlow(false)
     val totpRequired: StateFlow<Boolean> = _totpRequired.asStateFlow()
@@ -92,6 +149,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         _formState.value = VortXAccountFormState.Idle
         _totpRequired.value = false
         _totp.value = ""
+        if (mode != VortXAccountMode.SIGN_IN) stopQrJoiner()
     }
 
     fun onLoginChange(value: String) { _login.value = value }
@@ -104,6 +162,70 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         sync.retrySessionRestore()
     }
 
+    fun startQrJoiner() {
+        if (qrJoinJob?.isActive == true || account.value != null) return
+        qrJoinJob = viewModelScope.launch { runQrJoiner() }
+    }
+
+    fun retryQrJoiner() {
+        stopQrJoiner()
+        startQrJoiner()
+    }
+
+    fun stopQrJoiner() {
+        qrJoinJob?.cancel()
+        qrJoinJob = null
+        if (_qrJoinState.value !is VortXQrJoinState.SignedIn) {
+            _qrJoinState.value = VortXQrJoinState.Idle
+        }
+    }
+
+    private suspend fun runQrJoiner() {
+        while (currentCoroutineContext().isActive) {
+            _qrJoinState.value = VortXQrJoinState.Starting
+            val session = sync.qrStart()
+            if (session == null) {
+                _qrJoinState.value = VortXQrJoinState.Failed
+                return
+            }
+            val mintedAt = System.currentTimeMillis()
+            val reducer = QrJoinerReducer()
+            val approvalUrl = vortxApprovalUrl(session.code, session.devicePublicKey)
+            _qrJoinState.value = VortXQrJoinState.Waiting(session.code, approvalUrl, false)
+
+            var remint = false
+            while (currentCoroutineContext().isActive && !remint) {
+                delay(QR_POLL_INTERVAL_MS)
+                when (
+                    val action = reducer.onResult(
+                        sync.qrPoll(session),
+                        System.currentTimeMillis() - mintedAt,
+                    )
+                ) {
+                    is QrJoinerAction.KeepWaiting ->
+                        _qrJoinState.value = VortXQrJoinState.Waiting(
+                            session.code,
+                            approvalUrl,
+                            action.reachTrouble,
+                        )
+                    QrJoinerAction.Remint -> remint = true
+                    QrJoinerAction.Failed -> {
+                        _qrJoinState.value = VortXQrJoinState.Failed
+                        return
+                    }
+                    is QrJoinerAction.SignedIn -> {
+                        // Adoption updates sessionUiState immediately, which removes this QR composable.
+                        // Detach the current job first so its onDispose does not cancel reconciliation.
+                        qrJoinJob = null
+                        _qrJoinState.value = VortXQrJoinState.SignedIn(action.email)
+                        onQrAuthed()
+                        return
+                    }
+                }
+            }
+        }
+    }
+
     /// Submit whichever flow [mode] is showing. One submit in flight at a time.
     fun submit() {
         if (_formState.value == VortXAccountFormState.Submitting) return
@@ -112,6 +234,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
             _formState.value = VortXAccountFormState.Error(error)
             return
         }
+        stopQrJoiner()
         _formState.value = VortXAccountFormState.Submitting
         viewModelScope.launch {
             when (_mode.value) {
@@ -193,11 +316,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
      *    catch-up pull + poll retry until the doc is reachable.
      */
     private suspend fun onAuthed() {
-        _password.value = ""
-        _totp.value = ""
-        _recoveryInput.value = ""
-        _totpRequired.value = false
-        _formState.value = VortXAccountFormState.Idle
+        clearAuthInputs()
         when (sync.reconcileAfterSignIn()) {
             VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> {
                 _syncNotice.value = null
@@ -209,6 +328,26 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
                 sync.startRealtime()
             }
         }
+    }
+
+    /** QR is a deliberate transfer from an already approved device, so hydrate it without a second prompt. */
+    private suspend fun onQrAuthed() {
+        clearAuthInputs()
+        when (sync.reconcileAfterSignIn()) {
+            VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> _syncNotice.value = null
+            VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> sync.useAccountData()
+            VortXSyncManager.SignInReconcile.UNREACHABLE ->
+                _syncNotice.value = "Signed in. Your synced data wasn't reachable yet; it will catch up automatically."
+        }
+        sync.startRealtime()
+    }
+
+    private fun clearAuthInputs() {
+        _password.value = ""
+        _totp.value = ""
+        _recoveryInput.value = ""
+        _totpRequired.value = false
+        _formState.value = VortXAccountFormState.Idle
     }
 
     // ---- Reconcile choices (all still union/tombstone-safe inside the manager) ----
@@ -263,8 +402,14 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         _formState.value = VortXAccountFormState.Idle
     }
 
+    override fun onCleared() {
+        stopQrJoiner()
+        super.onCleared()
+    }
+
     private companion object {
         /// Floor for a NEW password (register/recover). Sign-in never gates: existing accounts rule.
         const val MIN_PASSWORD_LENGTH = 8
+        const val QR_POLL_INTERVAL_MS = 2_000L
     }
 }

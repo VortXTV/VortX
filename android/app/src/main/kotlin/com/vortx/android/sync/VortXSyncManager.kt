@@ -23,6 +23,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.URLEncoder
 import java.net.URL
 import java.util.Collections
 import java.util.IdentityHashMap
@@ -623,6 +624,25 @@ class VortXSyncManager(context: Context) {
         data class Failed(val message: String) : AuthResult
     }
 
+    /** In-memory QR pairing session. The private key and auth generation never leave this process. */
+    class QrJoinSession internal constructor(
+        val pairingID: String,
+        val code: String,
+        val devicePublicKey: String,
+        internal val ephemeralPrivateKey: ByteArray,
+        internal val operation: SessionOperationCoordinator.AuthOperation,
+    )
+
+    sealed interface QrJoinResult {
+        data object Pending : QrJoinResult
+        data object TransportError : QrJoinResult
+        data object Expired : QrJoinResult
+        data object Failed : QrJoinResult
+        data class SignedIn(val email: String) : QrJoinResult
+    }
+
+    enum class QrPollDisposition { READY, PENDING, EXPIRED, RETRIABLE_ERROR }
+
     /** [result] plus the one-time [recoveryCode] minted by a successful server-side registration. */
     data class RegisterResult(val result: AuthResult, val recoveryCode: String?) {
         companion object {
@@ -978,6 +998,71 @@ class VortXSyncManager(context: Context) {
             }
         }
         return AuthResult.Failed(if (code == 401) "Wrong login or password." else "Could not sign in.")
+    }
+
+    /** Start the joiner side of VortX account device pairing. */
+    suspend fun qrStart(): QrJoinSession? {
+        val operation = beginAuthOperation()
+        val ephemeral = VortXPairingCrypto.newEphemeral()
+        val permit = operation.acquireCallPermit() ?: return null
+        val (status, json) = request(
+            method = "POST",
+            path = "/v1/qr/start",
+            body = JSONObject().put("devicePublicKey", ephemeral.publicKeyBase64URL),
+            callPermit = permit,
+        )
+        if (!operation.isCurrent() || status != 200) return null
+        val pairingID = json?.optString("pairingID")?.takeIf { it.isNotBlank() } ?: return null
+        val code = json.optString("code").takeIf { it.isNotBlank() } ?: return null
+        return QrJoinSession(
+            pairingID = pairingID,
+            code = code.uppercase(),
+            devicePublicKey = ephemeral.publicKeyBase64URL,
+            ephemeralPrivateKey = ephemeral.privateKey,
+            operation = operation,
+        )
+    }
+
+    /** Poll once, adopting only after the approved payload decrypts to a valid 32-byte data key. */
+    suspend fun qrPoll(session: QrJoinSession): QrJoinResult {
+        val statusPermit = session.operation.acquireCallPermit() ?: return QrJoinResult.Failed
+        val encodedID = URLEncoder.encode(session.pairingID, Charsets.UTF_8.name())
+        val (status, json) = request(
+            method = "GET",
+            path = "/v1/qr/status?id=$encodedID",
+            body = null,
+            callPermit = statusPermit,
+        )
+        if (!session.operation.isCurrent()) return QrJoinResult.Failed
+        val token = json?.optString("token")?.takeIf { it.isNotBlank() }
+        val payload = json?.optString("payload")?.takeIf { it.isNotBlank() }
+        val approved = token != null && payload != null && !json.optBoolean("pending", false)
+        when (qrPollDisposition(status, approved)) {
+            QrPollDisposition.EXPIRED -> return QrJoinResult.Expired
+            QrPollDisposition.RETRIABLE_ERROR -> return QrJoinResult.TransportError
+            QrPollDisposition.PENDING -> return QrJoinResult.Pending
+            QrPollDisposition.READY -> Unit
+        }
+
+        val dataKey = unwrapQrPayload(payload.orEmpty(), session.ephemeralPrivateKey)
+            ?: return QrJoinResult.Failed
+        val mePermit = session.operation.acquireCallPermit() ?: return QrJoinResult.Failed
+        val (meStatus, meJson) = request(
+            method = "GET",
+            path = "/v1/auth/me",
+            body = null,
+            bearerToken = token,
+            callPermit = mePermit,
+        )
+        if (!session.operation.isCurrent()) return QrJoinResult.Failed
+        val account = meJson?.optJSONObject("account")
+        if (meStatus != 200 || account == null) return QrJoinResult.Failed
+        return when (adopt(session.operation, token.orEmpty(), account, dataKey)) {
+            SessionAdoption.ADOPTED -> QrJoinResult.SignedIn(account.optString("email"))
+            SessionAdoption.STALE,
+            SessionAdoption.STORAGE_FAILURE,
+            -> QrJoinResult.Failed
+        }
     }
 
     /**
@@ -1888,12 +1973,26 @@ class VortXSyncManager(context: Context) {
         }
     }
 
-    private companion object {
-        const val BASE = "https://api.vortx.tv"
-        const val TIMEOUT_MS = 20_000
-        const val SESSION_STORAGE_FAILURE =
+    companion object {
+        internal fun qrPollDisposition(status: Int, hasApproval: Boolean): QrPollDisposition = when {
+            status == 404 || status == 410 -> QrPollDisposition.EXPIRED
+            status == 0 || status == 429 || status >= 500 -> QrPollDisposition.RETRIABLE_ERROR
+            status == 200 && hasApproval -> QrPollDisposition.READY
+            else -> QrPollDisposition.PENDING
+        }
+
+        internal fun unwrapQrPayload(payload: String, privateKey: ByteArray): ByteArray? {
+            val envelope = runCatching { JSONObject(payload) }.getOrNull() ?: return null
+            val claim = envelope.optString("claim").takeIf { it.isNotBlank() } ?: return null
+            val wrapped = envelope.optString("wrapped").takeIf { it.isNotBlank() } ?: return null
+            return VortXPairingCrypto.unwrapDataKey(wrapped, claim, privateKey)
+        }
+
+        private const val BASE = "https://api.vortx.tv"
+        private const val TIMEOUT_MS = 20_000
+        private const val SESSION_STORAGE_FAILURE =
             "Secure storage is unavailable. Your VortX session was not changed. Please try again."
-        const val AUTH_SUPERSEDED =
+        private const val AUTH_SUPERSEDED =
             "This account action was superseded by a newer sign-in or sign-out."
 
         /**
@@ -1902,15 +2001,15 @@ class VortXSyncManager(context: Context) {
          * client that predates `openDocument`, so v2 writes stay off until every client ships dual-read.
          * `openDocument` reads BOTH formats regardless; only WRITE is gated. DO NOT flip.
          */
-        const val WRITE_SYNC_DOC_V2 = false
+        private const val WRITE_SYNC_DOC_V2 = false
 
         /** Debounce for the coalesced auto-push (Apple `requestSyncSoon`: 2.5s). */
-        const val SYNC_DEBOUNCE_MS = 2_500L
+        private const val SYNC_DEBOUNCE_MS = 2_500L
 
         /** Cap for failed pending-push retries; the delay doubles from [SYNC_DEBOUNCE_MS]. */
-        const val SYNC_RETRY_MAX_MS = 60_000L
+        private const val SYNC_RETRY_MAX_MS = 60_000L
 
         /** Bounded optimistic-concurrency retries for a derived push (Apple `pushDerivedDoc`: 3). */
-        const val PUSH_MAX_RETRIES = 3
+        private const val PUSH_MAX_RETRIES = 3
     }
 }
