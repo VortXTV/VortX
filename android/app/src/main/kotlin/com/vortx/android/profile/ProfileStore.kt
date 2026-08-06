@@ -283,6 +283,9 @@ class ProfileStore private constructor(context: Context) {
             subColor = base?.subColor ?: DEFAULT_SUB_COLOR,
             subBackground = base?.subBackground ?: DEFAULT_SUB_BACKGROUND,
             subSizeScale = base?.subSizeScale,
+            // Android does not apply the Apple brightness vocabulary yet, but it must carry the value
+            // losslessly so a profile round-trip cannot erase an Apple-side preference.
+            subBrightness = base?.subBrightness,
             // The FULL resolved order (never null), like Apple's SourcePreferences.typeOrder. A null here
             // would diff against the default order applyPlayback writes, spuriously re-pushing the roster.
             sourceTypeOrder = readFullOrder(),
@@ -453,18 +456,60 @@ class ProfileStore private constructor(context: Context) {
             .putString(ACTIVE_KEY, activeID)
             .apply()
         if (touch) {
-            // SECONDS since the epoch, matching Apple exactly (`Date().timeIntervalSince1970`,
-            // Profiles.swift). This value is the cross-platform newest-wins tiebreaker in [mergeInRoster];
-            // storing millis here would make every Android stamp dwarf every Apple seconds stamp, so
-            // Apple-side edits to a shared profile would silently lose every field conflict.
-            prefs.edit().putLong(MODIFIED_KEY, System.currentTimeMillis() / 1000).apply()
+            // Fractional epoch SECONDS, matching Apple's `Date().timeIntervalSince1970` Double. Integer
+            // seconds collapsed every edit within the same second into a tie and truncated Apple clocks.
+            writeRosterClock(
+                nextLocalRosterClock(
+                    nowSeconds = System.currentTimeMillis() / 1000.0,
+                    priorModified = rosterModified,
+                ),
+            )
             onRosterPush(profiles)
         }
     }
 
-    /** Local epoch-SECONDS stamp of the last real roster edit (Apple's unit); the merge tiebreak for a
-     *  same-id conflict. The sync layer must feed [mergeInRoster]'s `incomingModified` in seconds too. */
-    val rosterModified: Long get() = prefs.getLong(MODIFIED_KEY, 0L)
+    /**
+     * Local fractional epoch-SECONDS stamp of the last real roster edit. SharedPreferences has no Double
+     * primitive, so the exact IEEE-754 bits live in a private sync-bookkeeping Long. The canonical Apple
+     * key remains a whole-second Long for safe rollback to older Android builds; a missing exact key is
+     * migrated from that legacy value on first read.
+     */
+    val rosterModified: Double
+        get() {
+            val exactBits = if (prefs.contains(MODIFIED_BITS_KEY)) {
+                runCatching { prefs.getLong(MODIFIED_BITS_KEY, 0L) }.getOrNull()
+            } else {
+                null
+            }
+            val legacySeconds = legacyRosterClock()
+            val resolved = decodeStoredRosterClock(exactBits, legacySeconds) ?: return 0.0
+            // An older app updates only the canonical Long and leaves our exact-bits key behind. Heal both
+            // representations from the newest valid value so returning to this build cannot revive that stale key.
+            if (exactBits != resolved.toRawBits() || legacySeconds != resolved.toLong()) {
+                writeRosterClock(resolved)
+            }
+            return resolved
+        }
+
+    private fun legacyRosterClock(): Long? =
+        if (prefs.contains(MODIFIED_KEY)) runCatching { prefs.getLong(MODIFIED_KEY, 0L) }.getOrNull() else null
+
+    private fun writeRosterClock(seconds: Double) {
+        if (!seconds.isFinite() || seconds < 0.0) return
+        prefs.edit()
+            .putLong(MODIFIED_BITS_KEY, seconds.toRawBits())
+            .putLong(MODIFIED_KEY, seconds.toLong())
+            .apply()
+    }
+
+    /**
+     * Adopt a pulled roster's monotone high-water mark even when its fields already equal local state.
+     * Without this write, a later unrelated push republishes an older clock through both carriers and a
+     * stale peer can win the next same-id fold. This is housekeeping, so it never schedules a push.
+     */
+    private fun adoptRosterWatermark(next: Double) {
+        if (next > rosterModified) writeRosterClock(next)
+    }
 
     // ---- Delete tombstones ----
 
@@ -550,35 +595,25 @@ class ProfileStore private constructor(context: Context) {
      * [incomingModified] vs [rosterModified], both epoch-SECONDS) wins the fields; either way the id is retained. Delete
      * tombstones are subtracted from the union. Mirrors Apple `mergeInRoster`.
      */
-    fun mergeInRoster(incoming: List<UserProfile>, incomingModified: Long? = null) {
+    fun mergeInRoster(incoming: List<UserProfile>, incomingModified: Double? = null) {
         if (incoming.isEmpty()) return
-        val preferIncoming = (incomingModified ?: Long.MIN_VALUE) > rosterModified
-        val local = profiles
-        val incomingByID = incoming.associateBy { it.id }
-        val localByID = local.associateBy { it.id }
-
-        val merged = local.map { l ->
-            val r = incomingByID[l.id] ?: return@map l
-            // Fresh-install owner-clobber guard (tightly scoped). A just-reinstalled device restores its
-            // session but its roster is still the un-hydrated placeholder owner migrateFromSingleAccount
-            // mints: the FIXED owner id, name exactly "Main", nil email. If the local owner still carries
-            // that EXACT signature while the incoming (cloud) owner is hydrated (real name OR real email),
-            // adopt the incoming owner even when local looks "newer", so the reinstalled device shows the
-            // real profile instead of serializing its default "Main" back up. Scoped so it can NEVER
-            // override a real rename.
-            if (l.id == UserProfile.OWNER_ID && l.name == "Main" && (l.email ?: "").isEmpty() &&
-                (r.name != "Main" || !(r.email ?: "").isEmpty())
-            ) return@map r
-            if (preferIncoming) r else l
-        }.toMutableList()
-        for (r in incoming) if (!localByID.containsKey(r.id)) merged.add(r)
-
-        // SUBTRACT delete tombstones: a deleted profile must NOT come back, even if a peer still carries it.
-        merged.removeAll { deletedProfileIDs.contains(it.id) && !it.isOwner }
-
-        if (merged == profiles) return   // no change once ids + chosen fields already match; never loops
-        profiles = merged
-        afterRosterFold()
+        val transition = rosterPullMergeTransition(
+            local = profiles,
+            incoming = incoming,
+            deletedProfileIDs = deletedProfileIDs,
+            localModified = rosterModified,
+            incomingModified = incomingModified,
+        )
+        applyRosterPullMergeTransition(
+            transition = transition,
+            replaceProfiles = { merged ->
+                profiles = merged
+                afterRosterFold()
+            },
+            // The carrier watermark is state too. Persist it even when the roster payload is identical.
+            adoptWatermark = ::adoptRosterWatermark,
+            schedulePush = { onRosterPush(profiles) },
+        )
     }
 
     /** Whether [incoming] is a genuinely different roster (by the SET of ids). Mirrors Apple `rosterDiffers`. */
@@ -693,6 +728,7 @@ class ProfileStore private constructor(context: Context) {
         private const val LIST_KEY = "stremiox.profiles"
         private const val ACTIVE_KEY = "stremiox.profiles.active"
         private const val MODIFIED_KEY = "stremiox.profiles.modified"
+        private const val MODIFIED_BITS_KEY = "vortx.sync.profiles.modified.doubleBits"
         private const val DELETED_KEY = "stremiox.profiles.deleted"
         private const val EMAIL_KEY = "stremiox.email"
         const val ACTIVE_DISABLED_ADDONS_KEY = "stremiox.profile.disabledAddons"
@@ -723,4 +759,99 @@ class ProfileStore private constructor(context: Context) {
         /** The shared instance, or null before [init] (safe for early-boot wiring lambdas). */
         fun sharedOrNull(): ProfileStore? = instance
     }
+}
+
+/** Pure clock fold shared by field selection and the persisted high-water mark. */
+internal data class RosterClockDecision(
+    val preferIncoming: Boolean,
+    val effectiveModified: Double,
+)
+
+internal fun rosterClockDecision(localModified: Double, incomingModified: Double?): RosterClockDecision {
+    val local = localModified.takeIf { it.isFinite() && it >= 0.0 } ?: 0.0
+    val incoming = incomingModified?.takeIf { it.isFinite() && it >= 0.0 }
+    return RosterClockDecision(
+        preferIncoming = incoming != null && incoming > local,
+        effectiveModified = incoming?.let { maxOf(local, it) } ?: local,
+    )
+}
+
+/** Exact SharedPreferences representation with a legacy whole-second migration path. */
+internal fun decodeStoredRosterClock(exactBits: Long?, legacySeconds: Long?): Double? {
+    val exact = exactBits?.let(Double::fromBits)?.takeIf { it.isFinite() && it >= 0.0 }
+    val legacy = legacySeconds?.toDouble()?.takeIf { it >= 0.0 }
+    return when {
+        exact == null -> legacy
+        legacy == null -> exact
+        else -> maxOf(exact, legacy)
+    }
+}
+
+/**
+ * A local edit is a Lamport-style advance over both wall time and the persisted roster watermark. This
+ * keeps it newer than a future peer clock, survives a wall-clock rollback, and prevents same-millisecond ties.
+ */
+internal fun nextLocalRosterClock(nowSeconds: Double, priorModified: Double): Double {
+    val prior = priorModified.takeIf { it.isFinite() && it >= 0.0 } ?: 0.0
+    val now = nowSeconds.takeIf { it.isFinite() && it >= 0.0 } ?: 0.0
+    val successor = Math.nextUp(prior)
+    return if (successor.isFinite()) maxOf(now, successor) else prior
+}
+
+/**
+ * Pure production seam for a pulled roster fold. A pull can persist content and/or adopt a newer
+ * watermark, but never requests a push; this prevents an equal payload clock adoption from echoing.
+ */
+internal data class RosterPullMergeTransition(
+    val profiles: List<UserProfile>,
+    val effectiveModified: Double,
+    val contentChanged: Boolean,
+    val pushRequired: Boolean,
+)
+
+internal fun rosterPullMergeTransition(
+    local: List<UserProfile>,
+    incoming: List<UserProfile>,
+    deletedProfileIDs: Set<String>,
+    localModified: Double,
+    incomingModified: Double?,
+): RosterPullMergeTransition {
+    val clock = rosterClockDecision(localModified, incomingModified)
+    val incomingByID = incoming.associateBy { it.id }
+    val localByID = local.associateBy { it.id }
+    val merged = local.map { existing ->
+        val remote = incomingByID[existing.id] ?: return@map existing
+        // A freshly reinstalled placeholder owner may adopt the hydrated cloud owner even if its local
+        // clock is newer. The exact signature keeps this from overriding a real rename.
+        if (existing.id == UserProfile.OWNER_ID && existing.name == "Main" &&
+            (existing.email ?: "").isEmpty() &&
+            (remote.name != "Main" || !(remote.email ?: "").isEmpty())
+        ) {
+            remote
+        } else if (clock.preferIncoming) {
+            remote
+        } else {
+            existing
+        }
+    }.toMutableList()
+    for (remote in incoming) if (!localByID.containsKey(remote.id)) merged.add(remote)
+    merged.removeAll { deletedProfileIDs.contains(it.id) && !it.isOwner }
+    return RosterPullMergeTransition(
+        profiles = merged,
+        effectiveModified = clock.effectiveModified,
+        contentChanged = merged != local,
+        pushRequired = false,
+    )
+}
+
+/** Execute the pure transition through the same callbacks production uses, allowing behavioral JVM tests. */
+internal fun applyRosterPullMergeTransition(
+    transition: RosterPullMergeTransition,
+    replaceProfiles: (List<UserProfile>) -> Unit,
+    adoptWatermark: (Double) -> Unit,
+    schedulePush: () -> Unit,
+) {
+    if (transition.contentChanged) replaceProfiles(transition.profiles)
+    adoptWatermark(transition.effectiveModified)
+    if (transition.pushRequired) schedulePush()
 }

@@ -3,6 +3,7 @@ package com.vortx.android.sync
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import com.vortx.android.backup.SettingsBackup
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
@@ -671,8 +672,10 @@ class VortXSyncManager(context: Context) {
         override fun hashCode(): Int = 31 * (31 * token.hashCode() + account.hashCode()) + dataKey.contentHashCode()
     }
 
-    private val debridKeys = DebridKeys(context.applicationContext)
-    private val store = SessionStore(context.applicationContext)
+    private val appContext = context.applicationContext
+    private val settingsBundleId = appContext.packageName
+    private val debridKeys = DebridKeys(appContext)
+    private val store = SessionStore(appContext)
     private val initialSessionLoad = store.load()
     private val sessionState = DurableSessionState(
         initialValue = (initialSessionLoad as? SessionLoad.Available)?.session,
@@ -688,7 +691,7 @@ class VortXSyncManager(context: Context) {
      * UserDefaults `lastSyncedVersion` / `sawDocV2`). Plain SharedPreferences on purpose: a version int and
      * a bool are NOT sensitive (only the data key is), and Apple keeps them in UserDefaults, not the Keychain.
      */
-    private val syncState = SyncStateStore(context.applicationContext)
+    private val syncState = SyncStateStore(appContext)
     private val pendingState = DurablePendingSyncState(
         readDirty = syncState::hasPendingPush,
         writeDirty = syncState::setPendingPush,
@@ -1428,6 +1431,12 @@ class VortXSyncManager(context: Context) {
         }
         if (!isSyncLeaseCurrent(lease)) return null
         val parsed = VortXSyncDoc.parse(doc)
+        val resolvedRoster = SettingsBackup.resolveRosterForPull(
+            pulledBlob = doc.opt("settings"),
+            fallbackRoster = parsed.roster,
+            fallbackModifiedSeconds = parsed.rosterModifiedSeconds,
+            fallbackIsLossless = parsed.rosterIsLossless,
+        )
         // ProfileStore is a main-thread store (mirroring Apple's @MainActor); fold + build on Main.
         val published = withContext(Dispatchers.Main) {
             publishIfSyncLeaseCurrent(lease) {
@@ -1443,12 +1452,18 @@ class VortXSyncManager(context: Context) {
                     // is a monotone, idempotent union that also prunes the live roster, so it needs no version
                     // gate; buildVortx then emits the folded set (and read-merges the pulled one again).
                     if (parsed.deletedProfiles.isNotEmpty()) store.mergeDeletedTombstones(parsed.deletedProfiles)
-                    parsed.roster?.let {
-                        if (it.isNotEmpty()) store.mergeInRoster(it, parsed.rosterModifiedSeconds)
+                    resolvedRoster.roster?.let {
+                        if (it.isNotEmpty()) store.mergeInRoster(it, resolvedRoster.modifiedSeconds)
                     }
                 } finally {
                     applyingRemote = false
                 }
+                SettingsBackup.settingsBlobFor(
+                    pulledBlob = doc.opt("settings"),
+                    roster = store.profiles,
+                    rosterModifiedSeconds = store.rosterModified,
+                    bundleId = settingsBundleId,
+                )?.let { doc.put("settings", it) }
                 doc.put("vortx", VortXSyncDoc.buildVortx(store, doc.optJSONObject("vortx")))
             }
         }
@@ -1487,6 +1502,12 @@ class VortXSyncManager(context: Context) {
         // VERSION-WINS: apply only a STRICTLY-NEWER remote; a stale or equal pull is a no-op.
         if (!force && version <= lastSyncedVersion(lease)) return false
         val parsed = VortXSyncDoc.parse(doc)
+        val resolvedRoster = SettingsBackup.resolveRosterForPull(
+            pulledBlob = doc.opt("settings"),
+            fallbackRoster = parsed.roster,
+            fallbackModifiedSeconds = parsed.rosterModifiedSeconds,
+            fallbackIsLossless = parsed.rosterIsLossless,
+        )
         var restored = false
         val published = withContext(Dispatchers.Main) {
             val store = resolveStore() ?: return@withContext false
@@ -1501,9 +1522,9 @@ class VortXSyncManager(context: Context) {
                         restored = true
                     }
                     // Roster UNION (never shrinks local; newest-wins by epoch-SECONDS; subtracts tombstones).
-                    parsed.roster?.let { remote ->
+                    resolvedRoster.roster?.let { remote ->
                         if (remote.isNotEmpty()) {
-                            store.mergeInRoster(remote, parsed.rosterModifiedSeconds)
+                            store.mergeInRoster(remote, resolvedRoster.modifiedSeconds)
                             restored = true
                         }
                     }

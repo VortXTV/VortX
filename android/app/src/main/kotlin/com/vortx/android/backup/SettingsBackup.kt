@@ -2,7 +2,12 @@ package com.vortx.android.backup
 
 import com.vortx.android.profile.UserProfile
 import org.json.JSONObject
+import java.math.BigDecimal
+import java.math.BigInteger
 import java.text.SimpleDateFormat
+import java.time.OffsetDateTime
+import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeParseException
 import java.util.Base64
 import java.util.Date
 import java.util.Locale
@@ -53,6 +58,11 @@ import java.util.TimeZone
  */
 object SettingsBackup {
 
+    data class ResolvedRoster(
+        val roster: List<UserProfile>?,
+        val modifiedSeconds: Double?,
+    )
+
     /** Envelope schema. Apple `SettingsBackup.swift:20`. */
     const val SCHEMA = 1
 
@@ -96,10 +106,27 @@ object SettingsBackup {
         "stremiox.serverURL",
         "stremiox.videoUpscaling",
         "stremiox.dvRemux",
+        "vortx.pgsSubtitleOCR",
+        "vortx.downloads.queueOrder",
+        "vortx.downloads.maxConcurrent",
+        "vortx.moveSeeding.launchNagDismissedBuild",
     )
 
-    /** An app preference that is ALSO safe to sync. Apple `SettingsBackup.swift:47-49`. */
-    fun isSyncable(key: String): Boolean = isAppPref(key) && !DEVICE_LOCAL_KEYS.contains(key)
+    /** Per-account sync bookkeeping and Keychain mutation state belong only to the current device. */
+    private val DEVICE_LOCAL_KEY_PREFIXES = listOf(
+        "vortx.sync.",
+        "kcinvalidated.",
+    )
+
+    /** Old Keychain fallback slots contain credentials and must be scrubbed from pulled blobs. */
+    private val SECRET_KEY_PREFIXES = listOf("kcfallback.")
+
+    /** An app preference that is also safe to sync. Apple `SettingsBackup.swift:117-123`. */
+    fun isSyncable(key: String): Boolean =
+        isAppPref(key) &&
+            !DEVICE_LOCAL_KEYS.contains(key) &&
+            DEVICE_LOCAL_KEY_PREFIXES.none { key.startsWith(it) } &&
+            SECRET_KEY_PREFIXES.none { key.startsWith(it) }
 
     /**
      * The 0.4 rename seam. Both empty today, matching Apple `SettingsBackup.swift:57-58`. Populate IN
@@ -125,8 +152,8 @@ object SettingsBackup {
      *
      * Every one of the seven fields is REQUIRED: Apple decodes into a non-optional `Codable` struct, so a
      * missing field throws and the whole blob is rejected as `notABackup` (`SettingsBackup.swift:111`).
-     * `createdAt` must be ISO8601 with NO fractional seconds, because Swift's `.iso8601` strategy uses
-     * `ISO8601DateFormatter` with default `.withInternetDateTime`, which does not parse them.
+     * `createdAt` is emitted in Apple's canonical UTC second-precision shape. Current Foundation decoders
+     * also accept fractional seconds and numeric offsets, which [decodeDomain] deliberately tolerates.
      *
      * Returns null when the domain holds a value [BinaryPlist] cannot represent exactly.
      */
@@ -151,8 +178,14 @@ object SettingsBackup {
      */
     fun decodeDomain(data: ByteArray): Map<String, Any>? {
         val env = runCatching { JSONObject(String(data, Charsets.UTF_8)) }.getOrNull() ?: return null
-        if (env.optString("format") != FORMAT_TAG) return null
-        val payload = env.optString("payloadBase64", "")
+        if (!hasString(env, "format") || env.getString("format") != FORMAT_TAG) return null
+        if (!hasJsonInt(env, "schema")) return null
+        if (!hasString(env, "app")) return null
+        if (!hasString(env, "bundleID")) return null
+        if (!hasAppleIso8601Date(env, "createdAt")) return null
+        if (!hasJsonInt(env, "keyCount")) return null
+        if (!hasString(env, "payloadBase64")) return null
+        val payload = env.getString("payloadBase64")
         if (payload.isEmpty()) return null
         val plist = runCatching { Base64.getDecoder().decode(payload) }.getOrNull() ?: return null
         val decoded = BinaryPlist.decode(plist) as? Map<*, *> ?: return null
@@ -174,7 +207,7 @@ object SettingsBackup {
      * Returns null when the blob is absent, unreadable, or carries no roster, so a caller can skip the
      * union when there is nothing to merge (Apple's exact contract).
      */
-    fun rosterFromBlob(blob: String?): List<UserProfile>? {
+    fun rosterFromBlob(blob: Any?): List<UserProfile>? {
         val domain = domainFromBlob(blob) ?: return null
         val rosterBytes = domain[ROSTER_KEY] as? ByteArray ?: return null
         return UserProfile.decodeRoster(String(rosterBytes, Charsets.UTF_8))
@@ -185,28 +218,66 @@ object SettingsBackup {
      * from an APPLE-authored doc (which carries no `vortx.rosterModified`) still feed the real tiebreak to
      * `ProfileStore.mergeInRoster` instead of defaulting to "keep local".
      */
-    fun rosterModifiedFromBlob(blob: String?): Long? {
+    fun rosterModifiedFromBlob(blob: Any?): Double? {
         val v = domainFromBlob(blob)?.get(MODIFIED_KEY) ?: return null
-        return when (v) {
-            is Double -> v.toLong()
-            is Long -> v          // tolerated: an integral stamp is a valid plist int
-            else -> null
+        val seconds = when (v) {
+            is Double -> v
+            is Long -> v.toDouble() // tolerated: an integral stamp is a valid plist int
+            else -> return null
         }
+        return seconds.takeIf { it.isFinite() && it >= 0.0 }
     }
 
     /** The active-profile id out of a blob, or null when absent. Apple stores it as a plist string. */
-    fun activeFromBlob(blob: String?): String? = domainFromBlob(blob)?.get(ACTIVE_KEY) as? String
+    fun activeFromBlob(blob: Any?): String? = domainFromBlob(blob)?.get(ACTIVE_KEY) as? String
 
-    private fun domainFromBlob(blob: String?): Map<String, Any>? {
-        if (blob.isNullOrEmpty()) return null
-        val data = runCatching { Base64.getDecoder().decode(blob) }.getOrNull() ?: return null
+    private fun domainFromBlob(blob: Any?): Map<String, Any>? {
+        val encoded = blob as? String ?: return null
+        if (encoded.isEmpty()) return null
+        val data = runCatching { Base64.getDecoder().decode(encoded) }.getOrNull() ?: return null
         return decodeDomain(data)
     }
 
     /**
+     * Resolve the lossless settings carrier against `doc.vortx`. A valid, non-empty settings roster always
+     * wins same-id fields over the lossy dashboard summary because that summary omits account identity.
+     * When `doc.vortx.roster` is present, both carriers are lossless, so their own modification stamps pick
+     * same-id fields. Profiles unique to either carrier survive and the maximum stamp moves forward.
+     * A missing or unreadable settings blob leaves the fallback untouched.
+     */
+    fun resolveRosterForPull(
+        pulledBlob: Any?,
+        fallbackRoster: List<UserProfile>?,
+        fallbackModifiedSeconds: Double?,
+        fallbackIsLossless: Boolean = false,
+    ): ResolvedRoster {
+        val settingsRoster = rosterFromBlob(pulledBlob)?.takeIf { it.isNotEmpty() }
+            ?: return ResolvedRoster(fallbackRoster, fallbackModifiedSeconds)
+        val settingsModifiedSeconds = rosterModifiedFromBlob(pulledBlob)
+        val settingsWinsSameId = !fallbackIsLossless ||
+            (settingsModifiedSeconds ?: Double.NEGATIVE_INFINITY) >=
+            (fallbackModifiedSeconds ?: Double.NEGATIVE_INFINITY)
+        val preferred = if (settingsWinsSameId) settingsRoster else fallbackRoster.orEmpty()
+        val secondary = if (settingsWinsSameId) fallbackRoster.orEmpty() else settingsRoster
+        val preferredIds = preferred.mapTo(HashSet()) { it.id }
+        val merged = preferred + secondary.filterNot { preferredIds.contains(it.id) }
+        return ResolvedRoster(
+            roster = merged,
+            // `updatedAt` belongs to the lossy dashboard summary, not to the roster encoded in settings.
+            // It may describe a completely unrelated account-doc edit. Only another FULL roster carrier
+            // may donate its clock to the high-water mark.
+            modifiedSeconds = if (fallbackIsLossless) {
+                listOfNotNull(settingsModifiedSeconds, fallbackModifiedSeconds).maxOrNull()
+            } else {
+                settingsModifiedSeconds
+            },
+        )
+    }
+
+    /**
      * Build the `doc.settings` blob to push: the PULLED blob's domain with only this port's roster keys
-     * overwritten, re-encoded. This is the write half of the round-trip, and the one D5 wires into
-     * `VortXSyncManager.mergeLocalIntoDoc` next to `doc["vortx"] = ...`.
+     * overwritten, re-encoded. `VortXSyncManager.mergeLocalIntoDoc` uses this beside its `doc.vortx`
+     * summary update so both platforms receive the lossless roster carrier.
      *
      * Returns null meaning "do not touch `doc["settings"]`", in three cases, each deliberate:
      *   1. [roster] is empty. NEVER-ZERO: a momentarily empty local roster must not overwrite the account's
@@ -223,9 +294,9 @@ object SettingsBackup {
      * advisory). Left null, the pulled value passes through untouched rather than being clobbered.
      */
     fun settingsBlobFor(
-        pulledBlob: String?,
+        pulledBlob: Any?,
         roster: List<UserProfile>,
-        rosterModifiedSeconds: Long,
+        rosterModifiedSeconds: Double,
         bundleId: String,
         app: String = "VortX",
         activeId: String? = null,
@@ -233,16 +304,18 @@ object SettingsBackup {
     ): String? {
         if (roster.isEmpty()) return null                       // never-zero
 
-        val base: MutableMap<String, Any> = if (pulledBlob.isNullOrEmpty()) {
-            LinkedHashMap()                                     // fresh account: nothing to preserve
-        } else {
-            LinkedHashMap(domainFromBlob(pulledBlob) ?: return null)   // fail-closed on an unreadable blob
+        val base: MutableMap<String, Any> = when {
+            pulledBlob == null || pulledBlob == JSONObject.NULL -> LinkedHashMap()
+            pulledBlob is String && pulledBlob.isEmpty() -> LinkedHashMap()
+            pulledBlob is String -> LinkedHashMap(domainFromBlob(pulledBlob) ?: return null)
+            else -> return null
         }
 
         // The roster rides as plist DATA of UTF-8 JSON, matching JSONEncoder().encode(profiles) on Apple.
         base[ROSTER_KEY] = UserProfile.encodeRoster(roster).toByteArray(Charsets.UTF_8)
         // A plist REAL of epoch SECONDS, matching Date().timeIntervalSince1970 / double(forKey:) on Apple.
-        base[MODIFIED_KEY] = rosterModifiedSeconds.toDouble()
+        if (!rosterModifiedSeconds.isFinite() || rosterModifiedSeconds < 0.0) return null
+        base[MODIFIED_KEY] = rosterModifiedSeconds
         activeId?.let { base[ACTIVE_KEY] = it }
 
         val bytes = encode(base, bundleId = bundleId, app = app, now = now) ?: return null
@@ -250,11 +323,64 @@ object SettingsBackup {
     }
 
     /**
-     * Apple's `.iso8601` wire format: UTC, second precision, trailing Z. Fractional seconds would make
-     * Swift's decoder throw and reject the whole envelope as `notABackup`.
+     * Apple's encoder wire format: UTC, second precision, trailing Z.
      */
     private fun iso8601(date: Date): String =
         SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
             .apply { timeZone = TimeZone.getTimeZone("UTC") }
             .format(date)
+
+    private fun hasString(objectValue: JSONObject, key: String): Boolean =
+        objectValue.has(key) && !objectValue.isNull(key) && objectValue.opt(key) is String
+
+    /**
+     * Swift `Codable` requires a JSON integer for both `schema` and `keyCount`; strings/bools fail.
+     * Foundation accepts integral decimal/exponent forms such as `1.0` and `1e3`, but rejects values
+     * outside signed 64-bit `Int`. BigDecimal avoids Double's rounded Long.MAX boundary accepting 2^63.
+     */
+    private fun hasJsonInt(objectValue: JSONObject, key: String): Boolean {
+        if (!objectValue.has(key) || objectValue.isNull(key)) return false
+        val value = objectValue.opt(key)
+        if (value !is Number) return false
+        val integer = runCatching { BigDecimal(value.toString()).toBigIntegerExact() }.getOrNull()
+            ?: return false
+        if (integer < SWIFT_INT_MIN || integer > SWIFT_INT_MAX) return false
+        // Foundation rejects floating-form Int.min itself and positive values whose Double rounds onto 2^63.
+        // It still accepts negative Int.min + 1 decimal/exponent forms even though their Double also rounds to
+        // -2^63, so keep the lower check exact rather than applying symmetric floating bounds.
+        if (value is BigDecimal || value is Double || value is Float) {
+            val floating = value.toDouble()
+            if (!floating.isFinite() ||
+                integer == SWIFT_INT_MIN || floating >= SWIFT_INT_EXCLUSIVE_BOUND
+            ) {
+                return false
+            }
+        }
+        return true
+    }
+
+    /**
+     * Current local Foundation `.iso8601` verification accepts internet date-time with optional fractions
+     * plus `Z`, `+HH`, `+HHMM`, or `+HH:MM`; lowercase `t`/`z` is rejected. Keep this grammar aligned with
+     * those executed fixtures rather than broadening it independently.
+     */
+    private fun hasAppleIso8601Date(objectValue: JSONObject, key: String): Boolean {
+        if (!hasString(objectValue, key)) return false
+        val raw = objectValue.getString(key)
+        if (!APPLE_ISO8601.matches(raw)) return false
+        val normalized = COMPACT_ISO8601_OFFSET.replace(raw, "\$1:\$2")
+        return try {
+            OffsetDateTime.parse(normalized, DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+            true
+        } catch (_: DateTimeParseException) {
+            false
+        }
+    }
+
+    private val APPLE_ISO8601 =
+        Regex("""^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}(?::?\d{2})?)$""")
+    private val COMPACT_ISO8601_OFFSET = Regex("""([+-]\d{2})(\d{2})$""")
+    private const val SWIFT_INT_EXCLUSIVE_BOUND = 9_223_372_036_854_775_808.0
+    private val SWIFT_INT_MIN: BigInteger = BigInteger.valueOf(Long.MIN_VALUE)
+    private val SWIFT_INT_MAX: BigInteger = BigInteger.valueOf(Long.MAX_VALUE)
 }

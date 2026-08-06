@@ -16,11 +16,10 @@ import org.json.JSONObject
  * `decodeRoster` / `byProfile` / `deletedProfiles` reads (read side), in
  * `app/SourcesShared/VortXSyncManager.swift`.
  *
- * WHY A JSON ROSTER CARRIER (the one deliberate Apple divergence): Apple carries the roster inside the
- * opaque base64 `doc.settings` blob (a binary-plist of the whole UserDefaults domain) and emits
- * `doc.vortx.profiles` only as a lossy DASHBOARD summary. Android has not ported `SettingsBackup` yet
- * (see the notes in `MirrorSettings` / `TrackPreferences` / `PlayerSettings`), so there is no settings
- * blob to read a roster out of. This codec therefore carries the roster in the vortx block two ways:
+ * WHY A SECOND JSON ROSTER CARRIER: Apple carries the roster inside the opaque base64 `doc.settings`
+ * blob (a binary-plist of the whole UserDefaults domain) and emits `doc.vortx.profiles` only as a lossy
+ * DASHBOARD summary. Android now reads and writes that canonical settings carrier too, while retaining
+ * the older full `doc.vortx.roster` for compatibility with deployed Android clients. This codec carries:
  *   - `vortx.roster`  — the FULL, lossless roster (Apple's exact `UserProfile` Codable field names via
  *     [UserProfile.encodeProfile] / [UserProfile.decodeProfile]), so Android round-trips EVERY field
  *     (usesOwnAccount, email, accentID, the whole PlaybackPrefs) with zero loss on Android<->Android sync.
@@ -48,7 +47,9 @@ object VortXSyncDoc {
         /** The remote roster, or null when the doc carries neither `vortx.roster` nor `vortx.profiles`. */
         val roster: List<UserProfile>?,
         /** The roster's modification stamp in epoch-SECONDS (mergeInRoster's tiebreak), or null. */
-        val rosterModifiedSeconds: Long?,
+        val rosterModifiedSeconds: Double?,
+        /** True only when [roster] came from the full `vortx.roster`, never the lossy dashboard summary. */
+        val rosterIsLossless: Boolean,
         /** Each non-owner profile's overlay library/CW, keyed by profile id then meta id. */
         val overlays: Map<String, Map<String, WatchEntry>>,
         /** Cross-device profile delete tombstones. */
@@ -61,23 +62,23 @@ object VortXSyncDoc {
 
     fun parse(doc: JSONObject): Parsed {
         val vortx = doc.optJSONObject("vortx")
-            ?: return Parsed(null, null, emptyMap(), emptyList(), null)
+            ?: return Parsed(null, null, false, emptyMap(), emptyList(), null)
 
         // Roster: prefer the FULL lossless carrier (Android-authored); else reconstruct from the dashboard
         // summary (Apple / web-authored) so a cross-surface doc still yields a usable roster.
-        val roster: List<UserProfile>? = vortx.optJSONArray("roster")?.let { arr ->
+        val fullRoster = vortx.optJSONArray("roster")
+        val roster: List<UserProfile>? = fullRoster?.let { arr ->
             (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i)?.let { UserProfile.decodeProfile(it) } }
         } ?: vortx.optJSONArray("profiles")?.let { arr ->
             (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i)?.let { rosterFromSummary(it) } }
         }
 
-        // Modification tiebreak in epoch-SECONDS: prefer the explicit Android key; else derive from Apple's
-        // epoch-MS `updatedAt` (divide by 1000). ALWAYS read as Long (optLong) — updatedAt is a 64-bit
-        // epoch-ms value, and optInt would truncate it. null when neither is present (mergeInRoster then
-        // keeps the local roster, the safe default).
-        val modified: Long? = when {
-            vortx.has("rosterModified") -> vortx.optLong("rosterModified")
-            vortx.has("updatedAt") -> vortx.optLong("updatedAt") / 1000L
+        // Modification tiebreak in fractional epoch SECONDS: preserve an explicit Double exactly; else
+        // derive from Apple's epoch-ms `updatedAt` without dropping its millisecond component. Non-numeric,
+        // negative, or non-finite values are absent rather than becoming JSONObject's synthetic zero.
+        val modified: Double? = when {
+            vortx.has("rosterModified") -> finiteClock(vortx.opt("rosterModified"))
+            vortx.has("updatedAt") -> finiteClock(vortx.opt("updatedAt"))?.div(1000.0)
             else -> null
         }
 
@@ -100,7 +101,16 @@ object VortXSyncDoc {
 
         val deleted = vortx.optJSONArray("deletedProfiles")?.toStringList() ?: emptyList()
         val active = vortx.optStringOrNull("activeProfile")
-        return Parsed(roster, modified, overlays, deleted, active)
+        return Parsed(roster, modified, fullRoster != null, overlays, deleted, active)
+    }
+
+    private fun finiteClock(value: Any?): Double? =
+        (value as? Number)?.toDouble()?.takeIf { it.isFinite() && it >= 0.0 }
+
+    /** Publish the fractional clock without an integral conversion that would collapse same-second edits. */
+    internal fun writeRosterModified(target: JSONObject, modifiedSeconds: Double) {
+        require(modifiedSeconds.isFinite() && modifiedSeconds >= 0.0)
+        target.put("rosterModified", modifiedSeconds)
     }
 
     /**
@@ -148,7 +158,7 @@ object VortXSyncDoc {
     }
 
     /** Reconstruct [PlaybackPrefs] from the dashboard summary playback dict (note `forced` == forcedPolicy). */
-    private fun playbackFromSummary(p: JSONObject): PlaybackPrefs = PlaybackPrefs(
+    internal fun playbackFromSummary(p: JSONObject): PlaybackPrefs = PlaybackPrefs(
         audioLang = p.optString("audioLang", ""),
         subtitleLang = p.optString("subtitleLang", ""),
         forcedPolicy = p.optString("forced", ""),
@@ -157,6 +167,7 @@ object VortXSyncDoc {
         subColor = p.optString("subColor", ""),
         subBackground = p.optString("subBackground", ""),
         subSizeScale = if (p.has("subSizeScale")) p.optDouble("subSizeScale") else null,
+        subBrightness = p.optStringOrNull("subBrightness"),
         sourceTypeOrder = p.optJSONArray("sourceTypeOrder")?.toStringList(),
         useAddonOrder = if (p.has("useAddonOrder")) p.optBoolean("useAddonOrder") else null,
         safetyMode = p.optStringOrNull("safetyMode"),
@@ -250,9 +261,9 @@ object VortXSyncDoc {
         if (deletedUnion.isNotEmpty()) v.put("deletedProfiles", JSONArray(deletedUnion)) else v.remove("deletedProfiles")
 
         // updatedAt: epoch-MS, byte-parity with Apple (the dashboard reads it). rosterModified: the
-        // epoch-SECONDS tiebreak a peer Android device folds via mergeInRoster's `incomingModified`.
+        // fractional epoch-SECONDS tiebreak a peer folds via mergeInRoster's `incomingModified`.
         v.put("updatedAt", System.currentTimeMillis())
-        v.put("rosterModified", store.rosterModified)
+        writeRosterModified(v, store.rosterModified)
         return v
     }
 
@@ -283,7 +294,7 @@ object VortXSyncDoc {
      * Lane A prefer/avoid/autoPick fields are intentionally NOT in the summary — they still round-trip via
      * the full `roster` carrier). Optional fields are omitted when null (Apple's conditional puts).
      */
-    private fun playbackSummary(pb: PlaybackPrefs): JSONObject = JSONObject().apply {
+    internal fun playbackSummary(pb: PlaybackPrefs): JSONObject = JSONObject().apply {
         put("audioLang", pb.audioLang)
         put("subtitleLang", pb.subtitleLang)
         put("forced", pb.forcedPolicy)
@@ -292,6 +303,7 @@ object VortXSyncDoc {
         put("subColor", pb.subColor)
         put("subBackground", pb.subBackground)
         pb.subSizeScale?.let { put("subSizeScale", it) }
+        pb.subBrightness?.let { put("subBrightness", it) }
         pb.sourceTypeOrder?.let { put("sourceTypeOrder", JSONArray(it)) }
         pb.useAddonOrder?.let { put("useAddonOrder", it) }
         pb.safetyMode?.let { put("safetyMode", it) }
