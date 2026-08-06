@@ -7,7 +7,7 @@ import androidx.activity.ComponentActivity
 import com.vortx.android.MainActivity
 import com.vortx.android.ui.tv.TvActivity
 
-/** Routes one public URL to the correct form-factor launcher without an Android activity chooser. */
+/** Routes an accepted lowercase custom-scheme URL to the correct form-factor launcher. */
 class DeepLinkActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

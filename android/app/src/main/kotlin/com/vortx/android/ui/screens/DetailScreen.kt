@@ -89,6 +89,21 @@ import com.vortx.android.ui.viewmodel.PersonViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 
+internal data class ResolvedDetailPlayback(
+    val playable: Playable,
+    val metadata: MetaDetail,
+)
+
+/** A player route exists only when both the resolved source and real loaded detail metadata exist. */
+internal fun resolvedDetailPlayback(
+    playback: Playback,
+    metaState: UiState<MetaDetail>,
+): ResolvedDetailPlayback? {
+    val ready = playback as? Playback.Ready ?: return null
+    val loaded = metaState as? UiState.Success ?: return null
+    return ResolvedDetailPlayback(ready.playable, loaded.data)
+}
+
 /// Title detail, driven by [DetailViewModel] -- movie/series per DESIGN-SYSTEM.md §4 "Detail":
 /// a fixed hero banner (backdrop + dual scrim + bottom-left title block, NOT a full-page wash, the
 /// S03 landscape height clamp preserved) over a readable content column (the hero-actions cluster:
@@ -102,7 +117,7 @@ fun DetailScreen(
     viewModel: DetailViewModel,
     title: String,
     onBack: () -> Unit,
-    onPlay: (Playable) -> Unit,
+    onPlay: (Playable, MetaDetail) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
@@ -139,7 +154,7 @@ fun DetailScreen(
     titleTarget?.let { target ->
         val app = LocalContext.current.applicationContext as VortXApplication
         val nestedVm: DetailViewModel = viewModel(
-            key = "detail-nested-${target.id}",
+            key = "detail-nested-${target.type.id}-${target.id}",
             factory = StremioXViewModelFactory(
                 repo = app.catalogRepository,
                 detailArgs = StremioXViewModelFactory.DetailArgs(target.type, target.id),
@@ -207,11 +222,10 @@ fun DetailScreen(
 
     // When a source resolves, hand the Playable up to navigation and reset, so returning from the
     // player lands back on detail rather than immediately re-launching.
-    LaunchedEffect(playback) {
-        (playback as? Playback.Ready)?.let {
-            onPlay(it.playable)
-            viewModel.clearPlayback()
-        }
+    LaunchedEffect(playback, metaState) {
+        val resolved = resolvedDetailPlayback(playback, metaState) ?: return@LaunchedEffect
+        onPlay(resolved.playable, resolved.metadata)
+        viewModel.clearPlayback()
     }
 
     val resolving = playback is Playback.Resolving

@@ -37,6 +37,7 @@ import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
 import com.vortx.android.library.WatchlistStore
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.screens.resolvedDetailPlayback
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.Playback
@@ -91,7 +92,7 @@ fun TvDetailScreen(
     viewModel: DetailViewModel,
     title: String,
     onBack: () -> Unit,
-    onPlay: (Playable) -> Unit,
+    onPlay: (Playable, MetaDetail) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
@@ -103,11 +104,10 @@ fun TvDetailScreen(
 
     // A resolved source -> hand the Playable to the shell (which shows the player) and reset the ViewModel's
     // playback latch, mirroring the phone DetailScreen exactly.
-    LaunchedEffect(playback) {
-        (playback as? Playback.Ready)?.let {
-            onPlay(it.playable)
-            viewModel.clearPlayback()
-        }
+    LaunchedEffect(playback, metaState) {
+        val resolved = resolvedDetailPlayback(playback, metaState) ?: return@LaunchedEffect
+        onPlay(resolved.playable, resolved.metadata)
+        viewModel.clearPlayback()
     }
 
     val colors = VortXTheme.colors
@@ -121,7 +121,6 @@ fun TvDetailScreen(
                 streamsState = streamsState,
                 playback = playback,
                 watchlisted = watchlisted,
-                onPlay = onPlay,
             )
         }
     }
@@ -134,7 +133,6 @@ private fun TvDetailContent(
     streamsState: UiState<List<com.vortx.android.model.StreamGroup>>,
     playback: Playback,
     watchlisted: Boolean,
-    onPlay: (Playable) -> Unit,
 ) {
     val colors = VortXTheme.colors
     val playFocus = remember { FocusRequester() }

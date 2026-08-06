@@ -5,6 +5,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -21,6 +22,7 @@ import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.deeplink.VortXDeepLinkEvent
+import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.player.PlayerScreen
@@ -61,14 +63,19 @@ fun TvApp(
     ) {
         // The title currently open in Detail; null = the Home browse wall.
         var detail by remember { mutableStateOf<MetaItem?>(null) }
+        var detailGeneration by remember { mutableStateOf(0L) }
         // The resolved source currently playing; null = not in the player. The DETAIL page resolves a
         // chosen source into this [Playable] (through [DetailViewModel]); the shell then covers everything
         // with the player, exactly as the phone shell keys [PlayerScreen] off its own `playing` slot.
         var playing by remember { mutableStateOf<Playable?>(null) }
+        var playingMeta by remember { mutableStateOf<MetaDetail?>(null) }
 
         LaunchedEffect(deepLinkEvent) {
-            val target = deepLinkEvent?.target ?: return@LaunchedEffect
+            val event = deepLinkEvent ?: return@LaunchedEffect
+            val target = event.target
             playing = null
+            playingMeta = null
+            detailGeneration += 1
             detail = target.toMetaItem()
         }
 
@@ -93,9 +100,11 @@ fun TvApp(
         // VortXApp exactly, so Continue Watching + resume track on TV the same way they do on the phone.
         val playable = playing
         if (playable != null) {
+            val playbackMeta = playingMeta
             // Freshest reported position/duration (ms) for the save-on-exit write: [0] = position,
-            // [1] = duration. Reset when the played source changes.
-            val lastProgress = remember(playable) { longArrayOf(0L, 0L) }
+            // [1] = duration. The loaded media identity is part of the session key so a same-URL source
+            // reused by two catalog entries cannot inherit the previous title's progress state.
+            val lastProgress = remember(playable, playbackMeta?.type, playbackMeta?.id) { longArrayOf(0L, 0L) }
             // D-pad Back pops the player back to the detail page rather than exiting the app.
             BackHandler { playing = null }
             DisposableEffect(playable) {
@@ -125,30 +134,40 @@ fun TvApp(
         TvMaterialTheme(colorScheme = tvDarkColorScheme()) {
             val current = detail
             if (current != null) {
-                // One DetailViewModel per open title, keyed by id and fed type+id through the factory's
-                // DetailArgs -- the SAME construction the phone shell uses. Reusing it is what makes the TV
-                // detail page respect the active profile's Kids source guard for free (the guard lives in
-                // DetailViewModel.buildContext).
-                val detailVm: DetailViewModel = viewModel(
-                    key = "tv-detail-${current.id}-$debridOwnerEpoch",
-                    factory = StremioXViewModelFactory(
-                        repo = repo,
-                        detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),
-                        appContext = appContext,
-                    ),
-                )
-                TvDetailScreen(
-                    viewModel = detailVm,
-                    title = current.name,
-                    onBack = { detail = null },
-                    onPlay = { playing = it },
-                )
+                key(current.type, current.id, detailGeneration) {
+                    // One DetailViewModel per navigation event, keyed by media type + id. Reusing an id
+                    // across movie and series add-ons can therefore never reuse the wrong ViewModel.
+                    val detailVm: DetailViewModel = viewModel(
+                        key = "tv-detail-${current.type.id}-${current.id}-$detailGeneration-$debridOwnerEpoch",
+                        factory = StremioXViewModelFactory(
+                            repo = repo,
+                            detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),
+                            appContext = appContext,
+                        ),
+                    )
+                    TvDetailScreen(
+                        viewModel = detailVm,
+                        title = current.name,
+                        onBack = { detail = null },
+                        onPlay = { resolved, loadedMeta ->
+                            playingMeta = loadedMeta
+                            playing = resolved
+                        },
+                    )
+                }
             } else {
                 // The browse layer: the left-rail shell over the five top-level surfaces (Home / Discover /
                 // Library / Search / Settings). It sits UNDER this detail/player block, so opening a title
                 // from ANY surface routes through the same `detail` slot and the existing Home -> Detail ->
                 // Play flow is unchanged.
-                TvShell(repo = repo, auth = auth, onItem = { detail = it })
+                TvShell(
+                    repo = repo,
+                    auth = auth,
+                    onItem = {
+                        detailGeneration += 1
+                        detail = it
+                    },
+                )
             }
         }
     }

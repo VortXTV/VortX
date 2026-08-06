@@ -15,8 +15,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import com.vortx.android.deeplink.DeepLinkDeliveryState
 import com.vortx.android.deeplink.VortXDeepLinkEvent
-import com.vortx.android.deeplink.VortXDeepLinks
 import com.vortx.android.player.PlayerPipBridge
 import com.vortx.android.ui.VortXApp
 import com.vortx.android.ui.theme.isAnimatorScaleZero
@@ -30,6 +30,7 @@ import com.vortx.android.ui.theme.isAnimatorScaleZero
 class MainActivity : ComponentActivity() {
     private var deepLinkEvent by mutableStateOf<VortXDeepLinkEvent?>(null)
     private var deepLinkSequence = 0L
+    private var deepLinkDelivery = DeepLinkDeliveryState()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // installSplashScreen() must run before super.onCreate(): it installs the AndroidX
@@ -39,6 +40,9 @@ class MainActivity : ComponentActivity() {
         // uniformly.
         val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
+        deepLinkDelivery = DeepLinkDeliveryState(
+            restoredConsumed = savedInstanceState?.getBoolean(STATE_DEEP_LINK_CONSUMED) == true,
+        )
         routeDeepLink(intent)
 
         // Edge-to-edge is enforced app-wide (ANDROID-PLAN.md S01 scope; DESIGN-SYSTEM.md chrome
@@ -86,13 +90,29 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        deepLinkDelivery.beginNewIntent()
         routeDeepLink(intent)
     }
 
     private fun routeDeepLink(intent: Intent?) {
-        VortXDeepLinks.parse(intent?.dataString)?.let { target ->
-            deepLinkEvent = VortXDeepLinkEvent(target, ++deepLinkSequence)
+        if (deepLinkDelivery.consumed) {
+            clearDeepLinkData(intent)
+            return
         }
+        val target = deepLinkDelivery.consume(intent?.dataString) ?: return
+        clearDeepLinkData(intent)
+        deepLinkEvent = VortXDeepLinkEvent(target, ++deepLinkSequence)
+    }
+
+    private fun clearDeepLinkData(source: Intent?) {
+        source ?: return
+        source.data = null
+        setIntent(source)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(STATE_DEEP_LINK_CONSUMED, deepLinkDelivery.consumed)
+        super.onSaveInstanceState(outState)
     }
 
     /// Home press during playback -> Picture-in-Picture, on API 26-30 where the params-based
@@ -104,5 +124,9 @@ class MainActivity : ComponentActivity() {
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
         PlayerPipBridge.onUserLeaveHint()
+    }
+
+    private companion object {
+        const val STATE_DEEP_LINK_CONSUMED = "vortx.deepLinkConsumed"
     }
 }

@@ -1,23 +1,46 @@
 package com.vortx.android.deeplink
 
 import com.vortx.android.model.MediaType
+import com.vortx.android.model.MetaDetail
+import com.vortx.android.model.Playable
+import com.vortx.android.ui.UiState
+import com.vortx.android.ui.screens.resolvedDetailPlayback
+import com.vortx.android.ui.viewmodel.Playback
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VortXDeepLinkTest {
     @Test
-    fun `movie and series links accept case and decoded identifiers`() {
+    fun `lowercase movie and series links decode identifiers`() {
         assertEquals(
             VortXDeepLink(MediaType.MOVIE, "tt123"),
-            VortXDeepLinks.parse("VORTX://OPEN?type=Movie&id=%20tt123%20"),
+            VortXDeepLinks.parse("vortx://open?type=movie&id=%20tt123%20"),
         )
         assertEquals(
             VortXDeepLink(MediaType.SERIES, "series:id/1"),
             VortXDeepLinks.parse("vortx://open?type=series&id=series%3Aid%2F1"),
         )
+    }
+
+    @Test
+    fun `percent decoding preserves plus and rejects malformed utf8`() {
+        assertEquals(
+            VortXDeepLink(MediaType.MOVIE, "a+b+c"),
+            VortXDeepLinks.parse("vortx://open?type=movie&id=a+b%2Bc"),
+        )
+        assertEquals(
+            VortXDeepLink(MediaType.SERIES, "show-€"),
+            VortXDeepLinks.parse("vortx://open?type=series&id=show-%E2%82%AC"),
+        )
+        assertNull(VortXDeepLinks.parse("vortx://open?type=movie&id=%C3%28"))
+        assertNull(VortXDeepLinks.parse("vortx://open?type=movie&id=%E2%82"))
     }
 
     @Test
@@ -34,6 +57,9 @@ class VortXDeepLinkTest {
         listOf(
             null,
             "",
+            "VORTX://open?type=movie&id=tt1",
+            "vortx://OPEN?type=movie&id=tt1",
+            "vortx://open?type=Movie&id=tt1",
             "https://open?type=movie&id=tt1",
             "vortx://closed?type=movie&id=tt1",
             "vortx://open?type=channel&id=tt1",
@@ -44,7 +70,69 @@ class VortXDeepLinkTest {
     }
 
     @Test
-    fun `one browsable router forwards to two single task launchers`() {
+    fun `accepted delivery is not replayed after recreation but a new intent is accepted`() {
+        val raw = "vortx://open?type=movie&id=tt123"
+        val firstActivity = DeepLinkDeliveryState()
+        val accepted = firstActivity.consume(raw)
+
+        assertNotNull(accepted)
+        assertTrue(firstActivity.consumed)
+        assertNull(firstActivity.consume(raw))
+
+        val recreatedActivity = DeepLinkDeliveryState(restoredConsumed = firstActivity.consumed)
+        assertNull(recreatedActivity.consume(raw))
+
+        recreatedActivity.beginNewIntent()
+        assertFalse(recreatedActivity.consumed)
+        assertEquals(accepted, recreatedActivity.consume(raw))
+    }
+
+    @Test
+    fun `phone and tv activities persist and clear accepted intent data`() {
+        listOf(
+            readProjectFile("src/main/kotlin/com/vortx/android/MainActivity.kt"),
+            readProjectFile("src/main/kotlin/com/vortx/android/ui/tv/TvActivity.kt"),
+        ).forEach { source ->
+            assertTrue(source.contains("restoredConsumed = savedInstanceState?.getBoolean"))
+            assertTrue(source.contains("deepLinkDelivery.beginNewIntent()"))
+            assertTrue(source.contains("outState.putBoolean(STATE_DEEP_LINK_CONSUMED"))
+            assertTrue(source.contains("source.data = null"))
+        }
+    }
+
+    @Test
+    fun `invalid delivery does not block the next valid intent`() {
+        val state = DeepLinkDeliveryState()
+        assertNull(state.consume("vortx://open?type=channel&id=bad"))
+        assertFalse(state.consumed)
+        assertEquals(
+            VortXDeepLink(MediaType.SERIES, "tt456"),
+            state.consume("vortx://open?type=series&id=tt456"),
+        )
+    }
+
+    @Test
+    fun `deep link playback carries loaded detail metadata into auto add`() {
+        val provisional = VortXDeepLink(MediaType.MOVIE, "tt123").toMetaItem()
+        val loaded = MetaDetail(
+            id = "tt123",
+            type = MediaType.MOVIE,
+            name = "Real title",
+            poster = "https://images.example/poster.jpg",
+        )
+        val playable = Playable(url = "https://video.example/movie.mkv", title = loaded.name)
+        val resolved = resolvedDetailPlayback(Playback.Ready(playable), UiState.Success(loaded))
+
+        assertNotNull(resolved)
+        assertSame(loaded, resolved?.metadata)
+        assertEquals("Real title", resolved?.metadata?.name)
+        assertEquals("https://images.example/poster.jpg", resolved?.metadata?.poster)
+        assertNotEquals(provisional.name, resolved?.metadata?.name)
+        assertNull(resolvedDetailPlayback(Playback.Ready(playable), UiState.Loading))
+    }
+
+    @Test
+    fun `one lowercase browsable router forwards to two single task launchers`() {
         val manifest = readProjectFile("src/main/AndroidManifest.xml")
 
         assertEquals(2, Regex("android:launchMode=\"singleTask\"").findAll(manifest).count())
@@ -53,6 +141,22 @@ class VortXDeepLinkTest {
         assertTrue(manifest.contains("android:name=\".MainActivity\""))
         assertTrue(manifest.contains("android:name=\".ui.tv.TvActivity\""))
         assertTrue(manifest.contains("android:name=\".deeplink.DeepLinkActivity\""))
+    }
+
+    @Test
+    fun `navigation keys include media type and repeated events reset detail state`() {
+        val phone = readProjectFile("src/main/kotlin/com/vortx/android/ui/StremioXApp.kt")
+        val tv = readProjectFile("src/main/kotlin/com/vortx/android/ui/tv/TvApp.kt")
+        val detail = readProjectFile("src/main/kotlin/com/vortx/android/ui/screens/DetailScreen.kt")
+
+        assertTrue(phone.contains("detail-${'$'}{showForNext.type.id}-${'$'}{showForNext.id}"))
+        assertTrue(phone.contains("detail-${'$'}{current.type.id}-${'$'}{current.id}"))
+        assertTrue(tv.contains("tv-detail-${'$'}{current.type.id}-${'$'}{current.id}"))
+        assertTrue(detail.contains("detail-nested-${'$'}{target.type.id}-${'$'}{target.id}"))
+        assertTrue(phone.contains("key(current.type, current.id, detailGeneration)"))
+        assertTrue(tv.contains("key(current.type, current.id, detailGeneration)"))
+        assertTrue(phone.contains("detailGeneration += 1"))
+        assertTrue(tv.contains("detailGeneration += 1"))
     }
 
     private fun readProjectFile(relativePath: String): String {
