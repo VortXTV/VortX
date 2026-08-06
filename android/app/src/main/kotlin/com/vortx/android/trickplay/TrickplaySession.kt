@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.os.SystemClock
 import android.util.Log
 import com.vortx.android.model.MediaRef
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -59,6 +60,9 @@ class TrickplaySession(context: Context) {
 
     private val mutex = Mutex()
 
+    /** Orders frame admission and the final snapshot by call time, and closes admission at teardown. */
+    private val admissionQueue = TrickplayAdmissionQueue(scope)
+
     /**
      * The fetched community sheet. `@Volatile` because [previewAt] reads it from the scrubber on the main
      * thread while the fetch coroutine writes it from IO. [CommunityTrickplay.Sheet] is immutable once
@@ -87,8 +91,12 @@ class TrickplaySession(context: Context) {
     /** Raw JPEG frames captured THIS session, the time-ordered build input for the sprite sheet. */
     private val frames = mutableListOf<CommunityTrickplay.CapturedFrame>()
 
-    /** Frame count at the last upload, so a flush skips a re-send when no new coverage arrived. */
-    private var lastUploadedCount: Int = 0
+    /** Monotonic revision of the retained frame content, including same-count replacement after the cap. */
+    private var retainedRevision: Long = 0L
+
+    /** Owns one active upload and one exact deferred teardown snapshot. */
+    private val uploadCoordinator = TrickplayUploadCoordinator()
+    private var deferredUpload: PendingUpload? = null
 
     /**
      * [SystemClock.elapsedRealtime] ms of the last progressive push; 0 = none yet. MONOTONIC (not wall
@@ -96,9 +104,6 @@ class TrickplaySession(context: Context) {
      * `DispatchTime.now().uptimeNanoseconds` rather than a `Date`.
      */
     private var lastUploadUptimeMs: Long = 0L
-
-    /** True while a push is building/POSTing, so a burst of captures cannot spawn overlapping re-encodes. */
-    private var uploadInFlight: Boolean = false
 
     /** The raw `tmdb:` id already sent for resolution, so per-tick calls mint exactly ONE network lookup. */
     private var resolveTriedFor: String? = null
@@ -205,21 +210,29 @@ class TrickplaySession(context: Context) {
      * not just waste a POST, it would poison other platforms' previews for that title.
      */
     fun recordFrame(jpeg: ByteArray, timeSeconds: Double, videoHeight: Int) {
-        scope.launch {
-            if (!keepFrame(jpeg, timeSeconds)) return@launch
+        admissionQueue.enqueue {
+            if (!keepFrame(jpeg, timeSeconds)) return@enqueue
             val push = mutex.withLock {
-                if (contentKey == null) return@launch
+                if (contentKey == null) return@withLock null
                 // Remember the source height HERE rather than reading it off the engine at teardown: the
                 // engine is being released around then, and a property read against a destroyed native mpv
                 // handle is a segfault, which no runCatching can save. A frame we hold is proof the engine
                 // was alive and rendering when this height was read.
                 if (videoHeight > 0) srcHeight = videoHeight
-                // Bound the buffer; the worker caps at 600 tiles anyway (CommunityTrickplay.MAX_FRAMES).
-                if (frames.size >= MAX_SESSION_FRAMES) return@launch
-                frames += CommunityTrickplay.CapturedFrame(time = timeSeconds, jpeg = jpeg)
+                // Keep a bounded sample across the whole observed timeline. Once full, every later
+                // capture is admitted and the most temporally redundant interior frame is evicted, so
+                // long titles retain both their opening and current endpoint instead of freezing at the
+                // first 100 minutes.
+                val candidates = frames + CommunityTrickplay.CapturedFrame(time = timeSeconds, jpeg = jpeg)
+                val retained = TrickplayTimeline.retainedIndices(candidates.map { it.time }, MAX_SESSION_FRAMES)
+                val nextFrames = retained.map { candidates[it] }
+                if (sameRetainedContent(frames, nextFrames)) return@withLock null
+                frames.clear()
+                frames += nextFrames
+                retainedRevision += 1L
                 uploadDecision(progressive = true)
             }
-            push?.let { pushUpload(it) }
+            push?.let(::launchUpload)
         }
     }
 
@@ -271,6 +284,13 @@ class TrickplaySession(context: Context) {
         }
     }
 
+    private fun sameRetainedContent(
+        first: List<CommunityTrickplay.CapturedFrame>,
+        second: List<CommunityTrickplay.CapturedFrame>,
+    ): Boolean = first.size == second.size && first.indices.all { index ->
+        first[index].time == second[index].time && first[index].jpeg.contentEquals(second[index].jpeg)
+    }
+
     /**
      * Teardown flush: send the FULL session set if it grew since the last progressive push. Called when the
      * player leaves composition. Apple pushes progressively DURING playback precisely because a teardown
@@ -282,9 +302,9 @@ class TrickplaySession(context: Context) {
      * this is the last chance to store the fullest set.
      */
     fun finishAndFlush() {
-        scope.launch {
-            val push = mutex.withLock { uploadDecision(progressive = false) } ?: return@launch
-            pushUpload(push)
+        admissionQueue.closeAndEnqueue {
+            val push = mutex.withLock { uploadDecision(progressive = false) }
+            push?.let(::launchUpload)
         }
     }
 
@@ -301,7 +321,8 @@ class TrickplaySession(context: Context) {
         val hasKey = key != null && imdb != null
         // Keep-fuller: never spend a POST that could not improve on the stored set.
         val beatsStored = frames.size > existingFrameCount
-        val hasNewCoverage = frames.size > lastUploadedCount
+        val deliveredRevision = key?.let(uploadCoordinator::deliveredRevision) ?: 0L
+        val hasNewCoverage = retainedRevision > deliveredRevision
         // The sheet builder floors at 2 tiles (buildAndUpload's `while budget >= 2`), so a lone frame is
         // structurally unbuildable and admitting it only reproduces a noisy sorted=1 failure.
         val enoughToBuild = frames.size >= 2
@@ -311,55 +332,122 @@ class TrickplaySession(context: Context) {
         // Predict the Worker's coverage verdict so a doomed POST is skipped rather than sent and rejected.
         // Fails OPEN on an unknown bucket, so this only skips uploads we can positively call dead.
         val coverageReady = CommunityTrickplay.uploadCanStore(frames.size, CAPTURE_INTERVAL_S, durationBucket)
-        val willUpload = hasKey && beatsStored && hasNewCoverage && enoughToBuild &&
-            throttleElapsed && coverageReady && !uploadInFlight
+        val admission = if (key != null && imdb != null) {
+            uploadCoordinator.request(
+                key = key,
+                kind = if (progressive) {
+                    TrickplayUploadCoordinator.Kind.PROGRESSIVE
+                } else {
+                    TrickplayUploadCoordinator.Kind.FINAL
+                },
+                retainedRevision = retainedRevision,
+                frameCount = frames.size,
+                existingFrameCount = existingFrameCount,
+                coverageReady = coverageReady,
+                throttleReady = throttleElapsed,
+            )
+        } else null
+        val willUpload = admission != null
         Log.d(
             TAG,
             "upload-gate(${if (progressive) "progressive" else "teardown"}) frames=${frames.size} " +
-                "existing=$existingFrameCount lastUploaded=$lastUploadedCount hasKey=$hasKey " +
+                "existing=$existingFrameCount revision=$retainedRevision delivered=$deliveredRevision hasKey=$hasKey " +
                 "imdb=${imdb ?: "nil"} beatsStored=$beatsStored hasNewCoverage=$hasNewCoverage " +
                 "enoughToBuild=$enoughToBuild throttleElapsed=$throttleElapsed coverageReady=$coverageReady " +
-                "inFlight=$uploadInFlight -> ${if (willUpload) "UPLOAD" else "skip"}",
+                "inFlight=${uploadCoordinator.inFlight != null} finalRejected=${key?.let(uploadCoordinator::isFinalRejected) == true} " +
+                "-> ${if (willUpload) "UPLOAD" else "skip"}",
         )
-        if (!willUpload || key == null || imdb == null) return null
-        // Stamp the throttle + uploaded count NOW (still under the lock) so a concurrent tick cannot pick
-        // the same coverage up again before the POST returns.
-        lastUploadedCount = frames.size
-        lastUploadUptimeMs = now
-        uploadInFlight = true
-        return PendingUpload(
-            key = key, imdb = imdb, season = season, episode = episode,
-            durationBucket = durationBucket, srcHeight = srcHeight, frames = frames.toList(),
+        if (admission == null || key == null || imdb == null) return null
+        val pending = PendingUpload(
+            claim = admission.claim,
+            revision = retainedRevision,
+            key = key,
+            imdb = imdb,
+            season = season,
+            episode = episode,
+            durationBucket = durationBucket,
+            srcHeight = srcHeight,
+            frames = frames.toList(),
         )
+        return when (admission) {
+            is TrickplayUploadCoordinator.Admission.Start -> {
+                lastUploadUptimeMs = now
+                pending
+            }
+            is TrickplayUploadCoordinator.Admission.Deferred -> {
+                deferredUpload = pending
+                Log.d(TAG, "upload deferred key=$key revision=$retainedRevision frames=${frames.size}")
+                null
+            }
+        }
     }
 
-    /** Build + POST off the main thread, then clear the in-flight latch. Fail-soft; never throws. */
+    private fun launchUpload(push: PendingUpload) {
+        scope.launch { pushUpload(push) }
+    }
+
+    /** Build + POST off the main thread. The coordinator latch is cleared from finally for every exit. */
     private suspend fun pushUpload(push: PendingUpload) {
-        Log.d(TAG, "pushUpload FIRING key=${push.key} imdb=${push.imdb} frames=${push.frames.size}")
-        val outcome = CommunityTrickplay.buildAndUpload(
-            context = context,
-            key = push.key,
-            imdbId = push.imdb,
-            season = push.season,
-            episode = push.episode,
-            durationBucket = push.durationBucket,
-            srcHeight = push.srcHeight,
-            intervalS = CAPTURE_INTERVAL_S,
-            frames = push.frames,
+        Log.d(
+            TAG,
+            "pushUpload FIRING key=${push.key} imdb=${push.imdb} revision=${push.revision} frames=${push.frames.size}",
         )
-        // Honest result labels: a 200 the Worker consciously declined is "rejected(reason)", NOT "failed".
-        // "failed" is reserved for a transport error, a non-200, or a local build that never POSTed.
-        val label = when (outcome) {
-            is CommunityTrickplay.UploadOutcome.Stored -> "stored"
-            is CommunityTrickplay.UploadOutcome.Rejected -> "rejected(${outcome.reason})"
-            is CommunityTrickplay.UploadOutcome.Failed -> "failed"
+        var outcome: CommunityTrickplay.UploadOutcome = CommunityTrickplay.UploadOutcome.Failed
+        try {
+            outcome = CommunityTrickplay.buildAndUpload(
+                context = context,
+                key = push.key,
+                imdbId = push.imdb,
+                season = push.season,
+                episode = push.episode,
+                durationBucket = push.durationBucket,
+                srcHeight = push.srcHeight,
+                intervalS = CAPTURE_INTERVAL_S,
+                frames = push.frames,
+            )
+            // Honest result labels: a 200 the Worker consciously declined is "rejected(reason)", NOT "failed".
+            val label = when (outcome) {
+                is CommunityTrickplay.UploadOutcome.Stored -> "stored"
+                is CommunityTrickplay.UploadOutcome.Rejected -> "rejected(${outcome.reason})"
+                is CommunityTrickplay.UploadOutcome.Failed -> "failed"
+            }
+            Log.d(TAG, "upload key=${push.key} revision=${push.revision} frames=${push.frames.size} -> $label")
+        } catch (failure: CancellationException) {
+            throw failure
+        } catch (failure: Exception) {
+            Log.d(TAG, "upload key=${push.key} revision=${push.revision} -> failed(${failure.javaClass.simpleName})")
+        } finally {
+            completeAndLaunchNextUpload(
+                complete = {
+                    mutex.withLock {
+                        val policyOutcome = when (outcome) {
+                            is CommunityTrickplay.UploadOutcome.Stored -> TrickplayUploadCoordinator.Outcome.STORED
+                            is CommunityTrickplay.UploadOutcome.Rejected -> TrickplayUploadCoordinator.Outcome.REJECTED
+                            is CommunityTrickplay.UploadOutcome.Failed -> TrickplayUploadCoordinator.Outcome.FAILED
+                        }
+                        val completion = uploadCoordinator.complete(push.claim, policyOutcome)
+                        if (!completion.applied) return@withLock null
+                        val deferred = deferredUpload
+                        deferredUpload = null
+                        completion.nextClaim?.let { nextClaim -> deferred?.takeIf { it.claim == nextClaim } }
+                    }
+                },
+                launchNext = { next ->
+                    Log.d(
+                        TAG,
+                        "upload draining deferred final key=${next.key} revision=${next.revision} " +
+                            "frames=${next.frames.size}",
+                    )
+                    launchUpload(next)
+                },
+            )
         }
-        Log.d(TAG, "upload key=${push.key} frames=${push.frames.size} -> $label")
-        mutex.withLock { uploadInFlight = false }
     }
 
     /** The immutable snapshot handed to a push, so the build never races the live [frames] buffer. */
     private data class PendingUpload(
+        val claim: TrickplayUploadCoordinator.Claim,
+        val revision: Long,
         val key: String,
         val imdb: String,
         val season: Int?,
