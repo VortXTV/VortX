@@ -7,10 +7,15 @@ import com.vortx.android.data.CatalogRepository
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.home.ReleaseCalendarModel
+import com.vortx.android.home.SimklRailsModel
 import com.vortx.android.home.TopPicksModel
+import com.vortx.android.home.TraktRailsModel
 import com.vortx.android.home.upcomingMetaBases
+import com.vortx.android.home.withExternalWatchlistRails
 import com.vortx.android.home.withReleaseCalendarRails
 import com.vortx.android.home.withTopPicksRail
+import com.vortx.android.integrations.SIMKLAuth
+import com.vortx.android.integrations.TraktAuth
 import com.vortx.android.library.WatchlistStore
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
@@ -56,11 +61,13 @@ private fun <T> Result<T>.toUiState(): UiState<T> = fold(
 /// updated in place on every later change. If nothing arrives within [EMPTY_TIMEOUT_MS], Error with
 /// Retry -- never a silent black screen -- but collection continues, so data landing late still
 /// replaces the error.
-class HomeViewModel(
+class HomeViewModel internal constructor(
     private val repo: CatalogRepository,
     private val railPreferences: HomeRailPreferences? = null,
     private val railSurface: HomeRailSurface = HomeRailSurface.PHONE,
     private val watchlistStore: WatchlistStore? = null,
+    private val traktRails: TraktRailsModel = TraktRailsModel(),
+    private val simklRails: SimklRailsModel = SimklRailsModel(),
 ) : ViewModel() {
     private val _state = MutableStateFlow<UiState<List<Catalog>>>(UiState.Loading)
     val state: StateFlow<UiState<List<Catalog>>> = _state.asStateFlow()
@@ -72,6 +79,8 @@ class HomeViewModel(
     private var sourceHasRows = false
     private var upcomingEpisodes: List<MetaItem> = emptyList()
     private var upcomingMovies: List<MetaItem> = emptyList()
+    private var traktWatchlist: List<MetaItem> = emptyList()
+    private var simklWatchlist: List<MetaItem> = emptyList()
     private val topPicks = TopPicksModel()
     private val releaseCalendar = ReleaseCalendarModel()
 
@@ -88,6 +97,22 @@ class HomeViewModel(
                 store.items.drop(1).collectLatest { refreshPersonalizedRails() }
             }
         }
+        viewModelScope.launch {
+            TraktAuth.sessionBoundary.drop(1).collectLatest {
+                traktRails.clear()
+                traktWatchlist = emptyList()
+                publishHome()
+                refreshPersonalizedRails()
+            }
+        }
+        viewModelScope.launch {
+            SIMKLAuth.sessionBoundary.drop(1).collectLatest {
+                simklRails.clear()
+                simklWatchlist = emptyList()
+                publishHome()
+                refreshPersonalizedRails()
+            }
+        }
     }
 
     fun load() {
@@ -98,6 +123,8 @@ class HomeViewModel(
         sourceHasRows = false
         upcomingEpisodes = emptyList()
         upcomingMovies = emptyList()
+        traktWatchlist = emptyList()
+        simklWatchlist = emptyList()
         _state.value = UiState.Loading
         collectJob = viewModelScope.launch {
             // Watchdog: an engine that produces no rails at all (no network AND no cache) must show
@@ -150,6 +177,8 @@ class HomeViewModel(
                     publishHome()
                 }
             }
+            val traktWork = async { traktRails.refresh() }
+            val simklWork = async { simklRails.refresh() }
             val releaseWork = async {
                 val addonsResult = addonsWork.await()
                 if (libraryResult.isFailure || addonsResult.isFailure) return@async null
@@ -161,6 +190,8 @@ class HomeViewModel(
             }
             val refreshed = topPicksWork.await()
             val upcoming = releaseWork.await()
+            val trakt = traktWork.await()
+            val simkl = simklWork.await()
             if (refreshed.changed) {
                 topPicksItems = refreshed.items
             }
@@ -168,7 +199,10 @@ class HomeViewModel(
                 upcomingEpisodes = upcoming.episodes
                 upcomingMovies = upcoming.movies
             }
-            if (refreshed.changed || upcoming?.changed == true) {
+            val externalChanged = traktWatchlist != trakt.items || simklWatchlist != simkl.items
+            traktWatchlist = trakt.items
+            simklWatchlist = simkl.items
+            if (refreshed.changed || upcoming?.changed == true || trakt.changed || simkl.changed || externalChanged) {
                 publishHome()
             }
         }
@@ -177,7 +211,8 @@ class HomeViewModel(
     private fun publishHome() {
         if (!sourceHasRows) return
         val topRows = withTopPicksRail(baseRows, topPicksItems)
-        val enriched = withReleaseCalendarRails(topRows, upcomingEpisodes, upcomingMovies)
+        val externalRows = withExternalWatchlistRails(topRows, traktWatchlist, simklWatchlist)
+        val enriched = withReleaseCalendarRails(externalRows, upcomingEpisodes, upcomingMovies)
         val rows = railPreferences?.let { preferences ->
             preferences.arrange(enriched, railSurface, preferences.state.value)
         } ?: enriched

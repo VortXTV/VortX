@@ -31,6 +31,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
 import com.vortx.android.home.TOP_PICKS_CATALOG_ID
+import com.vortx.android.home.SIMKL_WATCHLIST_CATALOG_ID
+import com.vortx.android.home.TRAKT_WATCHLIST_CATALOG_ID
 import com.vortx.android.home.UPCOMING_EPISODES_CATALOG_ID
 import com.vortx.android.home.UPCOMING_MOVIES_CATALOG_ID
 import com.vortx.android.ui.UiState
@@ -183,6 +185,8 @@ private fun TvCatalogRow(
             "continue" -> "Pick up where you left off"
             TOP_PICKS_CATALOG_ID -> "Based on what you watch"
             UPCOMING_EPISODES_CATALOG_ID, UPCOMING_MOVIES_CATALOG_ID -> "Coming soon"
+            TRAKT_WATCHLIST_CATALOG_ID -> "From Trakt"
+            SIMKL_WATCHLIST_CATALOG_ID -> "From SIMKL"
             else -> null
         }
         Column(modifier = Modifier.padding(start = TvDimens.edge, bottom = VortXTheme.spacing.sm)) {
