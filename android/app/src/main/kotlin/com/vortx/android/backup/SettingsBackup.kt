@@ -2,6 +2,8 @@ package com.vortx.android.backup
 
 import com.vortx.android.profile.UserProfile
 import org.json.JSONObject
+import java.math.BigDecimal
+import java.math.BigInteger
 import java.text.SimpleDateFormat
 import java.time.OffsetDateTime
 import java.time.format.DateTimeFormatter
@@ -58,7 +60,7 @@ object SettingsBackup {
 
     data class ResolvedRoster(
         val roster: List<UserProfile>?,
-        val modifiedSeconds: Long?,
+        val modifiedSeconds: Double?,
     )
 
     /** Envelope schema. Apple `SettingsBackup.swift:20`. */
@@ -216,13 +218,14 @@ object SettingsBackup {
      * from an APPLE-authored doc (which carries no `vortx.rosterModified`) still feed the real tiebreak to
      * `ProfileStore.mergeInRoster` instead of defaulting to "keep local".
      */
-    fun rosterModifiedFromBlob(blob: Any?): Long? {
+    fun rosterModifiedFromBlob(blob: Any?): Double? {
         val v = domainFromBlob(blob)?.get(MODIFIED_KEY) ?: return null
-        return when (v) {
-            is Double -> v.toLong()
-            is Long -> v          // tolerated: an integral stamp is a valid plist int
-            else -> null
+        val seconds = when (v) {
+            is Double -> v
+            is Long -> v.toDouble() // tolerated: an integral stamp is a valid plist int
+            else -> return null
         }
+        return seconds.takeIf { it.isFinite() && it >= 0.0 }
     }
 
     /** The active-profile id out of a blob, or null when absent. Apple stores it as a plist string. */
@@ -245,21 +248,29 @@ object SettingsBackup {
     fun resolveRosterForPull(
         pulledBlob: Any?,
         fallbackRoster: List<UserProfile>?,
-        fallbackModifiedSeconds: Long?,
+        fallbackModifiedSeconds: Double?,
         fallbackIsLossless: Boolean = false,
     ): ResolvedRoster {
         val settingsRoster = rosterFromBlob(pulledBlob)?.takeIf { it.isNotEmpty() }
             ?: return ResolvedRoster(fallbackRoster, fallbackModifiedSeconds)
         val settingsModifiedSeconds = rosterModifiedFromBlob(pulledBlob)
         val settingsWinsSameId = !fallbackIsLossless ||
-            (settingsModifiedSeconds ?: Long.MIN_VALUE) >= (fallbackModifiedSeconds ?: Long.MIN_VALUE)
+            (settingsModifiedSeconds ?: Double.NEGATIVE_INFINITY) >=
+            (fallbackModifiedSeconds ?: Double.NEGATIVE_INFINITY)
         val preferred = if (settingsWinsSameId) settingsRoster else fallbackRoster.orEmpty()
         val secondary = if (settingsWinsSameId) fallbackRoster.orEmpty() else settingsRoster
         val preferredIds = preferred.mapTo(HashSet()) { it.id }
         val merged = preferred + secondary.filterNot { preferredIds.contains(it.id) }
         return ResolvedRoster(
             roster = merged,
-            modifiedSeconds = listOfNotNull(settingsModifiedSeconds, fallbackModifiedSeconds).maxOrNull(),
+            // `updatedAt` belongs to the lossy dashboard summary, not to the roster encoded in settings.
+            // It may describe a completely unrelated account-doc edit. Only another FULL roster carrier
+            // may donate its clock to the high-water mark.
+            modifiedSeconds = if (fallbackIsLossless) {
+                listOfNotNull(settingsModifiedSeconds, fallbackModifiedSeconds).maxOrNull()
+            } else {
+                settingsModifiedSeconds
+            },
         )
     }
 
@@ -285,7 +296,7 @@ object SettingsBackup {
     fun settingsBlobFor(
         pulledBlob: Any?,
         roster: List<UserProfile>,
-        rosterModifiedSeconds: Long,
+        rosterModifiedSeconds: Double,
         bundleId: String,
         app: String = "VortX",
         activeId: String? = null,
@@ -303,7 +314,8 @@ object SettingsBackup {
         // The roster rides as plist DATA of UTF-8 JSON, matching JSONEncoder().encode(profiles) on Apple.
         base[ROSTER_KEY] = UserProfile.encodeRoster(roster).toByteArray(Charsets.UTF_8)
         // A plist REAL of epoch SECONDS, matching Date().timeIntervalSince1970 / double(forKey:) on Apple.
-        base[MODIFIED_KEY] = rosterModifiedSeconds.toDouble()
+        if (!rosterModifiedSeconds.isFinite() || rosterModifiedSeconds < 0.0) return null
+        base[MODIFIED_KEY] = rosterModifiedSeconds
         activeId?.let { base[ACTIVE_KEY] = it }
 
         val bytes = encode(base, bundleId = bundleId, app = app, now = now) ?: return null
@@ -321,15 +333,25 @@ object SettingsBackup {
     private fun hasString(objectValue: JSONObject, key: String): Boolean =
         objectValue.has(key) && !objectValue.isNull(key) && objectValue.opt(key) is String
 
-    /** Swift `Codable` requires a JSON integer for both `schema` and `keyCount`; strings/bools fail. */
+    /**
+     * Swift `Codable` requires a JSON integer for both `schema` and `keyCount`; strings/bools fail.
+     * Foundation accepts integral decimal/exponent forms such as `1.0` and `1e3`, but rejects values
+     * outside signed 64-bit `Int`. BigDecimal avoids Double's rounded Long.MAX boundary accepting 2^63.
+     */
     private fun hasJsonInt(objectValue: JSONObject, key: String): Boolean {
         if (!objectValue.has(key) || objectValue.isNull(key)) return false
         val value = objectValue.opt(key)
-        return value is Number && value.toDouble().isFinite() &&
-            value.toDouble() == value.toLong().toDouble()
+        if (value !is Number) return false
+        val integer = runCatching { BigDecimal(value.toString()).toBigIntegerExact() }.getOrNull()
+            ?: return false
+        return integer >= SWIFT_INT_MIN && integer <= SWIFT_INT_MAX
     }
 
-    /** Apple's `.iso8601` decoder accepts internet date-time, optional fractions, and an explicit offset. */
+    /**
+     * Current local Foundation `.iso8601` verification accepts internet date-time with optional fractions
+     * plus `Z`, `+HH`, `+HHMM`, or `+HH:MM`; lowercase `t`/`z` is rejected. Keep this grammar aligned with
+     * those executed fixtures rather than broadening it independently.
+     */
     private fun hasAppleIso8601Date(objectValue: JSONObject, key: String): Boolean {
         if (!hasString(objectValue, key)) return false
         val raw = objectValue.getString(key)
@@ -346,4 +368,6 @@ object SettingsBackup {
     private val APPLE_ISO8601 =
         Regex("""^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}(?::?\d{2})?)$""")
     private val COMPACT_ISO8601_OFFSET = Regex("""([+-]\d{2})(\d{2})$""")
+    private val SWIFT_INT_MIN: BigInteger = BigInteger.valueOf(Long.MIN_VALUE)
+    private val SWIFT_INT_MAX: BigInteger = BigInteger.valueOf(Long.MAX_VALUE)
 }

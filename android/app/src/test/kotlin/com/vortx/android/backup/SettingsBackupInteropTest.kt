@@ -10,6 +10,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.math.BigInteger
 import java.util.Base64
 import java.util.Date
 
@@ -51,13 +52,13 @@ class SettingsBackupInteropTest {
         val blob = SettingsBackup.settingsBlobFor(
             pulledBlob = null,
             roster = roster,
-            rosterModifiedSeconds = 42L,
+            rosterModifiedSeconds = 42.875,
             bundleId = "com.vortx.android",
             now = Date(0L),
         )
 
         assertEquals(roster, SettingsBackup.rosterFromBlob(blob))
-        assertEquals(42L, SettingsBackup.rosterModifiedFromBlob(blob))
+        assertEquals(42.875, requireNotNull(SettingsBackup.rosterModifiedFromBlob(blob)), 0.0)
         val domain = decodedDomain(blob)
         assertArrayEquals(
             UserProfile.encodeRoster(roster).toByteArray(Charsets.UTF_8),
@@ -82,7 +83,7 @@ class SettingsBackupInteropTest {
             mapOf(
                 SettingsBackup.ROSTER_KEY to
                     UserProfile.encodeRoster(listOf(appleProfile)).toByteArray(Charsets.UTF_8),
-                SettingsBackup.MODIFIED_KEY to 73.0,
+                SettingsBackup.MODIFIED_KEY to 10.25,
             ),
         )
         val lossySummaryProfile = appleProfile.copy(
@@ -94,11 +95,11 @@ class SettingsBackupInteropTest {
         val resolved = SettingsBackup.resolveRosterForPull(
             pulledBlob = appleBlob,
             fallbackRoster = listOf(lossySummaryProfile, androidOnly),
-            fallbackModifiedSeconds = 70L,
+            fallbackModifiedSeconds = 100.0,
         )
 
         assertEquals(listOf(appleProfile, androidOnly), resolved.roster)
-        assertEquals(73L, resolved.modifiedSeconds)
+        assertEquals(10.25, requireNotNull(resolved.modifiedSeconds), 0.0)
     }
 
     @Test
@@ -110,7 +111,7 @@ class SettingsBackupInteropTest {
             mapOf(
                 SettingsBackup.ROSTER_KEY to
                     UserProfile.encodeRoster(listOf(oldSettings)).toByteArray(Charsets.UTF_8),
-                SettingsBackup.MODIFIED_KEY to 10.0,
+                SettingsBackup.MODIFIED_KEY to 10.25,
             ),
         )
 
@@ -119,7 +120,7 @@ class SettingsBackupInteropTest {
                 "vortx",
                 JSONObject()
                     .put("roster", JSONArray().put(UserProfile.encodeProfile(newFullRoster)))
-                    .put("rosterModified", 20L),
+                    .put("rosterModified", 20.75),
             ),
         )
         assertTrue(parsed.rosterIsLossless)
@@ -131,7 +132,7 @@ class SettingsBackupInteropTest {
         )
 
         assertEquals(listOf(newFullRoster), resolved.roster)
-        assertEquals(20L, resolved.modifiedSeconds)
+        assertEquals(20.75, requireNotNull(resolved.modifiedSeconds), 0.0)
 
         // Models pull-then-repush: the adopted maximum watermark must replace the old settings stamp.
         val republished = SettingsBackup.settingsBlobFor(
@@ -142,7 +143,21 @@ class SettingsBackupInteropTest {
             now = Date(0L),
         )
         assertEquals(listOf(newFullRoster), SettingsBackup.rosterFromBlob(republished))
-        assertEquals(20L, SettingsBackup.rosterModifiedFromBlob(republished))
+        assertEquals(20.75, requireNotNull(SettingsBackup.rosterModifiedFromBlob(republished)), 0.0)
+    }
+
+    @Test
+    fun vortxCarrierPublishesAndParsesFractionalRosterClocksWithoutTruncation() {
+        val published = JSONObject()
+        VortXSyncDoc.writeRosterModified(published, 80.625)
+
+        val parsedPublished = VortXSyncDoc.parse(JSONObject().put("vortx", published))
+        assertEquals(80.625, requireNotNull(parsedPublished.rosterModifiedSeconds), 0.0)
+
+        val parsedAppleMillis = VortXSyncDoc.parse(
+            JSONObject().put("vortx", JSONObject().put("updatedAt", 80_625L)),
+        )
+        assertEquals(80.625, requireNotNull(parsedAppleMillis.rosterModifiedSeconds), 0.0)
     }
 
     @Test
@@ -183,7 +198,7 @@ class SettingsBackupInteropTest {
         val rebuilt = SettingsBackup.settingsBlobFor(
             pulledBlob = appleBlob,
             roster = listOf(decoded),
-            rosterModifiedSeconds = 30L,
+            rosterModifiedSeconds = 30.0,
             bundleId = "com.vortx.android",
             now = Date(0L),
         )
@@ -222,7 +237,7 @@ class SettingsBackupInteropTest {
             SettingsBackup.settingsBlobFor(
                 pulledBlob = "not-base64",
                 roster = roster,
-                rosterModifiedSeconds = 1L,
+                rosterModifiedSeconds = 1.0,
                 bundleId = "com.vortx.android",
             ),
         )
@@ -230,7 +245,7 @@ class SettingsBackupInteropTest {
             SettingsBackup.settingsBlobFor(
                 pulledBlob = JSONObject().put("unexpected", true),
                 roster = roster,
-                rosterModifiedSeconds = 1L,
+                rosterModifiedSeconds = 1.0,
                 bundleId = "com.vortx.android",
             ),
         )
@@ -286,6 +301,17 @@ class SettingsBackupInteropTest {
         val badDate = JSONObject(valid.toString()).put("createdAt", "not-an-iso8601-date")
         assertNull("invalid date", SettingsBackup.decodeDomain(badDate.toString().toByteArray()))
         assertNull("bad date must not be rewritten", rewriteMalformedEnvelope(badDate))
+        val lowercaseDate = JSONObject(valid.toString()).put("createdAt", "1970-01-01t00:00:00z")
+        assertNull("Foundation rejects lowercase t/z", SettingsBackup.decodeDomain(lowercaseDate.toString().toByteArray()))
+
+        for (outsideSwiftInt in listOf(
+            BigInteger("9223372036854775808"),
+            BigInteger("-9223372036854775809"),
+        )) {
+            val outOfRange = JSONObject(valid.toString()).put("schema", outsideSwiftInt)
+            assertNull("out-of-range Swift Int", SettingsBackup.decodeDomain(outOfRange.toString().toByteArray()))
+            assertNull("out-of-range Swift Int must not be rewritten", rewriteMalformedEnvelope(outOfRange))
+        }
     }
 
     @Test
@@ -301,7 +327,7 @@ class SettingsBackupInteropTest {
         val rebuilt = SettingsBackup.settingsBlobFor(
             pulledBlob = original,
             roster = emptyList(),
-            rosterModifiedSeconds = 2L,
+            rosterModifiedSeconds = 2.0,
             bundleId = "com.vortx.android",
         )
 
@@ -326,7 +352,7 @@ class SettingsBackupInteropTest {
         val rebuilt = SettingsBackup.settingsBlobFor(
             pulledBlob = original,
             roster = listOf(after),
-            rosterModifiedSeconds = 9L,
+            rosterModifiedSeconds = 9.5,
             bundleId = "com.vortx.android",
             now = Date(0L),
         )
@@ -336,7 +362,7 @@ class SettingsBackupInteropTest {
         assertEquals(listOf("one", "two"), domain["vortx.future.setting"])
         assertEquals("KEEP-THIS-ACTIVE-ID", domain[SettingsBackup.ACTIVE_KEY])
         assertEquals(listOf(after), SettingsBackup.rosterFromBlob(rebuilt))
-        assertEquals(9L, SettingsBackup.rosterModifiedFromBlob(rebuilt))
+        assertEquals(9.5, requireNotNull(SettingsBackup.rosterModifiedFromBlob(rebuilt)), 0.0)
     }
 
     @Test
@@ -344,9 +370,9 @@ class SettingsBackupInteropTest {
         val fallback = listOf(profile(name = "Fallback"))
 
         for (blob in listOf<Any?>(null, "broken", JSONObject.NULL, 7)) {
-            val resolved = SettingsBackup.resolveRosterForPull(blob, fallback, 55L)
+            val resolved = SettingsBackup.resolveRosterForPull(blob, fallback, 55.0)
             assertEquals(fallback, resolved.roster)
-            assertEquals(55L, resolved.modifiedSeconds)
+            assertEquals(55.0, requireNotNull(resolved.modifiedSeconds), 0.0)
         }
     }
 
@@ -382,7 +408,7 @@ class SettingsBackupInteropTest {
         val rebuilt = SettingsBackup.settingsBlobFor(
             pulledBlob = original,
             roster = listOf(profile(name = "Local")),
-            rosterModifiedSeconds = 2L,
+            rosterModifiedSeconds = 2.0,
             bundleId = "com.vortx.android",
             now = Date(0L),
         )
@@ -423,7 +449,7 @@ class SettingsBackupInteropTest {
         SettingsBackup.settingsBlobFor(
             pulledBlob = Base64.getEncoder().encodeToString(envelope.toString().toByteArray()),
             roster = listOf(profile(name = "Local")),
-            rosterModifiedSeconds = 1L,
+            rosterModifiedSeconds = 1.0,
             bundleId = "com.vortx.android",
         )
 
