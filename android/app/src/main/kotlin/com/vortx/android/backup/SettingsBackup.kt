@@ -53,6 +53,11 @@ import java.util.TimeZone
  */
 object SettingsBackup {
 
+    data class ResolvedRoster(
+        val roster: List<UserProfile>?,
+        val modifiedSeconds: Long?,
+    )
+
     /** Envelope schema. Apple `SettingsBackup.swift:20`. */
     const val SCHEMA = 1
 
@@ -174,7 +179,7 @@ object SettingsBackup {
      * Returns null when the blob is absent, unreadable, or carries no roster, so a caller can skip the
      * union when there is nothing to merge (Apple's exact contract).
      */
-    fun rosterFromBlob(blob: String?): List<UserProfile>? {
+    fun rosterFromBlob(blob: Any?): List<UserProfile>? {
         val domain = domainFromBlob(blob) ?: return null
         val rosterBytes = domain[ROSTER_KEY] as? ByteArray ?: return null
         return UserProfile.decodeRoster(String(rosterBytes, Charsets.UTF_8))
@@ -185,7 +190,7 @@ object SettingsBackup {
      * from an APPLE-authored doc (which carries no `vortx.rosterModified`) still feed the real tiebreak to
      * `ProfileStore.mergeInRoster` instead of defaulting to "keep local".
      */
-    fun rosterModifiedFromBlob(blob: String?): Long? {
+    fun rosterModifiedFromBlob(blob: Any?): Long? {
         val v = domainFromBlob(blob)?.get(MODIFIED_KEY) ?: return null
         return when (v) {
             is Double -> v.toLong()
@@ -195,18 +200,40 @@ object SettingsBackup {
     }
 
     /** The active-profile id out of a blob, or null when absent. Apple stores it as a plist string. */
-    fun activeFromBlob(blob: String?): String? = domainFromBlob(blob)?.get(ACTIVE_KEY) as? String
+    fun activeFromBlob(blob: Any?): String? = domainFromBlob(blob)?.get(ACTIVE_KEY) as? String
 
-    private fun domainFromBlob(blob: String?): Map<String, Any>? {
-        if (blob.isNullOrEmpty()) return null
-        val data = runCatching { Base64.getDecoder().decode(blob) }.getOrNull() ?: return null
+    private fun domainFromBlob(blob: Any?): Map<String, Any>? {
+        val encoded = blob as? String ?: return null
+        if (encoded.isEmpty()) return null
+        val data = runCatching { Base64.getDecoder().decode(encoded) }.getOrNull() ?: return null
         return decodeDomain(data)
     }
 
     /**
+     * Resolve the lossless settings carrier against the legacy `doc.vortx` fallback. A valid, non-empty
+     * settings roster wins same-id fields because Apple's dashboard summary omits own-account identity,
+     * while profiles unique to either carrier survive. A missing or unreadable settings blob leaves the
+     * fallback untouched.
+     */
+    fun resolveRosterForPull(
+        pulledBlob: Any?,
+        fallbackRoster: List<UserProfile>?,
+        fallbackModifiedSeconds: Long?,
+    ): ResolvedRoster {
+        val settingsRoster = rosterFromBlob(pulledBlob)?.takeIf { it.isNotEmpty() }
+            ?: return ResolvedRoster(fallbackRoster, fallbackModifiedSeconds)
+        val settingsIds = settingsRoster.mapTo(HashSet()) { it.id }
+        val merged = settingsRoster + fallbackRoster.orEmpty().filterNot { settingsIds.contains(it.id) }
+        return ResolvedRoster(
+            roster = merged,
+            modifiedSeconds = rosterModifiedFromBlob(pulledBlob) ?: fallbackModifiedSeconds,
+        )
+    }
+
+    /**
      * Build the `doc.settings` blob to push: the PULLED blob's domain with only this port's roster keys
-     * overwritten, re-encoded. This is the write half of the round-trip, and the one D5 wires into
-     * `VortXSyncManager.mergeLocalIntoDoc` next to `doc["vortx"] = ...`.
+     * overwritten, re-encoded. `VortXSyncManager.mergeLocalIntoDoc` uses this beside its `doc.vortx`
+     * summary update so both platforms receive the lossless roster carrier.
      *
      * Returns null meaning "do not touch `doc["settings"]`", in three cases, each deliberate:
      *   1. [roster] is empty. NEVER-ZERO: a momentarily empty local roster must not overwrite the account's
@@ -223,7 +250,7 @@ object SettingsBackup {
      * advisory). Left null, the pulled value passes through untouched rather than being clobbered.
      */
     fun settingsBlobFor(
-        pulledBlob: String?,
+        pulledBlob: Any?,
         roster: List<UserProfile>,
         rosterModifiedSeconds: Long,
         bundleId: String,
@@ -233,10 +260,11 @@ object SettingsBackup {
     ): String? {
         if (roster.isEmpty()) return null                       // never-zero
 
-        val base: MutableMap<String, Any> = if (pulledBlob.isNullOrEmpty()) {
-            LinkedHashMap()                                     // fresh account: nothing to preserve
-        } else {
-            LinkedHashMap(domainFromBlob(pulledBlob) ?: return null)   // fail-closed on an unreadable blob
+        val base: MutableMap<String, Any> = when {
+            pulledBlob == null || pulledBlob == JSONObject.NULL -> LinkedHashMap()
+            pulledBlob is String && pulledBlob.isEmpty() -> LinkedHashMap()
+            pulledBlob is String -> LinkedHashMap(domainFromBlob(pulledBlob) ?: return null)
+            else -> return null
         }
 
         // The roster rides as plist DATA of UTF-8 JSON, matching JSONEncoder().encode(profiles) on Apple.
