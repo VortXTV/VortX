@@ -166,20 +166,18 @@ object TrickplayTimeline {
     ): List<TrickplayTimelineCue>? {
         if (frameCount <= 0 || cols <= 0 || tileW <= 0 || tileH <= 0) return null
         val lines = raw.replace("\r\n", "\n").replace('\r', '\n').split('\n')
-        val header = lines.firstOrNull()?.trim()?.removePrefix("\uFEFF") ?: return null
-        if (!header.startsWith("WEBVTT")) return null
+        val header = lines.firstOrNull()?.removePrefix("\uFEFF")?.trimEnd() ?: return null
+        if (!WEBVTT_HEADER.matches(header)) return null
 
         val parsed = mutableListOf<TrickplayTimelineCue>()
         var lineIndex = 1
         while (lineIndex < lines.size) {
             val timing = lines[lineIndex].trim()
             lineIndex += 1
-            val arrowAt = timing.indexOf("-->")
-            if (arrowAt < 0) continue
-            val start = parseVttTime(timing.substring(0, arrowAt).trim()) ?: return null
-            val endText = timing.substring(arrowAt + 3).trim().split(Regex("\\s+"), limit = 2).firstOrNull()
-                ?: return null
-            val end = parseVttTime(endText) ?: return null
+            if (!timing.contains("-->")) continue
+            val timingMatch = VTT_TIMING_LINE.matchEntire(timing) ?: return null
+            val start = parseVttTime(timingMatch.groupValues[1]) ?: return null
+            val end = parseVttTime(timingMatch.groupValues[2]) ?: return null
             if (start < 0.0 || end <= start) return null
 
             var coordinates: Coordinates? = null
@@ -190,7 +188,10 @@ object TrickplayTimeline {
                     break
                 }
                 if (payload.contains("-->")) break
-                if (coordinates == null) coordinates = parseCoordinates(payload)
+                // This protocol subset has exactly one payload line and that line must be valid geometry.
+                // Rejecting extras prevents a conflicting second xywh row from being silently ignored.
+                if (coordinates != null) return null
+                coordinates = parseCoordinates(payload) ?: return null
                 lineIndex += 1
             }
             val rect = coordinates ?: return null
@@ -219,6 +220,24 @@ object TrickplayTimeline {
             )
         }
         return parsed.takeIf { it.size == frameCount }
+    }
+
+    /**
+     * Preserve the fetch contract's three distinct states: null means legacy metadata never advertised
+     * a VTT, a nonempty list is a valid advertised index, and an empty list is an advertised index that
+     * was unavailable or invalid. Only the first state may use legacy uniform timing.
+     */
+    fun fetchedCues(
+        advertised: Boolean,
+        rawVtt: String?,
+        frameCount: Int,
+        cols: Int,
+        tileW: Int,
+        tileH: Int,
+    ): List<TrickplayTimelineCue>? {
+        if (!advertised) return null
+        val raw = rawVtt ?: return emptyList()
+        return parseVtt(raw, frameCount, cols, tileW, tileH) ?: emptyList()
     }
 
     /** Find true VTT coverage, or finite interval coverage for metadata which never advertised a VTT. */
@@ -311,34 +330,22 @@ object TrickplayTimeline {
 
     private fun parseCoordinates(payload: String): Coordinates? {
         val marker = payload.indexOf("#xywh=")
-        if (marker < 0) return null
-        val values = payload.substring(marker + 6).split(',')
-        if (values.size != 4) return null
-        val numbers = values.map { it.trim().toIntOrNull() ?: return null }
+        if (marker < 0 || marker != payload.lastIndexOf("#xywh=")) return null
+        val rawValues = payload.substring(marker + 6)
+        if (!VTT_COORDINATES.matches(rawValues)) return null
+        val numbers = rawValues.split(',').map { it.toIntOrNull() ?: return null }
         return Coordinates(numbers[0], numbers[1], numbers[2], numbers[3])
     }
 
     private fun parseVttTime(raw: String): Double? {
-        val fields = raw.split(':')
-        if (fields.size != 2 && fields.size != 3) return null
-        val hours: Double
-        val minutes: Double
-        val seconds: Double
-        if (fields.size == 3) {
-            hours = fields[0].toDoubleOrNull() ?: return null
-            minutes = fields[1].toDoubleOrNull() ?: return null
-            seconds = fields[2].toDoubleOrNull() ?: return null
-        } else {
-            hours = 0.0
-            minutes = fields[0].toDoubleOrNull() ?: return null
-            seconds = fields[1].toDoubleOrNull() ?: return null
-        }
-        if (!hours.isFinite() || !minutes.isFinite() || !seconds.isFinite() ||
-            hours < 0.0 || minutes < 0.0 || minutes >= 60.0 || seconds < 0.0 || seconds >= 60.0
-        ) {
-            return null
-        }
-        return (hours * 3600.0 + minutes * 60.0 + seconds).takeIf { it.isFinite() }
+        val match = VTT_TIMESTAMP.matchEntire(raw) ?: return null
+        val hours = match.groupValues[1].ifEmpty { "0" }.toLongOrNull() ?: return null
+        val minutes = match.groupValues[2].toLongOrNull() ?: return null
+        val seconds = match.groupValues[3].toLongOrNull() ?: return null
+        val milliseconds = match.groupValues[4].toLongOrNull() ?: return null
+        val total = hours.toDouble() * 3_600.0 + minutes.toDouble() * 60.0 +
+            seconds.toDouble() + milliseconds.toDouble() / 1_000.0
+        return total.takeIf { it.isFinite() }
     }
 
     private fun vttTime(seconds: Double): String {
@@ -353,4 +360,9 @@ object TrickplayTimeline {
 
     private data class Coordinates(val x: Int, val y: Int, val width: Int, val height: Int)
     private data class IndexedTime(val index: Int, val time: Double)
+
+    private val WEBVTT_HEADER = Regex("^WEBVTT(?:[ \\t].*)?$")
+    private val VTT_TIMING_LINE = Regex("^([^\\s]+)\\s+-->\\s+([^\\s]+)(?:\\s+.*)?$")
+    private val VTT_TIMESTAMP = Regex("^(?:(\\d{2,}):)?([0-5]\\d):([0-5]\\d)\\.(\\d{3})$")
+    private val VTT_COORDINATES = Regex("^\\d+,\\d+,\\d+,\\d+$")
 }

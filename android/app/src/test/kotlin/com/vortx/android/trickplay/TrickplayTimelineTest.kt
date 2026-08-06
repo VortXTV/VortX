@@ -26,6 +26,59 @@ class TrickplayTimelineTest {
     }
 
     @Test
+    fun `parser requires an exact webvtt signature boundary`() {
+        val cue = "\n\n00:00.000 --> 00:10.000\nsprite#xywh=0,0,320,180\n"
+
+        assertEquals(
+            1,
+            TrickplayTimeline.parseVtt("WEBVTT metadata$cue", 1, 1, 320, 180)?.size,
+        )
+        assertNull(TrickplayTimeline.parseVtt("WEBVTTjunk$cue", 1, 1, 320, 180))
+        assertNull(TrickplayTimeline.parseVtt(" WEBVTT$cue", 1, 1, 320, 180))
+    }
+
+    @Test
+    fun `parser requires fixed integer timestamps with three fractional digits`() {
+        listOf(
+            "00.5:01.000",
+            "00:01.00",
+            "00:01.0000",
+            "0:01.000",
+            "00:60.000",
+        ).forEach { invalidStart ->
+            val raw = "WEBVTT\n\n$invalidStart --> 00:10.000\nsprite#xywh=0,0,320,180\n"
+            assertNull(invalidStart, TrickplayTimeline.parseVtt(raw, 1, 1, 320, 180))
+        }
+    }
+
+    @Test
+    fun `parser rejects duplicate conflicting and malformed geometry payloads`() {
+        val duplicateLines = "WEBVTT\n\n00:00.000 --> 00:10.000\n" +
+            "sprite#xywh=0,0,320,180\nsprite#xywh=320,0,320,180\n"
+        val conflictingInline = "WEBVTT\n\n00:00.000 --> 00:10.000\n" +
+            "sprite#xywh=0,0,320,180#xywh=320,0,320,180\n"
+        val invalidSuffix = "WEBVTT\n\n00:00.000 --> 00:10.000\n" +
+            "sprite#xywh=0,0,320,180?bad=1\n"
+
+        assertNull(TrickplayTimeline.parseVtt(duplicateLines, 1, 2, 320, 180))
+        assertNull(TrickplayTimeline.parseVtt(conflictingInline, 1, 2, 320, 180))
+        assertNull(TrickplayTimeline.parseVtt(invalidSuffix, 1, 2, 320, 180))
+    }
+
+    @Test
+    fun `fetched cues preserve absent valid and invalid advertised states`() {
+        val valid = "WEBVTT\n\n00:00.000 --> 00:10.000\nsprite#xywh=0,0,320,180\n"
+
+        assertNull(TrickplayTimeline.fetchedCues(false, null, 1, 1, 320, 180))
+        assertEquals(1, TrickplayTimeline.fetchedCues(true, valid, 1, 1, 320, 180)?.size)
+        assertEquals(emptyList<TrickplayTimelineCue>(), TrickplayTimeline.fetchedCues(true, null, 1, 1, 320, 180))
+        assertEquals(
+            emptyList<TrickplayTimelineCue>(),
+            TrickplayTimeline.fetchedCues(true, "not-vtt", 1, 1, 320, 180),
+        )
+    }
+
+    @Test
     fun `parser rejects partial overlapping or mismatched geometry indexes`() {
         val oneCue = "WEBVTT\n\n00:00.000 --> 00:10.000\nsprite#xywh=0,0,320,180\n"
         val overlap = "WEBVTT\n\n" +

@@ -259,24 +259,37 @@ object CommunityTrickplay {
                 return@withContext null
             }
 
-            val cues: List<TrickplayTimelineCue>? = if (meta.has("vtt") && !meta.isNull("vtt")) {
+            val vttAdvertised = meta.has("vtt") && !meta.isNull("vtt")
+            val rawVtt: String? = if (vttAdvertised) {
                 val vttUrl = meta.optString("vtt", "")
                 // A declared VTT must establish real coverage. If it is unavailable or invalid, retain an
                 // empty index so crop falls through instead of inventing uniform timestamps.
                 runCatching {
-                    if (vttUrl.isBlank()) return@runCatching emptyList()
-                    vttConn = (URL(vttUrl).openConnection() as HttpURLConnection).apply {
-                        requestMethod = "GET"
-                        connectTimeout = 8_000
-                        readTimeout = 8_000
-                        useCaches = false
+                    if (vttUrl.isBlank()) {
+                        null
+                    } else {
+                        vttConn = (URL(vttUrl).openConnection() as HttpURLConnection).apply {
+                            requestMethod = "GET"
+                            connectTimeout = 8_000
+                            readTimeout = 8_000
+                            useCaches = false
+                        }
+                        if (vttConn?.responseCode == 200) {
+                            vttConn?.inputStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                        } else {
+                            null
+                        }
                     }
-                    if (vttConn?.responseCode != 200) return@runCatching emptyList()
-                    val vtt = vttConn?.inputStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
-                        ?: return@runCatching emptyList()
-                    TrickplayTimeline.parseVtt(vtt, frameCount, cols, tileW, tileH) ?: emptyList()
-                }.getOrElse { emptyList() }
+                }.getOrNull()
             } else null
+            val cues = TrickplayTimeline.fetchedCues(
+                advertised = vttAdvertised,
+                rawVtt = rawVtt,
+                frameCount = frameCount,
+                cols = cols,
+                tileW = tileW,
+                tileH = tileH,
+            )
 
             // 2) The sprite is on the R2 public asset host, NOT a gated *.vortx.tv service host, so it stays
             // UNSIGNED (that route is exempt), matching Apple.
