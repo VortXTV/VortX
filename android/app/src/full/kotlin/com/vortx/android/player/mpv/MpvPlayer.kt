@@ -53,6 +53,7 @@ class MpvPlayer private constructor(
     override val state: StateFlow<PlayerState> = _state.asStateFlow()
     override val subtitleDelayAvailable: Boolean = true
     override val audioDelayAvailable: Boolean = true
+    override val audioOutputModeAvailable: Boolean = true
 
     /// Set true if attaching the render surface ever throws. The caller can consult it to fall back to
     /// ExoPlayer on a hard surface failure instead of showing a black frame.
@@ -288,7 +289,7 @@ class MpvPlayer private constructor(
     /// (mpv may only fully honor them on the next AO (re)open); applied as options pre-init for the reliable
     /// path. Mirrors Apple `setAudioOutputMode`.
     override fun setAudioOutputMode(mode: AudioOutputMode) {
-        for ((name, value) in mode.mpvOptions()) {
+        for ((name, value) in mode.mpvLiveProperties()) {
             mpv.setPropertyString(name, value)
         }
     }

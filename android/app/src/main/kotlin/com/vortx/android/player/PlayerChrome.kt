@@ -86,6 +86,7 @@ fun PlayerChrome(
     onAdjustSubtitleDelay: (Double) -> Unit,
     audioDelayAvailable: Boolean,
     audioDelaySeconds: Double,
+    audioOutputModeAvailable: Boolean,
     audioOutputMode: AudioOutputMode,
     onAdjustAudioDelay: (Double) -> Unit,
     onSelectAudioOutputMode: (AudioOutputMode) -> Unit,
@@ -298,6 +299,7 @@ fun PlayerChrome(
                 options = audioSyncOptions(
                     available = audioDelayAvailable,
                     delaySeconds = audioDelaySeconds,
+                    outputAvailable = audioOutputModeAvailable,
                     outputMode = audioOutputMode,
                     onAdjust = onAdjustAudioDelay,
                     onSelectOutput = onSelectAudioOutputMode,
@@ -405,6 +407,7 @@ private fun subtitleSyncOptions(
 private fun audioSyncOptions(
     available: Boolean,
     delaySeconds: Double,
+    outputAvailable: Boolean,
     outputMode: AudioOutputMode,
     onAdjust: (Double) -> Unit,
     onSelectOutput: (AudioOutputMode) -> Unit,
@@ -427,20 +430,26 @@ private fun audioSyncOptions(
             ),
         )
     }
-    add(SheetOption("Output", false, enabled = false, isHeader = true))
-    AudioOutputMode.entries.forEach { mode ->
-        add(
-            SheetOption(
-                label = mode.label,
-                selected = mode == outputMode,
-                onPick = { onSelectOutput(mode) },
-                detail = mode.detail,
-                isChoice = true,
-                dismissOnPick = false,
-            ),
-        )
+    val outputModes = visibleAudioOutputModes(outputAvailable)
+    if (outputModes.isNotEmpty()) {
+        add(SheetOption("Output", false, enabled = false, isHeader = true))
+        outputModes.forEach { mode ->
+            add(
+                SheetOption(
+                    label = mode.label,
+                    selected = mode == outputMode,
+                    onPick = { onSelectOutput(mode) },
+                    detail = mode.detail,
+                    isChoice = true,
+                    dismissOnPick = false,
+                ),
+            )
+        }
     }
 }
+
+internal fun visibleAudioOutputModes(available: Boolean): List<AudioOutputMode> =
+    if (available) AudioOutputMode.entries else emptyList()
 
 private fun formatDelay(seconds: Double): String = "%+.1fs".format(java.util.Locale.ROOT, seconds)
 

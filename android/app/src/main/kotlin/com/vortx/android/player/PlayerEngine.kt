@@ -33,6 +33,9 @@ interface PlayerEngine {
     /** True only when this engine can shift audio presentation time while playback is live. */
     val audioDelayAvailable: Boolean get() = false
 
+    /** True only when this engine can force a live audio output policy. */
+    val audioOutputModeAvailable: Boolean get() = false
+
     /// Begin (or replace) playback of [playable]. Applies per-stream headers and mounts external
     /// subtitles. Safe to call once per engine instance for the player's lifetime.
     fun load(playable: com.vortx.android.model.Playable)

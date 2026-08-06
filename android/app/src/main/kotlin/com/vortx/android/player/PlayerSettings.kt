@@ -282,6 +282,23 @@ enum class AudioOutputMode(val storageValue: String, val label: String, val deta
         )
     }
 
+    /**
+     * Complete property set for a live mode transition. Clearing `audio-spdif` is required when
+     * leaving passthrough because mpv retains properties that are omitted from a later update.
+     */
+    internal fun mpvLiveProperties(): List<Pair<String, String>> = listOf(
+        "audio-channels" to when (this) {
+            AUTO -> "auto-safe"
+            STEREO -> "stereo"
+            SURROUND, PASSTHROUGH -> "auto"
+        },
+        "audio-spdif" to if (this == PASSTHROUGH) {
+            "ac3,dts,eac3,truehd,dts-hd"
+        } else {
+            ""
+        },
+    )
+
     companion object {
         const val KEY = "stremiox.audioOutputMode"
 

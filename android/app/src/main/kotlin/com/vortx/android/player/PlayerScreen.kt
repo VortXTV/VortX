@@ -314,7 +314,9 @@ fun PlayerScreen(
         if (engine.audioDelayAvailable && audioDelaySeconds != 0.0) {
             engine.setAudioDelay(audioDelaySeconds)
         }
-        engine.setAudioOutputMode(audioOutputMode)
+        if (engine.audioOutputModeAvailable) {
+            engine.setAudioOutputMode(audioOutputMode)
+        }
     }
 
     // STALL / START WATCHDOG (engine-agnostic). Neither engine has a timeout of its own for a source
@@ -918,6 +920,7 @@ fun PlayerScreen(
             },
             audioDelayAvailable = engine.audioDelayAvailable,
             audioDelaySeconds = audioDelaySeconds,
+            audioOutputModeAvailable = engine.audioOutputModeAvailable,
             audioOutputMode = audioOutputMode,
             onAdjustAudioDelay = { delta ->
                 showControls()
@@ -926,9 +929,11 @@ fun PlayerScreen(
             },
             onSelectAudioOutputMode = { mode ->
                 showControls()
-                audioOutputMode = mode
-                AudioOutputMode.setCurrent(context, mode)
-                engine.setAudioOutputMode(mode)
+                if (engine.audioOutputModeAvailable) {
+                    audioOutputMode = mode
+                    AudioOutputMode.setCurrent(context, mode)
+                    engine.setAudioOutputMode(mode)
+                }
             },
             // Also withheld in PiP: the tiny window gets video only (the system draws the PiP
             // controls; ours would be unreachable dead pixels under them).
