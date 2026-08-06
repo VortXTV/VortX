@@ -27,6 +27,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.player.PlaybackBehaviorSettings
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.sources.SourcePreset
@@ -75,6 +76,9 @@ fun SourcesSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
         SourcePinStore(appContext) { ProfileStore.sharedOrNull()?.activeProfileId ?: SourcePinStore.DEFAULT_PROFILE }
     }
     var pinnedCount by remember { mutableStateOf(pins.pinnedCount) }
+    var directLinksOnly by remember {
+        mutableStateOf(PlaybackBehaviorSettings.directLinksOnly(appContext))
+    }
 
     // ONE snapshot of the store drives the whole screen, and every write re-reads it. This is deliberate
     // over ~15 independent state vars: `apply(preset)` mutates six fields at once, and `moveType` rewrites
@@ -206,6 +210,15 @@ fun SourcesSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     detail = "Hide anything that would need to download first.",
                     checked = ui.instantOnly,
                     onCheckedChange = { value -> mutate { instantOnly = value } },
+                )
+                ToggleRow(
+                    label = "Direct links only",
+                    detail = "Hide unresolved torrents; keep direct, resolved debrid, and media-server links.",
+                    checked = directLinksOnly,
+                    onCheckedChange = { value ->
+                        directLinksOnly = value
+                        PlaybackBehaviorSettings.setDirectLinksOnly(appContext, value)
+                    },
                 )
                 ToggleRow(
                     label = "Hide dead torrents",

@@ -48,13 +48,18 @@ data class SubtitleStyle(
     val sizeId: String,
     val sizeScale: Double,
     val colorId: String,
+    val brightnessId: String,
     val backgroundId: String,
 ) {
     /** The named base size times the fine multiplier, the value handed to mpv's `sub-font-size`. */
     val fontSize: Int get() = (baseFontSize(sizeId) * sizeScale).roundToInt()
 
     /** Opaque subtitle text colour as an `#RRGGBB` hex string. */
-    val colorHex: String get() = colorHexFor(colorId)
+    val colorHex: String
+        get() = dimmedHex(
+            colorHexFor(colorId),
+            brightnessLevels.firstOrNull { it.id == brightnessId }?.factor ?: 1.0,
+        )
 
     /** Modern (streaming-service look: thin outline + soft shadow) vs Classic (heavier border). */
     val isModern: Boolean get() = fontId == MODERN
@@ -112,6 +117,7 @@ data class SubtitleStyle(
         const val KEY_SIZE = "stremiox.sub.size"
         const val KEY_SIZE_SCALE = "stremiox.sub.sizeScale"
         const val KEY_COLOR = "stremiox.sub.color"
+        const val KEY_BRIGHTNESS = "stremiox.sub.brightness"
         const val KEY_BACKGROUND = "stremiox.sub.background"
 
         const val MODERN = "modern"
@@ -121,6 +127,7 @@ data class SubtitleStyle(
         const val DEFAULT_FONT = MODERN
         const val DEFAULT_SIZE = "m"
         const val DEFAULT_COLOR = "white"
+        const val DEFAULT_BRIGHTNESS = "100"
         const val DEFAULT_BACKGROUND = "outline"
 
         val SIZE_SCALE_RANGE = 0.60..1.80
@@ -141,7 +148,14 @@ data class SubtitleStyle(
             "s" to "Small", "m" to "Medium", "l" to "Large", "xl" to "Extra Large",
         )
         val colors: List<Pair<String, String>> = listOf(
-            "white" to "White", "yellow" to "Yellow", "soft" to "Soft",
+            "white" to "White", "yellow" to "Yellow", "soft" to "Soft", "grey" to "Grey",
+        )
+        data class BrightnessLevel(val id: String, val label: String, val factor: Double)
+        val brightnessLevels: List<BrightnessLevel> = listOf(
+            BrightnessLevel("100", "100%", 1.0),
+            BrightnessLevel("80", "80%", 0.8),
+            BrightnessLevel("60", "60%", 0.6),
+            BrightnessLevel("40", "40%", 0.4),
         )
         val backgrounds: List<Pair<String, String>> = listOf(
             "outline" to "Outline only", SHADED to "Shaded", BOX to "Solid box",
@@ -166,7 +180,17 @@ data class SubtitleStyle(
         private fun colorHexFor(id: String): String = when (id) {
             "yellow" -> "#FFFF00"
             "soft" -> "#F2F2F2"
+            "grey" -> "#B3B3B3"
             else -> "#FFFFFF" // "white"
+        }
+
+        /** Scale a `#RRGGBB` colour without changing its hue. Malformed input is returned unchanged. */
+        fun dimmedHex(hex: String, factor: Double): String {
+            val clean = hex.removePrefix("#")
+            val value = clean.takeIf { it.length == 6 }?.toLongOrNull(16) ?: return hex
+            val f = factor.coerceIn(0.0, 1.0)
+            fun channel(shift: Int): Int = ((((value shr shift) and 0xFF) * f).roundToInt()).coerceIn(0, 255)
+            return "#%02X%02X%02X".format(channel(16), channel(8), channel(0))
         }
 
         /** Parse `#RRGGBB` (or `#AARRGGBB`) into an opaque ARGB int. */
@@ -186,6 +210,7 @@ data class SubtitleStyle(
                 sizeId = p.getString(KEY_SIZE, DEFAULT_SIZE) ?: DEFAULT_SIZE,
                 sizeScale = scale,
                 colorId = p.getString(KEY_COLOR, DEFAULT_COLOR) ?: DEFAULT_COLOR,
+                brightnessId = p.getString(KEY_BRIGHTNESS, DEFAULT_BRIGHTNESS) ?: DEFAULT_BRIGHTNESS,
                 backgroundId = p.getString(KEY_BACKGROUND, DEFAULT_BACKGROUND) ?: DEFAULT_BACKGROUND,
             )
         }
@@ -207,6 +232,7 @@ data class SubtitleStyle(
                 .putString(KEY_SIZE, style.sizeId)
                 .putFloat(KEY_SIZE_SCALE, rounded.toFloat())
                 .putString(KEY_COLOR, style.colorId)
+                .putString(KEY_BRIGHTNESS, style.brightnessId)
                 .putString(KEY_BACKGROUND, style.backgroundId)
                 .apply()
         }
@@ -255,6 +281,23 @@ enum class AudioOutputMode(val storageValue: String, val label: String, val deta
             "audio-channels" to "auto",
         )
     }
+
+    /**
+     * Complete property set for a live mode transition. Clearing `audio-spdif` is required when
+     * leaving passthrough because mpv retains properties that are omitted from a later update.
+     */
+    internal fun mpvLiveProperties(): List<Pair<String, String>> = listOf(
+        "audio-channels" to when (this) {
+            AUTO -> "auto-safe"
+            STEREO -> "stereo"
+            SURROUND, PASSTHROUGH -> "auto"
+        },
+        "audio-spdif" to if (this == PASSTHROUGH) {
+            "ac3,dts,eac3,truehd,dts-hd"
+        } else {
+            ""
+        },
+    )
 
     companion object {
         const val KEY = "stremiox.audioOutputMode"
@@ -490,6 +533,28 @@ object AutoAddLibrarySetting {
     /** Persist the viewer's choice. The write side of [isEnabled], used by the Settings UI. */
     fun setEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY, enabled).apply()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// PlaybackBehaviorSettings - Apple PlaybackSettings and player toggles
+// ---------------------------------------------------------------------------------------------------
+
+/** Small playback switches shared by source assembly, the player, and both Android settings surfaces. */
+object PlaybackBehaviorSettings {
+    const val DIRECT_LINKS_ONLY_KEY = "stremiox.directLinksOnly"
+    const val AUTO_SKIP_KEY = "stremiox.autoSkip"
+
+    fun directLinksOnly(context: Context): Boolean = prefs(context).getBoolean(DIRECT_LINKS_ONLY_KEY, false)
+
+    fun setDirectLinksOnly(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(DIRECT_LINKS_ONLY_KEY, enabled).apply()
+    }
+
+    fun autoSkip(context: Context): Boolean = prefs(context).getBoolean(AUTO_SKIP_KEY, false)
+
+    fun setAutoSkip(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(AUTO_SKIP_KEY, enabled).apply()
     }
 }
 

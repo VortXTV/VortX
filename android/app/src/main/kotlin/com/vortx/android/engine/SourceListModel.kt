@@ -74,7 +74,7 @@ class SourceListModel(
         val continuity: String? = null, // remembered quality signature for the best() pick (null for live)
         val pin: ResolvedPin? = null,
         val prefs: SourcePrefsSnapshot = SourcePrefsSnapshot.DEFAULT,
-        val directLinksOnly: Boolean = false, // drop torrent sources entirely
+        val directLinksOnly: Boolean = false, // drop unresolved raw torrents, preserve resolved direct links
         val disabledAddons: Set<String> = emptySet(), // per-profile disabled add-on labels
         val contentId: String? = null, // Singularity pool content id, for the HOARD seed only
     )
@@ -221,12 +221,7 @@ class SourceListModel(
                 ),
             )
 
-            if (ctx.directLinksOnly) {
-                assembled = assembled.mapNotNull { group ->
-                    val streams = group.streams.filter { !it.isTorrent }
-                    if (streams.isEmpty()) null else group.copy(streams = streams)
-                }
-            }
+            assembled = directLinkDisplayGroups(assembled, ctx.directLinksOnly)
 
             // Install the frozen snapshot so tiers()/resolutionOptions() (which read the installed reading) and
             // the explicit-prefs rankedGroups()/best() all rank against the SAME frozen copy, never a live
@@ -237,6 +232,30 @@ class SourceListModel(
             val tiers = StreamRanking.tiers(ranked)
             val resolutionOptions = StreamRanking.resolutionOptions(ranked)
             return SourceListState(groups = ranked, best = best, tiers = tiers, resolutionOptions = resolutionOptions)
+        }
+
+        /**
+         * Apply the viewer's direct-links-only display preference without mistaking an already-resolved
+         * debrid row for a raw torrent. Some resolvers retain [StreamSource.infoHash] and [StreamSource.isTorrent]
+         * as provenance after attaching a direct [StreamSource.url]; those rows are playable direct links and
+         * must stay. A media-server or external direct row also stays even if malformed upstream metadata set
+         * the torrent flag. This pure filter is shared by the coalesced assembly and Detail's immediate paint
+         * and Smart Source pick, so no pre-coalescer path can publish or rank a forbidden raw torrent.
+         */
+        fun directLinkDisplayGroups(
+            groups: List<StreamGroup>,
+            enabled: Boolean,
+        ): List<StreamGroup> {
+            if (!enabled) return groups
+            return groups.mapNotNull { group ->
+                val streams = group.streams.filterNot { stream ->
+                    stream.isTorrent &&
+                        stream.url.isNullOrBlank() &&
+                        stream.externalUrl.isNullOrBlank() &&
+                        !stream.isMediaServer
+                }
+                if (streams.isEmpty()) null else group.copy(streams = streams)
+            }
         }
 
         /// The only groups eligible for contribution: enabled raw add-on results plus TorBox search results.

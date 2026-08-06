@@ -88,8 +88,9 @@ enum class VideoUpscaling(val storageValue: String, val label: String, val detai
         }
 
     /**
-     * Ordered file names of the bundled Anime4K shader chain (Mode A: restore + upscale, Medium CNN
-     * variants), resolved from the app's shaders folder at runtime. Order is significant. Empty otherwise.
+     * Required file names for the planned Anime4K shader chain (Mode A: restore + upscale, Medium CNN
+     * variants). Android currently ships neither these resources nor the application wiring that resolves
+     * and applies them, so [ANIME4K] is never exposed or returned as an effective Android preset.
      */
     val glslShaderFileNames: List<String>
         get() = when (this) {
@@ -106,6 +107,9 @@ enum class VideoUpscaling(val storageValue: String, val label: String, val detai
 
     companion object {
         fun fromStorage(raw: String?): VideoUpscaling? = entries.firstOrNull { it.storageValue == raw }
+
+        /** Implemented Android presets. Anime4K needs both packaged shaders and application wiring. */
+        val androidChoices: List<VideoUpscaling> = entries.filterNot { it == ANIME4K }
     }
 }
 
@@ -113,9 +117,9 @@ enum class VideoUpscaling(val storageValue: String, val label: String, val detai
  * SharedPreferences-backed accessor for [TrackPreferences] and [VideoUpscaling], the Android analogue of
  * Apple's `TrackPreferences.current`/`.save()` and `PlaybackSettings.videoUpscaling` (both on `UserDefaults`).
  *
- * [isConstrainedDevice] stands in for Apple `PerformanceMode.isConstrainedDevice` (not yet ported to Android
- * per the parity map). It defaults to `false` so a caller can inject the real value once `PerformanceMode`
- * lands, preserving Apple's constrained-device fallbacks (Anime4K -> Performance, and the per-device default).
+ * [isConstrainedDevice] is Android's live `PerformanceMode.isConstrainedDevice` result. It controls the
+ * default preset. Anime4K falls back on every Android device because neither its shaders nor its application
+ * wiring are implemented; the stored value remains intact for cross-platform round trips.
  */
 class TrackPreferencesStore(
     context: Context,
@@ -143,20 +147,30 @@ class TrackPreferencesStore(
 
     /**
      * Video upscaling preset. Default is hardware-aware: a constrained device gets [VideoUpscaling.PERFORMANCE],
-     * everything else [VideoUpscaling.STANDARD]. A constrained device never actually runs Anime4K even if the
-     * stored value (or a synced profile) selected it. Mirrors Apple `PlaybackSettings.videoUpscaling`.
+     * everything else [VideoUpscaling.STANDARD]. Android never runs Anime4K until both its shader resources
+     * and application wiring exist, even if a synced profile selected it. Mirrors Apple
+     * `PlaybackSettings.videoUpscaling`.
      */
     var videoUpscaling: VideoUpscaling
         get() {
             val stored = VideoUpscaling.fromStorage(prefs.getString(KEY_UPSCALING, null))
             if (stored != null) {
-                if (stored == VideoUpscaling.ANIME4K && isConstrainedDevice) return VideoUpscaling.PERFORMANCE
+                if (stored == VideoUpscaling.ANIME4K) {
+                    return if (isConstrainedDevice) VideoUpscaling.PERFORMANCE else VideoUpscaling.STANDARD
+                }
                 return stored
             }
             return if (isConstrainedDevice) VideoUpscaling.PERFORMANCE else VideoUpscaling.STANDARD
         }
         set(value) {
             prefs.edit().putString(KEY_UPSCALING, value.storageValue).apply()
+        }
+
+    /** Whether external subtitle rows should be limited to the preferred subtitle language chain. */
+    var subtitlesOnlyPreferred: Boolean
+        get() = prefs.getBoolean(KEY_SUB_ONLY_PREFERRED, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_SUB_ONLY_PREFERRED, value).apply()
         }
 
     /**
@@ -193,6 +207,7 @@ class TrackPreferencesStore(
         const val KEY_SUBTITLE = "stremiox.tracks.subLangs"
         const val KEY_FORCED = "stremiox.tracks.forced"
         const val KEY_REJECT = "stremiox.tracks.reject"
+        const val KEY_SUB_ONLY_PREFERRED = "stremiox.tracks.subOnlyPreferred"
         const val KEY_UPSCALING = "stremiox.videoUpscaling"
         const val KEY_TRAILER_LANG = "stremiox.trailerLanguage"
     }

@@ -9,6 +9,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import com.vortx.android.model.Playable
+import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.DiskCacheSetting
 import com.vortx.android.player.PerformanceMode
@@ -50,6 +51,9 @@ class MpvPlayer private constructor(
 
     private val _state = MutableStateFlow(PlayerState())
     override val state: StateFlow<PlayerState> = _state.asStateFlow()
+    override val subtitleDelayAvailable: Boolean = true
+    override val audioDelayAvailable: Boolean = true
+    override val audioOutputModeAvailable: Boolean = true
 
     /// Set true if attaching the render surface ever throws. The caller can consult it to fall back to
     /// ExoPlayer on a hard surface failure instead of showing a black frame.
@@ -152,6 +156,13 @@ class MpvPlayer private constructor(
             mpv.setOptionString(name, value)
         }
         for ((name, value) in AudioOutputMode.current(appContext).mpvOptions()) {
+            mpv.setOptionString(name, value)
+        }
+        val upscaling = TrackPreferencesStore(
+            appContext,
+            PerformanceMode.isConstrainedDevice(appContext),
+        ).videoUpscaling
+        for ((name, value) in upscaling.mpvOptions) {
             mpv.setOptionString(name, value)
         }
         // Apply the trust policy last and fail closed if this packaged libmpv rejects any part of it.
@@ -278,7 +289,7 @@ class MpvPlayer private constructor(
     /// (mpv may only fully honor them on the next AO (re)open); applied as options pre-init for the reliable
     /// path. Mirrors Apple `setAudioOutputMode`.
     override fun setAudioOutputMode(mode: AudioOutputMode) {
-        for ((name, value) in mode.mpvOptions()) {
+        for ((name, value) in mode.mpvLiveProperties()) {
             mpv.setPropertyString(name, value)
         }
     }

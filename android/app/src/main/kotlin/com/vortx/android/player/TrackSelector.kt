@@ -124,6 +124,25 @@ object TrackSelector {
         return ca.isNotEmpty() && ca == canonical(b)
     }
 
+    /**
+     * Limit external subtitle rows to the preferred language chain when the opt-in setting is enabled.
+     * Unknown-language rows stay visible so incomplete add-on metadata can never hide every option.
+     * Embedded tracks never pass through this helper and are therefore never removed.
+     */
+    fun <T> keepingPreferredSubtitleLanguages(
+        items: List<T>,
+        enabled: Boolean,
+        preferredLanguages: List<String>,
+        language: (T) -> String,
+    ): List<T> {
+        if (!enabled || preferredLanguages.isEmpty()) return items
+        return items.filter { item ->
+            val raw = language(item).trim().lowercase()
+            raw.isEmpty() || raw == "und" || raw == "unknown" ||
+                preferredLanguages.any { matches(raw, it) }
+        }
+    }
+
     /** Reduce a language code to a canonical 2-letter form (eng -> en, en-US -> en, ja -> ja). */
     fun canonical(code: String?): String {
         val base = code?.lowercase()?.substringBefore('-') ?: ""

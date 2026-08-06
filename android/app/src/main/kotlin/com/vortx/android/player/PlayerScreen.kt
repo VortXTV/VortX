@@ -61,6 +61,7 @@ import com.vortx.android.VortXApplication
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.model.Playable
 import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.skip.AutoSkipPolicy
 import com.vortx.android.skip.SegmentResolver
 import com.vortx.android.skip.SkipSegment
 import com.vortx.android.skip.SkipTimestampService
@@ -72,6 +73,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.roundToInt
 
 /// Fullscreen player. It no longer owns a specific engine: [PlayerEngineRouter] picks the engine for
 /// this [playable] (libmpv PRIMARY, ExoPlayer for Dolby Vision / Atmos passthrough and as the fail-soft
@@ -135,6 +137,9 @@ fun PlayerScreen(
     // current playback speed reflected in the speed control.
     var scaleMode by remember(playable.url) { mutableStateOf(VideoScaleMode.FIT) }
     var speed by remember(playable.url) { mutableStateOf(1.0f) }
+    var subtitleDelaySeconds by remember(playable.url) { mutableStateOf(0.0) }
+    var audioDelaySeconds by remember(playable.url) { mutableStateOf(0.0) }
+    var audioOutputMode by remember(playable.url) { mutableStateOf(AudioOutputMode.current(context)) }
 
     // CONTROLS AUTO-HIDE. The chrome (top scrim + title + transport bar) previously had no visibility
     // state at all, so it was drawn permanently over the video. Now: visible on entry, auto-hidden after
@@ -300,6 +305,20 @@ fun PlayerScreen(
     val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
 
+    // Re-apply player-local controls when the live engine instance changes during a fail-soft demotion.
+    // The new engine advertises its capabilities, so unsupported offsets remain honest no-ops.
+    LaunchedEffect(engine) {
+        if (engine.subtitleDelayAvailable && subtitleDelaySeconds != 0.0) {
+            engine.setSubtitleDelay(subtitleDelaySeconds)
+        }
+        if (engine.audioDelayAvailable && audioDelaySeconds != 0.0) {
+            engine.setAudioDelay(audioDelaySeconds)
+        }
+        if (engine.audioOutputModeAvailable) {
+            engine.setAudioOutputMode(audioOutputMode)
+        }
+    }
+
     // STALL / START WATCHDOG (engine-agnostic). Neither engine has a timeout of its own for a source
     // that connects but never delivers (or stops delivering) data: mpv's `paused-for-cache` can sit
     // true forever with no error event, which used to mean an infinite silent black frame. This loop
@@ -454,7 +473,13 @@ fun PlayerScreen(
         val repo = (context.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
         val sources = SubtitleAddonService.installedSources(repo.installedAddons().getOrNull().orEmpty())
         if (sources.isEmpty()) return@LaunchedEffect
-        addonSubtitles = SubtitleAddonService.fetch(sources, type, videoId)
+        val store = TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context))
+        addonSubtitles = TrackSelector.keepingPreferredSubtitleLanguages(
+            items = SubtitleAddonService.fetch(sources, type, videoId),
+            enabled = store.subtitlesOnlyPreferred,
+            preferredLanguages = store.current.subtitleLanguages,
+            language = AddonSubtitle::lang,
+        )
     }
     // A picked add-on subtitle has mounted when the engine's subtitle list grows past its pre-mount
     // count; select the newly appended track (mpv appends on `sub-add`, the ExoPlayer rebuild
@@ -516,6 +541,21 @@ fun PlayerScreen(
             durationSeconds = durationSec,
         )
         skipSegments = SegmentResolver.resolve(candidates, durationSec)
+    }
+
+    // Keep the once-per-segment memory across same-episode source failover. A URL is source identity, not
+    // media identity; two failed sources for one episode must not cause the same intro to auto-skip twice.
+    val autoSkipIdentity = autoSkipMediaIdentity(playable)
+    val autoSkipEnabled = remember(autoSkipIdentity) {
+        PlaybackBehaviorSettings.autoSkip(context.applicationContext)
+    }
+    val autoSkippedStarts = remember(autoSkipIdentity) { mutableSetOf<Double>() }
+    LaunchedEffect(autoSkipEnabled, skipSegments, playerState.positionMs / 1000L) {
+        if (!autoSkipEnabled) return@LaunchedEffect
+        val target = AutoSkipPolicy.target(skipSegments, latestState.positionMs, autoSkippedStarts)
+            ?: return@LaunchedEffect
+        autoSkippedStarts += target.start
+        engine.seekTo((target.end * 1000).toLong())
     }
 
     // Community trickplay (shared scrub previews). Three seams, all fail-soft, all keyed per title:
@@ -871,6 +911,30 @@ fun PlayerScreen(
             emberAccent = emberAccent,
             speed = speed,
             scaleMode = scaleMode,
+            subtitleDelayAvailable = engine.subtitleDelayAvailable,
+            subtitleDelaySeconds = subtitleDelaySeconds,
+            onAdjustSubtitleDelay = { delta ->
+                showControls()
+                subtitleDelaySeconds = adjustedPlayerDelay(subtitleDelaySeconds, delta)
+                engine.setSubtitleDelay(subtitleDelaySeconds)
+            },
+            audioDelayAvailable = engine.audioDelayAvailable,
+            audioDelaySeconds = audioDelaySeconds,
+            audioOutputModeAvailable = engine.audioOutputModeAvailable,
+            audioOutputMode = audioOutputMode,
+            onAdjustAudioDelay = { delta ->
+                showControls()
+                audioDelaySeconds = adjustedPlayerDelay(audioDelaySeconds, delta)
+                engine.setAudioDelay(audioDelaySeconds)
+            },
+            onSelectAudioOutputMode = { mode ->
+                showControls()
+                if (engine.audioOutputModeAvailable) {
+                    audioOutputMode = mode
+                    AudioOutputMode.setCurrent(context, mode)
+                    engine.setAudioOutputMode(mode)
+                }
+            },
             // Also withheld in PiP: the tiny window gets video only (the system draws the PiP
             // controls; ours would be unreachable dead pixels under them).
             controlsVisible = controlsVisible && !controlsLocked && !pip.isInPip,
@@ -1046,6 +1110,32 @@ private fun videoHeightOf(engine: PlayerEngine): Int {
     val resolution = runCatching { engine.playbackStats() }.getOrNull()
         ?.firstOrNull { it.first == "Resolution" }?.second ?: return 0
     return resolution.substringAfter('x', "").toIntOrNull() ?: 0
+}
+
+/**
+ * Stable media identity for automatic-skip lifecycle state. IMDb plus season/episode survives a source
+ * failover for the same title. A series row without a complete episode identity is not safely mappable, so
+ * it falls back to the concrete URL rather than sharing skip state across every episode of one show.
+ */
+internal fun autoSkipMediaIdentity(playable: Playable): String {
+    val ref = playable.mediaRef
+    val imdb = ref?.imdb?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+    if (imdb != null) {
+        if (ref.isSeries) {
+            val season = ref.season?.takeIf { it > 0 }
+            val episode = ref.episode?.takeIf { it > 0 }
+            if (season != null && episode != null) return "imdb:$imdb:s$season:e$episode"
+        } else {
+            return "imdb:$imdb"
+        }
+    }
+    return "url:${playable.url}"
+}
+
+/** Apple-compatible one-decimal delay grid, also canonicalizing negative zero after Reset. */
+internal fun adjustedPlayerDelay(current: Double, delta: Double): Double {
+    val adjusted = ((current + delta) * 10.0).roundToInt() / 10.0
+    return if (adjusted == -0.0) 0.0 else adjusted
 }
 
 /// Resolve the hosting [Activity] from a Compose [LocalContext], which may be a [ContextWrapper] chain

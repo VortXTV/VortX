@@ -39,6 +39,12 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -48,9 +54,13 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.R
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.model.VideoUpscaling
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.AutoAddLibrarySetting
+import com.vortx.android.player.PlaybackBehaviorSettings
 import com.vortx.android.player.PerformanceMode
+import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.ui.theme.VortXAccents
@@ -60,9 +70,9 @@ import com.vortx.android.ui.theme.VortXTheme
 
 /// TV Settings: a focusable 10-foot list surfacing the couch-relevant toggles PLUS the "Who's watching?"
 /// profile switcher. Every playback control writes through the EXACT SAME store the phone Settings and the
-/// player read -- [AudioOutputMode] (`stremiox.audioOutputMode`), [PerformanceMode] (`stremiox.performanceMode`),
-/// [AutoAddLibrarySetting] (`stremiox.autoAddLibrary`) -- so a change from the couch and one on the phone are
-/// the SAME value in the shared `vortx_settings` SharedPreferences. There are no TV-only settings keys.
+/// player read: [AudioOutputMode], [PerformanceMode], [AutoAddLibrarySetting], [SubtitleStyle],
+/// [TrackPreferencesStore], and [PlaybackBehaviorSettings]. A couch change and a phone change therefore
+/// write the SAME value in `vortx_settings`. There are no TV-only settings keys.
 ///
 /// PROFILE SWITCHING (this round): the roster is now focusable and switchable from the couch. Tapping a
 /// profile calls [ProfileStore.select], which applies its theme/filters, fires the engine reload +
@@ -76,14 +86,17 @@ import com.vortx.android.ui.theme.VortXTheme
 /// SCOPE, honestly: this ships the primary 10-foot toggles a viewer changes from the couch plus profile
 /// SWITCHING. Creating / renaming / deleting a profile stays on the phone/tablet app for now (text entry is a
 /// touch job); debrid API keys have their own nested TV route, while the remaining deep phone-only surfaces
-/// (Account sign-in, Add-ons, Integrations, Media servers, subtitle styling, Sources ranking, Downloads,
-/// Library transfer) are named at the foot of the list rather than reproduced. Binding a profile to its own
-/// separate account is not wired on Android yet, so a
+/// (Account sign-in, Add-ons, Integrations, Media servers, advanced subtitle styling, Sources ranking,
+/// Downloads, Library transfer) are named at the foot of the list rather than reproduced. Binding a profile
+/// to its own separate account is not wired on Android yet, so a
 /// [ProfileStore.select] returning `SwitchAccount` / `NeedsSignIn` is surfaced as a note.
 @Composable
 fun TvSettingsScreen(modifier: Modifier = Modifier) {
     val appContext = LocalContext.current.applicationContext
     val debridKeys = remember(appContext) { DebridKeys(appContext) }
+    val trackStore = remember(appContext) {
+        TrackPreferencesStore(appContext, PerformanceMode.isConstrainedDevice(appContext))
+    }
     var route by remember { mutableStateOf(TvSettingsRoute.ROOT) }
     val settingsListState = rememberLazyListState()
     val debridServicesFocus = remember { FocusRequester() }
@@ -95,6 +108,13 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
     var audioMode by remember { mutableStateOf(AudioOutputMode.current(appContext)) }
     var performance by remember { mutableStateOf(PerformanceMode.currentOverride(appContext)) }
     var autoAdd by remember { mutableStateOf(AutoAddLibrarySetting.isEnabled(appContext)) }
+    var subtitleStyle by remember { mutableStateOf(SubtitleStyle.current(appContext)) }
+    var subtitlesOnlyPreferred by remember { mutableStateOf(trackStore.subtitlesOnlyPreferred) }
+    var videoUpscaling by remember { mutableStateOf(trackStore.videoUpscaling) }
+    var autoSkip by remember { mutableStateOf(PlaybackBehaviorSettings.autoSkip(appContext)) }
+    var directLinksOnly by remember {
+        mutableStateOf(PlaybackBehaviorSettings.directLinksOnly(appContext))
+    }
 
     val store = ProfileStore.sharedOrNull()
     // Bumped after a switch to force a fresh read of the plain (non-observable) store fields.
@@ -216,6 +236,96 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
                             },
                         )
                     }
+                }
+            }
+
+            item {
+                TvSettingsSection("Subtitle color") {
+                    SubtitleStyle.colors.forEach { (id, label) ->
+                        TvOptionRow(
+                            label = label,
+                            detail = null,
+                            selected = subtitleStyle.colorId == id,
+                            onClick = {
+                                subtitleStyle = subtitleStyle.copy(colorId = id)
+                                SubtitleStyle.save(appContext, subtitleStyle)
+                            },
+                        )
+                    }
+                }
+            }
+
+            item {
+                TvSettingsSection("Subtitle brightness") {
+                    SubtitleStyle.brightnessLevels.forEach { level ->
+                        TvOptionRow(
+                            label = level.label,
+                            detail = null,
+                            selected = subtitleStyle.brightnessId == level.id,
+                            onClick = {
+                                subtitleStyle = subtitleStyle.copy(brightnessId = level.id)
+                                SubtitleStyle.save(appContext, subtitleStyle)
+                            },
+                        )
+                    }
+                }
+            }
+
+            item {
+                TvSettingsSection("External subtitles") {
+                    TvToggleRow(
+                        label = "Only preferred external subtitles",
+                        detail = "Keep embedded tracks, but limit add-on subtitles to your preferred languages.",
+                        checked = subtitlesOnlyPreferred,
+                        onToggle = {
+                            subtitlesOnlyPreferred = !subtitlesOnlyPreferred
+                            trackStore.subtitlesOnlyPreferred = subtitlesOnlyPreferred
+                        },
+                    )
+                }
+            }
+
+            item {
+                TvSettingsSection("Video quality") {
+                    VideoUpscaling.androidChoices.forEach { preset ->
+                        TvOptionRow(
+                            label = preset.label,
+                            detail = preset.detail,
+                            selected = preset == videoUpscaling,
+                            onClick = {
+                                videoUpscaling = preset
+                                trackStore.videoUpscaling = preset
+                            },
+                        )
+                    }
+                }
+            }
+
+            item {
+                TvSettingsSection("Source selection") {
+                    TvToggleRow(
+                        label = "Direct links only",
+                        detail = "Hide unresolved torrents; keep direct, resolved debrid, and media-server links.",
+                        checked = directLinksOnly,
+                        onToggle = {
+                            directLinksOnly = !directLinksOnly
+                            PlaybackBehaviorSettings.setDirectLinksOnly(appContext, directLinksOnly)
+                        },
+                    )
+                }
+            }
+
+            item {
+                TvSettingsSection("Skip segments") {
+                    TvToggleRow(
+                        label = "Skip automatically",
+                        detail = "Jump past each detected intro, recap, credits, or preview once.",
+                        checked = autoSkip,
+                        onToggle = {
+                            autoSkip = !autoSkip
+                            PlaybackBehaviorSettings.setAutoSkip(appContext, autoSkip)
+                        },
+                    )
                 }
             }
 
@@ -387,7 +497,12 @@ private fun TvOptionRow(label: String, detail: String?, selected: Boolean, onCli
     val colors = VortXTheme.colors
     Surface(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .semantics(mergeDescendants = true) {
+                role = Role.RadioButton
+                this.selected = selected
+            },
         shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = colors.surface1,
@@ -445,7 +560,12 @@ private fun TvToggleRow(label: String, detail: String?, checked: Boolean, onTogg
     val colors = VortXTheme.colors
     Surface(
         onClick = onToggle,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .semantics(mergeDescendants = true) {
+                role = Role.Switch
+                toggleableState = if (checked) ToggleableState.On else ToggleableState.Off
+            },
         shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = colors.surface1,
@@ -639,7 +759,7 @@ private fun TvKeypadKey(label: String, onClick: () -> Unit, enabled: Boolean = t
 private fun TvSettingsFootnote() {
     Text(
         text = "Creating, renaming, and deleting profiles, plus account, add-ons, integrations, media " +
-            "servers, subtitle styling, source ranking, and downloads, are managed in the VortX phone and " +
+            "servers, advanced subtitle styling, source ranking, and downloads, are managed in the VortX phone and " +
             "tablet app.",
         style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
         modifier = Modifier.fillMaxWidth().padding(top = VortXTheme.spacing.sm),

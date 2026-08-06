@@ -53,6 +53,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
     private val _state = MutableStateFlow(PlayerState())
     override val state: StateFlow<PlayerState> = _state.asStateFlow()
+    override val audioOutputModeAvailable: Boolean = false
 
     private val listener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
