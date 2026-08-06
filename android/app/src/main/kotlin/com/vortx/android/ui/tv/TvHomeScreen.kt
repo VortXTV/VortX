@@ -75,9 +75,9 @@ private fun TvHomeContent(
 ) {
     val colors = VortXTheme.colors
     val visibleCatalogs = remember(catalogs) { tvHomeCatalogs(catalogs) }
-    // Keep the focused identity across incremental updates only while that exact type/id is still visible.
-    // A profile/account catalog replacement falls back in this composition, then commits the fallback key
-    // so a removed identity cannot return later and resurrect the previous owner's hero.
+    // Keep only an identity the viewer actually focused. A fallback item is rendered but never promoted
+    // into focused state, so an owner transition cannot tag the previous owner's first poster with the
+    // new generation while Home is still waiting for the replacement catalog emission.
     var heroState by remember { mutableStateOf(TvHomeHeroState(contentOwnerGeneration, null)) }
     val heroSelection = tvHomeHeroSelection(heroState, contentOwnerGeneration, visibleCatalogs)
     SideEffect {
@@ -265,7 +265,7 @@ internal fun tvHomeHeroSelection(
     }
     val selected = retained ?: catalogs.firstNotNullOfOrNull { it.items.firstOrNull() }
     return TvHomeHeroSelection(
-        state = TvHomeHeroState(contentOwnerGeneration, selected?.let(::tvHomeItemKey)),
+        state = TvHomeHeroState(contentOwnerGeneration, retained?.let(::tvHomeItemKey)),
         item = selected,
     )
 }

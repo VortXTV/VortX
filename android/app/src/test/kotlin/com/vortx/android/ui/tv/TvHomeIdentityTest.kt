@@ -55,10 +55,10 @@ class TvHomeIdentityTest {
             listOf(Catalog("profile-b", "Profile B", listOf(profileBFirst, sameIdDifferentType))),
         )
         assertEquals(profileBFirst, replaced.item)
-        assertEquals(tvHomeItemKey(profileBFirst), replaced.state.focusedKey)
+        assertEquals(TvHomeHeroState(1L, null), replaced.state)
 
         val lateProfileB = tvHomeHeroSelection(
-            replaced.state,
+            TvHomeHeroState(1L, tvHomeItemKey(profileBFirst)),
             1L,
             listOf(Catalog("profile-b", "Profile B", listOf(profileBFirst, sameIdDifferentType, focused))),
         )
@@ -71,14 +71,29 @@ class TvHomeIdentityTest {
         val newFirst = movie("tt-new", "New owner")
         val staleLateOld = oldFocused.copy(name = "Late stale old owner")
 
-        val coalesced = tvHomeHeroSelection(
-            previous = TvHomeHeroState(7L, tvHomeItemKey(oldFocused)),
+        val oldState = TvHomeHeroState(7L, tvHomeItemKey(oldFocused))
+        val generationFirst = tvHomeHeroSelection(
+            previous = oldState,
+            contentOwnerGeneration = 8L,
+            catalogs = listOf(Catalog("old", "Old", listOf(oldFocused))),
+        )
+        val coalescedWithCommittedBoundary = tvHomeHeroSelection(
+            previous = generationFirst.state,
+            contentOwnerGeneration = 8L,
+            catalogs = listOf(Catalog("new", "New", listOf(newFirst, staleLateOld))),
+        )
+        val coalescedWithSkippedBoundaryFrame = tvHomeHeroSelection(
+            previous = oldState,
             contentOwnerGeneration = 8L,
             catalogs = listOf(Catalog("new", "New", listOf(newFirst, staleLateOld))),
         )
 
-        assertEquals(newFirst, coalesced.item)
-        assertEquals(TvHomeHeroState(8L, tvHomeItemKey(newFirst)), coalesced.state)
+        assertEquals(oldFocused, generationFirst.item)
+        assertEquals(TvHomeHeroState(8L, null), generationFirst.state)
+        assertEquals(newFirst, coalescedWithCommittedBoundary.item)
+        assertEquals(newFirst, coalescedWithSkippedBoundaryFrame.item)
+        assertEquals(TvHomeHeroState(8L, null), coalescedWithCommittedBoundary.state)
+        assertEquals(TvHomeHeroState(8L, null), coalescedWithSkippedBoundaryFrame.state)
     }
 
     private fun movie(id: String, name: String) = MetaItem(id = id, type = MediaType.MOVIE, name = name)
