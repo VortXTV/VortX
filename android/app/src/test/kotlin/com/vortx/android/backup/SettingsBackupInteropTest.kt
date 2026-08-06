@@ -4,6 +4,7 @@ import com.vortx.android.profile.UserProfile
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -11,6 +12,28 @@ import java.util.Base64
 import java.util.Date
 
 class SettingsBackupInteropTest {
+
+    private val deniedKeys = listOf(
+        "AppleLanguages",
+        "NSNavLastRootDirectory",
+        "com.apple.example",
+        "WebKitLocalStorage",
+        "WebDatabaseDirectory",
+        "PKInstallHistory",
+        "MetricKitPayload",
+        "INNextRefreshDate",
+        "stremiox.diskCacheBytes",
+        "stremiox.serverURL",
+        "stremiox.videoUpscaling",
+        "stremiox.dvRemux",
+        "vortx.pgsSubtitleOCR",
+        "vortx.downloads.queueOrder",
+        "vortx.downloads.maxConcurrent",
+        "vortx.moveSeeding.launchNagDismissedBuild",
+        "vortx.sync.lastSyncedVersion.account",
+        "kcinvalidated.account",
+        "kcfallback.account",
+    )
 
     @Test
     fun androidBlobCarriesTheLosslessRosterAppleReads() {
@@ -160,6 +183,48 @@ class SettingsBackupInteropTest {
         }
     }
 
+    @Test
+    fun everyCurrentAppleDeniedKeyAndPrefixIsNotSyncable() {
+        deniedKeys.forEach { key ->
+            assertFalse("must not sync $key", SettingsBackup.isSyncable(key))
+        }
+        assertTrue(SettingsBackup.isSyncable("vortx.downloads.autoDeleteWatched"))
+        assertTrue(SettingsBackup.isSyncable("vortx.future.setting"))
+    }
+
+    @Test
+    fun poisonedIncomingBlobIsScrubbedWhileSafeUnknownSettingsSurvive() {
+        val cloudProfile = profile(name = "Cloud")
+        val poisoned = LinkedHashMap<String, Any>().apply {
+            deniedKeys.forEach { key -> put(key, "must-not-survive") }
+            put("vortx.downloads.autoDeleteWatched", true)
+            put("vortx.future.setting", listOf("one", "two"))
+            put(
+                SettingsBackup.ROSTER_KEY,
+                UserProfile.encodeRoster(listOf(cloudProfile)).toByteArray(Charsets.UTF_8),
+            )
+            put(SettingsBackup.MODIFIED_KEY, 1.0)
+        }
+        val original = blobFromDomain(poisoned)
+
+        val decoded = SettingsBackup.decodeDomain(Base64.getDecoder().decode(original))
+        deniedKeys.forEach { key -> assertFalse("decoded $key", requireNotNull(decoded).containsKey(key)) }
+        assertEquals(true, decoded?.get("vortx.downloads.autoDeleteWatched"))
+        assertEquals(listOf("one", "two"), decoded?.get("vortx.future.setting"))
+
+        val rebuilt = SettingsBackup.settingsBlobFor(
+            pulledBlob = original,
+            roster = listOf(profile(name = "Local")),
+            rosterModifiedSeconds = 2L,
+            bundleId = "com.vortx.android",
+            now = Date(0L),
+        )
+        val rawRebuilt = rawDomain(rebuilt)
+        deniedKeys.forEach { key -> assertFalse("rebuilt $key", rawRebuilt.containsKey(key)) }
+        assertEquals(true, rawRebuilt["vortx.downloads.autoDeleteWatched"])
+        assertEquals(listOf("one", "two"), rawRebuilt["vortx.future.setting"])
+    }
+
     private fun blobFromDomain(domain: Map<String, Any>): String {
         val bytes = SettingsBackup.encode(
             domain = domain,
@@ -174,6 +239,17 @@ class SettingsBackupInteropTest {
     private fun decodedDomain(blob: String?): Map<String, Any> {
         val bytes = Base64.getDecoder().decode(requireNotNull(blob))
         return requireNotNull(SettingsBackup.decodeDomain(bytes))
+    }
+
+    private fun rawDomain(blob: String?): Map<String, Any> {
+        val envelopeBytes = Base64.getDecoder().decode(requireNotNull(blob))
+        val envelope = JSONObject(String(envelopeBytes, Charsets.UTF_8))
+        val plist = Base64.getDecoder().decode(envelope.getString("payloadBase64"))
+        val decoded = requireNotNull(BinaryPlist.decode(plist) as? Map<*, *>)
+        return decoded.entries.associate { (key, value) ->
+            require(key is String && value != null)
+            key to value
+        }
     }
 
     private fun profile(

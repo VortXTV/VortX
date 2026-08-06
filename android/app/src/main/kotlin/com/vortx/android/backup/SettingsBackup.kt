@@ -101,10 +101,27 @@ object SettingsBackup {
         "stremiox.serverURL",
         "stremiox.videoUpscaling",
         "stremiox.dvRemux",
+        "vortx.pgsSubtitleOCR",
+        "vortx.downloads.queueOrder",
+        "vortx.downloads.maxConcurrent",
+        "vortx.moveSeeding.launchNagDismissedBuild",
     )
 
-    /** An app preference that is ALSO safe to sync. Apple `SettingsBackup.swift:47-49`. */
-    fun isSyncable(key: String): Boolean = isAppPref(key) && !DEVICE_LOCAL_KEYS.contains(key)
+    /** Per-account sync bookkeeping and Keychain mutation state belong only to the current device. */
+    private val DEVICE_LOCAL_KEY_PREFIXES = listOf(
+        "vortx.sync.",
+        "kcinvalidated.",
+    )
+
+    /** Old Keychain fallback slots contain credentials and must be scrubbed from pulled blobs. */
+    private val SECRET_KEY_PREFIXES = listOf("kcfallback.")
+
+    /** An app preference that is also safe to sync. Apple `SettingsBackup.swift:117-123`. */
+    fun isSyncable(key: String): Boolean =
+        isAppPref(key) &&
+            !DEVICE_LOCAL_KEYS.contains(key) &&
+            DEVICE_LOCAL_KEY_PREFIXES.none { key.startsWith(it) } &&
+            SECRET_KEY_PREFIXES.none { key.startsWith(it) }
 
     /**
      * The 0.4 rename seam. Both empty today, matching Apple `SettingsBackup.swift:57-58`. Populate IN
