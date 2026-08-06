@@ -61,6 +61,7 @@ import com.vortx.android.VortXApplication
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.model.Playable
 import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.skip.AutoSkipPolicy
 import com.vortx.android.skip.SegmentResolver
 import com.vortx.android.skip.SkipSegment
 import com.vortx.android.skip.SkipTimestampService
@@ -454,7 +455,13 @@ fun PlayerScreen(
         val repo = (context.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
         val sources = SubtitleAddonService.installedSources(repo.installedAddons().getOrNull().orEmpty())
         if (sources.isEmpty()) return@LaunchedEffect
-        addonSubtitles = SubtitleAddonService.fetch(sources, type, videoId)
+        val store = TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context))
+        addonSubtitles = TrackSelector.keepingPreferredSubtitleLanguages(
+            items = SubtitleAddonService.fetch(sources, type, videoId),
+            enabled = store.subtitlesOnlyPreferred,
+            preferredLanguages = store.current.subtitleLanguages,
+            language = AddonSubtitle::lang,
+        )
     }
     // A picked add-on subtitle has mounted when the engine's subtitle list grows past its pre-mount
     // count; select the newly appended track (mpv appends on `sub-add`, the ExoPlayer rebuild
@@ -516,6 +523,18 @@ fun PlayerScreen(
             durationSeconds = durationSec,
         )
         skipSegments = SegmentResolver.resolve(candidates, durationSec)
+    }
+
+    val autoSkipEnabled = remember(playable.url) {
+        PlaybackBehaviorSettings.autoSkip(context.applicationContext)
+    }
+    val autoSkippedStarts = remember(playable.url) { mutableSetOf<Double>() }
+    LaunchedEffect(autoSkipEnabled, skipSegments, playerState.positionMs / 1000L) {
+        if (!autoSkipEnabled) return@LaunchedEffect
+        val target = AutoSkipPolicy.target(skipSegments, latestState.positionMs, autoSkippedStarts)
+            ?: return@LaunchedEffect
+        autoSkippedStarts += target.start
+        engine.seekTo((target.end * 1000).toLong())
     }
 
     // Community trickplay (shared scrub previews). Three seams, all fail-soft, all keyed per title:

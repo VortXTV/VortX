@@ -38,9 +38,11 @@ import androidx.compose.ui.unit.dp
 import com.vortx.android.model.LanguagePriority
 import com.vortx.android.model.TrackPreferences
 import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.model.VideoUpscaling
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.DiskCacheSetting
+import com.vortx.android.player.PlaybackBehaviorSettings
 import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.skip.SkipConfig
@@ -73,12 +75,6 @@ import kotlin.math.roundToInt
 /// is the in-player segment editor (PlayerScreen.kt:163 notes it as a later round), not a settings toggle.
 /// The provider picker below configures the READ path it shares, which is the part that IS settings-shaped.
 ///
-/// Apple's "Video upscaling" picker (iOSSettingsView.swift:538) is deliberately NOT ported yet: the
-/// [com.vortx.android.model.VideoUpscaling] model is ported but NOTHING consumes its `mpvOptions` or
-/// `glslShaderFileNames` in any source set, so a picker would write a preference no engine reads. That is
-/// the same defect as the hardcoded "Audio output / Auto" and "Subtitle size / Medium" rows this screen
-/// replaces, and shipping it would just re-add a control that lies. It lands with the mpv wiring, not here.
-///
 /// Settings changes take effect on the NEXT load: every engine reads these at load time. (MpvPlayer's
 /// `applySubtitleStyle`/`setAudioOutputMode` exist for the in-player controls, which are a separate surface.)
 @OptIn(ExperimentalMaterial3Api::class)
@@ -100,6 +96,9 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     var perfOverride by remember { mutableStateOf(PerformanceMode.currentOverride(appContext)) }
     var subtitleStyle by remember { mutableStateOf(SubtitleStyle.current(appContext)) }
     var trackPrefs by remember { mutableStateOf(trackStore.current) }
+    var subtitlesOnlyPreferred by remember { mutableStateOf(trackStore.subtitlesOnlyPreferred) }
+    var videoUpscaling by remember { mutableStateOf(trackStore.videoUpscaling) }
+    var autoSkip by remember { mutableStateOf(PlaybackBehaviorSettings.autoSkip(appContext)) }
     var autoAddLibrary by remember { mutableStateOf(AutoAddLibrarySetting.isEnabled(appContext)) }
 
     var skipProvider by remember {
@@ -202,6 +201,12 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     onSelect = { updateSubtitles(subtitleStyle.copy(colorId = it)) },
                 )
                 PickerRow(
+                    label = "Brightness",
+                    options = SubtitleStyle.brightnessLevels.map { it.id to it.label },
+                    selectedId = subtitleStyle.brightnessId,
+                    onSelect = { updateSubtitles(subtitleStyle.copy(brightnessId = it)) },
+                )
+                PickerRow(
                     label = "Background",
                     options = SubtitleStyle.backgrounds,
                     selectedId = subtitleStyle.backgroundId,
@@ -224,6 +229,15 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     languages = trackPrefs.subtitleLanguages,
                     onChange = { updateTracks(trackPrefs.copy(subtitleLanguages = it)) },
                 )
+                ToggleRow(
+                    label = "Only preferred external subtitles",
+                    detail = "Keep embedded file tracks, but limit add-on subtitles to the languages above.",
+                    checked = subtitlesOnlyPreferred,
+                    onCheckedChange = {
+                        subtitlesOnlyPreferred = it
+                        trackStore.subtitlesOnlyPreferred = it
+                    },
+                )
             }
 
             SettingsSection(
@@ -236,6 +250,24 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                         detail = null,
                         selected = policy == trackPrefs.forcedPolicy,
                         onClick = { updateTracks(trackPrefs.copy(forcedPolicy = policy)) },
+                    )
+                }
+            }
+
+            SettingsSection(
+                title = "Video quality",
+                footer = "Applied by the built-in libmpv player on the next load. Anime4K stays unavailable " +
+                    "until its shader files ship in the Android app.",
+            ) {
+                VideoUpscaling.androidChoices.forEach { preset ->
+                    OptionRow(
+                        label = preset.label,
+                        detail = preset.detail,
+                        selected = preset == videoUpscaling,
+                        onClick = {
+                            videoUpscaling = preset
+                            trackStore.videoUpscaling = preset
+                        },
                     )
                 }
             }
@@ -257,6 +289,15 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                         },
                     )
                 }
+                ToggleRow(
+                    label = "Skip automatically",
+                    detail = "Automatically jump past each detected intro, recap, credits, or preview once.",
+                    checked = autoSkip,
+                    onCheckedChange = {
+                        autoSkip = it
+                        PlaybackBehaviorSettings.setAutoSkip(appContext, it)
+                    },
+                )
             }
 
             SettingsSection(

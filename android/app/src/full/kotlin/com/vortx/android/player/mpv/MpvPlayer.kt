@@ -9,6 +9,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import com.vortx.android.model.Playable
+import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.DiskCacheSetting
 import com.vortx.android.player.PerformanceMode
@@ -152,6 +153,13 @@ class MpvPlayer private constructor(
             mpv.setOptionString(name, value)
         }
         for ((name, value) in AudioOutputMode.current(appContext).mpvOptions()) {
+            mpv.setOptionString(name, value)
+        }
+        val upscaling = TrackPreferencesStore(
+            appContext,
+            PerformanceMode.isConstrainedDevice(appContext),
+        ).videoUpscaling
+        for ((name, value) in upscaling.mpvOptions) {
             mpv.setOptionString(name, value)
         }
         // Apply the trust policy last and fail closed if this packaged libmpv rejects any part of it.

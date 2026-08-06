@@ -27,6 +27,7 @@ import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.orderedBySeasonEpisode
 import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.player.PlaybackBehaviorSettings
 import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.singularity.SourceIndexServeSource
 import com.vortx.android.trailer.TrailerCoordinator
@@ -455,6 +456,7 @@ class DetailViewModel(
                 trackPrefs.current.audioLanguages,
                 isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
             ),
+            directLinksOnly = PlaybackBehaviorSettings.directLinksOnly(app),
             pin = currentPin(),
             contentId = SourceIndexClient.contentId(imdb, season, episodeNum),
         )

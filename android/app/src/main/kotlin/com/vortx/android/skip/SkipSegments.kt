@@ -31,6 +31,21 @@ data class SkipSegment(val kind: Kind, val start: Double, val end: Double) {
     }
 }
 
+/** Pure once-per-segment policy used by the player's optional automatic skip path. */
+object AutoSkipPolicy {
+    fun target(
+        segments: List<SkipSegment>,
+        positionMs: Long,
+        skippedStarts: Set<Double>,
+    ): SkipSegment? {
+        val position = positionMs / 1000.0
+        return segments
+            .asSequence()
+            .filter { position >= it.start && position < it.end && it.start !in skippedStarts }
+            .minByOrNull { it.start }
+    }
+}
+
 /// A detected span from ONE source, before resolution. Each detection layer (named chapters today,
 /// crowd-sourced timestamps, later on-device heuristics) produces candidates and [SegmentResolver] votes,
 /// so layers stay independent and new ones just plug in. Mirrors Apple `SegmentCandidate`.
