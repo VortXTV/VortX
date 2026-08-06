@@ -1371,14 +1371,16 @@ class DetailViewModel(
     /** Toggle the separate profile-local want-to-watch ledger without mutating the account library. */
     fun toggleWatchlist() {
         val current = (_meta.value as? UiState.Success)?.data ?: return
-        watchlistStore.toggle(
-            MetaItem(
-                id = current.id,
-                type = current.type,
-                name = current.name,
-                poster = current.poster,
-            ),
-        )
+        viewModelScope.launch {
+            watchlistStore.toggle(
+                MetaItem(
+                    id = current.id,
+                    type = current.type,
+                    name = current.name,
+                    poster = current.poster,
+                ),
+            )
+        }
     }
 
     private fun applyMutation(result: Result<MetaDetail>) {

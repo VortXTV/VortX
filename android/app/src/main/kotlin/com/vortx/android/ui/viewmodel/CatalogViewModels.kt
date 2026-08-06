@@ -9,6 +9,8 @@ import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.home.ImportedCatalogs
 import com.vortx.android.home.ReleaseCalendarModel
+import com.vortx.android.home.ReleaseCalendarOwner
+import com.vortx.android.home.ReleaseCalendarRefresh
 import com.vortx.android.home.SimklRailsModel
 import com.vortx.android.home.TopPicksModel
 import com.vortx.android.home.TraktRailsModel
@@ -29,6 +31,8 @@ import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.MetaItem
+import com.vortx.android.profile.ProfileStore
+import com.vortx.android.profile.UserProfile
 import com.vortx.android.search.SearchHistoryStore
 import com.vortx.android.ui.UiState
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -79,6 +83,9 @@ class HomeViewModel internal constructor(
     private val becauseYouWatched: BecauseYouWatchedModel = BecauseYouWatchedModel(),
     private val mediaServerCatalogs: MediaServerCatalogsModel = MediaServerCatalogsModel(),
     private val importedCatalogs: ImportedCatalogs? = null,
+    private val activeProfileId: () -> String = {
+        ProfileStore.sharedOrNull()?.activeProfileId ?: UserProfile.OWNER_ID
+    },
 ) : ViewModel() {
     private val _state = MutableStateFlow<UiState<List<Catalog>>>(UiState.Loading)
     val state: StateFlow<UiState<List<Catalog>>> = _state.asStateFlow()
@@ -98,11 +105,14 @@ class HomeViewModel internal constructor(
         ?.let(::importedCatalogRails).orEmpty()
     private val topPicks = TopPicksModel()
     private val releaseCalendar = ReleaseCalendarModel()
+    private var releaseOwnerGeneration = 0L
+    private var releaseOwner = ReleaseCalendarOwner(activeProfileId(), releaseOwnerGeneration)
 
     init {
         load()
         viewModelScope.launch {
             repo.ctxUpdates().drop(1).collectLatest {
+                advanceReleaseOwner()
                 watchlistStore?.reload()
                 refreshPersonalizedRails()
             }
@@ -196,6 +206,8 @@ class HomeViewModel internal constructor(
     }
 
     private fun refreshPersonalizedRails() {
+        val owner = currentReleaseOwner()
+        applyReleaseCalendar(releaseCalendar.activate(owner))
         val rows = baseRows
         personalizedJob?.cancel()
         personalizedJob = viewModelScope.launch {
@@ -223,11 +235,15 @@ class HomeViewModel internal constructor(
             val releaseWork = async {
                 val addonsResult = addonsWork.await()
                 if (libraryResult.isFailure || addonsResult.isFailure) return@async null
-                releaseCalendar.refresh(library, watchlist, upcomingMetaBases(addonsResult.getOrThrow())) {
-                    upcomingEpisodes = emptyList()
-                    upcomingMovies = emptyList()
-                    publishHome()
-                }
+                releaseCalendar.refresh(
+                    owner = owner,
+                    library = library,
+                    watchlist = watchlist,
+                    metaBases = upcomingMetaBases(addonsResult.getOrThrow()),
+                    onInvalidated = { invalidated ->
+                        if (applyReleaseCalendar(invalidated)) publishHome()
+                    },
+                )
             }
             val refreshed = topPicksWork.await()
             val because = becauseWork.await()
@@ -235,25 +251,45 @@ class HomeViewModel internal constructor(
             val trakt = traktWork.await()
             val simkl = simklWork.await()
             val media = mediaServerWork.await()
+            if (owner != currentReleaseOwner()) return@launch
             if (refreshed.changed) {
                 topPicksItems = refreshed.items
             }
-            if (upcoming?.changed == true) {
-                upcomingEpisodes = upcoming.episodes
-                upcomingMovies = upcoming.movies
-            }
+            val upcomingChanged = upcoming?.let(::applyReleaseCalendar) == true
             if (because.changed) becauseYouWatchedRail = because.rail
             if (media.changed) mediaServerRails = media.rails
             val externalChanged = traktWatchlist != trakt.items || simklWatchlist != simkl.items
             traktWatchlist = trakt.items
             simklWatchlist = simkl.items
             if (
-                refreshed.changed || because.changed || media.changed || upcoming?.changed == true ||
+                refreshed.changed || because.changed || media.changed || upcomingChanged ||
                 trakt.changed || simkl.changed || externalChanged
             ) {
                 publishHome()
             }
         }
+    }
+
+    private fun currentReleaseOwner(): ReleaseCalendarOwner {
+        val profileId = activeProfileId()
+        if (profileId != releaseOwner.profileId) {
+            releaseOwnerGeneration += 1
+            releaseOwner = ReleaseCalendarOwner(profileId, releaseOwnerGeneration)
+        }
+        return releaseOwner
+    }
+
+    private fun advanceReleaseOwner() {
+        releaseOwnerGeneration += 1
+        releaseOwner = ReleaseCalendarOwner(activeProfileId(), releaseOwnerGeneration)
+        if (applyReleaseCalendar(releaseCalendar.activate(releaseOwner))) publishHome()
+    }
+
+    private fun applyReleaseCalendar(refresh: ReleaseCalendarRefresh): Boolean {
+        val changed = upcomingEpisodes != refresh.episodes || upcomingMovies != refresh.movies
+        upcomingEpisodes = refresh.episodes
+        upcomingMovies = refresh.movies
+        return changed
     }
 
     private fun publishHome() {

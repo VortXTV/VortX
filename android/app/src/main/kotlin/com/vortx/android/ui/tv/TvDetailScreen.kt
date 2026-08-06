@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
@@ -183,30 +184,44 @@ private fun TvDetailContent(
                             modifier = Modifier.height(28.dp).width(28.dp),
                         )
                     }
+                }
+
+                // Keep the primary Watch CTA in its own fixed row. Secondary actions can outgrow the
+                // standard 52% TV pane, so they live in a focus-aware LazyRow that D-pad scrolls instead
+                // of clipping the trailing Save/Watchlist actions off-screen.
+                Spacer(Modifier.height(VortXTheme.spacing.sm))
+                LazyRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                ) {
                     // Trailer: free 1080p from the user's own IP via the client resolver (worker fallback on a
                     // miss). Shown only when the meta carries a YouTube trailer id; plays through the shared
                     // player pipeline (the same [DetailViewModel] playback latch the Watch button uses).
                     if (detail.trailerYouTubeId != null) {
-                        Spacer(Modifier.width(VortXTheme.spacing.md))
+                        item {
+                            TvFilterChip(
+                                label = "Trailer",
+                                selected = false,
+                                onClick = { viewModel.playTrailer() },
+                            )
+                        }
+                    }
+                    item {
                         TvFilterChip(
-                            label = "Trailer",
-                            selected = false,
-                            onClick = { viewModel.playTrailer() },
+                            label = if (detail.libraryItem?.savedToLibrary == true) "Saved" else "Save",
+                            selected = detail.libraryItem?.savedToLibrary == true,
+                            onClick = viewModel::toggleLibrary,
                         )
                     }
-                    Spacer(Modifier.width(VortXTheme.spacing.md))
-                    TvFilterChip(
-                        label = if (detail.libraryItem?.savedToLibrary == true) "Saved" else "Save",
-                        selected = detail.libraryItem?.savedToLibrary == true,
-                        onClick = viewModel::toggleLibrary,
-                    )
                     if (WatchlistStore.isSafeId(detail.id)) {
-                        Spacer(Modifier.width(VortXTheme.spacing.md))
-                        TvFilterChip(
-                            label = if (watchlisted) "In Watchlist" else "Watchlist",
-                            selected = watchlisted,
-                            onClick = viewModel::toggleWatchlist,
-                        )
+                        item {
+                            TvFilterChip(
+                                label = if (watchlisted) "In Watchlist" else "Watchlist",
+                                selected = watchlisted,
+                                onClick = viewModel::toggleWatchlist,
+                            )
+                        }
                     }
                 }
                 (playback as? Playback.Failed)?.let {
