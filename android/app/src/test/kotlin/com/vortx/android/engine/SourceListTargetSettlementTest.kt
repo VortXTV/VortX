@@ -6,7 +6,11 @@ import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.singularity.SourceIndexServeSource
 import com.vortx.android.torbox.TorBoxSearch
 import com.vortx.android.torbox.TorBoxSearchSource
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,6 +27,45 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SourceListTargetSettlementTest {
+
+    @Test
+    fun contributorSnapshotRetriesOldRowsPairedWithNewEpoch() {
+        val epoch = AtomicInteger(0)
+        val streams = AtomicReference(listOf("old"))
+        val firstReadCaptured = CountDownLatch(1)
+        val releaseFirstRead = CountDownLatch(1)
+        val readCount = AtomicInteger(0)
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            val result = executor.submit<SourceListModel.ContributorSnapshot<List<String>>> {
+                SourceListModel.stableContributorSnapshot(
+                    readEpoch = epoch::get,
+                    readStreams = {
+                        val captured = streams.get()
+                        if (readCount.getAndIncrement() == 0) {
+                            firstReadCaptured.countDown()
+                            assertTrue(releaseFirstRead.await(2, TimeUnit.SECONDS))
+                        }
+                        captured
+                    },
+                )
+            }
+
+            assertTrue(firstReadCaptured.await(2, TimeUnit.SECONDS))
+            streams.set(listOf("new"))
+            epoch.incrementAndGet()
+            releaseFirstRead.countDown()
+
+            val snapshot = result.get(2, TimeUnit.SECONDS)
+            assertEquals(listOf("new"), snapshot.streams)
+            assertEquals(1, snapshot.epoch)
+            assertTrue(readCount.get() >= 2)
+        } finally {
+            releaseFirstRead.countDown()
+            executor.shutdownNow()
+        }
+    }
 
     @Test
     fun emptyContributorSettlementDoesNotBurnTheOuterDeadline() = runBlocking {

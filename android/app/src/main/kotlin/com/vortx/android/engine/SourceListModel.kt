@@ -185,22 +185,24 @@ class SourceListModel(
         val raw = rawGroups.value
         val media = mediaServerGroups.value
         val torboxSnapshot = tb.snapshotFor(ctx.contentId)
-        val torboxStreams = torboxSnapshot.streams
-        val singularityStreams = sing.streams.value
+        val singularitySnapshot = stableContributorSnapshot(
+            readEpoch = { sing.epoch },
+            readStreams = { sing.streams.value },
+        )
 
         val signature = Signature(
             rawHash = raw.hashCode(),
             mediaHash = media.hashCode(),
             torboxEpoch = torboxSnapshot.epoch,
-            singularityEpoch = sing.epoch,
+            singularityEpoch = singularitySnapshot.epoch,
             inputsHash = inputsHash(ctx),
         )
         if (signature == publishedSignature) return // published output already correct: skip the assembly
         publishedSignature = signature
 
-        val assembled = assemble(raw, torboxStreams, singularityStreams, media, ctx).copy(
-            torboxEpoch = tb.epoch,
-            singularityEpoch = sing.epoch,
+        val assembled = assemble(raw, torboxSnapshot.streams, singularitySnapshot.streams, media, ctx).copy(
+            torboxEpoch = torboxSnapshot.epoch,
+            singularityEpoch = singularitySnapshot.epoch,
         )
         _state.value = assembled
 
@@ -210,7 +212,7 @@ class SourceListModel(
         // Dedup is per (content id, infohash), allowing torrents that arrive in later engine waves to upload.
         val cid = ctx.contentId
         if (cid != null && SourceIndexClient.isEnabled) {
-            val candidates = contributionDescriptors(raw, torboxStreams, ctx.disabledAddons)
+            val candidates = contributionDescriptors(raw, torboxSnapshot.streams, ctx.disabledAddons)
             // The process ledger is intentionally marked before the fail-soft POST starts. This at-most-once
             // tradeoff prevents rebuild storms from retrying a failing endpoint; a dropped POST becomes
             // eligible again on the next app launch. The pool is opportunistic and never gates playback.
@@ -252,12 +254,34 @@ class SourceListModel(
         val inputsHash: Int,
     )
 
+    internal data class ContributorSnapshot<T>(
+        val streams: T,
+        val epoch: Int,
+    )
+
     companion object {
         private val hoardLedger = SourceHoardLedger()
 
         /// The coalescing window. At most ~4 rebuilds/sec while an engine burst streams sources in. Mirrors
         /// Apple's `coalesceMs`.
         const val COALESCE_MS = 250L
+
+        /**
+         * Read one contributor's rows and epoch as a coherent publication snapshot. Contributors replace
+         * their rows before incrementing the epoch. Without the second epoch read, an interleaving can pair
+         * old rows with the new epoch; the signature then suppresses the later rebuild carrying the real rows.
+         */
+        internal fun <T> stableContributorSnapshot(
+            readEpoch: () -> Int,
+            readStreams: () -> T,
+        ): ContributorSnapshot<T> {
+            while (true) {
+                val epochBefore = readEpoch()
+                val streams = readStreams()
+                val epochAfter = readEpoch()
+                if (epochBefore == epochAfter) return ContributorSnapshot(streams, epochAfter)
+            }
+        }
 
         /// The PURE assembly: subtract disabled add-ons, merge the TorBox + Singularity + media-server lanes in
         /// Apple's order (TorBox first, then Singularity, then media-server groups), apply the direct-links
