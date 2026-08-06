@@ -304,6 +304,18 @@ fun PlayerScreen(
 
     val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
+    var chapters by remember(engine) { mutableStateOf<List<PlayerChapter>>(emptyList()) }
+    LaunchedEffect(engine, playerState.durationMs > 0L) {
+        if (playerState.durationMs <= 0L || chapters.isNotEmpty()) return@LaunchedEffect
+        repeat(CHAPTER_READ_ATTEMPTS) { attempt ->
+            val loaded = engine.chapters().sortedBy(PlayerChapter::startMs)
+            if (loaded.isNotEmpty()) {
+                chapters = loaded
+                return@LaunchedEffect
+            }
+            if (attempt + 1 < CHAPTER_READ_ATTEMPTS) delay(CHAPTER_READ_RETRY_MS)
+        }
+    }
 
     // Re-apply player-local controls when the live engine instance changes during a fail-soft demotion.
     // The new engine advertises its capabilities, so unsupported offsets remain honest no-ops.
@@ -911,6 +923,7 @@ fun PlayerScreen(
             emberAccent = emberAccent,
             speed = speed,
             scaleMode = scaleMode,
+            chapters = chapters,
             subtitleDelayAvailable = engine.subtitleDelayAvailable,
             subtitleDelaySeconds = subtitleDelaySeconds,
             onAdjustSubtitleDelay = { delta ->
@@ -1158,6 +1171,11 @@ private const val CONTROLS_AUTO_HIDE_MS = 3_500L
 /// How long the locked player's "Tap to unlock" pill stays up after each reveal. Shorter than the
 /// chrome's auto-hide: while locked the whole point is an undisturbed frame.
 private const val UNLOCK_HINT_AUTO_HIDE_MS = 2_500L
+
+/// Chapter metadata can trail the first duration publication by a few demux ticks. Read it only during
+/// this bounded startup window so ExoPlayer's empty result and chapterless files never create a poll loop.
+private const val CHAPTER_READ_ATTEMPTS = 5
+private const val CHAPTER_READ_RETRY_MS = 400L
 
 /// Watchdog sampling cadence: once a second, matching the ~1s position republish of both engines, so a
 /// healthy stream is seen advancing on every tick.

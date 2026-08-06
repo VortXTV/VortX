@@ -26,6 +26,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.Forward10
@@ -81,6 +82,7 @@ fun PlayerChrome(
     emberAccent: Color,
     speed: Float,
     scaleMode: VideoScaleMode,
+    chapters: List<PlayerChapter>,
     subtitleDelayAvailable: Boolean,
     subtitleDelaySeconds: Double,
     onAdjustSubtitleDelay: (Double) -> Unit,
@@ -173,6 +175,9 @@ fun PlayerChrome(
                 ChromeIcon(Icons.Filled.Audiotrack, "Audio and output settings") { onInteraction(); openSheet = ControlSheet.AUDIO }
                 ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { onInteraction(); openSheet = ControlSheet.SUBTITLE }
                 ChromeIcon(Icons.Filled.Speed, "Playback speed") { onInteraction(); openSheet = ControlSheet.SPEED }
+                if (chapters.isNotEmpty()) {
+                    ChromeIcon(Icons.AutoMirrored.Filled.List, "Chapters") { onInteraction(); openSheet = ControlSheet.CHAPTERS }
+                }
                 ChromeIcon(Icons.Filled.AspectRatio, "Aspect ratio", tint = if (scaleMode == VideoScaleMode.ZOOM) emberAccent else Color.White, onClick = onToggleScaleMode)
                 // Picture-in-Picture, before the lock so the lock stays the cluster's last (and
                 // therefore most protected-from-fat-finger) position.
@@ -320,6 +325,12 @@ fun PlayerChrome(
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
+            ControlSheet.CHAPTERS -> ControlSelectionSheet(
+                title = "Chapters",
+                options = chapterOptions(chapters, state.positionMs, onSeek),
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
             ControlSheet.NONE -> Unit
         }
 
@@ -356,7 +367,7 @@ fun PlayerChrome(
 }
 
 /// The selection sheets the chrome can open.
-private enum class ControlSheet { NONE, AUDIO, SUBTITLE, SUBTITLE_SETTINGS, AUDIO_SETTINGS, SPEED }
+private enum class ControlSheet { NONE, AUDIO, SUBTITLE, SUBTITLE_SETTINGS, AUDIO_SETTINGS, SPEED, CHAPTERS }
 
 /// The playback-speed presets offered in the speed sheet.
 private val SPEED_PRESETS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
@@ -375,6 +386,27 @@ private data class SheetOption(
     val dismissOnPick: Boolean = true,
     val onPick: () -> Unit = {},
 )
+
+private fun chapterOptions(
+    chapters: List<PlayerChapter>,
+    positionMs: Long,
+    onSeek: (Long) -> Unit,
+): List<SheetOption> {
+    val ordered = chapters.sortedBy(PlayerChapter::startMs)
+    val selected = currentChapterIndex(ordered, positionMs)
+    return ordered.mapIndexed { index, chapter ->
+        SheetOption(
+            label = chapter.title,
+            selected = index == selected,
+            detail = formatTime(chapter.startMs),
+            isChoice = true,
+            onPick = { onSeek(chapter.startMs) },
+        )
+    }
+}
+
+internal fun currentChapterIndex(chapters: List<PlayerChapter>, positionMs: Long): Int =
+    chapters.indexOfLast { it.startMs <= positionMs }
 
 private fun subtitleSyncOptions(
     available: Boolean,

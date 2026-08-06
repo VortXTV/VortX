@@ -11,6 +11,7 @@ object WhatsNew {
         "VortX account sign-in can be approved from another device with a QR code.",
         "Android phone and TV share the same profile, source, playback, and sync settings.",
         "Detail heroes now show title logos supplied by installed add-ons.",
+        "The player now offers a chapter picker when the file contains chapter markers.",
     )
 
     fun load(context: Context): List<ChangelogBlock> {
