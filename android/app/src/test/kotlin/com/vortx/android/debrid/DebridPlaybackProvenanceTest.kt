@@ -1,6 +1,8 @@
 package com.vortx.android.debrid
 
 import com.vortx.android.engine.debridResolveTarget
+import com.vortx.android.engine.usenetPlaybackFailure
+import com.vortx.android.engine.usenetResolveTarget
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
@@ -62,6 +64,49 @@ class DebridPlaybackProvenanceTest {
         assertEquals("fallback-handle", target.infoHash)
         assertNull(target.episode)
         assertEquals(3, target.fileIdx)
+    }
+
+    @Test
+    fun usenetTargetCarriesNzbHashRegexEpisodeAndFileIndexTogether() {
+        val selected = Episode(
+            id = "series:3:4",
+            title = "Episode 4",
+            season = 3,
+            episode = 4,
+        )
+        val source = StreamSource(
+            id = "opaque-source",
+            addon = "Test",
+            title = "Season pack",
+            infoHash = "Authoritative-NZB-MD5",
+            fileIdx = 9,
+            nzbUrl = "https://example.invalid/fetch/pack",
+            fileMustInclude = "(?i)S03E04.*\\.mkv$",
+        )
+
+        val target = source.usenetResolveTarget(selected)
+
+        assertEquals("https://example.invalid/fetch/pack", target.nzbUrl)
+        assertEquals("Authoritative-NZB-MD5", target.knownHash)
+        assertEquals("(?i)S03E04.*\\.mkv$", target.fileMustInclude)
+        assertEquals(DebridResolver.Episode(3, 4), target.episode)
+        assertEquals(9, target.fileIdx)
+    }
+
+    @Test
+    fun usenetResolveErrorsDescribeTheUsenetFailure() {
+        assertEquals(
+            "Usenet playback needs a TorBox debrid key.",
+            usenetPlaybackFailure(DebridResolver.DebridException.NoKey).message,
+        )
+        assertEquals(
+            "No playable video matched this Usenet source.",
+            usenetPlaybackFailure(DebridResolver.DebridException.NoMatchingFile).message,
+        )
+        assertEquals(
+            "This Usenet source is still preparing in TorBox.",
+            usenetPlaybackFailure(DebridResolver.DebridException.NotReady).message,
+        )
     }
 
     @Test
@@ -260,12 +305,18 @@ class DebridPlaybackProvenanceTest {
                 id = "usenet",
                 addon = "Test",
                 title = "Usenet release",
+                infoHash = "authoritative-nzb-md5",
+                fileIdx = 6,
                 nzbUrl = nzbUrl,
+                fileMustInclude = "(?i)movie.*\\.mkv$",
             ),
             torrentServices = mapOf("unrelated" to DebridService.PREMIUMIZE),
         )!!
 
         assertEquals(nzbUrl, candidate.nzbUrl)
+        assertEquals("authoritative-nzb-md5", candidate.usenetKnownHash)
+        assertEquals("(?i)movie.*\\.mkv$", candidate.fileMustInclude)
+        assertEquals(6, candidate.fileIdx)
         assertNull(candidate.confirmedCachedService)
     }
 
