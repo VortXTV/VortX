@@ -385,6 +385,49 @@ class EngineStremioRepository(
         return settled ?: StremioCoreNative.getState("\"$field\"")
     }
 
+    /**
+     * Wait for a series' remembered source provider after the first playable answer arrives. With no
+     * playable source the normal field timeout still applies; once playback is possible, the remembered
+     * provider gets at most [StreamRanking.WANTED_SOURCE_DEADLINE_SECONDS] to settle. Polling the resident
+     * state also survives a dropped NewState notification and mirrors the Apple wait policy.
+     */
+    private suspend fun loadStreamsUntilWanted(
+        actionJson: String,
+        streamId: String,
+        rememberedQuality: String,
+        wantedAddon: String,
+    ): String {
+        StremioCoreNative.dispatch(actionJson)
+        val startedAtMs = monotonicMs()
+        var firstPlayableAtMs: Long? = null
+        while (true) {
+            val state = StremioCoreNative.getState("\"${EngineActions.FIELD_META_DETAILS}\"")
+            val groups = EngineState.parseStreamGroups(state, streamId)
+            val nowMs = monotonicMs()
+            if (groups.isNotEmpty() && firstPlayableAtMs == null) firstPlayableAtMs = nowMs
+
+            val firstAt = firstPlayableAtMs
+            if (firstAt != null) {
+                val progress = EngineState.parseStreamLoadProgress(state, streamId)
+                if (
+                    StreamRanking.resolveSettled(
+                        groups = groups,
+                        loaded = progress.loaded,
+                        total = progress.total,
+                        secondsSinceFirstPlayable = (nowMs - firstAt) / 1_000.0,
+                        rememberedQuality = rememberedQuality,
+                        wantedAddon = wantedAddon,
+                    )
+                ) {
+                    return state
+                }
+            } else if (nowMs - startedAtMs >= loadTimeoutSeconds * 1_000L) {
+                return state
+            }
+            delay(STREAM_SETTLEMENT_POLL_MS)
+        }
+    }
+
     /// One-shot Home (kept for the [CatalogRepository] contract; the Home screen itself collects
     /// [homeUpdates]): waits until at least one board row has content, then snapshots.
     // withContext(Dispatchers.Default): the loadFieldUntil dispatch/getState + homeSnapshot()/parse
@@ -741,7 +784,13 @@ class EngineStremioRepository(
         withOverlayState(detail)
     } }
 
-    override suspend fun streams(type: MediaType, id: String, episodeId: String?): Result<List<StreamGroup>> = withContext(Dispatchers.Default) { runCatching {
+    override suspend fun streams(
+        type: MediaType,
+        id: String,
+        episodeId: String?,
+        rememberedQuality: String?,
+        wantedAddon: String?,
+    ): Result<List<StreamGroup>> = withContext(Dispatchers.Default) { runCatching {
         // Meta + a guessed stream were already requested by meta(); re-pull meta_details for its
         // stream groups. If meta() was not called first, this Load brings both in.
         //
@@ -755,8 +804,12 @@ class EngineStremioRepository(
         }
         // Ready = at least one add-on's stream group settled; later groups keep landing in engine
         // state and S05's reactive detail work will surface them incrementally.
-        val state = loadFieldUntil(EngineActions.FIELD_META_DETAILS, action) {
-            EngineState.parseStreamGroups(it).isNotEmpty()
+        val state = if (episodeId != null && !wantedAddon.isNullOrBlank() && !rememberedQuality.isNullOrBlank()) {
+            loadStreamsUntilWanted(action, episodeId, rememberedQuality, wantedAddon)
+        } else {
+            loadFieldUntil(EngineActions.FIELD_META_DETAILS, action) {
+                EngineState.parseStreamGroups(it, episodeId).isNotEmpty()
+            }
         }
         // Rank before the UI ever sees them: strongest source (debrid-cached > resolution > source ladder)
         // first within each add-on block, and the strongest add-on block first. This is what makes the
@@ -779,7 +832,7 @@ class EngineStremioRepository(
         // CoreBridge.swift:984): a disabled add-on's sources never reach ranking or the picker for
         // this profile. Groups with no base (a malformed request) are kept, never dropped.
         val disabledAddons = addonPrefs.disabledBases()
-        val groups = EngineState.parseStreamGroups(state).filter { group ->
+        val groups = EngineState.parseStreamGroups(state, episodeId).filter { group ->
             group.base.isEmpty() || AddonOrder.normalize(group.base) !in disabledAddons
         }
         // vortx-core SHADOW lane: with the flag ON, rank the SAME inputs through the own engine
@@ -1247,6 +1300,11 @@ class EngineStremioRepository(
         /// Safety-net poll cadence for [homeUpdates]. Each tick is a cheap local getState + parse;
         /// distinctUntilChanged means an unchanged snapshot never reaches the UI.
         const val HOME_POLL_MS = 3_000L
+
+        /** Resident meta-details poll interval while a remembered series provider is outstanding. */
+        const val STREAM_SETTLEMENT_POLL_MS = 250L
+
+        fun monotonicMs(): Long = System.nanoTime() / 1_000_000L
 
         /// The `device` tag stamped into every engine `TimeChanged` (Apple sends "iOS"/"tvOS").
         const val PROGRESS_DEVICE = "Android"

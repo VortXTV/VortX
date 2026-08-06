@@ -32,6 +32,12 @@ import org.json.JSONObject
 /// because engine state can be mid-load (a `Loading` Loadable) when a field is pulled.
 internal object EngineState {
 
+    /** Settlement counts for every stream-resource request in `meta_details`. */
+    data class StreamLoadProgress(
+        val loaded: Int,
+        val total: Int,
+    )
+
     /// Parse the `board`/`search` field (a `CatalogsWithExtra`) into UI [Catalog] rows. Each catalog
     /// is `{ request, content: Loadable<[meta]> }`; the engine nests them as `catalogs: [[page]]`
     /// (outer = catalog, inner = pages). We flatten pages and title each row from [titleMap] (the
@@ -371,22 +377,49 @@ internal object EngineState {
     /// `stream` resource, so official clients list `metaStreams` alongside `streams`. Reading only
     /// `streams` made every such add-on show ZERO sources (#122). One [StreamGroup] per source add-on
     /// (named by the request base host), best-effort, in engine order.
-    fun parseStreamGroups(json: String): List<StreamGroup> {
+    fun parseStreamGroups(json: String, streamId: String? = null): List<StreamGroup> {
         val root = json.toJsonObjectOrNull() ?: return emptyList()
         // #122: metaStreams FIRST, then the stream-resource groups, matching Apple's concat order. A
         // payload with only `metaStreams` (no `streams`) is now surfaced instead of dropped.
-        return parseStreamGroupArray(root.optJSONArray("metaStreams")) +
-            parseStreamGroupArray(root.optJSONArray("streams"))
+        return parseStreamGroupArray(root.optJSONArray("metaStreams"), streamId) +
+            parseStreamGroupArray(root.optJSONArray("streams"), streamId)
+    }
+
+    /**
+     * Count settled stream-resource requests without requiring them to contain playable rows. A Ready
+     * empty result and an engine error are both settled; only Loading remains outstanding. This lets
+     * source selection wait for a remembered provider without confusing "answered with no sources" with
+     * "has not answered yet".
+     */
+    fun parseStreamLoadProgress(json: String, streamId: String? = null): StreamLoadProgress {
+        val root = json.toJsonObjectOrNull() ?: return StreamLoadProgress(loaded = 0, total = 0)
+        var loaded = 0
+        var total = 0
+        for (field in listOf("metaStreams", "streams")) {
+            val array = root.optJSONArray(field) ?: continue
+            for (index in 0 until array.length()) {
+                val entry = array.optJSONObject(index) ?: continue
+                if (streamId != null && entry.streamRequestId() != streamId) continue
+                total += 1
+                val type = entry
+                    .optJSONObject("content")
+                    ?.optString("type")
+                    .orEmpty()
+                if (type.isNotEmpty() && type != "Loading") loaded += 1
+            }
+        }
+        return StreamLoadProgress(loaded = loaded, total = total)
     }
 
     /// One pass over a `[{ request, content: Loadable<[stream]> }]` array into [StreamGroup]s, dropping
     /// still-loading/empty entries. Shared by the metaStreams and streams passes so both decode
     /// identically.
-    private fun parseStreamGroupArray(array: JSONArray?): List<StreamGroup> {
+    private fun parseStreamGroupArray(array: JSONArray?, streamId: String?): List<StreamGroup> {
         if (array == null) return emptyList()
         val groups = mutableListOf<StreamGroup>()
         for (i in 0 until array.length()) {
             val entry = array.optJSONObject(i) ?: continue
+            if (streamId != null && entry.streamRequestId() != streamId) continue
             val request = entry.optJSONObject("request")
             val addon = addonName(request)
             val content = entry.readyArray("content") ?: continue
@@ -402,6 +435,9 @@ internal object EngineState {
         }
         return groups
     }
+
+    private fun JSONObject.streamRequestId(): String? =
+        optJSONObject("request")?.optJSONObject("path")?.optStringOrNull("id")
 
     // ---- S04: Discover / Library selectable filters, installed add-ons ----
 

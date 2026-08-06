@@ -33,6 +33,8 @@ import com.vortx.android.singularity.SourceIndexServeSource
 import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.ResolvedPin
+import com.vortx.android.sources.ProviderHealth
+import com.vortx.android.sources.SeriesSourceSticky
 import com.vortx.android.sources.SourcePinContext
 import com.vortx.android.sources.SourcePinScope
 import com.vortx.android.sources.SourcePinStore
@@ -189,7 +191,8 @@ class DetailViewModel(
     private val debrid = DebridCoordinator(DebridResolver(debridKeys), debridKeys)
     private val torbox = TorBoxSearchSource(debridKeys)
     private val singularity = SourceIndexServeSource()
-    private val sourceModel = SourceListModel(viewModelScope)
+    private val sourceSticky = SeriesSourceSticky(app)
+    private val sourceModel = SourceListModel(viewModelScope, sourceSticky = sourceSticky)
     private val sourcePrefs = SourcePreferencesStore(app)
     private val sourcePins = SourcePinStore(app)
     private val trackPrefs = TrackPreferencesStore(app)
@@ -392,7 +395,14 @@ class DetailViewModel(
         val serverGroups = if (MediaServerRepository.hasServers) mediaServerGroups(episodeId) else emptyList()
         sourceModel.setMediaServerGroups(serverGroups)
 
-        repo.streams(type, id, episodeId).fold(
+        val advanceHint = pendingAdvanceHint
+        repo.streams(
+            type = type,
+            id = id,
+            episodeId = episodeId,
+            rememberedQuality = advanceHint?.first,
+            wantedAddon = advanceHint?.let { sourceSticky.preference(id)?.addon },
+        ).fold(
             onSuccess = { raw ->
                 // Immediate paint of the ranked add-on groups (already ranked by the engine repo), then feed
                 // the model so the fuller assembled + re-ranked list refines it a beat later.
@@ -421,19 +431,30 @@ class DetailViewModel(
                         pendingAutoPick = false
                         val hint = pendingAdvanceHint
                         pendingAdvanceHint = null
+                        val sticky = sourceSticky.preference(id)
+                        val unhealthy: (String) -> Boolean = { addon -> ProviderHealth.penaltyActive(addon) }
                         val pick = if (hint != null) {
                             StreamRanking.best(
                                 displayRaw,
                                 continuity = hint.first,
                                 binge = hint.second,
                                 pin = currentPin(),
+                                sticky = sticky,
+                                providerPenalty = unhealthy,
                                 prefs = ctx.prefs,
                             )
                         } else {
-                            StreamRanking.best(displayRaw, prefs = ctx.prefs, pin = currentPin())
+                            StreamRanking.best(
+                                displayRaw,
+                                continuity = null,
+                                pin = currentPin(),
+                                sticky = sticky,
+                                providerPenalty = unhealthy,
+                                prefs = ctx.prefs,
+                            )
                         }
                         when {
-                            pick != null -> play(pick)
+                            pick != null -> playAutomatically(pick)
                             hint != null -> _playback.value = Playback.Failed("No playable source for the next episode.")
                         }
                     }
@@ -627,8 +648,15 @@ class DetailViewModel(
     /// Resolve a chosen source to a [Playable] and request playback. Drives a Resolving -> Ready /
     /// Failed transition so the row can show progress and a resolve failure surfaces instead of
     /// silently doing nothing.
-    fun play(source: StreamSource) {
+    fun play(source: StreamSource) = play(source, manualPick = true)
+
+    private fun playAutomatically(source: StreamSource) = play(source, manualPick = false)
+
+    private fun play(source: StreamSource, manualPick: Boolean) {
         if (_playback.value is Playback.Resolving) return
+        if (manualPick && type == MediaType.SERIES) {
+            sourceSticky.record(id, source.addon, source.bingeGroup)
+        }
         lastPlayedSource = source
         _playback.value = Playback.Resolving
         val resumeMs = resumeOffsetMs()
@@ -866,7 +894,13 @@ class DetailViewModel(
         if (evidence.hashes.isEmpty() && evidence.usenetUrls.isEmpty()) return null
         // Rank the candidates EXACTLY as the labeled best is picked (score + pin), de-duplicated by handle, so
         // the failover order matches the visible list.
-        val ranked = StreamRanking.rankedCandidates(groups, continuity = null, pin = currentPin())
+        val ranked = StreamRanking.rankedCandidates(
+            groups,
+            continuity = null,
+            pin = currentPin(),
+            sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null,
+            providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
+        )
         val candidates = ranked.mapNotNull { debridCandidateFor(it, evidence.torrentServices) }
         if (candidates.isEmpty()) return null
         return debrid.resolveFirstPlayable(
@@ -927,7 +961,16 @@ class DetailViewModel(
     /// the hero Watch button's enabled state.
     fun bestSource(): StreamSource? =
         sourceModel.state.value.best
-            ?: (_streams.value as? UiState.Success)?.data?.let { StreamRanking.best(it) }
+            ?: (_streams.value as? UiState.Success)?.data?.let { groups ->
+                StreamRanking.best(
+                    groups,
+                    continuity = lastCtx?.continuity,
+                    pin = currentPin(),
+                    sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null,
+                    providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
+                    prefs = lastCtx?.prefs ?: StreamRanking.reading(),
+                )
+            }
 
     /// The engine resume position (ms) for the source about to play: the saved library `timeOffset` when
     /// it applies to the current target (a movie, or the series episode whose sources are shown), else 0
@@ -1018,6 +1061,7 @@ class DetailViewModel(
         // trip: surface manual selection rather than risk retrying the same dead source forever.
         val failedSource = lastPlayedSource ?: return false
         failed.add(handleOf(failedSource))
+        ProviderHealth.noteFailure(failedSource.addon)
         if (failed.size >= MAX_SOURCE_ATTEMPTS) return false
         val groups = (_streams.value as? UiState.Success)?.data ?: return false
         val ctx = lastCtx ?: return false
@@ -1029,10 +1073,12 @@ class DetailViewModel(
             continuity = StreamRanking.signature(failedSource),
             binge = failedSource.bingeGroup,
             pin = currentPin(),
+            sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null,
+            providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
             prefs = ctx.prefs,
         )
         val next = ranked.firstOrNull { handleOf(it) !in failed } ?: return false
-        play(next)
+        playAutomatically(next)
         return true
     }
 
@@ -1043,10 +1089,24 @@ class DetailViewModel(
     fun manualSourceOptions(limit: Int = MANUAL_PICK_LIMIT): List<StreamSource> {
         val groups = (_streams.value as? UiState.Success)?.data ?: return emptyList()
         val prefs = lastCtx?.prefs
+        val sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null
         val ranked = if (prefs != null) {
-            StreamRanking.rankedCandidates(groups, continuity = null, pin = currentPin(), prefs = prefs)
+            StreamRanking.rankedCandidates(
+                groups,
+                continuity = null,
+                pin = currentPin(),
+                sticky = sticky,
+                providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
+                prefs = prefs,
+            )
         } else {
-            StreamRanking.rankedCandidates(groups, continuity = null, pin = currentPin())
+            StreamRanking.rankedCandidates(
+                groups,
+                continuity = null,
+                pin = currentPin(),
+                sticky = sticky,
+                providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
+            )
         }
         return ranked.take(limit)
     }

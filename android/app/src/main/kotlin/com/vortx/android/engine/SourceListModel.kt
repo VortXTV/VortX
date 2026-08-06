@@ -5,6 +5,8 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.singularity.SourceIndexServeSource
 import com.vortx.android.sources.ResolvedPin
+import com.vortx.android.sources.ProviderHealth
+import com.vortx.android.sources.SeriesSourceSticky
 import com.vortx.android.sources.SourcePrefsSnapshot
 import com.vortx.android.torbox.TorBoxSearchSource
 import kotlinx.coroutines.CoroutineScope
@@ -48,6 +50,7 @@ class SourceListModel(
     /// (e.g. a ViewModel's scope); [close] stops the coalescer.
     private val scope: CoroutineScope,
     private val coalesceMs: Long = COALESCE_MS,
+    private val sourceSticky: SeriesSourceSticky? = null,
 ) {
     private val _state = MutableStateFlow(SourceListState())
 
@@ -73,6 +76,8 @@ class SourceListModel(
         val streamId: String? = null, // null = all loaded groups (movie); set = one episode's groups
         val continuity: String? = null, // remembered quality signature for the best() pick (null for live)
         val pin: ResolvedPin? = null,
+        val sticky: SeriesSourceSticky.Preference? = null,
+        val unhealthyAddons: Set<String> = emptySet(),
         val prefs: SourcePrefsSnapshot = SourcePrefsSnapshot.DEFAULT,
         val directLinksOnly: Boolean = false, // drop unresolved raw torrents, preserve resolved direct links
         val disabledAddons: Set<String> = emptySet(), // per-profile disabled add-on labels
@@ -116,7 +121,19 @@ class SourceListModel(
 
     /// Update the view-owned ranking inputs. Publishes nothing synchronously; only nudges the coalescer.
     /// Mirrors Apple `setContext`.
-    fun setContext(ctx: Context) { context.value = ctx }
+    fun setContext(ctx: Context) {
+        // This method is called by DetailViewModel on Main. Snapshot the preferences here before the background
+        // assembly starts, matching Apple's main-actor snapshot and keeping SharedPreferences out of ranking.
+        val sticky = if (ctx.streamId != null && ctx.metaId.isNotEmpty()) {
+            sourceSticky?.preference(ctx.metaId) ?: ctx.sticky
+        } else {
+            null
+        }
+        context.value = ctx.copy(
+            sticky = sticky,
+            unhealthyAddons = ProviderHealth.activeAddons(),
+        )
+    }
 
     /// Stop the coalescer. The TorBox / Singularity sources own their own scopes (close them separately).
     fun close() { job?.cancel() }
@@ -172,6 +189,9 @@ class SourceListModel(
         ctx.streamId,
         ctx.continuity,
         ctx.pin?.let { "${it.scope}:${it.pin.label}:${it.pin.bingeGroup}" },
+        ctx.sticky?.addon,
+        ctx.sticky?.bingeGroup,
+        ctx.unhealthyAddons.sorted().joinToString(","),
         ctx.prefs.cacheTag,
         ctx.directLinksOnly,
         ctx.disabledAddons.sorted().joinToString(","),
@@ -228,7 +248,14 @@ class SourceListModel(
             // store, mirroring Apple's task-local prefs binding.
             StreamRanking.installReading(ctx.prefs)
             val ranked = StreamRanking.rankedGroups(assembled, prefs = ctx.prefs, pin = ctx.pin)
-            val best = StreamRanking.best(ranked, continuity = ctx.continuity, pin = ctx.pin, prefs = ctx.prefs)
+            val best = StreamRanking.best(
+                ranked,
+                continuity = ctx.continuity,
+                pin = ctx.pin,
+                sticky = ctx.sticky,
+                providerPenalty = { addon -> addon.trim().lowercase() in ctx.unhealthyAddons },
+                prefs = ctx.prefs,
+            )
             val tiers = StreamRanking.tiers(ranked)
             val resolutionOptions = StreamRanking.resolutionOptions(ranked)
             return SourceListState(groups = ranked, best = best, tiers = tiers, resolutionOptions = resolutionOptions)
