@@ -60,6 +60,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:theme="@style/Theme.VortX.Splash"
             android:supportsPictureInPicture="true"
             android:resizeableActivity="true"
@@ -87,6 +88,7 @@
         <activity
             android:name=".ui.tv.TvActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:banner="@drawable/tv_banner"
             android:theme="@style/Theme.VortX.Splash"
             android:supportsPictureInPicture="true"
@@ -95,6 +97,20 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".deeplink.DeepLinkActivity"
+            android:exported="true"
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="vortx" android:host="open" />
             </intent-filter>
         </activity>
 

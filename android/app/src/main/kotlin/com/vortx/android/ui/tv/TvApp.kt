@@ -3,6 +3,7 @@ package com.vortx.android.ui.tv
 import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -19,6 +20,7 @@ import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.deeplink.VortXDeepLinkEvent
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.player.PlayerScreen
@@ -47,6 +49,7 @@ fun TvApp(
     repo: CatalogRepository = PreviewCatalogRepository(),
     auth: AuthRepository = PreviewAuthRepository(),
     syncManager: VortXSyncManager? = null,
+    deepLinkEvent: VortXDeepLinkEvent? = null,
 ) {
     val profileStore = ProfileStore.sharedOrNull()
     val activeProfile by (profileStore?.activeProfile?.collectAsStateWithLifecycle()
@@ -62,6 +65,12 @@ fun TvApp(
         // chosen source into this [Playable] (through [DetailViewModel]); the shell then covers everything
         // with the player, exactly as the phone shell keys [PlayerScreen] off its own `playing` slot.
         var playing by remember { mutableStateOf<Playable?>(null) }
+
+        LaunchedEffect(deepLinkEvent) {
+            val target = deepLinkEvent?.target ?: return@LaunchedEffect
+            playing = null
+            detail = target.toMetaItem()
+        }
 
         val appContext = LocalContext.current.applicationContext
         val debridKeys = remember(appContext) { DebridKeys(appContext) }

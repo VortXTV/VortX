@@ -1,10 +1,16 @@
 package com.vortx.android.ui.tv
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.vortx.android.VortXApplication
+import com.vortx.android.deeplink.VortXDeepLinkEvent
+import com.vortx.android.deeplink.VortXDeepLinks
 
 /// Android TV (10-foot / D-pad) entry point. This is the activity the `LEANBACK_LAUNCHER` intent lands on
 /// (see AndroidManifest.xml), kept DISTINCT from the phone [com.vortx.android.MainActivity] so the two
@@ -24,6 +30,9 @@ import com.vortx.android.VortXApplication
 /// way the phone does (the source ranking's `isKids` gate lives inside [DetailViewModel], so it applies on
 /// TV with no extra code). Splash + edge-to-edge mirror [com.vortx.android.MainActivity].
 class TvActivity : ComponentActivity() {
+    private var deepLinkEvent by mutableStateOf<VortXDeepLinkEvent?>(null)
+    private var deepLinkSequence = 0L
+
     override fun onCreate(savedInstanceState: Bundle?) {
         // Same cold-start splash contract as MainActivity: install before super.onCreate so the brand
         // gold mark on warm obsidian covers the gap before Compose's first frame (framework-owned on
@@ -31,6 +40,7 @@ class TvActivity : ComponentActivity() {
         // the default fade is fine at 10 feet.
         installSplashScreen()
         super.onCreate(savedInstanceState)
+        routeDeepLink(intent)
 
         val app = application as VortXApplication
         setContent {
@@ -38,7 +48,20 @@ class TvActivity : ComponentActivity() {
                 repo = app.catalogRepository,
                 auth = app.authRepository,
                 syncManager = app.syncManager,
+                deepLinkEvent = deepLinkEvent,
             )
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        routeDeepLink(intent)
+    }
+
+    private fun routeDeepLink(intent: Intent?) {
+        VortXDeepLinks.parse(intent?.dataString)?.let { target ->
+            deepLinkEvent = VortXDeepLinkEvent(target, ++deepLinkSequence)
         }
     }
 }

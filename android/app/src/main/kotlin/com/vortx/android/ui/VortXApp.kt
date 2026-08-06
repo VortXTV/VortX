@@ -55,6 +55,7 @@ import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.deeplink.VortXDeepLinkEvent
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.library.LibraryAutoAdd
 import com.vortx.android.model.Episode
@@ -144,6 +145,7 @@ fun VortXApp(
     // when the manager could not be stood up (keystore failure): the VortX Account settings row is then
     // hidden and everything else is unchanged -- sync is off the critical path by design.
     syncManager: VortXSyncManager? = null,
+    deepLinkEvent: VortXDeepLinkEvent? = null,
 ) {
     val appContext = LocalContext.current.applicationContext
     // VortXApplication binds the persistence-backed owner before either the phone or TV launcher creates
@@ -224,6 +226,29 @@ fun VortXApp(
         var showCustomizeHome by remember { mutableStateOf(false) }
         var showTabBar by remember { mutableStateOf(false) }
         var showWhatsNew by remember { mutableStateOf(false) }
+        LaunchedEffect(deepLinkEvent) {
+            val target = deepLinkEvent?.target ?: return@LaunchedEffect
+            playing = null
+            playingMeta = null
+            showGallery = false
+            showAccount = false
+            showVortxAccount = false
+            showAddons = false
+            showIntegrations = false
+            showMediaServers = false
+            showDownloads = false
+            showPlayback = false
+            showSources = false
+            showDebridKeys = false
+            restoreDebridServicesFocus = false
+            showLiveTv = false
+            showLibraryTransfer = false
+            showProfiles = false
+            showAppearance = false
+            showWhatsNew = false
+            showTabBar = false
+            detail = target.toMetaItem()
+        }
         val onItem: (MetaItem) -> Unit = { detail = it }
         // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
         // (final progress tick + Player unload) still runs after the player leaves composition.

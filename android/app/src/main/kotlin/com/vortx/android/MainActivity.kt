@@ -3,6 +3,7 @@ package com.vortx.android
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ObjectAnimator
+import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
 import android.view.animation.AnticipateInterpolator
@@ -10,7 +11,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import com.vortx.android.deeplink.VortXDeepLinkEvent
+import com.vortx.android.deeplink.VortXDeepLinks
 import com.vortx.android.player.PlayerPipBridge
 import com.vortx.android.ui.VortXApp
 import com.vortx.android.ui.theme.isAnimatorScaleZero
@@ -22,6 +28,9 @@ import com.vortx.android.ui.theme.isAnimatorScaleZero
 /// once per process, not per Activity instance) -- see that class's doc comment for why that matters
 /// (engine double-init / event-listener orphaning safety across Activity recreation).
 class MainActivity : ComponentActivity() {
+    private var deepLinkEvent by mutableStateOf<VortXDeepLinkEvent?>(null)
+    private var deepLinkSequence = 0L
+
     override fun onCreate(savedInstanceState: Bundle?) {
         // installSplashScreen() must run before super.onCreate(): it installs the AndroidX
         // SplashScreen (Theme.VortX.Splash -- brand gold mark on warm obsidian, see themes.xml) for
@@ -30,6 +39,7 @@ class MainActivity : ComponentActivity() {
         // uniformly.
         val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
+        routeDeepLink(intent)
 
         // Edge-to-edge is enforced app-wide (ANDROID-PLAN.md S01 scope; DESIGN-SYSTEM.md chrome
         // recedes behind content). VortXTheme forces the dark scheme regardless of the system
@@ -68,7 +78,20 @@ class MainActivity : ComponentActivity() {
                 // The VortX account + cross-device sync engine (nullable: sync is off the critical
                 // path; a keystore failure hides the account row instead of blocking launch).
                 syncManager = app.syncManager,
+                deepLinkEvent = deepLinkEvent,
             )
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        routeDeepLink(intent)
+    }
+
+    private fun routeDeepLink(intent: Intent?) {
+        VortXDeepLinks.parse(intent?.dataString)?.let { target ->
+            deepLinkEvent = VortXDeepLinkEvent(target, ++deepLinkSequence)
         }
     }
 
