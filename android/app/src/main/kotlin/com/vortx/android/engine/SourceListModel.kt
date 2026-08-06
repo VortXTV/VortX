@@ -77,7 +77,7 @@ class SourceListModel(
 
     /// The view-owned ranking inputs the assembly needs, the Kotlin analogue of Apple's `Context` struct.
     /// [prefs] is the FROZEN [SourcePrefsSnapshot] the off-thread rank reads (never a live store); [contentId]
-    /// is the Singularity pool id used only to seed the fire-and-forget HOARD (null = do not hoard).
+    /// owns target-scoped TorBox rows and seeds the fire-and-forget HOARD (null = neither lane).
     data class Context(
         val metaId: String = "",
         val streamId: String? = null, // null = all loaded groups (movie); set = one episode's groups
@@ -90,7 +90,7 @@ class SourceListModel(
         val prefs: SourcePrefsSnapshot = SourcePrefsSnapshot.DEFAULT,
         val directLinksOnly: Boolean = false, // drop unresolved raw torrents, preserve resolved direct links
         val disabledAddons: Set<String> = emptySet(), // per-profile disabled add-on labels
-        val contentId: String? = null, // Singularity pool content id, for the HOARD seed only
+        val contentId: String? = null, // canonical auxiliary target id + Singularity HOARD seed
     )
 
     // ---- Binding + input setters ----
@@ -184,13 +184,14 @@ class SourceListModel(
         val ctx = context.value
         val raw = rawGroups.value
         val media = mediaServerGroups.value
-        val torboxStreams = tb.streams.value
+        val torboxSnapshot = tb.snapshotFor(ctx.contentId)
+        val torboxStreams = torboxSnapshot.streams
         val singularityStreams = sing.streams.value
 
         val signature = Signature(
             rawHash = raw.hashCode(),
             mediaHash = media.hashCode(),
-            torboxEpoch = tb.epoch,
+            torboxEpoch = torboxSnapshot.epoch,
             singularityEpoch = sing.epoch,
             inputsHash = inputsHash(ctx),
         )

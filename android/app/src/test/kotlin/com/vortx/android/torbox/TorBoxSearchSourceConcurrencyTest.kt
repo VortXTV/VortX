@@ -2,9 +2,12 @@ package com.vortx.android.torbox
 
 import com.vortx.android.model.StreamSource
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
@@ -14,9 +17,152 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TorBoxSearchSourceConcurrencyTest {
+    @Test
+    fun `closing the key gate clears episode A before episode B can assemble`() = runBlocking {
+        val fetchDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+        val configured = AtomicBoolean(true)
+        val fetchCount = AtomicInteger()
+        val source = TorBoxSearchSource(
+            scope = CoroutineScope(SupervisorJob() + fetchDispatcher),
+            fetchStreams = { _, _, episode, _ ->
+                fetchCount.incrementAndGet()
+                TorBoxSearch.Result(
+                    streams = listOf(stream(episode.toString().repeat(40))),
+                    rateLimited = false,
+                    transportError = false,
+                )
+            },
+            torBoxConfigured = configured::get,
+        )
+
+        try {
+            source.refresh("tt1234567", season = 1, episode = 1)
+            withTimeout(5_000) {
+                while (source.streams.value.singleOrNull()?.infoHash != "1".repeat(40)) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            val episodeAEpoch = source.epoch
+            assertEquals("1".repeat(40), source.streamsFor("tt1234567:1:1").single().infoHash)
+            assertTrue(source.streamsFor("tt1234567:1:2").isEmpty())
+
+            configured.set(false)
+            source.refresh("tt1234567", season = 1, episode = 2)
+
+            assertTrue(source.streams.value.isEmpty())
+            assertEquals(episodeAEpoch + 1, source.epoch)
+            assertEquals(1, fetchCount.get())
+
+            configured.set(true)
+            source.refresh("tt1234567", season = 1, episode = 2)
+            withTimeout(5_000) {
+                while (source.streams.value.singleOrNull()?.infoHash != "2".repeat(40)) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            assertEquals(2, fetchCount.get())
+            assertTrue(source.streamsFor("tt1234567:1:1").isEmpty())
+            assertEquals("2".repeat(40), source.streamsFor("tt1234567:1:2").single().infoHash)
+        } finally {
+            source.close()
+            fetchDispatcher.close()
+        }
+    }
+
+    @Test
+    fun `late episode A response cannot reopen a key gate closed for episode B`() = runBlocking {
+        val executor = Executors.newSingleThreadExecutor()
+        val fetchDispatcher = executor.asCoroutineDispatcher()
+        val configured = AtomicBoolean(true)
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        val fetchCount = AtomicInteger()
+        val source = TorBoxSearchSource(
+            scope = CoroutineScope(SupervisorJob() + fetchDispatcher),
+            fetchStreams = { _, _, _, _ ->
+                fetchCount.incrementAndGet()
+                firstStarted.complete(Unit)
+                // Reproduce a blocking transport that returns even after its coroutine is canceled.
+                withContext(NonCancellable) { releaseFirst.await() }
+                TorBoxSearch.Result(listOf(stream("a".repeat(40))), false, false)
+            },
+            torBoxConfigured = configured::get,
+        )
+
+        try {
+            source.refresh("tt1234567", season = 1, episode = 1)
+            withTimeout(5_000) { firstStarted.await() }
+
+            configured.set(false)
+            source.refresh("tt1234567", season = 1, episode = 2)
+            val closedEpoch = source.epoch
+
+            releaseFirst.complete(Unit)
+            // The single-thread executor orders this barrier after the resumed fetch completion.
+            withContext(fetchDispatcher) { Unit }
+
+            assertTrue(source.streams.value.isEmpty())
+            assertEquals(closedEpoch, source.epoch)
+            assertEquals(1, fetchCount.get())
+        } finally {
+            releaseFirst.complete(Unit)
+            source.close()
+            fetchDispatcher.close()
+        }
+    }
+
+    @Test
+    fun `response fetched with a replaced key cannot publish`() = runBlocking {
+        val executor = Executors.newSingleThreadExecutor()
+        val fetchDispatcher = executor.asCoroutineDispatcher()
+        val key = AtomicReference("key-a")
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        val fetchedKeys = CopyOnWriteArrayList<String>()
+        val source = TorBoxSearchSource(
+            scope = CoroutineScope(SupervisorJob() + fetchDispatcher),
+            fetchStreams = { _, _, _, requestKey ->
+                fetchedKeys += requestKey
+                if (requestKey == "key-a") {
+                    firstStarted.complete(Unit)
+                    withContext(NonCancellable) { releaseFirst.await() }
+                }
+                val hash = if (requestKey == "key-a") "a".repeat(40) else "b".repeat(40)
+                TorBoxSearch.Result(listOf(stream(hash)), false, false)
+            },
+            torBoxConfigured = { key.get().isNotEmpty() },
+            torBoxKey = key::get,
+        )
+
+        try {
+            source.refresh("tt1234567", season = 1, episode = 1)
+            withTimeout(5_000) { firstStarted.await() }
+
+            key.set("key-b")
+            releaseFirst.complete(Unit)
+            withContext(fetchDispatcher) { Unit }
+
+            assertTrue(source.streams.value.isEmpty())
+            assertTrue(source.streamsFor("tt1234567:1:1").isEmpty())
+
+            source.refresh("tt1234567", season = 1, episode = 2)
+            withTimeout(5_000) {
+                while (source.streams.value.singleOrNull()?.infoHash != "b".repeat(40)) {
+                    kotlinx.coroutines.yield()
+                }
+            }
+            assertEquals(listOf("key-a", "key-b"), fetchedKeys)
+        } finally {
+            releaseFirst.complete(Unit)
+            source.close()
+            fetchDispatcher.close()
+        }
+    }
+
     @Test
     fun `concurrent refreshes for one title coalesce into one fetch and one cached result`() = runBlocking {
         val fetchDispatcher = Executors.newFixedThreadPool(4).asCoroutineDispatcher()

@@ -513,7 +513,7 @@ class DetailViewModel(
                     sourcesReady = true
                     _streams.value = UiState.Success(displayRaw)
                     sourceModel.setRawGroups(raw)
-                    runCacheCheck(raw, episodeId, season, episodeNum, request)
+                    runCacheCheck(raw, episodeId, season, episodeNum, request, ctx.contentId)
                     // Smart Source Selection auto-pick (viewer opt-in, once per episode tap): play the
                     // best-ranked source of the FRESH raw groups straight away. Ranked directly (not via
                     // [bestSource]) because the assembly coalescer may still hold the previous episode's
@@ -576,7 +576,7 @@ class DetailViewModel(
     /// The frozen ranking context [sourceModel] assembles against: the real user preference snapshot + the
     /// effective per-title / provider pin (so a re-rank of the merged list keeps a pinned source on top and
     /// honours the user's filters), the chosen episode's [SourceListModel.Context.streamId], and the
-    /// Singularity pool [SourceListModel.Context.contentId] for the fire-and-forget hoard seed.
+    /// canonical [SourceListModel.Context.contentId] that owns TorBox rows and seeds the Singularity hoard.
     private fun buildContext(
         episodeId: String?,
         imdb: String?,
@@ -614,6 +614,7 @@ class DetailViewModel(
         season: Int?,
         episodeNum: Int?,
         request: SourceRequestFence.Token,
+        contentId: String?,
     ) {
         if (!debrid.hasAnyResolver && !debrid.hasUsenetResolver) return
         val owner = debridKeys.ownerToken() ?: return
@@ -621,7 +622,7 @@ class DetailViewModel(
             // Gather over the CURRENT lanes for this title (raw add-on groups + whatever the TorBox / Singularity
             // contributors have already published), never a possibly-stale prior assembly. Late-arriving TorBox
             // torrents self-badge from the index's own check_cache tag, so they need no account round trip here.
-            val laneStreams = raw.flatMap { it.streams } + torbox.streams.value + singularity.streams.value
+            val laneStreams = raw.flatMap { it.streams } + torbox.streamsFor(contentId) + singularity.streams.value
             val hashes = laneStreams
                 .mapNotNull { it.infoHash?.trim()?.lowercase()?.takeIf { h -> h.isNotEmpty() } }
                 .distinct()

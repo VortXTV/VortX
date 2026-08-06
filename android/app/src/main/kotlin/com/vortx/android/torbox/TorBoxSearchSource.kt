@@ -314,10 +314,10 @@ class TorBoxSearchSource private constructor(
         /// a caller that never provides one still works standalone (matching Apple's self-owned `Task`).
         scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     ) : this(
-        torBoxConfigured = { debridKeys.isConfigured(DebridService.TOR_BOX) },
-        torBoxKey = { debridKeys.key(DebridService.TOR_BOX) },
-        scope = scope,
-        fetchStreams = TorBoxSearch::streams,
+        { debridKeys.isConfigured(DebridService.TOR_BOX) },
+        { debridKeys.key(DebridService.TOR_BOX) },
+        scope,
+        TorBoxSearch::streams,
     )
 
     /// Deterministic test seam for the asynchronous fetch boundary. Production always uses the public
@@ -325,11 +325,13 @@ class TorBoxSearchSource private constructor(
     internal constructor(
         scope: CoroutineScope,
         fetchStreams: suspend (String, Int?, Int?, String) -> TorBoxSearch.Result,
+        torBoxConfigured: () -> Boolean = { true },
+        torBoxKey: () -> String = { "test-key" },
     ) : this(
-        torBoxConfigured = { true },
-        torBoxKey = { "test-key" },
-        scope = scope,
-        fetchStreams = fetchStreams,
+        torBoxConfigured,
+        torBoxKey,
+        scope,
+        fetchStreams,
     )
 
     private val _streams = MutableStateFlow<List<StreamSource>>(emptyList())
@@ -351,6 +353,9 @@ class TorBoxSearchSource private constructor(
 
     private var shownKey: String? = null
     private var shownGeneration: Long = -1L
+    /// Canonical title/episode identity for the currently published rows. Read through [streamsFor] so the
+    /// source-list assembler can reject a contributor snapshot owned by a different detail target.
+    private var publishedContentId: String? = null
     private var inFlightKey: String? = null
     private var inFlightGeneration: Long = -1L
     private val cache = HashMap<String, List<StreamSource>>()
@@ -372,7 +377,14 @@ class TorBoxSearchSource private constructor(
             return
         }
         val fetchKey = "$imdbId|${season ?: -1}|${episode ?: -1}"
+        val contentId = if (season != null && episode != null) "$imdbId:$season:$episode" else imdbId
         val key = torBoxKey()
+        if (key.isEmpty()) {
+            // The key can be cleared between the configured check and this read. Treat that race as the same
+            // closed lifecycle instead of launching a request with an empty credential.
+            reset(requestGeneration)
+            return
+        }
         val launched = synchronized(stateLock) {
             // New title: publish its cached results (or clear), so the prior title's streams never linger.
             if (fetchKey != shownKey || requestGeneration != shownGeneration) {
@@ -382,6 +394,7 @@ class TorBoxSearchSource private constructor(
                 inFlightGeneration = -1L
                 shownKey = fetchKey
                 shownGeneration = requestGeneration
+                publishedContentId = contentId
                 publishLocked(cache[fetchKey] ?: emptyList())
             }
             if (cache.containsKey(fetchKey)) {
@@ -418,6 +431,15 @@ class TorBoxSearchSource private constructor(
                         inFlightKey = null
                         inFlightGeneration = -1L
                         job = null
+                        // A credential mutation while the request was in flight retires this result. This is
+                        // the completion-side half of the gate fence; a cleared or replaced key cannot publish
+                        // streams fetched under the prior credential.
+                        if (!torBoxConfigured() || torBoxKey() != key) {
+                            shownKey = null
+                            publishedContentId = null
+                            if (_streams.value.isNotEmpty()) publishLocked(emptyList())
+                            return@synchronized
+                        }
                         if (result.rateLimited) {
                             // Over the TorBox scraper allowance. Back off ~15 min before re-probing; do NOT
                             // cache the empty result, so it re-fetches once the cooldown lifts.
@@ -455,6 +477,33 @@ class TorBoxSearchSource private constructor(
         launched.start()
     }
 
+    /// Close the configured-key lifecycle synchronously. A detail target installs its new generation only
+    /// after [refresh] returns, so clearing the prior target here prevents its streams from being relabeled as
+    /// the new target when the key gate is closed. The session cache and cooldown survive for a later reopen.
+    private fun closeGate() {
+        synchronized(stateLock) {
+            job?.cancel()
+            job = null
+            inFlightKey = null
+            shownKey = null
+            publishedContentId = null
+            if (_streams.value.isNotEmpty()) publishLocked(emptyList())
+        }
+    }
+
+    data class Snapshot(val streams: List<StreamSource>, val epoch: Int)
+
+    /// Snapshot the epoch and only rows whose canonical title/episode identity owns [contentId]. Taking all
+    /// three values under the contributor lock keeps the assembler from memoizing old rows with a new epoch.
+    fun snapshotFor(contentId: String?): Snapshot = synchronized(stateLock) {
+        Snapshot(
+            streams = if (contentId != null && publishedContentId == contentId) _streams.value else emptyList(),
+            epoch = epochCounter.get(),
+        )
+    }
+
+    fun streamsFor(contentId: String?): List<StreamSource> = snapshotFor(contentId).streams
+
     /// Empty the PUBLISHED results (and the shown-key, so a later refresh for the same title re-publishes from
     /// cache instead of being deduped into staying empty) WITHOUT touching the session cache, the in-flight
     /// bookkeeping, or the scraper-cooldown state (those protect the TorBox allowance for the whole session).
@@ -464,6 +513,7 @@ class TorBoxSearchSource private constructor(
         synchronized(stateLock) {
             shownKey = null
             shownGeneration = -1L
+            publishedContentId = null
             if (_streams.value.isNotEmpty()) publishLocked(emptyList())
         }
     }
@@ -477,6 +527,7 @@ class TorBoxSearchSource private constructor(
             inFlightGeneration = -1L
             shownKey = null
             shownGeneration = -1L
+            publishedContentId = null
             if (clearCache) cache.clear()
             if (_streams.value.isNotEmpty()) publishLocked(emptyList())
             _settlement.value = SourceContributorSettlement(requestGeneration, settled = true)
