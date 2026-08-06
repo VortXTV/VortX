@@ -52,6 +52,17 @@ object EngineActions {
             ),
         )
 
+    /// Append the next item page to one Home catalog. The index is the catalog's position in the
+    /// engine board, not its position after client-side filtering or ordering.
+    fun loadBoardRowNextPage(engineIndex: Int): String =
+        envelope(
+            FIELD_BOARD,
+            action(
+                "CatalogsWithExtra",
+                JSONObject().put("action", "LoadNextPage").put("args", engineIndex),
+            ),
+        )
+
     /// Load Discover's default catalog (the engine picks the first selectable type). Mirrors Apple
     /// `CoreBridge.loadDiscover`: `args.request` is null so the engine falls back to its own default
     /// selection rather than a client-guessed one.

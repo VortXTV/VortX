@@ -248,6 +248,7 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.json.jvm)
+    testImplementation(libs.kotlinx.coroutines.test)
 }
 
 // =====================================================================================================

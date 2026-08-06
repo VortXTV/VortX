@@ -11,6 +11,22 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 
+internal fun activateProfileInOrder(
+    transitionHome: () -> Unit,
+    applyPlayback: () -> Unit,
+    activateOverlay: () -> Unit,
+    reloadDependants: () -> Unit,
+    publishProfile: () -> Unit,
+    rebuildBoard: () -> Unit,
+) {
+    transitionHome()
+    applyPlayback()
+    activateOverlay()
+    reloadDependants()
+    publishProfile()
+    rebuildBoard()
+}
+
 /**
  * The profile roster and the active selection, the Android port of Apple `ProfileStore`
  * (`app/SourcesShared/Profiles.swift`). The roster persists as JSON in [SharedPreferences] (the direct
@@ -89,6 +105,7 @@ class ProfileStore private constructor(context: Context) {
     var onRebuildBoard: () -> Unit = {}
 
     private val switchListeners = mutableListOf<() -> Unit>()
+    private val homeTransitionListeners = mutableListOf<() -> Unit>()
 
     // ---- Derived reads ----
 
@@ -115,6 +132,28 @@ class ProfileStore private constructor(context: Context) {
 
     /** The token slot the rest of the app reads the session from right now. Mirrors Apple `activeKeychainAccount`. */
     val activeKeychainAccount: String get() = active?.let { keychainAccount(it) } ?: PRIMARY_TOKEN_ACCOUNT
+
+    /**
+     * The resolved profile binding before an ownership mutation starts. [selectedID] deliberately keeps
+     * the raw selection as well as the resolved profile: after a roster removes the selected profile, the
+     * public getters fall back to the owner defaults and can otherwise make a real transition look equal.
+     */
+    private data class ActiveProfileBinding(
+        val selectedID: String?,
+        val profileID: String?,
+        val accountSlot: String,
+        val usesEngineHistory: Boolean,
+    )
+
+    private fun captureActiveProfileBinding(): ActiveProfileBinding {
+        val profile = active
+        return ActiveProfileBinding(
+            selectedID = activeID,
+            profileID = profile?.id,
+            accountSlot = profile?.let(::keychainAccount) ?: PRIMARY_TOKEN_ACCOUNT,
+            usesEngineHistory = profile?.usesEngineHistory ?: true,
+        )
+    }
 
     /**
      * The token slot for [profile]. The owner IS the primary account (always the primary slot, whatever
@@ -147,6 +186,20 @@ class ProfileStore private constructor(context: Context) {
         overlay.addLibraryEntry(metaId, name, type, poster)
     fun finishedWatching(metaId: String) = overlay.finishedWatching(metaId)
     fun removeWatchEntry(metaId: String) = overlay.removeWatchEntry(metaId)
+
+    /**
+     * Execute one overlay operation for the explicitly captured profile. The shared owner monitor
+     * prevents activation from changing between identity validation and the operation itself.
+     */
+    internal fun <T> withActiveOverlayProfile(
+        expectedProfileId: String,
+        block: (WatchOverlayStore) -> T,
+    ): T = ContinueWatchingOwnerGate.serialized {
+        val normalized = UserProfile.normalizeId(expectedProfileId)
+        check(active?.id == normalized && !activeUsesEngineHistory) { "History overlay owner changed." }
+        block(overlay)
+    }
+
     /** The stored overlay for ANY profile (for the sync wave to emit each profile's CW/library). */
     fun watchEntries(profileId: String) = overlay.entries(profileId)
     fun applyRemoteOverlay(profileId: String, incoming: Map<String, WatchEntry>) {
@@ -163,57 +216,91 @@ class ProfileStore private constructor(context: Context) {
         if (!switchListeners.contains(listener)) switchListeners.add(listener)
     }
 
+    /**
+     * Register a fail-closed Home boundary listener. It fires synchronously as soon as [activeID] or
+     * the active profile's history identity changes, before playback preferences or a board rebuild.
+     */
+    fun addHomeTransitionListener(listener: () -> Unit) {
+        if (!homeTransitionListeners.contains(listener)) homeTransitionListeners.add(listener)
+    }
+
+    private fun notifyHomeTransitionListeners() = homeTransitionListeners.forEach { it() }
     private fun notifySwitchListeners() = switchListeners.forEach { it() }
+
+    /**
+     * Apply every active-profile mutation in privacy-safe order: first invalidate old Home permits,
+     * then install the new preferences and watch overlay, then reload dependants and rebuild once.
+     */
+    private fun activateProfileState(profile: UserProfile, resetUnset: Boolean = false) {
+        activateProfileInOrder(
+            transitionHome = ::notifyHomeTransitionListeners,
+            applyPlayback = {
+                applyPlayback(profile, resetUnset = resetUnset, rebuildBoard = false)
+            },
+            activateOverlay = { overlay.activate(profile.id, profile.usesEngineHistory) },
+            reloadDependants = ::notifySwitchListeners,
+            publishProfile = ::publishActiveProfile,
+            rebuildBoard = onRebuildBoard,
+        )
+    }
 
     // ---- Lifecycle ----
 
     private fun bootstrap() {
-        loadDeletedTombstones()
-        load()
-        if (profiles.isEmpty()) migrateFromSingleAccount()
-        hashLegacyPins()
-        // Rosters saved before history separation existed have no owner; the migrated first profile is
-        // the account's main one.
-        if (profiles.none { it.isOwner } && profiles.isNotEmpty()) {
-            profiles = profiles.mapIndexed { i, p -> if (i == 0) p.copy(isOwner = true) else p }
-            persist(touch = false)
+        ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
+            loadDeletedTombstones()
+            load()
+            if (profiles.isEmpty()) migrateFromSingleAccount()
+            hashLegacyPins()
+            // Rosters saved before history separation existed have no owner; the migrated first profile is
+            // the account's main one.
+            if (profiles.none { it.isOwner } && profiles.isNotEmpty()) {
+                profiles = profiles.mapIndexed { i, p -> if (i == 0) p.copy(isOwner = true) else p }
+                persist(touch = false)
+            }
+            val before = profiles
+            normalizeOwner()
+            if (activeID == null || profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
+            if (profiles != before) persist(touch = false)
+            active?.let(::writeAddonKidsMirror)
+            // One-time seed: pre-feature rosters share one flat set of playback preferences, so copying it into
+            // every profile preserves today's behavior exactly; from then on each profile diverges.
+            if (profiles.any { it.playback == null }) {
+                val seed = currentPlaybackPrefs(null)
+                profiles = profiles.map { if (it.playback == null) it.copy(playback = seed) else it }
+                persist(touch = false)
+            }
+            overlay.activate(active?.id, activeUsesEngineHistory)
+            publishActiveProfile()
         }
-        val before = profiles
-        normalizeOwner()
-        if (activeID == null || profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
-        if (profiles != before) persist(touch = false)
-        active?.let(::writeAddonKidsMirror)
-        // One-time seed: pre-feature rosters share one flat set of playback preferences, so copying it into
-        // every profile preserves today's behavior exactly; from then on each profile diverges.
-        if (profiles.any { it.playback == null }) {
-            val seed = currentPlaybackPrefs(null)
-            profiles = profiles.map { if (it.playback == null) it.copy(playback = seed) else it }
-            persist(touch = false)
-        }
-        overlay.activate(active?.id, activeUsesEngineHistory)
-        publishActiveProfile()
     }
 
     // ---- Selection / CRUD ----
 
     /** Make [candidate] active: applies its prefs immediately and reports the account work left. Apple `select`. */
-    fun select(candidate: UserProfile): SwitchOutcome {
-        val profile =
-            profiles.firstOrNull { it.id == candidate.id } ?: return SwitchOutcome.SameAccount
+    fun select(candidate: UserProfile): SwitchOutcome = ContinueWatchingOwnerGate.serialized {
+        val profile = profiles.firstOrNull { it.id == candidate.id }
+            ?: return@serialized SwitchOutcome.SameAccount
+        ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) { before ->
+            selectLocked(profile, before, captureOutgoingPlayback = true)
+        }
+    }
+
+    private fun selectLocked(
+        profile: UserProfile,
+        before: ActiveProfileBinding,
+        captureOutgoingPlayback: Boolean,
+    ): SwitchOutcome {
         // FIRST, before activeID moves: fold the live flat-key state into the OUTGOING profile, so a
         // viewer's Settings filter edits (which bind straight to the flat keys) are not overwritten by the
         // resetUnset apply below. The equality guard keeps this a no-op when the roster already matches.
-        capturePlayback()
-        val beforeAccount = active?.let { keychainAccount(it) }
+        if (captureOutgoingPlayback) capturePlaybackLocked()
         activeID = profile.id
         pickedThisLaunch = true
         persist(touch = false)   // selection is per-device, not a roster edit
-        applyPlayback(profile, resetUnset = true)   // a switch resets unset filters to defaults, never inherits
-        notifySwitchListeners()   // SourcePreferences.reload() + SourcePinStore.reload()
-        overlay.activate(profile.id, profile.usesEngineHistory)
-        publishActiveProfile()
+        activateProfileState(profile, resetUnset = true)
         val nowAccount = keychainAccount(profile)
-        if (nowAccount == beforeAccount) return SwitchOutcome.SameAccount
+        if (nowAccount == before.accountSlot) return SwitchOutcome.SameAccount
         val token = tokenProvider(nowAccount)
         return if (!token.isNullOrEmpty()) SwitchOutcome.SwitchAccount(token) else SwitchOutcome.NeedsSignIn
     }
@@ -223,14 +310,28 @@ class ProfileStore private constructor(context: Context) {
         persist()
     }
 
-    fun update(profile: UserProfile) {
+    fun update(profile: UserProfile) = ContinueWatchingOwnerGate.serialized {
         val idx = profiles.indexOfFirst { it.id == profile.id }
-        if (idx < 0) return
+        if (idx < 0) return@serialized
+        if (profile.id == activeID) {
+            ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
+                updateLocked(profile, idx, reactivateOverlay = true)
+            }
+        } else {
+            updateLocked(profile, idx, reactivateOverlay = false)
+        }
+    }
+
+    private fun updateLocked(profile: UserProfile, idx: Int, reactivateOverlay: Boolean) {
         profiles = profiles.toMutableList().also { it[idx] = profile }
         persist()
         if (profile.id == activeID) {
-            applyPlayback(profile)
-            publishActiveProfile()
+            if (reactivateOverlay) {
+                activateProfileState(profile)
+            } else {
+                applyPlayback(profile)
+                publishActiveProfile()
+            }
         }
     }
 
@@ -248,13 +349,34 @@ class ProfileStore private constructor(context: Context) {
     fun isAddonDisabledForActive(base: String): Boolean = (active?.disabledAddons ?: emptyList()).contains(base)
 
     /** Remove a profile (never the last one). Mirrors Apple `remove`. */
-    fun remove(profile: UserProfile): SwitchOutcome? {
-        if (profiles.size <= 1 || profiles.none { it.id == profile.id }) return null
-        profiles = profiles.filter { it.id != profile.id }
-        overlay.clearCache(profile.id)
-        tombstone(profile.id)   // durable cross-device delete; the union-merge can no longer resurrect it
-        persist()
-        return if (activeID == profile.id) profiles.firstOrNull()?.let { select(it) } else null
+    fun remove(profile: UserProfile): SwitchOutcome? = ContinueWatchingOwnerGate.serialized {
+        if (profiles.size <= 1 || profiles.none { it.id == profile.id }) return@serialized null
+        ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) { before ->
+            val removedActiveProfile = activeID == profile.id
+            profiles = profiles.filter { it.id != profile.id }
+            overlay.clearCache(profile.id)
+            tombstone(profile.id)   // durable cross-device delete; the union-merge can no longer resurrect it
+            if (!removedActiveProfile) {
+                persist()
+                return@transition null
+            }
+
+            // Keep the pre-removal binding all the way through fallback selection. Reading the public
+            // defaults after removal loses an own-account slot and can incorrectly report SameAccount.
+            val replacement = profiles.first()
+            activeID = replacement.id
+            pickedThisLaunch = true
+            persist()
+            activateProfileState(replacement, resetUnset = true)
+            val nextAccount = keychainAccount(replacement)
+            if (nextAccount == before.accountSlot) {
+                SwitchOutcome.SameAccount
+            } else {
+                tokenProvider(nextAccount)?.takeIf { it.isNotEmpty() }
+                    ?.let { SwitchOutcome.SwitchAccount(it) }
+                    ?: SwitchOutcome.NeedsSignIn
+            }
+        }
     }
 
     // ---- Per-profile playback preferences ----
@@ -327,7 +449,11 @@ class ProfileStore private constructor(context: Context) {
      * as-is, so a peer's null can never wipe live keys at pull time). Every value type MATCHES the
      * `SourcePreferencesStore` getter (Int/Float/Bool/String) so a later read never throws a class-cast.
      */
-    private fun applyPlayback(profile: UserProfile, resetUnset: Boolean = false) {
+    private fun applyPlayback(
+        profile: UserProfile,
+        resetUnset: Boolean = false,
+        rebuildBoard: Boolean = true,
+    ) {
         writeAddonKidsMirror(profile)
         val p = profile.playback
         val e = prefs.edit()
@@ -356,9 +482,9 @@ class ProfileStore private constructor(context: Context) {
         // Every apply changes stream FILTERING / RANKING order, so drop the memoized scores and rebuild the
         // per-profile Home board. Mirrors the tail of Apple `applyPlayback`. This makes a per-profile
         // add-on toggle (via update -> applyPlayback) take effect immediately, not only on the next switch.
-        // On a switch this double-invalidates with the reload hook, which is harmless.
+        // A profile activation suppresses this early rebuild and performs one after its overlay is live.
         StreamRanking.invalidateCaches()
-        onRebuildBoard()
+        if (rebuildBoard) onRebuildBoard()
     }
 
     private fun applyBool(e: SharedPreferences.Editor, key: String, v: Boolean?, def: Boolean, reset: Boolean) {
@@ -387,11 +513,16 @@ class ProfileStore private constructor(context: Context) {
      * follows the profile across devices. The equality guard stops [select]'s own flat-key writes from
      * echoing back as roster edits. Mirrors Apple `capturePlayback`.
      */
-    fun capturePlayback() {
+    fun capturePlayback() = ContinueWatchingOwnerGate.serialized {
+        capturePlaybackLocked()
+    }
+
+    private fun capturePlaybackLocked() {
         val profile = active ?: return
         val now = currentPlaybackPrefs(profile.playback)
         if (samePlayback(profile.playback, now)) return
-        update(profile.copy(playback = now))
+        val idx = profiles.indexOfFirst { it.id == profile.id }
+        if (idx >= 0) updateLocked(profile.copy(playback = now), idx, reactivateOverlay = false)
     }
 
     /**
@@ -535,26 +666,27 @@ class ProfileStore private constructor(context: Context) {
     }
 
     /** Fold incoming tombstones into the local set (dropping the owner defensively). Apple `mergeDeletedTombstones`. */
-    fun mergeDeletedTombstones(incoming: List<String>): Boolean {
+    fun mergeDeletedTombstones(incoming: List<String>): Boolean = ContinueWatchingOwnerGate.serialized {
         val add = incoming.map { UserProfile.normalizeId(it) }
             .filter { it != UserProfile.OWNER_ID && !deletedProfileIDs.contains(it) }
-        if (add.isEmpty()) return false
+        if (add.isEmpty()) return@serialized false
         deletedProfileIDs = deletedProfileIDs + add
         saveDeletedTombstones()
         pruneTombstonedProfiles()
-        return true
+        true
     }
 
     /** Remove any live profile whose id is tombstoned (never the owner). Apple `pruneTombstonedProfiles`. */
-    private fun pruneTombstonedProfiles() {
+    private fun pruneTombstonedProfiles() = ContinueWatchingOwnerGate.serialized {
         val before = profiles
-        profiles = profiles.filterNot { deletedProfileIDs.contains(it.id) && !it.isOwner }
-        if (profiles == before) return
-        if (activeID == null || profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
-        active?.let { applyPlayback(it) }
-        persist(touch = false)
-        overlay.activate(active?.id, activeUsesEngineHistory)
-        publishActiveProfile()
+        val pruned = profiles.filterNot { deletedProfileIDs.contains(it.id) && !it.isOwner }
+        if (pruned == before) return@serialized
+        ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
+            profiles = pruned
+            if (activeID == null || profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
+            persist(touch = false)
+            active?.let(::activateProfileState)
+        }
     }
 
     /** Apply the LOCAL delete tombstones to the live roster (called after EVERY sync pull). Apple `applyLocalTombstones`. */
@@ -564,28 +696,31 @@ class ProfileStore private constructor(context: Context) {
 
     /** Adopt a remote roster wholesale (newest side wins). Mirrors Apple `adoptRemoteRoster`. */
     fun adoptRemoteRoster(remote: List<UserProfile>) {
-        profiles = remote
-        afterRosterFold()
+        ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
+            profiles = remote
+            afterRosterFold()
+        }
     }
 
     /**
      * Re-read the roster from the restored defaults (after a settings-backup restore), KEEPING this
      * device's active selection (selection is per-device). Mirrors Apple `reloadFromDefaults`.
      */
-    fun reloadFromDefaults() {
-        val list = prefs.getString(LIST_KEY, null)?.let { UserProfile.decodeRoster(it) } ?: return
-        val keep = activeID
-        profiles = list
-        normalizeOwner()
-        activeID = when {
-            keep != null && profiles.any { it.id == keep } -> keep
-            profiles.none { it.id == activeID } -> profiles.firstOrNull()?.id
-            else -> activeID
+    fun reloadFromDefaults() = ContinueWatchingOwnerGate.serialized {
+        val list = prefs.getString(LIST_KEY, null)?.let { UserProfile.decodeRoster(it) }
+            ?: return@serialized
+        ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
+            val keep = activeID
+            profiles = list
+            normalizeOwner()
+            activeID = when {
+                keep != null && profiles.any { it.id == keep } -> keep
+                profiles.none { it.id == activeID } -> profiles.firstOrNull()?.id
+                else -> activeID
+            }
+            persist(touch = false)
+            active?.let(::activateProfileState)
         }
-        active?.let { applyPlayback(it); notifySwitchListeners() }
-        persist(touch = false)
-        overlay.activate(active?.id, activeUsesEngineHistory)
-        publishActiveProfile()
     }
 
     /**
@@ -595,8 +730,11 @@ class ProfileStore private constructor(context: Context) {
      * [incomingModified] vs [rosterModified], both epoch-SECONDS) wins the fields; either way the id is retained. Delete
      * tombstones are subtracted from the union. Mirrors Apple `mergeInRoster`.
      */
-    fun mergeInRoster(incoming: List<UserProfile>, incomingModified: Double? = null) {
-        if (incoming.isEmpty()) return
+    fun mergeInRoster(
+        incoming: List<UserProfile>,
+        incomingModified: Double? = null,
+    ) = ContinueWatchingOwnerGate.serialized {
+        if (incoming.isEmpty()) return@serialized
         val transition = rosterPullMergeTransition(
             local = profiles,
             incoming = incoming,
@@ -607,8 +745,10 @@ class ProfileStore private constructor(context: Context) {
         applyRosterPullMergeTransition(
             transition = transition,
             replaceProfiles = { merged ->
-                profiles = merged
-                afterRosterFold()
+                ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
+                    profiles = merged
+                    afterRosterFold()
+                }
             },
             // The carrier watermark is state too. Persist it even when the roster payload is identical.
             adoptWatermark = ::adoptRosterWatermark,
@@ -626,10 +766,8 @@ class ProfileStore private constructor(context: Context) {
     private fun afterRosterFold() {
         normalizeOwner()
         if (profiles.none { it.id == activeID }) activeID = profiles.firstOrNull()?.id
-        active?.let { applyPlayback(it); notifySwitchListeners() }
         persist(touch = false)
-        overlay.activate(active?.id, activeUsesEngineHistory)
-        publishActiveProfile()
+        active?.let(::activateProfileState)
     }
 
     // ---- Owner normalization + duplicate collapse (the hard-won guards) ----

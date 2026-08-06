@@ -18,6 +18,7 @@ import androidx.tv.material3.MaterialTheme as TvMaterialTheme
 import androidx.tv.material3.darkColorScheme as tvDarkColorScheme
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.PlaybackSessionLifecycle
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.debrid.DebridKeys
@@ -103,23 +104,22 @@ fun TvApp(
         // progress tick + Player unload) still completes after the player leaves composition -- the same
         // reason the phone shell uses an app-scoped coroutine for this.
         val appScope = rememberCoroutineScope()
+        val playbackSessions = remember(repo, appScope) { PlaybackSessionLifecycle(repo, appScope) }
 
         // Player is the topmost layer. When a source resolves to a [Playable] it covers Home/Detail and back
         // returns to the detail page underneath. The begin/report/end-playback-session calls mirror
         // VortXApp exactly, so Continue Watching + resume track on TV the same way they do on the phone.
         val playable = playing
         if (playable != null) {
-            val playbackMeta = playingMeta
-            // Freshest reported position/duration (ms) for the save-on-exit write: [0] = position,
-            // [1] = duration. The loaded media identity is part of the session key so a same-URL source
-            // reused by two catalog entries cannot inherit the previous title's progress state.
-            val lastProgress = remember(playable, playbackMeta?.type, playbackMeta?.id) { longArrayOf(0L, 0L) }
+            val playbackHistory = remember(playable) {
+                TvPlaybackHistorySession(playable, playbackSessions)
+            }
             // D-pad Back pops the player back to the detail page rather than exiting the app.
             BackHandler { playing = null }
             DisposableEffect(playable) {
-                appScope.launch { repo.beginPlaybackSession() }
+                playbackHistory.begin()
                 onDispose {
-                    appScope.launch { repo.endPlaybackSession(lastProgress[0], lastProgress[1]) }
+                    playbackHistory.end()
                 }
             }
             PlayerScreen(
@@ -127,9 +127,7 @@ fun TvApp(
                 onBack = { playing = null },
                 onError = { playing = null },
                 onProgress = { pos, dur ->
-                    lastProgress[0] = pos
-                    lastProgress[1] = dur
-                    appScope.launch { repo.reportProgress(pos, dur) }
+                    playbackHistory.report(pos, dur)
                 },
             )
             return@VortXTheme
@@ -185,5 +183,36 @@ fun TvApp(
                 )
             }
         }
+    }
+}
+
+/**
+ * Owns the TV shell's history callbacks for one [Playable]. Trailers receive no history handle, so
+ * periodic progress, the player's final progress callback, and composition disposal cannot reach the
+ * resident feature's history session. Ordinary playables retain the existing ordered lifecycle.
+ */
+internal class TvPlaybackHistorySession(
+    playable: Playable,
+    private val playbackSessions: PlaybackSessionLifecycle,
+) {
+    private val handle = if (playable.isTrailer) null else playbackSessions.newHandle()
+    private var lastPositionMs = 0L
+    private var lastDurationMs = 0L
+
+    fun begin() {
+        val activeHandle = handle ?: return
+        playbackSessions.begin(activeHandle)
+    }
+
+    fun report(positionMs: Long, durationMs: Long) {
+        val activeHandle = handle ?: return
+        lastPositionMs = positionMs
+        lastDurationMs = durationMs
+        playbackSessions.report(activeHandle, positionMs, durationMs)
+    }
+
+    fun end() {
+        val activeHandle = handle ?: return
+        playbackSessions.end(activeHandle, lastPositionMs, lastDurationMs)
     }
 }

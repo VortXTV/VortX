@@ -53,6 +53,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.PlaybackSessionLifecycle
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.debrid.DebridKeys
@@ -277,6 +278,7 @@ fun VortXApp(
         // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
         // (final progress tick + Player unload) still runs after the player leaves composition.
         val appScope = rememberCoroutineScope()
+        val playbackSessions = remember(repo, appScope) { PlaybackSessionLifecycle(repo, appScope) }
         // One AccountViewModel for the whole shell (not per-screen-visit like the catalog ViewModels):
         // Settings' Account row summary and the AccountScreen overlay both read the SAME live
         // authState, so a sign-in on one immediately reflects on the other with no extra plumbing.
@@ -405,15 +407,18 @@ fun VortXApp(
             // cap per episode) lives in [DetailViewModel], which survives the swaps.
             var retryingSource by remember(playable) { mutableStateOf(false) }
             var manualSourcePick by remember(playable) { mutableStateOf(false) }
+            val playbackSession = remember(playable) { playbackSessions.newHandle() }
             // Engine playback session: load the Player so progress attributes to the right library item,
             // then end it (final tick + unload + watched-near-end) when the player closes. A TRAILER is not
             // the feature (it must not write a resume position, mark watched, or attribute progress to any
             // library item), so it opens NO engine playback session -- exactly as Apple plays trailers through
             // dedicated player instances that never touch the library.
             DisposableEffect(playable) {
-                if (!playable.isTrailer) appScope.launch { repo.beginPlaybackSession() }
+                if (!playable.isTrailer) playbackSessions.begin(playbackSession)
                 onDispose {
-                    if (!playable.isTrailer) appScope.launch { repo.endPlaybackSession(lastProgress[0], lastProgress[1]) }
+                    if (!playable.isTrailer) {
+                        playbackSessions.end(playbackSession, lastProgress[0], lastProgress[1])
+                    }
                 }
             }
             Box {
@@ -447,7 +452,7 @@ fun VortXApp(
                         lastProgress[1] = dur
                         // A trailer reports no progress and never auto-adds to the library (it is not the feature).
                         if (playable.isTrailer) return@PlayerScreen
-                        appScope.launch { repo.reportProgress(pos, dur) }
+                        playbackSessions.report(playbackSession, pos, dur)
                         // ~60s in -> the viewer is really watching this: auto-add it to the Library (D8), once
                         // per playback. This is the Android seam for Apple's block at PlayerScreen.swift:972-978
                         // and TVPlayerView.swift:810-816, which hangs the same call off the same progress tick:

@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -42,14 +43,18 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalContext
 import androidx.tv.material3.Border
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import coil3.compose.AsyncImage
+import com.vortx.android.VortXApplication
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.StreamSource
 import com.vortx.android.ui.components.PosterArt
+import com.vortx.android.ui.components.PosterCardMenu
+import com.vortx.android.ui.components.PosterQuickActionMenu
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -73,12 +78,29 @@ fun TvPosterCard(
     modifier: Modifier = Modifier,
     focusRequester: FocusRequester? = null,
     width: Dp? = TvDimens.posterWidth,
+    menu: PosterCardMenu = PosterCardMenu.NONE,
+    onDetails: (() -> Unit)? = null,
+    onRemoveFromContinueWatching: (() -> Unit)? = null,
 ) {
     val colors = VortXTheme.colors
+    val appContext = LocalContext.current.applicationContext
     var focused by remember { mutableStateOf(false) }
+    var menuOpen by remember { mutableStateOf(false) }
     Column(modifier = modifier.then(if (width != null) Modifier.width(width) else Modifier.fillMaxWidth())) {
+        if (menu != PosterCardMenu.NONE) {
+            PosterQuickActionMenu(
+                item = item,
+                menu = menu,
+                expanded = menuOpen,
+                onDismiss = { menuOpen = false },
+                onDetails = onDetails,
+                onRemoveFromContinueWatching = onRemoveFromContinueWatching,
+                repository = { (appContext as? VortXApplication)?.catalogRepository },
+            )
+        }
         Surface(
             onClick = onClick,
+            onLongClick = if (menu != PosterCardMenu.NONE) ({ menuOpen = true }) else null,
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(2f / 3f)
@@ -103,6 +125,18 @@ fun TvPosterCard(
             ),
         ) {
             PosterArt(item.poster, item.name)
+            if (item.watched) {
+                Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
+                Icon(
+                    imageVector = VortXIcons.checkmarkCircle,
+                    contentDescription = "Watched",
+                    tint = colors.accentBright,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(8.dp)
+                        .size(24.dp),
+                )
+            }
             // Continue Watching items carry a watched fraction; draw the accent progress track under the
             // art the same way the phone [com.vortx.android.ui.components.PosterCard] does.
             val progress = item.progress
