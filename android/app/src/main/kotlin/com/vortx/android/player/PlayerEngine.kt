@@ -27,6 +27,12 @@ interface PlayerEngine {
     /// (position 0, duration 0, paused false, no tracks) until the engine loads the file.
     val state: StateFlow<PlayerState>
 
+    /** True only when this engine can shift subtitle presentation time while playback is live. */
+    val subtitleDelayAvailable: Boolean get() = false
+
+    /** True only when this engine can shift audio presentation time while playback is live. */
+    val audioDelayAvailable: Boolean get() = false
+
     /// Begin (or replace) playback of [playable]. Applies per-stream headers and mounts external
     /// subtitles. Safe to call once per engine instance for the player's lifetime.
     fun load(playable: com.vortx.android.model.Playable)

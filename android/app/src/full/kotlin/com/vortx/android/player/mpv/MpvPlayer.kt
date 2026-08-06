@@ -51,6 +51,8 @@ class MpvPlayer private constructor(
 
     private val _state = MutableStateFlow(PlayerState())
     override val state: StateFlow<PlayerState> = _state.asStateFlow()
+    override val subtitleDelayAvailable: Boolean = true
+    override val audioDelayAvailable: Boolean = true
 
     /// Set true if attaching the render surface ever throws. The caller can consult it to fall back to
     /// ExoPlayer on a hard surface failure instead of showing a black frame.

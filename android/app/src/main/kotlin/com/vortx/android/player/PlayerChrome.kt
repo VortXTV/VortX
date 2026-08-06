@@ -7,6 +7,8 @@ import android.view.Display
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,12 +16,14 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AspectRatio
@@ -51,6 +55,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vortx.android.model.Playable
@@ -76,6 +81,14 @@ fun PlayerChrome(
     emberAccent: Color,
     speed: Float,
     scaleMode: VideoScaleMode,
+    subtitleDelayAvailable: Boolean,
+    subtitleDelaySeconds: Double,
+    onAdjustSubtitleDelay: (Double) -> Unit,
+    audioDelayAvailable: Boolean,
+    audioDelaySeconds: Double,
+    audioOutputMode: AudioOutputMode,
+    onAdjustAudioDelay: (Double) -> Unit,
+    onSelectAudioOutputMode: (AudioOutputMode) -> Unit,
     /// Whether the top scrim + control cluster and the bottom transport bar are drawn. The selection
     /// sheets and the error overlay are NOT gated on it: a sheet the viewer opened must survive an
     /// auto-hide tick, and an error must always be visible. The host owns the show/hide/auto-hide
@@ -119,7 +132,7 @@ fun PlayerChrome(
     modifier: Modifier = Modifier,
 ) {
     // Which selection sheet (if any) is open. Local to the chrome; the engine never sees it.
-    var openSheet by remember { mutableStateOf(ControlSheet.NONE) }
+    var openSheet by remember(playable.url) { mutableStateOf(ControlSheet.NONE) }
 
     Box(modifier = modifier) {
         // Top scrim so the title, back button, and controls stay legible over bright video.
@@ -154,11 +167,9 @@ fun PlayerChrome(
                         .weight(1f)
                         .padding(start = 4.dp),
                 )
-                // Control cluster: audio (when >1 track), subtitles (always, includes Off), speed, aspect.
+                // Control cluster: audio/output, subtitles, speed, and aspect.
                 // Opening a sheet counts as interaction so the host's auto-hide timer re-arms.
-                if (state.audioTracks.size > 1) {
-                    ChromeIcon(Icons.Filled.Audiotrack, "Audio track") { onInteraction(); openSheet = ControlSheet.AUDIO }
-                }
+                ChromeIcon(Icons.Filled.Audiotrack, "Audio and output settings") { onInteraction(); openSheet = ControlSheet.AUDIO }
                 ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { onInteraction(); openSheet = ControlSheet.SUBTITLE }
                 ChromeIcon(Icons.Filled.Speed, "Playback speed") { onInteraction(); openSheet = ControlSheet.SPEED }
                 ChromeIcon(Icons.Filled.AspectRatio, "Aspect ratio", tint = if (scaleMode == VideoScaleMode.ZOOM) emberAccent else Color.White, onClick = onToggleScaleMode)
@@ -201,29 +212,108 @@ fun PlayerChrome(
         when (openSheet) {
             ControlSheet.AUDIO -> ControlSelectionSheet(
                 title = "Audio",
-                options = state.audioTracks.map { SheetOption(trackLabel(it.title, it.lang), it.selected) { onSelectAudio(it.id) } },
+                options = buildList {
+                    state.audioTracks.forEach { track ->
+                        add(
+                            SheetOption(
+                                label = trackLabel(track.title, track.lang),
+                                selected = track.selected,
+                                isChoice = true,
+                                onPick = { onSelectAudio(track.id) },
+                            ),
+                        )
+                    }
+                    add(
+                        SheetOption(
+                            label = "Audio Settings",
+                            selected = false,
+                            onPick = { openSheet = ControlSheet.AUDIO_SETTINGS },
+                            detail = "›",
+                            dismissOnPick = false,
+                        ),
+                    )
+                },
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
             ControlSheet.SUBTITLE -> ControlSelectionSheet(
                 title = "Subtitles",
                 options = buildList {
-                    add(SheetOption("Off", state.subtitleTracks.none { it.selected }) { onSelectSubtitle(null) })
-                    state.subtitleTracks.forEach { t -> add(SheetOption(trackLabel(t.title, t.lang), t.selected) { onSelectSubtitle(t.id) }) }
+                    add(
+                        SheetOption(
+                            label = "Off",
+                            selected = state.subtitleTracks.none { it.selected },
+                            isChoice = true,
+                            onPick = { onSelectSubtitle(null) },
+                        ),
+                    )
+                    state.subtitleTracks.forEach { track ->
+                        add(
+                            SheetOption(
+                                label = trackLabel(track.title, track.lang),
+                                selected = track.selected,
+                                isChoice = true,
+                                onPick = { onSelectSubtitle(track.id) },
+                            ),
+                        )
+                    }
                     // Add-on subtitles, after the embedded tracks (Apple lists them the same way):
                     // picking one mounts it on the live engine, after which it also appears above as
                     // a regular (selected) track.
                     addonSubtitles.forEach { sub ->
-                        add(SheetOption("${sub.lang} · ${sub.addonName}", false) { onSelectAddonSubtitle(sub) })
+                        add(
+                            SheetOption(
+                                label = "${sub.lang} · ${sub.addonName}",
+                                selected = false,
+                                isChoice = true,
+                                onPick = { onSelectAddonSubtitle(sub) },
+                            ),
+                        )
                     }
+                    add(
+                        SheetOption(
+                            label = "Subtitle Settings",
+                            selected = false,
+                            onPick = { openSheet = ControlSheet.SUBTITLE_SETTINGS },
+                            detail = "›",
+                            dismissOnPick = false,
+                        ),
+                    )
                 },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.SUBTITLE_SETTINGS -> ControlSelectionSheet(
+                title = "Subtitle Settings",
+                options = subtitleSyncOptions(
+                    available = subtitleDelayAvailable,
+                    delaySeconds = subtitleDelaySeconds,
+                    onAdjust = onAdjustSubtitleDelay,
+                ),
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.AUDIO_SETTINGS -> ControlSelectionSheet(
+                title = "Audio Settings",
+                options = audioSyncOptions(
+                    available = audioDelayAvailable,
+                    delaySeconds = audioDelaySeconds,
+                    outputMode = audioOutputMode,
+                    onAdjust = onAdjustAudioDelay,
+                    onSelectOutput = onSelectAudioOutputMode,
+                ),
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
             ControlSheet.SPEED -> ControlSelectionSheet(
                 title = "Playback speed",
                 options = SPEED_PRESETS.map { preset ->
-                    SheetOption(if (preset == 1.0f) "Normal" else "${trimSpeed(preset)}x", preset == speed) { onSetSpeed(preset) }
+                    SheetOption(
+                        label = if (preset == 1.0f) "Normal" else "${trimSpeed(preset)}x",
+                        selected = preset == speed,
+                        isChoice = true,
+                        onPick = { onSetSpeed(preset) },
+                    )
                 },
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
@@ -264,7 +354,7 @@ fun PlayerChrome(
 }
 
 /// The selection sheets the chrome can open.
-private enum class ControlSheet { NONE, AUDIO, SUBTITLE, SPEED }
+private enum class ControlSheet { NONE, AUDIO, SUBTITLE, SUBTITLE_SETTINGS, AUDIO_SETTINGS, SPEED }
 
 /// The playback-speed presets offered in the speed sheet.
 private val SPEED_PRESETS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
@@ -273,7 +363,86 @@ private val SPEED_PRESETS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
 /// glyphs and the host's double-tap gesture step.
 private const val SEEK_STEP_MS = 10_000L
 
-private data class SheetOption(val label: String, val selected: Boolean, val onPick: () -> Unit)
+private data class SheetOption(
+    val label: String,
+    val selected: Boolean,
+    val detail: String = "",
+    val enabled: Boolean = true,
+    val isHeader: Boolean = false,
+    val isChoice: Boolean = false,
+    val dismissOnPick: Boolean = true,
+    val onPick: () -> Unit = {},
+)
+
+private fun subtitleSyncOptions(
+    available: Boolean,
+    delaySeconds: Double,
+    onAdjust: (Double) -> Unit,
+): List<SheetOption> {
+    if (!available) {
+        return listOf(
+            SheetOption(
+                label = "Sync unavailable · external subtitles only",
+                selected = false,
+                enabled = false,
+                isHeader = true,
+            ),
+        )
+    }
+    val now = formatDelay(delaySeconds)
+    return buildList {
+        add(SheetOption("Sync", false, enabled = false, isHeader = true))
+        add(SheetOption("Earlier  -0.5s", false, detail = now, dismissOnPick = false) { onAdjust(-0.5) })
+        add(SheetOption("Later  +0.5s", false, detail = now, dismissOnPick = false) { onAdjust(0.5) })
+        add(SheetOption("Earlier  -0.1s", false, detail = now, dismissOnPick = false) { onAdjust(-0.1) })
+        add(SheetOption("Later  +0.1s", false, detail = now, dismissOnPick = false) { onAdjust(0.1) })
+        if (delaySeconds != 0.0) {
+            add(SheetOption("Reset sync", false, dismissOnPick = false) { onAdjust(-delaySeconds) })
+        }
+    }
+}
+
+private fun audioSyncOptions(
+    available: Boolean,
+    delaySeconds: Double,
+    outputMode: AudioOutputMode,
+    onAdjust: (Double) -> Unit,
+    onSelectOutput: (AudioOutputMode) -> Unit,
+): List<SheetOption> = buildList {
+    if (available) {
+        val now = formatDelay(delaySeconds)
+        add(SheetOption("Sync", false, enabled = false, isHeader = true))
+        add(SheetOption("Earlier  -0.1s", false, detail = now, dismissOnPick = false) { onAdjust(-0.1) })
+        add(SheetOption("Later  +0.1s", false, detail = now, dismissOnPick = false) { onAdjust(0.1) })
+        if (delaySeconds != 0.0) {
+            add(SheetOption("Reset sync", false, dismissOnPick = false) { onAdjust(-delaySeconds) })
+        }
+    } else {
+        add(
+            SheetOption(
+                label = "Audio sync isn't available on the Dolby Vision player",
+                selected = false,
+                enabled = false,
+                isHeader = true,
+            ),
+        )
+    }
+    add(SheetOption("Output", false, enabled = false, isHeader = true))
+    AudioOutputMode.entries.forEach { mode ->
+        add(
+            SheetOption(
+                label = mode.label,
+                selected = mode == outputMode,
+                onPick = { onSelectOutput(mode) },
+                detail = mode.detail,
+                isChoice = true,
+                dismissOnPick = false,
+            ),
+        )
+    }
+}
+
+private fun formatDelay(seconds: Double): String = "%+.1fs".format(java.util.Locale.ROOT, seconds)
 
 /// A bottom selection panel (scrim + card of rows). Deliberately a lightweight custom overlay rather than
 /// a ModalBottomSheet: it renders over full-screen video, needs no experimental sheet-state plumbing, and
@@ -295,6 +464,8 @@ private fun ControlSelectionSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
+                .heightIn(max = 560.dp)
+                .verticalScroll(rememberScrollState())
                 // The selection sheet is a VortX glass panel (was a flat near-black fill): high-alpha warm
                 // glass so track labels stay legible over bright video. Top-rounded, flush to the bottom.
                 .vortxGlassPanel(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
@@ -311,17 +482,54 @@ private fun ControlSelectionSheet(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(8.dp))
-                        .clickable { option.onPick(); onDismiss() }
+                        .then(
+                            if (option.enabled && option.isChoice) {
+                                Modifier.selectable(
+                                    selected = option.selected,
+                                    role = Role.RadioButton,
+                                ) {
+                                    option.onPick()
+                                    if (option.dismissOnPick) onDismiss()
+                                }
+                            } else if (option.enabled) {
+                                Modifier.clickable(role = Role.Button) {
+                                    option.onPick()
+                                    if (option.dismissOnPick) onDismiss()
+                                }
+                            } else {
+                                Modifier
+                            },
+                        )
                         .padding(vertical = 10.dp, horizontal = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(
-                        text = option.label,
-                        color = if (option.selected) emberAccent else Color.White,
-                        fontWeight = if (option.selected) FontWeight.SemiBold else FontWeight.Normal,
-                        fontSize = 15.sp,
-                        modifier = Modifier.weight(1f),
-                    )
+                    val longDetail = option.detail.length > 24
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = option.label,
+                            color = when {
+                                option.selected -> emberAccent
+                                option.enabled -> Color.White
+                                else -> Color.White.copy(alpha = 0.65f)
+                            },
+                            fontWeight = when {
+                                option.selected || option.isHeader -> FontWeight.SemiBold
+                                else -> FontWeight.Normal
+                            },
+                            fontSize = if (option.isHeader) 13.sp else 15.sp,
+                        )
+                        if (longDetail) {
+                            Text(
+                                text = option.detail,
+                                color = Color.White.copy(alpha = 0.65f),
+                                fontSize = 12.sp,
+                                maxLines = 2,
+                            )
+                        }
+                    }
+                    if (option.detail.isNotEmpty() && !longDetail) {
+                        Text(text = option.detail, color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp)
+                    }
                     if (option.selected) {
                         Text(text = "•", color = emberAccent, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                     }

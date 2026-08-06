@@ -73,6 +73,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.roundToInt
 
 /// Fullscreen player. It no longer owns a specific engine: [PlayerEngineRouter] picks the engine for
 /// this [playable] (libmpv PRIMARY, ExoPlayer for Dolby Vision / Atmos passthrough and as the fail-soft
@@ -136,6 +137,9 @@ fun PlayerScreen(
     // current playback speed reflected in the speed control.
     var scaleMode by remember(playable.url) { mutableStateOf(VideoScaleMode.FIT) }
     var speed by remember(playable.url) { mutableStateOf(1.0f) }
+    var subtitleDelaySeconds by remember(playable.url) { mutableStateOf(0.0) }
+    var audioDelaySeconds by remember(playable.url) { mutableStateOf(0.0) }
+    var audioOutputMode by remember(playable.url) { mutableStateOf(AudioOutputMode.current(context)) }
 
     // CONTROLS AUTO-HIDE. The chrome (top scrim + title + transport bar) previously had no visibility
     // state at all, so it was drawn permanently over the video. Now: visible on entry, auto-hidden after
@@ -300,6 +304,18 @@ fun PlayerScreen(
 
     val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
+
+    // Re-apply player-local controls when the live engine instance changes during a fail-soft demotion.
+    // The new engine advertises its capabilities, so unsupported offsets remain honest no-ops.
+    LaunchedEffect(engine) {
+        if (engine.subtitleDelayAvailable && subtitleDelaySeconds != 0.0) {
+            engine.setSubtitleDelay(subtitleDelaySeconds)
+        }
+        if (engine.audioDelayAvailable && audioDelaySeconds != 0.0) {
+            engine.setAudioDelay(audioDelaySeconds)
+        }
+        engine.setAudioOutputMode(audioOutputMode)
+    }
 
     // STALL / START WATCHDOG (engine-agnostic). Neither engine has a timeout of its own for a source
     // that connects but never delivers (or stops delivering) data: mpv's `paused-for-cache` can sit
@@ -893,6 +909,27 @@ fun PlayerScreen(
             emberAccent = emberAccent,
             speed = speed,
             scaleMode = scaleMode,
+            subtitleDelayAvailable = engine.subtitleDelayAvailable,
+            subtitleDelaySeconds = subtitleDelaySeconds,
+            onAdjustSubtitleDelay = { delta ->
+                showControls()
+                subtitleDelaySeconds = adjustedPlayerDelay(subtitleDelaySeconds, delta)
+                engine.setSubtitleDelay(subtitleDelaySeconds)
+            },
+            audioDelayAvailable = engine.audioDelayAvailable,
+            audioDelaySeconds = audioDelaySeconds,
+            audioOutputMode = audioOutputMode,
+            onAdjustAudioDelay = { delta ->
+                showControls()
+                audioDelaySeconds = adjustedPlayerDelay(audioDelaySeconds, delta)
+                engine.setAudioDelay(audioDelaySeconds)
+            },
+            onSelectAudioOutputMode = { mode ->
+                showControls()
+                audioOutputMode = mode
+                AudioOutputMode.setCurrent(context, mode)
+                engine.setAudioOutputMode(mode)
+            },
             // Also withheld in PiP: the tiny window gets video only (the system draws the PiP
             // controls; ours would be unreachable dead pixels under them).
             controlsVisible = controlsVisible && !controlsLocked && !pip.isInPip,
@@ -1088,6 +1125,12 @@ internal fun autoSkipMediaIdentity(playable: Playable): String {
         }
     }
     return "url:${playable.url}"
+}
+
+/** Apple-compatible one-decimal delay grid, also canonicalizing negative zero after Reset. */
+internal fun adjustedPlayerDelay(current: Double, delta: Double): Double {
+    val adjusted = ((current + delta) * 10.0).roundToInt() / 10.0
+    return if (adjusted == -0.0) 0.0 else adjusted
 }
 
 /// Resolve the hosting [Activity] from a Compose [LocalContext], which may be a [ContextWrapper] chain
