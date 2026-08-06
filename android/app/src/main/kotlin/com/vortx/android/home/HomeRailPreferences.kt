@@ -52,8 +52,11 @@ enum class HomeRail(val key: String, val title: String) {
             ADDON_CATALOGS,
         )
 
-        fun forCatalog(catalog: Catalog): HomeRail =
-            entries.firstOrNull { catalog.id == it.catalogId } ?: ADDON_CATALOGS
+        fun forCatalog(catalog: Catalog): HomeRail = when {
+            catalog.id.startsWith("${MEDIA_SERVERS.catalogId}:") -> MEDIA_SERVERS
+            catalog.id.startsWith("${IMPORTED_LISTS.catalogId}:") -> IMPORTED_LISTS
+            else -> entries.firstOrNull { catalog.id == it.catalogId } ?: ADDON_CATALOGS
+        }
 
         fun fromKey(key: String): HomeRail? = entries.firstOrNull { it.key == key }
     }
@@ -61,9 +64,35 @@ enum class HomeRail(val key: String, val title: String) {
 
 enum class HomeRailSurface { PHONE, TV }
 
+enum class HomeCatalogLayout(val storedValue: String) {
+    RAILS("rails"),
+    WALL("wall");
+
+    companion object {
+        fun fromStored(value: String?): HomeCatalogLayout =
+            entries.firstOrNull { it.storedValue == value } ?: RAILS
+    }
+}
+
+enum class HomeCatalogPresentation { RAIL, WALL }
+
+internal object HomeCatalogLayoutPolicy {
+    fun presentation(catalog: Catalog, layout: HomeCatalogLayout): HomeCatalogPresentation =
+        if (
+            layout == HomeCatalogLayout.WALL &&
+            catalog.id != HomeRail.CONTINUE_CATALOG_ID &&
+            HomeRail.forCatalog(catalog) == HomeRail.ADDON_CATALOGS
+        ) {
+            HomeCatalogPresentation.WALL
+        } else {
+            HomeCatalogPresentation.RAIL
+        }
+}
+
 data class HomeRailLayout(
     val order: List<HomeRail>,
     val hidden: Set<HomeRail>,
+    val catalogLayout: HomeCatalogLayout = HomeCatalogLayout.RAILS,
 )
 
 internal object HomeRailPolicy {
@@ -111,7 +140,7 @@ class HomeRailPreferences private constructor(context: Context) {
     val state = _state.asStateFlow()
 
     private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-        if (key == ORDER_KEY || key == HIDDEN_KEY) reload()
+        if (key == ORDER_KEY || key == HIDDEN_KEY || key == LAYOUT_KEY) reload()
     }
 
     init {
@@ -158,9 +187,15 @@ class HomeRailPreferences private constructor(context: Context) {
         setOrder(next)
     }
 
+    fun setCatalogLayout(layout: HomeCatalogLayout) = synchronized(lock) {
+        val current = currentLayoutLocked()
+        prefs.edit().putString(LAYOUT_KEY, layout.storedValue).apply()
+        _state.value = current.copy(catalogLayout = layout)
+    }
+
     fun reset() = synchronized(lock) {
-        prefs.edit().remove(ORDER_KEY).remove(HIDDEN_KEY).apply()
-        _state.value = HomeRailLayout(emptyList(), emptySet())
+        prefs.edit().remove(ORDER_KEY).remove(HIDDEN_KEY).remove(LAYOUT_KEY).apply()
+        _state.value = HomeRailLayout(emptyList(), emptySet(), HomeCatalogLayout.RAILS)
     }
 
     fun reload() = synchronized(lock) {
@@ -182,12 +217,17 @@ class HomeRailPreferences private constructor(context: Context) {
             .orEmpty()
             .mapNotNull(HomeRail::fromKey)
             .toSet()
-        return HomeRailLayout(order, hidden)
+        return HomeRailLayout(
+            order = order,
+            hidden = hidden,
+            catalogLayout = HomeCatalogLayout.fromStored(prefs.getString(LAYOUT_KEY, null)),
+        )
     }
 
     companion object {
         const val ORDER_KEY = "vortx.home.railOrder"
         const val HIDDEN_KEY = "vortx.home.railHidden"
+        const val LAYOUT_KEY = "vortx.home.layout"
 
         @Volatile private var instance: HomeRailPreferences? = null
 

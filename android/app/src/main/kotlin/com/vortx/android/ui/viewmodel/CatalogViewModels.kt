@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.home.BecauseYouWatchedModel
+import com.vortx.android.home.HomeCatalogLayout
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.home.ImportedCatalogs
@@ -120,6 +121,13 @@ class HomeViewModel internal constructor(
     val state: StateFlow<UiState<List<Catalog>>> = _state.asStateFlow()
     private val _contentOwnerGeneration = MutableStateFlow(0L)
     val contentOwnerGeneration: StateFlow<Long> = _contentOwnerGeneration.asStateFlow()
+    val homeCatalogLayout: StateFlow<HomeCatalogLayout> = railPreferences?.state
+        ?.map { it.catalogLayout }
+        ?.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.Eagerly,
+            initialValue = railPreferences?.state?.value?.catalogLayout ?: HomeCatalogLayout.RAILS,
+        ) ?: MutableStateFlow(HomeCatalogLayout.RAILS).asStateFlow()
 
     private var collectJob: Job? = null
     private var personalizedJob: Job? = null

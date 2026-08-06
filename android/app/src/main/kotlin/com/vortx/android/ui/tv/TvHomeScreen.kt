@@ -1,6 +1,7 @@
 package com.vortx.android.ui.tv
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,6 +12,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.itemsIndexed as gridItemsIndexed
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -29,13 +34,12 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.vortx.android.home.HomeCatalogLayout
+import com.vortx.android.home.HomeCatalogLayoutPolicy
+import com.vortx.android.home.HomeCatalogPresentation
+import com.vortx.android.home.HomeRail
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
-import com.vortx.android.home.TOP_PICKS_CATALOG_ID
-import com.vortx.android.home.SIMKL_WATCHLIST_CATALOG_ID
-import com.vortx.android.home.TRAKT_WATCHLIST_CATALOG_ID
-import com.vortx.android.home.UPCOMING_EPISODES_CATALOG_ID
-import com.vortx.android.home.UPCOMING_MOVIES_CATALOG_ID
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.HomeViewModel
@@ -50,6 +54,7 @@ import kotlinx.coroutines.delay
 fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val contentOwnerGeneration by viewModel.contentOwnerGeneration.collectAsStateWithLifecycle()
+    val catalogLayout by viewModel.homeCatalogLayout.collectAsStateWithLifecycle()
     when (val s = state) {
         is UiState.Loading -> TvLoading(modifier)
         is UiState.Error -> TvError(s.message, onRetry = viewModel::load, modifier = modifier)
@@ -61,7 +66,7 @@ fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier:
                     modifier = modifier,
                 )
             } else {
-                TvHomeContent(s.data, contentOwnerGeneration, onItem, modifier)
+                TvHomeContent(s.data, contentOwnerGeneration, catalogLayout, onItem, modifier)
             }
     }
 }
@@ -70,6 +75,7 @@ fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier:
 private fun TvHomeContent(
     catalogs: List<Catalog>,
     contentOwnerGeneration: Long,
+    catalogLayout: HomeCatalogLayout,
     onItem: (MetaItem) -> Unit,
     modifier: Modifier,
 ) {
@@ -93,20 +99,32 @@ private fun TvHomeContent(
 
     Column(modifier = modifier.fillMaxSize().background(colors.canvas)) {
         TvHero(heroSelection.item, modifier = Modifier.fillMaxWidth().height(heroHeight))
-        LazyColumn(
-            modifier = Modifier.fillMaxWidth().weight(1f),
-            contentPadding = PaddingValues(top = TvDimens.rowGap, bottom = TvDimens.edge),
-            verticalArrangement = Arrangement.spacedBy(TvDimens.rowGap),
-        ) {
-            itemsIndexed(visibleCatalogs, key = { _, c -> c.id }) { index, catalog ->
-                TvCatalogRow(
-                    catalog = catalog,
-                    onItem = onItem,
-                    onFocused = {
-                        heroState = TvHomeHeroState(contentOwnerGeneration, tvHomeItemKey(it))
-                    },
-                    firstCardFocus = if (index == 0) firstCardFocus else null,
-                )
+        if (catalogLayout == HomeCatalogLayout.WALL) {
+            TvCatalogWall(
+                catalogs = visibleCatalogs,
+                onItem = onItem,
+                onFocused = {
+                    heroState = TvHomeHeroState(contentOwnerGeneration, tvHomeItemKey(it))
+                },
+                firstCardFocus = firstCardFocus,
+                modifier = Modifier.fillMaxWidth().weight(1f),
+            )
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                contentPadding = PaddingValues(top = TvDimens.rowGap, bottom = TvDimens.edge),
+                verticalArrangement = Arrangement.spacedBy(TvDimens.rowGap),
+            ) {
+                itemsIndexed(visibleCatalogs, key = { _, c -> c.id }) { index, catalog ->
+                    TvCatalogRow(
+                        catalog = catalog,
+                        onItem = onItem,
+                        onFocused = {
+                            heroState = TvHomeHeroState(contentOwnerGeneration, tvHomeItemKey(it))
+                        },
+                        firstCardFocus = if (index == 0) firstCardFocus else null,
+                    )
+                }
             }
         }
     }
@@ -192,21 +210,8 @@ private fun TvCatalogRow(
     firstCardFocus: FocusRequester?,
 ) {
     val visibleItems = remember(catalog.items) { tvHomeItems(catalog.items) }
-    Column {
-        val eyebrow = when (catalog.id) {
-            "continue" -> "Pick up where you left off"
-            TOP_PICKS_CATALOG_ID -> "Based on what you watch"
-            UPCOMING_EPISODES_CATALOG_ID, UPCOMING_MOVIES_CATALOG_ID -> "Coming soon"
-            TRAKT_WATCHLIST_CATALOG_ID -> "From Trakt"
-            SIMKL_WATCHLIST_CATALOG_ID -> "From SIMKL"
-            else -> null
-        }
-        Column(modifier = Modifier.padding(start = TvDimens.edge, bottom = VortXTheme.spacing.sm)) {
-            if (eyebrow != null) {
-                Text(text = eyebrow.uppercase(), style = VortXTheme.type.eyebrow)
-            }
-            Text(text = catalog.title, style = VortXTheme.type.sectionTitle)
-        }
+    Column(modifier = Modifier.focusGroup()) {
+        TvCatalogHeader(catalog)
         LazyRow(
             contentPadding = PaddingValues(horizontal = TvDimens.edge),
             horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
@@ -220,6 +225,96 @@ private fun TvCatalogRow(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun TvCatalogWall(
+    catalogs: List<Catalog>,
+    onItem: (MetaItem) -> Unit,
+    onFocused: (MetaItem) -> Unit,
+    firstCardFocus: FocusRequester,
+    modifier: Modifier,
+) {
+    val firstAction = remember(catalogs) {
+        catalogs.firstNotNullOfOrNull { catalog ->
+            tvHomeItems(catalog.items).firstOrNull()?.let { catalog.id to tvHomeItemKey(it) }
+        }
+    }
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(TvDimens.posterWidth),
+        modifier = modifier.focusGroup(),
+        contentPadding = PaddingValues(
+            start = TvDimens.edge,
+            top = TvDimens.rowGap,
+            end = TvDimens.edge,
+            bottom = TvDimens.edge,
+        ),
+        horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
+        verticalArrangement = Arrangement.spacedBy(TvDimens.rowGap),
+    ) {
+        catalogs.forEach { catalog ->
+            when (HomeCatalogLayoutPolicy.presentation(catalog, HomeCatalogLayout.WALL)) {
+                HomeCatalogPresentation.RAIL -> item(
+                    key = "rail|${catalog.id}",
+                    span = { GridItemSpan(maxLineSpan) },
+                ) {
+                    TvCatalogRow(
+                        catalog = catalog,
+                        onItem = onItem,
+                        onFocused = onFocused,
+                        firstCardFocus = if (firstAction?.first == catalog.id) firstCardFocus else null,
+                    )
+                }
+
+                HomeCatalogPresentation.WALL -> {
+                    item(
+                        key = "header|${catalog.id}",
+                        span = { GridItemSpan(maxLineSpan) },
+                    ) {
+                        TvCatalogHeader(catalog, edgePadding = false)
+                    }
+                    val visibleItems = tvHomeItems(catalog.items)
+                    gridItemsIndexed(
+                        items = visibleItems,
+                        key = { _, item -> "wall|${catalog.id}|${tvHomeItemKey(item)}" },
+                    ) { _, item ->
+                        val ownsFirstFocus = firstAction == (catalog.id to tvHomeItemKey(item))
+                        TvPosterCard(
+                            item = item,
+                            onClick = { onItem(item) },
+                            onFocused = { onFocused(item) },
+                            focusRequester = if (ownsFirstFocus) firstCardFocus else null,
+                            width = null,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TvCatalogHeader(catalog: Catalog, edgePadding: Boolean = true) {
+    val eyebrow = if (catalog.id == HomeRail.CONTINUE_CATALOG_ID) {
+        "Pick up where you left off"
+    } else when (HomeRail.forCatalog(catalog)) {
+        HomeRail.TOP_PICKS -> "Based on what you watch"
+        HomeRail.UPCOMING_EPISODES, HomeRail.UPCOMING_MOVIES -> "Coming soon"
+        HomeRail.TRAKT_WATCHLIST -> "From Trakt"
+        HomeRail.SIMKL_WATCHLIST -> "From SIMKL"
+        else -> null
+    }
+    Column(
+        modifier = Modifier.padding(
+            start = if (edgePadding) TvDimens.edge else 0.dp,
+            bottom = VortXTheme.spacing.sm,
+        ),
+    ) {
+        if (eyebrow != null) {
+            Text(text = eyebrow.uppercase(), style = VortXTheme.type.eyebrow)
+        }
+        Text(text = catalog.title, style = VortXTheme.type.sectionTitle)
     }
 }
 
