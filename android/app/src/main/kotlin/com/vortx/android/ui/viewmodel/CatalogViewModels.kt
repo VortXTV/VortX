@@ -118,6 +118,8 @@ class HomeViewModel internal constructor(
 ) : ViewModel() {
     private val _state = MutableStateFlow<UiState<List<Catalog>>>(UiState.Loading)
     val state: StateFlow<UiState<List<Catalog>>> = _state.asStateFlow()
+    private val _contentOwnerGeneration = MutableStateFlow(0L)
+    val contentOwnerGeneration: StateFlow<Long> = _contentOwnerGeneration.asStateFlow()
 
     private var collectJob: Job? = null
     private var personalizedJob: Job? = null
@@ -319,7 +321,9 @@ class HomeViewModel internal constructor(
     )
 
     private fun currentReleaseOwner(): ReleaseCalendarOwner =
-        releaseOwnerTracker.ownerFor(currentReleaseBoundary())
+        releaseOwnerTracker.ownerFor(currentReleaseBoundary()).also { owner ->
+            _contentOwnerGeneration.value = owner.generation
+        }
 
     private fun applyReleaseCalendar(refresh: ReleaseCalendarRefresh): Boolean {
         val changed = upcomingEpisodes != refresh.episodes || upcomingMovies != refresh.movies

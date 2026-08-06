@@ -40,26 +40,45 @@ class TvHomeIdentityTest {
         val focused = movie("tt-shared", "Profile A movie")
         val refreshedFocused = focused.copy(name = "Profile A movie, refreshed")
         val retained = tvHomeHeroSelection(
-            tvHomeItemKey(focused),
+            TvHomeHeroState(0L, tvHomeItemKey(focused)),
+            0L,
             listOf(Catalog("profile-a", "Profile A", listOf(movie("tt-first", "First"), refreshedFocused))),
         )
         assertEquals(refreshedFocused, retained.item)
-        assertEquals(tvHomeItemKey(refreshedFocused), retained.key)
+        assertEquals(tvHomeItemKey(refreshedFocused), retained.state.focusedKey)
 
         val sameIdDifferentType = MetaItem("tt-shared", MediaType.SERIES, "Profile B series")
         val profileBFirst = movie("tt-profile-b", "Profile B first")
         val replaced = tvHomeHeroSelection(
-            retained.key,
+            retained.state,
+            1L,
             listOf(Catalog("profile-b", "Profile B", listOf(profileBFirst, sameIdDifferentType))),
         )
         assertEquals(profileBFirst, replaced.item)
-        assertEquals(tvHomeItemKey(profileBFirst), replaced.key)
+        assertEquals(tvHomeItemKey(profileBFirst), replaced.state.focusedKey)
 
         val lateProfileB = tvHomeHeroSelection(
-            replaced.key,
+            replaced.state,
+            1L,
             listOf(Catalog("profile-b", "Profile B", listOf(profileBFirst, sameIdDifferentType, focused))),
         )
         assertEquals(profileBFirst, lateProfileB.item)
+    }
+
+    @Test
+    fun `owner generation clears old hero even when intermediate replacement frame is skipped`() {
+        val oldFocused = movie("tt-old", "Old owner")
+        val newFirst = movie("tt-new", "New owner")
+        val staleLateOld = oldFocused.copy(name = "Late stale old owner")
+
+        val coalesced = tvHomeHeroSelection(
+            previous = TvHomeHeroState(7L, tvHomeItemKey(oldFocused)),
+            contentOwnerGeneration = 8L,
+            catalogs = listOf(Catalog("new", "New", listOf(newFirst, staleLateOld))),
+        )
+
+        assertEquals(newFirst, coalesced.item)
+        assertEquals(TvHomeHeroState(8L, tvHomeItemKey(newFirst)), coalesced.state)
     }
 
     private fun movie(id: String, name: String) = MetaItem(id = id, type = MediaType.MOVIE, name = name)

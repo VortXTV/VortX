@@ -49,6 +49,7 @@ import kotlinx.coroutines.delay
 @Composable
 fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val contentOwnerGeneration by viewModel.contentOwnerGeneration.collectAsStateWithLifecycle()
     when (val s = state) {
         is UiState.Loading -> TvLoading(modifier)
         is UiState.Error -> TvError(s.message, onRetry = viewModel::load, modifier = modifier)
@@ -60,22 +61,27 @@ fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier:
                     modifier = modifier,
                 )
             } else {
-                TvHomeContent(s.data, onItem, modifier)
+                TvHomeContent(s.data, contentOwnerGeneration, onItem, modifier)
             }
     }
 }
 
 @Composable
-private fun TvHomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, modifier: Modifier) {
+private fun TvHomeContent(
+    catalogs: List<Catalog>,
+    contentOwnerGeneration: Long,
+    onItem: (MetaItem) -> Unit,
+    modifier: Modifier,
+) {
     val colors = VortXTheme.colors
     val visibleCatalogs = remember(catalogs) { tvHomeCatalogs(catalogs) }
     // Keep the focused identity across incremental updates only while that exact type/id is still visible.
     // A profile/account catalog replacement falls back in this composition, then commits the fallback key
     // so a removed identity cannot return later and resurrect the previous owner's hero.
-    var focusedKey by remember { mutableStateOf<String?>(null) }
-    val heroSelection = tvHomeHeroSelection(focusedKey, visibleCatalogs)
+    var heroState by remember { mutableStateOf(TvHomeHeroState(contentOwnerGeneration, null)) }
+    val heroSelection = tvHomeHeroSelection(heroState, contentOwnerGeneration, visibleCatalogs)
     SideEffect {
-        if (focusedKey != heroSelection.key) focusedKey = heroSelection.key
+        if (heroState != heroSelection.state) heroState = heroSelection.state
     }
 
     // Seed D-pad focus on the first tile of the first row so a fresh TV entry lands somewhere actionable
@@ -96,7 +102,9 @@ private fun TvHomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, m
                 TvCatalogRow(
                     catalog = catalog,
                     onItem = onItem,
-                    onFocused = { focusedKey = tvHomeItemKey(it) },
+                    onFocused = {
+                        heroState = TvHomeHeroState(contentOwnerGeneration, tvHomeItemKey(it))
+                    },
                     firstCardFocus = if (index == 0) firstCardFocus else null,
                 )
             }
@@ -232,17 +240,32 @@ internal fun tvHomeItems(items: List<MetaItem>): List<MetaItem> =
 
 internal fun tvHomeItemKey(item: MetaItem): String = "${item.type.name}|${item.id}"
 
+internal data class TvHomeHeroState(
+    val contentOwnerGeneration: Long,
+    val focusedKey: String?,
+)
+
 internal data class TvHomeHeroSelection(
-    val key: String?,
+    val state: TvHomeHeroState,
     val item: MetaItem?,
 )
 
-internal fun tvHomeHeroSelection(focusedKey: String?, catalogs: List<Catalog>): TvHomeHeroSelection {
+internal fun tvHomeHeroSelection(
+    previous: TvHomeHeroState,
+    contentOwnerGeneration: Long,
+    catalogs: List<Catalog>,
+): TvHomeHeroSelection {
+    val focusedKey = previous.focusedKey.takeIf {
+        previous.contentOwnerGeneration == contentOwnerGeneration
+    }
     val retained = focusedKey?.let { key ->
         catalogs.asSequence()
             .flatMap { it.items.asSequence() }
             .firstOrNull { tvHomeItemKey(it) == key }
     }
     val selected = retained ?: catalogs.firstNotNullOfOrNull { it.items.firstOrNull() }
-    return TvHomeHeroSelection(selected?.let(::tvHomeItemKey), selected)
+    return TvHomeHeroSelection(
+        state = TvHomeHeroState(contentOwnerGeneration, selected?.let(::tvHomeItemKey)),
+        item = selected,
+    )
 }
