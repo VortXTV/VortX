@@ -1,11 +1,13 @@
 package com.vortx.android.singularity
 
 import android.util.Log
+import com.vortx.android.engine.SourceContributorSettlement
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.net.VortXEdgeAuth
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -495,16 +497,38 @@ internal class SourceUploadPacer(
 /// of Apple `SourceIndexServeSource`: `@Published streams` becomes a [StateFlow], the SwiftUI `Task` becomes a
 /// coroutine [Job]. Completed results are never retained across instances. Gated inside [SourceIndexClient]
 /// (toggle OFF / signed-out / fleet-off all yield an empty group).
-class SourceIndexServeSource(
+class SourceIndexServeSource private constructor(
     /// The scope the fetch coroutines run on. Owned + cancellable via [close]; defaults to an IO scope so a
     /// caller that never provides one still works standalone.
-    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    private val scope: CoroutineScope,
+    private val fetchStreams: suspend (String, Boolean) -> List<StreamSource>,
+    private val gateOpen: (Boolean) -> Boolean,
 ) {
+    constructor(
+        scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    ) : this(
+        scope = scope,
+        fetchStreams = { contentId, isSignedIn ->
+            SourceIndexClient.streams(SourceIndexClient.fetchPooled(contentId, isSignedIn))
+        },
+        gateOpen = { isSignedIn ->
+            SourceIndexClient.serveEnabled && SourceIndexClient.isEnabled && isSignedIn
+        },
+    )
+
+    internal constructor(
+        scope: CoroutineScope,
+        fetchStreams: suspend (String, Boolean) -> List<StreamSource>,
+        @Suppress("UNUSED_PARAMETER") testMarker: Unit = Unit,
+    ) : this(scope = scope, fetchStreams = fetchStreams, gateOpen = { true })
+
     private val _streams = MutableStateFlow<List<StreamSource>>(emptyList())
 
     /// The corroborated community streams, ready to merge. Empty until a fetch completes (and always when the
     /// SERVE toggle is off / signed out). Mirrors Apple's `@Published streams`.
     val streams: StateFlow<List<StreamSource>> = _streams.asStateFlow()
+    private val _settlement = MutableStateFlow(SourceContributorSettlement())
+    val settlement: StateFlow<SourceContributorSettlement> = _settlement.asStateFlow()
 
     private val epochCounter = AtomicInteger(0)
 
@@ -513,50 +537,85 @@ class SourceIndexServeSource(
     val epoch: Int get() = epochCounter.get()
 
     private var lastContentId: String? = null
+    private var requestGeneration: Long = -1L
     private var job: Job? = null
+    private val stateLock = Any()
 
     /// Fetch pooled sources for [contentId] when SERVE is enabled + the user is signed in. Fail-soft + deduped
     /// by content id. Safe to call on every meta change. Mirrors Apple `refresh`.
-    fun refresh(contentId: String?, isSignedIn: Boolean) {
-        val gateOpen = SourceIndexClient.serveEnabled && SourceIndexClient.isEnabled && isSignedIn
+    fun refresh(contentId: String?, isSignedIn: Boolean, requestGeneration: Long = 0L) {
+        val gateOpen = gateOpen(isSignedIn)
         val canonicalContentId = contentId?.let(SourceIndexClient::canonicalContentId)
-        if (!gateOpen || canonicalContentId == null || canonicalContentId == lastContentId) {
-            // Clear any previously-merged community sources whenever the SERVE gate is CLOSED, so stale rows do
-            // not linger after the gate closes. A skip for an unchanged / null content id with the gate still
-            // open leaves them in place.
-            if (!gateOpen) {
-                job?.cancel()
-                job = null
-                lastContentId = null
-                if (_streams.value.isNotEmpty()) publish(emptyList())
-            }
+        if (!gateOpen || canonicalContentId == null) {
+            reset(requestGeneration)
             return
         }
-        lastContentId = canonicalContentId
-        job?.cancel()
-        job = scope.launch {
-            val pooled = SourceIndexClient.fetchPooled(canonicalContentId, isSignedIn)
-            val built = SourceIndexClient.streams(pooled)
-            if (!isActive) {
-                Log.d(TAG, "refresh publish SKIPPED contentId=$canonicalContentId (cancelled) built=${built.size}")
-                return@launch
+        val launched = synchronized(stateLock) {
+            if (canonicalContentId == lastContentId && requestGeneration == this.requestGeneration) {
+                _settlement.value = SourceContributorSettlement(requestGeneration, settled = job == null)
+                return
             }
-            Log.d(TAG, "refresh publish contentId=$canonicalContentId streams=${built.size} (now merge-ready)")
-            publish(built)
+            job?.cancel()
+            job = null
+            lastContentId = canonicalContentId
+            this.requestGeneration = requestGeneration
+            if (_streams.value.isNotEmpty()) publish(emptyList())
+            _settlement.value = SourceContributorSettlement(requestGeneration, settled = false)
+            scope.launch(start = CoroutineStart.LAZY) {
+                val ownerJob = coroutineContext[Job]
+                try {
+                    val built = fetchStreams(canonicalContentId, isSignedIn)
+                    if (!isActive) {
+                        Log.d(TAG, "refresh publish SKIPPED contentId=$canonicalContentId (cancelled) built=${built.size}")
+                        return@launch
+                    }
+                    synchronized(stateLock) {
+                        if (
+                            job !== ownerJob ||
+                            lastContentId != canonicalContentId ||
+                            this@SourceIndexServeSource.requestGeneration != requestGeneration
+                        ) return@synchronized
+                        Log.d(TAG, "refresh publish contentId=$canonicalContentId streams=${built.size} (now merge-ready)")
+                        publish(built)
+                        job = null
+                        _settlement.value = SourceContributorSettlement(requestGeneration, settled = true)
+                    }
+                } finally {
+                    synchronized(stateLock) {
+                        if (job === ownerJob) {
+                            job = null
+                            _settlement.value = SourceContributorSettlement(requestGeneration, settled = true)
+                        }
+                    }
+                }
+            }.also { job = it }
         }
+        launched.start()
     }
 
     /// Empty the published community streams and cancel any in-flight fetch. No completed result survives this
     /// instance, and [lastContentId] resets so a later refresh for the same title performs a fresh read.
     fun clearResults() {
-        job?.cancel()
-        lastContentId = null
-        if (_streams.value.isNotEmpty()) publish(emptyList())
+        reset(-1L)
+    }
+
+    fun reset(requestGeneration: Long) {
+        synchronized(stateLock) {
+            job?.cancel()
+            job = null
+            lastContentId = null
+            this.requestGeneration = requestGeneration
+            if (_streams.value.isNotEmpty()) publish(emptyList())
+            _settlement.value = SourceContributorSettlement(requestGeneration, settled = true)
+        }
     }
 
     /// Cancel any in-flight fetch and tear down the owned scope. Call when the owning screen goes away.
     fun close() {
-        job?.cancel()
+        synchronized(stateLock) {
+            job?.cancel()
+            job = null
+        }
         scope.coroutineContext[Job]?.cancel()
     }
 

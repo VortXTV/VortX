@@ -33,6 +33,9 @@ import com.vortx.android.singularity.SourceIndexServeSource
 import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.ResolvedPin
+import com.vortx.android.sources.ProviderHealth
+import com.vortx.android.sources.SeriesSourceSticky
+import com.vortx.android.sources.SourceRequestFence
 import com.vortx.android.sources.SourcePinContext
 import com.vortx.android.sources.SourcePinScope
 import com.vortx.android.sources.SourcePinStore
@@ -42,6 +45,9 @@ import com.vortx.android.ui.UiState
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 internal fun MetaDetail.episodeForResolve(selectedEpisodeId: String?): Episode? =
@@ -189,10 +195,15 @@ class DetailViewModel(
     private val debrid = DebridCoordinator(DebridResolver(debridKeys), debridKeys)
     private val torbox = TorBoxSearchSource(debridKeys)
     private val singularity = SourceIndexServeSource()
-    private val sourceModel = SourceListModel(viewModelScope)
+    private val sourceSticky = SeriesSourceSticky(app)
+    private val sourceModel = SourceListModel(viewModelScope, sourceSticky = sourceSticky)
     private val sourcePrefs = SourcePreferencesStore(app)
     private val sourcePins = SourcePinStore(app)
     private val trackPrefs = TrackPreferencesStore(app)
+    private val sourceRequestFence = SourceRequestFence(sourceSticky.currentProfileId())
+    private var sourceLoadJob: Job? = null
+    private var playbackResolveJob: Job? = null
+    private var profileReloadJob: Job? = null
 
     /// Gate for the [sourceModel] -> [_streams] bridge: true only after the raw engine groups for the current
     /// target have loaded, so the coalescer's empty first-paint (and the empty state at each new load) never
@@ -317,14 +328,40 @@ class DetailViewModel(
         sourceModel.bind(torbox, singularity)
         viewModelScope.launch {
             sourceModel.state.collect { st ->
-                if (sourcesReady) _streams.value = UiState.Success(st.groups)
+                val token = sourceRequestFence.currentToken()
+                if (
+                    sourcesReady &&
+                    token != null &&
+                    st.requestGeneration == token.generation &&
+                    st.streamId == token.targetId &&
+                    sourceRequestFence.accepts(token, sourceSticky.currentProfileId())
+                ) {
+                    _streams.value = UiState.Success(st.groups)
+                }
             }
         }
-        viewModelScope.launch {
+        ProfileStore.sharedOrNull()?.let { profileStore ->
+            viewModelScope.launch {
+                var observedProfile = sourceSticky.currentProfileId()
+                profileStore.activeProfile
+                    .map { profileStore.activeProfileId }
+                    .distinctUntilChanged()
+                    .collect { profileId ->
+                        if (profileId != observedProfile) {
+                            observedProfile = profileId
+                            rebuildForProfile(profileId)
+                        }
+                    }
+            }
+        }
+        val initialProfile = sourceSticky.currentProfileId()
+        profileReloadJob = viewModelScope.launch {
             if (type == MediaType.SERIES) {
                 // A series' hero Watch/Resume target depends on which episode + watched state the meta
                 // carries, so meta must land before the sources fan-out is scoped.
-                _meta.value = repo.meta(type, id).toUiState()
+                val loaded = repo.meta(type, id)
+                if (sourceSticky.currentProfileId() != initialProfile) return@launch
+                _meta.value = loaded.toUiState()
                 val detail = (_meta.value as? UiState.Success)?.data
                 val primary = detail?.let { primaryEpisodeOf(it) }
                 if (primary != null) {
@@ -334,13 +371,15 @@ class DetailViewModel(
                     // page the viewer navigated to).
                     selectEpisode(primary.first.id, userTap = false)
                 } else {
-                    loadSources(null)
+                    startSourceLoad(null)
                 }
             } else {
                 // Movie: land meta first (the hero + the media-server scoping both read it), then load the
                 // title-level sources through the assembly.
-                _meta.value = repo.meta(type, id).toUiState()
-                loadSources(null)
+                val loaded = repo.meta(type, id)
+                if (sourceSticky.currentProfileId() != initialProfile) return@launch
+                _meta.value = loaded.toUiState()
+                startSourceLoad(null)
             }
         }
     }
@@ -355,8 +394,52 @@ class DetailViewModel(
         if (_selectedEpisodeId.value == episodeId) return
         _selectedEpisodeId.value = episodeId
         pendingAutoPick = userTap && sourcePrefs.autoPickBest
-        viewModelScope.launch {
-            loadSources(episodeId)
+        startSourceLoad(episodeId)
+    }
+
+    private fun startSourceLoad(episodeId: String?) {
+        sourceLoadJob?.cancel()
+        val token = sourceRequestFence.begin(sourceSticky.currentProfileId(), episodeId)
+        sourceLoadJob = viewModelScope.launch { loadSources(episodeId, token) }
+    }
+
+    private fun rebuildForProfile(profileId: String) {
+        sourceLoadJob?.cancel()
+        playbackResolveJob?.cancel()
+        profileReloadJob?.cancel()
+        val invalidGeneration = sourceRequestFence.invalidate(profileId)
+        sourceSticky.onProfileChanged()
+        torbox.reset(invalidGeneration, clearCache = true)
+        singularity.reset(invalidGeneration)
+        sourceModel.setRawGroups(emptyList())
+        sourceModel.setMediaServerGroups(emptyList())
+        sourceModel.setContext(SourceListModel.Context(requestGeneration = invalidGeneration))
+        sourcesReady = false
+        debridCacheEvidence = null
+        resumeRef = null
+        lastCtx = null
+        lastPlayedSource = null
+        pendingAutoPick = false
+        pendingAdvanceHint = null
+        failedHandlesByTarget.clear()
+        _streams.value = UiState.Loading
+        _playback.value = Playback.Idle
+        _meta.value = UiState.Loading
+        profileReloadJob = viewModelScope.launch {
+            val loaded = repo.meta(type, id)
+            if (sourceSticky.currentProfileId() != profileId) return@launch
+            _meta.value = loaded.toUiState()
+            val detail = loaded.getOrNull()
+            val oldTarget = _selectedEpisodeId.value
+            val target = if (type == MediaType.SERIES) {
+                detail?.videos?.firstOrNull { it.id == oldTarget }
+                    ?: detail?.let { primaryEpisodeOf(it)?.first }
+            } else {
+                null
+            }
+            _selectedEpisodeId.value = target?.id
+            target?.let { _selectedSeason.value = it.season }
+            startSourceLoad(target?.id)
         }
     }
 
@@ -366,7 +449,8 @@ class DetailViewModel(
     /// contributor lanes + the account cache badge fold in a beat later through the coalescer, the "sources
     /// stream in behind the hero" shape. Fail-soft: an add-on-load failure surfaces as [UiState.Error] and
     /// leaves any still-arriving contributor lane to be handled on the next load.
-    private suspend fun loadSources(episodeId: String?) {
+    private suspend fun loadSources(episodeId: String?, request: SourceRequestFence.Token) {
+        if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         // Reset per-target state so a superseded episode's rows / cache badges can never leak into the new one.
         sourcesReady = false
         debridCacheEvidence = null
@@ -382,21 +466,36 @@ class DetailViewModel(
         // Kick the contributor lanes + install the ranking context BEFORE the raw feed, so the first coalesced
         // rebuild ranks against the real user prefs/pin (never the empty default, which would clobber the
         // globally-installed reading) and merges every lane in one pass.
-        torbox.refresh(imdb, season, episodeNum)
-        singularity.refresh(SourceIndexClient.contentId(imdb, season, episodeNum), isSignedIn())
-        val ctx = buildContext(episodeId, imdb, season, episodeNum)
+        val advanceHint = pendingAdvanceHint
+        torbox.refresh(imdb, season, episodeNum, request.generation)
+        singularity.refresh(
+            SourceIndexClient.contentId(imdb, season, episodeNum),
+            isSignedIn(),
+            request.generation,
+        )
+        val ctx = buildContext(episodeId, imdb, season, episodeNum, request, advanceHint)
         lastCtx = ctx
         sourceModel.setContext(ctx)
         _pinUi.value = readPinUi()
         // Dormant + no network when no media server is connected (matches the pre-assembly guard).
         val serverGroups = if (MediaServerRepository.hasServers) mediaServerGroups(episodeId) else emptyList()
+        if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         sourceModel.setMediaServerGroups(serverGroups)
 
-        repo.streams(type, id, episodeId).fold(
+        repo.streams(
+            type = type,
+            id = id,
+            episodeId = episodeId,
+            rememberedQuality = advanceHint?.first,
+            wantedAddon = advanceHint?.let { sourceSticky.preference(id)?.addon },
+        ).fold(
             onSuccess = { raw ->
                 // Immediate paint of the ranked add-on groups (already ranked by the engine repo), then feed
                 // the model so the fuller assembled + re-ranked list refines it a beat later.
-                if (episodeId == _selectedEpisodeId.value) {
+                if (
+                    episodeId == _selectedEpisodeId.value &&
+                    sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
+                ) {
                     // The assembly coalescer applies this same pure filter later, but immediate paint and the
                     // once-latched Smart Source pick run before that publication. Filter their shared input
                     // now so direct-links-only can never flash or auto-play a raw torrent. Keep [raw] for the
@@ -406,7 +505,7 @@ class DetailViewModel(
                     sourcesReady = true
                     _streams.value = UiState.Success(displayRaw)
                     sourceModel.setRawGroups(raw)
-                    runCacheCheck(raw, episodeId, season, episodeNum)
+                    runCacheCheck(raw, episodeId, season, episodeNum, request)
                     // Smart Source Selection auto-pick (viewer opt-in, once per episode tap): play the
                     // best-ranked source of the FRESH raw groups straight away. Ranked directly (not via
                     // [bestSource]) because the assembly coalescer may still hold the previous episode's
@@ -421,26 +520,38 @@ class DetailViewModel(
                         pendingAutoPick = false
                         val hint = pendingAdvanceHint
                         pendingAdvanceHint = null
+                        val sticky = sourceSticky.preference(id)
+                        val unhealthy: (String) -> Boolean = { addon -> ProviderHealth.penaltyActive(addon) }
                         val pick = if (hint != null) {
+                            val assembled = sourceModel.awaitSettledTarget(
+                                requestGeneration = request.generation,
+                                streamId = episodeId,
+                                deadlineMs = AUTO_NEXT_ASSEMBLY_DEADLINE_MS,
+                            )
+                            if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@fold
+                            assembled?.best
+                        } else {
                             StreamRanking.best(
                                 displayRaw,
-                                continuity = hint.first,
-                                binge = hint.second,
+                                continuity = null,
                                 pin = currentPin(),
+                                sticky = sticky,
+                                providerPenalty = unhealthy,
                                 prefs = ctx.prefs,
                             )
-                        } else {
-                            StreamRanking.best(displayRaw, prefs = ctx.prefs, pin = currentPin())
                         }
                         when {
-                            pick != null -> play(pick)
+                            pick != null -> playAutomatically(pick)
                             hint != null -> _playback.value = Playback.Failed("No playable source for the next episode.")
                         }
                     }
                 }
             },
             onFailure = {
-                if (episodeId == _selectedEpisodeId.value) {
+                if (
+                    episodeId == _selectedEpisodeId.value &&
+                    sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
+                ) {
                     // An auto-advance load failure must reach the shell's Up Next overlay (it observes
                     // [playback], not [streams]); a Smart-Source tap keeps today's streams-Error surface.
                     if (pendingAutoPick && pendingAdvanceHint != null) {
@@ -458,10 +569,20 @@ class DetailViewModel(
     /// effective per-title / provider pin (so a re-rank of the merged list keeps a pinned source on top and
     /// honours the user's filters), the chosen episode's [SourceListModel.Context.streamId], and the
     /// Singularity pool [SourceListModel.Context.contentId] for the fire-and-forget hoard seed.
-    private fun buildContext(episodeId: String?, imdb: String?, season: Int?, episodeNum: Int?): SourceListModel.Context =
+    private fun buildContext(
+        episodeId: String?,
+        imdb: String?,
+        season: Int?,
+        episodeNum: Int?,
+        request: SourceRequestFence.Token,
+        advanceHint: Pair<String?, String?>?,
+    ): SourceListModel.Context =
         SourceListModel.Context(
             metaId = id,
             streamId = episodeId,
+            requestGeneration = request.generation,
+            continuity = advanceHint?.first,
+            binge = advanceHint?.second,
             // isKids rides the snapshot so a Kids profile's content guard (hard-hide adult/junk; Avoid
             // words always DROP, never merely demote) is live in the frozen reading, mirroring Apple's
             // `ProfileStore.activeIsKids()` read inside `passesUserFilters`.
@@ -479,7 +600,13 @@ class DetailViewModel(
     /// account-cached add-on torrents that carried no cache tag (re-fed to [sourceModel] so the same
     /// [StreamRanking] the app uses lights the badge + applies the cache bonus). No key -> no network, no
     /// badge. Guards against a superseding episode selection landing first.
-    private fun runCacheCheck(raw: List<StreamGroup>, episodeId: String?, season: Int?, episodeNum: Int?) {
+    private fun runCacheCheck(
+        raw: List<StreamGroup>,
+        episodeId: String?,
+        season: Int?,
+        episodeNum: Int?,
+        request: SourceRequestFence.Token,
+    ) {
         if (!debrid.hasAnyResolver && !debrid.hasUsenetResolver) return
         val owner = debridKeys.ownerToken() ?: return
         viewModelScope.launch {
@@ -494,6 +621,7 @@ class DetailViewModel(
             val hits = debrid.cacheCheck(hashes, owner)
             if (
                 episodeId != _selectedEpisodeId.value ||
+                !sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) ||
                 !debridKeys.isCurrent(owner)
             ) {
                 return@launch
@@ -515,6 +643,7 @@ class DetailViewModel(
             if (
                 decorated !== raw &&
                 episodeId == _selectedEpisodeId.value &&
+                sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) &&
                 debridKeys.isCurrent(owner)
             ) {
                 sourceModel.setRawGroups(decorated)
@@ -627,8 +756,15 @@ class DetailViewModel(
     /// Resolve a chosen source to a [Playable] and request playback. Drives a Resolving -> Ready /
     /// Failed transition so the row can show progress and a resolve failure surfaces instead of
     /// silently doing nothing.
-    fun play(source: StreamSource) {
+    fun play(source: StreamSource) = play(source, manualPick = true)
+
+    private fun playAutomatically(source: StreamSource) = play(source, manualPick = false)
+
+    private fun play(source: StreamSource, manualPick: Boolean) {
         if (_playback.value is Playback.Resolving) return
+        val request = sourceRequestFence.currentToken() ?: return
+        if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
+        val stickyWrite = if (manualPick && type == MediaType.SERIES) sourceSticky.capture(id) else null
         lastPlayedSource = source
         _playback.value = Playback.Resolving
         val resumeMs = resumeOffsetMs()
@@ -639,19 +775,31 @@ class DetailViewModel(
         // resolve() only knows the opaque source, not the title identity). Null for an id we can't map, in
         // which case playback simply doesn't scrobble.
         val ref = currentMediaRef()
-        viewModelScope.launch {
-            _playback.value = resolveForOwner(source, episode, actionOwner).fold(
+        playbackResolveJob?.cancel()
+        playbackResolveJob = viewModelScope.launch {
+            val result = resolveForOwner(source, episode, actionOwner)
+            if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@launch
+            _playback.value = result.fold(
                 onSuccess = { playable ->
-                    Playback.Ready(
-                        playable.copy(
+                    if (playable.url.isBlank()) {
+                        Playback.Failed("Could not start this source.")
+                    } else {
+                        Playback.Ready(
+                            playable.copy(
                             startPositionMs = if (resumeMs > 0L) resumeMs else playable.startPositionMs,
                             mediaRef = ref,
                             expectedDurationMs = expectedRuntimeMs(),
-                        ),
-                    )
+                            ),
+                        )
+                    }
                 },
                 onFailure = { Playback.Failed(it.message ?: "Could not start this source.") },
             )
+            // Persistence follows successful publication. A failed resolve, blank URL, superseded target, or
+            // profile switch leaves the previous preference untouched.
+            if (_playback.value is Playback.Ready && stickyWrite != null) {
+                sourceSticky.record(stickyWrite, source.addon, source.bingeGroup)
+            }
         }
     }
 
@@ -742,10 +890,13 @@ class DetailViewModel(
     /// resolve/play is already running.
     fun playTrailer() {
         if (_playback.value is Playback.Resolving) return
+        val request = sourceRequestFence.currentToken() ?: return
+        if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         val detail = (_meta.value as? UiState.Success)?.data ?: return
         val ytId = detail.trailerYouTubeId ?: return
         _playback.value = Playback.Resolving
-        viewModelScope.launch {
+        playbackResolveJob?.cancel()
+        playbackResolveJob = viewModelScope.launch {
             val playable = TrailerCoordinator.trailerPlayable(
                 context = app,
                 youTubeId = ytId,
@@ -754,8 +905,10 @@ class DetailViewModel(
                 year = detail.releaseInfo?.take(4),
                 mediaType = if (type == MediaType.SERIES) "series" else "movie",
             )
-            _playback.value = playable?.let { Playback.Ready(it) }
-                ?: Playback.Failed("This trailer isn't available right now.")
+            if (sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
+                _playback.value = playable?.let { Playback.Ready(it) }
+                    ?: Playback.Failed("This trailer isn't available right now.")
+            }
         }
     }
 
@@ -773,6 +926,8 @@ class DetailViewModel(
     ///     debrid source, or the promised confirmed-cached best when the gate refused every lower-res winner).
     fun playBest() {
         if (_playback.value is Playback.Resolving) return
+        val request = sourceRequestFence.currentToken() ?: return
+        if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         val groups = (_streams.value as? UiState.Success)?.data ?: return
         val best = bestSource() ?: return
         lastPlayedSource = best
@@ -783,15 +938,16 @@ class DetailViewModel(
         val episode = currentModelEpisode()
         val debridEpisode = episode?.debridEpisodeForResolve()
         val actionOwner = debridKeys.ownerToken()
-        viewModelScope.launch {
-            if (!isActionOwnerCurrent(actionOwner)) {
+        playbackResolveJob?.cancel()
+        playbackResolveJob = viewModelScope.launch {
+            if (!isActionOwnerCurrent(actionOwner) || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
                 _playback.value = Playback.Failed(OWNER_CHANGED_MESSAGE)
                 return@launch
             }
             // 1) CW resume: replay the exact stored debrid source for this target if we have one.
             resumeRef?.takeIf { it.targetId == targetId && it.ref.owner == actionOwner }?.let { stored ->
                 val resumed = debrid.resumePlaybackURL(stored.ref, stored.url, stored.savedAtMs)
-                if (!isActionOwnerCurrent(actionOwner)) {
+                if (!isActionOwnerCurrent(actionOwner) || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
                     _playback.value = Playback.Failed(OWNER_CHANGED_MESSAGE)
                     return@launch
                 }
@@ -809,7 +965,7 @@ class DetailViewModel(
             }
             // 2) Failover among the account-confirmed-cached candidates (label-authoritative gate applied).
             val winner = resolveBestViaFailover(groups, best, debridEpisode, actionOwner)
-            if (!isActionOwnerCurrent(actionOwner)) {
+            if (!isActionOwnerCurrent(actionOwner) || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
                 _playback.value = Playback.Failed(OWNER_CHANGED_MESSAGE)
                 return@launch
             }
@@ -829,7 +985,9 @@ class DetailViewModel(
             }
             // 3) Fall back to the single-source resolve of the labeled best (direct / media-server / single
             //    debrid, or the confirmed-cached best the gate insisted on).
-            _playback.value = resolveForOwner(best, episode, actionOwner).fold(
+            val resolved = resolveForOwner(best, episode, actionOwner)
+            if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@launch
+            _playback.value = resolved.fold(
                 onSuccess = { playable ->
                     Playback.Ready(
                         playable.copy(
@@ -866,7 +1024,13 @@ class DetailViewModel(
         if (evidence.hashes.isEmpty() && evidence.usenetUrls.isEmpty()) return null
         // Rank the candidates EXACTLY as the labeled best is picked (score + pin), de-duplicated by handle, so
         // the failover order matches the visible list.
-        val ranked = StreamRanking.rankedCandidates(groups, continuity = null, pin = currentPin())
+        val ranked = StreamRanking.rankedCandidates(
+            groups,
+            continuity = null,
+            pin = currentPin(),
+            sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null,
+            providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
+        )
         val candidates = ranked.mapNotNull { debridCandidateFor(it, evidence.torrentServices) }
         if (candidates.isEmpty()) return null
         return debrid.resolveFirstPlayable(
@@ -927,7 +1091,16 @@ class DetailViewModel(
     /// the hero Watch button's enabled state.
     fun bestSource(): StreamSource? =
         sourceModel.state.value.best
-            ?: (_streams.value as? UiState.Success)?.data?.let { StreamRanking.best(it) }
+            ?: (_streams.value as? UiState.Success)?.data?.let { groups ->
+                StreamRanking.best(
+                    groups,
+                    continuity = lastCtx?.continuity,
+                    pin = currentPin(),
+                    sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null,
+                    providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
+                    prefs = lastCtx?.prefs ?: StreamRanking.reading(),
+                )
+            }
 
     /// The engine resume position (ms) for the source about to play: the saved library `timeOffset` when
     /// it applies to the current target (a movie, or the series episode whose sources are shown), else 0
@@ -985,7 +1158,7 @@ class DetailViewModel(
         }
         _selectedEpisodeId.value = next.id
         pendingAutoPick = true
-        viewModelScope.launch { loadSources(next.id) }
+        startSourceLoad(next.id)
     }
 
     // ---- Bad-source retry ladder (the trust fix) ----
@@ -1018,6 +1191,7 @@ class DetailViewModel(
         // trip: surface manual selection rather than risk retrying the same dead source forever.
         val failedSource = lastPlayedSource ?: return false
         failed.add(handleOf(failedSource))
+        ProviderHealth.noteFailure(failedSource.addon)
         if (failed.size >= MAX_SOURCE_ATTEMPTS) return false
         val groups = (_streams.value as? UiState.Success)?.data ?: return false
         val ctx = lastCtx ?: return false
@@ -1029,10 +1203,12 @@ class DetailViewModel(
             continuity = StreamRanking.signature(failedSource),
             binge = failedSource.bingeGroup,
             pin = currentPin(),
+            sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null,
+            providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
             prefs = ctx.prefs,
         )
         val next = ranked.firstOrNull { handleOf(it) !in failed } ?: return false
-        play(next)
+        playAutomatically(next)
         return true
     }
 
@@ -1043,10 +1219,24 @@ class DetailViewModel(
     fun manualSourceOptions(limit: Int = MANUAL_PICK_LIMIT): List<StreamSource> {
         val groups = (_streams.value as? UiState.Success)?.data ?: return emptyList()
         val prefs = lastCtx?.prefs
+        val sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null
         val ranked = if (prefs != null) {
-            StreamRanking.rankedCandidates(groups, continuity = null, pin = currentPin(), prefs = prefs)
+            StreamRanking.rankedCandidates(
+                groups,
+                continuity = null,
+                pin = currentPin(),
+                sticky = sticky,
+                providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
+                prefs = prefs,
+            )
         } else {
-            StreamRanking.rankedCandidates(groups, continuity = null, pin = currentPin())
+            StreamRanking.rankedCandidates(
+                groups,
+                continuity = null,
+                pin = currentPin(),
+                sticky = sticky,
+                providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
+            )
         }
         return ranked.take(limit)
     }
@@ -1200,6 +1390,9 @@ class DetailViewModel(
         /// Manual-pick overlay cap: enough to always include every realistic quality tier without
         /// rendering a thousand-row list inside the player.
         const val MANUAL_PICK_LIMIT = 30
+
+        /** Contributor settlement budget for an accepted Up Next action. Always bounded. */
+        const val AUTO_NEXT_ASSEMBLY_DEADLINE_MS = 4_000L
 
         /// The text marker folded into an account-cached source's description so the text-based [StreamRanking]
         /// lights the cache badge + applies the +cache bonus (it looks for a bolt / "cached").

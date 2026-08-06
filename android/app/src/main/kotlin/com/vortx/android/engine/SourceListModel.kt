@@ -5,6 +5,8 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.singularity.SourceIndexServeSource
 import com.vortx.android.sources.ResolvedPin
+import com.vortx.android.sources.ProviderHealth
+import com.vortx.android.sources.SeriesSourceSticky
 import com.vortx.android.sources.SourcePrefsSnapshot
 import com.vortx.android.torbox.TorBoxSearchSource
 import kotlinx.coroutines.CoroutineScope
@@ -15,7 +17,14 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+
+data class SourceContributorSettlement(
+    val requestGeneration: Long = -1L,
+    val settled: Boolean = true,
+)
 
 /// Owns a detail screen's source-list ASSEMBLY pipeline off the render path: raw engine stream groups ->
 /// merge (TorBox search + Singularity + media-server groups) -> disabled-add-on subtraction -> direct-links
@@ -48,6 +57,7 @@ class SourceListModel(
     /// (e.g. a ViewModel's scope); [close] stops the coalescer.
     private val scope: CoroutineScope,
     private val coalesceMs: Long = COALESCE_MS,
+    private val sourceSticky: SeriesSourceSticky? = null,
 ) {
     private val _state = MutableStateFlow(SourceListState())
 
@@ -71,8 +81,12 @@ class SourceListModel(
     data class Context(
         val metaId: String = "",
         val streamId: String? = null, // null = all loaded groups (movie); set = one episode's groups
+        val requestGeneration: Long = 0L,
         val continuity: String? = null, // remembered quality signature for the best() pick (null for live)
+        val binge: String? = null,
         val pin: ResolvedPin? = null,
+        val sticky: SeriesSourceSticky.Preference? = null,
+        val unhealthyAddons: Set<String> = emptySet(),
         val prefs: SourcePrefsSnapshot = SourcePrefsSnapshot.DEFAULT,
         val directLinksOnly: Boolean = false, // drop unresolved raw torrents, preserve resolved direct links
         val disabledAddons: Set<String> = emptySet(), // per-profile disabled add-on labels
@@ -97,6 +111,8 @@ class SourceListModel(
                 torbox.streams,
                 singularity.streams,
             ) { _, _, _, _, _ -> Unit }
+                .combine(torbox.settlement) { _, _ -> Unit }
+                .combine(singularity.settlement) { _, _ -> Unit }
                 .conflate()
                 .collect {
                     // Trailing coalesce window: a burst of input changes collapses to the latest, and the
@@ -116,10 +132,49 @@ class SourceListModel(
 
     /// Update the view-owned ranking inputs. Publishes nothing synchronously; only nudges the coalescer.
     /// Mirrors Apple `setContext`.
-    fun setContext(ctx: Context) { context.value = ctx }
+    fun setContext(ctx: Context) {
+        // This method is called by DetailViewModel on Main. Snapshot the preferences here before the background
+        // assembly starts, matching Apple's main-actor snapshot and keeping SharedPreferences out of ranking.
+        val sticky = if (ctx.streamId != null && ctx.metaId.isNotEmpty()) {
+            sourceSticky?.preference(ctx.metaId) ?: ctx.sticky
+        } else {
+            null
+        }
+        context.value = ctx.copy(
+            sticky = sticky,
+            unhealthyAddons = ProviderHealth.activeAddons(),
+        )
+    }
 
     /// Stop the coalescer. The TorBox / Singularity sources own their own scopes (close them separately).
     fun close() { job?.cancel() }
+
+    /**
+     * Wait until the target's unified list has been assembled after both asynchronous contributor lanes settle.
+     * The outer deadline is unconditional; on timeout the freshest target-scoped snapshot is returned, never a
+     * previous episode's state. Media-server groups are already awaited before the raw lane is installed.
+     */
+    suspend fun awaitSettledTarget(
+        requestGeneration: Long,
+        streamId: String?,
+        deadlineMs: Long,
+    ): SourceListState? {
+        val tb = torbox ?: return null
+        val sing = singularity ?: return null
+        val settled = withTimeoutOrNull(deadlineMs) {
+            combine(state, tb.settlement, sing.settlement) { current, torboxState, singularityState ->
+                val targetMatches = current.requestGeneration == requestGeneration && current.streamId == streamId
+                val contributorsSettled =
+                    torboxState.requestGeneration == requestGeneration && torboxState.settled &&
+                        singularityState.requestGeneration == requestGeneration && singularityState.settled &&
+                        current.torboxEpoch == tb.epoch && current.singularityEpoch == sing.epoch
+                current.takeIf { targetMatches && contributorsSettled }
+            }.first { it != null }
+        }
+        return settled ?: state.value.takeIf {
+            it.requestGeneration == requestGeneration && it.streamId == streamId
+        }
+    }
 
     // ---- Rebuild (coalesced; assemble off-thread, publish once) ----
 
@@ -142,7 +197,10 @@ class SourceListModel(
         if (signature == publishedSignature) return // published output already correct: skip the assembly
         publishedSignature = signature
 
-        val assembled = assemble(raw, torboxStreams, singularityStreams, media, ctx)
+        val assembled = assemble(raw, torboxStreams, singularityStreams, media, ctx).copy(
+            torboxEpoch = tb.epoch,
+            singularityEpoch = sing.epoch,
+        )
         _state.value = assembled
 
         // HOARD (fire-and-forget): capture only raw add-on + TorBox torrent infohashes, before the display's
@@ -170,8 +228,13 @@ class SourceListModel(
     private fun inputsHash(ctx: Context): Int = listOf(
         ctx.metaId,
         ctx.streamId,
+        ctx.requestGeneration,
         ctx.continuity,
+        ctx.binge,
         ctx.pin?.let { "${it.scope}:${it.pin.label}:${it.pin.bingeGroup}" },
+        ctx.sticky?.addon,
+        ctx.sticky?.bingeGroup,
+        ctx.unhealthyAddons.sorted().joinToString(","),
         ctx.prefs.cacheTag,
         ctx.directLinksOnly,
         ctx.disabledAddons.sorted().joinToString(","),
@@ -228,10 +291,25 @@ class SourceListModel(
             // store, mirroring Apple's task-local prefs binding.
             StreamRanking.installReading(ctx.prefs)
             val ranked = StreamRanking.rankedGroups(assembled, prefs = ctx.prefs, pin = ctx.pin)
-            val best = StreamRanking.best(ranked, continuity = ctx.continuity, pin = ctx.pin, prefs = ctx.prefs)
+            val best = StreamRanking.best(
+                ranked,
+                continuity = ctx.continuity,
+                binge = ctx.binge,
+                pin = ctx.pin,
+                sticky = ctx.sticky,
+                providerPenalty = { addon -> addon.trim().lowercase() in ctx.unhealthyAddons },
+                prefs = ctx.prefs,
+            )
             val tiers = StreamRanking.tiers(ranked)
             val resolutionOptions = StreamRanking.resolutionOptions(ranked)
-            return SourceListState(groups = ranked, best = best, tiers = tiers, resolutionOptions = resolutionOptions)
+            return SourceListState(
+                groups = ranked,
+                best = best,
+                tiers = tiers,
+                resolutionOptions = resolutionOptions,
+                requestGeneration = ctx.requestGeneration,
+                streamId = ctx.streamId,
+            )
         }
 
         /**
@@ -342,4 +420,8 @@ data class SourceListState(
     val best: StreamSource? = null,
     val tiers: List<String> = emptyList(),
     val resolutionOptions: List<Pair<String, StreamSource>> = emptyList(),
+    val requestGeneration: Long = -1L,
+    val streamId: String? = null,
+    val torboxEpoch: Int = -1,
+    val singularityEpoch: Int = -1,
 )

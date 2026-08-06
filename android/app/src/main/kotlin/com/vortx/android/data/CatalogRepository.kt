@@ -145,9 +145,16 @@ interface CatalogRepository {
     ///
     /// For a series, pass the chosen [episodeId] (the engine `CoreVideo.id`, e.g. `tt123:1:2`) so the
     /// engine fetches THAT episode's streams; for a movie (or a series' auto-picked first episode) leave
-    /// it null and the engine guesses the best stream for the title. The default keeps every existing
-    /// caller (movies, the hero Watch button) source-compatible.
-    suspend fun streams(type: MediaType, id: String, episodeId: String? = null): Result<List<StreamGroup>>
+    /// it null and the engine guesses the best stream for the title. Auto-next may also pass its
+    /// [rememberedQuality] and manually chosen [wantedAddon], allowing a bounded wait for that provider;
+    /// ordinary detail loads leave both null and keep the original first-playable timing.
+    suspend fun streams(
+        type: MediaType,
+        id: String,
+        episodeId: String? = null,
+        rememberedQuality: String? = null,
+        wantedAddon: String? = null,
+    ): Result<List<StreamGroup>>
 
     /// Resolve a chosen [StreamSource] into a directly-playable [Playable] for the player. The engine
     /// does whatever the source requires: hand a magnet to the in-process streaming server and return
@@ -384,7 +391,13 @@ class PreviewCatalogRepository(
         )
     }
 
-    override suspend fun streams(type: MediaType, id: String, episodeId: String?): Result<List<StreamGroup>> {
+    override suspend fun streams(
+        type: MediaType,
+        id: String,
+        episodeId: String?,
+        rememberedQuality: String?,
+        wantedAddon: String?,
+    ): Result<List<StreamGroup>> {
         delay(latencyMs)
         // A representative stub of the per-add-on, multi-quality source list the engine returns. The
         // real impl fans out to every installed stream add-on; the UI hierarchy is identical. The

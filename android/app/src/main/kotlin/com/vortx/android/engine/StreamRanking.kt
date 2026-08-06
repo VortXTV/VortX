@@ -3,6 +3,7 @@ package com.vortx.android.engine
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.sources.ResolvedPin
+import com.vortx.android.sources.SeriesSourceSticky
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePrefsSnapshot
 import com.vortx.android.sources.SourceType
@@ -27,6 +28,15 @@ import java.util.concurrent.ConcurrentHashMap
 /// (Apple's frozen-snapshot race fix), so an off-thread rank never races a Settings edit. With the DEFAULT
 /// (empty) snapshot every filter is a no-op and scoring is byte-identical to the pre-layer core scorer.
 object StreamRanking {
+
+    /** Equal positive stickiness and negative recent-failure weights, kept below one source-type tier. */
+    const val STICKY_WEIGHT = 6_000
+
+    /** Caps continuity + binge + sticky so their sum cannot jump across two source-type tiers. */
+    const val CALLER_BONUS_CEILING = 8_000
+
+    /** Maximum wanted-provider wait after the first playable source arrives. */
+    const val WANTED_SOURCE_DEADLINE_SECONDS = 12.0
 
     // ---- Installed preference snapshot (the frozen copy the ranker reads) ----
 
@@ -103,6 +113,8 @@ object StreamRanking {
         continuity: String?,
         binge: String? = null,
         pin: ResolvedPin? = null,
+        sticky: SeriesSourceSticky.Preference? = null,
+        providerPenalty: ((String) -> Boolean)? = null,
         prefs: SourcePrefsSnapshot = installedReading,
     ): StreamSource? {
         val filtered = applyUserFilters(groups, prefs)
@@ -112,12 +124,15 @@ object StreamRanking {
         }
         val hasHint = !continuity.isNullOrEmpty()
         val hasBinge = !binge.isNullOrEmpty()
-        if (!hasHint && !hasBinge && pin == null) return best(groups, prefs, pin)
+        val hasSticky = !sticky?.addon.isNullOrEmpty() || !sticky?.bingeGroup.isNullOrEmpty()
+        if (!hasHint && !hasBinge && pin == null && !hasSticky && providerPenalty == null) {
+            return best(groups, prefs, pin)
+        }
         return playablePairs(filtered).maxByOrNull {
             score(it.stream, prefs) +
-                continuityBonus(it.stream, continuity) +
-                bingeBonus(it.stream, binge) +
-                pinBonus(it.stream, it.addon, pin)
+                callerBonuses(it.stream, it.addon, continuity, binge, sticky) +
+                pinBonus(it.stream, it.addon, pin) +
+                healthPenalty(it.addon, providerPenalty)
         }?.stream
     }
 
@@ -130,6 +145,8 @@ object StreamRanking {
         continuity: String?,
         binge: String? = null,
         pin: ResolvedPin? = null,
+        sticky: SeriesSourceSticky.Preference? = null,
+        providerPenalty: ((String) -> Boolean)? = null,
         prefs: SourcePrefsSnapshot = installedReading,
     ): List<StreamSource> {
         val filtered = applyUserFilters(groups, prefs)
@@ -147,9 +164,9 @@ object StreamRanking {
                     offset,
                     pair.stream,
                     score(pair.stream, prefs) +
-                        continuityBonus(pair.stream, continuity) +
-                        bingeBonus(pair.stream, binge) +
-                        pinBonus(pair.stream, pair.addon, pin),
+                        callerBonuses(pair.stream, pair.addon, continuity, binge, sticky) +
+                        pinBonus(pair.stream, pair.addon, pin) +
+                        healthPenalty(pair.addon, providerPenalty),
                 )
             }
                 .sortedWith(compareByDescending<Triple<Int, StreamSource, Int>> { it.third }.thenBy { it.first })
@@ -221,6 +238,34 @@ object StreamRanking {
         return 2500
     }
 
+    /** One matching add-on or binge-group signal earns the sticky weight once. */
+    fun stickyBonus(
+        s: StreamSource,
+        addon: String,
+        sticky: SeriesSourceSticky.Preference?,
+    ): Int {
+        if (sticky == null) return 0
+        if (!sticky.addon.isNullOrEmpty() && addon.equals(sticky.addon, ignoreCase = true)) return STICKY_WEIGHT
+        if (!sticky.bingeGroup.isNullOrEmpty() && s.bingeGroup == sticky.bingeGroup) return STICKY_WEIGHT
+        return 0
+    }
+
+    /** Recent provider failure is a demotion, never an exclusion. */
+    fun healthPenalty(addon: String, isUnhealthy: ((String) -> Boolean)?): Int =
+        if (isUnhealthy?.invoke(addon) == true) -STICKY_WEIGHT else 0
+
+    /** Shared bonus block used by best and rankedCandidates to keep their first choice identical. */
+    fun callerBonuses(
+        s: StreamSource,
+        addon: String,
+        hint: String?,
+        binge: String?,
+        sticky: SeriesSourceSticky.Preference?,
+    ): Int = minOf(
+        continuityBonus(s, hint) + bingeBonus(s, binge) + stickyBonus(s, addon, sticky),
+        CALLER_BONUS_CEILING,
+    )
+
     /// A user-pinned source floats above everything else. The bonus dwarfs the entire score range (quality
     /// spread 4313, cached +8000, source-type tier gap 15000) so a matching stream wins the one-press
     /// auto-pick and tops the list, yet it is still only a *score*, so the player's invisible failover hops
@@ -251,12 +296,20 @@ object StreamRanking {
         total: Int,
         secondsSinceFirstPlayable: Double,
         rememberedQuality: String?,
+        wantedAddon: String? = null,
         prefs: SourcePrefsSnapshot = installedReading,
     ): Boolean {
         if (groups.isEmpty()) return false
         if (total > 0 && loaded >= total) return true
         val hint = rememberedQuality
         if (hint.isNullOrEmpty()) return secondsSinceFirstPlayable > 4
+        if (!wantedAddon.isNullOrEmpty()) {
+            val wantedReady = groups.any { group ->
+                group.addon.equals(wantedAddon, ignoreCase = true) &&
+                    group.streams.any { !it.isYouTubeTrailer }
+            }
+            return wantedReady || secondsSinceFirstPlayable > WANTED_SOURCE_DEADLINE_SECONDS
+        }
         val torrentOK = prefs.useAddonOrder || prefs.typeOrder.firstOrNull() == SourceType.TORRENT
         val qualityReady = groups.any { group ->
             group.streams.any { s ->

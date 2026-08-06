@@ -3,6 +3,7 @@ package com.vortx.android.torbox
 import android.util.Log
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridService
+import com.vortx.android.engine.SourceContributorSettlement
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import kotlinx.coroutines.CoroutineScope
@@ -337,6 +338,8 @@ class TorBoxSearchSource private constructor(
     /// no TorBox key). One group so the source list shows a single "TorBox Search" section. Mirrors Apple's
     /// `@Published streams`.
     val streams: StateFlow<List<StreamSource>> = _streams.asStateFlow()
+    private val _settlement = MutableStateFlow(SourceContributorSettlement())
+    val settlement: StateFlow<SourceContributorSettlement> = _settlement.asStateFlow()
 
     private val epochCounter = AtomicInteger(0)
     private val stateLock = Any()
@@ -347,7 +350,9 @@ class TorBoxSearchSource private constructor(
     val epoch: Int get() = epochCounter.get()
 
     private var shownKey: String? = null
+    private var shownGeneration: Long = -1L
     private var inFlightKey: String? = null
+    private var inFlightGeneration: Long = -1L
     private val cache = HashMap<String, List<StreamSource>>()
     private var cooldownUntilMs: Long? = null
     private var job: Job? = null
@@ -356,23 +361,46 @@ class TorBoxSearchSource private constructor(
     /// off during a scraper cooldown. Safe to call on every meta change. Pass [season]/[episode] from an
     /// episode context so the index scopes results to that episode (null = movie level). Mirrors Apple
     /// `refresh`.
-    fun refresh(imdbId: String?, season: Int? = null, episode: Int? = null) {
-        if (imdbId == null || !imdbId.startsWith("tt")) return
-        if (!torBoxConfigured()) return // gate: no TorBox key -> no-op
+    fun refresh(
+        imdbId: String?,
+        season: Int? = null,
+        episode: Int? = null,
+        requestGeneration: Long = 0L,
+    ) {
+        if (imdbId == null || !imdbId.startsWith("tt") || !torBoxConfigured()) {
+            reset(requestGeneration)
+            return
+        }
         val fetchKey = "$imdbId|${season ?: -1}|${episode ?: -1}"
         val key = torBoxKey()
         val launched = synchronized(stateLock) {
             // New title: publish its cached results (or clear), so the prior title's streams never linger.
-            if (fetchKey != shownKey) {
+            if (fetchKey != shownKey || requestGeneration != shownGeneration) {
+                job?.cancel()
+                job = null
+                inFlightKey = null
+                inFlightGeneration = -1L
                 shownKey = fetchKey
+                shownGeneration = requestGeneration
                 publishLocked(cache[fetchKey] ?: emptyList())
             }
-            if (cache.containsKey(fetchKey)) return // cached: already published above, no round trip
-            if (inFlightKey == fetchKey) return // the paired refreshes for this id: fetch once
-            if ((cooldownUntilMs ?: 0L) > System.currentTimeMillis()) return // don't burn scraper allowance
+            if (cache.containsKey(fetchKey)) {
+                _settlement.value = SourceContributorSettlement(requestGeneration, settled = true)
+                return
+            }
+            if (inFlightKey == fetchKey && inFlightGeneration == requestGeneration) {
+                _settlement.value = SourceContributorSettlement(requestGeneration, settled = false)
+                return
+            }
+            if ((cooldownUntilMs ?: 0L) > System.currentTimeMillis()) {
+                _settlement.value = SourceContributorSettlement(requestGeneration, settled = true)
+                return
+            }
 
             job?.cancel()
             inFlightKey = fetchKey
+            inFlightGeneration = requestGeneration
+            _settlement.value = SourceContributorSettlement(requestGeneration, settled = false)
             scope.launch(start = CoroutineStart.LAZY) {
                 val ownerJob = coroutineContext[Job]
                 try {
@@ -381,8 +409,14 @@ class TorBoxSearchSource private constructor(
                     synchronized(stateLock) {
                         // A newer refresh may have canceled this fetch and claimed the slot. A late blocking
                         // response must never clear or publish over that newer request.
-                        if (job !== ownerJob || inFlightKey != fetchKey) return@synchronized
+                        if (
+                            job !== ownerJob ||
+                            inFlightKey != fetchKey ||
+                            inFlightGeneration != requestGeneration ||
+                            shownGeneration != requestGeneration
+                        ) return@synchronized
                         inFlightKey = null
+                        inFlightGeneration = -1L
                         job = null
                         if (result.rateLimited) {
                             // Over the TorBox scraper allowance. Back off ~15 min before re-probing; do NOT
@@ -398,14 +432,21 @@ class TorBoxSearchSource private constructor(
                             cache[fetchKey] = result.streams
                             if (shownKey == fetchKey) publishLocked(result.streams)
                         }
+                        _settlement.value = SourceContributorSettlement(requestGeneration, settled = true)
                     }
                 } finally {
                     synchronized(stateLock) {
                         // Also release a fetch canceled before it could return (including a canceled scope).
                         // Identity checks keep an obsolete completion from clobbering a newer request.
-                        if (job === ownerJob && inFlightKey == fetchKey) {
+                        if (
+                            job === ownerJob &&
+                            inFlightKey == fetchKey &&
+                            inFlightGeneration == requestGeneration
+                        ) {
                             inFlightKey = null
+                            inFlightGeneration = -1L
                             job = null
+                            _settlement.value = SourceContributorSettlement(requestGeneration, settled = true)
                         }
                     }
                 }
@@ -422,7 +463,23 @@ class TorBoxSearchSource private constructor(
     fun clearResults() {
         synchronized(stateLock) {
             shownKey = null
+            shownGeneration = -1L
             if (_streams.value.isNotEmpty()) publishLocked(emptyList())
+        }
+    }
+
+    /** Cancel all work and clear rows when the profile/source owner changes. */
+    fun reset(requestGeneration: Long, clearCache: Boolean = false) {
+        synchronized(stateLock) {
+            job?.cancel()
+            job = null
+            inFlightKey = null
+            inFlightGeneration = -1L
+            shownKey = null
+            shownGeneration = -1L
+            if (clearCache) cache.clear()
+            if (_streams.value.isNotEmpty()) publishLocked(emptyList())
+            _settlement.value = SourceContributorSettlement(requestGeneration, settled = true)
         }
     }
 
@@ -432,6 +489,7 @@ class TorBoxSearchSource private constructor(
             job?.cancel()
             job = null
             inFlightKey = null
+            inFlightGeneration = -1L
         }
         scope.coroutineContext[Job]?.cancel()
     }

@@ -29,7 +29,9 @@ import com.vortx.android.sources.SourcePinContext
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.BufferOverflow
@@ -49,6 +51,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
@@ -60,6 +63,19 @@ internal data class DebridResolveTarget(
     val episode: DebridResolver.Episode?,
     val fileIdx: Int?,
 )
+
+internal class StreamLoadGenerationFence {
+    private var generation = 0L
+
+    @Synchronized
+    fun begin(): Long {
+        generation += 1L
+        return generation
+    }
+
+    @Synchronized
+    fun isCurrent(candidate: Long): Boolean = candidate == generation
+}
 
 internal fun StreamSource.debridResolveTarget(
     fallbackHandle: String,
@@ -209,6 +225,9 @@ class EngineStremioRepository(
     /// single caller's coroutine (republishing [authState] off engine events). `SupervisorJob` so one
     /// failure (e.g. a malformed ctx JSON on a single event) can't cancel the whole scope.
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val streamLoadLock = Any()
+    private val streamLoadFence = StreamLoadGenerationFence()
+    private var streamLoadJob: Job? = null
 
     private val _authState = MutableStateFlow<AuthState>(AuthState.SignedOut)
     override val authState: StateFlow<AuthState> = _authState.asStateFlow()
@@ -371,7 +390,7 @@ class EngineStremioRepository(
     /// NewState as what it is -- "something changed, look again" -- and only returns when the state
     /// actually has what the caller needs.
     private suspend fun loadFieldUntil(field: String, actionJson: String, ready: (String) -> Boolean): String {
-        val settled = withTimeoutOrNull(loadTimeoutSeconds.seconds) {
+        val settled = withTimeoutOrNull<String>(loadTimeoutSeconds.seconds) {
             StremioCoreNative.dispatch(actionJson)
             // The state may already satisfy the caller (engine had it cached; Load was a no-op that
             // emits nothing) -- check before waiting on events at all.
@@ -383,6 +402,104 @@ class EngineStremioRepository(
                 .first { ready(it) }
         }
         return settled ?: StremioCoreNative.getState("\"$field\"")
+    }
+
+    private suspend fun <T> runLatestStreamLoad(block: suspend (Long) -> T): T {
+        val ownerJob = currentCoroutineContext()[Job]
+            ?: throw IllegalStateException("A stream load requires a coroutine Job")
+        val generation = synchronized(streamLoadLock) {
+            streamLoadJob?.takeIf { it !== ownerJob }?.cancel(
+                CancellationException("Superseded by a newer stream target"),
+            )
+            streamLoadJob = ownerJob
+            streamLoadFence.begin()
+        }
+        return try {
+            block(generation)
+        } finally {
+            synchronized(streamLoadLock) {
+                if (streamLoadJob === ownerJob) streamLoadJob = null
+            }
+        }
+    }
+
+    private fun requireCurrentStreamLoad(generation: Long) {
+        if (!streamLoadFence.isCurrent(generation)) {
+            throw CancellationException("Superseded by a newer stream target")
+        }
+    }
+
+    private suspend fun loadStreamFieldUntil(
+        generation: Long,
+        actionJson: String,
+        streamId: String?,
+    ): String {
+        val field = EngineActions.FIELD_META_DETAILS
+        val settled = withTimeoutOrNull(loadTimeoutSeconds.seconds) {
+            requireCurrentStreamLoad(generation)
+            StremioCoreNative.dispatch(actionJson)
+            val immediate = StremioCoreNative.getState("\"$field\"")
+            requireCurrentStreamLoad(generation)
+            if (EngineState.parseStreamGroups(immediate, streamId).isNotEmpty()) return@withTimeoutOrNull immediate
+            changedFields
+                .filter { field in it }
+                .map {
+                    requireCurrentStreamLoad(generation)
+                    StremioCoreNative.getState("\"$field\"")
+                }
+                .first { EngineState.parseStreamGroups(it, streamId).isNotEmpty() }
+        }
+        requireCurrentStreamLoad(generation)
+        return settled ?: StremioCoreNative.getState("\"$field\"")
+    }
+
+    /**
+     * Wait for a series' remembered source provider after the first playable answer arrives. With no
+     * playable source the normal field timeout still applies; once playback is possible, the remembered
+     * provider gets at most [StreamRanking.WANTED_SOURCE_DEADLINE_SECONDS] to settle. Polling the resident
+     * state also survives a dropped NewState notification and mirrors the Apple wait policy.
+     */
+    private suspend fun loadStreamsUntilWanted(
+        actionJson: String,
+        streamId: String,
+        rememberedQuality: String,
+        wantedAddon: String,
+        generation: Long,
+    ): String {
+        val settled = withTimeoutOrNull<String>(loadTimeoutSeconds.seconds) {
+            requireCurrentStreamLoad(generation)
+            StremioCoreNative.dispatch(actionJson)
+            var firstPlayableAtMs: Long? = null
+            var answer: String? = null
+            while (answer == null) {
+                requireCurrentStreamLoad(generation)
+                val state = StremioCoreNative.getState("\"${EngineActions.FIELD_META_DETAILS}\"")
+                val groups = EngineState.parseStreamGroups(state, streamId)
+                val nowMs = monotonicMs()
+                if (groups.isNotEmpty() && firstPlayableAtMs == null) firstPlayableAtMs = nowMs
+
+                val firstAt = firstPlayableAtMs
+                if (firstAt != null) {
+                    val progress = EngineState.parseStreamLoadProgress(state, streamId)
+                    if (
+                        StreamRanking.resolveSettled(
+                            groups = groups,
+                            loaded = progress.loaded,
+                            total = progress.total,
+                            secondsSinceFirstPlayable = (nowMs - firstAt) / 1_000.0,
+                            rememberedQuality = rememberedQuality,
+                            wantedAddon = wantedAddon,
+                        )
+                    ) {
+                        answer = state
+                    }
+                }
+                if (answer == null) delay(STREAM_SETTLEMENT_POLL_MS)
+            }
+            answer
+        }
+        requireCurrentStreamLoad(generation)
+        return settled ?: StremioCoreNative.getState("\"${EngineActions.FIELD_META_DETAILS}\"")
     }
 
     /// One-shot Home (kept for the [CatalogRepository] contract; the Home screen itself collects
@@ -741,7 +858,14 @@ class EngineStremioRepository(
         withOverlayState(detail)
     } }
 
-    override suspend fun streams(type: MediaType, id: String, episodeId: String?): Result<List<StreamGroup>> = withContext(Dispatchers.Default) { runCatching {
+    override suspend fun streams(
+        type: MediaType,
+        id: String,
+        episodeId: String?,
+        rememberedQuality: String?,
+        wantedAddon: String?,
+    ): Result<List<StreamGroup>> = runLatestStreamLoad { generation ->
+        withContext(Dispatchers.Default) { runCatching {
         // Meta + a guessed stream were already requested by meta(); re-pull meta_details for its
         // stream groups. If meta() was not called first, this Load brings both in.
         //
@@ -755,9 +879,12 @@ class EngineStremioRepository(
         }
         // Ready = at least one add-on's stream group settled; later groups keep landing in engine
         // state and S05's reactive detail work will surface them incrementally.
-        val state = loadFieldUntil(EngineActions.FIELD_META_DETAILS, action) {
-            EngineState.parseStreamGroups(it).isNotEmpty()
+        val state = if (episodeId != null && !wantedAddon.isNullOrBlank() && !rememberedQuality.isNullOrBlank()) {
+            loadStreamsUntilWanted(action, episodeId, rememberedQuality, wantedAddon, generation)
+        } else {
+            loadStreamFieldUntil(generation, action, episodeId)
         }
+        requireCurrentStreamLoad(generation)
         // Rank before the UI ever sees them: strongest source (debrid-cached > resolution > source ladder)
         // first within each add-on block, and the strongest add-on block first. This is what makes the
         // hero "Watch" auto-pick and the source picker meaningful, mirroring Apple's ranked source list.
@@ -779,7 +906,7 @@ class EngineStremioRepository(
         // CoreBridge.swift:984): a disabled add-on's sources never reach ranking or the picker for
         // this profile. Groups with no base (a malformed request) are kept, never dropped.
         val disabledAddons = addonPrefs.disabledBases()
-        val groups = EngineState.parseStreamGroups(state).filter { group ->
+        val groups = EngineState.parseStreamGroups(state, episodeId).filter { group ->
             group.base.isEmpty() || AddonOrder.normalize(group.base) !in disabledAddons
         }
         // vortx-core SHADOW lane: with the flag ON, rank the SAME inputs through the own engine
@@ -787,7 +914,8 @@ class EngineStremioRepository(
         // list returned below; with the flag at its default OFF this line is one volatile read.
         if (shadowRankingConfigured && VortxRankingShadow.enabled) VortxRankingShadow.compareAsync(groups, snapshot)
         StreamRanking.rankedGroups(groups, prefs = snapshot, pin = pin)
-    } }
+        } }
+    }
 
     override suspend fun resolve(
         source: StreamSource,
@@ -1247,6 +1375,11 @@ class EngineStremioRepository(
         /// Safety-net poll cadence for [homeUpdates]. Each tick is a cheap local getState + parse;
         /// distinctUntilChanged means an unchanged snapshot never reaches the UI.
         const val HOME_POLL_MS = 3_000L
+
+        /** Resident meta-details poll interval while a remembered series provider is outstanding. */
+        const val STREAM_SETTLEMENT_POLL_MS = 250L
+
+        fun monotonicMs(): Long = System.nanoTime() / 1_000_000L
 
         /// The `device` tag stamped into every engine `TimeChanged` (Apple sends "iOS"/"tvOS").
         const val PROGRESS_DEVICE = "Android"
