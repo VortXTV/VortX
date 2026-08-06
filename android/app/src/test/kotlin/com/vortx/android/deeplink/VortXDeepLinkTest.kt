@@ -1,5 +1,8 @@
 package com.vortx.android.deeplink
 
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.Playable
@@ -74,18 +77,29 @@ class VortXDeepLinkTest {
     fun `accepted delivery is not replayed after recreation but a new intent is accepted`() {
         val raw = "vortx://open?type=movie&id=tt123"
         val firstActivity = DeepLinkDeliveryState()
-        val accepted = firstActivity.consume(raw)
+        val accepted = firstActivity.consume("delivery-a", raw)
 
         assertNotNull(accepted)
-        assertTrue(firstActivity.consumed)
-        assertNull(firstActivity.consume(raw))
+        assertEquals("delivery-a", firstActivity.consumedDeliveryId)
+        assertNull(firstActivity.consume("delivery-a", raw))
 
-        val recreatedActivity = DeepLinkDeliveryState(restoredConsumed = firstActivity.consumed)
-        assertNull(recreatedActivity.consume(raw))
+        val recreatedActivity = DeepLinkDeliveryState(firstActivity.consumedDeliveryId)
+        assertNull(recreatedActivity.consume("delivery-a", raw))
 
-        recreatedActivity.beginNewIntent()
-        assertFalse(recreatedActivity.consumed)
-        assertEquals(accepted, recreatedActivity.consume(raw))
+        assertEquals(accepted, recreatedActivity.consume("delivery-b", raw))
+    }
+
+    @Test
+    fun `restored delivery rejects replay a but accepts genuinely new cold delivery b`() {
+        val oldUrl = "vortx://open?type=movie&id=tt-old"
+        val newUrl = "vortx://open?type=series&id=tt-new"
+        val state = DeepLinkDeliveryState(restoredConsumedDeliveryId = "delivery-a")
+
+        assertNull(state.consume("delivery-a", oldUrl))
+        assertEquals(
+            VortXDeepLink(MediaType.SERIES, "tt-new"),
+            state.consume("delivery-b", newUrl),
+        )
     }
 
     @Test
@@ -94,9 +108,9 @@ class VortXDeepLinkTest {
             readProjectFile("src/main/kotlin/com/vortx/android/MainActivity.kt"),
             readProjectFile("src/main/kotlin/com/vortx/android/ui/tv/TvActivity.kt"),
         ).forEach { source ->
-            assertTrue(source.contains("restoredConsumed = savedInstanceState?.getBoolean"))
-            assertTrue(source.contains("deepLinkDelivery.beginNewIntent()"))
-            assertTrue(source.contains("outState.putBoolean(STATE_DEEP_LINK_CONSUMED"))
+            assertTrue(source.contains("restoredConsumedDeliveryId = restoredDeliveryId"))
+            assertTrue(source.contains("forceNewDelivery = true"))
+            assertTrue(source.contains("outState.putString(STATE_DEEP_LINK_DELIVERY_ID"))
             assertTrue(source.contains("source.data = null"))
         }
     }
@@ -104,11 +118,11 @@ class VortXDeepLinkTest {
     @Test
     fun `invalid delivery does not block the next valid intent`() {
         val state = DeepLinkDeliveryState()
-        assertNull(state.consume("vortx://open?type=channel&id=bad"))
-        assertFalse(state.consumed)
+        assertNull(state.consume("delivery-a", "vortx://open?type=channel&id=bad"))
+        assertNull(state.consumedDeliveryId)
         assertEquals(
             VortXDeepLink(MediaType.SERIES, "tt456"),
-            state.consume("vortx://open?type=series&id=tt456"),
+            state.consume("delivery-b", "vortx://open?type=series&id=tt456"),
         )
     }
 
@@ -168,24 +182,40 @@ class VortXDeepLinkTest {
 
     @Test
     fun `repeat navigation to one target reuses one view model instance key`() {
-        val instances = mutableMapOf<String, Any>()
-        fun navigate(generation: Long): Any {
+        val store = ViewModelStore()
+        var created = 0
+        val provider = ViewModelProvider(
+            store,
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                    created += 1
+                    return CountingViewModel() as T
+                }
+            },
+        )
+        fun navigate(generation: Long): CountingViewModel {
+            assertTrue(generation > 0)
             val key = detailViewModelKey("detail", "movie", "tt123", "owner:7")
-            return instances.getOrPut(key) { Any() }.also {
-                assertTrue(generation > 0)
-            }
+            return provider[key, CountingViewModel::class.java]
         }
 
-        val first = navigate(generation = 1)
-        val repeated = navigate(generation = 2)
+        try {
+            val first = navigate(generation = 1)
+            val repeated = navigate(generation = 2)
 
-        assertSame(first, repeated)
-        assertEquals(1, instances.size)
-        assertNotEquals(
-            detailViewModelKey("detail", "movie", "tt123", "owner:7"),
-            detailViewModelKey("detail", "series", "tt123", "owner:7"),
-        )
+            assertSame(first, repeated)
+            assertEquals(1, created)
+            assertNotEquals(
+                detailViewModelKey("detail", "movie", "tt123", "owner:7"),
+                detailViewModelKey("detail", "series", "tt123", "owner:7"),
+            )
+        } finally {
+            store.clear()
+        }
     }
+
+    private class CountingViewModel : ViewModel()
 
     private fun readProjectFile(relativePath: String): String {
         val candidates = listOf(File(relativePath), File("app/$relativePath"), File("android/app/$relativePath"))

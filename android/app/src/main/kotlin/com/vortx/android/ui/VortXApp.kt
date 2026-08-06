@@ -256,6 +256,7 @@ fun VortXApp(
             showLibraryTransfer = false
             showProfiles = false
             showAppearance = false
+            showCustomizeHome = false
             showWhatsNew = false
             showTabBar = false
             detailGeneration += 1

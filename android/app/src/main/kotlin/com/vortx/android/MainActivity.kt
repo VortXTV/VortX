@@ -20,6 +20,7 @@ import com.vortx.android.deeplink.VortXDeepLinkEvent
 import com.vortx.android.player.PlayerPipBridge
 import com.vortx.android.ui.VortXApp
 import com.vortx.android.ui.theme.isAnimatorScaleZero
+import java.util.UUID
 
 /// Android + Android TV entry point. The five-tab Compose shell in [VortXApp] matches the iOS and
 /// Apple TV structure. It now runs on the shared stremio-core engine (over JNI, the same engine the
@@ -40,10 +41,11 @@ class MainActivity : ComponentActivity() {
         // uniformly.
         val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
+        val restoredDeliveryId = savedInstanceState?.getString(STATE_DEEP_LINK_DELIVERY_ID)
         deepLinkDelivery = DeepLinkDeliveryState(
-            restoredConsumed = savedInstanceState?.getBoolean(STATE_DEEP_LINK_CONSUMED) == true,
+            restoredConsumedDeliveryId = restoredDeliveryId,
         )
-        routeDeepLink(intent)
+        routeDeepLink(intent, restoredDeliveryId = restoredDeliveryId)
 
         // Edge-to-edge is enforced app-wide (ANDROID-PLAN.md S01 scope; DESIGN-SYSTEM.md chrome
         // recedes behind content). VortXTheme forces the dark scheme regardless of the system
@@ -90,18 +92,30 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        deepLinkDelivery.beginNewIntent()
-        routeDeepLink(intent)
+        routeDeepLink(intent, forceNewDelivery = true)
     }
 
-    private fun routeDeepLink(intent: Intent?) {
-        if (deepLinkDelivery.consumed) {
+    private fun routeDeepLink(
+        intent: Intent?,
+        restoredDeliveryId: String? = null,
+        forceNewDelivery: Boolean = false,
+    ) {
+        val deliveryId = deliveryId(intent, restoredDeliveryId, forceNewDelivery)
+        if (deepLinkDelivery.isConsumed(deliveryId)) {
             clearDeepLinkData(intent)
             return
         }
-        val target = deepLinkDelivery.consume(intent?.dataString) ?: return
+        val target = deepLinkDelivery.consume(deliveryId, intent?.dataString) ?: return
         clearDeepLinkData(intent)
         deepLinkEvent = VortXDeepLinkEvent(target, ++deepLinkSequence)
+    }
+
+    private fun deliveryId(source: Intent?, restoredDeliveryId: String?, forceNew: Boolean): String {
+        val retained = source?.getStringExtra(EXTRA_DEEP_LINK_DELIVERY_ID)
+        if (!forceNew && restoredDeliveryId != null && retained == restoredDeliveryId) {
+            return retained
+        }
+        return UUID.randomUUID().toString().also { source?.putExtra(EXTRA_DEEP_LINK_DELIVERY_ID, it) }
     }
 
     private fun clearDeepLinkData(source: Intent?) {
@@ -111,7 +125,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        outState.putBoolean(STATE_DEEP_LINK_CONSUMED, deepLinkDelivery.consumed)
+        outState.putString(STATE_DEEP_LINK_DELIVERY_ID, deepLinkDelivery.consumedDeliveryId)
         super.onSaveInstanceState(outState)
     }
 
@@ -127,6 +141,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private companion object {
-        const val STATE_DEEP_LINK_CONSUMED = "vortx.deepLinkConsumed"
+        const val STATE_DEEP_LINK_DELIVERY_ID = "vortx.deepLinkDeliveryId"
+        const val EXTRA_DEEP_LINK_DELIVERY_ID = "com.vortx.android.extra.DEEP_LINK_DELIVERY_ID"
     }
 }

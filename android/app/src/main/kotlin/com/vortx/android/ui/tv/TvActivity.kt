@@ -11,6 +11,7 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.vortx.android.VortXApplication
 import com.vortx.android.deeplink.DeepLinkDeliveryState
 import com.vortx.android.deeplink.VortXDeepLinkEvent
+import java.util.UUID
 
 /// Android TV (10-foot / D-pad) entry point. This is the activity the `LEANBACK_LAUNCHER` intent lands on
 /// (see AndroidManifest.xml), kept DISTINCT from the phone [com.vortx.android.MainActivity] so the two
@@ -41,10 +42,11 @@ class TvActivity : ComponentActivity() {
         // the default fade is fine at 10 feet.
         installSplashScreen()
         super.onCreate(savedInstanceState)
+        val restoredDeliveryId = savedInstanceState?.getString(STATE_DEEP_LINK_DELIVERY_ID)
         deepLinkDelivery = DeepLinkDeliveryState(
-            restoredConsumed = savedInstanceState?.getBoolean(STATE_DEEP_LINK_CONSUMED) == true,
+            restoredConsumedDeliveryId = restoredDeliveryId,
         )
-        routeDeepLink(intent)
+        routeDeepLink(intent, restoredDeliveryId = restoredDeliveryId)
 
         val app = application as VortXApplication
         setContent {
@@ -60,18 +62,30 @@ class TvActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        deepLinkDelivery.beginNewIntent()
-        routeDeepLink(intent)
+        routeDeepLink(intent, forceNewDelivery = true)
     }
 
-    private fun routeDeepLink(intent: Intent?) {
-        if (deepLinkDelivery.consumed) {
+    private fun routeDeepLink(
+        intent: Intent?,
+        restoredDeliveryId: String? = null,
+        forceNewDelivery: Boolean = false,
+    ) {
+        val deliveryId = deliveryId(intent, restoredDeliveryId, forceNewDelivery)
+        if (deepLinkDelivery.isConsumed(deliveryId)) {
             clearDeepLinkData(intent)
             return
         }
-        val target = deepLinkDelivery.consume(intent?.dataString) ?: return
+        val target = deepLinkDelivery.consume(deliveryId, intent?.dataString) ?: return
         clearDeepLinkData(intent)
         deepLinkEvent = VortXDeepLinkEvent(target, ++deepLinkSequence)
+    }
+
+    private fun deliveryId(source: Intent?, restoredDeliveryId: String?, forceNew: Boolean): String {
+        val retained = source?.getStringExtra(EXTRA_DEEP_LINK_DELIVERY_ID)
+        if (!forceNew && restoredDeliveryId != null && retained == restoredDeliveryId) {
+            return retained
+        }
+        return UUID.randomUUID().toString().also { source?.putExtra(EXTRA_DEEP_LINK_DELIVERY_ID, it) }
     }
 
     private fun clearDeepLinkData(source: Intent?) {
@@ -81,11 +95,12 @@ class TvActivity : ComponentActivity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        outState.putBoolean(STATE_DEEP_LINK_CONSUMED, deepLinkDelivery.consumed)
+        outState.putString(STATE_DEEP_LINK_DELIVERY_ID, deepLinkDelivery.consumedDeliveryId)
         super.onSaveInstanceState(outState)
     }
 
     private companion object {
-        const val STATE_DEEP_LINK_CONSUMED = "vortx.deepLinkConsumed"
+        const val STATE_DEEP_LINK_DELIVERY_ID = "vortx.deepLinkDeliveryId"
+        const val EXTRA_DEEP_LINK_DELIVERY_ID = "com.vortx.android.extra.DEEP_LINK_DELIVERY_ID"
     }
 }

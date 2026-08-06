@@ -21,22 +21,20 @@ data class VortXDeepLinkEvent(
 )
 
 /**
- * One delivery latch for an Activity intent. Accepted URLs are consumed once; an invalid URL does not
- * poison the latch, and [beginNewIntent] opens it for a genuinely new `onNewIntent` delivery. Persist
- * [consumed] in the Activity instance state so configuration and process recreation cannot replay the
- * previously accepted URL.
+ * One delivery latch for Activity intents. Accepted URLs are consumed once per delivery identity; an
+ * invalid URL does not poison the latch. Persist [consumedDeliveryId] in Activity instance state so a
+ * recreation rejects the retained Intent while a genuinely new cold or warm Intent remains eligible,
+ * even when it carries the same URL.
  */
-class DeepLinkDeliveryState(restoredConsumed: Boolean = false) {
-    var consumed: Boolean = restoredConsumed
+class DeepLinkDeliveryState(restoredConsumedDeliveryId: String? = null) {
+    var consumedDeliveryId: String? = restoredConsumedDeliveryId
         private set
 
-    fun consume(rawUrl: String?): VortXDeepLink? {
-        if (consumed) return null
-        return VortXDeepLinks.parse(rawUrl)?.also { consumed = true }
-    }
+    fun isConsumed(deliveryId: String): Boolean = consumedDeliveryId == deliveryId
 
-    fun beginNewIntent() {
-        consumed = false
+    fun consume(deliveryId: String, rawUrl: String?): VortXDeepLink? {
+        if (isConsumed(deliveryId)) return null
+        return VortXDeepLinks.parse(rawUrl)?.also { consumedDeliveryId = deliveryId }
     }
 }
 
