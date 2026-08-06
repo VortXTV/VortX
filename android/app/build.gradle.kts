@@ -158,6 +158,10 @@ dependencies {
     // the JDK's javax.crypto in VortXCrypto, so Tink is the sole crypto dependency the account layer needs.
     implementation(libs.tink.android)
 
+    // QR generation for VortX account device sign-in. Core is Apache-2.0 and contains no camera UI;
+    // Android only encodes the approval URL already handled by the VortX account site.
+    implementation(libs.zxing.core)
+
     // ViewModel + collectAsStateWithLifecycle, so screens consume one-way state instead of calling
     // the repository inline. The real engine plugs in behind the repository with no ViewModel churn.
     implementation(libs.lifecycle.viewmodel.compose)

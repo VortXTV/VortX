@@ -1,5 +1,8 @@
 package com.vortx.android.ui.screens
 
+import android.graphics.Bitmap
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -7,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -19,13 +23,23 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.ui.unit.dp
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.qrcode.QRCodeWriter
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.PrimaryButton
@@ -35,6 +49,7 @@ import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.VortXAccountFormState
 import com.vortx.android.ui.viewmodel.VortXAccountMode
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
+import com.vortx.android.ui.viewmodel.VortXQrJoinState
 
 /// The VortX account screen (Settings > VortX Account): sign in / create / recover when signed out;
 /// account summary + Sync now + sign out when signed in. This is the surface that finally DRIVES
@@ -237,7 +252,15 @@ private fun AuthCard(viewModel: VortXAccountViewModel) {
     val recoveryInput by viewModel.recoveryInput.collectAsStateWithLifecycle()
     val formState by viewModel.formState.collectAsStateWithLifecycle()
     val totpRequired by viewModel.totpRequired.collectAsStateWithLifecycle()
+    val qrJoinState by viewModel.qrJoinState.collectAsStateWithLifecycle()
     val submitting = formState is VortXAccountFormState.Submitting
+
+    LaunchedEffect(mode) {
+        if (mode == VortXAccountMode.SIGN_IN) viewModel.startQrJoiner() else viewModel.stopQrJoiner()
+    }
+    DisposableEffect(viewModel) {
+        onDispose(viewModel::stopQrJoiner)
+    }
 
     SurfaceCard(modifier = Modifier.fillMaxWidth()) {
         Column(
@@ -264,6 +287,14 @@ private fun AuthCard(viewModel: VortXAccountViewModel) {
                     onClick = { viewModel.onModeChange(VortXAccountMode.REGISTER) })
                 Chip("Recover", selected = mode == VortXAccountMode.RECOVER, enabled = !submitting,
                     onClick = { viewModel.onModeChange(VortXAccountMode.RECOVER) })
+            }
+            if (mode == VortXAccountMode.SIGN_IN) {
+                QrJoinerBlock(qrJoinState, viewModel::retryQrJoiner)
+                Text(
+                    "or sign in with your password",
+                    style = VortXTheme.type.label.copy(color = colors.textSecondary),
+                    modifier = Modifier.align(Alignment.CenterHorizontally),
+                )
             }
             FormField(
                 value = login,
@@ -326,6 +357,76 @@ private fun AuthCard(viewModel: VortXAccountViewModel) {
         }
     }
 }
+
+@Composable
+private fun QrJoinerBlock(state: VortXQrJoinState, onRetry: () -> Unit) {
+    val colors = VortXTheme.colors
+    val qrSize = if (LocalConfiguration.current.screenWidthDp >= 800) 320.dp else 232.dp
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+    ) {
+        when (state) {
+            VortXQrJoinState.Idle -> {
+                Text("Sign in without typing on this device.", style = VortXTheme.type.body)
+                TextAction("Prepare sign-in code", onClick = onRetry)
+            }
+            VortXQrJoinState.Starting ->
+                Text("Preparing your sign-in code...", style = VortXTheme.type.body)
+            is VortXQrJoinState.Waiting -> {
+                val bitmap = remember(state.approvalUrl) { makeQrBitmap(state.approvalUrl) }
+                bitmap?.let {
+                    Image(
+                        bitmap = it.asImageBitmap(),
+                        contentDescription = "VortX account sign-in QR code",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .size(qrSize)
+                            .background(Color.White)
+                            .padding(VortXTheme.spacing.sm),
+                    )
+                }
+                Text(
+                    state.code,
+                    style = VortXTheme.type.cardTitle.copy(fontFamily = FontFamily.Monospace),
+                )
+                Text(
+                    "Scan the code, or go to vortx.tv/approve and enter it, on a phone or browser signed in to VortX.",
+                    style = VortXTheme.type.body.copy(color = colors.textSecondary),
+                )
+                if (state.reachTrouble) {
+                    Text(
+                        "Trouble reaching VortX. Still trying...",
+                        style = VortXTheme.type.label.copy(color = colors.danger),
+                    )
+                }
+            }
+            is VortXQrJoinState.SignedIn -> Text(
+                if (state.email.isBlank()) "Signed in to VortX" else "Signed in as ${state.email}",
+                style = VortXTheme.type.body.copy(color = colors.accent),
+            )
+            VortXQrJoinState.Failed -> {
+                Text(
+                    "That sign-in did not complete. Try again.",
+                    style = VortXTheme.type.body.copy(color = colors.danger),
+                )
+                TextAction("Try again", onClick = onRetry)
+            }
+        }
+    }
+}
+
+private fun makeQrBitmap(value: String): Bitmap? = runCatching {
+    val matrix = QRCodeWriter().encode(value, BarcodeFormat.QR_CODE, 512, 512)
+    val pixels = IntArray(matrix.width * matrix.height)
+    for (y in 0 until matrix.height) {
+        for (x in 0 until matrix.width) {
+            pixels[y * matrix.width + x] = if (matrix[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE
+        }
+    }
+    Bitmap.createBitmap(pixels, matrix.width, matrix.height, Bitmap.Config.ARGB_8888)
+}.getOrNull()
 
 /// The themed text field every form row here uses (same colors as the other settings forms).
 @Composable
