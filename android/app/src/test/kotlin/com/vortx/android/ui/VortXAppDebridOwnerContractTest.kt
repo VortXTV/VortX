@@ -101,8 +101,10 @@ class VortXAppDebridOwnerContractTest {
 
     private companion object {
         const val PLAYER_OWNER_SCOPED_KEY =
-            """key = "detail-${'$'}{showForNext.type.id}-${'$'}{showForNext.id}-${'$'}detailGeneration-${'$'}debridOwnerEpoch""""
+            """mediaId = showForNext.id,
+                            ownerEpoch = debridOwnerEpoch"""
         const val DETAIL_OWNER_SCOPED_KEY =
-            """key = "detail-${'$'}{current.type.id}-${'$'}{current.id}-${'$'}detailGeneration-${'$'}debridOwnerEpoch""""
+            """mediaId = current.id,
+                        ownerEpoch = debridOwnerEpoch"""
     }
 }

@@ -122,6 +122,13 @@ import kotlinx.coroutines.launch
 /// TVPlayerView.swift:810. Expressed in ms because Android reports position in ms.
 private const val AUTO_ADD_AFTER_MS = 60_000L
 
+internal fun detailViewModelKey(
+    prefix: String,
+    typeId: String,
+    mediaId: String,
+    ownerEpoch: String,
+): String = "$prefix-$typeId-$mediaId-$ownerEpoch"
+
 private enum class Tab(
     val label: String,
     val icon: ImageVector,
@@ -364,7 +371,12 @@ fun VortXApp(
             val advanceVm: DetailViewModel? =
                 if (showForNext != null && !playable.isTrailer) {
                     viewModel(
-                        key = "detail-${showForNext.type.id}-${showForNext.id}-$detailGeneration-$debridOwnerEpoch",
+                        key = detailViewModelKey(
+                            prefix = "detail",
+                            typeId = showForNext.type.id,
+                            mediaId = showForNext.id,
+                            ownerEpoch = debridOwnerEpoch,
+                        ),
                         factory = StremioXViewModelFactory(
                             repo = repo,
                             detailArgs = StremioXViewModelFactory.DetailArgs(showForNext.type, showForNext.id),
@@ -665,10 +677,16 @@ fun VortXApp(
             // The generation boundary deliberately tears down DetailScreen's local person/nested-title
             // navigation when a new deep-link event targets the same media id again.
             key(current.type, current.id, detailGeneration) {
-                // A ViewModel keyed to media type + id + this navigation generation, fed the same type+id
-                // through the factory. Type is part of the key because add-ons may reuse an id across kinds.
+                // The Compose generation resets local nested-screen state, while the Activity-scoped
+                // ViewModel key remains bounded by target and owner. Reopening the same title therefore
+                // reuses its ViewModel instead of retaining one live repository subscription per visit.
                 val detailVm: DetailViewModel = viewModel(
-                    key = "detail-${current.type.id}-${current.id}-$detailGeneration-$debridOwnerEpoch",
+                    key = detailViewModelKey(
+                        prefix = "detail",
+                        typeId = current.type.id,
+                        mediaId = current.id,
+                        ownerEpoch = debridOwnerEpoch,
+                    ),
                     factory = StremioXViewModelFactory(
                         repo = repo,
                         detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),

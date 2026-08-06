@@ -28,6 +28,7 @@ import com.vortx.android.model.Playable
 import com.vortx.android.player.PlayerScreen
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.ui.detailViewModelKey
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
@@ -135,10 +136,15 @@ fun TvApp(
             val current = detail
             if (current != null) {
                 key(current.type, current.id, detailGeneration) {
-                    // One DetailViewModel per navigation event, keyed by media type + id. Reusing an id
-                    // across movie and series add-ons can therefore never reuse the wrong ViewModel.
+                    // The Compose generation resets the local screen tree, while this Activity-scoped
+                    // ViewModel key remains bounded by target and owner so repeat visits do not leak VMs.
                     val detailVm: DetailViewModel = viewModel(
-                        key = "tv-detail-${current.type.id}-${current.id}-$detailGeneration-$debridOwnerEpoch",
+                        key = detailViewModelKey(
+                            prefix = "tv-detail",
+                            typeId = current.type.id,
+                            mediaId = current.id,
+                            ownerEpoch = debridOwnerEpoch,
+                        ),
                         factory = StremioXViewModelFactory(
                             repo = repo,
                             detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),

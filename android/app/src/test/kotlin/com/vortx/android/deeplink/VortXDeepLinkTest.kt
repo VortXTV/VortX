@@ -4,6 +4,7 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.Playable
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.detailViewModelKey
 import com.vortx.android.ui.screens.resolvedDetailPlayback
 import com.vortx.android.ui.viewmodel.Playback
 import java.io.File
@@ -144,19 +145,46 @@ class VortXDeepLinkTest {
     }
 
     @Test
-    fun `navigation keys include media type and repeated events reset detail state`() {
-        val phone = readProjectFile("src/main/kotlin/com/vortx/android/ui/StremioXApp.kt")
+    fun `navigation keys include media type and repeated events reset only local detail state`() {
+        val phone = readProjectFile("src/main/kotlin/com/vortx/android/ui/VortXApp.kt")
         val tv = readProjectFile("src/main/kotlin/com/vortx/android/ui/tv/TvApp.kt")
         val detail = readProjectFile("src/main/kotlin/com/vortx/android/ui/screens/DetailScreen.kt")
 
-        assertTrue(phone.contains("detail-${'$'}{showForNext.type.id}-${'$'}{showForNext.id}"))
-        assertTrue(phone.contains("detail-${'$'}{current.type.id}-${'$'}{current.id}"))
-        assertTrue(tv.contains("tv-detail-${'$'}{current.type.id}-${'$'}{current.id}"))
+        assertTrue(phone.contains("typeId = showForNext.type.id"))
+        assertTrue(phone.contains("mediaId = showForNext.id"))
+        assertTrue(phone.contains("typeId = current.type.id"))
+        assertTrue(phone.contains("mediaId = current.id"))
+        assertTrue(tv.contains("prefix = \"tv-detail\""))
+        assertTrue(tv.contains("typeId = current.type.id"))
         assertTrue(detail.contains("detail-nested-${'$'}{target.type.id}-${'$'}{target.id}"))
         assertTrue(phone.contains("key(current.type, current.id, detailGeneration)"))
         assertTrue(tv.contains("key(current.type, current.id, detailGeneration)"))
         assertTrue(phone.contains("detailGeneration += 1"))
         assertTrue(tv.contains("detailGeneration += 1"))
+        assertFalse(Regex("viewModel\\([\\s\\S]{0,240}detailGeneration").containsMatchIn(phone))
+        assertFalse(Regex("viewModel\\([\\s\\S]{0,240}detailGeneration").containsMatchIn(tv))
+        assertTrue(phone.contains("showWhatsNew = false"))
+    }
+
+    @Test
+    fun `repeat navigation to one target reuses one view model instance key`() {
+        val instances = mutableMapOf<String, Any>()
+        fun navigate(generation: Long): Any {
+            val key = detailViewModelKey("detail", "movie", "tt123", "owner:7")
+            return instances.getOrPut(key) { Any() }.also {
+                assertTrue(generation > 0)
+            }
+        }
+
+        val first = navigate(generation = 1)
+        val repeated = navigate(generation = 2)
+
+        assertSame(first, repeated)
+        assertEquals(1, instances.size)
+        assertNotEquals(
+            detailViewModelKey("detail", "movie", "tt123", "owner:7"),
+            detailViewModelKey("detail", "series", "tt123", "owner:7"),
+        )
     }
 
     private fun readProjectFile(relativePath: String): String {
