@@ -88,8 +88,9 @@ enum class VideoUpscaling(val storageValue: String, val label: String, val detai
         }
 
     /**
-     * Ordered file names of the bundled Anime4K shader chain (Mode A: restore + upscale, Medium CNN
-     * variants), resolved from the app's shaders folder at runtime. Order is significant. Empty otherwise.
+     * Required file names for the planned Anime4K shader chain (Mode A: restore + upscale, Medium CNN
+     * variants). Android currently ships neither these resources nor the application wiring that resolves
+     * and applies them, so [ANIME4K] is never exposed or returned as an effective Android preset.
      */
     val glslShaderFileNames: List<String>
         get() = when (this) {
@@ -107,7 +108,7 @@ enum class VideoUpscaling(val storageValue: String, val label: String, val detai
     companion object {
         fun fromStorage(raw: String?): VideoUpscaling? = entries.firstOrNull { it.storageValue == raw }
 
-        /** Android presets backed by shipped renderer resources. Anime4K needs shaders not yet in this APK. */
+        /** Implemented Android presets. Anime4K needs both packaged shaders and application wiring. */
         val androidChoices: List<VideoUpscaling> = entries.filterNot { it == ANIME4K }
     }
 }
@@ -117,8 +118,8 @@ enum class VideoUpscaling(val storageValue: String, val label: String, val detai
  * Apple's `TrackPreferences.current`/`.save()` and `PlaybackSettings.videoUpscaling` (both on `UserDefaults`).
  *
  * [isConstrainedDevice] is Android's live `PerformanceMode.isConstrainedDevice` result. It controls the
- * default preset. Anime4K falls back on every Android device because the APK does not yet ship its shader
- * files; keeping the stored value intact lets it become effective if those resources are added later.
+ * default preset. Anime4K falls back on every Android device because neither its shaders nor its application
+ * wiring are implemented; the stored value remains intact for cross-platform round trips.
  */
 class TrackPreferencesStore(
     context: Context,
@@ -146,8 +147,9 @@ class TrackPreferencesStore(
 
     /**
      * Video upscaling preset. Default is hardware-aware: a constrained device gets [VideoUpscaling.PERFORMANCE],
-     * everything else [VideoUpscaling.STANDARD]. Android never runs Anime4K while its shader resources are
-     * absent, even if a synced profile selected it. Mirrors Apple `PlaybackSettings.videoUpscaling`.
+     * everything else [VideoUpscaling.STANDARD]. Android never runs Anime4K until both its shader resources
+     * and application wiring exist, even if a synced profile selected it. Mirrors Apple
+     * `PlaybackSettings.videoUpscaling`.
      */
     var videoUpscaling: VideoUpscaling
         get() {

@@ -256,8 +256,8 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 
             SettingsSection(
                 title = "Video quality",
-                footer = "Applied by the built-in libmpv player on the next load. Anime4K stays unavailable " +
-                    "until its shader files ship in the Android app.",
+                footer = "Applied by the built-in libmpv player on the next load. Anime4K is not implemented " +
+                    "on Android; it requires both packaged shaders and application wiring.",
             ) {
                 VideoUpscaling.androidChoices.forEach { preset ->
                     OptionRow(

@@ -39,6 +39,12 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -299,7 +305,7 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
                 TvSettingsSection("Source selection") {
                     TvToggleRow(
                         label = "Direct links only",
-                        detail = "Hide every torrent source and show only direct or media-server links.",
+                        detail = "Hide unresolved torrents; keep direct, resolved debrid, and media-server links.",
                         checked = directLinksOnly,
                         onToggle = {
                             directLinksOnly = !directLinksOnly
@@ -491,7 +497,12 @@ private fun TvOptionRow(label: String, detail: String?, selected: Boolean, onCli
     val colors = VortXTheme.colors
     Surface(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .semantics(mergeDescendants = true) {
+                role = Role.RadioButton
+                this.selected = selected
+            },
         shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = colors.surface1,
@@ -549,7 +560,12 @@ private fun TvToggleRow(label: String, detail: String?, checked: Boolean, onTogg
     val colors = VortXTheme.colors
     Surface(
         onClick = onToggle,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .semantics(mergeDescendants = true) {
+                role = Role.Switch
+                toggleableState = if (checked) ToggleableState.On else ToggleableState.Off
+            },
         shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = colors.surface1,

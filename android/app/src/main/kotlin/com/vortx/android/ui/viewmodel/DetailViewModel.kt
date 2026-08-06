@@ -396,8 +396,14 @@ class DetailViewModel(
                 // Immediate paint of the ranked add-on groups (already ranked by the engine repo), then feed
                 // the model so the fuller assembled + re-ranked list refines it a beat later.
                 if (episodeId == _selectedEpisodeId.value) {
+                    // The assembly coalescer applies this same pure filter later, but immediate paint and the
+                    // once-latched Smart Source pick run before that publication. Filter their shared input
+                    // now so direct-links-only can never flash or auto-play a raw torrent. Keep [raw] for the
+                    // model/capture/cache lanes: their display assembly filters before ranking, while capture
+                    // intentionally sees eligible torrent descriptors before the viewer-only display filter.
+                    val displayRaw = SourceListModel.directLinkDisplayGroups(raw, ctx.directLinksOnly)
                     sourcesReady = true
-                    _streams.value = UiState.Success(raw)
+                    _streams.value = UiState.Success(displayRaw)
                     sourceModel.setRawGroups(raw)
                     runCacheCheck(raw, episodeId, season, episodeNum)
                     // Smart Source Selection auto-pick (viewer opt-in, once per episode tap): play the
@@ -415,9 +421,15 @@ class DetailViewModel(
                         val hint = pendingAdvanceHint
                         pendingAdvanceHint = null
                         val pick = if (hint != null) {
-                            StreamRanking.best(raw, continuity = hint.first, binge = hint.second, pin = currentPin(), prefs = ctx.prefs)
+                            StreamRanking.best(
+                                displayRaw,
+                                continuity = hint.first,
+                                binge = hint.second,
+                                pin = currentPin(),
+                                prefs = ctx.prefs,
+                            )
                         } else {
-                            StreamRanking.best(raw, prefs = ctx.prefs, pin = currentPin())
+                            StreamRanking.best(displayRaw, prefs = ctx.prefs, pin = currentPin())
                         }
                         when {
                             pick != null -> play(pick)

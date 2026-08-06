@@ -213,7 +213,7 @@ fun SourcesSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 )
                 ToggleRow(
                     label = "Direct links only",
-                    detail = "Hide every torrent source and show only direct or media-server links.",
+                    detail = "Hide unresolved torrents; keep direct, resolved debrid, and media-server links.",
                     checked = directLinksOnly,
                     onCheckedChange = { value ->
                         directLinksOnly = value

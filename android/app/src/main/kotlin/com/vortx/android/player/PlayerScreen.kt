@@ -525,10 +525,13 @@ fun PlayerScreen(
         skipSegments = SegmentResolver.resolve(candidates, durationSec)
     }
 
-    val autoSkipEnabled = remember(playable.url) {
+    // Keep the once-per-segment memory across same-episode source failover. A URL is source identity, not
+    // media identity; two failed sources for one episode must not cause the same intro to auto-skip twice.
+    val autoSkipIdentity = autoSkipMediaIdentity(playable)
+    val autoSkipEnabled = remember(autoSkipIdentity) {
         PlaybackBehaviorSettings.autoSkip(context.applicationContext)
     }
-    val autoSkippedStarts = remember(playable.url) { mutableSetOf<Double>() }
+    val autoSkippedStarts = remember(autoSkipIdentity) { mutableSetOf<Double>() }
     LaunchedEffect(autoSkipEnabled, skipSegments, playerState.positionMs / 1000L) {
         if (!autoSkipEnabled) return@LaunchedEffect
         val target = AutoSkipPolicy.target(skipSegments, latestState.positionMs, autoSkippedStarts)
@@ -1065,6 +1068,26 @@ private fun videoHeightOf(engine: PlayerEngine): Int {
     val resolution = runCatching { engine.playbackStats() }.getOrNull()
         ?.firstOrNull { it.first == "Resolution" }?.second ?: return 0
     return resolution.substringAfter('x', "").toIntOrNull() ?: 0
+}
+
+/**
+ * Stable media identity for automatic-skip lifecycle state. IMDb plus season/episode survives a source
+ * failover for the same title. A series row without a complete episode identity is not safely mappable, so
+ * it falls back to the concrete URL rather than sharing skip state across every episode of one show.
+ */
+internal fun autoSkipMediaIdentity(playable: Playable): String {
+    val ref = playable.mediaRef
+    val imdb = ref?.imdb?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+    if (imdb != null) {
+        if (ref.isSeries) {
+            val season = ref.season?.takeIf { it > 0 }
+            val episode = ref.episode?.takeIf { it > 0 }
+            if (season != null && episode != null) return "imdb:$imdb:s$season:e$episode"
+        } else {
+            return "imdb:$imdb"
+        }
+    }
+    return "url:${playable.url}"
 }
 
 /// Resolve the hosting [Activity] from a Compose [LocalContext], which may be a [ContextWrapper] chain
