@@ -1847,7 +1847,10 @@ final class MPVMetalViewController: PlatformViewController {
                 return
             }
 
-            let status = mpv_set_property_string(handle, "cscale", prior)
+            // The default sentinel returns cscale to mpv's unset state (empty string = libplacebo
+            // default); a real recorded scaler restores verbatim. Never a wrong literal on default.
+            let restoreValue = TVOSFramePresentationPolicy.restoreCscaleValue(prior: prior)
+            let status = mpv_set_property_string(handle, "cscale", restoreValue)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.framePresentationRestorePending = false
@@ -1907,30 +1910,35 @@ final class MPVMetalViewController: PlatformViewController {
             signalPeak: getDouble(MPVProperty.videoParamsSigPeak),
             customOptionKeys: PlaybackSettings.parsedCustomMpvOptions.map { $0.key }
         )
-        let shouldApply = TVOSFramePresentationPolicy.shouldUseBilinearChroma(input)
-        if !shouldApply {
-            restoreFramePresentationCscale()
-            return
-        }
-        guard !framePresentationMitigationApplied,
-              let prior = diagnosticString("cscale")
-                ?? diagnosticString("options/cscale"),
-              let handle = mpv else {
-            return
-        }
-        let status = mpv_set_property_string(handle, "cscale", "bilinear")
-        guard status >= 0 else {
-            mpvLog.error(
-                "tvOS frame presentation cscale apply failed: \(String(cString: mpv_error_string(status)), privacy: .public)"
-            )
-            return
-        }
-        framePresentationPriorCscale = prior
-        framePresentationMitigationApplied = true
-        DiagnosticsLog.log(
-            "perf",
-            "tvOS frame presentation armed gate=production-4k-hdr size=\(input.videoWidth)x\(input.videoHeight) gamma=\(input.gamma) sigPeak=\(input.signalPeak) priorCscale=\(prior)"
+        // The prior read is EMPTY on `.standard` (libplacebo default is unset), and diagnosticString
+        // maps empty -> nil. The pure decision treats that nil as the default sentinel and arms,
+        // instead of the old guard that bailed on an unreadable prior and so could never arm here.
+        let action = TVOSFramePresentationPolicy.armDecision(
+            shouldApply: TVOSFramePresentationPolicy.shouldUseBilinearChroma(input),
+            alreadyApplied: framePresentationMitigationApplied,
+            priorCscale: diagnosticString("cscale") ?? diagnosticString("options/cscale")
         )
+        switch action {
+        case .restore:
+            restoreFramePresentationCscale()
+        case .noChange:
+            break
+        case .arm(let prior):
+            guard let handle = mpv else { return }
+            let status = mpv_set_property_string(handle, "cscale", "bilinear")
+            guard status >= 0 else {
+                mpvLog.error(
+                    "tvOS frame presentation cscale apply failed: \(String(cString: mpv_error_string(status)), privacy: .public)"
+                )
+                return
+            }
+            framePresentationPriorCscale = prior
+            framePresentationMitigationApplied = true
+            DiagnosticsLog.log(
+                "perf",
+                "tvOS frame presentation armed gate=production-4k-hdr size=\(input.videoWidth)x\(input.videoHeight) gamma=\(input.gamma) sigPeak=\(input.signalPeak) priorCscale=\(prior)"
+            )
+        }
     }
 
     private func scheduleFramePresentationVOPassesSnapshot(

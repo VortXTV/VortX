@@ -7318,7 +7318,26 @@ struct TVPlayerView: View {
             isScrubbing: scrubbing,
             captureInFlight: localTrickplayCaptureInFlight
         ) else { return }
+        // 4K Dolby Vision aggravator (diag-23): the libmpv frame grab is serviced INLINE on mpv's VO
+        // thread inside MetalLayer.nextDrawable (an MPS scale + cmd.commit), so on a heavy 4K DV frame
+        // it extends the very next drawable wait and can tip the present pipeline into a drop. Skip
+        // local/community capture for exactly that content. The only cost is no community trickplay
+        // contribution on 4K DV titles (a feature cost, zero image risk). Checked here, after the
+        // cadence gate, so mediaSummary() reads only at capture boundaries, not every timePos tick.
+        if shouldSkipTrickplayCaptureForUHDDolbyVision() { return }
         captureTrickplayFrame(at: time)
+    }
+
+    /// True only for a 4K (UHD) Dolby Vision libmpv frame, reusing the chroma mitigation's own UHD
+    /// gate so both read one definition. Fail-open: a non-DV player, or an unknown resolution before
+    /// mpv has probed the stream, returns false so capture stays enabled. Non-4K and non-DV content
+    /// are unaffected.
+    private func shouldSkipTrickplayCaptureForUHDDolbyVision() -> Bool {
+        guard let player = coordinator.player, player.contentIsDolbyVision else { return false }
+        let summary = player.mediaSummary()
+        guard summary.width > 0, summary.height > 0 else { return false }
+        return TVOSFramePresentationPolicy.isUltraHighDefinition(
+            width: summary.width, height: summary.height)
     }
 
     /// The one place a trickplay frame is grabbed (from the timePos tick OR the wall-clock timer). Engine-

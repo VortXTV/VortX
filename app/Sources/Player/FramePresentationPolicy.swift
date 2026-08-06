@@ -13,15 +13,18 @@ enum TVOSFramePresentationPolicy {
         let customOptionKeys: [String]
     }
 
+    /// The 4K/UHD gate shared by the chroma mitigation and the trickplay-capture skip, so both
+    /// answer "is this an Ultra HD frame" from one definition instead of two drifting copies.
+    static func isUltraHighDefinition(width: Int, height: Int) -> Bool {
+        max(width, height) >= 3_840 && min(width, height) >= 1_600
+    }
+
     static func shouldUseBilinearChroma(_ input: Input) -> Bool {
         let gamma = input.gamma.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let hdr = gamma == "pq" || gamma == "hlg" || input.dolbyVision
             || (input.signalPeak.isFinite && input.signalPeak > 1)
-        let maximumDimension = max(input.videoWidth, input.videoHeight)
-        let minimumDimension = min(input.videoWidth, input.videoHeight)
-        let is4K = maximumDimension >= 3_840 && minimumDimension >= 1_600
         return input.fullPlayer && input.standardQuality
-            && is4K && hdr
+            && isUltraHighDefinition(width: input.videoWidth, height: input.videoHeight) && hdr
             && !hasCustomRendererOrScaler(input.customOptionKeys)
     }
 
@@ -40,6 +43,50 @@ enum TVOSFramePresentationPolicy {
             }
             return key == "glsl-shaders" || key.hasPrefix("glsl-shader-")
         }
+    }
+
+    /// Sentinel recorded as the prior cscale when the live read is empty/unset, i.e. the libplacebo
+    /// default chroma scaler is active. It is NOT a real mpv scaler name, so `restoreCscaleValue`
+    /// maps it back to mpv's "unset, use default" on teardown. This is the crux of the fix: on
+    /// `.standard` the cscale property reads empty, and the old arm guard treated an empty read as a
+    /// reason to BAIL, so the mitigation could never arm on exactly the 4K DV case it targets.
+    static let defaultCscaleToken = "default"
+
+    enum CscaleAction: Equatable {
+        /// Not eligible (or the caller must otherwise return to default): restore/clear.
+        case restore
+        /// Eligible but the mitigation is already applied: leave the armed state untouched.
+        case noChange
+        /// Eligible and not yet applied: record `prior`, then set cscale to bilinear.
+        case arm(prior: String)
+    }
+
+    /// The pure arm decision. An empty/nil prior read is the libplacebo DEFAULT (cscale unset),
+    /// which is precisely the `.standard` case the mitigation targets, so it must ARM on the
+    /// default sentinel rather than treat an unreadable prior as a reason to bail. A real recorded
+    /// scaler name is preserved verbatim so restore returns to it.
+    static func armDecision(
+        shouldApply: Bool,
+        alreadyApplied: Bool,
+        priorCscale: String?
+    ) -> CscaleAction {
+        guard shouldApply else { return .restore }
+        guard !alreadyApplied else { return .noChange }
+        let prior: String
+        if let trimmed = priorCscale?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !trimmed.isEmpty {
+            prior = trimmed
+        } else {
+            prior = defaultCscaleToken
+        }
+        return .arm(prior: prior)
+    }
+
+    /// The value to write back on restore. The default sentinel returns cscale to mpv's unset state
+    /// (empty string = libplacebo default chroma scaler); a real recorded scaler restores verbatim.
+    /// It never emits a wrong literal scaler for the default case.
+    static func restoreCscaleValue(prior: String) -> String {
+        prior == defaultCscaleToken ? "" : prior
     }
 }
 

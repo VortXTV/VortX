@@ -286,7 +286,7 @@ private func productionWiring() {
         FramePresentationWiringRule(
             name: "failed live-handle restore remains retryable",
             file: "MPVMetalViewController.swift",
-            searchAfter: #"let status = mpv_set_property_string(handle, "cscale", prior)"#,
+            searchAfter: #"let status = mpv_set_property_string(handle, "cscale", restoreValue)"#,
             start: "self.framePresentationRestorePending = false",
             end: "DiagnosticsLog.log(",
             exactSection: #"""
@@ -320,7 +320,7 @@ private func productionWiring() {
         FramePresentationWiringRule(
             name: "successful live-handle restore clears mitigation state",
             file: "MPVMetalViewController.swift",
-            searchAfter: #"let status = mpv_set_property_string(handle, "cscale", prior)"#,
+            searchAfter: #"let status = mpv_set_property_string(handle, "cscale", restoreValue)"#,
             mutationAfter: "guard status >= 0 else {",
             start: "self.framePresentationRestorePending = false",
             end: "DiagnosticsLog.log(",
@@ -415,6 +415,7 @@ private enum FramePresentationPolicyTests {
     static func main() {
         productionWiring()
         policy()
+        cscaleArmDecision()
         resetSafeCounters()
         presentedSamplingCadence()
         intervalScopedAggregates()
@@ -469,6 +470,64 @@ private enum FramePresentationPolicyTests {
             check("\(key) custom option vetoes",
                   !TVOSFramePresentationPolicy.shouldUseBilinearChroma(input(custom: [key])))
         }
+    }
+
+    @MainActor
+    private static func cscaleArmDecision() {
+        typealias Policy = TVOSFramePresentationPolicy
+
+        // THE FIX A core: predicate passes AND the prior cscale read is empty/nil (the `.standard`
+        // libplacebo-default case) must ARM on the default sentinel, not bail. The old guard bailed
+        // on an unreadable prior, so the mitigation could never arm on exactly its 4K DV target.
+        check("nil prior arms on default sentinel",
+              Policy.armDecision(shouldApply: true, alreadyApplied: false, priorCscale: nil)
+                == .arm(prior: Policy.defaultCscaleToken))
+        check("empty prior arms on default sentinel",
+              Policy.armDecision(shouldApply: true, alreadyApplied: false, priorCscale: "")
+                == .arm(prior: Policy.defaultCscaleToken))
+        check("whitespace-only prior arms on default sentinel",
+              Policy.armDecision(shouldApply: true, alreadyApplied: false, priorCscale: "  ")
+                == .arm(prior: Policy.defaultCscaleToken))
+
+        // A real recorded scaler is preserved verbatim so restore returns to it.
+        check("real prior is recorded verbatim",
+              Policy.armDecision(shouldApply: true, alreadyApplied: false,
+                                 priorCscale: "ewa_lanczossharp")
+                == .arm(prior: "ewa_lanczossharp"))
+        check("real prior is trimmed",
+              Policy.armDecision(shouldApply: true, alreadyApplied: false,
+                                 priorCscale: " ewa_lanczossharp ")
+                == .arm(prior: "ewa_lanczossharp"))
+
+        // Already applied does not re-arm; ineligible restores.
+        check("already applied makes no change",
+              Policy.armDecision(shouldApply: true, alreadyApplied: true, priorCscale: nil)
+                == .noChange)
+        check("ineligible restores regardless of prior",
+              Policy.armDecision(shouldApply: false, alreadyApplied: false,
+                                 priorCscale: "ewa_lanczossharp") == .restore)
+        check("ineligible restores even when already applied",
+              Policy.armDecision(shouldApply: false, alreadyApplied: true, priorCscale: nil)
+                == .restore)
+
+        // Restore maps the sentinel back to the libplacebo DEFAULT (empty = mpv unset), never a
+        // wrong literal scaler; a real scaler restores verbatim.
+        check("sentinel restores to default (empty), not a literal scaler",
+              Policy.restoreCscaleValue(prior: Policy.defaultCscaleToken) == "")
+        check("real scaler restores verbatim",
+              Policy.restoreCscaleValue(prior: "ewa_lanczossharp") == "ewa_lanczossharp")
+
+        // FIX B shares this UHD gate with the mitigation predicate.
+        check("UHD gate: 3840x2160 is UHD",
+              Policy.isUltraHighDefinition(width: 3_840, height: 2_160))
+        check("UHD gate: portrait 2160x3840 is UHD",
+              Policy.isUltraHighDefinition(width: 2_160, height: 3_840))
+        check("UHD gate: 1920x1080 is not UHD",
+              !Policy.isUltraHighDefinition(width: 1_920, height: 1_080))
+        check("UHD gate: 3840x1599 is not UHD",
+              !Policy.isUltraHighDefinition(width: 3_840, height: 1_599))
+        check("UHD gate: unknown 0x0 is not UHD (fail-open signal)",
+              !Policy.isUltraHighDefinition(width: 0, height: 0))
     }
 
     @MainActor
