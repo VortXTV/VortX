@@ -3,6 +3,9 @@ package com.vortx.android.backup
 import com.vortx.android.profile.UserProfile
 import org.json.JSONObject
 import java.text.SimpleDateFormat
+import java.time.OffsetDateTime
+import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeParseException
 import java.util.Base64
 import java.util.Date
 import java.util.Locale
@@ -147,8 +150,8 @@ object SettingsBackup {
      *
      * Every one of the seven fields is REQUIRED: Apple decodes into a non-optional `Codable` struct, so a
      * missing field throws and the whole blob is rejected as `notABackup` (`SettingsBackup.swift:111`).
-     * `createdAt` must be ISO8601 with NO fractional seconds, because Swift's `.iso8601` strategy uses
-     * `ISO8601DateFormatter` with default `.withInternetDateTime`, which does not parse them.
+     * `createdAt` is emitted in Apple's canonical UTC second-precision shape. Current Foundation decoders
+     * also accept fractional seconds and numeric offsets, which [decodeDomain] deliberately tolerates.
      *
      * Returns null when the domain holds a value [BinaryPlist] cannot represent exactly.
      */
@@ -173,8 +176,14 @@ object SettingsBackup {
      */
     fun decodeDomain(data: ByteArray): Map<String, Any>? {
         val env = runCatching { JSONObject(String(data, Charsets.UTF_8)) }.getOrNull() ?: return null
-        if (env.optString("format") != FORMAT_TAG) return null
-        val payload = env.optString("payloadBase64", "")
+        if (!hasString(env, "format") || env.getString("format") != FORMAT_TAG) return null
+        if (!hasJsonInt(env, "schema")) return null
+        if (!hasString(env, "app")) return null
+        if (!hasString(env, "bundleID")) return null
+        if (!hasAppleIso8601Date(env, "createdAt")) return null
+        if (!hasJsonInt(env, "keyCount")) return null
+        if (!hasString(env, "payloadBase64")) return null
+        val payload = env.getString("payloadBase64")
         if (payload.isEmpty()) return null
         val plist = runCatching { Base64.getDecoder().decode(payload) }.getOrNull() ?: return null
         val decoded = BinaryPlist.decode(plist) as? Map<*, *> ?: return null
@@ -227,23 +236,30 @@ object SettingsBackup {
     }
 
     /**
-     * Resolve the lossless settings carrier against the legacy `doc.vortx` fallback. A valid, non-empty
-     * settings roster wins same-id fields because Apple's dashboard summary omits own-account identity,
-     * while profiles unique to either carrier survive. A missing or unreadable settings blob leaves the
-     * fallback untouched.
+     * Resolve the lossless settings carrier against `doc.vortx`. A valid, non-empty settings roster always
+     * wins same-id fields over the lossy dashboard summary because that summary omits account identity.
+     * When `doc.vortx.roster` is present, both carriers are lossless, so their own modification stamps pick
+     * same-id fields. Profiles unique to either carrier survive and the maximum stamp moves forward.
+     * A missing or unreadable settings blob leaves the fallback untouched.
      */
     fun resolveRosterForPull(
         pulledBlob: Any?,
         fallbackRoster: List<UserProfile>?,
         fallbackModifiedSeconds: Long?,
+        fallbackIsLossless: Boolean = false,
     ): ResolvedRoster {
         val settingsRoster = rosterFromBlob(pulledBlob)?.takeIf { it.isNotEmpty() }
             ?: return ResolvedRoster(fallbackRoster, fallbackModifiedSeconds)
-        val settingsIds = settingsRoster.mapTo(HashSet()) { it.id }
-        val merged = settingsRoster + fallbackRoster.orEmpty().filterNot { settingsIds.contains(it.id) }
+        val settingsModifiedSeconds = rosterModifiedFromBlob(pulledBlob)
+        val settingsWinsSameId = !fallbackIsLossless ||
+            (settingsModifiedSeconds ?: Long.MIN_VALUE) >= (fallbackModifiedSeconds ?: Long.MIN_VALUE)
+        val preferred = if (settingsWinsSameId) settingsRoster else fallbackRoster.orEmpty()
+        val secondary = if (settingsWinsSameId) fallbackRoster.orEmpty() else settingsRoster
+        val preferredIds = preferred.mapTo(HashSet()) { it.id }
+        val merged = preferred + secondary.filterNot { preferredIds.contains(it.id) }
         return ResolvedRoster(
             roster = merged,
-            modifiedSeconds = rosterModifiedFromBlob(pulledBlob) ?: fallbackModifiedSeconds,
+            modifiedSeconds = listOfNotNull(settingsModifiedSeconds, fallbackModifiedSeconds).maxOrNull(),
         )
     }
 
@@ -295,11 +311,39 @@ object SettingsBackup {
     }
 
     /**
-     * Apple's `.iso8601` wire format: UTC, second precision, trailing Z. Fractional seconds would make
-     * Swift's decoder throw and reject the whole envelope as `notABackup`.
+     * Apple's encoder wire format: UTC, second precision, trailing Z.
      */
     private fun iso8601(date: Date): String =
         SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
             .apply { timeZone = TimeZone.getTimeZone("UTC") }
             .format(date)
+
+    private fun hasString(objectValue: JSONObject, key: String): Boolean =
+        objectValue.has(key) && !objectValue.isNull(key) && objectValue.opt(key) is String
+
+    /** Swift `Codable` requires a JSON integer for both `schema` and `keyCount`; strings/bools fail. */
+    private fun hasJsonInt(objectValue: JSONObject, key: String): Boolean {
+        if (!objectValue.has(key) || objectValue.isNull(key)) return false
+        val value = objectValue.opt(key)
+        return value is Number && value.toDouble().isFinite() &&
+            value.toDouble() == value.toLong().toDouble()
+    }
+
+    /** Apple's `.iso8601` decoder accepts internet date-time, optional fractions, and an explicit offset. */
+    private fun hasAppleIso8601Date(objectValue: JSONObject, key: String): Boolean {
+        if (!hasString(objectValue, key)) return false
+        val raw = objectValue.getString(key)
+        if (!APPLE_ISO8601.matches(raw)) return false
+        val normalized = COMPACT_ISO8601_OFFSET.replace(raw, "\$1:\$2")
+        return try {
+            OffsetDateTime.parse(normalized, DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+            true
+        } catch (_: DateTimeParseException) {
+            false
+        }
+    }
+
+    private val APPLE_ISO8601 =
+        Regex("""^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}(?::?\d{2})?)$""")
+    private val COMPACT_ISO8601_OFFSET = Regex("""([+-]\d{2})(\d{2})$""")
 }

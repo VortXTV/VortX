@@ -190,6 +190,8 @@ data class PlaybackPrefs(
     val subColor: String,
     val subBackground: String,
     val subSizeScale: Double? = null,
+    /** Apple `PlaybackPrefs.subBrightness` string percentage (#155); null preserves older rosters. */
+    val subBrightness: String? = null,
     /** Raw `SourceType` values, top priority first. */
     val sourceTypeOrder: List<String>? = null,
     val useAddonOrder: Boolean? = null,
@@ -222,6 +224,7 @@ data class PlaybackPrefs(
             put("subColor", p.subColor)
             put("subBackground", p.subBackground)
             p.subSizeScale?.let { put("subSizeScale", it) }
+            p.subBrightness?.let { put("subBrightness", it) }
             p.sourceTypeOrder?.let { put("sourceTypeOrder", JSONArray(it)) }
             p.useAddonOrder?.let { put("useAddonOrder", it) }
             p.safetyMode?.let { put("safetyMode", it) }
@@ -251,6 +254,7 @@ data class PlaybackPrefs(
             subColor = o.optString("subColor", ""),
             subBackground = o.optString("subBackground", ""),
             subSizeScale = o.optDoubleOrNull("subSizeScale"),
+            subBrightness = o.optStringOrNull("subBrightness"),
             sourceTypeOrder = o.optJSONArray("sourceTypeOrder")?.toStringList(),
             useAddonOrder = o.optBooleanOrNull("useAddonOrder"),
             safetyMode = o.optStringOrNull("safetyMode"),

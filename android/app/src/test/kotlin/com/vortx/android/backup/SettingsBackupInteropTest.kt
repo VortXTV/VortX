@@ -1,6 +1,8 @@
 package com.vortx.android.backup
 
 import com.vortx.android.profile.UserProfile
+import com.vortx.android.sync.VortXSyncDoc
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -100,6 +102,119 @@ class SettingsBackupInteropTest {
     }
 
     @Test
+    fun newerFullVortxRosterBeatsOlderSettingsFieldsAndCarriesTheClockForward() {
+        val sharedId = "22000000-0000-0000-0000-000000000002"
+        val oldSettings = profile(id = sharedId, name = "Old settings")
+        val newFullRoster = profile(id = sharedId, name = "New full roster")
+        val oldBlob = blobFromDomain(
+            mapOf(
+                SettingsBackup.ROSTER_KEY to
+                    UserProfile.encodeRoster(listOf(oldSettings)).toByteArray(Charsets.UTF_8),
+                SettingsBackup.MODIFIED_KEY to 10.0,
+            ),
+        )
+
+        val parsed = VortXSyncDoc.parse(
+            JSONObject().put(
+                "vortx",
+                JSONObject()
+                    .put("roster", JSONArray().put(UserProfile.encodeProfile(newFullRoster)))
+                    .put("rosterModified", 20L),
+            ),
+        )
+        assertTrue(parsed.rosterIsLossless)
+        val resolved = SettingsBackup.resolveRosterForPull(
+            pulledBlob = oldBlob,
+            fallbackRoster = parsed.roster,
+            fallbackModifiedSeconds = parsed.rosterModifiedSeconds,
+            fallbackIsLossless = parsed.rosterIsLossless,
+        )
+
+        assertEquals(listOf(newFullRoster), resolved.roster)
+        assertEquals(20L, resolved.modifiedSeconds)
+
+        // Models pull-then-repush: the adopted maximum watermark must replace the old settings stamp.
+        val republished = SettingsBackup.settingsBlobFor(
+            pulledBlob = oldBlob,
+            roster = requireNotNull(resolved.roster),
+            rosterModifiedSeconds = requireNotNull(resolved.modifiedSeconds),
+            bundleId = "com.vortx.android",
+            now = Date(0L),
+        )
+        assertEquals(listOf(newFullRoster), SettingsBackup.rosterFromBlob(republished))
+        assertEquals(20L, SettingsBackup.rosterModifiedFromBlob(republished))
+    }
+
+    @Test
+    fun appleSubBrightnessSurvivesFullRosterAndSummaryRoundTrips() {
+        val appleProfileJson = JSONObject()
+            .put("id", "23000000-0000-0000-0000-000000000002")
+            .put("name", "Apple")
+            .put("avatar", "A")
+            .put("accentID", "ember")
+            .put("oled", false)
+            .put("textScale", 1.0)
+            .put("usesOwnAccount", false)
+            .put("isOwner", false)
+            .put("familyEdit", false)
+            .put("isKids", false)
+            .put(
+                "playback",
+                JSONObject()
+                    .put("audioLang", "en")
+                    .put("subtitleLang", "en")
+                    .put("forcedPolicy", "forced")
+                    .put("subFont", "modern")
+                    .put("subSize", "m")
+                    .put("subColor", "white")
+                    .put("subBackground", "outline")
+                    .put("subBrightness", "75"),
+            )
+        val appleBlob = blobFromDomain(
+            mapOf(
+                SettingsBackup.ROSTER_KEY to
+                    JSONArray().put(appleProfileJson).toString().toByteArray(Charsets.UTF_8),
+                SettingsBackup.MODIFIED_KEY to 30.0,
+            ),
+        )
+        val decoded = requireNotNull(SettingsBackup.rosterFromBlob(appleBlob)).single()
+        assertEquals("75", decoded.playback?.subBrightness)
+
+        val rebuilt = SettingsBackup.settingsBlobFor(
+            pulledBlob = appleBlob,
+            roster = listOf(decoded),
+            rosterModifiedSeconds = 30L,
+            bundleId = "com.vortx.android",
+            now = Date(0L),
+        )
+        val rawRoster = String(rawDomain(rebuilt)[SettingsBackup.ROSTER_KEY] as ByteArray, Charsets.UTF_8)
+        assertEquals("75", JSONArray(rawRoster).getJSONObject(0).getJSONObject("playback").getString("subBrightness"))
+        assertEquals("75", VortXSyncDoc.playbackSummary(requireNotNull(decoded.playback)).getString("subBrightness"))
+
+        val summaryDoc = JSONObject().put(
+            "vortx",
+            JSONObject().put(
+                "profiles",
+                JSONArray().put(
+                    JSONObject()
+                        .put("id", decoded.id)
+                        .put("name", decoded.name)
+                        .put("settings", JSONObject().put("playback", JSONObject()
+                            .put("audioLang", "en")
+                            .put("subtitleLang", "en")
+                            .put("forced", "forced")
+                            .put("subFont", "modern")
+                            .put("subSize", "m")
+                            .put("subColor", "white")
+                            .put("subBackground", "outline")
+                            .put("subBrightness", "75"))),
+                ),
+            ),
+        )
+        assertEquals("75", VortXSyncDoc.parse(summaryDoc).roster?.single()?.playback?.subBrightness)
+    }
+
+    @Test
     fun malformedPulledBlobIsNeverReplacedByALocalSnapshot() {
         val roster = listOf(profile(name = "Local"))
 
@@ -119,6 +234,58 @@ class SettingsBackupInteropTest {
                 bundleId = "com.vortx.android",
             ),
         )
+    }
+
+    @Test
+    fun envelopeRequiresEveryAppleCodableFieldWithItsWireType() {
+        val valid = JSONObject(
+            String(
+                requireNotNull(
+                    SettingsBackup.encode(
+                        domain = mapOf("vortx.future.setting" to true),
+                        bundleId = "com.vortx.apple",
+                        app = "VortX",
+                        now = Date(0L),
+                    ),
+                ),
+                Charsets.UTF_8,
+            ),
+        )
+        val required = listOf("format", "schema", "app", "bundleID", "createdAt", "keyCount", "payloadBase64")
+        required.forEach { key ->
+            val missing = JSONObject(valid.toString()).apply { remove(key) }
+            assertNull("missing $key", SettingsBackup.decodeDomain(missing.toString().toByteArray()))
+            assertNull("missing $key must not be rewritten", rewriteMalformedEnvelope(missing))
+        }
+        val wrongTypes = mapOf<String, Any>(
+            "format" to 1,
+            "schema" to "1",
+            "app" to true,
+            "bundleID" to 7,
+            "createdAt" to 0,
+            "keyCount" to "1",
+            "payloadBase64" to false,
+        )
+        wrongTypes.forEach { (key, value) ->
+            val malformed = JSONObject(valid.toString()).put(key, value)
+            assertNull("wrong type $key", SettingsBackup.decodeDomain(malformed.toString().toByteArray()))
+            assertNull("wrong type $key must not be rewritten", rewriteMalformedEnvelope(malformed))
+        }
+        for (compatible in listOf(
+            "1970-01-01T00:00:00.123Z",
+            "1970-01-01T01:00:00+01:00",
+            "1970-01-01T00:00:00+0000",
+            "1970-01-01T00:00:00+00",
+        )) {
+            val compatibleDate = JSONObject(valid.toString()).put("createdAt", compatible)
+            assertTrue(
+                "Apple-compatible date $compatible",
+                SettingsBackup.decodeDomain(compatibleDate.toString().toByteArray()) != null,
+            )
+        }
+        val badDate = JSONObject(valid.toString()).put("createdAt", "not-an-iso8601-date")
+        assertNull("invalid date", SettingsBackup.decodeDomain(badDate.toString().toByteArray()))
+        assertNull("bad date must not be rewritten", rewriteMalformedEnvelope(badDate))
     }
 
     @Test
@@ -251,6 +418,14 @@ class SettingsBackupInteropTest {
             key to value
         }
     }
+
+    private fun rewriteMalformedEnvelope(envelope: JSONObject): String? =
+        SettingsBackup.settingsBlobFor(
+            pulledBlob = Base64.getEncoder().encodeToString(envelope.toString().toByteArray()),
+            roster = listOf(profile(name = "Local")),
+            rosterModifiedSeconds = 1L,
+            bundleId = "com.vortx.android",
+        )
 
     private fun profile(
         id: String = UserProfile.newId(),

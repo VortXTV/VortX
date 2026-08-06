@@ -1350,6 +1350,7 @@ class VortXSyncManager(context: Context) {
             pulledBlob = doc.opt("settings"),
             fallbackRoster = parsed.roster,
             fallbackModifiedSeconds = parsed.rosterModifiedSeconds,
+            fallbackIsLossless = parsed.rosterIsLossless,
         )
         // ProfileStore is a main-thread store (mirroring Apple's @MainActor); fold + build on Main.
         val published = withContext(Dispatchers.Main) {
@@ -1420,6 +1421,7 @@ class VortXSyncManager(context: Context) {
             pulledBlob = doc.opt("settings"),
             fallbackRoster = parsed.roster,
             fallbackModifiedSeconds = parsed.rosterModifiedSeconds,
+            fallbackIsLossless = parsed.rosterIsLossless,
         )
         var restored = false
         val published = withContext(Dispatchers.Main) {

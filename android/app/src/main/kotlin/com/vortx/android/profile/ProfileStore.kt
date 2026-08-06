@@ -283,6 +283,9 @@ class ProfileStore private constructor(context: Context) {
             subColor = base?.subColor ?: DEFAULT_SUB_COLOR,
             subBackground = base?.subBackground ?: DEFAULT_SUB_BACKGROUND,
             subSizeScale = base?.subSizeScale,
+            // Android does not apply the Apple brightness vocabulary yet, but it must carry the value
+            // losslessly so a profile round-trip cannot erase an Apple-side preference.
+            subBrightness = base?.subBrightness,
             // The FULL resolved order (never null), like Apple's SourcePreferences.typeOrder. A null here
             // would diff against the default order applyPlayback writes, spuriously re-pushing the roster.
             sourceTypeOrder = readFullOrder(),
@@ -466,6 +469,15 @@ class ProfileStore private constructor(context: Context) {
      *  same-id conflict. The sync layer must feed [mergeInRoster]'s `incomingModified` in seconds too. */
     val rosterModified: Long get() = prefs.getLong(MODIFIED_KEY, 0L)
 
+    /**
+     * Adopt a pulled roster's monotone high-water mark even when its fields already equal local state.
+     * Without this write, a later unrelated push republishes an older clock through both carriers and a
+     * stale peer can win the next same-id fold. This is housekeeping, so it never schedules a push.
+     */
+    private fun adoptRosterWatermark(next: Long) {
+        if (next > rosterModified) prefs.edit().putLong(MODIFIED_KEY, next).apply()
+    }
+
     // ---- Delete tombstones ----
 
     private fun loadDeletedTombstones() {
@@ -552,7 +564,8 @@ class ProfileStore private constructor(context: Context) {
      */
     fun mergeInRoster(incoming: List<UserProfile>, incomingModified: Long? = null) {
         if (incoming.isEmpty()) return
-        val preferIncoming = (incomingModified ?: Long.MIN_VALUE) > rosterModified
+        val clock = rosterClockDecision(rosterModified, incomingModified)
+        val preferIncoming = clock.preferIncoming
         val local = profiles
         val incomingByID = incoming.associateBy { it.id }
         val localByID = local.associateBy { it.id }
@@ -576,9 +589,14 @@ class ProfileStore private constructor(context: Context) {
         // SUBTRACT delete tombstones: a deleted profile must NOT come back, even if a peer still carries it.
         merged.removeAll { deletedProfileIDs.contains(it.id) && !it.isOwner }
 
-        if (merged == profiles) return   // no change once ids + chosen fields already match; never loops
+        if (merged == profiles) {
+            // The carrier watermark is state too. Persist it even when the roster payload is identical.
+            adoptRosterWatermark(clock.effectiveModified)
+            return
+        }
         profiles = merged
         afterRosterFold()
+        adoptRosterWatermark(clock.effectiveModified)
     }
 
     /** Whether [incoming] is a genuinely different roster (by the SET of ids). Mirrors Apple `rosterDiffers`. */
@@ -723,4 +741,18 @@ class ProfileStore private constructor(context: Context) {
         /** The shared instance, or null before [init] (safe for early-boot wiring lambdas). */
         fun sharedOrNull(): ProfileStore? = instance
     }
+}
+
+/** Pure clock fold shared by field selection and the persisted high-water mark. */
+internal data class RosterClockDecision(
+    val preferIncoming: Boolean,
+    val effectiveModified: Long,
+)
+
+internal fun rosterClockDecision(localModified: Long, incomingModified: Long?): RosterClockDecision {
+    val incoming = incomingModified ?: Long.MIN_VALUE
+    return RosterClockDecision(
+        preferIncoming = incoming > localModified,
+        effectiveModified = maxOf(localModified, incoming),
+    )
 }
