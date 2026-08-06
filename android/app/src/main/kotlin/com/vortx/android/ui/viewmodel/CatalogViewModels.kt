@@ -250,7 +250,7 @@ class HomeViewModel internal constructor(
 
     private fun refreshPersonalizedRails() {
         val owner = currentReleaseOwner()
-        applyReleaseCalendar(releaseCalendar.activate(owner))
+        if (applyReleaseCalendar(releaseCalendar.activate(owner))) publishHome()
         val rows = baseRows
         personalizedJob?.cancel()
         personalizedJob = viewModelScope.launch {

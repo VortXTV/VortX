@@ -35,5 +35,32 @@ class TvHomeIdentityTest {
         assertEquals("SERIES|tt1", tvHomeItemKey(series))
     }
 
+    @Test
+    fun `profile catalog replacement keeps only a currently visible exact hero identity`() {
+        val focused = movie("tt-shared", "Profile A movie")
+        val refreshedFocused = focused.copy(name = "Profile A movie, refreshed")
+        val retained = tvHomeHeroSelection(
+            tvHomeItemKey(focused),
+            listOf(Catalog("profile-a", "Profile A", listOf(movie("tt-first", "First"), refreshedFocused))),
+        )
+        assertEquals(refreshedFocused, retained.item)
+        assertEquals(tvHomeItemKey(refreshedFocused), retained.key)
+
+        val sameIdDifferentType = MetaItem("tt-shared", MediaType.SERIES, "Profile B series")
+        val profileBFirst = movie("tt-profile-b", "Profile B first")
+        val replaced = tvHomeHeroSelection(
+            retained.key,
+            listOf(Catalog("profile-b", "Profile B", listOf(profileBFirst, sameIdDifferentType))),
+        )
+        assertEquals(profileBFirst, replaced.item)
+        assertEquals(tvHomeItemKey(profileBFirst), replaced.key)
+
+        val lateProfileB = tvHomeHeroSelection(
+            replaced.key,
+            listOf(Catalog("profile-b", "Profile B", listOf(profileBFirst, sameIdDifferentType, focused))),
+        )
+        assertEquals(profileBFirst, lateProfileB.item)
+    }
+
     private fun movie(id: String, name: String) = MetaItem(id = id, type = MediaType.MOVIE, name = name)
 }

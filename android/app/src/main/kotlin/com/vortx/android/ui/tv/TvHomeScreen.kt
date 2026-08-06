@@ -15,6 +15,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -68,11 +69,14 @@ fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier:
 private fun TvHomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, modifier: Modifier) {
     val colors = VortXTheme.colors
     val visibleCatalogs = remember(catalogs) { tvHomeCatalogs(catalogs) }
-    // The tile the viewer is pointing at drives the hero backdrop. Initialised once to the first item (so
-    // the hero is never empty on entry) and NOT re-keyed on catalog emissions, so a late engine tick that
-    // replaces the row set does not yank the hero back to the top while the viewer is browsing.
-    var focused by remember { mutableStateOf<MetaItem?>(visibleCatalogs.firstOrNull()?.items?.firstOrNull()) }
-    val heroItem = focused ?: visibleCatalogs.firstOrNull()?.items?.firstOrNull()
+    // Keep the focused identity across incremental updates only while that exact type/id is still visible.
+    // A profile/account catalog replacement falls back in this composition, then commits the fallback key
+    // so a removed identity cannot return later and resurrect the previous owner's hero.
+    var focusedKey by remember { mutableStateOf<String?>(null) }
+    val heroSelection = tvHomeHeroSelection(focusedKey, visibleCatalogs)
+    SideEffect {
+        if (focusedKey != heroSelection.key) focusedKey = heroSelection.key
+    }
 
     // Seed D-pad focus on the first tile of the first row so a fresh TV entry lands somewhere actionable
     // instead of nowhere (a TV has no touch to bootstrap focus). Guarded: requestFocus throws if the node
@@ -82,7 +86,7 @@ private fun TvHomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, m
     val heroHeight = (LocalConfiguration.current.screenHeightDp * 0.5f).dp.coerceIn(280.dp, 460.dp)
 
     Column(modifier = modifier.fillMaxSize().background(colors.canvas)) {
-        TvHero(heroItem, modifier = Modifier.fillMaxWidth().height(heroHeight))
+        TvHero(heroSelection.item, modifier = Modifier.fillMaxWidth().height(heroHeight))
         LazyColumn(
             modifier = Modifier.fillMaxWidth().weight(1f),
             contentPadding = PaddingValues(top = TvDimens.rowGap, bottom = TvDimens.edge),
@@ -92,7 +96,7 @@ private fun TvHomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, m
                 TvCatalogRow(
                     catalog = catalog,
                     onItem = onItem,
-                    onFocused = { focused = it },
+                    onFocused = { focusedKey = tvHomeItemKey(it) },
                     firstCardFocus = if (index == 0) firstCardFocus else null,
                 )
             }
@@ -227,3 +231,18 @@ internal fun tvHomeItems(items: List<MetaItem>): List<MetaItem> =
     items.distinctBy(::tvHomeItemKey)
 
 internal fun tvHomeItemKey(item: MetaItem): String = "${item.type.name}|${item.id}"
+
+internal data class TvHomeHeroSelection(
+    val key: String?,
+    val item: MetaItem?,
+)
+
+internal fun tvHomeHeroSelection(focusedKey: String?, catalogs: List<Catalog>): TvHomeHeroSelection {
+    val retained = focusedKey?.let { key ->
+        catalogs.asSequence()
+            .flatMap { it.items.asSequence() }
+            .firstOrNull { tvHomeItemKey(it) == key }
+    }
+    val selected = retained ?: catalogs.firstNotNullOfOrNull { it.items.firstOrNull() }
+    return TvHomeHeroSelection(selected?.let(::tvHomeItemKey), selected)
+}
