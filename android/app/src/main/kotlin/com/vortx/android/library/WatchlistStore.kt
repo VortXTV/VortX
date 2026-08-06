@@ -39,8 +39,8 @@ class WatchlistStore internal constructor(
     private val mutex = Mutex()
     private val publishLock = Any()
 
-    @Volatile
     private var publishedProfileId: String? = null
+    private var profileGeneration = 0L
 
     init {
         scheduleReload()
@@ -48,19 +48,17 @@ class WatchlistStore internal constructor(
     }
 
     suspend fun reload() {
-        val profileId = activeProfileId()
-        invalidateForProfile(profileId)
-        val loaded = mutex.withLock {
-            withContext(ioDispatcher) {
-                WatchlistCodec.decode(persistence.read(storageKey(profileId)))
+        reload(currentProfileOperation())
+    }
+
+    private suspend fun reload(operation: ProfileOperation) {
+        mutex.withLock {
+            val loaded = withContext(ioDispatcher) {
+                WatchlistCodec.decode(persistence.read(storageKey(operation.profileId)))
                     .take(MAX_ENTRIES)
                     .map(WatchlistEntry::toMetaItem)
             }
-        }
-        synchronized(publishLock) {
-            if (activeProfileId() == profileId && publishedProfileId == profileId) {
-                _items.value = loaded
-            }
+            publishIfCurrent(operation, loaded)
         }
     }
 
@@ -69,11 +67,12 @@ class WatchlistStore internal constructor(
     /** Returns the new membership state. Unsafe synthetic ids are rejected. */
     suspend fun toggle(item: MetaItem): Boolean {
         if (!isSafeId(item.id)) return false
-        val profileId = activeProfileId()
-        invalidateForProfile(profileId)
-        val result = mutex.withLock {
-            withContext(ioDispatcher) {
-                val current = WatchlistCodec.decode(persistence.read(storageKey(profileId))).toMutableList()
+        val operation = currentProfileOperation()
+        return mutex.withLock {
+            val result = withContext(ioDispatcher) {
+                val current = WatchlistCodec.decode(
+                    persistence.read(storageKey(operation.profileId)),
+                ).toMutableList()
                 val existing = current.indexOfFirst { it.id == item.id }
                 val nowWatchlisted = existing < 0
                 if (existing >= 0) {
@@ -88,33 +87,60 @@ class WatchlistStore internal constructor(
                     )
                 }
                 val bounded = current.sortedByDescending(WatchlistEntry::addedAt).take(MAX_ENTRIES)
-                persistence.write(storageKey(profileId), WatchlistCodec.encode(bounded))
+                persistence.write(storageKey(operation.profileId), WatchlistCodec.encode(bounded))
                 ToggleResult(nowWatchlisted, bounded.map(WatchlistEntry::toMetaItem))
             }
+            // Publication is part of the same serialized operation as the read/write. A reload that
+            // entered first must publish before a queued toggle, never after that newer mutation.
+            publishIfCurrent(operation, result.items)
+            result.nowWatchlisted
         }
-        synchronized(publishLock) {
-            if (activeProfileId() == profileId && publishedProfileId == profileId) {
-                _items.value = result.items
-            }
-        }
-        return result.nowWatchlisted
     }
 
     private fun scheduleReload() {
-        invalidateForProfile(activeProfileId())
-        scope.launch { reload() }
+        val operation = beginProfileReload()
+        scope.launch { reload(operation) }
     }
 
-    private fun invalidateForProfile(profileId: String) {
-        synchronized(publishLock) {
+    private fun beginProfileReload(): ProfileOperation = synchronized(publishLock) {
+        val profileId = activeProfileId()
+        profileGeneration += 1
+        if (publishedProfileId != profileId) {
+            publishedProfileId = profileId
+            _items.value = emptyList()
+        }
+        ProfileOperation(profileId, profileGeneration)
+    }
+
+    private fun currentProfileOperation(): ProfileOperation {
+        val profileId = activeProfileId()
+        return synchronized(publishLock) {
+            // Normally the profile listener has already advanced the generation. This branch also
+            // makes a direct reload/toggle safe if the active-profile provider changes first.
             if (publishedProfileId != profileId) {
+                profileGeneration += 1
                 publishedProfileId = profileId
                 _items.value = emptyList()
+            }
+            ProfileOperation(profileId, profileGeneration)
+        }
+    }
+
+    private fun publishIfCurrent(operation: ProfileOperation, items: List<MetaItem>) {
+        synchronized(publishLock) {
+            if (
+                profileGeneration == operation.generation &&
+                publishedProfileId == operation.profileId &&
+                activeProfileId() == operation.profileId
+            ) {
+                _items.value = items
             }
         }
     }
 
     private fun storageKey(profileId: String): String = "$KEY_PREFIX.$profileId"
+
+    private data class ProfileOperation(val profileId: String, val generation: Long)
 
     private data class ToggleResult(val nowWatchlisted: Boolean, val items: List<MetaItem>)
 

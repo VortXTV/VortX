@@ -3,6 +3,7 @@ package com.vortx.android.ui.viewmodel
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.home.BecauseYouWatchedModel
 import com.vortx.android.home.HomeRailPreferences
@@ -27,6 +28,7 @@ import com.vortx.android.library.WatchlistStore
 import com.vortx.android.mediaserver.MediaServerCatalogsModel
 import com.vortx.android.mediaserver.MediaServerRepository
 import com.vortx.android.mediaserver.withMediaServerRails
+import com.vortx.android.model.AuthState
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryResult
@@ -62,6 +64,33 @@ private fun <T> Result<T>.toUiState(): UiState<T> = fold(
     onSuccess = { UiState.Success(it) },
     onFailure = { UiState.Error(it.message ?: "Something went wrong loading your add-ons.") },
 )
+
+internal data class ReleaseCalendarBoundary(
+    val profileId: String,
+    val accountId: String,
+)
+
+/** Keeps the release-cache generation stable across noisy ctx ticks and advances only on owner changes. */
+internal class ReleaseCalendarOwnerTracker(initialBoundary: ReleaseCalendarBoundary) {
+    private var boundary = initialBoundary
+    private var generation = 0L
+
+    fun ownerFor(nextBoundary: ReleaseCalendarBoundary): ReleaseCalendarOwner {
+        if (nextBoundary != boundary) {
+            boundary = nextBoundary
+            generation += 1
+        }
+        return ReleaseCalendarOwner(nextBoundary.profileId, generation)
+    }
+}
+
+private fun CatalogRepository.releaseCalendarAccountId(): String = when (
+    val auth = (this as? AuthRepository)?.authState?.value
+) {
+    is AuthState.SignedIn -> "signed-in:${auth.uid ?: auth.email ?: "unknown"}"
+    AuthState.SignedOut -> "signed-out"
+    null -> "account-unavailable"
+}
 
 /// Home: Continue Watching + add-on catalog rails. Collects the repository's CONTINUOUS
 /// [CatalogRepository.homeUpdates] stream for the ViewModel's lifetime (not a one-shot load): the
@@ -105,16 +134,30 @@ class HomeViewModel internal constructor(
         ?.let(::importedCatalogRails).orEmpty()
     private val topPicks = TopPicksModel()
     private val releaseCalendar = ReleaseCalendarModel()
-    private var releaseOwnerGeneration = 0L
-    private var releaseOwner = ReleaseCalendarOwner(activeProfileId(), releaseOwnerGeneration)
+    private val releaseOwnerTracker = ReleaseCalendarOwnerTracker(currentReleaseBoundary())
 
     init {
         load()
         viewModelScope.launch {
             repo.ctxUpdates().drop(1).collectLatest {
-                advanceReleaseOwner()
                 watchlistStore?.reload()
                 refreshPersonalizedRails()
+            }
+        }
+        (repo as? AuthRepository)?.let { authRepository ->
+            viewModelScope.launch {
+                authRepository.authState.collectLatest {
+                    // Engine auth publication can follow its ctx tick. Re-sample the stable account
+                    // identity here so that boundary invalidation cannot lose that race.
+                    refreshPersonalizedRails()
+                }
+            }
+        }
+        ProfileStore.sharedOrNull()?.let { profileStore ->
+            viewModelScope.launch {
+                profileStore.activeProfile
+                    .drop(1)
+                    .collectLatest { refreshPersonalizedRails() }
             }
         }
         watchlistStore?.let { store ->
@@ -270,20 +313,13 @@ class HomeViewModel internal constructor(
         }
     }
 
-    private fun currentReleaseOwner(): ReleaseCalendarOwner {
-        val profileId = activeProfileId()
-        if (profileId != releaseOwner.profileId) {
-            releaseOwnerGeneration += 1
-            releaseOwner = ReleaseCalendarOwner(profileId, releaseOwnerGeneration)
-        }
-        return releaseOwner
-    }
+    private fun currentReleaseBoundary() = ReleaseCalendarBoundary(
+        profileId = activeProfileId(),
+        accountId = repo.releaseCalendarAccountId(),
+    )
 
-    private fun advanceReleaseOwner() {
-        releaseOwnerGeneration += 1
-        releaseOwner = ReleaseCalendarOwner(activeProfileId(), releaseOwnerGeneration)
-        if (applyReleaseCalendar(releaseCalendar.activate(releaseOwner))) publishHome()
-    }
+    private fun currentReleaseOwner(): ReleaseCalendarOwner =
+        releaseOwnerTracker.ownerFor(currentReleaseBoundary())
 
     private fun applyReleaseCalendar(refresh: ReleaseCalendarRefresh): Boolean {
         val changed = upcomingEpisodes != refresh.episodes || upcomingMovies != refresh.movies

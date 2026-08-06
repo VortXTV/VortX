@@ -25,6 +25,7 @@ import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 
@@ -285,8 +286,14 @@ internal class ReleaseCalendarModel(
     private suspend fun firstMeta(id: String, type: MediaType, bases: List<String>): MetaLookup {
         var sawTransientFailure = false
         for (base in bases) {
-            when (val response = runCatching { fetcher.fetch(base, type, id) }
-                .getOrDefault(UpcomingMetaResponse.TransientFailure)) {
+            val response = try {
+                fetcher.fetch(base, type, id)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                UpcomingMetaResponse.TransientFailure
+            }
+            when (response) {
                 is UpcomingMetaResponse.Success -> {
                     val meta = response.payload?.optJSONObject("meta")
                     if (meta != null) return MetaLookup.Found(meta)

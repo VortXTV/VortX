@@ -4,17 +4,21 @@ import com.vortx.android.model.Catalog
 import com.vortx.android.model.InstalledAddon
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.net.ServerSocket
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.concurrent.Executors
+import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -219,6 +223,35 @@ class ReleaseCalendarModelTest {
             assertTrue(result.movies.isEmpty())
             assertEquals(7, server.accepted.get())
             assertEquals(ReleaseCalendarRailOutcome.PARTIAL_AFTER_TRANSIENT_FAILURE, result.movieOutcome)
+        }
+    }
+
+    @Test
+    fun `cancellation from a suspended fetch propagates instead of becoming a transient miss`() = runBlocking {
+        val response = CompletableDeferred<UpcomingMetaResponse>()
+        val enteredFetch = CompletableDeferred<Unit>()
+        val model = ReleaseCalendarModel { _, _, _ ->
+            enteredFetch.complete(Unit)
+            response.await()
+        }
+        val refresh = async {
+            model.refresh(
+                owner,
+                listOf(item("tt-cancelled", MediaType.MOVIE)),
+                emptyList(),
+                listOf("https://meta.example"),
+                reference,
+            )
+        }
+
+        enteredFetch.await()
+        response.cancel(CancellationException("fetch cancelled"))
+
+        try {
+            refresh.await()
+            fail("Expected the suspended fetch cancellation to propagate")
+        } catch (_: CancellationException) {
+            assertTrue(refresh.isCancelled)
         }
     }
 
