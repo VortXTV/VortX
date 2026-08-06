@@ -1,4 +1,5 @@
 import SwiftUI
+import QuartzCore   // CALayer / CABasicAnimation for the detached, render-server Ken Burns pan (#178)
 #if canImport(UIKit)
 import UIKit   // UIScreen / UIDevice for the screen-proportional hero band height
 #elseif canImport(AppKit)
@@ -243,31 +244,27 @@ struct FeaturedHeroView: View {
         // rest of the wide macOS band stayed bare scrim, the "backdrop only fills part of the band" report.
         // (On the narrow iPhone the image width happened to exceed the band, so the gap never showed.)
         GeometryReader { geo in
-            KenBurnsArt {
             ZStack {
                 // Dynamic dominant-color base: the featured art's average color under everything, so the
                 // band already carries the title's palette while the art streams in (and whenever a layer
-                // above misses). nil = today's flat canvas, the graceful fallback.
+                // above misses). nil = today's flat canvas, the graceful fallback. STATIC on purpose: a
+                // solid tint has no visible pan, so leaving it off the render path is pixel-identical.
                 (heroTint ?? Theme.Palette.canvas)
                 // Poster fallback layer: a slow or failed backdrop request must never leave a flat black
-                // band (the iPhone "no backdrop" report; AsyncImage fell straight to the black canvas on
-                // a load miss while the iPad had it cached). The poster is the catalog art the screen
-                // already loaded, so it's almost always available; the backdrop paints over it on success.
+                // band (the iPhone "no backdrop" report). The poster is the catalog art the screen already
+                // loaded, so it's almost always available; the layer host paints the band-filling art over
+                // it on success. STATIC here (the pan lives on the layer below), and once the layer paints
+                // its band-filling art this poster is fully occluded, so it matches the old Ken Burns exactly.
                 posterFallback
-                AsyncImage(url: URL(string: model.hero?.backdrop ?? "")) { phase in
-                    switch phase {
-                    case .success(let img):
-                        // ONE fill image clipped to the band, the same clean approach as
-                        // iOSDetailView.backdrop. The earlier dual layer (a blurred band-filling copy under a
-                        // fit copy of the SAME photo) painted the image twice and read as "two overlapping
-                        // images". A single scaledToFill covers the band with no second copy and no side gaps.
-                        img.resizable().aspectRatio(contentMode: .fill)
-                            .frame(width: geo.size.width, height: geo.size.height)
-                            .clipped()
-                    default: Color.clear   // transparent while loading / on failure so the poster shows through
-                    }
-                }
-            }
+                // The ambient Ken Burns pan now runs as a DETACHED CALayer `CABasicAnimation` on the render
+                // server (KenBurnsLayerHost), off the main thread, in place of a SwiftUI `.repeatForever`
+                // transform. On macOS `NSHostingView` SwiftUI could not promote that transform to a GPU
+                // `CAAnimation`, so every display frame drove a whole-window relayout that re-rasterized the
+                // sibling hero TEXT via Core Text (~55% of a core on idle Home, #178). Painting the backdrop
+                // on its own layer and animating THAT keeps the exact motion at ~0% main-thread cost. The
+                // host loads the 16:9 backdrop (poster fallback) through the shared PosterImageLoader.
+                KenBurnsLayerHost(backdrop: model.hero?.backdrop, poster: model.hero?.poster,
+                                  reduceMotion: reduceMotion)
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .clipped()
@@ -541,25 +538,239 @@ struct FeaturedHeroView: View {
     }
 }
 
-/// A still backdrop that slowly pans + zooms (Ken Burns) so the hero band is never static when no muted
-/// clip is playing (Lite build, no trailer, or while the /clip mp4 is still warming). Local `@State` plus
-/// the parent's per-title `.id` on the backdrop means each new featured title restarts the pan from
-/// neutral. Fully gated off under Reduce Motion. The host frame + `.clipped()` keep the drift inside the
-/// band (scale >= 1.05 so the offset never bares an edge). Compositor-only (transform/opacity) per the
-/// motion rules, never animates layout.
-private struct KenBurnsArt<Content: View>: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var active = false
-    private let content: Content
-    init(@ViewBuilder _ content: () -> Content) { self.content = content() }
-    var body: some View {
-        content
-            .scaleEffect(active ? 1.08 : 1.0, anchor: .center)
-            .offset(x: active ? 12 : -12, y: active ? 8 : -8)
-            .animation(reduceMotion ? nil : .easeInOut(duration: 18).repeatForever(autoreverses: true), value: active)
-            .onAppear { if !reduceMotion { active = true } }
+// MARK: - Ken Burns pan on a detached CALayer (off-main render-server animation, #178)
+
+/// The ambient hero backdrop's slow pan + zoom (Ken Burns), re-homed from a SwiftUI `.repeatForever`
+/// transform onto a DETACHED `CABasicAnimation` the render server runs on the compositor, off the main
+/// thread. The old SwiftUI form was
+/// `.scaleEffect(active ? 1.08 : 1.0, anchor: .center).offset(x: active ? 12 : -12, y: active ? 8 : -8)`
+/// eased `.easeInOut(duration: 18).repeatForever(autoreverses: true)`. On macOS `NSHostingView`, SwiftUI
+/// could not promote that repeating transform to a GPU `CAAnimation`, so every display frame drove a
+/// whole-window `layoutSubtreeIfNeeded` + `renderDisplayList` that re-rasterized the SIBLING hero text
+/// through Core Text (~55% of a core on an idle Home, #178). Expressed as a single layer animation the
+/// motion is byte-for-byte the same while the main thread does nothing per frame. Reduce Motion adds no
+/// animation (static art), exactly as before.
+private enum KenBurnsPan {
+    static let scaleFrom: CGFloat = 1.0
+    static let scaleTo: CGFloat = 1.08
+    static let offsetX: CGFloat = 12
+    static let offsetY: CGFloat = 8
+    static let duration: CFTimeInterval = 18
+    static let animationKey = "vortxKenBurns"
+    /// Backdrops are wider than portrait posters, so the shared loader's larger 16:9 downsample ceiling
+    /// (the same 1280 the landscape backdrop cache uses) keeps the hero art crisp.
+    static let maxPixel: CGFloat = 1280
+
+    /// A scale about the centre (anchorPoint .5,.5) plus an UN-scaled translate, matching SwiftUI's
+    /// `.scaleEffect(anchor: .center)` then `.offset(...)` (the offset is applied after, not multiplied by,
+    /// the scale, so it is written straight into m41/m42). Direction: a default UIView backing layer is
+    /// y-DOWN (top-left) like SwiftUI, but a default (non-flipped) AppKit backing layer is y-UP
+    /// (bottom-left), so macOS negates the vertical component to keep the pan drifting the same way as the
+    /// old SwiftUI motion. Horizontal is x-right on both, and there is no geometry flip anywhere, so the
+    /// CGImage contents stay upright on both platforms.
+    static func transform(scale s: CGFloat, offsetX x: CGFloat, offsetY y: CGFloat) -> CATransform3D {
+        var t = CATransform3DMakeScale(s, s, 1)
+        t.m41 = x
+        #if canImport(UIKit)
+        t.m42 = y
+        #else
+        t.m42 = -y
+        #endif
+        return t
+    }
+
+    /// The neutral end of the pan and the Reduce-Motion resting pose, matching the old `active == false`
+    /// state (scale 1.0, offset (-12, -8)).
+    static var restingTransform: CATransform3D {
+        transform(scale: scaleFrom, offsetX: -offsetX, offsetY: -offsetY)
+    }
+    /// The far end of the pan, matching the old `active == true` state (scale 1.08, offset (12, 8)).
+    static var activeTransform: CATransform3D {
+        transform(scale: scaleTo, offsetX: offsetX, offsetY: offsetY)
+    }
+
+    static func makeAnimation() -> CABasicAnimation {
+        let anim = CABasicAnimation(keyPath: "transform")
+        anim.fromValue = NSValue(caTransform3D: restingTransform)
+        anim.toValue = NSValue(caTransform3D: activeTransform)
+        anim.duration = duration
+        anim.autoreverses = true
+        anim.repeatCount = .infinity
+        anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        anim.isRemovedOnCompletion = false
+        anim.fillMode = .both
+        return anim
+    }
+
+    /// Install the resting transform + (unless Reduce Motion) the pan ONCE, from make…View, so the animation
+    /// is submitted a single time per host and never re-created per SwiftUI frame.
+    static func configure(_ layer: CALayer, reduceMotion: Bool) {
+        layer.contentsGravity = .resizeAspectFill
+        layer.masksToBounds = true
+        layer.transform = restingTransform
+        if !reduceMotion { layer.add(makeAnimation(), forKey: animationKey) }
+    }
+
+    /// Reconcile only a Reduce-Motion toggle (rare): add or remove the pan without touching contents, so a
+    /// routine SwiftUI update never restarts the animation.
+    static func reconcile(_ layer: CALayer, reduceMotion: Bool) {
+        let running = layer.animation(forKey: animationKey) != nil
+        if reduceMotion, running {
+            layer.removeAnimation(forKey: animationKey)
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            layer.transform = restingTransform
+            CATransaction.commit()
+        } else if !reduceMotion, !running {
+            layer.transform = restingTransform
+            layer.add(makeAnimation(), forKey: animationKey)
+        }
     }
 }
+
+/// Loads the hero art off-main and sets it on the pan layer's `contents`, preferring the 16:9 backdrop and
+/// falling back to the poster (the same order the old poster-behind-backdrop stack showed). Owned by the
+/// representable's coordinator so a host torn down mid-load (the per-title rotation) cancels cleanly.
+private final class KenBurnsLoader {
+    private var task: Task<Void, Never>?
+
+    func load(backdrop: String?, poster: String?, into layer: CALayer) {
+        task?.cancel()
+        task = Task { [weak layer] in
+            let cg = await Self.bestArt(backdrop: backdrop, poster: poster)
+            guard let cg, !Task.isCancelled, let layer else { return }
+            let width = cg.width, height = cg.height
+            await MainActor.run {
+                CATransaction.begin(); CATransaction.setDisableActions(true)
+                layer.contents = cg
+                CATransaction.commit()
+            }
+            // Note that the art actually reached the layer, so a low-CPU reading is a real hero and not a
+            // blank band. Logged OFF the main thread, after the contents hop returns: logging on the render
+            // path would re-add the very main-thread cost #178 removes. Dimensions only, no URLs or PII.
+            Self.recordProof(width: width, height: height)
+        }
+    }
+
+    func cancel() { task?.cancel(); task = nil }
+    deinit { task?.cancel() }
+
+    /// Note one hero paint: the backdrop art reached the layer at these pixel dimensions. Off-main, log only.
+    private static func recordProof(width: Int, height: Int) {
+        NSLog("[kenburns] contents set %dx%d", width, height)
+    }
+
+    private static func bestArt(backdrop: String?, poster: String?) async -> CGImage? {
+        if let img = await PosterImageLoader.load(backdrop, maxPixel: KenBurnsPan.maxPixel),
+           let cg = img.kenBurnsCGImage { return cg }
+        if let img = await PosterImageLoader.load(poster, maxPixel: KenBurnsPan.maxPixel),
+           let cg = img.kenBurnsCGImage { return cg }
+        return nil
+    }
+}
+
+private extension VXPosterImage {
+    /// The decoded `CGImage`, however the platform image type exposes it.
+    var kenBurnsCGImage: CGImage? {
+        #if canImport(UIKit)
+        return cgImage
+        #elseif canImport(AppKit)
+        return cgImage(forProposedRect: nil, context: nil, hints: nil)
+        #endif
+    }
+}
+
+// The layer-hosting view: a plain layer-backed view whose single sublayer carries the panning art. The
+// sublayer is sized via bounds+position (NOT `.frame`, which is undefined while a non-identity transform is
+// applied), and the host clips it to the band (the old outer `.clipped()`). `#if` splits ONLY the view-host
+// type; the CALayer + animation code above is shared.
+#if canImport(UIKit)
+private final class KenBurnsBackingView: UIView {
+    let artLayer = CALayer()
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false          // decorative art; the CTA/overlay sit in a sibling layer
+        backgroundColor = .clear                   // let the static tint/poster show through until art loads
+        clipsToBounds = true                       // clip the scaled/panned sublayer to the band (old .clipped())
+        artLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer.addSublayer(artLayer)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        artLayer.contentsScale = layer.contentsScale   // crisp on Retina (sublayers don't inherit scale)
+        artLayer.bounds = CGRect(origin: .zero, size: bounds.size)
+        artLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        CATransaction.commit()
+    }
+}
+
+private struct KenBurnsLayerHost: UIViewRepresentable {
+    let backdrop: String?
+    let poster: String?
+    let reduceMotion: Bool
+
+    func makeCoordinator() -> KenBurnsLoader { KenBurnsLoader() }
+
+    func makeUIView(context: Context) -> KenBurnsBackingView {
+        let view = KenBurnsBackingView(frame: .zero)
+        KenBurnsPan.configure(view.artLayer, reduceMotion: reduceMotion)
+        context.coordinator.load(backdrop: backdrop, poster: poster, into: view.artLayer)
+        return view
+    }
+
+    func updateUIView(_ view: KenBurnsBackingView, context: Context) {
+        KenBurnsPan.reconcile(view.artLayer, reduceMotion: reduceMotion)
+    }
+
+    static func dismantleUIView(_ view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
+        coordinator.cancel()
+    }
+}
+#elseif canImport(AppKit)
+private final class KenBurnsBackingView: NSView {
+    let artLayer = CALayer()
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true               // clip the scaled/panned sublayer to the band (old .clipped())
+        artLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer?.addSublayer(artLayer)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func layout() {
+        super.layout()
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        if let host = layer { artLayer.contentsScale = host.contentsScale }   // crisp on Retina
+        artLayer.bounds = CGRect(origin: .zero, size: bounds.size)
+        artLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        CATransaction.commit()
+    }
+}
+
+private struct KenBurnsLayerHost: NSViewRepresentable {
+    let backdrop: String?
+    let poster: String?
+    let reduceMotion: Bool
+
+    func makeCoordinator() -> KenBurnsLoader { KenBurnsLoader() }
+
+    func makeNSView(context: Context) -> KenBurnsBackingView {
+        let view = KenBurnsBackingView(frame: .zero)
+        KenBurnsPan.configure(view.artLayer, reduceMotion: reduceMotion)
+        context.coordinator.load(backdrop: backdrop, poster: poster, into: view.artLayer)
+        return view
+    }
+
+    func updateNSView(_ view: KenBurnsBackingView, context: Context) {
+        KenBurnsPan.reconcile(view.artLayer, reduceMotion: reduceMotion)
+    }
+
+    static func dismantleNSView(_ view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
+        coordinator.cancel()
+    }
+}
+#endif
 
 /// Identifiable launch box for the hero Trailer chip's in-app IFrame cover (`platformFullScreenPlayerCover(item:)`).
 private struct TrailerEmbedLaunch: Identifiable {
