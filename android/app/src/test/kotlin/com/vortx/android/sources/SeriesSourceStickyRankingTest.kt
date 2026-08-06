@@ -6,11 +6,22 @@ import com.vortx.android.model.StreamSource
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SeriesSourceStickyRankingTest {
+
+    private class MemoryPersistence : SeriesSourceStickyPersistence {
+        private val values = mutableMapOf<String, String>()
+        override fun read(key: String): String? = synchronized(values) { values[key] }
+        override fun write(key: String, value: String): Boolean = synchronized(values) {
+            values[key] = value
+            true
+        }
+        override fun contains(key: String): Boolean = synchronized(values) { key in values }
+    }
 
     @After
     fun clearHealth() {
@@ -40,6 +51,41 @@ class SeriesSourceStickyRankingTest {
         assertThrows(Exception::class.java) {
             SeriesSourceSticky.decode("""{"series":{"addon":"A"}}""")
         }
+    }
+
+    @Test
+    fun twoInstancesMergeAgainstLatestPersistenceWithoutLosingEitherSeries() {
+        val persistence = MemoryPersistence()
+        var now = 1_000L
+        val first = SeriesSourceSticky(persistence, activeProfileId = { "profile-a" }, nowMs = { now++ })
+        val second = SeriesSourceSticky(persistence, activeProfileId = { "profile-a" }, nowMs = { now++ })
+
+        // Prime both instance caches with the same empty snapshot before either writes.
+        assertNull(first.preference("show-a"))
+        assertNull(second.preference("show-b"))
+        first.record("show-a", "Provider A", "release-a")
+        second.record("show-b", "Provider B", "release-b")
+
+        assertEquals("Provider A", first.preference("show-a")?.addon)
+        assertEquals("Provider B", first.preference("show-b")?.addon)
+        assertEquals("Provider A", second.preference("show-a")?.addon)
+        assertEquals("Provider B", second.preference("show-b")?.addon)
+    }
+
+    @Test
+    fun capturedWriteIsRejectedAcrossProfileRoundTrip() {
+        val persistence = MemoryPersistence()
+        var profile = "profile-a"
+        val sticky = SeriesSourceSticky(persistence, activeProfileId = { profile })
+        val stale = sticky.capture("show")!!
+
+        profile = "profile-b"
+        sticky.onProfileChanged()
+        profile = "profile-a"
+        sticky.onProfileChanged()
+
+        assertFalse(sticky.record(stale, "Provider A", "release-a"))
+        assertNull(sticky.preference("show"))
     }
 
     @Test

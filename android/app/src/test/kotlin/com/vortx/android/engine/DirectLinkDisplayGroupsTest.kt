@@ -56,8 +56,41 @@ class DirectLinkDisplayGroupsTest {
 
         assertTrue(source.contains("val displayRaw = SourceListModel.directLinkDisplayGroups(raw, ctx.directLinksOnly)"))
         assertTrue(source.contains("_streams.value = UiState.Success(displayRaw)"))
-        assertTrue(source.contains("StreamRanking.best(displayRaw, prefs = ctx.prefs, pin = currentPin())"))
-        assertTrue(source.contains("displayRaw,\n                                continuity = hint.first"))
+        assertTrue(source.contains("val assembled = sourceModel.awaitSettledTarget("))
+        assertTrue(source.contains("assembled?.best"))
+        assertTrue(source.contains("displayRaw,\n                                continuity = null,"))
+        assertTrue(source.contains("sticky = sticky,"))
+        assertTrue(source.contains("providerPenalty = unhealthy,"))
+    }
+
+    @Test
+    fun `manual sticky write follows accepted ready publication`() {
+        val source = readProjectFile("src/main/kotlin/com/vortx/android/ui/viewmodel/DetailViewModel.kt")
+        val play = source.substringAfter("private fun play(source: StreamSource, manualPick: Boolean)")
+        val accepted = play.indexOf("sourceRequestFence.accepts(request, sourceSticky.currentProfileId())")
+        val published = play.indexOf("_playback.value = result.fold(")
+        val readyGate = play.indexOf("if (_playback.value is Playback.Ready && stickyWrite != null)")
+        val persisted = play.indexOf("sourceSticky.record(stickyWrite, source.addon, source.bingeGroup)")
+
+        assertTrue(accepted >= 0)
+        assertTrue(published > accepted)
+        assertTrue(readyGate > published)
+        assertTrue(persisted > readyGate)
+    }
+
+    @Test
+    fun `profile switch cancels invalidates clears and rebuilds`() {
+        val source = readProjectFile("src/main/kotlin/com/vortx/android/ui/viewmodel/DetailViewModel.kt")
+        val rebuild = source.substringAfter("private fun rebuildForProfile(profileId: String)")
+            .substringBefore("private suspend fun loadSources")
+
+        assertTrue(rebuild.contains("sourceLoadJob?.cancel()"))
+        assertTrue(rebuild.contains("playbackResolveJob?.cancel()"))
+        assertTrue(rebuild.contains("sourceRequestFence.invalidate(profileId)"))
+        assertTrue(rebuild.contains("sourceSticky.onProfileChanged()"))
+        assertTrue(rebuild.contains("torbox.reset(invalidGeneration, clearCache = true)"))
+        assertTrue(rebuild.contains("singularity.reset(invalidGeneration)"))
+        assertTrue(rebuild.contains("startSourceLoad(target?.id)"))
     }
 
     private fun source(

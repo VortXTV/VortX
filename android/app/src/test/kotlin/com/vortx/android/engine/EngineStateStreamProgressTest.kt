@@ -1,6 +1,7 @@
 package com.vortx.android.engine
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -57,5 +58,16 @@ class EngineStateStreamProgressTest {
             EngineState.StreamLoadProgress(loaded = 0, total = 1),
             EngineState.parseStreamLoadProgress(json, "show:1:2"),
         )
+    }
+
+    @Test
+    fun newerStreamLoadGenerationSupersedesOlderRequest() {
+        val fence = StreamLoadGenerationFence()
+        val old = fence.begin()
+        assertTrue(fence.isCurrent(old))
+
+        val fresh = fence.begin()
+        assertFalse(fence.isCurrent(old))
+        assertTrue(fence.isCurrent(fresh))
     }
 }

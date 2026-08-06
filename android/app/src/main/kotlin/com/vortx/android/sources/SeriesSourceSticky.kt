@@ -6,19 +6,54 @@ import androidx.annotation.MainThread
 import com.vortx.android.profile.ProfileStore
 import org.json.JSONObject
 
+internal interface SeriesSourceStickyPersistence {
+    fun read(key: String): String?
+    fun write(key: String, value: String): Boolean
+    fun contains(key: String): Boolean
+}
+
+private class SharedPreferencesStickyPersistence(
+    private val preferences: SharedPreferences,
+) : SeriesSourceStickyPersistence {
+    override fun read(key: String): String? = preferences.getString(key, null)
+    override fun write(key: String, value: String): Boolean = preferences.edit().putString(key, value).commit()
+    override fun contains(key: String): Boolean = preferences.contains(key)
+}
+
 /**
  * Remembers the source a viewer selected by hand for a series. The record is a ranking preference, never a
  * playback lock: a later episode may still fall through to any other provider when the remembered one is absent
  * or unhealthy. Storage uses the same per-profile key and JSON shape as Apple.
  */
-class SeriesSourceSticky(
-    context: Context,
+class SeriesSourceSticky internal constructor(
+    private val persistence: SeriesSourceStickyPersistence,
     private val activeProfileId: () -> String = {
         ProfileStore.sharedOrNull()?.activeProfileId ?: DEFAULT_PROFILE
     },
     private val nowMs: () -> Long = System::currentTimeMillis,
 ) {
+    constructor(
+        context: Context,
+        activeProfileId: () -> String = {
+            ProfileStore.sharedOrNull()?.activeProfileId ?: DEFAULT_PROFILE
+        },
+        nowMs: () -> Long = System::currentTimeMillis,
+    ) : this(
+        persistence = SharedPreferencesStickyPersistence(
+            context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE),
+        ),
+        activeProfileId = activeProfileId,
+        nowMs = nowMs,
+    )
+
     data class Preference(val addon: String?, val bingeGroup: String?)
+
+    /** Captures both the profile and this screen's profile-switch epoch before an async resolve starts. */
+    class WriteToken internal constructor(
+        val profile: String,
+        val seriesKey: String,
+        internal val profileGeneration: Long,
+    )
 
     internal data class Choice(
         val addon: String?,
@@ -28,34 +63,85 @@ class SeriesSourceSticky(
         fun preference(): Preference = Preference(addon, bingeGroup)
     }
 
-    private val prefs: SharedPreferences =
-        context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
     private val lock = Any()
     private var cachedProfile: String? = null
     private var cache: Map<String, Choice>? = null
+    private var cachedRevision: Long = -1L
+    private var profileGeneration: Long = 0L
+
+    fun currentProfileId(): String = activeProfileId().ifBlank { DEFAULT_PROFILE }
+
+    /**
+     * Invalidate every outstanding write token when ProfileStore switches, including A -> B -> A. Checking only
+     * the profile string would let a slow resolve from the first A session write after the round trip back to A.
+     */
+    fun onProfileChanged() = synchronized(lock) {
+        profileGeneration += 1L
+        cachedProfile = null
+        cache = null
+        cachedRevision = -1L
+    }
+
+    fun capture(seriesKey: String): WriteToken? {
+        if (seriesKey.isBlank()) return null
+        return synchronized(lock) {
+            WriteToken(currentProfileId(), seriesKey, profileGeneration)
+        }
+    }
 
     /** Record only explicit viewer picks. Automatic selection and failover callers must never call this. */
     @MainThread
     fun record(seriesKey: String, addon: String?, bingeGroup: String?) {
-        if (seriesKey.isBlank() || (addon.isNullOrBlank() && bingeGroup.isNullOrBlank())) return
-        val loaded = loaded()
-        val updated = loaded.second.toMutableMap().apply {
-            put(
-                seriesKey,
-                Choice(
-                    addon = addon?.takeIf { it.isNotBlank() },
-                    bingeGroup = bingeGroup?.takeIf { it.isNotBlank() },
-                    timestamp = appleReferenceSeconds(nowMs()),
-                ),
-            )
-        }
-        val pruned = prune(updated)
+        capture(seriesKey)?.let { record(it, addon, bingeGroup) }
+    }
+
+    /** Returns false if resolve crossed a profile switch or persistence failed. */
+    @MainThread
+    fun record(token: WriteToken, addon: String?, bingeGroup: String?): Boolean {
+        if (addon.isNullOrBlank() && bingeGroup.isNullOrBlank()) return false
         synchronized(lock) {
-            cachedProfile = loaded.first
-            cache = pruned
+            if (
+                token.profileGeneration != profileGeneration ||
+                token.profile != currentProfileId()
+            ) {
+                return false
+            }
         }
-        prefs.edit().putString(storageKey(loaded.first), encode(pruned)).apply()
-        // Deliberately no StreamRanking.invalidateCaches(): stickiness is applied outside the score memo.
+
+        // The process-wide critical section is deliberate. Multiple detail screens own separate store instances;
+        // each write must merge against the latest persisted map, not its instance cache, or concurrent picks for
+        // different series lose whichever write commits first.
+        return synchronized(processLock) write@{
+            synchronized(lock) {
+                if (
+                    token.profileGeneration != profileGeneration ||
+                    token.profile != currentProfileId()
+                ) {
+                    return@write false
+                }
+            }
+            val latest = decodeStored(token.profile)
+            val updated = latest.toMutableMap().apply {
+                put(
+                    token.seriesKey,
+                    Choice(
+                        addon = addon?.takeIf { it.isNotBlank() },
+                        bingeGroup = bingeGroup?.takeIf { it.isNotBlank() },
+                        timestamp = appleReferenceSeconds(nowMs()),
+                    ),
+                )
+            }
+            val pruned = prune(updated)
+            if (!persistence.write(storageKey(token.profile), encode(pruned))) return@write false
+            processRevision += 1L
+            synchronized(lock) {
+                cachedProfile = token.profile
+                cache = pruned
+                cachedRevision = processRevision
+            }
+            // Deliberately no StreamRanking.invalidateCaches(): stickiness is applied outside the score memo.
+            true
+        }
     }
 
     /** Thread-safe read; callers snapshot the immutable result before an off-thread rank pass. */
@@ -65,33 +151,41 @@ class SeriesSourceSticky(
     }
 
     private fun loaded(): Pair<String, Map<String, Choice>> {
-        val profile = activeProfileId().ifBlank { DEFAULT_PROFILE }
+        val profile = currentProfileId()
         synchronized(lock) {
-            if (cachedProfile == profile) cache?.let { return profile to it }
-        }
-
-        val raw = prefs.getString(storageKey(profile), null)
-        val decoded = if (raw == null) {
-            emptyMap()
-        } else {
-            runCatching { decode(raw) }.getOrElse {
-                quarantineOnce(profile, raw)
-                emptyMap()
+            if (cachedProfile == profile && cachedRevision == processRevision) {
+                cache?.let { return profile to it }
             }
         }
-        synchronized(lock) {
-            cachedProfile = profile
-            cache = decoded
+
+        return synchronized(processLock) {
+            val decoded = decodeStored(profile)
+            synchronized(lock) {
+                cachedProfile = profile
+                cache = decoded
+                cachedRevision = processRevision
+            }
+            profile to decoded
         }
-        return profile to decoded
+    }
+
+    private fun decodeStored(profile: String): Map<String, Choice> {
+        val raw = persistence.read(storageKey(profile)) ?: return emptyMap()
+        return runCatching { decode(raw) }.getOrElse {
+            quarantineOnce(profile, raw)
+            emptyMap()
+        }
     }
 
     private fun quarantineOnce(profile: String, raw: String) {
         val key = storageKey(profile) + QUARANTINE_SUFFIX
-        if (!prefs.contains(key)) prefs.edit().putString(key, raw).apply()
+        if (!persistence.contains(key)) persistence.write(key, raw)
     }
 
     internal companion object {
+        private val processLock = Any()
+        @Volatile
+        private var processRevision: Long = 0L
         const val PREFS_FILE = "vortx_settings"
         const val DEFAULT_PROFILE = "default"
         const val MAX_SERIES = 200
