@@ -411,6 +411,9 @@ data class StreamSource(
     val fileIdx: Int? = null,
     val externalUrl: String? = null,
     val nzbUrl: String? = null,
+    /// The authoritative NZB md5 supplied by the Usenet source emitter. This is separate from [infoHash],
+    /// which remains torrent-only provenance. Null falls back to deriving an identifier from [nzbUrl].
+    val usenetKnownHash: String? = null,
     val fileMustInclude: String? = null,
     /// VortX provenance marker: the server UUID on a synthetic MEDIA-SERVER stream, null on every
     /// engine-decoded stream. The STRUCTURAL, text-independent classification hook mirroring Apple

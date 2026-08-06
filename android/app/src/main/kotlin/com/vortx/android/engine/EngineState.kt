@@ -755,6 +755,7 @@ internal object EngineState {
             fileIdx = fileIdx,
             externalUrl = externalUrl,
             nzbUrl = nzbUrl,
+            usenetKnownHash = parseUsenetKnownHash(obj),
             fileMustInclude = obj.optStringOrNull("fileMustInclude"),
             vortxProvider = obj.optStringOrNull("vortxProvider"),
             bingeGroup = behaviorHints?.optStringOrNull("bingeGroup"),
@@ -766,6 +767,19 @@ internal object EngineState {
             },
             requestHeaders = parseProxyRequestHeaders(behaviorHints),
         )
+    }
+
+    /// Read the first authoritative NZB md5 marker from the stream's `sources` array. Torrent trackers
+    /// share that array, so only the dedicated `usenethash:` prefix is consumed and [StreamSource.infoHash]
+    /// remains torrent-only provenance.
+    private fun parseUsenetKnownHash(obj: JSONObject): String? {
+        val sources = obj.optJSONArray("sources") ?: return null
+        for (index in 0 until sources.length()) {
+            val marker = sources.optString(index)
+            if (!marker.startsWith(USENET_HASH_PREFIX)) continue
+            return marker.removePrefix(USENET_HASH_PREFIX).trim().lowercase().ifEmpty { null }
+        }
+        return null
     }
 
     /// `behaviorHints.proxyHeaders.request` -> the per-stream HTTP request headers some add-ons declare
@@ -834,4 +848,6 @@ internal object EngineState {
         if (!has(key) || isNull(key)) return null
         return optString(key).ifBlank { null }
     }
+
+    private const val USENET_HASH_PREFIX = "usenethash:"
 }

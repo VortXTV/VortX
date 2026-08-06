@@ -78,7 +78,7 @@ internal fun debridCandidateFor(
     return when {
         source.isUsenet -> DebridCoordinator.DebridCandidate(
             nzbUrl = source.nzbUrl,
-            usenetKnownHash = source.infoHash,
+            usenetKnownHash = source.usenetKnownHash,
             fileMustInclude = source.fileMustInclude,
             fileIdx = source.fileIdx,
             source = source,

@@ -87,7 +87,7 @@ internal fun StreamSource.usenetResolveTarget(
     selectedEpisode: Episode?,
 ): UsenetResolveTarget = UsenetResolveTarget(
     nzbUrl = requireNotNull(nzbUrl) { "Usenet source is missing its NZB URL." },
-    knownHash = infoHash,
+    knownHash = usenetKnownHash,
     fileMustInclude = fileMustInclude,
     episode = selectedEpisode?.let {
         DebridResolver.Episode(

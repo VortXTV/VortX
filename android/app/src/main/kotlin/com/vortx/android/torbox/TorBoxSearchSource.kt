@@ -127,8 +127,7 @@ object TorBoxSearch {
                 if (code == 429) return@withContext Result(emptyList(), rateLimited = true, transportError = false)
                 if (code !in 200..299) return@withContext Result(emptyList(), rateLimited = false, transportError = false)
                 val body = conn.inputStream.bufferedReader().use(BufferedReader::readText)
-                val items = parseItems(body)
-                Result(items.mapNotNull { streamFrom(it) }, rateLimited = false, transportError = false)
+                Result(decodeStreams(body), rateLimited = false, transportError = false)
             } catch (io: IOException) {
                 // A request that never completed (offline, DNS/TLS failure, timeout) yields no HTTP response.
                 // Report it as a distinct transportError so the caller does not cache the empty result as "no
@@ -151,6 +150,9 @@ object TorBoxSearch {
         appendArray(data.optJSONArray("torrents"), out)
         return out
     }
+
+    internal fun decodeStreams(body: String): List<StreamSource> =
+        parseItems(body).mapNotNull { streamFrom(it) }
 
     private fun appendArray(arr: JSONArray?, into: MutableList<Item>) {
         if (arr == null) return
@@ -202,7 +204,12 @@ object TorBoxSearch {
             val nzb = (item.nzb ?: item.link).orEmpty()
             if (nzb.isEmpty() || !nzb.lowercase().startsWith("http")) return null
             val desc = "TorBox Usenet$sizeSuffix$cachedSuffix"
-            return makeUsenet(name = "📰 $displayName", description = desc, nzbUrl = nzb)
+            return makeUsenet(
+                name = "📰 $displayName",
+                description = desc,
+                nzbUrl = nzb,
+                knownHash = item.hash?.trim()?.lowercase()?.ifEmpty { null },
+            )
         }
 
         // TORRENT: an infohash (or a magnet we can pull one from).
@@ -242,12 +249,18 @@ object TorBoxSearch {
 
     /// A usenet search stream: a non-null [StreamSource.nzbUrl] with no [StreamSource.url] makes the ranker
     /// report `isUsenet`, so the existing TorBox usenet resolve path plays it with the user's own account.
-    private fun makeUsenet(name: String, description: String, nzbUrl: String): StreamSource = StreamSource(
+    private fun makeUsenet(
+        name: String,
+        description: String,
+        nzbUrl: String,
+        knownHash: String?,
+    ): StreamSource = StreamSource(
         id = "$nzbUrl#$name#$description",
         addon = GROUP_ADDON,
         title = name,
         description = description,
         nzbUrl = nzbUrl,
+        usenetKnownHash = knownHash,
     )
 
     /// A binary byte size ("12.4 GB" / "850 MB") in the shape StreamRanking's size regex reads (locale-US so
