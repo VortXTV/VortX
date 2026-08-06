@@ -10,7 +10,7 @@ import org.junit.Test
 class DetailSettingsRevisionContractTest {
     @Test
     fun `phone tv and nested details are keyed by credential and source revisions`() {
-        val phone = source("src/main/kotlin/com/vortx/android/ui/StremioXApp.kt")
+        val phone = source("src/main/kotlin/com/vortx/android/ui/VortXApp.kt")
         val tv = source("src/main/kotlin/com/vortx/android/ui/tv/TvApp.kt")
         val detail = source("src/main/kotlin/com/vortx/android/ui/screens/DetailScreen.kt")
 

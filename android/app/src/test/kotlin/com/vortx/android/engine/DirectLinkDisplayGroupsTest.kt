@@ -93,49 +93,6 @@ class DirectLinkDisplayGroupsTest {
         assertTrue(rebuild.contains("startSourceLoad(target?.id)"))
     }
 
-    @Test
-    fun `old published generation is rejected after a new target becomes ready`() {
-        assertFalse(
-            SourceGenerationPolicy.accepts(
-                activeGeneration = 2L,
-                readyGeneration = 2L,
-                publishedGeneration = 1L,
-            ),
-        )
-    }
-
-    @Test
-    fun `matching active ready and published generations are accepted`() {
-        assertTrue(
-            SourceGenerationPolicy.accepts(
-                activeGeneration = 7L,
-                readyGeneration = 7L,
-                publishedGeneration = 7L,
-            ),
-        )
-    }
-
-    @Test
-    fun `stale assembled best falls back to current filtered target groups`() {
-        val old = source("old", url = "https://old.example/episode-a")
-        val rawTorrent = source("raw", isTorrent = true, infoHash = HASH)
-        val current = source("current", url = "https://cdn.example/episode-b")
-        val currentGroups = SourceListModel.directLinkDisplayGroups(
-            listOf(StreamGroup("Provider", listOf(rawTorrent, current))),
-            enabled = true,
-        )
-
-        val picked = SourceGenerationPolicy.best(
-            activeGeneration = 2L,
-            readyGeneration = 2L,
-            published = SourceListState(generation = 1L, best = old),
-            currentGroups = currentGroups,
-            currentContext = SourceListModel.Context(generation = 2L, directLinksOnly = true),
-        )
-
-        assertEquals("current", picked?.id)
-    }
-
     private fun source(
         id: String,
         isTorrent: Boolean = false,

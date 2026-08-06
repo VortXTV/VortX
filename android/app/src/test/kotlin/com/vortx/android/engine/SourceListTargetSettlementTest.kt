@@ -27,9 +27,12 @@ class SourceListTargetSettlementTest {
     @Test
     fun emptyContributorSettlementDoesNotBurnTheOuterDeadline() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val torbox = TorBoxSearchSource(scope) { _, _, _, _ ->
-            TorBoxSearch.Result(emptyList(), rateLimited = false, transportError = false)
-        }
+        val torbox = TorBoxSearchSource(
+            scope = scope,
+            fetchStreams = { _, _, _, _ ->
+                TorBoxSearch.Result(emptyList(), rateLimited = false, transportError = false)
+            },
+        )
         val singularity = SourceIndexServeSource(
             scope = scope,
             fetchStreams = { _, _ -> emptyList() },
@@ -42,7 +45,13 @@ class SourceListTargetSettlementTest {
 
         try {
             model.bind(torbox, singularity)
-            model.setContext(SourceListModel.Context(streamId = target, requestGeneration = generation))
+            model.setContext(
+                SourceListModel.Context(
+                    streamId = target,
+                    requestGeneration = generation,
+                    contentId = target,
+                ),
+            )
             model.setRawGroups(listOf(StreamGroup("Raw", listOf(direct("raw", "Raw")))))
             torbox.refresh("tt1234567", 1, 3, generation)
             singularity.refresh(target, isSignedIn = true, requestGeneration = generation)
@@ -111,9 +120,12 @@ class SourceListTargetSettlementTest {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val torboxStream = torrent("b".repeat(40), "TorBox Search")
         val singularityStream = torrent("c".repeat(40), SourceIndexClient.GROUP_ADDON)
-        val torbox = TorBoxSearchSource(scope) { _, _, _, _ ->
-            TorBoxSearch.Result(listOf(torboxStream), rateLimited = false, transportError = false)
-        }
+        val torbox = TorBoxSearchSource(
+            scope = scope,
+            fetchStreams = { _, _, _, _ ->
+                TorBoxSearch.Result(listOf(torboxStream), rateLimited = false, transportError = false)
+            },
+        )
         val singularity = SourceIndexServeSource(
             scope = scope,
             fetchStreams = { _, _ -> listOf(singularityStream) },
@@ -131,6 +143,7 @@ class SourceListTargetSettlementTest {
                 metaId = "tt1234567",
                 streamId = target,
                 requestGeneration = generation,
+                contentId = target,
             ),
         )
         model.setRawGroups(raw)
