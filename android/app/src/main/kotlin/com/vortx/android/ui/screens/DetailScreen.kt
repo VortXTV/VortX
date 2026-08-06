@@ -54,6 +54,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import coil3.compose.AsyncImage
 import com.vortx.android.VortXApplication
 import com.vortx.android.engine.StreamRanking
+import com.vortx.android.library.WatchlistStore
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
@@ -113,6 +114,7 @@ fun DetailScreen(
     val downloadNotice by viewModel.downloadNotice.collectAsStateWithLifecycle()
     val pinUi by viewModel.pinUi.collectAsStateWithLifecycle()
     val sourceSort by viewModel.sourceSort.collectAsStateWithLifecycle()
+    val watchlisted by viewModel.watchlisted.collectAsStateWithLifecycle()
 
     // The download status line is a transient confirmation, not a persistent state: show it for a beat then
     // clear it (the live queue/progress lives on the Downloads screen). Keyed on the notice text so each new
@@ -234,6 +236,8 @@ fun DetailScreen(
                         onWatch = { viewModel.playBest() },
                         onToggleSources = { sourcesOpen = !sourcesOpen },
                         onToggleLibrary = viewModel::toggleLibrary,
+                        watchlisted = watchlisted,
+                        onToggleWatchlist = viewModel::toggleWatchlist,
                         onToggleWatched = { viewModel.setWatched(!(m.data.libraryItem?.isWatched ?: false)) },
                         hasTrailer = m.data.trailerYouTubeId != null,
                         onTrailer = { viewModel.playTrailer() },
@@ -572,6 +576,8 @@ private fun ActionsCluster(
     onWatch: () -> Unit,
     onToggleSources: () -> Unit,
     onToggleLibrary: () -> Unit,
+    watchlisted: Boolean,
+    onToggleWatchlist: () -> Unit,
     onToggleWatched: () -> Unit,
     hasTrailer: Boolean,
     onTrailer: () -> Unit,
@@ -600,38 +606,56 @@ private fun ActionsCluster(
             loading = resolving,
             leadingIcon = if (!resolving) VortXIcons.playFill else null,
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
-            Chip(
-                label = if (inLibrary) "Saved" else "Save",
-                selected = inLibrary,
-                leadingIcon = if (inLibrary) VortXIcons.bookmarkFill else VortXIcons.bookmark,
-                onClick = onToggleLibrary,
-            )
-            Chip(
-                label = "Sources",
-                selected = sourcesOpen,
-                leadingIcon = VortXIcons.listBullet,
-                onClick = onToggleSources,
-            )
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+            item {
+                Chip(
+                    label = if (inLibrary) "Saved" else "Save",
+                    selected = inLibrary,
+                    leadingIcon = if (inLibrary) VortXIcons.bookmarkFill else VortXIcons.bookmark,
+                    onClick = onToggleLibrary,
+                )
+            }
+            if (WatchlistStore.isSafeId(m.id)) {
+                item {
+                    Chip(
+                        label = if (watchlisted) "In Watchlist" else "Watchlist",
+                        selected = watchlisted,
+                        leadingIcon = VortXIcons.starFill,
+                        onClick = onToggleWatchlist,
+                    )
+                }
+            }
+            item {
+                Chip(
+                    label = "Sources",
+                    selected = sourcesOpen,
+                    leadingIcon = VortXIcons.listBullet,
+                    onClick = onToggleSources,
+                )
+            }
             // Trailer: free 1080p from the user's own IP via the client resolver (worker fallback on a miss).
             // Shown only when the meta carries a YouTube trailer id. Plays through the shared player pipeline.
             if (hasTrailer) {
-                Chip(
-                    label = "Trailer",
-                    selected = false,
-                    leadingIcon = VortXIcons.playRectangle,
-                    onClick = onTrailer,
-                )
+                item {
+                    Chip(
+                        label = "Trailer",
+                        selected = false,
+                        leadingIcon = VortXIcons.playRectangle,
+                        onClick = onTrailer,
+                    )
+                }
             }
             // Movie-level watched toggle (a series marks watched per-episode/season via the
             // SeasonSelector's chips instead, since there's no single "the" episode here).
             if (m.videos.isEmpty()) {
-                Chip(
-                    label = if (isWatched) "Watched" else "Mark Watched",
-                    selected = isWatched,
-                    leadingIcon = VortXIcons.checkmarkCircle,
-                    onClick = onToggleWatched,
-                )
+                item {
+                    Chip(
+                        label = if (isWatched) "Watched" else "Mark Watched",
+                        selected = isWatched,
+                        leadingIcon = VortXIcons.checkmarkCircle,
+                        onClick = onToggleWatched,
+                    )
+                }
             }
         }
     }

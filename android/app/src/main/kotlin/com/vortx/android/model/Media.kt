@@ -154,6 +154,7 @@ data class MetaItem(
     val imdbRating: String? = null,
     val genres: List<String> = emptyList(),
     val resumeSeconds: Double? = null,
+    val caption: String? = null,
 ) {
     /// The formatted "resume 1:03" affordance for a Continue Watching card, or null when there is
     /// nothing to resume (mirrors Apple `CoreCWItem.resumeSeconds` -> `resumeTimecode`).

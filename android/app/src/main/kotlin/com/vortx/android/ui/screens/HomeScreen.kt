@@ -29,6 +29,8 @@ import coil3.compose.AsyncImage
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
 import com.vortx.android.home.TOP_PICKS_CATALOG_ID
+import com.vortx.android.home.UPCOMING_EPISODES_CATALOG_ID
+import com.vortx.android.home.UPCOMING_MOVIES_CATALOG_ID
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.EmptyState
 import com.vortx.android.ui.components.ErrorState
@@ -85,6 +87,7 @@ private fun HomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, mod
             val eyebrow = when (catalog.id) {
                 "continue" -> "Pick up where you left off"
                 TOP_PICKS_CATALOG_ID -> "Based on what you watch"
+                UPCOMING_EPISODES_CATALOG_ID, UPCOMING_MOVIES_CATALOG_ID -> "Coming soon"
                 else -> null
             }
             PosterRail(catalog = catalog, onItem = onItem, eyebrow = eyebrow)

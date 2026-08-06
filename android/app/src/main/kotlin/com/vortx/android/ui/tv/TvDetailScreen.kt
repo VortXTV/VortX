@@ -33,6 +33,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
+import com.vortx.android.library.WatchlistStore
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
@@ -65,6 +66,7 @@ fun TvDetailScreen(
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
     val playback by viewModel.playback.collectAsStateWithLifecycle()
+    val watchlisted by viewModel.watchlisted.collectAsStateWithLifecycle()
 
     BackHandler { onBack() }
 
@@ -87,6 +89,7 @@ fun TvDetailScreen(
                 detail = meta.data,
                 streamsState = streamsState,
                 playback = playback,
+                watchlisted = watchlisted,
                 onPlay = onPlay,
             )
         }
@@ -99,6 +102,7 @@ private fun TvDetailContent(
     detail: MetaDetail,
     streamsState: UiState<List<com.vortx.android.model.StreamGroup>>,
     playback: Playback,
+    watchlisted: Boolean,
     onPlay: (Playable) -> Unit,
 ) {
     val colors = VortXTheme.colors
@@ -188,6 +192,20 @@ private fun TvDetailContent(
                             label = "Trailer",
                             selected = false,
                             onClick = { viewModel.playTrailer() },
+                        )
+                    }
+                    Spacer(Modifier.width(VortXTheme.spacing.md))
+                    TvFilterChip(
+                        label = if (detail.libraryItem?.savedToLibrary == true) "Saved" else "Save",
+                        selected = detail.libraryItem?.savedToLibrary == true,
+                        onClick = viewModel::toggleLibrary,
+                    )
+                    if (WatchlistStore.isSafeId(detail.id)) {
+                        Spacer(Modifier.width(VortXTheme.spacing.md))
+                        TvFilterChip(
+                            label = if (watchlisted) "In Watchlist" else "Watchlist",
+                            selected = watchlisted,
+                            onClick = viewModel::toggleWatchlist,
                         )
                     }
                 }

@@ -14,6 +14,7 @@ import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.engine.SourceListModel
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.integrations.buildMediaRef
+import com.vortx.android.library.WatchlistStore
 import com.vortx.android.mediaserver.MediaServerRepository
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.Episode
@@ -22,6 +23,7 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
 import com.vortx.android.model.MetaDetail
+import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
@@ -48,6 +50,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 internal fun MetaDetail.episodeForResolve(selectedEpisodeId: String?): Episode? =
@@ -204,6 +208,10 @@ class DetailViewModel(
     private var sourceLoadJob: Job? = null
     private var playbackResolveJob: Job? = null
     private var profileReloadJob: Job? = null
+    private val watchlistStore = WatchlistStore.shared(app)
+    val watchlisted: StateFlow<Boolean> = watchlistStore.items
+        .map { items -> items.any { it.id == id } }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, watchlistStore.isWatchlisted(id))
 
     /// Gate for the [sourceModel] -> [_streams] bridge: true only after the raw engine groups for the current
     /// target have loaded, so the coalescer's empty first-paint (and the empty state at each new load) never
@@ -1358,6 +1366,19 @@ class DetailViewModel(
             }
             applyMutation(result)
         }
+    }
+
+    /** Toggle the separate profile-local want-to-watch ledger without mutating the account library. */
+    fun toggleWatchlist() {
+        val current = (_meta.value as? UiState.Success)?.data ?: return
+        watchlistStore.toggle(
+            MetaItem(
+                id = current.id,
+                type = current.type,
+                name = current.name,
+                poster = current.poster,
+            ),
+        )
     }
 
     private fun applyMutation(result: Result<MetaDetail>) {

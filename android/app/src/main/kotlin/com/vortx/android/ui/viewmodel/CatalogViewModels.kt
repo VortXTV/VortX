@@ -6,8 +6,12 @@ import androidx.lifecycle.viewModelScope
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
+import com.vortx.android.home.ReleaseCalendarModel
 import com.vortx.android.home.TopPicksModel
+import com.vortx.android.home.upcomingMetaBases
+import com.vortx.android.home.withReleaseCalendarRails
 import com.vortx.android.home.withTopPicksRail
+import com.vortx.android.library.WatchlistStore
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryResult
@@ -17,6 +21,7 @@ import com.vortx.android.ui.UiState
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -55,30 +60,44 @@ class HomeViewModel(
     private val repo: CatalogRepository,
     private val railPreferences: HomeRailPreferences? = null,
     private val railSurface: HomeRailSurface = HomeRailSurface.PHONE,
+    private val watchlistStore: WatchlistStore? = null,
 ) : ViewModel() {
     private val _state = MutableStateFlow<UiState<List<Catalog>>>(UiState.Loading)
     val state: StateFlow<UiState<List<Catalog>>> = _state.asStateFlow()
 
     private var collectJob: Job? = null
-    private var topPicksJob: Job? = null
+    private var personalizedJob: Job? = null
     private var baseRows: List<Catalog> = emptyList()
     private var topPicksItems: List<MetaItem> = emptyList()
     private var sourceHasRows = false
+    private var upcomingEpisodes: List<MetaItem> = emptyList()
+    private var upcomingMovies: List<MetaItem> = emptyList()
     private val topPicks = TopPicksModel()
+    private val releaseCalendar = ReleaseCalendarModel()
 
     init {
         load()
         viewModelScope.launch {
-            repo.ctxUpdates().drop(1).collectLatest { refreshTopPicks() }
+            repo.ctxUpdates().drop(1).collectLatest {
+                watchlistStore?.reload()
+                refreshPersonalizedRails()
+            }
+        }
+        watchlistStore?.let { store ->
+            viewModelScope.launch {
+                store.items.drop(1).collectLatest { refreshPersonalizedRails() }
+            }
         }
     }
 
     fun load() {
         collectJob?.cancel()
-        topPicksJob?.cancel()
+        personalizedJob?.cancel()
         baseRows = emptyList()
         topPicksItems = emptyList()
         sourceHasRows = false
+        upcomingEpisodes = emptyList()
+        upcomingMovies = emptyList()
         _state.value = UiState.Loading
         collectJob = viewModelScope.launch {
             // Watchdog: an engine that produces no rails at all (no network AND no cache) must show
@@ -108,25 +127,48 @@ class HomeViewModel(
                         this@HomeViewModel.sourceHasRows = true
                         baseRows = rows
                         publishHome()
-                        refreshTopPicks()
+                        refreshPersonalizedRails()
                     }
                 }
         }
     }
 
-    private fun refreshTopPicks() {
+    private fun refreshPersonalizedRails() {
         val rows = baseRows
         if (rows.isEmpty()) return
-        topPicksJob?.cancel()
-        topPicksJob = viewModelScope.launch {
-            val library = repo.library().getOrNull()?.items.orEmpty()
+        personalizedJob?.cancel()
+        personalizedJob = viewModelScope.launch {
+            val libraryWork = async { repo.library() }
+            val addonsWork = async { repo.installedAddons() }
+            val libraryResult = libraryWork.await()
+            val library = libraryResult.getOrNull()?.items.orEmpty()
             val continueWatching = rows.firstOrNull { it.id == "continue" }?.items.orEmpty()
-            val refreshed = topPicks.refresh(continueWatching, library) {
-                topPicksItems = emptyList()
-                publishHome()
+            val watchlist = watchlistStore?.items?.value.orEmpty()
+            val topPicksWork = async {
+                topPicks.refresh(continueWatching, library) {
+                    topPicksItems = emptyList()
+                    publishHome()
+                }
             }
+            val releaseWork = async {
+                val addonsResult = addonsWork.await()
+                if (libraryResult.isFailure || addonsResult.isFailure) return@async null
+                releaseCalendar.refresh(library, watchlist, upcomingMetaBases(addonsResult.getOrThrow())) {
+                    upcomingEpisodes = emptyList()
+                    upcomingMovies = emptyList()
+                    publishHome()
+                }
+            }
+            val refreshed = topPicksWork.await()
+            val upcoming = releaseWork.await()
             if (refreshed.changed) {
                 topPicksItems = refreshed.items
+            }
+            if (upcoming?.changed == true) {
+                upcomingEpisodes = upcoming.episodes
+                upcomingMovies = upcoming.movies
+            }
+            if (refreshed.changed || upcoming?.changed == true) {
                 publishHome()
             }
         }
@@ -134,7 +176,8 @@ class HomeViewModel(
 
     private fun publishHome() {
         if (!sourceHasRows) return
-        val enriched = withTopPicksRail(baseRows, topPicksItems)
+        val topRows = withTopPicksRail(baseRows, topPicksItems)
+        val enriched = withReleaseCalendarRails(topRows, upcomingEpisodes, upcomingMovies)
         val rows = railPreferences?.let { preferences ->
             preferences.arrange(enriched, railSurface, preferences.state.value)
         } ?: enriched

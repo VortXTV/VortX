@@ -31,6 +31,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
 import com.vortx.android.home.TOP_PICKS_CATALOG_ID
+import com.vortx.android.home.UPCOMING_EPISODES_CATALOG_ID
+import com.vortx.android.home.UPCOMING_MOVIES_CATALOG_ID
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.HomeViewModel
@@ -140,7 +142,7 @@ private fun TvHero(item: MetaItem?, modifier: Modifier) {
                     modifier = Modifier.padding(top = VortXTheme.spacing.xs),
                 )
                 val meta = listOfNotNull(
-                    item.year,
+                    item.caption ?: item.year,
                     item.imdbRating?.let { "★ $it" },
                     item.genres.firstOrNull(),
                 ).joinToString("   ·   ")
@@ -180,6 +182,7 @@ private fun TvCatalogRow(
         val eyebrow = when (catalog.id) {
             "continue" -> "Pick up where you left off"
             TOP_PICKS_CATALOG_ID -> "Based on what you watch"
+            UPCOMING_EPISODES_CATALOG_ID, UPCOMING_MOVIES_CATALOG_ID -> "Coming soon"
             else -> null
         }
         Column(modifier = Modifier.padding(start = TvDimens.edge, bottom = VortXTheme.spacing.sm)) {

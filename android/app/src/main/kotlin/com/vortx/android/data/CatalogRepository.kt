@@ -323,6 +323,7 @@ class PreviewCatalogRepository(
             isOfficial = true,
             isProtected = true,
             providesStreams = false,
+            providesMeta = true,
             rawDescriptorJson = "{}",
         ),
     )

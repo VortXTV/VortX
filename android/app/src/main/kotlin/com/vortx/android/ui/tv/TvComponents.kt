@@ -132,7 +132,7 @@ fun TvPosterCard(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.padding(top = 8.dp),
         )
-        val subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · ")
+        val subtitle = item.caption ?: listOfNotNull(item.year, item.type.label).joinToString(" · ")
         if (subtitle.isNotBlank()) {
             Text(
                 text = subtitle,

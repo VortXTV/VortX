@@ -575,6 +575,7 @@ internal object EngineState {
                 isOfficial = flags?.optBoolean("official", false) ?: false,
                 isProtected = flags?.optBoolean("protected", false) ?: false,
                 providesStreams = addonDeclaresResource(manifest, "stream"),
+                providesMeta = addonDeclaresResource(manifest, "meta"),
                 providesSubtitles = addonDeclaresResource(manifest, "subtitles"),
                 rawDescriptorJson = addon.toString(),
             )

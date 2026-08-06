@@ -75,7 +75,7 @@ fun PosterRail(
             items(catalog.items, key = { it.id }) { item ->
                 PosterCard(
                     title = item.name,
-                    subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · "),
+                    subtitle = item.caption ?: listOfNotNull(item.year, item.type.label).joinToString(" · "),
                     onClick = { onItem(item) },
                     // Continue Watching items carry a watched fraction; the card draws its accent
                     // progress track for them (null on plain catalog items = no track).
