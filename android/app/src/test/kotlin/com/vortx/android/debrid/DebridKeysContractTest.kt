@@ -576,7 +576,10 @@ class DebridKeysContractTest {
         val releaseIssue = CountDownLatch(1)
         val mutationStarted = CountDownLatch(1)
         val mutationFinished = CountDownLatch(1)
+        val transitionStarted = CountDownLatch(1)
+        val transitionFinished = CountDownLatch(1)
         val issued = AtomicBoolean(false)
+        val ownerMutationPublished = AtomicBoolean(false)
 
         val issuer = thread(start = true) {
             assertTrue(
@@ -597,15 +600,31 @@ class DebridKeysContractTest {
             assertTrue(keys.setKey(DebridService.TOR_BOX, "key-b"))
             mutationFinished.countDown()
         }
+        val transition = thread(start = true) {
+            transitionStarted.countDown()
+            assertTrue(
+                keys.runOwnerTransition {
+                    ownerMutationPublished.set(true)
+                    true
+                },
+            )
+            transitionFinished.countDown()
+        }
 
         assertTrue(mutationStarted.await(5, TimeUnit.SECONDS))
+        assertTrue(transitionStarted.await(5, TimeUnit.SECONDS))
         assertFalse(mutationFinished.await(100, TimeUnit.MILLISECONDS))
+        assertFalse(transitionFinished.await(100, TimeUnit.MILLISECONDS))
+        assertFalse(ownerMutationPublished.get())
         releaseIssue.countDown()
         issuer.join(5_000)
         mutator.join(5_000)
+        transition.join(5_000)
 
         assertTrue(issued.get())
         assertTrue(mutationFinished.await(5, TimeUnit.SECONDS))
+        assertTrue(transitionFinished.await(5, TimeUnit.SECONDS))
+        assertTrue(ownerMutationPublished.get())
         assertEquals("key-b", keys.key(DebridService.TOR_BOX))
         assertFalse(
             keys.authorizeAndIssue(

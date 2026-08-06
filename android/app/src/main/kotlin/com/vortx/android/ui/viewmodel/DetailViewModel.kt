@@ -84,6 +84,22 @@ internal fun DebridCacheEvidence?.forOwner(
         owner != null && it.owner == owner && it.credentialRevision == credentialRevision
     }
 
+internal fun currentAssembledBest(
+    state: com.vortx.android.engine.SourceListState,
+    request: SourceRequestFence.Token?,
+): StreamSource? = state.best.takeIf {
+    request != null &&
+        state.requestGeneration == request.generation &&
+        state.streamId == request.targetId
+}
+
+internal fun bestSourceForCurrentRequest(
+    state: com.vortx.android.engine.SourceListState,
+    request: SourceRequestFence.Token?,
+    currentGroups: List<StreamGroup>,
+    rankCurrent: (List<StreamGroup>) -> StreamSource?,
+): StreamSource? = currentAssembledBest(state, request) ?: rankCurrent(currentGroups)
+
 /// Map one ranked stream into the failover candidate that carries both its source identity and, for torrents,
 /// the exact provider whose account cache check confirmed the hash. Usenet deliberately carries no torrent
 /// provider because its resolve path remains TorBox-only.
@@ -1119,11 +1135,13 @@ class DetailViewModel(
     /// assembled best (ranked with the same prefs/pin/continuity the list is), falling back to ranking the
     /// published groups directly before the first assembly lands. Null when no sources resolved yet. Drives
     /// the hero Watch button's enabled state.
-    fun bestSource(): StreamSource? =
-        sourceModel.state.value.best
-            ?: (_streams.value as? UiState.Success)?.data?.let { groups ->
+    fun bestSource(): StreamSource? {
+        val request = sourceRequestFence.currentToken()
+        val groups = (_streams.value as? UiState.Success)?.data.orEmpty()
+        return bestSourceForCurrentRequest(sourceModel.state.value, request, groups) { currentGroups ->
+            currentGroups.takeIf { it.isNotEmpty() }?.let {
                 StreamRanking.best(
-                    groups,
+                    currentGroups,
                     continuity = lastCtx?.continuity,
                     pin = currentPin(),
                     sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null,
@@ -1131,6 +1149,8 @@ class DetailViewModel(
                     prefs = lastCtx?.prefs ?: StreamRanking.reading(),
                 )
             }
+        }
+    }
 
     /// The engine resume position (ms) for the source about to play: the saved library `timeOffset` when
     /// it applies to the current target (a movie, or the series episode whose sources are shown), else 0

@@ -840,11 +840,13 @@ class DebridKeys private constructor(
      * the caller's durable session state remains unchanged.
      */
     internal fun runOwnerTransition(mutation: () -> Boolean): Boolean =
-        synchronized(LEGACY_ADOPTION_LOCK) {
-            val owner = currentOwner() ?: return@synchronized false
-            if (!prepareLegacyRollbackSlotsForOwnerTransition(owner)) return@synchronized false
-            if (!tombstoneLegacyRollbackSlots()) return@synchronized false
-            mutation()
+        synchronized(CREDENTIAL_STATE_LOCK) credentialState@{
+            synchronized(LEGACY_ADOPTION_LOCK) legacyState@{
+                val owner = currentOwner() ?: return@legacyState false
+                if (!prepareLegacyRollbackSlotsForOwnerTransition(owner)) return@legacyState false
+                if (!tombstoneLegacyRollbackSlots()) return@legacyState false
+                mutation()
+            }
         }
 
     private fun isStorageUnavailable(storageKey: String): Boolean =

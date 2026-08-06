@@ -317,9 +317,10 @@ class SourceListModel(
          * Apply the viewer's direct-links-only display preference without mistaking an already-resolved
          * debrid row for a raw torrent. Some resolvers retain [StreamSource.infoHash] and [StreamSource.isTorrent]
          * as provenance after attaching a direct [StreamSource.url]; those rows are playable direct links and
-         * must stay. A media-server or external direct row also stays even if malformed upstream metadata set
-         * the torrent flag. This pure filter is shared by the coalesced assembly and Detail's immediate paint
-         * and Smart Source pick, so no pre-coalescer path can publish or rank a forbidden raw torrent.
+         * must stay. A media-server row also stays even if malformed upstream metadata set the torrent flag.
+         * [StreamSource.externalUrl] is only a hand-off descriptor and cannot make a torrent directly playable.
+         * This pure filter is shared by the coalesced assembly and Detail's immediate paint and Smart Source
+         * pick, so no pre-coalescer path can publish or rank a forbidden raw torrent.
          */
         fun directLinkDisplayGroups(
             groups: List<StreamGroup>,
@@ -328,9 +329,12 @@ class SourceListModel(
             if (!enabled) return groups
             return groups.mapNotNull { group ->
                 val streams = group.streams.filterNot { stream ->
+                    val directUrl = stream.url?.trim().orEmpty()
+                    val hasDirectUrl =
+                        directUrl.startsWith("https://", ignoreCase = true) ||
+                            directUrl.startsWith("http://", ignoreCase = true)
                     stream.isTorrent &&
-                        stream.url.isNullOrBlank() &&
-                        stream.externalUrl.isNullOrBlank() &&
+                        !hasDirectUrl &&
                         !stream.isMediaServer
                 }
                 if (streams.isEmpty()) null else group.copy(streams = streams)

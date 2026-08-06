@@ -21,13 +21,30 @@ class DirectLinkDisplayGroupsTest {
             url = "https://debrid.example/file",
         )
         val direct = source("direct", url = "https://cdn.example/file")
+        val externalTorrent = source(
+            "external-torrent",
+            isTorrent = true,
+            infoHash = HASH,
+            externalUrl = "https://addon.example/resolve",
+        )
+        val fakeDirectTorrent = source(
+            "fake-direct-torrent",
+            isTorrent = true,
+            infoHash = HASH,
+            url = "magnet:?xt=urn:btih:$HASH",
+        )
         val mediaServer = source(
             "server",
             isTorrent = true,
             infoHash = HASH,
             isMediaServer = true,
         )
-        val groups = listOf(StreamGroup("Provider", listOf(rawTorrent, resolvedDebrid, direct, mediaServer)))
+        val groups = listOf(
+            StreamGroup(
+                "Provider",
+                listOf(rawTorrent, resolvedDebrid, direct, externalTorrent, fakeDirectTorrent, mediaServer),
+            ),
+        )
 
         val display = SourceListModel.directLinkDisplayGroups(groups, enabled = true)
 
@@ -99,6 +116,7 @@ class DirectLinkDisplayGroupsTest {
         isMediaServer: Boolean = false,
         infoHash: String? = null,
         url: String? = null,
+        externalUrl: String? = null,
     ) = StreamSource(
         id = id,
         addon = "Provider",
@@ -107,6 +125,7 @@ class DirectLinkDisplayGroupsTest {
         isMediaServer = isMediaServer,
         infoHash = infoHash,
         url = url,
+        externalUrl = externalUrl,
     )
 
     private fun readProjectFile(relativePath: String): String {

@@ -190,7 +190,7 @@ class TorBoxSearchSourceConcurrencyTest {
         )
 
         try {
-            source.refresh("tt1234567", season = 1, episode = 1)
+            source.refresh("tt1234567", season = 1, episode = 1, requestGeneration = 41L)
             withTimeout(5_000) { firstStarted.await() }
 
             key.set("key-b")
@@ -200,6 +200,10 @@ class TorBoxSearchSourceConcurrencyTest {
 
             assertTrue(source.streams.value.isEmpty())
             assertTrue(source.streamsFor("tt1234567:1:1").isEmpty())
+            assertEquals(
+                com.vortx.android.engine.SourceContributorSettlement(41L, settled = true),
+                source.settlement.value,
+            )
 
             source.refresh("tt1234567", season = 1, episode = 2)
             withTimeout(5_000) {

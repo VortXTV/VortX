@@ -518,6 +518,11 @@ class TorBoxSearchSource private constructor(
                             currentCredential.revision != credential.revision ||
                             currentCredential.key != key
                         ) {
+                            // This request generation is retired, but it is still a completed contributor.
+                            // Publish that terminal state explicitly before changing credential ownership so
+                            // an assembler waiting on this generation cannot remain stuck at unsettled.
+                            _settlement.value =
+                                SourceContributorSettlement(requestGeneration, settled = true)
                             replaceCredentialRevisionLocked(currentCredential.revision)
                             shownKey = null
                             publishedContentId = null
