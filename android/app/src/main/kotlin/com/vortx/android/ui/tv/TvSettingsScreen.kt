@@ -55,6 +55,7 @@ import androidx.tv.material3.Surface
 import com.vortx.android.R
 import com.vortx.android.BuildConfig
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.model.VideoUpscaling
 import com.vortx.android.player.AudioOutputMode
@@ -94,6 +95,7 @@ import com.vortx.android.ui.theme.VortXTheme
 @Composable
 fun TvSettingsScreen(modifier: Modifier = Modifier) {
     val appContext = LocalContext.current.applicationContext
+    val homeRailPreferences = remember(appContext) { HomeRailPreferences.shared(appContext) }
     val debridKeys = remember(appContext) { DebridKeys(appContext) }
     val trackStore = remember(appContext) {
         TrackPreferencesStore(appContext, PerformanceMode.isConstrainedDevice(appContext))
@@ -149,6 +151,15 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
         return
     }
 
+    if (route == TvSettingsRoute.CUSTOMIZE_HOME) {
+        TvCustomizeHomeScreen(
+            preferences = homeRailPreferences,
+            onBack = { route = TvSettingsRoute.ROOT },
+            modifier = modifier,
+        )
+        return
+    }
+
     fun commitSwitch(profile: UserProfile) {
         if (store == null) return
         status = null
@@ -190,6 +201,16 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
                             )
                         }
                     }
+                }
+            }
+
+            item {
+                TvSettingsSection("Appearance") {
+                    TvSettingsNavigationRow(
+                        label = "Customize Home",
+                        detail = "Reorder or hide Home rows",
+                        onClick = { route = TvSettingsRoute.CUSTOMIZE_HOME },
+                    )
                 }
             }
 
@@ -390,7 +411,8 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
 internal enum class TvSettingsRoute {
     ROOT,
     DEBRID,
-    WHATS_NEW;
+    WHATS_NEW,
+    CUSTOMIZE_HOME;
 
     internal fun back(): TvSettingsRoute = ROOT
 }

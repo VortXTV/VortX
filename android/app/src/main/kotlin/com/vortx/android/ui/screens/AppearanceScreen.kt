@@ -38,6 +38,7 @@ import kotlin.math.roundToInt
 @Composable
 fun AppearanceScreen(
     prefs: AppearancePrefs,
+    onCustomizeHome: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -157,6 +158,22 @@ fun AppearanceScreen(
                     ) {
                         Text("Larger")
                     }
+                }
+            }
+
+            SettingsSection(
+                title = "Home",
+                footer = "Continue Watching stays first. Every other Home row can be reordered or hidden.",
+            ) {
+                OutlinedButton(
+                    onClick = onCustomizeHome,
+                    modifier = Modifier.fillMaxWidth().padding(VortXTheme.spacing.sm),
+                ) {
+                    Icon(VortXIcons.listBullet, contentDescription = null)
+                    Text(
+                        "Customize Home",
+                        modifier = Modifier.padding(start = VortXTheme.spacing.sm),
+                    )
                 }
             }
         }

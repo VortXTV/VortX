@@ -49,7 +49,7 @@ fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier:
         is UiState.Success ->
             if (s.data.isEmpty()) {
                 TvError(
-                    "No catalogs yet. Check your connection, or sign in.",
+                    "No Home rows are visible. Turn rows back on in Settings > Appearance > Customize Home.",
                     onRetry = viewModel::load,
                     modifier = modifier,
                 )

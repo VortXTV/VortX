@@ -4,6 +4,8 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.home.HomeRailPreferences
+import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryResult
@@ -19,10 +21,12 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -43,7 +47,11 @@ private fun <T> Result<T>.toUiState(): UiState<T> = fold(
 /// updated in place on every later change. If nothing arrives within [EMPTY_TIMEOUT_MS], Error with
 /// Retry -- never a silent black screen -- but collection continues, so data landing late still
 /// replaces the error.
-class HomeViewModel(private val repo: CatalogRepository) : ViewModel() {
+class HomeViewModel(
+    private val repo: CatalogRepository,
+    private val railPreferences: HomeRailPreferences? = null,
+    private val railSurface: HomeRailSurface = HomeRailSurface.PHONE,
+) : ViewModel() {
     private val _state = MutableStateFlow<UiState<List<Catalog>>>(UiState.Loading)
     val state: StateFlow<UiState<List<Catalog>>> = _state.asStateFlow()
 
@@ -66,14 +74,21 @@ class HomeViewModel(private val repo: CatalogRepository) : ViewModel() {
                     _state.value = UiState.Error("Couldn't load your catalogs. Check your connection and try again.")
                 }
             }
-            repo.homeUpdates()
+            val homeUpdates = railPreferences?.let { preferences ->
+                repo.homeUpdates().combine(preferences.state) { rows, layout ->
+                    rows.isNotEmpty() to preferences.arrange(rows, railSurface, layout)
+                }
+            } ?: repo.homeUpdates().map { rows -> rows.isNotEmpty() to rows }
+            homeUpdates
                 .catch { error ->
                     _state.value = UiState.Error(error.message ?: "Something went wrong loading your add-ons.")
                 }
-                .collect { rows ->
+                .collect { (sourceHasRows, rows) ->
                     // Empty emissions are the stream's "nothing settled yet" heartbeat -- keep the
-                    // shimmer (or the previous Success) rather than rendering an empty Home.
-                    if (rows.isNotEmpty()) _state.value = UiState.Success(rows)
+                    // shimmer (or the previous Success) rather than rendering an empty Home. A non-empty
+                    // source that becomes empty only after the user's visibility filter is still a real
+                    // settled result, so publish it instead of leaving the now-hidden rows on screen.
+                    if (sourceHasRows) _state.value = UiState.Success(rows)
                 }
         }
     }
