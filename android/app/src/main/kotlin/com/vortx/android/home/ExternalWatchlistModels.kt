@@ -119,7 +119,11 @@ internal fun withExternalWatchlistRails(
 ): List<Catalog> {
     val base = rows.filterNot { it.id == TRAKT_WATCHLIST_CATALOG_ID || it.id == SIMKL_WATCHLIST_CATALOG_ID }
     if (trakt.isEmpty() && simkl.isEmpty()) return base
-    val insertion = (base.indexOfFirst { it.id == TOP_PICKS_CATALOG_ID } + 1).coerceAtLeast(0)
+    val anchor = base.indexOfFirst { it.id == BECAUSE_YOU_WATCHED_CATALOG_ID }
+        .takeIf { it >= 0 }
+        ?: base.indexOfFirst { it.id == TOP_PICKS_CATALOG_ID }.takeIf { it >= 0 }
+        ?: -1
+    val insertion = anchor + 1
     return base.toMutableList().apply {
         var index = insertion
         if (trakt.isNotEmpty()) add(index++, Catalog(TRAKT_WATCHLIST_CATALOG_ID, "Trakt Watchlist", trakt))
@@ -127,7 +131,7 @@ internal fun withExternalWatchlistRails(
     }
 }
 
-private data class ExternalSeed(
+internal data class ExternalSeed(
     val imdb: String,
     val type: MediaType,
     val title: String,
@@ -238,7 +242,7 @@ private class SimklWatchlistSource(private val context: Context?) : ExternalWatc
     }
 }
 
-private object ExternalMetadataResolver {
+internal object ExternalMetadataResolver {
     private const val CINEMETA = "https://v3-cinemeta.strem.io"
     private const val TIMEOUT_MS = 12_000
     private val slots = Semaphore(6)

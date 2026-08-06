@@ -230,8 +230,15 @@ internal fun withReleaseCalendarRails(
 ): List<com.vortx.android.model.Catalog> {
     val base = rows.filterNot { it.id == UPCOMING_EPISODES_CATALOG_ID || it.id == UPCOMING_MOVIES_CATALOG_ID }
     if (episodes.isEmpty() && movies.isEmpty()) return base
-    val anchor = base.indexOfFirst { it.id == TOP_PICKS_CATALOG_ID }
+    val anchor = base.indexOfLast {
+        it.id.startsWith("vortx.home.importedLists:") ||
+            it.id.startsWith("vortx.home.mediaServers:")
+    }
         .takeIf { it >= 0 }
+        ?: base.indexOfFirst { it.id == SIMKL_WATCHLIST_CATALOG_ID }.takeIf { it >= 0 }
+        ?: base.indexOfFirst { it.id == TRAKT_WATCHLIST_CATALOG_ID }.takeIf { it >= 0 }
+        ?: base.indexOfFirst { it.id == BECAUSE_YOU_WATCHED_CATALOG_ID }.takeIf { it >= 0 }
+        ?: base.indexOfFirst { it.id == TOP_PICKS_CATALOG_ID }.takeIf { it >= 0 }
         ?: base.indexOfFirst { it.id == "continue" }.takeIf { it >= 0 }
         ?: -1
     return base.toMutableList().apply {

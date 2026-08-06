@@ -4,19 +4,27 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.home.BecauseYouWatchedModel
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
+import com.vortx.android.home.ImportedCatalogs
 import com.vortx.android.home.ReleaseCalendarModel
 import com.vortx.android.home.SimklRailsModel
 import com.vortx.android.home.TopPicksModel
 import com.vortx.android.home.TraktRailsModel
+import com.vortx.android.home.importedCatalogRails
 import com.vortx.android.home.upcomingMetaBases
+import com.vortx.android.home.withBecauseYouWatchedRail
 import com.vortx.android.home.withExternalWatchlistRails
+import com.vortx.android.home.withImportedCatalogRails
 import com.vortx.android.home.withReleaseCalendarRails
 import com.vortx.android.home.withTopPicksRail
 import com.vortx.android.integrations.SIMKLAuth
 import com.vortx.android.integrations.TraktAuth
 import com.vortx.android.library.WatchlistStore
+import com.vortx.android.mediaserver.MediaServerCatalogsModel
+import com.vortx.android.mediaserver.MediaServerRepository
+import com.vortx.android.mediaserver.withMediaServerRails
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryResult
@@ -68,6 +76,9 @@ class HomeViewModel internal constructor(
     private val watchlistStore: WatchlistStore? = null,
     private val traktRails: TraktRailsModel = TraktRailsModel(),
     private val simklRails: SimklRailsModel = SimklRailsModel(),
+    private val becauseYouWatched: BecauseYouWatchedModel = BecauseYouWatchedModel(),
+    private val mediaServerCatalogs: MediaServerCatalogsModel = MediaServerCatalogsModel(),
+    private val importedCatalogs: ImportedCatalogs? = null,
 ) : ViewModel() {
     private val _state = MutableStateFlow<UiState<List<Catalog>>>(UiState.Loading)
     val state: StateFlow<UiState<List<Catalog>>> = _state.asStateFlow()
@@ -81,6 +92,10 @@ class HomeViewModel internal constructor(
     private var upcomingMovies: List<MetaItem> = emptyList()
     private var traktWatchlist: List<MetaItem> = emptyList()
     private var simklWatchlist: List<MetaItem> = emptyList()
+    private var becauseYouWatchedRail: Catalog? = null
+    private var mediaServerRails: List<Catalog> = emptyList()
+    private var importedRails: List<Catalog> = importedCatalogs?.catalogs?.value
+        ?.let(::importedCatalogRails).orEmpty()
     private val topPicks = TopPicksModel()
     private val releaseCalendar = ReleaseCalendarModel()
 
@@ -113,6 +128,22 @@ class HomeViewModel internal constructor(
                 refreshPersonalizedRails()
             }
         }
+        viewModelScope.launch {
+            MediaServerRepository.configurationBoundary.drop(1).collectLatest {
+                mediaServerCatalogs.clear()
+                mediaServerRails = emptyList()
+                publishHome()
+                refreshPersonalizedRails()
+            }
+        }
+        importedCatalogs?.let { registry ->
+            viewModelScope.launch {
+                registry.catalogs.drop(1).collectLatest { catalogs ->
+                    importedRails = importedCatalogRails(catalogs)
+                    publishHome()
+                }
+            }
+        }
     }
 
     fun load() {
@@ -125,6 +156,8 @@ class HomeViewModel internal constructor(
         upcomingMovies = emptyList()
         traktWatchlist = emptyList()
         simklWatchlist = emptyList()
+        becauseYouWatchedRail = null
+        mediaServerRails = emptyList()
         _state.value = UiState.Loading
         collectJob = viewModelScope.launch {
             // Watchdog: an engine that produces no rails at all (no network AND no cache) must show
@@ -158,11 +191,12 @@ class HomeViewModel internal constructor(
                     }
                 }
         }
+        publishHome()
+        refreshPersonalizedRails()
     }
 
     private fun refreshPersonalizedRails() {
         val rows = baseRows
-        if (rows.isEmpty()) return
         personalizedJob?.cancel()
         personalizedJob = viewModelScope.launch {
             val libraryWork = async { repo.library() }
@@ -177,8 +211,15 @@ class HomeViewModel internal constructor(
                     publishHome()
                 }
             }
+            val becauseWork = async {
+                becauseYouWatched.refresh(continueWatching, library) {
+                    becauseYouWatchedRail = null
+                    publishHome()
+                }
+            }
             val traktWork = async { traktRails.refresh() }
             val simklWork = async { simklRails.refresh() }
+            val mediaServerWork = async { mediaServerCatalogs.refresh() }
             val releaseWork = async {
                 val addonsResult = addonsWork.await()
                 if (libraryResult.isFailure || addonsResult.isFailure) return@async null
@@ -189,9 +230,11 @@ class HomeViewModel internal constructor(
                 }
             }
             val refreshed = topPicksWork.await()
+            val because = becauseWork.await()
             val upcoming = releaseWork.await()
             val trakt = traktWork.await()
             val simkl = simklWork.await()
+            val media = mediaServerWork.await()
             if (refreshed.changed) {
                 topPicksItems = refreshed.items
             }
@@ -199,20 +242,31 @@ class HomeViewModel internal constructor(
                 upcomingEpisodes = upcoming.episodes
                 upcomingMovies = upcoming.movies
             }
+            if (because.changed) becauseYouWatchedRail = because.rail
+            if (media.changed) mediaServerRails = media.rails
             val externalChanged = traktWatchlist != trakt.items || simklWatchlist != simkl.items
             traktWatchlist = trakt.items
             simklWatchlist = simkl.items
-            if (refreshed.changed || upcoming?.changed == true || trakt.changed || simkl.changed || externalChanged) {
+            if (
+                refreshed.changed || because.changed || media.changed || upcoming?.changed == true ||
+                trakt.changed || simkl.changed || externalChanged
+            ) {
                 publishHome()
             }
         }
     }
 
     private fun publishHome() {
-        if (!sourceHasRows) return
+        val hasClientRows = topPicksItems.isNotEmpty() || becauseYouWatchedRail != null ||
+            traktWatchlist.isNotEmpty() || simklWatchlist.isNotEmpty() || mediaServerRails.isNotEmpty() ||
+            importedRails.isNotEmpty() || upcomingEpisodes.isNotEmpty() || upcomingMovies.isNotEmpty()
+        if (!sourceHasRows && !hasClientRows) return
         val topRows = withTopPicksRail(baseRows, topPicksItems)
-        val externalRows = withExternalWatchlistRails(topRows, traktWatchlist, simklWatchlist)
-        val enriched = withReleaseCalendarRails(externalRows, upcomingEpisodes, upcomingMovies)
+        val becauseRows = withBecauseYouWatchedRail(topRows, becauseYouWatchedRail)
+        val externalRows = withExternalWatchlistRails(becauseRows, traktWatchlist, simklWatchlist)
+        val serverRows = withMediaServerRails(externalRows, mediaServerRails)
+        val importedRows = withImportedCatalogRails(serverRows, importedRails)
+        val enriched = withReleaseCalendarRails(importedRows, upcomingEpisodes, upcomingMovies)
         val rows = railPreferences?.let { preferences ->
             preferences.arrange(enriched, railSurface, preferences.state.value)
         } ?: enriched

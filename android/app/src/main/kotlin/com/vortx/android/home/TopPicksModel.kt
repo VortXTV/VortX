@@ -102,7 +102,7 @@ internal fun withTopPicksRail(rows: List<Catalog>, items: List<MetaItem>): List<
 }
 
 /** Keyless TMDB recommendations resolved through Cinemeta into normal playable VortX cards. */
-private object TopPicksClient {
+internal object TopPicksClient {
     private const val CINEMETA = "https://v3-cinemeta.strem.io"
     private const val TIMEOUT_MS = 20_000
     private val metadataSlots = Semaphore(8)
