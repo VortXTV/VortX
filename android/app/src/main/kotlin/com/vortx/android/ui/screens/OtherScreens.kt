@@ -265,6 +265,7 @@ fun SettingsScreen(
     onDebridKeysScreenClick: () -> Unit,
     onDownloadsClick: () -> Unit,
     onLibraryClick: () -> Unit,
+    onWhatsNewClick: () -> Unit,
     settingsScrollState: ScrollState,
     debridServicesFocusRequester: FocusRequester,
     modifier: Modifier = Modifier,
@@ -359,6 +360,12 @@ fun SettingsScreen(
         // the two things a viewer might do here (export, import) are the honest summary anyway. Same rule as
         // the Add-ons and Media servers rows.
         SettingRow(VortXIcons.library, "Library", "Export, import", onClick = onLibraryClick)
+        SettingRow(
+            VortXIcons.checkmarkCircle,
+            "What's New",
+            "Version ${BuildConfig.VERSION_NAME}",
+            onClick = onWhatsNewClick,
+        )
         if (BuildConfig.DEBUG && onOpenGallery != null) {
             SettingRow(VortXIcons.checkmarkCircle, "Design gallery", "Debug", onClick = onOpenGallery)
         }

@@ -53,6 +53,7 @@ import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.R
+import com.vortx.android.BuildConfig
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.model.VideoUpscaling
@@ -140,6 +141,11 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
             onBack = ::returnToSettingsRoot,
             modifier = modifier,
         )
+        return
+    }
+
+    if (route == TvSettingsRoute.WHATS_NEW) {
+        TvWhatsNewScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
         return
     }
 
@@ -345,6 +351,16 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
                 }
             }
 
+            item {
+                TvSettingsSection("About") {
+                    TvSettingsNavigationRow(
+                        label = "What's New",
+                        detail = "VortX ${BuildConfig.VERSION_NAME}",
+                        onClick = { route = TvSettingsRoute.WHATS_NEW },
+                    )
+                }
+            }
+
             item { TvSettingsFootnote() }
         }
 
@@ -373,9 +389,10 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
 
 internal enum class TvSettingsRoute {
     ROOT,
-    DEBRID;
+    DEBRID,
+    WHATS_NEW;
 
-    internal fun back(): TvSettingsRoute = if (this == DEBRID) ROOT else this
+    internal fun back(): TvSettingsRoute = ROOT
 }
 
 /// The active profile, shown large above the switcher (avatar + name + a Kids marker), so "who is watching"
