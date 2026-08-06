@@ -2,15 +2,16 @@ package com.vortx.android.skip
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.vortx.android.integrations.SecureTokenStore
 
 /// The Android analogue of the Apple skip stack's `UserDefaults` provider key + `ApiKeys.skipDBKey()` /
 /// `ApiKeys.customSkipURL()` / `ApiKeys.customSkipKey()` accessors. Backs the crowd provider selection and
 /// the OPTIONAL best-effort legs (community skipdb.tv + a user's custom SkipDB-compatible mirror).
 ///
-/// FAIL-SOFT / DORMANT by default: with no settings surface wired yet, the community + custom keys resolve
-/// to null and those legs make zero network calls, exactly like the Apple actors when `ApiKeys` returns nil.
-/// The authoritative, keyless skip.vortx.tv leg needs none of this. [init] is idempotent; the store is a
-/// plain preferences file (these are user preferences, not secrets, mirroring the Apple `UserDefaults` use).
+/// FAIL-SOFT / DORMANT by default: with no credentials configured, the community + custom keys resolve to
+/// null and those legs make zero network calls, exactly like the Apple actors when `ApiKeys` returns nil.
+/// The provider choice remains a preference. API keys and the custom endpoint use encrypted storage, matching
+/// the Apple Keychain boundary. [init] is idempotent and migrates the three legacy preference values in place.
 object SkipConfig {
 
     /// Values: "theintrodb" | "skipdb" | "both". Matches the Apple `SkipTimestampService.providerKey`
@@ -20,18 +21,30 @@ object SkipConfig {
     const val PROVIDER_KEY = "stremiox.skipProvider"
 
     private const val PREFS_FILE = "vortx_skip"
-    private const val KEY_SKIPDB = "vortx.skip.skipdbKey"
-    private const val KEY_CUSTOM_URL = "vortx.skip.customUrl"
-    private const val KEY_CUSTOM_KEY = "vortx.skip.customKey"
+    private const val CREDENTIALS_FILE = "vortx_skip_credentials"
+
+    internal val credentialKeys = listOf(
+        SkipCredentialKey("vortx.apikey.skipdb", "vortx.skip.skipdbKey"),
+        SkipCredentialKey("vortx.skip.customurl", "vortx.skip.customUrl"),
+        SkipCredentialKey("vortx.apikey.customskip", "vortx.skip.customKey"),
+    )
 
     @Volatile private var prefs: SharedPreferences? = null
+    @Volatile private var credentials: SecureTokenStore? = null
 
     /// Idempotent init: wire the preferences file. Safe to call from every entry point (the player skip
     /// fetch, a later Streams-settings screen). Cheap and network-free.
     fun init(context: Context) {
-        if (prefs == null) {
+        if (prefs == null || credentials == null) {
             synchronized(this) {
-                if (prefs == null) prefs = context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
+                if (prefs == null || credentials == null) {
+                    val appContext = context.applicationContext
+                    val loadedPrefs = appContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
+                    val loadedCredentials = SecureTokenStore(appContext, CREDENTIALS_FILE)
+                    migrateLegacyCredentials(loadedPrefs, loadedCredentials)
+                    prefs = loadedPrefs
+                    credentials = loadedCredentials
+                }
             }
         }
     }
@@ -45,16 +58,26 @@ object SkipConfig {
     }
 
     /// The user's optional skipdb.tv API key (Apple `ApiKeys.skipDBKey()`). null (dormant) when unset.
-    fun skipDBKey(): String? = nonEmpty(prefs?.getString(KEY_SKIPDB, null))
+    fun skipDBKey(): String? = nonEmpty(credentials?.string(credentialKeys[0].current))
 
     /// The user's optional custom SkipDB-compatible mirror base URL (Apple `ApiKeys.customSkipURL()`).
-    fun customSkipURL(): String? = nonEmpty(prefs?.getString(KEY_CUSTOM_URL, null))
+    fun customSkipURL(): String? = nonEmpty(credentials?.string(credentialKeys[1].current))
 
     /// The optional key for the custom mirror (Apple `ApiKeys.customSkipKey()`); some mirrors are keyless.
-    fun customSkipKey(): String? = nonEmpty(prefs?.getString(KEY_CUSTOM_KEY, null))
+    fun customSkipKey(): String? = nonEmpty(credentials?.string(credentialKeys[2].current))
+
+    private fun migrateLegacyCredentials(prefs: SharedPreferences, credentials: SecureTokenStore) {
+        credentialKeys.forEach { key ->
+            val legacyValue = nonEmpty(prefs.getString(key.legacy, null)) ?: return@forEach
+            val destinationReady = credentials.string(key.current) != null || credentials.set(key.current, legacyValue)
+            if (destinationReady) prefs.edit().remove(key.legacy).apply()
+        }
+    }
 
     private fun nonEmpty(s: String?): String? = s?.trim()?.takeIf { it.isNotEmpty() }
 }
+
+internal data class SkipCredentialKey(val current: String, val legacy: String)
 
 /// The user's optional custom SkipDB-compatible provider. Shared by the read path
 /// ([SkipTimestampService] custom leg) and the submit path ([SkipDBClient] custom leg). Mirrors Apple
