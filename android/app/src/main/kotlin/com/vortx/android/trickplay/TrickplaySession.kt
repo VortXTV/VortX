@@ -60,6 +60,9 @@ class TrickplaySession(context: Context) {
 
     private val mutex = Mutex()
 
+    /** Orders frame admission and the final snapshot by call time, and closes admission at teardown. */
+    private val admissionQueue = TrickplayAdmissionQueue(scope)
+
     /**
      * The fetched community sheet. `@Volatile` because [previewAt] reads it from the scrubber on the main
      * thread while the fetch coroutine writes it from IO. [CommunityTrickplay.Sheet] is immutable once
@@ -207,10 +210,10 @@ class TrickplaySession(context: Context) {
      * not just waste a POST, it would poison other platforms' previews for that title.
      */
     fun recordFrame(jpeg: ByteArray, timeSeconds: Double, videoHeight: Int) {
-        scope.launch {
-            if (!keepFrame(jpeg, timeSeconds)) return@launch
+        admissionQueue.enqueue {
+            if (!keepFrame(jpeg, timeSeconds)) return@enqueue
             val push = mutex.withLock {
-                if (contentKey == null) return@launch
+                if (contentKey == null) return@withLock null
                 // Remember the source height HERE rather than reading it off the engine at teardown: the
                 // engine is being released around then, and a property read against a destroyed native mpv
                 // handle is a segfault, which no runCatching can save. A frame we hold is proof the engine
@@ -223,13 +226,13 @@ class TrickplaySession(context: Context) {
                 val candidates = frames + CommunityTrickplay.CapturedFrame(time = timeSeconds, jpeg = jpeg)
                 val retained = TrickplayTimeline.retainedIndices(candidates.map { it.time }, MAX_SESSION_FRAMES)
                 val nextFrames = retained.map { candidates[it] }
-                if (sameRetainedContent(frames, nextFrames)) return@launch
+                if (sameRetainedContent(frames, nextFrames)) return@withLock null
                 frames.clear()
                 frames += nextFrames
                 retainedRevision += 1L
                 uploadDecision(progressive = true)
             }
-            push?.let { pushUpload(it) }
+            push?.let(::launchUpload)
         }
     }
 
@@ -299,9 +302,9 @@ class TrickplaySession(context: Context) {
      * this is the last chance to store the fullest set.
      */
     fun finishAndFlush() {
-        scope.launch {
-            val push = mutex.withLock { uploadDecision(progressive = false) } ?: return@launch
-            pushUpload(push)
+        admissionQueue.closeAndEnqueue {
+            val push = mutex.withLock { uploadDecision(progressive = false) }
+            push?.let(::launchUpload)
         }
     }
 
@@ -379,6 +382,10 @@ class TrickplaySession(context: Context) {
         }
     }
 
+    private fun launchUpload(push: PendingUpload) {
+        scope.launch { pushUpload(push) }
+    }
+
     /** Build + POST off the main thread. The coordinator latch is cleared from finally for every exit. */
     private suspend fun pushUpload(push: PendingUpload) {
         Log.d(
@@ -410,25 +417,30 @@ class TrickplaySession(context: Context) {
         } catch (failure: Exception) {
             Log.d(TAG, "upload key=${push.key} revision=${push.revision} -> failed(${failure.javaClass.simpleName})")
         } finally {
-            val next = mutex.withLock {
-                val policyOutcome = when (outcome) {
-                    is CommunityTrickplay.UploadOutcome.Stored -> TrickplayUploadCoordinator.Outcome.STORED
-                    is CommunityTrickplay.UploadOutcome.Rejected -> TrickplayUploadCoordinator.Outcome.REJECTED
-                    is CommunityTrickplay.UploadOutcome.Failed -> TrickplayUploadCoordinator.Outcome.FAILED
-                }
-                val completion = uploadCoordinator.complete(push.claim, policyOutcome)
-                if (!completion.applied) return@withLock null
-                val deferred = deferredUpload
-                deferredUpload = null
-                completion.nextClaim?.let { nextClaim -> deferred?.takeIf { it.claim == nextClaim } }
-            }
-            if (next != null) {
-                Log.d(
-                    TAG,
-                    "upload draining deferred final key=${next.key} revision=${next.revision} frames=${next.frames.size}",
-                )
-                pushUpload(next)
-            }
+            completeAndLaunchNextUpload(
+                complete = {
+                    mutex.withLock {
+                        val policyOutcome = when (outcome) {
+                            is CommunityTrickplay.UploadOutcome.Stored -> TrickplayUploadCoordinator.Outcome.STORED
+                            is CommunityTrickplay.UploadOutcome.Rejected -> TrickplayUploadCoordinator.Outcome.REJECTED
+                            is CommunityTrickplay.UploadOutcome.Failed -> TrickplayUploadCoordinator.Outcome.FAILED
+                        }
+                        val completion = uploadCoordinator.complete(push.claim, policyOutcome)
+                        if (!completion.applied) return@withLock null
+                        val deferred = deferredUpload
+                        deferredUpload = null
+                        completion.nextClaim?.let { nextClaim -> deferred?.takeIf { it.claim == nextClaim } }
+                    }
+                },
+                launchNext = { next ->
+                    Log.d(
+                        TAG,
+                        "upload draining deferred final key=${next.key} revision=${next.revision} " +
+                            "frames=${next.frames.size}",
+                    )
+                    launchUpload(next)
+                },
+            )
         }
     }
 

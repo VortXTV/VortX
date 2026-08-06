@@ -38,6 +38,37 @@ class TrickplayTimelineTest {
     }
 
     @Test
+    fun `parser requires blank separators after the header and between cue blocks`() {
+        val missingHeaderSeparator = "WEBVTT\n" +
+            "00:00.000 --> 00:10.000\nsprite#xywh=0,0,320,180\n"
+        val missingCueSeparator = "WEBVTT\n\n" +
+            "00:00.000 --> 00:10.000\nsprite#xywh=0,0,320,180\n" +
+            "00:10.000 --> 00:20.000\nsprite#xywh=320,0,320,180\n"
+
+        assertNull(TrickplayTimeline.parseVtt(missingHeaderSeparator, 1, 1, 320, 180))
+        assertNull(TrickplayTimeline.parseVtt(missingCueSeparator, 2, 2, 320, 180))
+        assertEquals(
+            emptyList<TrickplayTimelineCue>(),
+            TrickplayTimeline.fetchedCues(true, missingHeaderSeparator, 1, 1, 320, 180),
+        )
+    }
+
+    @Test
+    fun `parser rejects non webvtt whitespace and a second timing arrow`() {
+        val verticalTab = "WEBVTT\n\n" +
+            "00:00.000\u000B-->\u000B00:10.000\nsprite#xywh=0,0,320,180\n"
+        val secondArrow = "WEBVTT\n\n" +
+            "00:00.000 --> 00:10.000 --> bogus\nsprite#xywh=0,0,320,180\n"
+
+        assertNull(TrickplayTimeline.parseVtt(verticalTab, 1, 1, 320, 180))
+        assertNull(TrickplayTimeline.parseVtt(secondArrow, 1, 1, 320, 180))
+        assertEquals(
+            emptyList<TrickplayTimelineCue>(),
+            TrickplayTimeline.fetchedCues(true, secondArrow, 1, 1, 320, 180),
+        )
+    }
+
+    @Test
     fun `parser requires fixed integer timestamps with three fractional digits`() {
         listOf(
             "00.5:01.000",

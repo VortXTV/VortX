@@ -166,35 +166,37 @@ object TrickplayTimeline {
     ): List<TrickplayTimelineCue>? {
         if (frameCount <= 0 || cols <= 0 || tileW <= 0 || tileH <= 0) return null
         val lines = raw.replace("\r\n", "\n").replace('\r', '\n').split('\n')
-        val header = lines.firstOrNull()?.removePrefix("\uFEFF")?.trimEnd() ?: return null
+        val header = lines.firstOrNull()?.removePrefix("\uFEFF") ?: return null
         if (!WEBVTT_HEADER.matches(header)) return null
+        // A valid WebVTT file separates its signature from the first block with a blank line.
+        if (lines.size < 2 || lines[1].isNotEmpty()) return null
 
         val parsed = mutableListOf<TrickplayTimelineCue>()
-        var lineIndex = 1
+        var lineIndex = 2
         while (lineIndex < lines.size) {
-            val timing = lines[lineIndex].trim()
-            lineIndex += 1
-            if (!timing.contains("-->")) continue
+            while (lineIndex < lines.size && lines[lineIndex].isEmpty()) lineIndex += 1
+            if (lineIndex >= lines.size) break
+
+            val blockStart = lineIndex
+            while (lineIndex < lines.size && lines[lineIndex].isNotEmpty()) lineIndex += 1
+            val block = lines.subList(blockStart, lineIndex)
+            val timingIndex = when {
+                block.first().contains(VTT_CUE_ARROW) -> 0
+                block.size >= 2 && block[1].contains(VTT_CUE_ARROW) -> 1
+                else -> return null
+            }
+            // This protocol subset permits an optional cue identifier, then exactly one geometry payload.
+            if (block.size != timingIndex + 2) return null
+
+            val timing = block[timingIndex]
+            if (timing.indexOf(VTT_CUE_ARROW) != timing.lastIndexOf(VTT_CUE_ARROW)) return null
             val timingMatch = VTT_TIMING_LINE.matchEntire(timing) ?: return null
             val start = parseVttTime(timingMatch.groupValues[1]) ?: return null
             val end = parseVttTime(timingMatch.groupValues[2]) ?: return null
             if (start < 0.0 || end <= start) return null
+            if (!validCueSettings(timingMatch.groupValues[3])) return null
 
-            var coordinates: Coordinates? = null
-            while (lineIndex < lines.size) {
-                val payload = lines[lineIndex].trim()
-                if (payload.isEmpty()) {
-                    lineIndex += 1
-                    break
-                }
-                if (payload.contains("-->")) break
-                // This protocol subset has exactly one payload line and that line must be valid geometry.
-                // Rejecting extras prevents a conflicting second xywh row from being silently ignored.
-                if (coordinates != null) return null
-                coordinates = parseCoordinates(payload) ?: return null
-                lineIndex += 1
-            }
-            val rect = coordinates ?: return null
+            val rect = parseCoordinates(block[timingIndex + 1]) ?: return null
             if (rect.x < 0 || rect.y < 0 || rect.width != tileW || rect.height != tileH ||
                 rect.x % tileW != 0 || rect.y % tileH != 0
             ) {
@@ -348,6 +350,13 @@ object TrickplayTimeline {
         return total.takeIf { it.isFinite() }
     }
 
+    private fun validCueSettings(raw: String): Boolean {
+        if (raw.isEmpty()) return true
+        return raw.split(VTT_SPACE_TAB_RUN).all { setting ->
+            VTT_CUE_SETTING.matches(setting) && !setting.contains(VTT_CUE_ARROW)
+        }
+    }
+
     private fun vttTime(seconds: Double): String {
         val totalMilliseconds = (seconds * 1000.0).roundToLong()
         val milliseconds = totalMilliseconds % 1000L
@@ -361,8 +370,13 @@ object TrickplayTimeline {
     private data class Coordinates(val x: Int, val y: Int, val width: Int, val height: Int)
     private data class IndexedTime(val index: Int, val time: Double)
 
+    private const val VTT_CUE_ARROW = "-->"
     private val WEBVTT_HEADER = Regex("^WEBVTT(?:[ \\t].*)?$")
-    private val VTT_TIMING_LINE = Regex("^([^\\s]+)\\s+-->\\s+([^\\s]+)(?:\\s+.*)?$")
+    private val VTT_TIMING_LINE = Regex(
+        "^([^ \\t]+)[ \\t]+-->[ \\t]+([^ \\t]+)(?:[ \\t]+([^ \\t]+(?:[ \\t]+[^ \\t]+)*))?$",
+    )
     private val VTT_TIMESTAMP = Regex("^(?:(\\d{2,}):)?([0-5]\\d):([0-5]\\d)\\.(\\d{3})$")
     private val VTT_COORDINATES = Regex("^\\d+,\\d+,\\d+,\\d+$")
+    private val VTT_SPACE_TAB_RUN = Regex("[ \\t]+")
+    private val VTT_CUE_SETTING = Regex("^[A-Za-z][A-Za-z0-9-]*:[^\\u0000-\\u0020]+$")
 }

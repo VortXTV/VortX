@@ -16,7 +16,11 @@ class TrickplaySessionUploadContractTest {
         assertTrue(source.contains("deferredUpload = pending"))
         assertTrue(source.contains("uploadCoordinator.complete(push.claim, policyOutcome)"))
         assertTrue(source.contains("finally {"))
+        assertTrue(source.contains("admissionQueue.enqueue"))
+        assertTrue(source.contains("admissionQueue.closeAndEnqueue"))
+        assertTrue(source.contains("completeAndLaunchNextUpload"))
         assertTrue(source.contains("val revision: Long"))
+        assertFalse(source.contains("pushUpload(next)"))
         assertFalse(source.contains("lastUploadedCount"))
         assertFalse(source.contains("frames.size > lastUploadedCount"))
     }
