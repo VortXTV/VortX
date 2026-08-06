@@ -549,6 +549,81 @@ class DebridKeysContractTest {
     }
 
     @Test
+    fun credentialRevisionAdvancesWhenSecureReadRecoversAVisibleKey() {
+        val scoped =
+            DebridService.REAL_DEBRID.storageKey(DebridOwnerScope.Account("account-recovery"))
+        val store = FakeDebridKeyValueStore(
+            persistentValues = mutableMapOf(scoped to "saved-key"),
+            available = false,
+        )
+        val keys = accountKeys(store, "account-recovery")
+        val unavailable = keys.credentialSnapshot(DebridService.REAL_DEBRID)
+        assertEquals("", unavailable.key)
+
+        store.available = true
+        val recovered = keys.credentialSnapshot(DebridService.REAL_DEBRID)
+
+        assertEquals("saved-key", recovered.key)
+        assertTrue(recovered.revision > unavailable.revision)
+    }
+
+    @Test
+    fun credentialMutationCannotSlipBetweenAuthorizationAndRequestIssuance() {
+        val keys = accountKeys(FakeDebridKeyValueStore(), "account-issuance")
+        assertTrue(keys.setKey(DebridService.TOR_BOX, "key-a"))
+        val snapshot = keys.credentialSnapshot(DebridService.TOR_BOX)
+        val issueEntered = CountDownLatch(1)
+        val releaseIssue = CountDownLatch(1)
+        val mutationStarted = CountDownLatch(1)
+        val mutationFinished = CountDownLatch(1)
+        val issued = AtomicBoolean(false)
+
+        val issuer = thread(start = true) {
+            assertTrue(
+                keys.authorizeAndIssue(
+                    DebridService.TOR_BOX,
+                    snapshot.key,
+                    snapshot.revision,
+                ) {
+                    issued.set(true)
+                    issueEntered.countDown()
+                    assertTrue(releaseIssue.await(5, TimeUnit.SECONDS))
+                },
+            )
+        }
+        assertTrue(issueEntered.await(5, TimeUnit.SECONDS))
+        val mutator = thread(start = true) {
+            mutationStarted.countDown()
+            assertTrue(keys.setKey(DebridService.TOR_BOX, "key-b"))
+            mutationFinished.countDown()
+        }
+
+        assertTrue(mutationStarted.await(5, TimeUnit.SECONDS))
+        assertFalse(mutationFinished.await(100, TimeUnit.MILLISECONDS))
+        releaseIssue.countDown()
+        issuer.join(5_000)
+        mutator.join(5_000)
+
+        assertTrue(issued.get())
+        assertTrue(mutationFinished.await(5, TimeUnit.SECONDS))
+        assertEquals("key-b", keys.key(DebridService.TOR_BOX))
+        assertFalse(
+            keys.authorizeAndIssue(
+                DebridService.TOR_BOX,
+                snapshot.key,
+                snapshot.revision,
+            ) { throw AssertionError("stale credential was issued") },
+        )
+        assertFalse(
+            accountKeys(FakeDebridKeyValueStore(), "account-empty").authorizeAndIssue(
+                DebridService.TOR_BOX,
+                "",
+                snapshot.revision,
+            ) { throw AssertionError("empty credential was issued") },
+        )
+    }
+
+    @Test
     fun rejectedMutationNeverPublishesUnconfirmedValue() {
         val scoped =
             DebridService.TOR_BOX.storageKey(DebridOwnerScope.Account("account-a"))

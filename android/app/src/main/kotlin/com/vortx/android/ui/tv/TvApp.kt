@@ -34,6 +34,7 @@ import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
+import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 import kotlinx.coroutines.launch
 
 /// The Android TV shell: a three-state D-pad flow (Home browse -> Detail -> Player) that is the 10-foot
@@ -95,6 +96,9 @@ fun TvApp(
         val debridCredentialRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
         val sourceSettingsRevision by SourceSettingsRevision.observe(appContext).collectAsStateWithLifecycle()
         val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
+        val detailVmOwner = rememberReplacingViewModelStoreOwner(
+            detail?.let { "${it.type}:${it.id}:$detailSourceEpoch" } ?: "no-detail:$detailSourceEpoch",
+        )
         // A scope tied to the whole shell (not the player layer), so the end-of-playback engine write (final
         // progress tick + Player unload) still completes after the player leaves composition -- the same
         // reason the phone shell uses an app-scoped coroutine for this.
@@ -143,6 +147,7 @@ fun TvApp(
                     // The Compose generation resets the local screen tree, while this Activity-scoped
                     // ViewModel key remains bounded by target and owner so repeat visits do not leak VMs.
                     val detailVm: DetailViewModel = viewModel(
+                        viewModelStoreOwner = detailVmOwner,
                         key = detailViewModelKey(
                             prefix = "tv-detail",
                             typeId = current.type.id,

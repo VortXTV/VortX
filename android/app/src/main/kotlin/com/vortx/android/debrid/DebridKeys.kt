@@ -357,6 +357,27 @@ class DebridKeys private constructor(
         credentialRevisionCounter.get()
     }
 
+    /**
+     * Atomically validate [expectedKey]/[expectedRevision] and issue an already-built asynchronous request.
+     * The callback must only enqueue or resume the request and return immediately. Successful credential
+     * mutations use the same process lock, so a replaced key can never slip between validation and issuance.
+     */
+    internal fun authorizeAndIssue(
+        service: DebridService,
+        expectedKey: String,
+        expectedRevision: Long,
+        issue: () -> Unit,
+    ): Boolean = synchronized(CREDENTIAL_STATE_LOCK) {
+        val current = credentialSnapshot(service)
+        if (
+            expectedKey.isEmpty() ||
+            current.key != expectedKey ||
+            current.revision != expectedRevision
+        ) return@synchronized false
+        issue()
+        true
+    }
+
     /// True only when the current account has a non-empty key whose latest mutation reached encrypted
     /// storage. Settings uses this instead of treating a process-memory fallback as a saved credential.
     @Synchronized
@@ -508,6 +529,7 @@ class DebridKeys private constructor(
 
     private fun keyFromStorage(service: DebridService, owner: DebridOwnerToken): String {
         val storageKey = service.storageKey(owner.scope)
+        val wasUnavailable = isStorageUnavailable(storageKey)
         synchronized(LEGACY_ADOPTION_LOCK) {
             val failed = FAILED_LEGACY_ADOPTIONS[store.adoptionDomain]
             if (
@@ -523,7 +545,13 @@ class DebridKeys private constructor(
             return ""
         }
         synchronized(LEGACY_ADOPTION_LOCK) { clearStorageFailure(storageKey) }
-        return snapshot.values[storageKey].orEmpty().takeIf { isCurrent(owner) }.orEmpty()
+        val value = snapshot.values[storageKey].orEmpty().takeIf { isCurrent(owner) }.orEmpty()
+        if (wasUnavailable && value.isNotEmpty()) {
+            synchronized(CREDENTIAL_STATE_LOCK) {
+                if (currentOwner() == owner) advanceCredentialRevisionLocked()
+            }
+        }
+        return value
     }
 
     /**
@@ -891,7 +919,7 @@ class DebridKeys private constructor(
         private var observedCredentialOwner: DebridOwnerToken? = null
         private var didObserveCredentialOwner = false
 
-        /** Successful key mutations and observed owner transitions publish one process-wide revision. */
+        /** Visible key changes, successful mutations, and observed owner transitions publish one revision. */
         internal val credentialRevision: StateFlow<Long> = _credentialRevision.asStateFlow()
 
         private fun advanceCredentialRevisionLocked() {

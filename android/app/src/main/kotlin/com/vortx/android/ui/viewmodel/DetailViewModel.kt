@@ -208,7 +208,9 @@ class DetailViewModel(
     private val sourceSticky = SeriesSourceSticky(app)
     private val sourceModel = SourceListModel(viewModelScope, sourceSticky = sourceSticky)
     private val sourcePrefs = SourcePreferencesStore(app)
-    private val sourcePins = SourcePinStore(app)
+    private val sourcePins = SourcePinStore(app) {
+        ProfileStore.sharedOrNull()?.activeProfileId ?: SourcePinStore.DEFAULT_PROFILE
+    }
     private val trackPrefs = TrackPreferencesStore(app)
     private val sourceRequestFence = SourceRequestFence(sourceSticky.currentProfileId())
     private var sourceLoadJob: Job? = null

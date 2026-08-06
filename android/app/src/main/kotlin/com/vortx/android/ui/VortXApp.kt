@@ -116,6 +116,7 @@ import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.SearchViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
+import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -212,6 +213,9 @@ fun VortXApp(
         var detail by remember { mutableStateOf<MetaItem?>(null) }
         var detailGeneration by remember { mutableStateOf(0L) }
         var playing by remember { mutableStateOf<Playable?>(null) }
+        val detailVmOwner = rememberReplacingViewModelStoreOwner(
+            detail?.let { "${it.type}:${it.id}:$detailSourceEpoch" } ?: "no-detail:$detailSourceEpoch",
+        )
         // The catalog meta of the title currently in [playing], captured at the moment play starts. This is
         // the Android analogue of Apple's `curMeta` (`PlaybackMeta`): [Playable] itself carries only the
         // resolved stream (url/flags/mediaRef), never the library identity, so the auto-add seam below would
@@ -376,6 +380,7 @@ fun VortXApp(
             val advanceVm: DetailViewModel? =
                 if (showForNext != null && !playable.isTrailer) {
                     viewModel(
+                        viewModelStoreOwner = detailVmOwner,
                         key = detailViewModelKey(
                             prefix = "detail",
                             typeId = showForNext.type.id,
@@ -686,6 +691,7 @@ fun VortXApp(
                 // ViewModel key remains bounded by target and owner. Reopening the same title therefore
                 // reuses its ViewModel instead of retaining one live repository subscription per visit.
                 val detailVm: DetailViewModel = viewModel(
+                    viewModelStoreOwner = detailVmOwner,
                     key = detailViewModelKey(
                         prefix = "detail",
                         typeId = current.type.id,

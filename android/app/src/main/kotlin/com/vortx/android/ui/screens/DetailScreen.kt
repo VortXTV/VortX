@@ -90,6 +90,7 @@ import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.PersonViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
+import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 
 internal data class ResolvedDetailPlayback(
     val playable: Playable,
@@ -159,7 +160,11 @@ fun DetailScreen(
         val nestedCredentialRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
         val nestedSourceRevision by SourceSettingsRevision.observe(app).collectAsStateWithLifecycle()
         val nestedOwner = nestedDebridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
+        val nestedVmOwner = rememberReplacingViewModelStoreOwner(
+            "${target.type}:${target.id}:$nestedOwner:$nestedCredentialRevision:$nestedSourceRevision",
+        )
         val nestedVm: DetailViewModel = viewModel(
+            viewModelStoreOwner = nestedVmOwner,
             key = "detail-nested-${target.type.id}-${target.id}-$nestedOwner:$nestedCredentialRevision:$nestedSourceRevision",
             factory = StremioXViewModelFactory(
                 repo = app.catalogRepository,

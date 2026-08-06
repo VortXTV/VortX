@@ -427,7 +427,7 @@ class ProfileStore private constructor(context: Context) {
 
     private fun load() {
         prefs.getString(LIST_KEY, null)?.let { UserProfile.decodeRoster(it) }?.let { profiles = it }
-        activeID = prefs.getString(ACTIVE_KEY, null)?.let { UserProfile.normalizeId(it) }
+        activeID = prefs.getString(ACTIVE_PROFILE_KEY, null)?.let { UserProfile.normalizeId(it) }
     }
 
     /** One-time: rosters from before PIN hashing carry raw digits; replace them with salted hashes. Apple `hashLegacyPins`. */
@@ -453,7 +453,7 @@ class ProfileStore private constructor(context: Context) {
     private fun persist(touch: Boolean = true) {
         prefs.edit()
             .putString(LIST_KEY, UserProfile.encodeRoster(profiles))
-            .putString(ACTIVE_KEY, activeID)
+            .putString(ACTIVE_PROFILE_KEY, activeID)
             .apply()
         if (touch) {
             // Fractional epoch SECONDS, matching Apple's `Date().timeIntervalSince1970` Double. Integer
@@ -726,7 +726,7 @@ class ProfileStore private constructor(context: Context) {
 
         // Apple's EXACT keys.
         private const val LIST_KEY = "stremiox.profiles"
-        private const val ACTIVE_KEY = "stremiox.profiles.active"
+        internal const val ACTIVE_PROFILE_KEY = "stremiox.profiles.active"
         private const val MODIFIED_KEY = "stremiox.profiles.modified"
         private const val MODIFIED_BITS_KEY = "vortx.sync.profiles.modified.doubleBits"
         private const val DELETED_KEY = "stremiox.profiles.deleted"

@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.PlaybackBehaviorSettings
+import com.vortx.android.profile.ProfileStore
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -29,7 +30,7 @@ object SourceSettingsRevision {
                     Context.MODE_PRIVATE,
                 )
                 val installed = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-                    if (key == null || key in RESULT_KEYS) synchronized(lock) {
+                    if (affectsSourceResults(key)) synchronized(lock) {
                         _revision.value = _revision.value + 1L
                     }
                 }
@@ -40,6 +41,14 @@ object SourceSettingsRevision {
             return revision
         }
     }
+
+    /**
+     * Complete source-result mutation surface in this preferences file: flat ranking/filter/playback keys,
+     * active-profile identity and safety mirrors, plus every per-profile source-pin blob. Kept pure so a
+     * missing channel can be caught without an Android SharedPreferences runtime.
+     */
+    internal fun affectsSourceResults(key: String?): Boolean =
+        key == null || key in RESULT_KEYS || key.startsWith(SourcePinStore.PREFS_KEY_PREFIX)
 
     private val RESULT_KEYS = setOf(
         SourcePreferencesStore.ORDER_KEY,
@@ -63,5 +72,8 @@ object SourceSettingsRevision {
         SourcePreferencesStore.DEFAULT_SORT_KEY,
         PlaybackBehaviorSettings.DIRECT_LINKS_ONLY_KEY,
         TrackPreferencesStore.KEY_AUDIO,
+        ProfileStore.ACTIVE_PROFILE_KEY,
+        ProfileStore.ACTIVE_DISABLED_ADDONS_KEY,
+        ProfileStore.ACTIVE_KIDS_KEY,
     )
 }

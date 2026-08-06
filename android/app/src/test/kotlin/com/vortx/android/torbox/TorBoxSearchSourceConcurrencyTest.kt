@@ -13,6 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -21,6 +22,52 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TorBoxSearchSourceConcurrencyTest {
+    @Test
+    fun `credential replaced before queued fetch cannot be spent on the network`() = runBlocking {
+        val executor = Executors.newSingleThreadExecutor()
+        val fetchDispatcher = executor.asCoroutineDispatcher()
+        val credential = AtomicReference(TorBoxSearchSource.Credential("key-a", 1L))
+        val workerOccupied = CompletableDeferred<Unit>()
+        val releaseWorker = CompletableDeferred<Unit>()
+        val fetchedKeys = CopyOnWriteArrayList<String>()
+        val scope = CoroutineScope(SupervisorJob() + fetchDispatcher)
+        val blocker = scope.launch {
+            workerOccupied.complete(Unit)
+            releaseWorker.await()
+        }
+        val source = TorBoxSearchSource(
+            scope = scope,
+            fetchStreams = { _, _, _, requestKey ->
+                fetchedKeys += requestKey
+                TorBoxSearch.Result(listOf(stream("a".repeat(40))), false, false)
+            },
+            torBoxCredential = credential::get,
+        )
+
+        try {
+            withTimeout(5_000) { workerOccupied.await() }
+            source.refresh("tt1234567", season = 0, episode = 0)
+
+            credential.set(TorBoxSearchSource.Credential("key-b", 2L))
+            releaseWorker.complete(Unit)
+            blocker.join()
+            withContext(fetchDispatcher) { Unit }
+
+            assertTrue(fetchedKeys.isEmpty())
+            assertTrue(source.streams.value.isEmpty())
+
+            source.refresh("tt1234567", season = 0, episode = 0)
+            withTimeout(5_000) {
+                while (fetchedKeys != listOf("key-b")) kotlinx.coroutines.yield()
+            }
+            assertEquals(listOf("key-b"), fetchedKeys)
+        } finally {
+            releaseWorker.complete(Unit)
+            source.close()
+            fetchDispatcher.close()
+        }
+    }
+
     @Test
     fun `closing the key gate clears episode A before episode B can assemble`() = runBlocking {
         val fetchDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()

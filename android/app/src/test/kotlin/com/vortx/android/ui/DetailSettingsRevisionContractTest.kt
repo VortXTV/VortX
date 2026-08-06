@@ -1,6 +1,9 @@
 package com.vortx.android.ui
 
 import java.io.File
+import com.vortx.android.profile.ProfileStore
+import com.vortx.android.sources.SourcePinStore
+import com.vortx.android.sources.SourceSettingsRevision
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -13,13 +16,33 @@ class DetailSettingsRevisionContractTest {
 
         assertTrue(phone.contains("DebridKeys.credentialRevision.collectAsStateWithLifecycle()"))
         assertTrue(phone.contains("SourceSettingsRevision.observe(appContext).collectAsStateWithLifecycle()"))
-        assertTrue(phone.contains("key = \"detail-${'$'}{current.id}-${'$'}detailSourceEpoch\""))
-        assertTrue(tv.contains("key = \"tv-detail-${'$'}{current.id}-${'$'}detailSourceEpoch\""))
-        assertTrue(detail.contains("detail-nested-${'$'}{target.id}-${'$'}nestedOwner:"))
+        assertTrue(phone.contains("rememberReplacingViewModelStoreOwner"))
+        assertTrue(phone.contains("viewModelStoreOwner = detailVmOwner"))
+        assertTrue(tv.contains("rememberReplacingViewModelStoreOwner"))
+        assertTrue(tv.contains("viewModelStoreOwner = detailVmOwner"))
+        assertTrue(detail.contains("rememberReplacingViewModelStoreOwner"))
+        assertTrue(detail.contains("viewModelStoreOwner = nestedVmOwner"))
+
+        val boundedOwner = source("src/main/kotlin/com/vortx/android/ui/viewmodel/ReplacingViewModelStoreOwner.kt")
+        assertTrue(boundedOwner.contains("remember(generation)"))
+        assertTrue(boundedOwner.contains("override fun onForgotten() = clear()"))
+        assertTrue(boundedOwner.contains("override fun onAbandoned() = clear()"))
 
         val revisions = source("src/main/kotlin/com/vortx/android/sources/SourceSettingsRevision.kt")
-        assertTrue(revisions.contains("key == null || key in RESULT_KEYS"))
+        assertTrue(revisions.contains("affectsSourceResults(key)"))
         assertTrue(revisions.contains("TrackPreferencesStore.KEY_AUDIO"))
+    }
+
+    @Test
+    fun `profile safety and per-profile pin mutations invalidate source results`() {
+        assertTrue(SourceSettingsRevision.affectsSourceResults(ProfileStore.ACTIVE_PROFILE_KEY))
+        assertTrue(SourceSettingsRevision.affectsSourceResults(ProfileStore.ACTIVE_DISABLED_ADDONS_KEY))
+        assertTrue(SourceSettingsRevision.affectsSourceResults(ProfileStore.ACTIVE_KIDS_KEY))
+        assertTrue(SourceSettingsRevision.affectsSourceResults(SourcePinStore.preferenceKey("profile-a")))
+
+        val detail = source("src/main/kotlin/com/vortx/android/ui/viewmodel/DetailViewModel.kt")
+        assertTrue(detail.contains("SourcePinStore(app) {"))
+        assertTrue(detail.contains("ProfileStore.sharedOrNull()?.activeProfileId"))
     }
 
     @Test
