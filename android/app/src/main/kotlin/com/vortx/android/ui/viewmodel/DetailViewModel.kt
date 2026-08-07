@@ -14,6 +14,7 @@ import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.engine.SourceListModel
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.integrations.buildMediaRef
+import com.vortx.android.library.WatchlistStore
 import com.vortx.android.mediaserver.MediaServerRepository
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.Episode
@@ -22,17 +23,18 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
 import com.vortx.android.model.MetaDetail
+import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.orderedBySeasonEpisode
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.PlaybackBehaviorSettings
-import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.singularity.SourceIndexServeSource
 import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.ResolvedPin
+import com.vortx.android.sources.CanonicalContentIdentity
 import com.vortx.android.sources.ProviderHealth
 import com.vortx.android.sources.SeriesSourceSticky
 import com.vortx.android.sources.SourceRequestFence
@@ -48,6 +50,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 internal fun MetaDetail.episodeForResolve(selectedEpisodeId: String?): Episode? =
@@ -60,6 +64,7 @@ internal fun Episode.debridEpisodeForResolve(): DebridResolver.Episode? {
 
 internal data class DebridCacheEvidence(
     val owner: DebridOwnerToken,
+    val credentialRevision: Long,
     val torrentServices: Map<String, DebridService>,
     val usenetUrls: Set<String>,
 ) {
@@ -71,8 +76,29 @@ internal fun torrentServicesFromCacheHits(
 ): Map<String, DebridService> =
     hits.entries.associate { (hash, hit) -> hash.trim().lowercase() to hit.service }
 
-internal fun DebridCacheEvidence?.forOwner(owner: DebridOwnerToken?): DebridCacheEvidence? =
-    this?.takeIf { owner != null && it.owner == owner }
+internal fun DebridCacheEvidence?.forOwner(
+    owner: DebridOwnerToken?,
+    credentialRevision: Long,
+): DebridCacheEvidence? =
+    this?.takeIf {
+        owner != null && it.owner == owner && it.credentialRevision == credentialRevision
+    }
+
+internal fun currentAssembledBest(
+    state: com.vortx.android.engine.SourceListState,
+    request: SourceRequestFence.Token?,
+): StreamSource? = state.best.takeIf {
+    request != null &&
+        state.requestGeneration == request.generation &&
+        state.streamId == request.targetId
+}
+
+internal fun bestSourceForCurrentRequest(
+    state: com.vortx.android.engine.SourceListState,
+    request: SourceRequestFence.Token?,
+    currentGroups: List<StreamGroup>,
+    rankCurrent: (List<StreamGroup>) -> StreamSource?,
+): StreamSource? = currentAssembledBest(state, request) ?: rankCurrent(currentGroups)
 
 /// Map one ranked stream into the failover candidate that carries both its source identity and, for torrents,
 /// the exact provider whose account cache check confirmed the hash. Usenet deliberately carries no torrent
@@ -198,12 +224,18 @@ class DetailViewModel(
     private val sourceSticky = SeriesSourceSticky(app)
     private val sourceModel = SourceListModel(viewModelScope, sourceSticky = sourceSticky)
     private val sourcePrefs = SourcePreferencesStore(app)
-    private val sourcePins = SourcePinStore(app)
+    private val sourcePins = SourcePinStore(app) {
+        ProfileStore.sharedOrNull()?.activeProfileId ?: SourcePinStore.DEFAULT_PROFILE
+    }
     private val trackPrefs = TrackPreferencesStore(app)
     private val sourceRequestFence = SourceRequestFence(sourceSticky.currentProfileId())
     private var sourceLoadJob: Job? = null
     private var playbackResolveJob: Job? = null
     private var profileReloadJob: Job? = null
+    private val watchlistStore = WatchlistStore.shared(app)
+    val watchlisted: StateFlow<Boolean> = watchlistStore.items
+        .map { items -> items.any { it.id == id } }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, watchlistStore.isWatchlisted(id))
 
     /// Gate for the [sourceModel] -> [_streams] bridge: true only after the raw engine groups for the current
     /// target have loaded, so the coalescer's empty first-paint (and the empty state at each new load) never
@@ -460,20 +492,28 @@ class DetailViewModel(
         val detail = (_meta.value as? UiState.Success)?.data
         val imdb = id.takeIf { it.startsWith("tt") }
         val ep = episodeId?.let { eid -> detail?.videos?.firstOrNull { it.id == eid } }
-        val season = if (type == MediaType.SERIES) ep?.season?.takeIf { it > 0 } else null
-        val episodeNum = if (type == MediaType.SERIES) ep?.episode?.takeIf { it > 0 } else null
+        val season = if (type == MediaType.SERIES) ep?.season else null
+        val episodeNum = if (type == MediaType.SERIES) ep?.episode else null
+        val contentId = when {
+            type == MediaType.SERIES && ep == null -> null
+            else -> CanonicalContentIdentity.imdb(imdb, season, episodeNum)
+        }
 
         // Kick the contributor lanes + install the ranking context BEFORE the raw feed, so the first coalesced
         // rebuild ranks against the real user prefs/pin (never the empty default, which would clobber the
         // globally-installed reading) and merges every lane in one pass.
         val advanceHint = pendingAdvanceHint
-        torbox.refresh(imdb, season, episodeNum, request.generation)
+        if (contentId != null) {
+            torbox.refresh(imdb, season, episodeNum, request.generation)
+        } else {
+            torbox.reset(request.generation)
+        }
         singularity.refresh(
-            SourceIndexClient.contentId(imdb, season, episodeNum),
+            contentId,
             isSignedIn(),
             request.generation,
         )
-        val ctx = buildContext(episodeId, imdb, season, episodeNum, request, advanceHint)
+        val ctx = buildContext(episodeId, contentId, request, advanceHint)
         lastCtx = ctx
         sourceModel.setContext(ctx)
         _pinUi.value = readPinUi()
@@ -505,7 +545,7 @@ class DetailViewModel(
                     sourcesReady = true
                     _streams.value = UiState.Success(displayRaw)
                     sourceModel.setRawGroups(raw)
-                    runCacheCheck(raw, episodeId, season, episodeNum, request)
+                    runCacheCheck(raw, episodeId, season, episodeNum, request, ctx.contentId)
                     // Smart Source Selection auto-pick (viewer opt-in, once per episode tap): play the
                     // best-ranked source of the FRESH raw groups straight away. Ranked directly (not via
                     // [bestSource]) because the assembly coalescer may still hold the previous episode's
@@ -568,12 +608,10 @@ class DetailViewModel(
     /// The frozen ranking context [sourceModel] assembles against: the real user preference snapshot + the
     /// effective per-title / provider pin (so a re-rank of the merged list keeps a pinned source on top and
     /// honours the user's filters), the chosen episode's [SourceListModel.Context.streamId], and the
-    /// Singularity pool [SourceListModel.Context.contentId] for the fire-and-forget hoard seed.
+    /// canonical [SourceListModel.Context.contentId] that owns TorBox rows and seeds the Singularity hoard.
     private fun buildContext(
         episodeId: String?,
-        imdb: String?,
-        season: Int?,
-        episodeNum: Int?,
+        contentId: String?,
         request: SourceRequestFence.Token,
         advanceHint: Pair<String?, String?>?,
     ): SourceListModel.Context =
@@ -592,7 +630,7 @@ class DetailViewModel(
             ),
             directLinksOnly = PlaybackBehaviorSettings.directLinksOnly(app),
             pin = currentPin(),
-            contentId = SourceIndexClient.contentId(imdb, season, episodeNum),
+            contentId = contentId,
         )
 
     /// Query the user's debrid account for which of the loaded torrents it has CACHED, then use the result to
@@ -606,14 +644,16 @@ class DetailViewModel(
         season: Int?,
         episodeNum: Int?,
         request: SourceRequestFence.Token,
+        contentId: String?,
     ) {
         if (!debrid.hasAnyResolver && !debrid.hasUsenetResolver) return
         val owner = debridKeys.ownerToken() ?: return
+        val credentialRevision = debridKeys.currentCredentialRevision()
         viewModelScope.launch {
             // Gather over the CURRENT lanes for this title (raw add-on groups + whatever the TorBox / Singularity
             // contributors have already published), never a possibly-stale prior assembly. Late-arriving TorBox
             // torrents self-badge from the index's own check_cache tag, so they need no account round trip here.
-            val laneStreams = raw.flatMap { it.streams } + torbox.streams.value + singularity.streams.value
+            val laneStreams = raw.flatMap { it.streams } + torbox.streamsFor(contentId) + singularity.streams.value
             val hashes = laneStreams
                 .mapNotNull { it.infoHash?.trim()?.lowercase()?.takeIf { h -> h.isNotEmpty() } }
                 .distinct()
@@ -622,7 +662,8 @@ class DetailViewModel(
             if (
                 episodeId != _selectedEpisodeId.value ||
                 !sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) ||
-                !debridKeys.isCurrent(owner)
+                !debridKeys.isCurrent(owner) ||
+                debridKeys.currentCredentialRevision() != credentialRevision
             ) {
                 return@launch
             }
@@ -635,6 +676,7 @@ class DetailViewModel(
             val torrentServices = torrentServicesFromCacheHits(hits)
             debridCacheEvidence = DebridCacheEvidence(
                 owner = owner,
+                credentialRevision = credentialRevision,
                 torrentServices = torrentServices,
                 usenetUrls = cachedUsenetUrls,
             )
@@ -644,7 +686,8 @@ class DetailViewModel(
                 decorated !== raw &&
                 episodeId == _selectedEpisodeId.value &&
                 sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) &&
-                debridKeys.isCurrent(owner)
+                debridKeys.isCurrent(owner) &&
+                debridKeys.currentCredentialRevision() == credentialRevision
             ) {
                 sourceModel.setRawGroups(decorated)
             }
@@ -1012,7 +1055,10 @@ class DetailViewModel(
         episode: DebridResolver.Episode?,
         actionOwner: DebridOwnerToken?,
     ): DebridCoordinator.PlayableWinner? {
-        val evidence = debridCacheEvidence.forOwner(actionOwner)
+        val evidence = debridCacheEvidence.forOwner(
+            actionOwner,
+            debridKeys.currentCredentialRevision(),
+        )
         if (
             actionOwner == null ||
             evidence == null ||
@@ -1089,11 +1135,13 @@ class DetailViewModel(
     /// assembled best (ranked with the same prefs/pin/continuity the list is), falling back to ranking the
     /// published groups directly before the first assembly lands. Null when no sources resolved yet. Drives
     /// the hero Watch button's enabled state.
-    fun bestSource(): StreamSource? =
-        sourceModel.state.value.best
-            ?: (_streams.value as? UiState.Success)?.data?.let { groups ->
+    fun bestSource(): StreamSource? {
+        val request = sourceRequestFence.currentToken()
+        val groups = (_streams.value as? UiState.Success)?.data.orEmpty()
+        return bestSourceForCurrentRequest(sourceModel.state.value, request, groups) { currentGroups ->
+            currentGroups.takeIf { it.isNotEmpty() }?.let {
                 StreamRanking.best(
-                    groups,
+                    currentGroups,
                     continuity = lastCtx?.continuity,
                     pin = currentPin(),
                     sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null,
@@ -1101,6 +1149,8 @@ class DetailViewModel(
                     prefs = lastCtx?.prefs ?: StreamRanking.reading(),
                 )
             }
+        }
+    }
 
     /// The engine resume position (ms) for the source about to play: the saved library `timeOffset` when
     /// it applies to the current target (a movie, or the series episode whose sources are shown), else 0
@@ -1357,6 +1407,21 @@ class DetailViewModel(
                 repo.addToLibrary(type, id, current.name, current.poster)
             }
             applyMutation(result)
+        }
+    }
+
+    /** Toggle the separate profile-local want-to-watch ledger without mutating the account library. */
+    fun toggleWatchlist() {
+        val current = (_meta.value as? UiState.Success)?.data ?: return
+        viewModelScope.launch {
+            watchlistStore.toggle(
+                MetaItem(
+                    id = current.id,
+                    type = current.type,
+                    name = current.name,
+                    poster = current.poster,
+                ),
+            )
         }
     }
 

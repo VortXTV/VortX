@@ -79,6 +79,48 @@ class HomeRailPreferencesTest {
     fun `storage keys exactly match the Apple settings contract`() {
         assertEquals("vortx.home.railOrder", HomeRailPreferences.ORDER_KEY)
         assertEquals("vortx.home.railHidden", HomeRailPreferences.HIDDEN_KEY)
+        assertEquals("vortx.home.layout", HomeRailPreferences.LAYOUT_KEY)
+    }
+
+    @Test
+    fun `catalog layout defaults fail closed to rails`() {
+        assertEquals(HomeCatalogLayout.RAILS, HomeCatalogLayout.fromStored(null))
+        assertEquals(HomeCatalogLayout.RAILS, HomeCatalogLayout.fromStored("unexpected"))
+        assertEquals(HomeCatalogLayout.WALL, HomeCatalogLayout.fromStored("wall"))
+    }
+
+    @Test
+    fun `poster wall applies only to add-on catalogs`() {
+        val addOn = catalog("https://example.test/manifest.json|movie|popular")
+
+        assertEquals(
+            HomeCatalogPresentation.WALL,
+            HomeCatalogLayoutPolicy.presentation(addOn, HomeCatalogLayout.WALL),
+        )
+        assertEquals(
+            HomeCatalogPresentation.RAIL,
+            HomeCatalogLayoutPolicy.presentation(catalog(HomeRail.CONTINUE_CATALOG_ID), HomeCatalogLayout.WALL),
+        )
+        assertEquals(
+            HomeCatalogPresentation.RAIL,
+            HomeCatalogLayoutPolicy.presentation(catalog(HomeRail.TOP_PICKS.catalogId), HomeCatalogLayout.WALL),
+        )
+        assertEquals(
+            HomeCatalogPresentation.RAIL,
+            HomeCatalogLayoutPolicy.presentation(addOn, HomeCatalogLayout.RAILS),
+        )
+    }
+
+    @Test
+    fun `dynamic rail families do not become add-on poster walls`() {
+        assertEquals(
+            HomeRail.MEDIA_SERVERS,
+            HomeRail.forCatalog(catalog("${HomeRail.MEDIA_SERVERS.catalogId}:plex-main")),
+        )
+        assertEquals(
+            HomeRail.IMPORTED_LISTS,
+            HomeRail.forCatalog(catalog("${HomeRail.IMPORTED_LISTS.catalogId}:weekend")),
+        )
     }
 
     private fun catalog(id: String) = Catalog(id = id, title = id, items = emptyList())

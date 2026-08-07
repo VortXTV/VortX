@@ -5,9 +5,13 @@ import android.util.Log
 import com.vortx.android.BuildConfig
 import com.vortx.android.security.PersistentCredentialAvailability
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicLong
 
 /// Trakt.tv OAuth device-code flow plus encrypted token storage. Kotlin port of the Apple
 /// `app/SourcesShared/TraktAuth.swift`, matching its verified-live flow byte for byte:
@@ -59,6 +63,11 @@ object TraktAuth {
 
     @Volatile private var tokenStore: TokenPersistence? = null
     private val tokenMutations = CredentialMutationCoordinator()
+    private val sessionEpoch = AtomicLong(0L)
+    private val _sessionBoundary = MutableStateFlow(0L)
+
+    /** Changes after a confirmed sign-in replacement or disconnect so mounted Home rails reconcile now. */
+    internal val sessionBoundary: StateFlow<Long> = _sessionBoundary.asStateFlow()
 
     /// A single in-flight refresh serializer. Trakt rotates the refresh token on every refresh, so two
     /// concurrent refreshes would race and the loser 401s on an already-spent token, dropping the session.
@@ -92,7 +101,14 @@ object TraktAuth {
         tokenMutations.invalidate {
             tokenStore?.clear()
         }
+        publishSessionBoundary()
     }
+
+    /** Stable only for the currently connected credential generation. Contains no credential material. */
+    internal val currentSessionEpoch: Long?
+        get() = tokenMutations.snapshot {
+            sessionEpoch.get() to (tokenStore?.connectionState == CredentialConnectionState.CONNECTED)
+        }.value.let { (epoch, connected) -> epoch.takeIf { isConfigured && connected } }
 
     // MARK: - Step 1: request a device code
 
@@ -337,6 +353,33 @@ object TraktAuth {
     private fun store(token: TraktToken) {
         val store = tokenStore ?: throw TraktAuthException.SecureStorage
         store.save(token)
+        publishSessionBoundary()
+    }
+
+    /**
+     * One authenticated read fenced to the exact account generation captured before network I/O.
+     * A disconnect or a second account completing auth while the request is in flight discards the body.
+     */
+    internal suspend fun sessionBoundGet(path: String, expectedEpoch: Long): IntegrationsHttp.Response? {
+        if (!isSessionCurrent(expectedEpoch)) return null
+        val token = runCatching { validToken() }.getOrNull() ?: return null
+        if (!isSessionCurrent(expectedEpoch)) return null
+        val response = IntegrationsHttp.request(
+            method = "GET",
+            urlString = "$API_BASE$path",
+            headers = baseHeaders() + mapOf("Authorization" to "Bearer $token"),
+        )
+        return response.takeIf { isSessionCurrent(expectedEpoch) }
+    }
+
+    private fun isSessionCurrent(expectedEpoch: Long): Boolean = tokenMutations.snapshot {
+        sessionEpoch.get() == expectedEpoch &&
+            tokenStore?.connectionState == CredentialConnectionState.CONNECTED
+    }.value
+
+    private fun publishSessionBoundary() {
+        val next = sessionEpoch.incrementAndGet()
+        _sessionBoundary.value = next
     }
 
     internal class TokenPersistence(

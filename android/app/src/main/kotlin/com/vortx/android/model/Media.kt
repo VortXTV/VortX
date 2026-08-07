@@ -154,6 +154,8 @@ data class MetaItem(
     val imdbRating: String? = null,
     val genres: List<String> = emptyList(),
     val resumeSeconds: Double? = null,
+    val caption: String? = null,
+    val watched: Boolean = false,
 ) {
     /// The formatted "resume 1:03" affordance for a Continue Watching card, or null when there is
     /// nothing to resume (mirrors Apple `CoreCWItem.resumeSeconds` -> `resumeTimecode`).
@@ -165,6 +167,11 @@ data class Catalog(
     val id: String,
     val title: String,
     val items: List<MetaItem>,
+    /** Remote-owned rails such as Trakt Continue Watching must not expose local delete actions. */
+    val readOnly: Boolean = false,
+    val engineIndex: Int? = null,
+    val hasNextPage: Boolean = false,
+    val pageLoading: Boolean = false,
 )
 
 /// One episode of a series, mirroring the engine's `CoreVideo`. [season]/[episode] drive the season

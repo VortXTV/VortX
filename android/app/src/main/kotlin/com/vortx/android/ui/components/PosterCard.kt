@@ -49,6 +49,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
+enum class PosterCardMenu {
+    NONE,
+    CATALOG,
+    CONTINUE_WATCHING,
+}
+
 /// The canonical poster card (DESIGN-SYSTEM.md §3 "Poster card"): 2:3 art, card radius, `rest` shadow,
 /// title below in label style. Press/focus: lift + scale(~1.03) + glow + title brightens to
 /// textPrimary. [watched] dims the art and shows a check badge; [progress] (0f..1f, null = not in
@@ -72,6 +78,9 @@ fun PosterCard(
     /// data.CatalogRepository] (the Android twin of the menu firing at `CoreBridge.shared`); the
     /// affected surfaces refresh on their own through the repository's ctx tick.
     menuItem: MetaItem? = null,
+    menu: PosterCardMenu = if (menuItem == null) PosterCardMenu.NONE else PosterCardMenu.CATALOG,
+    onDetails: (() -> Unit)? = null,
+    onRemoveFromContinueWatching: (() -> Unit)? = null,
     art: @Composable BoxScope.() -> Unit = { DefaultPosterArt(title) },
 ) {
     val colors = VortXTheme.colors
@@ -100,7 +109,7 @@ fun PosterCard(
                 // Long-press opens the quick-action menu only when a [menuItem] is attached; a card
                 // without one behaves exactly as before (combinedClickable with a null onLongClick
                 // is a plain clickable).
-                onLongClick = if (menuItem != null) {
+                onLongClick = if (menuItem != null && menu != PosterCardMenu.NONE) {
                     { menuOpen = true }
                 } else {
                     null
@@ -110,8 +119,11 @@ fun PosterCard(
         if (menuItem != null) {
             PosterQuickActionMenu(
                 item = menuItem,
+                menu = menu,
                 expanded = menuOpen,
                 onDismiss = { menuOpen = false },
+                onDetails = onDetails,
+                onRemoveFromContinueWatching = onRemoveFromContinueWatching,
                 repository = { (appContext as? VortXApplication)?.catalogRepository },
             )
         }
@@ -178,10 +190,13 @@ fun PosterCard(
 /// from a card. Fire-and-forget on a process-lifetime scope so a rail scrolling the card out of
 /// composition can never cancel the engine write mid-flight.
 @Composable
-private fun PosterQuickActionMenu(
+internal fun PosterQuickActionMenu(
     item: MetaItem,
+    menu: PosterCardMenu,
     expanded: Boolean,
     onDismiss: () -> Unit,
+    onDetails: (() -> Unit)? = null,
+    onRemoveFromContinueWatching: (() -> Unit)? = null,
     repository: () -> CatalogRepository?,
 ) {
     fun fire(action: suspend (CatalogRepository) -> Unit) {
@@ -190,18 +205,43 @@ private fun PosterQuickActionMenu(
         onDismiss()
     }
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
-        DropdownMenuItem(
-            text = { Text("Add to Library") },
-            onClick = { fire { it.addToLibrary(item) } },
-        )
-        DropdownMenuItem(
-            text = { Text("Mark as Watched") },
-            onClick = { fire { it.setCatalogWatched(item, true) } },
-        )
-        DropdownMenuItem(
-            text = { Text("Mark as Unwatched") },
-            onClick = { fire { it.setCatalogWatched(item, false) } },
-        )
+        when (menu) {
+            PosterCardMenu.NONE -> Unit
+            PosterCardMenu.CATALOG -> {
+                DropdownMenuItem(
+                    text = { Text("Add to Library") },
+                    onClick = { fire { it.addToLibrary(item) } },
+                )
+                DropdownMenuItem(
+                    text = { Text("Mark as Watched") },
+                    onClick = { fire { it.setCatalogWatched(item, true) } },
+                )
+                DropdownMenuItem(
+                    text = { Text("Mark as Unwatched") },
+                    onClick = { fire { it.setCatalogWatched(item, false) } },
+                )
+            }
+            PosterCardMenu.CONTINUE_WATCHING -> {
+                onDetails?.let { details ->
+                    DropdownMenuItem(
+                        text = { Text("Details") },
+                        onClick = {
+                            onDismiss()
+                            details()
+                        },
+                    )
+                }
+                onRemoveFromContinueWatching?.let { remove ->
+                    DropdownMenuItem(
+                        text = { Text("Remove from Continue Watching") },
+                        onClick = {
+                            onDismiss()
+                            remove()
+                        },
+                    )
+                }
+            }
+        }
     }
 }
 

@@ -22,6 +22,14 @@ import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.MessageDigest
+
+internal sealed interface AuthAttemptOutcome {
+    val requestId: String
+
+    data class Succeeded(override val requestId: String) : AuthAttemptOutcome
+    data class Failed(override val requestId: String, val message: String) : AuthAttemptOutcome
+}
 
 /// Decoders that turn the engine's JSON state (as returned by [StremioCoreNative.getState]) into the
 /// Android domain models the Compose UI renders. The shapes mirror the Apple `CoreModels` Codable
@@ -50,8 +58,10 @@ internal object EngineState {
         for (catalogIdx in 0 until catalogs.length()) {
             val pages = catalogs.optJSONArray(catalogIdx) ?: continue
             val items = mutableListOf<MetaItem>()
+            val seenIds = mutableSetOf<String>()
             var title: String? = null
             var rowId: String? = null
+            var pageLoading = false
             for (pageIdx in 0 until pages.length()) {
                 val page = pages.optJSONObject(pageIdx) ?: continue
                 if (title == null) {
@@ -59,17 +69,33 @@ internal object EngineState {
                     rowId = catalogRowId(request, catalogIdx)
                     title = titleMap[rowId] ?: catalogTitle(request)
                 }
+                if (page.optJSONObject("content")?.optString("type") == "Loading") {
+                    pageLoading = true
+                }
                 val content = page.readyArray("content") ?: continue
                 for (metaIdx in 0 until content.length()) {
-                    content.optJSONObject(metaIdx)?.let { items += parseMetaPreview(it) }
+                    val item = content.optJSONObject(metaIdx)?.let { parseMetaPreview(it) } ?: continue
+                    if (seenIds.add(item.id)) items += item
                 }
             }
             if (items.isNotEmpty()) {
-                rows += Catalog(id = rowId ?: "row-$catalogIdx", title = title ?: "Catalog", items = items)
+                rows += Catalog(
+                    id = rowId ?: "row-$catalogIdx",
+                    title = title ?: "Catalog",
+                    items = items,
+                    engineIndex = catalogIdx,
+                    hasNextPage = true,
+                    pageLoading = pageLoading,
+                )
             }
         }
         return rows
     }
+
+    /// Number of raw catalog slots in the board. Visible rows are not a valid substitute because
+    /// disabled, empty, failed, and not-yet-loaded catalogs still occupy stable engine indices.
+    fun boardCatalogCount(json: String): Int =
+        json.toJsonObjectOrNull()?.optJSONArray("catalogs")?.length() ?: 0
 
     /// Parse the `discover` field (a `CatalogWithFilters`) into UI [Catalog] rows. Unlike `board` (a
     /// `CatalogsWithExtra` whose `catalogs` is nested `[[page]]`), Discover is a SINGLE selectable rail:
@@ -186,6 +212,31 @@ internal object EngineState {
         return out
     }
 
+    /**
+     * Confirmation-grade decoder. The normal Home decoder above is intentionally fail-soft because engine
+     * state can be mid-load; a dismissal confirmation has the opposite contract: uncertainty must roll the
+     * optimistic card back. Therefore literal null, malformed JSON, a missing/non-array `items`, or any item
+     * whose identity cannot be decoded is a failure rather than an empty list that would falsely prove absence.
+     */
+    fun parseContinueWatchingStrict(json: String): Result<List<MetaItem>> = runCatching {
+        val root = JSONObject(json)
+        val items = root.getJSONArray("items")
+        for (index in 0 until items.length()) {
+            val item = items.getJSONObject(index)
+            val id = when {
+                item.has("_id") && !item.isNull("_id") -> item.getString("_id")
+                item.has("id") && !item.isNull("id") -> item.getString("id")
+                else -> throw IllegalArgumentException("Continue Watching item $index is missing id.")
+            }
+            require(id.isNotBlank() && id != "null") { "Continue Watching item $index has an invalid id." }
+            val type = item.getString("type")
+            require(MediaType.entries.any { it.id.equals(type, ignoreCase = true) }) {
+                "Continue Watching item $index has an invalid media type."
+            }
+        }
+        parseContinueWatching(json)
+    }
+
     /// The raw watch fraction (0f..1f, 0 when unknown) for the finished-prune math -- distinct from
     /// [cwProgress], which returns null (not 0) so the display track can hide. Mirrors Apple
     /// `CoreCWItem.progress`.
@@ -260,21 +311,50 @@ internal object EngineState {
         )
     }
 
-    /// Parse a `RuntimeEvent` for a sign-in failure: `{"name":"CoreEvent","args":{"event":"Error",
-    /// "args":{"error":{..., "message": "..."},"source":{"event":"UserAuthenticated",...}}}}`. Every
-    /// `CtxError` variant (API/Env/Other) serializes with a `message` field (see stremio-core's
-    /// `impl Serialize for OtherError`/`APIError`), so reading it uniformly covers all three. Returns
-    /// null for any other event (including a successful `UserAuthenticated`, which is just the ctx
-    /// NewState the repository already awaits) or malformed JSON, so callers can `?:` past a miss.
-    fun parseAuthErrorMessage(json: String): String? {
+    /**
+     * Stable, non-secret identity for one exact Login request. The core echoes the full auth request in
+     * its completion event, so matching this digest binds a result to email + password + login mode
+     * instead of letting an older attempt for the same email complete the current one.
+     */
+    fun authRequestId(email: String, password: String, facebook: Boolean = false): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val canonical = buildString {
+            append(email)
+            append('\u0000')
+            append(password)
+            append('\u0000')
+            append(facebook)
+        }
+        return digest.digest(canonical.toByteArray(Charsets.UTF_8)).joinToString("") { byte ->
+            "%02x".format(byte.toInt() and 0xff)
+        }
+    }
+
+    /** Parse only a login result whose serialized auth request carries an exact request identity. */
+    fun parseAuthAttemptOutcome(json: String): AuthAttemptOutcome? {
         val event = json.toJsonObjectOrNull() ?: return null
         if (event.optString("name") != "CoreEvent") return null
         val coreEvent = event.optJSONObject("args") ?: return null
-        if (coreEvent.optString("event") != "Error") return null
-        val args = coreEvent.optJSONObject("args") ?: return null
-        val source = args.optJSONObject("source")
-        if (source?.optString("event") != "UserAuthenticated") return null
-        return args.optJSONObject("error")?.optStringOrNull("message")
+        return when (coreEvent.optString("event")) {
+            "UserAuthenticated" -> loginRequestId(coreEvent)?.let { AuthAttemptOutcome.Succeeded(it) }
+            "Error" -> {
+                val args = coreEvent.optJSONObject("args") ?: return null
+                val source = args.optJSONObject("source") ?: return null
+                if (source.optString("event") != "UserAuthenticated") return null
+                val requestId = loginRequestId(source) ?: return null
+                val message = args.optJSONObject("error")?.optStringOrNull("message") ?: "Sign-in failed."
+                AuthAttemptOutcome.Failed(requestId, message)
+            }
+            else -> null
+        }
+    }
+
+    private fun loginRequestId(authEvent: JSONObject): String? {
+        val request = authEvent.optJSONObject("args")?.optJSONObject("auth_request") ?: return null
+        if (request.optString("type") != "Login") return null
+        val email = request.optStringOrNull("email") ?: return null
+        val password = request.optStringOrNull("password") ?: return null
+        return authRequestId(email, password, request.optBoolean("facebook", false))
     }
 
     /// Parse a `LibraryWithFilters` (`catalog: [libraryItem]`) into UI [MetaItem]s.
@@ -286,6 +366,32 @@ internal object EngineState {
             catalog.optJSONObject(i)?.let { items += parseLibraryItem(it) }
         }
         return items
+    }
+
+    /** Watched whole-title ids from the currently published Library model. */
+    fun parseWatchedLibraryIds(json: String): Set<String> {
+        val root = json.toJsonObjectOrNull() ?: return emptySet()
+        val catalog = root.optJSONArray("catalog") ?: return emptySet()
+        val watched = linkedSetOf<String>()
+        for (i in 0 until catalog.length()) {
+            val item = catalog.optJSONObject(i) ?: continue
+            if ((item.optJSONObject("state")?.optInt("timesWatched", 0) ?: 0) <= 0) continue
+            item.optString("_id").ifEmpty { item.optString("id") }.takeIf(String::isNotEmpty)?.let(watched::add)
+        }
+        return watched
+    }
+
+    /** Live watched ids from Continue Watching, additive to the persisted library buckets. */
+    fun parseWatchedContinueWatchingIds(json: String): Set<String> {
+        val root = json.toJsonObjectOrNull() ?: return emptySet()
+        val items = root.optJSONArray("items") ?: return emptySet()
+        val watched = linkedSetOf<String>()
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: continue
+            if ((item.optJSONObject("state")?.optInt("timesWatched", 0) ?: 0) <= 0) continue
+            item.optString("_id").ifEmpty { item.optString("id") }.takeIf(String::isNotEmpty)?.let(watched::add)
+        }
+        return watched
     }
 
     /// Parse the `meta_details` field into a UI [MetaDetail] plus its grouped [StreamGroup]s. The meta
@@ -575,6 +681,7 @@ internal object EngineState {
                 isOfficial = flags?.optBoolean("official", false) ?: false,
                 isProtected = flags?.optBoolean("protected", false) ?: false,
                 providesStreams = addonDeclaresResource(manifest, "stream"),
+                providesMeta = addonDeclaresResource(manifest, "meta"),
                 providesSubtitles = addonDeclaresResource(manifest, "subtitles"),
                 rawDescriptorJson = addon.toString(),
             )

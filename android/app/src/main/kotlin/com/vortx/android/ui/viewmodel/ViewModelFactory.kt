@@ -9,6 +9,11 @@ import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.model.MediaType
+import com.vortx.android.library.WatchlistStore
+import com.vortx.android.home.SimklRailsModel
+import com.vortx.android.home.TraktRailsModel
+import com.vortx.android.home.ImportedCatalogs
+import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.search.SearchHistoryStore
 import com.vortx.android.sync.VortXSyncManager
 
@@ -37,6 +42,10 @@ class StremioXViewModelFactory(
             repo = repo,
             railPreferences = appContext?.let(HomeRailPreferences::shared),
             railSurface = homeSurface,
+            watchlistStore = appContext?.let(WatchlistStore::shared),
+            traktRails = TraktRailsModel(),
+            simklRails = SimklRailsModel(appContext?.also(ScrobbleService::init)),
+            importedCatalogs = appContext?.let(ImportedCatalogs::shared),
         ) as T
         modelClass.isAssignableFrom(DiscoverViewModel::class.java) -> DiscoverViewModel(repo) as T
         modelClass.isAssignableFrom(LibraryViewModel::class.java) -> LibraryViewModel(repo) as T

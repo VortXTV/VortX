@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
@@ -25,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
@@ -33,11 +35,42 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
+import com.vortx.android.library.WatchlistStore
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.screens.resolvedDetailPlayback
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import kotlinx.coroutines.delay
+
+internal enum class TvDetailFocusTarget {
+    WATCH,
+    SECONDARY_ACTION,
+}
+
+/** One initial request, plus one Watch retry if the loading-state request could not land. */
+internal class TvDetailInitialFocus {
+    private var settled = false
+    private var secondaryAttempted = false
+    private var watchAttempted = false
+
+    fun next(watchEnabled: Boolean): TvDetailFocusTarget? = when {
+        settled -> null
+        watchEnabled && !watchAttempted -> {
+            watchAttempted = true
+            TvDetailFocusTarget.WATCH
+        }
+        !watchEnabled && !secondaryAttempted -> {
+            secondaryAttempted = true
+            TvDetailFocusTarget.SECONDARY_ACTION
+        }
+        else -> null
+    }
+
+    fun record(requestSucceeded: Boolean) {
+        if (requestSucceeded) settled = true
+    }
+}
 
 /// The TV title page, driven by the SAME [DetailViewModel] as the phone [com.vortx.android.ui.screens.DetailScreen]
 /// (constructed once in [TvApp] via the shared factory). It renders a 10-foot two-pane layout -- a
@@ -59,22 +92,22 @@ fun TvDetailScreen(
     viewModel: DetailViewModel,
     title: String,
     onBack: () -> Unit,
-    onPlay: (Playable) -> Unit,
+    onPlay: (Playable, MetaDetail) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
     val playback by viewModel.playback.collectAsStateWithLifecycle()
+    val watchlisted by viewModel.watchlisted.collectAsStateWithLifecycle()
 
     BackHandler { onBack() }
 
     // A resolved source -> hand the Playable to the shell (which shows the player) and reset the ViewModel's
     // playback latch, mirroring the phone DetailScreen exactly.
-    LaunchedEffect(playback) {
-        (playback as? Playback.Ready)?.let {
-            onPlay(it.playable)
-            viewModel.clearPlayback()
-        }
+    LaunchedEffect(playback, metaState) {
+        val resolved = resolvedDetailPlayback(playback, metaState) ?: return@LaunchedEffect
+        onPlay(resolved.playable, resolved.metadata)
+        viewModel.clearPlayback()
     }
 
     val colors = VortXTheme.colors
@@ -87,7 +120,7 @@ fun TvDetailScreen(
                 detail = meta.data,
                 streamsState = streamsState,
                 playback = playback,
-                onPlay = onPlay,
+                watchlisted = watchlisted,
             )
         }
     }
@@ -99,10 +132,17 @@ private fun TvDetailContent(
     detail: MetaDetail,
     streamsState: UiState<List<com.vortx.android.model.StreamGroup>>,
     playback: Playback,
-    onPlay: (Playable) -> Unit,
+    watchlisted: Boolean,
 ) {
     val colors = VortXTheme.colors
     val playFocus = remember { FocusRequester() }
+    val secondaryFocus = remember { FocusRequester() }
+    val initialFocus = remember(detail.id) { TvDetailInitialFocus() }
+    val hasSources = (streamsState as? UiState.Success)?.data?.any { it.streams.isNotEmpty() } == true
+    val watchEnabled = hasSources && playback !is Playback.Resolving
+    val hasTrailer = detail.trailerYouTubeId != null
+    val trailerModifier = if (hasTrailer) Modifier.focusRequester(secondaryFocus) else Modifier
+    val saveModifier = if (hasTrailer) Modifier else Modifier.focusRequester(secondaryFocus)
 
     Box(modifier = Modifier.fillMaxSize()) {
         TvBackdrop(
@@ -162,7 +202,6 @@ private fun TvDetailContent(
 
                 Spacer(Modifier.height(TvDimens.rowGap))
 
-                val hasSources = (streamsState as? UiState.Success)?.data?.any { it.streams.isNotEmpty() } == true
                 val resolving = playback is Playback.Resolving
                 val isResume = ((detail.libraryItem?.timeOffsetMs) ?: 0L) > 0L
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -179,16 +218,46 @@ private fun TvDetailContent(
                             modifier = Modifier.height(28.dp).width(28.dp),
                         )
                     }
+                }
+
+                // Keep the primary Watch CTA in its own fixed row. Secondary actions can outgrow the
+                // standard 52% TV pane, so they live in a focus-aware LazyRow that D-pad scrolls instead
+                // of clipping the trailing Save/Watchlist actions off-screen.
+                Spacer(Modifier.height(VortXTheme.spacing.sm))
+                LazyRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                ) {
                     // Trailer: free 1080p from the user's own IP via the client resolver (worker fallback on a
                     // miss). Shown only when the meta carries a YouTube trailer id; plays through the shared
                     // player pipeline (the same [DetailViewModel] playback latch the Watch button uses).
-                    if (detail.trailerYouTubeId != null) {
-                        Spacer(Modifier.width(VortXTheme.spacing.md))
+                    if (hasTrailer) {
+                        item {
+                            TvFilterChip(
+                                label = "Trailer",
+                                selected = false,
+                                onClick = { viewModel.playTrailer() },
+                                modifier = trailerModifier,
+                            )
+                        }
+                    }
+                    item {
                         TvFilterChip(
-                            label = "Trailer",
-                            selected = false,
-                            onClick = { viewModel.playTrailer() },
+                            label = if (detail.libraryItem?.savedToLibrary == true) "Saved" else "Save",
+                            selected = detail.libraryItem?.savedToLibrary == true,
+                            onClick = viewModel::toggleLibrary,
+                            modifier = saveModifier,
                         )
+                    }
+                    if (WatchlistStore.isSafeId(detail.id)) {
+                        item {
+                            TvFilterChip(
+                                label = if (watchlisted) "In Watchlist" else "Watchlist",
+                                selected = watchlisted,
+                                onClick = viewModel::toggleWatchlist,
+                            )
+                        }
                     }
                 }
                 (playback as? Playback.Failed)?.let {
@@ -214,10 +283,18 @@ private fun TvDetailContent(
         }
     }
 
-    // Seed focus on the Watch button once meta is up, so a fresh detail page lands on the primary action.
-    LaunchedEffect(Unit) {
+    // While sources settle, Save is the stable enabled target. If that request could not land, Watch
+    // gets one retry when it becomes enabled. A successful secondary request is never displaced.
+    LaunchedEffect(detail.id, watchEnabled) {
         delay(140)
-        runCatching { playFocus.requestFocus() }
+        val target = initialFocus.next(watchEnabled) ?: return@LaunchedEffect
+        val requestSucceeded = runCatching {
+            when (target) {
+                TvDetailFocusTarget.WATCH -> playFocus.requestFocus()
+                TvDetailFocusTarget.SECONDARY_ACTION -> secondaryFocus.requestFocus()
+            }
+        }.getOrDefault(false)
+        initialFocus.record(requestSucceeded)
     }
 }
 

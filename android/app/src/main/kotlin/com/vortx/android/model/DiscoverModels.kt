@@ -68,6 +68,7 @@ data class InstalledAddon(
     val isOfficial: Boolean = false,
     val isProtected: Boolean = false,
     val providesStreams: Boolean = false,
+    val providesMeta: Boolean = false,
     /// The manifest declares a `subtitles` resource (mirrors Apple `CoreDescriptor.providesSubtitles`,
     /// the `SubtitleAddons.swift:37` union filter): this add-on can be queried for external subtitle
     /// tracks at play time by [com.vortx.android.player.SubtitleAddonService].

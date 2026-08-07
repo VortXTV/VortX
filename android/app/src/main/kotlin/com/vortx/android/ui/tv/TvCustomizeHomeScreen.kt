@@ -28,6 +28,7 @@ import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.home.HomeRail
+import com.vortx.android.home.HomeCatalogLayout
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.ui.theme.VortXShapes
@@ -56,6 +57,21 @@ fun TvCustomizeHomeScreen(
                     "Move or hide Home rows. Continue Watching always stays first.",
                     style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
                 )
+                Text("Catalog layout", style = VortXTheme.type.cardTitle)
+                Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+                    TvHomeEditorAction(
+                        label = "Rails",
+                        enabled = true,
+                        selected = layout.catalogLayout == HomeCatalogLayout.RAILS,
+                        onClick = { preferences.setCatalogLayout(HomeCatalogLayout.RAILS) },
+                    )
+                    TvHomeEditorAction(
+                        label = "Poster wall",
+                        enabled = true,
+                        selected = layout.catalogLayout == HomeCatalogLayout.WALL,
+                        onClick = { preferences.setCatalogLayout(HomeCatalogLayout.WALL) },
+                    )
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
                     TvHomeEditorAction("Done", enabled = true, onClick = onBack)
                     TvHomeEditorAction("Reset to default", enabled = true, onClick = preferences::reset)
@@ -112,17 +128,22 @@ fun TvCustomizeHomeScreen(
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun TvHomeEditorAction(label: String, enabled: Boolean, onClick: () -> Unit) {
+private fun TvHomeEditorAction(
+    label: String,
+    enabled: Boolean,
+    selected: Boolean = false,
+    onClick: () -> Unit,
+) {
     val colors = VortXTheme.colors
     Surface(
         onClick = onClick,
         enabled = enabled,
         shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
         colors = ClickableSurfaceDefaults.colors(
-            containerColor = colors.surface1,
-            contentColor = colors.textPrimary,
-            focusedContainerColor = colors.surface3,
-            focusedContentColor = colors.textPrimary,
+            containerColor = if (selected) colors.accent else colors.surface1,
+            contentColor = if (selected) colors.onAccent else colors.textPrimary,
+            focusedContainerColor = if (selected) colors.accentBright else colors.surface3,
+            focusedContentColor = if (selected) colors.onAccent else colors.textPrimary,
             disabledContainerColor = colors.surface1,
             disabledContentColor = colors.textTertiary,
         ),

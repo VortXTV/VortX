@@ -9,5 +9,7 @@ import com.vortx.android.player.mpv.MpvPlayer
 /// ExoPlayer instead of crashing. [MpvPlayer.create] itself never throws: it wraps native failure and
 /// returns null.
 object MpvEngineFactory {
+    const val isBundled: Boolean = true
+
     fun create(context: Context): PlayerEngine? = MpvPlayer.create(context)
 }

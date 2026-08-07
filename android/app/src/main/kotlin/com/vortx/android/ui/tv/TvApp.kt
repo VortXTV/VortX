@@ -3,7 +3,9 @@ package com.vortx.android.ui.tv
 import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -16,18 +18,24 @@ import androidx.tv.material3.MaterialTheme as TvMaterialTheme
 import androidx.tv.material3.darkColorScheme as tvDarkColorScheme
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.PlaybackSessionLifecycle
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.deeplink.VortXDeepLinkEvent
+import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.player.PlayerScreen
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.ui.detailViewModelKey
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
+import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 import kotlinx.coroutines.launch
 
 /// The Android TV shell: a three-state D-pad flow (Home browse -> Detail -> Player) that is the 10-foot
@@ -47,6 +55,7 @@ fun TvApp(
     repo: CatalogRepository = PreviewCatalogRepository(),
     auth: AuthRepository = PreviewAuthRepository(),
     syncManager: VortXSyncManager? = null,
+    deepLinkEvent: VortXDeepLinkEvent? = null,
 ) {
     val profileStore = ProfileStore.sharedOrNull()
     val activeProfile by (profileStore?.activeProfile?.collectAsStateWithLifecycle()
@@ -58,10 +67,21 @@ fun TvApp(
     ) {
         // The title currently open in Detail; null = the Home browse wall.
         var detail by remember { mutableStateOf<MetaItem?>(null) }
+        var detailGeneration by remember { mutableStateOf(0L) }
         // The resolved source currently playing; null = not in the player. The DETAIL page resolves a
         // chosen source into this [Playable] (through [DetailViewModel]); the shell then covers everything
         // with the player, exactly as the phone shell keys [PlayerScreen] off its own `playing` slot.
         var playing by remember { mutableStateOf<Playable?>(null) }
+        var playingMeta by remember { mutableStateOf<MetaDetail?>(null) }
+
+        LaunchedEffect(deepLinkEvent) {
+            val event = deepLinkEvent ?: return@LaunchedEffect
+            val target = event.target
+            playing = null
+            playingMeta = null
+            detailGeneration += 1
+            detail = target.toMetaItem()
+        }
 
         val appContext = LocalContext.current.applicationContext
         val debridKeys = remember(appContext) { DebridKeys(appContext) }
@@ -74,25 +94,32 @@ fun TvApp(
         val debridOwnerEpoch = remember(sessionUiState) {
             debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
         }
+        val debridCredentialRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
+        val sourceSettingsRevision by SourceSettingsRevision.observe(appContext).collectAsStateWithLifecycle()
+        val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
+        val detailVmOwner = rememberReplacingViewModelStoreOwner(
+            detail?.let { "${it.type}:${it.id}:$detailSourceEpoch" } ?: "no-detail:$detailSourceEpoch",
+        )
         // A scope tied to the whole shell (not the player layer), so the end-of-playback engine write (final
         // progress tick + Player unload) still completes after the player leaves composition -- the same
         // reason the phone shell uses an app-scoped coroutine for this.
         val appScope = rememberCoroutineScope()
+        val playbackSessions = remember(repo, appScope) { PlaybackSessionLifecycle(repo, appScope) }
 
         // Player is the topmost layer. When a source resolves to a [Playable] it covers Home/Detail and back
         // returns to the detail page underneath. The begin/report/end-playback-session calls mirror
         // VortXApp exactly, so Continue Watching + resume track on TV the same way they do on the phone.
         val playable = playing
         if (playable != null) {
-            // Freshest reported position/duration (ms) for the save-on-exit write: [0] = position,
-            // [1] = duration. Reset when the played source changes.
-            val lastProgress = remember(playable) { longArrayOf(0L, 0L) }
+            val playbackHistory = remember(playable) {
+                TvPlaybackHistorySession(playable, playbackSessions)
+            }
             // D-pad Back pops the player back to the detail page rather than exiting the app.
             BackHandler { playing = null }
             DisposableEffect(playable) {
-                appScope.launch { repo.beginPlaybackSession() }
+                playbackHistory.begin()
                 onDispose {
-                    appScope.launch { repo.endPlaybackSession(lastProgress[0], lastProgress[1]) }
+                    playbackHistory.end()
                 }
             }
             PlayerScreen(
@@ -100,9 +127,7 @@ fun TvApp(
                 onBack = { playing = null },
                 onError = { playing = null },
                 onProgress = { pos, dur ->
-                    lastProgress[0] = pos
-                    lastProgress[1] = dur
-                    appScope.launch { repo.reportProgress(pos, dur) }
+                    playbackHistory.report(pos, dur)
                 },
             )
             return@VortXTheme
@@ -116,31 +141,78 @@ fun TvApp(
         TvMaterialTheme(colorScheme = tvDarkColorScheme()) {
             val current = detail
             if (current != null) {
-                // One DetailViewModel per open title, keyed by id and fed type+id through the factory's
-                // DetailArgs -- the SAME construction the phone shell uses. Reusing it is what makes the TV
-                // detail page respect the active profile's Kids source guard for free (the guard lives in
-                // DetailViewModel.buildContext).
-                val detailVm: DetailViewModel = viewModel(
-                    key = "tv-detail-${current.id}-$debridOwnerEpoch",
-                    factory = StremioXViewModelFactory(
-                        repo = repo,
-                        detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),
-                        appContext = appContext,
-                    ),
-                )
-                TvDetailScreen(
-                    viewModel = detailVm,
-                    title = current.name,
-                    onBack = { detail = null },
-                    onPlay = { playing = it },
-                )
+                key(current.type, current.id, detailGeneration) {
+                    // The Compose generation resets the local screen tree, while this Activity-scoped
+                    // ViewModel key remains bounded by target and owner so repeat visits do not leak VMs.
+                    val detailVm: DetailViewModel = viewModel(
+                        viewModelStoreOwner = detailVmOwner,
+                        key = detailViewModelKey(
+                            prefix = "tv-detail",
+                            typeId = current.type.id,
+                            mediaId = current.id,
+                            ownerEpoch = detailSourceEpoch,
+                        ),
+                        factory = StremioXViewModelFactory(
+                            repo = repo,
+                            detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),
+                            appContext = appContext,
+                        ),
+                    )
+                    TvDetailScreen(
+                        viewModel = detailVm,
+                        title = current.name,
+                        onBack = { detail = null },
+                        onPlay = { resolved, loadedMeta ->
+                            playingMeta = loadedMeta
+                            playing = resolved
+                        },
+                    )
+                }
             } else {
                 // The browse layer: the left-rail shell over the five top-level surfaces (Home / Discover /
                 // Library / Search / Settings). It sits UNDER this detail/player block, so opening a title
                 // from ANY surface routes through the same `detail` slot and the existing Home -> Detail ->
                 // Play flow is unchanged.
-                TvShell(repo = repo, auth = auth, onItem = { detail = it })
+                TvShell(
+                    repo = repo,
+                    auth = auth,
+                    onItem = {
+                        detailGeneration += 1
+                        detail = it
+                    },
+                )
             }
         }
+    }
+}
+
+/**
+ * Owns the TV shell's history callbacks for one [Playable]. Trailers receive no history handle, so
+ * periodic progress, the player's final progress callback, and composition disposal cannot reach the
+ * resident feature's history session. Ordinary playables retain the existing ordered lifecycle.
+ */
+internal class TvPlaybackHistorySession(
+    playable: Playable,
+    private val playbackSessions: PlaybackSessionLifecycle,
+) {
+    private val handle = if (playable.isTrailer) null else playbackSessions.newHandle()
+    private var lastPositionMs = 0L
+    private var lastDurationMs = 0L
+
+    fun begin() {
+        val activeHandle = handle ?: return
+        playbackSessions.begin(activeHandle)
+    }
+
+    fun report(positionMs: Long, durationMs: Long) {
+        val activeHandle = handle ?: return
+        lastPositionMs = positionMs
+        lastDurationMs = durationMs
+        playbackSessions.report(activeHandle, positionMs, durationMs)
+    }
+
+    fun end() {
+        val activeHandle = handle ?: return
+        playbackSessions.end(activeHandle, lastPositionMs, lastDurationMs)
     }
 }

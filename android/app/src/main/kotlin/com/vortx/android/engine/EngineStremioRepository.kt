@@ -6,6 +6,12 @@ import com.vortx.android.auth.AuthIdentityStore
 import com.vortx.android.data.AddonPrefsStore
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.ContinueWatchingDismissal
+import com.vortx.android.data.ContinueWatchingOwner
+import com.vortx.android.data.ContinueWatchingSnapshot
+import com.vortx.android.data.HomeSnapshot
+import com.vortx.android.data.HomeUpdate
+import com.vortx.android.data.PlaybackSessionToken
 import com.vortx.android.model.AddonOrder
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridResolver
@@ -24,16 +30,20 @@ import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.library.WatchedIndex
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.profile.ContinueWatchingOwnerGate
+import com.vortx.android.profile.UserProfile
 import com.vortx.android.sources.SourcePinContext
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -48,7 +58,6 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.currentCoroutineContext
@@ -99,6 +108,18 @@ internal data class UsenetResolveTarget(
     val fileIdx: Int?,
 )
 
+/** Bare-id native removal is allowed only when the carried media type uniquely identifies that id. */
+internal fun validateContinueWatchingRemovalTarget(
+    items: List<MetaItem>,
+    target: ContinueWatchingDismissal,
+): Boolean {
+    val matching = items.filter { it.id == target.id }
+    check(matching.none { it.type != target.type }) {
+        "Continue Watching removal cannot disambiguate duplicate media types."
+    }
+    return matching.any { it.type == target.type }
+}
+
 internal fun StreamSource.usenetResolveTarget(
     selectedEpisode: Episode?,
 ): UsenetResolveTarget = UsenetResolveTarget(
@@ -131,6 +152,380 @@ internal fun usenetPlaybackFailure(error: Throwable): Throwable = when (error) {
         IllegalStateException("TorBox could not resolve this Usenet source: ${error.message}.", error)
     else -> error
 }
+
+/** One immutable authorization view carried through a complete Home snapshot build. */
+internal data class HomeProfileIdentity(
+    val profileId: String,
+    val usesEngineHistory: Boolean,
+    val accountKey: String,
+    val expectedPrincipal: String? = null,
+)
+
+internal fun engineHistoryPrincipalMatches(profile: UserProfile?, state: AuthState): Boolean {
+    if (profile == null || profile.isOwner || !profile.usesOwnAccount) return true
+    val expected = profile.email?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return false
+    val actual = (state as? AuthState.SignedIn)?.email
+        ?.trim()
+        ?.lowercase()
+        ?.takeIf { it.isNotEmpty() }
+        ?: return false
+    return expected == actual
+}
+
+internal data class PlaybackHistorySession(
+    val token: PlaybackSessionToken,
+    val owner: ContinueWatchingOwner,
+    val enginePlayerLoaded: Boolean,
+    val type: String?,
+    val videoId: String?,
+    val overlayMetaId: String?,
+    val name: String?,
+    val poster: String?,
+)
+
+/** Holds exactly one playback session and rejects every callback carrying a replaced generation. */
+internal class PlaybackHistorySessions {
+    private val lock = Any()
+    private var generation = 0L
+    private var current: PlaybackHistorySession? = null
+
+    fun replace(
+        unloadPrevious: (PlaybackHistorySession) -> Unit,
+        create: (PlaybackSessionToken) -> PlaybackHistorySession,
+    ): PlaybackSessionToken = synchronized(lock) {
+        current?.let(unloadPrevious)
+        current = null
+        check(generation < Long.MAX_VALUE) { "Playback session generation exhausted." }
+        generation += 1L
+        val token = PlaybackSessionToken(generation)
+        val replacement = create(token)
+        check(replacement.token == token) { "Playback session token mismatch." }
+        current = replacement
+        token
+    }
+
+    fun withCurrent(token: PlaybackSessionToken, block: (PlaybackHistorySession) -> Unit): Boolean =
+        synchronized(lock) {
+            val session = current?.takeIf { it.token == token } ?: return@synchronized false
+            block(session)
+            true
+        }
+
+    fun finish(token: PlaybackSessionToken, block: (PlaybackHistorySession) -> Unit): Boolean =
+        synchronized(lock) {
+            val session = current?.takeIf { it.token == token } ?: return@synchronized false
+            try {
+                block(session)
+            } finally {
+                if (current === session) current = null
+            }
+            true
+        }
+}
+
+internal data class HomePrivacyPermit(
+    val generation: Long,
+    val profile: HomeProfileIdentity,
+    val suppressAccountHistory: Boolean,
+    val suppressContinueWatchingPreview: Boolean,
+)
+
+/** Ownership evidence captured synchronously with the native callback that announced a preview. */
+internal data class HomePreviewTicket(
+    val privacy: HomePrivacyPermit,
+    val eventSequence: Long,
+)
+
+/** An exact local authentication attempt bound to the core request digest it dispatched. */
+internal data class HomeSignInAttempt(
+    val id: Long,
+    val requestId: String,
+    val privacyGeneration: Long,
+    val profile: HomeProfileIdentity,
+)
+
+private data class FencedHomeSnapshot(
+    val privacy: HomePrivacyPermit,
+    val snapshot: HomeSnapshot,
+)
+
+/** Fail-closed gate for account-derived Home history across authentication transitions. */
+internal class HomePrivacyFence(
+    initiallySuppressed: Boolean = true,
+    initialProfile: HomeProfileIdentity = HomeProfileIdentity(
+        profileId = "default",
+        usesEngineHistory = true,
+        accountKey = "default",
+        expectedPrincipal = null,
+    ),
+) {
+    private var generation = 0L
+    private var nextSignInAttemptId = 0L
+    private var profile = initialProfile
+    private var minimumPreviewEventSequence = 0L
+    private var suppressAccountHistory = initiallySuppressed
+    private var suppressContinueWatchingPreview = initiallySuppressed
+    private var pendingSignIn: HomeSignInAttempt? = null
+    private var activeAccountUid: String? = null
+    private var activeAccountGeneration: Long? = null
+    private var previewObservation: PreviewObservation? = null
+
+    val isRaised: Boolean
+        @Synchronized get() = suppressAccountHistory || suppressContinueWatchingPreview
+
+    @Synchronized
+    fun capture(): HomePrivacyPermit = HomePrivacyPermit(
+        generation = generation,
+        profile = profile,
+        suppressAccountHistory = suppressAccountHistory,
+        suppressContinueWatchingPreview = suppressContinueWatchingPreview,
+    )
+
+    @Synchronized
+    fun isCurrent(permit: HomePrivacyPermit): Boolean =
+        permit.generation == generation && permit.profile == profile
+
+    /** Validate and publish while holding the same monitor every privacy transition advances. */
+    @Synchronized
+    fun publishIfCurrent(permit: HomePrivacyPermit, publish: () -> Boolean): Boolean =
+        permit.generation == generation && permit.profile == profile && publish()
+
+    /** Called once after a newly constructed engine has hydrated its own coherent persisted model. */
+    @Synchronized
+    fun establishFreshEngineState(
+        isSignedIn: Boolean,
+        signedInUid: String?,
+        accountUidVerified: Boolean,
+        activeProfile: HomeProfileIdentity = profile,
+        nextPreviewEventSequence: Long = minimumPreviewEventSequence,
+    ) {
+        generation += 1
+        profile = activeProfile
+        minimumPreviewEventSequence = nextPreviewEventSequence
+        pendingSignIn = null
+        previewObservation = null
+        activeAccountUid = signedInUid?.takeIf { isSignedIn && accountUidVerified }
+        activeAccountGeneration = activeAccountUid?.let { generation }
+        val accountIsFresh = !isSignedIn || (!signedInUid.isNullOrBlank() && accountUidVerified)
+        suppressAccountHistory = !accountIsFresh
+        // A newly constructed engine derived this preview from the same hydrated state. A UID-less
+        // signed-in ctx is not an owned account and therefore remains fail-closed.
+        suppressContinueWatchingPreview = !accountIsFresh
+    }
+
+    /** Advance the Home generation at the instant the active profile identity moves. */
+    @Synchronized
+    fun switchProfile(
+        activeProfile: HomeProfileIdentity,
+        nextPreviewEventSequence: Long,
+    ): Boolean {
+        if (profile == activeProfile) return false
+        val accountChanged = profile.accountKey != activeProfile.accountKey
+        val principalChanged = profile.expectedPrincipal != activeProfile.expectedPrincipal
+        generation += 1
+        profile = activeProfile
+        minimumPreviewEventSequence = nextPreviewEventSequence
+        pendingSignIn = null
+        previewObservation = null
+        if (accountChanged || principalChanged) {
+            suppressAccountHistory = true
+            suppressContinueWatchingPreview = true
+            activeAccountUid = null
+            activeAccountGeneration = null
+        }
+        return true
+    }
+
+    @Synchronized
+    fun beginSignIn(
+        requestId: String,
+        nextPreviewEventSequence: Long = minimumPreviewEventSequence,
+    ): HomeSignInAttempt {
+        generation += 1
+        nextSignInAttemptId += 1
+        minimumPreviewEventSequence = nextPreviewEventSequence
+        suppressAccountHistory = true
+        suppressContinueWatchingPreview = true
+        activeAccountUid = null
+        activeAccountGeneration = null
+        previewObservation = null
+        return HomeSignInAttempt(
+            id = nextSignInAttemptId,
+            requestId = requestId,
+            privacyGeneration = generation,
+            profile = profile,
+        ).also { pendingSignIn = it }
+    }
+
+    @Synchronized
+    fun invalidateAccount(
+        nextPreviewEventSequence: Long = minimumPreviewEventSequence,
+    ): HomePrivacyPermit {
+        generation += 1
+        minimumPreviewEventSequence = nextPreviewEventSequence
+        suppressAccountHistory = true
+        suppressContinueWatchingPreview = true
+        pendingSignIn = null
+        activeAccountUid = null
+        activeAccountGeneration = null
+        previewObservation = null
+        return capture()
+    }
+
+    fun beforeLogout(
+        nextPreviewEventSequence: Long = minimumPreviewEventSequence,
+        dispatch: () -> Unit,
+    ) {
+        invalidateAccount(nextPreviewEventSequence)
+        dispatch()
+    }
+
+    /**
+     * Establish account-owned buckets for this exact attempt. A UID-less preview remains suppressed;
+     * it becomes readable only after a preview event from this attempt is observed with the same uid.
+     */
+    @Synchronized
+    fun completeSignIn(attempt: HomeSignInAttempt, accountUid: String?): Boolean {
+        if (attempt != pendingSignIn || attempt.profile != profile || accountUid.isNullOrBlank()) return false
+        activeAccountUid = accountUid
+        activeAccountGeneration = attempt.privacyGeneration
+        suppressAccountHistory = false
+        suppressContinueWatchingPreview = previewObservation != PreviewObservation(
+            generation = attempt.privacyGeneration,
+            profile = attempt.profile,
+            uid = accountUid,
+        )
+        pendingSignIn = null
+        generation += 1
+        return true
+    }
+
+    /**
+     * Record a UID-less preview only when its producing engine event belongs to the current account
+     * generation and the caller independently verified the current ctx plus persisted bucket uid.
+     */
+    @Synchronized
+    fun previewTicket(eventSequence: Long): HomePreviewTicket = HomePreviewTicket(
+        privacy = capture(),
+        eventSequence = eventSequence,
+    )
+
+    @Synchronized
+    fun noteContinueWatchingRefresh(ticket: HomePreviewTicket, accountUid: String): Boolean {
+        if (accountUid.isBlank()) return false
+        if (ticket.eventSequence < minimumPreviewEventSequence) return false
+        if (ticket.privacy.profile != profile) return false
+        val eventGeneration = ticket.privacy.generation
+        val pending = pendingSignIn
+        if (
+            pending != null &&
+            pending.privacyGeneration == eventGeneration &&
+            pending.profile == ticket.privacy.profile
+        ) {
+            previewObservation = PreviewObservation(eventGeneration, ticket.privacy.profile, accountUid)
+            return false
+        }
+        if (
+            activeAccountUid == accountUid &&
+            (activeAccountGeneration == eventGeneration || generation == eventGeneration) &&
+            suppressContinueWatchingPreview
+        ) {
+            suppressContinueWatchingPreview = false
+            generation += 1
+            return true
+        }
+        return false
+    }
+
+    private data class PreviewObservation(
+        val generation: Long,
+        val profile: HomeProfileIdentity,
+        val uid: String,
+    )
+}
+
+internal data class AuthAttemptLease(
+    val id: Long,
+    val requestId: String,
+    val outcome: CompletableDeferred<AuthAttemptOutcome>,
+)
+
+/**
+ * Owns the one native login request that may currently produce a terminal CoreEvent. An identical
+ * retry is refused while its predecessor is unresolved, because the native AuthRequest has no nonce
+ * and therefore cannot distinguish their responses. Different requests supersede safely: their exact
+ * request digests differ, so a late predecessor response cannot complete the replacement lease.
+ */
+internal class AuthAttemptCoordinator {
+    private var nextId = 0L
+    private var active: AuthAttemptLease? = null
+    private val retiredRequestIds = mutableSetOf<String>()
+
+    @Synchronized
+    fun begin(requestId: String): AuthAttemptLease? {
+        val current = active
+        if (current?.requestId == requestId || requestId in retiredRequestIds) return null
+        current?.outcome?.complete(
+            AuthAttemptOutcome.Failed(current.requestId, "Sign-in was replaced by a newer attempt."),
+        )
+        current?.let { retiredRequestIds += it.requestId }
+        nextId += 1
+        return AuthAttemptLease(
+            id = nextId,
+            requestId = requestId,
+            outcome = CompletableDeferred(),
+        ).also { active = it }
+    }
+
+    @Synchronized
+    fun complete(outcome: AuthAttemptOutcome): Boolean {
+        if (retiredRequestIds.remove(outcome.requestId)) return false
+        val current = active ?: return false
+        if (current.requestId != outcome.requestId) return false
+        active = null
+        return current.outcome.complete(outcome)
+    }
+
+    /** Release a lease whose native dispatch threw before a request could be accepted. */
+    @Synchronized
+    fun releaseBeforeDispatch(lease: AuthAttemptLease): Boolean {
+        if (active !== lease) return false
+        active = null
+        return lease.outcome.complete(
+            AuthAttemptOutcome.Failed(lease.requestId, "Sign-in could not be dispatched."),
+        )
+    }
+
+    /**
+     * Quarantine a dispatched request whose caller timed out or was cancelled. Its eventual terminal
+     * event is consumed as stale before an identical retry can begin.
+     */
+    @Synchronized
+    fun abandon(lease: AuthAttemptLease): Boolean {
+        if (active !== lease) return false
+        active = null
+        retiredRequestIds += lease.requestId
+        return lease.outcome.complete(
+            AuthAttemptOutcome.Failed(lease.requestId, "Sign-in attempt was abandoned."),
+        )
+    }
+
+    @Synchronized
+    fun abandonActive(): Boolean {
+        val current = active ?: return false
+        return abandon(current)
+    }
+}
+
+/** Convert ordinary failures to [Result] without turning structured cancellation into a value. */
+internal suspend fun <T> runCatchingPreservingCancellation(block: suspend () -> T): Result<T> =
+    try {
+        Result.success(block())
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Throwable) {
+        Result.failure(error)
+    }
 
 /// The real engine implementation of the UI seams. Drop-in replacement for `PreviewCatalogRepository`
 /// AND `PreviewAuthRepository`: it satisfies the SAME [CatalogRepository] (alias `StremioRepository`)
@@ -198,6 +593,8 @@ class EngineStremioRepository(
     private val addonPrefs by lazy {
         AddonPrefsStore(appContext) { ProfileStore.sharedOrNull()?.activeProfileId ?: AddonPrefsStore.DEFAULT_PROFILE }
     }
+    private val homePagination = HomePaginationState(DEFAULT_BOARD_ROWS, DEFAULT_BOARD_ROWS)
+    private val watchedIndex = WatchedIndex(appContext.filesDir)
 
     /// One-time flag read for the vortx-core SHADOW ranking lane (engine cutover Phase 7 slice 1,
     /// the Android analogue of the Apple VortxBridge shadow). Forced on the first stream rank; after
@@ -213,10 +610,8 @@ class EngineStremioRepository(
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
 
-    /// Sign-in failure messages, published only for `CoreEvent` `Error`s whose `source` is
-    /// `UserAuthenticated` (see [EngineState.parseAuthErrorMessage]) so an unrelated background error
-    /// (a library sync hiccup, say) can never masquerade as a sign-in failure.
-    private val authErrors = MutableSharedFlow<String>(
+    /** Transition signals folded into the same ordered [homeUpdates] stream as row snapshots. */
+    private val homePrivacyClears = MutableSharedFlow<HomePrivacyPermit>(
         extraBufferCapacity = 4,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
@@ -235,7 +630,24 @@ class EngineStremioRepository(
     @Volatile
     private var started = false
 
-    /// Set on [signOut], cleared on the next [signIn]. Works around a stremio-core engine quirk: on
+    /** Dismissals fail closed while a network-backed account transition is unresolved. */
+    private val authTransition = ContinueWatchingAuthTransition()
+
+    private sealed interface HistoryRoute {
+        data class Overlay(val profiles: ProfileStore, val profileId: String) : HistoryRoute
+        data object Engine : HistoryRoute
+    }
+
+    private val historyOwnerFence = HistoryOwnerFence(
+        captureOwner = ::continueWatchingOwnerLocked,
+        ownerRouteMatches = ::historyOwnerRouteMatchesLocked,
+        transitionInProgress = { authTransition.inProgress },
+    )
+
+    /// Raised before [signOut]'s Logout dispatch and cleared in layers only after [signIn] verifies
+    /// the signed-in ctx, persisted library buckets, and a current-generation Continue Watching
+    /// refresh for that exact account uid. Works around a
+    /// stremio-core engine quirk: on
     /// `Logout` the engine clears `ctx.library` but emits `Internal::LibraryChanged(false)` (the
     /// "don't persist" variant), and `ContinueWatchingPreview`'s `update` only recomputes on
     /// `LibraryChanged(true)` -- so the engine's `continue_watching_preview` field keeps serving the
@@ -243,10 +655,13 @@ class EngineStremioRepository(
     /// rebuilt from the (now-empty, persisted) library bucket from scratch. That's exactly the device
     /// finding: "Continue Watching posters persist after Logout" until relaunch. Board rails do NOT
     /// have this problem (Logout's `ProfileChanged` correctly drives `catalogs_update`), but we clear
-    /// both defensively in [homeSnapshot] so a signed-out Home is never rendered from ANY leftover
+    /// both defensively in [homeRowsLocked] so a signed-out Home is never rendered from ANY leftover
     /// per-account state while this flag is set.
-    @Volatile
-    private var suppressHomeUntilFreshLoad = false
+    /** Serializes native preview callback tickets with account/profile transition barriers. */
+    private val homeEventOrder = Any()
+    private var homeEventSequence = 0L
+    private val authAttemptCoordinator = AuthAttemptCoordinator()
+    private val homePrivacyFence = HomePrivacyFence(initialProfile = currentHomeProfileIdentity())
 
     init {
         start()
@@ -256,9 +671,21 @@ class EngineStremioRepository(
         // rewritten); SourcePinStore.reload() re-reads the new active profile's pins. No-op until
         // ProfileStore is initialized (VortXApplication.onCreate), which always precedes engine
         // construction, so this registers exactly once for the process.
-        ProfileStore.sharedOrNull()?.addSwitchListener {
-            sourcePrefs.reload()
-            sourcePins.reload()
+        ProfileStore.sharedOrNull()?.let { profiles ->
+            profiles.addHomeTransitionListener {
+                val clear = synchronized(homeEventOrder) {
+                    val changed = homePrivacyFence.switchProfile(
+                        activeProfile = currentHomeProfileIdentity(),
+                        nextPreviewEventSequence = homeEventSequence + 1,
+                    )
+                    if (changed) homePrivacyFence.capture() else null
+                }
+                clear?.let(homePrivacyClears::tryEmit)
+            }
+            profiles.addSwitchListener {
+                sourcePrefs.reload()
+                sourcePins.reload()
+            }
         }
         // Home is per-profile (the CW rail swaps between the engine rail and the overlay rail on a
         // switch, and a per-profile prefs apply can change what the board shows). Mirrors the tail of
@@ -279,28 +706,154 @@ class EngineStremioRepository(
     private fun overlayProfiles(): ProfileStore? =
         ProfileStore.sharedOrNull()?.takeIf { !it.activeUsesEngineHistory }
 
-    /// Re-shape an engine [MetaDetail] for an overlay profile: the per-ACCOUNT fields (saved-to-library
-    /// state, resume position, watched episode ticks) are replaced with the active profile's private
-    /// overlay state, so Detail/resume/ticks are per-profile with zero screen changes. Engine-backed
-    /// profiles get the detail back untouched.
-    private fun withOverlayState(detail: MetaDetail): MetaDetail {
-        val store = overlayProfiles() ?: return detail
-        val entry = store.watch[detail.id]
-        val libraryItem = entry?.let {
-            LibraryItemInfo(
-                id = detail.id,
-                removed = false,
-                temp = false,
-                videoId = it.videoId,
-                timeOffsetMs = it.timeOffsetMs.toLong(),
-                durationMs = it.durationMs.toLong(),
-                // A movie is watched in the overlay when its OWN meta id is in watchedVideoIds (that is
-                // exactly what markWatched appends and what Apple `cwItems`' finished-movie prune keys on).
-                timesWatched = if (detail.id in it.watchedVideoIds) 1 else 0,
-                flaggedWatched = if (detail.id in it.watchedVideoIds) 1 else 0,
+    private fun currentNativeAuthState(): AuthState = if (started) {
+        runCatching {
+            EngineState.parseAuthState(StremioCoreNative.getState(EngineActions.ctxField()))
+        }.getOrDefault(_authState.value)
+    } else {
+        _authState.value
+    }
+
+    private fun continueWatchingOwnerLocked(revision: Long): ContinueWatchingOwner {
+        val profiles = ProfileStore.sharedOrNull()
+        val profileId = profiles?.activeProfileId ?: UserProfile.OWNER_ID
+        val accountSlot = profiles?.activeKeychainAccount ?: "primary"
+        val principal = authPrincipal(currentNativeAuthState())
+        return ContinueWatchingOwner(
+            profileId = profileId,
+            accountSlot = accountSlot,
+            principal = principal,
+            usesEngineHistory = profiles?.activeUsesEngineHistory ?: true,
+            revision = revision,
+        )
+    }
+
+    private fun historyOwnerRouteMatchesLocked(owner: ContinueWatchingOwner): Boolean {
+        val profiles = ProfileStore.sharedOrNull()
+        val profileId = profiles?.activeProfileId ?: UserProfile.OWNER_ID
+        val accountSlot = profiles?.activeKeychainAccount ?: "primary"
+        val usesEngineHistory = profiles?.activeUsesEngineHistory ?: true
+        if (
+            owner.profileId != profileId ||
+            owner.accountSlot != accountSlot ||
+            owner.usesEngineHistory != usesEngineHistory
+        ) return false
+
+        val nativeState = currentNativeAuthState()
+        if (owner.principal != authPrincipal(nativeState)) return false
+        return if (owner.usesEngineHistory) {
+            engineHistoryPrincipalMatches(profiles?.active, nativeState)
+        } else {
+            profiles?.active?.id == owner.profileId
+        }
+    }
+
+    private fun historyRouteLocked(owner: ContinueWatchingOwner): HistoryRoute {
+        check(historyOwnerRouteMatchesLocked(owner)) { "History owner or account principal changed." }
+        return if (owner.usesEngineHistory) {
+            HistoryRoute.Engine
+        } else {
+            HistoryRoute.Overlay(
+                profiles = requireNotNull(ProfileStore.sharedOrNull()) { "History overlay is unavailable." },
+                profileId = owner.profileId,
             )
         }
-        return detail.copy(libraryItem = libraryItem, watchedVideoIds = store.watchedVideoIds(detail.id))
+    }
+
+    override fun continueWatchingOwner(): ContinueWatchingOwner =
+        ContinueWatchingOwnerGate.serialized(::continueWatchingOwnerLocked)
+
+    private fun continueWatchingSnapshot(): List<MetaItem> {
+        val overlayStore = overlayProfiles()
+        return when {
+            overlayStore != null -> runCatching { overlayStore.continueWatching() }.getOrDefault(emptyList())
+            homePrivacyFence.isRaised || !engineHistoryPrincipalMatches() -> emptyList()
+            else -> runCatching {
+                EngineState.parseContinueWatching(StremioCoreNative.getState(EngineActions.continueWatchingPreviewField()))
+            }.getOrDefault(emptyList())
+        }
+    }
+
+    private fun strictContinueWatchingItemsLocked(): List<MetaItem> {
+        val overlayStore = overlayProfiles()
+        if (overlayStore != null) return overlayStore.continueWatching()
+        check(started) { "Continue Watching native engine is not started." }
+        requireEngineHistoryPrincipalMatch()
+        check(!homePrivacyFence.isRaised) { "Continue Watching native state is not trustworthy after sign-out." }
+        val json = StremioCoreNative.getState(EngineActions.continueWatchingPreviewField())
+        return EngineState.parseContinueWatchingStrict(json).getOrThrow()
+    }
+
+    override suspend fun continueWatchingSnapshot(
+        expectedOwner: ContinueWatchingOwner,
+    ): Result<ContinueWatchingSnapshot> = withContext(Dispatchers.Default) { runCatching {
+        ContinueWatchingOwnerGate.serialized { revision ->
+            check(!authTransition.inProgress) { "Continue Watching account transition is in progress." }
+            val owner = continueWatchingOwnerLocked(revision)
+            check(owner == expectedOwner) { "Continue Watching owner changed." }
+            val items = strictContinueWatchingItemsLocked()
+            check(continueWatchingOwnerLocked(revision) == expectedOwner) { "Continue Watching owner changed." }
+            ContinueWatchingSnapshot(owner, items)
+        }
+    } }
+
+    private fun currentHomeProfileIdentity(): HomeProfileIdentity {
+        val profiles = ProfileStore.sharedOrNull()
+        val active = profiles?.active
+        return HomeProfileIdentity(
+            profileId = profiles?.activeProfileId ?: "default",
+            usesEngineHistory = profiles?.activeUsesEngineHistory ?: true,
+            accountKey = profiles?.activeKeychainAccount ?: "default",
+            expectedPrincipal = active?.takeIf { it.usesOwnAccount }
+                ?.email
+                ?.trim()
+                ?.lowercase()
+                ?.takeIf { it.isNotEmpty() },
+        )
+    }
+
+    private fun engineHistoryPrincipalMatches(): Boolean {
+        val nativeState = currentNativeAuthState()
+        return engineHistoryPrincipalMatches(ProfileStore.sharedOrNull()?.active, nativeState)
+    }
+
+    private fun requireEngineHistoryPrincipalMatch() {
+        check(engineHistoryPrincipalMatches()) {
+            "This profile's own account is not authenticated in the native engine."
+        }
+    }
+    /// Re-shape an engine [MetaDetail] for the owner captured by [permit]. Overlay resume and watched
+    /// fields come from one immutable entry read while that exact profile is active. A transition before
+    /// or after the read returns null instead of publishing a mixed-profile detail snapshot.
+    private fun withOverlayState(detail: MetaDetail, permit: HistoryReadPermit): MetaDetail? {
+        val shaped = try {
+            when (val route = historyRouteLocked(permit.owner)) {
+                HistoryRoute.Engine -> detail
+                is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                    val entry = overlay.watch[detail.id]
+                    val libraryItem = entry?.let {
+                        LibraryItemInfo(
+                            id = detail.id,
+                            removed = false,
+                            temp = false,
+                            videoId = it.videoId,
+                            timeOffsetMs = it.timeOffsetMs.toLong(),
+                            durationMs = it.durationMs.toLong(),
+                            // A movie is watched in the overlay when its OWN meta id is in watchedVideoIds.
+                            timesWatched = if (detail.id in it.watchedVideoIds) 1 else 0,
+                            flaggedWatched = if (detail.id in it.watchedVideoIds) 1 else 0,
+                        )
+                    }
+                    detail.copy(
+                        libraryItem = libraryItem,
+                        watchedVideoIds = entry?.watchedVideoIds?.toSet() ?: emptySet(),
+                    )
+                }
+            }
+        } catch (_: IllegalStateException) {
+            return null
+        }
+        return shaped.takeIf { historyOwnerFence.readIsCurrent(permit) }
     }
 
     /// Initialize the engine once. Idempotent; safe to call from multiple repositories (the native
@@ -329,14 +882,33 @@ class EngineStremioRepository(
         if (started) {
             Log.i(TAG, "engine initialized (schemaVersion=${runCatching { StremioCoreNative.schemaVersion() }.getOrDefault(-1)})")
             refreshAuthState()
+            val restoredUid = (_authState.value as? AuthState.SignedIn)?.uid?.takeIf { it.isNotBlank() }
+            synchronized(homeEventOrder) {
+                homePrivacyFence.establishFreshEngineState(
+                    isSignedIn = _authState.value is AuthState.SignedIn,
+                    signedInUid = restoredUid,
+                    accountUidVerified = restoredUid?.let {
+                        engineHistoryPrincipalMatches() && WatchedIndex.storageMatchesUid(appContext.filesDir, it)
+                    } ?: (_authState.value is AuthState.SignedOut),
+                    activeProfile = currentHomeProfileIdentity(),
+                    nextPreviewEventSequence = homeEventSequence + 1,
+                )
+            }
         }
     }
 
-    /// Decode a `RuntimeEvent`: publish changed field names on a NewState, or a sign-in failure
-    /// message on a matching CoreEvent (see [EngineState.parseAuthErrorMessage]). Called on a native
+    /// Decode a `RuntimeEvent`: publish changed field names on a NewState, or an attempt-bound login
+    /// result on a matching CoreEvent (see [EngineState.parseAuthAttemptOutcome]). Called on a native
     /// worker thread (see the class doc) -- every branch here is a cheap parse + a non-suspending
     /// `tryEmit`, so this always returns promptly regardless of collector speed.
     private fun onEngineEvent(json: ByteArray) {
+        // Capture sequence + privacy ownership at callback ENTRY. A callback that entered before a
+        // profile/account transition therefore keeps the old generation even if JSON parsing or its
+        // async uid proof completes after that transition.
+        val callbackTicket = synchronized(homeEventOrder) {
+            homeEventSequence += 1
+            homePrivacyFence.previewTicket(homeEventSequence)
+        }
         val event = runCatching { JSONObject(String(json, Charsets.UTF_8)) }.getOrNull() ?: return
         when (event.optString("name")) {
             "NewState" -> {
@@ -348,20 +920,51 @@ class EngineStremioRepository(
                     }
                 }
                 if (fields.isEmpty()) return
+                val continueWatchingTicket = callbackTicket.takeIf {
+                    EngineActions.FIELD_CONTINUE_WATCHING_PREVIEW in fields
+                }
                 // Diagnostic contract with the on-device test script: `adb logcat -s StremioXEngine`
                 // MUST show these lines while Home loads -- their absence proves the native event
                 // path is broken (vs. a parsing/reactivity bug on this side).
                 Log.d(TAG, "engine event NewState fields=$fields")
-                changedFields.tryEmit(fields)
                 // ctx changed (a sign-in, sign-out, or a persisted-profile hydration racing this
-                // listener registration): refresh the published AuthState off this thread so
-                // subscribers see it without polling. Cheap to check on every event; ctx changes are
-                // infrequent (account actions), not per-frame.
-                if (EngineActions.FIELD_CTX in fields) engineScope.launch { refreshAuthState() }
+                // listener registration): refresh the owner before publishing the field tick. That
+                // prevents a Home collector from pairing newly loaded native state with the previous
+                // account token. The callback itself still returns immediately.
+                if (EngineActions.FIELD_CTX in fields) {
+                    engineScope.launch {
+                        runCatching { refreshAuthState() }
+                            .onFailure { Log.w(TAG, "could not refresh auth state after ctx event", it) }
+                        changedFields.tryEmit(fields)
+                    }
+                } else {
+                    changedFields.tryEmit(fields)
+                }
+                // The preview carries no uid. Establish its owner only off the native callback thread,
+                // after independently reading a non-empty ctx uid and matching persisted buckets, and
+                // bind that proof to the privacy generation captured with this exact engine event.
+                if (continueWatchingTicket != null) {
+                    engineScope.launch {
+                        val uid = (EngineState.parseAuthState(
+                            StremioCoreNative.getState(EngineActions.ctxField()),
+                        ) as? AuthState.SignedIn)?.uid?.takeIf { it.isNotBlank() } ?: return@launch
+                        if (WatchedIndex.storageMatchesUid(appContext.filesDir, uid)) {
+                            val becameReadable = homePrivacyFence.noteContinueWatchingRefresh(
+                                ticket = continueWatchingTicket,
+                                accountUid = uid,
+                            )
+                            if (becameReadable) {
+                                changedFields.tryEmit(setOf(EngineActions.FIELD_CONTINUE_WATCHING_PREVIEW))
+                            }
+                        }
+                    }
+                }
             }
             "CoreEvent" -> {
                 Log.d(TAG, "engine event CoreEvent ${event.optJSONObject("args")?.optString("event")}")
-                EngineState.parseAuthErrorMessage(json.toString(Charsets.UTF_8))?.let { authErrors.tryEmit(it) }
+                EngineState.parseAuthAttemptOutcome(json.toString(Charsets.UTF_8))?.let {
+                    authAttemptCoordinator.complete(it)
+                }
             }
         }
     }
@@ -370,11 +973,28 @@ class EngineStremioRepository(
     /// cache only -- see its doc comment; the engine's own `ctx.profile.auth` stays authoritative).
     private fun refreshAuthState() {
         val state = EngineState.parseAuthState(StremioCoreNative.getState(EngineActions.ctxField()))
-        _authState.value = state
-        when (state) {
-            is AuthState.SignedIn -> identityStore.rememberSignedIn(state.email)
-            AuthState.SignedOut -> identityStore.forget()
+        ContinueWatchingOwnerGate.serialized {
+            val ownerChanged = authPrincipal(_authState.value) != authPrincipal(state)
+            val unexpectedIdentityClear = if (ownerChanged && !authTransition.inProgress) {
+                synchronized(homeEventOrder) {
+                    homePrivacyFence.invalidateAccount(homeEventSequence + 1)
+                }
+            } else {
+                null
+            }
+            _authState.value = state
+            if (ownerChanged) ContinueWatchingOwnerGate.advance()
+            when (state) {
+                is AuthState.SignedIn -> identityStore.rememberSignedIn(state.email)
+                AuthState.SignedOut -> identityStore.forget()
+            }
+            unexpectedIdentityClear?.let(homePrivacyClears::tryEmit)
         }
+    }
+
+    private fun authPrincipal(state: AuthState): String = when (state) {
+        is AuthState.SignedIn -> state.uid ?: state.email ?: "signed-in"
+        AuthState.SignedOut -> "signed-out"
     }
 
     /// Dispatch [actionJson], then keep re-pulling [field] on every NewState that names it until
@@ -504,14 +1124,19 @@ class EngineStremioRepository(
 
     /// One-shot Home (kept for the [CatalogRepository] contract; the Home screen itself collects
     /// [homeUpdates]): waits until at least one board row has content, then snapshots.
-    // withContext(Dispatchers.Default): the loadFieldUntil dispatch/getState + homeSnapshot()/parse
+    // withContext(Dispatchers.Default): the loadFieldUntil dispatch/getState + ownedHomeSnapshot()/parse
     // must run off the caller's (Main) context -- JNI + org.json never on the UI thread.
     override suspend fun home(): Result<List<Catalog>> = withContext(Dispatchers.Default) { runCatching {
+        val rows = homePagination.reset()
         StremioCoreNative.dispatch(EngineActions.loadBoard())
-        loadFieldUntil(EngineActions.FIELD_BOARD, EngineActions.loadBoardRange(DEFAULT_BOARD_ROWS)) {
+        val state = loadFieldUntil(EngineActions.FIELD_BOARD, EngineActions.loadBoardRange(rows)) {
             EngineState.parseCatalogs(it).isNotEmpty()
         }
-        homeSnapshot()
+        homePagination.onBoardEvent(
+            total = EngineState.boardCatalogCount(state),
+            rows = EngineState.parseCatalogs(state),
+        )
+        currentHomeSnapshot().rows
     } }
 
     /// The continuous Home stream (see [CatalogRepository.homeUpdates]). Emits a snapshot immediately,
@@ -523,16 +1148,87 @@ class EngineStremioRepository(
     /// A slow poll (every [HOME_POLL_MS]) is merged in as a safety net: if engine events are ever
     /// lost/undelivered on some device, Home still converges on the real state within a few seconds
     /// instead of hanging forever -- and the `onEvent` logcat lines (see [onEngineEvent]) tell us
-    /// whether the events actually flowed. distinctUntilChanged suppresses the no-change poll spam;
-    /// conflate keeps a slow collector from ever queueing stale snapshots.
-    override fun homeUpdates(): Flow<List<Catalog>> = channelFlow {
+    /// whether the events actually flowed. distinctUntilChanged suppresses the no-change poll spam.
+    /// This stream is deliberately not conflated: an authoritative clear must precede the new rows.
+    override fun homeUpdates(): Flow<HomeUpdate> = channelFlow {
+        val publicationLock = Any()
+        val initialPermit = homePrivacyFence.capture()
+        var announcedGeneration = initialPermit.generation
+        var announcedProfile = initialPermit.profile
+        var updateSequence = 0L
+
+        fun sendClearIfNeeded(
+            permit: HomePrivacyPermit,
+            owner: ContinueWatchingOwner,
+        ): Boolean = synchronized(publicationLock) {
+            if (permit.generation == announcedGeneration && permit.profile == announcedProfile) {
+                return@synchronized true
+            }
+            updateSequence += 1
+            val sent = trySend(
+                HomeUpdate(
+                    rows = emptyList(),
+                    generation = permit.generation,
+                    sequence = updateSequence,
+                    profileId = permit.profile.profileId,
+                    authoritative = true,
+                    owner = owner,
+                ),
+            ).isSuccess
+            if (sent) {
+                announcedGeneration = permit.generation
+                announcedProfile = permit.profile
+            }
+            sent
+        }
+        fun publishHomeSnapshot(reconcilePagination: Boolean = false) {
+            while (isActive) {
+                val fenced = fencedOwnedHomeSnapshot(reconcilePagination) ?: return
+                var publishAttempted = false
+                val published = homePrivacyFence.publishIfCurrent(fenced.privacy) {
+                    publishAttempted = true
+                    if (!sendClearIfNeeded(fenced.privacy, fenced.snapshot.owner)) {
+                        return@publishIfCurrent false
+                    }
+                    synchronized(publicationLock) {
+                        updateSequence += 1
+                        trySend(
+                            HomeUpdate(
+                                rows = fenced.snapshot.rows,
+                                generation = fenced.privacy.generation,
+                                sequence = updateSequence,
+                                profileId = fenced.privacy.profile.profileId,
+                                owner = fenced.snapshot.owner,
+                            ),
+                        ).isSuccess
+                    }
+                }
+                // A stale build is rebuilt. A closed/full channel is not a privacy race and should
+                // not spin; the next event/poll will carry a fresh conflated snapshot if still open.
+                if (published || publishAttempted) return
+            }
+        }
+
+        // Subscribe before the first board dispatch so no sign-out/sign-in clear can fall into the
+        // launch gap between an initial account snapshot and the long-lived collectors.
+        launch(start = CoroutineStart.UNDISPATCHED) {
+            homePrivacyClears.collect { permit ->
+                val owner = continueWatchingOwner()
+                homePrivacyFence.publishIfCurrent(permit) {
+                    sendClearIfNeeded(permit, owner)
+                }
+            }
+        }
         var lastUid = (EngineState.parseAuthState(StremioCoreNative.getState(EngineActions.ctxField())) as? AuthState.SignedIn)?.uid
         dispatchHomeLoad()
-        send(homeSnapshot())
+        // Both dispatches update the local model synchronously. Reconcile that authoritative state
+        // immediately so a fully cached board does not depend on a later network event to enable paging.
+        publishHomeSnapshot(reconcilePagination = true)
         launch {
             changedFields.collect { fields ->
                 if (fields.none { it in HOME_FIELDS }) return@collect
-                if (EngineActions.FIELD_CTX in fields) {
+                val reloaded = EngineActions.FIELD_CTX in fields
+                if (reloaded) {
                     val uid = (EngineState.parseAuthState(StremioCoreNative.getState(EngineActions.ctxField())) as? AuthState.SignedIn)?.uid
                     val identityChanged = uid != lastUid
                     lastUid = uid
@@ -549,22 +1245,53 @@ class EngineStremioRepository(
                     }
                     dispatchHomeLoad()
                 }
-                send(homeSnapshot())
+                publishHomeSnapshot(
+                    reconcilePagination = EngineActions.FIELD_BOARD in fields || reloaded,
+                )
             }
         }
         launch {
             while (isActive) {
                 delay(HOME_POLL_MS)
-                send(homeSnapshot())
+                publishHomeSnapshot()
             }
         }
-        // flowOn so the channelFlow producer -- every homeSnapshot()/getState()/parse below -- runs on
+        // flowOn so the channelFlow producer -- every ownedHomeSnapshot()/getState()/parse below -- runs on
         // Dispatchers.Default, never the collector's (Main) context: JNI + org.json off the UI thread.
-    }.distinctUntilChanged().conflate().flowOn(Dispatchers.Default)
+    }.distinctUntilChanged { old, new ->
+        old.generation == new.generation &&
+            old.profileId == new.profileId &&
+            old.owner == new.owner &&
+            old.authoritative == new.authoritative &&
+            old.rows == new.rows
+    }.flowOn(Dispatchers.Default)
 
     private fun dispatchHomeLoad() {
+        val rows = homePagination.reset()
         StremioCoreNative.dispatch(EngineActions.loadBoard())
-        StremioCoreNative.dispatch(EngineActions.loadBoardRange(DEFAULT_BOARD_ROWS))
+        StremioCoreNative.dispatch(EngineActions.loadBoardRange(rows))
+    }
+
+    override suspend fun loadHomeRowNextPage(catalog: Catalog): Result<Unit> =
+        withContext(Dispatchers.Default) {
+            val engineIndex = homePagination.claimNextPage(catalog)
+                ?: return@withContext Result.success(Unit)
+            runCatching {
+                StremioCoreNative.dispatch(EngineActions.loadBoardRowNextPage(engineIndex))
+                Unit
+            }.onFailure {
+                homePagination.abortNextPage(engineIndex)
+            }
+        }
+
+    override suspend fun loadMoreHomeRows(): Result<Unit> = withContext(Dispatchers.Default) {
+        val rows = homePagination.claimMoreRows() ?: return@withContext Result.success(Unit)
+        runCatching {
+            StremioCoreNative.dispatch(EngineActions.loadBoardRange(rows))
+            Unit
+        }.onFailure {
+            homePagination.abortMoreRows()
+        }
     }
 
     /// The Group-1 reactivity primitive (see [CatalogRepository.ctxUpdates]'s doc comment): a
@@ -588,9 +1315,67 @@ class EngineStremioRepository(
     /// names from the installed manifests) with Continue Watching prepended (id = "continue" is the
     /// contract HomeScreen keys its editorial eyebrow off of). Pure read -- no dispatch, no await --
     /// so [homeUpdates] can call it on every event/poll tick cheaply.
-    private fun homeSnapshot(): List<Catalog> {
-        val titleMap = EngineState.parseAddonCatalogTitles(StremioCoreNative.getState(EngineActions.ctxField()))
-        val allBoardRows = EngineState.parseCatalogs(StremioCoreNative.getState(EngineActions.boardField()), titleMap)
+    private fun fencedOwnedHomeSnapshot(reconcilePagination: Boolean = false): FencedHomeSnapshot? =
+        ContinueWatchingOwnerGate.serialized { revision ->
+            if (authTransition.inProgress) return@serialized null
+            val privacy = homePrivacyFence.capture()
+            FencedHomeSnapshot(
+                privacy = privacy,
+                snapshot = HomeSnapshot(
+                    owner = continueWatchingOwnerLocked(revision),
+                    rows = homeRowsLocked(privacy, reconcilePagination),
+                ),
+            )
+        }
+
+    /** Called only while [ContinueWatchingOwnerGate] is held, so rows and owner cannot straddle a switch. */
+    private fun homeRowsLocked(
+        privacy: HomePrivacyPermit,
+        reconcilePagination: Boolean = false,
+    ): List<Catalog> {
+        val ctxJson = StremioCoreNative.getState(EngineActions.ctxField())
+        val titleMap = EngineState.parseAddonCatalogTitles(ctxJson)
+        val boardJson = StremioCoreNative.getState(EngineActions.boardField())
+        val parsedBoardRows = EngineState.parseCatalogs(boardJson, titleMap)
+        if (reconcilePagination) {
+            homePagination.onBoardEvent(
+                total = EngineState.boardCatalogCount(boardJson),
+                rows = parsedBoardRows,
+            )
+        }
+        val pagedBoardRows = parsedBoardRows.map { row ->
+            row.copy(hasNextPage = homePagination.rowHasNextPage(row.engineIndex))
+        }
+        val profileStore = ProfileStore.sharedOrNull()
+        val principalMatches = engineHistoryPrincipalMatches(
+            profileStore?.active,
+            EngineState.parseAuthState(ctxJson),
+        )
+        val suppressEngineHistory = privacy.suppressAccountHistory || !principalMatches
+        val watchedIds = if (profileStore != null && !profileStore.activeUsesEngineHistory) {
+            WatchedIndex.overlayIds(profileStore.watch)
+        } else {
+            val uid = (EngineState.parseAuthState(ctxJson) as? AuthState.SignedIn)?.uid
+            WatchedIndex.engineHomeIds(
+                bucketIds = if (suppressEngineHistory) emptySet() else watchedIndex.engineIds(uid),
+                libraryIds = if (suppressEngineHistory) {
+                    emptySet()
+                } else {
+                    EngineState.parseWatchedLibraryIds(
+                        StremioCoreNative.getState(EngineActions.libraryField()),
+                    )
+                },
+                continueWatchingIds = if (privacy.suppressContinueWatchingPreview || !principalMatches) {
+                    emptySet()
+                } else {
+                    EngineState.parseWatchedContinueWatchingIds(
+                        StremioCoreNative.getState(EngineActions.continueWatchingPreviewField()),
+                    )
+                },
+                suppressAccountHistory = suppressEngineHistory,
+            )
+        }
+        val allBoardRows = WatchedIndex.apply(pagedBoardRows, watchedIds)
         // Per-profile add-on on/off overlay (Apple `buildBoardRows`' disabledAddons guard,
         // CoreBridge.swift:2191): a disabled add-on's catalog rows must not render on this profile's
         // Home. The row id is "<base>|<type>|<id>" (see [EngineState.parseCatalogs]); rows with no
@@ -604,7 +1389,7 @@ class EngineStremioRepository(
                 base.isEmpty() || AddonOrder.normalize(base) !in disabledAddons
             }
         }
-        // Suppressed right after sign-out: see [suppressHomeUntilFreshLoad]'s doc comment. The engine's
+        // Suppressed right after sign-out: see [homePrivacyFence]'s doc comment. The engine's
         // continue_watching_preview field keeps serving the PREVIOUS account's items indefinitely (an
         // engine quirk, not a race), so trusting it here would render a signed-out Home with another
         // account's "Continue Watching" posters. Board rows are unaffected (Logout correctly drives a
@@ -615,15 +1400,25 @@ class EngineStremioRepository(
         val overlayStore = overlayProfiles()
         val continueWatching = when {
             overlayStore != null -> runCatching { overlayStore.continueWatching() }.getOrDefault(emptyList())
-            suppressHomeUntilFreshLoad -> emptyList()
+            privacy.suppressContinueWatchingPreview || !principalMatches -> emptyList()
             else -> runCatching {
                 EngineState.parseContinueWatching(StremioCoreNative.getState(EngineActions.continueWatchingPreviewField()))
             }.getOrDefault(emptyList())
         }
-        return if (continueWatching.isEmpty()) {
+        val rows = if (continueWatching.isEmpty()) {
             boardRows
         } else {
             listOf(Catalog(id = "continue", title = "Continue Watching", items = continueWatching)) + boardRows
+        }
+        return rows
+    }
+
+    /** One-shot callers retry if an auth transition crossed their synchronous JNI/JSON build. */
+    private fun currentHomeSnapshot(reconcilePagination: Boolean = false): HomeSnapshot {
+        while (true) {
+            val fenced = fencedOwnedHomeSnapshot(reconcilePagination)
+                ?: throw IllegalStateException("Home owner is changing.")
+            if (homePrivacyFence.isCurrent(fenced.privacy)) return fenced.snapshot
         }
     }
 
@@ -667,47 +1462,104 @@ class EngineStremioRepository(
         // Per-profile gate: an OVERLAY profile's Library is its private overlay (every title it has
         // watched or saved), never the account's engine library (Apple `ProfileStore.libraryItems`).
         // Slice note: the overlay list ignores the type/sort chips for now (no pivot row renders).
-        overlayProfiles()?.let { store ->
-            return@runCatching LibraryResult(items = store.libraryItems())
+        val permit = historyOwnerFence.captureRead()
+            ?: return@runCatching LibraryResult(items = emptyList())
+        val result = if (!permit.owner.usesEngineHistory) {
+            val items = runCatching {
+                ProfileStore.sharedOrNull()?.withActiveOverlayProfile(permit.owner.profileId) { overlay ->
+                    overlay.libraryItems()
+                }.orEmpty()
+            }.getOrDefault(emptyList())
+            LibraryResult(items = items)
+        } else {
+            val dispatchAction = if (requestJson != null) {
+                EngineActions.loadLibrarySelect(requestJson)
+            } else {
+                EngineActions.loadLibrary()
+            }
+            val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, dispatchAction) { true }
+            LibraryResult(
+                items = EngineState.parseLibrary(state),
+                filters = EngineState.parseLibraryFilters(state),
+            )
         }
-        val dispatchAction = if (requestJson != null) EngineActions.loadLibrarySelect(requestJson) else EngineActions.loadLibrary()
-        val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, dispatchAction) { true }
-        LibraryResult(items = EngineState.parseLibrary(state), filters = EngineState.parseLibraryFilters(state))
+        if (historyOwnerFence.readIsCurrent(permit)) result else LibraryResult(items = emptyList())
     } }
 
     override suspend fun libraryPortableItems(now: String): Result<List<LibraryPortability.Item>> =
         withContext(Dispatchers.Default) { runCatching {
+            val permit = historyOwnerFence.captureRead() ?: return@runCatching emptyList()
+            // Overlay export has no portable representation yet. Never fall through to the engine
+            // account's library while a private-history profile is active.
+            if (!permit.owner.usesEngineHistory) return@runCatching emptyList()
             // Same field + same dispatch as [library] above (a derived read of the persisted ctx.library
             // bucket, no add-on HTTP, ready immediately), differing only in the parse: the portable shape
             // keeps each entry's resume state and drops the engine's removed/temp bookkeeping entries.
             // Always the DEFAULT selection (no requestJson): an export is the whole library, never the
             // type/sort pivot the Library screen happens to be showing.
             val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, EngineActions.loadLibrary()) { true }
-            EngineState.parseLibraryPortable(state, now)
+            val items = EngineState.parseLibraryPortable(state, now)
+            if (historyOwnerFence.readIsCurrent(permit)) items else emptyList()
         } }
 
     override suspend fun addToLibrary(item: MetaItem): Result<Unit> = runCatching {
-        // Per-profile gate: an overlay profile saves into its PRIVATE overlay, never the account
-        // library (Apple `ProfileStore.addLibraryEntry`; the never-poison invariant).
-        val store = overlayProfiles()
-        if (store != null) {
-            store.addLibraryEntry(metaId = item.id, name = item.name, type = item.type.id, poster = item.poster)
-            return@runCatching
+        historyOwnerFence.mutate { owner ->
+            when (val route = historyRouteLocked(owner)) {
+                is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                    overlay.addLibraryEntry(
+                        metaId = item.id,
+                        name = item.name,
+                        type = item.type.id,
+                        poster = item.poster,
+                    )
+                }
+                HistoryRoute.Engine -> StremioCoreNative.dispatch(
+                    EngineActions.addToLibrary(
+                        id = item.id,
+                        type = item.type.id,
+                        name = item.name,
+                        poster = item.poster,
+                    ),
+                )
+            }
         }
-        // AddToLibrary is a synchronous local ctx mutation (no add-on HTTP), so a dispatch-and-return is
-        // enough; the caller re-pulls [library] afterward to see the change (same pattern [signOut] uses
-        // for its own synchronous ctx mutation).
-        StremioCoreNative.dispatch(EngineActions.addToLibrary(id = item.id, type = item.type.id, name = item.name, poster = item.poster))
     }
 
     override suspend fun removeFromLibrary(id: String): Result<Unit> = runCatching {
-        val store = overlayProfiles()
-        if (store != null) {
-            store.removeWatchEntry(id)
-            return@runCatching
+        historyOwnerFence.mutate { owner ->
+            when (val route = historyRouteLocked(owner)) {
+                is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                    overlay.removeWatchEntry(id)
+                }
+                HistoryRoute.Engine -> StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
+            }
         }
-        StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
     }
+
+    override suspend fun removeFromContinueWatching(
+        target: ContinueWatchingDismissal,
+    ): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
+        historyOwnerFence.mutate(expectedOwner = target.owner) { owner ->
+            when (val route = historyRouteLocked(owner)) {
+                is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                    if (validateContinueWatchingRemovalTarget(overlay.continueWatching(), target)) {
+                        overlay.removeWatchEntry(target.id)
+                    }
+                }
+                HistoryRoute.Engine -> {
+                    // ActionCtx::RemoveFromLibrary accepts only a bare id. Carry type to this boundary and
+                    // fail closed when the current native snapshot contains the same id under another type.
+                    if (validateContinueWatchingRemovalTarget(strictContinueWatchingItemsLocked(), target)) {
+                        StremioCoreNative.dispatch(EngineActions.removeFromLibrary(target.id))
+                    }
+                }
+            }
+            // Overlay mutation is local and native events may be coalesced. Force one off-Main authoritative
+            // Home re-read so the optimistic UI can observe confirmation without waiting for the safety poll.
+            changedFields.tryEmit(setOf(EngineActions.FIELD_CONTINUE_WATCHING_PREVIEW))
+        }
+        Unit
+    } }
 
     override suspend fun installedAddons(): Result<List<InstalledAddon>> = withContext(Dispatchers.Default) { runCatching {
         // Display order = the user's applied add-on order (Apple `orderedByApplied` on the add-on
@@ -742,26 +1594,32 @@ class EngineStremioRepository(
 
     override suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean): Result<Unit> =
         withContext(Dispatchers.Default) { runCatching {
-            // Per-profile gate first (Apple `setCatalogWatched`'s `overlaySetWatchedById` branch): an
-            // overlay profile's card mark toggles its OWN private watch overlay, never the account
-            // library (the never-poison invariant).
-            overlayProfiles()?.let { store ->
-                store.setWatched(isWatched, item.id, listOf(item.id), item.name, item.type.id, item.poster)
+            historyOwnerFence.mutate { owner ->
+                when (val route = historyRouteLocked(owner)) {
+                    is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                        overlay.setWatched(
+                            isWatched,
+                            item.id,
+                            listOf(item.id),
+                            item.name,
+                            item.type.id,
+                            item.poster,
+                        )
+                    }
+                    HistoryRoute.Engine -> {
+                        // Hand the native action its resident preview when available. The minimal fallback
+                        // is the same shape accepted by AddToLibrary.
+                        val preview = rawMetaPreview(item.id) ?: JSONObject()
+                            .put("id", item.id)
+                            .put("type", item.type.id)
+                            .put("name", item.name)
+                            .also { if (item.poster != null) it.put("poster", item.poster) }
+                        StremioCoreNative.dispatch(EngineActions.metaItemMarkAsWatched(preview, isWatched))
+                    }
+                }
                 changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
-                return@runCatching
             }
-            // Engine path (Apple CoreBridge.swift:1624): hand `MetaItemMarkAsWatched` the engine's OWN
-            // serialized preview for this id when a resident catalog field holds it (`MetaItemPreview`
-            // deserializes through a legacy shape, so echoing beats reconstructing), falling back to
-            // the same minimal `{id,type,name,poster}` object [EngineActions.addToLibrary] already
-            // proves the deserializer accepts. The action creates a temporary library item when none
-            // exists -- exactly the mark-from-a-card use case.
-            val preview = rawMetaPreview(item.id) ?: JSONObject()
-                .put("id", item.id)
-                .put("type", item.type.id)
-                .put("name", item.name)
-                .also { if (item.poster != null) it.put("poster", item.poster) }
-            StremioCoreNative.dispatch(EngineActions.metaItemMarkAsWatched(preview, isWatched))
+            Unit
         } }
 
     /// The raw `MetaItemPreview` JSON for a catalog item id, pulled verbatim from whichever catalog
@@ -842,6 +1700,8 @@ class EngineStremioRepository(
     } }
 
     override suspend fun meta(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
+        val permit = historyOwnerFence.captureRead()
+            ?: throw IllegalStateException("History owner is changing. Try again.")
         // Ready = the meta actually parsed (first Ready Loadable in metaItems). The immediate
         // post-Load state is Loading, so a single-event await would leak a not-ready miss to the UI
         // (the "meta_details not ready" string the S03 device round saw rendered raw).
@@ -855,7 +1715,8 @@ class EngineStremioRepository(
             ?: throw IllegalStateException("Couldn't load this title's details. Check your connection and try again.")
         // Per-profile gate: replace the account-derived saved/resume/ticks with the overlay's for an
         // overlay profile (no-op for engine-backed profiles).
-        withOverlayState(detail)
+        withOverlayState(detail, permit)
+            ?: throw IllegalStateException("History owner changed while loading this title.")
     } }
 
     override suspend fun streams(
@@ -1039,129 +1900,154 @@ class EngineStremioRepository(
     // no-op (the engine records no progress), never a crash. Continue Watching then updates off the
     // engine's own `continue_watching_preview` re-derivation, which [homeUpdates] already streams live.
 
-    /// The played item's meta type + this stream's video id, captured when the Player is loaded so the
-    /// near-end watched mark in [endPlaybackSession] can scope itself correctly. A SERIES episode must be
-    /// marked per-EPISODE, never with the engine's aggregate MarkAsWatched (which flips every episode of
-    /// the series watched and greys the whole series out of Continue Watching). Single active playback at
-    /// a time; @Volatile for cross-thread visibility (begin/end both run on Dispatchers.Default).
-    @Volatile private var playbackType: String? = null
-    @Volatile private var playbackVideoId: String? = null
+    /// One immutable history owner, media context, and generation for the active playback. A callback
+    /// can act only when its token still names that exact session; replacement makes every older callback
+    /// a no-op, including an old end that must never unload the replacement player.
+    private val playbackHistorySessions = PlaybackHistorySessions()
 
-    /// Overlay-profile playback context, captured at [beginPlaybackSession] so the per-profile
-    /// progress/watched writes in [reportProgress]/[endPlaybackSession] know WHICH title to record
-    /// against without an interface change (the engine path carries this inside the engine's own
-    /// `player` model instead). Null whenever the active profile is engine-backed.
-    @Volatile private var overlayMetaId: String? = null
-    @Volatile private var overlayName: String? = null
-    @Volatile private var overlayPoster: String? = null
-
-    override suspend fun beginPlaybackSession(): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
-        overlayMetaId = null
-        overlayName = null
-        overlayPoster = null
-        val selected = buildPlayerSelected()
-        // Per-profile gate: an OVERLAY profile must NEVER load the engine Player — its TimeChanged
-        // ticks and watched marks write the ACCOUNT library (the shared history). Capture the meta
-        // context instead, so reportProgress/endPlaybackSession write the profile's PRIVATE overlay
-        // (Apple: StremioAccount/CoreBridge route to `ProfileStore.recordProgress` when
-        // `activeUsesEngineHistory` is false).
-        if (overlayProfiles() != null) {
-            val detail = currentMetaDetail()
-            playbackType = selected?.optJSONObject("metaRequest")?.optJSONObject("path")?.optString("type")?.ifBlank { null }
-                ?: detail?.type?.id
-            playbackVideoId = selected?.optJSONObject("streamRequest")?.optJSONObject("path")?.optString("id")?.ifBlank { null }
-            overlayMetaId = selected?.optJSONObject("metaRequest")?.optJSONObject("path")?.optString("id")?.ifBlank { null }
-                ?: detail?.id
-            overlayName = detail?.name
-            overlayPoster = detail?.poster
-            return@runCatching
-        }
-        if (selected == null) {
-            playbackType = null
-            playbackVideoId = null
-            return@runCatching
-        }
-        // Capture the meta type + this stream's video id (streamRequest.path.id -- the episode id for a
-        // series, the movie id for a movie), mirroring Apple reading selected.stream_request.path.id, so
-        // the near-end mark can be episode-scoped for a series.
-        playbackType = selected.optJSONObject("metaRequest")?.optJSONObject("path")?.optString("type")?.ifBlank { null }
-        playbackVideoId = selected.optJSONObject("streamRequest")?.optJSONObject("path")?.optString("id")?.ifBlank { null }
-        StremioCoreNative.dispatch(EngineActions.loadPlayer(selected))
-    } }
-
-    override suspend fun reportProgress(positionMs: Long, durationMs: Long): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
-        if (durationMs <= 0L || positionMs < 0L) return@runCatching
-        // Per-profile gate: overlay progress goes to the profile's private overlay, never the engine.
-        val store = overlayProfiles()
-        if (store != null) {
-            val metaId = overlayMetaId ?: return@runCatching
-            store.recordProgress(
-                metaId = metaId,
-                videoId = playbackVideoId ?: metaId,   // a movie's video id IS its meta id (Apple PlaybackMeta)
-                positionSeconds = positionMs / 1000.0,
-                durationSeconds = durationMs / 1000.0,
-                name = overlayName ?: "",
-                type = playbackType ?: MediaType.MOVIE.id,
-                poster = overlayPoster,
-            )
-            return@runCatching
-        }
-        StremioCoreNative.dispatch(EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE))
-    } }
-
-    override suspend fun endPlaybackSession(positionMs: Long, durationMs: Long): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
-        // Per-profile gate: final overlay write + near-end watched mark, then clear the context. The
-        // engine Player was never loaded for an overlay profile, so there is nothing to unload.
-        val store = overlayProfiles()
-        if (store != null) {
-            val metaId = overlayMetaId
-            if (metaId != null && durationMs > 0L && positionMs >= 0L) {
-                val videoId = playbackVideoId ?: metaId
-                val type = playbackType ?: MediaType.MOVIE.id
-                store.recordProgress(
-                    metaId = metaId, videoId = videoId,
-                    positionSeconds = positionMs / 1000.0, durationSeconds = durationMs / 1000.0,
-                    name = overlayName ?: "", type = type, poster = overlayPoster,
+    override suspend fun beginPlaybackSession(): Result<PlaybackSessionToken> = withContext(Dispatchers.Default) { runCatching {
+        playbackHistorySessions.replace(
+            unloadPrevious = { previous ->
+                if (previous.enginePlayerLoaded) StremioCoreNative.dispatch(EngineActions.unloadPlayer())
+            },
+        ) { token ->
+            historyOwnerFence.mutate { owner ->
+                val route = historyRouteLocked(owner)
+                val selected = buildPlayerSelected()
+                val detail = if (route is HistoryRoute.Overlay) currentMetaDetail() else null
+                val type = selected?.optJSONObject("metaRequest")
+                    ?.optJSONObject("path")
+                    ?.optString("type")
+                    ?.ifBlank { null }
+                    ?: detail?.type?.id
+                val videoId = selected?.optJSONObject("streamRequest")
+                    ?.optJSONObject("path")
+                    ?.optString("id")
+                    ?.ifBlank { null }
+                val overlayMetaId = if (route is HistoryRoute.Overlay) {
+                    selected?.optJSONObject("metaRequest")
+                        ?.optJSONObject("path")
+                        ?.optString("id")
+                        ?.ifBlank { null }
+                        ?: detail?.id
+                } else {
+                    null
+                }
+                val enginePlayerLoaded = route is HistoryRoute.Engine && selected != null
+                if (enginePlayerLoaded) StremioCoreNative.dispatch(EngineActions.loadPlayer(selected!!))
+                PlaybackHistorySession(
+                    token = token,
+                    owner = owner,
+                    enginePlayerLoaded = enginePlayerLoaded,
+                    type = type,
+                    videoId = videoId,
+                    overlayMetaId = overlayMetaId,
+                    name = detail?.name,
+                    poster = detail?.poster,
                 )
-                if (positionMs.toDouble() / durationMs.toDouble() >= WATCHED_THRESHOLD) {
-                    // Near-end: a series marks the EPISODE id watched; a movie marks its OWN meta id
-                    // (exactly what Apple `markWatched(meta:)` appends and what the finished-movie
-                    // Continue Watching prune keys on), then zeroes the offset (`finishedWatching`).
-                    store.markWatched(metaId, videoId, overlayName ?: "", type, overlayPoster)
-                    if (type != MediaType.SERIES.id) store.finishedWatching(metaId)
-                }
-            }
-            playbackType = null
-            playbackVideoId = null
-            overlayMetaId = null
-            overlayName = null
-            overlayPoster = null
-            return@runCatching
-        }
-        if (durationMs > 0L && positionMs >= 0L) {
-            StremioCoreNative.dispatch(EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE))
-            // Watched-near-end: past the threshold, mark the finished item watched so it leaves Continue
-            // Watching and its tick flips. CRITICAL (mirrors Apple CoreBridge.markPlaybackWatched's type
-            // branch, app/SourcesShared/CoreBridge.swift:1166): a SERIES must be marked per-EPISODE via
-            // MarkVideoAsWatched, NEVER with the aggregate MarkAsWatched(true) -- that flips every episode
-            // of the series watched and greys the whole series out of Continue Watching. Only a movie (any
-            // known non-series type) uses the aggregate; an unknown type skips the explicit mark, since
-            // the final TimeChanged above already recorded near-end progress and we must never risk the
-            // aggregate on an item that might be a series.
-            if (positionMs.toDouble() / durationMs.toDouble() >= WATCHED_THRESHOLD) {
-                val type = playbackType
-                val videoId = playbackVideoId
-                if (type == MediaType.SERIES.id && !videoId.isNullOrEmpty()) {
-                    val (season, episode) = seasonEpisodeFromVideoId(videoId)
-                    StremioCoreNative.dispatch(EngineActions.markVideoAsWatched(videoId, season, episode, true))
-                } else if (type != null && type != MediaType.SERIES.id) {
-                    StremioCoreNative.dispatch(EngineActions.markAsWatched(true))
-                }
             }
         }
-        StremioCoreNative.dispatch(EngineActions.unloadPlayer())
-        playbackType = null
-        playbackVideoId = null
+    } }
+
+    override suspend fun reportProgress(
+        session: PlaybackSessionToken,
+        positionMs: Long,
+        durationMs: Long,
+    ): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
+        if (durationMs <= 0L || positionMs < 0L) return@runCatching
+        playbackHistorySessions.withCurrent(session) { active ->
+            historyOwnerFence.mutate(expectedOwner = active.owner) { owner ->
+                when (val route = historyRouteLocked(owner)) {
+                    is HistoryRoute.Overlay -> {
+                        val metaId = active.overlayMetaId
+                        if (metaId != null) {
+                            route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                                overlay.recordProgress(
+                                    metaId = metaId,
+                                    videoId = active.videoId ?: metaId,
+                                    positionSeconds = positionMs / 1000.0,
+                                    durationSeconds = durationMs / 1000.0,
+                                    name = active.name ?: "",
+                                    type = active.type ?: MediaType.MOVIE.id,
+                                    poster = active.poster,
+                                )
+                            }
+                        }
+                    }
+                    HistoryRoute.Engine -> if (active.enginePlayerLoaded) {
+                        StremioCoreNative.dispatch(
+                            EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE),
+                        )
+                    }
+                }
+            }
+        }
+        Unit
+    } }
+
+    override suspend fun endPlaybackSession(
+        session: PlaybackSessionToken,
+        positionMs: Long,
+        durationMs: Long,
+    ): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
+        playbackHistorySessions.finish(session) { active ->
+            try {
+                historyOwnerFence.mutate(expectedOwner = active.owner) { owner ->
+                    when (val route = historyRouteLocked(owner)) {
+                        is HistoryRoute.Overlay -> {
+                            val metaId = active.overlayMetaId
+                            if (metaId != null && durationMs > 0L && positionMs >= 0L) {
+                                val videoId = active.videoId ?: metaId
+                                val type = active.type ?: MediaType.MOVIE.id
+                                route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                                    overlay.recordProgress(
+                                        metaId = metaId,
+                                        videoId = videoId,
+                                        positionSeconds = positionMs / 1000.0,
+                                        durationSeconds = durationMs / 1000.0,
+                                        name = active.name ?: "",
+                                        type = type,
+                                        poster = active.poster,
+                                    )
+                                    if (positionMs.toDouble() / durationMs.toDouble() >= WATCHED_THRESHOLD) {
+                                        overlay.markWatched(
+                                            metaId,
+                                            videoId,
+                                            active.name ?: "",
+                                            type,
+                                            active.poster,
+                                        )
+                                        if (type != MediaType.SERIES.id) overlay.finishedWatching(metaId)
+                                    }
+                                }
+                            }
+                        }
+                        HistoryRoute.Engine -> if (
+                            active.enginePlayerLoaded && durationMs > 0L && positionMs >= 0L
+                        ) {
+                            StremioCoreNative.dispatch(
+                                EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE),
+                            )
+                            if (positionMs.toDouble() / durationMs.toDouble() >= WATCHED_THRESHOLD) {
+                                val type = active.type
+                                val videoId = active.videoId
+                                if (type == MediaType.SERIES.id && !videoId.isNullOrEmpty()) {
+                                    val (season, episode) = seasonEpisodeFromVideoId(videoId)
+                                    StremioCoreNative.dispatch(
+                                        EngineActions.markVideoAsWatched(videoId, season, episode, true),
+                                    )
+                                } else if (type != null && type != MediaType.SERIES.id) {
+                                    StremioCoreNative.dispatch(EngineActions.markAsWatched(true))
+                                }
+                            }
+                        }
+                    }
+                }
+            } finally {
+                if (active.enginePlayerLoaded) StremioCoreNative.dispatch(EngineActions.unloadPlayer())
+            }
+        }
+        Unit
     } }
 
     /// Best-effort season/episode from a stremio series video id (`<metaId>:<season>:<episode>`): the
@@ -1219,16 +2105,17 @@ class EngineStremioRepository(
         EngineState.parseMetaDetail(StremioCoreNative.getState(EngineActions.metaDetailsField()), addonPrefs.appliedOrder())
 
     override suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
-        // Per-profile gate: an overlay profile's aggregate (movie-level) watched mark toggles its OWN
-        // meta id in the private overlay (Apple routes this to `ProfileStore.setWatched`), never the
-        // engine's MarkAsWatched (which would mutate the account library).
-        overlayProfiles()?.let { store ->
+        historyOwnerFence.mutate { owner ->
             val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
-            store.setWatched(isWatched, id, listOf(id), detail.name, type.id, detail.poster)
-            return@runCatching withOverlayState(detail)
+            when (val route = historyRouteLocked(owner)) {
+                is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                    overlay.setWatched(isWatched, id, listOf(id), detail.name, type.id, detail.poster)
+                }
+                HistoryRoute.Engine -> StremioCoreNative.dispatch(EngineActions.markAsWatched(isWatched))
+            }
+            currentMetaDetail()?.let { withOverlayState(it, HistoryReadPermit(owner)) }
+                ?: throw IllegalStateException("Couldn't update watched state.")
         }
-        StremioCoreNative.dispatch(EngineActions.markAsWatched(isWatched))
-        currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
     } }
 
     override suspend fun setVideoWatched(
@@ -1239,46 +2126,73 @@ class EngineStremioRepository(
         episode: Int?,
         isWatched: Boolean,
     ): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
-        overlayProfiles()?.let { store ->
+        historyOwnerFence.mutate { owner ->
             val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
-            store.setWatched(isWatched, id, listOf(videoId), detail.name, type.id, detail.poster)
-            return@runCatching withOverlayState(detail)
+            when (val route = historyRouteLocked(owner)) {
+                is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                    overlay.setWatched(
+                        isWatched,
+                        id,
+                        listOf(videoId),
+                        detail.name,
+                        type.id,
+                        detail.poster,
+                    )
+                }
+                HistoryRoute.Engine -> StremioCoreNative.dispatch(
+                    EngineActions.markVideoAsWatched(videoId, season, episode, isWatched),
+                )
+            }
+            currentMetaDetail()?.let { withOverlayState(it, HistoryReadPermit(owner)) }
+                ?: throw IllegalStateException("Couldn't update watched state.")
         }
-        StremioCoreNative.dispatch(EngineActions.markVideoAsWatched(videoId, season, episode, isWatched))
-        currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
     } }
 
     override suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> =
         withContext(Dispatchers.Default) { runCatching {
-            overlayProfiles()?.let { store ->
+            historyOwnerFence.mutate { owner ->
                 val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
-                val ids = detail.videos.filter { it.season == season }.map { it.id }
-                store.setWatched(isWatched, id, ids, detail.name, type.id, detail.poster)
-                return@runCatching withOverlayState(detail)
+                when (val route = historyRouteLocked(owner)) {
+                    is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                        val ids = detail.videos.filter { it.season == season }.map { it.id }
+                        overlay.setWatched(isWatched, id, ids, detail.name, type.id, detail.poster)
+                    }
+                    HistoryRoute.Engine -> StremioCoreNative.dispatch(
+                        EngineActions.markSeasonAsWatched(season, isWatched),
+                    )
+                }
+                currentMetaDetail()?.let { withOverlayState(it, HistoryReadPermit(owner)) }
+                    ?: throw IllegalStateException("Couldn't update watched state.")
             }
-            StremioCoreNative.dispatch(EngineActions.markSeasonAsWatched(season, isWatched))
-            currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
         } }
 
     override suspend fun addToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> =
         withContext(Dispatchers.Default) { runCatching {
-            overlayProfiles()?.let { store ->
-                store.addLibraryEntry(metaId = id, name = name, type = type.id, poster = poster)
-                val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't add this title to your library.")
-                return@runCatching withOverlayState(detail)
+            historyOwnerFence.mutate { owner ->
+                when (val route = historyRouteLocked(owner)) {
+                    is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                        overlay.addLibraryEntry(metaId = id, name = name, type = type.id, poster = poster)
+                    }
+                    HistoryRoute.Engine -> StremioCoreNative.dispatch(
+                        EngineActions.addToLibrary(id, type.id, name, poster),
+                    )
+                }
+                currentMetaDetail()?.let { withOverlayState(it, HistoryReadPermit(owner)) }
+                    ?: throw IllegalStateException("Couldn't add this title to your library.")
             }
-            StremioCoreNative.dispatch(EngineActions.addToLibrary(id, type.id, name, poster))
-            currentMetaDetail() ?: throw IllegalStateException("Couldn't add this title to your library.")
         } }
 
     override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
-        overlayProfiles()?.let { store ->
-            store.removeWatchEntry(id)
-            val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't remove this title from your library.")
-            return@runCatching withOverlayState(detail)
+        historyOwnerFence.mutate { owner ->
+            when (val route = historyRouteLocked(owner)) {
+                is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                    overlay.removeWatchEntry(id)
+                }
+                HistoryRoute.Engine -> StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
+            }
+            currentMetaDetail()?.let { withOverlayState(it, HistoryReadPermit(owner)) }
+                ?: throw IllegalStateException("Couldn't remove this title from your library.")
         }
-        StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
-        currentMetaDetail() ?: throw IllegalStateException("Couldn't remove this title from your library.")
     } }
 
     /// A pure local re-read (see [CatalogRepository.peekMeta]): no dispatch at all, just the same
@@ -1288,67 +2202,109 @@ class EngineStremioRepository(
     // withContext(Dispatchers.Default): called on every ctxUpdates tick, so its getState + parse
     // (via currentMetaDetail) must stay off the collector's (Main) context.
     override suspend fun peekMeta(type: MediaType, id: String): MetaDetail? = withContext(Dispatchers.Default) {
-        currentMetaDetail()?.takeIf { it.id == id }?.let { withOverlayState(it) }
+        val permit = historyOwnerFence.captureRead() ?: return@withContext null
+        currentMetaDetail()?.takeIf { it.id == id }?.let { withOverlayState(it, permit) }
     }
 
     // ---- AuthRepository ----
 
-    override suspend fun signIn(email: String, password: String): Result<Unit> = runCatching {
+    override suspend fun signIn(email: String, password: String): Result<Unit> {
         if (email.isBlank() || password.isBlank()) {
-            throw IllegalArgumentException("Enter your email and password.")
+            return Result.failure(IllegalArgumentException("Enter your email and password."))
         }
-        // A fresh sign-in always resolves the truth: the engine syncs the account's real library from
-        // the server (a genuine `LibraryChanged(true)`), which correctly repopulates
-        // continue_watching_preview -- so it's safe to stop overriding it with empty from here on.
-        suppressHomeUntilFreshLoad = false
-        // Race a `ctx` NewState (success: profile.auth now set) against a CoreEvent sign-in error (bad
-        // password, no network, ...) by merging both into one flow and taking whichever lands first --
-        // mirrors how Apple `StremioAccount.signIn` surfaces `res.error?.message` instead of a generic
-        // failure. The await is launched before the dispatch (and login is a full network round-trip,
-        // so the subscription is up long before the engine can answer); if an event is somehow still
-        // missed, the post-timeout ctx re-read below resolves the true outcome -- the race exists to
-        // make the common path fast and the error message specific, not for correctness.
-        val ctxChanged: Flow<AuthWait> = changedFields.filter { EngineActions.FIELD_CTX in it }.map { AuthWait.CtxChanged }
-        val failed: Flow<AuthWait> = authErrors.map { AuthWait.Failed(it) }
-        val awaitOutcome = withTimeoutOrNull(loadTimeoutSeconds.seconds) {
-            val outcome = async { merge(ctxChanged, failed).first() }
-            StremioCoreNative.dispatch(EngineActions.authenticateLogin(email, password))
-            outcome.await()
+        val authAttempt = runCatching { authTransition.begin() }
+            .getOrElse { return Result.failure(it) }
+        val authRequestId = EngineState.authRequestId(email, password)
+        val authLease = authAttemptCoordinator.begin(authRequestId)
+        if (authLease == null) {
+            authTransition.finish(authAttempt)
+            return Result.failure(
+                IllegalStateException(
+                    "This exact sign-in is still settling. Wait for its native result before retrying.",
+                ),
+            )
         }
-        if (awaitOutcome is AuthWait.Failed) throw IllegalStateException(awaitOutcome.message)
-        // Whether we won the race on ctx, timed out (a dropped/coalesced event -- current state is
-        // best, the same fallback [loadField] uses), the actual signed-in-ness is the real check.
-        // withContext(Dispatchers.Default): [refreshAuthState]'s ctx getState (JNI) + parseAuthState
-        // runs here on signIn's (Main) context -- move it off, matching the file's idiom. [start]'s
-        // restore call stays synchronous by design; the event-listener call already uses [engineScope].
-        withContext(Dispatchers.Default) { refreshAuthState() }
-        if (_authState.value !is AuthState.SignedIn) {
-            throw IllegalStateException("Sign-in failed. Check your connection and try again.")
+        val privacyAttempt = synchronized(homeEventOrder) {
+            homePrivacyFence.beginSignIn(
+                requestId = authRequestId,
+                nextPreviewEventSequence = homeEventSequence + 1,
+            )
         }
-    }
-
-    /// The two outcomes [signIn] races: a `ctx` change (assume success; the real check afterward is
-    /// `authState is SignedIn`) or an explicit failure message from the engine.
-    private sealed interface AuthWait {
-        data object CtxChanged : AuthWait
-        data class Failed(val message: String) : AuthWait
+        homePrivacyClears.tryEmit(homePrivacyFence.capture())
+        var dispatched = false
+        val result = try {
+            runCatchingPreservingCancellation {
+                val attemptOutcome = withTimeoutOrNull(loadTimeoutSeconds.seconds) {
+                    StremioCoreNative.dispatch(EngineActions.authenticateLogin(email, password))
+                    dispatched = true
+                    authLease.outcome.await()
+                } ?: throw IllegalStateException("Sign-in timed out. Check your connection and try again.")
+                if (attemptOutcome is AuthAttemptOutcome.Failed) {
+                    throw IllegalStateException(attemptOutcome.message)
+                }
+                withContext(Dispatchers.Default) { refreshAuthState() }
+                val signedIn = _authState.value as? AuthState.SignedIn
+                    ?: throw IllegalStateException("Sign-in failed. Check your connection and try again.")
+                if (!engineHistoryPrincipalMatches(ProfileStore.sharedOrNull()?.active, signedIn)) {
+                    throw IllegalStateException(
+                        "The signed-in account does not match this profile's own-account identity.",
+                    )
+                }
+                val uid = signedIn.uid?.takeIf { it.isNotBlank() }
+                    ?: throw IllegalStateException("Sign-in completed without an account identifier. Try again.")
+                val accountUidVerified = withContext(Dispatchers.Default) {
+                    withTimeoutOrNull(loadTimeoutSeconds.seconds) {
+                        while (!WatchedIndex.storageMatchesUid(appContext.filesDir, uid)) {
+                            delay(AUTH_STORAGE_POLL_MS)
+                        }
+                        true
+                    } ?: false
+                }
+                if (!accountUidVerified) {
+                    throw IllegalStateException("Sign-in completed, but account data did not finish loading. Try again.")
+                }
+                check(homePrivacyFence.completeSignIn(privacyAttempt, uid)) {
+                    "The active profile or account changed while sign-in was finishing."
+                }
+                Unit
+            }
+        } finally {
+            if (!authLease.outcome.isCompleted) {
+                if (dispatched) {
+                    authAttemptCoordinator.abandon(authLease)
+                } else {
+                    authAttemptCoordinator.releaseBeforeDispatch(authLease)
+                }
+            }
+            authTransition.finish(authAttempt)
+        }
+        if (result.isSuccess) changedFields.tryEmit(HOME_FIELDS)
+        return result
     }
 
     override suspend fun signOut() {
-        // Broadcast dispatch (field = null): mirrors Apple's plain Logout, an explicit user sign-out.
-        // Fail-soft by design -- if the engine is unavailable the dispatch is a no-op, but we still
-        // clear the LOCAL published state + identity cache so the UI never shows a stale signed-in
-        // account it can't actually act on.
-        runCatching { StremioCoreNative.dispatch(EngineActions.logout()) }
-        _authState.value = AuthState.SignedOut
-        identityStore.forget()
-        // See [suppressHomeUntilFreshLoad]'s doc comment: the engine's Continue Watching field will
-        // NOT clear itself on Logout, so from this point on homeSnapshot() must not trust it until the
-        // next real sign-in. Also re-dispatch the board load directly (not just relying on homeUpdates'
-        // uid-change reload, which only fires while something is actively collecting the flow) so the
-        // board rails deterministically swap to the signed-out defaults too.
-        suppressHomeUntilFreshLoad = true
-        runCatching { dispatchHomeLoad() }
+        ContinueWatchingOwnerGate.serialized {
+            // Broadcast dispatch (field = null): mirrors Apple's plain Logout, an explicit user sign-out.
+            // The dispatch, published state, suppression flag, and revision are one owner transition, so a
+            // Continue Watching mutation cannot enter between them.
+            authTransition.cancelActive()
+            authAttemptCoordinator.abandonActive()
+            val clear = synchronized(homeEventOrder) {
+                var permit: HomePrivacyPermit? = null
+                homePrivacyFence.beforeLogout(
+                    nextPreviewEventSequence = homeEventSequence + 1,
+                ) {
+                    permit = homePrivacyFence.capture()
+                }
+                requireNotNull(permit)
+            }
+            homePrivacyClears.tryEmit(clear)
+            runCatching { StremioCoreNative.dispatch(EngineActions.logout()) }
+            _authState.value = AuthState.SignedOut
+            identityStore.forget()
+            ContinueWatchingOwnerGate.advance()
+            runCatching { dispatchHomeLoad() }
+        }
     }
 
     private companion object {
@@ -1365,6 +2321,7 @@ class EngineStremioRepository(
         val HOME_FIELDS = setOf(
             EngineActions.FIELD_BOARD,
             EngineActions.FIELD_CTX,
+            EngineActions.FIELD_LIBRARY,
             EngineActions.FIELD_CONTINUE_WATCHING_PREVIEW,
         )
 
@@ -1380,6 +2337,7 @@ class EngineStremioRepository(
         const val STREAM_SETTLEMENT_POLL_MS = 250L
 
         fun monotonicMs(): Long = System.nanoTime() / 1_000_000L
+        const val AUTH_STORAGE_POLL_MS = 25L
 
         /// The `device` tag stamped into every engine `TimeChanged` (Apple sends "iOS"/"tvOS").
         const val PROGRESS_DEVICE = "Android"

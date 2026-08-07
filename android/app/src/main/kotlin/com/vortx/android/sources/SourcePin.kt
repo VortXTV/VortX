@@ -83,7 +83,7 @@ class SourcePinStore(
     fun reload() {
         val profile = activeProfileId()
         loadedProfile = profile
-        val raw = prefs.getString(key(profile), null)
+        val raw = prefs.getString(preferenceKey(profile), null)
         if (raw == null) {
             entryPins = mutableMapOf(); globalPin = null; return
         }
@@ -97,7 +97,7 @@ class SourcePinStore(
 
     private fun persist() {
         val profile = loadedProfile ?: activeProfileId()
-        prefs.edit().putString(key(profile), encodeBlob(entryPins, globalPin).toString()).apply()
+        prefs.edit().putString(preferenceKey(profile), encodeBlob(entryPins, globalPin).toString()).apply()
         StreamRanking.invalidateCaches() // a pin changes rank order; memoized scores must be dropped
     }
 
@@ -147,8 +147,9 @@ class SourcePinStore(
     companion object {
         const val PREFS_FILE = "vortx_settings"
         const val DEFAULT_PROFILE = "default"
+        internal const val PREFS_KEY_PREFIX = "stremiox.sourcePins."
 
-        private fun key(profile: String): String = "stremiox.sourcePins.$profile"
+        internal fun preferenceKey(profile: String): String = "$PREFS_KEY_PREFIX$profile"
 
         /// Build a pin from a chosen stream, capturing its signature (Apple `makePin`).
         fun makePin(addon: String, stream: StreamSource): SourcePin = SourcePin(

@@ -3,18 +3,53 @@ package com.vortx.android.ui.viewmodel
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.ContinueWatchingDismissal
+import com.vortx.android.data.ContinueWatchingOwner
+import com.vortx.android.data.ContinueWatchingSnapshot
+import com.vortx.android.data.HomeUpdate
+import com.vortx.android.home.BecauseYouWatchedModel
+import com.vortx.android.home.HomeCatalogLayout
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
+import com.vortx.android.home.ImportedCatalogs
+import com.vortx.android.home.ReleaseCalendarModel
+import com.vortx.android.home.ReleaseCalendarOwner
+import com.vortx.android.home.ReleaseCalendarRefresh
+import com.vortx.android.home.SimklRailsModel
+import com.vortx.android.home.TopPicksModel
+import com.vortx.android.home.TraktRailsModel
+import com.vortx.android.home.importedCatalogRails
+import com.vortx.android.home.upcomingMetaBases
+import com.vortx.android.home.withBecauseYouWatchedRail
+import com.vortx.android.home.withExternalWatchlistRails
+import com.vortx.android.home.withImportedCatalogRails
+import com.vortx.android.home.withReleaseCalendarRails
+import com.vortx.android.home.withTopPicksRail
+import com.vortx.android.integrations.SIMKLAuth
+import com.vortx.android.integrations.TraktAuth
+import com.vortx.android.library.WatchlistStore
+import com.vortx.android.mediaserver.MediaServerCatalogsModel
+import com.vortx.android.mediaserver.MediaServerRepository
+import com.vortx.android.mediaserver.withMediaServerRails
+import com.vortx.android.model.AuthState
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryResult
+import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
+import com.vortx.android.profile.ProfileStore
+import com.vortx.android.profile.UserProfile
 import com.vortx.android.search.SearchHistoryStore
 import com.vortx.android.ui.UiState
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -22,13 +57,17 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /// Maps a repository [Result] to a [UiState], turning a thrown/failed add-on call into a visible
 /// error instead of an empty screen. Shared by every catalog ViewModel.
@@ -36,6 +75,33 @@ private fun <T> Result<T>.toUiState(): UiState<T> = fold(
     onSuccess = { UiState.Success(it) },
     onFailure = { UiState.Error(it.message ?: "Something went wrong loading your add-ons.") },
 )
+
+internal data class ReleaseCalendarBoundary(
+    val profileId: String,
+    val accountId: String,
+)
+
+/** Keeps the release-cache generation stable across noisy ctx ticks and advances only on owner changes. */
+internal class ReleaseCalendarOwnerTracker(initialBoundary: ReleaseCalendarBoundary) {
+    private var boundary = initialBoundary
+    private var generation = 0L
+
+    fun ownerFor(nextBoundary: ReleaseCalendarBoundary): ReleaseCalendarOwner {
+        if (nextBoundary != boundary) {
+            boundary = nextBoundary
+            generation += 1
+        }
+        return ReleaseCalendarOwner(nextBoundary.profileId, generation)
+    }
+}
+
+private fun CatalogRepository.releaseCalendarAccountId(): String = when (
+    val auth = (this as? AuthRepository)?.authState?.value
+) {
+    is AuthState.SignedIn -> "signed-in:${auth.uid ?: auth.email ?: "unknown"}"
+    AuthState.SignedOut -> "signed-out"
+    null -> "account-unavailable"
+}
 
 /// Home: Continue Watching + add-on catalog rails. Collects the repository's CONTINUOUS
 /// [CatalogRepository.homeUpdates] stream for the ViewModel's lifetime (not a one-shot load): the
@@ -47,24 +113,165 @@ private fun <T> Result<T>.toUiState(): UiState<T> = fold(
 /// updated in place on every later change. If nothing arrives within [EMPTY_TIMEOUT_MS], Error with
 /// Retry -- never a silent black screen -- but collection continues, so data landing late still
 /// replaces the error.
-class HomeViewModel(
+internal class HomeUpdateReducer {
+    private var latestGeneration = Long.MIN_VALUE
+    private var latestSequence = Long.MIN_VALUE
+    private var latestProfileId: String? = null
+
+    fun reduce(update: HomeUpdate): UiState<List<Catalog>>? {
+        if (update.generation < latestGeneration) return null
+        if (update.generation == latestGeneration && update.sequence < latestSequence) return null
+        if (
+            update.generation == latestGeneration &&
+            latestProfileId != null &&
+            latestProfileId != update.profileId
+        ) return null
+
+        latestGeneration = update.generation
+        latestSequence = update.sequence
+        latestProfileId = update.profileId
+        return when {
+            update.authoritative -> UiState.Success(update.rows)
+            update.rows.isNotEmpty() -> UiState.Success(update.rows)
+            else -> null
+        }
+    }
+}
+
+class HomeViewModel internal constructor(
     private val repo: CatalogRepository,
     private val railPreferences: HomeRailPreferences? = null,
     private val railSurface: HomeRailSurface = HomeRailSurface.PHONE,
+    private val watchlistStore: WatchlistStore? = null,
+    private val traktRails: TraktRailsModel = TraktRailsModel(),
+    private val simklRails: SimklRailsModel = SimklRailsModel(),
+    private val becauseYouWatched: BecauseYouWatchedModel = BecauseYouWatchedModel(),
+    private val mediaServerCatalogs: MediaServerCatalogsModel = MediaServerCatalogsModel(),
+    private val importedCatalogs: ImportedCatalogs? = null,
+    private val activeProfileId: () -> String = {
+        ProfileStore.sharedOrNull()?.activeProfileId ?: UserProfile.OWNER_ID
+    },
+    private val dismissalDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    private val scopeOverride: CoroutineScope? = null,
+    private val confirmationTimeoutMs: Long = CONFIRMATION_TIMEOUT_MS,
+    private val confirmationPollMs: Long = CONFIRMATION_POLL_MS,
 ) : ViewModel() {
     private val _state = MutableStateFlow<UiState<List<Catalog>>>(UiState.Loading)
     val state: StateFlow<UiState<List<Catalog>>> = _state.asStateFlow()
+    private val _contentOwnerGeneration = MutableStateFlow(0L)
+    val contentOwnerGeneration: StateFlow<Long> = _contentOwnerGeneration.asStateFlow()
+    val homeCatalogLayout: StateFlow<HomeCatalogLayout> = railPreferences?.state
+        ?.map { it.catalogLayout }
+        ?.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.Eagerly,
+            initialValue = railPreferences?.state?.value?.catalogLayout ?: HomeCatalogLayout.RAILS,
+        ) ?: MutableStateFlow(HomeCatalogLayout.RAILS).asStateFlow()
 
+    private val scope: CoroutineScope get() = scopeOverride ?: viewModelScope
     private var collectJob: Job? = null
+    private var personalizedJob: Job? = null
+    private var baseRows: List<Catalog> = emptyList()
+    private var topPicksItems: List<MetaItem> = emptyList()
+    private var sourceHasRows = false
+    private var upcomingEpisodes: List<MetaItem> = emptyList()
+    private var upcomingMovies: List<MetaItem> = emptyList()
+    private var traktWatchlist: List<MetaItem> = emptyList()
+    private var simklWatchlist: List<MetaItem> = emptyList()
+    private var becauseYouWatchedRail: Catalog? = null
+    private var mediaServerRails: List<Catalog> = emptyList()
+    private var importedRails: List<Catalog> = importedCatalogs?.catalogs?.value
+        ?.let(::importedCatalogRails).orEmpty()
+    private val topPicks = TopPicksModel()
+    private val releaseCalendar = ReleaseCalendarModel()
+    private val releaseOwnerTracker = ReleaseCalendarOwnerTracker(currentReleaseBoundary())
+    private val pendingContinueWatchingDismissals = linkedSetOf<ContinueWatchingDismissal>()
+    private val continueWatchingRollbacks = mutableMapOf<ContinueWatchingDismissal, ContinueWatchingRollback>()
+    private var renderedOwner: ContinueWatchingOwner? = null
+    private var latestAuthoritativeRows: List<Catalog>? = null
 
     init {
         load()
+        scope.launch {
+            repo.ctxUpdates().drop(1).collectLatest {
+                watchlistStore?.reload()
+                refreshPersonalizedRails()
+            }
+        }
+        (repo as? AuthRepository)?.let { authRepository ->
+            scope.launch {
+                authRepository.authState.collectLatest {
+                    // Engine auth publication can follow its ctx tick. Re-sample the stable account
+                    // identity here so that boundary invalidation cannot lose that race.
+                    refreshPersonalizedRails()
+                }
+            }
+        }
+        ProfileStore.sharedOrNull()?.let { profileStore ->
+            scope.launch {
+                profileStore.activeProfile
+                    .drop(1)
+                    .collectLatest { refreshPersonalizedRails() }
+            }
+        }
+        watchlistStore?.let { store ->
+            scope.launch {
+                store.items.drop(1).collectLatest { refreshPersonalizedRails() }
+            }
+        }
+        scope.launch {
+            TraktAuth.sessionBoundary.drop(1).collectLatest {
+                traktRails.clear()
+                traktWatchlist = emptyList()
+                publishHome()
+                refreshPersonalizedRails()
+            }
+        }
+        scope.launch {
+            SIMKLAuth.sessionBoundary.drop(1).collectLatest {
+                simklRails.clear()
+                simklWatchlist = emptyList()
+                publishHome()
+                refreshPersonalizedRails()
+            }
+        }
+        scope.launch {
+            MediaServerRepository.configurationBoundary.drop(1).collectLatest {
+                mediaServerCatalogs.clear()
+                mediaServerRails = emptyList()
+                publishHome()
+                refreshPersonalizedRails()
+            }
+        }
+        importedCatalogs?.let { registry ->
+            scope.launch {
+                registry.catalogs.drop(1).collectLatest { catalogs ->
+                    importedRails = importedCatalogRails(catalogs)
+                    publishHome()
+                }
+            }
+        }
     }
 
     fun load() {
         collectJob?.cancel()
+        personalizedJob?.cancel()
+        baseRows = emptyList()
+        topPicksItems = emptyList()
+        sourceHasRows = false
+        upcomingEpisodes = emptyList()
+        upcomingMovies = emptyList()
+        traktWatchlist = emptyList()
+        simklWatchlist = emptyList()
+        becauseYouWatchedRail = null
+        mediaServerRails = emptyList()
+        pendingContinueWatchingDismissals.clear()
+        continueWatchingRollbacks.clear()
+        latestAuthoritativeRows = null
+        renderedOwner = null
         _state.value = UiState.Loading
-        collectJob = viewModelScope.launch {
+        collectJob = scope.launch {
+            val reducer = HomeUpdateReducer()
             // Watchdog: an engine that produces no rails at all (no network AND no cache) must show
             // the composed error card, never shimmer/black forever. A child job, so cancel-on-reload
             // covers it too; it no-ops once real data has landed.
@@ -75,28 +282,295 @@ class HomeViewModel(
                 }
             }
             val homeUpdates = railPreferences?.let { preferences ->
-                repo.homeUpdates().combine(preferences.state) { rows, layout ->
-                    rows.isNotEmpty() to preferences.arrange(rows, railSurface, layout)
+                repo.homeUpdates().combine(preferences.state) { update, _ ->
+                    update.rows.isNotEmpty() to update
                 }
-            } ?: repo.homeUpdates().map { rows -> rows.isNotEmpty() to rows }
+            } ?: repo.homeUpdates().map { snapshot -> snapshot.rows.isNotEmpty() to snapshot }
             homeUpdates
                 .catch { error ->
                     _state.value = UiState.Error(error.message ?: "Something went wrong loading your add-ons.")
                 }
-                .collect { (sourceHasRows, rows) ->
-                    // Empty emissions are the stream's "nothing settled yet" heartbeat -- keep the
-                    // shimmer (or the previous Success) rather than rendering an empty Home. A non-empty
-                    // source that becomes empty only after the user's visibility filter is still a real
-                    // settled result, so publish it instead of leaving the now-hidden rows on screen.
-                    if (sourceHasRows) _state.value = UiState.Success(rows)
+                .collect { (hasRows, update) ->
+                    val reduced = reducer.reduce(update) ?: return@collect
+                    val owner = update.owner
+                    val previousOwner = renderedOwner
+                    // A queued emission remains stamped with the owner/revision it was produced under. Once
+                    // a newer revision rendered, never let an older owner overwrite it.
+                    if (previousOwner != null && owner.revision < previousOwner.revision) return@collect
+                    if (previousOwner != null &&
+                        owner.revision == previousOwner.revision &&
+                        owner != previousOwner
+                    ) {
+                        return@collect
+                    }
+                    if (owner != previousOwner) {
+                        pendingContinueWatchingDismissals.clear()
+                        continueWatchingRollbacks.clear()
+                        latestAuthoritativeRows = null
+                        renderedOwner = owner
+                        clearOwnerPersonalizedRows()
+                        if (update.rows.isEmpty() && !update.authoritative) _state.value = UiState.Loading
+                    }
+                    val rows = (reduced as UiState.Success).data
+                    if (update.authoritative) {
+                        pendingContinueWatchingDismissals.clear()
+                        continueWatchingRollbacks.clear()
+                    }
+                    this@HomeViewModel.sourceHasRows = update.authoritative || hasRows
+                    baseRows = rows
+                    latestAuthoritativeRows = rows
+                    publishHome()
+                    refreshPersonalizedRails()
                 }
         }
+        publishHome()
+        refreshPersonalizedRails()
+    }
+
+    private fun refreshPersonalizedRails() {
+        val owner = currentReleaseOwner()
+        if (applyReleaseCalendar(releaseCalendar.activate(owner))) publishHome()
+        val rows = baseRows
+        personalizedJob?.cancel()
+        personalizedJob = scope.launch {
+            val libraryWork = async { repo.library() }
+            val addonsWork = async { repo.installedAddons() }
+            val libraryResult = libraryWork.await()
+            val library = libraryResult.getOrNull()?.items.orEmpty()
+            val continueWatching = rows.firstOrNull { it.id == "continue" }?.items.orEmpty()
+            val watchlist = watchlistStore?.items?.value.orEmpty()
+            val topPicksWork = async {
+                topPicks.refresh(continueWatching, library) {
+                    topPicksItems = emptyList()
+                    publishHome()
+                }
+            }
+            val becauseWork = async {
+                becauseYouWatched.refresh(continueWatching, library) {
+                    becauseYouWatchedRail = null
+                    publishHome()
+                }
+            }
+            val traktWork = async { traktRails.refresh() }
+            val simklWork = async { simklRails.refresh() }
+            val mediaServerWork = async { mediaServerCatalogs.refresh() }
+            val releaseWork = async {
+                val addonsResult = addonsWork.await()
+                if (libraryResult.isFailure || addonsResult.isFailure) return@async null
+                releaseCalendar.refresh(
+                    owner = owner,
+                    library = library,
+                    watchlist = watchlist,
+                    metaBases = upcomingMetaBases(addonsResult.getOrThrow()),
+                    onInvalidated = { invalidated ->
+                        if (applyReleaseCalendar(invalidated)) publishHome()
+                    },
+                )
+            }
+            val refreshed = topPicksWork.await()
+            val because = becauseWork.await()
+            val upcoming = releaseWork.await()
+            val trakt = traktWork.await()
+            val simkl = simklWork.await()
+            val media = mediaServerWork.await()
+            if (owner != currentReleaseOwner()) return@launch
+            if (refreshed.changed) {
+                topPicksItems = refreshed.items
+            }
+            val upcomingChanged = upcoming?.let(::applyReleaseCalendar) == true
+            if (because.changed) becauseYouWatchedRail = because.rail
+            if (media.changed) mediaServerRails = media.rails
+            val externalChanged = traktWatchlist != trakt.items || simklWatchlist != simkl.items
+            traktWatchlist = trakt.items
+            simklWatchlist = simkl.items
+            if (
+                refreshed.changed || because.changed || media.changed || upcomingChanged ||
+                trakt.changed || simkl.changed || externalChanged
+            ) {
+                publishHome()
+            }
+        }
+    }
+
+    private fun currentReleaseBoundary() = ReleaseCalendarBoundary(
+        profileId = activeProfileId(),
+        accountId = repo.releaseCalendarAccountId(),
+    )
+
+    private fun currentReleaseOwner(): ReleaseCalendarOwner =
+        releaseOwnerTracker.ownerFor(currentReleaseBoundary()).also { owner ->
+            _contentOwnerGeneration.value = owner.generation
+        }
+
+    private fun applyReleaseCalendar(refresh: ReleaseCalendarRefresh): Boolean {
+        val changed = upcomingEpisodes != refresh.episodes || upcomingMovies != refresh.movies
+        upcomingEpisodes = refresh.episodes
+        upcomingMovies = refresh.movies
+        return changed
+    }
+
+    /** Clear every owner-derived client rail before the replacement owner can render. */
+    private fun clearOwnerPersonalizedRows() {
+        personalizedJob?.cancel()
+        topPicksItems = emptyList()
+        upcomingEpisodes = emptyList()
+        upcomingMovies = emptyList()
+        traktWatchlist = emptyList()
+        simklWatchlist = emptyList()
+        becauseYouWatchedRail = null
+        mediaServerRails = emptyList()
+    }
+
+    private fun publishHome() {
+        val hasClientRows = topPicksItems.isNotEmpty() || becauseYouWatchedRail != null ||
+            traktWatchlist.isNotEmpty() || simklWatchlist.isNotEmpty() || mediaServerRails.isNotEmpty() ||
+            importedRails.isNotEmpty() || upcomingEpisodes.isNotEmpty() || upcomingMovies.isNotEmpty()
+        if (!sourceHasRows && !hasClientRows) return
+        val topRows = withTopPicksRail(baseRows, topPicksItems)
+        val becauseRows = withBecauseYouWatchedRail(topRows, becauseYouWatchedRail)
+        val externalRows = withExternalWatchlistRails(becauseRows, traktWatchlist, simklWatchlist)
+        val serverRows = withMediaServerRails(externalRows, mediaServerRails)
+        val importedRows = withImportedCatalogRails(serverRows, importedRails)
+        val enriched = withReleaseCalendarRails(importedRows, upcomingEpisodes, upcomingMovies)
+        val rows = railPreferences?.let { preferences ->
+            preferences.arrange(enriched, railSurface, preferences.state.value)
+        } ?: enriched
+        val visibleRows = renderedOwner?.let { owner ->
+            withoutContinueWatchingItems(rows, pendingContinueWatchingDismissals, owner)
+        } ?: rows
+        _state.value = UiState.Success(visibleRows)
+    }
+
+    fun removeFromContinueWatching(item: MetaItem) {
+        val owner = renderedOwner ?: return
+        val target = ContinueWatchingDismissal(owner, item.type, item.id)
+        if (!pendingContinueWatchingDismissals.add(target)) return
+        val current = (_state.value as? UiState.Success)?.data
+        if (current != null) {
+            captureContinueWatchingRollback(current, target)?.let { continueWatchingRollbacks[target] = it }
+            publishHome()
+        }
+        scope.launch {
+            val confirmed = withContext(dismissalDispatcher) {
+                val removed = repo.removeFromContinueWatching(target)
+                removed.isSuccess && awaitContinueWatchingAbsent(
+                    target = target,
+                    snapshot = { repo.continueWatchingSnapshot(owner) },
+                    timeoutMs = confirmationTimeoutMs,
+                    pollMs = confirmationPollMs,
+                )
+            }
+            if (renderedOwner != owner) {
+                pendingContinueWatchingDismissals.remove(target)
+                continueWatchingRollbacks.remove(target)
+            } else if (confirmed) {
+                pendingContinueWatchingDismissals.remove(target)
+                continueWatchingRollbacks.remove(target)
+                latestAuthoritativeRows = latestAuthoritativeRows?.let {
+                    withoutContinueWatchingItems(it, setOf(target), owner)
+                }
+                baseRows = withoutContinueWatchingItems(baseRows, setOf(target), owner)
+                publishHome()
+            } else if (pendingContinueWatchingDismissals.remove(target)) {
+                latestAuthoritativeRows?.let { rows ->
+                    baseRows = continueWatchingRollbacks.remove(target)
+                        ?.let { restoreContinueWatchingItem(rows, it) }
+                        ?: rows
+                }
+                publishHome()
+            }
+        }
+    }
+
+    fun loadNextPage(catalog: Catalog) {
+        scope.launch { repo.loadHomeRowNextPage(catalog) }
+    }
+
+    fun loadMoreRows() {
+        scope.launch { repo.loadMoreHomeRows() }
     }
 
     private companion object {
         const val EMPTY_TIMEOUT_MS = 15_000L
+        const val CONFIRMATION_TIMEOUT_MS = 3_000L
+        const val CONFIRMATION_POLL_MS = 75L
     }
 }
+
+private data class ContinueWatchingRollback(
+    val row: Catalog,
+    val rowIndex: Int,
+    val item: MetaItem,
+    val itemIndex: Int,
+)
+
+private fun captureContinueWatchingRollback(
+    rows: List<Catalog>,
+    target: ContinueWatchingDismissal,
+): ContinueWatchingRollback? {
+    val rowIndex = rows.indexOfFirst { it.id == "continue" }
+    val row = rows.getOrNull(rowIndex) ?: return null
+    val itemIndex = row.items.indexOfFirst { it.type == target.type && it.id == target.id }
+    val item = row.items.getOrNull(itemIndex) ?: return null
+    return ContinueWatchingRollback(row, rowIndex, item, itemIndex)
+}
+
+private fun restoreContinueWatchingItem(
+    rows: List<Catalog>,
+    rollback: ContinueWatchingRollback,
+): List<Catalog> {
+    val existingRowIndex = rows.indexOfFirst { it.id == rollback.row.id }
+    if (existingRowIndex < 0) {
+        val insertionIndex = rollback.rowIndex.coerceIn(0, rows.size)
+        return rows.toMutableList().apply {
+            add(insertionIndex, rollback.row.copy(items = listOf(rollback.item)))
+        }
+    }
+    val existingRow = rows[existingRowIndex]
+    if (existingRow.items.any { it.type == rollback.item.type && it.id == rollback.item.id }) return rows
+    val restoredItems = existingRow.items.toMutableList().apply {
+        add(rollback.itemIndex.coerceIn(0, size), rollback.item)
+    }
+    return rows.toMutableList().apply {
+        this[existingRowIndex] = existingRow.copy(items = restoredItems)
+    }
+}
+
+internal fun withoutContinueWatchingItems(
+    rows: List<Catalog>,
+    pending: Set<ContinueWatchingDismissal>,
+    owner: ContinueWatchingOwner,
+): List<Catalog> {
+    val removed = pending.filterTo(hashSetOf()) { it.owner == owner }
+    if (removed.isEmpty()) return rows
+    return rows.mapNotNull { row ->
+        if (row.id != "continue") return@mapNotNull row
+        row.copy(
+            items = row.items.filterNot { item ->
+                ContinueWatchingDismissal(owner, item.type, item.id) in removed
+            },
+        ).takeIf { it.items.isNotEmpty() }
+    }
+}
+
+internal suspend fun awaitContinueWatchingAbsent(
+    target: ContinueWatchingDismissal,
+    snapshot: suspend () -> Result<ContinueWatchingSnapshot>,
+    timeoutMs: Long = 3_000L,
+    pollMs: Long = 75L,
+): Boolean = withTimeoutOrNull(timeoutMs) {
+    var confirmed = false
+    while (!confirmed) {
+        val authoritative = snapshot().getOrNull() ?: break
+        if (authoritative.owner != target.owner) break
+        if (authoritative.items.none { it.id == target.id && it.type == target.type }) {
+            confirmed = true
+            break
+        }
+        delay(pollMs)
+    }
+    confirmed
+} ?: false
 
 /// Discover: the engine-driven type/catalog/genre pivot (S04). REPLACES the old static-[MediaType]
 /// chip switch: that switch dispatched the SAME `args: null` Load regardless of which chip was tapped

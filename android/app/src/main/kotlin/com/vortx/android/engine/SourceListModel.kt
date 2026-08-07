@@ -77,7 +77,7 @@ class SourceListModel(
 
     /// The view-owned ranking inputs the assembly needs, the Kotlin analogue of Apple's `Context` struct.
     /// [prefs] is the FROZEN [SourcePrefsSnapshot] the off-thread rank reads (never a live store); [contentId]
-    /// is the Singularity pool id used only to seed the fire-and-forget HOARD (null = do not hoard).
+    /// owns target-scoped TorBox rows and seeds the fire-and-forget HOARD (null = neither lane).
     data class Context(
         val metaId: String = "",
         val streamId: String? = null, // null = all loaded groups (movie); set = one episode's groups
@@ -90,7 +90,7 @@ class SourceListModel(
         val prefs: SourcePrefsSnapshot = SourcePrefsSnapshot.DEFAULT,
         val directLinksOnly: Boolean = false, // drop unresolved raw torrents, preserve resolved direct links
         val disabledAddons: Set<String> = emptySet(), // per-profile disabled add-on labels
-        val contentId: String? = null, // Singularity pool content id, for the HOARD seed only
+        val contentId: String? = null, // canonical auxiliary target id + Singularity HOARD seed
     )
 
     // ---- Binding + input setters ----
@@ -184,22 +184,25 @@ class SourceListModel(
         val ctx = context.value
         val raw = rawGroups.value
         val media = mediaServerGroups.value
-        val torboxStreams = tb.streams.value
-        val singularityStreams = sing.streams.value
+        val torboxSnapshot = tb.snapshotFor(ctx.contentId)
+        val singularitySnapshot = stableContributorSnapshot(
+            readEpoch = { sing.epoch },
+            readStreams = { sing.streams.value },
+        )
 
         val signature = Signature(
             rawHash = raw.hashCode(),
             mediaHash = media.hashCode(),
-            torboxEpoch = tb.epoch,
-            singularityEpoch = sing.epoch,
+            torboxEpoch = torboxSnapshot.epoch,
+            singularityEpoch = singularitySnapshot.epoch,
             inputsHash = inputsHash(ctx),
         )
         if (signature == publishedSignature) return // published output already correct: skip the assembly
         publishedSignature = signature
 
-        val assembled = assemble(raw, torboxStreams, singularityStreams, media, ctx).copy(
-            torboxEpoch = tb.epoch,
-            singularityEpoch = sing.epoch,
+        val assembled = assemble(raw, torboxSnapshot.streams, singularitySnapshot.streams, media, ctx).copy(
+            torboxEpoch = torboxSnapshot.epoch,
+            singularityEpoch = singularitySnapshot.epoch,
         )
         _state.value = assembled
 
@@ -209,7 +212,7 @@ class SourceListModel(
         // Dedup is per (content id, infohash), allowing torrents that arrive in later engine waves to upload.
         val cid = ctx.contentId
         if (cid != null && SourceIndexClient.isEnabled) {
-            val candidates = contributionDescriptors(raw, torboxStreams, ctx.disabledAddons)
+            val candidates = contributionDescriptors(raw, torboxSnapshot.streams, ctx.disabledAddons)
             // The process ledger is intentionally marked before the fail-soft POST starts. This at-most-once
             // tradeoff prevents rebuild storms from retrying a failing endpoint; a dropped POST becomes
             // eligible again on the next app launch. The pool is opportunistic and never gates playback.
@@ -251,12 +254,34 @@ class SourceListModel(
         val inputsHash: Int,
     )
 
+    internal data class ContributorSnapshot<T>(
+        val streams: T,
+        val epoch: Int,
+    )
+
     companion object {
         private val hoardLedger = SourceHoardLedger()
 
         /// The coalescing window. At most ~4 rebuilds/sec while an engine burst streams sources in. Mirrors
         /// Apple's `coalesceMs`.
         const val COALESCE_MS = 250L
+
+        /**
+         * Read one contributor's rows and epoch as a coherent publication snapshot. Contributors replace
+         * their rows before incrementing the epoch. Without the second epoch read, an interleaving can pair
+         * old rows with the new epoch; the signature then suppresses the later rebuild carrying the real rows.
+         */
+        internal fun <T> stableContributorSnapshot(
+            readEpoch: () -> Int,
+            readStreams: () -> T,
+        ): ContributorSnapshot<T> {
+            while (true) {
+                val epochBefore = readEpoch()
+                val streams = readStreams()
+                val epochAfter = readEpoch()
+                if (epochBefore == epochAfter) return ContributorSnapshot(streams, epochAfter)
+            }
+        }
 
         /// The PURE assembly: subtract disabled add-ons, merge the TorBox + Singularity + media-server lanes in
         /// Apple's order (TorBox first, then Singularity, then media-server groups), apply the direct-links
@@ -316,9 +341,10 @@ class SourceListModel(
          * Apply the viewer's direct-links-only display preference without mistaking an already-resolved
          * debrid row for a raw torrent. Some resolvers retain [StreamSource.infoHash] and [StreamSource.isTorrent]
          * as provenance after attaching a direct [StreamSource.url]; those rows are playable direct links and
-         * must stay. A media-server or external direct row also stays even if malformed upstream metadata set
-         * the torrent flag. This pure filter is shared by the coalesced assembly and Detail's immediate paint
-         * and Smart Source pick, so no pre-coalescer path can publish or rank a forbidden raw torrent.
+         * must stay. A media-server row also stays even if malformed upstream metadata set the torrent flag.
+         * [StreamSource.externalUrl] is only a hand-off descriptor and cannot make a torrent directly playable.
+         * This pure filter is shared by the coalesced assembly and Detail's immediate paint and Smart Source
+         * pick, so no pre-coalescer path can publish or rank a forbidden raw torrent.
          */
         fun directLinkDisplayGroups(
             groups: List<StreamGroup>,
@@ -327,9 +353,12 @@ class SourceListModel(
             if (!enabled) return groups
             return groups.mapNotNull { group ->
                 val streams = group.streams.filterNot { stream ->
+                    val directUrl = stream.url?.trim().orEmpty()
+                    val hasDirectUrl =
+                        directUrl.startsWith("https://", ignoreCase = true) ||
+                            directUrl.startsWith("http://", ignoreCase = true)
                     stream.isTorrent &&
-                        stream.url.isNullOrBlank() &&
-                        stream.externalUrl.isNullOrBlank() &&
+                        !hasDirectUrl &&
                         !stream.isMediaServer
                 }
                 if (streams.isEmpty()) null else group.copy(streams = streams)

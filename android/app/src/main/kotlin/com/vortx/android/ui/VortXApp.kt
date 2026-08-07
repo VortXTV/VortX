@@ -30,6 +30,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -52,13 +53,16 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.PlaybackSessionLifecycle
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.deeplink.VortXDeepLinkEvent
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.library.LibraryAutoAdd
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
+import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
@@ -67,6 +71,7 @@ import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.DefaultEmber
 import com.vortx.android.player.PlayerScreen
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.ui.components.Wordmark
 import com.vortx.android.ui.gallery.GalleryScreen
 import com.vortx.android.ui.prefs.AppearancePrefs
@@ -112,12 +117,20 @@ import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.SearchViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
+import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /// Auto-add fires at ~60s of playback, matching Apple's `d >= 60` at PlayerScreen.swift:972 and
 /// TVPlayerView.swift:810. Expressed in ms because Android reports position in ms.
 private const val AUTO_ADD_AFTER_MS = 60_000L
+
+internal fun detailViewModelKey(
+    prefix: String,
+    typeId: String,
+    mediaId: String,
+    ownerEpoch: String,
+): String = "$prefix-$typeId-$mediaId-$ownerEpoch"
 
 private enum class Tab(
     val label: String,
@@ -144,6 +157,7 @@ fun VortXApp(
     // when the manager could not be stood up (keystore failure): the VortX Account settings row is then
     // hidden and everything else is unchanged -- sync is off the critical path by design.
     syncManager: VortXSyncManager? = null,
+    deepLinkEvent: VortXDeepLinkEvent? = null,
 ) {
     val appContext = LocalContext.current.applicationContext
     // VortXApplication binds the persistence-backed owner before either the phone or TV launcher creates
@@ -162,6 +176,9 @@ fun VortXApp(
     // account transition that every resolver/coordinator/view-model DebridKeys instance observes.
     val debridAccountIdentity = debridKeys.ownerIdentity()
     val debridOwnerEpoch = debridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
+    val debridCredentialRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
+    val sourceSettingsRevision by SourceSettingsRevision.observe(appContext).collectAsStateWithLifecycle()
+    val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
     val appearancePrefs = remember(appContext) { AppearancePrefs(appContext) }
     val tabBarPrefs = remember(appContext) { TabBarPrefs(appContext) }
     val appearance by appearancePrefs.state.collectAsStateWithLifecycle()
@@ -195,7 +212,11 @@ fun VortXApp(
                 if (hiddenTabs.resolveSelected(tab.slot) != tab.slot) tab = Tab.HOME
             }
         var detail by remember { mutableStateOf<MetaItem?>(null) }
+        var detailGeneration by remember { mutableStateOf(0L) }
         var playing by remember { mutableStateOf<Playable?>(null) }
+        val detailVmOwner = rememberReplacingViewModelStoreOwner(
+            detail?.let { "${it.type}:${it.id}:$detailSourceEpoch" } ?: "no-detail:$detailSourceEpoch",
+        )
         // The catalog meta of the title currently in [playing], captured at the moment play starts. This is
         // the Android analogue of Apple's `curMeta` (`PlaybackMeta`): [Playable] itself carries only the
         // resolved stream (url/flags/mediaRef), never the library identity, so the auto-add seam below would
@@ -203,7 +224,7 @@ fun VortXApp(
         // `detail` slot, so an entrypoint with no catalog title (a local download) can never inherit a stale
         // detail and auto-add the WRONG title. Null = an ad-hoc play, which auto-add skips (fail-soft, and
         // exactly what Apple's `let m = curMeta` does).
-        var playingMeta by remember { mutableStateOf<MetaItem?>(null) }
+        var playingMeta by remember { mutableStateOf<MetaDetail?>(null) }
         var showGallery by remember { mutableStateOf(false) }
         var showAccount by remember { mutableStateOf(false) }
         var showVortxAccount by remember { mutableStateOf(false) }
@@ -224,10 +245,40 @@ fun VortXApp(
         var showCustomizeHome by remember { mutableStateOf(false) }
         var showTabBar by remember { mutableStateOf(false) }
         var showWhatsNew by remember { mutableStateOf(false) }
-        val onItem: (MetaItem) -> Unit = { detail = it }
+        LaunchedEffect(deepLinkEvent) {
+            val event = deepLinkEvent ?: return@LaunchedEffect
+            val target = event.target
+            playing = null
+            playingMeta = null
+            showGallery = false
+            showAccount = false
+            showVortxAccount = false
+            showAddons = false
+            showIntegrations = false
+            showMediaServers = false
+            showDownloads = false
+            showPlayback = false
+            showSources = false
+            showDebridKeys = false
+            restoreDebridServicesFocus = false
+            showLiveTv = false
+            showLibraryTransfer = false
+            showProfiles = false
+            showAppearance = false
+            showCustomizeHome = false
+            showWhatsNew = false
+            showTabBar = false
+            detailGeneration += 1
+            detail = target.toMetaItem()
+        }
+        val onItem: (MetaItem) -> Unit = {
+            detailGeneration += 1
+            detail = it
+        }
         // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
         // (final progress tick + Player unload) still runs after the player leaves composition.
         val appScope = rememberCoroutineScope()
+        val playbackSessions = remember(repo, appScope) { PlaybackSessionLifecycle(repo, appScope) }
         // One AccountViewModel for the whole shell (not per-screen-visit like the catalog ViewModels):
         // Settings' Account row summary and the AccountScreen overlay both read the SAME live
         // authState, so a sign-in on one immediately reflects on the other with no extra plumbing.
@@ -331,7 +382,13 @@ fun VortXApp(
             val advanceVm: DetailViewModel? =
                 if (showForNext != null && !playable.isTrailer) {
                     viewModel(
-                        key = "detail-${showForNext.id}-$debridOwnerEpoch",
+                        viewModelStoreOwner = detailVmOwner,
+                        key = detailViewModelKey(
+                            prefix = "detail",
+                            typeId = showForNext.type.id,
+                            mediaId = showForNext.id,
+                            ownerEpoch = detailSourceEpoch,
+                        ),
                         factory = StremioXViewModelFactory(
                             repo = repo,
                             detailArgs = StremioXViewModelFactory.DetailArgs(showForNext.type, showForNext.id),
@@ -350,15 +407,18 @@ fun VortXApp(
             // cap per episode) lives in [DetailViewModel], which survives the swaps.
             var retryingSource by remember(playable) { mutableStateOf(false) }
             var manualSourcePick by remember(playable) { mutableStateOf(false) }
+            val playbackSession = remember(playable) { playbackSessions.newHandle() }
             // Engine playback session: load the Player so progress attributes to the right library item,
             // then end it (final tick + unload + watched-near-end) when the player closes. A TRAILER is not
             // the feature (it must not write a resume position, mark watched, or attribute progress to any
             // library item), so it opens NO engine playback session -- exactly as Apple plays trailers through
             // dedicated player instances that never touch the library.
             DisposableEffect(playable) {
-                if (!playable.isTrailer) appScope.launch { repo.beginPlaybackSession() }
+                if (!playable.isTrailer) playbackSessions.begin(playbackSession)
                 onDispose {
-                    if (!playable.isTrailer) appScope.launch { repo.endPlaybackSession(lastProgress[0], lastProgress[1]) }
+                    if (!playable.isTrailer) {
+                        playbackSessions.end(playbackSession, lastProgress[0], lastProgress[1])
+                    }
                 }
             }
             Box {
@@ -392,7 +452,7 @@ fun VortXApp(
                         lastProgress[1] = dur
                         // A trailer reports no progress and never auto-adds to the library (it is not the feature).
                         if (playable.isTrailer) return@PlayerScreen
-                        appScope.launch { repo.reportProgress(pos, dur) }
+                        playbackSessions.report(playbackSession, pos, dur)
                         // ~60s in -> the viewer is really watching this: auto-add it to the Library (D8), once
                         // per playback. This is the Android seam for Apple's block at PlayerScreen.swift:972-978
                         // and TVPlayerView.swift:810-816, which hangs the same call off the same progress tick:
@@ -444,7 +504,6 @@ fun VortXApp(
                         when (val pb = nextPlayback) {
                             is Playback.Ready -> {
                                 advanceVm.clearPlayback()
-                                playingMeta = showForNext
                                 playing = pb.playable
                             }
                             is Playback.Failed -> {
@@ -630,28 +689,42 @@ fun VortXApp(
 
         val current = detail
         if (current != null) {
-            // A ViewModel keyed to this title's id, fed type+id through the factory's DetailArgs.
-            val detailVm: DetailViewModel = viewModel(
-                key = "detail-${current.id}-$debridOwnerEpoch",
-                factory = StremioXViewModelFactory(
-                    repo = repo,
-                    detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),
-                    appContext = appContext,
-                ),
-            )
-            // System Back closes the detail overlay back to the browse shell. Composed BEFORE
-            // DetailScreen so the screen's own nested overlay handlers (person page / nested title,
-            // DetailScreen.kt) register later and therefore take precedence while they are open.
-            BackHandler { detail = null }
-            DetailScreen(
-                viewModel = detailVm,
-                title = current.name,
-                onBack = { detail = null },
-                // Bind the played title's catalog meta for the 60s auto-add. [current] is the SHOW/movie
-                // item, never an episode, which is the identity the library is keyed by -- the same
-                // distinction Apple draws between `PlaybackMeta.libraryId` and its `videoId`.
-                onPlay = { playing = it; playingMeta = current },
-            )
+            // The generation boundary deliberately tears down DetailScreen's local person/nested-title
+            // navigation when a new deep-link event targets the same media id again.
+            key(current.type, current.id, detailGeneration) {
+                // The Compose generation resets local nested-screen state, while the Activity-scoped
+                // ViewModel key remains bounded by target and owner. Reopening the same title therefore
+                // reuses its ViewModel instead of retaining one live repository subscription per visit.
+                val detailVm: DetailViewModel = viewModel(
+                    viewModelStoreOwner = detailVmOwner,
+                    key = detailViewModelKey(
+                        prefix = "detail",
+                        typeId = current.type.id,
+                        mediaId = current.id,
+                        ownerEpoch = detailSourceEpoch,
+                    ),
+                    factory = StremioXViewModelFactory(
+                        repo = repo,
+                        detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),
+                        appContext = appContext,
+                    ),
+                )
+                // System Back closes the detail overlay back to the browse shell. Composed BEFORE
+                // DetailScreen so the screen's own nested overlay handlers (person page / nested title,
+                // DetailScreen.kt) register later and therefore take precedence while they are open.
+                BackHandler { detail = null }
+                DetailScreen(
+                    viewModel = detailVm,
+                    title = current.name,
+                    onBack = { detail = null },
+                    // DetailScreen supplies the successfully loaded MetaDetail, not the provisional
+                    // deep-link MetaItem. This keeps auto-add title/poster truth tied to engine metadata.
+                    onPlay = { playable, loadedMeta ->
+                        playingMeta = loadedMeta
+                        playing = playable
+                    },
+                )
+            }
             return@VortXTheme
         }
 

@@ -13,9 +13,12 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
@@ -28,7 +31,13 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
+import com.vortx.android.home.TOP_PICKS_CATALOG_ID
+import com.vortx.android.home.SIMKL_WATCHLIST_CATALOG_ID
+import com.vortx.android.home.TRAKT_WATCHLIST_CATALOG_ID
+import com.vortx.android.home.UPCOMING_EPISODES_CATALOG_ID
+import com.vortx.android.home.UPCOMING_MOVIES_CATALOG_ID
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.normalizeHomeCatalogs
 import com.vortx.android.ui.components.EmptyState
 import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.components.LoadingRail
@@ -56,14 +65,20 @@ fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: M
                     modifier,
                 )
             } else {
-                HomeContent(s.data, onItem, modifier)
+                HomeContent(s.data, onItem, viewModel, modifier)
             }
     }
 }
 
 @Composable
-private fun HomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, modifier: Modifier) {
-    val hero = catalogs.firstOrNull()?.items?.firstOrNull()
+private fun HomeContent(
+    catalogs: List<Catalog>,
+    onItem: (MetaItem) -> Unit,
+    viewModel: HomeViewModel,
+    modifier: Modifier,
+) {
+    val visibleCatalogs = remember(catalogs) { normalizeHomeCatalogs(catalogs) }
+    val hero = visibleCatalogs.firstOrNull()?.items?.firstOrNull()
     // The featured hero is the first item of the first rail (Continue Watching, else the leading add-on
     // catalog) -- the SAME data the rails below already render. It now loads that title's real
     // backdrop/poster art (see [HeroHeader]), so the earlier large-screen gate (which hid the hero on
@@ -79,10 +94,30 @@ private fun HomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, mod
         if (hero != null) {
             item { HeroHeader(hero, onItem) }
         }
-        items(catalogs, key = { it.id }) { catalog ->
+        itemsIndexed(visibleCatalogs, key = { _, catalog -> catalog.id }) { index, catalog ->
+            if (index == visibleCatalogs.lastIndex) {
+                LaunchedEffect(visibleCatalogs.size, catalog.id) { viewModel.loadMoreRows() }
+            }
             // The leading Continue Watching rail carries the editorial kicker, like tvOS.
-            val eyebrow = if (catalog.id == "continue") "Pick up where you left off" else null
-            PosterRail(catalog = catalog, onItem = onItem, eyebrow = eyebrow)
+            val eyebrow = when (catalog.id) {
+                "continue" -> "Pick up where you left off"
+                TOP_PICKS_CATALOG_ID -> "Based on what you watch"
+                UPCOMING_EPISODES_CATALOG_ID, UPCOMING_MOVIES_CATALOG_ID -> "Coming soon"
+                TRAKT_WATCHLIST_CATALOG_ID -> "From Trakt"
+                SIMKL_WATCHLIST_CATALOG_ID -> "From SIMKL"
+                else -> null
+            }
+            PosterRail(
+                catalog = catalog,
+                onItem = onItem,
+                onRemoveFromContinueWatching = viewModel::removeFromContinueWatching,
+                eyebrow = eyebrow,
+                onEndReached = if (catalog.hasNextPage) {
+                    { viewModel.loadNextPage(catalog) }
+                } else {
+                    null
+                },
+            )
         }
     }
 }

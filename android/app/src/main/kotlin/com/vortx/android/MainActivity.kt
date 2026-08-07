@@ -3,6 +3,7 @@ package com.vortx.android
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ObjectAnimator
+import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
 import android.view.animation.AnticipateInterpolator
@@ -10,10 +11,16 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import com.vortx.android.deeplink.DeepLinkDeliveryState
+import com.vortx.android.deeplink.VortXDeepLinkEvent
 import com.vortx.android.player.PlayerPipBridge
 import com.vortx.android.ui.VortXApp
 import com.vortx.android.ui.theme.isAnimatorScaleZero
+import java.util.UUID
 
 /// Android + Android TV entry point. The five-tab Compose shell in [VortXApp] matches the iOS and
 /// Apple TV structure. It now runs on the shared stremio-core engine (over JNI, the same engine the
@@ -22,6 +29,10 @@ import com.vortx.android.ui.theme.isAnimatorScaleZero
 /// once per process, not per Activity instance) -- see that class's doc comment for why that matters
 /// (engine double-init / event-listener orphaning safety across Activity recreation).
 class MainActivity : ComponentActivity() {
+    private var deepLinkEvent by mutableStateOf<VortXDeepLinkEvent?>(null)
+    private var deepLinkSequence = 0L
+    private var deepLinkDelivery = DeepLinkDeliveryState()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         // installSplashScreen() must run before super.onCreate(): it installs the AndroidX
         // SplashScreen (Theme.VortX.Splash -- brand gold mark on warm obsidian, see themes.xml) for
@@ -30,6 +41,11 @@ class MainActivity : ComponentActivity() {
         // uniformly.
         val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
+        val restoredDeliveryId = savedInstanceState?.getString(STATE_DEEP_LINK_DELIVERY_ID)
+        deepLinkDelivery = DeepLinkDeliveryState(
+            restoredConsumedDeliveryId = restoredDeliveryId,
+        )
+        routeDeepLink(intent, restoredDeliveryId = restoredDeliveryId)
 
         // Edge-to-edge is enforced app-wide (ANDROID-PLAN.md S01 scope; DESIGN-SYSTEM.md chrome
         // recedes behind content). VortXTheme forces the dark scheme regardless of the system
@@ -68,8 +84,49 @@ class MainActivity : ComponentActivity() {
                 // The VortX account + cross-device sync engine (nullable: sync is off the critical
                 // path; a keystore failure hides the account row instead of blocking launch).
                 syncManager = app.syncManager,
+                deepLinkEvent = deepLinkEvent,
             )
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        routeDeepLink(intent, forceNewDelivery = true)
+    }
+
+    private fun routeDeepLink(
+        intent: Intent?,
+        restoredDeliveryId: String? = null,
+        forceNewDelivery: Boolean = false,
+    ) {
+        val deliveryId = deliveryId(intent, restoredDeliveryId, forceNewDelivery)
+        if (deepLinkDelivery.isConsumed(deliveryId)) {
+            clearDeepLinkData(intent)
+            return
+        }
+        val target = deepLinkDelivery.consume(deliveryId, intent?.dataString) ?: return
+        clearDeepLinkData(intent)
+        deepLinkEvent = VortXDeepLinkEvent(target, ++deepLinkSequence)
+    }
+
+    private fun deliveryId(source: Intent?, restoredDeliveryId: String?, forceNew: Boolean): String {
+        val retained = source?.getStringExtra(EXTRA_DEEP_LINK_DELIVERY_ID)
+        if (!forceNew && restoredDeliveryId != null && retained == restoredDeliveryId) {
+            return retained
+        }
+        return UUID.randomUUID().toString().also { source?.putExtra(EXTRA_DEEP_LINK_DELIVERY_ID, it) }
+    }
+
+    private fun clearDeepLinkData(source: Intent?) {
+        source ?: return
+        source.data = null
+        setIntent(source)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString(STATE_DEEP_LINK_DELIVERY_ID, deepLinkDelivery.consumedDeliveryId)
+        super.onSaveInstanceState(outState)
     }
 
     /// Home press during playback -> Picture-in-Picture, on API 26-30 where the params-based
@@ -81,5 +138,10 @@ class MainActivity : ComponentActivity() {
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
         PlayerPipBridge.onUserLeaveHint()
+    }
+
+    private companion object {
+        const val STATE_DEEP_LINK_DELIVERY_ID = "vortx.deepLinkDeliveryId"
+        const val EXTRA_DEEP_LINK_DELIVERY_ID = "com.vortx.android.extra.DEEP_LINK_DELIVERY_ID"
     }
 }

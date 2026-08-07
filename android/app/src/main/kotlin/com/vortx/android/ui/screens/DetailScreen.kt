@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -53,7 +54,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil3.compose.AsyncImage
 import com.vortx.android.VortXApplication
+import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.engine.StreamRanking
+import com.vortx.android.library.WatchlistStore
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
@@ -68,6 +71,7 @@ import com.vortx.android.ratings.MdbListRatings
 import com.vortx.android.ratings.VortXRatingsClient
 import com.vortx.android.sources.SourcePinScope
 import com.vortx.android.sources.SourcePinStore
+import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.DefaultEpisodeThumb
@@ -87,6 +91,22 @@ import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.PersonViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
+import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
+
+internal data class ResolvedDetailPlayback(
+    val playable: Playable,
+    val metadata: MetaDetail,
+)
+
+/** A player route exists only when both the resolved source and real loaded detail metadata exist. */
+internal fun resolvedDetailPlayback(
+    playback: Playback,
+    metaState: UiState<MetaDetail>,
+): ResolvedDetailPlayback? {
+    val ready = playback as? Playback.Ready ?: return null
+    val loaded = metaState as? UiState.Success ?: return null
+    return ResolvedDetailPlayback(ready.playable, loaded.data)
+}
 
 /// Title detail, driven by [DetailViewModel] -- movie/series per DESIGN-SYSTEM.md §4 "Detail":
 /// a fixed hero banner (backdrop + dual scrim + bottom-left title block, NOT a full-page wash, the
@@ -101,7 +121,7 @@ fun DetailScreen(
     viewModel: DetailViewModel,
     title: String,
     onBack: () -> Unit,
-    onPlay: (Playable) -> Unit,
+    onPlay: (Playable, MetaDetail) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
@@ -113,6 +133,7 @@ fun DetailScreen(
     val downloadNotice by viewModel.downloadNotice.collectAsStateWithLifecycle()
     val pinUi by viewModel.pinUi.collectAsStateWithLifecycle()
     val sourceSort by viewModel.sourceSort.collectAsStateWithLifecycle()
+    val watchlisted by viewModel.watchlisted.collectAsStateWithLifecycle()
 
     // The download status line is a transient confirmation, not a persistent state: show it for a beat then
     // clear it (the live queue/progress lives on the Downloads screen). Keyed on the notice text so each new
@@ -136,8 +157,16 @@ fun DetailScreen(
     // without threading a new callback through the app shell. System back closes it back to the Person page.
     titleTarget?.let { target ->
         val app = LocalContext.current.applicationContext as VortXApplication
+        val nestedDebridKeys = remember(app) { DebridKeys(app) }
+        val nestedCredentialRevision by DebridKeys.credentialRevision.collectAsStateWithLifecycle()
+        val nestedSourceRevision by SourceSettingsRevision.observe(app).collectAsStateWithLifecycle()
+        val nestedOwner = nestedDebridKeys.ownerToken()?.let { "${it.identity}:${it.generation}" } ?: "unknown"
+        val nestedVmOwner = rememberReplacingViewModelStoreOwner(
+            "${target.type}:${target.id}:$nestedOwner:$nestedCredentialRevision:$nestedSourceRevision",
+        )
         val nestedVm: DetailViewModel = viewModel(
-            key = "detail-nested-${target.id}",
+            viewModelStoreOwner = nestedVmOwner,
+            key = "detail-nested-${target.type.id}-${target.id}-$nestedOwner:$nestedCredentialRevision:$nestedSourceRevision",
             factory = StremioXViewModelFactory(
                 repo = app.catalogRepository,
                 detailArgs = StremioXViewModelFactory.DetailArgs(target.type, target.id),
@@ -205,11 +234,10 @@ fun DetailScreen(
 
     // When a source resolves, hand the Playable up to navigation and reset, so returning from the
     // player lands back on detail rather than immediately re-launching.
-    LaunchedEffect(playback) {
-        (playback as? Playback.Ready)?.let {
-            onPlay(it.playable)
-            viewModel.clearPlayback()
-        }
+    LaunchedEffect(playback, metaState) {
+        val resolved = resolvedDetailPlayback(playback, metaState) ?: return@LaunchedEffect
+        onPlay(resolved.playable, resolved.metadata)
+        viewModel.clearPlayback()
     }
 
     val resolving = playback is Playback.Resolving
@@ -234,6 +262,8 @@ fun DetailScreen(
                         onWatch = { viewModel.playBest() },
                         onToggleSources = { sourcesOpen = !sourcesOpen },
                         onToggleLibrary = viewModel::toggleLibrary,
+                        watchlisted = watchlisted,
+                        onToggleWatchlist = viewModel::toggleWatchlist,
                         onToggleWatched = { viewModel.setWatched(!(m.data.libraryItem?.isWatched ?: false)) },
                         hasTrailer = m.data.trailerYouTubeId != null,
                         onTrailer = { viewModel.playTrailer() },
@@ -476,12 +506,38 @@ private fun Backdrop(m: MetaDetail) {
                 modifier = Modifier.align(Alignment.BottomStart).padding(VortXTheme.spacing.md),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                Text(text = m.name, style = VortXTheme.type.hero, color = Color.White, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                DetailTitle(m)
                 MetaRow(m)
             }
         }
     }
 }
+
+@Composable
+private fun DetailTitle(m: MetaDetail) {
+    var logoFailed by remember(m.logo) { mutableStateOf(false) }
+    val logo = detailLogoUrl(m.logo, logoFailed)
+    if (logo != null) {
+        AsyncImage(
+            model = logo,
+            contentDescription = m.name,
+            contentScale = ContentScale.Fit,
+            onError = { logoFailed = true },
+            modifier = Modifier.widthIn(max = 320.dp).fillMaxWidth().height(110.dp),
+        )
+    } else {
+        Text(
+            text = m.name,
+            style = VortXTheme.type.hero,
+            color = Color.White,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+internal fun detailLogoUrl(raw: String?, failed: Boolean): String? =
+    raw?.trim()?.takeIf { it.isNotEmpty() && !failed }
 
 /// The hero banner's height for a given measured [width]: the true 16:9-of-width height, clamped to
 /// the S03 260dp cap -- computed directly instead of via `.heightIn(max = …).aspectRatio(…)`, whose
@@ -572,6 +628,8 @@ private fun ActionsCluster(
     onWatch: () -> Unit,
     onToggleSources: () -> Unit,
     onToggleLibrary: () -> Unit,
+    watchlisted: Boolean,
+    onToggleWatchlist: () -> Unit,
     onToggleWatched: () -> Unit,
     hasTrailer: Boolean,
     onTrailer: () -> Unit,
@@ -600,38 +658,56 @@ private fun ActionsCluster(
             loading = resolving,
             leadingIcon = if (!resolving) VortXIcons.playFill else null,
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
-            Chip(
-                label = if (inLibrary) "Saved" else "Save",
-                selected = inLibrary,
-                leadingIcon = if (inLibrary) VortXIcons.bookmarkFill else VortXIcons.bookmark,
-                onClick = onToggleLibrary,
-            )
-            Chip(
-                label = "Sources",
-                selected = sourcesOpen,
-                leadingIcon = VortXIcons.listBullet,
-                onClick = onToggleSources,
-            )
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+            item {
+                Chip(
+                    label = if (inLibrary) "Saved" else "Save",
+                    selected = inLibrary,
+                    leadingIcon = if (inLibrary) VortXIcons.bookmarkFill else VortXIcons.bookmark,
+                    onClick = onToggleLibrary,
+                )
+            }
+            if (WatchlistStore.isSafeId(m.id)) {
+                item {
+                    Chip(
+                        label = if (watchlisted) "In Watchlist" else "Watchlist",
+                        selected = watchlisted,
+                        leadingIcon = VortXIcons.starFill,
+                        onClick = onToggleWatchlist,
+                    )
+                }
+            }
+            item {
+                Chip(
+                    label = "Sources",
+                    selected = sourcesOpen,
+                    leadingIcon = VortXIcons.listBullet,
+                    onClick = onToggleSources,
+                )
+            }
             // Trailer: free 1080p from the user's own IP via the client resolver (worker fallback on a miss).
             // Shown only when the meta carries a YouTube trailer id. Plays through the shared player pipeline.
             if (hasTrailer) {
-                Chip(
-                    label = "Trailer",
-                    selected = false,
-                    leadingIcon = VortXIcons.playRectangle,
-                    onClick = onTrailer,
-                )
+                item {
+                    Chip(
+                        label = "Trailer",
+                        selected = false,
+                        leadingIcon = VortXIcons.playRectangle,
+                        onClick = onTrailer,
+                    )
+                }
             }
             // Movie-level watched toggle (a series marks watched per-episode/season via the
             // SeasonSelector's chips instead, since there's no single "the" episode here).
             if (m.videos.isEmpty()) {
-                Chip(
-                    label = if (isWatched) "Watched" else "Mark Watched",
-                    selected = isWatched,
-                    leadingIcon = VortXIcons.checkmarkCircle,
-                    onClick = onToggleWatched,
-                )
+                item {
+                    Chip(
+                        label = if (isWatched) "Watched" else "Mark Watched",
+                        selected = isWatched,
+                        leadingIcon = VortXIcons.checkmarkCircle,
+                        onClick = onToggleWatched,
+                    )
+                }
             }
         }
     }

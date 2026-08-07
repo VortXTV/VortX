@@ -11,6 +11,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -55,12 +58,24 @@ object MediaServerRepository {
         val activeIds: Set<UUID>,
     )
 
+    internal data class CatalogSnapshot(
+        val generation: Long,
+        val configs: List<MediaServerConfig>,
+    )
+
     @Volatile
     private var providerState = ProviderState(
         generation = 0L,
         providers = emptyList(),
         activeIds = emptySet(),
     )
+
+    @Volatile
+    private var catalogState = CatalogSnapshot(generation = 0L, configs = emptyList())
+    private val _configurationBoundary = MutableStateFlow(0L)
+    internal val configurationBoundary: StateFlow<Long> = _configurationBoundary.asStateFlow()
+
+    internal fun catalogSnapshot(): CatalogSnapshot = catalogState
 
     /// Idempotent init: build the plain metadata prefs + encrypted token store, load persisted records, and
     /// warm the providers so a server connected in a previous run is queryable after a restart WITHOUT the
@@ -411,7 +426,7 @@ object MediaServerRepository {
 
     private fun rebuildProviders() {
         val store = tokenStore
-        val nextProviders = records.mapNotNull { r ->
+        val next = records.mapNotNull { r ->
             val token = store?.confirmedString(tokenKey(r.id)).orEmpty()
             if (token.isEmpty()) return@mapNotNull null
             val base = r.urls.firstOrNull() ?: return@mapNotNull null
@@ -428,13 +443,19 @@ object MediaServerRepository {
                 MediaServerKind.JELLYFIN, MediaServerKind.EMBY -> JellyfinProvider(config)
                 MediaServerKind.PLEX -> PlexProvider(config, plexClientId)
             }
-            ServerProvider(r.id, provider)
+            config to ServerProvider(r.id, provider)
         }
+        val generation = providerState.generation + 1L
         providerState = ProviderState(
-            generation = providerState.generation + 1L,
-            providers = nextProviders,
-            activeIds = nextProviders.mapTo(linkedSetOf()) { it.id },
+            generation = generation,
+            providers = next.map { it.second },
+            activeIds = next.mapTo(linkedSetOf()) { it.second.id },
         )
+        // Catalog callers need the same exact credential/config generation as playback lookup. Publish the
+        // immutable snapshot before the boundary tick so collectors can never observe a new generation with
+        // the old account's configs. Tokens remain process-memory only and never enter logs or plain prefs.
+        catalogState = CatalogSnapshot(generation, next.map { it.first })
+        _configurationBoundary.value = generation
     }
 
     private fun tokenKey(id: UUID): String = "vortx.mediaserver.$id.token"

@@ -9,7 +9,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
@@ -60,31 +62,47 @@ fun RailHeader(title: String, eyebrow: String? = null, modifier: Modifier = Modi
 /// "continue" is the CW rail, everything else is an add-on catalog row).
 private const val CONTINUE_WATCHING_ROW_ID = "continue"
 
+internal fun posterMenuFor(catalog: Catalog): PosterCardMenu = when {
+    catalog.id == CONTINUE_WATCHING_ROW_ID && catalog.readOnly -> PosterCardMenu.NONE
+    catalog.id == CONTINUE_WATCHING_ROW_ID -> PosterCardMenu.CONTINUE_WATCHING
+    else -> PosterCardMenu.CATALOG
+}
+
 /// A titled horizontal rail of [PosterCard]s, the core building block of Home and Discover. [eyebrow]
 /// adds the editorial kicker over the title (e.g. "Pick up where you left off" on Continue Watching).
 @Composable
 fun PosterRail(
     catalog: Catalog,
     onItem: (MetaItem) -> Unit,
+    onRemoveFromContinueWatching: ((MetaItem) -> Unit)? = null,
     eyebrow: String? = null,
+    onEndReached: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier) {
         RailHeader(title = catalog.title, eyebrow = eyebrow)
         LazyRow(contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge)) {
-            items(catalog.items, key = { it.id }) { item ->
+            itemsIndexed(catalog.items, key = { _, item -> "${item.type.name}|${item.id}" }) { index, item ->
+                if (onEndReached != null && index == catalog.items.lastIndex) {
+                    LaunchedEffect(catalog.engineIndex, catalog.items.size, item.type, item.id) {
+                        onEndReached()
+                    }
+                }
+                val menu = posterMenuFor(catalog)
                 PosterCard(
                     title = item.name,
-                    subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · "),
+                    subtitle = item.caption ?: listOfNotNull(item.year, item.type.label).joinToString(" · "),
                     onClick = { onItem(item) },
                     // Continue Watching items carry a watched fraction; the card draws its accent
                     // progress track for them (null on plain catalog items = no track).
                     progress = item.progress,
-                    // Long-press quick actions (Mark as Watched / Unwatched, Add to Library) on
-                    // CATALOG cards only, mirroring Apple's `PosterContextMenu.catalog`
-                    // (iOSRootView.swift:4253): the Continue Watching rail's Apple menu is a
-                    // different action set (Details / Remove), so it attaches none here.
-                    menuItem = if (catalog.id == CONTINUE_WATCHING_ROW_ID) null else item,
+                    watched = item.watched,
+                    menuItem = item.takeIf { menu != PosterCardMenu.NONE },
+                    menu = menu,
+                    onDetails = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onItem(item) }) else null,
+                    onRemoveFromContinueWatching = if (
+                        menu == PosterCardMenu.CONTINUE_WATCHING && onRemoveFromContinueWatching != null
+                    ) ({ onRemoveFromContinueWatching(item) }) else null,
                     art = { PosterArt(item.poster, item.name) },
                     modifier = Modifier.width(124.dp).padding(end = VortXTheme.spacing.sm),
                 )

@@ -8,7 +8,7 @@ import org.junit.Test
 class VortXAppDebridOwnerContractTest {
 
     @Test
-    fun playerOverlayAndDetailLayerUseTheSameOwnerScopedViewModelKey() {
+    fun playerOverlayAndDetailLayerUseTheSameBoundedOwner() {
         val source = readSource()
 
         assertTrue(
@@ -18,11 +18,11 @@ class VortXAppDebridOwnerContractTest {
     }
 
     @Test
-    fun omittingThePlayerOwnerEpochTurnsTheContractRed() {
+    fun omittingThePlayerBoundedOwnerTurnsTheContractRed() {
         val source = readSource()
         val mutation = source.replace(
-            PLAYER_OWNER_SCOPED_KEY,
-            """key = "detail-${'$'}{showForNext.id}"""",
+            PLAYER_BOUNDED_OWNER,
+            """key = "detail-${'$'}{showForNext.id}",""",
         )
 
         assertTrue(ownerScopedKeyViolations(mutation).isNotEmpty())
@@ -61,11 +61,17 @@ class VortXAppDebridOwnerContractTest {
     }
 
     private fun ownerScopedKeyViolations(source: String): List<String> = buildList {
-        if (!source.contains(PLAYER_OWNER_SCOPED_KEY)) {
-            add("The active-player DetailViewModel key must include the current debrid owner epoch")
+        if (!source.contains(DETAIL_SOURCE_EPOCH)) {
+            add("The detail epoch must include owner, credential, and source-setting revisions")
         }
-        if (!source.contains(DETAIL_OWNER_SCOPED_KEY)) {
-            add("The detail-layer DetailViewModel key must include the current debrid owner epoch")
+        if (!source.contains(BOUNDED_OWNER_GENERATION)) {
+            add("The bounded DetailViewModel owner must replace its store for every source epoch")
+        }
+        if (!source.contains(PLAYER_BOUNDED_OWNER)) {
+            add("The active-player DetailViewModel must use the bounded detail owner")
+        }
+        if (!source.contains(DETAIL_BOUNDED_OWNER)) {
+            add("The detail-layer DetailViewModel must use the same bounded detail owner")
         }
     }
 
@@ -100,9 +106,21 @@ class VortXAppDebridOwnerContractTest {
             settingsSource.contains("Modifier.focusRequester(debridServicesFocusRequester)")
 
     private companion object {
-        const val PLAYER_OWNER_SCOPED_KEY =
-            """key = "detail-${'$'}{showForNext.id}-${'$'}debridOwnerEpoch""""
-        const val DETAIL_OWNER_SCOPED_KEY =
-            """key = "detail-${'$'}{current.id}-${'$'}debridOwnerEpoch""""
+        const val BOUNDED_OWNER_GENERATION =
+            """detail?.let { "${'$'}{it.type}:${'$'}{it.id}:${'$'}detailSourceEpoch" }"""
+        const val PLAYER_BOUNDED_OWNER =
+            """viewModelStoreOwner = detailVmOwner,
+                        key = detailViewModelKey(
+                            prefix = "detail",
+                            typeId = showForNext.type.id,
+                            mediaId = showForNext.id,"""
+        const val DETAIL_BOUNDED_OWNER =
+            """viewModelStoreOwner = detailVmOwner,
+                    key = detailViewModelKey(
+                        prefix = "detail",
+                        typeId = current.type.id,
+                        mediaId = current.id,"""
+        const val DETAIL_SOURCE_EPOCH =
+            """val detailSourceEpoch = "${'$'}debridOwnerEpoch:${'$'}debridCredentialRevision:${'$'}sourceSettingsRevision""""
     }
 }

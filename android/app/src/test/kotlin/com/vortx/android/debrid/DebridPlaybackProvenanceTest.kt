@@ -171,13 +171,15 @@ class DebridPlaybackProvenanceTest {
         val ownerA = DebridOwnerToken(DebridOwnerScope.Account("account-a"), generation = 1)
         val ownerB = DebridOwnerToken(DebridOwnerScope.Account("account-b"), generation = 2)
         val evidence = DebridCacheEvidence(
-            ownerA,
-            mapOf("hash-a" to DebridService.PREMIUMIZE),
-            setOf("nzb-a"),
+            owner = ownerA,
+            credentialRevision = 7L,
+            torrentServices = mapOf("hash-a" to DebridService.PREMIUMIZE),
+            usenetUrls = setOf("nzb-a"),
         )
 
-        assertEquals(evidence, evidence.forOwner(ownerA))
-        assertNull(evidence.forOwner(ownerB))
+        assertEquals(evidence, evidence.forOwner(ownerA, credentialRevision = 7L))
+        assertNull(evidence.forOwner(ownerA, credentialRevision = 8L))
+        assertNull(evidence.forOwner(ownerB, credentialRevision = 7L))
     }
 
     @Test
@@ -265,6 +267,7 @@ class DebridPlaybackProvenanceTest {
         )
         val evidence = DebridCacheEvidence(
             owner = owner,
+            credentialRevision = 3L,
             torrentServices = torrentServicesFromCacheHits(cacheHits),
             usenetUrls = emptySet(),
         )

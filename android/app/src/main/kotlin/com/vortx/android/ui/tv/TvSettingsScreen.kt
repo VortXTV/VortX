@@ -60,6 +60,7 @@ import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.model.VideoUpscaling
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.AutoAddLibrarySetting
+import com.vortx.android.player.MpvEngineFactory
 import com.vortx.android.player.PlaybackBehaviorSettings
 import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.SubtitleStyle
@@ -312,18 +313,20 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
                 }
             }
 
-            item {
-                TvSettingsSection("Video quality") {
-                    VideoUpscaling.androidChoices.forEach { preset ->
-                        TvOptionRow(
-                            label = preset.label,
-                            detail = preset.detail,
-                            selected = preset == videoUpscaling,
-                            onClick = {
-                                videoUpscaling = preset
-                                trackStore.videoUpscaling = preset
-                            },
-                        )
+            if (MpvEngineFactory.isBundled) {
+                item {
+                    TvSettingsSection("Video quality") {
+                        VideoUpscaling.androidChoices.forEach { preset ->
+                            TvOptionRow(
+                                label = preset.label,
+                                detail = preset.detail,
+                                selected = preset == videoUpscaling,
+                                onClick = {
+                                    videoUpscaling = preset
+                                    trackStore.videoUpscaling = preset
+                                },
+                            )
+                        }
                     }
                 }
             }

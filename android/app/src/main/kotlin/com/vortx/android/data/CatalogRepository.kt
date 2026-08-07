@@ -21,6 +21,68 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 
+/**
+ * Immutable identity of the profile/account session that owns a Home snapshot. [revision] is process-local
+ * and monotonic: every profile or account transition advances it, so an emission produced before a switch
+ * can never be mistaken for fresh rows merely because the same profile is selected again later.
+ */
+data class ContinueWatchingOwner(
+    val profileId: String,
+    val accountSlot: String,
+    val principal: String,
+    val usesEngineHistory: Boolean,
+    val revision: Long,
+)
+
+/** Rows and their owner are one value. Consumers must never infer ownership by reading mutable state later. */
+data class HomeSnapshot(
+    val owner: ContinueWatchingOwner,
+    val rows: List<Catalog>,
+)
+
+/** Complete identity of one Continue Watching mutation, carried unchanged through every layer. */
+data class ContinueWatchingDismissal(
+    val owner: ContinueWatchingOwner,
+    val type: MediaType,
+    val id: String,
+)
+
+/** Authoritative Continue Watching read used to confirm a mutation. */
+data class ContinueWatchingSnapshot(
+    val owner: ContinueWatchingOwner,
+    val items: List<MetaItem>,
+)
+
+/** Opaque identity for one playback-history session. Every progress/end callback must return it. */
+@JvmInline
+value class PlaybackSessionToken internal constructor(internal val generation: Long) {
+    companion object {
+        internal val NOOP = PlaybackSessionToken(0L)
+    }
+}
+
+private val LOCAL_CONTINUE_WATCHING_OWNER = ContinueWatchingOwner(
+    profileId = "local",
+    accountSlot = "local",
+    principal = "local",
+    usesEngineHistory = false,
+    revision = 0L,
+)
+
+/**
+ * One ordered Home publication. [generation] and [sequence] let the consumer reject a row snapshot
+ * queued before a later account/profile clear. [owner] independently protects Continue Watching
+ * mutations from being replayed against a different profile or native principal.
+ */
+data class HomeUpdate(
+    val rows: List<Catalog>,
+    val generation: Long = 0L,
+    val sequence: Long = 0L,
+    val profileId: String = "default",
+    val authoritative: Boolean = false,
+    val owner: ContinueWatchingOwner = LOCAL_CONTINUE_WATCHING_OWNER,
+)
+
 /// The seam between the UI and the engine. The Compose screens depend only on this interface, so the
 /// real stremio-core-kotlin engine (Rust core over JNI, the same engine the iOS/tvOS apps use) lands
 /// behind it in a later iteration with no UI churn. Functions are suspend/Result-shaped to match the
@@ -42,7 +104,18 @@ interface CatalogRepository {
     ///
     /// Default = a single [home] emission, so the offline preview impl (and any other one-shot
     /// implementation) satisfies the contract without change.
-    fun homeUpdates(): Flow<List<Catalog>> = flow { emit(home().getOrThrow()) }
+    fun homeUpdates(): Flow<HomeUpdate> = flow {
+        val owner = continueWatchingOwner()
+        val rows = home().getOrThrow()
+        check(continueWatchingOwner() == owner) { "Continue Watching owner changed while reading Home." }
+        emit(HomeUpdate(rows = rows, profileId = owner.profileId, owner = owner))
+    }
+
+    /// Append the next item page to one Home rail. Default no-op keeps preview repositories simple.
+    suspend fun loadHomeRowNextPage(catalog: Catalog): Result<Unit> = Result.success(Unit)
+
+    /// Widen the Home board so catalog rows beyond the first window can hydrate.
+    suspend fun loadMoreHomeRows(): Result<Unit> = Result.success(Unit)
 
     /// CONTINUOUS ctx/library change ticks -- the Group-1 reactivity primitive every other mutable
     /// surface (Library, Detail's Saved chip, Discover's current selection, the installed-addons list)
@@ -96,6 +169,33 @@ interface CatalogRepository {
     /// Remove a title from the Library (the Library grid's per-poster "x" control, DESIGN-SYSTEM.md §4
     /// "Library").
     suspend fun removeFromLibrary(id: String): Result<Unit>
+
+    /// Dismiss one LOCAL Continue Watching card. Implementations must consume the full immutable target:
+    /// falling back to bare-id [removeFromLibrary] is unsafe because the native action cannot distinguish a
+    /// movie and series that share an external id. Remote-owned rows never call this method.
+    suspend fun removeFromContinueWatching(target: ContinueWatchingDismissal): Result<Unit> =
+        Result.failure(UnsupportedOperationException("Typed Continue Watching dismissal is not implemented."))
+
+    /// Current owner token. Equality, including [ContinueWatchingOwner.revision], is the only supported
+    /// staleness check. Repositories with switchable owners override this with their serialized token.
+    fun continueWatchingOwner(): ContinueWatchingOwner = LOCAL_CONTINUE_WATCHING_OWNER
+
+    /// Authoritative post-mutation read. A success must describe one valid, owner-stable snapshot; native
+    /// implementations fail for unavailable/malformed state rather than translating uncertainty to empty.
+    suspend fun continueWatchingSnapshot(
+        expectedOwner: ContinueWatchingOwner,
+    ): Result<ContinueWatchingSnapshot> {
+        if (continueWatchingOwner() != expectedOwner) {
+            return Result.failure(IllegalStateException("Continue Watching owner changed."))
+        }
+        return home().mapCatching { rows ->
+            check(continueWatchingOwner() == expectedOwner) { "Continue Watching owner changed." }
+            ContinueWatchingSnapshot(
+                owner = expectedOwner,
+                items = rows.firstOrNull { it.id == "continue" }?.items.orEmpty(),
+            )
+        }
+    }
 
     /// Every add-on installed on the signed-in account (S04 "Add-on management"), read live from
     /// `ctx.profile.addons`.
@@ -172,17 +272,24 @@ interface CatalogRepository {
     // any future one-shot implementation satisfy the contract without change; [EngineStremioRepository]
     // overrides them for the real engine dispatch.
 
-    /// Load the engine Player for the title currently open in `meta_details`, so subsequent
-    /// [reportProgress] ticks attribute to the right library item. Call once when playback begins.
-    suspend fun beginPlaybackSession(): Result<Unit> = Result.success(Unit)
+    /// Load the engine Player for the title currently open in `meta_details` and return the opaque
+    /// identity that every subsequent [reportProgress] and [endPlaybackSession] callback must carry.
+    suspend fun beginPlaybackSession(): Result<PlaybackSessionToken> = Result.success(PlaybackSessionToken.NOOP)
 
-    /// Report the live playback position + duration (ms) to the engine, so Continue Watching updates.
-    /// Call periodically while playing.
-    suspend fun reportProgress(positionMs: Long, durationMs: Long): Result<Unit> = Result.success(Unit)
+    /// Report the live playback position + duration (ms) for [session]. Replaced sessions are no-ops.
+    suspend fun reportProgress(
+        session: PlaybackSessionToken,
+        positionMs: Long,
+        durationMs: Long,
+    ): Result<Unit> = Result.success(Unit)
 
-    /// Report a final position and tear the engine Player down. Call once when the player closes (save on
-    /// exit). A near-the-end position additionally marks the title watched.
-    suspend fun endPlaybackSession(positionMs: Long, durationMs: Long): Result<Unit> = Result.success(Unit)
+    /// Report a final position and tear down [session]. A replaced token neither writes nor unloads the
+    /// current Player. A near-the-end position additionally marks the title watched.
+    suspend fun endPlaybackSession(
+        session: PlaybackSessionToken,
+        positionMs: Long,
+        durationMs: Long,
+    ): Result<Unit> = Result.success(Unit)
 
     // ---- S05: Detail watched-state + library mutations ----
     //
@@ -249,11 +356,13 @@ class PreviewCatalogRepository(
             )
         }
 
+    private val previewContinueWatching = sample("Resume", MediaType.SERIES, 6).toMutableList()
+
     override suspend fun home(): Result<List<Catalog>> {
         delay(latencyMs)
         return Result.success(
             listOf(
-                Catalog("continue", "Continue Watching", sample("Resume", MediaType.SERIES, 6)),
+                Catalog("continue", "Continue Watching", previewContinueWatching.toList()),
                 Catalog("popular-movies", "Popular Movies", sample("Movie", MediaType.MOVIE, 10)),
                 Catalog("popular-series", "Popular Series", sample("Series", MediaType.SERIES, 10)),
                 Catalog("trending", "Trending Now", sample("Trending", MediaType.MOVIE, 10)),
@@ -316,6 +425,27 @@ class PreviewCatalogRepository(
         return Result.success(Unit)
     }
 
+    override suspend fun removeFromContinueWatching(target: ContinueWatchingDismissal): Result<Unit> {
+        delay(latencyMs)
+        if (continueWatchingOwner() != target.owner) {
+            return Result.failure(IllegalStateException("Continue Watching owner changed."))
+        }
+        if (previewContinueWatching.any { it.id == target.id && it.type != target.type }) {
+            return Result.failure(IllegalStateException("Continue Watching id is ambiguous across media types."))
+        }
+        previewContinueWatching.removeAll { it.id == target.id && it.type == target.type }
+        return Result.success(Unit)
+    }
+
+    override suspend fun continueWatchingSnapshot(
+        expectedOwner: ContinueWatchingOwner,
+    ): Result<ContinueWatchingSnapshot> {
+        if (continueWatchingOwner() != expectedOwner) {
+            return Result.failure(IllegalStateException("Continue Watching owner changed."))
+        }
+        return Result.success(ContinueWatchingSnapshot(expectedOwner, previewContinueWatching.toList()))
+    }
+
     private val previewAddons = mutableListOf(
         InstalledAddon(
             transportUrl = "https://v3-cinemeta.strem.io/manifest.json",
@@ -323,6 +453,7 @@ class PreviewCatalogRepository(
             isOfficial = true,
             isProtected = true,
             providesStreams = false,
+            providesMeta = true,
             rawDescriptorJson = "{}",
         ),
     )
