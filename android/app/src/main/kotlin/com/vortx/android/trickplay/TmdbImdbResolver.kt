@@ -3,6 +3,7 @@ package com.vortx.android.trickplay
 import android.content.Context
 import android.content.SharedPreferences
 import com.vortx.android.net.VortXEdgeAuth
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -35,6 +36,15 @@ import java.net.URL
  * FAIL-SOFT by contract, exactly like the Swift original: returns null on an unparseable id, both media
  * lookups missing, a non-200, or any transport error. Never throws.
  */
+internal sealed interface TmdbImdbResolution {
+    data class Resolved(val imdbId: String) : TmdbImdbResolution
+    data object NoImdbId : TmdbImdbResolution
+    data object InvalidId : TmdbImdbResolution
+    data object TransportFailure : TmdbImdbResolution
+    data class HttpFailure(val statusCode: Int) : TmdbImdbResolution
+    data object ParseFailure : TmdbImdbResolution
+}
+
 object TmdbImdbResolver {
 
     /**
@@ -85,14 +95,27 @@ object TmdbImdbResolver {
      *
      * Accepts the canonical "tmdb:693134" and tolerates "tmdb:movie:693134" / "tmdb:tv:693134".
      */
-    suspend fun resolveImdbId(context: Context, rawId: String, seriesHint: Boolean): String? {
+    suspend fun resolveImdbId(context: Context, rawId: String, seriesHint: Boolean): String? =
+        (resolveImdbIdTyped(context, rawId, seriesHint) as? TmdbImdbResolution.Resolved)?.imdbId
+
+    /**
+     * Typed form of [resolveImdbId]. A missing IMDb id is different from an invalid input, a transport
+     * failure, a non-200 response, and an unreadable response body. Callers that can safely retain the
+     * original `tmdb:` identity use this result without mistaking an outage for a confirmed absence.
+     */
+    internal suspend fun resolveImdbIdTyped(
+        context: Context,
+        rawId: String,
+        seriesHint: Boolean,
+    ): TmdbImdbResolution {
         ensureHydrated(context)
         val cacheKey = rawId.lowercase()
-        synchronized(lock) { cache[cacheKey] }?.let { return it }
+        synchronized(lock) { cache[cacheKey] }?.let { return TmdbImdbResolution.Resolved(it) }
 
         val parts = cacheKey.split(":").filter { it.isNotEmpty() }
-        if (parts.firstOrNull() != "tmdb") return null
-        val numeric = parts.drop(1).firstOrNull { it.toIntOrNull() != null } ?: return null
+        if (parts.firstOrNull() != "tmdb") return TmdbImdbResolution.InvalidId
+        val numeric = parts.drop(1).firstOrNull { it.toIntOrNull()?.let { value -> value > 0 } == true }
+            ?: return TmdbImdbResolution.InvalidId
         val explicit = when {
             parts.contains("tv") -> "tv"
             parts.contains("movie") -> "movie"
@@ -101,16 +124,22 @@ object TmdbImdbResolver {
         val order = explicit?.let { listOf(it) }
             ?: if (seriesHint) listOf("tv", "movie") else listOf("movie", "tv")
 
+        var failure: TmdbImdbResolution? = null
         for (media in order) {
-            val tt = fetchExternalImdbId(media = media, tmdbId = numeric) ?: continue
-            val snapshot = synchronized(lock) {
-                cache[cacheKey] = tt
-                HashMap(cache)
+            when (val result = fetchExternalImdbId(media = media, tmdbId = numeric)) {
+                is TmdbImdbResolution.Resolved -> {
+                    val snapshot = synchronized(lock) {
+                        cache[cacheKey] = result.imdbId
+                        HashMap(cache)
+                    }
+                    persist(context, snapshot)
+                    return result
+                }
+                TmdbImdbResolution.NoImdbId -> Unit
+                else -> if (failure == null) failure = result
             }
-            persist(context, snapshot)
-            return tt
         }
-        return null
+        return failure ?: TmdbImdbResolution.NoImdbId
     }
 
     /**
@@ -118,7 +147,10 @@ object TmdbImdbResolver {
      * + URL are set, before the connection opens, per the signer's contract). Runs on [Dispatchers.IO]; a
      * non-200 or any transport error resolves to null. Mirrors the edge half of Apple `fetchExternalIMDbID`.
      */
-    private suspend fun fetchExternalImdbId(media: String, tmdbId: String): String? = withContext(Dispatchers.IO) {
+    private suspend fun fetchExternalImdbId(
+        media: String,
+        tmdbId: String,
+    ): TmdbImdbResolution = withContext(Dispatchers.IO) {
         var connection: HttpURLConnection? = null
         try {
             val url = URL("$EDGE_BASE/$media/$tmdbId/external_ids")
@@ -130,12 +162,18 @@ object TmdbImdbResolver {
                 setRequestProperty("accept", "application/json")
             }
             VortXEdgeAuth.sign(connection)
-            if (connection.responseCode != 200) return@withContext null
+            val status = connection.responseCode
+            if (status != 200) return@withContext TmdbImdbResolution.HttpFailure(status)
             val text = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-            val obj = runCatching { JSONObject(text) }.getOrNull() ?: return@withContext null
+            val obj = runCatching { JSONObject(text) }.getOrNull()
+                ?: return@withContext TmdbImdbResolution.ParseFailure
             ttPrefix(obj.optStringOrNull("imdb_id"))
+                ?.let(TmdbImdbResolution::Resolved)
+                ?: TmdbImdbResolution.NoImdbId
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: IOException) {
-            null
+            TmdbImdbResolution.TransportFailure
         } finally {
             connection?.disconnect()
         }

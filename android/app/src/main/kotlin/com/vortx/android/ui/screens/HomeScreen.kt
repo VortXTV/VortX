@@ -31,6 +31,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
+import com.vortx.android.home.CollectionsHubSnapshot
 import com.vortx.android.home.TOP_PICKS_CATALOG_ID
 import com.vortx.android.home.SIMKL_WATCHLIST_CATALOG_ID
 import com.vortx.android.home.TRAKT_WATCHLIST_CATALOG_ID
@@ -40,6 +41,8 @@ import com.vortx.android.ui.UiState
 import com.vortx.android.ui.normalizeHomeCatalogs
 import com.vortx.android.ui.components.EmptyState
 import com.vortx.android.ui.components.ErrorState
+import com.vortx.android.ui.components.CollectionsBrowseScreen
+import com.vortx.android.ui.components.CollectionsHub
 import com.vortx.android.ui.components.LoadingRail
 import com.vortx.android.ui.components.PosterRail
 import com.vortx.android.ui.theme.VortXTheme
@@ -51,6 +54,21 @@ import com.vortx.android.ui.viewmodel.HomeViewModel
 @Composable
 fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val collections by viewModel.collections.collectAsStateWithLifecycle()
+    val collectionBrowse by viewModel.collectionBrowse.collectAsStateWithLifecycle()
+
+    if (collectionBrowse.target != null) {
+        CollectionsBrowseScreen(
+            state = collectionBrowse,
+            onBack = viewModel::closeCollection,
+            onItem = onItem,
+            onCategory = viewModel::selectCollectionCategory,
+            onRetry = viewModel::retryCollection,
+            onLoadMore = viewModel::loadMoreCollection,
+            modifier = modifier,
+        )
+        return
+    }
 
     when (val s = state) {
         is UiState.Loading -> LoadingColumn(modifier)
@@ -65,7 +83,7 @@ fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: M
                     modifier,
                 )
             } else {
-                HomeContent(s.data, onItem, viewModel, modifier)
+                HomeContent(s.data, collections, onItem, viewModel, modifier)
             }
     }
 }
@@ -73,6 +91,7 @@ fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: M
 @Composable
 private fun HomeContent(
     catalogs: List<Catalog>,
+    collections: CollectionsHubSnapshot,
     onItem: (MetaItem) -> Unit,
     viewModel: HomeViewModel,
     modifier: Modifier,
@@ -93,6 +112,11 @@ private fun HomeContent(
     ) {
         if (hero != null) {
             item { HeroHeader(hero, onItem) }
+        }
+        if (collections.isVisible) {
+            item(key = "vortx.home.collectionsHub") {
+                CollectionsHub(collections, viewModel::openCollection, viewModel::retryCollectionsHub)
+            }
         }
         itemsIndexed(visibleCatalogs, key = { _, catalog -> catalog.id }) { index, catalog ->
             if (index == visibleCatalogs.lastIndex) {

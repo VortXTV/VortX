@@ -26,6 +26,7 @@ import com.vortx.android.deeplink.VortXDeepLinkEvent
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
+import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.PlayerScreen
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.SourceSettingsRevision
@@ -34,6 +35,7 @@ import com.vortx.android.ui.detailViewModelKey
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
+import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 import kotlinx.coroutines.launch
@@ -110,9 +112,61 @@ fun TvApp(
         // returns to the detail page underneath. The begin/report/end-playback-session calls mirror
         // VortXApp exactly, so Continue Watching + resume track on TV the same way they do on the phone.
         val playable = playing
+        val playerDetail = detail
+        val playerVm: DetailViewModel? = if (playable != null && playerDetail != null && !playable.isTrailer) {
+            viewModel(
+                viewModelStoreOwner = detailVmOwner,
+                key = detailViewModelKey(
+                    prefix = "tv-detail",
+                    typeId = playerDetail.type.id,
+                    mediaId = playerDetail.id,
+                    ownerEpoch = detailSourceEpoch,
+                ),
+                factory = StremioXViewModelFactory(
+                    repo = repo,
+                    detailArgs = StremioXViewModelFactory.DetailArgs(playerDetail.type, playerDetail.id),
+                    appContext = appContext,
+                ),
+            )
+        } else {
+            null
+        }
         if (playable != null) {
             val playbackHistory = remember(playable) {
                 TvPlaybackHistorySession(playable, playbackSessions)
+            }
+            val playerSourceState = if (playerVm != null) {
+                playerVm.streams.collectAsStateWithLifecycle().value
+            } else {
+                null
+            }
+            val playerSourceOptions = remember(playerVm, playerSourceState) {
+                playerVm?.playerSourceOptions().orEmpty()
+            }
+            val playerQualityOptions = remember(playerVm, playerSourceState) {
+                playerVm?.playerQualityOptions().orEmpty()
+            }
+            var retryingSource by remember(playable) { mutableStateOf(false) }
+            var retryResumePositionMs by remember(playable) { mutableStateOf(playable.startPositionMs) }
+            val retryPlayback = if (playerVm != null) {
+                playerVm.playback.collectAsStateWithLifecycle().value
+            } else {
+                Playback.Idle
+            }
+            LaunchedEffect(retryingSource, retryPlayback) {
+                if (!retryingSource || playerVm == null) return@LaunchedEffect
+                when (val state = retryPlayback) {
+                    is Playback.Ready -> {
+                        playerVm.clearPlayback()
+                        retryingSource = false
+                        playing = state.playable
+                    }
+                    is Playback.Failed -> {
+                        playerVm.clearPlayback()
+                        if (!playerVm.retryNextSource(retryResumePositionMs)) retryingSource = false
+                    }
+                    else -> Unit
+                }
             }
             // D-pad Back pops the player back to the detail page rather than exiting the app.
             BackHandler { playing = null }
@@ -124,8 +178,22 @@ fun TvApp(
             }
             PlayerScreen(
                 playable = playable,
+                sourceOptions = playerSourceOptions,
+                qualityOptions = playerQualityOptions,
+                currentSource = playerVm?.currentPlayerSource(),
+                onSwitchSource = playerVm?.let { vm ->
+                    { source -> vm.resolveSourceSwitch(source) }
+                },
                 onBack = { playing = null },
                 onError = { playing = null },
+                onSourceFailed = if (playerVm != null && BadSourceAutoRetrySetting.isEnabled(appContext)) {
+                    { positionMs ->
+                        retryResumePositionMs = positionMs
+                        retryingSource = playerVm.retryNextSource(positionMs)
+                    }
+                } else {
+                    null
+                },
                 onProgress = { pos, dur ->
                     playbackHistory.report(pos, dur)
                 },

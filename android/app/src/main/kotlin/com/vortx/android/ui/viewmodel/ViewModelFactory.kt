@@ -13,6 +13,8 @@ import com.vortx.android.library.WatchlistStore
 import com.vortx.android.home.SimklRailsModel
 import com.vortx.android.home.TraktRailsModel
 import com.vortx.android.home.ImportedCatalogs
+import com.vortx.android.home.CollectionsHubModel
+import com.vortx.android.home.CollectionsHubProviderPolicy
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.search.SearchHistoryStore
 import com.vortx.android.sync.VortXSyncManager
@@ -46,6 +48,16 @@ class StremioXViewModelFactory(
             traktRails = TraktRailsModel(),
             simklRails = SimklRailsModel(appContext?.also(ScrobbleService::init)),
             importedCatalogs = appContext?.let(ImportedCatalogs::shared),
+            collectionsHub = appContext?.let { context ->
+                CollectionsHubModel(
+                    context = context,
+                    tmdbCatalogSupported = {
+                        repo.installedAddons().getOrNull()
+                            ?.let(CollectionsHubProviderPolicy::supportsTmdbCatalogItems)
+                            ?: false
+                    },
+                )
+            },
         ) as T
         modelClass.isAssignableFrom(DiscoverViewModel::class.java) -> DiscoverViewModel(repo) as T
         modelClass.isAssignableFrom(LibraryViewModel::class.java) -> LibraryViewModel(repo) as T

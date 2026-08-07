@@ -41,7 +41,7 @@ class AutoSkipMediaIdentityTest {
     fun `player remembers automatic skip state by stable media identity`() {
         val source = readProjectFile("src/main/kotlin/com/vortx/android/player/PlayerScreen.kt")
 
-        assertTrue(source.contains("val autoSkipIdentity = autoSkipMediaIdentity(playable)"))
+        assertTrue(source.contains("val autoSkipIdentity = autoSkipMediaIdentity(currentPlayable)"))
         assertTrue(source.contains("val autoSkippedStarts = remember(autoSkipIdentity)"))
         assertTrue(source.contains("AutoSkipPolicy.target(skipSegments, latestState.positionMs, autoSkippedStarts)"))
     }

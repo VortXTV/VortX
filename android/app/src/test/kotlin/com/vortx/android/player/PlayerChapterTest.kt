@@ -25,13 +25,16 @@ class PlayerChapterTest {
     }
 
     @Test
-    fun `unsorted engine markers use chronological chapter order`() {
-        val unordered = listOf(
-            PlayerChapter("Finale", 120_000L),
-            PlayerChapter("Opening", 0L),
-            PlayerChapter("The plan", 60_000L),
-        ).sortedBy(PlayerChapter::startMs)
+    fun `production normalization orders unsorted engine markers chronologically`() {
+        val normalized = normalizePlayerChapters(
+            listOf(
+                PlayerChapter("Finale", 120_000L),
+                PlayerChapter("Opening", 0L),
+                PlayerChapter("The plan", 60_000L),
+            ),
+        )
 
-        assertEquals(1, currentChapterIndex(unordered, 90_000L))
+        assertEquals(listOf("Opening", "The plan", "Finale"), normalized.map(PlayerChapter::title))
+        assertEquals(1, currentChapterIndex(normalized, 90_000L))
     }
 }

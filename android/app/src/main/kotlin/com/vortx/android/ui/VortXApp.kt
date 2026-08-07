@@ -398,6 +398,19 @@ fun VortXApp(
                 } else {
                     null
                 }
+            // Keep the in-player Sources/Quality sheets live as late add-ons settle. The options themselves
+            // come from the ViewModel's unified, filtered, ranked assembly, never from an ad-hoc UI sort.
+            val playerSourceState = if (advanceVm != null) {
+                advanceVm.streams.collectAsStateWithLifecycle().value
+            } else {
+                null
+            }
+            val playerSourceOptions = remember(advanceVm, playerSourceState) {
+                advanceVm?.playerSourceOptions().orEmpty()
+            }
+            val playerQualityOptions = remember(advanceVm, playerSourceState) {
+                advanceVm?.playerQualityOptions().orEmpty()
+            }
             // The next episode being offered, set by onEnded. Keyed per playable so advancing into the
             // next episode (a NEW playable) clears the offer automatically.
             var upNext by remember(playable) { mutableStateOf<Episode?>(null) }
@@ -408,6 +421,7 @@ fun VortXApp(
             var retryingSource by remember(playable) { mutableStateOf(false) }
             var manualSourcePick by remember(playable) { mutableStateOf(false) }
             val playbackSession = remember(playable) { playbackSessions.newHandle() }
+            var retryResumePositionMs by remember(playable) { mutableStateOf(playable.startPositionMs) }
             // Engine playback session: load the Player so progress attributes to the right library item,
             // then end it (final tick + unload + watched-near-end) when the player closes. A TRAILER is not
             // the feature (it must not write a resume position, mark watched, or attribute progress to any
@@ -424,6 +438,12 @@ fun VortXApp(
             Box {
                 PlayerScreen(
                     playable = playable,
+                    sourceOptions = playerSourceOptions,
+                    qualityOptions = playerQualityOptions,
+                    currentSource = advanceVm?.currentPlayerSource(),
+                    onSwitchSource = advanceVm?.let { vm ->
+                        { source -> vm.resolveSourceSwitch(source) }
+                    },
                     onBack = { playing = null },
                     onError = { playing = null },
                     // Natural end of the stream: offer the next episode when the open series has one,
@@ -441,8 +461,9 @@ fun VortXApp(
                     // detail ViewModel exists (a local download / ad-hoc play) or the kill switch
                     // [BadSourceAutoRetrySetting] is off.
                     onSourceFailed = if (advanceVm != null && BadSourceAutoRetrySetting.isEnabled(appContext)) {
-                        {
-                            if (advanceVm.retryNextSource()) retryingSource = true else manualSourcePick = true
+                        { positionMs ->
+                            retryResumePositionMs = positionMs
+                            if (advanceVm.retryNextSource(positionMs)) retryingSource = true else manualSourcePick = true
                         }
                     } else {
                         null
@@ -546,7 +567,7 @@ fun VortXApp(
                             }
                             is Playback.Failed -> {
                                 advanceVm.clearPlayback()
-                                if (!manualSourcePick && !advanceVm.retryNextSource()) {
+                                if (!manualSourcePick && !advanceVm.retryNextSource(retryResumePositionMs)) {
                                     retryingSource = false
                                     manualSourcePick = true
                                 }

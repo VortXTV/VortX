@@ -23,6 +23,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -45,6 +46,13 @@ import com.vortx.android.home.HomeCatalogPresentation
 import com.vortx.android.home.HomeRail
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
+import com.vortx.android.home.CollectionsHubSnapshot
+import com.vortx.android.home.CollectionsHubTarget
+import com.vortx.android.home.TOP_PICKS_CATALOG_ID
+import com.vortx.android.home.SIMKL_WATCHLIST_CATALOG_ID
+import com.vortx.android.home.TRAKT_WATCHLIST_CATALOG_ID
+import com.vortx.android.home.UPCOMING_EPISODES_CATALOG_ID
+import com.vortx.android.home.UPCOMING_MOVIES_CATALOG_ID
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.homeCatalogItemKey
 import com.vortx.android.ui.normalizeHomeCatalogs
@@ -67,6 +75,20 @@ fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier:
     val state by viewModel.state.collectAsStateWithLifecycle()
     val contentOwnerGeneration by viewModel.contentOwnerGeneration.collectAsStateWithLifecycle()
     val catalogLayout by viewModel.homeCatalogLayout.collectAsStateWithLifecycle()
+    val collections by viewModel.collections.collectAsStateWithLifecycle()
+    val collectionBrowse by viewModel.collectionBrowse.collectAsStateWithLifecycle()
+    if (collectionBrowse.target != null) {
+        TvCollectionsBrowseScreen(
+            state = collectionBrowse,
+            onBack = viewModel::closeCollection,
+            onItem = onItem,
+            onCategory = viewModel::selectCollectionCategory,
+            onRetry = viewModel::retryCollection,
+            onLoadMore = viewModel::loadMoreCollection,
+            modifier = modifier,
+        )
+        return
+    }
     when (val s = state) {
         is UiState.Loading -> TvLoading(modifier)
         is UiState.Error -> TvError(s.message, onRetry = viewModel::load, modifier = modifier)
@@ -82,6 +104,9 @@ fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier:
                     catalogs = s.data,
                     contentOwnerGeneration = contentOwnerGeneration,
                     catalogLayout = catalogLayout,
+                    collections = collections,
+                    onCollection = viewModel::openCollection,
+                    onRetryCollections = viewModel::retryCollectionsHub,
                     onItem = onItem,
                     onRemoveFromContinueWatching = viewModel::removeFromContinueWatching,
                     onLoadRowPage = viewModel::loadNextPage,
@@ -97,6 +122,9 @@ private fun TvHomeContent(
     catalogs: List<Catalog>,
     contentOwnerGeneration: Long,
     catalogLayout: HomeCatalogLayout,
+    collections: CollectionsHubSnapshot,
+    onCollection: (CollectionsHubTarget) -> Unit,
+    onRetryCollections: () -> Unit,
     onItem: (MetaItem) -> Unit,
     onRemoveFromContinueWatching: (MetaItem) -> Unit,
     onLoadRowPage: (Catalog) -> Unit,
@@ -158,6 +186,11 @@ private fun TvHomeContent(
                 contentPadding = PaddingValues(top = TvDimens.rowGap, bottom = TvDimens.edge),
                 verticalArrangement = Arrangement.spacedBy(TvDimens.rowGap),
             ) {
+                if (collections.isVisible) {
+                    item(key = "vortx.home.collectionsHub") {
+                        TvCollectionsHub(collections, onCollection, onRetryCollections, firstCardFocus)
+                    }
+                }
                 itemsIndexed(visibleCatalogs, key = { _, c -> c.id }) { index, catalog ->
                     if (index == visibleCatalogs.lastIndex) {
                         LaunchedEffect(visibleCatalogs.size, catalog.id) { onLoadMoreRows() }
@@ -172,7 +205,7 @@ private fun TvHomeContent(
                         } else {
                             null
                         },
-                        firstCardFocus = if (index == 0) firstCardFocus else null,
+                        firstCardFocus = if (index == 0 && !collections.isVisible) firstCardFocus else null,
                         recovery = focusRecovery?.recovery,
                         recoveryFocus = recoveryFocus,
                         onRowState = { rowId, state -> rowStates[rowId] = state },
@@ -526,6 +559,9 @@ internal fun TvHomeFocusState.withFocused(rowId: String, item: MetaItem): TvHome
     focused = TvHomeFocusKey(rowId, item.type, item.id),
 )
 
+// Retained hero-identity helpers. The live TV hero is driven by the focus coordinator above
+// ([focusState] / [reconcileTvHomeFocus]); these pure owner-generation selection helpers are kept for
+// the Home hero-identity contract test and share [tvHomeItemKey] with the rest of the screen.
 internal data class TvHomeHeroState(
     val contentOwnerGeneration: Long,
     val focusedKey: String?,

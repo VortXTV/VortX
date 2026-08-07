@@ -30,6 +30,8 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.model.orderedBySeasonEpisode
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.PlaybackBehaviorSettings
+import com.vortx.android.player.PlayerSourceSwitchCommitGate
+import com.vortx.android.player.PlayerSourceSwitchResolution
 import com.vortx.android.singularity.SourceIndexServeSource
 import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.profile.ProfileStore
@@ -229,6 +231,7 @@ class DetailViewModel(
     }
     private val trackPrefs = TrackPreferencesStore(app)
     private val sourceRequestFence = SourceRequestFence(sourceSticky.currentProfileId())
+    private val sourceSwitchCommitGate = PlayerSourceSwitchCommitGate()
     private var sourceLoadJob: Job? = null
     private var playbackResolveJob: Job? = null
     private var profileReloadJob: Job? = null
@@ -799,18 +802,23 @@ class DetailViewModel(
     /// Resolve a chosen source to a [Playable] and request playback. Drives a Resolving -> Ready /
     /// Failed transition so the row can show progress and a resolve failure surfaces instead of
     /// silently doing nothing.
-    fun play(source: StreamSource) = play(source, manualPick = true)
+    fun play(source: StreamSource) = play(source, manualPick = true, startPositionOverrideMs = null)
 
-    private fun playAutomatically(source: StreamSource) = play(source, manualPick = false)
+    private fun playAutomatically(source: StreamSource, startPositionOverrideMs: Long? = null) =
+        play(source, manualPick = false, startPositionOverrideMs = startPositionOverrideMs)
 
-    private fun play(source: StreamSource, manualPick: Boolean) {
+    private fun play(
+        source: StreamSource,
+        manualPick: Boolean,
+        startPositionOverrideMs: Long?,
+    ) {
         if (_playback.value is Playback.Resolving) return
         val request = sourceRequestFence.currentToken() ?: return
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         val stickyWrite = if (manualPick && type == MediaType.SERIES) sourceSticky.capture(id) else null
         lastPlayedSource = source
         _playback.value = Playback.Resolving
-        val resumeMs = resumeOffsetMs()
+        val resumeMs = startPositionOverrideMs?.coerceAtLeast(0L) ?: resumeOffsetMs()
         val episode = currentModelEpisode()
         val actionOwner = debridKeys.ownerToken()
         // Resolve the external-sync identity ONCE here, the one place that knows the meta id + the chosen
@@ -843,6 +851,50 @@ class DetailViewModel(
             if (_playback.value is Playback.Ready && stickyWrite != null) {
                 sourceSticky.record(stickyWrite, source.addon, source.bingeGroup)
             }
+        }
+    }
+
+    /**
+     * Resolve an in-player source or quality pick without publishing through [playback]. The outgoing player
+     * remains alive while this suspends. Resolution itself has no source-identity or sticky side effects: those
+     * are captured behind [PlayerSourceSwitchResolution]'s explicit commit seam and run only after the player host
+     * accepts the exact outer-session/request token. A failed or stale resolve therefore cannot dismiss or poison
+     * the healthy playback session underneath it.
+     */
+    suspend fun resolveSourceSwitch(source: StreamSource): Result<PlayerSourceSwitchResolution> {
+        if (_playback.value is Playback.Resolving) return Result.failure(IllegalStateException())
+        val request = sourceRequestFence.currentToken() ?: return Result.failure(IllegalStateException())
+        if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
+            return Result.failure(IllegalStateException())
+        }
+        val stickyWrite = if (type == MediaType.SERIES) sourceSticky.capture(id) else null
+        val episode = currentModelEpisode()
+        val actionOwner = debridKeys.ownerToken()
+        val ref = currentMediaRef()
+        val result = resolveForOwner(source, episode, actionOwner)
+        if (
+            !isActionOwnerCurrent(actionOwner) ||
+            !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
+        ) {
+            return Result.failure(IllegalStateException(OWNER_CHANGED_MESSAGE))
+        }
+        return result.mapCatching { resolved ->
+            if (resolved.url.isBlank()) throw IllegalStateException()
+            PlayerSourceSwitchResolution(
+                playable = resolved.copy(
+                    mediaRef = ref,
+                    expectedDurationMs = expectedRuntimeMs(),
+                ),
+                commitGate = sourceSwitchCommitGate,
+                commitAuthorityIsCurrent = {
+                    isActionOwnerCurrent(actionOwner) &&
+                        sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
+                },
+                commitAccepted = {
+                    lastPlayedSource = source
+                    stickyWrite?.let { sourceSticky.record(it, source.addon, source.bingeGroup) }
+                },
+            )
         }
     }
 
@@ -1234,7 +1286,7 @@ class DetailViewModel(
     /// sources failed) or no untried candidate exists, in which case the caller must surface MANUAL
     /// selection. (The hive-mind failure-report hook (#80) would attach here: target id + failed
     /// handle + attempt count are all in scope. Not built in this change.)
-    fun retryNextSource(): Boolean {
+    fun retryNextSource(resumePositionMs: Long? = null): Boolean {
         val targetId = _selectedEpisodeId.value ?: id
         val failed = failedHandlesByTarget.getOrPut(targetId) { mutableSetOf() }
         // No record of what just failed means the ledger cannot grow and the attempt cap could never
@@ -1258,7 +1310,7 @@ class DetailViewModel(
             prefs = ctx.prefs,
         )
         val next = ranked.firstOrNull { handleOf(it) !in failed } ?: return false
-        playAutomatically(next)
+        playAutomatically(next, resumePositionMs)
         return true
     }
 
@@ -1266,7 +1318,27 @@ class DetailViewModel(
     /// exhausts): best-first, de-duplicated, ranked with the same prefs/pin as the detail rows.
     /// Deliberately NOT filtered by the failed set -- the viewer may knowingly re-try one -- and capped
     /// so the overlay stays scannable. Empty before sources load (the shell then exits to Detail).
-    fun manualSourceOptions(limit: Int = MANUAL_PICK_LIMIT): List<StreamSource> {
+    fun playerSourceOptions(limit: Int = PLAYER_SOURCE_LIMIT): List<StreamSource> =
+        rankedSourceOptions(limit)
+
+    /** Best stream per visible resolution bucket, using the current assembled target only. */
+    fun playerQualityOptions(): List<Pair<String, StreamSource>> {
+        val request = sourceRequestFence.currentToken() ?: return emptyList()
+        val state = sourceModel.state.value
+        if (state.requestGeneration == request.generation && state.streamId == request.targetId) {
+            return state.resolutionOptions
+        }
+        val groups = (_streams.value as? UiState.Success)?.data ?: return emptyList()
+        return StreamRanking.resolutionOptions(groups)
+    }
+
+    /** The exact source whose resolved [Playable] is currently mounted in the player. */
+    fun currentPlayerSource(): StreamSource? = lastPlayedSource
+
+    fun manualSourceOptions(limit: Int = MANUAL_PICK_LIMIT): List<StreamSource> =
+        rankedSourceOptions(limit)
+
+    private fun rankedSourceOptions(limit: Int): List<StreamSource> {
         val groups = (_streams.value as? UiState.Success)?.data ?: return emptyList()
         val prefs = lastCtx?.prefs
         val sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null
@@ -1439,6 +1511,7 @@ class DetailViewModel(
     /// stops the coalescer (it runs on [viewModelScope], which is cancelled anyway, but the contributors own
     /// their OWN scopes and must be closed explicitly to cancel any in-flight TorBox / Singularity fetch).
     override fun onCleared() {
+        sourceSwitchCommitGate.invalidate()
         super.onCleared()
         sourceModel.close()
         torbox.close()
@@ -1455,6 +1528,9 @@ class DetailViewModel(
         /// Manual-pick overlay cap: enough to always include every realistic quality tier without
         /// rendering a thousand-row list inside the player.
         const val MANUAL_PICK_LIMIT = 30
+
+        /** Maximum ranked alternates kept in the eager in-player source sheet. */
+        const val PLAYER_SOURCE_LIMIT = 60
 
         /** Contributor settlement budget for an accepted Up Next action. Always bounded. */
         const val AUTO_NEXT_ASSEMBLY_DEADLINE_MS = 4_000L

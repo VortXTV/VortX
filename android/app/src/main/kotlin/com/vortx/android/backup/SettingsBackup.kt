@@ -110,6 +110,7 @@ object SettingsBackup {
         "vortx.downloads.queueOrder",
         "vortx.downloads.maxConcurrent",
         "vortx.moveSeeding.launchNagDismissedBuild",
+        "vortx.subtitleOffsetMemory.v1",
     )
 
     /** Per-account sync bookkeeping and Keychain mutation state belong only to the current device. */

@@ -33,6 +33,7 @@ class SettingsBackupInteropTest {
         "vortx.downloads.queueOrder",
         "vortx.downloads.maxConcurrent",
         "vortx.moveSeeding.launchNagDismissedBuild",
+        "vortx.subtitleOffsetMemory.v1",
         "vortx.sync.lastSyncedVersion.account",
         "kcinvalidated.account",
         "kcfallback.account",

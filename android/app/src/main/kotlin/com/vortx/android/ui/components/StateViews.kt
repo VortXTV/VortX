@@ -19,7 +19,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
+import com.vortx.android.R
 import com.vortx.android.ui.theme.VortXTheme
 
 /// A calm shimmering placeholder fill — the loading-state building block (DESIGN-SYSTEM.md §3
@@ -81,7 +83,12 @@ private fun GuidanceCard(message: String, actionLabel: String?, onAction: (() ->
 /// land here unchanged.
 @Composable
 fun ErrorState(message: String, onRetry: (() -> Unit)? = null, modifier: Modifier = Modifier) {
-    GuidanceCard(message = message, actionLabel = if (onRetry != null) "Retry" else null, onAction = onRetry, modifier = modifier)
+    GuidanceCard(
+        message = message,
+        actionLabel = if (onRetry != null) stringResource(R.string.action_retry) else null,
+        onAction = onRetry,
+        modifier = modifier,
+    )
 }
 
 /// A calm empty (but successful) state, e.g. an empty Library or a search with no query yet.

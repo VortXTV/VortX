@@ -38,6 +38,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -49,6 +50,7 @@ import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import coil3.compose.AsyncImage
+import com.vortx.android.R
 import com.vortx.android.VortXApplication
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.StreamSource
@@ -340,7 +342,12 @@ fun TvError(message: String, onRetry: () -> Unit, modifier: Modifier = Modifier)
             textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(TvDimens.rowGap))
-        TvPlayButton(label = "Retry", enabled = true, onClick = onRetry, focusRequester = retryFocus)
+        TvPlayButton(
+            label = stringResource(R.string.action_retry),
+            enabled = true,
+            onClick = onRetry,
+            focusRequester = retryFocus,
+        )
     }
     androidx.compose.runtime.LaunchedEffect(Unit) {
         runCatching { retryFocus.requestFocus() }

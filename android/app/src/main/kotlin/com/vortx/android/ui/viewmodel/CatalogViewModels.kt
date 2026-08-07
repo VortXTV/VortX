@@ -10,6 +10,11 @@ import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.data.ContinueWatchingSnapshot
 import com.vortx.android.data.HomeUpdate
 import com.vortx.android.home.BecauseYouWatchedModel
+import com.vortx.android.home.CollectionsHubBrowseState
+import com.vortx.android.home.CollectionsHubCategory
+import com.vortx.android.home.CollectionsHubModel
+import com.vortx.android.home.CollectionsHubSnapshot
+import com.vortx.android.home.CollectionsHubTarget
 import com.vortx.android.home.HomeCatalogLayout
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
@@ -155,6 +160,7 @@ class HomeViewModel internal constructor(
     private val scopeOverride: CoroutineScope? = null,
     private val confirmationTimeoutMs: Long = CONFIRMATION_TIMEOUT_MS,
     private val confirmationPollMs: Long = CONFIRMATION_POLL_MS,
+    private val collectionsHub: CollectionsHubModel? = null,
 ) : ViewModel() {
     private val _state = MutableStateFlow<UiState<List<Catalog>>>(UiState.Loading)
     val state: StateFlow<UiState<List<Catalog>>> = _state.asStateFlow()
@@ -167,6 +173,10 @@ class HomeViewModel internal constructor(
             started = SharingStarted.Eagerly,
             initialValue = railPreferences?.state?.value?.catalogLayout ?: HomeCatalogLayout.RAILS,
         ) ?: MutableStateFlow(HomeCatalogLayout.RAILS).asStateFlow()
+    internal val collections: StateFlow<CollectionsHubSnapshot> = collectionsHub?.snapshot
+        ?: MutableStateFlow(CollectionsHubSnapshot())
+    internal val collectionBrowse: StateFlow<CollectionsHubBrowseState> = collectionsHub?.browse
+        ?: MutableStateFlow(CollectionsHubBrowseState())
 
     private val scope: CoroutineScope get() = scopeOverride ?: viewModelScope
     private var collectJob: Job? = null
@@ -192,6 +202,11 @@ class HomeViewModel internal constructor(
 
     init {
         load()
+        collectionsHub?.let { hub ->
+            scope.launch {
+                hub.settingsChanges.collectLatest { hub.load() }
+            }
+        }
         scope.launch {
             repo.ctxUpdates().drop(1).collectLatest {
                 watchlistStore?.reload()
@@ -325,6 +340,36 @@ class HomeViewModel internal constructor(
         }
         publishHome()
         refreshPersonalizedRails()
+        scope.launch { collectionsHub?.load() }
+    }
+
+    internal fun openCollection(target: CollectionsHubTarget) {
+        viewModelScope.launch { collectionsHub?.open(target) }
+    }
+
+    fun retryCollectionsHub() {
+        viewModelScope.launch { collectionsHub?.load() }
+    }
+
+    fun retryCollection() {
+        viewModelScope.launch { collectionsHub?.retry() }
+    }
+
+    internal fun selectCollectionCategory(category: CollectionsHubCategory) {
+        viewModelScope.launch { collectionsHub?.selectCategory(category) }
+    }
+
+    fun loadMoreCollection() {
+        viewModelScope.launch { collectionsHub?.loadMore() }
+    }
+
+    fun closeCollection() {
+        collectionsHub?.closeBrowse()
+    }
+
+    override fun onCleared() {
+        collectionsHub?.close()
+        super.onCleared()
     }
 
     private fun refreshPersonalizedRails() {

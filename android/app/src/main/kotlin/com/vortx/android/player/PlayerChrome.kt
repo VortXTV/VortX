@@ -29,7 +29,9 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.Audiotrack
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Forward10
+import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PictureInPictureAlt
@@ -37,6 +39,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Subtitles
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -44,26 +47,37 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.vortx.android.R
 import com.vortx.android.model.Playable
+import com.vortx.android.model.StreamSource
 import com.vortx.android.ui.theme.VortXGlass
 import com.vortx.android.ui.theme.vortxGlass
 import com.vortx.android.ui.theme.vortxGlassPanel
 import com.vortx.android.ui.theme.vortxGlassProminent
+import kotlin.math.roundToInt
 
 /// The VortX-specific chrome layered over whichever [PlayerEngine] is live. It is fully engine-agnostic:
 /// it renders the [PlayerState] snapshot and calls back through the transport + track lambdas, never
@@ -86,6 +100,8 @@ fun PlayerChrome(
     subtitleDelayAvailable: Boolean,
     subtitleDelaySeconds: Double,
     onAdjustSubtitleDelay: (Double) -> Unit,
+    subtitleStyle: SubtitleStyle,
+    onChangeSubtitleStyle: (SubtitleStyle) -> Unit,
     audioDelayAvailable: Boolean,
     audioDelaySeconds: Double,
     audioOutputModeAvailable: Boolean,
@@ -132,10 +148,46 @@ fun PlayerChrome(
     /// what [com.vortx.android.trickplay.TrickplaySession.previewAt] guarantees: an in-memory crop of an
     /// already-downloaded sprite. Defaults to no preview so the chrome stays usable in isolation.
     scrubPreview: (Double) -> Bitmap? = { null },
+    /// Successful in-place switches increment this even when the replacement resolves to the same URL, closing
+    /// the old sheet and resetting chrome state with the engine-owned session.
+    playbackSessionRevision: Long = 0L,
+    sourceOptions: List<StreamSource> = emptyList(),
+    qualityOptions: List<Pair<String, StreamSource>> = emptyList(),
+    currentSource: StreamSource? = null,
+    sourceSwitching: Boolean = false,
+    sourceSwitchError: String? = null,
+    onSwitchSource: (StreamSource) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     // Which selection sheet (if any) is open. Local to the chrome; the engine never sees it.
-    var openSheet by remember(playable.url) { mutableStateOf(ControlSheet.NONE) }
+    var openSheet by remember(playable.url, playbackSessionRevision) { mutableStateOf(ControlSheet.NONE) }
+    val sourceChoices = remember(sourceOptions, currentSource) { playerSourceChoices(sourceOptions, currentSource) }
+    val qualityChoices = remember(qualityOptions, currentSource) { playerQualityChoices(qualityOptions, currentSource) }
+    val sourcesTitle = stringResource(R.string.player_sources)
+    val sourcesDescription = stringResource(R.string.player_sources_action_description)
+    val qualityTitle = stringResource(R.string.player_quality)
+    val qualityDescription = stringResource(R.string.player_quality_action_description)
+    val switchingSource = stringResource(R.string.player_switching_source)
+    val switchFailed = stringResource(R.string.player_source_switch_failed)
+    val chaptersTitle = stringResource(R.string.player_chapters)
+    val chaptersDescription = stringResource(R.string.player_chapters_action_description)
+    val subtitleSettingsTitle = stringResource(R.string.player_subtitle_settings)
+    val subtitleSettingsCopy = SubtitleSettingsCopy(
+        unavailable = stringResource(R.string.player_subtitle_sync_unavailable),
+        sync = stringResource(R.string.player_subtitle_sync),
+        earlierHalf = stringResource(R.string.player_subtitle_earlier_half),
+        laterHalf = stringResource(R.string.player_subtitle_later_half),
+        earlierFine = stringResource(R.string.player_subtitle_earlier_fine),
+        laterFine = stringResource(R.string.player_subtitle_later_fine),
+        reset = stringResource(R.string.player_subtitle_reset_sync),
+        style = stringResource(R.string.player_subtitle_style),
+        size = stringResource(R.string.player_subtitle_size),
+        smaller = stringResource(R.string.player_subtitle_smaller),
+        larger = stringResource(R.string.player_subtitle_larger),
+        color = stringResource(R.string.player_subtitle_color),
+        brightness = stringResource(R.string.player_subtitle_brightness),
+        background = stringResource(R.string.player_subtitle_background),
+    )
 
     Box(modifier = modifier) {
         // Top scrim so the title, back button, and controls stay legible over bright video.
@@ -170,13 +222,19 @@ fun PlayerChrome(
                         .weight(1f)
                         .padding(start = 4.dp),
                 )
-                // Control cluster: audio/output, subtitles, speed, and aspect.
+                // Control cluster: source/quality switching, audio/output, subtitles, speed, and aspect.
                 // Opening a sheet counts as interaction so the host's auto-hide timer re-arms.
+                if (sourceChoices.size > 1) {
+                    ChromeIcon(Icons.Filled.Tune, sourcesDescription) { onInteraction(); openSheet = ControlSheet.SOURCES }
+                }
+                if (qualityChoices.size > 1) {
+                    ChromeIcon(Icons.Filled.HighQuality, qualityDescription) { onInteraction(); openSheet = ControlSheet.QUALITY }
+                }
                 ChromeIcon(Icons.Filled.Audiotrack, "Audio and output settings") { onInteraction(); openSheet = ControlSheet.AUDIO }
                 ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { onInteraction(); openSheet = ControlSheet.SUBTITLE }
                 ChromeIcon(Icons.Filled.Speed, "Playback speed") { onInteraction(); openSheet = ControlSheet.SPEED }
                 if (chapters.isNotEmpty()) {
-                    ChromeIcon(Icons.AutoMirrored.Filled.List, "Chapters") { onInteraction(); openSheet = ControlSheet.CHAPTERS }
+                    ChromeIcon(Icons.AutoMirrored.Filled.List, chaptersDescription) { onInteraction(); openSheet = ControlSheet.CHAPTERS }
                 }
                 ChromeIcon(Icons.Filled.AspectRatio, "Aspect ratio", tint = if (scaleMode == VideoScaleMode.ZOOM) emberAccent else Color.White, onClick = onToggleScaleMode)
                 // Picture-in-Picture, before the lock so the lock stays the cluster's last (and
@@ -216,6 +274,70 @@ fun PlayerChrome(
 
         // Selection sheets (audio / subtitle / speed) as a bottom overlay panel.
         when (openSheet) {
+            ControlSheet.SOURCES -> ControlSelectionSheet(
+                title = sourcesTitle,
+                options = buildList {
+                    if (sourceSwitching) {
+                        add(SheetOption(switchingSource, false, enabled = false, isStatus = true))
+                    } else if (sourceSwitchError != null) {
+                        add(
+                            SheetOption(
+                                switchFailed,
+                                false,
+                                enabled = false,
+                                isStatus = true,
+                            ),
+                        )
+                    }
+                    sourceChoices.forEach { choice ->
+                        add(
+                            SheetOption(
+                                label = choice.label,
+                                selected = choice.selected,
+                                detail = choice.detail,
+                                enabled = !sourceSwitching,
+                                isChoice = true,
+                                dismissOnPick = false,
+                                onPick = { onSwitchSource(choice.source) },
+                            ),
+                        )
+                    }
+                },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.QUALITY -> ControlSelectionSheet(
+                title = qualityTitle,
+                options = buildList {
+                    if (sourceSwitching) {
+                        add(SheetOption(switchingSource, false, enabled = false, isStatus = true))
+                    } else if (sourceSwitchError != null) {
+                        add(
+                            SheetOption(
+                                switchFailed,
+                                false,
+                                enabled = false,
+                                isStatus = true,
+                            ),
+                        )
+                    }
+                    qualityChoices.forEach { choice ->
+                        add(
+                            SheetOption(
+                                label = choice.label,
+                                selected = choice.selected,
+                                detail = choice.detail,
+                                enabled = !sourceSwitching,
+                                isChoice = true,
+                                dismissOnPick = false,
+                                onPick = { onSwitchSource(choice.source) },
+                            ),
+                        )
+                    }
+                },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
             ControlSheet.AUDIO -> ControlSelectionSheet(
                 title = "Audio",
                 options = buildList {
@@ -278,7 +400,7 @@ fun PlayerChrome(
                     }
                     add(
                         SheetOption(
-                            label = "Subtitle Settings",
+                            label = subtitleSettingsTitle,
                             selected = false,
                             onPick = { openSheet = ControlSheet.SUBTITLE_SETTINGS },
                             detail = "›",
@@ -290,11 +412,14 @@ fun PlayerChrome(
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
             ControlSheet.SUBTITLE_SETTINGS -> ControlSelectionSheet(
-                title = "Subtitle Settings",
-                options = subtitleSyncOptions(
+                title = subtitleSettingsTitle,
+                options = subtitleSettingsOptions(
                     available = subtitleDelayAvailable,
                     delaySeconds = subtitleDelaySeconds,
                     onAdjust = onAdjustSubtitleDelay,
+                    style = subtitleStyle,
+                    onChangeStyle = onChangeSubtitleStyle,
+                    copy = subtitleSettingsCopy,
                 ),
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
@@ -326,7 +451,7 @@ fun PlayerChrome(
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
             ControlSheet.CHAPTERS -> ControlSelectionSheet(
-                title = "Chapters",
+                title = chaptersTitle,
                 options = chapterOptions(chapters, state.positionMs, onSeek),
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
@@ -360,14 +485,32 @@ fun PlayerChrome(
         }
 
         // Error-to-sources fallback: a failed source lands here instead of a dead black frame.
-        if (state.hasError) {
-            PlayerErrorOverlay(emberAccent = emberAccent, onRetry = onErrorRetry, onBack = onBack)
+        if (state.hasError && openSheet != ControlSheet.SOURCES && openSheet != ControlSheet.QUALITY) {
+            PlayerErrorOverlay(
+                emberAccent = emberAccent,
+                onRetry = if (sourceChoices.size > 1) {
+                    { openSheet = ControlSheet.SOURCES }
+                } else {
+                    onErrorRetry
+                },
+                onBack = onBack,
+            )
         }
     }
 }
 
 /// The selection sheets the chrome can open.
-private enum class ControlSheet { NONE, AUDIO, SUBTITLE, SUBTITLE_SETTINGS, AUDIO_SETTINGS, SPEED, CHAPTERS }
+private enum class ControlSheet {
+    NONE,
+    SOURCES,
+    QUALITY,
+    AUDIO,
+    SUBTITLE,
+    SUBTITLE_SETTINGS,
+    AUDIO_SETTINGS,
+    SPEED,
+    CHAPTERS,
+}
 
 /// The playback-speed presets offered in the speed sheet.
 private val SPEED_PRESETS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
@@ -382,6 +525,7 @@ private data class SheetOption(
     val detail: String = "",
     val enabled: Boolean = true,
     val isHeader: Boolean = false,
+    val isStatus: Boolean = false,
     val isChoice: Boolean = false,
     val dismissOnPick: Boolean = true,
     val onPick: () -> Unit = {},
@@ -392,7 +536,7 @@ private fun chapterOptions(
     positionMs: Long,
     onSeek: (Long) -> Unit,
 ): List<SheetOption> {
-    val ordered = chapters.sortedBy(PlayerChapter::startMs)
+    val ordered = normalizePlayerChapters(chapters)
     val selected = currentChapterIndex(ordered, positionMs)
     return ordered.mapIndexed { index, chapter ->
         SheetOption(
@@ -405,34 +549,143 @@ private fun chapterOptions(
     }
 }
 
+/** One shared production normalization path for engine markers, chrome rows, and their tests. */
+internal fun normalizePlayerChapters(chapters: List<PlayerChapter>): List<PlayerChapter> =
+    chapters.sortedBy(PlayerChapter::startMs)
+
 internal fun currentChapterIndex(chapters: List<PlayerChapter>, positionMs: Long): Int =
     chapters.indexOfLast { it.startMs <= positionMs }
 
-private fun subtitleSyncOptions(
+private data class SubtitleSettingsCopy(
+    val unavailable: String,
+    val sync: String,
+    val earlierHalf: String,
+    val laterHalf: String,
+    val earlierFine: String,
+    val laterFine: String,
+    val reset: String,
+    val style: String,
+    val size: String,
+    val smaller: String,
+    val larger: String,
+    val color: String,
+    val brightness: String,
+    val background: String,
+)
+
+private fun subtitleSettingsOptions(
     available: Boolean,
     delaySeconds: Double,
     onAdjust: (Double) -> Unit,
-): List<SheetOption> {
-    if (!available) {
-        return listOf(
+    style: SubtitleStyle,
+    onChangeStyle: (SubtitleStyle) -> Unit,
+    copy: SubtitleSettingsCopy,
+): List<SheetOption> = buildList {
+    if (available) {
+        val now = formatDelay(delaySeconds)
+        add(SheetOption(copy.sync, false, enabled = false, isHeader = true))
+        add(SheetOption(copy.earlierHalf, false, detail = now, dismissOnPick = false) { onAdjust(-0.5) })
+        add(SheetOption(copy.laterHalf, false, detail = now, dismissOnPick = false) { onAdjust(0.5) })
+        add(SheetOption(copy.earlierFine, false, detail = now, dismissOnPick = false) { onAdjust(-0.1) })
+        add(SheetOption(copy.laterFine, false, detail = now, dismissOnPick = false) { onAdjust(0.1) })
+        if (delaySeconds != 0.0) {
+            add(SheetOption(copy.reset, false, dismissOnPick = false) { onAdjust(-delaySeconds) })
+        }
+    } else {
+        add(
             SheetOption(
-                label = "Sync unavailable · external subtitles only",
+                label = copy.unavailable,
                 selected = false,
                 enabled = false,
                 isHeader = true,
             ),
         )
     }
-    val now = formatDelay(delaySeconds)
-    return buildList {
-        add(SheetOption("Sync", false, enabled = false, isHeader = true))
-        add(SheetOption("Earlier  -0.5s", false, detail = now, dismissOnPick = false) { onAdjust(-0.5) })
-        add(SheetOption("Later  +0.5s", false, detail = now, dismissOnPick = false) { onAdjust(0.5) })
-        add(SheetOption("Earlier  -0.1s", false, detail = now, dismissOnPick = false) { onAdjust(-0.1) })
-        add(SheetOption("Later  +0.1s", false, detail = now, dismissOnPick = false) { onAdjust(0.1) })
-        if (delaySeconds != 0.0) {
-            add(SheetOption("Reset sync", false, dismissOnPick = false) { onAdjust(-delaySeconds) })
-        }
+
+    add(SheetOption(copy.style, false, enabled = false, isHeader = true))
+    SubtitleStyle.fonts.forEach { (id, label) ->
+        add(
+            SheetOption(
+                label = label,
+                selected = style.fontId == id,
+                isChoice = true,
+                dismissOnPick = false,
+                onPick = { onChangeStyle(style.copy(fontId = id)) },
+            ),
+        )
+    }
+
+    add(SheetOption(copy.size, false, enabled = false, isHeader = true))
+    SubtitleStyle.sizes.forEach { (id, label) ->
+        add(
+            SheetOption(
+                label = label,
+                selected = style.sizeId == id,
+                isChoice = true,
+                dismissOnPick = false,
+                onPick = { onChangeStyle(style.copy(sizeId = id)) },
+            ),
+        )
+    }
+    val scalePercent = "${(style.sizeScale * 100).roundToInt()}%"
+    add(
+        SheetOption(
+            label = copy.smaller,
+            selected = false,
+            detail = scalePercent,
+            enabled = style.sizeScale > SubtitleStyle.SIZE_SCALE_RANGE.start,
+            dismissOnPick = false,
+            onPick = { onChangeStyle(style.copy(sizeScale = style.sizeScale - SubtitleStyle.SIZE_SCALE_STEP)) },
+        ),
+    )
+    add(
+        SheetOption(
+            label = copy.larger,
+            selected = false,
+            detail = scalePercent,
+            enabled = style.sizeScale < SubtitleStyle.SIZE_SCALE_RANGE.endInclusive,
+            dismissOnPick = false,
+            onPick = { onChangeStyle(style.copy(sizeScale = style.sizeScale + SubtitleStyle.SIZE_SCALE_STEP)) },
+        ),
+    )
+
+    add(SheetOption(copy.color, false, enabled = false, isHeader = true))
+    SubtitleStyle.colors.forEach { (id, label) ->
+        add(
+            SheetOption(
+                label = label,
+                selected = style.colorId == id,
+                isChoice = true,
+                dismissOnPick = false,
+                onPick = { onChangeStyle(style.copy(colorId = id)) },
+            ),
+        )
+    }
+
+    add(SheetOption(copy.brightness, false, enabled = false, isHeader = true))
+    SubtitleStyle.brightnessLevels.forEach { level ->
+        add(
+            SheetOption(
+                label = level.label,
+                selected = style.brightnessId == level.id,
+                isChoice = true,
+                dismissOnPick = false,
+                onPick = { onChangeStyle(style.copy(brightnessId = level.id)) },
+            ),
+        )
+    }
+
+    add(SheetOption(copy.background, false, enabled = false, isHeader = true))
+    SubtitleStyle.backgrounds.forEach { (id, label) ->
+        add(
+            SheetOption(
+                label = label,
+                selected = style.backgroundId == id,
+                isChoice = true,
+                dismissOnPick = false,
+                onPick = { onChangeStyle(style.copy(backgroundId = id)) },
+            ),
+        )
     }
 }
 
@@ -495,6 +748,14 @@ private fun ControlSelectionSheet(
     emberAccent: Color,
     onDismiss: () -> Unit,
 ) {
+    val firstEnabledIndex = options.indexOfFirst(SheetOption::enabled)
+    val firstOptionFocus = remember(title) { FocusRequester() }
+    LaunchedEffect(title, firstEnabledIndex, options.size) {
+        if (firstEnabledIndex >= 0) {
+            withFrameNanos { }
+            runCatching { firstOptionFocus.requestFocus() }
+        }
+    }
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -518,11 +779,19 @@ private fun ControlSelectionSheet(
             if (options.isEmpty()) {
                 Text(text = "None available", color = Color.White.copy(alpha = 0.6f), fontSize = 14.sp, modifier = Modifier.padding(vertical = 8.dp))
             }
-            options.forEach { option ->
+            options.forEachIndexed { index, option ->
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(8.dp))
+                        .then(if (index == firstEnabledIndex) Modifier.focusRequester(firstOptionFocus) else Modifier)
+                        .then(
+                            if (option.isStatus) {
+                                Modifier.semantics { liveRegion = LiveRegionMode.Polite }
+                            } else {
+                                Modifier
+                            },
+                        )
                         .then(
                             if (option.enabled && option.isChoice) {
                                 Modifier.selectable(
@@ -572,7 +841,12 @@ private fun ControlSelectionSheet(
                         Text(text = option.detail, color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp)
                     }
                     if (option.selected) {
-                        Text(text = "•", color = emberAccent, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        Icon(
+                            imageVector = Icons.Filled.Check,
+                            contentDescription = stringResource(R.string.player_current_selection),
+                            tint = emberAccent,
+                            modifier = Modifier.size(20.dp),
+                        )
                     }
                 }
             }

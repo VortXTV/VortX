@@ -60,6 +60,7 @@ import androidx.media3.common.util.UnstableApi
 import com.vortx.android.VortXApplication
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.model.Playable
+import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.skip.AutoSkipPolicy
 import com.vortx.android.skip.SegmentResolver
@@ -119,7 +120,15 @@ fun PlayerScreen(
     /// expected to auto-retry the next ranked source (the phone shell's bad-source ladder) WITHOUT
     /// bouncing the viewer out. Null (the default) keeps the pre-existing behavior exactly: the
     /// error overlay with its manual "Choose another source" action (the TV shell today).
-    onSourceFailed: (() -> Unit)? = null,
+    onSourceFailed: ((positionMs: Long) -> Unit)? = null,
+    /// Ranked alternates and best-per-resolution choices for the in-player Sources / Quality sheets.
+    /// Empty lists keep both controls hidden for trailers, downloads, and ad-hoc links.
+    sourceOptions: List<StreamSource> = emptyList(),
+    qualityOptions: List<Pair<String, StreamSource>> = emptyList(),
+    currentSource: StreamSource? = null,
+    /// Resolve a replacement without tearing down the healthy engine. Resolution is side-effect-free; the
+    /// returned commit seam runs only after this host accepts the exact session/request authority.
+    onSwitchSource: (suspend (source: StreamSource) -> Result<PlayerSourceSwitchResolution>)? = null,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -132,14 +141,42 @@ fun PlayerScreen(
     val currentOnError by rememberUpdatedState(onError)
     val currentOnEnded by rememberUpdatedState(onEnded)
     val currentOnSourceFailed by rememberUpdatedState(onSourceFailed)
+    val currentOnSwitchSource by rememberUpdatedState(onSwitchSource)
+    val sourceSwitchCoordinator = remember { PlayerSourceSwitchCoordinator() }
+    val outerPlaybackSessionId = remember(playable) { sourceSwitchCoordinator.replaceOuterSession() }
+    DisposableEffect(sourceSwitchCoordinator, outerPlaybackSessionId) {
+        onDispose { sourceSwitchCoordinator.invalidateIfCurrent(outerPlaybackSessionId) }
+    }
+
+    // The shell's [playable] is the initial mount (and still changes for the established retry / Up Next
+    // flows). A viewer's Sources/Quality pick stays INSIDE this player: keep the old engine alive while the
+    // replacement resolves, then accept it atomically. [sessionKey] re-keys every source-owned effect even
+    // when two rows resolve to one URL; a failed resolve leaves both the engine and key unchanged.
+    var sourceSwitchState by remember(outerPlaybackSessionId) {
+        mutableStateOf(
+            PlayerSourceSwitchState(
+                outerSessionId = outerPlaybackSessionId,
+                playable = playable,
+                currentSource = currentSource,
+            ),
+        )
+    }
+    val currentPlayable = sourceSwitchState.playable
+    val playbackSessionKey = sourceSwitchState.sessionKey
+    val subtitleContentKey = remember(playbackSessionKey) {
+        subtitleOffsetContentKey(currentPlayable.mediaRef)
+    }
 
     // Chrome-owned view state (not engine state): the aspect/zoom mode passed to the surface, and the
     // current playback speed reflected in the speed control.
-    var scaleMode by remember(playable.url) { mutableStateOf(VideoScaleMode.FIT) }
-    var speed by remember(playable.url) { mutableStateOf(1.0f) }
-    var subtitleDelaySeconds by remember(playable.url) { mutableStateOf(0.0) }
-    var audioDelaySeconds by remember(playable.url) { mutableStateOf(0.0) }
-    var audioOutputMode by remember(playable.url) { mutableStateOf(AudioOutputMode.current(context)) }
+    var scaleMode by remember(playbackSessionKey) { mutableStateOf(VideoScaleMode.FIT) }
+    var speed by remember(playbackSessionKey) { mutableStateOf(1.0f) }
+    var subtitleDelaySeconds by remember(playbackSessionKey) {
+        mutableStateOf(SubtitleOffsetMemory.savedOffset(context, subtitleContentKey) ?: 0.0)
+    }
+    var subtitleStyle by remember(playbackSessionKey) { mutableStateOf(SubtitleStyle.current(context)) }
+    var audioDelaySeconds by remember(playbackSessionKey) { mutableStateOf(0.0) }
+    var audioOutputMode by remember(playbackSessionKey) { mutableStateOf(AudioOutputMode.current(context)) }
 
     // CONTROLS AUTO-HIDE. The chrome (top scrim + title + transport bar) previously had no visibility
     // state at all, so it was drawn permanently over the video. Now: visible on entry, auto-hidden after
@@ -147,10 +184,10 @@ fun PlayerScreen(
     // bare video toggles it, the double-tap seek re-shows it, every transport/track action re-arms it, and
     // on TV any D-pad press while hidden re-reveals (consumed, so a blind press never fires an invisible
     // control). The error overlay and the selection sheets are NOT gated (see PlayerChrome).
-    var controlsVisible by remember(playable.url) { mutableStateOf(true) }
+    var controlsVisible by remember(playbackSessionKey) { mutableStateOf(true) }
     // Monotonic interaction counter: bumping it restarts the auto-hide countdown without toggling
     // visibility (the timer effect keys on it).
-    var controlsInteractionTick by remember(playable.url) { mutableStateOf(0) }
+    var controlsInteractionTick by remember(playbackSessionKey) { mutableStateOf(0) }
     fun showControls() {
         controlsVisible = true
         controlsInteractionTick++
@@ -163,18 +200,18 @@ fun PlayerScreen(
     // [UNLOCK_HINT_AUTO_HIDE_MS]); unlocking restores the normal chrome. Hardware Back deliberately
     // keeps meaning "leave the player": the lock guards against accidental TOUCH, and trapping the
     // viewer inside a locked player would be worse than any accidental exit.
-    var controlsLocked by remember(playable.url) { mutableStateOf(false) }
-    var unlockHintVisible by remember(playable.url) { mutableStateOf(false) }
-    var unlockHintTick by remember(playable.url) { mutableStateOf(0) }
+    var controlsLocked by remember(playbackSessionKey) { mutableStateOf(false) }
+    var unlockHintVisible by remember(playbackSessionKey) { mutableStateOf(false) }
+    var unlockHintTick by remember(playbackSessionKey) { mutableStateOf(0) }
     fun revealUnlockHint() {
         unlockHintVisible = true
         unlockHintTick++
     }
 
     // Force-to-ExoPlayer latch: flipped when the mpv engine reports a surface failure, so the remember
-    // key changes and the engine is rebuilt on ExoPlayer. Keyed alongside the playable url so a new
-    // stream starts fresh.
-    var forceExoPlayer by remember(playable.url) { mutableStateOf(false) }
+    // key changes and the engine is rebuilt on ExoPlayer. Keyed alongside the playback session so a
+    // switched stream starts fresh.
+    var forceExoPlayer by remember(playbackSessionKey) { mutableStateOf(false) }
 
     // ENGINE, built OFF the composition thread. The old `remember { ... .also { it.load() } }` ran the
     // whole build synchronously in composition: for the libmpv route that is System.loadLibrary +
@@ -191,11 +228,11 @@ fun PlayerScreen(
     // suspension point between create and set), and every release path -- the keyed dispose below, the
     // lifecycle ON_DESTROY, and the "composition left while still building" tail -- claims it with ONE
     // atomic getAndSet(null), so exactly one release ever runs no matter how teardown races the build.
-    val engineHolder = remember(playable.url, forceExoPlayer) { AtomicReference<PlayerEngine?>(null) }
-    var builtEngine by remember(playable.url, forceExoPlayer) { mutableStateOf<PlayerEngine?>(null) }
-    LaunchedEffect(playable.url, forceExoPlayer) {
+    val engineHolder = remember(playbackSessionKey, forceExoPlayer) { AtomicReference<PlayerEngine?>(null) }
+    var builtEngine by remember(playbackSessionKey, forceExoPlayer) { mutableStateOf<PlayerEngine?>(null) }
+    LaunchedEffect(playbackSessionKey, forceExoPlayer) {
         val wantsMpv = !forceExoPlayer &&
-            PlayerEngineRouter.choose(playable, engineOverride) == PlayerEngineRouter.Engine.MPV
+            PlayerEngineRouter.choose(currentPlayable, engineOverride) == PlayerEngineRouter.Engine.MPV
         val engine: PlayerEngine = if (wantsMpv) {
             // NonCancellable: a half-initialized native mpv context must never be abandoned mid-build
             // (cancellation would leak it un-releasable); the block always completes, and the isActive
@@ -203,17 +240,17 @@ fun PlayerScreen(
             withContext(Dispatchers.Default + NonCancellable) {
                 MpvEngineFactory.create(context)?.also {
                     engineHolder.set(it)
-                    it.load(playable)
+                    it.load(currentPlayable)
                 }
             } ?: ExoPlayerEngine(context).also {
                 // Fail-soft fallback (mpv unavailable), on the main thread per the Media3 contract.
                 engineHolder.set(it)
-                it.load(playable)
+                it.load(currentPlayable)
             }
         } else {
             ExoPlayerEngine(context).also {
                 engineHolder.set(it)
-                it.load(playable)
+                it.load(currentPlayable)
             }
         }
         if (!isActive) {
@@ -224,7 +261,7 @@ fun PlayerScreen(
         }
         builtEngine = engine
     }
-    DisposableEffect(playable.url, forceExoPlayer) {
+    DisposableEffect(playbackSessionKey, forceExoPlayer) {
         onDispose { engineHolder.getAndSet(null)?.release() }
     }
 
@@ -304,11 +341,26 @@ fun PlayerScreen(
 
     val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
+    // Keying the resolver job by the exact authority cancels it when the outer playback session or request
+    // changes. The token check below is the authoritative defense if a resolver ignores cancellation.
+    val pendingSourceSwitch = sourceSwitchState.pendingSwitch
+    LaunchedEffect(pendingSourceSwitch?.authority) {
+        val pending = pendingSourceSwitch ?: return@LaunchedEffect
+        val resolver = currentOnSwitchSource
+        resolveAndApplyPlayerSourceSwitch(
+            coordinator = sourceSwitchCoordinator,
+            pending = pending,
+            resolver = { source -> resolver?.invoke(source) ?: Result.failure(IllegalStateException()) },
+            currentState = { sourceSwitchState },
+            latestPositionMs = { latestState.positionMs },
+            publishState = { sourceSwitchState = it },
+        )
+    }
     var chapters by remember(engine) { mutableStateOf<List<PlayerChapter>>(emptyList()) }
     LaunchedEffect(engine, playerState.durationMs > 0L) {
         if (playerState.durationMs <= 0L || chapters.isNotEmpty()) return@LaunchedEffect
         repeat(CHAPTER_READ_ATTEMPTS) { attempt ->
-            val loaded = engine.chapters().sortedBy(PlayerChapter::startMs)
+            val loaded = normalizePlayerChapters(engine.chapters())
             if (loaded.isNotEmpty()) {
                 chapters = loaded
                 return@LaunchedEffect
@@ -342,8 +394,8 @@ fun PlayerScreen(
     // A user pause resets the clock (holding position is then intent, not failure), a terminal
     // error/ended state suspends it, and any position advance both re-arms the clock AND clears a
     // previously tripped verdict, so a stream that recovers on its own heals back to normal playback.
-    var stallError by remember(playable.url) { mutableStateOf(false) }
-    LaunchedEffect(engine, playable.url) {
+    var stallError by remember(playbackSessionKey) { mutableStateOf(false) }
+    LaunchedEffect(engine, playbackSessionKey) {
         var lastPositionMs = -1L
         var lastProgressAt = SystemClock.elapsedRealtime()
         var everAdvanced = false
@@ -387,12 +439,12 @@ fun PlayerScreen(
     // change), so unlike [stallError] it never self-clears. A [Playable.userForcedSource] play (the
     // viewer's own pick off the manual fallback) is exempt from the VERDICT -- their warned, explicit
     // choice must play -- while the never-poison writeback gates below stay in force regardless.
-    var runtimeMismatch by remember(playable.url) { mutableStateOf(false) }
-    LaunchedEffect(playerState.durationMs, playable.url) {
-        if (runtimeMismatch || playable.userForcedSource) return@LaunchedEffect
+    var runtimeMismatch by remember(playbackSessionKey) { mutableStateOf(false) }
+    LaunchedEffect(playerState.durationMs, playbackSessionKey) {
+        if (runtimeMismatch || currentPlayable.userForcedSource) return@LaunchedEffect
         val fileMs = latestState.durationMs
         if (fileMs <= 0L) return@LaunchedEffect
-        if (isJunkDuration(fileMs, playable)) runtimeMismatch = true
+        if (isJunkDuration(fileMs, currentPlayable)) runtimeMismatch = true
     }
     // Stop the condemned file immediately: pausing keeps it from playing (or EOF-ing) under the
     // error surface while the host's retry ladder resolves the next source. Only the mismatch pauses
@@ -421,7 +473,7 @@ fun PlayerScreen(
     )
     // Crossing the PiP boundary: entering drops the chrome + any live gesture HUD (dead pixels in
     // the small window); expanding back restores the controls so the viewer lands oriented.
-    var gestureHud by remember(playable.url) { mutableStateOf<PlayerGestureHud?>(null) }
+    var gestureHud by remember(playbackSessionKey) { mutableStateOf<PlayerGestureHud?>(null) }
     LaunchedEffect(pip.isInPip) {
         if (pip.isInPip) {
             controlsVisible = false
@@ -434,19 +486,19 @@ fun PlayerScreen(
     // System MediaSession over the live engine: headset/Bluetooth transport, the Android TV
     // now-playing row, assistant play/pause. Scoped to this composition (no background playback
     // exists to outlive it); rebuilt with the engine on a mid-session ExoPlayer fallback.
-    PlayerMediaSessionEffect(engine = engine, playable = playable, speed = speed)
+    PlayerMediaSessionEffect(engine = engine, playable = currentPlayable, speed = speed)
 
     // BAD-SOURCE DISPATCH: hand the verdict to the host's auto-retry ladder exactly once per source.
     // Every bad-source class funnels through here -- a dead link (hasError), a silent stall
     // (stallError), a wrong/junk file (runtimeMismatch) -- so the ladder is the single recovery
-    // path. With no [onSourceFailed] wired (the TV shell) this is inert and the chrome's error
-    // overlay + manual "Choose another source" behavior is byte-identical to before.
-    var sourceFailureDispatched by remember(playable.url) { mutableStateOf(false) }
+    // path. With no [onSourceFailed] wired this is inert and the chrome's error overlay + manual
+    // "Choose another source" behavior stays available.
+    var sourceFailureDispatched by remember(playbackSessionKey) { mutableStateOf(false) }
     LaunchedEffect(effectiveError) {
         if (!effectiveError || sourceFailureDispatched) return@LaunchedEffect
         val dispatch = currentOnSourceFailed ?: return@LaunchedEffect
         sourceFailureDispatched = true
-        dispatch()
+        dispatch(latestState.positionMs.coerceAtLeast(0L))
     }
 
     // The auto-hide countdown: runs only while the controls are up and playback is actually rolling.
@@ -475,12 +527,12 @@ fun PlayerScreen(
     // The results list in the chrome's subtitle sheet under the embedded tracks; picking one mounts
     // it on the live engine (mpv `sub-add` / the ExoPlayer side-loaded track rebuild) and
     // auto-selects it once the engine reports the grown track list.
-    var addonSubtitles by remember(playable.url) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
-    val mountedAddonSubs = remember(playable.url) { mutableSetOf<String>() }
-    var pendingSubSelectAbove by remember(playable.url) { mutableStateOf<Int?>(null) }
-    LaunchedEffect(playable.url) {
-        if (playable.isTrailer) return@LaunchedEffect
-        val ref = playable.mediaRef ?: return@LaunchedEffect
+    var addonSubtitles by remember(playbackSessionKey) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
+    val mountedAddonSubs = remember(playbackSessionKey) { mutableSetOf<String>() }
+    var pendingSubSelectAbove by remember(playbackSessionKey) { mutableStateOf<Int?>(null) }
+    LaunchedEffect(playbackSessionKey) {
+        if (currentPlayable.isTrailer) return@LaunchedEffect
+        val ref = currentPlayable.mediaRef ?: return@LaunchedEffect
         val (type, videoId) = SubtitleAddonService.queryFor(ref) ?: return@LaunchedEffect
         val repo = (context.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
         val sources = SubtitleAddonService.installedSources(repo.installedAddons().getOrNull().orEmpty())
@@ -511,11 +563,11 @@ fun PlayerScreen(
     // ONCE per load. This closes the "manual select only" parity gap. A nil audio pick leaves the engine's
     // own default; a -1 subtitle pick means "off". Runs after the engine's own default selection, so it
     // overrides toward the user's language chain (e.g. a Turkish-only preference beats a French dub, #76).
-    val trackPreferences = remember(playable.url) {
+    val trackPreferences = remember(playbackSessionKey) {
         TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).current
     }
-    var autoSelectDone by remember(playable.url) { mutableStateOf(false) }
-    LaunchedEffect(playable.url, playerState.audioTracks, playerState.subtitleTracks) {
+    var autoSelectDone by remember(playbackSessionKey) { mutableStateOf(false) }
+    LaunchedEffect(playbackSessionKey, playerState.audioTracks, playerState.subtitleTracks) {
         if (autoSelectDone) return@LaunchedEffect
         val audioTracks = latestState.audioTracks
         val subtitleTracks = latestState.subtitleTracks
@@ -538,9 +590,9 @@ fun PlayerScreen(
     // an empty list and no skip button ever shows. Mirrors the Apple player's skip gate, which loads
     // SkipTimestampService.candidates once it has the imdb id + duration and resolves them through
     // SegmentResolver. This is the READ side; the in-player submit editor (SkipDBClient) is a later round.
-    var skipSegments by remember(playable.url) { mutableStateOf<List<SkipSegment>>(emptyList()) }
-    LaunchedEffect(playable.url, playerState.durationMs > 0L) {
-        val ref = playable.mediaRef
+    var skipSegments by remember(playbackSessionKey) { mutableStateOf<List<SkipSegment>>(emptyList()) }
+    LaunchedEffect(playbackSessionKey, playerState.durationMs > 0L) {
+        val ref = currentPlayable.mediaRef
         val imdb = ref?.imdb
         val durationMs = latestState.durationMs
         if (imdb.isNullOrEmpty() || durationMs <= 0L) return@LaunchedEffect
@@ -557,7 +609,7 @@ fun PlayerScreen(
 
     // Keep the once-per-segment memory across same-episode source failover. A URL is source identity, not
     // media identity; two failed sources for one episode must not cause the same intro to auto-skip twice.
-    val autoSkipIdentity = autoSkipMediaIdentity(playable)
+    val autoSkipIdentity = autoSkipMediaIdentity(currentPlayable)
     val autoSkipEnabled = remember(autoSkipIdentity) {
         PlaybackBehaviorSettings.autoSkip(context.applicationContext)
     }
@@ -576,7 +628,7 @@ fun PlayerScreen(
     //   3. SERVE        -- [previewAt] handed to the chrome's scrubber.
     // The session owns its own scope (it must outlive this composition to flush on exit), so it is only
     // remembered here, never scoped to the composition.
-    val trickplay = remember(playable.url) { TrickplaySession(context) }
+    val trickplay = remember(playbackSessionKey) { TrickplaySession(context) }
 
     // KEY + FETCH. Gated on a real reported duration because the content key is
     // sha1(imdb:season:episode:durationBucket) -- keying on 0 would compute the WRONG key and index a
@@ -586,12 +638,12 @@ fun PlayerScreen(
     // [TrickplaySession.configure] is idempotent and does the tmdb->imdb resolve itself: a hub/TMDB-catalog
     // play arrives with mediaRef.imdb == null and only a numeric tmdb id, and a tt-only content key would
     // silently drop it (the known past root cause of an account that contributed nothing from any device).
-    LaunchedEffect(playable.url, playerState.durationMs > 0L) {
+    LaunchedEffect(playbackSessionKey, playerState.durationMs > 0L) {
         val durationMs = latestState.durationMs
         // A junk-length file must never key (or feed) the SHARED community pool: its duration bucket
         // is the wrong file's, not the episode's. Same never-poison rule as the progress writes.
-        if (durationMs <= 0L || isJunkDuration(durationMs, playable)) return@LaunchedEffect
-        trickplay.configure(playable.mediaRef, durationMs / 1000.0)
+        if (durationMs <= 0L || isJunkDuration(durationMs, currentPlayable)) return@LaunchedEffect
+        trickplay.configure(currentPlayable.mediaRef, durationMs / 1000.0)
     }
 
     // CAPTURE. A wall-clock driver, deliberately NOT a position-delta driver: Apple runs both (a timePos
@@ -604,7 +656,7 @@ fun PlayerScreen(
     // (the session is not keyed yet, so the frame would be buffered against no title and thrown away).
     // A null return is the normal, expected outcome on the ExoPlayer engine, which cannot read back a
     // SurfaceView without breaking Dolby Vision -- see [PlayerEngine.captureFrameJpeg].
-    LaunchedEffect(engine, playable.url) {
+    LaunchedEffect(engine, playbackSessionKey) {
         while (true) {
             delay((TrickplaySession.CAPTURE_INTERVAL_S * 1000).toLong())
             val s = latestState
@@ -624,7 +676,7 @@ fun PlayerScreen(
     // this is the backstop that sends the final, fullest set. It survives this composition because the
     // session owns a SupervisorJob scope rather than a remembered one, and it deliberately touches only
     // session state, never the engine that is being released alongside it.
-    DisposableEffect(playable.url) {
+    DisposableEffect(playbackSessionKey) {
         onDispose { trickplay.finishAndFlush() }
     }
 
@@ -648,7 +700,7 @@ fun PlayerScreen(
         // A userForcedSource play skips the conversion (the viewer chose this exact file off the
         // manual fallback; its end is their end) -- but its progress writes were still junk-gated, so
         // even a forced junk file reaches here UNWATCHED and the advance is the viewer's own doing.
-        if (!playable.userForcedSource && isJunkEof(s.positionMs, s.durationMs, playable)) {
+        if (!currentPlayable.userForcedSource && isJunkEof(s.positionMs, s.durationMs, currentPlayable)) {
             runtimeMismatch = true
             return@LaunchedEffect
         }
@@ -676,7 +728,7 @@ fun PlayerScreen(
         while (true) {
             delay(PROGRESS_REPORT_MS)
             val s = latestState
-            if (!s.isPaused && s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, playable)) {
+            if (!s.isPaused && s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, currentPlayable)) {
                 currentOnProgress(s.positionMs, s.durationMs)
             }
         }
@@ -689,7 +741,7 @@ fun PlayerScreen(
     DisposableEffect(engine) {
         onDispose {
             val s = latestState
-            if (s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, playable)) {
+            if (s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, currentPlayable)) {
                 currentOnProgress(s.positionMs, s.durationMs)
             }
         }
@@ -701,11 +753,11 @@ fun PlayerScreen(
     // (the offline preview, an unmappable id) never scrobbles. [ScrobbleService]'s ops are fire-and-forget
     // on its own scope, so nothing here blocks playback and the stop still completes after this leaves
     // composition. See com.vortx.android.integrations.ScrobbleService.
-    val scrobbleRef = playable.mediaRef
+    val scrobbleRef = currentPlayable.mediaRef
     // Latch the started/paused transitions so a play sends exactly one `start`, a resume sends one `start`,
     // and a pause sends one `pause`, rather than a scrobble on every recomposition.
-    var scrobbleStarted by remember(playable.url) { mutableStateOf(false) }
-    var scrobblePauseSent by remember(playable.url) { mutableStateOf(false) }
+    var scrobbleStarted by remember(playbackSessionKey) { mutableStateOf(false) }
+    var scrobblePauseSent by remember(playbackSessionKey) { mutableStateOf(false) }
     LaunchedEffect(playerState.isPaused, playerState.durationMs > 0L, playerState.hasEnded) {
         val ref = scrobbleRef ?: return@LaunchedEffect
         // Never start scrobbling a condemned junk file (the mismatch verdict lands with the duration
@@ -713,7 +765,7 @@ fun PlayerScreen(
         if (runtimeMismatch) return@LaunchedEffect
         ScrobbleService.init(context.applicationContext)
         val s = latestState
-        if (s.durationMs <= 0L || s.hasEnded || isJunkDuration(s.durationMs, playable)) return@LaunchedEffect
+        if (s.durationMs <= 0L || s.hasEnded || isJunkDuration(s.durationMs, currentPlayable)) return@LaunchedEffect
         val progress = s.positionMs.toDouble() / s.durationMs.toDouble() * 100.0
         if (!s.isPaused) {
             // First play, or a resume: Trakt uses `start` for both.
@@ -725,7 +777,7 @@ fun PlayerScreen(
             scrobblePauseSent = true
         }
     }
-    DisposableEffect(playable.url) {
+    DisposableEffect(playbackSessionKey) {
         onDispose {
             val ref = scrobbleRef
             if (ref != null && scrobbleStarted) {
@@ -733,7 +785,7 @@ fun PlayerScreen(
                 // NEVER-POISON GATE: a junk-length file's EOF ratio is ~100%, which Trakt records as
                 // WATCHED (>= 80%) and SIMKL writes to history. A condemned source therefore stops at
                 // 0% -- the session still closes cleanly server-side, but records nothing watched.
-                val junk = runtimeMismatch || isJunkDuration(s.durationMs, playable)
+                val junk = runtimeMismatch || isJunkDuration(s.durationMs, currentPlayable)
                 val progress = if (s.durationMs > 0L && !junk) {
                     s.positionMs.toDouble() / s.durationMs.toDouble() * 100.0
                 } else {
@@ -908,7 +960,8 @@ fun PlayerScreen(
         )
 
         PlayerChrome(
-            playable = playable,
+            playable = currentPlayable,
+            playbackSessionRevision = sourceSwitchState.revision,
             // The watchdog's stall verdict and the runtime-mismatch verdict both ride the same
             // hasError the engines publish, so the chrome has exactly one error surface (the overlay
             // + "Choose another source" retry path). A mismatch additionally clears hasEnded: the
@@ -930,6 +983,14 @@ fun PlayerScreen(
                 showControls()
                 subtitleDelaySeconds = adjustedPlayerDelay(subtitleDelaySeconds, delta)
                 engine.setSubtitleDelay(subtitleDelaySeconds)
+                SubtitleOffsetMemory.save(context, subtitleDelaySeconds, subtitleContentKey)
+            },
+            subtitleStyle = subtitleStyle,
+            onChangeSubtitleStyle = { next ->
+                showControls()
+                SubtitleStyle.save(context, next)
+                subtitleStyle = SubtitleStyle.current(context)
+                engine.applySubtitleStyle()
             },
             audioDelayAvailable = engine.audioDelayAvailable,
             audioDelaySeconds = audioDelaySeconds,
@@ -970,6 +1031,27 @@ fun PlayerScreen(
                 scaleMode = if (scaleMode == VideoScaleMode.FIT) VideoScaleMode.ZOOM else VideoScaleMode.FIT
             },
             onErrorRetry = currentOnError,
+            sourceOptions = if (currentOnSwitchSource != null) sourceOptions else emptyList(),
+            qualityOptions = if (currentOnSwitchSource != null) qualityOptions else emptyList(),
+            currentSource = sourceSwitchState.currentSource,
+            sourceSwitching = sourceSwitchState.isSwitching,
+            sourceSwitchError = sourceSwitchState.errorMessage,
+            onSwitchSource = { source ->
+                val resolver = currentOnSwitchSource
+                if (
+                    resolver != null &&
+                    !sourceSwitchState.isSwitching &&
+                    !playerSourceIsCurrent(source, sourceSwitchState.currentSource)
+                ) {
+                    sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
+                        sourceSwitchState = beginPlayerSourceSwitch(
+                            state = sourceSwitchState,
+                            source = source,
+                            authority = authority,
+                        )
+                    }
+                }
+            },
             // The explicit PiP entry (user action); null on devices/hosts that cannot PiP, which
             // hides the control entirely. Home-press entry rides auto-enter / onUserLeaveHint.
             onEnterPip = if (pip.supported) {
