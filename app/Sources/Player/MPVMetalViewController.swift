@@ -727,20 +727,44 @@ final class MPVMetalViewController: PlatformViewController {
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "128MiB"))
 #endif
 
-        // Configurable ON-DISK streaming/seek cache (Settings → "Streaming cache"). When enabled, the
-        // big forward buffer is backed by a Caches subdirectory instead of RAM, so a viewer can pick a
-        // large cache (seek minutes ahead with no re-buffer, pre-cache) WITHOUT spending the jetsam-bound
-        // in-process RAM budget. The actual byte budget is the clamped `demuxer-max-bytes` applied per
-        // file in loadFile (DiskCacheSetting.resolvedMaxBytes, always bounded by free disk, never
-        // unlimited). The hero-preview (#44) is a tiny silent loop, so it stays on the in-memory cache.
+        // Configurable ON-DISK streaming/seek cache (Settings -> "Streaming cache"). When enabled, mpv backs the
+        // FORWARD read-ahead on disk: `add_packet_locked` writes each forward packet's payload to the cache dir
+        // and FREES its RAM, keeping only a file offset (mpv demux/demux.c). So the big seek-ahead buffer lives
+        // on disk, WITHOUT spending the jetsam-bound in-process RAM budget. The hero-preview (#44) is a tiny
+        // silent loop, so it stays on the in-memory cache (this block is skipped for the muted instance).
         //
-        // `cache-on-disk` is a stable libmpv option (mpv 0.30+, present in MPVKit 0.41); if a future
-        // build ever drops it, these lines no-op and mpv falls back to the in-memory cache that the same
-        // clamped `demuxer-max-bytes` already bounds, so the safety guarantee holds either way.
+        // THE 0.2.11 CRASH, reconciled. That experiment did two things wrong: (1) it used the REMOVED option name
+        // `cache-dir`, so offload silently did not engage; and (2) it set `demuxer-max-bytes` to the multi-GB disk
+        // budget, which under working cache-on-disk is a GB packet-METADATA budget authorizing hours of runaway
+        // read-ahead -> jetsam. The fix is here and in loadFile: the dir option is now `demuxer-cache-dir`, the
+        // forward depth is bounded in TIME by `cache-secs` (demuxer-max-bytes stops binding once payloads leave
+        // RAM), and loadFile's per-file `demuxer-max-bytes` is a MODEST metadata cap (RemoteConfig
+        // diskCacheMetadataCapMiB), not the disk budget.
+        //
+        // If a future mpv build drops any of these options they no-op (checkError only logs); offload then falls
+        // back to the in-memory cache that loadFile's modest `demuxer-max-bytes` still bounds, so the RAM safety
+        // holds either way. `resolvedMaxBytes` remains the free-disk ceiling shown in Settings and the sweep that
+        // wipes the cache dir on exit; `demuxer-cache-unlink-files=immediate` keeps consumed segments from
+        // accumulating, so the cache file tracks only the [back-buffer, cache-secs forward] window.
         if !startMuted, DiskCacheSetting.diskCacheEnabled, let cacheDir = DiskCacheSetting.ensureCacheDirectory() {
             checkError(mpv_set_option_string(mpv, "cache-on-disk", "yes"))
-            checkError(mpv_set_option_string(mpv, "cache-dir", cacheDir))
-            mpvLog.log("disk cache armed at \(cacheDir, privacy: .public), budget \(DiskCacheSetting.resolvedMaxBytes(), privacy: .public) bytes")
+            // FIX: `cache-dir` was removed upstream; the current option is `demuxer-cache-dir`. Point it at the
+            // app-tracked Caches subdir so payload offload actually engages (and the exit sweep can clear it).
+            checkError(mpv_set_option_string(mpv, "demuxer-cache-dir", cacheDir))
+            // Unlink consumed cache files immediately (mpv's default, set explicitly) so the on-disk cache never
+            // grows toward the whole title.
+            checkError(mpv_set_option_string(mpv, "demuxer-cache-unlink-files", "immediate"))
+            // Bound forward read-ahead in TIME: this is the real lever once payloads live on disk, because
+            // demuxer-max-bytes then caps only metadata. mpv's `cache-secs` default is ~10 hours; hold it to
+            // RemoteConfig `diskCacheReadaheadSecs` (baked 900 s = 15 min). `demuxer-readahead-secs` is mostly
+            // ignored while the cache is on.
+            checkError(mpv_set_option_string(mpv, "cache-secs", String(RemoteConfig.snapshot.diskCacheReadaheadSecs)))
+            // DEVICE-TEST CAVEAT: on tvOS `demuxer-cache-dir` may not be writable, in which case mpv silently keeps
+            // payloads in RAM (the modest per-file demuxer-max-bytes is the guardrail there). Log writability so a
+            // soak can tell genuine offload apart from the RAM fallback. Also note: DV-FEL TRUSTED/wrapped packets
+            // bypass offload and stay in RAM regardless.
+            let writable = FileManager.default.isWritableFile(atPath: cacheDir)
+            mpvLog.log("disk cache armed at \(cacheDir, privacy: .public) writable=\(writable, privacy: .public) cacheSecs=\(RemoteConfig.snapshot.diskCacheReadaheadSecs, privacy: .public) freeDiskCeiling=\(DiskCacheSetting.resolvedMaxBytes(), privacy: .public) bytes")
         }
 
 #if os(tvOS)
@@ -1324,70 +1348,63 @@ final class MPVMetalViewController: PlatformViewController {
             // below; iOS keeps its existing 256 MiB baseline. The Mac keeps a larger buffer because its
             // server and swap model are different.
             #if os(tvOS)
-            // The tvOS NORMAL remote read-ahead baseline, RemoteConfig-backed (default 256 MiB, raised from
+            // The tvOS NORMAL remote read-ahead baseline, RemoteConfig-backed (default 384 MiB, raised from
             // 128). Twelve field logs proved the earlier 128 MiB starved the forward buffer into constant
             // rebuffering because a SPURIOUS advisory-warning shed kept slamming the cap down; the shed is now
-            // gated on real headroom (shedForMemoryPressure), so a 256 MiB baseline is both safe and necessary
-            // for smooth 4K. 256 stays under the ~700 MiB jetsam wall; the applied-cap policy below still
-            // bounds this even with the disk-cache setting armed. Local torrents keep the tight 96 MiB
-            // (jetsam-critical in-process server), and the reduced (2 GB Apple TV HD) branch is untouched.
+            // gated on real headroom (shedForMemoryPressure), so a 384 MiB baseline is both safe and necessary
+            // for smooth 4K in the biggest files. 384 stays under the ~700 MiB jetsam wall; the applied-cap
+            // policy below still bounds this even with the disk-cache setting armed. Local torrents keep the
+            // tight 96 MiB (jetsam-critical in-process server), and the reduced (2 GB Apple TV HD) branch is
+            // untouched.
             readAhead = isLocalStream ? "96MiB" : "\(RemoteConfig.snapshot.tvosReadAheadBaseline)MiB"
             #else
             readAhead = isLocalStream ? "96MiB" : "256MiB"
             #endif
             #endif
         }
-        // With the on-disk cache armed (Settings → Streaming cache) we lift `demuxer-max-bytes` for a
-        // REMOTE (debrid/direct CDN) VOD stream so the viewer gets a bigger seek-ahead buffer. CRITICAL:
-        // `demuxer-max-bytes` is mpv's HARD in-memory forward-buffer cap, and `cache-on-disk` does NOT
-        // reliably move it to the Caches dir on this MPVKit build, so the budget is held in RAM. Setting
-        // it to the full disk budget (hundreds of MB to GBs) jetsam-killed the Apple TV ~47s in, with the
-        // buffer ~800s / ~700MB ahead, even on the 3 GB ATV 4K. So clamp the APPLIED value to a device-safe
-        // RAM ceiling: iOS and macOS may lift above their baseline within their platform ceiling. tvOS
-        // remains bounded to its 128 MiB normal or 96 MiB reduced baseline because its server and mpv
-        // share one jetsam-limited process. demuxer-max-bytes is a hard byte cap, so it bounds RAM
-        // regardless of bitrate or whether cache-on-disk offloads. A LOCAL torrent buffers into the
-        // embedded server's own disk cache, and live owns its tight buffers, so those retain readAhead.
+        // `demuxer-max-bytes` for a REMOTE (debrid/direct CDN) VOD stream, reconciled by cache-on-disk state.
+        //
+        // WHAT demuxer-max-bytes MEANS depends on whether the on-disk cache is armed:
+        //   - cache-on-disk OFF (default): it is a HARD in-memory forward-PAYLOAD cap. mpv stops reading ahead
+        //     when the RAM buffer fills, so it, not `cache-secs`, is the binding forward limit. Keep the device's
+        //     RAM baseline here, UNCHANGED.
+        //   - cache-on-disk ON: mpv offloads forward payloads to `demuxer-cache-dir` and frees their RAM, so this
+        //     cap bounds packet METADATA (~50 MB per hour of media), NOT payload. Setting it to the multi-GB disk
+        //     budget (the 0.2.11 mistake) is therefore a GB METADATA budget authorizing hours of runaway
+        //     read-ahead -> jetsam (that build died ~47s in, buffer ~800s / ~700MB ahead, even on a 3 GB ATV 4K).
+        //     So on this path we use a MODEST metadata cap (RemoteConfig diskCacheMetadataCapMiB, baked 128 MiB),
+        //     deliberately allowed BELOW the RAM baseline because metadata is cheap; the forward DEPTH is bounded
+        //     in TIME by `cache-secs` at setup. That modest value is also the RAM-payload guardrail should offload
+        //     silently fall back (dir not writable).
+        //
+        // tvOS additionally caps the armed value under its device-safe process-memory wall (384 MiB normal /
+        // 96 MiB reduced) so its server and mpv, which share one jetsam-limited process, stay bounded. A LOCAL
+        // torrent buffers into the embedded server's own disk cache, and live owns its tight buffers, so both are
+        // excluded from the armed branch and retain readAhead.
         let appliedCap: String
         if DiskCacheSetting.diskCacheEnabled, !live, !isLocalStream {
-            // DIAG-12 RECEIPT: restoring the tvOS ceiling to 768 MiB was not device-safe. The embedded
-            // Node heartbeat rose from about 422 MiB to 1.2 GiB immediately after libmpv opened a debrid
-            // stream while the JS heap stayed at 26 MiB. That native RSS delta matches the 768 MiB cap.
-            // tvOS is further bounded below to 128 MiB normal or 96 MiB reduced. iOS retains its
-            // 256 MiB normal and 128 MiB reduced ceilings, and macOS retains 1 GiB because its server
-            // and swap model are different.
-            //
-            // THE RECURRING JETSAM KNOB: these ceilings are now the RemoteConfig `player.readAhead.*` dials
-            // (debrid 64..256, reduced 64..192, mac 128..1536, floor fixed 64). Baked fallbacks (256/128/1024)
-            // equal the shipping literals, so a null / absent remote config is behaviorally identical to today;
-            // a bad value clamps to the baked default and can never breach the jetsam-safe range.
-            #if os(macOS)
-            let isMac = true
-            #else
-            let isMac = false
-            #endif
-            let ramCeiling = Int64(RemoteConfig.snapshot.readAheadDebridCeilingBytes(reduced: PerformanceMode.reduced, isMac: isMac))
-            let applied = min(DiskCacheSetting.resolvedMaxBytes(), ramCeiling)
+            // ON-DISK STREAMING CACHE ARMED. Under cache-on-disk, demuxer-max-bytes bounds packet METADATA, not
+            // payload, and the real forward lever is `cache-secs` (set at setup). So set a MODEST, independently
+            // tunable metadata budget instead of the RAM read-ahead ceiling or the multi-GB disk budget: the
+            // RemoteConfig knob diskCacheMetadataCapMiB (baked 128 MiB, clamp 48..256), which is allowed to fall
+            // BELOW the RAM baseline. This is also the RAM-payload guardrail on the offload-fallback path.
+            let metadataCapBytes = Int64(RemoteConfig.snapshot.diskCacheMetadataCapBytes)
             #if os(tvOS)
-            let baselineBytes = Int64(
-                VortXCacheShedPolicy.capBytes(readAhead)
-                    ?? (PerformanceMode.reduced ? 96 << 20 : RemoteConfig.snapshot.tvosReadAheadBaseline << 20)
-            )
+            // tvOS caps it under the device-safe process-memory wall (remoteVODCapBytes: 384 MiB normal /
+            // 96 MiB reduced) so a remote diskCacheMetadataCapMiB near 256 can never breach it; a smaller remote
+            // value passes through, so the armed cap can still go below the RAM baseline (metadata is cheap).
+            // remoteVODCapBytes ignores baselineBytes when diskCacheEnabled is true, so passing the metadata cap
+            // for both arguments is exact.
             let tvOSApplied = TVOSProactiveMemoryPressurePolicy.remoteVODCapBytes(
                 diskCacheEnabled: true,
-                baselineBytes: baselineBytes,
-                // On tvOS the disk cache does NOT offload demuxer-max-bytes (MPVKit build), so the RAM cap is
-                // the same whether or not the Streaming cache is armed: never LESS than the normal-tier
-                // baseline. `applied` is bounded by debridCeilingMiB (256), which is now BELOW the 384 baseline,
-                // so without this max() arming the disk cache would shrink the buffer 384 -> 256. The tvOS wall
-                // (remoteVODCapBytes' normal limit, 384) still caps the result.
-                configuredDiskCacheBytes: max(applied, baselineBytes),
+                baselineBytes: metadataCapBytes,
+                configuredDiskCacheBytes: metadataCapBytes,
                 performanceReduced: PerformanceMode.reduced,
                 enforceTVOSLimit: true
             )
             appliedCap = String(tvOSApplied)
             #else
-            appliedCap = String(applied)
+            appliedCap = String(metadataCapBytes)
             #endif
         } else {
             #if os(tvOS)

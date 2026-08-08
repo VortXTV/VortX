@@ -3,23 +3,30 @@ import os
 
 /// User-configurable streaming/seek cache for the libmpv player.
 ///
-/// libmpv keeps a forward read-ahead buffer (`demuxer-max-bytes`) so the play head can run ahead of
-/// the network. By default that buffer lives in RAM, which on the in-process, jetsam-bound iOS/tvOS
-/// targets is tightly capped (see MPVMetalViewController's per-file read-ahead sizing). This setting
-/// moves the big buffer to an ON-DISK cache (`cache-on-disk=yes` + `cache-dir`), so a viewer can pick
-/// a large forward buffer (seek minutes ahead without re-buffering, pre-cache) WITHOUT spending RAM.
+/// libmpv keeps a forward read-ahead buffer so the play head can run ahead of the network. By default that
+/// buffer lives in RAM, which on the in-process, jetsam-bound iOS/tvOS targets is tightly capped (see
+/// MPVMetalViewController's per-file read-ahead sizing). This setting arms mpv's ON-DISK cache
+/// (`cache-on-disk=yes` + `demuxer-cache-dir`): mpv then writes each forward packet's PAYLOAD to the cache dir
+/// and frees its RAM, keeping only a file offset, so a viewer can seek minutes ahead without re-buffering
+/// WITHOUT spending the RAM budget. Because the payload leaves RAM, `demuxer-max-bytes` on this path caps packet
+/// METADATA (~50 MB per hour of media), not payload, and the real forward-DEPTH lever becomes `cache-secs`
+/// (bounded by RemoteConfig `diskCacheReadaheadSecs`). MPVMetalViewController owns those option writes.
 ///
-/// CRITICAL SAFETY (the two owner guardrails):
-///   1. Unbounded growth is impossible. `UNLIMITED` and any large finite value are still capped at a
-///      fraction of CURRENT FREE DISK at the moment the player starts (`resolvedMaxBytes`), so the
-///      cache can never fill the device. The cap is recomputed every time a file loads.
-///   2. A finished title does not persist. The cache directory is wiped on a genuine playback exit
-///      (the finish / leavePlayback path) and again as a safety sweep on app launch, so a crash can
-///      never leave an unbounded cache behind.
+/// CRITICAL SAFETY (the owner guardrails):
+///   1. Forward read-ahead is bounded in TIME by `cache-secs`, so it cannot run multiple hours ahead. The
+///      per-file `demuxer-max-bytes` metadata cap (RemoteConfig `diskCacheMetadataCapMiB`, modest by design)
+///      doubles as the RAM-payload ceiling if disk offload ever silently falls back to memory.
+///   2. Disk footprint stays bounded. `demuxer-cache-unlink-files=immediate` unlinks consumed cache files, and
+///      `resolvedMaxBytes` (a fraction of CURRENT FREE DISK, recomputed per file, shown in Settings) is the
+///      device-fill ceiling. `UNLIMITED` is never actually unlimited.
+///   3. A finished title does not persist. The cache directory is wiped on a genuine playback exit (the finish
+///      / leavePlayback path) and again as a safety sweep on app launch, so a crash can never leave a cache
+///      behind.
 ///
-/// `cache-on-disk` has been a stable libmpv option since mpv 0.30 (2019); MPVKit 0.41.0 (mpv 0.41.x)
-/// includes it. If a future mpv build ever drops it, the options simply no-op and mpv falls back to
-/// the in-memory cache bounded by `demuxer-max-bytes`, which is still clamped by `resolvedMaxBytes`.
+/// `cache-on-disk` / `demuxer-cache-dir` / `cache-secs` are stable libmpv options on our pinned mpv. If a future
+/// mpv build ever drops one, the writes simply no-op and mpv falls back to the in-memory cache that the modest
+/// `demuxer-max-bytes` still bounds, so the RAM safety holds either way. DV-FEL TRUSTED/wrapped packets bypass
+/// offload and stay in RAM regardless of this setting.
 enum DiskCacheSetting {
     /// UserDefaults key. Stored as the raw byte count (Int64) the viewer asked for; `0` == OFF,
     /// `unlimitedSentinel` == UNLIMITED. Any other value is a literal finite byte budget.
@@ -34,9 +41,10 @@ enum DiskCacheSetting {
     static let unlimitedSentinel: Int64 = -1
 
     /// Free-disk-ceiling FALLBACK budget when free space can't be read (NOT the unset default). 2 GB is a
-    /// safe middle value. The actual unset default is OFF (see `storedBytes`): this on-disk cache is the
-    /// same mechanism that crashed Apple TVs at ~21s into 4K remuxes in 0.2.11, so it ships OFF until it has
-    /// been soak-tested on real hardware. The owner opts in to test.
+    /// safe middle value. The actual unset default is OFF (see `storedBytes`): this is the same on-disk cache
+    /// whose 0.2.11 config bugs (dead `cache-dir` option + a GB `demuxer-max-bytes` metadata budget) crashed
+    /// Apple TVs at ~21s into 4K remuxes. Those bugs are fixed (see MPVMetalViewController), but it still ships
+    /// OFF until the fix has been soak-tested on real hardware. The owner opts in to test.
     static let defaultBytes: Int64 = 2 * gib
 
     /// OFF still needs a tiny forward buffer so playback is not starved. Mirrors the smallest existing
@@ -56,8 +64,8 @@ enum DiskCacheSetting {
     // MARK: Persistence
 
     /// The viewer's stored choice as a raw byte count (or a sentinel). Defaults to OFF (0) when unset:
-    /// the on-disk cache is opt-in because this exact mechanism crashed Apple TVs at ~21s into 4K remuxes
-    /// in 0.2.11 and has not been re-soak-tested on hardware. Interops with the Settings
+    /// the on-disk cache is opt-in because the config bugs that crashed Apple TVs at ~21s into 4K remuxes in
+    /// 0.2.11 are fixed but the fix has not yet been re-soak-tested on hardware. Interops with the Settings
     /// `@AppStorage(...) var: Int` binding: UserDefaults boxes both Int and Int64 as NSNumber, so reading
     /// via NSNumber round-trips whichever side wrote it.
     static var storedBytes: Int64 {

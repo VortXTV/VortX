@@ -76,6 +76,22 @@ enum RemoteConfigDefaults {
                                              // lowering) is trialable on the fleet via the RemoteConfig dial
                                              // without a build.
 
+    // On-disk Streaming Cache knobs (DiskCacheSetting + MPVMetalViewController.loadFile). Baked == the
+    // shipping-safe literals, so an absent / garbage `player` block is behaviorally identical to today.
+    static let diskCacheMetadataCapMiB = 128 // `demuxer-max-bytes` applied when `cache-on-disk` is ARMED. Under
+                                             // working offload mpv frees each forward packet's payload to the
+                                             // cache dir and keeps only a file offset, so this bounds packet
+                                             // METADATA (~50 MB per hour of media), NOT payload. It is therefore
+                                             // modest by design and may sit BELOW the RAM read-ahead baseline
+                                             // (metadata is cheap). It is ALSO the RAM-payload guardrail on the
+                                             // silent RAM-fallback path (dir not writable): 128 MiB is the
+                                             // shipping-safe tvOS payload cap.
+    static let diskCacheReadaheadSecs = 900  // `cache-secs` (15 min) applied when `cache-on-disk` is armed: the
+                                             // REAL forward-depth lever once payloads live on disk, because
+                                             // demuxer-max-bytes no longer binds. mpv's default is ~10 hours,
+                                             // which is exactly the multi-hour runaway read-ahead that
+                                             // jetsam-killed the 0.2.11 disk-cache experiment.
+
     // Timeouts (detail settle / debrid resolve). Present for future wiring; clamped in validate.
     //
     // NONE of these three is wired to a call site yet: no code outside this file reads
@@ -250,6 +266,8 @@ struct RemoteConfigData: Decodable {
         let readAhead: ReadAhead?
         let readAheadOff: ReadAheadOff?
         let vodReadaheadSecs: Int?
+        let diskCacheMetadataCapMiB: Int?   // demuxer-max-bytes (metadata cap) when cache-on-disk is armed
+        let diskCacheReadaheadSecs: Int?    // cache-secs forward-time bound when cache-on-disk is armed
         let live: Live?
         let perfConstrainedThresholdBytes: Int?
         let hdrToneMapMode: String?
@@ -355,6 +373,9 @@ final class ResolvedConfig: @unchecked Sendable {
     let offFloorMiB: Int
     let vodReadaheadSecsValue: Int
     let dvRemuxWindowMiB: Int
+    // On-disk Streaming Cache, already clamped.
+    let diskCacheMetadataCapMiB: Int
+    let diskCacheReadaheadSecs: Int
 
     // tvOS forward-buffer dials (MiB), already clamped: hardMin <= floor <= baseline <= ceiling <= 448.
     let tvosReadAheadBaselineMiB: Int
@@ -419,6 +440,8 @@ final class ResolvedConfig: @unchecked Sendable {
          tvosReadAheadFloorMiB: Int,
          tvosReadAheadHardMinMiB: Int,
          tvosReadAheadCeilingMiB: Int,
+         diskCacheMetadataCapMiB: Int,
+         diskCacheReadaheadSecs: Int,
          detailSettleIOSSecs: Int,
          detailSettleTVSecs: Int,
          debridResolveSecs: Int,
@@ -456,6 +479,8 @@ final class ResolvedConfig: @unchecked Sendable {
         self.tvosReadAheadFloorMiB = tvosReadAheadFloorMiB
         self.tvosReadAheadHardMinMiB = tvosReadAheadHardMinMiB
         self.tvosReadAheadCeilingMiB = tvosReadAheadCeilingMiB
+        self.diskCacheMetadataCapMiB = diskCacheMetadataCapMiB
+        self.diskCacheReadaheadSecs = diskCacheReadaheadSecs
         self.detailSettleIOSSecs = detailSettleIOSSecs
         self.detailSettleTVSecs = detailSettleTVSecs
         self.debridResolveSecs = debridResolveSecs
@@ -499,6 +524,8 @@ final class ResolvedConfig: @unchecked Sendable {
             tvosReadAheadFloorMiB: RemoteConfigDefaults.tvosReadAheadFloorMiB,
             tvosReadAheadHardMinMiB: RemoteConfigDefaults.tvosReadAheadHardMinMiB,
             tvosReadAheadCeilingMiB: RemoteConfigDefaults.tvosReadAheadCeilingMiB,
+            diskCacheMetadataCapMiB: RemoteConfigDefaults.diskCacheMetadataCapMiB,
+            diskCacheReadaheadSecs: RemoteConfigDefaults.diskCacheReadaheadSecs,
             detailSettleIOSSecs: RemoteConfigDefaults.detailSettleIOSSecs,
             detailSettleTVSecs: RemoteConfigDefaults.detailSettleTVSecs,
             debridResolveSecs: RemoteConfigDefaults.debridResolveSecs,
@@ -559,6 +586,12 @@ final class ResolvedConfig: @unchecked Sendable {
 
     /// demuxer-readahead-secs for VOD (baked 300).
     var vodReadaheadSecs: Int { vodReadaheadSecsValue }
+
+    /// `demuxer-max-bytes` (BYTES) applied when the on-disk Streaming Cache is armed (baked 128 MiB). Under
+    /// working `cache-on-disk` offload this bounds packet METADATA (file offsets), not payload, so it is modest
+    /// by design and may sit BELOW the RAM read-ahead baseline; it is also the RAM-payload guardrail if disk
+    /// offload silently falls back to memory. `diskCacheReadaheadSecs` is the real forward-depth lever alongside.
+    var diskCacheMetadataCapBytes: Int { diskCacheMetadataCapMiB * 1024 * 1024 }
 
     /// Detail-settle timeout for the current platform (baked 12 both).
     func detailSettleSecs(tv: Bool) -> Int { tv ? detailSettleTVSecs : detailSettleIOSSecs }
@@ -817,11 +850,18 @@ actor RemoteConfig {
         //     holds no matter which fields are present, absent, or out of range. The 448 hi keeps the in-RAM
         //     cap under the ~700 MiB wall the 4K field logs proved fatal. `clamp` returns the baked fallback
         //     un-ranged when a field is ABSENT, so max()/min() re-impose the ordering (mirrors debrid/reduced
-        //     above). Baked all-absent resolves to 150/192/256/384. ---
+        //     above). Baked all-absent resolves to 150/192/384/384 (hardMin/floor/baseline/ceiling). ---
         let tvosHardMin = clamp(data.player?.readAhead?.tvosHardMinMiB, RemoteConfigDefaults.tvosReadAheadHardMinMiB, 96, 256)
         let tvosCeiling = max(tvosHardMin, clamp(data.player?.readAhead?.tvosCeilingMiB, RemoteConfigDefaults.tvosReadAheadCeilingMiB, 128, 448))
         let tvosFloor = min(tvosCeiling, max(tvosHardMin, clamp(data.player?.readAhead?.tvosFloorMiB, RemoteConfigDefaults.tvosReadAheadFloorMiB, 96, 448)))
         let tvosBaseline = min(tvosCeiling, max(tvosFloor, clamp(data.player?.readAhead?.tvosBaselineMiB, RemoteConfigDefaults.tvosReadAheadBaselineMiB, 96, 448)))
+
+        // --- On-disk Streaming Cache. Metadata cap 48..256 MiB: deliberately allowed BELOW the RAM read-ahead
+        //     baseline because under cache-on-disk it bounds packet metadata, not payload (metadata is cheap),
+        //     and is only the RAM guardrail on the offload-fallback path. Forward time bound 60..3600 s: mpv's
+        //     ~10 h default is the 0.2.11 runaway, so the ceiling stays well under an hour by default. ---
+        let diskCacheMetaMiB = clamp(data.player?.diskCacheMetadataCapMiB, RemoteConfigDefaults.diskCacheMetadataCapMiB, 48, 256)
+        let diskCacheReadSecs = clamp(data.player?.diskCacheReadaheadSecs, RemoteConfigDefaults.diskCacheReadaheadSecs, 60, 3600)
 
         // --- Timeouts. ---
         let settleIOS = clamp(data.timeouts?.detailSettleIOSSecs, RemoteConfigDefaults.detailSettleIOSSecs, 5, 60)
@@ -979,6 +1019,8 @@ actor RemoteConfig {
             tvosReadAheadFloorMiB: tvosFloor,
             tvosReadAheadHardMinMiB: tvosHardMin,
             tvosReadAheadCeilingMiB: tvosCeiling,
+            diskCacheMetadataCapMiB: diskCacheMetaMiB,
+            diskCacheReadaheadSecs: diskCacheReadSecs,
             detailSettleIOSSecs: settleIOS,
             detailSettleTVSecs: settleTV,
             debridResolveSecs: debridResolve,
