@@ -168,11 +168,12 @@ final class MPVMetalViewController: PlatformViewController {
     private var pausedCacheClampWork: DispatchWorkItem?
     /// True while the paused clamp holds `demuxer-max-bytes` at the small floor (restored on resume).
     private var pausedCacheClamped = false
-    /// True once a system memory warning stepped this file's cache down, which sends the NEXT warning
-    /// straight to the floor: a resume must not re-raise the cap, because the pressure that fired the
-    /// warning is usually still there. Reset on the next loadFile (a new file starts with its buffers
-    /// freed and gets its normal budget back), and on tvOS also by a sustained-headroom restore that gets
-    /// all the way back to the load budget, at which point this file's state is what a fresh load's is.
+    /// True once a GENUINE-low-headroom memory warning stepped this file's cache down. The ROOT FIX means an
+    /// advisory warning with ample real headroom no longer sets it (nor lowers the cap). A bookkeeping marker
+    /// now that the shed steps the cap down one 64 MiB rung at a time toward the raised floor rather than
+    /// distinguishing a first warning from a later one. Reset on the next loadFile (a new file starts with its
+    /// buffers freed and its normal budget), and on tvOS cleared by a sustained-headroom restore that reaches
+    /// the load budget, at which point this file's state matches a fresh load's.
     private var memoryCacheClamped = false
     #if os(tvOS)
     /// Nonisolated because the locked helper is the boundary between mpv's event queue and main actor.
@@ -1323,11 +1324,14 @@ final class MPVMetalViewController: PlatformViewController {
             // below; iOS keeps its existing 256 MiB baseline. The Mac keeps a larger buffer because its
             // server and swap model are different.
             #if os(tvOS)
-            // Build 199/200 field logs reached about 1.0-1.2 GiB RSS with a 256 MiB remote cache while
-            // libmpv was also decoding and capturing 4K frames. Keep useful read-ahead, but return tvOS
-            // to the 128 MiB baseline. The applied-cap policy below keeps this ceiling even when the
-            // disk-cache setting is enabled.
-            readAhead = isLocalStream ? "96MiB" : "128MiB"
+            // The tvOS NORMAL remote read-ahead baseline, RemoteConfig-backed (default 256 MiB, raised from
+            // 128). Twelve field logs proved the earlier 128 MiB starved the forward buffer into constant
+            // rebuffering because a SPURIOUS advisory-warning shed kept slamming the cap down; the shed is now
+            // gated on real headroom (shedForMemoryPressure), so a 256 MiB baseline is both safe and necessary
+            // for smooth 4K. 256 stays under the ~700 MiB jetsam wall; the applied-cap policy below still
+            // bounds this even with the disk-cache setting armed. Local torrents keep the tight 96 MiB
+            // (jetsam-critical in-process server), and the reduced (2 GB Apple TV HD) branch is untouched.
+            readAhead = isLocalStream ? "96MiB" : "\(RemoteConfig.snapshot.tvosReadAheadBaseline)MiB"
             #else
             readAhead = isLocalStream ? "96MiB" : "256MiB"
             #endif
@@ -1367,12 +1371,17 @@ final class MPVMetalViewController: PlatformViewController {
             #if os(tvOS)
             let baselineBytes = Int64(
                 VortXCacheShedPolicy.capBytes(readAhead)
-                    ?? (PerformanceMode.reduced ? 96 << 20 : 128 << 20)
+                    ?? (PerformanceMode.reduced ? 96 << 20 : RemoteConfig.snapshot.tvosReadAheadBaseline << 20)
             )
             let tvOSApplied = TVOSProactiveMemoryPressurePolicy.remoteVODCapBytes(
                 diskCacheEnabled: true,
                 baselineBytes: baselineBytes,
-                configuredDiskCacheBytes: applied,
+                // On tvOS the disk cache does NOT offload demuxer-max-bytes (MPVKit build), so the RAM cap is
+                // the same whether or not the Streaming cache is armed: never LESS than the normal-tier
+                // baseline. `applied` is bounded by debridCeilingMiB (256), which is now BELOW the 384 baseline,
+                // so without this max() arming the disk cache would shrink the buffer 384 -> 256. The tvOS wall
+                // (remoteVODCapBytes' normal limit, 384) still caps the result.
+                configuredDiskCacheBytes: max(applied, baselineBytes),
                 performanceReduced: PerformanceMode.reduced,
                 enforceTVOSLimit: true
             )
@@ -1529,11 +1538,32 @@ final class MPVMetalViewController: PlatformViewController {
     private static let pausedClampGraceSeconds: TimeInterval = 60
     private static let clampedCacheCap = "48MiB"
 
+    /// The paused-cache clamp target in bytes (`clampedCacheCap`, 48 MiB). This "user walked away" jetsam floor
+    /// is DISTINCT from the memory-warning/proactive shed floor (`shedFloorBytes`, 192/128 MiB): a parked
+    /// viewer whose tvOS screensaver stacks a second 4K pipeline on top still wants the buffer cut to the
+    /// minimum, then restored on resume. Kept at 48 MiB on every tier so the paused-clamp arming guards below
+    /// stay correct on the 2 GB Apple TV HD too (a 96 MiB reduced buffer is still > 48 and so still arms).
+    private var pausedClampFloorBytes: Int {
+        VortXCacheShedPolicy.capBytes(Self.clampedCacheCap) ?? (48 << 20)
+    }
+
+    /// The device-scaled, RemoteConfig-backed shed floor in bytes for the memory-warning and (tvOS) proactive
+    /// clamp/restore paths: 192 MiB on the normal tier, scaled down on PerformanceMode.reduced. This is the
+    /// controller's single point of RemoteConfig/PerformanceMode resolution; the dependency-free policy takes
+    /// it as a parameter.
+    private var shedFloorBytes: Int {
+        RemoteConfig.snapshot.tvosShedFloorBytes(reduced: PerformanceMode.reduced)
+    }
+
+    /// One memory-warning shed rung (64 MiB): a genuine-low warning steps the cap down by this toward the
+    /// floor rather than halving it or slamming it to the floor in one move.
+    private var shedStepBytes: Int { VortXCacheShedPolicy.stepBytes }
+
     /// This file's CURRENT forward-cache budget in bytes: `activeReadAheadCap` as applied by loadFile,
-    /// permanently reduced by each memory-warning shed. Falls back to the floor when the stored spelling
-    /// is unparseable (never happens with the two spellings loadFile writes; defensive only).
+    /// permanently reduced by each memory-warning shed. Falls back to the paused-clamp floor when the stored
+    /// spelling is unparseable (never happens with the two spellings loadFile writes; defensive only).
     private var currentReadAheadBudgetBytes: Int {
-        activeReadAheadCap.flatMap(VortXCacheShedPolicy.capBytes) ?? VortXCacheShedPolicy.floorBytes
+        activeReadAheadCap.flatMap(VortXCacheShedPolicy.capBytes) ?? pausedClampFloorBytes
     }
 
     /// Main-thread mirror of mpv's pause property (posted from the event drain). Arms the paused clamp
@@ -1545,7 +1575,7 @@ final class MPVMetalViewController: PlatformViewController {
             // clamp. #148: a memory-warning shed no longer disarms this - after a first-warning step-down the
             // file keeps a real (halved) budget, and a parked viewer must still drop to the paused floor.
             guard mpv != nil, !configuredLiveMode, !pausedCacheClamped,
-                  currentReadAheadBudgetBytes > VortXCacheShedPolicy.floorBytes else { return }
+                  currentReadAheadBudgetBytes > pausedClampFloorBytes else { return }
             let graceReason = "paused \(Int(Self.pausedClampGraceSeconds))s"
             let work = DispatchWorkItem { [weak self] in self?.applyPausedCacheClamp(reason: graceReason) }
             pausedCacheClampWork = work
@@ -1564,7 +1594,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// re-checked here (not only in pausedStateChanged) because enterBackground calls this directly.
     private func applyPausedCacheClamp(reason: String = "long pause") {
         guard mpv != nil, !configuredLiveMode, !pausedCacheClamped,
-              currentReadAheadBudgetBytes > VortXCacheShedPolicy.floorBytes else { return }
+              currentReadAheadBudgetBytes > pausedClampFloorBytes else { return }
         guard getFlag(MPVProperty.pause) else { return }   // belt-and-suspenders; resume cancels the work item
         pausedCacheClamped = true
         setString("demuxer-max-bytes", Self.clampedCacheCap)
@@ -1599,51 +1629,76 @@ final class MPVMetalViewController: PlatformViewController {
 
     private func shedForMemoryPressure() {
         guard mpv != nil else { return }
-        // #148 ("caches then stops caching ~40s in"): the old handler answered the FIRST warning by
-        // slamming the forward cap to the 48 MiB floor for the rest of the file. On the Apple TV the big
-        // read-ahead fills at link speed, so a warning arrived ~40s into every mpv mount (six in one field
-        // log) and caching visibly died for the whole film. The real relief is the buffer DROP below,
-        // which frees the resident bytes immediately either way; the refill budget only sets the next
-        // peak. So step DOWN instead of slamming: first warning halves the budget (256 -> 128 MiB;
-        // caching stays alive), any later warning floors it (the old terminal state).
-        // The reduced budget is written back to activeReadAheadCap so pause/resume and later warnings all
-        // key off it; loadFile still resets a NEW file to its full budget.
+        // ROOT FIX ("buffers constantly after Beta 8"): the old handler LOWERED the forward cap on EVERY
+        // memory warning. But those warnings are system-wide ADVISORY signals, not this process's headroom.
+        // Twelve field logs settled it: across 743 os_proc_available_memory samples during playback the
+        // MINIMUM free was 712 MiB and NONE dipped below the ~384 MiB pressure threshold, yet the cap was
+        // slammed toward 48 MiB 65+ times, starving the forward buffer into constant rebuffering. Now the cap
+        // is lowered ONLY when THIS process's real headroom is below the PRESSURE threshold (the same bar the
+        // proactive clamp uses, ~384 MiB on the 3 GB box - so the 712 MiB field-min holds comfortably), and
+        // then by one 64 MiB rung toward the raised, device-scaled floor (192 MiB normal / 128 MiB reduced),
+        // never to a razor-thin 48 MiB. At/above the pressure bar the cap is returned UNCHANGED. The forwardCap
+        // decision owns that bar; the expensive flush stays on the stricter restore bar (see shedForMemory
+        // below and shouldDeferFlushOnWarning).
         let currentCapBytes = currentReadAheadBudgetBytes
-        let previouslyShed = memoryCacheClamped
-        let newCapBytes = VortXCacheShedPolicy.forwardCapAfterWarning(
-            currentBytes: currentCapBytes, previouslyShed: previouslyShed)
-        memoryCacheClamped = true
-        let newCap = String(newCapBytes)
-        activeReadAheadCap = newCap
-        if pausedCacheClamped {
-            // Parked at the paused floor already: keep the live cap there (raising it under pressure would
-            // be backwards); the shrunken budget takes over on resume via pausedStateChanged.
-        } else {
-            setString("demuxer-max-bytes", newCap)
-        }
-        setString("demuxer-max-back-bytes", "8MiB")
-        // diag-23 FIX-C: the cap step-down above is unconditional and non-increasing - the jetsam-safe
-        // part - and always runs. The DROP below (drop-buffers + exact re-anchor seek) is what frees
-        // resident bytes NOW, but it also causes a visible frame-drop burst. Skip it ONLY when free memory
-        // is provably ample (restore-grade headroom) AND the live cache already fits the reduced cap, so
-        // the drop would free nothing the cap does not already bound: the diag-23 case (a soft warning at
-        // ~940 MiB free, no jetsam). A failed fill read passes Int.max, which overflows any reduced cap, so
-        // low/uncertain headroom, an unreadable fill, or a cache above the reduced cap all keep the drop.
+        let floor = shedFloorBytes
+        let step = shedStepBytes
         let availableBytes = UInt64(os_proc_available_memory())
+        let physicalBytes = ProcessInfo.processInfo.physicalMemory
+        let newCapBytes = VortXCacheShedPolicy.forwardCapAfterWarning(
+            currentBytes: currentCapBytes,
+            availableBytes: availableBytes,
+            physicalBytes: physicalBytes,
+            floorBytes: floor,
+            stepBytes: step)
+        let capLowered = newCapBytes < currentCapBytes
+
+        // The flush gate is unchanged (diag-23 FIX-C): drop-buffers + an exact re-anchor seek frees resident
+        // bytes NOW but causes a visible frame-drop burst, so defer it when headroom is provably ample AND the
+        // live cache already fits the reduced cap (the drop would free nothing the cap does not already bound).
+        // A failed fill read passes Int.max, which overflows any reduced cap, so an unreadable fill keeps the
+        // drop; when headroom is genuinely low this returns false and the drastic flush fires, jetsam intact.
         let cacheFillBytes = diagnosticInt("demuxer-cache-state/fw-bytes") ?? Int.max
         let deferFlush = VortXCacheShedPolicy.shouldDeferFlushOnWarning(
             availableBytes: availableBytes,
-            physicalBytes: ProcessInfo.processInfo.physicalMemory,
+            physicalBytes: physicalBytes,
             currentCapBytes: currentCapBytes,
             cacheFillBytes: cacheFillBytes,
-            previouslyShed: previouslyShed)
+            floorBytes: floor,
+            stepBytes: step)
+
+        if capLowered {
+            // Genuine low headroom: apply the non-increasing step-down and remember this file was shed. A
+            // parked player keeps the paused floor on the live property (re-inflating a parked player's
+            // read-ahead is the jetsam case the paused clamp prevents); pausedStateChanged picks the reduced
+            // budget up on resume.
+            memoryCacheClamped = true
+            activeReadAheadCap = String(newCapBytes)
+            if !pausedCacheClamped {
+                setString("demuxer-max-bytes", String(newCapBytes))
+            }
+        }
         if !deferFlush {
+            // Real pressure relief: shrink the seek-back buffer and drop the forward cache. Coupled to the
+            // flush so an advisory warning with ample headroom never quietly costs the viewer their rewind
+            // window or a frame-drop burst.
+            setString("demuxer-max-back-bytes", "8MiB")
             flushDemuxerCachePreservingPosition()   // NOT bare drop-buffers: that moves the play head (see above)
         }
+
         let mib = newCapBytes >> 20
-        let dropNote = deferFlush ? "flush deferred (ample headroom, cache within reduced cap)" : "buffers dropped"
-        mpvLog.log("memory warning: demuxer cache stepped down to \(mib, privacy: .public)MiB for the rest of this file")
-        DiagnosticsLog.log("player", "memory warning: mpv cache stepped down to \(mib)MiB + \(dropNote)")
+        let flushNote = deferFlush ? "flush deferred" : "buffers dropped"
+        if capLowered {
+            // Genuine low headroom (below the pressure bar): cap stepped down toward the floor.
+            mpvLog.log("memory warning: low headroom, demuxer cache stepped down to \(mib, privacy: .public)MiB")
+            DiagnosticsLog.log("player", "memory warning: available \(availableBytes >> 20)MiB below pressure bar, cache -> \(mib)MiB + \(flushNote)")
+        } else {
+            // Cap HELD (headroom at/above the pressure bar). The overwhelming field case; note the flush may
+            // still have fired in the [pressure, restore) band, where the cap holds but the conservative flush
+            // does not yet defer.
+            mpvLog.log("memory warning: cap held at \(mib, privacy: .public)MiB, headroom \(availableBytes >> 20, privacy: .public)MiB (\(flushNote, privacy: .public))")
+            DiagnosticsLog.log("player", "memory warning: available \(availableBytes >> 20)MiB at/above pressure bar, cache held at \(mib)MiB + \(flushNote)")
+        }
     }
 
     #if os(tvOS)
@@ -1719,9 +1774,9 @@ final class MPVMetalViewController: PlatformViewController {
             }
             // Re-arm the one-shot proactive clamp on EVERY rung, including partial ones: a raise that left
             // the shrink control disabled would be a control that cannot answer the pressure the raise
-            // itself creates. `memoryCacheClamped` is the harsher flag (it makes the next system warning
-            // floor instead of halve) and is cleared only on a FULL return to baseline, where this file's
-            // budget is once again exactly what a fresh load would have given it.
+            // itself creates. `memoryCacheClamped` is the "this file was shed by a warning" marker; clear it
+            // only on a FULL return to baseline, where this file's budget is once again exactly what a fresh
+            // load would have given it.
             proactiveMemoryCacheClamped = false
             if restored >= baseline { memoryCacheClamped = false }
             let restoredMiB = restored >> 20
@@ -1739,7 +1794,7 @@ final class MPVMetalViewController: PlatformViewController {
             availableMemoryBytes: available,
             physicalMemoryBytes: physical,
             currentCapBytes: currentReadAheadBudgetBytes,
-            floorBytes: VortXCacheShedPolicy.floorBytes,
+            floorBytes: shedFloorBytes,
             alreadyClamped: proactiveMemoryCacheClamped
         ) else { return }
 

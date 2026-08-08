@@ -2366,6 +2366,23 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 // Diagnostic: a player stuck at .waitingToPlayAtSpecifiedRate (2) with a buffering wait-reason
                 // is the "mounts but never plays" signature; logging the reason pinpoints it in one test.
                 DiagnosticsLog.log("avplayer", "timeControlStatus=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")
+                // AUTO-RESUME GUARD. The DV / remux lane is served to AVPlayer as a LIVE, indefinite-duration
+                // HLS (a sliding window with no EXT-X-ENDLIST) with automaticallyWaitsToMinimizeStalling on, and
+                // AVFoundation does not honor an indefinite user pause on a live item: after roughly a forward-
+                // buffer window it leaves .paused on its own to track the growing edge, and nothing else re-
+                // pauses it, so a deliberately paused title silently resumes about a minute later. `playbackRequested`
+                // is the user's committed transport intent, false ONLY when the viewer (or an explicit Now Playing
+                // pause) asked to stop; when it is false a departure from .paused was never requested, so re-assert
+                // the pause. This can only ever CANCEL an unrequested resume: a genuine play() sets
+                // playbackRequested = true BEFORE it moves the rate, so an intended resume - and the ordinary
+                // .waitingToPlayAtSpecifiedRate buffering that precedes intended playback - is never touched.
+                // Return before the state emit so the chrome never flashes a buffering / playing blip: the pause
+                // settles and this observer re-fires at .paused, republishing the already-correct paused state.
+                if !self.playbackRequested, player.timeControlStatus != .paused {
+                    player.pause()
+                    DiagnosticsLog.log("avplayer", "re-asserted user pause: AVPlayer left .paused (tcs=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")) while transport intent was paused")
+                    return
+                }
                 // Mirror the transport state + buffering wait into the probe so the heartbeat is meaningful
                 // on the AVPlayer path (DV / HLS). waitingToPlayAtSpecifiedRate is AVPlayer's "buffering".
                 let waiting = player.timeControlStatus == .waitingToPlayAtSpecifiedRate

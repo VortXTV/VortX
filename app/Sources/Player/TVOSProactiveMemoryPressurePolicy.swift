@@ -20,7 +20,15 @@ enum TVOSProactiveMemoryPressurePolicy {
 
     private static let minimumThresholdBytes: UInt64 = 192 << 20
     private static let maximumThresholdBytes: UInt64 = 384 << 20
-    private static let normalRemoteVODLimitBytes: Int64 = 128 << 20
+    /// The tvOS NORMAL-tier RAM wall for the remote VOD forward buffer. Raised 128 -> 384 MiB so the new
+    /// RemoteConfig-backed 384 MiB read-ahead baseline (the RAM-safe max for the "smoother playback" fix)
+    /// passes through rather than being clamped back down. 384 MiB stays well under the ~700 MiB jetsam wall
+    /// the 3 GB Apple TV 4K field logs proved fatal (at the field-min 712 MiB free it leaves ~328 MiB), and the
+    /// RemoteConfig ceiling (default 384, clamped <= 448) bounds any operator-raised baseline in
+    /// `RemoteConfig.validate`.
+    private static let normalRemoteVODLimitBytes: Int64 = 384 << 20
+    /// The 2 GB Apple TV HD (`PerformanceMode.reduced`) RAM wall. UNCHANGED at 96 MiB: that tier is
+    /// jetsam-critical and its tight buffers must stay exactly as shipped.
     private static let reducedRemoteVODLimitBytes: Int64 = 96 << 20
 
     /// Select the remote VOD budget, then enforce the tvOS process-memory ceiling. The disk cache

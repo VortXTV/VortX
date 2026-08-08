@@ -44,6 +44,19 @@ enum RemoteConfigDefaults {
     static let reducedCeilingMiB = 128       // Apple TV HD (PerformanceMode.reduced) ceiling (was `128 * 1024 * 1024`)
     static let macCeilingMiB = 1024          // macOS ceiling (was `1_024 * 1024 * 1024`)
     static let offFloorMiB = 64              // hard floor: no ceiling may drop below this
+    // tvOS forward-buffer dials (the "smoother Apple TV playback" fix). The client scales the floor DOWN on
+    // PerformanceMode.reduced (the 2 GB Apple TV HD); the reduced remote read-ahead itself stays the shipped
+    // 96 MiB. All four are jetsam-bounded in `validate`: floor and baseline never below the hard-min, ceiling
+    // never past 448 MiB so the in-RAM cap stays under the ~700 MiB wall the field logs proved fatal on 4K.
+    static let tvosReadAheadBaselineMiB = 384   // tvOS NORMAL remote-VOD load cap (demuxer-max-bytes). Was 128.
+                                                // 384 is the RAM-safe max: at the field-min 712 MiB free it
+                                                // leaves ~456 MiB headroom, still above the ~384 MiB pressure
+                                                // threshold and well under the ~700 MiB fatal wall. Bigger
+                                                // buffers need disk-offload, a separate track. Equal to the
+                                                // ceiling below (baseline == ceiling is intentional here).
+    static let tvosReadAheadFloorMiB = 192      // NORMAL-tier shed floor: a warning/clamp never drops below this
+    static let tvosReadAheadHardMinMiB = 150    // absolute never-below for the NORMAL tier
+    static let tvosReadAheadCeilingMiB = 384    // upper bound on the tvOS RAM cap (stays under the ~700 MiB wall)
     static let vodReadaheadSecs = 300        // demuxer-readahead-secs for VOD (configureLiveMode else-branch)
     static let dvRemuxWindowMiB = 64         // Re-read floor, in MiB. THE 64 IS EMPIRICAL, not derived.
                                              // It used to be justified here as "2 x hlsMaxSegmentBytes = 2 x 32
@@ -208,6 +221,12 @@ struct RemoteConfigData: Decodable {
             let macCeilingMiB: Int?
             let offFloorMiB: Int?
             let dvRemuxWindowMiB: Int?
+            // tvOS forward-buffer dials (see RemoteConfigDefaults). Every field optional; a config with no
+            // tvos* keys decodes fine and falls back to the baked defaults.
+            let tvosBaselineMiB: Int?
+            let tvosFloorMiB: Int?
+            let tvosHardMinMiB: Int?
+            let tvosCeilingMiB: Int?
         }
         struct ReadAheadOff: Decodable {
             let reducedLocalMiB: Int?
@@ -337,6 +356,12 @@ final class ResolvedConfig: @unchecked Sendable {
     let vodReadaheadSecsValue: Int
     let dvRemuxWindowMiB: Int
 
+    // tvOS forward-buffer dials (MiB), already clamped: hardMin <= floor <= baseline <= ceiling <= 448.
+    let tvosReadAheadBaselineMiB: Int
+    let tvosReadAheadFloorMiB: Int
+    let tvosReadAheadHardMinMiB: Int
+    let tvosReadAheadCeilingMiB: Int
+
     // Timeouts (secs), clamped.
     let detailSettleIOSSecs: Int
     let detailSettleTVSecs: Int
@@ -390,6 +415,10 @@ final class ResolvedConfig: @unchecked Sendable {
          offFloorMiB: Int,
          vodReadaheadSecs: Int,
          dvRemuxWindowMiB: Int,
+         tvosReadAheadBaselineMiB: Int,
+         tvosReadAheadFloorMiB: Int,
+         tvosReadAheadHardMinMiB: Int,
+         tvosReadAheadCeilingMiB: Int,
          detailSettleIOSSecs: Int,
          detailSettleTVSecs: Int,
          debridResolveSecs: Int,
@@ -423,6 +452,10 @@ final class ResolvedConfig: @unchecked Sendable {
         self.offFloorMiB = offFloorMiB
         self.vodReadaheadSecsValue = vodReadaheadSecs
         self.dvRemuxWindowMiB = dvRemuxWindowMiB
+        self.tvosReadAheadBaselineMiB = tvosReadAheadBaselineMiB
+        self.tvosReadAheadFloorMiB = tvosReadAheadFloorMiB
+        self.tvosReadAheadHardMinMiB = tvosReadAheadHardMinMiB
+        self.tvosReadAheadCeilingMiB = tvosReadAheadCeilingMiB
         self.detailSettleIOSSecs = detailSettleIOSSecs
         self.detailSettleTVSecs = detailSettleTVSecs
         self.debridResolveSecs = debridResolveSecs
@@ -462,6 +495,10 @@ final class ResolvedConfig: @unchecked Sendable {
             offFloorMiB: RemoteConfigDefaults.offFloorMiB,
             vodReadaheadSecs: RemoteConfigDefaults.vodReadaheadSecs,
             dvRemuxWindowMiB: RemoteConfigDefaults.dvRemuxWindowMiB,
+            tvosReadAheadBaselineMiB: RemoteConfigDefaults.tvosReadAheadBaselineMiB,
+            tvosReadAheadFloorMiB: RemoteConfigDefaults.tvosReadAheadFloorMiB,
+            tvosReadAheadHardMinMiB: RemoteConfigDefaults.tvosReadAheadHardMinMiB,
+            tvosReadAheadCeilingMiB: RemoteConfigDefaults.tvosReadAheadCeilingMiB,
             detailSettleIOSSecs: RemoteConfigDefaults.detailSettleIOSSecs,
             detailSettleTVSecs: RemoteConfigDefaults.detailSettleTVSecs,
             debridResolveSecs: RemoteConfigDefaults.debridResolveSecs,
@@ -504,6 +541,20 @@ final class ResolvedConfig: @unchecked Sendable {
             mib = debridCeilingMiB
         }
         return mib * 1024 * 1024
+    }
+
+    /// The tvOS NORMAL-tier remote-VOD forward-buffer load cap in MiB (baked 256). The controller applies this
+    /// only on the normal tvOS branch (via a "\(...)MiB" spelling); the reduced (2 GB Apple TV HD) remote
+    /// read-ahead stays the shipped 96 MiB, untouched.
+    var tvosReadAheadBaseline: Int { tvosReadAheadBaselineMiB }
+
+    /// The device-scaled shed floor in BYTES for the memory-warning and proactive clamp/restore paths. On the
+    /// NORMAL tier it is the floor knob (>= the 150 MiB hard-min by construction, baked 192). On
+    /// PerformanceMode.reduced it scales down to at most the reduced RAM ceiling (128 MiB) and can never exceed
+    /// the normal floor, so a shed stays non-increasing and crash-safe on the 2 GB Apple TV HD.
+    func tvosShedFloorBytes(reduced: Bool) -> Int {
+        let mib = reduced ? min(reducedCeilingMiB, tvosReadAheadFloorMiB) : tvosReadAheadFloorMiB
+        return mib << 20
     }
 
     /// demuxer-readahead-secs for VOD (baked 300).
@@ -761,6 +812,17 @@ actor RemoteConfig {
         // RAM this window replaced.
         let dvWindow = clamp(data.player?.readAhead?.dvRemuxWindowMiB, RemoteConfigDefaults.dvRemuxWindowMiB, 64, 512)
 
+        // --- tvOS forward-buffer dials (THE jetsam knob's other half). The static clamp is followed by an
+        //     explicit ordering enforcement so the invariant hardMin <= floor <= baseline <= ceiling <= 448
+        //     holds no matter which fields are present, absent, or out of range. The 448 hi keeps the in-RAM
+        //     cap under the ~700 MiB wall the 4K field logs proved fatal. `clamp` returns the baked fallback
+        //     un-ranged when a field is ABSENT, so max()/min() re-impose the ordering (mirrors debrid/reduced
+        //     above). Baked all-absent resolves to 150/192/256/384. ---
+        let tvosHardMin = clamp(data.player?.readAhead?.tvosHardMinMiB, RemoteConfigDefaults.tvosReadAheadHardMinMiB, 96, 256)
+        let tvosCeiling = max(tvosHardMin, clamp(data.player?.readAhead?.tvosCeilingMiB, RemoteConfigDefaults.tvosReadAheadCeilingMiB, 128, 448))
+        let tvosFloor = min(tvosCeiling, max(tvosHardMin, clamp(data.player?.readAhead?.tvosFloorMiB, RemoteConfigDefaults.tvosReadAheadFloorMiB, 96, 448)))
+        let tvosBaseline = min(tvosCeiling, max(tvosFloor, clamp(data.player?.readAhead?.tvosBaselineMiB, RemoteConfigDefaults.tvosReadAheadBaselineMiB, 96, 448)))
+
         // --- Timeouts. ---
         let settleIOS = clamp(data.timeouts?.detailSettleIOSSecs, RemoteConfigDefaults.detailSettleIOSSecs, 5, 60)
         let settleTV = clamp(data.timeouts?.detailSettleTVSecs, RemoteConfigDefaults.detailSettleTVSecs, 5, 60)
@@ -913,6 +975,10 @@ actor RemoteConfig {
             offFloorMiB: floor,
             vodReadaheadSecs: vodSecs,
             dvRemuxWindowMiB: dvWindow,
+            tvosReadAheadBaselineMiB: tvosBaseline,
+            tvosReadAheadFloorMiB: tvosFloor,
+            tvosReadAheadHardMinMiB: tvosHardMin,
+            tvosReadAheadCeilingMiB: tvosCeiling,
             detailSettleIOSSecs: settleIOS,
             detailSettleTVSecs: settleTV,
             debridResolveSecs: debridResolve,

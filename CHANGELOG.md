@@ -4,6 +4,14 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 (unreleased)
+
+### Apple TV playback
+
+**Apple TV playback is smoother and stops the constant buffering.** After Beta 8 the player rebuffered on everything, even where Beta 8 and other apps played fine. The player was shrinking its own forward streaming buffer on every routine tvOS memory warning, treating that system wide advisory as if this app were out of memory. Twelve device logs settled it: across 743 memory readings during playback the least free memory was 712 MiB and none ever came near the pressure line, yet the buffer was cut toward its minimum more than sixty times per film until it held only a few seconds of 4K and had to pause to refill again and again. The player now reads how much memory this process actually has before it touches the buffer, so a harmless warning is ignored and the buffer is trimmed only when the app is genuinely low, and even then it steps down gently and keeps a healthy cushion rather than collapsing to a sliver. It also starts with a larger read ahead buffer and grows it back promptly once memory frees up. The 2 GB Apple TV HD keeps its tighter, crash safe buffers, and torrent and trailer buffers are unchanged. All of the sizes are backend adjustable without an app update. Apple TV.
+
+**A paused Dolby Vision or HLS title stays paused.** On the built-in Apple player these streams are delivered as a live feed with no fixed end, and that player does not honor an indefinite pause on a live feed, so about a minute after you paused it would quietly resume on its own. The player now catches the moment it drifts off a pause you asked for and re-asserts the pause immediately, so a paused title stays paused until you press play, while an ordinary buffering wait during intended playback is left untouched. Apple TV, iPhone, iPad, and Mac.
+
 ## 0.3.14 Beta 11 - 2026-07-31
 
 A hotfix that replaces Beta 10. Beta 10 could freeze on the splash screen and never open on a signed-in install, worst on Apple TV, where it could hang the device until it was unplugged. It was a real bug in Beta 10, not a bad download, which is why a fresh signed-out install could look fine while a signed-in one would not.
