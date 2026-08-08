@@ -19,7 +19,10 @@
 
 # VortX
 
-VortX is the native streaming app for Apple TV, iPhone, iPad, and Mac. Fully native apps built on a native Rust engine and the libmpv player, with no web wrapper. **Android is here too, in beta** (one build for phone and Android TV, as a sideload APK), alongside the four Apple apps, with desktop (Windows, Linux, Mac) and more on the way.
+> [!WARNING]
+> **The Android APK is an early technical preview, not the finished app.** VortX is Apple first: the Apple TV, iPhone, iPad, and Mac apps are the complete experience today. Android is just getting started, sharing the same native engine, and the preview exists so Android users can watch the port take shape and help steer it. Expect missing features, rough edges, and fast-moving builds. If you want the full VortX experience right now, use the Apple apps; if you try the Android preview, please report what you hit, because every report shapes the port.
+
+VortX is the native streaming app for Apple TV, iPhone, iPad, and Mac. Fully native apps built on a native Rust engine and the libmpv player, with no web wrapper. **Android is here too, as an early technical preview** (one build for phone and Android TV, as a sideload APK), alongside the four Apple apps, with desktop (Windows, Linux, Mac) and more on the way.
 
 ## New in the 0.3.14 line
 
