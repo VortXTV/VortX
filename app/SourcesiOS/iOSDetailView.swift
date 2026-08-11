@@ -44,16 +44,143 @@ func prepareTorrentStream(_ stream: CoreStream) -> Task<Void, Never>? {
 /// One add-on's streams for a series episode, fetched straight over the Stremio add-on protocol so the
 /// F6 warm-up never touches the engine's single meta slot (which would evict the playing episode). Mirrors
 /// the tvOS preload's fetchStreams. nil on any failure or an empty answer, so a dead add-on is skipped.
-private func warmFetchEpisodeStreams(base: String, addon: String, id: String) async -> CoreStreamSourceGroup? {
+private func warmFetchEpisodeStreams(
+    base: String,
+    addon: String,
+    id: String,
+    requestTimeout: TimeInterval
+) async -> CoreStreamSourceGroup? {
     let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
     guard let url = URL(string: "\(base)/stream/series/\(escaped).json") else { return nil }
     var request = URLRequest(url: url)
-    request.timeoutInterval = 20
+    request.timeoutInterval = requestTimeout
     struct Response: Decodable { let streams: [CoreStream]? }
     guard let (data, _) = try? await URLSession.shared.data(for: request),
           let response = try? JSONDecoder().decode(Response.self, from: data),
           let streams = response.streams, !streams.isEmpty else { return nil }
     return CoreStreamSourceGroup(id: base, addon: addon, streams: streams)
+}
+
+/// Structured, bounded account add-on fetch for iOS/macOS preparation. The user's sticky provider enters the
+/// first five-wide window, ordinary providers keep a short cap, and results return to account order for rank.
+private func warmFetchEpisodeSourceGroups(
+    sources: [StreamSource],
+    request: NextEpisodePreparationRequest,
+    wantedAddon: String?
+) async -> [CoreStreamSourceGroup] {
+    let remaining = max(0, min(
+        NextEpisodePreparationBudget.addonFetchBudget,
+        request.deadline - ProcessInfo.processInfo.systemUptime
+    ))
+    guard remaining > 0, !Task.isCancelled else { return [] }
+    let order = PreloadProviderRotation.order(
+        count: sources.count,
+        request: request,
+        stride: NextEpisodePreparationBudget.providerRotationStride,
+        prioritizedIndex: wantedAddon.flatMap { wanted in
+            sources.firstIndex { $0.name.caseInsensitiveCompare(wanted) == .orderedSame }
+        }
+    )
+    let rotatedSources = order.map { sources[$0] }
+    let rotated: [CoreStreamSourceGroup?] = await BoundedPreloadWorkPool.map(
+        rotatedSources,
+        limit: NextEpisodePreparationBudget.addonConcurrencyLimit,
+        timeoutNanoseconds: UInt64(remaining * 1_000_000_000),
+        operationTimeoutFor: { source in
+            UInt64(
+                NextEpisodePreparationBudget.requestTimeout(
+                    addon: source.name,
+                    wantedAddon: wantedAddon
+                ) * 1_000_000_000
+            )
+        }
+    ) { source in
+        await warmFetchEpisodeStreams(
+            base: source.base,
+            addon: source.name,
+            id: request.episodeID,
+            requestTimeout: NextEpisodePreparationBudget.requestTimeout(
+                addon: source.name,
+                wantedAddon: wantedAddon
+            )
+        )
+    }
+    return PreloadProviderRotation.restoreOriginalOrder(
+        rotated,
+        order: order,
+        count: sources.count
+    ).compactMap { $0 }
+}
+
+/// Retire one raw-torrent preparation exactly once. A season-pack request can point at the hash already
+/// feeding the current episode; that engine remains under the ordinary player lifecycle and must not be
+/// removed by a canceled E+1 preload.
+private func retireWarmTorrentEngine(
+    _ lease: PreparedTorrentEngineLease,
+    reason: String
+) {
+    guard lease.abandon() else { return }
+    let shouldRemove = !lease.protectsPlayingEngine
+    if shouldRemove,
+       lease.hash.count == 40,
+       let url = URL(string: "\(StremioServer.base)/\(lease.hash)/remove") {
+        URLSession.shared.dataTask(with: url).resume()
+    }
+    DiagnosticsLog.log(
+        "binge",
+        "next prepare torrent cleanup target=\(VXProbeRedaction.identityToken(lease.request.episodeID)) attempt=\(lease.request.attemptSequence) remove=\(shouldRemove ? "Y" : "N") reason=\(reason)"
+    )
+}
+
+/// Start the exact tracker-bearing embedded torrent engine and retain its ownership receipt. A ranged media
+/// GET is forbidden until this returns a lease whose create completed with a 2xx response.
+private func prepareWarmTorrentEngine(
+    _ stream: CoreStream,
+    request: NextEpisodePreparationRequest
+) async -> PreparedTorrentEngineLease? {
+    guard !PlaybackSettings.torrentsDisabled,
+          stream.url == nil,
+          let hash = stream.infoHash?.lowercased(),
+          hash.count == 40,
+          let url = URL(string: "\(StremioServer.base)/\(hash)/create") else { return nil }
+    let sources = TorrentTrackers.sources(forHash: hash, streamSources: stream.sources)
+    let body: [String: Any] = [
+        "torrent": ["infoHash": hash],
+        "peerSearch": ["sources": sources, "min": 40, "max": 150]
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+    let lease = PreparedTorrentEngineLease(request: request, hash: hash)
+    var retained = false
+    defer {
+        if !retained { retireWarmTorrentEngine(lease, reason: "create failed or canceled") }
+    }
+
+    let configured: Bool? = await BoundedPreloadWorkPool.valueBeforeDeadline(request.deadline) {
+        await StremioServer.applyServerConfig(maxAttempts: 3)
+    }
+    guard configured != nil, !Task.isCancelled else { return nil }
+    let timeout = max(
+        1,
+        min(15, request.deadline - ProcessInfo.processInfo.systemUptime)
+    )
+    let status: Int? = await BoundedPreloadWorkPool.valueBeforeDeadline(request.deadline) {
+        try? await TorrentCreateTransport.shared.create(
+            url: url,
+            jsonBody: data,
+            timeout: timeout
+        )
+    } ?? nil
+    guard !Task.isCancelled,
+          let status,
+          status / 100 == 2,
+          lease.markCreateSucceeded(),
+          lease.canWarm(for: request) else { return nil }
+    retained = true
+    DiagnosticsLog.log(
+        "binge",
+        "next prepare torrent ready target=\(VXProbeRedaction.identityToken(request.episodeID)) attempt=\(request.attemptSequence)"
+    )
+    return lease
 }
 
 /// Direct-links-only filter (drop torrent sources), the free twin of the per-view displayGroups,
@@ -86,29 +213,26 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
                              account: StremioAccount) async -> PlayerEpisodeStream? {
     guard !Task.isCancelled else { return nil }
     guard let v = videos.first(where: { $0.id == videoId }) else { return nil }
+    let settlementStartedAt = Date()
     core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
     var groups: [CoreStreamSourceGroup] = []
-    var firstPlayableAt: Date? = nil
     // The source the viewer picked BY HAND for this show (`SeriesSourceSticky`, keyed on the show id `seriesId`).
     // PlayerScreen also drives its binge auto-next through THIS resolver (a Continue-Watching resume launch), so
-    // like the detail-page `loadEpisodeStream` and tvOS it must honor the pick on BOTH halves: the gate waits
-    // until that source is present (`wantedAddon`), and `best` below prefers it (`sticky` + provider-health). nil
-    // when the viewer never chose a source (a fresh play): both stay byte-identical to before.
+    // like the detail-page `loadEpisodeStream` and tvOS it must honor the pick. Settlement waits for every raw
+    // contributor or the request deadline; only then does `best` prefer it with sticky + provider-health terms.
     let sticky = SeriesSourceSticky.preference(for: seriesId)
     let wantedAddon = sticky?.addon
-    for _ in 0 ..< 80 {                                // ~20s ceiling, matching the episode page
+    while true {
         guard !Task.isCancelled else { return nil }
         groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
-        if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
-        // Settle gate (see StreamRanking.resolveSettled): with a remembered manual source, hold for IT (bounded)
-        // instead of committing off whichever provider answers fastest; otherwise, for a resume, hold until the
-        // SAME quality the user last played has loaded (and, unless they rank torrents on top, a non-torrent
-        // one), because torrents answer in ~4s while the user's debrid of that quality lands ~10-12s later.
+        // Hints affect ranking only after every registered contributor is terminal or this request reaches the
+        // shared deadline. A fast matching source cannot open the partial set.
         let progress = core.streamLoadProgress(forStreamId: v.id)
-        let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
+        let elapsed = Date().timeIntervalSince(settlementStartedAt)
         if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                        secondsSinceFirstPlayable: elapsed, rememberedQuality: continuity,
+                                        secondsSinceRequestStart: elapsed, rememberedQuality: continuity,
                                         wantedAddon: wantedAddon) { break }
+        if elapsed >= StreamRanking.completeSetDeadline { break }
         do {
             try await Task.sleep(for: .milliseconds(250))
         } catch {
@@ -468,7 +592,6 @@ struct iOSDetailView: View {
     @StateObject private var sourceList = SourceListModel()
     @State private var season = 1
     @State private var didApplySeason = false   // once the initial-season hint lands (or the user taps a season), stop re-applying it
-    @State private var settleTimedOut = false            // movie/live resolution gave up → "No sources found", not a spinner
     @State private var sourceRefreshDebounce: Task<Void, Never>? = nil
     private static let sourceRefreshDebounceMs = 400     // trailing settle for the movie/live add-on load storm
     // Debrid cache AWARENESS for the movie/live source list: which raw torrents the user's debrid account
@@ -868,11 +991,6 @@ struct iOSDetailView: View {
         // iOS while MOVIES (no child push) and macOS (different onDisappear timing) worked. The next
         // detail's loadMeta replaces the resident meta anyway, so leaving it loaded is harmless.
         .onDisappear { torrentPrime?.cancel(); sourceRefreshDebounce?.cancel(); langChipsDebounce?.cancel() }
-        // Flip the spinner to "No sources found" if resolution hangs past 20s (mirrors iOSEpisodeStreams).
-        .task {
-            try? await Task.sleep(for: .seconds(20))
-            settleTimedOut = true
-        }
         // Debrid cache awareness: as add-ons answer (the load count climbs), check which raw torrents the
         // user's debrid account has cached. `refresh` de-dups by the hash set, so this only hits a provider
         // when the torrents actually change; with no debrid key it returns an empty set and nothing renders.
@@ -892,17 +1010,23 @@ struct iOSDetailView: View {
         // their own episode view.
         .onChange(of: meta?.id) { _ in
             if effectiveType != "series" {
-                torboxSearch.refresh(imdbId: titleIdentity.titleID)
+                AuxiliarySourcePipeline.refresh(
+                    target: auxiliaryTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
+                    isSignedIn: VortXSyncManager.shared.isSignedIn
+                )
                 mediaServers.refresh(imdb: titleIdentity.titleID, title: meta?.name,
-                                     publicationTarget: mediaServerTargetID)
+                                     publicationTarget: mediaServerTarget)
                 refreshSourceIndex()
             }
         }
         .onAppear {
             if effectiveType != "series" {
-                torboxSearch.refresh(imdbId: titleIdentity.titleID)
+                AuxiliarySourcePipeline.refresh(
+                    target: auxiliaryTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
+                    isSignedIn: VortXSyncManager.shared.isSignedIn
+                )
                 mediaServers.refresh(imdb: titleIdentity.titleID, title: meta?.name,
-                                     publicationTarget: mediaServerTargetID)
+                                     publicationTarget: mediaServerTarget)
                 refreshSourceIndex()
             }
         }
@@ -2233,7 +2357,7 @@ struct iOSDetailView: View {
             groups: suspended ? [] : rankedMovie().groups,
             progress: core.streamLoadProgress(),
             states: core.streamAddonStates(),
-            settleTimedOut: settleTimedOut,
+            sourcesSettled: sourceList.isSettled,
             continuity: rememberedQuality,
             pinContext: pinContext,
             cachedHashes: debridCache.cachedHashes,
@@ -2431,29 +2555,39 @@ struct iOSDetailView: View {
     /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
-    private var sourceContentID: String? {
-        SourceIndexClient.contentID(roles: identityRoles)
+    private var auxiliaryTarget: SourceIndexIdentity.TargetResolution {
+        SourceIndexIdentity.publicationTarget(identityRoles)
     }
 
     /// Media-server lookup also supports IMDb-less title matching. Its merge fence therefore uses an exact
     /// page token even when the indexed contributors have no canonical query id.
-    private var mediaServerTargetID: String {
-        sourceContentID ?? "meta:\(id)"
+    private var mediaServerTarget: SourceIndexIdentity.MediaServerTarget? {
+        SourceIndexIdentity.mediaServerTarget(
+            preferring: auxiliaryTarget, metaID: id
+        )
     }
 
     private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil,
                                     providerByHash: [String: String] = [:]) {
-        let contentID = sourceContentID
-        sourceIndex.refresh(contentID: contentID, isSignedIn: VortXSyncManager.shared.isSignedIn)
-        guard let contentID else { return }
+        AuxiliarySourcePipeline.refresh(
+            target: auxiliaryTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
+            isSignedIn: VortXSyncManager.shared.isSignedIn
+        )
         // HOARD: report the anonymized descriptors from the UNFILTERED assembled groups (the pool should see
         // torrents even when the user hides them locally). Includes the TorBox search sources. No user data.
         // Pool-EXCLUDED: the caller's torbox-base when it already merged one, else self-merge. NEVER the
         // Singularity-pool-inclusive set: hoarding the pool's own results back into itself would be wrong.
         // `providerByHash` tags each cached torrent with the provider the user's OWN cache-check confirmed.
-        let groups = torboxMerged ?? torboxSearch.merged(into: core.streamGroups())
+        let groups = torboxMerged ?? AuxiliarySourcePipeline.torBoxMerged(
+            into: core.streamGroups(), target: auxiliaryTarget, torBox: torboxSearch
+        )
         guard !groups.isEmpty else { return }
-        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups, providerByHash: providerByHash) }
+        let target = auxiliaryTarget
+        Task.detached {
+            await AuxiliarySourcePipeline.hoard(
+                target: target, groups: groups, providerByHash: providerByHash
+            )
+        }
     }
 
     /// Trailing-debounced driver for the movie/live add-on load storm: the raw `.onChange` fired per add-on
@@ -2466,8 +2600,13 @@ struct iOSDetailView: View {
         sourceRefreshDebounce = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
             guard !Task.isCancelled else { return }
-            let torboxBase = torboxSearch.merged(into: core.streamGroups())   // pool-EXCLUDED (hoard set)
-            debridCache.refresh(from: sourceIndex.merged(into: torboxBase))   // pool-INCLUDED (debrid set)
+            let torboxBase = AuxiliarySourcePipeline.torBoxMerged(
+                into: core.streamGroups(), target: auxiliaryTarget, torBox: torboxSearch
+            )   // pool-EXCLUDED (hoard set)
+            debridCache.refresh(from: AuxiliarySourcePipeline.merged(
+                into: torboxBase, target: auxiliaryTarget,
+                torBox: torboxSearch, sourceIndex: sourceIndex
+            ))   // pool-INCLUDED (debrid set)
             refreshSourceIndex(torboxMerged: torboxBase,
                                providerByHash: debridCache.cachedProviderByHash) // reuse the base; tag cached facts
         }
@@ -2597,7 +2736,10 @@ struct iOSDetailView: View {
         // source-index sources (no-op unless the Singularity toggle is on + signed in), then apply the
         // Direct-links-only filter so a search/community torrent source is filtered on the same rule as an
         // add-on's (keeps the filter contract intact).
-        let withSearch = sourceIndex.merged(into: torboxSearch.merged(into: groups))
+        let withSearch = AuxiliarySourcePipeline.merged(
+            into: groups, target: auxiliaryTarget,
+            torBox: torboxSearch, sourceIndex: sourceIndex
+        )
         guard PlaybackSettings.directLinksOnly else { return withSearch }
         return withSearch.compactMap { group in
             let streams = group.streams.filter { !$0.isTorrent }
@@ -2620,8 +2762,8 @@ struct iOSDetailView: View {
     private func rankedMovie() -> (groups: [CoreStreamSourceGroup], best: CoreStream?) {
         sourceList.setContext(
             metaId: id, streamId: nil, continuity: rememberedQuality, pin: sourcePin,
-            auxiliaryContentID: sourceContentID,
-            mediaServerTargetID: mediaServerTargetID
+            auxiliaryTarget: auxiliaryTarget,
+            mediaServerTarget: mediaServerTarget
         )
         return (sourceList.groups, sourceList.best)
     }
@@ -2632,8 +2774,8 @@ struct iOSDetailView: View {
     private func rankedLive() -> [CoreStreamSourceGroup] {
         sourceList.setContext(
             metaId: id, streamId: nil, continuity: nil, pin: sourcePin,
-            auxiliaryContentID: sourceContentID,
-            mediaServerTargetID: mediaServerTargetID
+            auxiliaryTarget: auxiliaryTarget,
+            mediaServerTarget: mediaServerTarget
         )
         return sourceList.groups
     }
@@ -2647,9 +2789,7 @@ struct iOSDetailView: View {
     /// total == 0 means no add-on has reported yet; loaded < total means some are still in flight. The
     /// settle timeout opens the gate even if one add-on hangs.
     private var movieLoadingSources: Bool {
-        guard !settleTimedOut else { return false }
-        let p = core.streamLoadProgress()
-        return p.total == 0 || p.loaded < p.total
+        !sourceList.isSettled
     }
 
     /// Watch-Now arms once a best stream has resolved and sources have settled. A4b: this is NO LONGER gated
@@ -2990,16 +3130,16 @@ struct iOSDetailView: View {
     /// owns the transfer + automatic next-best fallback; nothing here writes to the account / libraryItem docs.
     private func presentSeriesDownloadPicker(_ video: CoreVideo) async {
         guard let m = meta else { return }
+        let settlementStartedAt = Date()
         core.loadMeta(type: "series", id: m.id, streamType: "series", streamId: video.id)
         var groups: [CoreStreamSourceGroup] = []
-        var firstPlayableAt: Date? = nil
-        for _ in 0 ..< 80 {                                // ~20s ceiling, matching the episode page
+        while true {
             groups = iOSDisplayGroups(core.streamGroups(forStreamId: video.id))
-            if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
             let progress = core.streamLoadProgress(forStreamId: video.id)
-            let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
+            let elapsed = Date().timeIntervalSince(settlementStartedAt)
             if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                            secondsSinceFirstPlayable: elapsed, rememberedQuality: rememberedQuality) { break }
+                                            secondsSinceRequestStart: elapsed, rememberedQuality: rememberedQuality) { break }
+            if elapsed >= StreamRanking.completeSetDeadline { break }
             try? await Task.sleep(for: .milliseconds(250))
         }
         guard !groups.isEmpty else { return }
@@ -3133,7 +3273,7 @@ struct iOSDetailView: View {
             groups: suspended ? [] : rankedLive(),
             progress: core.streamLoadProgress(),
             states: core.streamAddonStates(),
-            settleTimedOut: settleTimedOut,
+            sourcesSettled: sourceList.isSettled,
             pinContext: pinContext,
             cachedHashes: debridCache.cachedHashes,
             cachedUsenetURLs: debridCache.cachedUsenetURLs,
@@ -3827,7 +3967,6 @@ struct iOSEpisodeStreams: View {
     /// id, so CoreBridge bumps while the list is open no longer rebuild it per body eval.
     @StateObject private var sourceList = SourceListModel()
     @State private var lastBinge: String?   // release-group of the last pick; biases the next episode's source (#3 sticky autoplay)
-    @State private var settleTimedOut = false      // resolution gave up → show "No sources found", not a spinner
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
     @State private var sourceRefreshDebounce: Task<Void, Never>? = nil
     private static let sourceRefreshDebounceMs = 400     // trailing settle for this episode's add-on load storm
@@ -3843,6 +3982,11 @@ struct iOSEpisodeStreams: View {
     @StateObject private var sourceIndex = SourceIndexServeSource()
     // Media servers (Plex/Jellyfin/Emby) for THIS episode: direct-play hits resolved by SxEy. Dormant with no server.
     @StateObject private var mediaServers = MediaServerSource()
+    /// Separate episode-preparation contributors. The visible episode source list keeps owning the three
+    /// objects above while the player prepares a later episode behind it.
+    @StateObject private var preloadTorboxSearch = TorBoxSearchSource()
+    @StateObject private var preloadSourceIndex = SourceIndexServeSource()
+    @StateObject private var preloadMediaServers = MediaServerSource()
 
     /// A series pin is keyed by the show id, so every episode shares the pinned provider/quality.
     private var pinContext: SourcePinContext { SourcePinContext(metaId: meta.id, isSeries: true) }
@@ -3850,7 +3994,8 @@ struct iOSEpisodeStreams: View {
 
     /// The show's identity ROLES, stated for the ONE shared resolver (tvOS twin: DetailView.swift
     /// `CoreStreamList.identityRoles`). Naming the roles is what stops an episode-scoped `defaultVideoId`
-    /// ("tt0903747:1:1") from outranking the catalog id purely because it sat earlier in an array.
+    /// ("tt0903747:1:1") from silently escaping under a conflicting catalog id merely because it occupied one
+    /// position in an ordered array; conflicting valid heads now fail closed.
     ///
     /// The FIELD CASE is preserved (REQ-260721-05): a TMDB/Kitsu-identified series with no defaultVideoId
     /// (meta.id "tmdb:94997") holds its IMDb identity only on the EPISODE video id ("tt0460649:3:6"), which
@@ -3946,10 +4091,6 @@ struct iOSEpisodeStreams: View {
             }
         }
         .onDisappear { torrentPrime?.cancel(); sourceRefreshDebounce?.cancel() }
-        .task {
-            try? await Task.sleep(for: .seconds(20))
-            settleTimedOut = true
-        }
         // Debrid cache awareness for this episode's torrents + usenet: re-check as add-ons answer (de-duped
         // by hash set in refresh). Includes the TorBox search sources so those rows badge too. No-op with
         // no debrid key.
@@ -3961,15 +4102,21 @@ struct iOSEpisodeStreams: View {
         // synchronously before starting the replacement request, and SourceListModel independently checks
         // the same content token before merging.
         .onAppear {
-            torboxSearch.refresh(imdbId: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode)
+            AuxiliarySourcePipeline.refresh(
+                target: episodeTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
+                isSignedIn: VortXSyncManager.shared.isSignedIn
+            )
             mediaServers.refresh(imdb: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode,
-                                 title: meta.name, publicationTarget: mediaServerEpisodeTargetID)
+                                 title: meta.name, publicationTarget: mediaServerTarget)
             refreshSourceIndex()
         }
         .onChange(of: shownVideo.id) { _ in
-            torboxSearch.refresh(imdbId: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode)
+            AuxiliarySourcePipeline.refresh(
+                target: episodeTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
+                isSignedIn: VortXSyncManager.shared.isSignedIn
+            )
             mediaServers.refresh(imdb: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode,
-                                 title: meta.name, publicationTarget: mediaServerEpisodeTargetID)
+                                 title: meta.name, publicationTarget: mediaServerTarget)
             refreshSourceIndex()
             scheduleSourceRefresh()
         }
@@ -3997,8 +4144,18 @@ struct iOSEpisodeStreams: View {
                     initialSourceStream: launch.sourceStream,
                     initialEnginePlayerVideoId: launch.enginePlayerVideoId,
                     startedFromExplicitPick: launch.wasExplicitPick,
-                    episodes: seasonEpisodes.map { PlayerEpisodeRef(id: $0.id, label: "S\($0.season ?? 1)E\($0.episodeNumber) · \($0.episodeTitle)") },
+                    episodes: seasonEpisodes.map {
+                        PlayerEpisodeRef(id: $0.id,
+                                         label: "S\($0.season ?? 1)E\($0.episodeNumber) · \($0.episodeTitle)",
+                                         season: $0.season,
+                                         episode: $0.episode)
+                    },
+                    // Detail metadata is a launch/current-season view, not proof of a settled full-title
+                    // CoreMetaDetails aggregation. Terminal refresh may upgrade this only from its exact
+                    // request-owned appleCWTerminalFullMeta receipt.
+                    seriesInventoryAuthority: .launch,
                     loadEpisode: { await loadEpisodeStream($0) },
+                    loadEpisodeWithMetadata: { await loadEpisodeStream($0.id, refreshedVideo: $0) },
                     warmNextEpisode: { await warmEpisodeStream($0) },
                     // Engine feed only: the ACCOUNT write lives in PlayerScreen.saveAccountProgress, keyed on
                     // curMeta, so a binge advance attributes progress to the CURRENT episode (capturing
@@ -4099,7 +4256,7 @@ struct iOSEpisodeStreams: View {
             groups: presentation != nil ? [] : rankedEpisode(),
             progress: core.streamLoadProgress(forStreamId: shownVideo.id),
             states: core.streamAddonStates(forStreamId: shownVideo.id),
-            settleTimedOut: settleTimedOut,
+            sourcesSettled: sourceList.isSettled,
             continuity: rememberedQuality,
             pinContext: pinContext,
             cachedHashes: debridCache.cachedHashes,
@@ -4395,47 +4552,32 @@ struct iOSEpisodeStreams: View {
         await play(best, url: url, explicit: false)   // auto Watch fallback: may hop normally
     }
 
-    /// Smart Source Selection (Lane A): resolve this episode's best source and present the player, the
-    /// auto-pick-my-best entry. Reuses `loadEpisodeStream` (full settle gate + `StreamRanking.best` + resume
-    /// + engine/torrent prime), so it introduces no new resolve or playback logic; it only builds the same
-    /// `PlayerLaunch` a manual Watch would and presents it. `wasExplicitPick` stays false (this is an
-    /// auto-pick, so the player keeps its silent-hop-on-timeout behavior). No-op if a cover is already up.
+    /// Smart Source Selection waits for the exact complete-set receipt paired with the visible ranked rows.
+    /// It then routes that settled set through the existing automatic cached-candidate resolver. This keeps
+    /// page auto-pick from racing a late TorBox, Singularity, media-server, or raw add-on contributor.
     private func autoPickAndPlayEpisode() async {
         guard presentation == nil, !preparing else { return }
-        preparing = true
         let target = shownVideo
         let targetGeneration = episodeTargetGeneration
-        let resolved = await loadEpisodeStream(target.id)
-        preparing = false
-        guard presentation == nil, let e = resolved,
-              e.meta.videoId == target.id,
+        _ = rankedEpisode()
+        for _ in 0..<120 {
+            guard !Task.isCancelled, presentation == nil,
+                  episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
+            if sourceList.isSettled { break }
+            do { try await Task.sleep(for: .milliseconds(250)) }
+            catch { return }
+        }
+        let groups = sourceList.groups
+        guard sourceList.isSettled, let best = sourceList.best,
               episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
-        let resumeProposal = await proposedResume(e.meta, localFallback: e.resume)
-        guard presentation == nil,
-              e.meta.videoId == target.id,
-              episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
-        let bindingSucceeded = core.loadEnginePlayer(
-            for: e.stream, videoId: e.meta.videoId, base: e.engineAddonBase,
-            resolvedURL: e.debridRef?.url
+        let sticky = SeriesSourceSticky.preference(for: meta.id)
+        let candidates = StreamRanking.rankedCandidates(
+            groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
+            sticky: sticky,
+            providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
+            debridCachedHashes: debridCache.cachedHashes
         )
-        let engineVideoID = EpisodePlaybackIdentity.boundVideoID(
-            requestedVideoID: e.meta.videoId, bindingSucceeded: bindingSucceeded
-        )
-        guard presentation == nil,
-              e.meta.videoId == target.id,
-              episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
-        guard let admittedResume = initialStartGate.admit(
-            resumeProposal,
-            currentSessionID: TraktAuth.storedSessionID
-        ) else { return }
-        presentation = .player(iOSDetailView.PlayerLaunch(
-            url: e.url, title: e.title, headers: e.stream.requestHeaders,
-            resume: admittedResume.seconds ?? 0, meta: e.meta,
-            qualityText: StreamRanking.signature(e.stream),
-            bingeGroup: e.stream.behaviorHints?.bingeGroup,
-            isTorrent: e.debridRef == nil && e.stream.isTorrent,
-            debridRef: e.debridRef, sourceStream: e.stream,
-            enginePlayerVideoId: engineVideoID))
+        await playBest(candidates, labeledBest: best)
     }
 
     #if !os(tvOS)
@@ -4539,7 +4681,10 @@ struct iOSEpisodeStreams: View {
     /// auto-plays one, the same `displayGroups` filter the tvOS `CoreStreamList` applies. Merges the
     /// TorBox search sources first (no-op with no TorBox key / no results).
     private func displayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        let withSearch = sourceIndex.merged(into: torboxSearch.merged(into: groups))
+        let withSearch = AuxiliarySourcePipeline.merged(
+            into: groups, target: episodeTarget,
+            torBox: torboxSearch, sourceIndex: sourceIndex
+        )
         guard PlaybackSettings.directLinksOnly else { return withSearch }
         return withSearch.compactMap { group in
             let streams = group.streams.filter { !$0.isTorrent }
@@ -4555,8 +4700,8 @@ struct iOSEpisodeStreams: View {
     private func rankedEpisode() -> [CoreStreamSourceGroup] {
         sourceList.setContext(
             metaId: meta.id, streamId: shownVideo.id, continuity: rememberedQuality, pin: sourcePin,
-            auxiliaryContentID: episodeContentID,
-            mediaServerTargetID: mediaServerEpisodeTargetID
+            auxiliaryTarget: episodeTarget,
+            mediaServerTarget: mediaServerTarget
         )
         return sourceList.groups
     }
@@ -4583,11 +4728,15 @@ struct iOSEpisodeStreams: View {
         guard auxiliarySeason >= 0, let episode = auxiliaryEpisode, episode >= 0 else { return nil }
         return DebridEpisode(season: auxiliarySeason, episode: episode)
     }
-    private var episodeContentID: String? {
-        SourceIndexClient.contentID(roles: showIdentityRoles, season: auxiliarySeason, episode: auxiliaryEpisode)
+    private var episodeTarget: SourceIndexIdentity.TargetResolution {
+        SourceIndexIdentity.publicationTarget(
+            showIdentityRoles, season: auxiliarySeason, episode: auxiliaryEpisode
+        )
     }
-    private var mediaServerEpisodeTargetID: String {
-        episodeContentID ?? "meta:\(meta.id)|video:\(shownVideo.id)"
+    private var mediaServerTarget: SourceIndexIdentity.MediaServerTarget? {
+        SourceIndexIdentity.mediaServerTarget(
+            preferring: episodeTarget, metaID: meta.id, videoID: shownVideo.id
+        )
     }
 
     /// Community source index (episode): SERVE refresh + HOARD contribution for THIS episode. Fully gated +
@@ -4600,15 +4749,23 @@ struct iOSEpisodeStreams: View {
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
     private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil,
                                     providerByHash: [String: String] = [:]) {
-        let contentID = episodeContentID
-        sourceIndex.refresh(contentID: contentID, isSignedIn: VortXSyncManager.shared.isSignedIn)
-        guard let contentID else { return }
+        AuxiliarySourcePipeline.refresh(
+            target: episodeTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
+            isSignedIn: VortXSyncManager.shared.isSignedIn
+        )
         // Pool-EXCLUDED hoard set: the caller's episode-scoped torbox-base when it merged one, else self-merge.
         // NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into itself is wrong.
         // `providerByHash` tags each cached torrent with the provider the user's OWN cache-check confirmed.
-        let groups = torboxMerged ?? torboxSearch.merged(into: core.streamGroups(forStreamId: shownVideo.id))
+        let groups = torboxMerged ?? AuxiliarySourcePipeline.torBoxMerged(
+            into: core.streamGroups(forStreamId: shownVideo.id), target: episodeTarget, torBox: torboxSearch
+        )
         guard !groups.isEmpty else { return }
-        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups, providerByHash: providerByHash) }
+        let target = episodeTarget
+        Task.detached {
+            await AuxiliarySourcePipeline.hoard(
+                target: target, groups: groups, providerByHash: providerByHash
+            )
+        }
     }
 
     /// Trailing-debounced driver for THIS episode's add-on load storm: the raw `.onChange` fired per add-on
@@ -4621,8 +4778,14 @@ struct iOSEpisodeStreams: View {
         sourceRefreshDebounce = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
             guard !Task.isCancelled else { return }
-            let torboxBase = torboxSearch.merged(into: core.streamGroups(forStreamId: shownVideo.id))   // pool-EXCLUDED
-            debridCache.refresh(from: sourceIndex.merged(into: torboxBase))   // pool-INCLUDED (debrid set)
+            let torboxBase = AuxiliarySourcePipeline.torBoxMerged(
+                into: core.streamGroups(forStreamId: shownVideo.id), target: episodeTarget,
+                torBox: torboxSearch
+            )   // pool-EXCLUDED
+            debridCache.refresh(from: AuxiliarySourcePipeline.merged(
+                into: torboxBase, target: episodeTarget,
+                torBox: torboxSearch, sourceIndex: sourceIndex
+            ))   // pool-INCLUDED (debrid set)
             refreshSourceIndex(torboxMerged: torboxBase,
                                providerByHash: debridCache.cachedProviderByHash) // reuse the base; tag cached facts
         }
@@ -4637,35 +4800,39 @@ struct iOSEpisodeStreams: View {
     /// Resolve an episode to a ready-to-play stream for the player's in-place Next / Prev / list. Reuses
     /// the same load → rank → direct-links → torrent-prime → resume path as a manual source tap, so the
     /// player can switch episodes without owning any of that logic. Returns nil when nothing is playable.
-    private func loadEpisodeStream(_ videoId: String) async -> PlayerEpisodeStream? {
+    private func loadEpisodeStream(_ videoId: String, refreshedVideo: CoreVideo? = nil) async -> PlayerEpisodeStream? {
         guard !Task.isCancelled else { return nil }
-        guard let v = seasonEpisodes.first(where: { $0.id == videoId }) else { return nil }
+        let v: CoreVideo
+        if let refreshedVideo {
+            // PlayerScreen passes this only after its exact request-owned Apple CW receipt and target fences
+            // admit the successor. Never replace it with a same-ID/global resident snapshot here.
+            guard refreshedVideo.id == videoId else { return nil }
+            v = refreshedVideo
+        } else {
+            guard let launchVideo = seasonEpisodes.first(where: { $0.id == videoId }) else { return nil }
+            v = launchVideo
+        }
+        let settlementStartedAt = Date()
         core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: v.id)
         var groups: [CoreStreamSourceGroup] = []
-        var firstPlayableAt: Date? = nil
         // The source the viewer picked BY HAND for this show (`SeriesSourceSticky`, keyed on `meta.id`, the SAME
         // show id the pin uses and every episode shares). This is the binge auto-next lane (`goToEpisode` calls
-        // it through `loadEpisode`), so BOTH halves must honor it, exactly like tvOS: the settle gate below waits
-        // until that source is PRESENT (`wantedAddon`), and `StreamRanking.best` then PREFERS it (`sticky` +
-        // provider-health), so a higher-scoring rival that also landed cannot win. nil when the viewer has never
-        // chosen a source (a fresh play): both stay byte-identical to before.
+        // it through `loadEpisode`), so `StreamRanking.best` applies it only after the complete-set gate closes.
         let sticky = SeriesSourceSticky.preference(for: meta.id)
         let wantedAddon = sticky?.addon
-        for _ in 0 ..< 80 {                                // ~20s ceiling, matching the page's settle timeout
+        while true {
             guard !Task.isCancelled else { return nil }
             // Target-engine groups only. The page-owned auxiliary contributors are scoped to shownVideo and
             // must not leak into a different episode being resolved behind the player.
             groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
-            if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
-            // Settle gate (see StreamRanking.resolveSettled): with a remembered manual source, hold for IT
-            // (bounded) instead of committing off whichever provider answers fastest (the diag-22 race where a
-            // fast 1080p opened the gate before the user's aggregator loaded); otherwise hold for the remembered
-            // quality (non-torrent unless the user ranks torrents first) so a resume lands on the user's stream.
+            // Settlement is contributor-complete or request-deadline bounded. Quality and sticky hints cannot
+            // admit a partial set, which is the diag-22 fast-1080p-before-aggregator race.
             let progress = core.streamLoadProgress(forStreamId: v.id)
-            let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
+            let elapsed = Date().timeIntervalSince(settlementStartedAt)
             if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                            secondsSinceFirstPlayable: elapsed, rememberedQuality: rememberedQuality,
+                                            secondsSinceRequestStart: elapsed, rememberedQuality: rememberedQuality,
                                             wantedAddon: wantedAddon) { break }
+            if elapsed >= StreamRanking.completeSetDeadline { break }
             do {
                 try await Task.sleep(for: .milliseconds(250))
             } catch {
@@ -4712,38 +4879,287 @@ struct iOSEpisodeStreams: View {
     /// episode's slot), rank with the same continuity hint, then start the chosen torrent's peer search
     /// or pull the first bytes of a direct file. Best-effort and silent; if nothing resolves, the later
     /// auto-advance simply pays the cold start it would have paid anyway.
-    private func warmEpisodeStream(_ videoId: String) async {
-        guard let v = seasonEpisodes.first(where: { $0.id == videoId }) else { return }
+    private func warmEpisodeStream(
+        _ request: NextEpisodePreparationRequest
+    ) async -> PlayerEpisodeStream? {
+        let videoId = request.episodeID
+        guard !Task.isCancelled,
+              request.deadline > ProcessInfo.processInfo.systemUptime,
+              let v = seasonEpisodes.first(where: { $0.id == videoId }) else { return nil }
         let sources = account.streamSources
-        var groups: [CoreStreamSourceGroup] = []
-        await withTaskGroup(of: CoreStreamSourceGroup?.self) { tasks in
-            for s in sources {
-                tasks.addTask { await warmFetchEpisodeStreams(base: s.base, addon: s.name, id: v.id) }
-            }
-            for await g in tasks { if let g { groups.append(g) } }
-        }
-        guard let best = StreamRanking.best(iOSDisplayGroups(groups), continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
-                                            debridCachedHashes: debridCache.cachedHashes) else { return }
+        let preparationDeadline = request.deadline
+        let sticky = SeriesSourceSticky.preference(for: meta.id)
+        async let rawGroups = warmFetchEpisodeSourceGroups(
+            sources: sources,
+            request: request,
+            wantedAddon: sticky?.addon
+        )
+
         let targetSeason = v.season ?? season
-        // PRESENCE, not truthiness: the display helper cannot tell absence from an explicit E0.
         let targetEpisode = v.episode
+        let identityRoles = SourceIndexIdentity.Roles(
+            catalogID: meta.id,
+            defaultVideoID: meta.behaviorHints?.defaultVideoId,
+            currentVideoID: v.id,
+            kind: .series
+        )
+        let titleID = SourceIndexIdentity.resolve(identityRoles).titleID
+        let target = SourceIndexIdentity.publicationTarget(
+            identityRoles,
+            season: targetSeason,
+            episode: targetEpisode
+        )
+        let mediaTarget = SourceIndexIdentity.mediaServerTarget(
+            preferring: target, metaID: meta.id, videoID: v.id
+        )
+        AuxiliarySourcePipeline.refresh(
+            target: target, torBox: preloadTorboxSearch, sourceIndex: preloadSourceIndex,
+            isSignedIn: VortXSyncManager.shared.isSignedIn
+        )
+        preloadMediaServers.refresh(
+            imdb: titleID,
+            season: targetSeason,
+            episode: targetEpisode,
+            title: meta.name,
+            publicationTarget: mediaTarget
+        )
+        // These owners exist only to choose one prepared stream. Release their potentially large row arrays
+        // on every exit (success, empty, stale, or cancelled); the retained PlayerEpisodeStream is the only
+        // value that should survive through the second half of playback. Exact target guards prevent a stale
+        // cancelled preparation from clearing a replacement episode that already reused these StateObjects.
+        let clearAuxiliaryPublications = {
+            if SourceIndexIdentity.mergeAuthorization(
+                published: preloadTorboxSearch.publishedTarget, page: target
+            ) != nil {
+                preloadTorboxSearch.clearResults()
+            }
+            if SourceIndexIdentity.mergeAuthorization(
+                published: preloadSourceIndex.publishedTarget, page: target
+            ) != nil {
+                preloadSourceIndex.clearResults()
+            }
+            if SourceIndexIdentity.mediaServerMergeAuthorization(
+                published: preloadMediaServers.publishedTarget, page: mediaTarget
+            ) != nil {
+                preloadMediaServers.clearResults()
+            }
+        }
+        defer { clearAuxiliaryPublications() }
+        let auxiliary = await awaitWarmAuxiliarySettlement(
+            target: target,
+            mediaTarget: mediaTarget,
+            deadline: min(
+                preparationDeadline,
+                ProcessInfo.processInfo.systemUptime
+                    + NextEpisodePreparationBudget.addonFetchBudget
+            )
+        )
+        guard !Task.isCancelled else { return nil }
+        var groups = await rawGroups
+        guard !Task.isCancelled else { return nil }
+        groups = TorBoxSearchSource.merge(
+            authorizedBy: SourceIndexIdentity.mergeAuthorization(
+                published: preloadTorboxSearch.publishedTarget, page: target
+            ),
+            auxiliary.torbox, into: groups
+        )
+        groups = SourceIndexServeSource.merge(
+            authorizedBy: SourceIndexIdentity.mergeAuthorization(
+                published: preloadSourceIndex.publishedTarget, page: target
+            ),
+            auxiliary.sourceIndex, into: groups
+        )
+        groups = MediaServerSource.merge(
+            authorizedBy: SourceIndexIdentity.mediaServerMergeAuthorization(
+                published: preloadMediaServers.publishedTarget, page: mediaTarget
+            ),
+            auxiliary.mediaServers, into: groups
+        )
+        clearAuxiliaryPublications()
+        let displayGroups = iOSDisplayGroups(groups)
+        guard let best = StreamRanking.best(
+            displayGroups,
+            continuity: rememberedQuality,
+            binge: lastBinge,
+            pin: sourcePin,
+            sticky: sticky,
+            providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
+            debridCachedHashes: debridCache.cachedHashes
+        ) else { return nil }
+        // PRESENCE, not truthiness: the display helper cannot tell absence from an explicit E0.
         let hint = targetSeason >= 0 && (targetEpisode ?? -1) >= 0
             ? DebridEpisode(season: targetSeason, episode: targetEpisode ?? 0) : nil
         let ref: DebridPlaybackRef?
         if best.url == nil, hint == nil {
             ref = nil
         } else {
-            ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: best, episode: hint)
+            ref = await BoundedPreloadWorkPool.valueBeforeDeadline(preparationDeadline) {
+                await DebridCoordinator.shared.resolvedPlaybackRef(for: best, episode: hint)
+            } ?? nil
+            guard !Task.isCancelled else { return nil }
         }
-        if ref == nil { prepareTorrentStream(best) }
         guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
             isUsenet: best.isUsenet, resolvedURL: ref?.url,
             fallbackURL: best.playableURL(isEpisode: true)
-        ) else { return }
-        var request = URLRequest(url: url)
-        request.setValue("bytes=0-8388607", forHTTPHeaderField: "Range")    // first 8 MB
-        request.timeoutInterval = 30
-        _ = try? await URLSession.shared.data(for: request)
+        ) else { return nil }
+
+        // Prime raw torrents without touching CoreBridge's active episode slot. Ordinary direct/debrid links
+        // get a bounded prefix read; an eligible AVPlayer remux instead produces its own startup cohort below,
+        // never both. Required add-on headers stay on the original origin only.
+        let requiresTorrentPreparation = ref == nil && best.url == nil
+        let torrentLease: PreparedTorrentEngineLease?
+        if requiresTorrentPreparation {
+            guard let prepared = await prepareWarmTorrentEngine(best, request: request) else {
+                return nil
+            }
+            torrentLease = prepared
+        } else {
+            torrentLease = nil
+        }
+        var retainTorrentLease = false
+        defer {
+            if let torrentLease, !retainTorrentLease {
+                retireWarmTorrentEngine(torrentLease, reason: "preparation did not retain winner")
+            }
+        }
+        let sourceSignature = StreamRanking.signature(best)
+        let isDolbyVision = StreamRanking.isDolbyVision(sourceSignature)
+        let preparedMode = VortXPreparedRemuxCallerPolicy.mode(
+            avPlayerActive: request.prepareLocalAVPlayerRemux,
+            mountIsOnDevice: request.prepareLocalAVPlayerRemux,
+            rawTorrent: requiresTorrentPreparation,
+            dolbyVision: isDolbyVision,
+            dolbyVisionRemuxEligible: isDolbyVision
+                && PlayerEngineRouter.shouldDVRemux(url: url),
+            plainRemuxEligible: !isDolbyVision
+                && PlayerEngineRouter.shouldPlainRemux(url: url)
+        )
+        var mediaRequest = URLRequest(url: url)
+        mediaRequest.setValue("bytes=0-8388607", forHTTPHeaderField: "Range")
+        for (name, value) in best.requestHeaders ?? [:] where name.lowercased() != "range" {
+            mediaRequest.setValue(value, forHTTPHeaderField: name)
+        }
+        mediaRequest.timeoutInterval = max(
+            1,
+            preparationDeadline - ProcessInfo.processInfo.systemUptime
+        )
+        let mediaRequestSnapshot = mediaRequest
+        let warmResult: BoundedRangeWarmup.Result?
+        if VortXPreparedRemuxCallerPolicy.transportWarmPath(
+            preparedMode: preparedMode
+        ) == .prefixRange {
+            warmResult = await BoundedPreloadWorkPool.valueBeforeDeadline(preparationDeadline) {
+                try? await BoundedRangeWarmup.fetch(mediaRequestSnapshot, limit: 8 * 1_024 * 1_024)
+            } ?? nil
+        } else {
+            warmResult = nil
+        }
+        guard !Task.isCancelled else { return nil }
+        if requiresTorrentPreparation, warmResult == nil { return nil }
+
+        let pm = PlaybackMeta(libraryId: meta.id, videoId: v.id, type: "series",
+                              name: meta.name, poster: v.thumbnail ?? meta.poster,
+                              season: v.season, episode: v.episode)
+        let title = "\(meta.name)  ·  S\(v.season ?? season)E\(v.episodeNumber)"
+        let resolvedResume = await BoundedPreloadWorkPool.valueBeforeDeadline(preparationDeadline) {
+            await localResume(pm)
+        } ?? 0
+        guard !Task.isCancelled else { return nil }
+        // Source settlement, debrid resolution, torrent create and any bounded range warm-up above all belong
+        // to the 34-second attempt. A selected direct/debrid local-AVPlayer remux is different: it may wait
+        // behind the current episode's single producer until credits, so begin it only after source work has
+        // finished and do not race it against the expired source deadline.
+        let preparedRemux: VortXPreparedRemuxAttachment?
+        if let preparedMode {
+            let owner = VortXPreparedRemuxOwnerIdentity(
+                mediaID: pm.videoId,
+                generation: request.preparedRemuxGeneration,
+                sourceSignature: sourceSignature
+            )
+            if let handle = await AVPlayerEngineController.prepareRemuxTransport(
+                input: url,
+                headers: best.requestHeaders,
+                mode: preparedMode,
+                startAtSeconds: resolvedResume,
+                ownerIdentity: owner
+            ) {
+                preparedRemux = VortXPreparedRemuxAttachment(
+                    handle: handle,
+                    ownerIdentity: owner
+                )
+            } else {
+                preparedRemux = nil
+            }
+        } else {
+            preparedRemux = nil
+        }
+        guard !Task.isCancelled else {
+            preparedRemux?.abandon(reason: "iOS preparation cancelled after transport readiness")
+            return nil
+        }
+        DiagnosticsLog.log(
+            "binge",
+            "next prepare resolved target=\(VXProbeRedaction.identityToken(videoId)) settlement=\(String(describing: auxiliary.settlement)) groups=\(displayGroups.count) warmBytes=\(warmResult?.byteCount ?? 0)"
+        )
+        retainTorrentLease = true
+        return PlayerEpisodeStream(
+            stream: best, url: url, meta: pm, title: title, resume: resolvedResume,
+            debridRef: ref, engineAddonBase: iOSEngineAddonBase(for: best, in: displayGroups),
+            preparationRequest: request,
+            torrentPreparationLease: torrentLease,
+            preparedRemux: preparedRemux
+        )
+    }
+
+    private struct WarmAuxiliarySnapshot {
+        let torbox: [CoreStream]
+        let sourceIndex: [CoreStream]
+        let mediaServers: [CoreStreamSourceGroup]
+        let settlement: SourceSettlementDecision
+    }
+
+    /// Wait for every registered auxiliary contributor for the warm target. A legitimate empty or error is
+    /// terminal; only a truly hung generation consumes the shared twenty-second ceiling.
+    @MainActor
+    private func awaitWarmAuxiliarySettlement(
+        target: SourceIndexIdentity.TargetResolution,
+        mediaTarget: SourceIndexIdentity.MediaServerTarget?,
+        deadline: TimeInterval
+    ) async -> WarmAuxiliarySnapshot {
+        var decision: SourceSettlementDecision = .waiting
+        repeat {
+            decision = SourceSettlementPolicy.decide(
+                raw: .terminal,
+                auxiliary: [
+                    preloadTorboxSearch.settlementState(for: target),
+                    preloadSourceIndex.settlementState(for: target),
+                    preloadMediaServers.settlementState(for: mediaTarget),
+                ],
+                deadlineExpired: ProcessInfo.processInfo.systemUptime >= deadline
+            )
+            if decision.isSettled { break }
+            do {
+                try await Task.sleep(for: .milliseconds(100))
+            } catch {
+                break
+            }
+        } while !Task.isCancelled
+
+        return WarmAuxiliarySnapshot(
+            torbox: SourceIndexIdentity.mergeAuthorization(
+                published: preloadTorboxSearch.publishedTarget, page: target
+            ) != nil
+                ? preloadTorboxSearch.streams : [],
+            sourceIndex: SourceIndexIdentity.mergeAuthorization(
+                published: preloadSourceIndex.publishedTarget, page: target
+            ) != nil
+                ? preloadSourceIndex.streams : [],
+            mediaServers: SourceIndexIdentity.mediaServerMergeAuthorization(
+                published: preloadMediaServers.publishedTarget, page: mediaTarget
+            ) != nil
+                ? preloadMediaServers.groups : [],
+            settlement: decision
+        )
     }
 }
 
@@ -4862,7 +5278,7 @@ struct iOSSourceList: View {
     /// Per-add-on resolution state, used ONLY to explain an empty result: an add-on that errored
     /// (fetch/timeout/TLS) is surfaced distinctly from one that returned nothing. Empty by default.
     var states: [CoreBridge.StreamAddonState] = []
-    var settleTimedOut = false                          // resolution gave up → show "No sources" not a spinner
+    var sourcesSettled = false                         // complete contributor set or explicit bounded deadline
     var continuity: String? = nil                       // remembered quality signature → same-quality Watch-in pick
     var pinContext: SourcePinContext? = nil             // title context for the per-row pin source menu/badge (#15)
     /// Raw-torrent infoHashes the user's debrid account has cached, lowercased, for the per-row "Cached"
@@ -4953,7 +5369,7 @@ struct iOSSourceList: View {
     private var streamCount: Int { groups.reduce(0) { $0 + $1.streams.count } }
     // Still loading unless every add-on answered, OR the settle timeout fired, which flips a hung
     // resolution to the real "No sources found" state instead of an endless spinner.
-    private var loading: Bool { !settleTimedOut && (progress.total == 0 || progress.loaded < progress.total) }
+    private var loading: Bool { !sourcesSettled }
     private var visibleGroups: [CoreStreamSourceGroup] {
         groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
     }
@@ -5389,7 +5805,7 @@ extension iOSSourceList: Equatable {
     static func == (lhs: iOSSourceList, rhs: iOSSourceList) -> Bool {
         lhs.isSuspended == rhs.isSuspended
             && lhs.isEpisode == rhs.isEpisode
-            && lhs.settleTimedOut == rhs.settleTimedOut
+            && lhs.sourcesSettled == rhs.sourcesSettled
             && lhs.showsPrimaryControls == rhs.showsPrimaryControls
             && lhs.progress == rhs.progress
             && lhs.continuity == rhs.continuity

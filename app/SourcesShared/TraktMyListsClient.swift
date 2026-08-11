@@ -125,7 +125,7 @@ enum TraktMyListsClient {
     private static func authenticatedUserSlug(expectedSession: TraktSessionID) async -> String? {
         guard let data = await getData("/users/settings", expectedSession: expectedSession),
               TraktAuth.storedSessionID == expectedSession,
-              let settings = try? JSONDecoder().decode(SettingsDTO.self, from: data),
+              let settings = try? AuthenticatedHTTPTransport.decodeJSON(SettingsDTO.self, from: data),
               let slug = settings.user?.ids?.slug?.trimmingCharacters(in: .whitespacesAndNewlines),
               !slug.isEmpty else { return nil }
         return slug
@@ -196,10 +196,14 @@ enum TraktMyListsClient {
         req.setValue("2", forHTTPHeaderField: "trakt-api-version")
         req.setValue(TraktAuth.clientID, forHTTPHeaderField: "trakt-api-key")
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              (resp as? HTTPURLResponse)?.statusCode == 200,
+        guard let response = try? await AuthenticatedHTTPTransport.shared.send(
+                  req,
+                  allowedHosts: ["api.trakt.tv"],
+                  maxResponseBytes: AuthenticatedHTTPTransport.snapshotResponseLimit
+              ),
+              response.statusCode == 200,
               TraktAuth.storedSessionID == expectedSession else { return nil }
-        return data
+        return response.data
     }
 
     /// Authenticated GET decoding a JSON array, or nil on any failure (including a bad shape).
@@ -208,7 +212,7 @@ enum TraktMyListsClient {
         expectedSession: TraktSessionID
     ) async -> [T]? {
         guard let data = await getData(path, expectedSession: expectedSession),
-              let decoded = try? JSONDecoder().decode([T].self, from: data) else { return nil }
+              let decoded = try? AuthenticatedHTTPTransport.decodeJSON([T].self, from: data) else { return nil }
         return decoded
     }
 

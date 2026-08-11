@@ -50,17 +50,34 @@ enum AddonURLGuard {
     /// Max redirect hops we follow while re-validating each target. A normal manifest never needs more than a
     /// couple; a chain longer than this is treated as abuse and refused.
     private static let maxRedirects = 5
+    /// Hard upper bound for a manifest response. The check is applied to Content-Length when present and again
+    /// while consuming the streamed body, so chunked/lying responses cannot grow an unbounded Data buffer.
+    static let maxManifestBytes = 2 * 1024 * 1024
+
+    /// Return whether appending a streamed chunk remains inside the manifest cap without integer overflow.
+    static func canAcceptBody(currentBytes: Int, incomingBytes: Int) -> Bool {
+        guard currentBytes >= 0, incomingBytes >= 0, currentBytes <= maxManifestBytes else { return false }
+        return incomingBytes <= maxManifestBytes - currentBytes
+    }
+
+    /// Resolve one redirect Location against the current URL. The caller must run the result through
+    /// `validate` before issuing the next request; this helper deliberately does not trust the target.
+    static func redirectTarget(from current: URL, location: String) -> URL? {
+        guard !location.isEmpty else { return nil }
+        return URL(string: location, relativeTo: current)?.absoluteURL
+    }
 
     // MARK: - Public validation
 
-    /// Validate a URL's SCHEME + HOST before any fetch: reject a non-http(s) scheme, a literal-IP host in a
+    /// Validate a URL's SCHEME + HOST before any fetch: reject a non-HTTPS scheme, a literal-IP host in a
     /// blocked range, and a hostname that RESOLVES to any blocked address. This is the synchronous pre-fetch
     /// gate; `fetch(...)` additionally re-checks every redirect target.
     static func validate(_ url: URL) async -> Rejection? {
-        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
-            return .invalidScheme
-        }
-        guard let host = url.host, !host.isEmpty else { return .invalidScheme }
+        guard let scheme = url.scheme?.lowercased(),
+              let host = url.host, !host.isEmpty,
+              url.user == nil,
+              url.password == nil,
+              url.fragment == nil else { return .invalidScheme }
 
         // A bracketed/literal IP host is checked directly (no DNS), so a raw `http://127.0.0.1/…` or
         // `http://[::1]/…` is refused without a lookup.
@@ -68,7 +85,17 @@ enum AddonURLGuard {
             ? String(host.dropFirst().dropLast())   // IPv6 literals arrive bracketed from URL.host
             : host
         if let literal = IPAddress(parsing: bareHost) {
-            return literal.isBlocked ? .privateAddress : nil
+            if literal.isBlocked { return .privateAddress }
+            guard scheme == "https",
+                  Data(url.absoluteString.utf8).count <= AddonPairingProtocol.maxManifestURLBytes else {
+                return .invalidScheme
+            }
+            return nil
+        }
+
+        guard scheme == "https",
+              Data(url.absoluteString.utf8).count <= AddonPairingProtocol.maxManifestURLBytes else {
+            return .invalidScheme
         }
 
         // Otherwise resolve the hostname and check EVERY address it maps to. Any blocked address fails closed.
@@ -94,14 +121,26 @@ enum AddonURLGuard {
             defer { session.finishTasksAndInvalidate() }
 
             do {
-                let (data, response) = try await session.data(for: request)
+                let (byteStream, response) = try await session.bytes(for: request)
                 guard let http = response as? HTTPURLResponse else { return .failure(.unresolvable) }
                 // 3xx with a Location: re-validate the target host before following it.
                 if (300...399).contains(http.statusCode),
                    let location = http.value(forHTTPHeaderField: "Location"),
-                   let next = URL(string: location, relativeTo: current)?.absoluteURL {
+                   let next = redirectTarget(from: current, location: location) {
                     current = next
                     continue
+                }
+                // A manifest is accepted only from a successful response. In particular, do not parse a
+                // manifest-looking 404/500 body as a valid add-on.
+                guard (200...299).contains(http.statusCode) else { return .failure(.unresolvable) }
+                if http.expectedContentLength > Int64(maxManifestBytes) { return .failure(.unresolvable) }
+                var data = Data()
+                data.reserveCapacity(min(maxManifestBytes, 64 * 1024))
+                for try await byte in byteStream {
+                    guard canAcceptBody(currentBytes: data.count, incomingBytes: 1) else {
+                        return .failure(.unresolvable)
+                    }
+                    data.append(byte)
                 }
                 // Re-validate the URL URLSession actually connected to (its own resolution, not ours). This
                 // narrows the resolve-then-connect DNS-rebinding window: a host that answered a public address

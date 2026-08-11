@@ -352,6 +352,7 @@ enum SourceIndexClient {
     /// SCOPE: this is the LOW-LEVEL entry, for shared code that has already resolved a single title id. View
     /// and coordinator code must not call it -- those callers state ROLES via `contentID(roles:)` or, for a
     /// Continue-Watching card, `resumeContentID`. `IdentityCallerGateTests` fails if that is violated.
+    #if SOURCE_INDEX_IDENTITY_TESTING
     static func contentID(imdbId: String?, season: Int? = nil, episode: Int? = nil) -> String? {
         guard let bounded = SourceIndexIdentity.boundedIdentityInput(imdbId),
               let titleID = SourceIndexContract.canonicalTitleID(bounded) else {
@@ -359,27 +360,31 @@ enum SourceIndexClient {
                  counts: [(.rawLen, SourceIndexDiag.identityLength(imdbId))])
             return nil
         }
-        guard let composed = SourceIndexIdentity.contentKey(titleID: titleID, season: season, episode: episode) else {
+        guard let composed = SourceIndexIdentity.contentKeyForTesting(
+            titleID: titleID, season: season, episode: episode
+        ) else {
             diag(.contentIDSkip, reason: .nonCanonicalEpisodeKey,
                  counts: [(.hasSeason, season == nil ? 0 : 1), (.hasEpisode, episode == nil ? 0 : 1)])
             return nil
         }
         return composed
     }
+    #endif
 
     /// The pool `content_id` for a SCREEN, from its named identity roles.
     ///
     /// This is the entry point every view and coordinator uses. It exists so that no screen ever picks which
     /// of its several ids "is" the title: it declares what each id IS (catalog, default-video, current-video)
-    /// and what the page is (movie / series / live), and the shared resolver applies the one authority rule.
-    /// The previous shape took an ordered array, and the ORDER decided authority, which is how an add-on's
-    /// episode-shaped `defaultVideoId` came to outrank the catalog id of the page the user was on.
+    /// and what the page is (movie / series / live), and the shared resolver requires every applicable valid head
+    /// to agree. A disagreement returns no target, so an add-on's episode-shaped `defaultVideoId` cannot be
+    /// published under the catalog id of the page the user was on. The previous shape took an ordered array, and
+    /// the ORDER silently decided which conflicting identity escaped.
     static func contentID(
         roles: SourceIndexIdentity.Roles,
         season: Int? = nil,
         episode: Int? = nil
     ) -> String? {
-        contentID(imdbId: SourceIndexIdentity.resolve(roles).titleID, season: season, episode: episode)
+        SourceIndexIdentity.publicationTarget(roles, season: season, episode: episode).target?.contentID
     }
 
     /// The pool `content_id` for a Continue-Watching DIRECT RESUME, which has no page to arbitrate between its
@@ -817,14 +822,18 @@ enum SourceIndexClient {
         }
     }
 
-    /// Convenience: extract descriptors from `groups` and contribute them for `contentID`. The HOARD entry the
-    /// detail screens call. `providerByHash` optionally tags each torrent hash with the debrid provider this
-    /// device confirmed had it cached (from the per-view cache-check), so the pool learns provider facts.
-    static func hoard(contentID: String, groups: [CoreStreamSourceGroup],
-                      providerByHash: [String: String] = [:]) async {
+    /// Extract descriptors and contribute only for a relationally valid publication target. The typed call keeps
+    /// a screen from pairing one title's groups with another title's raw content id. `providerByHash` preserves
+    /// beta's existing privacy-safe provider fact behavior.
+    static func hoard(
+        call: AuxiliarySourcePipeline.Call,
+        groups: [CoreStreamSourceGroup],
+        providerByHash: [String: String] = [:]
+    ) async {
         guard isEnabled, await contributionAllowedNow() else { return }
+        guard let target = SourceIndexIdentity.validatedTarget(call.resolution) else { return }
         let descriptors = descriptors(from: groups, providerByHash: providerByHash)
-        await contribute(contentID: contentID, descriptors: descriptors)
+        await contribute(contentID: target.contentID, descriptors: descriptors)
     }
 
     /// HOARD the SINGLE source a Continue-Watching / card resume actually plays. The resume path re-resolves one
@@ -1699,6 +1708,82 @@ actor SourceIndexFetchCoalescer {
     func activeCount() -> Int { entries.count }
 }
 
+// MARK: - Shared auxiliary-source caller
+
+/// One typed call shared by tvOS, iOS detail, and iOS batch-download owners. The private stored resolution
+/// prevents a same-module extension from synthesizing a call with independently forged state.
+enum AuxiliarySourcePipeline {
+    struct Call: Sendable {
+        private let storedResolution: SourceIndexIdentity.TargetResolution
+
+        var resolution: SourceIndexIdentity.TargetResolution { storedResolution }
+
+        fileprivate init(resolution: SourceIndexIdentity.TargetResolution) {
+            storedResolution = resolution
+        }
+    }
+
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    static func callForTesting(_ resolution: SourceIndexIdentity.TargetResolution) -> Call {
+        Call(resolution: resolution)
+    }
+    #endif
+
+    @MainActor
+    static func refresh(
+        target: SourceIndexIdentity.TargetResolution,
+        torBox: TorBoxSearchSource,
+        sourceIndex: SourceIndexServeSource,
+        isSignedIn: Bool
+    ) {
+        let call = Call(resolution: target)
+        torBox.refresh(call: call)
+        sourceIndex.refresh(call: call, isSignedIn: isSignedIn)
+    }
+
+    @MainActor
+    static func torBoxMerged(
+        into groups: [CoreStreamSourceGroup],
+        target: SourceIndexIdentity.TargetResolution,
+        torBox: TorBoxSearchSource
+    ) -> [CoreStreamSourceGroup] {
+        torBox.merged(into: groups, call: Call(resolution: target))
+    }
+
+    @MainActor
+    static func sourceIndexMerged(
+        into groups: [CoreStreamSourceGroup],
+        target: SourceIndexIdentity.TargetResolution,
+        sourceIndex: SourceIndexServeSource
+    ) -> [CoreStreamSourceGroup] {
+        sourceIndex.merged(into: groups, call: Call(resolution: target))
+    }
+
+    @MainActor
+    static func merged(
+        into groups: [CoreStreamSourceGroup],
+        target: SourceIndexIdentity.TargetResolution,
+        torBox: TorBoxSearchSource,
+        sourceIndex: SourceIndexServeSource
+    ) -> [CoreStreamSourceGroup] {
+        let call = Call(resolution: target)
+        let withTorBox = torBox.merged(into: groups, call: call)
+        return sourceIndex.merged(into: withTorBox, call: call)
+    }
+
+    static func hoard(
+        target: SourceIndexIdentity.TargetResolution,
+        groups: [CoreStreamSourceGroup],
+        providerByHash: [String: String] = [:]
+    ) async {
+        await SourceIndexClient.hoard(
+            call: Call(resolution: target),
+            groups: groups,
+            providerByHash: providerByHash
+        )
+    }
+}
+
 // MARK: - Per-view SERVE contributor
 
 /// A per-detail-view `@StateObject` that reads the community source index for the current title and publishes
@@ -1714,11 +1799,16 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     /// O(1) rebuild signature (a single Int compare instead of hashing the array).
     private(set) var epoch = 0
 
-    private var lastContentID: String?
-    /// Canonical identity for the rows currently owned by this source. The source-list assembler checks it
-    /// before merging so a detached E2 snapshot cannot be reused for E3.
-    var publishedContentID: String? { lastContentID }
+    /// The sealed target for the rows currently owned by this source. The source-list assembler authorizes its
+    /// merge against this value, so a detached E2 snapshot cannot be reused for E3.
+    private var lastTarget: SourceIndexIdentity.PublicationTarget?
+    var publishedTarget: SourceIndexIdentity.PublicationTarget? { lastTarget }
     private var task: Task<Void, Never>?
+    /// Empty successful/failing fetches do not bump the rows epoch, so settlement has its own observable
+    /// generation. This lets SourceListModel atomically rank the complete contributor set.
+    @Published private(set) var settlementEpoch = 0
+    private var settlementContentID: String?
+    private var settlementTerminal = false
 
     typealias FetchPooled = @Sendable (String, Bool) async throws -> [SourceIndexClient.PooledSource]
     typealias ServeGate = @Sendable () -> Bool
@@ -1763,24 +1853,46 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         SourceIndexLifecycleScope.shared.register(self)
     }
 
-    /// Fetch pooled sources for `contentID` when SERVE is enabled + the user is signed in (owner decision
-    /// 2026-07-04: Singularity results are a VortX-user-only benefit). Fail-soft + deduped by content id. Safe
-    /// to call on every meta change / `.task` / `.onAppear`.
-    func refresh(contentID requestedContentID: String?, isSignedIn _: Bool) {
+    func settlementState(for contentID: String?) -> SourceContributorSettlement {
+        guard let contentID,
+              SourceIndexContract.canonicalContentID(contentID) == contentID,
+              serveGate(), accountGate() else { return .inactive }
+        guard settlementContentID == contentID else { return .pending }
+        return settlementTerminal ? .terminal : .pending
+    }
+
+    func settlementState(for resolution: SourceIndexIdentity.TargetResolution) -> SourceContributorSettlement {
+        guard let target = SourceIndexIdentity.validatedTarget(resolution) else { return .inactive }
+        return settlementState(for: target.contentID)
+    }
+
+    private func publishSettlement(contentID: String?, terminal: Bool) {
+        guard settlementContentID != contentID || settlementTerminal != terminal else { return }
+        settlementContentID = contentID
+        settlementTerminal = terminal
+        settlementEpoch &+= 1
+    }
+
+    /// Fetch pooled sources for one resolver-built target when SERVE is enabled + the user is signed in. The
+    /// wire content id is derived from the validated target at this owner boundary.
+    func refresh(call: AuxiliarySourcePipeline.Call, isSignedIn _: Bool) {
         guard serveGate(), accountGate() else {
             invalidateLocal(clearIdentity: true)
             return
         }
-        let contentID = requestedContentID.flatMap { candidate in
-            SourceIndexContract.canonicalContentID(candidate) == candidate ? candidate : nil
+        guard let target = SourceIndexIdentity.validatedTarget(call.resolution) else {
+            invalidateLocal(clearIdentity: true)
+            return
         }
-        let identityChanged = contentID != lastContentID
+        let identityChanged = target != lastTarget
         if identityChanged {
             invalidateLocal(clearIdentity: false)
-            lastContentID = contentID
+            lastTarget = target
+            publishSettlement(contentID: target.contentID, terminal: false)
         }
 
-        guard identityChanged, let contentID else { return }
+        guard identityChanged else { return }
+        let contentID = target.contentID
 
         let lifecycle = SourceIndexLifecycleClock.snapshot()
         let generation = refreshGeneration
@@ -1799,7 +1911,7 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
             let built = SourceIndexClient.streams(from: pooled, capabilities: serveCapabilities)
             guard !Task.isCancelled, let self,
                   self.refreshGeneration == generation,
-                  self.lastContentID == contentID,
+                  self.lastTarget == target,
                   SourceIndexLifecycleClock.snapshot() == lifecycle,
                   serveGate(),
                   accountGate() else {
@@ -1809,8 +1921,16 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
             }
             SourceIndexClient.diag(.refreshPublish, counts: [(.streams, built.count)])
             self.streams = built
+            self.task = nil
+            self.publishSettlement(contentID: contentID, terminal: true)
         }
     }
+
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    func refresh(target resolution: SourceIndexIdentity.TargetResolution, isSignedIn: Bool) {
+        refresh(call: AuxiliarySourcePipeline.callForTesting(resolution), isSignedIn: isSignedIn)
+    }
+    #endif
 
     /// Empty the published community streams and invalidate this owner's waiter. Ordinary title changes do not
     /// cancel shared coalescing; a replacement view may still join an active request for the same title.
@@ -1837,7 +1957,10 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         refreshGeneration &+= 1
         task?.cancel()
         task = nil
-        if clearIdentity { lastContentID = nil }
+        if clearIdentity {
+            lastTarget = nil
+            publishSettlement(contentID: nil, terminal: true)
+        }
         if !streams.isEmpty { streams = [] }
     }
 
@@ -1848,9 +1971,25 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     /// rendering a second identical row, so only hashes the add-ons did NOT surface become new Singularity rows.
     /// Internal duplicates within Singularity's own list are dropped too. Empty pool (SERVE off / not signed in /
     /// fleet-off / nothing corroborated) is a pure pass-through, so the list is unchanged.
-    func merged(into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        Self.merge(streams, into: groups)
+    func merged(
+        into groups: [CoreStreamSourceGroup],
+        call: AuxiliarySourcePipeline.Call
+    ) -> [CoreStreamSourceGroup] {
+        let authorization = SourceIndexIdentity.mergeAuthorization(
+            published: lastTarget,
+            page: call.resolution
+        )
+        return Self.merge(authorizedBy: authorization, streams, into: groups)
     }
+
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    func merged(
+        into groups: [CoreStreamSourceGroup],
+        for resolution: SourceIndexIdentity.TargetResolution
+    ) -> [CoreStreamSourceGroup] {
+        merged(into: groups, call: AuxiliarySourcePipeline.callForTesting(resolution))
+    }
+    #endif
 
     /// The pure merge. `nonisolated static` so `SourceListModel`'s off-main assembly can run it over a
     /// snapshotted `streams` array without hopping to the main actor; the instance `merged(into:)`
@@ -1860,7 +1999,12 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     /// (thousands of lines, ~150 ms apart, on a loading title) and was the log-flood symptom of the
     /// main-thread source-list storm. The `[sing] merged` health log now lives in
     /// `SourceListModel.rebuild`, once per coalesced rebuild, where its frequency is the metric.
-    nonisolated static func merge(_ extra: [CoreStream], into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+    nonisolated static func merge(
+        authorizedBy authorization: SourceIndexIdentity.MergeAuthorization?,
+        _ extra: [CoreStream],
+        into groups: [CoreStreamSourceGroup]
+    ) -> [CoreStreamSourceGroup] {
+        guard authorization != nil else { return groups }
         guard !extra.isEmpty else { return groups }
         // Torrent infohashes the user's OWN add-ons already surfaced (any case). A pooled torrent that matches
         // one is corroboration of a row the list already shows, not a new source, so it is dropped below. The

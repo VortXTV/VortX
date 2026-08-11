@@ -19,6 +19,10 @@ import Foundation
 
 enum TorBoxSearch {
     private static let base = "https://search-api.torbox.app"
+    /// The HEALTHY account host, used ONLY as the A1 resilience fallback when `base` never answers (its DNS
+    /// went dead). Its torrent search is live and used by other clients; it returns torrent rows only (no
+    /// usenet). Never the primary path: the public index at `base` is what this source is built around.
+    private static let fallbackBase = "https://api.torbox.app"
 
     /// One usenet result parsed from the search index into a playable `CoreStream` (nzb link + optional
     /// pick regex), plus torrent results (infoHash / magnet). Tolerant decoding: the index wraps items
@@ -93,7 +97,19 @@ enum TorBoxSearch {
         async let usenet = fetch(kind: "usenet", imdbId: imdbId, season: season, episode: episode, apiKey: apiKey)
         async let torrents = fetch(kind: "torrents", imdbId: imdbId, season: season, episode: episode, apiKey: apiKey)
         let (u, t) = await (usenet, torrents)
-        return (u.streams + t.streams, u.rateLimited || t.rateLimited, u.transportError || t.transportError)
+        let combined = u.streams + t.streams
+        let rateLimited = u.rateLimited || t.rateLimited
+        let transportError = u.transportError || t.transportError
+        // A1 resilience: `base` (search-api.torbox.app) is the DNS-dead host. When neither leg completed and
+        // we have nothing to show, fall back ONCE to the HEALTHY host's torrent search so a TorBox user still
+        // gets torrent sources instead of a silent nothing. A completed fallback (even an empty 200) clears the
+        // transportError signal, so the caller caches it and resets its consecutive-transport-error streak; a
+        // fallback that also fails to complete returns nil and we fall through to the existing transportError
+        // path (offline blip self-heals on the next open).
+        if transportError, combined.isEmpty, let fallback = await fallbackTorrentSearch(imdbId: imdbId, apiKey: apiKey) {
+            return (fallback, rateLimited, false)
+        }
+        return (combined, rateLimited, transportError)
     }
 
     /// One `GET /{kind}/imdb_id:{id}` call, bounded and fail-soft. The id-type prefix must be `imdb_id:`
@@ -131,6 +147,51 @@ enum TorBoxSearch {
               let decoded = try? JSONDecoder().decode(Response.self, from: data) else { return ([], false, false) }
         let items = (decoded.data?.nzbs ?? []) + (decoded.data?.torrents ?? [])
         return (items.compactMap { stream(from: $0, imdbId: imdbId) }, false, false)
+    }
+
+    /// A1 resilience fallback. `search-api.torbox.app` (the public index this source normally uses) is the
+    /// dead host; the ACCOUNT host `api.torbox.app` is healthy and exposes a torrent search other clients use.
+    /// When the index never answers, hit the healthy host ONCE for TORRENT rows (no usenet) so a TorBox user
+    /// still gets sources. Bearer-auth, bounded, fail-soft. Returns `nil` ONLY when the fallback itself never
+    /// completes / answers non-2xx (so `streams` falls through to the existing transportError path); a 200 with
+    /// no torrents returns `[]` (a completed empty response), which the caller treats as a real "no results".
+    private static func fallbackTorrentSearch(imdbId: String, apiKey: String) async -> [CoreStream]? {
+        guard imdbId.hasPrefix("tt"), !apiKey.isEmpty else { return nil }
+        var comps = URLComponents(string: "\(fallbackBase)/v1/api/torrents/search")
+        comps?.queryItems = [URLQueryItem(name: "query", value: imdbId)]
+        guard let url = comps?.url else { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 12
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 12
+        let session = URLSession(configuration: cfg)
+        guard let (data, response) = try? await session.data(for: req),
+              let code = (response as? HTTPURLResponse)?.statusCode,
+              (200...299).contains(code),
+              let decoded = try? JSONDecoder().decode(FallbackResponse.self, from: data) else { return nil }
+        let mapped = decoded.torrentItems.compactMap { stream(from: $0, imdbId: imdbId) }
+        NSLog("[torbox-search] search-api unreachable; healthy-host fallback returned %d torrent row(s)", mapped.count)
+        return mapped
+    }
+
+    /// Tolerant decode of the healthy host's torrent search. TorBox wraps payloads under `data`, which is
+    /// either a torrents array directly or an object carrying a `torrents` array. Every shape falls back to []
+    /// rather than throwing, so a shape drift degrades to "no fallback results", never a decode crash.
+    private struct FallbackResponse: Decodable {
+        let torrentItems: [Response.Item]
+        enum CodingKeys: String, CodingKey { case data }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            if let arr = (try? c.decodeIfPresent([Response.Item].self, forKey: .data)) ?? nil {
+                torrentItems = arr
+            } else if let obj = (try? c.decodeIfPresent(Response.Payload.self, forKey: .data)) ?? nil {
+                torrentItems = obj.torrents ?? []
+            } else {
+                torrentItems = []
+            }
+        }
     }
 
     /// Build a `CoreStream` from one search item. Usenet vs torrent is discriminated by the index's own
@@ -213,16 +274,25 @@ enum TorBoxSearch {
 /// of the same title does not re-hit the index.
 @MainActor
 final class TorBoxSearchSource: ObservableObject {
+    typealias SearchResult = (streams: [CoreStream], rateLimited: Bool, transportError: Bool)
+    typealias FetchStreams = (SourceIndexIdentity.PublicationTarget, String) async -> SearchResult
+    typealias KeyGate = @MainActor () -> Bool
+    typealias KeyProvider = @MainActor () -> String
+
     /// The extra streams from the search index, ready to merge. Empty until a fetch completes (and always
     /// with no TorBox key). One group so the source list shows a single "TorBox Search" section.
     @Published private(set) var streams: [CoreStream] = [] { didSet { epoch &+= 1 } }
     /// Monotonic epoch bumped whenever `streams` is REPLACED. `SourceListModel` folds this into its
     /// O(1) rebuild signature (a single Int compare instead of hashing the array).
     private(set) var epoch = 0
-    /// Canonical title/episode identity for the currently published rows. SourceListModel compares this
-    /// token with the page target before merging, so an owner that is reused across E2 -> E3 can never lend
-    /// E2 search rows to E3 while the replacement request is in flight.
-    private(set) var publishedContentID: String?
+    /// The sealed target for the currently published rows. Merge authorization revalidates this target against
+    /// the page resolution before any row can enter the visible list.
+    private(set) var publishedTarget: SourceIndexIdentity.PublicationTarget?
+    /// Separate from the rows epoch: a legitimate empty response or terminal transport failure changes
+    /// settlement without changing `streams`, and SourceListModel must rebuild for that transition too.
+    @Published private(set) var settlementEpoch = 0
+    private var settlementContentID: String?
+    private var settlementTerminal = false
 
     /// The title currently shown (its fetch key). Switching titles resets `streams` so a previous title's
     /// results can never leak onto one we don't (or can't) fetch.
@@ -239,39 +309,98 @@ final class TorBoxSearchSource: ObservableObject {
     /// exact reset from the 429, so we back off a short window and re-probe: the feature self-heals the
     /// moment the allowance frees, without hammering in between.
     private var cooldownUntil: Date?
+    /// Consecutive transport errors (no HTTP response completed) seen so far. A single offline blip must still
+    /// self-heal immediately on the next open, so the first few are retried with no backoff; only a PERSISTENT
+    /// streak arms a cooldown, so a dead host (search-api.torbox.app went DNS-dead) is probed occasionally
+    /// instead of firing two failing lookups on every title open forever. ANY completed HTTP response (2xx,
+    /// 429, other) resets it: the host is reachable, so the streak is broken.
+    private var consecutiveTransportErrors = 0
+    private static let maxConsecutiveTransportErrors = 3
     private var task: Task<Void, Never>?
+    private let fetchStreams: FetchStreams
+    private let hasKey: KeyGate
+    private let keyProvider: KeyProvider
 
-    /// Fetch search results for `imdbId` if the user has a TorBox key. Fail-soft, session-cached, and backed
-    /// off during a scraper cooldown. Safe to call on every meta change / `.onAppear`. Pass `season`/`episode`
-    /// from an episode context so the index scopes usenet/torrent results to that episode (nil = movie level).
-    func refresh(imdbId: String?, season: Int? = nil, episode: Int? = nil) {
-        // Re-validate through the SHARED module rather than trusting a `tt` prefix. Callers pass an id that a
-        // screen resolved; the old prefix check also accepted the EPISODE form ("tt0903747:1:1"), so `imdb_id:`
-        // below was keyed on an id no IMDb index can answer and the content id composed "tt0903747:1:1:3:5".
-        // `imdbTitleID` yields a BARE tt id or nothing, which is exactly this path's contract: it is IMDb-keyed,
-        // so a tmdb id here is wrong rather than weak.
-        guard let imdbId = SourceIndexIdentity.imdbTitleID(imdbId) else {
+    init(
+        fetchStreams: @escaping FetchStreams = { target, apiKey in
+            await TorBoxSearch.streams(
+                imdbId: target.titleID,
+                season: target.season,
+                episode: target.episode,
+                apiKey: apiKey
+            )
+        },
+        hasKey: @escaping KeyGate = {
+            DebridKeys.shared.isConfigured(.torBox)
+        },
+        keyProvider: @escaping KeyProvider = {
+            DebridKeys.shared.key(for: .torBox)
+        }
+    ) {
+        self.fetchStreams = fetchStreams
+        self.hasKey = hasKey
+        self.keyProvider = keyProvider
+    }
+
+    func settlementState(for contentID: String?) -> SourceContributorSettlement {
+        guard let contentID,
+              SourceIndexIdentity.imdbTitleID(contentID) != nil,
+              DebridKeys.shared.isConfigured(.torBox),
+              RemoteConfig.snapshot.isFeatureOn(
+                "torBoxSearch", default: RemoteConfigDefaults.featureTorBoxSearch
+              ) else { return .inactive }
+        guard settlementContentID == contentID else { return .pending }
+        return settlementTerminal ? .terminal : .pending
+    }
+
+    func settlementState(for resolution: SourceIndexIdentity.TargetResolution) -> SourceContributorSettlement {
+        guard let target = SourceIndexIdentity.validatedTarget(resolution) else { return .inactive }
+        return settlementState(for: target.contentID)
+    }
+
+    private func publishSettlement(contentID: String?, terminal: Bool) {
+        guard settlementContentID != contentID || settlementTerminal != terminal else { return }
+        settlementContentID = contentID
+        settlementTerminal = terminal
+        settlementEpoch &+= 1
+    }
+
+    /// Fetch search results for one resolver-built target. A mismatch, absent target, malformed relationship,
+    /// missing key, or fleet-off state clears publication synchronously and launches no transport.
+    func refresh(call: AuxiliarySourcePipeline.Call) {
+        guard let target = SourceIndexIdentity.validatedTarget(call.resolution) else {
             clearResults(); return
         }
-        guard DebridKeys.shared.isConfigured(.torBox) else { clearResults(); return }   // gate: no TorBox key -> no-op
-        let fetchKey = "\(imdbId)|\(season ?? -1)|\(episode ?? -1)"
-        // Tuple-exact, same rule as the pool key: a PARTIAL coordinate pair is not silently widened to the
-        // show, because that publishes one episode's results under the show-wide token.
-        guard let contentID = SourceIndexIdentity.contentKey(titleID: imdbId, season: season, episode: episode) else {
+        guard hasKey() else { clearResults(); return }
+        guard RemoteConfig.snapshot.isFeatureOn(
+            "torBoxSearch", default: RemoteConfigDefaults.featureTorBoxSearch
+        ) else {
             clearResults(); return
         }
+        let fetchKey = target.contentID
         // New title: publish its cached results (or clear), so the prior title's streams never linger.
         if fetchKey != shownKey {
+            task?.cancel()
+            task = nil
+            inFlightKey = nil
             shownKey = fetchKey
-            publishedContentID = contentID
+            publishedTarget = target
             streams = cache[fetchKey] ?? []
+            publishSettlement(contentID: fetchKey, terminal: cache[fetchKey] != nil)
         }
-        if cache[fetchKey] != nil { return }              // cached: already published above, no round trip
+        if cache[fetchKey] != nil {
+            publishSettlement(contentID: fetchKey, terminal: true)
+            return
+        }                                                  // cached: already published above, no round trip
         if inFlightKey == fetchKey { return }             // the paired onChange/onAppear for this id: fetch once
-        if let until = cooldownUntil, until > Date() { return }   // in scraper cooldown: don't burn requests
+        if let until = cooldownUntil, until > Date() {
+            publishSettlement(contentID: fetchKey, terminal: true)
+            return
+        }                                                   // in scraper cooldown: terminal failure for this generation
         task?.cancel()
         inFlightKey = fetchKey
-        let key = DebridKeys.shared.key(for: .torBox)
+        publishSettlement(contentID: fetchKey, terminal: false)
+        let key = keyProvider()
         // H9 diagnostic (terminal-run repro): confirm refresh actually fires with a key. Logs the id + whether
         // a non-empty TorBox key is present (never the key itself). If this line never appears, the gate above
         // no-op'd; if it appears but the count line below is 0, the index returned nothing for the id.
@@ -282,62 +411,114 @@ final class TorBoxSearchSource: ObservableObject {
         // movie teardown; it is neither. `scope=movie` says what the request is, and the episode form still
         // prints its real coordinates, so a genuinely wrong coordinate pair is now distinguishable from the
         // movie case instead of hiding behind the same two numbers.
-        let scope = season == nil && episode == nil
+        let scope = target.season == nil && target.episode == nil
             ? "scope=movie"
-            : "scope=episode s=\(season.map(String.init) ?? "-") e=\(episode.map(String.init) ?? "-")"
-        VXProbe.log("torbox-search", "refresh id=\(VXProbeRedaction.identityToken(imdbId)) \(scope) hasKey=\(key.isEmpty ? "no" : "yes")")
+            : "scope=episode s=\(target.season.map(String.init) ?? "-") e=\(target.episode.map(String.init) ?? "-")"
+        VXProbe.log("torbox-search", "refresh id=\(VXProbeRedaction.identityToken(target.titleID)) \(scope) hasKey=\(key.isEmpty ? "no" : "yes")")
         task = Task { [weak self] in
-            let result = await TorBoxSearch.streams(imdbId: imdbId, season: season, episode: episode, apiKey: key)
-            guard !Task.isCancelled, let self else { return }
+            guard let self else { return }
+            let result = await self.fetchStreams(target, key)
+            guard SourceContributorCompletionOwnership.accepts(
+                completedKey: fetchKey,
+                shownKey: self.shownKey,
+                inFlightKey: self.inFlightKey,
+                canceled: Task.isCancelled
+            ) else { return }
             self.inFlightKey = nil
+            self.task = nil
             if result.rateLimited {
                 // Over the TorBox scraper allowance. Back off ~15 min before re-probing; do NOT cache the
-                // empty result, so it re-fetches for real once the cooldown lifts.
+                // empty result, so it re-fetches for real once the cooldown lifts. A 429 IS a completed HTTP
+                // response, so the host is reachable: reset the transport-error streak.
+                self.consecutiveTransportErrors = 0
                 self.cooldownUntil = Date().addingTimeInterval(15 * 60)
-                VXProbe.log("torbox-search", "rate-limited (scraper cooldown) for id=\(VXProbeRedaction.identityToken(imdbId)), backing off ~15m")
+                VXProbe.log("torbox-search", "rate-limited (scraper cooldown) for id=\(VXProbeRedaction.identityToken(target.titleID)), backing off ~15m")
+                self.publishSettlement(contentID: fetchKey, terminal: true)
                 return
             }
             if result.transportError {
-                // The request never completed (offline / network failure). Do NOT cache the empty result and do
-                // NOT set a cooldown, so the next meta change or reopen re-fetches for real once the network is
-                // back. Without this, an offline first open cached an empty list for the whole session.
-                VXProbe.log("torbox-search", "transport error for id=\(VXProbeRedaction.identityToken(imdbId)), not caching, will retry")
+                // The request never completed (offline / network failure / a DNS-dead host). Do NOT cache the
+                // empty result. A single blip must self-heal immediately on the next open, so the first few
+                // retry with no backoff; only a PERSISTENT streak arms a ~15 min cooldown (mirroring the 429
+                // path) so a dead host is probed occasionally instead of firing failing lookups on every open.
+                self.consecutiveTransportErrors += 1
+                if self.consecutiveTransportErrors >= Self.maxConsecutiveTransportErrors {
+                    self.cooldownUntil = Date().addingTimeInterval(15 * 60)
+                    VXProbe.log("torbox-search", "\(self.consecutiveTransportErrors) consecutive transport errors for id=\(VXProbeRedaction.identityToken(target.titleID)), backing off ~15m")
+                } else {
+                    VXProbe.log("torbox-search", "transport error for id=\(VXProbeRedaction.identityToken(target.titleID)), not caching, will retry")
+                }
+                self.publishSettlement(contentID: fetchKey, terminal: true)
                 return
             }
-            VXProbe.log("torbox-search", "fetched \(result.streams.count) stream(s) for id=\(VXProbeRedaction.identityToken(imdbId))")
+            // A completed HTTP response with results (or a legit empty 200): the host is reachable, so reset the
+            // transport-error streak and clear any stale cooldown before caching.
+            self.consecutiveTransportErrors = 0
+            self.cooldownUntil = nil
+            VXProbe.log("torbox-search", "fetched \(result.streams.count) stream(s) for id=\(VXProbeRedaction.identityToken(target.titleID))")
             self.cache[fetchKey] = result.streams
-            if self.shownKey == fetchKey { self.streams = result.streams }
+            self.streams = result.streams
+            self.publishSettlement(contentID: fetchKey, terminal: true)
         }
     }
 
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    func refresh(target resolution: SourceIndexIdentity.TargetResolution) {
+        refresh(call: AuxiliarySourcePipeline.callForTesting(resolution))
+    }
+
+    var ownerStateForTesting: (shownKey: String?, inFlightKey: String?, hasTask: Bool) {
+        (shownKey: shownKey, inFlightKey: inFlightKey, hasTask: task != nil)
+    }
+    #endif
+
     /// Empty the PUBLISHED results (and the shown-key, so a later refresh for the same title
-    /// re-publishes from cache instead of being deduped into staying empty) WITHOUT touching the
-    /// session cache, the in-flight bookkeeping, or the scraper-cooldown state - those protect the
-    /// TorBox allowance for the whole session and must survive a clear. For an owner that reuses ONE
+    /// re-publishes from cache instead of being deduped into staying empty) without touching the
+    /// session cache or scraper-cooldown state. Cancel and release the current request so a preload owner
+    /// cannot keep a stale network operation alive after retaining its winner. For an owner that reuses ONE
     /// instance across titles (the batch-download coordinator #119, unlike the per-view @StateObjects
     /// that die with their screen): the result pool is PER-TITLE, and a title that cannot query the
     /// index (no imdb id / no key) must see it EMPTY, never a predecessor title's results - `refresh`
-    /// early-returns on those gates without clearing, so the owner clears explicitly. A still-in-flight
-    /// fetch is left running ON PURPOSE: cancelling it would strand `inFlightKey` and drop a 429
-    /// cooldown signal, while letting it finish only fills the session cache (the `shownKey` guard
-    /// already blocks a stale publish).
+    /// early-returns on those gates without clearing, so the owner clears explicitly.
     func clearResults() {
+        task?.cancel()
+        task = nil
+        inFlightKey = nil
         shownKey = nil
-        publishedContentID = nil
+        publishedTarget = nil
+        publishSettlement(contentID: nil, terminal: true)
         if !streams.isEmpty { streams = [] }
     }
 
-    /// Merge the fetched search streams into `groups` as one extra group, deduped against the streams
-    /// already present (by infoHash for torrents, nzbUrl for usenet, url otherwise). Returns `groups`
-    /// unchanged when there is nothing to add, so a no-key / empty-result path is a pure pass-through.
-    func merged(into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        Self.merge(streams, into: groups)
+    /// Merge only with a capability proving that these rows and this page share one validated target.
+    func merged(
+        into groups: [CoreStreamSourceGroup],
+        call: AuxiliarySourcePipeline.Call
+    ) -> [CoreStreamSourceGroup] {
+        let authorization = SourceIndexIdentity.mergeAuthorization(
+            published: publishedTarget,
+            page: call.resolution
+        )
+        return Self.merge(authorizedBy: authorization, streams, into: groups)
     }
 
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    func merged(
+        into groups: [CoreStreamSourceGroup],
+        for resolution: SourceIndexIdentity.TargetResolution
+    ) -> [CoreStreamSourceGroup] {
+        merged(into: groups, call: AuxiliarySourcePipeline.callForTesting(resolution))
+    }
+    #endif
+
     /// The pure merge. `nonisolated static` so `SourceListModel`'s off-main assembly can run it over a
-    /// snapshotted `streams` array without hopping to the main actor; the instance `merged(into:)`
-    /// wraps it for the existing main-actor call sites. Value types in, value types out, no state.
-    nonisolated static func merge(_ extra: [CoreStream], into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+    /// snapshotted `streams` array without hopping to the main actor. A nil capability is a pure pass-through.
+    nonisolated static func merge(
+        authorizedBy authorization: SourceIndexIdentity.MergeAuthorization?,
+        _ extra: [CoreStream],
+        into groups: [CoreStreamSourceGroup]
+    ) -> [CoreStreamSourceGroup] {
+        guard authorization != nil else { return groups }
         guard !extra.isEmpty else { return groups }
         var seenHashes: Set<String> = []
         var seenNZB: Set<String> = []

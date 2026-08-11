@@ -758,20 +758,24 @@ let targetSevenReadiness = VortXHLSStartupReadiness(
 // 6-segment / 3x-target floor (36s at the conservative target) held every UHD master past the chrome's 10s
 // start watchdog and inflated the live window into the then-smaller session spool ceiling - the build 189
 // field regression, twice over.
-check("startup readiness: one independently decodable segment and four seconds are one immutable contract",
+check("startup readiness: one independently decodable segment and six seconds are one immutable contract",
       targetSevenReadiness == .init(
           frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex),
           minimumSegmentCount: 1))
-check("startup readiness: the startup floor is 4000 rendered milliseconds regardless of target",
-      targetSevenReadiness?.minimumRenderedDurationMilliseconds == 4_000
+check("startup readiness: the startup floor is 6000 rendered milliseconds regardless of target",
+      targetSevenReadiness?.minimumRenderedDurationMilliseconds == 6_000
           && VortXHLSStartupReadiness(
               frozenTarget: VortXHLSTargetPolicy.conservativeTarget)?
-              .minimumRenderedDurationMilliseconds == 4_000)
-check("startup forward buffer: local remux starts at the four-second publication floor",
+              .minimumRenderedDurationMilliseconds == 6_000)
+// The forward buffer starts at AVPlayer's readiness window; the publication floor deliberately sits ABOVE it
+// (readiness + 50%) so a startup cohort is never declined for want of a few milliseconds of media.
+check("startup forward buffer: local remux starts at the readiness window the publication floor exceeds",
       VortXRemuxForwardBufferPolicy.preferredDuration(
           mount: .localRemux,
           hasProducedFirstFrame: false)
-          == Double(VortXHLSStartupReadiness.startupFloorMilliseconds) / 1_000)
+          == VortXRemuxForwardBufferPolicy.startupSeconds
+          && Double(VortXHLSStartupReadiness.startupFloorMilliseconds) / 1_000
+              > VortXRemuxForwardBufferPolicy.startupSeconds)
 check("startup forward buffer: remote remux starts adaptive at zero",
       VortXRemuxForwardBufferPolicy.preferredDuration(
           mount: .remoteRemux,

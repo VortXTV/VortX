@@ -2709,6 +2709,10 @@ enum PlayerLiveContractTests {
         let playControl = sourceSection(engine, from: "func play() {", to: "func pause() {")
         let pauseControl = sourceSection(engine, from: "func pause() {", to: "func togglePause()")
         let speedControl = sourceSection(engine, from: "func setSpeed(_ speed: Double)", to: "/// Live playback position")
+        let committedTransportApplication = sourceSection(
+            engine,
+            from: "private func applyCommittedTransport()",
+            to: "/// One line per transport call")
         let playbackIntentCapture = sourceSection(
             engine,
             from: "private func capturePlaybackIntent(",
@@ -2753,6 +2757,10 @@ enum PlayerLiveContractTests {
             to: "/// AVFoundation cannot time-shift native")
         let groupLoad = sourceSection(engine, from: "private func loadSelectionGroups()",
                                       to: "/// Rebuild cached selected flags")
+        let selectionRestore = sourceSection(
+            groupLoad,
+            from: "if let restore {",
+            to: "} else if pendingPlaybackIntent != nil")
         let sourceAudioAlignment = sourceSection(
             engine,
             from: "private func selectionContextIsCurrent(",
@@ -2833,6 +2841,10 @@ enum PlayerLiveContractTests {
             server,
             from: "private func waitForMount",
             to: "// MARK: - Resources")
+        let remuxStartupTimeoutHandler = sourceSection(
+            engine,
+            from: "private func handleRemuxStartupTimeout(",
+            to: "private func handleStatus(")
         let subtitleInvalidation = sourceSection(
             stream,
             from: "private func invalidateSubtitles(",
@@ -2969,15 +2981,16 @@ enum PlayerLiveContractTests {
                   "let audioAttribute = audioTags.isEmpty ? \"\" : \",AUDIO=\\\"audio\\\"\"",
                   "DVPlaybackPolicy.masterPlaylistData(",
               ]))
-        // The startup floor is the flat four-second / one-decodable-segment budget; the 3x-target multiplication was the
-        // build 189 regression (36s of media before the master, while the start watchdog fires at 10s).
+        // The startup floor is the flat six-second / one-decodable-segment budget (four seconds sat exactly on
+        // AVPlayer's readiness window); the 3x-target multiplication was the build 189 regression (36s of media
+        // before the master, while the start watchdog fires at 10s).
         check("wiring: master waits for the flat first-decodable-segment startup floor",
               masterPublication?.contains("DVPlaybackPolicy.pinnedStartupCohort(") == true
                   && masterPublication?.contains(
                     "minimumSegmentCount: startupReadiness.minimumSegmentCount") == true
                   && masterPublication?.contains(
                     "startupReadiness.minimumRenderedDurationMilliseconds") == true
-                  && policy?.contains("static let startupFloorMilliseconds = 4_000") == true
+                  && policy?.contains("static let startupFloorMilliseconds = min(") == true
                   && policy?.contains("minimumSegmentCount: Int = 1") == true
                   && rollingPublication?.contains(
                       "startupReadiness.maximumUnconsumedSegmentCount") == true
@@ -3197,13 +3210,14 @@ enum PlayerLiveContractTests {
                       "mountAlreadyReady: server.hasMarkedEngineReady",
                   ]))
         check("wiring: timeout callback is generation-safe and emits one fatal chrome event",
-              engine?.contains("onStartupTimeout: { [weak self] timedOutServer in") == true
-                  && engine?.contains("remuxHLSServer === timedOutServer") == true
-                  && engine?.contains("activeLoadToken == loadToken") == true
-                  && engine?.contains("!isReady") == true
-                  && engine?.contains("!fatalErrorEmitted") == true
-                  && engine?.contains("fatalErrorEmitted = true") == true
-                  && engine?.contains("MPVProperty.endFileError") == true)
+              engine?.contains("let startupTimeout: @Sendable (VortXRemuxHLSServer) -> Void") == true
+                  && engine?.contains("self?.handleRemuxStartupTimeout(") == true
+                  && remuxStartupTimeoutHandler?.contains("remuxHLSServer === timedOutServer") == true
+                  && remuxStartupTimeoutHandler?.contains("activeLoadToken == loadToken") == true
+                  && remuxStartupTimeoutHandler?.contains("!isReady") == true
+                  && remuxStartupTimeoutHandler?.contains("!fatalErrorEmitted") == true
+                  && remuxStartupTimeoutHandler?.contains("fatalErrorEmitted = true") == true
+                  && remuxStartupTimeoutHandler?.contains("MPVProperty.endFileError") == true)
         check("wiring: owner-only permissions are applied and verified for directories and media files",
               remuxBuffer?.contains("NSNumber(value: 0o700)") == true
                   && remuxBuffer?.contains("NSNumber(value: 0o600)") == true
@@ -3407,9 +3421,9 @@ enum PlayerLiveContractTests {
                   && tvPlayerChapterRows?.contains(
                     "coordinator.player?.seek(to: ch.start)") == true
                   && playerScreenSkipPill?.contains(
-                    "coordinator.player?.seek(to: segment.end)") == true
+                    "issueSeek(to: segment.end, reason: \"skip\")") == true
                   && tvPlayerSkipAction?.contains(
-                    "coordinator.player?.seek(to: segment.end)") == true
+                    "issueSeek(to: segment.end, reason: \"skip\")") == true
                   && playerScreenDemotionUsesNewestEngineTarget
                   && tvPlayerDemotionUsesNewestEngineTarget)
         check("wiring: Apple scrub chrome no longer pins a long seek to the buffered edge",
@@ -3606,6 +3620,36 @@ enum PlayerLiveContractTests {
                       "intent.updateSourceSeconds(seconds)",
                       "pendingPlaybackIntent = intent",
                   ]))
+        check("wiring: ready and selection restore share the committed transport application",
+              sourceContainsInOrder(committedTransportApplication, [
+                  "PlaybackIntentPolicy.committedTransportAction(",
+                  "playbackRequested: playbackRequested",
+                  "requestedRate: requestedRate",
+                  "player.play()",
+                  "player.rate = rate",
+                  "player.pause()",
+              ])
+                  && sourceContainsInOrder(remuxDurationMapping, [
+                      "if !didStart",
+                      "applyCommittedTransport()",
+                      "readyToPlay -> committed transport",
+                  ])
+                  && sourceContainsInOrder(selectionRestore, [
+                      "switch restore.subtitle",
+                      "applyCommittedTransport()",
+                      "pendingPlaybackIntent = nil",
+                  ]))
+        check("wiring: selection restoration cannot overwrite newer live pause or play intent",
+              selectionRestore?.contains(
+                  "playbackRequested = restore.playbackRequested") == false
+                  && selectionRestore?.contains(
+                      "requestedRate = restore.requestedRate") == false
+                  && selectionRestore?.contains("player.play()") == false
+                  && selectionRestore?.contains("player.pause()") == false
+                  && selectionRestore?.contains(
+                      "capturedPlaybackRequested=\\(restore.playbackRequested)") == true
+                  && selectionRestore?.contains(
+                      "committedPlaybackRequested=\\(playbackRequested)") == true)
         check("wiring: passive intent capture cannot overwrite an explicit pending seek",
               sourceContainsInOrder(playbackIntentCapture, [
                   "if let intent = pendingPlaybackIntent",

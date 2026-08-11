@@ -4,6 +4,8 @@
 //   xcrun swiftc -o /tmp/episode-playback-identity-test \
 //     app/SourcesShared/DetailMetaRecoveryPolicy.swift \
 //     app/SourcesShared/CatalogRowResolution.swift \
+//     app/SourcesShared/AppleCWSeasonRolloverPolicy.swift \
+//     app/SourcesShared/AppleEpisodeResolverAdmission.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //     app/Tests/EpisodePlaybackIdentityTests.swift && \
@@ -46,7 +48,7 @@ actor DebridCoordinator {
 
 enum StubError: Error { case unavailable }
 
-enum VortXSyncManager { static let appliedAddonOrder: [String] = [] }
+enum VortXSyncManager { static var appliedAddonOrder: [String] = [] }
 enum AddonTombstones { static func normalize(_ value: String) -> String { value } }
 
 final class DebridKeys {
@@ -125,6 +127,11 @@ private func usesAllSeasonDirectResume(_ rootSource: String) -> Bool {
         && !episodeList.contains(".filter { ($0.season ?? 1) == season }")
 }
 
+private final class ResolverCallTrace {
+    var idCalls = 0
+    var metadataCalls = 0
+}
+
 private func usesGenerationOwnedRetryResume(_ playerSource: String) -> Bool {
     let helper = slice(
         playerSource, from: "private func loadRetryIntoPlayer(",
@@ -180,6 +187,57 @@ private func video(id: String, season: Int, episode: Int) -> CoreVideo {
         "episode": episode,
     ])
     return try! JSONDecoder().decode(CoreVideo.self, from: data)
+}
+
+private func metaEntry(base: String, state: String, videoIDs: [String] = ["s1e1"]) -> [String: Any] {
+    let path: [String: Any] = ["resource": "meta", "type": "series", "id": "show"]
+    var entry: [String: Any] = [
+        "request": ["base": base, "path": path],
+    ]
+    if state == "Ready" {
+        entry["content"] = [
+            "type": "Ready",
+            "content": [
+                "id": "show", "type": "series", "name": "Show",
+                "videos": videoIDs.enumerated().map {
+                    ["id": $0.element, "title": $0.element, "season": 1, "episode": $0.offset + 1]
+                },
+            ],
+        ]
+    } else if state == "NotStarted" {
+        entry["content"] = NSNull()
+    } else {
+        entry["content"] = ["type": state]
+    }
+    return entry
+}
+
+private func streamGroup(id: String, state: String) -> [String: Any] {
+    let path: [String: Any] = ["resource": "stream", "type": "series", "id": id]
+    var group: [String: Any] = ["request": ["base": "stream-\(id)", "path": path]]
+    if state == "Ready" {
+        group["content"] = ["type": "Ready", "content": []]
+    } else {
+        group["content"] = ["type": state]
+    }
+    return group
+}
+
+private func metaDetails(entries: [[String: Any]],
+                         streamIDs: [(String, String)] = []) -> CoreMetaDetails {
+    let selectedPath: [String: Any] = [
+        "resource": "meta", "type": "series", "id": "show",
+    ]
+    let json: [String: Any] = [
+        "selected": ["metaPath": selectedPath],
+        "metaItems": entries,
+        "streams": streamIDs.map { streamGroup(id: $0.0, state: $0.1) },
+        "metaStreams": NSNull(),
+        "libraryItem": NSNull(),
+        "watchedVideoIds": NSNull(),
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: json)
+    return try! JSONDecoder().decode(CoreMetaDetails.self, from: data)
 }
 
 /// Small pure transaction driver for the rapid episode-switch composition checks below. It models only the
@@ -366,7 +424,7 @@ private struct EpisodeTransactionHarness {
 
 @main
 private struct EpisodePlaybackIdentityTests {
-    static func main() {
+    static func main() async {
         let hash = "0123456789abcdef0123456789abcdef01234567"
         let e2 = stream(hash: hash, fileIdx: 1)
         let e3 = stream(hash: hash, fileIdx: 2)
@@ -405,11 +463,170 @@ private struct EpisodePlaybackIdentityTests {
         let s1FinaleIndex = fullSeries.firstIndex(where: { $0.id == s1Finale.id })
         expect(s1FinaleIndex.map { $0 + 1 < fullSeries.count && fullSeries[$0 + 1].id == s2e1.id } == true,
                "S1 finale has S2E1 as its next direct-resume episode")
-        expect(!EpisodePlaybackIdentity.canRewindWholeTitleAtTerminal(
-            usesSeriesLifecycle: true,
-            currentEpisodeIndex: s1FinaleIndex,
-            episodeCount: fullSeries.count
-        ), "S1 finale is not terminal when the resident direct-resume list includes S2E1")
+        expect(EpisodePlaybackIdentity.appleCWTerminalDecision(
+            currentVideoID: s1Finale.id,
+            episodes: fullSeries,
+            authority: .authoritativeFullSeries,
+            refresh: .completedWithFullInventory
+        ) == .advance(s2e1.id),
+               "authoritative S1 finale advances when the full inventory includes S2E1")
+        expect(EpisodePlaybackIdentity.appleCWTerminalDecision(
+            currentVideoID: s2e1.id,
+            episodes: fullSeries,
+            authority: .authoritativeFullSeries,
+            refresh: .completedWithFullInventory
+        ) == .keepState,
+               "authoritative-looking true finale keeps state because the app cannot remove a series")
+        expect(EpisodePlaybackIdentity.appleCWAuthoritativeBackfill(
+            from: fullSeries,
+            replacing: fullSeries
+        ) != nil, "equal-count complete authoritative backfill certifies an untrusted launch list")
+        expect(EpisodePlaybackIdentity.appleCWAuthoritativeBackfill(
+            from: [s1e9, s1Finale],
+            replacing: fullSeries
+        ) == nil, "authoritative shrink cannot replace the launch inventory")
+        expect(EpisodePlaybackIdentity.appleCWAuthoritativeBackfill(
+            from: [s1e9, s1Finale, video(id: "tt-show:2:2", season: 2, episode: 2)],
+            replacing: fullSeries
+        ) == nil, "equal-count coordinate mismatch cannot certify the launch inventory")
+
+        // Execute the real production async resolver-admission helper with CoreVideo values from the compiled
+        // CoreModels.swift. The exact refreshed object must reach the metadata resolver directly for both empty
+        // and partial launch inventories; a failed exact resolver must not fall back to the ID resolver.
+        let unrelatedVideo = video(id: "unrelated", season: 9, episode: 9)
+        let emptyResolverTrace = ResolverCallTrace()
+        let emptyRoute: AppleEpisodeResolverAdmission.Route<CoreVideo>? =
+            AppleEpisodeResolverAdmission.route(
+                videoID: s2e1.id,
+                refreshedMetadata: s2e1,
+                idResolver: { _ in
+                    emptyResolverTrace.idCalls += 1
+                    return unrelatedVideo
+                },
+                metadataResolver: { exact in
+                    emptyResolverTrace.metadataCalls += 1
+                    return exact
+                }
+            )
+        let emptyResult: CoreVideo? = if let emptyRoute {
+            await AppleEpisodeResolverAdmission.resolve(emptyRoute)
+        } else {
+            nil
+        }
+        expect(emptyResult?.id == s2e1.id
+               && emptyResolverTrace.metadataCalls == 1
+               && emptyResolverTrace.idCalls == 0,
+               "production async seam admits refreshed S2E1 from an empty launch inventory")
+
+        let partialResolverTrace = ResolverCallTrace()
+        let partialRoute: AppleEpisodeResolverAdmission.Route<CoreVideo>? =
+            AppleEpisodeResolverAdmission.route(
+                videoID: s2e1.id,
+                refreshedMetadata: s2e1,
+                idResolver: { id in
+                    partialResolverTrace.idCalls += 1
+                    return s1Finale.id == id ? s1Finale : nil
+                },
+                metadataResolver: { exact in
+                    partialResolverTrace.metadataCalls += 1
+                    return exact
+                }
+            )
+        let partialResult: CoreVideo? = if let partialRoute {
+            await AppleEpisodeResolverAdmission.resolve(partialRoute)
+        } else {
+            nil
+        }
+        expect(partialResult?.id == s2e1.id
+               && partialResolverTrace.metadataCalls == 1
+               && partialResolverTrace.idCalls == 0,
+               "production async seam admits refreshed S2E1 outside a partial launch inventory")
+
+        let failedResolverTrace = ResolverCallTrace()
+        let failedRoute: AppleEpisodeResolverAdmission.Route<CoreVideo>? =
+            AppleEpisodeResolverAdmission.route(
+                videoID: s2e1.id,
+                refreshedMetadata: s2e1,
+                idResolver: { _ in
+                    failedResolverTrace.idCalls += 1
+                    return unrelatedVideo
+                },
+                metadataResolver: { _ in
+                    failedResolverTrace.metadataCalls += 1
+                    return nil
+                }
+            )
+        let failedResult: CoreVideo? = if let failedRoute {
+            await AppleEpisodeResolverAdmission.resolve(failedRoute)
+        } else {
+            nil
+        }
+        expect(failedResult == nil
+               && failedResolverTrace.metadataCalls == 1
+               && failedResolverTrace.idCalls == 0,
+               "production async seam rejects failed exact admission without ID fallback")
+
+        var noRouteStateMutated = false
+        let noRoute: AppleEpisodeResolverAdmission.Route<CoreVideo>? =
+            AppleEpisodeResolverAdmission.route(
+                videoID: s2e1.id,
+                refreshedMetadata: s2e1,
+                idResolver: { _ in unrelatedVideo },
+                metadataResolver: nil
+            )
+        if noRoute != nil { noRouteStateMutated = true }
+        expect(noRoute == nil && !noRouteStateMutated,
+               "production async seam leaves admission state untouched when exact route is unavailable")
+
+        // Full-meta authority is distinct from first-provider readiness. A ready provider plus any
+        // loading/not-started provider remains provisional; failed providers are terminal, but an all-failed
+        // aggregation still has no title data to certify. When the higher-priority provider finally lands,
+        // the settled seam must choose its unfiltered videos rather than the earlier lower-priority list.
+        let readyLowerLoadingHigher = metaDetails(entries: [
+            metaEntry(base: "lower", state: "Ready", videoIDs: ["lower-episode"]),
+            metaEntry(base: "higher", state: "Loading"),
+        ])
+        expect(readyLowerLoadingHigher.appleCWTerminalFullMeta(for: "show") == nil,
+               "ready plus loading meta providers cannot certify first-provider data")
+        let readyLowerNotStartedHigher = metaDetails(entries: [
+            metaEntry(base: "lower", state: "Ready", videoIDs: ["lower-episode"]),
+            metaEntry(base: "higher", state: "NotStarted"),
+        ])
+        expect(readyLowerNotStartedHigher.appleCWTerminalFullMeta(for: "show") == nil,
+               "ready plus not-started meta providers cannot certify first-provider data")
+        let readyLowerFailedHigher = metaDetails(entries: [
+            metaEntry(base: "lower", state: "Ready", videoIDs: ["lower-episode"]),
+            metaEntry(base: "higher", state: "Err"),
+        ])
+        expect(readyLowerFailedHigher.appleCWTerminalFullMeta(for: "show")?.videos?.first?.id == "lower-episode",
+               "ready plus failed meta providers is a terminal exact-title aggregation")
+        let allFailed = metaDetails(entries: [
+            metaEntry(base: "lower", state: "Err"),
+            metaEntry(base: "higher", state: "Err"),
+        ])
+        expect(allFailed.appleCWTerminalFullMeta(for: "show") == nil,
+               "all-failed meta aggregation cannot certify title authority")
+        VortXSyncManager.appliedAddonOrder = ["higher", "lower"]
+        let lowerThenHigherReady = metaDetails(entries: [
+            metaEntry(base: "lower", state: "Ready", videoIDs: ["lower-episode"]),
+            metaEntry(base: "higher", state: "Ready", videoIDs: ["higher-episode"]),
+        ])
+        expect(lowerThenHigherReady.appleCWTerminalFullMeta(for: "show")?.videos?.first?.id == "higher-episode",
+               "settled provider aggregation stabilizes on the higher-priority ready title")
+        let mismatchedStreamResponse = metaDetails(
+            entries: [metaEntry(base: "higher", state: "Ready", videoIDs: ["s1e10"])],
+            streamIDs: [("old-video", "Ready")]
+        )
+        expect(mismatchedStreamResponse.appleCWTerminalFullMeta(for: "show", streamID: "s1e10") == nil,
+               "stale or different stream-path response cannot certify the requested episode")
+        let loadingStreamResponse = metaDetails(
+            entries: [metaEntry(base: "higher", state: "Ready", videoIDs: ["s1e10"])],
+            streamIDs: [("s1e10", "Loading")]
+        )
+        expect(loadingStreamResponse.appleCWTerminalFullMeta(for: "show", streamID: "s1e10") == nil,
+               "matching stream-path must be terminal before refresh authority is emitted")
+        VortXSyncManager.appliedAddonOrder = []
+
         let playerScreenSource = source("Sources/PlayerScreen.swift")
         expect(
             usesGenerationOwnedRetryResume(playerScreenSource),
@@ -726,12 +943,28 @@ private struct EpisodePlaybackIdentityTests {
                "resolved usenet binds the concrete direct URL instead of its NZB descriptor")
         let rawNZB = URL(string: "https://usenet.invalid/show-s01e02.nzb")!
         let resolvedUsenet = URL(string: "https://debrid.invalid/show-s01e02.mkv")!
+        let nzbOnlyData = try! JSONSerialization.data(withJSONObject: [
+            "nzbUrl": rawNZB.absoluteString,
+        ])
+        let nzbOnlyStream = try! JSONDecoder().decode(CoreStream.self, from: nzbOnlyData)
+        DebridPlaybackAvailability.shared.publish(torBoxConfigured: false)
+        expect(DispatchQueue.global().sync {
+            nzbOnlyStream.playableURL(isEpisode: false)
+        } == nil, "usenet playableURL is closed when TorBox availability is false")
+        DebridPlaybackAvailability.shared.publish(torBoxConfigured: true)
+        expect(DispatchQueue.global().sync {
+            nzbOnlyStream.playableURL(isEpisode: false)
+        } == rawNZB, "usenet playableURL returns the exact NZB descriptor when TorBox is available")
         expect(EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
             isUsenet: true, resolvedURL: nil, fallbackURL: rawNZB
         ) == nil, "raw NZB descriptor is never selected as media")
         expect(EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
             isUsenet: true, resolvedURL: resolvedUsenet, fallbackURL: rawNZB
         ) == resolvedUsenet, "resolved usenet direct URL is selected as media")
+        DebridPlaybackAvailability.shared.publish(torBoxConfigured: false)
+        expect(DispatchQueue.global().sync {
+            nzbOnlyStream.playableURL(isEpisode: false)
+        } == nil, "usenet playableURL resets closed after TorBox availability is revoked")
 
         let files = [
             EpisodePlaybackIdentity.FileCandidate(offset: 0, name: "Show.S01E04.mkv", size: 900, isVideo: true),

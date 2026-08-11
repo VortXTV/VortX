@@ -60,7 +60,9 @@ enum TopShelfSnapshotWriter {
             // the rail, but the shelf re-applies it rather than trusting that, because a shelf is
             // rendered from a FILE that can outlive the process that wrote it: a title finished on
             // another device and synced down must not linger on the TV's Home screen.
-            .filter { !$0.isFinished }
+            .filter {
+                EpisodePlaybackIdentity.usesSeriesLifecycle(type: $0.type) || !$0.isFinished
+            }
             // Removed / temp entries are not "in the library" (see CoreCWItem), so they have no
             // business on the Home screen even while the engine still carries them in the bucket.
             .filter { $0.removed != true && $0.temp != true }

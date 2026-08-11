@@ -12,10 +12,11 @@ import Foundation
 
 // MARK: - OAuth device-code flow
 
-/// Result of `POST /oauth/device/code`: the codes plus the polling schedule the client must obey.
+/// Result of the VortX broker's `POST /v1/oauth/trakt/device/start`: an opaque session handle, the
+/// user-facing code, and the polling schedule. Trakt's own device code never enters the app.
 struct TraktDeviceCode: Codable, Sendable, Equatable {
-    /// Opaque code the app polls with (never shown to the user).
-    let deviceCode: String
+    /// Opaque broker session the app polls with (never shown to the user).
+    let session: String
     /// Short human code the user types at `verificationURL` (e.g. "ABCD-EFGH").
     let userCode: String
     /// Where the user goes to enter `userCode` (e.g. "https://trakt.tv/activate").
@@ -26,7 +27,7 @@ struct TraktDeviceCode: Codable, Sendable, Equatable {
     let interval: Int
 
     enum CodingKeys: String, CodingKey {
-        case deviceCode = "device_code"
+        case session
         case userCode = "user_code"
         case verificationURL = "verification_url"
         case expiresIn = "expires_in"
@@ -34,12 +35,10 @@ struct TraktDeviceCode: Codable, Sendable, Equatable {
     }
 }
 
-/// An OAuth token set from `POST /oauth/device/token` or `POST /oauth/token`.
+/// An OAuth token set returned by the VortX broker.
 ///
 /// Trakt access tokens are valid for 7 days; `refreshToken` mints a new set without re-prompting the
-/// user. `createdAt` is when the token was issued so the app can compute expiry locally
-/// (Trakt sends `created_at` on `/oauth/token` but not always on the device path, so it defaults to
-/// "now" when absent).
+/// user. `createdAt` is when the token was issued so the app can compute expiry locally.
 struct TraktToken: Codable, Sendable, Equatable {
     let accessToken: String
     let refreshToken: String

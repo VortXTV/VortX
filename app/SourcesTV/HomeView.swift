@@ -158,6 +158,12 @@ struct HomeView: View {
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Discover too
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
+        .onChange(of: core.revision) { _ in
+            guard core.changedFields.contains("continue_watching_preview")
+                    || core.changedFields.contains("library") else { return }
+            seed()
+            refreshTopPicks()
+        }
         // An overlay profile draws its Continue Watching from `profiles.cwItems`, not the engine, so its own
         // plays must also re-seed the hero and Top Picks (the engine-CW onChange above never fires for them).
         .onChange(of: profiles.cwItems.first?.id) { seed(); refreshTopPicks() }

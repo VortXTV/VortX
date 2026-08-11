@@ -563,12 +563,12 @@ check("wired: the resumed playlist carries the frozen conservative target durati
       frozenTarget.seconds == 12
         && resumedPlaylist.contains("#EXT-X-TARGETDURATION:12"))
 let readiness = VortXHLSStartupReadiness(frozenTarget: frozenTarget)
-// The startup floor is the flat one-decodable-segment / four-second budget (the 6-segment / 3x-target floor held every
-// UHD master past the chrome's 10s start watchdog in the field - the build 189 regression), and resume must
-// not change it.
+// The startup floor is the flat one-decodable-segment / six-second budget (the 6-segment / 3x-target floor held every
+// UHD master past the chrome's 10s start watchdog in the field - the build 189 regression; four seconds sat
+// exactly on AVPlayer's readiness window and cost a declined-readiness reload), and resume must not change it.
 check("wired: startup readiness admission is unchanged by resume",
       readiness?.minimumSegmentCount == 1
-        && readiness?.minimumRenderedDurationMilliseconds == 4_000)
+        && readiness?.minimumRenderedDurationMilliseconds == 6_000)
 if let readiness {
     let pinned = DVPlaybackPolicy.pinnedStartupSnapshot(
         window: resumedWindow, ended: false,

@@ -114,6 +114,274 @@ private struct FramePresentationWiringRule {
     }
 }
 
+private func occurrenceCount(_ needle: String, in source: String) -> Int {
+    source.components(separatedBy: needle).count - 1
+}
+
+private func snippetsInOrder(_ source: String, _ snippets: [String]) -> Bool {
+    var cursor = source.startIndex
+    for snippet in snippets {
+        let compactSnippet = compactSwift(snippet)
+        guard let range = source.range(
+            of: compactSnippet,
+            range: cursor..<source.endIndex
+        ) else {
+            return false
+        }
+        cursor = range.upperBound
+    }
+    return true
+}
+
+private func moveFirst(
+    _ source: String,
+    target: String,
+    before anchor: String
+) -> String? {
+    guard let targetRange = source.range(of: target),
+          let anchorRange = source.range(of: anchor),
+          targetRange.lowerBound > anchorRange.lowerBound else {
+        return nil
+    }
+    var mutated = source
+    mutated.removeSubrange(targetRange)
+    guard let adjustedAnchor = mutated.range(of: anchor) else { return nil }
+    mutated.insert(contentsOf: target, at: adjustedAnchor.lowerBound)
+    return mutated
+}
+
+private func moveFirst(
+    _ source: String,
+    target: String,
+    after anchor: String
+) -> String? {
+    guard let targetRange = source.range(of: target),
+          let anchorRange = source.range(of: anchor),
+          targetRange != anchorRange else {
+        return nil
+    }
+    var mutated = source
+    mutated.removeSubrange(targetRange)
+    guard let adjustedAnchor = mutated.range(of: anchor) else { return nil }
+    mutated.insert(contentsOf: target, at: adjustedAnchor.upperBound)
+    return mutated
+}
+
+private func teardownStopSource(_ source: String) -> String? {
+    sourceSlice(
+        source,
+        after: "    func stop() {",
+        from: "    func stop() {",
+        to: "\n    deinit {"
+    )
+}
+
+private func teardownReceiptContractPasses(_ source: String) -> Bool {
+    guard let stop = teardownStopSource(source) else { return false }
+    let compactStop = compactSwift(stop)
+    let surfaceClassification = #"let surface = isFullPlayerPresentation || probeChannel.description == "player" ? "player" : "ambient""#
+    let requestedReceipt = #"DiagnosticsLog.log("mpv", "stop-requested surface=\(surface)")"#
+    let finishedReceipt = #"DiagnosticsLog.log("mpv", "destroy-finished surface=\(surface)")"#
+    let guardLiveHandle = "guard let handle = mpv else { return }"
+    let claimHandle = "mpv = nil"
+    let quit = #"mpv_command_string(handle, "quit")"#
+    let terminate = "mpv_terminate_destroy(handle)"
+    let relayRelease = "relay?.release()"
+    let destroyToFinished = compactSwift("\(terminate)\n\(finishedReceipt)")
+
+    guard occurrenceCount("stop-requested", in: stop) == 1,
+          occurrenceCount("destroy-finished", in: stop) == 1,
+          occurrenceCount(compactSwift(surfaceClassification), in: compactStop) == 1,
+          occurrenceCount(compactSwift(requestedReceipt), in: compactStop) == 1,
+          occurrenceCount(compactSwift(finishedReceipt), in: compactStop) == 1,
+          occurrenceCount("DiagnosticsLog.log(\"mpv\",", in: compactStop) == 2,
+          occurrenceCount(destroyToFinished, in: compactStop) == 1 else {
+        return false
+    }
+
+    return snippetsInOrder(
+        compactStop,
+        [
+            guardLiveHandle,
+            claimHandle,
+            surfaceClassification,
+            requestedReceipt,
+            quit,
+            "queue.async {",
+            terminate,
+            finishedReceipt,
+            relayRelease,
+        ]
+    )
+}
+
+@MainActor
+private func rejectTeardownReceiptMutation(
+    _ name: String,
+    original: String,
+    mutated: String?
+) {
+    guard let mutated else {
+        check("mpv teardown receipt mutation: \(name) is constructed", false)
+        return
+    }
+    check("mpv teardown receipt mutation: \(name) changes source", mutated != original)
+    check(
+        "mpv teardown receipt mutation: \(name) turns red",
+        !teardownReceiptContractPasses(mutated)
+    )
+}
+
+@MainActor
+private func teardownReceiptWiring(source: String) {
+    guard let stop = teardownStopSource(source) else {
+        check("mpv teardown receipts: normal stop is readable", false)
+        return
+    }
+    let compactStop = compactSwift(stop)
+    let surfaceClassification = #"let surface = isFullPlayerPresentation || probeChannel.description == "player" ? "player" : "ambient""#
+    let requestedReceipt = #"DiagnosticsLog.log("mpv", "stop-requested surface=\(surface)")"#
+    let finishedReceipt = #"DiagnosticsLog.log("mpv", "destroy-finished surface=\(surface)")"#
+    let guardLiveHandle = "guard let handle = mpv else { return }"
+    let quit = #"mpv_command_string(handle, "quit")"#
+    let terminate = "mpv_terminate_destroy(handle)"
+    let relayRelease = "relay?.release()"
+
+    check("mpv teardown receipts: source contract", teardownReceiptContractPasses(source))
+    check(
+        "mpv teardown receipts: requested literal appears once in normal stop",
+        occurrenceCount("stop-requested", in: stop) == 1
+    )
+    check(
+        "mpv teardown receipts: finished literal appears once in normal stop",
+        occurrenceCount("destroy-finished", in: stop) == 1
+    )
+    check(
+        "mpv teardown receipts: requested receipt is after live-handle claim and before quit",
+        snippetsInOrder(compactStop, [guardLiveHandle, "mpv = nil", requestedReceipt, quit])
+    )
+    check(
+        "mpv teardown receipts: finished receipt is after destroy and before relay release",
+        snippetsInOrder(compactStop, ["queue.async {", terminate, finishedReceipt, relayRelease])
+    )
+    check(
+        "mpv teardown receipts: only fixed mpv receipt payloads are present",
+        occurrenceCount("DiagnosticsLog.log(\"mpv\",", in: compactStop) == 2
+            && compactStop.contains(compactSwift(requestedReceipt))
+            && compactStop.contains(compactSwift(finishedReceipt))
+            && compactStop.contains(compactSwift(surfaceClassification))
+    )
+
+    let earlyRelayReleaseMutant = replacingFirst(
+        source,
+        after: "    func stop() {",
+        target: terminate,
+        with: "\(terminate)\n\(relayRelease)"
+    )
+    rejectTeardownReceiptMutation(
+        "early relay release between destroy and finished receipt",
+        original: source,
+        mutated: earlyRelayReleaseMutant
+    )
+
+    rejectTeardownReceiptMutation(
+        "requested before guard/claim",
+        original: source,
+        mutated: moveFirst(
+            source,
+            target: requestedReceipt,
+            before: guardLiveHandle
+        )
+    )
+    rejectTeardownReceiptMutation(
+        "requested after quit",
+        original: source,
+        mutated: moveFirst(
+            source,
+            target: requestedReceipt,
+            after: quit
+        )
+    )
+    rejectTeardownReceiptMutation(
+        "finished before terminate",
+        original: source,
+        mutated: moveFirst(
+            source,
+            target: finishedReceipt,
+            before: terminate
+        )
+    )
+    rejectTeardownReceiptMutation(
+        "finished after relay release",
+        original: source,
+        mutated: moveFirst(
+            source,
+            target: finishedReceipt,
+            after: relayRelease
+        )
+    )
+    rejectTeardownReceiptMutation(
+        "duplicate requested literal",
+        original: source,
+        mutated: replacingFirst(
+            source,
+            after: "    func stop() {",
+            target: requestedReceipt,
+            with: "\(requestedReceipt)\n\(requestedReceipt)"
+        )
+    )
+    rejectTeardownReceiptMutation(
+        "pointer data",
+        original: source,
+        mutated: replacingFirst(
+            source,
+            after: "    func stop() {",
+            target: requestedReceipt,
+            with: #"DiagnosticsLog.log("mpv", "stop-requested surface=\(surface) handle=\(handle)")"#
+        )
+    )
+    rejectTeardownReceiptMutation(
+        "load-token data",
+        original: source,
+        mutated: replacingFirst(
+            source,
+            after: "    func stop() {",
+            target: requestedReceipt,
+            with: #"DiagnosticsLog.log("mpv", "stop-requested surface=\(surface) loadToken=\(activeLoadToken)")"#
+        )
+    )
+    rejectTeardownReceiptMutation(
+        "user data",
+        original: source,
+        mutated: replacingFirst(
+            source,
+            after: "    func stop() {",
+            target: requestedReceipt,
+            with: #"DiagnosticsLog.log("mpv", "stop-requested surface=\(surface) url=\(playUrl)")"#
+        )
+    )
+    rejectTeardownReceiptMutation(
+        "missing ambient classification",
+        original: source,
+        mutated: replacingFirst(
+            source,
+            after: "    func stop() {",
+            target: surfaceClassification,
+            with: #"let surface = isFullPlayerPresentation || probeChannel.description == "player" ? "player" : "trailer""#
+        )
+    )
+    rejectTeardownReceiptMutation(
+        "missing player classification",
+        original: source,
+        mutated: replacingFirst(
+            source,
+            after: "    func stop() {",
+            target: surfaceClassification,
+            with: #"let surface = isFullPlayerPresentation || probeChannel.description == "ambient" ? "ambient" : "ambient""#
+        )
+    )
+}
+
 private func input(
     full: Bool = true,
     standard: Bool = true,
@@ -166,6 +434,8 @@ private func productionWiring() {
             exactSection: """
                 #if os(tvOS)
                 private let framePresentationDiagnostics = FramePresentationDiagnosticsAccumulator()
+                private var lastFramePresentationDecisionSignature: String?
+                private var lastReceiptFrameDropsPerMinute: Double?
                 private var framePresentationGeneration: UInt64 = 0
                 private var framePresentationLoadedGeneration: UInt64?
                 private var framePresentationStartedGeneration: UInt64?
@@ -407,6 +677,141 @@ private func productionWiring() {
             !rule.passes(sources: mutantSources)
         )
     }
+
+    let tvReceiptPasses: (String) -> Bool = { source in
+        guard let section = sourceSlice(
+            source,
+            after: "let presentationText: String = {",
+            from: "return String(",
+            to: "        }()\n        VXProbe.log("
+        ) else { return false }
+        return section.contains("nextDrawableWaitMs=")
+            && section.contains("presentLatency=unsupported-tvos")
+            && !section.contains("presentSample30=")
+            && !section.contains("presentSampleMs=")
+    }
+    let tvSource = sources["TVPlayerView.swift"]!
+    check(
+        "frame source contract: tvOS receipt uses unsupported presentation latency",
+        tvReceiptPasses(tvSource)
+    )
+    if let mutated = replacingFirst(
+        tvSource,
+        after: "let presentationText: String = {",
+        target: "presentLatency=unsupported-tvos",
+        with: "presentSample30=%d/%d"
+    ) {
+        check(
+            "frame source contract mutation: legacy presentation sample is rejected",
+            !tvReceiptPasses(mutated)
+        )
+    } else {
+        check("frame source contract mutation: legacy presentation sample is constructed", false)
+    }
+    if let mutated = replacingFirst(
+        tvSource,
+        after: "let presentationText: String = {",
+        target: "nextDrawableWaitMs=",
+        with: "waitMs="
+    ) {
+        check(
+            "frame source contract mutation: old drawable wait label is rejected",
+            !tvReceiptPasses(mutated)
+        )
+    } else {
+        check("frame source contract mutation: old drawable wait label is constructed", false)
+    }
+
+    let eventPasses: (String) -> Bool = { source in
+        guard let section = sourceSlice(
+            source,
+            after: "case MPVProperty.frameDropCount:",
+            from: "case MPVProperty.frameDropCount:",
+            to: "case MPVProperty.decoderFrameDropCount:"
+        ) else { return false }
+        let boundedProperties = [
+            "\"demuxer-cache-duration\"",
+            "\"cache-buffering-state\"",
+            "\"paused-for-cache\"",
+            "\"demuxer-cache-state/underrun\"",
+            "\"demuxer-cache-state/idle\"",
+            "generation=\\(sample.generation)",
+            "outputDelta=\\(sample.delta)",
+        ]
+        return section.components(separatedBy: "if sample.shouldEmitOutputContext {").count - 1 == 1
+            && section.components(separatedBy: "DiagnosticsLog.log(").count - 1 == 1
+            && section.components(separatedBy: "handle: handle").count - 1 == 5
+            && section.components(separatedBy: "?? \"na\"").count - 1 == 5
+            && boundedProperties.allSatisfy(section.contains)
+            && section.contains("decoder: false")
+            && section.contains("if sample.delta > 0 {")
+            && !section.contains("handle: self.mpv")
+    }
+    let controllerSource = sources["MPVMetalViewController.swift"]!
+    check(
+        "frame source contract: frame-drop sampling uses local event handle",
+        sourceSlice(
+            controllerSource,
+            after: "while true {",
+            from: "guard let handle = self.mpv else { break }",
+            to: "let event = mpv_wait_event(handle, 0)"
+        ) != nil && eventPasses(controllerSource)
+    )
+    if let mutated = replacingFirst(
+        controllerSource,
+        after: "case MPVProperty.frameDropCount:",
+        target: "if sample.shouldEmitOutputContext {",
+        with: "if true {"
+    ) {
+        check(
+            "frame source contract mutation: output context guard is required",
+            !eventPasses(mutated)
+        )
+    } else {
+        check("frame source contract mutation: output context guard is constructed", false)
+    }
+    if let mutated = replacingFirst(
+        controllerSource,
+        after: "case MPVProperty.frameDropCount:",
+        target: "handle: handle",
+        with: "handle: self.mpv"
+    ) {
+        check(
+            "frame source contract mutation: nullable mpv reread is rejected",
+            !eventPasses(mutated)
+        )
+    } else {
+        check("frame source contract mutation: nullable mpv reread is constructed", false)
+    }
+    if let mutated = replacingFirst(
+        controllerSource,
+        after: "case MPVProperty.frameDropCount:",
+        target: "decoder: false",
+        with: "decoder: true"
+    ) {
+        check(
+            "frame source contract mutation: decoder counter confusion is rejected",
+            !eventPasses(mutated)
+        )
+    } else {
+        check("frame source contract mutation: decoder counter confusion is constructed", false)
+    }
+    let helperBlock = sourceSlice(
+        controllerSource,
+        after: "private func diagnosticDouble(_ name: String) -> Double? {",
+        from: "private func diagnosticDouble(_ name: String) -> Double? {",
+        to: "private func diagnosticString"
+    )
+    check(
+        "frame source contract: double and flag handle overloads delegate",
+        helperBlock?.contains("return diagnosticDouble(name, handle: handle)") == true
+            && helperBlock?.contains("return diagnosticFlag(name, handle: handle)") == true
+    )
+    if let source = sources["MPVMetalViewController.swift"] {
+        teardownReceiptWiring(source: source)
+    } else {
+        check("mpv teardown receipts: governed source is readable", false)
+    }
 }
 
 @main
@@ -417,6 +822,7 @@ private enum FramePresentationPolicyTests {
         policy()
         cscaleArmDecision()
         resetSafeCounters()
+        outputDropContextEmission()
         presentedSamplingCadence()
         intervalScopedAggregates()
         print("")
@@ -539,6 +945,39 @@ private enum FramePresentationPolicyTests {
         check("interval spans resets", counter.takeInterval() == 9)
         check("receipt clears only the interval", counter.takeInterval() == 0 && counter.raw == 4)
         check("negative raw samples are ignored", counter.observe(-1) == 0 && counter.raw == 4)
+    }
+
+    @MainActor
+    private static func outputDropContextEmission() {
+        let accumulator = FramePresentationDiagnosticsAccumulator()
+        accumulator.begin(generation: 7, now: 100, frameDropRaw: 10, decoderDropRaw: 3)
+        let first = accumulator.recordDrop(raw: 12, decoder: false)
+        check("first positive output delta emits context",
+              first?.delta == 2 && first?.shouldEmitOutputContext == true)
+        check("later output delta in interval suppresses context",
+              accumulator.recordDrop(raw: 13, decoder: false)?.shouldEmitOutputContext == false)
+
+        let decoderAccumulator = FramePresentationDiagnosticsAccumulator()
+        decoderAccumulator.begin(generation: 7, now: 100, frameDropRaw: 10, decoderDropRaw: 3)
+        check("decoder delta never emits output context",
+              decoderAccumulator.recordDrop(raw: 5, decoder: true)?.shouldEmitOutputContext == false)
+
+        _ = accumulator.takeSnapshot(
+            now: 110, subtitleCodec: nil, subtitleSource: "off",
+            activeCscale: nil, mitigationPriorCscale: nil,
+            mitigationApplied: false, mitigationGate: "off"
+        )
+        check("takeSnapshot rearms output context",
+              accumulator.recordDrop(raw: 14, decoder: false)?.shouldEmitOutputContext == true)
+
+        accumulator.begin(generation: 8, now: 120, frameDropRaw: 40, decoderDropRaw: 4)
+        check("new generation rearms output context",
+              accumulator.recordDrop(raw: 41, decoder: false)?.shouldEmitOutputContext == true)
+
+        accumulator.begin(generation: 9, now: 130, frameDropRaw: 50, decoderDropRaw: 4)
+        let reset = accumulator.recordDrop(raw: 2, decoder: false)
+        check("output context uses reset-safe delta",
+              reset?.delta == 2 && reset?.shouldEmitOutputContext == true)
     }
 
     @MainActor

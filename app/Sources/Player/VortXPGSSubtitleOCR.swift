@@ -4,6 +4,22 @@ import Libavcodec
 import Libavutil
 import Vision
 
+/// The classification of one `VortXPGSSubtitleOCR.prepare` call, surfaced so the caller can tell a BENIGN
+/// non-cue apart from a genuine rejection. About half of PGS packets are HDMV clear-screen/erase compositions
+/// (`num_rects == 0`) or Vision-empty OCR outcomes (bitmap fine, no text); counting those as rejections made
+/// the reject tally read 50-64% when the real failure rate is ~0.08%. `prepare` already computes the internal
+/// empty/dropped/rejected stats; this just lets the caller route them to honest counters.
+enum PGSOCRPrepareOutcome {
+    /// A cue was decoded and is ready to submit.
+    case prepared(PGSOCRWorkItem)
+    /// No rectangles / no recognizable text (clear-screen, erase, or empty OCR). Normal PGS traffic, NOT a failure.
+    case empty
+    /// Dropped under worker backpressure before immutable allocation / submission. Benign, NOT a failure.
+    case dropped
+    /// A genuine decode / policy / timing rejection.
+    case rejected
+}
+
 /// Turns HDMV PGS bitmap subtitles into text cues without running Vision on the remux producer.
 ///
 /// FFmpeg subtitle decoding remains producer-confined. `prepare` copies admitted bitmap planes into immutable
@@ -55,19 +71,20 @@ final class VortXPGSSubtitleOCR {
 
     /// Decode one packet on the remux thread and copy its bitmap data into a worker-safe value.
     ///
-    /// Returning nil is fail-open. Empty clear-screen compositions, malformed rectangles, queue pressure, and
-    /// refused streams affect only that optional subtitle packet.
+    /// The outcome is fail-open. Empty clear-screen compositions, malformed rectangles, queue pressure, and
+    /// refused streams affect only that one subtitle packet; the classification lets the caller tally a benign
+    /// `.empty` / `.dropped` apart from a genuine `.rejected` instead of treating every non-cue as a rejection.
     func prepare(packet: UnsafeMutablePointer<AVPacket>,
                  parameters: UnsafePointer<AVCodecParameters>,
                  streamIndex: Int,
                  renditionID: Int,
                  token: UInt64,
                  startSeconds: Double,
-                 durationSeconds: Double) -> PGSOCRWorkItem? {
+                 durationSeconds: Double) -> PGSOCRPrepareOutcome {
         guard admits(stream: streamIndex),
               let context = decoder(for: streamIndex, parameters: parameters) else {
             recordRejected()
-            return nil
+            return .rejected
         }
 
         var subtitle = AVSubtitle()
@@ -76,24 +93,24 @@ final class VortXPGSSubtitleOCR {
         defer { avsubtitle_free(&subtitle) }
         guard rc >= 0, got != 0 else {
             recordRejected()
-            return nil
+            return .rejected
         }
         let rectangleCount = Int(subtitle.num_rects)
         guard rectangleCount > 0 else {
             recordEmpty()
-            return nil
+            return .empty
         }
         guard PGSOCRPolicy.acceptsPacketRectangleCount(rectangleCount),
               let rects = subtitle.rects else {
             recordRejected()
-            return nil
+            return .rejected
         }
         // Feed every admitted packet through the stateful FFmpeg decoder even under worker pressure. PGS
         // object and palette definitions can span packets, so dropping input before decode can corrupt every
         // later cue. Backpressure starts here, before immutable bitmap allocation and Vision submission.
         guard worker.canPrepare else {
             recordDropped()
-            return nil
+            return .dropped
         }
 
         var bitmaps: [PGSOCRBitmap] = []
@@ -107,7 +124,7 @@ final class VortXPGSSubtitleOCR {
                 existingBytes: copiedBytes,
                 nextBytes: nextBytes) else {
                 recordRejected()
-                return nil
+                return .rejected
             }
             guard let bitmap = Self.copyBitmap(from: rect.pointee) else { continue }
             bitmaps.append(bitmap)
@@ -115,7 +132,7 @@ final class VortXPGSSubtitleOCR {
         }
         guard !bitmaps.isEmpty else {
             recordEmpty()
-            return nil
+            return .empty
         }
         guard let timing = PGSOCRPolicy.cueTiming(
             packetStartSeconds: startSeconds,
@@ -123,13 +140,13 @@ final class VortXPGSSubtitleOCR {
             displayStartMilliseconds: subtitle.start_display_time,
             displayEndMilliseconds: subtitle.end_display_time) else {
             recordRejected()
-            return nil
+            return .rejected
         }
 
         statsLock.lock()
         preparedPackets += 1
         statsLock.unlock()
-        return PGSOCRWorkItem(
+        return .prepared(PGSOCRWorkItem(
             token: token,
             epoch: epoch,
             sourceIndex: streamIndex,
@@ -138,7 +155,7 @@ final class VortXPGSSubtitleOCR {
             durationSeconds: timing.duration,
             deadlineUptime: ProcessInfo.processInfo.systemUptime
                 + PGSOCRPolicy.recognitionDeadlineSeconds,
-            bitmaps: bitmaps)
+            bitmaps: bitmaps))
     }
 
     func submit(_ item: PGSOCRWorkItem) -> PGSOCRSubmission {

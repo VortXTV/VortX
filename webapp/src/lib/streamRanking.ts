@@ -195,11 +195,14 @@ export function isMobileFriendly(s: Stream): boolean {
   return true;
 }
 
-/** Prefer mobile-playable sources when the browser is mobile; fall back to the whole pool when none are. */
-function mobilePool(pool: Stream[]): Stream[] {
-  if (!isMobileBrowser()) return pool;
-  const friendly = pool.filter(isMobileFriendly);
-  return friendly.length ? friendly : pool;
+/** Prefer web-ready sources when running in a browser, so "Watch" never auto-picks a DTS-HD/TrueHD or MKV
+ *  remux that plays silently or as a black frame while a fully-playable web source exists. SOFT: falls back
+ *  to the whole pool when none are web-ready. Applies on DESKTOP as well as mobile (both lack the AC3/DTS
+ *  decoders and the Matroska demuxer), superseding the old mobile-only pool for the auto-pick. */
+function webReadyPool(pool: Stream[]): Stream[] {
+  if (typeof navigator === "undefined") return pool; // non-browser context (tests): keep the raw pool
+  const ready = pool.filter(isWebReady);
+  return ready.length ? ready : pool;
 }
 
 /** Audio codecs NO browser can decode in an HTML5 <video> (AC3/E-AC3/DTS/TrueHD are the common culprits in
@@ -218,6 +221,25 @@ export function hasUndecodableAudio(s: Stream): boolean {
  *  produce sound in the browser. */
 export function hasDecodableAudio(s: Stream): boolean {
   return !hasUndecodableAudio(s);
+}
+
+/** True if a source is LIKELY to fully play - VIDEO AND AUDIO - in a desktop OR mobile browser's HTML5
+ *  <video>: the add-on hasn't flagged it notWebReady, its audio is browser-decodable (not AC3/E-AC3/DTS/
+ *  TrueHD), its video isn't HEVC/H.265 (spotty in browsers), and its container is one a browser can demux.
+ *  A raw MKV/Matroska is treated as NOT web-ready even when it declares AAC, because no desktop browser ships
+ *  a Matroska demuxer - the classic "picture plays but Chrome shows a black frame / no sound" case. Prefers
+ *  H.264/AV1 + AAC/Opus in mp4/fMP4/webm/HLS. A SOFT heuristic on the label + url; callers fall back to the
+ *  ranked best when nothing is web-ready, so it never strands the user. Unlike isMobileFriendly (mobile-only)
+ *  this holds on desktop too, because desktop browsers share the same missing decoders and demuxer. */
+export function isWebReady(s: Stream): boolean {
+  if (s.behaviorHints?.notWebReady === true) return false;
+  if (!hasDecodableAudio(s)) return false;
+  const t = (qualityText(s) + " " + (s.url ?? "")).toLowerCase();
+  if (/(?<![a-z0-9])(hevc|h\.?265|x265)(?![a-z0-9])/.test(t)) return false; // no reliable browser HEVC decode
+  // Containers no browser can demux (MKV/Matroska especially - Chrome has no Matroska demuxer). An unknown
+  // or undeclared container passes (optimistic: most web-dl / direct debrid encodes are mp4/fMP4).
+  if (/(?<![a-z0-9])(mkv|matroska|avi|wmv|vob|flv)(?![a-z0-9])|x-matroska/.test(t)) return false;
+  return true;
 }
 
 /** An ordered fallback chain of playable sources for one title/episode, best-first, with sources whose audio
@@ -243,12 +265,14 @@ export function playbackFallbacks(groups: RankedGroup[]): Stream[] {
   return [...decodable, ...undecodable];
 }
 
-/** The single best playable stream across all groups, for the one-press "Watch". On mobile, prefers a
- *  mobile-playable source so Watch doesn't auto-pick an MKV/HEVC that renders a black <video>. */
+/** The single best playable stream across all groups, for the one-press "Watch". In a browser, prefers a
+ *  web-ready source (decodable audio, no HEVC, a browser-muxable container) so Watch doesn't auto-pick a
+ *  DTS-HD/TrueHD or MKV remux that plays silently or renders a black <video>; falls back to the ranked best
+ *  when nothing is web-ready. */
 export function best(groups: RankedGroup[]): Stream | undefined {
   const all = groups.flatMap((g) => g.streams).filter(isPlayable);
   if (!all.length) return undefined;
-  const pool = mobilePool(all);
+  const pool = webReadyPool(all);
   return pool.reduce((b, s) => (score(s) > score(b) ? s : b));
 }
 
@@ -271,7 +295,7 @@ export function pickPreferred(groups: RankedGroup[], maxRes: number): Stream | u
     const r = resolutionOf(s);
     return r === null || r <= maxRes;
   });
-  const pool = mobilePool(eligible.length ? eligible : all);
+  const pool = webReadyPool(eligible.length ? eligible : all);
   return pool.reduce((b, s) => (score(s) > score(b) ? s : b));
 }
 

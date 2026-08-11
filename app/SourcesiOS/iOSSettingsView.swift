@@ -137,7 +137,12 @@ struct iOSSettingsView: View {
     @AppStorage("vortx.streams.compactLabels") private var compactStreamLabels = false
     #if os(iOS) || os(macOS)
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
-    @AppStorage(PlayerEngineRouter.dvRemuxKey) private var dvRemux = false   // Dolby Vision for MKV (Beta): in-app remux -> AVPlayer; default OFF
+    // Dolby Vision for MKV (Beta): in-app remux -> AVPlayer. Stored as an OPTIONAL Bool for the same reason
+    // as the tvOS row: the key is ABSENT until the viewer touches it and the router's absent-key default is ON
+    // for a DV-capable display, so a plain `= false` binding showed Off while the remux lane was running and a
+    // tap on the lying row wrote a real Off that killed Dolby Vision. nil = never set: render what the router
+    // resolves (see dvRemuxBinding). Mirrors SourcesTV/SettingsView.
+    @AppStorage(PlayerEngineRouter.dvRemuxKey) private var dvRemuxStored: Bool?
     #endif
     @AppStorage("stremiox.autoSkip") private var autoSkip = false
     @AppStorage(CommunityTrickplay.settingKey) private var communityTrickplay = true   // share/fetch scrub previews
@@ -383,6 +388,12 @@ struct iOSSettingsView: View {
                 }
             }
             .task { updates.checkIfStale(maxAge: 30 * 60) }   // a Settings visit deserves a fresh answer
+            .onAppear { SettingsChangeLog.prime() }   // I-settings: baseline the [settings] change log for this visit
+            // I-settings: ONE centralized hook records every preference write on the [settings] channel (see
+            // SettingsChangeLog), covering all the @AppStorage controls without a scattered .onChange per control.
+            .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+                SettingsChangeLog.logChanges()
+            }
         }
     }
 
@@ -632,6 +643,19 @@ struct iOSSettingsView: View {
 
     // MARK: Playback
 
+    /// The Dolby Vision for MKV toggle, resolved the way the ROUTER resolves it rather than from a bare stored
+    /// Bool. With the key absent the getter reports `PlayerEngineRouter.dvRemuxEnabled`, which is what playback
+    /// will actually do, so the toggle can no longer read Off while true Dolby Vision is running. The setter
+    /// always writes an EXPLICIT value, which then wins over the remote and display defaults.
+    private var dvRemuxBinding: Binding<Bool> {
+        Binding(
+            get: {
+                dvRemuxStored
+                    ?? PlayerEngineRouter.dvRemuxEnabled(dvDisplayCapable: DVDisplaySupport.isCapable)
+            },
+            set: { dvRemuxStored = $0 })
+    }
+
     @ViewBuilder private var playbackSection: some View {
         Section {
             if PlaybackSettings.directLinksOnlyForced {
@@ -662,9 +686,11 @@ struct iOSSettingsView: View {
             }
             Text("Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture) and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv.")
                 .font(.caption).foregroundStyle(.secondary)
-            Toggle("Dolby Vision for MKV (Beta)", isOn: $dvRemux)
+            Toggle("Dolby Vision for MKV (Beta)", isOn: dvRemuxBinding)
                 .tint(Theme.Palette.accent)
             Text("Plays Dolby Vision .mkv from debrid via an in-app remux. Experimental; falls back automatically if it fails.")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("Off forces HDR10 tone-mapping for every Dolby Vision MKV.")
                 .font(.caption).foregroundStyle(.secondary)
             Text("Using a Mac for this lives under Streaming Server.")
                 .font(.caption).foregroundStyle(.secondary)

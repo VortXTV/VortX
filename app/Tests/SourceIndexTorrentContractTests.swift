@@ -2,11 +2,15 @@
 // bundle, so this compiles the production SourceIndexContract.swift and SourceIndexClient.swift with only the
 // surrounding app dependencies stubbed:
 //
-//   xcrun swiftc -o /tmp/source-index-contract-test \
+//   xcrun swiftc -D SOURCE_INDEX_IDENTITY_TESTING -swift-version 6 \
+//     -strict-concurrency=complete -warnings-as-errors \
+//     -o /tmp/source-index-contract-test \
 //     app/SourcesShared/SourceIndexContract.swift \
 //     app/SourcesShared/SourceIndexIdentity.swift \
 //     app/SourcesShared/SourceContributionWorkPolicy.swift \
 //     app/SourcesShared/MoatToken.swift \
+//     app/SourcesShared/SourceSettlementPolicy.swift \
+//     app/SourcesShared/TorBoxSearchSource.swift \
 //     app/SourcesShared/SourceIndexClient.swift \
 //     app/Tests/SourceIndexTorrentContractTests.swift && /tmp/source-index-contract-test
 //
@@ -84,6 +88,9 @@ enum StreamRanking {
 
 enum VortXEdgeAuth { static func sign(_ request: inout URLRequest) {} }
 enum VXProbe { static func log(_ channel: String, _ message: String) {} }
+enum VXProbeRedaction {
+    static func identityToken(_ raw: String?) -> String { raw == nil ? "none" : "identity" }
+}
 enum MoatConsent {
     static let key = "stremiox.moatContribute"
     nonisolated(unsafe) static var contributeAndConsume = true
@@ -99,6 +106,7 @@ final class DebridKeys: @unchecked Sendable {
     private let lock = NSLock()
     private var configured: Set<DebridService> = []
     func isConfigured(_ service: DebridService) -> Bool { lock.withLock { configured.contains(service) } }
+    func key(for service: DebridService) -> String { "test-key-\(service.rawValue)" }
     func setConfigured(_ set: Set<DebridService>) { lock.withLock { configured = set } }
 }
 
@@ -136,6 +144,7 @@ enum RemoteConfig {
 }
 enum RemoteConfigDefaults {
     static let featureSourceIndex = true
+    static let featureTorBoxSearch = true
     static let endpointSources = "https://sources.vortx.tv"
 }
 
@@ -502,6 +511,27 @@ final class RedirectDelegateProbe: @unchecked Sendable {
 
 // MARK: - Assertions
 
+fileprivate func contractTarget(_ contentID: String?) -> SourceIndexIdentity.TargetResolution {
+    guard let contentID else { return .absent }
+    let parts = contentID.split(separator: ":")
+    guard parts.count == 1 || parts.count == 3,
+          let titleID = parts.first.map(String.init) else { return .absent }
+    let kind: SourceIndexIdentity.ContentKind = parts.count == 3 ? .series : .movie
+    let roles = SourceIndexIdentity.Roles(
+        catalogID: titleID, defaultVideoID: nil, currentVideoID: nil, kind: kind
+    )
+    let season = parts.count == 3 ? Int(parts[1]) : nil
+    let episode = parts.count == 3 ? Int(parts[2]) : nil
+    return SourceIndexIdentity.publicationTarget(roles, season: season, episode: episode)
+}
+
+fileprivate func contractAuthorization(_ contentID: String) -> SourceIndexIdentity.MergeAuthorization? {
+    let page = contractTarget(contentID)
+    return SourceIndexIdentity.mergeAuthorization(
+        published: SourceIndexIdentity.validatedTarget(page), page: page
+    )
+}
+
 @main
 struct SourceIndexTorrentContractTests {
     @MainActor
@@ -562,7 +592,7 @@ struct SourceIndexTorrentContractTests {
         )
         scope.register(source)
 
-        source.refresh(contentID: "tt1234567", isSignedIn: true)
+        source.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await fetch.callCount() == 1 { break }
             await Task.yield()
@@ -574,7 +604,7 @@ struct SourceIndexTorrentContractTests {
         }
         let initialPublished = source.streams.first?.infoHash == initial.id
 
-        source.refresh(contentID: "tt7654321", isSignedIn: true)
+        source.refresh(target: contractTarget("tt7654321"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await fetch.callCount() == 2 { break }
             await Task.yield()
@@ -609,7 +639,7 @@ struct SourceIndexTorrentContractTests {
         }
         let afterReopen = SourceIndexLifecycleClock.snapshot()
         gate.reopen()
-        source.refresh(contentID: "tt7654321", isSignedIn: true)
+        source.refresh(target: contractTarget("tt7654321"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await fetch.callCount() == 3 { break }
             await Task.yield()
@@ -752,8 +782,8 @@ struct SourceIndexTorrentContractTests {
             addon: "blocked",
             streams: [CoreStream(infoHash: lower)]
         )
-        await SourceIndexClient.hoard(
-            contentID: "tt1234567:1:2",
+        await AuxiliarySourcePipeline.hoard(
+            target: contractTarget("tt1234567:1:2"),
             groups: [blockedGroup]
         )
         let blockedPostCount = await postProbe.count()
@@ -1157,6 +1187,7 @@ struct SourceIndexTorrentContractTests {
         let publicHTTP = "https://cdn.example.com/movie.mkv"
         let publicNZB = "https://indexer.example.com/file.nzb"
         let merged = SourceIndexServeSource.merge(
+            authorizedBy: contractAuthorization("tt1234567"),
             served + [CoreStream(name: "direct", url: publicHTTP), CoreStream(name: "nzb", nzbUrl: publicNZB),
                       CoreStream(name: "direct-dup", url: publicHTTP)],
             into: []
@@ -1308,13 +1339,17 @@ struct SourceIndexTorrentContractTests {
         ], capabilities: .torrentOnly)
         let addonGroups = [CoreStreamSourceGroup(id: "addon-group", addon: "AnAddon",
                                                  streams: [CoreStream(name: "1080p", infoHash: upper)])]  // == lower, upper-case
-        let dedupeMerged = SourceIndexServeSource.merge(dedupePooled, into: addonGroups)
+        let dedupeMerged = SourceIndexServeSource.merge(
+            authorizedBy: contractAuthorization("tt1234567"), dedupePooled, into: addonGroups
+        )
         let singularityGroup = dedupeMerged.first(where: { $0.id == SourceIndexClient.groupID })
         expect(dedupeMerged.count == 2
                && singularityGroup?.streams.count == 1
                && singularityGroup?.streams.first?.infoHash == secondHash,
                "a pooled torrent an add-on already surfaced merges away; only the add-on-unseen hash becomes a new row")
-        let noAddonMerged = SourceIndexServeSource.merge(dedupePooled, into: [])
+        let noAddonMerged = SourceIndexServeSource.merge(
+            authorizedBy: contractAuthorization("tt1234567"), dedupePooled, into: []
+        )
         expect(noAddonMerged.first(where: { $0.id == SourceIndexClient.groupID })?.streams.count == 2,
                "with no add-on overlap both pooled torrents remain (pass-through unchanged)")
 
@@ -1396,7 +1431,7 @@ struct SourceIndexTorrentContractTests {
             serveGate: { lifecycleGate.value() },
             coalescer: lifecycleCoalescer
         )
-        priorSource?.refresh(contentID: "tt1234567", isSignedIn: true)
+        priorSource?.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if priorSource?.streams.first?.infoHash == lower,
                await lifecycleCoalescer.activeCount() == 0 { break }
@@ -1414,7 +1449,7 @@ struct SourceIndexTorrentContractTests {
             serveGate: { lifecycleGate.value() },
             coalescer: lifecycleCoalescer
         )
-        emptySource.refresh(contentID: "tt1234567", isSignedIn: true)
+        emptySource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         expect(emptySource.streams.isEmpty, "recreated source never warm-paints a prior completed result")
         for _ in 0..<1_000 {
             if await lifecycleSequence.callCount() >= 2,
@@ -1428,7 +1463,7 @@ struct SourceIndexTorrentContractTests {
             serveGate: { lifecycleGate.value() },
             coalescer: lifecycleCoalescer
         )
-        failedSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        failedSource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await lifecycleSequence.callCount() >= 3,
                await lifecycleCoalescer.activeCount() == 0 { break }
@@ -1441,7 +1476,7 @@ struct SourceIndexTorrentContractTests {
             serveGate: { lifecycleGate.value() },
             coalescer: lifecycleCoalescer
         )
-        rotatedSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        rotatedSource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if rotatedSource.streams.first?.infoHash == secondHash,
                await lifecycleCoalescer.activeCount() == 0 { break }
@@ -1450,7 +1485,7 @@ struct SourceIndexTorrentContractTests {
         expect(rotatedSource.streams.map(\.infoHash) == [secondHash],
                "fresh rotation publishes only the new response without prior-row carryover")
         lifecycleGate.close()
-        rotatedSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        rotatedSource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await lifecycleCoalescer.activeCount() == 0 { break }
             await Task.yield()
@@ -1468,12 +1503,12 @@ struct SourceIndexTorrentContractTests {
             serveGate: { true },
             coalescer: identityCoalescer
         )
-        identitySource.refresh(contentID: "tt1234567", isSignedIn: true)
+        identitySource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if identitySource.streams.first?.infoHash == lower { break }
             await Task.yield()
         }
-        identitySource.refresh(contentID: "tt7654321", isSignedIn: true)
+        identitySource.refresh(target: contractTarget("tt7654321"), isSignedIn: true)
         let accountBBlankedImmediately = identitySource.streams.isEmpty
         for _ in 0..<1_000 {
             if await identitySequence.callCount() == 2,
@@ -1482,14 +1517,69 @@ struct SourceIndexTorrentContractTests {
         }
         expect(accountBBlankedImmediately && identitySource.streams.isEmpty,
                "identity A to B clears A immediately and a failed B fetch stays empty")
-        identitySource.refresh(contentID: "tt1234567", isSignedIn: true)
+        identitySource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if identitySource.streams.first?.infoHash == lower { break }
             await Task.yield()
         }
-        identitySource.refresh(contentID: nil, isSignedIn: true)
+        identitySource.refresh(target: contractTarget(nil), isSignedIn: true)
         expect(identitySource.streams.isEmpty,
                "identity A to nil clears every previously published row synchronously")
+
+        let mismatchFetch = SourceFetchSequence([.rows([trusted])])
+        let mismatchSource = SourceIndexServeSource(
+            fetchPooled: { _, _ in try await mismatchFetch.next() },
+            serveGate: { true },
+            coalescer: SourceIndexFetchCoalescer()
+        )
+        let mismatchedPage = SourceIndexIdentity.publicationTarget(
+            SourceIndexIdentity.Roles(
+                catalogID: "tt1234567", defaultVideoID: "tt7654321",
+                currentVideoID: nil, kind: .movie
+            )
+        )
+        mismatchSource.refresh(target: mismatchedPage, isSignedIn: true)
+        for _ in 0..<1_000 {
+            if await mismatchFetch.callCount() == 0 { break }
+            await Task.yield()
+        }
+        let mismatchCalls = await mismatchFetch.callCount()
+        expect(mismatchCalls == 0 && mismatchSource.streams.isEmpty
+               && mismatchSource.publishedTarget == nil,
+               "mismatched SourceIndex roles launch no transport and publish no rows")
+
+        let forgedFetch = SourceFetchSequence([.rows([trusted])])
+        let forgedSource = SourceIndexServeSource(
+            fetchPooled: { _, _ in try await forgedFetch.next() },
+            serveGate: { true },
+            coalescer: SourceIndexFetchCoalescer()
+        )
+        let forgedTarget = SourceIndexIdentity.uncheckedTargetForTesting(
+            titleID: "tt1234567", contentID: "tt7654321", season: nil, episode: nil
+        )
+        forgedSource.refresh(target: forgedTarget, isSignedIn: true)
+        for _ in 0..<1_000 {
+            if await forgedFetch.callCount() == 0 { break }
+            await Task.yield()
+        }
+        let forgedCalls = await forgedFetch.callCount()
+        expect(forgedCalls == 0 && forgedSource.streams.isEmpty
+               && forgedSource.publishedTarget == nil,
+               "relationally forged SourceIndex targets launch no transport and publish no rows")
+
+        let mergeProbe = SourceFetchSequence([.rows([trusted])])
+        let mergeSource = SourceIndexServeSource(
+            fetchPooled: { _, _ in try await mergeProbe.next() },
+            serveGate: { true },
+            coalescer: SourceIndexFetchCoalescer()
+        )
+        mergeSource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
+        for _ in 0..<1_000 {
+            if !mergeSource.streams.isEmpty { break }
+            await Task.yield()
+        }
+        expect(mergeSource.merged(into: [], for: contractTarget("tt7654321")).isEmpty,
+               "SourceIndex merge capability rejects rows from another exact target")
 
         let lateIdentityFetch = IndexedReleasableFetch(results: [[trusted], [rotated]])
         let lateIdentityCoalescer = SourceIndexFetchCoalescer()
@@ -1498,12 +1588,12 @@ struct SourceIndexTorrentContractTests {
             serveGate: { true },
             coalescer: lateIdentityCoalescer
         )
-        lateIdentitySource.refresh(contentID: "tt1234567", isSignedIn: true)
+        lateIdentitySource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await lateIdentityFetch.callCount() == 1 { break }
             await Task.yield()
         }
-        lateIdentitySource.refresh(contentID: "tt7654321", isSignedIn: true)
+        lateIdentitySource.refresh(target: contractTarget("tt7654321"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await lateIdentityFetch.callCount() == 2 { break }
             await Task.yield()
@@ -1530,7 +1620,7 @@ struct SourceIndexTorrentContractTests {
             accountGate: { liveAccountGate.value() },
             coalescer: accountFenceCoalescer
         )
-        accountFenceSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        accountFenceSource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await accountFenceFetch.callCount() == 1 { break }
             await Task.yield()
@@ -1579,7 +1669,7 @@ struct SourceIndexTorrentContractTests {
             serveGate: { true },
             coalescer: replacementCoalescer
         )
-        replacedSource?.refresh(contentID: "tt1234567", isSignedIn: true)
+        replacedSource?.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await replacementFetch.callCount() == 1 { break }
             await Task.yield()
@@ -1591,7 +1681,7 @@ struct SourceIndexTorrentContractTests {
             serveGate: { true },
             coalescer: replacementCoalescer
         )
-        replacementSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        replacementSource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<100 { await Task.yield() }
         let replacementCallsBeforeRelease = await replacementFetch.callCount()
         await replacementFetch.release()
@@ -1622,14 +1712,14 @@ struct SourceIndexTorrentContractTests {
             clearMoat: { _, _ in }
         )
         closingScope.register(closingSource)
-        closingSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        closingSource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await closingFetch.counts().calls == 1 { break }
             await Task.yield()
         }
         closingScope.preferencesWillApply(serve: false)
         closingGate.close()
-        closingSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        closingSource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             let counts = await closingFetch.counts()
             if counts.cancellations == 1, await closingCoalescer.activeCount() == 0 { break }
@@ -1677,7 +1767,7 @@ struct SourceIndexTorrentContractTests {
         let beforeServeClose = SourceIndexLifecycleClock.snapshot()
         liminalServeScope.preferencesWillApply(serve: false)
         let afterServeClose = SourceIndexLifecycleClock.snapshot()
-        liminalServeSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        liminalServeSource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await liminalServeFetch.callCount() == 1 { break }
             await Task.yield()
@@ -1686,7 +1776,7 @@ struct SourceIndexTorrentContractTests {
         liminalServeScope.preferencesWillApply(serve: true)
         let afterServeReopen = SourceIndexLifecycleClock.snapshot()
         liminalServeGate.reopen()
-        liminalServeSource.refresh(contentID: "tt1234567", isSignedIn: true)
+        liminalServeSource.refresh(target: contractTarget("tt1234567"), isSignedIn: true)
         for _ in 0..<1_000 {
             if await liminalServeFetch.callCount() == 2 { break }
             await Task.yield()
@@ -2287,20 +2377,20 @@ struct SourceIndexTorrentContractTests {
         }
 
         // THE REVERSED CASE, stated first: a MOVIE whose add-on default is an episode-shaped id from an
-        // entirely different title. The catalog id is what the user opened and must win.
+        // entirely different title. The page is mismatched, so no role may authorize a fetch.
         expect(SourceIndexIdentity.resolve(
                    roles(catalog: "tt1375666", defaultVideo: "tt0903747:1:1",
-                         currentVideo: nil, kind: .movie)).titleID == "tt1375666",
-               "F1: a valid bare CATALOG imdb id outranks an episode-derived default on a movie")
+                         currentVideo: nil, kind: .movie)) == .mismatch,
+               "F1: a valid bare CATALOG imdb id cannot authorize a mismatched episode-derived default on a movie")
         expect(SourceIndexIdentity.resolve(
                    roles(catalog: "tt1375666", defaultVideo: "tt0903747:1:1",
-                         currentVideo: "tt0903747:1:1", kind: .live)).titleID == "tt1375666",
-               "F1: the same authority holds for a live page, whose current-video role does not exist")
-        // Conflicting heads on a SERIES resolve to the catalog identity too.
+                         currentVideo: "tt0903747:1:1", kind: .live)) == .mismatch,
+               "F1: a live page also refuses a mismatched auxiliary identity")
+        // Conflicting heads on a SERIES refuse to choose one title.
         expect(SourceIndexIdentity.resolve(
                    roles(catalog: "tt0903747", defaultVideo: "tt1375666",
-                         currentVideo: "tt2861424:1:1", kind: .series)).titleID == "tt0903747",
-               "F1: on conflicting heads the CATALOG identity wins")
+                         currentVideo: "tt2861424:1:1", kind: .series)) == .mismatch,
+               "F1: conflicting heads refuse to choose the CATALOG identity")
 
         // An episode-scoped default is canonicalized, never returned unchanged.
         let episodeScoped = SourceIndexIdentity.resolve(
@@ -2420,17 +2510,17 @@ struct SourceIndexTorrentContractTests {
         // `contentKey` re-canonicalizes its `titleID` rather than trusting the caller, and nothing asserted it:
         // replacing that guard with `let title = titleID` left the whole suite green. It is the F1 defect class
         // one level down -- an episode-scoped id passed straight through -- so it gets its own coverage.
-        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747:1:1", season: nil, episode: nil) == "tt0903747",
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747:1:1", season: nil, episode: nil) == "tt0903747",
                "A2: contentKey REDUCES an episode-scoped title id to the bare title, it does not pass it through")
-        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747:1:1", season: 3, episode: 5) == "tt0903747:3:5",
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747:1:1", season: 3, episode: 5) == "tt0903747:3:5",
                "A2: contentKey composes from the REDUCED title, never tt0903747:1:1:3:5")
         // INVERTED (REQ-260721-33): the reduction still happens (canonicalTitleID is a reducer, and the
         // resume fence needs tmdb heads), but the reduced value is refused as a KEY at the final gate.
-        expect(SourceIndexIdentity.contentKey(titleID: "tmdb:1399:2:3", season: 4, episode: 6) == nil
-               && SourceIndexIdentity.contentKey(titleID: "tmdb:1399", season: nil, episode: nil) == nil,
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "tmdb:1399:2:3", season: 4, episode: 6) == nil
+               && SourceIndexIdentity.contentKeyForTesting(titleID: "tmdb:1399", season: nil, episode: nil) == nil,
                "A2: a tmdb head is refused as a pool key in BOTH the composed and the bare-title branch")
-        expect(SourceIndexIdentity.contentKey(titleID: "kitsu:42", season: nil, episode: nil) == nil
-               && SourceIndexIdentity.contentKey(titleID: "tt0903747:garbage", season: nil, episode: nil) == nil,
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "kitsu:42", season: nil, episode: nil) == nil
+               && SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747:garbage", season: nil, episode: nil) == nil,
                "A2: a non-canonical titleID yields NO key, rather than being echoed back as one")
 
         // MOVIE behaviour: a movie page has no video-id role and no coordinates.
@@ -2441,14 +2531,14 @@ struct SourceIndexTorrentContractTests {
                "F1: a movie resolves to a bare title id and keys the pool without coordinates")
 
         // SEASON ZERO is VALID (specials air as S00Exx). Presence, never truthiness.
-        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747", season: 0, episode: 1) == "tt0903747:0:1",
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747", season: 0, episode: 1) == "tt0903747:0:1",
                "F5: season zero is a VALID coordinate and still composes")
 
         // F5: PARTIAL coordinate pairs are REJECTED; both-absent is a valid show-wide request.
-        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747", season: 3, episode: nil) == nil
-               && SourceIndexIdentity.contentKey(titleID: "tt0903747", season: nil, episode: 5) == nil,
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747", season: 3, episode: nil) == nil
+               && SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747", season: nil, episode: 5) == nil,
                "F5: a PARTIAL coordinate pair is rejected, never widened to the show-wide key")
-        expect(SourceIndexIdentity.contentKey(titleID: "tt0903747", season: nil, episode: nil) == "tt0903747",
+        expect(SourceIndexIdentity.contentKeyForTesting(titleID: "tt0903747", season: nil, episode: nil) == "tt0903747",
                "F5: both coordinates absent is a valid bare-title request")
         expect(SourceIndexClient.contentID(imdbId: "tt0903747", season: 3) == nil
                && SourceIndexClient.contentID(imdbId: "tt0903747", episode: 5) == nil

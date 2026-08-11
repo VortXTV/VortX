@@ -142,6 +142,11 @@ struct VortXiOSApp: App {
                         // rqbit shutdown off-main); .active above restarts it. No-op while the flag is off.
                         VortxNativeServer.stopOnBackground()
                         #endif
+                        // Drop the memoized YouTube-trailer range-proxy listener: iOS can reclaim its bound
+                        // loopback port across a suspension, and the proxy caches the port once, so every hero
+                        // preview trailer fails after a resume until it rebinds. proxied() rebinds lazily on the
+                        // next preview, so this just clears the stale listener/port.
+                        VXTrailerProxy.shared.invalidate()
                         VortXSyncManager.shared.stopRealtime()   // drop the socket + poll while suspended
                         // push profiles + settings under a background-task grace window so a just-made library
                         // removal / rewind survives a sideload-update process kill (CW resurrection fix).
@@ -496,23 +501,32 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
 /// then back to `.all` on exit so the rest of the app rotates per the user's preference again.
 final class OrientationAppDelegate: NSObject, UIApplicationDelegate {
     static var lock: UIInterfaceOrientationMask = .allButUpsideDown
+    /// UIKit may relaunch once for byte downloads and once for HLS in the same process. Retain every handler
+    /// until DownloadManager has adopted the matching session and reconnected its tasks.
+    private var pendingBackgroundCompletions: [String: [() -> Void]] = [:]
     func application(_ application: UIApplication,
                      supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         Self.lock
     }
 
     /// iOS relaunches the app in the background to deliver finished background downloads, handing us a
-    /// completion handler we must call once the session drains. Stash it on DownloadManager (touching
-    /// `.shared` also re-creates the background URLSession + re-attaches its delegate, so the queued
-    /// `didFinishDownloadingTo` events actually fire and the saved file lands). Without this the download
-    /// that finished while suspended never moved its temp file -> the owner's "cannot create file" / 0-byte
-    /// save. We only adopt OUR session id; anything else is completed immediately so iOS isn't left waiting.
+    /// completion handler we must call once the matching session drains. Retain it until DownloadManager
+    /// re-creates the session, re-attaches its delegate, and reconnects the tasks. Unknown identifiers are
+    /// completed immediately so iOS is never left waiting on a session we do not own.
     func application(_ application: UIApplication,
                      handleEventsForBackgroundURLSession identifier: String,
                      completionHandler: @escaping () -> Void) {
-        guard identifier == "tv.vortx.downloads.background" else { completionHandler(); return }
-        Task { @MainActor in
-            DownloadManager.shared.adoptBackgroundEvents(completionHandler: completionHandler)
+        guard identifier == DownloadManager.backgroundSessionIdentifier
+                || identifier == DownloadManager.hlsSessionIdentifier else {
+            completionHandler()
+            return
+        }
+        pendingBackgroundCompletions[identifier, default: []].append(completionHandler)
+        Task { @MainActor [weak self] in
+            guard let self, let handlers = self.pendingBackgroundCompletions.removeValue(forKey: identifier) else { return }
+            DownloadManager.shared.adoptBackgroundEvents(for: identifier) {
+                handlers.forEach { $0() }
+            }
         }
     }
 }

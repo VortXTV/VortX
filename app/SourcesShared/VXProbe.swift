@@ -69,6 +69,9 @@ enum VXProbe {
     /// Exposed so callers outside the heartbeat (e.g. the F5 post-remux-teardown server-config replay) can log
     /// the process footprint around a suspected leak edge. Not gated on `enabled`: a caller that already
     /// decided to log wants a real number.
+    ///
+    /// A2-2: this is whole-process RSS (the app plus the in-process node server), so the heartbeat's `mem=`
+    /// field covers both. The node heap alone rides the separate `server=[... heap=NMB]` field.
     static func residentMemoryMB() -> Double? {
         var info = mach_task_basic_info()
         var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
@@ -315,6 +318,20 @@ final class VXProbeState {
         if let source { sourceLabel = source }
         if let engine { self.engine = engine }
         if let buffering { self.buffering = buffering }
+    }
+
+    /// A10-i: reset the player fields to idle at a definitive teardown (engine Unload / the player screen's
+    /// real disappearance). The player fields otherwise freeze at their last live values with nothing ever
+    /// clearing them, so the heartbeat kept reporting player=playing for minutes after playback ended. The
+    /// route is owned by `setRoute` and left untouched here.
+    func clearPlayer() {
+        lock.lock(); defer { lock.unlock() }
+        playerState = "idle"
+        posSec = 0
+        durSec = 0
+        sourceLabel = "-"
+        engine = "-"
+        buffering = false
     }
 
     /// Record the most recent discrete event and bump the monotonically increasing sequence.

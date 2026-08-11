@@ -22,11 +22,11 @@ actor TraktService {
     static let shared = TraktService(auth: .shared)
 
     private let auth: TraktAuth
-    private let session: URLSession
+    private let transport: AuthenticatedHTTPTransport
 
-    init(auth: TraktAuth, session: URLSession = .shared) {
+    init(auth: TraktAuth, transport: AuthenticatedHTTPTransport = .shared) {
         self.auth = auth
-        self.session = session
+        self.transport = transport
     }
 
     // MARK: - Scrobble (player progress)
@@ -290,7 +290,10 @@ actor TraktService {
             // A malformed/absent conflict body must not turn a known 409 into a generic server error:
             // fall through with a nil expiry so the caller still reports the right thing ("already
             // checked in"), just without a time.
-            let conflict = try? JSONDecoder().decode(TraktCheckinConflict.self, from: data)
+            let conflict = try? AuthenticatedHTTPTransport.decodeJSON(
+                TraktCheckinConflict.self,
+                from: data
+            )
             throw TraktServiceError.alreadyCheckedIn(expiresAt: TraktDate.parse(conflict?.expiresAt))
         }
         try expectSuccess(status)
@@ -328,7 +331,10 @@ actor TraktService {
         request.setValue("2", forHTTPHeaderField: "trakt-api-version")
         request.setValue(TraktAuth.clientID, forHTTPHeaderField: "trakt-api-key")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let result = try await perform(request)
+        let result = try await perform(
+            request,
+            maxResponseBytes: AuthenticatedHTTPTransport.snapshotResponseLimit
+        )
         guard await auth.sessionID == expectedSession else { throw TraktAuthError.sessionChanged }
         if result.1 == 401 {
             await auth.signOut(ifCurrent: expectedSession)
@@ -337,7 +343,7 @@ actor TraktService {
     }
 
     /// Final lifecycle and retry write boundary. The auth actor keeps `expectedSession` and its bearer
-    /// leased until `URLSession.data` returns, so credentials cannot switch in the validation-to-use gap.
+    /// leased until the authenticated transport returns, so credentials cannot switch in the validation-to-use gap.
     private func sendSessionBound<Body: Encodable>(
         path: String,
         method: String,
@@ -371,7 +377,7 @@ actor TraktService {
         bodyData: Data?,
         expectedSession: TraktSessionID
     ) async throws -> (Data, Int) {
-        let urlSession = session
+        let transport = transport
         let result: (Data, Int) = try await auth.performSessionBoundWrite(
             expectedSession: expectedSession
         ) { token in
@@ -388,10 +394,14 @@ actor TraktService {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             request.httpBody = bodyData
             do {
-                let (data, response) = try await urlSession.data(for: request)
-                return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+                let response = try await transport.send(
+                    request,
+                    allowedHosts: ["api.trakt.tv"],
+                    maxResponseBytes: AuthenticatedHTTPTransport.controlResponseLimit
+                )
+                return (response.data, response.statusCode)
             } catch {
-                throw TraktServiceError.transport(error.localizedDescription)
+                throw TraktServiceError.transport("Trakt request failed.")
             }
         }
         if result.1 == 401 {
@@ -400,12 +410,19 @@ actor TraktService {
         return result
     }
 
-    private func perform(_ request: URLRequest) async throws -> (Data, Int) {
+    private func perform(
+        _ request: URLRequest,
+        maxResponseBytes: Int
+    ) async throws -> (Data, Int) {
         do {
-            let (data, response) = try await session.data(for: request)
-            return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+            let response = try await transport.send(
+                request,
+                allowedHosts: ["api.trakt.tv"],
+                maxResponseBytes: maxResponseBytes
+            )
+            return (response.data, response.statusCode)
         } catch {
-            throw TraktServiceError.transport(error.localizedDescription)
+            throw TraktServiceError.transport("Trakt request failed.")
         }
     }
 
@@ -419,7 +436,7 @@ actor TraktService {
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
-        do { return try JSONDecoder().decode(type, from: data) }
+        do { return try AuthenticatedHTTPTransport.decodeJSON(type, from: data) }
         catch { throw TraktServiceError.decoding }
     }
 
@@ -548,7 +565,7 @@ enum TraktServiceError: LocalizedError, Sendable, Equatable {
 //       - On tap: `let code = try await TraktAuth.shared.requestDeviceCode()`, present
 //         `code.userCode` + `code.verificationURL` (a QR of the URL fits the existing link-login UI
 //         in `LinkLoginView`), then `try await TraktAuth.shared.pollForToken(
-//             deviceCode: code.deviceCode, interval: code.interval, expiresIn: code.expiresIn)`.
-//       - When signed in, show "Disconnect Trakt" -> `await TraktAuth.shared.signOut()`.
-//    Gate the whole row on `TraktAuth.isConfigured` so it stays hidden until the client id/secret
-//    constants are filled in.
+//             session: code.session, interval: code.interval, expiresIn: code.expiresIn)`.
+//       - When signed in, show "Disconnect Trakt" -> `await TraktAuth.shared.revokeAndSignOut()`.
+//    Gate the whole row on `TraktAuth.isConfigured` so it stays hidden until the public client ID is
+//    provisioned.

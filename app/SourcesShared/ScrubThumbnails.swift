@@ -37,6 +37,8 @@ enum TrickplayFrameByteFloor {
 // harness, never by any real build) drops the store so the pure floor rule compiles and is unit-tested in
 // isolation. This mirrors CommunityTrickplay.swift's TRICKPLAY_E2E_POLICY_TESTING seam; production never sets it.
 #if !TRICKPLAY_BYTEFLOOR_TESTING
+enum PreviewState: Equatable { case hidden, loading, ready, unavailable }
+
 /// Provides scrub-preview thumbnails from locally captured frames.
 /// When no server storyboard is available the player captures a frame every ~10 s of playback
 /// and stores it via `recordCapturedFrameData`. During scrubbing `show(time:)` serves the
@@ -44,6 +46,7 @@ enum TrickplayFrameByteFloor {
 @MainActor
 final class ScrubThumbnailsStore: ObservableObject {
     @Published private(set) var image: ScrubImage?
+    @Published private(set) var previewState: PreviewState = .hidden
 
     private var localCacheKey: String?
     private static let localFrameCache = LocalTrickplayFrameCache()
@@ -59,6 +62,10 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// is strictly fuller than this, so a thin community set gets improved (keep-fuller) while a full one is
     /// not needlessly re-POSTed. The worker also keep-fuller-merges as a race safety net.
     private var communityExistingFrameCount = 0
+    private enum CommunityRemotePhase { case idle, loading, settled }
+    private var communityRemotePhase = CommunityRemotePhase.idle
+    private var communityFetchTask: Task<Void, Never>?; private var communityFetchEpoch: UInt64 = 0
+    private var communityFetchKey: String?; private var activeScrubTime: Double?; private var pendingLocalReadToken: Int?
     /// The shareable identity for the current title, set by `configureCommunity`. nil for ad-hoc plays.
     private var communityKey: String?
     private var communityImdb: String?
@@ -109,6 +116,12 @@ final class ScrubThumbnailsStore: ObservableObject {
         )
     }
 
+    deinit { communityFetchTask?.cancel() }
+
+    private func cancelCommunityFetch() {
+        communityFetchEpoch &+= 1; communityFetchTask?.cancel(); communityFetchTask = nil; communityFetchKey = nil
+    }
+
     func configure(localCacheKey: String?) {
         guard TrickplayCaptureSessionPolicy.transition(
             from: self.localCacheKey,
@@ -116,13 +129,16 @@ final class ScrubThumbnailsStore: ObservableObject {
         ) == .reset else { return }
         retireCommunityUploadIfNeeded()
         _ = communityIdentityGeneration.advance()
+        cancelCommunityFetch()
         showToken &+= 1
         self.localCacheKey = localCacheKey
         image = nil
+        previewState = .hidden; activeScrubTime = nil; pendingLocalReadToken = nil
         // A new stable media or episode timeline: drop the prior community sheet and session frames.
         communitySheet = nil
         communityAlreadyExists = false
         communityExistingFrameCount = 0
+        communityRemotePhase = .idle
         communityKey = nil
         communityResolveTriedFor = nil
         hasRealDuration = false
@@ -168,6 +184,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         if communityKey == key { return }
         if communityKey != nil, !isRealDuration { return }   // keep the provisional key until the real one lands
         let rekeying = communityKey != nil
+        if rekeying { cancelCommunityFetch() }
         VXProbe.log("tp", "community \(rekeying ? "re-keyed" : "keyed"): \(VXProbeRedaction.identityToken(key)) (imdb=\(VXProbeRedaction.identityToken(imdbId)) real=\(isRealDuration ? "yes" : "no"))")
         communityKey = key
         communityImdb = imdbId
@@ -178,17 +195,42 @@ final class ScrubThumbnailsStore: ObservableObject {
         // invalidates only the fetched sheet; captured session frames remain valid because they are time-indexed.
         if rekeying { communitySheet = nil; communityAlreadyExists = false; communityExistingFrameCount = 0 }
         uploadPolicy.reset(for: key)
-        Task { [weak self] in
-            let sheet = await CommunityTrickplay.fetch(key: key)
+        if !rekeying { communityFetchEpoch &+= 1 }
+        let fetchEpoch = communityFetchEpoch
+        communityRemotePhase = .loading
+        previewState = activeScrubTime == nil ? .hidden : .loading
+        communityFetchKey = key
+        if rekeying, let activeTime = activeScrubTime { show(time: activeTime) }
+        communityFetchTask = Task { [weak self] in
+            let result = await CommunityTrickplay.fetch(key: key)
             await MainActor.run {
-                guard let self, self.communityKey == key else { return }   // title may have changed
-                if let sheet {
-                    self.communitySheet = sheet
-                    self.communityAlreadyExists = true
-                    self.communityExistingFrameCount = sheet.frameCount
-                }
+                self?.completeCommunityFetch(result, epoch: fetchEpoch, key: key)
             }
         }
+    }
+
+    private func completeCommunityFetch(_ result: CommunityTrickplay.FetchResult, epoch: UInt64, key: String) {
+        guard TrickplayFetchClaim.accepts(
+            requestEpoch: epoch, requestKey: key,
+            currentEpoch: communityFetchEpoch, currentKey: communityFetchKey
+        ), communityKey == key else { return }
+        communityFetchTask = nil
+        communityFetchKey = nil
+        let receipt: String; let hit: Bool
+        switch result {
+        case .hit(let sheet):
+            receipt = "hit"; hit = true; communitySheet = sheet; communityAlreadyExists = true; communityExistingFrameCount = sheet.frameCount
+        case .unavailable:
+            receipt = "unavailable"; hit = false; communitySheet = nil; communityAlreadyExists = false; communityExistingFrameCount = 0
+        case .cancelled:
+            receipt = "cancelled"; hit = false
+        }
+        VXProbe.log("tp", "community-fetch outcome=\(receipt)")
+        if case .cancelled = result {
+            communityRemotePhase = .idle; previewState = .hidden; return
+        }
+        communityRemotePhase = .settled
+        if let activeTime = activeScrubTime { if pendingLocalReadToken == nil || hit { show(time: activeTime) } } else { previewState = .hidden }
     }
 
     /// The raw `tmdb:…` id currently being (or already) resolved, so a burst of per-tick `configureCommunity`
@@ -234,22 +276,21 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// MAIN THREAD during scrubbing; that read+decode is now hopped off the main actor and the resolved frame
     /// is assigned back on the MainActor, gated by `showToken` so a stale late result can't overwrite a newer one.
     func show(time: Double) {
-        showToken &+= 1
+        activeScrubTime = time; showToken &+= 1; pendingLocalReadToken = nil; image = nil
         if let sheet = communitySheet, let crop = sheet.crop(at: time) {
-            image = crop
-            return
+            image = crop; previewState = .ready; return
         }
         guard let key = localCacheKey else {
-            image = nil
-            return
+            previewState = previewStateForRemoteState(); return
         }
         // In-memory hit resolves synchronously so a warm scrub is instant and never touches disk.
         if let cached = Self.localFrameCache.memoryImage(for: key, time: time) {
-            image = cached
-            return
+            image = cached; previewState = .ready; return
         }
+        previewState = .loading
         // Cache miss: read + decode off the main thread, then assign on the MainActor if still current.
         let token = showToken
+        pendingLocalReadToken = token
         Self.localFrameCache.imageAsync(for: key, time: time) { [weak self] resolved in
             Task { @MainActor in
                 guard let self,
@@ -258,15 +299,19 @@ final class ScrubThumbnailsStore: ObservableObject {
                           requestMediaKey: key,
                           currentToken: self.showToken,
                           currentMediaKey: self.localCacheKey
-                      ) else { return }
-                self.image = resolved
+                      ), self.pendingLocalReadToken == token else { return }
+                self.pendingLocalReadToken = nil; self.image = resolved
+                self.previewState = resolved == nil ? self.previewStateForRemoteState() : .ready
             }
         }
     }
 
     func clear() {
-        showToken &+= 1
-        image = nil
+        showToken &+= 1; activeScrubTime = nil; pendingLocalReadToken = nil; image = nil; previewState = .hidden
+    }
+
+    private func previewStateForRemoteState() -> PreviewState {
+        switch communityRemotePhase { case .idle: return .unavailable; case .loading: return .loading; case .settled: return .unavailable }
     }
 
     /// Heavy frame processing (JPEG decode + macOS near-black rasterization/sampling), kept OFF the main

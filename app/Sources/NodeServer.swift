@@ -73,6 +73,29 @@ enum NodeServer {
         return "Server process running"
     }
 
+    /// A2-2: the diagnostics-facing status (the VXProbe heartbeat + the diagnostics export), which is
+    /// `statusDescription` plus the node heap from the most recent server heartbeat while the process is
+    /// alive. Kept SEPARATE from the Settings-facing `statusDescription` so the user text is unchanged; this
+    /// is log-only. The heartbeat wraps it as `server=[Server process running heap=26MB]`, surfacing the flat
+    /// ~26MB node heap that whole-process RSS (the heartbeat's `mem=`) hides.
+    static var diagnosticStatusDescription: String {
+        let base = statusDescription
+        guard started, exitCode == nil, let heap = lastHeapMB() else { return base }
+        return "\(base) heap=\(heap)MB"
+    }
+
+    /// The node heap in MB from the most recent server heartbeat line, or nil when unavailable. The preload
+    /// heartbeat writes `[hb] ... heap=NMB` every ~1s; scan the log tail newest-first for that token.
+    /// Best-effort and log-only.
+    private static func lastHeapMB() -> Int? {
+        for line in logTail(16).reversed() {
+            guard let range = line.range(of: "heap=") else { continue }
+            let digits = line[range.upperBound...].prefix { $0.isNumber }
+            if let mb = Int(digits) { return mb }
+        }
+        return nil
+    }
+
     /// Age in seconds of the server log's last write. The preload heartbeat writes every ~1s, so a value
     /// well past that (while the process is alive) means the event loop has frozen. Best-effort, nil when
     /// the log is absent/unreadable, in which case the caller falls back to the plain running state.
@@ -99,7 +122,7 @@ enum NodeServer {
         guard !started else { return }
         // Wire the shared diagnostics indirection so the VXProbe heartbeat and the diagnostics export can
         // surface this server's state without SourcesShared referencing NodeServer directly. Idempotent.
-        ServerDiagnostics.register(status: { statusDescription }, logTail: { logTail($0) })
+        ServerDiagnostics.register(status: { diagnosticStatusDescription }, logTail: { logTail($0) })
         guard let serverJs = Bundle.main.path(forResource: "server", ofType: "js") else {
             NSLog("StremioX: server.js not found in bundle, streaming server disabled")
             return

@@ -130,6 +130,18 @@ enum PGSOCRPipelineTests {
                     packetDurationSeconds: 9,
                     displayStartMilliseconds: 250,
                     displayEndMilliseconds: 2_250)?.duration == 2)
+        check("PGS open-end sentinel falls back to the packet duration",
+              PGSOCRPolicy.cueTiming(
+                  packetStartSeconds: 10,
+                  packetDurationSeconds: 2,
+                  displayStartMilliseconds: 0,
+                  displayEndMilliseconds: UInt32.max)?.duration == 2)
+        check("PGS open-end sentinel with no packet duration stays open for fallback or clear",
+              PGSOCRPolicy.cueTiming(
+                  packetStartSeconds: 10,
+                  packetDurationSeconds: 0,
+                  displayStartMilliseconds: 0,
+                  displayEndMilliseconds: UInt32.max)?.duration == 0)
 
         let appRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

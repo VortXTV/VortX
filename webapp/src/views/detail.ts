@@ -19,7 +19,7 @@ import { fetchSkipSegments } from "../lib/skip";
 import { defaultSeason, episodesForSeason, isSeries, seasonsOf, sortedVideos } from "../lib/series";
 import { actionOf, escapeHtml, httpUrl } from "../lib/dom";
 import { icon } from "../lib/icons";
-import { play } from "../lib/player";
+import { play, setSkipSegments, currentPlayToken } from "../lib/player";
 import { cwPosition, cwProgress, cwResumeId, inLibrary, toggleLibrary } from "../lib/store";
 import { getSettings } from "../lib/settings";
 import { fetchRatings, ratingsText, type Ratings } from "../lib/mdblist";
@@ -769,30 +769,38 @@ async function playStream(stream: Stream): Promise<void> {
     .map((s) => s.url)
     .filter((u): u is string => !!u && /^https?:\/\//i.test(u));
   const fallbacks = [stream.url, ...pool.filter((u) => u !== stream.url)];
-
-  // Skip segments + next-episode are series playback niceties; fetched fail-soft so playback never waits.
-  const skipSegments = state?.meta
-    ? await fetchSkipSegments(state.meta.id, episode?.season, episode?.episode).catch(() => [])
-    : [];
   const next = episode ? nextEpisode(episode) : null;
+  const meta = state?.meta;
 
-  await play(stream.url, title, {
-    item: state?.meta
+  // Start playback SYNCHRONOUSLY inside the click's user-activation window: any `await` between the click and
+  // play() (e.g. fetching skip segments) consumes the gesture, so the browser rejects unmuted autoplay and
+  // the player falls back to a muted start - the "no sound" bug. So we launch play() with no pre-play await.
+  const playing = play(stream.url, title, {
+    item: meta
       ? {
-          id: state.meta.id,
-          type: state.meta.type,
-          name: state.meta.name,
-          poster: state.meta.poster,
-          resumeId: episode?.id ?? state.meta.id,
+          id: meta.id,
+          type: meta.type,
+          name: meta.name,
+          poster: meta.poster,
+          resumeId: episode?.id ?? meta.id,
         }
       : undefined,
-    subtitles: state?.meta
-      ? fetchSubtitles(addons, state.meta.type, episode?.id ?? state.meta.id)
-      : undefined,
+    subtitles: meta ? fetchSubtitles(addons, meta.type, episode?.id ?? meta.id) : undefined,
     fallbacks,
-    skipSegments,
     onNextEpisode: next ? () => void playEpisodeById(next.id) : undefined,
   });
+
+  // Skip segments are a playback nicety that only matters minutes in, so they're fetched OFF the gesture path
+  // and fed into the live player once resolved. The session token guards against a stale fetch from a prior
+  // title landing on the source now playing. Fail-soft: no segments simply means no Skip button.
+  const token = currentPlayToken();
+  if (meta) {
+    void fetchSkipSegments(meta.id, episode?.season, episode?.episode)
+      .then((segs) => setSkipSegments(token, segs))
+      .catch(() => undefined);
+  }
+
+  await playing;
 }
 
 /** The episode that follows `current` in play order (next episode this season, else first of the next

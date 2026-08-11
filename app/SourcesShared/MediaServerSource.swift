@@ -16,8 +16,12 @@ final class MediaServerSource: ObservableObject {
     /// rebuild signature.
     @Published private(set) var groups: [CoreStreamSourceGroup] = [] { didSet { epoch &+= 1 } }
     private(set) var epoch = 0
-    /// Canonical title/episode identity for the currently published direct-play groups.
-    private(set) var publishedContentID: String?
+    /// Sealed page identity for the currently published direct-play groups.
+    private(set) var publishedTarget: SourceIndexIdentity.MediaServerTarget?
+    @Published private(set) var settlementEpoch = 0
+    private var settlementContentID: String?
+    private var settlementActive = false
+    private var settlementTerminal = false
 
     /// The title currently shown (its fetch key). Switching titles resets `groups`.
     private var shownKey: String?
@@ -27,47 +31,98 @@ final class MediaServerSource: ObservableObject {
     private var cache: [String: [CoreStreamSourceGroup]] = [:]
     private var task: Task<Void, Never>?
 
+    func settlementState(for contentID: String?) -> SourceContributorSettlement {
+        guard let contentID, !MediaServerStore.shared.servers.isEmpty else { return .inactive }
+        guard settlementContentID == contentID else { return .pending }
+        guard settlementActive else { return .inactive }
+        return settlementTerminal ? .terminal : .pending
+    }
+
+    func settlementState(for target: SourceIndexIdentity.MediaServerTarget?) -> SourceContributorSettlement {
+        settlementState(for: target?.token)
+    }
+
+    private func publishSettlement(contentID: String?, active: Bool, terminal: Bool) {
+        guard settlementContentID != contentID || settlementActive != active
+                || settlementTerminal != terminal else { return }
+        settlementContentID = contentID
+        settlementActive = active
+        settlementTerminal = terminal
+        settlementEpoch &+= 1
+    }
+
     /// Resolve the current title on the connected servers, if any. Fail-soft and session-cached. Safe on every
     /// meta change / `.onAppear`. `imdb` is the detail id (imdb `tt...` or tmdb `tmdb:...`); `title`/`year` are
     /// the name+year fallback for GUID-less libraries; `season`/`episode` scope a series to one episode.
     func refresh(imdb: String?, season: Int? = nil, episode: Int? = nil, title: String? = nil,
-                 year: Int? = nil, publicationTarget: String? = nil) {
+                 year: Int? = nil, publicationTarget: SourceIndexIdentity.MediaServerTarget? = nil) {
         // DORMANCY GATE (synchronous, before any resolver work): no server -> no network, ever.
-        guard !MediaServerStore.shared.servers.isEmpty else { clearResults(); return }
-        let idKey = imdb ?? ""
-        guard !idKey.isEmpty || !(title ?? "").isEmpty else { clearResults(); return }
-
-        let target = publicationTarget ?? {
-            if let season, let episode { return "\(idKey):\(season):\(episode)" }
-            return idKey
-        }()
-        guard !target.isEmpty else { clearResults(); return }
-        let fetchKey = "\(idKey)|\(season ?? -1)|\(episode ?? -1)|\(title ?? "")|\(year ?? -1)|\(target)"
-        if fetchKey != shownKey {
-            shownKey = fetchKey
-            publishedContentID = target
-            groups = cache[fetchKey] ?? []
+        guard !MediaServerStore.shared.servers.isEmpty else {
+            clearResults(settlementTarget: publicationTarget)
+            return
         }
-        if cache[fetchKey] != nil { return }          // cached: already published above
+        let idKey = imdb ?? ""
+        guard !idKey.isEmpty || !(title ?? "").isEmpty else {
+            clearResults(settlementTarget: publicationTarget)
+            return
+        }
+
+        guard let target = publicationTarget else {
+            clearResults(settlementTarget: nil)
+            return
+        }
+        let fetchKey = "\(idKey)|\(season ?? -1)|\(episode ?? -1)|\(title ?? "")|\(year ?? -1)|\(target.token)"
+        if fetchKey != shownKey {
+            task?.cancel()
+            task = nil
+            inFlightKey = nil
+            shownKey = fetchKey
+            publishedTarget = target
+            groups = cache[fetchKey] ?? []
+            publishSettlement(contentID: target.token, active: true, terminal: cache[fetchKey] != nil)
+        }
+        if cache[fetchKey] != nil {
+            publishSettlement(contentID: target.token, active: true, terminal: true)
+            return
+        }                                              // cached: already published above
         if inFlightKey == fetchKey { return }         // the paired onChange/onAppear for this id: resolve once
         task?.cancel()
         inFlightKey = fetchKey
+        publishSettlement(contentID: target.token, active: true, terminal: false)
         task = Task { [weak self] in
             let hits = await MediaServerCoordinator.shared.find(imdb: imdb, season: season, episode: episode,
                                                                 title: title, year: year)
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled, let self,
+                  self.shownKey == fetchKey,
+                  self.inFlightKey == fetchKey else { return }
             self.inFlightKey = nil
+            self.task = nil
             let built = Self.buildGroups(from: hits)
             self.cache[fetchKey] = built
-            if self.shownKey == fetchKey { self.groups = built }
+            self.groups = built
+            self.publishSettlement(contentID: target.token, active: true, terminal: true)
         }
     }
+
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    var ownerStateForTesting: (shownKey: String?, inFlightKey: String?, hasTask: Bool) {
+        (shownKey: shownKey, inFlightKey: inFlightKey, hasTask: task != nil)
+    }
+    #endif
 
     /// Empty the published groups without touching the session cache (for an owner that reuses one instance
     /// across titles). A title that cannot resolve (no server / no id) must see it EMPTY.
     func clearResults() {
+        clearResults(settlementTarget: nil)
+    }
+
+    private func clearResults(settlementTarget: SourceIndexIdentity.MediaServerTarget?) {
+        task?.cancel()
+        task = nil
+        inFlightKey = nil
         shownKey = nil
-        publishedContentID = nil
+        publishedTarget = nil
+        publishSettlement(contentID: settlementTarget?.token, active: false, terminal: true)
         if !groups.isEmpty { groups = [] }
     }
 
@@ -118,9 +173,13 @@ final class MediaServerSource: ObservableObject {
 
     // MARK: Merge
 
-    /// Merge the per-server groups into `groups`, deduped by url against streams already present. `nonisolated
-    /// static` so `SourceListModel`'s off-main assembly can run it over a snapshot. Pass-through when empty.
-    nonisolated static func merge(_ extra: [CoreStreamSourceGroup], into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+    /// Merge only with the typed media-server capability proving the published token matches the page token.
+    nonisolated static func merge(
+        authorizedBy authorization: SourceIndexIdentity.MediaServerMergeAuthorization?,
+        _ extra: [CoreStreamSourceGroup],
+        into groups: [CoreStreamSourceGroup]
+    ) -> [CoreStreamSourceGroup] {
+        guard authorization != nil else { return groups }
         guard !extra.isEmpty else { return groups }
         var seenURLs: Set<String> = []
         for g in groups { for s in g.streams { if let u = s.url { seenURLs.insert(u) } } }

@@ -115,8 +115,23 @@ enum LastStreamStore {
         var detail = ""
         if outcome == "noEntry", let profileID {
             let dict = load(profileID)
-            let keys = dict.keys.sorted().prefix(8).joined(separator: ",")
-            detail = " count=\(dict.count) keys=[\(keys)]"
+            // Membership probe, not a fixed lexicographic head (which never contained the MISSED id, so it
+            // could not show a key mismatch). `present` says whether the exact missed key is in the store at
+            // all (a true here with a "noEntry" outcome means the caller's lookup key differs from this one).
+            // When absent, `variant` says whether a case-only or same-base-id (the part before the first ':')
+            // key IS present, which is the id-format / legacy-key mismatch this miss is usually caused by.
+            let present = dict[libraryId] != nil
+            var variant = "none"
+            if !present {
+                let lower = libraryId.lowercased()
+                let base = libraryId.split(separator: ":").first.map(String.init) ?? libraryId
+                if dict.keys.contains(where: { $0.lowercased() == lower }) {
+                    variant = "case"
+                } else if dict.keys.contains(where: { ($0.split(separator: ":").first.map(String.init) ?? $0) == base }) {
+                    variant = "base"
+                }
+            }
+            detail = " present=\(present) variant=\(variant) count=\(dict.count)"
         }
         let pid = profileID.map { String($0.uuidString.prefix(8)) } ?? "nil"
         DiagnosticsLog.log("cw-resume", "\(outcome) id=\(VXProbeRedaction.identityToken(libraryId)) profile=\(pid)\(detail)")

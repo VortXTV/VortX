@@ -97,6 +97,20 @@ final class VXTrailerProxy {
         return comps.url
     }
 
+    /// Tear down the memoized listener so the NEXT `proxied(_:)` rebinds on a fresh ephemeral port. The proxy
+    /// memoizes its NWListener and OS-assigned port ONCE (`ensureListening` short-circuits while both are set),
+    /// but a suspend/resume can leave that port dead after tvOS/iOS reclaims the socket, so every Home-screen
+    /// hero-preview trailer then fails 100%. The scenePhase `.background` handler calls this alongside the
+    /// server stop so the proxy rebinds lazily on the next preview. Runs on `queue` (which owns `listener`);
+    /// `allowLocalEndpointReuse` is already set on the params so the immediate rebind never trips a stale bind.
+    func invalidate() {
+        queue.async {
+            self.listener?.cancel()
+            self.listener = nil
+            self.setPort(0)
+        }
+    }
+
     // MARK: - Listener lifecycle
 
     /// Start the listener once (idempotent) and return its bound port, or nil on failure. Serialized on `queue`
@@ -128,6 +142,19 @@ final class VXTrailerProxy {
                         ready.signal()
                     case .failed, .cancelled:
                         ready.signal()
+                        // Self-heal: a listener that fails or is cancelled AFTER it went ready (the OS reclaimed
+                        // the loopback socket across a suspend/resume, say) must not stay memoized as a live
+                        // listener, or `ensureListening` keeps short-circuiting to a dead port and every trailer
+                        // preview fails until the next scenePhase transition. Clear it on `queue` (which owns
+                        // `listener`) so the next `proxied(_:)` rebinds even without a background/foreground cycle.
+                        // Identity-guarded so a stale handler cannot wipe a listener a later rebind already installed;
+                        // on the startup-failure path `self.listener` is still nil (only set on success below), so
+                        // this is a no-op there.
+                        self?.queue.async {
+                            guard let self, self.listener === newListener else { return }
+                            self.listener = nil
+                            self.setPort(0)
+                        }
                     default:
                         break
                     }

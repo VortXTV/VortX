@@ -3197,6 +3197,9 @@ struct iOSPlayerLaunch: Identifiable {
     /// same in-player Next / Prev / episode-list as the detail page. Empty/nil for movies + paste-a-link.
     var episodes: [PlayerEpisodeRef] = []
     var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
+    /// Resolver for an exact CoreVideo admitted by PlayerScreen's request-owned authoritative refresh. This
+    /// remains available even when the launch inventory was empty, so a newly surfaced successor can play.
+    var loadEpisodeWithMetadata: ((CoreVideo) async -> PlayerEpisodeStream?)? = nil
     /// A Continue-Watching launch carries the identity needed for one owned,
     /// deferred source contribution after the player exits.
     var resumeHoardContentID: String? = nil
@@ -3229,6 +3232,7 @@ extension View {
                 startedFromResume: item.wasResume,
                 audioSidecarURL: item.audioSidecarURL,
                 episodes: item.episodes, loadEpisode: item.loadEpisode,
+                loadEpisodeWithMetadata: item.loadEpisodeWithMetadata,
                 // Feed the engine Player so Continue Watching updates live + watched time is tracked (the
                 // direct-resume / paste-a-link path was missing this, like the detail covers). It's keyed off
                 // the engine's loaded Player, so it runs regardless of `item.meta` and no-ops if none is loaded.
@@ -3359,10 +3363,11 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     }
     // For a series, give the player the full all-season episode list + a resolver so the CW resume has the same
     // in-player Next / Prev / episode-list as the detail page. The CW item's videos may not be resident,
-    // so wait briefly (~1.5s) for the meta; if it doesn't arrive, the recorded stream still resumes,
-    // just without episode nav this session.
+    // so wait briefly (~1.5s) for the launch meta; if it doesn't arrive, the recorded stream still resumes
+    // and the exact-metadata resolver remains available for a later request-owned authoritative backfill.
     var episodes: [PlayerEpisodeRef] = []
     var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
+    var loadEpisodeWithMetadata: ((CoreVideo) async -> PlayerEpisodeStream?)? = nil
     var enginePlayerVideoId: String? = nil
     var launchSource: CoreStream? = nil
     if usesSeriesLifecycle {
@@ -3381,11 +3386,35 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         }
         let season = entry.season ?? 1
         let allSeriesVideos = (core.metaDetails?.meta?.videos ?? []).orderedBySeasonEpisode
+        // Keep this exact-metadata path alive even when the launch inventory is empty or partial. PlayerScreen
+        // supplies only a CoreVideo admitted by its request-owned authoritative refresh, so a later S2E1 cannot
+        // be rejected merely because this direct-resume snapshot was mounted before that backfill arrived.
+        loadEpisodeWithMetadata = { video in
+            guard expectedTraktSession == nil
+                    || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
+            let resolved = await iOSResolveEpisodeStream(
+                videoId: video.id,
+                in: [video],
+                seriesId: item.id,
+                seriesName: entry.name,
+                defaultSeason: season,
+                fallbackPoster: entry.poster,
+                continuity: entry.qualityText,
+                binge: entry.bingeGroup,
+                core: core,
+                account: account
+            )
+            guard expectedTraktSession == nil
+                    || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
+            return resolved
+        }
         if !allSeriesVideos.isEmpty {
             episodes = allSeriesVideos.map {
                 PlayerEpisodeRef(
                     id: $0.id,
-                    label: "S\($0.season ?? 1)E\($0.episodeNumber) · \($0.episodeTitle)"
+                    label: "S\($0.season ?? 1)E\($0.episodeNumber) · \($0.episodeTitle)",
+                    season: $0.season,
+                    episode: $0.episode
                 )
             }
             loadEpisode = { vid in
@@ -3451,6 +3480,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                            enginePlayerVideoId: enginePlayerVideoId,
                            wasExplicitPick: wasExplicitPick, wasResume: true,
                            episodes: episodes, loadEpisode: loadEpisode,
+                           loadEpisodeWithMetadata: loadEpisodeWithMetadata,
                            resumeHoardContentID: resumeHoardContentID,
                            resumeHoardStreamID: resumeHoardContentID == nil ? nil : entry.videoId)
 }

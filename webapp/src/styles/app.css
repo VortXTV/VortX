@@ -2501,25 +2501,59 @@ video::cue {
 .pl-skipseg[hidden], .pl-next[hidden] { display: none; }
 .pl-next .ico { width: 1.2rem; height: 1.2rem; }
 
-/* Tap-to-unmute pill (mobile autoplay muted -> one tap restores sound) */
+/* Full-stage "Tap for sound" scrim (autoplay forced a muted start -> restore sound). Covers the whole player
+   so the affordance is impossible to miss; a tap anywhere restores sound (also auto-restored on the first
+   interaction anywhere, see wireMobileAudio). Sits above every other player layer. */
 .pl-unmute {
   position: absolute;
-  top: 4.2rem;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 5;
-  display: inline-flex;
+  inset: 0;
+  width: 100%;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 0.45rem;
-  padding: 0.55rem 1.2rem;
-  border: 1px solid rgba(255,255,255,0.2);
+  justify-content: center;
+  gap: 0.85rem;
+  border: 0;
+  background: rgba(0, 0, 0, 0.44);
+  color: #fff;
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.7);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+}
+.pl-unmute .ico {
+  box-sizing: content-box;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0.85rem;
   border-radius: 999px;
   background: var(--accent, #f59e0b);
   color: var(--on-accent, #0f0d0a);
-  font-size: 0.9rem;
-  font-weight: 700;
-  cursor: pointer;
-  box-shadow: 0 6px 24px rgba(0,0,0,0.4);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
 }
-.pl-unmute .ico { width: 1.3rem; height: 1.3rem; }
 .pl-unmute[hidden] { display: none; }
+
+/* Honest "browser can't decode this audio" notice (D floor): a centered card shown when the fallback chain
+   is exhausted and only silent sources remain. Non-blocking so Back + the control bar stay reachable. */
+.pl-notice {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 5;
+  max-width: min(30rem, 82vw);
+  padding: 0.95rem 1.25rem;
+  border-radius: 14px;
+  background: rgba(20, 18, 16, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  color: #fff;
+  text-align: center;
+  font-size: 0.95rem;
+  line-height: 1.45;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+}

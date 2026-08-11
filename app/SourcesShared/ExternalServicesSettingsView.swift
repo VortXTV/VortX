@@ -100,6 +100,9 @@ private struct TraktConnectCard: View {
             Text("Trakt").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
             if connected {
                 Text("Connected").font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                if let errorMessage {
+                    Text(errorMessage).font(Theme.Typography.label).foregroundStyle(Theme.Palette.danger)
+                }
                 Toggle("Scrobble what you watch", isOn: $scrobble).tint(Theme.Palette.accent)
                 Toggle("Add to watchlist when you add to Library", isOn: $watchlist).tint(Theme.Palette.accent)
                 Toggle("Show titles watched on Trakt as watched here", isOn: $importWatched)
@@ -185,7 +188,7 @@ private struct TraktConnectCard: View {
                 let dc = try await TraktAuth.shared.requestDeviceCode()
                 let image = QRCodeImage.make(dc.verificationURL)
                 await MainActor.run { code = dc; qr = image; working = false; status = "Waiting for you to authorize…" }
-                _ = try await TraktAuth.shared.pollForToken(deviceCode: dc.deviceCode, interval: dc.interval, expiresIn: dc.expiresIn)
+                _ = try await TraktAuth.shared.pollForToken(session: dc.session, interval: dc.interval, expiresIn: dc.expiresIn)
                 // Authentication is a new account boundary. Supersede any signed-out no-op/in-flight pull
                 // and fetch the enabled playback surface immediately instead of inheriting its stale throttle.
                 TraktPlaybackShadow.shared.refreshNow()
@@ -207,7 +210,10 @@ private struct TraktConnectCard: View {
 
     private func disconnect() {
         Task {
-            await TraktAuth.shared.signOut()
+            guard await TraktAuth.shared.revokeAndSignOut() else {
+                await MainActor.run { errorMessage = "Couldn't disconnect. Please try again." }
+                return
+            }
             // Wipe local shadow state so the imported watched badges drop now and no queued push can drain
             // into the next account that connects on this device (cross-account contamination).
             TraktSyncEngine.shared.reset()
@@ -218,7 +224,7 @@ private struct TraktConnectCard: View {
             // rating", nor drain to their Trakt from this device's queue. Same contamination rule.
             TraktRatingsStore.shared.reset()
             await MainActor.run {
-                connected = false; code = nil; qr = nil
+                connected = false; code = nil; qr = nil; errorMessage = nil
                 WatchedIndex.shared.externalShadowChanged()   // rebuild the read path without the shadow set
                 // Drop Home rows built from PRIVATE / friends-only Trakt lists: those titles were readable
                 // only through the session we just ended, so leaving them on-device would leak one account's
@@ -257,6 +263,9 @@ private struct SIMKLConnectCard: View {
             Text("SIMKL").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
             if connected {
                 Text("Connected").font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                if let errorMessage {
+                    Text(errorMessage).font(Theme.Typography.label).foregroundStyle(Theme.Palette.danger)
+                }
                 Toggle("Mark watched when you finish", isOn: $scrobble).tint(Theme.Palette.accent)
                 Toggle("Add to watchlist when you add to Library", isOn: $watchlist).tint(Theme.Palette.accent)
                 Toggle("Show titles watched on SIMKL as watched here", isOn: $importWatched)
@@ -339,7 +348,10 @@ private struct SIMKLConnectCard: View {
 
     private func disconnect() {
         Task {
-            await SIMKLAuth.shared.signOut()
+            guard await SIMKLAuth.shared.signOut() else {
+                await MainActor.run { errorMessage = "Couldn't disconnect. Please try again." }
+                return
+            }
             // Wipe the local SIMKL watched shadow so the imported badges drop now and one account's SIMKL
             // history can never badge covers for the next account that connects on this device (the same
             // cross-account contamination rule as the Trakt disconnect wipe).
@@ -348,7 +360,7 @@ private struct SIMKLConnectCard: View {
             // "SIMKL rating", nor drain to their SIMKL from this device. Same contamination rule as Trakt.
             SIMKLRatingsStore.shared.reset()
             await MainActor.run {
-                connected = false; pin = nil; qr = nil
+                connected = false; pin = nil; qr = nil; errorMessage = nil
                 WatchedIndex.shared.externalShadowChanged()   // rebuild the read path without the shadow set
                 NotificationCenter.default.post(name: SIMKLRailsModel.disconnectedNote, object: nil)   // clear the Home plan-to-watch rail now
             }

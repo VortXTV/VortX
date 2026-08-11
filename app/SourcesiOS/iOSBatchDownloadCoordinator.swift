@@ -15,7 +15,7 @@ import Combine
 ///  2. The SAME client-side contributors the manual page merges before ranking: the TorBox search
 ///     index (`TorBoxSearchSource`) and the Singularity community pool (`SourceIndexServeSource`),
 ///     refreshed ONCE PER SERIES (matching the episode page's show-level refresh) and merged into the
-///     engine groups in the same order (`sourceIndex.merged(into: torboxSearch.merged(into: groups))`)
+///     engine groups through the typed auxiliary pipeline in the same order (TorBox, then SERVE)
 ///     BEFORE the Direct-links-only filter. Without this merge, a TorBox-primary user's batch would
 ///     skip every episode a manual tap finds. SERVE only: the HOARD contribution stays on the
 ///     interactive surfaces.
@@ -149,7 +149,7 @@ final class BatchDownloadCoordinator: ObservableObject {
     private let sourceIndex = SourceIndexServeSource()
     /// The series whose contributors were last refreshed, so the refresh fires once per series, not
     /// per episode (both clients also dedup internally; this keeps the intent explicit).
-    private var contributorSeriesKey: String?
+    private var contributorTarget: SourceIndexIdentity.TargetResolution?
 
     /// Pending one-shot failure swaps, keyed by the DownloadRecord id the batch queued (#119 remainder). An
     /// entry is registered ONLY when a distinct next-best source exists, and is CONSUMED on the first swap
@@ -280,10 +280,9 @@ final class BatchDownloadCoordinator: ObservableObject {
         // The episode ACTUALLY being resolved supplies the current-video role, so the key this batch
         // publishes under is the same key the manual episode page would use.
         let roles = job.identityRoles.selecting(currentVideoID: job.video.id)
-        let contentID = SourceIndexClient.contentID(roles: roles, season: season, episode: episode)
-        let target = contentID ?? "meta:\(job.seriesId)|video:\(job.video.id)"
-        guard target != contributorSeriesKey else { return }
-        contributorSeriesKey = target
+        let target = SourceIndexIdentity.publicationTarget(roles, season: season, episode: episode)
+        guard target != contributorTarget else { return }
+        contributorTarget = target
         // Reset FIRST, unconditionally: this also closes the valid-id window where the previous
         // series' streams linger until the new series' own fetch lands (Singularity does not clear
         // on a content-id change until its fetch returns).
@@ -294,11 +293,10 @@ final class BatchDownloadCoordinator: ObservableObject {
         // special silently lost both contributor pools. The coordinates still have to be COMPLETE: a
         // half-resolved pair is refused rather than widened to the show, which is what `contentID != nil`
         // already enforces one level down.
-        guard let season, season >= 0, let episode, episode >= 0, contentID != nil else { return }
-        torboxSearch.refresh(imdbId: SourceIndexIdentity.resolve(roles).titleID,
-                             season: season, episode: episode)
-        sourceIndex.refresh(contentID: contentID,
-                            isSignedIn: VortXSyncManager.shared.isSignedIn)
+        AuxiliarySourcePipeline.refresh(
+            target: target, torBox: torboxSearch, sourceIndex: sourceIndex,
+            isSignedIn: VortXSyncManager.shared.isSignedIn
+        )
     }
 
     /// The per-episode pipeline, mirroring the manual episode page step for step (load + settle with
@@ -322,18 +320,23 @@ final class BatchDownloadCoordinator: ObservableObject {
         }
         // Only load when this episode's streams aren't already resident (the user just had its source page
         // open): less churn on the shared meta slot, identical result.
+        let settlementStartedAt = Date()
         if core.streamGroups(forStreamId: job.video.id).isEmpty { assertEpisodeLoad() }
         var groups: [CoreStreamSourceGroup] = []
-        var firstPlayableAt: Date? = nil
         var lastAssertAt = Date()
-        for _ in 0 ..< 80 {                                // ~20s ceiling, matching the episode page
+        while true {
             if Task.isCancelled { return .cancelled }
             // The manual `displayGroups` composition: TorBox search merged first, the community pool
             // second, THEN the Direct-links-only filter, so a search/pool torrent obeys the same rule
             // as an add-on's. Re-merged every iteration so contributor results landing mid-settle count.
-            groups = iOSDisplayGroups(
-                sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups(forStreamId: job.video.id))))
-            if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
+            groups = iOSDisplayGroups(AuxiliarySourcePipeline.merged(
+                into: core.streamGroups(forStreamId: job.video.id),
+                target: SourceIndexIdentity.publicationTarget(
+                    job.identityRoles.selecting(currentVideoID: job.video.id),
+                    season: job.video.season, episode: job.video.episode
+                ),
+                torBox: torboxSearch, sourceIndex: sourceIndex
+            ))
             let progress = core.streamLoadProgress(forStreamId: job.video.id)
             // The engine has registered NO loadable for this episode (total == 0) and nothing is resident:
             // the shared slot never actually switched to this episode (the #142 race). Re-assert the load,
@@ -344,10 +347,11 @@ final class BatchDownloadCoordinator: ObservableObject {
                 lastAssertAt = Date()
                 assertEpisodeLoad()
             }
-            let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
+            let elapsed = Date().timeIntervalSince(settlementStartedAt)
             if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                            secondsSinceFirstPlayable: elapsed,
+                                            secondsSinceRequestStart: elapsed,
                                             rememberedQuality: job.continuity) { break }
+            if elapsed >= StreamRanking.completeSetDeadline { break }
             try? await Task.sleep(for: .milliseconds(250))
         }
         guard let best = StreamRanking.best(groups, continuity: job.continuity, pin: job.pin,
@@ -428,8 +432,7 @@ final class BatchDownloadCoordinator: ObservableObject {
     /// the swap window leaves the original failed row on disk to retry from, never a vanished episode.
     private func performRetrySwap(failedRecordID id: UUID, plan: RetryPlan) {
         guard retryPlans.removeValue(forKey: id) != nil else { return }   // already swapped: one swap per episode
-        Task { @MainActor [weak self] in
-            guard let self else { return }
+        Task { @MainActor in
             let resolved: URL?
             if plan.alternate.url == nil, plan.episode == nil {
                 resolved = nil
@@ -466,7 +469,7 @@ final class BatchDownloadCoordinator: ObservableObject {
         pending = []
         plannedBySeries = [:]
         startedBySeries = [:]
-        contributorSeriesKey = nil
+        contributorTarget = nil
         statusText = nil
         runningSeriesIds = []
         remainingBySeries = [:]

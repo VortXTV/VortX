@@ -71,3 +71,55 @@ enum AudioOutputMode: String, CaseIterable {
         }
     }
 }
+
+/// The bounded AVAudioSession request and the mpv layout it resolves to. The maximum channel
+/// count tells us what may be requested; the realized count tells us what the active route can
+/// play now. Keeping those facts separate avoids handing a currently stereo TV route a 5.1 layout.
+enum AudioRoutePolicy {
+    static func supportsMultichannelContent(
+        mode: AudioOutputMode,
+        maximumOutputChannels: Int,
+        routeIsStereoOnly: Bool,
+        routeIsAirPods: Bool
+    ) -> Bool {
+        mode != .stereo
+            && !routeIsStereoOnly
+            && (routeIsAirPods || maximumOutputChannels > 2)
+    }
+
+    static func preferredOutputChannels(
+        mode: AudioOutputMode,
+        maximumOutputChannels: Int,
+        routeIsStereoOnly: Bool,
+        routeIsAirPods: Bool
+    ) -> Int {
+        guard supportsMultichannelContent(
+            mode: mode,
+            maximumOutputChannels: maximumOutputChannels,
+            routeIsStereoOnly: routeIsStereoOnly,
+            routeIsAirPods: routeIsAirPods
+        ) else {
+            return 2
+        }
+        return min(max(maximumOutputChannels, 2), 8)
+    }
+
+    static func resolvedOutputChannels(_ outputChannels: Int) -> Int {
+        max(outputChannels, 2)
+    }
+
+    static func channelPolicy(
+        mode: AudioOutputMode,
+        actualOutputChannels: Int,
+        routeIsStereoOnly: Bool,
+        routeIsAirPods: Bool
+    ) -> String {
+        if routeIsAirPods, mode != .stereo { return "auto-safe" }
+        if routeIsStereoOnly { return "stereo" }
+        switch mode {
+        case .stereo: return "stereo"
+        case .surround, .passthrough: return "auto"
+        case .auto: return resolvedOutputChannels(actualOutputChannels) > 2 ? "auto-safe" : "stereo"
+        }
+    }
+}

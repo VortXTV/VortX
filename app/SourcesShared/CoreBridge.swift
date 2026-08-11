@@ -18,6 +18,14 @@ final class CoreBridge: ObservableObject {
     @Published private(set) var continueWatching: [CoreCWItem] = []
     @Published private(set) var boardRows: [CoreBoardRow] = []
     @Published private(set) var metaDetails: CoreMetaDetails?
+    /// Request-owned terminal refresh receipt. Unlike a global meta event count, this can only be populated
+    /// by the exact two-phase Apple CW refresh that invalidated the resident meta and then settled its own
+    /// Load generation. This is a request-completion receipt, not a full-series completeness proof.
+    /// Main-queue writes only.
+    private(set) var appleCWMetaRefreshReceipt: AppleCWMetaRefreshReceipt?
+    /// The exact settled payload paired with `appleCWMetaRefreshReceipt`. Players consume this snapshot,
+    /// not a later global `metaDetails` re-emit that might belong to another source/progress event.
+    private(set) var appleCWMetaRefreshDetails: CoreMetaDetails?
     /// Monotonic epoch of the READY-STREAM SET for the loaded meta. Bumps ONLY when the coalesced
     /// `meta_details` republish actually changed the loaded meta id or the per-group ready-stream
     /// signature (or on an explicit load/unload that cleared it), never on a library/progress-only
@@ -35,6 +43,12 @@ final class CoreBridge: ObservableObject {
     /// Raw addon descriptors keyed by transportUrl, kept so we can round-trip a full Descriptor back
     /// to the engine for UninstallAddon (which takes the whole descriptor, not just a URL).
     private var rawAddonsByUrl: [String: [String: Any]] = [:]
+
+    /// Short-lived cache of a manifest preview so QR preview -> confirmed install uses the same guarded
+    /// response instead of fetching a mutable/remote URL twice. The cache is consume-once and bounded.
+    private var manifestPreviewCache: [String: (manifest: [String: Any], canonicalURL: String, fetchedAt: Date)] = [:]
+    private static let manifestCacheTTL: TimeInterval = 60
+    private static let manifestCacheCap = 64
     private var started = false
     /// Coalesces the Home-board rebuild. The engine emits a BURST of `board` events during launch and while a
     /// catalog page lands (one per catalog settling), and each event used to trigger a full `buildBoardRows()`
@@ -55,6 +69,21 @@ final class CoreBridge: ObservableObject {
     /// inside the in-player 20s / 250ms poll), so next-episode / binge is unaffected. Touched only on main.
     private var metaDetailsWork: DispatchWorkItem?
     private static let metaDetailsDebounce: TimeInterval = 0.09
+    private struct AppleCWMetaRefreshRequest {
+        enum Phase {
+            case awaitingInvalidation
+            case awaitingLoadSettlement
+        }
+
+        let generation: Int
+        let type: String
+        let libraryID: String
+        let streamType: String?
+        let streamID: String
+        var phase: Phase
+    }
+    private var appleCWMetaRefreshGeneration = 0
+    private var appleCWMetaRefreshRequest: AppleCWMetaRefreshRequest?
     /// True while we're seeding the engine from the old app's authKey and waiting for the user fetch.
     private var awaitingAuthMigration = false
     /// Set while a profile account switch is in flight: the uid we're leaving (nil = was signed out).
@@ -300,89 +329,189 @@ final class CoreBridge: ObservableObject {
         }
     }
 
-    /// Install an add-on from its manifest URL. Stremio add-on URLs ARE the manifest.json URL; we fetch
-    /// it, build the full Descriptor the engine's InstallAddon action expects (mirroring UninstallAddon's
-    /// contract), and dispatch it. The engine's ctx event then refreshes `addons`. Returns a user-facing
-    /// error string on failure, nil on success.
-    /// Normalize a pasted add-on URL the way installAddon does (trim + ensure a /manifest.json suffix),
-    /// so AddonsView can detect an already-installed URL and offer to UPDATE it instead of erroring.
-    /// Nil if it is not a valid http(s) URL.
+    /// Normalize a pasted add-on URL using the shared query/fragment-safe canonical identity rule.
     func normalizedAddonURL(_ urlString: String) -> String? {
-        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard var url = URL(string: trimmed), let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else { return nil }
-        if !url.absoluteString.lowercased().hasSuffix("manifest.json") {
-            url = url.appendingPathComponent("manifest.json")
-        }
-        return url.absoluteString
+        canonicalAddonIdentity(urlString)
     }
 
+    /// Legacy facade: nil means the engine has confirmed the add-on, while the typed path below carries
+    /// already-installed/retryability information for QR acknowledgements.
     @MainActor
     func installAddon(urlString: String, replacingExisting: Bool = false) async -> String? {
-        guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else {
-            return "Enter a valid add-on URL (https://…/manifest.json)."
-        }
-        let alreadyInstalled = addons.contains(where: { $0.transportUrl == normalized })
-        if alreadyInstalled, !replacingExisting { return "That add-on is already installed." }
-        // SSRF guard: fetch through AddonURLGuard, which validates the host + every RESOLVED address (and each
-        // redirect hop) against the private/loopback/link-local/CGNAT/ULA ranges and refuses a private target.
-        // A pasted or QR-relayed URL can never point the install fetch at 127.0.0.1 / a LAN service / a cloud
-        // metadata endpoint. Fail-closed for private targets; normal public manifests are unaffected.
-        switch await AddonURLGuard.fetch(url) {
-        case .failure(let rejection):
-            return rejection.message
-        case .success(let (data, _)):
-            guard let manifest = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  manifest["id"] != nil, manifest["name"] != nil else {
-                return "That URL did not return a valid add-on manifest."
-            }
-            // Update in place: drop the existing descriptor ONLY now that the new manifest is fetched +
-            // validated, so a flaky fetch / bad manifest can never leave the user with NEITHER the old nor
-            // the new add-on (the install-first invariant the Change-URL path also holds). The engine
-            // processes Uninstall before Install, so the freshly-fetched manifest replaces the old one.
-            if alreadyInstalled, let existing = rawAddonsByUrl[normalized] {
-                dispatchCtx(["action": "UninstallAddon", "args": existing])
-            }
-            // An EXPLICIT install supersedes any prior removal tombstone for this URL: clear it so the
-            // freshly-installed add-on is not instantly re-uninstalled by refreshAddons' tombstone
-            // enforcement, and so the next sync push stops carrying the stale removal in the account doc.
-            // A genuine fresh install of a previously-deleted add-on therefore works on every device.
-            AddonTombstones.forget(url.absoluteString)
-            let descriptor: [String: Any] = [
-                "transportUrl": url.absoluteString,
-                "manifest": manifest,
-                "flags": ["official": false, "protected": false],
-            ]
-            dispatchCtx(["action": "InstallAddon", "args": descriptor])
+        switch await installAddonConfirmed(urlString: urlString, replacingExisting: replacingExisting) {
+        case .installed, .alreadyInstalled:
             return nil
+        case .failed(_, let message):
+            return message
         }
     }
 
-    /// Result of validating a pasted / QR-relayed manifest URL WITHOUT installing it. Used by the
-    /// Install-by-QR pairing view to show "Install <name>?" and to know whether a URL is already
-    /// installed, using the SAME fetch + validation `installAddon` performs (same normalization, same
-    /// 200 + `id`/`name` manifest check). This never mutates engine state; `installAddon` stays the
-    /// one and only installer, so its validation is not bypassed or weakened.
+    /// Single hardened installer used by QR. It does not report success at dispatch time: the engine roster
+    /// must contain the expected descriptor first. A timeout is retryable and leaves the previous replacement
+    /// intact when the new manifest never confirms.
+    @MainActor
+    func installAddonConfirmed(urlString: String, replacingExisting: Bool = false) async -> AddonInstallOutcome {
+        guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else {
+            return .failed(retryable: false, message: "Enter a valid add-on URL (https://…/manifest.json).")
+        }
+        if addons.contains(where: { $0.transportUrl == normalized }), !replacingExisting {
+            return .alreadyInstalled
+        }
+
+        let manifest: [String: Any]
+        let identity: String
+        if let cached = takeCachedManifest(normalized) {
+            manifest = cached.manifest
+            identity = cached.canonicalURL
+        } else {
+            switch await AddonURLGuard.fetch(url) {
+            case .failure(let rejection):
+                return .failed(retryable: Self.isRetryable(rejection), message: rejection.message)
+            case .success(let (data, finalURL)):
+                guard let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                      Self.hasNonEmptyIdentity(parsed) else {
+                    return .failed(retryable: false, message: "That URL did not return a valid add-on manifest.")
+                }
+                manifest = parsed
+                identity = normalizedAddonURL(finalURL.absoluteString) ?? normalized
+            }
+        }
+        guard let identityURL = URL(string: identity) else {
+            return .failed(retryable: false, message: "That URL did not return a valid add-on manifest.")
+        }
+
+        // A redirect can land on an already-installed identity different from the submitted URL.
+        let replacing = addons.contains(where: { $0.transportUrl == identity })
+        if replacing, !replacingExisting { return .alreadyInstalled }
+        let previousManifest: [String: Any]? = replacing
+            ? (rawAddonsByUrl[identity]?["manifest"] as? [String: Any]) : nil
+        if replacing, let existing = rawAddonsByUrl[identity] {
+            dispatchCtx(["action": "UninstallAddon", "args": existing])
+        }
+
+        // The descriptor is installed under the guarded final identity, never the unvalidated redirect source.
+        let descriptor: [String: Any] = [
+            "transportUrl": identityURL.absoluteString,
+            "manifest": manifest,
+            "flags": ["official": false, "protected": false],
+        ]
+        dispatchCtx(["action": "InstallAddon", "args": descriptor])
+
+        guard await awaitAddonInstalled(identity, replacingManifest: previousManifest, expectedManifest: manifest) else {
+            return .failed(retryable: true, message: "Install did not confirm. Check your connection and try again.")
+        }
+        // Only a confirmed install clears a prior removal tombstone. A dropped/unconfirmed dispatch must not
+        // mutate durable cross-device removal authority.
+        AddonTombstones.forget(identityURL.absoluteString)
+        return .installed
+    }
+
     struct AddonManifestPreview: Equatable {
         let normalizedURL: String
         let name: String
         let alreadyInstalled: Bool
     }
 
-    /// Fetch + validate a manifest URL the way `installAddon` does, returning its name (for a confirm
-    /// prompt) without installing. Returns nil when the URL is invalid or the manifest fails validation.
-    /// The actual install still goes through `installAddon`, which re-fetches and re-validates.
+    /// Typed preview used by the durable QR reducer. It caches a guarded, final-redirect identity for the
+    /// following install, while the legacy optional facade below preserves existing callers' behavior.
+    @MainActor
+    func previewAddonManifestResult(urlString: String) async -> AddonPreviewOutcome {
+        guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else {
+            return .rejected(retryable: false, message: "Enter a valid add-on URL (https://…/manifest.json).")
+        }
+        switch await AddonURLGuard.fetch(url) {
+        case .failure(let rejection):
+            return .rejected(retryable: Self.isRetryable(rejection), message: rejection.message)
+        case .success(let (data, finalURL)):
+            guard let manifest = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let name = manifest["name"] as? String, !name.isEmpty,
+                  Self.hasNonEmptyIdentity(manifest) else {
+                return .rejected(retryable: false, message: "That URL did not return a valid add-on manifest.")
+            }
+            let identity = normalizedAddonURL(finalURL.absoluteString) ?? normalized
+            storeCachedManifest(normalized, manifest: manifest, canonicalURL: identity)
+            let alreadyInstalled = addons.contains { $0.transportUrl == normalized || $0.transportUrl == identity }
+            return alreadyInstalled ? .alreadyInstalled(name: name) : .ready(name: name)
+        }
+    }
+
+    /// Existing optional preview facade; QR uses `previewAddonManifestResult` to preserve retryability.
     @MainActor
     func previewAddonManifest(urlString: String) async -> AddonManifestPreview? {
-        guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else { return nil }
-        let alreadyInstalled = addons.contains(where: { $0.transportUrl == normalized })
-        // SSRF guard: same private-address gate `installAddon` uses (the QR confirm resolves the name here),
-        // so a manifest URL pointing at a private/loopback/LAN address never even previews. Fail-soft to nil.
-        guard case let .success((data, _)) = await AddonURLGuard.fetch(url),
-              let manifest = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              manifest["id"] != nil,
-              let name = manifest["name"] as? String, !name.isEmpty else { return nil }
-        return AddonManifestPreview(normalizedURL: normalized, name: name, alreadyInstalled: alreadyInstalled)
+        switch await previewAddonManifestResult(urlString: urlString) {
+        case let .ready(name):
+            guard let normalized = normalizedAddonURL(urlString) else { return nil }
+            return AddonManifestPreview(normalizedURL: normalized, name: name, alreadyInstalled: false)
+        case let .alreadyInstalled(name):
+            guard let normalized = normalizedAddonURL(urlString) else { return nil }
+            return AddonManifestPreview(normalizedURL: normalized, name: name, alreadyInstalled: true)
+        case .rejected:
+            return nil
+        }
+    }
+
+    private static func hasNonEmptyIdentity(_ manifest: [String: Any]) -> Bool {
+        guard let id = manifest["id"] as? String, !id.isEmpty,
+              let name = manifest["name"] as? String, !name.isEmpty else { return false }
+        return true
+    }
+
+    @MainActor
+    private func awaitAddonInstalled(_ identity: String,
+                                     replacingManifest: [String: Any]?,
+                                     expectedManifest: [String: Any]?,
+                                     timeout: TimeInterval = 6) async -> Bool {
+        if confirmedInstalled(identity, replacingManifest: replacingManifest, expectedManifest: expectedManifest) {
+            return true
+        }
+        let stepNanos: UInt64 = 100_000_000
+        let deadlineNanos = UInt64(timeout * 1_000_000_000)
+        var elapsed: UInt64 = 0
+        while elapsed < deadlineNanos, !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: stepNanos)
+            if confirmedInstalled(identity, replacingManifest: replacingManifest, expectedManifest: expectedManifest) {
+                return true
+            }
+            elapsed += stepNanos
+        }
+        return confirmedInstalled(identity, replacingManifest: replacingManifest, expectedManifest: expectedManifest)
+    }
+
+    @MainActor
+    private func confirmedInstalled(_ identity: String,
+                                    replacingManifest: [String: Any]?,
+                                    expectedManifest: [String: Any]?) -> Bool {
+        guard addons.contains(where: { $0.transportUrl == identity }) else { return false }
+        guard replacingManifest != nil, let expectedManifest else { return true }
+        guard let published = rawAddonsByUrl[identity]?["manifest"] as? [String: Any] else { return false }
+        return NSDictionary(dictionary: published).isEqual(to: expectedManifest)
+    }
+
+    private static func isRetryable(_ rejection: AddonURLGuard.Rejection) -> Bool {
+        switch rejection {
+        case .unresolvable: return true
+        case .invalidScheme, .privateAddress, .tooManyRedirects: return false
+        }
+    }
+
+    @MainActor
+    private func takeCachedManifest(_ normalizedURL: String) -> (manifest: [String: Any], canonicalURL: String)? {
+        guard let cached = manifestPreviewCache.removeValue(forKey: normalizedURL) else { return nil }
+        guard Date().timeIntervalSince(cached.fetchedAt) < Self.manifestCacheTTL else { return nil }
+        return (cached.manifest, cached.canonicalURL)
+    }
+
+    @MainActor
+    private func storeCachedManifest(_ normalizedURL: String, manifest: [String: Any], canonicalURL: String) {
+        let now = Date()
+        manifestPreviewCache = manifestPreviewCache.filter {
+            now.timeIntervalSince($0.value.fetchedAt) < Self.manifestCacheTTL
+        }
+        if manifestPreviewCache.count >= Self.manifestCacheCap,
+           let oldest = manifestPreviewCache.min(by: { $0.value.fetchedAt < $1.value.fetchedAt })?.key {
+            manifestPreviewCache.removeValue(forKey: oldest)
+        }
+        manifestPreviewCache[normalizedURL] = (manifest, canonicalURL, now)
     }
 
     /// True when the engine has NO stream-capable add-on installed (every title would report "no
@@ -1045,6 +1174,79 @@ final class CoreBridge: ObservableObject {
 
     // MARK: Meta details
 
+    private func metaLoadAction(type: String, id: String,
+                                streamType: String?, streamId: String?) -> [String: Any] {
+        var args: [String: Any] = [
+            "metaPath": ["resource": "meta", "type": type, "id": id, "extra": []],
+            "guessStream": true,
+        ]
+        if let streamType, let streamId {
+            args["streamPath"] = [
+                "resource": "stream", "type": streamType, "id": streamId, "extra": []
+            ]
+        } else {
+            args["streamPath"] = NSNull()
+        }
+        return ["action": "Load", "args": ["model": "MetaDetails", "args": args]]
+    }
+
+    /// Begin the Apple terminal-finality refresh with an explicit invalidation phase. A resident same-ID
+    /// payload is cleared and unloaded first; only a later non-ready invalidation receipt is permitted to
+    /// issue this request's exact Load. The returned generation is the only generation whose later terminal
+    /// receipt can certify completion for this exact stream request; full-series/finality authority remains
+    /// a separate policy decision.
+    func beginAppleCWAuthoritativeMetaRefresh(type: String, id: String,
+                                               streamType: String?, streamId: String) -> Int {
+        appleCWMetaRefreshGeneration &+= 1
+        let generation = appleCWMetaRefreshGeneration
+        appleCWMetaRefreshRequest = AppleCWMetaRefreshRequest(
+            generation: generation,
+            type: type,
+            libraryID: id,
+            streamType: streamType,
+            streamID: streamId,
+            phase: .awaitingInvalidation
+        )
+        appleCWMetaRefreshReceipt = nil
+        appleCWMetaRefreshDetails = nil
+        metaDetailsWork?.cancel()
+        metaDetailsWork = nil
+        let hadDetails = metaDetails != nil
+        metaDetails = nil
+        if hadDetails { streamsEpoch &+= 1 }
+        dispatch(action: ["action": "Unload"], field: "meta_details")
+        return generation
+    }
+
+    /// Cancel a pending Apple terminal refresh when ordinary navigation or player teardown takes ownership
+    /// of the shared meta slot. A stale polling Task may return harmlessly, but its bridge request must also
+    /// be unable to dispatch a late Load into the newer target.
+    func cancelAppleCWMetaRefresh() {
+        guard let generation = appleCWMetaRefreshRequest?.generation else {
+            appleCWMetaRefreshReceipt = nil
+            appleCWMetaRefreshDetails = nil
+            return
+        }
+        _ = cancelAppleCWMetaRefresh(generation: generation)
+    }
+
+    /// Cancel only the request owned by one player generation. A view replacement can call this after its
+    /// successor has already started a same-title refresh, so a mismatched generation must be a no-op and
+    /// must not cancel the replacement's pending coalesced republish or exact Load.
+    @discardableResult
+    func cancelAppleCWMetaRefresh(generation: Int) -> Bool {
+        guard AppleCWMetaRefreshGenerationFence.owns(
+            capturedGeneration: generation,
+            activeGeneration: appleCWMetaRefreshRequest?.generation
+        ) else { return false }
+        metaDetailsWork?.cancel()
+        metaDetailsWork = nil
+        appleCWMetaRefreshRequest = nil
+        appleCWMetaRefreshReceipt = nil
+        appleCWMetaRefreshDetails = nil
+        return true
+    }
+
     /// Scoped observations for detail recovery. Keeping these behind the bridge preserves the detail
     /// screens' one-read identity contract while still fencing terminal and canonical-ready state to
     /// the engine selection that owns it.
@@ -1065,16 +1267,9 @@ final class CoreBridge: ObservableObject {
     /// Load a title's meta + streams. For a series episode, pass the episode's video id as the stream
     /// path so the engine fetches that episode's streams.
     func loadMeta(type: String, id: String, streamType: String? = nil, streamId: String? = nil) {
-        var args: [String: Any] = [
-            "metaPath": ["resource": "meta", "type": type, "id": id, "extra": []],
-            "guessStream": true,
-        ]
-        if let streamType, let streamId {
-            args["streamPath"] = ["resource": "stream", "type": streamType, "id": streamId, "extra": []]
-        } else {
-            args["streamPath"] = NSNull()
-        }
-        dispatch(action: ["action": "Load", "args": ["model": "MetaDetails", "args": args]], field: "meta_details")
+        cancelAppleCWMetaRefresh()
+        dispatch(action: metaLoadAction(type: type, id: id, streamType: streamType, streamId: streamId),
+                 field: "meta_details")
         // If the engine already had this exact meta loaded, ActionLoad is a no-op (eq_update) and no
         // meta_details NewState fires, so the page would stick on the spinner. Read the current state:
         // keep it when the requested meta is already ready, otherwise clear to the spinner until it loads.
@@ -1091,6 +1286,7 @@ final class CoreBridge: ObservableObject {
     }
 
     func unloadMeta() {
+        cancelAppleCWMetaRefresh()
         dispatch(action: ["action": "Unload"], field: "meta_details")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -1213,6 +1409,21 @@ final class CoreBridge: ObservableObject {
             }
         }
         return (loaded, total)
+    }
+
+    /// Registration-aware raw contributor state for SourceListModel's complete-set receipt. `total == 0`
+    /// alone is ambiguous: it is both the brief pre-registration window and the legitimate shape of an
+    /// auxiliary-only install. Once the current meta selection is resident, an installed profile with no
+    /// stream resource is known inactive; otherwise zero remains pending until registration or the deadline.
+    @MainActor
+    func streamContributorSettlement(metaId: String, streamId: String?) -> SourceContributorSettlement {
+        let progress = streamId.map { streamLoadProgress(forStreamId: $0) } ?? streamLoadProgress()
+        if progress.total > 0 {
+            return progress.loaded >= progress.total ? .terminal : .pending
+        }
+        guard let details = metaDetails,
+              details.selectedMetaID == metaId || details.meta?.id == metaId else { return .pending }
+        return addons.contains(where: \.providesStreams) ? .pending : .inactive
     }
 
     /// Per-add-on stream-resolution state for the loaded title, read from the RAW engine JSON so it
@@ -1611,12 +1822,13 @@ final class CoreBridge: ObservableObject {
     /// title watched to the end, marked watched, or finished on another device and synced down keeps a
     /// non-zero offset and sits in the rail forever. `finishedWatching` (the runtime rewind) only fires from
     /// a local play-to-EOF, so it never catches the marked-watched or watched-elsewhere cases. Filtering
-    /// here at the data layer is the single backstop that covers all of them for every surface (tvOS Home
-    /// and iOS/Mac both render `continueWatching` directly), so no view needs to change. `CoreCWItem.isFinished`
-    /// defines "finished" per type (movies: watched-flag or >= 0.9 progress; series: current episode >= 0.9,
-    /// so a mid-series roll-forward with a fresh low-progress episode is preserved).
+    /// here at the data layer is the single movie backstop that covers all of them for every surface (tvOS Home
+    /// and iOS/Mac both render `continueWatching` directly). Series membership is owned by the engine/account
+    /// or active overlay profile, so app-side progress never removes a series entry.
     static func pruneFinished(_ items: [CoreCWItem]) -> [CoreCWItem] {
-        items.filter { !$0.isFinished }
+        items.filter {
+            EpisodePlaybackIdentity.usesSeriesLifecycle(type: $0.type) || !$0.isFinished
+        }
     }
 
     /// Recompute + publish the owner Continue Watching rail as the engine's own `continue_watching_preview`
@@ -1722,10 +1934,11 @@ final class CoreBridge: ObservableObject {
         return engine + pruneFinished(synthesized)
     }
 
-    /// Drop a finished title (a movie, or the last episode of a series) out of Continue Watching by
-    /// rewinding its saved position to zero. `is_in_continue_watching()` is just `time_offset > 0`, so a
-    /// title finished at its end position would otherwise linger forever. Rewind keeps the library entry
-    /// (still marked watched) and its new-episode notifications, unlike a full removal.
+    /// Drop a finished movie, or honor an explicit owner/profile finish action, by rewinding its saved
+    /// position to zero. Apple terminal series paths do not call this from inferred metadata because
+    /// `CoreMetaDetails` has no completeness marker; engine/account state owns genuine final-series removal.
+    /// `is_in_continue_watching()` is just `time_offset > 0`, so a movie at its end position would otherwise
+    /// linger forever. Rewind keeps the library entry and its new-episode notifications, unlike full removal.
     func finishedWatching(libraryId: String) {
         guard ProfileStore.shared.activeUsesEngineHistory else {
             ProfileStore.shared.finishedWatching(metaId: libraryId)   // overlay profile
@@ -1951,7 +2164,15 @@ final class CoreBridge: ObservableObject {
         // A torrent is identified by the full (infoHash,fileIdx) pair. Falling back to an arbitrary ready
         // torrent after an exact miss can bind a different episode from the same season pack. Direct sources
         // keep the historical fallback because proxy/reconstruction can legitimately obscure their URL.
-        if rawStream == nil, !stream.isTorrent, !stream.isUsenet {
+        // A3: that wrong-episode risk exists ONLY for an episodic title. A movie has a single video, so an
+        // arbitrary ready torrent cannot be the "wrong episode"; skipping the fallback for a movie whose picked
+        // source is a torrent-origin debrid link (isTorrent==true, plays via a direct RD URL) just left it with
+        // no library item, so CW + progress stopped tracking after a suspend / re-resolve. Gate the skip on the
+        // episodic context, not the source type, so a movie always binds while an episode keeps the guard.
+        let titleIsEpisode = EpisodePlaybackIdentity.isEpisodicContext(
+            type: metaType, season: nil, episode: nil, videoID: metaPath?["id"] as? String ?? ""
+        )
+        if rawStream == nil, !(titleIsEpisode && (stream.isTorrent || stream.isUsenet)) {
             rawStream = firstReadyStream
             streamRequest = firstReadyRequest
         }
@@ -2071,6 +2292,9 @@ final class CoreBridge: ObservableObject {
     /// Player). Call ONLY from a player cover's onClose, never a load path. Mirrors `unloadMeta`.
     func unloadEnginePlayer() {
         dispatch(action: ["action": "Unload"], field: "player")
+        // A10-i: reset the probe's player fields at this definitive teardown. They otherwise freeze at their
+        // last live values, so the heartbeat kept reporting player=playing for minutes after playback ended.
+        VXProbeState.shared.clearPlayer()
     }
 
     private func streamMatches(_ raw: [String: Any], _ stream: CoreStream, isEpisode: Bool) -> Bool {
@@ -2219,6 +2443,12 @@ final class CoreBridge: ObservableObject {
         guard name == "NewState", let fields = object["args"] as? [String] else {
             return // "CoreEvent" (auth results, errors, …) handled in a later step.
         }
+        // Did ANY branch below actually republish (or schedule a republish)? `revision` is the coarse "the
+        // engine changed something" signal every screen observes, and it used to bump on every NewState even
+        // when each per-field guard had suppressed its own work: the engine re-announces `discover` (and
+        // friends) as changed on every library tick for free, so an idle device woke every `revision` observer
+        // several times a minute to re-render identical state. Bump only when something was really published.
+        var published = false
 
         // Legacy authKey migration + account-switch completion both depend on `ctx` landing while logged in.
         // Their state (awaitingAuthMigration, switchInFlight, switchFromUID) is ALSO written on the MAIN thread
@@ -2249,17 +2479,20 @@ final class CoreBridge: ObservableObject {
             // Publish the engine preview UNIONED with the OwnerResumeStore recovery, not the bare preview, so a
             // migrated / cold device (whose preview is empty at time 0) still fills the rail (#149).
             rebuildContinueWatching()
+            published = true
         }
         // The board needs ctx (addon manifests) for row titles, so rebuild on either change. Coalesced: a
         // launch/page-land burst of `board` events collapses into a single trailing rebuild instead of N
         // full decodes + republishes (the on-open lag). The rebuild itself still decodes off-main.
         if fields.contains("board") || fields.contains("ctx") {
             scheduleBoardRebuild()   // [engine] board row count is logged there (coalesced, one per burst)
+            published = true
         }
         if fields.contains("ctx") {
             VXProbe.log("engine", "ctx/settings changed addons=\(decode(CoreCtx.self, field: "ctx")?.profile.addons.count ?? 0)")
             DispatchQueue.main.async { [weak self] in self?.addonNamesCache = nil }   // addon set changed → rebuild name map
             refreshAddons()
+            published = true
             // MID-SEARCH RE-PLAN. A profile/addon change mid-search runs `Internal::ProfileChanged`, which
             // in `catalogs_with_extra.rs` calls `catalogs_update(..., range: None, ...)`: every planned
             // catalog still parked at a nil content is re-seeded to a nil content again WITH NO fetch
@@ -2277,6 +2510,7 @@ final class CoreBridge: ObservableObject {
             // 1757-stream decode used to run on this worker thread on every re-emit; now it runs once per
             // burst, and the diff drops the republish when nothing the UI / streamGroups needs has changed.
             scheduleMetaDetailsRepublish()
+            published = true
         }
         if fields.contains("discover") {
             // NO-OP SUPPRESSION. The engine re-announces `discover` as changed on every LibraryChanged for
@@ -2305,6 +2539,7 @@ final class CoreBridge: ObservableObject {
                 // ordinary idle re-announce (in flight false) is still suppressed, which is the whole point.
                 if fingerprint != discoverPublishedFingerprint || discoverPageInFlight {
                     discoverPublishedFingerprint = fingerprint
+                    published = true
                     let value: CoreDiscover?
                     do { value = try Self.decoder.decode(CoreDiscover.self, from: data) }
                     catch { NSLog("%@", "[CoreBridge] decode discover failed: \(error)"); value = nil }
@@ -2338,6 +2573,7 @@ final class CoreBridge: ObservableObject {
             let value = decode(CoreLibrary.self, field: "library")
             VXProbe.log("engine", "library changed n=\(value?.catalog.count ?? 0)")
             DispatchQueue.main.async { [weak self] in self?.library = value }
+            published = true
             // A library change can change which owner titles belong in Continue Watching: the cold-recovery
             // re-add lands at time 0 and NEVER fires a continue_watching_preview event, and a newly-synced
             // offset (refreshOwnerResumeCache) can qualify a title. Rebuild the rail from the engine preview
@@ -2415,6 +2651,7 @@ final class CoreBridge: ObservableObject {
             var seen = Set<String>(); var unique: [CoreMeta] = []
             for item in items where seen.insert(item.id).inserted { unique.append(item) }
             VXProbe.log("engine", "search changed results=\(unique.count) loading=\(hasLoadingPages)")
+            published = true
             DispatchQueue.main.async { [weak self] in
                 self?.searchIsLoading = hasLoadingPages
                 if !hasLoadingPages || !unique.isEmpty {
@@ -2425,12 +2662,17 @@ final class CoreBridge: ObservableObject {
         if fields.contains("local_search") {
             let value = decode(CoreLocalSearchState.self, field: "local_search")
             DispatchQueue.main.async { [weak self] in self?.searchSuggestions = value?.searchResults ?? [] }
+            published = true
         }
 
+        // `changedFields` is written unconditionally (it describes the newest event, and it is not
+        // @Published so writing it invalidates nothing); only the bump is gated. Observers read the set in
+        // reaction to the bump, so the two stay consistent: a suppressed event published nothing for anyone
+        // to read. WatchedIndex's fields (ctx / library / continue_watching_preview) all mark published.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.changedFields = Set(fields)
-            self.revision &+= 1
+            if published { self.revision &+= 1 }
         }
     }
 
@@ -2448,6 +2690,7 @@ final class CoreBridge: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.metaDetailsWork?.cancel()
+            let refreshGenerationAtSchedule = self.appleCWMetaRefreshRequest?.generation
             let work = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -2463,6 +2706,13 @@ final class CoreBridge: ObservableObject {
                     }
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
+                        // The decoded payload belongs to the request generation that was active when this
+                        // debounce work was scheduled. If teardown cancelled that generation, or a
+                        // replacement player installed another one, discard the stale work before it can
+                        // republish meta or drive the replacement's invalidation/load state.
+                        guard self.appleCWMetaRefreshRequest?.generation == refreshGenerationAtSchedule else {
+                            return
+                        }
                         if Self.metaDetailsNeedsRepublish(current: self.metaDetails, next: details) {
                             // Compute the streams-only diff BEFORE the assignment, then bump the
                             // source-list epoch only when the ready-stream set (or the loaded meta)
@@ -2472,12 +2722,52 @@ final class CoreBridge: ObservableObject {
                             self.metaDetails = details
                             if streamsChanged { self.streamsEpoch &+= 1 }
                         }
+                        guard let request = self.appleCWMetaRefreshRequest,
+                              let refreshGenerationAtSchedule,
+                              AppleCWMetaRefreshGenerationFence.owns(
+                                  capturedGeneration: refreshGenerationAtSchedule,
+                                  activeGeneration: request.generation
+                              ) else { return }
+                        let settledForRequest = Self.appleCWMetaRefreshIsSettled(
+                            details, libraryID: request.libraryID, streamID: request.streamID
+                        )
+                        switch request.phase {
+                        case .awaitingInvalidation:
+                            // A same-ID ready re-emit is explicitly NOT invalidation. Leave the request
+                            // pending so an unrelated event cannot turn a Load no-op into proof. Only the
+                            // explicit Unload's nil meta_details receipt opens the exact Load phase.
+                            guard details == nil else { return }
+                            self.appleCWMetaRefreshRequest?.phase = .awaitingLoadSettlement
+                            self.dispatch(
+                                action: self.metaLoadAction(
+                                    type: request.type, id: request.libraryID,
+                                    streamType: request.streamType, streamId: request.streamID
+                                ),
+                                field: "meta_details"
+                            )
+                        case .awaitingLoadSettlement:
+                            guard settledForRequest else { return }
+                            self.appleCWMetaRefreshReceipt = AppleCWMetaRefreshReceipt(
+                                requestGeneration: request.generation,
+                                selectedMetaID: details?.selectedMetaID,
+                                loadedMetaID: details?.meta?.id,
+                                settled: true,
+                                requestedStreamID: request.streamID
+                            )
+                            self.appleCWMetaRefreshDetails = details
+                            self.appleCWMetaRefreshRequest = nil
+                        }
                     }
                 }
             }
             self.metaDetailsWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.metaDetailsDebounce, execute: work)
         }
+    }
+
+    private static func appleCWMetaRefreshIsSettled(_ details: CoreMetaDetails?,
+                                                    libraryID: String, streamID: String) -> Bool {
+        details?.appleCWTerminalFullMeta(for: libraryID, streamID: streamID) != nil
     }
 
     /// True when the newly decoded meta_details differs from the stored one in a way the UI or the

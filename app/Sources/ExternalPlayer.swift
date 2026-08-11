@@ -9,6 +9,28 @@ import AppKit
 /// (UIApplication) and macOS (NSWorkspace); tvOS does not compile this file (it cannot launch other
 /// apps and uses SourcesTV/ExternalPlayers.swift's own curated handoff instead).
 enum ExternalPlayer {
+    /// Exact identity for one external handoff request. A completion from another URL, playback
+    /// session, episode generation, or engine load is stale and must not mutate the current player.
+    struct HandoffIdentity<LoadToken: Hashable & Sendable>: Equatable, Sendable {
+        let url: URL
+        let sessionID: String
+        let episodeGeneration: Int
+        let loadToken: LoadToken
+
+        func matches(
+            url: URL,
+            sessionID: String,
+            episodeGeneration: Int,
+            loadToken: LoadToken?
+        ) -> Bool {
+            guard let loadToken else { return false }
+            return self.url == url
+                && self.sessionID == sessionID
+                && self.episodeGeneration == episodeGeneration
+                && self.loadToken == loadToken
+        }
+    }
+
     /// A supported external player and how to deep-link a stream into it.
     struct Target: Identifiable {
         let id: String                      // stable key (also used if we ever persist a default)
@@ -35,7 +57,7 @@ enum ExternalPlayer {
     /// Every supported target (installed or not). Order = chooser order. Built per-platform: the
     /// x-callback players below are iOS apps; macOS-native players are appended on Mac builds, where
     /// those iOS-only schemes don't resolve and so filter themselves out of the installed list.
-    static let all: [Target] = {
+    @MainActor static let all: [Target] = {
         var targets: [Target] = [
         Target(id: "infuse", name: "Infuse", icon: "play.rectangle.on.rectangle.fill",
                probe: URL(string: "infuse://")!,
@@ -84,17 +106,32 @@ enum ExternalPlayer {
     /// Only the targets actually installed on this device, what the chooser should offer.
     @MainActor static var installed: [Target] { all.filter(\.isInstalled) }
 
-    /// Open `stream` in `target`. Returns false if the app isn't installed or the link couldn't be
-    /// built, so the caller can fall back to the built-in player.
-    @discardableResult
-    @MainActor static func open(_ target: Target, stream: URL) -> Bool {
-        guard target.isInstalled, let link = target.deepLink(for: stream) else { return false }
+    /// Open `stream` in `target` and report the platform's actual asynchronous launch result. The
+    /// completion is delivered on the main queue so callers can safely keep or dismiss the built-in
+    /// player from it.
+    @MainActor static func open(
+        _ target: Target,
+        stream: URL,
+        completion: @escaping @MainActor @Sendable (Bool) -> Void
+    ) {
+        let finish: @Sendable (Bool) -> Void = { launched in
+            DispatchQueue.main.async { completion(launched) }
+        }
+        guard target.isInstalled, let link = target.deepLink(for: stream) else {
+            finish(false)
+            return
+        }
         #if canImport(UIKit)
-        UIApplication.shared.open(link)
+        UIApplication.shared.open(link, options: [:]) { launched in
+            finish(launched)
+        }
         #elseif canImport(AppKit)
-        NSWorkspace.shared.open(link)
+        NSWorkspace.shared.open(link, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+            finish(error == nil)
+        }
+        #else
+        finish(false)
         #endif
-        return true
     }
 
     /// HEAD-probe a stream URL before handing it to an external app, so a dead debrid / CDN link is caught
@@ -149,10 +186,14 @@ enum ExternalPlayer {
         return host != "127.0.0.1" && host != "localhost"
     }
 
-    /// If a default external player is set and `stream` is eligible, open it there and return true; the
-    /// caller then dismisses the built-in player. Returns false to play in the built-in player as usual.
-    @MainActor static func routeToDefaultIfSet(_ stream: URL, isTorrent: Bool) -> Bool {
-        guard canRouteExternally(stream, isTorrent: isTorrent), let target = defaultTarget else { return false }
-        return open(target, stream: stream)
+    /// If a default external player is set and `stream` is eligible, open it there and report the launch
+    /// result. No completion is delivered when the stream is ineligible or no installed default is set.
+    @MainActor static func routeToDefaultIfSet(
+        _ stream: URL,
+        isTorrent: Bool,
+        completion: @escaping @MainActor @Sendable (Bool) -> Void
+    ) {
+        guard canRouteExternally(stream, isTorrent: isTorrent), let target = defaultTarget else { return }
+        open(target, stream: stream, completion: completion)
     }
 }

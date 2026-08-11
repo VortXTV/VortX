@@ -319,6 +319,7 @@ xcrun swiftc -sdk "$SDK_PATH" \
   app/Sources/Player/MultiAudioPolicy.swift \
   app/Sources/Player/SubtitleRenditionPolicy.swift \
   app/Sources/Player/RemuxResumePolicy.swift \
+  app/Sources/Player/RemuxTimelineOriginPolicy.swift \
   app/Sources/Player/AudioTranscodePolicy.swift \
   app/Sources/Player/VortXAudioTranscoder.swift \
   app/SourcesShared/VortXEngineProtocol.swift \

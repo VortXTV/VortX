@@ -3,6 +3,7 @@
 //   xcrun swiftc -o /tmp/nonseries-episode-lifecycle-test \
 //     app/SourcesShared/DetailMetaRecoveryPolicy.swift \
 //     app/SourcesShared/CatalogRowResolution.swift \
+//     app/SourcesShared/AppleCWSeasonRolloverPolicy.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //     app/SourcesShared/DownloadModels.swift \
@@ -268,10 +269,10 @@ private struct NonSeriesEpisodeLifecycleContractTests {
 
         expect(!EpisodePlaybackIdentity.canRewindWholeTitleAtTerminal(
             usesSeriesLifecycle: true, currentEpisodeIndex: 1, episodeCount: 8
-        ), "mid-series EOF cannot rewind the whole title")
-        expect(EpisodePlaybackIdentity.canRewindWholeTitleAtTerminal(
+        ), "legacy series terminal helper stays fail-closed without authority")
+        expect(!EpisodePlaybackIdentity.canRewindWholeTitleAtTerminal(
             usesSeriesLifecycle: true, currentEpisodeIndex: 7, episodeCount: 8
-        ), "resident list proves the final series episode may rewind the whole title")
+        ), "resident count alone cannot prove the final series episode")
         expect(EpisodePlaybackIdentity.canRewindWholeTitleAtTerminal(
             usesSeriesLifecycle: collection.usesSeriesLifecycle,
             currentEpisodeIndex: 1,
@@ -361,8 +362,9 @@ private struct NonSeriesEpisodeLifecycleContractTests {
                "Trakt playback shadow uses the lifecycle fence")
         expect(checkinSource.contains("EpisodePlaybackIdentity.usesSeriesLifecycle(type: meta.type)"),
                "Trakt check-in uses the lifecycle fence")
-        expect(occurrences(of: "usesSeriesLifecycle: m.usesSeriesLifecycle", in: playerSource) >= 2,
-               "iOS EOF and manual-close terminal paths use the lifecycle fence")
+        expect(playerSource.contains("terminalSeriesDecision(for: m)")
+               && playerSource.contains("terminalRewindGate.issueTerminalRewind()"),
+               "iOS EOF and manual-close terminal paths use the fail-closed lifecycle policy")
         expect(tvPlayerSource.contains("m.usesSeriesLifecycle"),
                "tvOS navigation and finale paths use the lifecycle fence")
         expect(detailSource.contains("meta?.usesSeriesLifecycle == true"),

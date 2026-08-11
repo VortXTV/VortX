@@ -118,7 +118,7 @@ struct Issue164TraktContractTests {
                 "refresh completion must use the signed-in throttle policy")
 
         // Security boundary: every lifecycle and pending retry is tied to one random auth session.
-        require(auth.contains("private static let sessionAccount = \"vortx.trakt.sessionID\"")
+        require(auth.contains("private static let sessionAccount = TraktTokenSlots.legacySession")
                     && auth.contains("TraktSessionID.random()"),
                 "every authenticated credential set must carry a random session id")
         require(auth.contains("func performSessionBoundWrite<Result: Sendable>(")
@@ -217,11 +217,11 @@ struct Issue164TraktContractTests {
                     && auth.contains("await performCredentialBoundary {")
                     && auth.contains("replaceCredentialsWithNewSession("),
                 "synced Trakt recovery without account proof must rotate the session boundary")
-        require(auth.contains("await signOut(ifCurrent: expectedSession)"),
+        require(auth.contains("signOut(ifCurrent: expectedSession, ownerCapture: capture)"),
                 "an old Trakt refresh failure must not sign out a replacement account")
 
         // SIMKL has the same exact-session transport authority as Trakt.
-        require(simklAuth.contains("private static let sessionAccount = \"vortx.simkl.sessionID\"")
+        require(simklAuth.contains("private static let sessionAccount = SIMKLTokenSlots.legacySession")
                     && simklAuth.contains("SIMKLSessionID.random()")
                     && simklAuth.contains("func performSessionBoundWrite<Result: Sendable>("),
                 "SIMKL credentials must carry random session identity and a final write lease")
@@ -242,7 +242,7 @@ struct Issue164TraktContractTests {
                 "try await rateGate()",
                 "auth.performSessionBoundWrite(",
                 "expectedSession: expectedSession",
-                "urlSession.data(for: request)",
+                "transport.send(",
             ]
         ), "SIMKL writes must rate-wait before acquiring their exact-session credential lease")
         require(simklService.contains("auth.validToken(for: expectedSession)")

@@ -2,6 +2,7 @@
 //
 //   xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
 //     -o /tmp/next-episode-preload-policy \
+//     app/SourcesShared/NextEpisodePreparationWork.swift \
 //     app/SourcesTV/NextEpisodePreloadPolicy.swift \
 //     app/Tests/NextEpisodePreloadPolicyTests.swift && /tmp/next-episode-preload-policy
 
@@ -21,6 +22,8 @@ struct NextEpisodePreloadPolicyTests {
         warmFailureGetsOneRefresh()
         creditsPreemptAnInFlightAttempt()
         timedOutAttemptCannotOwnThePolicyForever()
+        requestTimeoutMatchesThePoolLease()
+        stickyProviderBudgetCoversMeasuredSettlement()
         delayedTorrentPrepareHonorsInvalidation()
         admittedTorrentPrepareIsNotRemoved()
         rangeWarmupWaitsForCreateSuccess()
@@ -28,7 +31,10 @@ struct NextEpisodePreloadPolicyTests {
         await addonResultsRetainInputOrder()
         await hungFirstWindowAdvancesToLaterAddons()
         await boundedRetriesRotateWithoutChangingAccountOrder()
+        productionAttemptWiringRotatesEveryRetry()
+        stickyAtTailStartsFirstAndRestoresAccountOrder()
         await cancellationStopsSchedulingNewAddons()
+        await absoluteDeadlineCancelsTheWrappedOperation()
 
         print("")
         print(failed == 0 ? "ALL PASS (\(passed) checks)" : "FAILURES: \(failed) of \(passed + failed) checks")
@@ -172,6 +178,44 @@ struct NextEpisodePreloadPolicyTests {
         )
         expect(replacement?.sequence != first.sequence,
                "a timed-out attempt is replaced instead of blocking through EOF")
+    }
+
+    private static func requestTimeoutMatchesThePoolLease() {
+        expect(
+            NextEpisodePreloadPolicy.requestTimeout(
+                addon: "Debridio", wantedAddon: "debridio"
+            ) == NextEpisodePreloadPolicy.stickyAddonRequestTimeout,
+            "the remembered add-on gets the sticky request timeout case-insensitively"
+        )
+        expect(
+            NextEpisodePreloadPolicy.requestTimeout(
+                addon: "Cinemeta", wantedAddon: "Debridio"
+            ) == NextEpisodePreloadPolicy.addonRequestTimeout,
+            "other add-ons keep the ordinary bounded request timeout"
+        )
+    }
+
+    private static func stickyProviderBudgetCoversMeasuredSettlement() {
+        expect(
+            NextEpisodePreloadPolicy.stickyAddonRequestTimeout >= 12,
+            "the sticky provider timeout covers the measured 9-12 second settlement tail"
+        )
+        expect(
+            NextEpisodePreloadPolicy.stickyAddonRequestTimeout
+                < NextEpisodePreloadPolicy.addonFetchBudget,
+            "the sticky provider remains bounded by the whole add-on batch"
+        )
+        expect(
+            NextEpisodePreloadPolicy.addonFetchBudget
+                < NextEpisodePreloadPolicy.attemptTimeout,
+            "the add-on batch leaves time for ranking and resolution before the attempt deadline"
+        )
+        expect(
+            NextEpisodePreloadPolicy.attemptTimeout
+                - NextEpisodePreloadPolicy.addonFetchBudget
+                >= NextEpisodePreloadPolicy.minimumResolutionBudget,
+            "the post-settlement budget covers cache check plus playback-link resolution"
+        )
     }
 
     private static func delayedTorrentPrepareHonorsInvalidation() {
@@ -371,6 +415,76 @@ struct NextEpisodePreloadPolicyTests {
                "fair retry rotation preserves the five-request concurrency limit")
     }
 
+    private static func stickyAtTailStartsFirstAndRestoresAccountOrder() {
+        let order = PreloadProviderRotation.order(
+            count: 50,
+            attemptSequence: 1,
+            stride: NextEpisodePreloadPolicy.providerRotationStride,
+            prioritizedIndex: 49
+        )
+        expect(order.first == 49,
+               "a remembered provider at the account tail enters the first request window")
+        expect(Set(order) == Set(0..<50) && order.count == 50,
+               "sticky prioritization keeps every provider exactly once")
+        let rotated = order.map { Optional("addon-\($0)") }
+        let restored = PreloadProviderRotation.restoreOriginalOrder(
+            rotated,
+            order: order,
+            count: 50
+        )
+        expect(restored.compactMap { $0 } == (0..<50).map { "addon-\($0)" },
+               "sticky-first fetching restores account order before ranking")
+    }
+
+    private static func productionAttemptWiringRotatesEveryRetry() {
+        let expectedLeadingProviders = [0, 20, 40, 10]
+        let stickyIndex = 49
+        let observed = (1...4).map { sequence -> Int? in
+            let request = NextEpisodePreparationRequest(
+                episodeID: "tt-test:1:2",
+                attemptSequence: sequence,
+                deadline: 100,
+                nearCredits: sequence == 4,
+                protectedTorrentHash: nil
+            )
+            let order = PreloadProviderRotation.order(
+                count: 50,
+                request: request,
+                stride: NextEpisodePreloadPolicy.providerRotationStride,
+                prioritizedIndex: stickyIndex
+            )
+            expect(order.first == stickyIndex,
+                   "attempt \(sequence) keeps the sticky provider in the first window")
+            return order.dropFirst().first
+        }
+        expect(
+            observed.compactMap { $0 } == expectedLeadingProviders,
+            "player attempts 1, 2, 3 and 4 reach the exact production rotation windows"
+        )
+
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let player = try? String(
+            contentsOf: root.appendingPathComponent("app/Sources/PlayerScreen.swift"),
+            encoding: .utf8
+        )
+        let detail = try? String(
+            contentsOf: root.appendingPathComponent("app/SourcesiOS/iOSDetailView.swift"),
+            encoding: .utf8
+        )
+        expect(
+            player?.contains("let request = attempt.preparationRequest") == true
+                && player?.contains("let result = await warm(request)") == true,
+            "PlayerScreen passes the admitted attempt request into production warming"
+        )
+        expect(
+            detail?.contains("request: request,\n        stride: NextEpisodePreparationBudget.providerRotationStride") == true,
+            "iOS/macOS production warming rotates providers from the player request sequence"
+        )
+    }
+
     private static func cancellationStopsSchedulingNewAddons() async {
         let counter = ConcurrencyCounter()
         let task = Task {
@@ -391,5 +505,44 @@ struct NextEpisodePreloadPolicyTests {
         let snapshot = await counter.snapshot()
         expect(snapshot.started.count <= 5,
                "canceling an attempt prevents the sliding window from launching more add-ons")
+    }
+
+    private final class CancellationFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+
+        func mark() {
+            lock.withLock { value = true }
+        }
+
+        func snapshot() -> Bool {
+            lock.withLock { value }
+        }
+    }
+
+    private static func absoluteDeadlineCancelsTheWrappedOperation() async {
+        let flag = CancellationFlag()
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let value: Int? = await BoundedPreloadWorkPool.valueBeforeDeadline(
+            startedAt + 0.03
+        ) {
+            await withTaskCancellationHandler {
+                do {
+                    try await Task<Never, Never>.sleep(nanoseconds: 5_000_000_000)
+                    return 7
+                } catch {
+                    return -1
+                }
+            } onCancel: {
+                flag.mark()
+            }
+        }
+        let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+        expect(value == nil,
+               "the absolute preparation deadline returns no late phase value")
+        expect(flag.snapshot(),
+               "the absolute preparation deadline cancels the wrapped operation")
+        expect(elapsed < 0.5,
+               "a cooperative wrapped operation cannot hold the owner past its deadline")
     }
 }

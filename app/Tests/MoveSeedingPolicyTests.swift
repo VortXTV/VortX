@@ -2,6 +2,7 @@
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
 //     app/SourcesShared/MoveSeeding.swift \
 //     app/SourcesShared/SettingsBackup.swift \
+//     app/SourcesShared/CredentialScope.swift \
 //     app/SourcesShared/Keychain.swift \
 //     app/Tests/MoveSeedingPolicyTests.swift \
 //     -o /tmp/vortx-move-seeding-policy-tests && /tmp/vortx-move-seeding-policy-tests

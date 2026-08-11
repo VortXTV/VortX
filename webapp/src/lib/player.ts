@@ -50,10 +50,11 @@ const HLS_EXT = /\.m3u8(\?|$)/i;
 
 let hls: Hls | null = null;
 let keyHandler: ((e: KeyboardEvent) => void) | null = null;
-// The one-shot unmute listeners wired on the PERSISTENT #player host (see wireMobileAudio). They self-remove
-// via { once: true } only if the user interacts before teardown; otherwise teardownMedia must remove them so
-// they don't accumulate (and hold a stale controller closure) across every play()/advanceSource().
-let audioGesture: ((e: Event) => void) | null = null;
+// Removes the one-shot unmute listeners wired by wireMobileAudio (on the PERSISTENT #player host AND on
+// document, so the FIRST interaction anywhere - overlay tap, play button, keypress - restores sound). The
+// listeners self-remove via { once: true } when the user interacts before teardown; otherwise teardownMedia
+// calls this so they don't accumulate (and pin a stale controller closure) across every play()/advanceSource().
+let audioGestureCleanup: (() => void) | null = null;
 let subtitleBlobs: string[] = [];
 let controller: PlayerController | null = null;
 // Monotonic session id: bumped on every play() and close() so an in-flight `await import("hls.js")` can
@@ -88,12 +89,11 @@ function teardownMedia(host: HTMLElement | null): void {
     document.removeEventListener("keydown", keyHandler);
     keyHandler = null;
   }
-  // Remove the one-shot unmute listeners from the persistent host if the user never triggered them (their
+  // Remove the one-shot unmute listeners (host + document) if the user never triggered them (their
   // { once: true } only fires on interaction); otherwise they'd stack up and pin the old session's controller.
-  if (audioGesture && host) {
-    host.removeEventListener("pointerdown", audioGesture, { capture: true });
-    host.removeEventListener("keydown", audioGesture, { capture: true });
-    audioGesture = null;
+  if (audioGestureCleanup) {
+    audioGestureCleanup();
+    audioGestureCleanup = null;
   }
   controller?.dispose();
   controller = null;
@@ -311,37 +311,63 @@ function wireMobileAudio(vid: HTMLVideoElement): void {
       if (vid.volume === 0) vid.volume = 1;
     }
   };
-  // Capture-phase, one-shot: the first pointer or key anywhere in the player counts as the user gesture.
-  // Bound to the PERSISTENT #player host, so teardownMedia removes them (via the stored audioGesture ref)
-  // when the session ends without a prior interaction - otherwise they'd leak across sessions.
+  // Capture-phase, one-shot: the FIRST interaction anywhere restores sound. Bound both to the PERSISTENT
+  // #player host (a tap on the overlay / the full-stage "Tap for sound" scrim) AND to document (the play
+  // button, a keypress, a click anywhere) so the auto-mute is never something the user has to hunt for.
+  // teardownMedia removes any that never fired (via audioGestureCleanup) so they don't leak across sessions.
   const host = el(PLAYER_HOST_ID);
-  audioGesture = unmute;
-  host?.addEventListener("pointerdown", unmute, { capture: true, once: true });
-  host?.addEventListener("keydown", unmute, { capture: true, once: true });
+  const opts = { capture: true, once: true } as const;
+  host?.addEventListener("pointerdown", unmute, opts);
+  host?.addEventListener("keydown", unmute, opts);
+  document.addEventListener("click", unmute, opts);
+  document.addEventListener("keydown", unmute, opts);
+  audioGestureCleanup = () => {
+    host?.removeEventListener("pointerdown", unmute, { capture: true });
+    host?.removeEventListener("keydown", unmute, { capture: true });
+    document.removeEventListener("click", unmute, { capture: true });
+    document.removeEventListener("keydown", unmute, { capture: true });
+  };
 }
 
-/** D6 (b): watch for a source that PLAYS but produces no decodable audio (the AC3/E-AC3/DTS/TrueHD case a
- *  browser can't decode: the picture moves but there is silence). When the element reports zero audio tracks
- *  shortly after playback starts, auto-advance to the next fallback source. The check is deferred a moment
- *  after `playing` so a still-initializing pipeline isn't misread as silent. */
+/** D6 (b): watch for a source that PLAYS video but produces NO decodable audio (the AC3/E-AC3/DTS/TrueHD case
+ *  a browser can't decode: the picture moves but there is silence). We sample Chromium's
+ *  webkitAudioDecodedByteCount ~3s after playback starts: if the video clock genuinely advanced but ZERO
+ *  audio bytes were decoded, the audio codec is undecodable here - auto-advance to the next fallback source
+ *  (the chain floats decodable-audio sources first). When the chain is exhausted, show the honest
+ *  "can't decode this audio" message (D) instead of playing on in silence. The counter is Chromium-only;
+ *  where it is absent (Firefox) we feature-detect and degrade gracefully rather than misjudge the source.
+ *  This replaces the old `audioTracks.length` gate, which is UNDEFINED in Chrome and so never fired. */
 function wireAudioFailure(host: HTMLElement, vid: HTMLVideoElement, gen: number): void {
+  const AUDIO_PROBE_MS = 3000;
+  const decodedBytes = (): number | undefined =>
+    (vid as unknown as { webkitAudioDecodedByteCount?: number }).webkitAudioDecodedByteCount;
   let checked = false;
   const check = () => {
     if (checked) return;
     checked = true;
+    if (typeof decodedBytes() !== "number") return; // property unsupported (Firefox): can't detect silence
+    const startAt = vid.currentTime;
     window.setTimeout(() => {
-      // A newer source may have replaced this one while the 2.5s deferral was pending; don't judge (or
-      // advance past) a source that is no longer playing.
+      // A newer source may have replaced this one during the probe window; don't judge (or advance past) a
+      // source that is no longer playing.
       if (gen !== sourceGen) return;
-      // audioTracks is supported in Safari + Chromium; when present and empty, the browser found no audio it
-      // can render. Guard on readyState so we only judge a source that has genuinely loaded media.
-      const at = (vid as unknown as { audioTracks?: { length: number } }).audioTracks;
-      if (vid.readyState >= 2 && at && at.length === 0) {
-        advanceSource(host, "silent");
+      const advanced = vid.currentTime > startAt + 0.3; // the video clock genuinely moved (really playing)
+      // Video is playing but not one audio byte decoded across the window -> the audio track is undecodable.
+      if (!vid.paused && advanced && (decodedBytes() ?? 0) === 0) {
+        if (!advanceSource(host, "silent")) showAudioUndecodable();
       }
-    }, 2500);
+    }, AUDIO_PROBE_MS);
   };
   vid.addEventListener("playing", check, { once: true });
+}
+
+/** D (honesty floor): the fallback chain is exhausted and the current source plays silently (undecodable
+ *  audio). Rather than leave the user watching in silence, surface an honest on-player message telling them
+ *  the browser can't decode this Dolby/DTS track and to try another source or the app. */
+function showAudioUndecodable(): void {
+  controller?.notice(
+    "This source uses Dolby or DTS audio your browser can't decode. Try another source, or open it in the VortX app.",
+  );
 }
 
 /** Advance to the next source in the fallback chain, rebuilding media on a fresh <video> in place. Returns
@@ -571,4 +597,23 @@ export function close(): void {
 /** Whether the player overlay is currently open. */
 export function isPlayerOpen(): boolean {
   return el(PLAYER_HOST_ID)?.classList.contains("hidden") === false;
+}
+
+/** The token identifying the session play() most recently started. The Detail surface reads this right after
+ *  calling play() so a skip-segment fetch it kicks off can prove it still belongs to THIS session before
+ *  feeding the result in (a later title's play() bumps the token). */
+export function currentPlayToken(): number {
+  return playToken;
+}
+
+/** Feed intro/outro skip segments to the live session AFTER playback has started. They are fetched OFF the
+ *  click -> play() gesture path (an await there would consume the user activation and force a muted autoplay,
+ *  the "no sound" bug), so they arrive a beat late; that is fine because a segment only matters minutes into
+ *  playback. `token` must match the session that requested them (see currentPlayToken) so a stale fetch from
+ *  a previous title can't push its segments onto the source now playing. Applies to the current source's
+ *  chrome and stores them on the session so a source auto-advance rebuild keeps them. */
+export function setSkipSegments(token: number, segments: SkipSegment[]): void {
+  if (token !== playToken || !controller) return; // superseded session, or no live controller
+  sessionOptions = { ...sessionOptions, skipSegments: segments };
+  controller.setSkipSegments(segments);
 }

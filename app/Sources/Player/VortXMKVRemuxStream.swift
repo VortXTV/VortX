@@ -86,6 +86,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private let hlsAuxiliaryAccounting: VortXHLSAuxiliaryAccounting?
     private var thread: Thread?
     private let cancelledFlag = ManagedAtomicFlag()
+    private let producerTerminalLock = NSLock()
+    private var producerTerminalState = VortXRemuxProducerTerminalState()
+    private let onProducerTerminal: @Sendable () -> Void
+    private let preparationGate = VortXRemuxPreparationGate()
 
     /// F1: stable heap cell the INPUT context's `interrupt_callback` polls to abort a blocking network
     /// open/read/reconnect-sleep the instant cancel() fires. Without it a demote on a STALLED CDN leaves the
@@ -152,7 +156,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     init(input: String, headers: [String: String]?, indexForHLS: Bool = false,
          mode: Mode = .dolbyVision, startAtSeconds: Double = 0,
          retainFullTimeline: Bool = false, selectedAudioStreamIndex: Int? = nil,
-         preferredAudioLanguages: [String]? = nil, audioRejectTerms: [String]? = nil) {
+         preferredAudioLanguages: [String]? = nil, audioRejectTerms: [String]? = nil,
+         onProducerTerminal: @escaping @Sendable () -> Void = {}) {
         let primaryBuffer = VortXRemuxBuffer()
         let retaining = (indexForHLS && retainFullTimeline)
             ? VortXHLSSessionSpool.makeRetaining() : nil
@@ -166,6 +171,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         self.requestedAudioStreamIndex = selectedAudioStreamIndex
         self.preferredAudioLanguages = preferredAudioLanguages
         self.audioRejectTerms = audioRejectTerms
+        self.onProducerTerminal = onProducerTerminal
         self.hlsTarget = VortXHLSTargetPolicy.conservativeTarget
         self.requestedOriginSeconds = RemuxResumePolicy.isEnabledByDefault
             ? RemuxResumePolicy.originRequest(resumeSeconds: startAtSeconds)
@@ -467,6 +473,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var subtitleCollectors: [Int: (renditionID: Int, format: SubtitleRenditionPolicy.TextFormat)] = [:]
     /// Per-source-stream count of subtitle packets the parser or bitmap recognizer rejected. Diagnostic only.
     private var subtitleRejectedPackets: [Int: Int] = [:]
+    /// Per-source-stream count of BENIGN PGS non-cues: HDMV clear-screen/erase compositions (num_rects==0),
+    /// Vision empty-OCR outcomes (bitmap fine, no text), and worker-backpressure drops. About half of PGS
+    /// packets are these; they are normal traffic, NOT failures, so they are tallied here instead of on the
+    /// reject counter (which they used to inflate to 50-64%). Remux-thread only. Diagnostic only.
+    private var subtitleEmptyPackets: [Int: Int] = [:]
     /// Per-source-stream count of subtitle packets that REACHED the collector. Paired with the
     /// rejection count this separates "the demuxer delivered nothing" from "the parser refused
     /// everything", which static reading cannot distinguish and which decides the whole fix.
@@ -917,6 +928,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// Foundation releases the block when the thread exits, breaking the cycle. `cancel()` sets the flag so the
     /// write callback returns AVERROR_EXIT and the loop unwinds promptly, so this never leaks past teardown.
     func start() {
+        producerTerminalLock.lock()
+        let shouldStart = producerTerminalState.begin()
+        producerTerminalLock.unlock()
+        guard shouldStart else { return }
         let t = Thread { self.run() }
         t.name = "vortx.dvremux"
         t.stackSize = 1 << 20      // 1 MiB; libav muxing is not deeply recursive but give it headroom
@@ -929,6 +944,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// call more than once and from any thread. Does NOT block; teardown completes on the remux thread.
     func cancel() {
         cancelledFlag.set()
+        preparationGate.cancel()
         // F1: trip the INPUT context's interrupt flag too, so a thread blocked inside avformat_open_input /
         // av_read_frame / a reconnect sleep on a stalled CDN aborts in milliseconds (AVERROR_EXIT) instead of
         // waiting out rw_timeout x reconnects. Set-after cancelledFlag so isCancelled is already true when the
@@ -947,9 +963,27 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         hlsSpool?.invalidateSession()
         hlsLock.lock(); let audioMuxer = _alternateAudioMuxer; hlsLock.unlock()
         audioMuxer?.abort()
+        producerTerminalLock.lock()
+        let shouldNotify = producerTerminalState.cancelBeforeStart()
+        producerTerminalLock.unlock()
+        if shouldNotify {
+            hlsSpool?.producerDidTerminate()
+            onProducerTerminal()
+        }
     }
 
     var isCancelled: Bool { cancelledFlag.get() }
+
+    @discardableResult
+    func requestPreparationProducerPark() -> Bool {
+        preparationGate.requestParkAfterBoundary()
+    }
+
+    var isPreparationProducerParked: Bool { preparationGate.isParked }
+
+    func resumePreparationProducer() {
+        preparationGate.resume()
+    }
 
     func markEngineReady() {
         buffer.markEngineReady()
@@ -1007,7 +1041,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         originShiftUsec = max(0, av_rescale_q(timestamp, timeBase, Self.avTimeBaseQ))
         originShiftLatched = true
         let shift = Double(originShiftUsec) / Double(Self.avTimeBase)
-        let publishedOrigin = originSeekApplied ? shift : 0
+        let publishedOrigin = RemuxTimelineOriginPolicy.publishedOriginSeconds(
+            mode: originSeekApplied ? .resume : .fresh,
+            achievedShiftSeconds: shift)
         hlsLock.lock(); _timelineOriginSeconds = publishedOrigin; hlsLock.unlock()
         if originSeekApplied {
             VXProbe.log(
@@ -1030,7 +1066,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         originShiftUsec = fallback
         originShiftLatched = true
         let shift = Double(originShiftUsec) / Double(Self.avTimeBase)
-        let publishedOrigin = originSeekApplied ? shift : 0
+        let publishedOrigin = RemuxTimelineOriginPolicy.publishedOriginSeconds(
+            mode: originSeekApplied ? .resume : .fresh,
+            achievedShiftSeconds: shift)
         hlsLock.lock(); _timelineOriginSeconds = publishedOrigin; hlsLock.unlock()
         if originSeekApplied {
             VXProbe.log(
@@ -1194,6 +1232,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             if !preservesNormalEOFDrain { logSubtitleTallyIfNeeded() }
             releaseHLSParserOpenClaim()
             hlsSpool?.producerDidTerminate()
+            notifyProducerDidUnwind()
         }
         var info = SourceInfo()
 
@@ -1875,21 +1914,30 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         if baseVideoIn >= 0,
            timelineRebaseRequired || (mode == .dolbyVision && info.dvProfile < 0) || !hvc1Check.eligible {
             let scanNalLen = Self.hevcNalLengthSize(inCtx.pointee.streams[baseVideoIn]?.pointee.codecpar)
-            let maxScan = 240   // well within probesize; caps memory + reads if the base-video packet is late/absent
+            let maxScan = RemuxTimelineOriginPolicy.preScanPacketLimit
             var scanned = 0
+            var mappedBaseScanned = 0
+            var prescanDTS: Int64?
             while scanned < maxScan, !isCancelled {
                 guard let p = av_packet_alloc() else { break }
                 if av_read_frame(inCtx, p) < 0 { var pp: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&pp); break }
                 scanned += 1
                 prebuffered.append(p)
                 if Int(p.pointee.stream_index) == baseVideoIn {
+                    let isMappedBasePacket = mappable.contains(baseVideoIn)
+                    if isMappedBasePacket {
+                        mappedBaseScanned += 1
+                        if p.pointee.dts != AV_NOPTS_VALUE_CONST {
+                            prescanDTS = p.pointee.dts
+                        }
+                    }
                     if let baseStream = inCtx.pointee.streams[baseVideoIn] {
                         establishTimelineShift(
                             from: p,
                             timeBase: baseStream.pointee.time_base,
                             packetStreamIndex: baseVideoIn,
                             baseVideoStreamIndex: baseVideoIn,
-                            isMapped: mappable.contains(baseVideoIn))
+                            isMapped: isMappedBasePacket)
                     }
                     if mode == .dolbyVision, info.dvProfile < 0 {
                         let prof = Self.inBandDoViProfile(p, nalLengthSize: scanNalLen)
@@ -1910,9 +1958,30 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     }
                     // A timestamp-less first base packet cannot establish either the fresh or resume shift.
                     // Keep buffering until a real DTS arrives, bounded by maxScan like the DV/hvc1 probe.
-                    if !timelineRebaseRequired || originShiftLatched { break }
+                    if RemuxTimelineOriginPolicy.shouldStopAfterMappedBasePacket(
+                        isMappedBasePacket: isMappedBasePacket,
+                        timelineRebaseRequired: timelineRebaseRequired,
+                        originLatched: originShiftLatched) {
+                        break
+                    }
                 }
             }
+            let mode: RemuxTimelineOriginPolicy.Mode = originSeekApplied ? .resume : .fresh
+            let basis = RemuxTimelineOriginPolicy.originBasis(
+                dts: prescanDTS,
+                ptsFallback: originPtsFallbackUsec)
+            let knownShiftUsec: Int64? = originShiftLatched
+                ? originShiftUsec
+                : (basis == .ptsFallback ? originPtsFallbackUsec : nil)
+            let knownShiftSeconds = knownShiftUsec.map { Double($0) / Double(Self.avTimeBase) }
+            let receipt = RemuxTimelineOriginPolicy.PrescanOutcome(
+                mode: mode,
+                scanned: scanned,
+                mappedBase: mappedBaseScanned,
+                basis: basis,
+                exhausted: scanned >= maxScan,
+                achievedShiftSeconds: knownShiftSeconds)
+            DiagnosticsLog.log("dv", receipt.receipt)
         }
         if let mismatch = DVPlaybackPolicy.sourceCapabilityMismatch(
             requiresDolbyVision: mode == .dolbyVision,
@@ -2294,7 +2363,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         var rpuStats = RPUConvStats()
         defer {
             if convertP7 {
-                VXProbe.log("dv", "P7 RPU convert exit: converted=\(rpuStats.rpuConverted) fellBack=\(rpuStats.rpuFellBack) elDropped=\(rpuStats.elDropped) pktBailed=\(rpuStats.pktBailed) bytes=\(buffer.producedCount)")
+                VXProbe.log("dv", "P7 RPU convert exit: converted=\(rpuStats.rpuConverted) fellBack=\(rpuStats.rpuFellBack) elNalsDropped=\(rpuStats.elDropped) pktBailed=\(rpuStats.pktBailed) bytes=\(buffer.producedCount)")
             }
         }
 
@@ -2584,6 +2653,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             // evidence; an unproved tail returned above and deliberately leaves the playlist open.
             guard hlsCloseSegment(
                 endSec: finalEnd, audioResource: finalAudioResource) else { return }
+            if preparationGate.waitAtClosedSegmentBoundary() == .cancelled { return }
             hlsLock.lock()
             pgsAcceptingPackets = false
             pgsDrainRequestedAtEOF = true
@@ -2594,6 +2664,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
         buffer.finish()
         NSLog("[dv-remux-stream] done: %d bytes muxed", buffer.producedCount)
+    }
+
+    private func notifyProducerDidUnwind() {
+        producerTerminalLock.lock()
+        let shouldNotify = producerTerminalState.producerDidUnwind()
+        producerTerminalLock.unlock()
+        if shouldNotify { onProducerTerminal() }
     }
 
     // MARK: - Custom AVIO write/seek (the muxer's file emulation; remux-thread only)
@@ -3637,6 +3714,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     parserProvenEndByte: provenEndByte) else { return false }
                 hlsSegmentStartSec = pending.endSeconds
                 hlsSegmentStartPacketProven = true
+                if preparationGate.waitAtClosedSegmentBoundary() == .cancelled { return false }
                 return true
             })
         switch result {
@@ -3647,7 +3725,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             DiagnosticsLog.log("dv", "hls post-init fragment drain FAILED rc=\(rc)")
             buffer.fail("fragment drain failed (\(rc))")
         case .failed(.publishFailed):
-            if buffer.status().failure == nil {
+            if !isCancelled, buffer.status().failure == nil {
                 buffer.fail("HLS pending boundary publication failed")
             }
         case .failed(.incompleteAfterDrain):
@@ -4253,10 +4331,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
         let arrived = subtitleArrivedPackets.values.reduce(0, +)
         let rejected = subtitleRejectedPackets.values.reduce(0, +)
+        let benign = subtitleEmptyPackets.values.reduce(0, +)
         if !subtitleCollectors.isEmpty || arrived > 0 || stored > 0 {
             DiagnosticsLog.log(
                 "dv",
-                "subtitle cue tally: arrived=\(arrived) rejected=\(rejected) stored=\(stored) "
+                "subtitle cue tally: arrived=\(arrived) rejected=\(rejected) empty=\(benign) stored=\(stored) "
                 + "collectors=\(subtitleCollectors.count) valid=\(settlementValid) "
                 + "pgsComplete=\(completed) pgsTimeout=\(timedOut) pgsFailed=\(failed) "
                 + (subtitleOCR?.summary ?? "pgs-ocr inactive"))
@@ -4550,14 +4629,24 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             let token = nextPGSToken
             nextPGSToken &+= 1
             if nextPGSToken == 0 { nextPGSToken = 1 }
-            guard let work = pgsOCR.prepare(
+            let work: PGSOCRWorkItem
+            switch pgsOCR.prepare(
                 packet: packet,
                 parameters: codecpar,
                 streamIndex: inIdx,
                 renditionID: collector.renditionID,
                 token: token,
                 startSeconds: cueStart,
-                durationSeconds: duration) else {
+                durationSeconds: duration) {
+            case .prepared(let item):
+                work = item
+            case .empty, .dropped:
+                // BENIGN, not a rejection: a clear-screen/erase composition (num_rects==0), a Vision empty-OCR
+                // outcome (bitmap fine, no text), or a worker-backpressure drop. Tally these apart so the reject
+                // count is not inflated by normal PGS traffic (they were ~50% of it).
+                subtitleEmptyPackets[inIdx] = (subtitleEmptyPackets[inIdx] ?? 0) + 1
+                return true
+            case .rejected:
                 rejectSubtitlePacket(
                     sourceIndex: inIdx,
                     format: collector.format,

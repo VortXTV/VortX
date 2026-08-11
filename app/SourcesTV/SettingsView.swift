@@ -83,7 +83,15 @@ struct SettingsView: View {
     @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = 0   // Off by default, matching DiskCacheSetting.storedBytes; the cache is opt-in
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds, shared with the player
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
-    @AppStorage(PlayerEngineRouter.dvRemuxKey) private var dvRemux = false   // Dolby Vision for MKV (Beta): in-app remux -> AVPlayer; default OFF
+    // Dolby Vision for MKV (Beta): in-app remux -> AVPlayer. Stored as an OPTIONAL Bool on purpose. The key is
+    // ABSENT until the viewer touches the row, and the router's absent-key default is ON for a DV-capable
+    // display (PlayerEngineRouter.dvRemuxEnabled). A plain `= false` binding therefore rendered "Off" on a
+    // virgin Apple TV while the remux lane was actually running: the row lied, and a viewer "turning it on"
+    // wrote a real Off that killed Dolby Vision fleet-silently. nil = never set, so render what the ROUTER
+    // resolves (see dvRemuxSelection); a set value is the user's own answer and is shown verbatim.
+    @AppStorage(PlayerEngineRouter.dvRemuxKey) private var dvRemuxStored: Bool?
+    /// The "Play in" menu, resolved once per appearance (see refreshExternalPlayerChoices).
+    @State private var externalPlayerChoices: [(String, String)] = []
     @AppStorage("stremiox.autoSkip") private var autoSkip = false  // auto-skip intro/credits, shared with iOS/Mac
     // Trailer language (D11): the ISO-639-1 code the trailer picker prefers when choosing the YouTube id. Empty
     // = follow the app UI language (the default). Read by TMDBClient.preferredTrailerLanguages / trailerLanguageBaseCode.
@@ -200,6 +208,16 @@ struct SettingsView: View {
         // equality guard inside capturePlayback keeps a switch's own reload() echo from becoming a
         // roster edit unless it genuinely materializes new values.
         .onChange(of: sourcePrefs.rankingSignature) { ProfileStore.shared.capturePlayback() }
+        .onAppear {
+            refreshExternalPlayerChoices()   // six canOpenURL IPC probes, once per appearance
+            SettingsChangeLog.prime()        // I-settings: baseline the [settings] change log for this visit
+        }
+        // I-settings: ONE centralized hook records every preference write on the [settings] channel (see
+        // SettingsChangeLog). This covers all the @AppStorage controls without ~120 scattered .onChange
+        // modifiers, which would also blow this body's type-check budget (see the rankingSignature note above).
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+            SettingsChangeLog.logChanges()
+        }
         .task {
             // Live server monitor that NEVER gives up. The embedded server cold-starts well after
             // launch on a real Apple TV (node boots while the engine and sync are also busy), and
@@ -507,8 +525,10 @@ struct SettingsView: View {
             Text("Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture), with the full player controls, and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Dolby Vision for MKV (Beta)"), [("0", "Off"), ("1", "On")],
-                      selection: Binding(get: { dvRemux ? "1" : "0" }, set: { dvRemux = ($0 == "1") }))
+                      selection: dvRemuxSelection)
             Text("Plays Dolby Vision .mkv from debrid via an in-app remux. Experimental; falls back automatically if it fails.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            Text("Off forces HDR10 tone-mapping for every Dolby Vision MKV.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             Text("Using a Mac for this lives under Streaming Server.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
@@ -648,9 +668,28 @@ struct SettingsView: View {
         }
     }
 
-    /// Built-in plus every curated external player; picking one auto-hands eligible streams to it.
-    private var externalPlayerChoices: [(String, String)] {
-        [("", "Built-in player")] + ExternalPlayers.menu().map { ($0.id, $0.name) }
+    /// The Dolby Vision for MKV row's selection, resolved the way the ROUTER resolves it rather than from a
+    /// bare stored Bool. With the key absent the getter reports `PlayerEngineRouter.dvRemuxEnabled`, which is
+    /// what playback will actually do (ON wherever the display can present DV), so the row can no longer show
+    /// Off while true Dolby Vision is running. The setter always writes an EXPLICIT value: once the viewer
+    /// answers, that answer wins over the remote and display defaults, exactly as documented on the router.
+    private var dvRemuxSelection: Binding<String> {
+        Binding(
+            get: {
+                let resolved = dvRemuxStored
+                    ?? PlayerEngineRouter.dvRemuxEnabled(dvDisplayCapable: DVDisplaySupport.isCapable)
+                return resolved ? "1" : "0"
+            },
+            set: { dvRemuxStored = ($0 == "1") })
+    }
+
+    /// Built-in plus every curated external player; picking one auto-hands eligible streams to it. Rebuilt
+    /// once per appearance rather than per body pass: `ExternalPlayers.menu()` probes six URL schemes through
+    /// `UIApplication.canOpenURL`, and each probe is a synchronous LaunchServices IPC round trip, so this row
+    /// alone cost six blocking IPC calls every time ANY setting on this screen changed. The installed set
+    /// cannot change while Settings is on screen, so one resolve per appearance is the same answer.
+    private func refreshExternalPlayerChoices() {
+        externalPlayerChoices = [("", "Built-in player")] + ExternalPlayers.menu().map { ($0.id, $0.name) }
     }
 
     /// Explains the streaming cache and shows live on-disk usage when on. On the Apple TV HD the cache

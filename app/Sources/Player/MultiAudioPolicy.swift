@@ -6,6 +6,11 @@ import Foundation
 /// mount identity. A restore consumes it once only after both identities match, so an older async completion
 /// cannot overwrite a newer B then C choice, explicit subtitle Off, pause, rate, or playhead.
 enum PlaybackIntentPolicy {
+    enum TransportAction: Equatable, Sendable {
+        case play(rate: Float)
+        case pause
+    }
+
     enum HostLossAction: Equatable, Sendable {
         /// An in-flight audio replacement keeps ownership and remounts its newest target locally.
         case remountAudioReplacement
@@ -120,6 +125,14 @@ enum PlaybackIntentPolicy {
     /// to the actual replacement transaction so an ordinary host loss cannot return without mounting locally.
     static func hostLossAction(hasAudioReplacement: Bool) -> HostLossAction {
         hasAudioReplacement ? .remountAudioReplacement : .reloadLocalSameToken
+    }
+
+    /// Resolve the transport operation from the controller's current committed intent. A remount snapshot
+    /// owns playhead and media selections, but it must not override a play or pause committed while its groups
+    /// were loading.
+    static func committedTransportAction(playbackRequested: Bool,
+                                         requestedRate: Float) -> TransportAction {
+        playbackRequested ? .play(rate: requestedRate) : .pause
     }
 }
 

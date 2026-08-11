@@ -520,20 +520,24 @@ final class TraktPlaybackShadow {
     ) async -> Any? {
         guard TraktAuth.storedSessionID == sessionID,
               let url = URL(string: TraktAuth.apiBase + path) else { return nil }
-        let result: (Data, URLResponse)
+        let result: AuthenticatedHTTPResponse
         do {
-            result = try await URLSession.shared.data(for: Self.request(url, token: token))
+            result = try await AuthenticatedHTTPTransport.shared.send(
+                Self.request(url, token: token),
+                allowedHosts: ["api.trakt.tv"],
+                maxResponseBytes: AuthenticatedHTTPTransport.snapshotResponseLimit
+            )
         } catch {
             return nil
         }
         guard TraktAuth.storedSessionID == sessionID else { return nil }
-        let status = (result.1 as? HTTPURLResponse)?.statusCode ?? 0
+        let status = result.statusCode
         if status == 401 {
             await TraktAuth.shared.signOut(ifCurrent: sessionID)
             return nil
         }
         guard status == 200 else { return nil }
-        return try? JSONSerialization.jsonObject(with: result.0)
+        return try? AuthenticatedHTTPTransport.jsonObject(from: result.data)
     }
 
     /// The four headers Trakt requires. Reuses `TraktAuth` for creds so `TraktService` stays untouched,

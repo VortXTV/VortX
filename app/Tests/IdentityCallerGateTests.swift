@@ -354,6 +354,176 @@ private let rules: [Rule] = [
                 + "                  options: .regularExpression) != nil ? raw : nil\n    }\n",
         ]
     ),
+    Rule(
+        name: "R9 auxiliary publication targets are sealed and merges require capabilities",
+        files: [
+            "app/SourcesShared/SourceIndexIdentity.swift",
+            "app/SourcesShared/SourceIndexClient.swift",
+            "app/SourcesShared/TorBoxSearchSource.swift",
+            "app/SourcesShared/MediaServerSource.swift",
+            "app/SourcesShared/SourceListModel.swift",
+        ],
+        check: { files in
+            var found: [String] = []
+            if let identity = files["app/SourcesShared/SourceIndexIdentity.swift"] {
+                for needle in [
+                    "struct PublicationTarget",
+                    "private struct Storage",
+                    "enum TargetResolution: Equatable, Hashable, Sendable",
+                    "struct MergeAuthorization",
+                    "static func mergeAuthorization(",
+                    "struct MediaServerTarget",
+                    "struct MediaServerMergeAuthorization",
+                    "fileprivate init(target:",
+                    "static func validatedTarget(",
+                ] {
+                    found += requiring(identity, needle,
+                                       why: "the identity module must keep its sealed relational target/capability types")
+                }
+            }
+            if let client = files["app/SourcesShared/SourceIndexClient.swift"] {
+                found += requiring(client, "private let storedResolution:",
+                                    why: "the shared pipeline call must not expose forgeable stored identity")
+                found += requiring(client, "call: AuxiliarySourcePipeline.Call",
+                                    why: "SourceIndex hoard must accept the typed pipeline call")
+                found += requiring(client, "authorizedBy authorization:",
+                                    why: "SourceIndex merge must require a typed authorization capability")
+            }
+            if let torbox = files["app/SourcesShared/TorBoxSearchSource.swift"] {
+                found += requiring(torbox, "typealias FetchStreams = (SourceIndexIdentity.PublicationTarget, String) async",
+                                    why: "TorBox transport must receive the sealed publication target")
+                found += requiring(torbox, "authorizedBy authorization:",
+                                    why: "TorBox merge must require a typed authorization capability")
+            }
+            if let media = files["app/SourcesShared/MediaServerSource.swift"] {
+                found += requiring(media, "publicationTarget: SourceIndexIdentity.MediaServerTarget?",
+                                    why: "media-server publication must carry a sealed media target")
+                found += requiring(media, "authorizedBy authorization:",
+                                    why: "media-server merge must require a typed authorization capability")
+            }
+            if let model = files["app/SourcesShared/SourceListModel.swift"] {
+                found += requiring(model, "auxiliaryTarget: SourceIndexIdentity.TargetResolution",
+                                    why: "source-list context must carry the typed page resolution")
+                found += requiring(model, "mediaServerTarget: SourceIndexIdentity.MediaServerTarget?",
+                                    why: "source-list context must carry the sealed media target")
+            }
+            return found
+        },
+        revertedFixture: [
+            "app/SourcesShared/SourceIndexIdentity.swift":
+                "struct PublicationTarget { let titleID: String; let contentID: String }\n"
+                + "enum TargetResolution { case target(PublicationTarget) }\n",
+        ]
+    ),
+    Rule(
+        name: "R10 every Apple caller uses one typed auxiliary pipeline",
+        files: [
+            "app/SourcesTV/DetailView.swift",
+            "app/SourcesTV/TVPlayerView.swift",
+            "app/SourcesiOS/iOSDetailView.swift",
+            "app/SourcesiOS/iOSBatchDownloadCoordinator.swift",
+        ],
+        check: { files in
+            var found: [String] = []
+            for path in [
+                "app/SourcesTV/DetailView.swift",
+                "app/SourcesTV/TVPlayerView.swift",
+                "app/SourcesiOS/iOSDetailView.swift",
+                "app/SourcesiOS/iOSBatchDownloadCoordinator.swift",
+            ] {
+                if let file = files[path] {
+                    found += requiring(file, "AuxiliarySourcePipeline.refresh(",
+                                       why: "the caller must refresh both auxiliary owners through one typed call")
+                }
+            }
+            for file in files.values {
+                for forbidden in [
+                    "torboxSearch.refresh(imdbId:",
+                    "sourceIndex.refresh(contentID:",
+                    "publishedContentID",
+                    "auxiliaryContentID:",
+                    "mediaServerTargetID:",
+                ] {
+                    found += violations(file, forbidding: forbidden,
+                                        why: "raw auxiliary identity bypasses the sealed target boundary")
+                }
+            }
+            return found
+        },
+        revertedFixture: [
+            "app/SourcesTV/DetailView.swift":
+                "struct DetailView {\n"
+                + "    func refresh() { torboxSearch.refresh(imdbId: id) }\n"
+                + "}\n",
+        ]
+    ),
+    Rule(
+        name: "R11 media-server fallback refuses mismatched page identity",
+        files: ["app/SourcesShared/SourceIndexIdentity.swift"],
+        check: { files in
+            guard let identity = files["app/SourcesShared/SourceIndexIdentity.swift"] else {
+                return ["identity source missing"]
+            }
+            return requiring(identity, "case .mismatch:",
+                             why: "a mismatched page must not enter the IMDb-less media fallback")
+                + requiring(identity, "static func mediaServerTarget(",
+                            why: "media-server target derivation must stay centralized")
+                + requiring(identity, "static func mediaServerMergeAuthorization(",
+                            why: "media-server merge must have its own capability")
+        },
+        revertedFixture: [
+            "app/SourcesShared/SourceIndexIdentity.swift":
+                "static func mediaServerTarget(preferring page: TargetResolution,\n"
+                + "    metaID: String?, videoID: String? = nil) -> MediaServerTarget? {\n"
+                + "    return mediaServerTarget(metaID: metaID, videoID: videoID)\n"
+                + "}\n",
+        ]
+    ),
+    Rule(
+        name: "R12 iOS episode media refresh uses the declared typed target",
+        files: ["app/SourcesiOS/iOSDetailView.swift"],
+        check: { files in
+            guard let detail = files["app/SourcesiOS/iOSDetailView.swift"] else {
+                return ["iOS detail source missing"]
+            }
+            return requiring(detail, "private var mediaServerTarget: SourceIndexIdentity.MediaServerTarget?",
+                             why: "the episode media refresh must use the declared sealed target")
+                + requiring(detail, "publicationTarget: mediaServerTarget",
+                            why: "the episode onAppear/onChange wiring must pass the typed target")
+                + violations(detail, forbidding: "mediaServerEpisodeTarget",
+                             why: "references an undefined legacy media target instead of the declared typed property")
+        },
+        revertedFixture: [
+            "app/SourcesiOS/iOSDetailView.swift":
+                "private var mediaServerTarget: SourceIndexIdentity.MediaServerTarget? { nil }\n"
+                + "mediaServers.refresh(publicationTarget: mediaServerEpisodeTarget)\n",
+        ]
+    ),
+    Rule(
+        name: "R13 shadow ranking receives only the redacted meta token",
+        files: ["app/SourcesShared/SourceListModel.swift"],
+        check: { files in
+            guard let model = files["app/SourcesShared/SourceListModel.swift"] else {
+                return ["SourceListModel source missing"]
+            }
+            var found = requiring(model, "let metaToken = VXProbeRedaction.identityToken(",
+                                  why: "shadow ranking must receive a bounded redacted identity token")
+                + requiring(model, "metaId: metaToken",
+                            why: "the shadow-ranking producer must pass the redacted token")
+            if let start = model.lines(containing: "VortxShadowRanking.observe").first {
+                let end = min(start + 8, model.lines.count)
+                found += violations(model, forbidding: "metaId: ctx.metaId",
+                                    why: "raw catalog identity reaches the exportable shadow sink",
+                                    in: start...end)
+            }
+            return found
+        },
+        revertedFixture: [
+            "app/SourcesShared/SourceListModel.swift":
+                "let metaToken = VXProbeRedaction.identityToken(ctx.metaId)\n"
+                + "VortxShadowRanking.observe(groups: [], metaId: ctx.metaId)\n",
+        ]
+    ),
 ]
 
 // MARK: - Run

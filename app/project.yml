@@ -172,9 +172,7 @@ settings:
     # hidden no-op with zero external network). The real values are injected at build time from the
     # gitignored Config/ExternalSync.xcconfig or CI secrets; the repo is public, never hardcode them.
     TRAKT_CLIENT_ID: ""
-    TRAKT_CLIENT_SECRET: ""
     SIMKL_CLIENT_ID: ""
-    SIMKL_CLIENT_SECRET: ""
 targets:
   VortX:
     type: application

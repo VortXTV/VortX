@@ -1,11 +1,8 @@
-// BingeSourceMemoryRaceContractTests: a standalone, runnable proof of the DECISION LOGIC in the diag-22
-// binge source-memory race fix. Wave-1 recorded the user's remembered source correctly but auto-next still
-// committed off a faster rival, because `StreamRanking.resolveSettled`'s gate opened on quality-from-ANY
-// provider: a fast comet|torbox 1080p matched the remembered quality ~1-2s after EOF while the user's
-// aggregator (aiostreams/debridio, ~9s to answer) was still loading, and the sticky +6000 bonus cannot
-// bonus an ABSENT stream, so the list was ranked ~66% loaded and the rival won. This file drives the REAL
-// `resolveSettled` (and the REAL `continuityBonus` behind it, via the real StreamRanking.swift + CoreModels.swift)
-// and proves the new wanted-source gate.
+// BingeSourceMemoryRaceContractTests: a standalone, runnable proof of the complete-set decision used by
+// automatic source selection. The historical gate opened on an early matching quality or preferred add-on,
+// while a slower contributor could still return a superior stream. This harness drives the real
+// StreamRanking.resolveSettled and proves that ranking starts only after every registered raw contributor is
+// terminal, or after the shared bounded deadline.
 //
 // VortX's Apple app has no Xcode unit-test bundle (verification is build + on-device, per the repo guide), so,
 // like app/Tests/SearchIdleStateContractTests.swift, this is a self-contained executable that compiles the real
@@ -17,12 +14,9 @@
 //     app/SourcesShared/CatalogRowResolution.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //     app/SourcesShared/CoreModels.swift \
+//     app/SourcesShared/SourceSettlementPolicy.swift \
 //     app/SourcesShared/StreamRanking.swift \
 //     app/Tests/BingeSourceMemoryRaceContractTests.swift && /tmp/binge-race-test
-//
-// The load-bearing proof is the OLD-vs-NEW divergence: because the fix makes `wantedAddon: nil` byte-identical
-// to the pre-fix gate, calling the SAME real function with `wantedAddon: nil` reproduces the old behavior and
-// with `wantedAddon: X` exercises the new one - on one shared fixture, no mirror.
 
 import Foundation
 
@@ -181,8 +175,8 @@ private func group(_ addon: String, _ streams: [CoreStream]) -> CoreStreamSource
     CoreStreamSourceGroup(id: addon, addon: addon, streams: streams)
 }
 
-/// A fast rival: a direct 1080p WEB stream (non-torrent, playable). Matches the remembered quality, so under
-/// the OLD quality-only gate it opened the gate on its own.
+/// A fast rival: a direct 1080p WEB stream (non-torrent, playable). It matches the remembered quality, but
+/// that hint must affect ranking only after the complete contributor set settles.
 private let cometDirect1080 = stream(#"{"url":"https://cdn.invalid/comet-1080p.mkv","name":"Comet 1080p WEB-DL"}"#)
 /// The user's remembered aggregator, arrived: a real playable stream.
 private let aioDirect = stream(#"{"url":"https://cdn.invalid/aio.mkv","name":"AIOStreams 1080p WEB"}"#)
@@ -200,15 +194,13 @@ private let wanted = "aiostreams"
 private func settledNew(_ groups: [CoreStreamSourceGroup], loaded: Int, total: Int,
                         seconds: TimeInterval, quality: String?, wantedAddon: String?) -> Bool {
     StreamRanking.resolveSettled(groups, loaded: loaded, total: total,
-                                 secondsSinceFirstPlayable: seconds, rememberedQuality: quality,
+                                 secondsSinceRequestStart: seconds, rememberedQuality: quality,
                                  wantedAddon: wantedAddon)
 }
-/// The pre-fix behavior, reached through the SAME real function: the fix guarantees `wantedAddon: nil` is
-/// byte-identical to the old gate.
 private func settledOld(_ groups: [CoreStreamSourceGroup], loaded: Int, total: Int,
                         seconds: TimeInterval, quality: String?) -> Bool {
     StreamRanking.resolveSettled(groups, loaded: loaded, total: total,
-                                 secondsSinceFirstPlayable: seconds, rememberedQuality: quality,
+                                 secondsSinceRequestStart: seconds, rememberedQuality: quality,
                                  wantedAddon: nil)
 }
 
@@ -228,24 +220,24 @@ enum BingeSourceMemoryRaceContractTests {
         expect(StreamRanking.continuityBonus(cometDirect1080, hint: hint1080) > 0,
                "fixture: the rival really matches the remembered quality (so the OLD gate would open on it)")
 
-        // MARK: 1 - RACE REPRODUCED: the old-vs-new divergence on ONE shared fixture
+        // MARK: 1 - Late superior contributor cannot lose to an early matching rival
         // Only the rival has answered (1 of 3), the user's aggregator is still loading, 5s in.
         let raceGroups = [group("comet", [cometDirect1080])]
         let old = settledOld(raceGroups, loaded: 1, total: 3, seconds: 5, quality: hint1080)
         let new = settledNew(raceGroups, loaded: 1, total: 3, seconds: 5, quality: hint1080, wantedAddon: wanted)
-        expect(old == true,
-               "race: the OLD quality-only gate OPENS on the fast rival (this is exactly the diag-22 bug)")
+        expect(old == false,
+               "race: matching remembered quality cannot open a partial contributor set")
         expect(new == false,
-               "race: the NEW gate WAITS - a remembered source that has not arrived does not commit off a rival")
-        expect(old != new,
-               "race: the wanted-source param is what changed the decision, on an otherwise identical call")
+               "race: a remembered source that has not arrived cannot commit off a rival")
+        expect(old == new,
+               "race: quality and wanted-source hints share the complete-set gate")
 
-        // MARK: 2 - Wanted PRESENT-and-playable in a partial list -> commit immediately, no needless wait
+        // MARK: 2 - Wanted present is still partial and must wait
         let presentGroups = [group("comet", [cometDirect1080]), group("aiostreams", [aioDirect])]
-        expect(settledNew(presentGroups, loaded: 2, total: 3, seconds: 1, quality: hint1080, wantedAddon: wanted),
-               "present: the wanted source has arrived (loaded < total, only 1s in) -> gate opens at once")
-        expect(settledNew(presentGroups, loaded: 2, total: 3, seconds: 1, quality: hint1080, wantedAddon: "AIOStreams"),
-               "present: the wanted-source match is case-insensitive, like stickyBonus / the pin match")
+        expect(settledNew(presentGroups, loaded: 2, total: 3, seconds: 1, quality: hint1080, wantedAddon: wanted) == false,
+               "present: the wanted source cannot open while another contributor remains pending")
+        expect(settledNew(presentGroups, loaded: 2, total: 3, seconds: 1, quality: hint1080, wantedAddon: "AIOStreams") == false,
+               "present: wanted-source case does not change settlement")
         // Present in the list but only as a bare trailer: NOT an arrival, so the bounded wait still holds.
         let trailerOnlyGroups = [group("comet", [cometDirect1080]), group("aiostreams", [bareTrailer])]
         expect(settledNew(trailerOnlyGroups, loaded: 2, total: 3, seconds: 1, quality: hint1080, wantedAddon: wanted) == false,
@@ -255,43 +247,65 @@ enum BingeSourceMemoryRaceContractTests {
         expect(settledNew(raceGroups, loaded: 3, total: 3, seconds: 0, quality: hint1080, wantedAddon: wanted),
                "everyone-answered: loaded >= total commits, so a wanted source that never returns cannot hang it")
 
-        // MARK: 4 - Deadline: wanted absent, past the 12s cap -> bounded fallback commits
-        expect(settledNew(raceGroups, loaded: 1, total: 3, seconds: 11, quality: hint1080, wantedAddon: wanted) == false,
-               "deadline: 11s in (< 12) with the wanted source still absent, the gate is still holding")
-        expect(settledNew(raceGroups, loaded: 1, total: 3, seconds: 13, quality: hint1080, wantedAddon: wanted),
-               "deadline: 13s in (> 12) the bounded fallback opens the gate - the wait can never hang")
-        expect(StreamRanking.wantedSourceDeadline == 12,
-               "deadline: the cap is the documented 12s, under the commit loop's own ~20s hard cap")
+        // MARK: 4 - Deadline: partial contributors are bounded by the shared 20 second cap
+        expect(settledNew(raceGroups, loaded: 1, total: 3, seconds: 19.9, quality: hint1080, wantedAddon: wanted) == false,
+               "deadline: a partial set remains closed immediately before the shared deadline")
+        expect(settledNew(raceGroups, loaded: 1, total: 3, seconds: 20, quality: hint1080, wantedAddon: wanted),
+               "deadline: the bounded fallback opens at the shared deadline")
+        expect(settledNew(raceGroups, loaded: 1, total: 3, seconds: 20, quality: nil, wantedAddon: nil),
+               "deadline: a first playable arriving late cannot reset the request-owned settlement clock")
+        expect(StreamRanking.completeSetDeadline == SourceSettlementPolicy.maximumWait,
+               "deadline: raw waits use the shared complete-set ceiling")
 
-        // MARK: 5 - No-wanted case is byte-identical to before
-        // 5a fresh play (no remembered quality): the original snappy 4s window.
-        expect(settledNew([group("comet", [cometDirect1080])], loaded: 1, total: 3, seconds: 5, quality: nil, wantedAddon: nil),
-               "no-wanted fresh: 5s (> 4) opens the fresh-play window")
-        expect(settledNew([group("comet", [cometDirect1080])], loaded: 1, total: 3, seconds: 3, quality: nil, wantedAddon: nil) == false,
-               "no-wanted fresh: 3s (< 4) is still too early")
-        // 5b resume, quality-only gate: the remembered quality present opens it; absent, it holds to the 16s ceiling.
-        expect(settledOld([group("comet", [cometDirect1080])], loaded: 1, total: 3, seconds: 1, quality: hint1080),
-               "no-wanted resume: the remembered quality is present -> the quality gate opens")
+        // MARK: 5 - Fresh/resume/torrent hints all wait for full registration
+        expect(settledNew([group("comet", [cometDirect1080])], loaded: 1, total: 3, seconds: 5, quality: nil, wantedAddon: nil) == false,
+               "no-wanted fresh: the old four-second early-open window is closed")
         expect(settledOld([group("p", [direct720])], loaded: 1, total: 3, seconds: 1, quality: hint1080) == false,
                "no-wanted resume: a non-matching quality holds early")
-        expect(settledOld([group("p", [direct720])], loaded: 1, total: 3, seconds: 17, quality: hint1080),
-               "no-wanted resume: the 16s ceiling still releases a quality that never returned")
-        // 5c the torrent-order branch exercises the real SourcePreferences read surface.
         let torrentGroups = [group("comet", [cometTorrent1080])]
         expect(settledOld(torrentGroups, loaded: 1, total: 3, seconds: 1, quality: hint1080) == false,
-               "no-wanted resume: with the default order a matching TORRENT is held (user's stream lands later)")
+               "no-wanted resume: a matching torrent cannot open a partial set")
         SourcePreferences.stub.typeOrder = [.torrent, .debrid, .usenet, .direct]
-        expect(settledOld(torrentGroups, loaded: 1, total: 3, seconds: 1, quality: hint1080),
-               "no-wanted resume: a torrent-first user's matching torrent opens the gate (torrentOK true)")
+        expect(settledOld(torrentGroups, loaded: 1, total: 3, seconds: 1, quality: hint1080) == false,
+               "no-wanted resume: torrent-first preference affects rank, not settlement")
         SourcePreferences.stub = StubPrefs()
 
         // MARK: guards
         expect(settledNew([], loaded: 0, total: 0, seconds: 99, quality: hint1080, wantedAddon: wanted) == false,
                "guard: an empty group set never settles")
-        // A wanted source that IS present short-circuits even when quality never matched the remembered hint.
+        // A wanted source that is present remains partial until all contributors finish.
         let presentButNoQuality = [group("aiostreams", [direct720])]
-        expect(settledNew(presentButNoQuality, loaded: 1, total: 3, seconds: 1, quality: hint1080, wantedAddon: wanted),
-               "present: the wanted source arriving commits even before its quality is judged (best() ranks within it)")
+        expect(settledNew(presentButNoQuality, loaded: 1, total: 3, seconds: 1, quality: hint1080, wantedAddon: wanted) == false,
+               "present: wanted arrival alone cannot commit before all contributors finish")
+
+        // Ranking sees the late superior source only after the complete-set gate opens.
+        let inferior = stream(#"{"url":"https://cdn.invalid/inferior.mkv","name":"Comet 720p WEBRip"}"#)
+        let superior = stream(#"{"url":"https://cdn.invalid/superior.mkv","name":"AIOStreams 2160p REMUX DV"}"#)
+        let completeGroups = [group("comet", [inferior]), group("aiostreams", [superior])]
+        expect(settledNew(completeGroups, loaded: 2, total: 2, seconds: 0, quality: nil, wantedAddon: nil),
+               "late superior: the complete contributor set settles immediately")
+        expect(StreamRanking.best(completeGroups, continuity: nil, pin: nil)?.url == superior.url,
+               "late superior: ranking the complete set selects the superior late source")
+
+        let callerPaths = [
+            "app/SourcesiOS/iOSDetailView.swift",
+            "app/SourcesiOS/iOSBatchDownloadCoordinator.swift",
+            "app/SourcesTV/TVEpisodePanel.swift",
+            "app/SourcesTV/TVPlayerView.swift",
+        ]
+        let callerSource = callerPaths.compactMap { try? String(contentsOfFile: $0, encoding: .utf8) }
+            .joined(separator: "\n")
+        expect(callerSource.components(separatedBy: "secondsSinceRequestStart:").count - 1 == 6,
+               "caller clock: every raw settle call passes request-start elapsed time")
+        expect(!callerSource.contains("secondsSinceFirstPlayable"),
+               "caller clock: no production raw settle loop retains the first-playable reset")
+        expect(callerSource.components(separatedBy: "let settlementStartedAt = Date()").count - 1 == 6,
+               "caller clock: all six raw requests own an absolute settlement start")
+        let directDeadlineBreaks = callerSource.components(
+            separatedBy: "if elapsed >= StreamRanking.completeSetDeadline { break }"
+        ).count - 1
+        expect(directDeadlineBreaks == 5 && callerSource.contains("if deadlineReached { break }"),
+               "caller clock: every raw loop hard-stops on the same twenty-second request deadline")
 
         print(failures == 0 ? "\nALL PASS" : "\n\(failures) FAILURE(S)")
         exit(failures == 0 ? 0 : 1)

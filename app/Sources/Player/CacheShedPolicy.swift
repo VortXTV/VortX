@@ -1,5 +1,187 @@
 import Foundation
 
+/// The only finite sources allowed to request the destructive cache drop. Keeping this beside the value gate
+/// makes the gate dependency-free while preventing an arbitrary diagnostic string from becoming ownership data.
+enum CacheFlushReason: String, Equatable {
+    case pausedCacheClamp = "paused-cache-clamp"
+    case memoryWarning = "memory-warning"
+    case proactiveMemoryPressure = "proactive-memory-pressure"
+}
+
+/// Result returned by the controller's destructive-cache admission point. A started flight may still terminate
+/// with a command error, settle-window acceptance, or cancellation; those outcomes are recorded by the
+/// controller's bounded receipts rather than added to this finite admission surface.
+enum CacheFlushDisposition: Equatable {
+    case started
+    case coalesced
+    case skipped
+}
+
+/// One controller-local destructive cache operation. `Owner` is the exact loaded-file token in production; the
+/// standalone policy harness uses an integer so these lifecycle rules remain testable without libmpv/UIKit.
+struct CacheFlushFlight<Owner: Equatable> {
+    enum Phase: String, Equatable {
+        case dropping
+        case seeking
+        case settling
+        case terminal
+    }
+
+    enum Result: String, Equatable {
+        case pending
+        case commandAccepted = "command-accepted"
+        case dropCommandError = "drop-command-error"
+        case seekCommandError = "seek-command-error"
+        case canceled
+    }
+
+    let id: UInt64
+    let owner: Owner
+    let reason: CacheFlushReason
+    let target: Double
+    let targetArgument: String
+    let startUptime: TimeInterval
+    var coalescedCount = 0
+    var phase: Phase = .dropping
+    var result: Result = .pending
+    var timeoutWorkItem: DispatchWorkItem?
+}
+
+/// Main-queue-owned single flight for the destructive cache drop plus exact re-anchor seek. This is a value
+/// type, not a reusable operation framework: one instance belongs to one MPVMetalViewController.
+struct CacheFlushSingleFlight<Owner: Equatable> {
+    private(set) var nextFlightID: UInt64 = 0
+    private(set) var current: CacheFlushFlight<Owner>?
+
+    /// Return `.coalesced` only for the exact current owner. A different owner drops the old flight and lets the
+    /// caller revalidate before installing a new one; no command is issued by this value type.
+    mutating func admit(owner: Owner) -> CacheFlushDisposition {
+        guard var flight = current else { return .started }
+        guard flight.owner == owner else {
+            flight.timeoutWorkItem?.cancel()
+            current = nil
+            return .started
+        }
+        flight.coalescedCount += 1
+        current = flight
+        return .coalesced
+    }
+
+    /// Install the complete immutable target snapshot before any destructive command is attempted.
+    @discardableResult
+    mutating func install(
+        owner: Owner,
+        reason: CacheFlushReason,
+        target: Double,
+        targetArgument: String,
+        startUptime: TimeInterval,
+        timeoutWorkItem: DispatchWorkItem
+    ) -> CacheFlushFlight<Owner> {
+        precondition(target.isFinite && target > 0)
+        precondition(!targetArgument.isEmpty)
+        precondition(startUptime.isFinite)
+        precondition(current == nil)
+        precondition(nextFlightID < UInt64.max)
+        nextFlightID += 1
+        let flight = CacheFlushFlight(
+            id: nextFlightID,
+            owner: owner,
+            reason: reason,
+            target: target,
+            targetArgument: targetArgument,
+            startUptime: startUptime,
+            timeoutWorkItem: timeoutWorkItem
+        )
+        current = flight
+        return flight
+    }
+
+    func matches(id: UInt64, owner: Owner) -> Bool {
+        current?.id == id && current?.owner == owner
+    }
+
+    mutating func markDropSucceeded(id: UInt64, owner: Owner) -> Bool {
+        guard var flight = current, flight.id == id, flight.owner == owner else { return false }
+        guard flight.phase == .dropping, flight.result == .pending else { return false }
+        flight.phase = .seeking
+        current = flight
+        return true
+    }
+
+    mutating func markSeekCommandAccepted(id: UInt64, owner: Owner) -> Bool {
+        guard var flight = current, flight.id == id, flight.owner == owner else { return false }
+        guard flight.phase == .seeking, flight.result == .pending else { return false }
+        flight.phase = .settling
+        current = flight
+        return true
+    }
+
+    @discardableResult
+    mutating func dropCommandError(id: UInt64, owner: Owner) -> CacheFlushFlight<Owner>? {
+        finishIfExact(id: id, owner: owner, phase: .dropping, result: .dropCommandError)
+    }
+
+    /// A seek command error is latched in the settling phase, not retried or resampled. The settle window remains
+    /// the one bounded exit.
+    mutating func seekCommandError(id: UInt64, owner: Owner) -> Bool {
+        guard var flight = current, flight.id == id, flight.owner == owner else { return false }
+        guard flight.phase == .seeking, flight.result == .pending else { return false }
+        flight.phase = .settling
+        flight.result = .seekCommandError
+        current = flight
+        return true
+    }
+
+    /// The single 15-second settle-window edge accepts a successful seek or preserves its latched error. It
+    /// requires the exact flight identity and never consults a replacement's current ID.
+    @discardableResult
+    mutating func settle(id: UInt64, owner: Owner) -> CacheFlushFlight<Owner>? {
+        guard let flight = current,
+              flight.id == id,
+              flight.owner == owner,
+              flight.phase == .settling,
+              flight.result == .pending || flight.result == .seekCommandError else { return nil }
+        let result: CacheFlushFlight<Owner>.Result =
+            flight.result == .seekCommandError ? .seekCommandError : .commandAccepted
+        return finish(result: result)
+    }
+
+    @discardableResult
+    mutating func reset() -> CacheFlushFlight<Owner>? {
+        guard current != nil else { return nil }
+        return finish(result: .canceled)
+    }
+
+    @discardableResult
+    mutating func reset(owner: Owner) -> CacheFlushFlight<Owner>? {
+        guard current?.owner == owner else { return nil }
+        return reset()
+    }
+
+    private mutating func finishIfExact(
+        id: UInt64,
+        owner: Owner,
+        phase: CacheFlushFlight<Owner>.Phase? = nil,
+        result: CacheFlushFlight<Owner>.Result
+    ) -> CacheFlushFlight<Owner>? {
+        guard let current,
+              current.id == id,
+              current.owner == owner,
+              phase == nil || current.phase == phase,
+              current.result == .pending else { return nil }
+        return finish(result: result)
+    }
+
+    private mutating func finish(result: CacheFlushFlight<Owner>.Result) -> CacheFlushFlight<Owner>? {
+        guard var flight = current else { return nil }
+        flight.timeoutWorkItem?.cancel()
+        flight.phase = .terminal
+        flight.result = result
+        current = nil
+        return flight
+    }
+}
+
 /// Dependency-free memory-warning cache-shedding decisions for `MPVMetalViewController`, split out so the
 /// executable test harness can run them without UIKit/libmpv/RemoteConfig (the DVPlaybackContractTests pattern).
 /// Every device-scaled, RemoteConfig-backed number (`floorBytes`, `stepBytes`) is PASSED IN by the controller,
@@ -65,7 +247,7 @@ enum VortXCacheShedPolicy {
         guard availableBytes < TVOSProactiveMemoryPressurePolicy.pressureThresholdBytes(
             physicalMemoryBytes: physicalBytes
         ) else {
-            return currentBytes   // headroom at/above the pressure bar: an advisory warning must NOT lower the cap
+            return currentBytes   // headroom meets the pressure bar: an advisory warning must NOT lower the cap
         }
         let stepped = max(floorBytes, currentBytes - stepBytes)
         return min(currentBytes, stepped)   // non-increasing: never raise the cap even if floor > current

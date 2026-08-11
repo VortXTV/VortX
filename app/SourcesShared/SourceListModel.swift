@@ -44,6 +44,9 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     /// Best playable stream per resolution label (forward-compat: the player's resolution dropdown).
     /// Computed alongside `tiers` on the same off-main pass.
     @Published private var publishedResolutionOptions: [(label: String, stream: CoreStream)] = []
+    /// Published in the same main-actor transaction as the ranked rows it describes. Auto-pick reads this
+    /// receipt instead of independently polling one subset of contributors.
+    @Published private var publishedSettlement: SourceSettlementDecision = .waiting
 
     var groups: [CoreStreamSourceGroup] {
         publishedIdentity == outputIdentity(for: context) ? publishedGroups : []
@@ -57,6 +60,10 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     var resolutionOptions: [(label: String, stream: CoreStream)] {
         publishedIdentity == outputIdentity(for: context) ? publishedResolutionOptions : []
     }
+    var settlement: SourceSettlementDecision {
+        publishedIdentity == outputIdentity(for: context) ? publishedSettlement : .waiting
+    }
+    var isSettled: Bool { settlement.isSettled }
 
     // MARK: Context (the view-owned ranking inputs, set from body, equality-guarded)
 
@@ -66,8 +73,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     struct Context: Equatable {
         var metaId = ""              // for the pin scope + the health-metric log only
         var streamId: String?        // nil = all loaded groups (movie/live); set = one episode's groups (iOS + tvOS episode pages)
-        var auxiliaryContentID: String?   // canonical query token for TorBox Search + Singularity
-        var mediaServerTargetID: String?  // exact page token, including IMDb-less title/year fallback pages
+        var auxiliaryTarget: SourceIndexIdentity.TargetResolution = .absent
+        var mediaServerTarget: SourceIndexIdentity.MediaServerTarget?
         var continuity: String?      // remembered quality signature for the best() pick (nil for live)
         var pin: ResolvedPin?        // resolved pinned source, from the view's SourcePinStore lookup
         var prefsSignature = ""      // SourcePreferences.rankingSignature (filter/rank settings)
@@ -85,14 +92,18 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         let torboxEpoch: Int
         let singularityEpoch: Int
         let mediaServerEpoch: Int
+        let torboxSettlementEpoch: Int
+        let singularitySettlementEpoch: Int
+        let mediaServerSettlementEpoch: Int
+        let settlementDeadlineExpired: Bool
         let inputsHash: Int
     }
 
     private struct OutputIdentity: Equatable {
         let metaId: String
         let streamId: String?
-        let auxiliaryContentID: String?
-        let mediaServerTargetID: String?
+        let auxiliaryContentToken: String?
+        let mediaServerTargetToken: String?
     }
 
     /// Sendable weak indirection for the detached worker's main-actor publish. Capturing `weak self` directly
@@ -112,9 +123,24 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     private var subscriptions: Set<AnyCancellable> = []
     private let trigger = PassthroughSubject<Void, Never>()
     private var generation = 0
+
+    /// A stable per-instance discriminator for the shared health log ONLY. When two SourceListModel instances
+    /// exist for one title (a detail page re-created while the old one is still tearing down), their
+    /// per-instance `generation` counters, each monotonic on its own, interleave in the single log with nothing
+    /// to tell them apart, which reads as the counter "going backward". This tags each rebuild line so the two
+    /// streams separate. Assigned once at init from a main-actor counter; never load-bearing.
+    private static var instanceSeq = 0
+    private let instanceID: Int = { SourceListModel.instanceSeq += 1; return SourceListModel.instanceSeq }()
     private var publishedSignature: Signature?
     private var publishedIdentity: OutputIdentity?
     private var pendingSignature: Signature?
+    private var settlementDeadlineExpired = false
+    private var settlementDeadlineTask: Task<Void, Never>?
+    private let settlementMaximumWait: TimeInterval
+
+    init(settlementMaximumWait: TimeInterval = SourceSettlementPolicy.maximumWait) {
+        self.settlementMaximumWait = max(0, settlementMaximumWait)
+    }
 
     /// The coalescing window. At most ~4 rebuilds/sec while an engine burst streams sources in; the
     /// `[sing] merged` log below fires once per rebuild, so >4 lines/sec on a loading title means
@@ -142,8 +168,11 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             core.$streamsEpoch.map { _ in () }.eraseToAnyPublisher(),      // ready-stream set really changed
             core.$addons.map { _ in () }.eraseToAnyPublisher(),            // add-on installed/removed (tombstones)
             torbox.$streams.map { _ in () }.eraseToAnyPublisher(),         // TorBox search results replaced
+            torbox.$settlementEpoch.map { _ in () }.eraseToAnyPublisher(), // including empty/error terminal result
             singularity.$streams.map { _ in () }.eraseToAnyPublisher(),    // Singularity pool results replaced
+            singularity.$settlementEpoch.map { _ in () }.eraseToAnyPublisher(),
             mediaServers.$groups.map { _ in () }.eraseToAnyPublisher(),    // media-server direct-play groups replaced
+            mediaServers.$settlementEpoch.map { _ in () }.eraseToAnyPublisher(),
             debridCache.$cachedHashes.map { _ in () }.eraseToAnyPublisher(), // cache awareness re-ranks
             trigger.eraseToAnyPublisher(),                                 // context change / manual nudge
         ]
@@ -158,13 +187,19 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     /// Update the view-owned ranking inputs. Safe (and intended) to call from `body`: it is a few
     /// cheap reads plus an equality check, publishes nothing synchronously, and only nudges the
     /// coalescer when an input actually moved.
-    func setContext(metaId: String, streamId: String?, continuity: String?, pin: ResolvedPin?,
-                    auxiliaryContentID: String? = nil, mediaServerTargetID: String? = nil) {
+    func setContext(
+        metaId: String,
+        streamId: String?,
+        continuity: String?,
+        pin: ResolvedPin?,
+        auxiliaryTarget: SourceIndexIdentity.TargetResolution,
+        mediaServerTarget: SourceIndexIdentity.MediaServerTarget?
+    ) {
         var next = Context()
         next.metaId = metaId
         next.streamId = streamId
-        next.auxiliaryContentID = auxiliaryContentID
-        next.mediaServerTargetID = mediaServerTargetID
+        next.auxiliaryTarget = auxiliaryTarget
+        next.mediaServerTarget = mediaServerTarget
         next.continuity = continuity
         next.pin = pin
         next.prefsSignature = SourcePreferences.shared.rankingSignature
@@ -173,8 +208,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         next.disabledAddons = ProfileStore.activeDisabledAddons()
         guard next != context else { return }
         let identityChanged = next.metaId != context.metaId || next.streamId != context.streamId
-            || next.auxiliaryContentID != context.auxiliaryContentID
-            || next.mediaServerTargetID != context.mediaServerTargetID
+            || next.auxiliaryTarget != context.auxiliaryTarget
+            || next.mediaServerTarget != context.mediaServerTarget
         context = next
         if identityChanged {
             // A detached rebuild for the prior title/episode may still be running. Retire its generation and
@@ -183,16 +218,36 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             generation &+= 1
             pendingSignature = nil
             publishedSignature = nil
+            publishedSettlement = .waiting
+            resetSettlementDeadline(for: outputIdentity(for: next))
         }
         trigger.send()
+    }
+
+    private func resetSettlementDeadline(for identity: OutputIdentity) {
+        settlementDeadlineTask?.cancel()
+        settlementDeadlineExpired = false
+        let maximumWait = settlementMaximumWait
+        settlementDeadlineTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(maximumWait))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled,
+                  self.outputIdentity(for: self.context) == identity else { return }
+            self.settlementDeadlineTask = nil
+            self.settlementDeadlineExpired = true
+            self.trigger.send()
+        }
     }
 
     private func outputIdentity(for context: Context) -> OutputIdentity {
         OutputIdentity(
             metaId: context.metaId,
             streamId: context.streamId,
-            auxiliaryContentID: context.auxiliaryContentID,
-            mediaServerTargetID: context.mediaServerTargetID
+            auxiliaryContentToken: SourceIndexIdentity.validatedTarget(context.auxiliaryTarget)?.contentID,
+            mediaServerTargetToken: context.mediaServerTarget?.token
         )
     }
 
@@ -224,8 +279,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         var hasher = Hasher()
         hasher.combine(ctx.metaId)
         hasher.combine(ctx.streamId)
-        hasher.combine(ctx.auxiliaryContentID)
-        hasher.combine(ctx.mediaServerTargetID)
+        hasher.combine(ctx.auxiliaryTarget)
+        hasher.combine(ctx.mediaServerTarget)
         hasher.combine(ctx.continuity)
         hasher.combine(String(describing: ctx.pin))
         hasher.combine(ctx.prefsSignature)
@@ -242,6 +297,10 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                                   torboxEpoch: torbox.epoch,
                                   singularityEpoch: singularity.epoch,
                                   mediaServerEpoch: mediaServers.epoch,
+                                  torboxSettlementEpoch: torbox.settlementEpoch,
+                                  singularitySettlementEpoch: singularity.settlementEpoch,
+                                  mediaServerSettlementEpoch: mediaServers.settlementEpoch,
+                                  settlementDeadlineExpired: settlementDeadlineExpired,
                                   inputsHash: hasher.finalize())
         guard signature != publishedSignature, signature != pendingSignature else { return }
         pendingSignature = signature
@@ -250,15 +309,54 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
 
         // Immutable snapshot on the main actor; everything below is value types.
         let raw = ctx.streamId.map { core.streamGroups(forStreamId: $0) } ?? core.streamGroups()
-        let target = ctx.auxiliaryContentID
-        let torboxStreams = target != nil && torbox.publishedContentID == target ? torbox.streams : []
-        let singularityStreams = target != nil && singularity.publishedContentID == target ? singularity.streams : []
+        let target = ctx.auxiliaryTarget
+        let torboxAuthorization = SourceIndexIdentity.mergeAuthorization(
+            published: torbox.publishedTarget,
+            page: target
+        )
+        let singularityAuthorization = SourceIndexIdentity.mergeAuthorization(
+            published: singularity.publishedTarget,
+            page: target
+        )
+        let torboxStreams = torboxAuthorization == nil ? [] : torbox.streams
+        let singularityStreams = singularityAuthorization == nil ? [] : singularity.streams
         let singularityEpoch = singularity.epoch
         let sourceLifecycle = SourceIndexLifecycleClock.snapshot()
         let includedSingularity = !singularityStreams.isEmpty
-        let mediaTarget = ctx.mediaServerTargetID
-        let mediaServerGroups = mediaTarget != nil && mediaServers.publishedContentID == mediaTarget
-            ? mediaServers.groups : []
+        let mediaTarget = ctx.mediaServerTarget
+        let mediaAuthorization = SourceIndexIdentity.mediaServerMergeAuthorization(
+            published: mediaServers.publishedTarget,
+            page: mediaTarget
+        )
+        let mediaServerGroups = mediaAuthorization == nil ? [] : mediaServers.groups
+        let rawProgress = ctx.streamId.map { core.streamLoadProgress(forStreamId: $0) }
+            ?? core.streamLoadProgress()
+        let rawSettlement = core.streamContributorSettlement(metaId: ctx.metaId, streamId: ctx.streamId)
+        let auxiliarySettlement = [
+            torbox.settlementState(for: target),
+            singularity.settlementState(for: target),
+            mediaServers.settlementState(for: mediaTarget),
+        ]
+        let hasPendingContributor = ([rawSettlement] + auxiliarySettlement).contains(.pending)
+        if SourceSettlementPolicy.shouldRearmDeadline(
+            previous: publishedSettlement,
+            hasPendingContributor: hasPendingContributor,
+            deadlineTaskActive: settlementDeadlineTask != nil
+        ) {
+            // A contributor may retry for the SAME title after an empty/error terminal result. The prior
+            // settled-all receipt canceled its deadline, so this new generation needs a fresh bounded owner;
+            // otherwise a hung retry would leave auto-pick waiting forever.
+            pendingSignature = nil
+            publishedSettlement = .waiting
+            resetSettlementDeadline(for: outputIdentity(for: ctx))
+            trigger.send()
+            return
+        }
+        let settlement = SourceSettlementPolicy.decide(
+            raw: rawSettlement,
+            auxiliary: auxiliarySettlement,
+            deadlineExpired: settlementDeadlineExpired
+        )
         // Freeze the ranking prefs HERE, on the main actor. StreamRanking reads SourcePreferences live at
         // score/filter time; its excludeRegex/includeRegex refs + @Published flags are reassigned on the
         // main thread (Settings edits, profile reload()), so reading them from the detached rank below
@@ -266,6 +364,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         // does not inherit task-locals), so the off-main rank reads this frozen copy, never the singleton.
         let prefsSnapshot = SourcePreferences.shared.snapshot()
         let owner = WeakOwner(self)
+        let metaToken = VXProbeRedaction.identityToken(ctx.metaId.isEmpty ? nil : ctx.metaId)
 
         Task.detached(priority: .userInitiated) {
             // STEP 3 (delete fix), belt and suspenders: CoreBridge.streamGroups() already subtracts
@@ -278,9 +377,19 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             // Merge order preserved from the old per-body displayGroups: TorBox search first, then the
             // Singularity pool, then the media-server direct-play groups, then the direct-links filter so a
             // merged torrent obeys the same rule. Final rank order is decided by StreamRanking, not merge order.
-            assembled = MediaServerSource.merge(mediaServerGroups,
-                          into: SourceIndexServeSource.merge(singularityStreams,
-                                  into: TorBoxSearchSource.merge(torboxStreams, into: assembled)))
+            assembled = MediaServerSource.merge(
+                authorizedBy: mediaAuthorization,
+                mediaServerGroups,
+                into: SourceIndexServeSource.merge(
+                    authorizedBy: singularityAuthorization,
+                    singularityStreams,
+                    into: TorBoxSearchSource.merge(
+                        authorizedBy: torboxAuthorization,
+                        torboxStreams,
+                        into: assembled
+                    )
+                )
+            )
             if ctx.directLinksOnly {
                 assembled = assembled.compactMap { group in
                     let streams = group.streams.filter { !$0.isTorrent }
@@ -305,6 +414,20 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                 guard let self = owner.value else { return }
                 // A newer rebuild superseded this one mid-flight: discard the stale result.
                 guard gen == self.generation else { return }
+                // A contributor can finish or retry while detached ranking is running. Never attach a
+                // complete receipt to a rank built from a different contributor generation.
+                guard core.streamsEpoch == signature.streamsEpoch,
+                      torbox.epoch == signature.torboxEpoch,
+                      singularity.epoch == signature.singularityEpoch,
+                      mediaServers.epoch == signature.mediaServerEpoch,
+                      torbox.settlementEpoch == signature.torboxSettlementEpoch,
+                      singularity.settlementEpoch == signature.singularitySettlementEpoch,
+                      mediaServers.settlementEpoch == signature.mediaServerSettlementEpoch,
+                      self.settlementDeadlineExpired == signature.settlementDeadlineExpired else {
+                    self.pendingSignature = nil
+                    self.trigger.send()
+                    return
+                }
                 guard singularity.permitsDetachedPublish(
                     sourceEpoch: singularityEpoch,
                     lifecycle: sourceLifecycle,
@@ -319,11 +442,23 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                 self.publishedIdentity = self.outputIdentity(for: ctx)
                 // HEALTH METRIC: one line per rebuild. More than ~4/sec on a loading title means the
                 // 250 ms coalescer is broken (this used to fire per body eval, thousands of lines).
-                VXProbe.log("sing", "merged rebuild meta=\(ctx.metaId.isEmpty ? "-" : ctx.metaId) groups=\(ranked.count) streams=\(streamCount) torbox=\(torboxStreams.count) singularity=\(singularityStreams.count) gen=\(gen)")
+                VXProbe.log("sing", "merged rebuild inst=\(self.instanceID) meta=\(metaToken) groups=\(ranked.count) streams=\(streamCount) torbox=\(torboxStreams.count) singularity=\(singularityStreams.count) gen=\(gen)")
                 self.publishedGroups = ranked
                 self.publishedBest = rankedBest
                 self.publishedTiers = rankedTiers
                 self.publishedResolutionOptions = rankedResOpts
+                if self.publishedSettlement != settlement {
+                    let pending = auxiliarySettlement.filter { $0 == .pending }.count
+                    VXProbe.log(
+                        "sources",
+                        "settlement meta=\(metaToken) decision=\(String(describing: settlement)) raw=\(rawProgress.loaded)/\(rawProgress.total) auxiliaryPending=\(pending) gen=\(gen)"
+                    )
+                }
+                self.publishedSettlement = settlement
+                if settlement == .settledAll {
+                    self.settlementDeadlineTask?.cancel()
+                    self.settlementDeadlineTask = nil
+                }
             }
 
             // Phase 7 SHADOW (flag `vortxShadowRanking`, default OFF): rank the SAME assembled
@@ -333,7 +468,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             // neither case can it touch `groups`/`best` or delay this rebuild.
             VortxShadowRanking.observe(groups: assembled, continuity: ctx.continuity, pin: ctx.pin,
                                        cachedHashes: cachedHashes, prefs: prefsSnapshot,
-                                       metaId: ctx.metaId)
+                                       metaId: metaToken)
         }
     }
 
@@ -349,6 +484,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         publishedBest = nil
         publishedTiers = []
         publishedResolutionOptions = []
+        publishedSettlement = .waiting
         trigger.send()
     }
 }

@@ -65,6 +65,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     // MARK: - Lifecycle
 
     private let stream: VortXMKVRemuxStream
+    private let producerTerminalRelay: VortXRemuxProducerTerminalRelay
     /// Listener + connection event queue (never blocked).
     private let queue = DispatchQueue(label: "vortx.dvremux.hls")
     /// Request servicing queue: concurrent, because playlist answers legitimately WAIT (poll) for the remux
@@ -112,10 +113,17 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private var primaryDisplayDispatched = false
     private var recoveryDisplayDispatched = false
     private let startupReadiness: VortXHLSStartupReadiness
-    private let onStartupTimeout: @Sendable (VortXRemuxHLSServer) -> Void
+    private var onStartupTimeout: @Sendable (VortXRemuxHLSServer) -> Void
     private let deadlineLock = NSLock()
     private var mountDeadline = VortXHLSMountDeadlineState()
     private var mountDeadlineWorkItem: DispatchWorkItem?
+    private let producerLifecycleLock = NSLock()
+    private var producerTicket: VortXRemuxProducerTicket?
+    private var producerPurpose: VortXRemuxProducerArbitration.Purpose?
+    private var producerRequestIssued = false
+    private var producerTerminated = false
+    private var preparedReady = false
+    private var preparedAdopted = false
     /// Rate limit for the per-fetch `hls req` / `hls resp` lines. Playlist bodies, failures and the session
     /// lifecycle do NOT pass through it; see `VortXHLSServeLogThrottle` for why the per-fetch stream does.
     private let serveLog = VortXHLSServeLogThrottle()
@@ -219,6 +227,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                      hosting: HostingConfig? = nil,
                      onStartupTimeout: @escaping @Sendable (VortXRemuxHLSServer) -> Void = { _ in })
         -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
+        let producerTerminalRelay = VortXRemuxProducerTerminalRelay()
         let stream = VortXMKVRemuxStream(
             input: input.absoluteString,
             headers: headers,
@@ -228,9 +237,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             retainFullTimeline: hosting?.retainFullTimeline ?? false,
             selectedAudioStreamIndex: selectedAudioStreamIndex,
             preferredAudioLanguages: preferredAudioLanguages,
-            audioRejectTerms: audioRejectTerms)
+            audioRejectTerms: audioRejectTerms,
+            onProducerTerminal: { producerTerminalRelay.fire() })
         guard let server = VortXRemuxHLSServer(
             stream: stream,
+            producerTerminalRelay: producerTerminalRelay,
             hosting: hosting,
             onStartupTimeout: onStartupTimeout) else {
             stream.cancel()
@@ -248,29 +259,250 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     }
 
     private init?(stream: VortXMKVRemuxStream,
+                  producerTerminalRelay: VortXRemuxProducerTerminalRelay,
                   hosting: HostingConfig?,
                   onStartupTimeout: @escaping @Sendable (VortXRemuxHLSServer) -> Void) {
         guard let startupReadiness = VortXHLSStartupReadiness(
             frozenTarget: stream.frozenHLSTarget) else { return nil }
         self.stream = stream
+        self.producerTerminalRelay = producerTerminalRelay
         self.hosting = hosting
         self.startupReadiness = startupReadiness
         self.onStartupTimeout = onStartupTimeout
     }
 
-    /// Begin remuxing. Call once, after the asset is (about to be) mounted.
+    /// Begin a cold playback remux. The asset is about to mount, so this path owns the ready deadline.
     func start() {
+        guard armMountDeadline() else { return }
+        requestProducer(purpose: .playback)
+    }
+
+    /// Queue transport-only preparation behind the current playback producer. No AVPlayerItem exists yet, so
+    /// the mount-to-ready deadline remains idle until an exact owner adopts this server.
+    func beginPreparation() {
+        DiagnosticsLog.log("binge", "prepared-remux phase=queued")
+        requestProducer(purpose: .preparation)
+    }
+
+    enum PreparationReadiness: Sendable {
+        case ready(segmentCount: Int, producedBytes: Int, waitMilliseconds: Int)
+        case rejected(reason: String)
+    }
+
+    /// Wait for the preparation poller to freeze an init plus startup-media cohort. This is separate from the
+    /// mount deadline because no AVPlayerItem exists yet. Cancellation and the caller-supplied wall-clock bound
+    /// both retire the transport instead of allowing a background listener or producer to outlive its owner.
+    func awaitPreparedReadiness(timeoutSeconds: Double) async -> PreparationReadiness {
+        let boundedTimeout = timeoutSeconds.isFinite ? max(0, timeoutSeconds) : 0
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        while true {
+            if Task.isCancelled { return .rejected(reason: "preparation-task-cancelled") }
+            if isPreparedForAdoption {
+                let progress = stream.mountProgress()
+                let waited = max(0, Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1_000))
+                return .ready(
+                    segmentCount: progress.segmentCount,
+                    producedBytes: progress.producedBytes,
+                    waitMilliseconds: waited)
+            }
+            if isInvalidated { return .rejected(reason: "preparation-invalidated") }
+            let failure = stream.buffer.status().failure
+            if let failure {
+                return .rejected(reason: "producer-failed:\(failure)")
+            }
+            if preparationProducerIsTerminal {
+                pollPreparedReadiness()
+                if isPreparedForAdoption { continue }
+                return .rejected(reason: "producer-terminal-before-ready")
+            }
+            if ProcessInfo.processInfo.systemUptime - startedAt >= boundedTimeout {
+                return .rejected(reason: "preparation-readiness-timeout")
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(100))
+            } catch {
+                return .rejected(reason: "preparation-task-cancelled")
+            }
+        }
+    }
+
+    private var preparationProducerIsTerminal: Bool {
+        producerLifecycleLock.lock(); defer { producerLifecycleLock.unlock() }
+        return producerTerminated
+    }
+
+    /// Adopt an exact prepared server once init, signalling and a startup cohort are durable. This installs the
+    /// current engine timeout owner and arms the deadline without starting another producer or listener.
+    func adoptPrepared(
+        onStartupTimeout: @escaping @Sendable (VortXRemuxHLSServer) -> Void
+    ) -> Bool {
+        guard !isInvalidated, stream.buffer.status().failure == nil else { return false }
+        producerLifecycleLock.lock()
+        guard preparedReady, !preparedAdopted else {
+            producerLifecycleLock.unlock()
+            return false
+        }
+        preparedAdopted = true
+        producerLifecycleLock.unlock()
+        deadlineLock.lock()
+        self.onStartupTimeout = onStartupTimeout
+        deadlineLock.unlock()
+        guard armMountDeadline() else {
+            producerLifecycleLock.lock()
+            preparedAdopted = false
+            producerLifecycleLock.unlock()
+            return false
+        }
+        stream.resumePreparationProducer()
+        DiagnosticsLog.log("binge", "prepared-remux phase=adopted port=\(port)")
+        return true
+    }
+
+    var isPreparedForAdoption: Bool {
+        guard !isInvalidated, stream.buffer.status().failure == nil else { return false }
+        producerLifecycleLock.lock(); defer { producerLifecycleLock.unlock() }
+        return preparedReady && !preparedAdopted
+    }
+
+    @discardableResult
+    private func armMountDeadline() -> Bool {
         let now = ProcessInfo.processInfo.systemUptime
         deadlineLock.lock()
         guard let deadline = mountDeadline.start(now: now) else {
             deadlineLock.unlock()
-            return
+            return false
         }
         let work = DispatchWorkItem { [weak self] in self?.expireMountIfNeeded() }
         mountDeadlineWorkItem = work
         deadlineLock.unlock()
         queue.asyncAfter(deadline: .now() + max(0, deadline - now), execute: work)
+        return true
+    }
+
+    private func requestProducer(purpose: VortXRemuxProducerArbitration.Purpose) {
+        producerLifecycleLock.lock()
+        guard !producerRequestIssued else {
+            producerLifecycleLock.unlock()
+            return
+        }
+        producerRequestIssued = true
+        producerPurpose = purpose
+        producerLifecycleLock.unlock()
+
+        let ticket = VortXRemuxProducerCoordinator.shared.submit(
+            purpose: purpose,
+            start: { [weak self] ticket in
+                guard let self else {
+                    ticket.producerDidUnwind()
+                    return
+                }
+                self.producerWasGranted(ticket)
+            },
+            preempt: { [weak self] in
+                self?.invalidate()
+            },
+            reject: { [weak self] in
+                self?.producerRequestWasRejected()
+            })
+        producerLifecycleLock.lock()
+        if producerTicket == nil { producerTicket = ticket }
+        producerLifecycleLock.unlock()
+        if isInvalidated { ticket.cancel() }
+    }
+
+    private func producerWasGranted(_ ticket: VortXRemuxProducerTicket) {
+        producerLifecycleLock.lock()
+        producerTicket = ticket
+        let purpose = producerPurpose
+        producerLifecycleLock.unlock()
+
+        producerTerminalRelay.install { [weak self, ticket] in
+            guard let self else {
+                ticket.producerDidUnwind()
+                return
+            }
+            self.producerDidUnwind()
+        }
+        guard !isInvalidated else {
+            stream.cancel()
+            return
+        }
+        DiagnosticsLog.log(
+            purpose == .preparation ? "binge" : "dv",
+            purpose == .preparation
+                ? "prepared-remux phase=started port=\(port)"
+                : "remux producer phase=started port=\(port)")
         stream.start()
+        if purpose == .preparation { schedulePreparedReadinessPoll() }
+    }
+
+    private func producerRequestWasRejected() {
+        DiagnosticsLog.log("binge", "prepared-remux phase=rejected reason=arbitration")
+        invalidate()
+    }
+
+    private func producerDidUnwind() {
+        producerLifecycleLock.lock()
+        let ticket = producerTicket
+        producerTerminated = true
+        let failed = stream.buffer.status().failure != nil
+        let wasPreparation = producerPurpose == .preparation
+        producerLifecycleLock.unlock()
+        if let ticket { ticket.producerDidUnwind() }
+        if wasPreparation, failed {
+            DiagnosticsLog.log(
+                "binge",
+                "prepared-remux phase=rejected reason=producer-terminal")
+        }
+    }
+
+    private func schedulePreparedReadinessPoll() {
+        queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.pollPreparedReadiness()
+        }
+    }
+
+    private func pollPreparedReadiness() {
+        guard !isInvalidated else { return }
+        producerLifecycleLock.lock()
+        let shouldPoll = producerPurpose == .preparation && !preparedReady
+        let terminal = producerTerminated
+        producerLifecycleLock.unlock()
+        guard shouldPoll else { return }
+
+        let snapshot = stream.hlsSnapshot()
+        if snapshot.signaling != nil, prepareMasterPublication() != nil {
+            let parkAccepted = stream.requestPreparationProducerPark()
+            let parked = stream.isPreparationProducerParked
+            if !parked, !terminal {
+                if !parkAccepted {
+                    DiagnosticsLog.log(
+                        "binge",
+                        "prepared-remux phase=rejected reason=producer-park-unavailable")
+                    return
+                }
+                schedulePreparedReadinessPoll()
+                return
+            }
+            producerLifecycleLock.lock()
+            let publishReady = !preparedReady
+            preparedReady = true
+            producerLifecycleLock.unlock()
+            if publishReady {
+                let progress = stream.mountProgress()
+                DiagnosticsLog.log(
+                    "binge",
+                    "prepared-remux phase=ready segments=\(progress.segmentCount) bytes=\(progress.producedBytes) parked=\(parked ? 1 : 0)")
+            }
+            return
+        }
+        if stream.buffer.status().failure != nil || terminal {
+            DiagnosticsLog.log(
+                "binge",
+                "prepared-remux phase=rejected reason=not-ready-at-terminal")
+            return
+        }
+        schedulePreparedReadinessPoll()
     }
 
     /// F3: forward the engine's first-frame readiness to the buffer so its producer lead widens from the
@@ -481,6 +713,10 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         playbackClockLock.lock()
         seekAnchorState.invalidate()
         playbackClockLock.unlock()
+        producerLifecycleLock.lock()
+        let ticket = producerTicket
+        producerLifecycleLock.unlock()
+        ticket?.cancel()
         stream.cancel()
         listener?.cancel()
         open.forEach { $0.cancel() }
@@ -812,7 +1048,10 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             "dv", "hls_mount_to_ready_timeout count=1 waitedMs=30000 -> fail-soft")
         stream.failHLS("HLS mount did not reach AVPlayer readyToPlay within 30 seconds")
         invalidate()
-        onStartupTimeout(self)
+        deadlineLock.lock()
+        let callback = onStartupTimeout
+        deadlineLock.unlock()
+        callback(self)
     }
 
     // MARK: - Resources

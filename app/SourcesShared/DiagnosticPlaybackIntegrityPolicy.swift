@@ -249,6 +249,19 @@ enum EpisodicAssetSanityPolicy {
     /// Reject only the narrow preview-shaped false asset confirmed in diagnostic 13. Every unknown
     /// or counterexample is fail-open for playback and fail-closed for rejection.
     static func verdict(for evidence: Evidence) -> Verdict {
+        // A5b: a stream far shorter than its expected runtime is a wrong or placeholder asset, whether it is a
+        // movie or an episode and at any frame rate. This catches the decoy the preview shape below misses: a
+        // movie has no episode number (so the episodic guard fails open) and an 18fps 8s clip is not the
+        // <=1.5fps preview shape. Reuse the same runtime heuristic (expected known and long, observed at or
+        // under a quarter of it). Only decide on a settled duration (a track list has been observed) so an
+        // early zero-duration tick never rejects; otherwise fall through and keep the prior fail-open behavior.
+        if evidence.isLibMPV, !evidence.isLive, !evidence.isTrailer,
+           evidence.trackListObserved,
+           evidence.durationSeconds.isFinite, evidence.durationSeconds > 0,
+           let expected = evidence.expectedRuntimeSeconds, expected.isFinite, expected >= 600,
+           evidence.durationSeconds <= expected * 0.25 {
+            return .reject
+        }
         guard evidence.isLibMPV,
               let season = evidence.season, season >= 0,
               let episode = evidence.episode, episode > 0,

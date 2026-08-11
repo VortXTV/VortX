@@ -68,6 +68,17 @@ final class Host {
             } else {
                 dispatch(.resolved(rowId: rowId, outcome: .ready(name: manifestNames[identity] ?? "Add-on")))
             }
+        case let .resolveDurable(ticket, url):
+            let identity = normalize(url) ?? url
+            if invalidURLs.contains(url) || invalidURLs.contains(identity) {
+                dispatch(.resolvedDurable(ticket: ticket, outcome: .invalid))
+            } else if installedTransport.contains(identity) {
+                dispatch(.resolvedDurable(ticket: ticket,
+                                          outcome: .alreadyInstalled(name: manifestNames[identity] ?? "Add-on")))
+            } else {
+                dispatch(.resolvedDurable(ticket: ticket,
+                                          outcome: .ready(name: manifestNames[identity] ?? "Add-on")))
+            }
         case let .install(rowId, url):
             installEffectCount += 1
             let identity = normalize(url) ?? url
@@ -77,6 +88,18 @@ final class Host {
                 installedTransport.insert(identity)   // engine now holds it (idempotent success)
                 dispatch(.installFinished(rowId: rowId, outcome: .installed))
             }
+        case let .claim(deliveryID, _, _, authoritySession, authorityGeneration):
+            let attempt = (state.rows.first(where: { $0.id == deliveryID })?.attempt ?? 0) + 1
+            dispatch(.claimFinished(rowId: deliveryID,
+                                    authoritySession: authoritySession,
+                                    authorityGeneration: authorityGeneration,
+                                    attempt: attempt,
+                                    deliveryRevision: (state.rows.first(where: { $0.id == deliveryID })?.deliveryRevision ?? 0) + 1,
+                                    success: true))
+        case .installAttempt, .poll, .ack, .releaseSession:
+            // The legacy harness never emits durable effects; keep the switch exhaustive so it can
+            // continue exercising the beta URL-only compatibility path.
+            break
         }
     }
 
@@ -88,7 +111,7 @@ final class Host {
 
 @main
 enum AddonPairingReducerTests {
-    static var failures = 0
+    nonisolated(unsafe) static var failures = 0
     static func check(_ cond: Bool, _ name: String) {
         if cond { print("  ok   \(name)") }
         else { failures += 1; print("  FAIL \(name)") }

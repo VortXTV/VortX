@@ -3,6 +3,7 @@
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
 //     -o /tmp/subtitle-rendition-policy-test \
 //     app/Sources/Player/VortXRemuxBuffer.swift \
+//     app/Sources/Player/PGSOCRPolicy.swift \
 //     app/Sources/Player/SubtitleRenditionPolicy.swift \
 //     app/Tests/SubtitleRenditionPolicyTests.swift && /tmp/subtitle-rendition-policy-test
 //
@@ -450,6 +451,33 @@ check("cue: a too-short duration is raised to the floor",
 check("cue: a runaway duration is capped",
       Policy.cue(payload: data("Hi"), format: .subRip, startSeconds: 1, durationSeconds: 9000)?.end
         == 1 + Policy.maxCueDuration)
+let openPGSTiming = PGSOCRPolicy.cueTiming(
+    packetStartSeconds: 10,
+    packetDurationSeconds: 2,
+    displayStartMilliseconds: 0,
+    displayEndMilliseconds: UInt32.max)!
+let openPGSCue = Policy.cue(
+    payload: data("PGS"), format: .pgs,
+    startSeconds: openPGSTiming.start, durationSeconds: openPGSTiming.duration)!
+check("cue: PGS open-end sentinel never becomes the generic 30-second cap",
+      openPGSCue == Cue(start: 10, end: 12, text: "PGS"))
+let openPGSSegmentHits = (10..<50).filter { second in
+    !Policy.cues(
+        [openPGSCue], overlapping: Double(second), end: Double(second + 1)
+    ).isEmpty
+}
+check("cue: a two-second open PGS packet reaches two one-second WebVTT segments, not thirty",
+      openPGSSegmentHits == [10, 11])
+let clearPGSTiming = PGSOCRPolicy.cueTiming(
+    packetStartSeconds: 20,
+    packetDurationSeconds: 0,
+    displayStartMilliseconds: 0,
+    displayEndMilliseconds: UInt32.max)!
+check("cue: a PGS display awaiting its clear uses the bounded missing-duration fallback",
+      Policy.cue(
+        payload: data("CLEAR"), format: .pgs,
+        startSeconds: clearPGSTiming.start, durationSeconds: clearPGSTiming.duration)
+        == Cue(start: 20, end: 20 + Policy.fallbackCueDuration, text: "CLEAR"))
 check("cue: a duration just under the cap is NOT capped",
       Policy.cue(payload: data("Hi"), format: .subRip, startSeconds: 0,
                  durationSeconds: Policy.maxCueDuration - 0.5)?.end == Policy.maxCueDuration - 0.5)

@@ -16,12 +16,8 @@
 	     the whole External Services feature is a hidden no-op. The repo is public; never hardcode. -->
 	<key>TraktClientId</key>
 	<string>$(TRAKT_CLIENT_ID)</string>
-	<key>TraktClientSecret</key>
-	<string>$(TRAKT_CLIENT_SECRET)</string>
 	<key>SIMKLClientId</key>
 	<string>$(SIMKL_CLIENT_ID)</string>
-	<key>SIMKLClientSecret</key>
-	<string>$(SIMKL_CLIENT_SECRET)</string>
 	<!-- Base Info.plist: Xcode merges its GENERATE_INFOPLIST_FILE keys (scene manifest, launch
 	     screen, icons, bundle keys) on top of this. We only declare what generation can't: the
 	     ATS exception that lets the WKWebView (https web.stremio.com) reach the embedded streaming

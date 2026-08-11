@@ -48,6 +48,33 @@ private func compact(_ source: String) -> String {
     source.filter { !$0.isWhitespace }
 }
 
+private func replacingFirst(_ needle: String, with replacement: String, in source: String) -> String {
+    guard let range = source.range(of: needle) else { return source }
+    return source.replacingCharacters(in: range, with: replacement)
+}
+
+private func hasPersistentVODReconnectContract(_ source: String) -> Bool {
+    let vod = #""reconnect=1,reconnect_streamed=1,reconnect_delay_max=7,multiple_requests=1""#
+    let live = #""reconnect=1,reconnect_streamed=0,reconnect_delay_max=1""#
+    guard let setup = section(
+        in: source,
+        from: "checkError(mpv_set_option_string(mpv, \"network-timeout\"",
+        to: "// Read-ahead cache:"
+    ), let liveMode = section(
+        in: source,
+        from: "private func configureLiveMode(_ live: Bool)",
+        to: "func togglePause()"
+    ), let split = liveMode.range(of: "} else {") else {
+        return false
+    }
+    let liveBranch = String(liveMode[..<split.lowerBound])
+    let vodBranch = String(liveMode[split.upperBound...])
+    return setup.contains(vod)
+        && vodBranch.contains(vod)
+        && liveBranch.contains(live)
+        && !liveBranch.contains("multiple_requests=1")
+}
+
 @main
 private enum ApplePlaybackRobustnessContractTests {
     @MainActor
@@ -89,9 +116,47 @@ private enum ApplePlaybackRobustnessContractTests {
         check("duration wiring: raw Int(value) conversion is absent",
               !duration.contains("Int(value)"))
 
+        let vodReconnect =
+            #""reconnect=1,reconnect_streamed=1,reconnect_delay_max=7,multiple_requests=1""#
+        let priorVODReconnect = #""reconnect=1,reconnect_streamed=1,reconnect_delay_max=7""#
+        let liveReconnect = #""reconnect=1,reconnect_streamed=0,reconnect_delay_max=1""#
+        let setupReconnect = section(
+            in: mpv,
+            from: "checkError(mpv_set_option_string(mpv, \"network-timeout\"",
+            to: "// Read-ahead cache:"
+        ) ?? ""
+        let liveMode = section(
+            in: mpv,
+            from: "private func configureLiveMode(_ live: Bool)",
+            to: "func togglePause()"
+        ) ?? ""
+        let liveSplit = liveMode.range(of: "} else {")
+        let liveBranch = liveSplit.map { String(liveMode[..<$0.lowerBound]) } ?? ""
+        let runtimeVODBranch = liveSplit.map { String(liveMode[$0.upperBound...]) } ?? ""
+        check("network: setup VOD enables persistent lavf requests",
+              setupReconnect.contains(vodReconnect))
+        check("network: runtime non-HLS restores the exact persistent VOD options",
+              runtimeVODBranch.contains(vodReconnect))
+        check("network: HLS-live keeps its exact short reconnect policy",
+              liveBranch.contains(liveReconnect) && !liveBranch.contains("multiple_requests=1"))
+        check("network: the combined persistent VOD contract is complete",
+              hasPersistentVODReconnectContract(mpv))
+        check("network mutant: the prior two-site VOD policy fails the contract",
+              !hasPersistentVODReconnectContract(
+                  mpv.replacingOccurrences(of: vodReconnect, with: priorVODReconnect)))
+        check("network mutant: a one-site VOD patch fails the contract",
+              !hasPersistentVODReconnectContract(
+                  replacingFirst(vodReconnect, with: priorVODReconnect, in: mpv)))
+        check("network mutant: adding persistent requests to HLS-live fails the contract",
+              !hasPersistentVODReconnectContract(
+                  replacingFirst(
+                      liveReconnect,
+                      with: #""reconnect=1,reconnect_streamed=0,reconnect_delay_max=1,multiple_requests=1""#,
+                      in: mpv)))
+
         let settle = section(
             in: episode,
-            from: "for _ in 0 ..< 80 {",
+            from: "while true {",
             to: "let pin = SourcePinStore.shared.effectivePin"
         ) ?? ""
         check("episode settle: cancellation is checked before engine queries",

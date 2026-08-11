@@ -13,6 +13,7 @@
 //     xcrun swiftc -o /tmp/slwtest \
 //         app/SourcesShared/SettingsDirtyKeys.swift \
 //         app/SourcesShared/SettingsBackup.swift \
+//         app/SourcesShared/CredentialScope.swift \
 //         app/SourcesShared/Keychain.swift \
 //         app/Tests/SettingsLocalWinsTests.swift && /tmp/slwtest
 //

@@ -36,8 +36,9 @@ enum ResidentMeta {
 /// WHY THE INPUTS ARE NAMED ROLES rather than an ordered array: the previous signature was
 /// `preferred(candidates: [String?])`, and the ARRAY ORDER silently encoded authority. It encoded it WRONGLY:
 /// `preferred(["tt0903747:1:1", "tt1375666"])` returned `tt0903747`, so an add-on-controlled episode-shaped
-/// `defaultVideoId` outranked the real catalog id of the page the user was actually on, and the wrong title key
-/// reached both serve and hoard. A role cannot be reordered by accident, and the authority rule below is stated
+/// `defaultVideoId` could silently outrank the real catalog id of the page the user was actually on, and the wrong
+/// title key reached both serve and hoard. A role cannot be reordered by accident: the resolver now accepts a title
+/// only when every applicable valid role agrees, and returns a mismatch otherwise. That fail-closed rule is stated
 /// once instead of being re-implied by each call site's argument order.
 enum SourceIndexIdentity {
 
@@ -59,8 +60,8 @@ enum SourceIndexIdentity {
 
     /// The identity inputs, by ROLE. Every field is add-on- or catalog-controlled text; none is trusted.
     struct Roles: Equatable {
-        /// The id of the page/route/library row the user is actually on. Highest authority: it is the thing
-        /// the user navigated to, and it is the one value not supplied by a stream add-on's free-form hints.
+        /// The id of the page/route/library row the user is actually on. It is the primary page context and is the
+        /// one value not supplied by a stream add-on's free-form hints; a conflicting valid head still fails closed.
         let catalogID: String?
         /// `meta.behaviorHints.defaultVideoId`. Add-on-controlled, frequently episode-shaped on a series.
         let defaultVideoID: String?
@@ -87,15 +88,153 @@ enum SourceIndexIdentity {
         }
     }
 
-    /// The resolved identity: ONE bare IMDb title id, or none.
+    /// The resolved identity: one bare IMDb title id, no usable identity, or a conflict.
     ///
     /// It is one field, not two. It used to carry a separate `indexID` (pool) and `torBoxID` (IMDb search),
     /// because the pool accepted the tmdb namespace and the IMDb-keyed index did not. Decision REQ-260721-33
     /// made pool keys IMDb-only, so the two values are now the same value by construction. Keeping two fields
     /// that can never differ is how a caller eventually picks the wrong one.
-    struct Resolved: Equatable {
-        /// A canonical BARE "tt..." title id (no `:S:E`), or nil when this title has no IMDb identity at all.
-        let titleID: String?
+    enum Resolved: Equatable, Sendable {
+        case title(String)
+        case absent
+        case mismatch
+
+        /// A canonical bare `tt...` title id, or nil when the roles are absent or disagree.
+        var titleID: String? {
+            guard case let .title(value) = self else { return nil }
+            return value
+        }
+    }
+
+    /// One exact target shared by auxiliary transport, publication, merge, ranking, and download assembly.
+    /// Stored state is private and construction is file-scoped so same-module extensions cannot synthesize a
+    /// relationally inconsistent value from independently chosen fields.
+    struct PublicationTarget: Equatable, Hashable, Sendable {
+        private struct Storage: Equatable, Hashable, Sendable {
+            let titleID: String
+            let contentID: String
+            let season: Int?
+            let episode: Int?
+        }
+
+        private let storage: Storage
+
+        var titleID: String { storage.titleID }
+        var contentID: String { storage.contentID }
+        var season: Int? { storage.season }
+        var episode: Int? { storage.episode }
+
+        fileprivate init(titleID: String, contentID: String, season: Int?, episode: Int?) {
+            storage = Storage(titleID: titleID, contentID: contentID, season: season, episode: episode)
+        }
+    }
+
+    /// The typed result of resolving a page's auxiliary publication target. A mismatch is distinct from an
+    /// absent identity so every owner can clear synchronously and fail closed without widening scope.
+    enum TargetResolution: Equatable, Hashable, Sendable {
+        case target(PublicationTarget)
+        case absent
+        case mismatch
+
+        var target: PublicationTarget? {
+            guard case let .target(value) = self else { return nil }
+            return value
+        }
+    }
+
+    /// A capability authorizing one exact published target to merge into one exact page resolution.
+    struct MergeAuthorization: Equatable, Sendable {
+        private let storedTarget: PublicationTarget
+
+        var target: PublicationTarget { storedTarget }
+
+        fileprivate init(target: PublicationTarget) {
+            storedTarget = target
+        }
+    }
+
+    /// Build a merge capability only after both the source publication and the page resolution have been
+    /// revalidated from the canonical title/coordinate relation. Raw strings cannot authorize a merge.
+    static func mergeAuthorization(
+        published: PublicationTarget?,
+        page: TargetResolution
+    ) -> MergeAuthorization? {
+        guard let published,
+              let validPublished = validatedTarget(.target(published)),
+              let validPage = validatedTarget(page),
+              validPublished.contentID == validPage.contentID else { return nil }
+        return MergeAuthorization(target: validPublished)
+    }
+
+    /// The sealed page identity for the media-server lane. This lane also supports IMDb-less pages, so it has
+    /// its own namespace instead of weakening the IMDb-only `PublicationTarget` contract.
+    struct MediaServerTarget: Equatable, Hashable, Sendable {
+        private struct Storage: Equatable, Hashable, Sendable {
+            let token: String
+        }
+
+        private let storage: Storage
+
+        var token: String { storage.token }
+
+        fileprivate init(token: String) {
+            storage = Storage(token: token)
+        }
+    }
+
+    /// Derive a media-server token from a validated IMDb target.
+    static func mediaServerTarget(page: TargetResolution) -> MediaServerTarget? {
+        guard let target = validatedTarget(page) else { return nil }
+        return MediaServerTarget(token: target.contentID)
+    }
+
+    /// Format the IMDb-less media-server fallback from raw parts in one place. Rejecting the separator rather
+    /// than escaping it makes the one-part and two-part forms injective under Swift String equality.
+    static func mediaServerTarget(metaID: String?, videoID: String? = nil) -> MediaServerTarget? {
+        guard let meta = mediaServerFallbackPart(metaID) else { return nil }
+        guard let videoID else { return MediaServerTarget(token: "meta:\(meta)") }
+        guard let video = mediaServerFallbackPart(videoID) else { return nil }
+        return MediaServerTarget(token: "meta:\(meta)|video:\(video)")
+    }
+
+    private static func mediaServerFallbackPart(_ raw: String?) -> String? {
+        guard let part = boundedIdentityInput(raw), !part.contains("|") else { return nil }
+        return part
+    }
+
+    /// Prefer the canonical page target, falling back to the media-server-only identity for IMDb-less pages.
+    static func mediaServerTarget(
+        preferring page: TargetResolution,
+        metaID: String?,
+        videoID: String? = nil
+    ) -> MediaServerTarget? {
+        switch page {
+        case .target:
+            return mediaServerTarget(page: page)
+        case .absent:
+            return mediaServerTarget(metaID: metaID, videoID: videoID)
+        case .mismatch:
+            return nil
+        }
+    }
+
+    /// A media-server merge capability bound to one sealed published token.
+    struct MediaServerMergeAuthorization: Equatable, Sendable {
+        private let storedTarget: MediaServerTarget
+
+        var target: MediaServerTarget { storedTarget }
+
+        fileprivate init(target: MediaServerTarget) {
+            storedTarget = target
+        }
+    }
+
+    static func mediaServerMergeAuthorization(
+        published: MediaServerTarget?,
+        page: MediaServerTarget?
+    ) -> MediaServerMergeAuthorization? {
+        guard let published, let page, published.token == page.token else { return nil }
+        return MediaServerMergeAuthorization(target: published)
     }
 
     /// Identity inputs are add-on-controlled text. Cap BEFORE any parsing so a megabyte-long "id" cannot be
@@ -104,9 +243,9 @@ enum SourceIndexIdentity {
 
     /// Resolve the title identity from named roles.
     ///
-    /// AUTHORITY ORDER, stated once: catalog, then default-video, then current-video. On CONFLICTING heads the
-    /// catalog identity wins, because it is the title the user opened. `.movie` and `.live` have no episode, so
-    /// `currentVideoID` is ignored entirely for them rather than being ranked last.
+    /// Role order selects the representative only when every applicable valid IMDb head agrees. Conflicting
+    /// valid heads return `.mismatch`; silently choosing one could publish one title's rows under another.
+    /// `.movie` and `.live` have no episode, so `currentVideoID` is ignored entirely for them.
     ///
     /// PRESERVED FIELD CASE (do not "simplify" this away): a TMDB- or Kitsu-identified SERIES ("tmdb:94997")
     /// with no `defaultVideoId` carries its IMDb identity ONLY on the episode video id ("tt0460649:3:6"). The
@@ -115,10 +254,10 @@ enum SourceIndexIdentity {
         let ordered: [String?] = roles.kind == .series
             ? [roles.catalogID, roles.defaultVideoID, roles.currentVideoID]
             : [roles.catalogID, roles.defaultVideoID]
-        for candidate in ordered {
-            if let title = imdbTitleID(candidate) { return Resolved(titleID: title) }
-        }
-        return Resolved(titleID: nil)
+        let titles = ordered.compactMap(imdbTitleID)
+        guard let first = titles.first else { return .absent }
+        guard titles.dropFirst().allSatisfy({ $0 == first }) else { return .mismatch }
+        return .title(first)
     }
 
     /// Accept ONE already-resolved value at a module boundary and hand back a bare canonical IMDb title id.
@@ -134,15 +273,64 @@ enum SourceIndexIdentity {
         return title
     }
 
-    /// The pool / TorBox / publication key for a resolved page, in one call.
+    /// The forced typed entry point for a page or batch job.
     ///
     /// This is the FORCED ENTRY POINT for view and coordinator code: a screen states its roles and its episode
     /// coordinates and gets a key or nothing. It must not reach past this to `contentKey`, `canonicalTitleID`,
     /// or `SourceIndexClient.contentID`, and `IdentityCallerGateTests` fails the build's test step if it does.
     static func poolKey(_ roles: Roles, season: Int? = nil, episode: Int? = nil) -> String? {
-        guard let titleID = resolve(roles).titleID else { return nil }
-        return contentKey(titleID: titleID, season: season, episode: episode)
+        publicationTarget(roles, season: season, episode: episode).target?.contentID
     }
+
+    /// Resolve one exact auxiliary publication target from named roles and tuple coordinates.
+    static func publicationTarget(
+        _ roles: Roles,
+        season: Int? = nil,
+        episode: Int? = nil
+    ) -> TargetResolution {
+        switch resolve(roles) {
+        case let .title(titleID):
+            guard let contentID = contentKey(titleID: titleID, season: season, episode: episode) else {
+                return .absent
+            }
+            return .target(PublicationTarget(
+                titleID: titleID,
+                contentID: contentID,
+                season: season,
+                episode: episode
+            ))
+        case .absent:
+            return .absent
+        case .mismatch:
+            return .mismatch
+        }
+    }
+
+    /// Recheck the relationship inside a target at an owner boundary. Invalid or forged values fail soft.
+    static func validatedTarget(_ resolution: TargetResolution) -> PublicationTarget? {
+        guard let target = resolution.target,
+              imdbTitleID(target.titleID) == target.titleID,
+              contentKey(titleID: target.titleID, season: target.season, episode: target.episode)
+                == target.contentID else { return nil }
+        return target
+    }
+
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    /// Adversarial-only seam for proving owner gates reject a relational mismatch introduced inside the module.
+    static func uncheckedTargetForTesting(
+        titleID: String,
+        contentID: String,
+        season: Int?,
+        episode: Int?
+    ) -> TargetResolution {
+        .target(PublicationTarget(
+            titleID: titleID,
+            contentID: contentID,
+            season: season,
+            episode: episode
+        ))
+    }
+    #endif
 
     /// The pool key for a Continue-Watching DIRECT RESUME, which is the one path with TWO independent ids and
     /// no page to arbitrate between them.
@@ -186,7 +374,7 @@ enum SourceIndexIdentity {
     ///
     /// EVERY branch returns through `canonicalContentID`, so the IMDb-only key rule holds even for the bare
     /// title case. Returning `title` directly there is what previously let a tmdb head out as a pool key.
-    static func contentKey(titleID: String, season: Int?, episode: Int?) -> String? {
+    fileprivate static func contentKey(titleID: String, season: Int?, episode: Int?) -> String? {
         guard let title = SourceIndexContract.canonicalTitleID(titleID) else { return nil }
         switch (season, episode) {
         case (nil, nil):
@@ -197,6 +385,12 @@ enum SourceIndexIdentity {
             return nil
         }
     }
+
+    #if SOURCE_INDEX_IDENTITY_TESTING
+    static func contentKeyForTesting(titleID: String, season: Int?, episode: Int?) -> String? {
+        contentKey(titleID: titleID, season: season, episode: episode)
+    }
+    #endif
 }
 
 /// Bounded, category-only diagnostics for the source-index client.

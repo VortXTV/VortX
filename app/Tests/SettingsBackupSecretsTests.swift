@@ -11,6 +11,7 @@
 //
 //     xcrun swiftc -o /tmp/sbtest \
 //         app/SourcesShared/SettingsBackup.swift \
+//         app/SourcesShared/CredentialScope.swift \
 //         app/SourcesShared/Keychain.swift \
 //         app/Tests/SettingsBackupSecretsTests.swift && /tmp/sbtest
 //
@@ -18,10 +19,10 @@
 // FAIL is indistinguishable from a guard that CANNOT fail, so break it on purpose and confirm the tests
 // notice. Emptying `secretKeyPrefixes` must turn T1.1/T1.2/T1.3/T2.1/T3.1/T3.3/T5.4 RED and exit 1:
 //
-//     mkdir -p /tmp/sbctrl && cp app/SourcesShared/Keychain.swift /tmp/sbctrl/
+//     mkdir -p /tmp/sbctrl && cp app/SourcesShared/CredentialScope.swift app/SourcesShared/Keychain.swift /tmp/sbctrl/
 //     sed 's|static let secretKeyPrefixes: \[String\] = \[Keychain.fallbackKeyPrefix\]|static let secretKeyPrefixes: [String] = []|' \
 //         app/SourcesShared/SettingsBackup.swift > /tmp/sbctrl/SettingsBackup.swift
-//     xcrun swiftc -o /tmp/sbctrl/bin /tmp/sbctrl/SettingsBackup.swift /tmp/sbctrl/Keychain.swift \
+//     xcrun swiftc -o /tmp/sbctrl/bin /tmp/sbctrl/SettingsBackup.swift /tmp/sbctrl/CredentialScope.swift /tmp/sbctrl/Keychain.swift \
 //         app/Tests/SettingsBackupSecretsTests.swift && /tmp/sbctrl/bin   # expect exit 1
 //
 // A second negative control removes `Keychain.invalidationKeyPrefix` from `deviceLocalKeyPrefixes`.

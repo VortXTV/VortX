@@ -323,6 +323,213 @@ for current in [96 * mib, 128 * mib, 192 * mib, 256 * mib, 384 * mib] {
           deferredBranch == true && drasticBranch == false && capAmple <= current && capLow <= current)
 }
 
+// MARK: - Single-flight cache-flush lifecycle (deterministic; no timers or sleeps)
+
+// The controller supplies the real PlayerLoadToken. This harness uses Int so the narrow value type stays
+// dependency-free and its ownership rules can be exercised without UIKit/libmpv.
+let firstTimeout = DispatchWorkItem { }
+var flightGate = CacheFlushSingleFlight<Int>()
+check("single-flight: an idle gate admits the first owner", flightGate.admit(owner: 1) == .started)
+let firstFlight = flightGate.install(
+    owner: 1,
+    reason: .memoryWarning,
+    target: 1604,
+    targetArgument: "1604.000",
+    startUptime: 10,
+    timeoutWorkItem: firstTimeout
+)
+check("single-flight: first flight has monotonic id, exact owner, finite target, and one formatted argument",
+      firstFlight.id == 1 && firstFlight.owner == 1 && firstFlight.target == 1604
+        && firstFlight.targetArgument == "1604.000" && firstFlight.startUptime == 10
+        && firstFlight.phase == .dropping && firstFlight.result == .pending)
+check("single-flight: duplicate and triple warnings coalesce without changing reason or target",
+      flightGate.admit(owner: 1) == .coalesced
+        && flightGate.admit(owner: 1) == .coalesced
+        && flightGate.current?.id == firstFlight.id
+        && flightGate.current?.coalescedCount == 2
+        && flightGate.current?.reason == .memoryWarning
+        && flightGate.current?.targetArgument == "1604.000")
+check("single-flight: drop success enters seeking only for the exact owner",
+      flightGate.markDropSucceeded(id: firstFlight.id, owner: 2) == false
+        && flightGate.markDropSucceeded(id: firstFlight.id, owner: 1)
+        && flightGate.current?.phase == .seeking)
+check("single-flight: exact seek acceptance enters settling and wrong identity is ignored",
+      flightGate.markSeekCommandAccepted(id: firstFlight.id + 1, owner: 1) == false
+        && flightGate.markSeekCommandAccepted(id: firstFlight.id, owner: 2) == false
+        && flightGate.markSeekCommandAccepted(id: firstFlight.id, owner: 1)
+        && flightGate.current?.phase == .settling
+        && flightGate.markSeekCommandAccepted(id: firstFlight.id, owner: 1) == false)
+check("single-flight: same-owner warnings coalesce for the full settle window",
+      flightGate.admit(owner: 1) == .coalesced
+        && flightGate.current?.coalescedCount == 3
+        && flightGate.current?.phase == .settling)
+check("single-flight: exact settle produces command-accepted and cancels the deadline once",
+      flightGate.settle(id: firstFlight.id, owner: 1)?.result == .commandAccepted
+        && flightGate.current == nil
+        && firstTimeout.isCancelled
+        && flightGate.settle(id: firstFlight.id, owner: 1) == nil)
+
+check("single-flight: completion permits a later flight with a newer id",
+      flightGate.admit(owner: 1) == .started)
+let secondFlight = flightGate.install(
+    owner: 1,
+    reason: .pausedCacheClamp,
+    target: 1404,
+    targetArgument: "1404.000",
+    startUptime: 20,
+    timeoutWorkItem: DispatchWorkItem { }
+)
+check("single-flight: an old same-owner settle cannot clear a newer flight",
+      flightGate.settle(id: firstFlight.id, owner: 1) == nil
+        && flightGate.current?.id == secondFlight.id
+        && flightGate.current?.phase == .dropping
+        && flightGate.settle(id: secondFlight.id, owner: 1) == nil)
+check("single-flight: stale or wrong-owner settle cannot clear the current flight",
+      flightGate.settle(id: secondFlight.id - 1, owner: 2) == nil
+        && flightGate.settle(id: secondFlight.id, owner: 2) == nil
+        && flightGate.current?.id == secondFlight.id
+        && flightGate.current?.owner == 1)
+check("single-flight: exact settle clears the current flight once",
+      flightGate.markDropSucceeded(id: secondFlight.id, owner: 1)
+        && flightGate.markSeekCommandAccepted(id: secondFlight.id, owner: 1)
+        && flightGate.settle(id: secondFlight.id, owner: 1)?.result == .commandAccepted
+        && flightGate.current == nil
+        && flightGate.settle(id: secondFlight.id, owner: 1) == nil)
+
+var errorGate = CacheFlushSingleFlight<Int>()
+let dropErrorFlight = errorGate.install(
+    owner: 11,
+    reason: .memoryWarning,
+    target: 11,
+    targetArgument: "11.000",
+    startUptime: 60,
+    timeoutWorkItem: DispatchWorkItem { }
+)
+check("single-flight: drop command error clears without a seek or settle window",
+      errorGate.dropCommandError(id: dropErrorFlight.id, owner: 11)?.result == .dropCommandError
+        && errorGate.current == nil)
+let seekErrorFlight = errorGate.install(
+    owner: 11,
+    reason: .memoryWarning,
+    target: 12,
+    targetArgument: "12.000",
+    startUptime: 61,
+    timeoutWorkItem: DispatchWorkItem { }
+)
+check("single-flight: seek command error enters settling and latches the outcome",
+      errorGate.markDropSucceeded(id: seekErrorFlight.id, owner: 11)
+        && errorGate.seekCommandError(id: seekErrorFlight.id, owner: 12) == false
+        && errorGate.seekCommandError(id: seekErrorFlight.id, owner: 11)
+        && errorGate.current?.result == .seekCommandError
+        && errorGate.current?.phase == .settling
+        && errorGate.seekCommandError(id: seekErrorFlight.id, owner: 11) == false
+        && errorGate.admit(owner: 11) == .coalesced
+        && errorGate.current?.result == .seekCommandError)
+check("single-flight: settle preserves seekCommandError and clears only the exact flight",
+      errorGate.settle(id: seekErrorFlight.id, owner: 12) == nil
+        && errorGate.settle(id: seekErrorFlight.id, owner: 11)?.result == .seekCommandError
+        && errorGate.current == nil
+        && errorGate.settle(id: seekErrorFlight.id, owner: 11) == nil)
+
+var lateDeadlineGate = CacheFlushSingleFlight<Int>()
+let lateDeadlineFlight = lateDeadlineGate.install(
+    owner: 13,
+    reason: .memoryWarning,
+    target: 14,
+    targetArgument: "14.000",
+    startUptime: 63,
+    timeoutWorkItem: DispatchWorkItem { }
+)
+check("single-flight: reset before settle makes a late deadline a no-op",
+      lateDeadlineGate.reset()?.result == .canceled
+        && lateDeadlineGate.settle(id: lateDeadlineFlight.id, owner: 13) == nil
+        && lateDeadlineGate.current == nil)
+
+var replacementGate = CacheFlushSingleFlight<Int>()
+let replacementFlight = replacementGate.install(
+    owner: 7,
+    reason: .memoryWarning,
+    target: 7,
+    targetArgument: "7.000",
+    startUptime: 30,
+    timeoutWorkItem: DispatchWorkItem { }
+)
+check("single-flight: accepted replacement reset cancels the old flight",
+      replacementGate.reset()?.id == replacementFlight.id && replacementGate.current == nil)
+let retainedFlight = replacementGate.install(
+    owner: 8,
+    reason: .memoryWarning,
+    target: 8,
+    targetArgument: "8.000",
+    startUptime: 31,
+    timeoutWorkItem: DispatchWorkItem { }
+)
+check("single-flight: rejected replacement identity retains the current flight",
+      replacementGate.reset(owner: 7) == nil
+        && replacementGate.current?.id == retainedFlight.id
+        && replacementGate.current?.owner == 8)
+
+var pauseGate = CacheFlushSingleFlight<Int>()
+_ = pauseGate.install(
+    owner: 9,
+    reason: .pausedCacheClamp,
+    target: 90,
+    targetArgument: "90.000",
+    startUptime: 40,
+    timeoutWorkItem: DispatchWorkItem { }
+)
+check("single-flight: proactive and pause callbacks coalesce on the same owner",
+      pauseGate.admit(owner: 9) == .coalesced
+        && pauseGate.current?.reason == .pausedCacheClamp
+        && pauseGate.current?.coalescedCount == 1)
+var independentA = CacheFlushSingleFlight<Int>()
+var independentB = CacheFlushSingleFlight<Int>()
+_ = independentA.install(
+    owner: 10,
+    reason: .memoryWarning,
+    target: 10,
+    targetArgument: "10.000",
+    startUptime: 50,
+    timeoutWorkItem: DispatchWorkItem { }
+)
+check("single-flight: two helper instances have independent gates",
+      independentA.current != nil && independentB.current == nil
+        && independentB.admit(owner: 10) == .started)
+
+// Source contracts here are intentionally small and semantic: they keep this executable harness useful even
+// when the controller cannot be compiled outside the Apple target. The full command/lifecycle mutants live in
+// MPVCacheFlushReceiptContractTests.swift.
+let policyURL = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .appendingPathComponent("Sources/Player/CacheShedPolicy.swift")
+if let policySource = try? String(contentsOf: policyURL, encoding: .utf8) {
+    check("single-flight: policy source declares a finite reason and narrow value gate",
+          policySource.contains("enum CacheFlushReason: String, Equatable")
+            && policySource.contains("struct CacheFlushSingleFlight<Owner: Equatable>"))
+    check("single-flight: correction pass 2 uses the synchronous settle-window phase model",
+          policySource.contains("case settling")
+            && policySource.contains("case commandAccepted = \"command-accepted\"")
+            && policySource.contains("markSeekCommandAccepted")
+            && policySource.contains("mutating func settle(id: UInt64, owner: Owner)")
+            && !policySource.contains("awaitingSeekReply")
+            && !policySource.contains("awaitingRestart")
+            && !policySource.contains("playbackRestart")
+            && !policySource.contains("markSeek(id:"))
+    check("single-flight: flight source stores owner, immutable target argument, phase, result, and timeout",
+          policySource.contains("let owner: Owner")
+            && policySource.contains("let targetArgument: String")
+            && policySource.contains("var phase: Phase")
+            && policySource.contains("var result: Result")
+            && policySource.contains("var timeoutWorkItem: DispatchWorkItem?"))
+    check("single-flight: phase model has no generic seek latch",
+          policySource.contains("case settling")
+            && !policySource.contains("case awaitingSeekReply")
+            && !policySource.contains("case awaitingRestart")
+            && !policySource.contains("sawSeek")
+            && !policySource.contains("mutating func markSeek(id:"))
+}
+
 // MARK: - Result
 
 print("")

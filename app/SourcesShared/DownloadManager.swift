@@ -22,6 +22,10 @@ import UIKit
 @MainActor
 final class DownloadManager: NSObject, ObservableObject {
     static let shared = DownloadManager()
+    nonisolated static let backgroundSessionIdentifier = "tv.vortx.downloads.background"
+    #if os(iOS)
+    nonisolated static let hlsSessionIdentifier = "tv.vortx.downloads.hls"
+    #endif
 
     private let store = DownloadStore.shared
 
@@ -98,13 +102,6 @@ final class DownloadManager: NSObject, ObservableObject {
     /// ~8 MB per record.
     private var lastProgressPush: [UUID: (bytes: Int64, at: TimeInterval)] = [:]
 
-    /// The UIKit completion handler handed to us when iOS relaunches the app to deliver finished
-    /// background downloads (`application(_:handleEventsForBackgroundURLSession:completionHandler:)`).
-    /// We MUST call it once the session has finished delivering all its events
-    /// (`urlSessionDidFinishEvents`) or iOS will throttle / kill future background transfers. Stored here
-    /// because the app delegate that receives it has no other handle on this session.
-    var backgroundCompletionHandler: (() -> Void)?
-
     /// `taskIdentifier -> final destination file URL`, captured at task-creation time and read from the
     /// `didFinishDownloadingTo` delegate callback. That callback runs on the session's BACKGROUND
     /// delegate queue, where the temp file must be moved synchronously before it's deleted, so the
@@ -113,12 +110,16 @@ final class DownloadManager: NSObject, ObservableObject {
     nonisolated let destinations = DownloadDestinationMap()
 
     #if os(iOS)
-    /// The finished HLS `.movpkg` location, captured SYNCHRONOUSLY in `didFinishDownloadingTo` (on the serial
-    /// background delegate queue, which AVFoundation runs BEFORE `didCompleteWithError`). `handleAssetTaskCompletion`
-    /// reads it synchronously to decide completed-vs-failed, so the decision never depends on a separately-hopped
-    /// @MainActor Task that could run out of order and flip a fully-downloaded asset to `.failed`.
-    nonisolated let hlsFinishedLocations = DownloadDestinationMap()
+    /// HLS callback state lives outside the main actor because AVFoundation delivers finish callbacks on its
+    /// serial background delegate queue. The ledger makes cancellation, duplicate callbacks, and deferred
+    /// finalization deterministic without ever moving a system-managed `.movpkg` off that queue.
+    nonisolated let hlsAssetLifecycle = HLSAssetLifecycleLedger()
     #endif
+
+    /// Completion handlers are joined to the exact background session that UIKit relaunched. Reconnection work
+    /// and HLS finalizers increment the matching barrier before hopping to the main actor, so
+    /// `urlSessionDidFinishEvents` cannot release UIApplication until all session reconciliation has completed.
+    nonisolated let backgroundEventBarriers = HLSBackgroundEventBarrierRegistry()
 
     #if canImport(UIKit)
     /// Background-task assertion for the torrent (foreground) session, so a brief backgrounding doesn't
@@ -173,7 +174,7 @@ final class DownloadManager: NSObject, ObservableObject {
 
     /// Survives app suspension: debrid / direct / HTTP.
     private lazy var backgroundSession: URLSession = {
-        let config = URLSessionConfiguration.background(withIdentifier: "tv.vortx.downloads.background")
+        let config = URLSessionConfiguration.background(withIdentifier: Self.backgroundSessionIdentifier)
         config.isDiscretionary = false
         config.sessionSendsLaunchEvents = true
         config.allowsCellularAccess = true
@@ -192,7 +193,8 @@ final class DownloadManager: NSObject, ObservableObject {
     /// play back through AVPlayer (libmpv can't open a `.movpkg`). Background config so it survives suspension.
     /// iOS only: `AVAssetDownloadURLSession` is unavailable on tvOS and native macOS (there the source fails soft).
     private lazy var hlsAssetSession: AVAssetDownloadURLSession = {
-        let config = URLSessionConfiguration.background(withIdentifier: "tv.vortx.downloads.hls")
+        let config = URLSessionConfiguration.background(withIdentifier: Self.hlsSessionIdentifier)
+        config.sessionSendsLaunchEvents = true
         config.allowsCellularAccess = true
         return AVAssetDownloadURLSession(configuration: config, assetDownloadDelegate: self, delegateQueue: nil)
     }()
@@ -548,19 +550,52 @@ final class DownloadManager: NSObject, ObservableObject {
     /// Record id for an asset task, recovering across a relaunch (in-memory map empty) via the uuid stored in
     /// `taskDescription`, and re-binding so later callbacks resolve fast.
     private func assetRecordID(for task: AVAssetDownloadTask) -> UUID? {
-        if let id = recordForAssetTask[task.taskIdentifier] { return id }
-        guard let desc = task.taskDescription, let id = UUID(uuidString: desc), store.record(id: id) != nil else { return nil }
+        if let id = recordForAssetTask[task.taskIdentifier], let record = store.record(id: id),
+           HLSBackgroundRecoveryPolicy.accepts(recoveryCandidate(for: record), for: .hlsAsset) { return id }
+        guard let desc = task.taskDescription, let id = UUID(uuidString: desc),
+              let record = store.record(id: id),
+              HLSBackgroundRecoveryPolicy.accepts(recoveryCandidate(for: record), for: .hlsAsset),
+              (record.taskIdentifier == nil || record.taskIdentifier == task.taskIdentifier) else { return nil }
         recordForAssetTask[task.taskIdentifier] = id
         return id
     }
 
     /// Cancel + forget a live HLS asset task (its partial `.movpkg` is discarded by AVFoundation on cancel).
     private func cancelAssetTask(id: UUID) {
-        if let task = assetTaskForRecord[id] {
-            recordForAssetTask[task.taskIdentifier] = nil
-            task.cancel()
+        guard let record = store.record(id: id), isHLSRecord(record) else {
+            assetTaskForRecord[id] = nil
+            return
+        }
+        let task = assetTaskForRecord[id]
+        let taskIdentifier = task?.taskIdentifier ?? record.taskIdentifier
+        if let taskIdentifier {
+            if let location = hlsAssetLifecycle.cancel(taskIdentifier: taskIdentifier) {
+                cleanupHLSAsset(at: location, taskIdentifier: taskIdentifier)
+            }
+            recordForAssetTask[taskIdentifier] = nil
+            task?.cancel()
         }
         assetTaskForRecord[id] = nil
+    }
+
+    private nonisolated func cleanupHLSAsset(at location: URL, taskIdentifier: Int) {
+        let succeeded = Self.removeHLSAsset(at: location)
+        hlsAssetLifecycle.finishCleanup(
+            taskIdentifier: taskIdentifier,
+            location: location,
+            succeeded: succeeded)
+    }
+
+    private nonisolated static func removeHLSAsset(at location: URL) -> Bool {
+        guard let error = HLSAssetCleanupPolicy.remove(
+            using: { try FileManager.default.removeItem(at: location) },
+            isAbsent: { !FileManager.default.fileExists(atPath: location.path) }) else {
+            return true
+        }
+        let message = "HLS cleanup failed path=\(location.path) attempts=\(HLSAssetCleanupPolicy.maxAttempts) error=\(error)"
+        NSLog("[downloads] %@", message)
+        DiagnosticsLog.log("downloads", message)
+        return false
     }
 
     /// True when a record's source is an HLS `.m3u8` (so pause/resume/cancel route to the asset session).
@@ -636,15 +671,34 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private func recordID(for task: URLSessionTask, on session: URLSession) -> UUID? { recordForTask[Self.taskKey(session, task.taskIdentifier)] }
 
-    /// Adopt the iOS background-relaunch completion handler. Touching `backgroundSession` here forces the
-    /// lazy session to materialize so its delegate is attached and the queued finished-download events
-    /// actually deliver in this relaunched process; the handler is then fired from `urlSessionDidFinishEvents`.
-    func adoptBackgroundEvents(completionHandler: @escaping () -> Void) {
-        backgroundCompletionHandler = completionHandler
-        // Also re-wire pause/cancel to any transfer still running: a background relaunch may hand us live
-        // tasks the in-memory maps know nothing about. reconnect materializes both sessions and rebuilds
-        // the maps (and is idempotent, so calling it here + at launch is safe).
-        reconnectInFlightDownloads()
+    private func recoveryCandidate(for record: DownloadRecord) -> HLSBackgroundRecoveryPolicy.Candidate {
+        #if os(iOS)
+        let isHLS = isHLSRecord(record)
+        #else
+        let isHLS = false
+        #endif
+        return HLSBackgroundRecoveryPolicy.Candidate(
+            id: record.id.uuidString,
+            taskIdentifier: record.taskIdentifier,
+            isHLS: isHLS,
+            isTorrent: record.isTorrent,
+            downloading: record.state == .downloading)
+    }
+
+    /// Adopt a background-relaunch completion handler. The app delegate retains it until this main-actor method
+    /// runs, then the exact session barrier retains it until that session drains its delegate events AND all HLS
+    /// finalizers have joined. The identifier-specific reconnect deliberately materializes the session even when
+    /// the store has zero `.downloading` records, because UIKit can relaunch for queued events after the record
+    /// was already reconciled or removed. Adoption rotates away from an unadopted finished generation so a prior
+    /// drain cannot release this handler before the current generation's finish callback.
+    func adoptBackgroundEvents(for identifier: String, completionHandler: @escaping () -> Void) {
+        let barrier = backgroundEventBarriers.beginAdoption(for: identifier)
+        guard !barrier.addCompletion(completionHandler) else {
+            completionHandler()
+            return
+        }
+        barrier.beginFinalization()
+        reconnectInFlightDownloads(for: identifier, hasInFlightRecords: true, barrier: barrier)
     }
 
     /// Reconnect after an app relaunch so pause/cancel operate on the real, still-running transfers again.
@@ -663,35 +717,69 @@ final class DownloadManager: NSObject, ObservableObject {
     ///     never deleted, since its bytes-on-disk / partial asset are intact.
     ///
     /// Idempotent + fail-soft: safe to call at launch AND from the background-relaunch handler; a
-    /// reconnection miss reconciles to `.paused` rather than crashing or dropping a good download. No-op when
-    /// there are no in-flight records, so a normal launch pays nothing.
+    /// reconnection miss reconciles to `.paused` rather than crashing or dropping a good download. A normal
+    /// launch with no in-flight records remains a no-op; an identifier-specific relaunch still materializes
+    /// exactly the named session so its queued events reach this delegate.
     func reconnectInFlightDownloads() {
-        // Only in-flight (or seemingly-in-flight) records need reconnecting. Nothing to do otherwise, so an
-        // ordinary launch with no active downloads materializes no session and touches no state.
         let inFlight = store.records.filter { $0.state == .downloading }
-        guard !inFlight.isEmpty else { return }
+        reconnectInFlightDownloads(for: nil, hasInFlightRecords: !inFlight.isEmpty)
+    }
 
-        // (1) Force the lazy background byte-download session to materialize (recreates it in this process
-        // with the same identifier + delegate, so getAllTasks returns its running tasks).
-        let byteSession = backgroundSession
-        byteSession.getAllTasks { [weak self] tasks in
-            let downloadTasks = tasks.compactMap { $0 as? URLSessionDownloadTask }
-            Task { @MainActor [weak self] in
-                self?.reconcileByteTasks(downloadTasks)
-            }
-        }
-
+    private func reconnectInFlightDownloads(
+        for identifier: String?,
+        hasInFlightRecords: Bool? = nil,
+        barrier: HLSBackgroundEventBarrier? = nil
+    ) {
         #if os(iOS)
-        // (1) Same for the HLS asset session. Its live tasks are AVAssetDownloadTasks (a URLSessionTask but
-        // NOT a URLSessionDownloadTask), so they arrive via getAllTasks and are filtered on that type.
-        let assetSession = hlsAssetSession
-        assetSession.getAllTasks { [weak self] tasks in
-            let assetTasks = tasks.compactMap { $0 as? AVAssetDownloadTask }
-            Task { @MainActor [weak self] in
-                self?.reconcileAssetTasks(assetTasks)
-            }
-        }
+        let hlsIdentifier = Self.hlsSessionIdentifier
+        #else
+        let hlsIdentifier = ""
         #endif
+        let hasInFlight = hasInFlightRecords ?? store.records.contains { $0.state == .downloading }
+        let sessions = HLSBackgroundRecoveryPolicy.sessionsToMaterialize(
+            for: identifier,
+            backgroundIdentifier: Self.backgroundSessionIdentifier,
+            hlsIdentifier: hlsIdentifier,
+            hasInFlightRecords: hasInFlight)
+        guard !sessions.isEmpty else {
+            Self.finishBackgroundEventWork(barrier)
+            return
+        }
+        for session in sessions { reconnect(session: session, barrier: barrier) }
+    }
+
+    private func reconnect(
+        session: HLSBackgroundRecoveryPolicy.SessionKind,
+        barrier: HLSBackgroundEventBarrier?
+    ) {
+        switch session {
+        case .byteBackground:
+            // Force the lazy background byte-download session to materialize, then re-adopt its tasks.
+            let byteSession = backgroundSession
+            byteSession.getAllTasks { tasks in
+                let downloadTasks = tasks.compactMap { $0 as? URLSessionDownloadTask }
+                Task { @MainActor [weak self] in
+                    defer { Self.finishBackgroundEventWork(barrier) }
+                    guard let self else { return }
+                    self.reconcileByteTasks(downloadTasks)
+                }
+            }
+        case .hlsAsset:
+            #if os(iOS)
+            // Force the lazy HLS asset session to materialize, including the zero-record relaunch case.
+            let assetSession = hlsAssetSession
+            assetSession.getAllTasks { tasks in
+                let assetTasks = tasks.compactMap { $0 as? AVAssetDownloadTask }
+                Task { @MainActor [weak self] in
+                    defer { Self.finishBackgroundEventWork(barrier) }
+                    guard let self else { return }
+                    self.reconcileAssetTasks(assetTasks)
+                }
+            }
+            #else
+            Self.finishBackgroundEventWork(barrier)
+            #endif
+        }
     }
 
     /// (2) for byte downloads. Re-adopt each live task into the in-memory maps, then reconcile any record
@@ -729,6 +817,10 @@ final class DownloadManager: NSObject, ObservableObject {
         for task in tasks {
             guard let id = reconnectAssetRecordID(for: task) else {
                 task.cancel()   // orphan asset task: no record to fill, discard its partial .movpkg
+                continue
+            }
+            if let existing = assetTaskForRecord[id], existing.taskIdentifier != task.taskIdentifier {
+                task.cancel()   // stale duplicate: one record may have exactly one live HLS task
                 continue
             }
             assetTaskForRecord[id] = task
@@ -771,21 +863,33 @@ final class DownloadManager: NSObject, ObservableObject {
     /// then the filename we serialized on `taskDescription` matched against `localFilename`. Both survive a
     /// relaunch; the pair makes a stale identifier fall back to the filename rather than orphaning a task.
     private func reconnectRecordID(for task: URLSessionTask, filename: String?) -> UUID? {
-        if let id = store.records.first(where: { $0.taskIdentifier == task.taskIdentifier && $0.state == .downloading })?.id {
-            return id
+        let candidates = store.records.map(recoveryCandidate(for:))
+        if let id = HLSBackgroundRecoveryPolicy.matchingID(
+            taskIdentifier: task.taskIdentifier, session: .byteBackground, records: candidates),
+           let uuid = UUID(uuidString: id) {
+            return uuid
         }
         guard let filename else { return nil }
-        return store.records.first { $0.localFilename == filename && $0.state == .downloading }?.id
+        return store.records.first {
+            $0.localFilename == filename
+                && HLSBackgroundRecoveryPolicy.accepts(recoveryCandidate(for: $0), for: .byteBackground)
+        }?.id
     }
 
     #if os(iOS)
     /// HLS asset-download record id for a live task during reconnection: persisted `taskIdentifier` first,
     /// then the record uuid we serialized on `taskDescription`.
     private func reconnectAssetRecordID(for task: AVAssetDownloadTask) -> UUID? {
-        if let id = store.records.first(where: { $0.taskIdentifier == task.taskIdentifier && $0.state == .downloading })?.id {
-            return id
+        let candidates = store.records.map(recoveryCandidate(for:))
+        if let id = HLSBackgroundRecoveryPolicy.matchingID(
+            taskIdentifier: task.taskIdentifier, session: .hlsAsset, records: candidates),
+           let uuid = UUID(uuidString: id) {
+            return uuid
         }
-        guard let desc = task.taskDescription, let id = UUID(uuidString: desc), store.record(id: id) != nil else { return nil }
+        guard let desc = task.taskDescription, let id = UUID(uuidString: desc),
+              let record = store.record(id: id),
+              HLSBackgroundRecoveryPolicy.accepts(recoveryCandidate(for: record), for: .hlsAsset),
+              (record.taskIdentifier == nil || record.taskIdentifier == task.taskIdentifier) else { return nil }
         return id
     }
     #endif
@@ -828,6 +932,21 @@ final class DownloadManager: NSObject, ObservableObject {
         UIApplication.shared.endBackgroundTask(bgTask)
         bgTask = .invalid
         #endif
+    }
+
+    /// Finish one background-relaunch work item and invoke any completion handlers that became releasable.
+    /// This is deliberately callable when `self` has already gone away: the barrier owns the completion
+    /// handlers, and a weak-self reconciliation exit must not strand UIKit's launch transaction.
+    private static func finishBackgroundEventWork(_ barrier: HLSBackgroundEventBarrier?) {
+        barrier?.completeFinalization().forEach { $0() }
+    }
+
+    /// Begin one asynchronous byte-download finalizer only for this manager's named background session. The
+    /// foreground torrent session is unnamed, and HLS uses its own delegate path and session barrier.
+    private nonisolated func beginByteBackgroundEventWork(for session: URLSession) -> HLSBackgroundEventBarrier? {
+        guard session.configuration.identifier == Self.backgroundSessionIdentifier else { return nil }
+        let barrier = backgroundEventBarriers.beginWork(for: Self.backgroundSessionIdentifier)
+        return barrier
     }
 
     // MARK: Helpers
@@ -991,6 +1110,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
     /// the main actor (which `assumeIsolated` would crash on, since this runs off-main).
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                                 didFinishDownloadingTo location: URL) {
+        let barrier = beginByteBackgroundEventWork(for: session)
         // Prefer the in-memory map (same-process completion). After an app suspend/relaunch that map is
         // EMPTY in the new process, so recover the destination from the filename we persisted on the task
         // (`taskDescription`, which the background session serializes). This is the iOS "cannot create file"
@@ -1035,6 +1155,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         // (where `recordForTask` is empty), by matching it against the stored `localFilename`.
         let taskFilename = downloadTask.taskDescription
         Task { @MainActor [weak self] in
+            defer { Self.finishBackgroundEventWork(barrier) }
             guard let self, let id = self.recoverRecordID(for: downloadTask, on: session, filename: taskFilename) else { return }
             // Record the save OUTCOME in the exportable diagnostic log. Previously only the
             // didCompleteWithError (-3000 daemon) path logged; an app-side MOVE failure here (dest nil, or a
@@ -1071,9 +1192,11 @@ extension DownloadManager: URLSessionDownloadDelegate {
         }
         #endif
         guard let error else { return }
+        let barrier = beginByteBackgroundEventWork(for: session)
         let resume = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data
         let taskFilename = task.taskDescription
         Task { @MainActor [weak self] in
+            defer { Self.finishBackgroundEventWork(barrier) }
             guard let self, let id = self.recoverRecordID(for: task, on: session, filename: taskFilename) else { return }
             // A deliberate pause cancels the task; pause() already recorded `.paused` + resume data.
             if (error as NSError).code == NSURLErrorCancelled { return }
@@ -1152,42 +1275,67 @@ extension DownloadManager: URLSessionDownloadDelegate {
         let taskId = task.taskIdentifier
         let taskDesc = task.taskDescription
         if let ns = error as NSError?, ns.code == NSURLErrorCancelled {
-            // Clear BOTH maps even for a system-initiated cancel (one that did not go through cancelAssetTask):
-            // clearing only recordForAssetTask would leak the AVAssetDownloadTask held in assetTaskForRecord.
-            self.hlsFinishedLocations.remove("hls:\(taskId)")
+            // Claim background work synchronously before finishEvents can observe this cancellation as drained.
+            // Cleanup and map mutation run together on MainActor; defer releases the claim even if the manager
+            // disappears while the task is queued.
+            let barrier = self.backgroundEventBarriers.beginWork(for: Self.hlsSessionIdentifier)
+            let cleanupLocation = self.hlsAssetLifecycle.cancel(taskIdentifier: taskId)
             Task { @MainActor [weak self] in
+                defer { barrier.completeFinalization().forEach { $0() } }
                 guard let self else { return }
+                if let cleanupLocation {
+                    self.cleanupHLSAsset(at: cleanupLocation, taskIdentifier: taskId)
+                }
                 let id = self.recordForAssetTask[taskId] ?? taskDesc.flatMap { UUID(uuidString: $0) }
                 self.recordForAssetTask[taskId] = nil
                 if let id { self.assetTaskForRecord[id] = nil; self.lastProgressPush[id] = nil }
             }
             return
         }
-        // Capture the finished location SYNCHRONOUSLY here (this callback is serialized after
-        // didFinishDownloadingTo on the same background delegate queue), so success is decided on a value that
-        // is guaranteed present rather than on record.hlsRelativePath written by a separate, possibly-later Task.
-        let finishedRelPath = self.hlsFinishedLocations.url(for: "hls:\(taskId)")?.relativePath
+        guard case let .accepted(finishedLocation) = self.hlsAssetLifecycle.beginFinalization(taskIdentifier: taskId) else {
+            return
+        }
+        let barrier = self.backgroundEventBarriers.beginWork(for: Self.hlsSessionIdentifier)
         let failureText = error.map { "\(String(localized: "Couldn't save this download:")) \(Self.downloadFailureDetail($0))" }
+        var canonicalLocation: URL?
         Task { @MainActor [weak self] in
+            defer {
+                if let self {
+                    self.hlsAssetLifecycle.complete(taskIdentifier: taskId, canonicalLocation: canonicalLocation)
+                }
+                barrier.completeFinalization().forEach { $0() }
+            }
             guard let self else { return }
-            let id = self.recordForAssetTask[taskId] ?? taskDesc.flatMap { UUID(uuidString: $0) }
-            guard let id, self.store.record(id: id) != nil else { return }
+            guard let id = self.recordForAssetTask[taskId] ?? taskDesc.flatMap({ UUID(uuidString: $0) }),
+                  let record = self.store.record(id: id),
+                  HLSBackgroundRecoveryPolicy.accepts(self.recoveryCandidate(for: record), for: .hlsAsset),
+                  (record.taskIdentifier == nil || record.taskIdentifier == taskId) else {
+                if let location = self.hlsAssetLifecycle.discard(taskIdentifier: taskId) {
+                    self.cleanupHLSAsset(at: location, taskIdentifier: taskId)
+                }
+                return
+            }
+            let succeeded = error == nil && finishedLocation != nil
             self.store.update(id: id) {
-                if error == nil, let rel = finishedRelPath {
+                if succeeded, let rel = finishedLocation?.relativePath {
                     $0.state = .completed
                     $0.hlsRelativePath = rel   // persist here too so completion no longer races the finish Task
                     $0.bytesTotal = Self.hlsProgressScale
                     $0.bytesDone = Self.hlsProgressScale
                     $0.errorText = nil
+                    canonicalLocation = finishedLocation
                 } else {
                     $0.state = .failed
                     $0.errorText = failureText ?? String(localized: "The HLS download didn't complete.")
                 }
             }
+            if canonicalLocation == nil,
+               let location = self.hlsAssetLifecycle.discard(taskIdentifier: taskId) {
+                self.cleanupHLSAsset(at: location, taskIdentifier: taskId)
+            }
             self.recordForAssetTask[taskId] = nil
             self.assetTaskForRecord[id] = nil
             self.lastProgressPush[id] = nil
-            self.hlsFinishedLocations.remove("hls:\(taskId)")
         }
     }
     #endif
@@ -1220,11 +1368,11 @@ extension DownloadManager: URLSessionDownloadDelegate {
     /// keeps future background transfers eligible. Required for background downloads that finish while the
     /// app is suspended; without it iOS progressively throttles the session.
     nonisolated func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let handler = self.backgroundCompletionHandler
-            self.backgroundCompletionHandler = nil
-            handler?()
+        guard let identifier = session.configuration.identifier else { return }
+        let barrier = backgroundEventBarriers.barrier(for: identifier)
+        Task { @MainActor in
+            let handlers = barrier.finishEvents()
+            handlers.forEach { $0() }
         }
     }
 }
@@ -1256,26 +1404,340 @@ extension DownloadManager: AVAssetDownloadDelegate {
         }
     }
 
-    /// The finished `.movpkg` location: system-managed, so we do NOT move it. Persist its path RELATIVE to the
-    /// home dir (the container UUID can change between launches); the completion callback flips the record to
-    /// `.completed`. Fires BEFORE `didCompleteWithError`.
+    /// The finished `.movpkg` location is system-managed, so we do NOT move it. Capture it for the completion
+    /// callback, which persists its path RELATIVE to the home dir (the container UUID can change between launches)
+    /// and flips the record to `.completed`. Fires BEFORE `didCompleteWithError`.
     nonisolated func urlSession(_ session: URLSession, assetDownloadTask: AVAssetDownloadTask,
                                 didFinishDownloadingTo location: URL) {
-        let relativePath = location.relativePath
         let taskId = assetDownloadTask.taskIdentifier
-        let taskDesc = assetDownloadTask.taskDescription
         // Record the finished location SYNCHRONOUSLY on the delegate queue so handleAssetTaskCompletion (which
-        // runs next on the same serial queue) sees it without depending on the @MainActor persistence below.
-        self.hlsFinishedLocations.set(location, for: "hls:\(taskId)")
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let id = self.recordForAssetTask[taskId] ?? taskDesc.flatMap { UUID(uuidString: $0) }
-            guard let id else { return }
-            self.store.update(id: id) { $0.hlsRelativePath = relativePath }
+        // runs next on the same serial queue) sees it without depending on a separately-hopped main-actor task.
+        // A stale duplicate or a cancellation may return a cleanup attempt for this system path; the ledger
+        // commits it only after the filesystem deletion succeeds.
+        if let cleanup = self.hlsAssetLifecycle.recordFinishedLocation(taskIdentifier: taskId, location: location) {
+            self.cleanupHLSAsset(at: cleanup, taskIdentifier: taskId)
         }
     }
 }
 #endif
+
+enum HLSBackgroundRecoveryPolicy {
+    enum SessionKind: Equatable {
+        case byteBackground
+        case hlsAsset
+    }
+
+    struct Candidate: Equatable {
+        let id: String
+        let taskIdentifier: Int?
+        let isHLS: Bool
+        let isTorrent: Bool
+        let downloading: Bool
+    }
+
+    static func accepts(_ candidate: Candidate, for session: SessionKind) -> Bool {
+        guard candidate.downloading, !candidate.isTorrent else { return false }
+        switch session {
+        case .byteBackground: return !candidate.isHLS
+        case .hlsAsset: return candidate.isHLS
+        }
+    }
+
+    static func matchingID(
+        taskIdentifier: Int,
+        session: SessionKind,
+        records: [Candidate]
+    ) -> String? {
+        records.first {
+            $0.taskIdentifier == taskIdentifier && accepts($0, for: session)
+        }?.id
+    }
+
+    static func sessionsToMaterialize(
+        for identifier: String?,
+        backgroundIdentifier: String,
+        hlsIdentifier: String,
+        hasInFlightRecords: Bool
+    ) -> [SessionKind] {
+        if let identifier {
+            if identifier == backgroundIdentifier { return [.byteBackground] }
+            if !hlsIdentifier.isEmpty, identifier == hlsIdentifier { return [.hlsAsset] }
+            return []
+        }
+        return hasInFlightRecords ? [.byteBackground, .hlsAsset] : []
+    }
+}
+
+final class HLSBackgroundEventBarrier: @unchecked Sendable {
+    let generation: UInt64
+    private let lock = NSLock()
+    private var pendingFinalizations = 0
+    private var eventsFinished = false
+    private var completionAdopted = false
+    private var released = false
+    private var handlers: [() -> Void] = []
+
+    init(generation: UInt64 = 0) {
+        self.generation = generation
+    }
+
+    var isReleased: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return released
+    }
+
+    private var hasUnadoptedFinishedEventsLocked: Bool {
+        eventsFinished && !completionAdopted && pendingFinalizations == 0
+    }
+
+    var hasUnadoptedFinishedEvents: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return hasUnadoptedFinishedEventsLocked
+    }
+
+    func canAdoptCurrentGeneration() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !released && !hasUnadoptedFinishedEventsLocked
+    }
+
+    /// Returns true when the caller must invoke the handler immediately because this barrier already released.
+    @discardableResult
+    func addCompletion(_ handler: @escaping () -> Void) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if released { return true }
+        completionAdopted = true
+        handlers.append(handler)
+        return false
+    }
+
+    /// Atomically claim one outstanding delegate finalizer. Separate adoption/reconnection work uses
+    /// beginFinalization directly.
+    @discardableResult
+    func beginWork() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !released, !hasUnadoptedFinishedEventsLocked else { return false }
+        pendingFinalizations += 1
+        return true
+    }
+
+    func beginFinalization() {
+        lock.lock(); defer { lock.unlock() }
+        pendingFinalizations += 1
+    }
+
+    func completeFinalization() -> [() -> Void] {
+        lock.lock(); defer { lock.unlock() }
+        if pendingFinalizations > 0 {
+            pendingFinalizations -= 1
+        }
+        return releaseIfReadyLocked()
+    }
+
+    func finishEvents() -> [() -> Void] {
+        lock.lock(); defer { lock.unlock() }
+        eventsFinished = true
+        return releaseIfReadyLocked()
+    }
+
+    private func releaseIfReadyLocked() -> [() -> Void] {
+        guard completionAdopted, eventsFinished, pendingFinalizations == 0, !released else { return [] }
+        released = true
+        let pending = handlers
+        handlers.removeAll()
+        return pending
+    }
+}
+
+final class HLSBackgroundEventBarrierRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var barriers: [String: HLSBackgroundEventBarrier] = [:]
+    private var nextGeneration: UInt64 = 0
+
+    func barrier(for identifier: String) -> HLSBackgroundEventBarrier {
+        lock.lock(); defer { lock.unlock() }
+        if let current = barriers[identifier], !current.isReleased { return current }
+        let new = makeBarrierLocked()
+        barriers[identifier] = new
+        return new
+    }
+
+    /// Start or continue the generation that owns a newly adopted UIKit completion handler. A prior generation
+    /// that finished without adoption is never reused, because its `eventsFinished` bit describes an old drain.
+    func beginAdoption(for identifier: String) -> HLSBackgroundEventBarrier {
+        lock.lock(); defer { lock.unlock() }
+        if let current = barriers[identifier], current.canAdoptCurrentGeneration() {
+            return current
+        }
+        let new = makeBarrierLocked()
+        barriers[identifier] = new
+        return new
+    }
+
+    /// Atomically claim the current generation for asynchronous delegate work. A released barrier or an old
+    /// finish-without-adoption state is replaced before the claim, so a queued adoption reuses this generation.
+    func beginWork(for identifier: String) -> HLSBackgroundEventBarrier {
+        lock.lock(); defer { lock.unlock() }
+        if let current = barriers[identifier], current.beginWork() {
+            return current
+        }
+        let new = makeBarrierLocked()
+        _ = new.beginWork()
+        barriers[identifier] = new
+        return new
+    }
+
+    private func makeBarrierLocked() -> HLSBackgroundEventBarrier {
+        nextGeneration += 1
+        return HLSBackgroundEventBarrier(generation: nextGeneration)
+    }
+}
+
+enum HLSAssetCleanupPolicy {
+    static let maxAttempts = 3
+
+    /// Try a cleanup a bounded number of times. A path that is already absent is success, while a persistent
+    /// failure is returned to the caller for visible diagnostics. The injected closures keep this policy
+    /// executable in a dependency-free hostile test without touching a real `.movpkg`.
+    static func remove(using remover: () throws -> Void, isAbsent: () -> Bool) -> Error? {
+        var lastError: Error?
+        for _ in 0..<maxAttempts {
+            do {
+                try remover()
+                return nil
+            } catch {
+                if isAbsent() { return nil }
+                lastError = error
+            }
+        }
+        return lastError
+    }
+}
+
+enum HLSAssetFinalizationDecision: Equatable {
+    case accepted(URL?)
+    case ignored
+}
+
+final class HLSAssetLifecycleLedger: @unchecked Sendable {
+    private struct Entry {
+        var cancelled = false
+        var finalizing = false
+        var terminal = false
+        var location: URL?
+        var canonicalPath: String?
+        var cleanedPaths: Set<String> = []
+        var cleanupInFlight: Set<String> = []
+    }
+
+    private let lock = NSLock()
+    private var entries: [Int: Entry] = [:]
+
+    /// Returns a URL only when this callback owns one cleanup attempt for that system path. The caller must
+    /// report the deletion result through `finishCleanup`; failed deletion remains retryable.
+    func recordFinishedLocation(taskIdentifier: Int, location: URL) -> URL? {
+        lock.lock(); defer { lock.unlock() }
+        var entry = entries[taskIdentifier] ?? Entry()
+        let path = location.standardizedFileURL.path
+        if entry.terminal {
+            let cleanup = entry.canonicalPath == path ? nil : claimCleanupLocked(location, entry: &entry)
+            entries[taskIdentifier] = entry
+            return cleanup
+        }
+        if entry.finalizing, entry.location?.standardizedFileURL.path == path {
+            return nil
+        }
+        if entry.cancelled || entry.finalizing {
+            let cleanup = claimCleanupLocked(location, entry: &entry)
+            entries[taskIdentifier] = entry
+            return cleanup
+        }
+        if let current = entry.location {
+            guard current.standardizedFileURL.path != path else { return nil }
+            let cleanup = claimCleanupLocked(location, entry: &entry)
+            entries[taskIdentifier] = entry
+            return cleanup
+        }
+        entry.location = location
+        entries[taskIdentifier] = entry
+        return nil
+    }
+
+    func beginFinalization(taskIdentifier: Int) -> HLSAssetFinalizationDecision {
+        lock.lock(); defer { lock.unlock() }
+        var entry = entries[taskIdentifier] ?? Entry()
+        guard !entry.cancelled, !entry.finalizing, !entry.terminal else {
+            entries[taskIdentifier] = entry
+            return .ignored
+        }
+        entry.finalizing = true
+        entries[taskIdentifier] = entry
+        return .accepted(entry.location)
+    }
+
+    /// Marks cancellation and returns the one pending system path that must be removed, if any.
+    func cancel(taskIdentifier: Int) -> URL? {
+        lock.lock(); defer { lock.unlock() }
+        var entry = entries[taskIdentifier] ?? Entry()
+        entry.cancelled = true
+        let location = entry.location
+        let cleanup = location.flatMap { claimCleanupLocked($0, entry: &entry) }
+        entries[taskIdentifier] = entry
+        return cleanup
+    }
+
+    /// Claims a failed or stale path for cleanup. Successful canonical paths are never returned here.
+    func discard(taskIdentifier: Int) -> URL? {
+        lock.lock(); defer { lock.unlock() }
+        var entry = entries[taskIdentifier] ?? Entry()
+        let location = entry.location
+        let cleanup = location.flatMap { claimCleanupLocked($0, entry: &entry) }
+        entries[taskIdentifier] = entry
+        return cleanup
+    }
+
+    /// Commits a cleanup claim only after the filesystem operation has completed. A failed operation clears
+    /// its in-flight claim so a later duplicate/cancellation callback can retry it.
+    func finishCleanup(taskIdentifier: Int, location: URL, succeeded: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        var entry = entries[taskIdentifier] ?? Entry()
+        let path = location.standardizedFileURL.path
+        entry.cleanupInFlight.remove(path)
+        if succeeded {
+            entry.cleanedPaths.insert(path)
+            if entry.location?.standardizedFileURL.path == path { entry.location = nil }
+        }
+        entries[taskIdentifier] = entry
+    }
+
+    func complete(taskIdentifier: Int, canonicalLocation: URL?) {
+        lock.lock(); defer { lock.unlock() }
+        var entry = entries[taskIdentifier] ?? Entry()
+        entry.terminal = true
+        entry.finalizing = false
+        if let canonicalLocation {
+            entry.location = nil
+            entry.canonicalPath = entry.cancelled ? nil : canonicalLocation.standardizedFileURL.path
+        } else {
+            // Keep a failed cleanup location so a later duplicate callback can retry it. Successful cleanup
+            // has already cleared `location` in `finishCleanup`.
+            entry.canonicalPath = nil
+        }
+        entries[taskIdentifier] = entry
+    }
+
+    func isCancelled(taskIdentifier: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return entries[taskIdentifier]?.cancelled ?? false
+    }
+
+    private func claimCleanupLocked(_ location: URL, entry: inout Entry) -> URL? {
+        let path = location.standardizedFileURL.path
+        guard !entry.cleanedPaths.contains(path), entry.cleanupInFlight.insert(path).inserted else { return nil }
+        return location
+    }
+}
+
+// END HLS background policy state
 
 /// A tiny lock-guarded `taskIdentifier -> destination URL` map. It exists OUTSIDE the `@MainActor`
 /// isolation of `DownloadManager` so the `didFinishDownloadingTo` delegate callback (which runs on the

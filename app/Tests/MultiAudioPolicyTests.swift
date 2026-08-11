@@ -43,6 +43,7 @@ enum MultiAudioPolicyTests {
         testSourcePrimaryReadiness()
         testReplacementRollbackAndNewestWins()
         testPlaybackIntentNewestWinsAndExactOwnership()
+        testCommittedTransportWinsSelectionRestore()
         testHostLossRecoveryChoosesTheOwnedTransaction()
         testQualificationAndDistinctSinks()
         testMasterTopology()
@@ -380,6 +381,40 @@ enum MultiAudioPolicyTests {
         intent.bind(generation: 72, mountIdentity: 10)
         check("playback intent: host-loss rebind rejects the retired host mount",
               intent.consume(generation: 72, mountIdentity: 9) == nil)
+    }
+
+    private static func testCommittedTransportWinsSelectionRestore() {
+        var capturedPlaying = PlaybackIntentPolicy.Intent(
+            sourceSeconds: 60,
+            playbackRequested: true,
+            requestedRate: 1.25,
+            audioSelectionKnown: false,
+            audioSourceIndex: nil,
+            nativeAudioIndex: nil,
+            subtitle: .unresolved)
+        capturedPlaying.bind(generation: 80, mountIdentity: 10)
+        let playingRestore = capturedPlaying.consume(generation: 80, mountIdentity: 10)
+        let pauseAction = PlaybackIntentPolicy.committedTransportAction(
+            playbackRequested: false,
+            requestedRate: 1)
+        check("selection restore: captured playing cannot override a live pause",
+              playingRestore?.playbackRequested == true && pauseAction == .pause)
+
+        var capturedPaused = PlaybackIntentPolicy.Intent(
+            sourceSeconds: 60,
+            playbackRequested: false,
+            requestedRate: 1,
+            audioSelectionKnown: false,
+            audioSourceIndex: nil,
+            nativeAudioIndex: nil,
+            subtitle: .unresolved)
+        capturedPaused.bind(generation: 81, mountIdentity: 11)
+        let pausedRestore = capturedPaused.consume(generation: 81, mountIdentity: 11)
+        let playAction = PlaybackIntentPolicy.committedTransportAction(
+            playbackRequested: true,
+            requestedRate: 1.5)
+        check("selection restore: captured paused cannot override a live play",
+              pausedRestore?.playbackRequested == false && playAction == .play(rate: 1.5))
     }
 
     private static func testHostLossRecoveryChoosesTheOwnedTransaction() {

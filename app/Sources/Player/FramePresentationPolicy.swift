@@ -132,6 +132,11 @@ struct FramePresentationDiagnosticsSnapshot: Equatable, Sendable {
     let presentedSampleAverageMilliseconds: Double
     let presentedSampleMaximumMilliseconds: Double
     let frameDropsSinceReceipt: Int
+    /// `frameDropsSinceReceipt` expressed as a rate over the interval that produced it. Same derivation as
+    /// `subtitleCuesPerMinute`, no extra counter: it exists so the player's Playback info overlay can say
+    /// "57 total, 0/min" instead of a bare cumulative 57, which a viewer reasonably read as a live burst when
+    /// it was actually 57 drops spread over 51 minutes.
+    let frameDropsPerMinute: Double
     let decoderDropsSinceReceipt: Int
     let subtitleCodec: String?
     let subtitleSource: String
@@ -162,6 +167,7 @@ final class FramePresentationDiagnosticsAccumulator: @unchecked Sendable {
         var presentedMax = 0.0
         var frameDrops: FramePresentationDropCounter
         var decoderDrops: FramePresentationDropCounter
+        var outputDropContextEmitted = false
         var subtitleCues = 0
         var lastSubtitleStart: Double?
         var voPasses: FramePresentationVOPassesSnapshot?
@@ -222,15 +228,24 @@ final class FramePresentationDiagnosticsAccumulator: @unchecked Sendable {
         state = current
     }
 
-    func recordDrop(raw: Int, decoder: Bool) -> (generation: UInt64, delta: Int)? {
+    func recordDrop(
+        raw: Int,
+        decoder: Bool
+    ) -> (generation: UInt64, delta: Int, shouldEmitOutputContext: Bool)? {
         lock.lock()
         defer { lock.unlock() }
         guard var current = state else { return nil }
         let delta = decoder
             ? current.decoderDrops.observe(raw)
             : current.frameDrops.observe(raw)
+        let shouldEmitOutputContext = !decoder
+            && delta > 0
+            && !current.outputDropContextEmitted
+        if shouldEmitOutputContext {
+            current.outputDropContextEmitted = true
+        }
         state = current
-        return (current.generation, delta)
+        return (current.generation, delta, shouldEmitOutputContext)
     }
 
     /// `nil` or non-finite means the property is unavailable and resets deduplication.
@@ -297,6 +312,7 @@ final class FramePresentationDiagnosticsAccumulator: @unchecked Sendable {
                 ? current.presentedTotal * 1_000 / Double(current.presentedTimeValid) : 0,
             presentedSampleMaximumMilliseconds: current.presentedMax * 1_000,
             frameDropsSinceReceipt: frameDrops,
+            frameDropsPerMinute: elapsed > 0 ? Double(frameDrops) * 60 / elapsed : 0,
             decoderDropsSinceReceipt: decoderDrops,
             subtitleCodec: subtitleCodec,
             subtitleSource: subtitleSource,
@@ -317,6 +333,7 @@ final class FramePresentationDiagnosticsAccumulator: @unchecked Sendable {
         current.presentedTimeValid = 0
         current.presentedTotal = 0
         current.presentedMax = 0
+        current.outputDropContextEmitted = false
         current.subtitleCues = 0
         state = current
         return snapshot

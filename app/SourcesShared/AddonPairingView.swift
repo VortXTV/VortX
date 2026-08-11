@@ -38,6 +38,15 @@ struct AddonPairingView: View {
     // Long-lived task: creates + rotates the session and polls it.
     @State private var pollTask: Task<Void, Never>?
 
+    // Side-effect fencing: a reset or dismissal invalidates every resolve/install/ack task from the old
+    // generation, so a late network result cannot resurrect stale reducer state.
+    @State private var generation = 0
+    @State private var sideEffectTasks: [Task<Void, Never>] = []
+    @State private var latestRevision = 0
+    /// Server claim/ack authority. A new view instance starts with a fresh tuple; a persisted session restores its
+    /// durable tuple so an interrupted install resumes without stealing a live claim.
+    @State private var authority = AddonPairingClient.newAuthority()
+
     private var batch: AddonPairingReducer.BatchStatus {
         AddonPairingReducer.batchStatus(pairing.rows.map(\.state))
     }
@@ -296,21 +305,46 @@ struct AddonPairingView: View {
     private func perform(_ effect: AddonPairingReducer.Effect) {
         switch effect {
         case let .resolve(rowId, url):
-            Task { @MainActor in
-                guard let preview = await core.previewAddonManifest(urlString: url) else {
-                    dispatch(.resolved(rowId: rowId, outcome: .invalid))
-                    return
+            let gen = generation
+            let task = Task { @MainActor in
+                let preview = await core.previewAddonManifestResult(urlString: url)
+                guard gen == generation, !Task.isCancelled else { return }
+                let outcome: AddonPairingReducer.ResolveOutcome
+                switch preview {
+                case let .ready(name):
+                    outcome = .ready(name: name)
+                case let .alreadyInstalled(name):
+                    outcome = .alreadyInstalled(name: name)
+                case let .rejected(retryable, message):
+                    outcome = .rejected(retryable: retryable, message: message)
                 }
-                let outcome: AddonPairingReducer.ResolveOutcome = preview.alreadyInstalled
-                    ? .alreadyInstalled(name: preview.name)
-                    : .ready(name: preview.name)
                 dispatch(.resolved(rowId: rowId, outcome: outcome))
             }
+            track(task)
+        case let .resolveDurable(ticket, url):
+            let gen = generation
+            let task = Task { @MainActor in
+                let preview = await core.previewAddonManifestResult(urlString: url)
+                guard gen == generation, !Task.isCancelled else { return }
+                let outcome: AddonPairingReducer.ResolveOutcome
+                switch preview {
+                case let .ready(name):
+                    outcome = .ready(name: name)
+                case let .alreadyInstalled(name):
+                    outcome = .alreadyInstalled(name: name)
+                case let .rejected(retryable, message):
+                    outcome = .rejected(retryable: retryable, message: message)
+                }
+                dispatch(.resolvedDurable(ticket: ticket, outcome: outcome))
+            }
+            track(task)
         case let .install(rowId, url):
-            Task { @MainActor in
+            let gen = generation
+            let task = Task { @MainActor in
                 // The ONE installer: fetches + validates + dispatches into the engine's add-on collection
                 // (idempotent - an already-present add-on is a no-op).
                 let error = await core.installAddon(urlString: url)
+                guard gen == generation, !Task.isCancelled else { return }
                 if error == nil {
                     dispatch(.installFinished(rowId: rowId, outcome: .installed))
                 } else if let identity = pairing.rows.first(where: { $0.id == rowId })?.identity,
@@ -321,6 +355,150 @@ struct AddonPairingView: View {
                     dispatch(.installFinished(rowId: rowId, outcome: .failed(error ?? String(localized: "Could not install."))))
                 }
             }
+            track(task)
+        case let .claim(deliveryID, token, deliveryRevision, authoritySession, authorityGeneration):
+            let gen = generation
+            let task = Task { @MainActor in
+                var authority = AddonPairingClient.Authority(id: authoritySession, generation: authorityGeneration)
+                guard gen == generation, !Task.isCancelled else { return }
+                let success = await AddonPairingClient.claim(token: token, authority: authority,
+                                                             deliveryIDs: [deliveryID],
+                                                             deliveryRevision: deliveryRevision)
+                guard gen == generation, !Task.isCancelled else { return }
+                dispatch(.claimFinished(rowId: deliveryID,
+                                        authoritySession: authoritySession,
+                                        authorityGeneration: authorityGeneration,
+                                        attempt: success?.attempt ?? 0,
+                                        deliveryRevision: success?.deliveryRevision ?? deliveryRevision,
+                                        success: success != nil))
+            }
+            track(task)
+        case let .installAttempt(rowId, url, attempt):
+            let gen = generation
+            let task = Task { @MainActor in
+                let result = await core.installAddonConfirmed(urlString: url)
+                guard gen == generation, !Task.isCancelled else { return }
+                let outcome: AddonPairingReducer.InstallOutcome
+                switch result {
+                case .installed, .alreadyInstalled:
+                    outcome = .installed
+                case let .failed(retryable, message):
+                    outcome = .failedWithRetry(retryable: retryable, message: message)
+                }
+                dispatch(.installFinishedAttempt(rowId: rowId, attempt: attempt, outcome: outcome))
+            }
+            track(task)
+        case let .ack(deliveryID, token, status, authoritySession, authorityGeneration,
+                      attempt, deliveryRevision, revision, retryable, mutationID, requiresClaim):
+            let gen = generation
+            let task = Task { @MainActor in
+                guard gen == generation, !Task.isCancelled else { return }
+                let authority = AddonPairingClient.Authority(id: authoritySession, generation: authorityGeneration)
+                var wireAttempt = max(1, attempt)
+                var wireDeliveryRevision = deliveryRevision
+                if requiresClaim {
+                    let claimResult = await AddonPairingClient.claim(token: token, authority: authority,
+                                                                       deliveryIDs: [deliveryID],
+                                                                       deliveryRevision: deliveryRevision)
+                    // Fence immediately after the await. Cancellation is cooperative and a relay claim may
+                    // complete after stop(); neither a late success nor a late failure may mutate reducer state.
+                    guard AddonPairingReducer.canDispatchAckClaimCompletion(
+                        pairing,
+                        deliveryID: deliveryID,
+                        authoritySession: authoritySession,
+                        authorityGeneration: authorityGeneration,
+                        mutationID: mutationID,
+                        expectedGeneration: gen,
+                        currentGeneration: generation,
+                        taskIsCancelled: Task.isCancelled
+                    ) else { return }
+                    guard let claimed = claimResult else {
+                        dispatch(.ackClaimFinished(deliveryID: deliveryID,
+                                                   token: token,
+                                                   authoritySession: authoritySession,
+                                                   authorityGeneration: authorityGeneration,
+                                                   attempt: attempt,
+                                                   deliveryRevision: deliveryRevision,
+                                                   mutationID: mutationID,
+                                                   success: false))
+                        return
+                    }
+                    dispatch(.ackClaimFinished(deliveryID: deliveryID,
+                                               token: token,
+                                               authoritySession: authoritySession,
+                                               authorityGeneration: authorityGeneration,
+                                               attempt: claimed.attempt,
+                                               deliveryRevision: claimed.deliveryRevision,
+                                               mutationID: mutationID,
+                                               success: true))
+                    guard gen == generation, !Task.isCancelled,
+                          pairing.pendingAcks[deliveryID]?.mutationID == mutationID,
+                          pairing.pendingAcks[deliveryID]?.requiresClaim == false else { return }
+                    wireAttempt = claimed.attempt
+                    wireDeliveryRevision = claimed.deliveryRevision
+                }
+                guard gen == generation, !Task.isCancelled,
+                      pairing.pendingAcks[deliveryID]?.mutationID == mutationID else { return }
+                let wireAck = AddonPairingClient.DeliveryAck(
+                    deliveryId: deliveryID,
+                    status: status.rawValue,
+                    attempt: wireAttempt,
+                    rev: revision,
+                    mutationId: mutationID,
+                    deliveryRevision: wireDeliveryRevision,
+                    retryable: retryable
+                )
+                let success = await AddonPairingClient.ack(token: token, authority: authority,
+                                                           deliveries: [wireAck], mutationID: mutationID)
+                guard gen == generation, !Task.isCancelled else { return }
+                dispatch(.ackFinished(deliveryID: deliveryID,
+                                      token: token,
+                                      status: status,
+                                      authoritySession: authoritySession,
+                                      authorityGeneration: authorityGeneration,
+                                      attempt: wireAttempt,
+                                      deliveryRevision: wireDeliveryRevision,
+                                      revision: revision,
+                                      retryable: retryable,
+                                      mutationID: mutationID,
+                                      success: success))
+            }
+            track(task)
+        case let .poll(token, authoritySession, authorityGeneration):
+            let gen = generation
+            let task = Task { @MainActor in
+                guard gen == generation, !Task.isCancelled else { return }
+                let authority = AddonPairingClient.Authority(id: authoritySession, generation: authorityGeneration)
+                switch await AddonPairingClient.poll(token: token, authority: authority) {
+                case let .ok(poll):
+                    guard gen == generation, !Task.isCancelled else { return }
+                    merge(poll, token: token)
+                case let .staleGeneration(currentGeneration):
+                    guard let recovered = AddonPairingClient.authorityForStaleGeneration(
+                        authority,
+                        currentGeneration: currentGeneration
+                    ) else { return }
+                    guard gen == generation, !Task.isCancelled else { return }
+                    self.authority = recovered
+                    dispatch(.authorityChanged(session: recovered.id, generation: recovered.generation))
+                case .gone, .failed:
+                    // The normal lifecycle poll remains authoritative for expiry/rotation; this one-shot poll only
+                    // exists to resolve an ambiguous claim before allowing its ACK to retry.
+                    return
+                }
+            }
+            track(task)
+        case let .releaseSession(token, authoritySession, authorityGeneration, mutationID):
+            let gen = generation
+            let task = Task { @MainActor in
+                let authority = AddonPairingClient.Authority(id: authoritySession, generation: authorityGeneration)
+                let success = await AddonPairingClient.release(token: token, authority: authority,
+                                                               mutationID: mutationID)
+                guard gen == generation, !Task.isCancelled else { return }
+                dispatch(.releaseFinished(sessionToken: token, success: success))
+                if success, session?.token == token { AddonPairingClient.clearPersistedSession() }
+            }
+            track(task)
         }
     }
 
@@ -333,10 +511,10 @@ struct AddonPairingView: View {
 
     private func startSession() {
         stop()
+        authority = AddonPairingClient.newAuthority()
+        dispatch(.authorityChanged(session: authority.id, generation: authority.generation))
         creating = true
         createFailed = false
-        qrImage = nil
-        session = nil
 
         pollTask = Task { @MainActor in
             await createAndPollLoop()
@@ -346,67 +524,208 @@ struct AddonPairingView: View {
     /// Create a session, render its QR, then poll it. If the session expires (or the relay reports it gone /
     /// closed), rotate to a fresh one so the QR on screen is always live.
     private func createAndPollLoop() async {
+        let lifecycleGeneration = generation
+        guard AddonPairingClient.canApplyLifecycleResult(
+            expectedGeneration: lifecycleGeneration,
+            currentGeneration: generation,
+            taskIsCancelled: Task.isCancelled
+        ) else { return }
+        var rollbackSession: AddonPairingClient.Session?
         // Resume the persisted session FIRST, if the relay still knows it: a manifest the phone added after
         // this sheet was last closed is sitting unread in that session, and minting a fresh QR here would
-        // orphan it forever. One poll decides; a dead token falls through to a new session.
+        // orphan it forever. One poll decides; a dead token falls through to a new session. A transient poll
+        // failure keeps the old session as the rollback target instead of replacing it speculatively.
         if let saved = AddonPairingClient.persistedSession() {
-            if case .ok(let poll) = await AddonPairingClient.poll(token: saved.token) {
-                session = saved
+            if AddonPairingProtocol.isMutationID(saved.authoritySession) {
+                // A sheet reopen in the same process must retain the authority that owns any live server claim.
+                authority = AddonPairingClient.Authority(id: saved.authoritySession, generation: 0)
+            }
+            let savedPollResult = await AddonPairingClient.poll(token: saved.token)
+            guard AddonPairingClient.canApplyLifecycleResult(
+                expectedGeneration: lifecycleGeneration,
+                currentGeneration: generation,
+                taskIsCancelled: Task.isCancelled
+            ) else { return }
+            switch savedPollResult {
+            case .ok(let initialPoll):
+                guard !initialPoll.released else {
+                    AddonPairingClient.clearPersistedSession()
+                    session = nil
+                    qrImage = nil
+                    break
+                }
+                var poll = initialPoll
+                authority = AddonPairingClient.Authority(id: authority.id, generation: initialPoll.generation)
+                if !initialPoll.terminal {
+                    // A closed session needs the relay's generation transition to clear the prior claim. An open
+                    // session returns the same generation, and the persisted authority makes an existing claim
+                    // resumable rather than competing with it under a new owner.
+                    let reopenedResult = await AddonPairingClient.reopen(token: saved.token, authority: authority)
+                    guard AddonPairingClient.canApplyLifecycleResult(
+                        expectedGeneration: lifecycleGeneration,
+                        currentGeneration: generation,
+                        taskIsCancelled: Task.isCancelled
+                    ) else { return }
+                    guard let reopened = reopenedResult else {
+                        session = saved
+                        qrImage = QRCodeImage.make(saved.pageUrl)
+                        creating = false
+                        createFailed = true
+                        return
+                    }
+                    authority = reopened
+                    let refreshedResult = await AddonPairingClient.poll(token: saved.token, authority: authority)
+                    guard AddonPairingClient.canApplyLifecycleResult(
+                        expectedGeneration: lifecycleGeneration,
+                        currentGeneration: generation,
+                        taskIsCancelled: Task.isCancelled
+                    ) else { return }
+                    guard case .ok(let refreshed) = refreshedResult else {
+                        session = saved
+                        qrImage = QRCodeImage.make(saved.pageUrl)
+                        creating = false
+                        createFailed = true
+                        return
+                    }
+                    guard !refreshed.released else {
+                        AddonPairingClient.clearPersistedSession()
+                        session = nil
+                        qrImage = nil
+                        break
+                    }
+                    poll = refreshed
+                }
+                let resumed = AddonPairingClient.Session(token: saved.token,
+                                                         pageUrl: saved.pageUrl,
+                                                         expiresAtMs: poll.expiresAtMs,
+                                                         generation: authority.generation,
+                                                         authoritySession: authority.id)
+                session = resumed
                 qrImage = QRCodeImage.make(saved.pageUrl)
                 creating = false
                 createFailed = false
+                dispatch(.authorityChanged(session: authority.id, generation: authority.generation))
                 dispatch(.sessionRotated(liveToken: saved.token))
-                dispatch(.delivered(urls: poll.manifests.map(\.url), sessionToken: saved.token, liveToken: session?.token))
-                if !poll.closed {
+                merge(poll, token: saved.token)
+                if !poll.closed || pairing.isInFlight(sessionToken: saved.token) {
                     let ended = await pollSession(token: saved.token, expiresAt: poll.expiresAt)
+                    guard AddonPairingClient.canApplyLifecycleResult(
+                        expectedGeneration: lifecycleGeneration,
+                        currentGeneration: generation,
+                        taskIsCancelled: Task.isCancelled
+                    ) else { return }
                     if !ended { return }   // cancelled (view dismissed)
                 }
+                if poll.closed { rollbackSession = resumed }
+                AddonPairingClient.clearPersistedSession()
+            case .gone:
+                AddonPairingClient.clearPersistedSession()
+            case .staleGeneration:
+                // The initial resume poll carries no authority generation, so a stale response cannot be
+                // recovered safely here; the regular lifecycle poll handles authenticated generation rebases.
+                return
+            case .failed:
+                session = saved
+                qrImage = QRCodeImage.make(saved.pageUrl)
+                creating = false
+                createFailed = true
+                return
             }
-            AddonPairingClient.clearPersistedSession()
         }
         while !Task.isCancelled {
+            guard AddonPairingClient.canApplyLifecycleResult(
+                expectedGeneration: lifecycleGeneration,
+                currentGeneration: generation,
+                taskIsCancelled: Task.isCancelled
+            ) else { return }
             creating = true
-            guard let created = await AddonPairingClient.createSession() else {
+            let createdResult = await AddonPairingClient.createSession()
+            guard AddonPairingClient.canApplyLifecycleResult(
+                expectedGeneration: lifecycleGeneration,
+                currentGeneration: generation,
+                taskIsCancelled: Task.isCancelled
+            ) else { return }
+            guard let created = createdResult else {
+                if let rollbackSession {
+                    session = rollbackSession
+                    qrImage = QRCodeImage.make(rollbackSession.pageUrl)
+                    AddonPairingClient.persist(rollbackSession)
+                }
                 creating = false
                 createFailed = true
                 return   // startSession()'s Retry button re-enters this loop
             }
-            session = created
+            authority = AddonPairingClient.Authority(id: authority.id, generation: created.generation)
+            let persisted = AddonPairingClient.Session(token: created.token,
+                                                       pageUrl: created.pageUrl,
+                                                       expiresAtMs: created.expiresAtMs,
+                                                       generation: created.generation,
+                                                       authoritySession: authority.id)
+            session = persisted
             qrImage = QRCodeImage.make(created.pageUrl)
             creating = false
             createFailed = false
-            AddonPairingClient.persist(created)   // survives sheet close, so a late add still arrives
+            latestRevision = 0
+            dispatch(.authorityChanged(session: authority.id, generation: authority.generation))
+            AddonPairingClient.persist(persisted)   // survives sheet close, so a late add still arrives
             // A fresh session token means any not-yet-terminal row from a PRIOR session can never complete (its
             // phone page is dead); drop those so a wrong-session submission leaves no stuck state and Done is
             // not pinned "Installing…" forever. Terminal rows stay as visible history.
             dispatch(.sessionRotated(liveToken: created.token))
 
-            // Poll THIS session until it dies, then loop to mint a new one. NOTE the polarity: pollSession
-            // returns true when the session ENDED (expired / gone / closed) and a fresh one should be minted;
-            // false means the task was cancelled (view dismissed).
+            // Poll THIS session until it dies, then loop to mint a fresh one. NOTE the polarity: pollSession
+            // returns true when the session ENDED (expired / gone / closed) and false when cancelled.
             let ended = await pollSession(token: created.token, expiresAt: created.expiresAt)
+            guard AddonPairingClient.canApplyLifecycleResult(
+                expectedGeneration: lifecycleGeneration,
+                currentGeneration: generation,
+                taskIsCancelled: Task.isCancelled
+            ) else { return }
             if ended { continue }
             return   // cancelled
         }
     }
 
     /// Poll one session. Returns true if the session ended (expired / gone / closed) and the caller should
-    /// rotate to a new one; returns false when the task was cancelled (view dismissed).
+    /// rotate to a new one; returns false when the task is cancelled (view dismissed).
     private func pollSession(token: String, expiresAt: Date) async -> Bool {
         var deadline = expiresAt
+        var closed = false
+        let pollGeneration = generation
         while !Task.isCancelled {
-            if Date() >= deadline { return true }   // expired → rotate
-            switch await AddonPairingClient.poll(token: token) {
+            // A closed relay session remains live until every ACK and the server release mutation are
+            // confirmed. It must still poll first: a phone-side reopen increments generation and clears claims,
+            // while an old-authority poll otherwise falls into a sleep-only loop and never reaches the structured
+            // stale-generation recovery branch.
+            if closed && pairing.isSessionReleased(token) { return true }
+            if !closed && Date() >= deadline { return true }
+            let pollAuthority: AddonPairingClient.Authority? = authority.generation >= 1 ? authority : nil
+            let result = await AddonPairingClient.poll(token: token, authority: pollAuthority)
+            guard pollGeneration == generation, !Task.isCancelled else { return false }
+            switch result {
             case .gone:
-                return true                          // unknown / expired token → rotate
+                return true
             case .ok(let poll):
-                // Deliver BEFORE the closed check: a URL the phone adds in the same poll window as its "Done"
-                // tap arrives with closed == true and must not be dropped by the rotation.
-                dispatch(.delivered(urls: poll.manifests.map(\.url), sessionToken: token, liveToken: session?.token))
-                if poll.closed { return true }       // phone closed it → rotate
-                deadline = poll.expiresAt            // keep the deadline fresh from the relay
+                guard let transition = AddonPairingClient.pollTransition(result: .ok(poll), authority: authority) else {
+                    if poll.released { return true }
+                    break
+                }
+                guard case .current = transition else { break }
+                merge(poll, token: token)
+                closed = poll.closed
+                if closed {
+                    if !pairing.isInFlight(sessionToken: token) { return true }
+                    dispatch(.retryPendingWork(sessionToken: token))
+                }
+                if !closed { deadline = poll.expiresAt }
+            case let .staleGeneration(currentGeneration):
+                guard case let .stale(recovered) = AddonPairingClient.pollTransition(
+                    result: .staleGeneration(currentGeneration), authority: authority
+                ) else { return false }
+                authority = recovered
+                dispatch(.authorityChanged(session: recovered.id, generation: recovered.generation))
             case .failed:
-                break                                // transient; keep polling
+                if closed { dispatch(.retryPendingWork(sessionToken: token)) }
             }
             do { try await Task.sleep(for: Self.pollInterval) } catch { return false }
         }
@@ -414,12 +733,58 @@ struct AddonPairingView: View {
     }
 
     private func stop() {
+        generation += 1
         pollTask?.cancel()
         pollTask = nil
+        for task in sideEffectTasks { task.cancel() }
+        sideEffectTasks = []
         // The session is deliberately LEFT ALIVE on the relay (it self-expires): a manifest the phone adds
         // after this sheet closes is picked up by the persisted-session resume on the next open.
     }
 
+    /// Keep cancellation handles for resolve/install/ack work, pruning cancelled entries before appending.
+    private func track(_ task: Task<Void, Never>) {
+        sideEffectTasks.removeAll { $0.isCancelled }
+        sideEffectTasks.append(task)
+    }
+
+    /// Convert one relay poll into durable reducer deliveries. Unknown relay statuses are rejected as a whole
+    /// poll so no unclassified remote state can enter the install path.
+    private func merge(_ poll: AddonPairingClient.Poll, token: String) {
+        guard session?.token == token,
+              poll.generation >= authority.generation else { return }
+        guard poll.manifests.allSatisfy({ manifest in
+            AddonPairingProtocol.isOpaqueIdentifier(manifest.deliveryId, maxLength: 128) &&
+            AddonPairingReducer.DeliveryStatus(rawValue: manifest.status) != nil &&
+            AddonPairingProtocol.isStrictManifestURL(manifest.url)
+        }) else { return }
+        if authority.generation != poll.generation {
+            authority = AddonPairingClient.Authority(id: authority.id, generation: poll.generation)
+            dispatch(.authorityChanged(session: authority.id, generation: authority.generation))
+        }
+        latestRevision = max(latestRevision, poll.rev)
+        let deliveries = poll.manifests.compactMap { manifest -> AddonPairingReducer.Delivery? in
+            guard let status = AddonPairingReducer.DeliveryStatus(rawValue: manifest.status),
+                  !manifest.deliveryId.isEmpty else { return nil }
+            return AddonPairingReducer.Delivery(
+                id: manifest.deliveryId,
+                url: manifest.url,
+                identity: core.normalizedAddonURL(manifest.url) ?? manifest.url,
+                sessionToken: token,
+                revision: poll.rev,
+                status: status,
+                deliveryRevision: manifest.deliveryRevision,
+                attempt: manifest.attempt,
+                retryable: manifest.retryable,
+                claimed: manifest.claimed
+            )
+        }
+        dispatch(.deliveries(deliveries,
+                             sessionToken: token,
+                             liveToken: session?.token,
+                             revision: poll.rev))
+        if poll.closed { dispatch(.sessionClosed(sessionToken: token)) }
+    }
     // MARK: - Row presentation
 
     private func iconName(for state: AddonPairingReducer.RowState) -> String {

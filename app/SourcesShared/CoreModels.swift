@@ -62,13 +62,12 @@ struct CoreCWItem: Decodable, Identifiable {
     ///   it sits in the live-in-progress band (`resumeFloor`…0.9); that must KEEP it in the rail so the
     ///   rewatch shows and resumes, even though the watched counters are non-zero. A movie parked at the
     ///   credits, or freshly flagged-watched with no active offset, has no in-progress position and clears.
-    /// - Series: `timesWatched` counts watched episodes, so it must NOT gate the rail. The only safe
-    ///   finished signal is the current episode being at/past 0.9.
-    ///   A finished episode with a next one rolls `time_offset` back to a low value for the new episode, so
-    ///   its progress is low and it correctly stays.
+    /// - Series: Continue Watching membership belongs to the engine/account or the active overlay profile.
+    ///   App-side progress cannot prove that a title is a true series finale, so series entries stay present
+    ///   here until the authoritative player/engine lifecycle changes membership.
     var isFinished: Bool {
+        if EpisodePlaybackIdentity.usesSeriesLifecycle(type: type) { return false }
         let watchedToEnd = progress >= 0.9
-        if EpisodePlaybackIdentity.usesSeriesLifecycle(type: type) { return watchedToEnd }
         // A live, resumable position (progress above the resume floor but below the finished ceiling)
         // means an active watch/rewatch: keep it even if the watched counters are set.
         let resumeFloor = 0.0
@@ -558,6 +557,44 @@ struct CoreMetaDetails: Decodable {
     }
 
     var selectedMetaID: String? { selected?.metaPath.id }
+
+    /// A terminal exact-title meta response for Apple refreshes. General `metaResolution` is intentionally
+    /// broader: it becomes `.ready` when ANY provider is ready. This seam waits for every provider entry to
+    /// be terminal (`Ready` or `Err`), requires at least one ready item for the exact selected title, rejects
+    /// a ready item for another title, and returns the normal priority-selected item. Its videos are the
+    /// unfiltered videos from that settled response, not a season-scoped player list. This is not an
+    /// all-season completeness marker; title-finality authority remains pending the explicit consensus seam.
+    /// The optional stream id adds the exact stream-path response fence used by Apple refreshes; a matching
+    /// stream group must exist and be terminal.
+    func appleCWTerminalFullMeta(for requestedID: String, streamID requestedStreamID: String? = nil) -> CoreMetaItem? {
+        guard selectedMetaID == requestedID, !metaItems.isEmpty else { return nil }
+        if let requestedStreamID {
+            let matchingGroups = streams.filter {
+                $0.request.path.resource == "stream" && $0.request.path.id == requestedStreamID
+            }
+            guard !matchingGroups.isEmpty,
+                  matchingGroups.allSatisfy({ group in
+                      switch group.content {
+                      case .ready?, .err?: return true
+                      case .loading?, .none: return false
+                      }
+                  }) else { return nil }
+        }
+        var hasReadyExactTitle = false
+        for entry in metaItems {
+            switch entry.content {
+            case .ready(let item)?:
+                guard item.id == requestedID else { return nil }
+                hasReadyExactTitle = true
+            case .err?:
+                continue
+            case .loading?, .none:
+                return nil
+            }
+        }
+        guard hasReadyExactTitle else { return nil }
+        return meta
+    }
 
     private var metaEntryStates: [DetailMetaRecoveryPolicy.EntryState] {
         metaItems.map { entry in
@@ -1070,20 +1107,62 @@ enum EpisodePlaybackIdentity {
         usesSeriesLifecycle && savedVideoID.map { $0 != requestedVideoID } == true
     }
 
-    /// Whole-title rewind is safe for a movie. Episodic playback requires a resident episode list and the
-    /// current episode must be the proven final entry, so a missing list or mid-season close cannot erase the
-    /// title resume position.
+    /// This legacy compatibility shape is intentionally conservative for series. A count and index alone
+    /// cannot prove a title inventory is complete, so current Apple series routing does not use it for removal.
     static func canRewindWholeTitleAtTerminal(usesSeriesLifecycle: Bool,
                                               currentEpisodeIndex: Int?, episodeCount: Int) -> Bool {
-        guard usesSeriesLifecycle else { return true }
-        guard episodeCount > 0,
-              let currentEpisodeIndex,
-              episodesContains(index: currentEpisodeIndex, count: episodeCount) else { return false }
-        return currentEpisodeIndex == episodeCount - 1
+        guard !usesSeriesLifecycle else { return false }
+        _ = currentEpisodeIndex
+        _ = episodeCount
+        return true
     }
 
-    private static func episodesContains(index: Int, count: Int) -> Bool {
-        index >= 0 && index < count
+    /// Convert CoreVideo metadata into the Apple inventory contract without discarding raw ordering. The
+    /// settled-backfill case rejects partial coordinates and raw unsorted input; all metadata remains usable
+    /// only for safe successor navigation because CoreMetaDetails has no completeness marker.
+    static func appleCWSeriesInventory(from episodes: [CoreVideo],
+                                       authority: AppleCWSeriesInventory.Authority) -> AppleCWSeriesInventory? {
+        let identities = episodes.compactMap { video -> AppleCWSeriesEpisode? in
+            guard let season = video.season, let episode = video.episode else { return nil }
+            return AppleCWSeriesEpisode(id: video.id, season: season, episode: episode)
+        }
+        guard identities.count == episodes.count else { return nil }
+        return AppleCWSeriesInventory(raw: identities, authority: authority)
+    }
+
+    /// Accept a later settled backfill when it is fuller than, or an exact identity match for, the launch list.
+    /// The candidate remains raw until the inventory check rejects partial or unsorted metadata. This seam may
+    /// establish a successor for navigation, never destructive series finality.
+    static func appleCWAuthoritativeBackfill(from episodes: [CoreVideo],
+                                             replacing launchEpisodes: [CoreVideo]) -> [CoreVideo]? {
+        guard episodes.count >= launchEpisodes.count,
+              let candidate = appleCWSeriesInventory(from: episodes, authority: .authoritativeFullSeries) else {
+            return nil
+        }
+        guard !launchEpisodes.isEmpty else { return episodes }
+        guard let launch = appleCWSeriesInventory(from: launchEpisodes, authority: .launch) else { return nil }
+        if episodes.count == launchEpisodes.count {
+            guard candidate.ordered == launch.ordered else { return nil }
+        } else {
+            guard launch.ordered.allSatisfy({ launchEpisode in
+                candidate.ordered.contains(launchEpisode)
+            }) else { return nil }
+        }
+        return episodes
+    }
+
+    /// Decide terminal series behavior. A successor can advance from a normalized launch list; rewind can
+    /// happen only after an explicit ordered full-series inventory is available.
+    static func appleCWTerminalDecision(currentVideoID: String?, episodes: [CoreVideo],
+                                        authority: AppleCWSeriesInventory.Authority,
+                                        refresh: AppleCWSeriesRefreshResult) -> AppleCWSeriesTerminalDecision {
+        guard let currentVideoID,
+              let inventory = appleCWSeriesInventory(from: episodes, authority: authority) else {
+            return refresh == .notAttempted ? .refresh : .keepState
+        }
+        return AppleCWSeriesTerminalPolicy.decide(currentID: currentVideoID,
+                                                  inventory: inventory,
+                                                  refresh: refresh)
     }
 
     /// Accept an async media result only while both its request generation and target identity remain
@@ -1261,6 +1340,25 @@ enum EpisodePlaybackIdentity {
     }
 }
 
+final class DebridPlaybackAvailability: @unchecked Sendable {
+    static let shared = DebridPlaybackAvailability()
+
+    private let lock = NSLock()
+    private var torBoxConfigured = false
+
+    private init() {}
+
+    func publish(torBoxConfigured: Bool) {
+        lock.withLock {
+            self.torBoxConfigured = torBoxConfigured
+        }
+    }
+
+    var canResolveUsenet: Bool {
+        lock.withLock { torBoxConfigured }
+    }
+}
+
 /// A playable stream. `StreamSource` is `#[serde(untagged)]` + flattened, so the source fields
 /// (url / ytId / infoHash / externalUrl) sit at the top level, decode them all optionally.
 struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
@@ -1324,7 +1422,8 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
         // this, every usenet row rendered as a dead disabled label (every row gate keys on this
         // property). No TorBox key -> nil, the pre-usenet behavior. Deliberately NOT behind the
         // torrents gate: usenet resolves to a remote link, no embedded server needed (Lite plays it).
-        if isUsenet, DebridKeys.shared.isConfigured(.torBox), let nzb = nzbUrl, let parsed = URL(string: nzb) {
+        if isUsenet, DebridPlaybackAvailability.shared.canResolveUsenet,
+           let nzb = nzbUrl, let parsed = URL(string: nzb) {
             return parsed
         }
         if let ytId, !ytId.isEmpty {

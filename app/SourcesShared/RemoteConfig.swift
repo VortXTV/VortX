@@ -27,9 +27,15 @@ import Foundation
 ///      the wrong description survived review. They do NOT coincide in general, and a future knob whose baked
 ///      value sits mid-range would behave nothing like the old sentence claimed.
 ///
-///   4. DEFAULTS DO NOT CHANGE. A field defaulting to null => baked default. `features.dvRemux` stays
-///      effectively OFF unless the owner's user toggle (UserDefaults `stremiox.dvRemux`) or a remote value
-///      turns it on; the user's EXPLICIT toggle always wins over the remote default (see PlayerEngineRouter).
+///   4. DEFAULTS DO NOT CHANGE. A field defaulting to null => baked default. For `features.dvRemux` the baked
+///      default is NOT "off": with no remote value and no user toggle the lane is ON wherever the display can
+///      actually present Dolby Vision (`PlayerEngineRouter.dvRemuxEnabled`, the DV mandate), and OFF only on a
+///      display that cannot show DV. This description used to say the lane stayed "effectively OFF" by default,
+///      which is what a Settings row was written against; the row then reported Off on a virgin device while
+///      true DV was playing. The resolution order is: the user's EXPLICIT toggle (UserDefaults
+///      `stremiox.dvRemux`) wins over everything, else a PRESENT remote value is the fleet kill-switch, else
+///      the display-capability baked default. An explicit "Prefer AVPlayer" pick also engages the lane on a
+///      DV-capable display regardless of the toggle (`dvRemuxEngaged`).
 ///
 ///   5. FAIL-SOFT everywhere. Any fetch / decode / disk error keeps the last-good snapshot (or baked defaults);
 ///      nothing throws out of `bootstrap`/`refresh`. `master.remoteConfigEnabled == false` discards a fetched
@@ -179,6 +185,10 @@ enum RemoteConfigDefaults {
     static let featureCommunityTrickplay = true // CommunityTrickplay.isEnabled default
     static let featureCollectionsHub = true     // CollectionsHubModel.isAvailable
     static let featureSpoilerBlur = true        // vortx.spoilerBlur default (user setting wins)
+    static let featureTorBoxSearch = true       // TorBox SEARCH-as-a-source master gate. Baked ON, so an
+                                                // unreachable RemoteConfig is behaviorally identical to today;
+                                                // an explicit remote OFF disables the source with NO app update
+                                                // (its search host, search-api.torbox.app, went DNS-dead).
 }
 
 // MARK: - Decodable schema (decode ALL; wire a subset). Every field Optional; unknown keys ignored.
@@ -205,6 +215,7 @@ struct RemoteConfigData: Decodable {
         let xrdbPosters: Bool?
         let erdbPosters: Bool?
         let collectionsHub: Bool?
+        let torBoxSearch: Bool?        // TorBoxSearchSource master gate (baked ON; remote OFF kills the dead path)
         let skipVortxLayer: Bool?
         let aniSkip: Bool?
         let spoilerBlur: Bool?
@@ -983,6 +994,7 @@ actor RemoteConfig {
             put("xrdbPosters", f.xrdbPosters)
             put("erdbPosters", f.erdbPosters)
             put("collectionsHub", f.collectionsHub)
+            put("torBoxSearch", f.torBoxSearch)
             put("skipVortxLayer", f.skipVortxLayer)
             put("aniSkip", f.aniSkip)
             put("spoilerBlur", f.spoilerBlur)

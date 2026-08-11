@@ -17,6 +17,15 @@ import AVKit   // AVRoutePickerView (in-player AirPlay button)
 struct PlayerEpisodeRef: Identifiable, Equatable {
     let id: String
     let label: String
+    let season: Int?
+    let episode: Int?
+
+    init(id: String, label: String, season: Int? = nil, episode: Int? = nil) {
+        self.id = id
+        self.label = label
+        self.season = season
+        self.episode = episode
+    }
 }
 
 /// A resolved, ready-to-play episode handed back by the caller's `loadEpisode` closure: the picked
@@ -31,6 +40,9 @@ struct PlayerEpisodeStream {
     let resume: Double
     var debridRef: DebridPlaybackRef? = nil
     var engineAddonBase: String? = nil
+    var preparationRequest: NextEpisodePreparationRequest? = nil
+    var torrentPreparationLease: PreparedTorrentEngineLease? = nil
+    var preparedRemux: VortXPreparedRemuxAttachment? = nil
 }
 
 struct PlayerScreen: View {
@@ -76,12 +88,17 @@ struct PlayerScreen: View {
     // When `episodes` is non-empty the player derives Next/Prev from the CURRENT episode, ignoring the
     // legacy `hasNext` / `onNext`.
     var episodes: [PlayerEpisodeRef] = []
+    var seriesInventoryAuthority: AppleCWSeriesInventory.Authority = .launch
     var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
+    /// Exact CoreVideo metadata admitted by this player's request-owned authoritative refresh. This is
+    /// deliberately separate from `loadEpisode`: the launch-ID resolver may close over an immutable list,
+    /// while this path consumes a successor that was not present when the player was mounted.
+    var loadEpisodeWithMetadata: ((CoreVideo) async -> PlayerEpisodeStream?)? = nil
     /// Optional background pre-heat for the next episode's source (start a torrent's peer search, pull
     /// the first bytes of a direct file), called once around the episode's halfway point. Distinct from
     /// `loadEpisode`: it must NOT touch the engine's meta/player slot (that would hijack the current
     /// episode's progress), it only warms network I/O. Series detail wires it; nil elsewhere is a no-op.
-    var warmNextEpisode: ((String) async -> Void)? = nil
+    var warmNextEpisode: ((NextEpisodePreparationRequest) async -> PlayerEpisodeStream?)? = nil
     var onProgress: (Double, Double) -> Void = { _, _ in }   // periodic forward progress (TimeChanged)
     var onSeek: (Double, Double) -> Void = { _, _ in }       // exact position on user-seek (Seek)
     var onNext: () -> Void = {}                             // advance to the next episode (legacy, non-episode callers)
@@ -369,6 +386,11 @@ struct PlayerScreen: View {
     // once the playhead passes it. iOS port of TVPlayerView.suppressedResumeFloor.
     @State private var suppressedResumeFloor: Double?
     @State private var warmedEpisodeID: String?      // next-episode source already warmed this episode (F6 preload)
+    @State private var preparingEpisodeID: String?
+    @State private var preparedEpisode: PlayerEpisodeStream?
+    @State private var nextEpisodePreparationTask: Task<Void, Never>?
+    @State private var nextEpisodePreparationGeneration = 0
+    @State private var nextEpisodeAttemptPolicy = PreparedEpisodeAttemptPolicy()
     @State private var showShare = false             // system share sheet
     @State private var grabbedFrame: GrabbedFrame?   // a captured still, pending the share sheet (#24 frame grab)
     // Current-episode tracking for in-place episode switching: seeded from the launch values, updated on
@@ -390,6 +412,14 @@ struct PlayerScreen: View {
     @State private var episodeResolutionAdmitted = false
     private static let episodeResolutionDeadlineSeconds: Double = 30
     @State private var playbackExited = false
+    @State private var terminalFinalityRefreshTarget: AppleCWTerminalRefreshTarget?
+    @State private var terminalFinalityRefreshGeneration: Int?
+    @State private var terminalFinalityRefreshTask: Task<Void, Never>?
+    @State private var sourceSwitchGeneration = 0
+    @State private var loadedSeriesEpisodes: [PlayerEpisodeRef] = []
+    @State private var loadedSeriesVideoMetadata: [CoreVideo] = []
+    @State private var authoritativeSeriesEpisodes: [PlayerEpisodeRef]?
+    @State private var terminalRewindGate = AppleCWTerminalProgressGate()
     private var curMeta: PlaybackMeta? { curMetaState ?? recordMeta }
     private var curTitle: String { curTitleState ?? title }
     private var isEpisodePlaybackContext: Bool {
@@ -398,7 +428,7 @@ struct PlayerScreen: View {
             type: target.type, season: target.season, episode: target.episode,
             videoID: target.videoId
         ) { return true }
-        return loadEpisode != nil || !episodes.isEmpty
+        return loadEpisode != nil || !allEpisodeRefs.isEmpty
     }
     // UNIFIED CURRENT-EPISODE IDENTITY (binge-desync fix, publish-at-first-frame; mirror of
     // TVPlayerView.pendingAdvance). goToEpisode used to publish curMetaState/curTitleState the moment the
@@ -423,6 +453,7 @@ struct PlayerScreen: View {
         var deferredDuration: Double? = nil
         var deferredTrackList = false
         var deferredSeekable: Bool? = nil
+        var subtitleTimingScope: SubtitleTimingScope? = nil
     }
     private struct EpisodeSourceSnapshot {
         let url: URL?
@@ -484,7 +515,11 @@ struct PlayerScreen: View {
     /// Debounced persist of the manual subtitle offset (W2-B FIX 2). One write per nudge burst instead of one
     /// per press; `pendingSubOffsetSave` carries the value the task will write so a teardown can flush it.
     @State private var subOffsetSaveTask: Task<Void, Never>?
-    @State private var pendingSubOffsetSave: (delay: Double, contentKey: String?)?
+    @State private var pendingSubOffsetSave: (delay: Double, scope: SubtitleTimingScope?)?
+    /// Stable local subtitle-timing identity. This is independent from the richer community fingerprint below.
+    @State private var subtitleTimingScope: SubtitleTimingScope?
+    @State private var subtitleTimingGeneration = 0
+    @State private var subtitleDelayAppliedLoadToken: PlayerLoadToken?
     /// One consistent release fingerprint per playback session, so fetch/upload/offset all agree. Recomputed
     /// on a source switch or once the real duration/fps land (nil until first computed).
     @State private var subFingerprint: String?
@@ -709,6 +744,13 @@ struct PlayerScreen: View {
         // views unmount their looping libmpv clip on it, instead of decoding a 1080p trailer beneath the
         // whole movie (micro stutter + audio crackle on every stream).
         .onAppear { FullscreenPlaybackGate.shared.playerDidAppear(); LoopbackPlaybackAssertion.begin(for: url) }
+        .onChange(of: core.streamsEpoch) { _ in
+            establishSubtitleTimingScopeIfAvailable()
+            if appliedAutoTracks {
+                restoreSubtitleTimingOffsetIfReady()
+                applyCurrentSubtitleDelayIfReady(force: false)
+            }
+        }
         .onDisappear { FullscreenPlaybackGate.shared.playerDidDisappear(); LoopbackPlaybackAssertion.end() }
     }
 
@@ -753,13 +795,15 @@ struct PlayerScreen: View {
     /// True when routing the ACTIVE source to AVPlayer would mount the forward-only DV remux (a Dolby Vision
     /// title in a container AVFoundation cannot demux, with the remux lane enabled for this display). Drives
     /// both the engine-picker gate and the resume-floor suppression on a switch INTO such a mount. Uses the
-    /// router's non-isolated Auto-path predicates (dvRemuxEnabled + isDVRemuxCandidate), i.e. the exact
+    /// router's non-isolated predicates (dvRemuxEngaged + isDVRemuxCandidate), i.e. the exact
     /// condition AVPlayerEngine.loadFile's shouldDVRemux evaluates, without the @MainActor wrapper.
+    /// `dvRemuxEngaged` (not `dvRemuxEnabled`) so an explicit "Prefer AVPlayer" pick predicts the same DV
+    /// mount the engine will actually make; mirrors TVPlayerView.activeAVPlayerWouldRemux.
     private var activeAVPlayerWouldRemux: Bool {
         let activeURL = curURL ?? url
         let isDV = StreamRanking.isDolbyVision(curHint ?? recordQualityText ?? "")
         return isDV
-            && PlayerEngineRouter.dvRemuxEnabled(dvDisplayCapable: DVDisplaySupport.isCapable)
+            && PlayerEngineRouter.dvRemuxEngaged(dvDisplayCapable: DVDisplaySupport.isCapable)
             && PlayerEngineRouter.isDVRemuxCandidate(activeURL)
     }
 
@@ -811,7 +855,9 @@ struct PlayerScreen: View {
         // always-on route trail tvOS already had (DiagnosticsLog still mirrors into the probe log when
         // probing is on, so nothing an export used to carry is lost).
         let candidacy = PlayerEngineRouter.dvRemuxCandidacy(url)
-        DVRouteBreadcrumb.log("route file=\(VXProbeRedaction.identityToken(url.lastPathComponent)) ext=\(url.pathExtension) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(candidacy.candidate) [\(candidacy.reason)] container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)")
+        // The dvRemux field carries the VALUE and its SOURCE (user toggle / remote fleet value / display
+        // default / explicit AVPlayer pick), so a routing flip is never diagnosed by elimination. Mirrors tvOS.
+        DVRouteBreadcrumb.log("route file=\(VXProbeRedaction.identityToken(url.lastPathComponent)) ext=\(url.pathExtension) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(candidacy.candidate) [\(candidacy.reason)] container=\(PlayerEngineRouter.isAVPlayerContainer(url)) \(PlayerEngineRouter.dvRemuxRouteDescription(dvDisplayCapable: DVDisplaySupport.isCapable)) -> engine=\(chosen.rawValue)")
         return chosen == .avfoundation
     }
     #endif
@@ -1024,8 +1070,28 @@ struct PlayerScreen: View {
             // header-free direct/debrid stream. Torrents, header-gated streams (external apps can't apply our
             // request headers), loopback URLs, and trailers (a direct trailer URL is structurally identical
             // to a debrid movie URL, so it would otherwise be hijacked) stay in the built-in player.
-            if !isTrailer, (headers?.isEmpty ?? true), ExternalPlayer.routeToDefaultIfSet(url, isTorrent: recordIsTorrent) {
-                onClose(); return
+            if !isTrailer, (headers?.isEmpty ?? true),
+               let externalHandoffLoadToken = coordinator.player?.activeLoadToken {
+                let externalHandoff = ExternalPlayer.HandoffIdentity(
+                    url: url,
+                    sessionID: playbackSessionID,
+                    episodeGeneration: episodeSwitchGeneration,
+                    loadToken: externalHandoffLoadToken
+                )
+                ExternalPlayer.routeToDefaultIfSet(url, isTorrent: recordIsTorrent) { launched in
+                    guard !playbackExited,
+                          externalHandoff.matches(
+                              url: curURL ?? url,
+                              sessionID: playbackSessionID,
+                              episodeGeneration: episodeSwitchGeneration,
+                              loadToken: coordinator.player?.activeLoadToken
+                          ) else { return }
+                    if launched {
+                        onClose()
+                    } else {
+                        externalLinkDead = true
+                    }
+                }
             }
             #endif
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
@@ -1036,6 +1102,7 @@ struct PlayerScreen: View {
             }
             if curDebridRef == nil { curDebridRef = recordDebridRef }
             if curHint == nil { curHint = recordQualityText }   // seed the "playing now" signature from the launch stream
+            establishSubtitleTimingScopeIfAvailable()
             currentPickWasExplicit = startedFromExplicitPick   // honor an explicit launch pick on the first start-timeout
             currentPlaybackIsResume = startedFromResume        // a resume plays exact first but hops on a HARD failure
             #if os(iOS) || os(macOS)
@@ -1080,6 +1147,7 @@ struct PlayerScreen: View {
             hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
             stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
             refreshTask?.cancel(); sleepTask?.cancel(); trickplayCaptureTimer?.cancel(); idleWatchTask?.cancel()
+            cancelTerminalFinalityRefresh()
             #if os(iOS) || os(macOS)
             engineNoticeTask?.cancel(); avStartWatchdog?.cancel()
             #endif
@@ -1130,14 +1198,53 @@ struct PlayerScreen: View {
                             titleVisibility: .visible) {
             ForEach(ExternalPlayer.installed) { target in
                 Button(target.name) {
+                    let externalHandoffURL = curURL ?? url
+                    let externalHandoffSessionID = playbackSessionID
+                    let externalHandoffEpisodeGeneration = episodeSwitchGeneration
+                    guard let externalHandoffLoadToken = coordinator.player?.activeLoadToken else {
+                        externalLinkDead = true
+                        return
+                    }
+                    let externalHandoff = ExternalPlayer.HandoffIdentity(
+                        url: externalHandoffURL,
+                        sessionID: externalHandoffSessionID,
+                        episodeGeneration: externalHandoffEpisodeGeneration,
+                        loadToken: externalHandoffLoadToken
+                    )
                     // Pre-flight the link before handing off, so a dead debrid / CDN URL is caught here
                     // (we keep playing in the built-in player and say so) instead of bouncing the user
                     // into Infuse / VLC's own load error. Loopback torrents probe as alive instantly.
                     Task { @MainActor in
-                        guard await ExternalPlayer.probeAlive(curURL ?? url) else { externalLinkDead = true; return }
+                        guard !playbackExited,
+                              externalHandoff.matches(
+                                  url: curURL ?? url,
+                                  sessionID: playbackSessionID,
+                                  episodeGeneration: episodeSwitchGeneration,
+                                  loadToken: coordinator.player?.activeLoadToken
+                              ) else { return }
+                        let probeSucceeded = await ExternalPlayer.probeAlive(externalHandoff.url)
+                        guard !playbackExited,
+                              externalHandoff.matches(
+                                  url: curURL ?? url,
+                                  sessionID: playbackSessionID,
+                                  episodeGeneration: episodeSwitchGeneration,
+                                  loadToken: coordinator.player?.activeLoadToken
+                              ) else { return }
+                        guard probeSucceeded else { externalLinkDead = true; return }
                         // Handed off, stop local playback so the stream isn't decoded twice.
-                        if ExternalPlayer.open(target, stream: curURL ?? url), !isPaused {
-                            coordinator.player?.togglePause()
+                        ExternalPlayer.open(target, stream: externalHandoff.url) { launched in
+                            guard !playbackExited,
+                                  externalHandoff.matches(
+                                      url: curURL ?? url,
+                                      sessionID: playbackSessionID,
+                                      episodeGeneration: episodeSwitchGeneration,
+                                      loadToken: coordinator.player?.activeLoadToken
+                                  ) else { return }
+                            if launched, !isPaused {
+                                coordinator.player?.togglePause()
+                            } else if !launched {
+                                externalLinkDead = true
+                            }
                         }
                     }
                 }
@@ -1400,7 +1507,7 @@ struct PlayerScreen: View {
         let originalResume = assetSanityRequestedResume
         let hasAlternative = nextUntriedStream() != nil
         srcProbe(
-            "rejected preview-shaped episodic asset originalResume=\(Int(originalResume))s alternative=\(hasAlternative)"
+            "rejected mismatched asset originalResume=\(Int(originalResume))s alternative=\(hasAlternative)"
         )
         loadTimeout?.cancel()
         recoveryDeadline?.cancel()
@@ -1428,7 +1535,7 @@ struct PlayerScreen: View {
         case .showMismatch:
             break
         }
-        loadErrorMsg = "This source returned a short, audio-less preview instead of the selected episode."
+        loadErrorMsg = "This source returned a stream that does not match the selected title."
         presentTerminalLoadFailure()
     }
 
@@ -1639,15 +1746,13 @@ struct PlayerScreen: View {
                         // miss) so those plays feed the pool too; a tt id still pings inline. Never blocks.
                         WatchSignalClient.pingResolvingTMDB(contentId: m.libraryId, type: m.type, seriesHint: m.season != nil)
                     }
-                    // Halfway through a series episode → warm the NEXT episode's source in the
-                    // background (start its torrent's peer search, pull the first bytes of a direct
-                    // file) so auto-advance isn't a cold start. Purely additive: the actual advance
-                    // still resolves through loadEpisode, so progress reporting and engine binding are
-                    // unchanged - this only pre-heats the slow I/O the next open would otherwise pay for.
+                    // Halfway through a series episode, prepare and retain the NEXT episode's exact settled
+                    // source. Auto-advance consumes that generation-owned value without a cold re-rank, then
+                    // advances CoreBridge's episode identity before issuing the already selected stream.
                     // Past the halfway mark when the duration is known, or after ~2 min of playback when it
                     // ISN'T: many debrid MKVs never emit mpv's `duration`, so the duration>60 trigger alone
                     // never fired for them and the next episode never pre-heated (the "next episode cold-starts"
-                    // case). warmNextIfNeeded is idempotent per episode.
+                    // case). The attempt policy bounds retries and reserves one final credits recovery.
                     if assetSanityAccepted, !effectivelyLive,
                        ((duration > 60 && d / duration >= 0.5) || (duration <= 0 && d >= 120)) {
                         warmNextIfNeeded()
@@ -1724,7 +1829,11 @@ struct PlayerScreen: View {
             // ignore non-finite / behind-playhead values so the band never runs backward or breaks the bar.
             if let d = data as? Double, d.isFinite, d >= currentTime { bufferedTime = d }
         case MPVProperty.pause:
-            if let b = data as? Bool {
+            // play()/pause() emit MPVProperty.pause optimistically and the KVO echo then arrives with the same
+            // value, so gate every side effect on a real change: the scrobble pause/resume must fire once per
+            // press, not twice (this also collapses the pre-existing KVO double-fire). The now-playing write is
+            // idempotent, so running it only on a real change is correct.
+            if let b = data as? Bool, b != isPaused {
                 isPaused = b
                 // Reflect the play/pause state on the Lock Screen immediately (timePos stops ticking while
                 // paused, so without this the now-playing rate would stay stuck at "playing").
@@ -1758,6 +1867,7 @@ struct PlayerScreen: View {
                 appliedAutoTracks = true
                 autoSelectTracks()
             }
+            applyCurrentSubtitleDelayIfReady(force: false)
             if let loadToken,
                assetSanityDeferredStartToken == loadToken,
                !settleAssetSanityIfPossible(
@@ -1897,25 +2007,20 @@ struct PlayerScreen: View {
                 // pause at this boundary and ask instead of rolling straight on (Continue resumes the roll).
                 consecutiveAutoAdvances += 1
                 if consecutiveAutoAdvances >= Self.idleAutoAdvanceLimit {
-                    presentStillWatching(pendingNext: episodes[i + 1].id)
+                    presentStillWatching(pendingNext: allEpisodeRefs[i + 1].id)
                 } else {
-                    goToEpisode(episodes[i + 1].id, autoAdvance: true)
+                    goToEpisode(allEpisodeRefs[i + 1].id, autoAdvance: true)
                 }
             } else if hasNext, !skipEditActive {
                 onNext()                                  // legacy non-episode caller (in-place)
             } else if !skipEditActive {
-                // Finished (movie or last episode): rewind the title OUT of Continue Watching. The engine
-                // keeps any item with time_offset > 0 in the rail, so without this a finished title lingers
-                // at its end position forever (the "CW never clears" report). Mirrors tvOS autoAdvance:1479.
-                // Guard: a series that reached EOF with NO episode list (a CW resume whose list never loaded)
-                // is a mid-season episode misread as a finale, so do NOT clear the whole series from Continue
-                // Watching here; only genuine finishes (movies, or a series with a real list) rewind it out.
-                if let m = curMeta,
-                   EpisodePlaybackIdentity.canRewindWholeTitleAtTerminal(
-                       usesSeriesLifecycle: m.usesSeriesLifecycle,
-                       currentEpisodeIndex: episodeIndex,
-                       episodeCount: episodes.count
-                   ) {
+                if let m = curMeta, m.usesSeriesLifecycle {
+                    let decision = terminalSeriesDecision(for: m)
+                    if decision == .refresh, !terminalFinalityRefreshUsed {
+                        refreshTerminalSeriesInventory(for: m)
+                        return
+                    }
+                } else if let m = curMeta, terminalRewindGate.issueTerminalRewind() {
                     core.finishedWatching(libraryId: m.libraryId)
                 }
                 if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
@@ -2324,7 +2429,9 @@ struct PlayerScreen: View {
     private func loadIntoPlayer(_ u: URL, headers h: [String: String]?, live: Bool,
                                 reusing loadToken: PlayerLoadToken? = nil,
                                 contentHint: String? = nil,
-                                resumeOrigin: Double? = nil) -> PlayerLoadToken? {
+                                resumeOrigin: Double? = nil,
+                                preparedRemux: VortXPreparedRemuxAttachment? = nil,
+                                expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> PlayerLoadToken? {
         // ENGINE-AWARE playback tuple. The AVFoundation engine must receive the RAW stream url + headers:
         // it attaches the headers itself (AVURLAssetHTTPHeaderFieldsKey) and the DV remux server takes them
         // directly, while the StremioServer proxy rewrite (playback(for:)) turns the host into 127.0.0.1,
@@ -2355,12 +2462,42 @@ struct PlayerScreen: View {
         )
         avSurfaceResumeOrigin = requestedResumeOrigin
         player.configureResumeOrigin(seconds: requestedResumeOrigin)
+        // Configure on the exact mounted AVPlayer controller immediately before its existing load command.
+        // Re-check the live external-engine setting here because it may have changed since halfway preload;
+        // a rejection abandons the local transport exactly once and the unmodified load below cold-loads once.
+        if let preparedRemux {
+            let mountIsOnDevice: Bool
+            if case .onDevice = VortXExternalEngine.shared.mountPlan {
+                mountIsOnDevice = true
+            } else {
+                mountIsOnDevice = false
+            }
+            let admission = expectedPreparedRemuxOwner.map {
+                VortXPreparedRemuxCallerPolicy.admission(
+                    actualOwner: preparedRemux.ownerIdentity,
+                    expectedOwner: $0,
+                    avPlayerActive: player is AVPlayerEngineController,
+                    mountIsOnDevice: mountIsOnDevice
+                )
+            } ?? .abandonAndColdLoad
+            if admission == .configure,
+               let avPlayer = player as? AVPlayerEngineController,
+               let expectedPreparedRemuxOwner {
+                _ = avPlayer.configurePreparedRemuxForNextLoad(
+                    preparedRemux.handle,
+                    ownerIdentity: expectedPreparedRemuxOwner
+                )
+            } else {
+                preparedRemux.abandon(reason: "iOS admission owner or engine mismatch")
+            }
+        }
         let candidateToken = player.loadFile(
             p.url, headers: p.headers, live: live, audioSidecar: sidecar,
             reusing: loadToken
         )
         let issuedToken = candidateToken == player.activeLoadToken ? candidateToken : nil
         if let issuedToken {
+            sourceSwitchGeneration &+= 1
             beginAssetSanityAttemptIfNeeded(
                 loadToken: issuedToken,
                 requestedResumeOrigin: requestedResumeOrigin
@@ -3303,7 +3440,7 @@ struct PlayerScreen: View {
                 loadIntoPlayer(cu, headers: curHeaders, live: isLive, resumeOrigin: resume)
             }
         }
-        // Re-apply speed + subtitle sync once the new engine's controller is mounted (next render).
+        // Re-apply speed once the new engine's controller is mounted (next render).
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(700))
             guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled,
@@ -3311,9 +3448,6 @@ struct PlayerScreen: View {
                   reissueMediaGeneration == resumeRetryGeneration,
                   reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
             if abs(speed - 1.0) > 0.01 { coordinator.player?.setSpeed(speed) }
-            if subDelay != 0, coordinator.player?.subtitleDelayAvailable == true {
-                coordinator.player?.setSubDelay(subDelay)
-            }
         }
         close()   // dismiss the settings sheet so the video is visible during the swap
     }
@@ -3370,6 +3504,11 @@ struct PlayerScreen: View {
                             || (cur.initPublished && !prev.initPublished)
                             || (cur.signalingPublished && !prev.signalingPublished)
                             || (cur.ended && !prev.ended)
+                            // Input liveness is progress too: during avformat_open_input (a 10s rw_timeout) plus
+                            // find_stream_info nothing has been MUXED yet, so the output counters above all sit
+                            // at zero while the source is still legitimately opening. Count growing input bytes
+                            // so a slow-but-alive open does not accrue the stall window and get demoted blind.
+                            || ((cur.inputBytesRead ?? 0) > (prev.inputBytesRead ?? 0))
                     } ?? true
                     if progressed, !cur.failed { lastProgressAt = now }
                     last = cur
@@ -3383,8 +3522,13 @@ struct PlayerScreen: View {
                     return "\(bytes)"
                 }()
                 let state = "produced=\(last?.producedBytes ?? -1)B segs=\(last?.segmentCount ?? -1) init=\(last?.initPublished ?? false) classify=\(last?.signalingPublished ?? false) failed=\(last?.failed ?? false) inBytes=\(inBytes) inOpen=\(last?.inputOpened ?? false) inOpening=\(last?.inputOpenInFlight ?? false)"
-                if stalled >= avRemuxStallDemoteSeconds || elapsed >= avRemuxStartHardCeilingSeconds {
-                    let why = stalled >= avRemuxStallDemoteSeconds
+                // A stall while an input open is still in flight is not a true stall: the source is legitimately
+                // blocked inside avformat_open_input / find_stream_info and has produced no output yet. Do not
+                // demote on that; the hard ceiling below still bounds a source that stays inOpening forever, so
+                // a genuinely dead source always fails soft to libmpv eventually.
+                let trueStall = stalled >= avRemuxStallDemoteSeconds && !(last?.inputOpenInFlight ?? false)
+                if trueStall || elapsed >= avRemuxStartHardCeilingSeconds {
+                    let why = trueStall
                         ? "TRUE STALL, no remux progress for \(Int(stalled))s"
                         : "hard ceiling \(Int(avRemuxStartHardCeilingSeconds))s with no playable frame"
                     // W2-A item 2 (tvOS twin in TVPlayerView.startAVStartWatchdog): a demote re-loads the SAME
@@ -3443,16 +3587,32 @@ struct PlayerScreen: View {
                 guard !Task.isCancelled, deferredResumeAttempt.owns(ticket) else { return }
                 if let av = coordinator.player as? AVPlayerEngineController, av.isRemuxMounted {
                     guard let origin = av.achievedRemuxTimelineOriginSeconds else { continue }
+                    // A5 mirror: a carried head at or past this asset's own duration is out of range for THIS
+                    // stream (a wrong or much shorter replacement), so start from the beginning rather than land
+                    // at the tail; A5b's sanity policy routes a true decoy to a working source. Clamp otherwise
+                    // to 5s from the end. Only clamp once a real duration is known so an unknown-duration mount
+                    // fails open.
+                    if duration > 0, ticket.targetSeconds >= duration {
+                        suppressedResumeFloor = nil
+                        currentTime = 0
+                        lastReported = 0
+                        _ = deferredResumeAttempt.complete(ticket)
+                        return
+                    }
                     switch RemuxResumePolicy.preStartSeek(
                         target: ticket.targetSeconds, origin: origin
                     ) {
                     case .satisfied:
                         suppressedResumeFloor = nil
-                        currentTime = origin
-                        lastReported = origin
+                        let landed = duration > 0 ? min(max(0, origin), max(0, duration - 5)) : max(0, origin)
+                        currentTime = landed
+                        lastReported = landed
                     case .unreachable:
-                        suppressedResumeFloor = ticket.targetSeconds
-                        lastReported = ticket.targetSeconds
+                        let floor = duration > 0
+                            ? min(max(0, ticket.targetSeconds), max(0, duration - 5))
+                            : max(0, ticket.targetSeconds)
+                        suppressedResumeFloor = floor
+                        lastReported = floor
                         showEngineNotice("That resume point is unavailable for this source. Playing from the earliest available position.")
                     }
                     _ = deferredResumeAttempt.complete(ticket)
@@ -3656,7 +3816,7 @@ struct PlayerScreen: View {
         torrentWarmupsUsed = 0; torrentStatus = nil
         subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
         subtitlePoolRequests.invalidate(); subtitleLoadingURL = nil
-        addedPooledIDs = []; pooledSeededOffset = false; embeddedUploadDone = false
+        addedPooledIDs = []; embeddedUploadDone = false
         langContributeDone = false
         reconnectMsg = "Switching source…"
     }
@@ -3687,7 +3847,9 @@ struct PlayerScreen: View {
                               resumeOverride: Double? = nil,
                               debridRef: DebridPlaybackRef? = nil, engineAlreadyBound: Bool = false,
                               engineAddonBaseOverride: String? = nil,
-                              mediaGenerationAlreadyClaimed: Bool = false) -> Bool {
+                              mediaGenerationAlreadyClaimed: Bool = false,
+                              preparedRemux: VortXPreparedRemuxAttachment? = nil,
+                              expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> Bool {
         guard newURL != curURL else {
             if let pending = pendingAdvance, !pending.issued,
                pending.meta.videoId != curMeta?.videoId {
@@ -3747,7 +3909,9 @@ struct PlayerScreen: View {
         let nextLive = recordMeta.map { LiveTypes.contains($0.type) } == true && !nextIsTorrent
         let issuedToken = loadIntoPlayer(
             newURL, headers: nextHeaders, live: nextLive, contentHint: nextHint,
-            resumeOrigin: resume
+            resumeOrigin: resume,
+            preparedRemux: preparedRemux,
+            expectedPreparedRemuxOwner: expectedPreparedRemuxOwner
         )
         if pendingAdvance != nil {
             guard let issuedToken else {
@@ -3782,6 +3946,16 @@ struct PlayerScreen: View {
         curHeaders = nextHeaders
         curSourceStream = stream
         curIsTorrent = nextIsTorrent
+        let acceptedSubtitleTimingScope = subtitleTimingScope(
+            for: pendingAdvance?.meta ?? curMeta,
+            stream: stream
+        )
+        if pendingAdvance != nil {
+            pendingAdvance?.subtitleTimingScope = acceptedSubtitleTimingScope
+            coordinator.player?.setSubDelay(0)
+        } else {
+            acceptSubtitleTimingReplacement(scope: acceptedSubtitleTimingScope)
+        }
         // REMEMBER A MANUAL PICK (diag-21). The in-session binge group is add-on-authored text worth +2500 and
         // loses to the cached (+8000) and source-type (15000) terms on the very next rank, so the viewer
         // re-picked the same provider every single episode. Record the choice durably here, the one place a
@@ -3814,18 +3988,225 @@ struct PlayerScreen: View {
                 requestedVideoID: meta.videoId, bindingSucceeded: succeeded
             )
         }
+        // A successful CURRENT-episode source switch changes the continuity, binge-group, and provider inputs
+        // used to choose E+1. Retire any winner prepared under the old source and re-arm immediately when this
+        // episode is already past the preload gate. During an in-flight episode advance curMeta still names the
+        // outgoing episode, so that lane keeps its own pending identity and must not prepare from stale inputs.
+        if pendingAdvance == nil, isEpisodePlaybackContext {
+            let shouldRearm = PreparedEpisodeAttemptPolicy.shouldRearmAfterSourceSwitch(
+                hasPendingAdvance: false,
+                isEpisodePlayback: true,
+                position: currentTime,
+                duration: duration
+            )
+            invalidatePreparedEpisode(reason: "current source changed")
+            if shouldRearm { warmNextIfNeeded() }
+        }
         startLoadTimeout()
         if resume > 5 { nudgeResume(to: resume) }
         return true
     }
 
-    // MARK: - Episode navigation (series; `episodes` is the ordered season list, switched in place)
+    // MARK: - Episode navigation (series; launch and later backfill share one ordered list)
+
+    private var navigationEpisodeSource: [PlayerEpisodeRef] {
+        guard !episodes.isEmpty else { return loadedSeriesEpisodes }
+        return loadedSeriesEpisodes.count > episodes.count ? loadedSeriesEpisodes : episodes
+    }
+
+    private var allEpisodeRefs: [PlayerEpisodeRef] {
+        navigationEpisodeSource.sorted {
+            let ls = $0.season ?? 0, rs = $1.season ?? 0
+            if ls != rs { return ls < rs }
+            let le = $0.episode ?? 0, re = $1.episode ?? 0
+            if le != re { return le < re }
+            return $0.id < $1.id
+        }
+    }
+
+    private var terminalEpisodeSource: [PlayerEpisodeRef] {
+        authoritativeSeriesEpisodes ?? episodes
+    }
+
+    private func seriesInventory(from refs: [PlayerEpisodeRef],
+                                 authority: AppleCWSeriesInventory.Authority) -> AppleCWSeriesInventory? {
+        let identities = refs.compactMap { ref -> AppleCWSeriesEpisode? in
+            guard let season = ref.season, let episode = ref.episode else { return nil }
+            return AppleCWSeriesEpisode(id: ref.id, season: season, episode: episode)
+        }
+        guard identities.count == refs.count else { return nil }
+        return AppleCWSeriesInventory(raw: identities, authority: authority)
+    }
+
+    private var terminalInventoryAuthority: AppleCWSeriesInventory.Authority {
+        authoritativeSeriesEpisodes == nil ? seriesInventoryAuthority : .authoritativeFullSeries
+    }
+
+    private func terminalRefreshTarget(for m: PlaybackMeta) -> AppleCWTerminalRefreshTarget {
+        AppleCWTerminalRefreshTarget(
+            libraryID: m.libraryId,
+            videoID: m.videoId,
+            sessionID: playbackSessionID,
+            episodeGeneration: episodeSwitchGeneration,
+            sourceGeneration: sourceSwitchGeneration,
+            resumeGeneration: resumeRetryGeneration,
+            loadOwner: coordinator.player?.activeLoadToken.map { String(describing: $0) }
+        )
+    }
+
+    private func terminalRefreshTargetIsCurrent(
+        _ captured: AppleCWTerminalRefreshTarget,
+        loadToken: PlayerLoadToken
+    ) -> Bool {
+        guard !playbackExited, let current = curMeta,
+              current.libraryId == captured.libraryID,
+              current.videoId == captured.videoID,
+              AppleCWTerminalRefreshFence.accepts(
+                  captured: captured, current: terminalRefreshTarget(for: current)
+              ) else { return false }
+        guard coordinator.player?.activeLoadToken == loadToken else { return false }
+        return true
+    }
+
+    private var terminalFinalityRefreshUsed: Bool {
+        guard let captured = terminalFinalityRefreshTarget, let current = curMeta else { return false }
+        return AppleCWTerminalRefreshFence.accepts(
+            captured: captured, current: terminalRefreshTarget(for: current)
+        )
+    }
+
+    /// Cancel only this player's bridge refresh generation. SwiftUI may tear down this view after a
+    /// replacement player has started a newer request against the same title, so the captured generation
+    /// must be retained through teardown and passed to CoreBridge rather than using global cancellation.
+    private func cancelTerminalFinalityRefresh() {
+        terminalFinalityRefreshTask?.cancel()
+        terminalFinalityRefreshTask = nil
+        if let generation = terminalFinalityRefreshGeneration {
+            core.cancelAppleCWMetaRefresh(generation: generation)
+        }
+        terminalFinalityRefreshGeneration = nil
+        terminalFinalityRefreshTarget = nil
+    }
+
+    private var terminalRefreshResult: AppleCWSeriesRefreshResult {
+        if seriesInventory(from: terminalEpisodeSource, authority: terminalInventoryAuthority) != nil,
+           terminalInventoryAuthority == .authoritativeFullSeries {
+            return .completedWithFullInventory
+        }
+        return terminalFinalityRefreshUsed ? .completedWithoutFullInventory : .notAttempted
+    }
+
+    private func terminalSeriesDecision(for m: PlaybackMeta) -> AppleCWSeriesTerminalDecision {
+        let inventory = seriesInventory(from: terminalEpisodeSource, authority: terminalInventoryAuthority)
+        return AppleCWSeriesTerminalPolicy.decide(currentID: m.videoId,
+                                                  inventory: inventory,
+                                                  refresh: terminalRefreshResult)
+    }
+
+    private func authoritativeBackfillRefs(_ videos: [CoreVideo]) -> [PlayerEpisodeRef]? {
+        guard EpisodePlaybackIdentity.appleCWSeriesInventory(
+            from: videos, authority: .authoritativeFullSeries
+        ) != nil else { return nil }
+        let candidate = videos.map {
+            PlayerEpisodeRef(id: $0.id,
+                             label: "S\($0.season ?? 1)E\($0.episode ?? 0) · \($0.episodeTitle)",
+                             season: $0.season,
+                             episode: $0.episode)
+        }
+        guard let launch = seriesInventory(from: episodes, authority: .launch) else {
+            return episodes.isEmpty ? candidate : nil
+        }
+        guard let candidateInventory = seriesInventory(from: candidate, authority: .authoritativeFullSeries),
+              candidateInventory.ordered.count >= launch.ordered.count else { return nil }
+        if candidateInventory.ordered.count == launch.ordered.count {
+            guard candidateInventory.ordered == launch.ordered else { return nil }
+        } else {
+            guard launch.ordered.allSatisfy({ candidateInventory.ordered.contains($0) }) else { return nil }
+        }
+        return candidate
+    }
+
+    private func refreshTerminalSeriesInventory(for m: PlaybackMeta) {
+        guard let loadToken = coordinator.player?.activeLoadToken else { return }
+        let target = terminalRefreshTarget(for: m)
+        guard terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
+        cancelTerminalFinalityRefresh()
+        terminalFinalityRefreshTarget = target
+        let requestGeneration = core.beginAppleCWAuthoritativeMetaRefresh(
+            type: m.type, id: m.libraryId, streamType: m.type, streamId: m.videoId
+        )
+        terminalFinalityRefreshGeneration = requestGeneration
+        terminalFinalityRefreshTask = Task { @MainActor in
+            guard !Task.isCancelled,
+                  terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
+            var candidate: [CoreVideo]?
+            for attempt in 0..<16 {
+                guard !Task.isCancelled,
+                      terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
+                let receipt = AppleCWMetaRefreshReceipt(
+                    requestGeneration: core.appleCWMetaRefreshReceipt?.requestGeneration,
+                    selectedMetaID: core.appleCWMetaRefreshReceipt?.selectedMetaID,
+                    loadedMetaID: core.appleCWMetaRefreshReceipt?.loadedMetaID,
+                    settled: core.appleCWMetaRefreshReceipt?.settled == true,
+                    requestedStreamID: core.appleCWMetaRefreshReceipt?.requestedStreamID
+                )
+                if AppleCWMetaRefreshAuthorityPolicy.accepts(
+                    receipt, forRequestGeneration: requestGeneration, expectedLibraryID: m.libraryId,
+                    expectedStreamID: m.videoId
+                ), let loaded = core.appleCWMetaRefreshDetails?.appleCWTerminalFullMeta(
+                    for: m.libraryId, streamID: m.videoId
+                ),
+                   let vids = loaded.videos, !vids.isEmpty {
+                    candidate = vids
+                    break
+                }
+                guard attempt < 15 else { break }
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled,
+                      terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
+            }
+            guard !Task.isCancelled,
+                  terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
+            if let candidate, let accepted = authoritativeBackfillRefs(candidate) {
+                guard !Task.isCancelled,
+                      terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
+                loadedSeriesEpisodes = accepted
+                loadedSeriesVideoMetadata = candidate
+                authoritativeSeriesEpisodes = accepted
+            }
+            guard !Task.isCancelled,
+                  terminalRefreshTargetIsCurrent(target, loadToken: loadToken),
+                  let current = curMeta,
+                  current.libraryId == target.libraryID,
+                  current.videoId == target.videoID else { return }
+            switch terminalSeriesDecision(for: current) {
+            case .advance(let id):
+                guard !Task.isCancelled,
+                      terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
+                guard goToEpisode(id, autoAdvance: true) else {
+                    // A settled successor without an admitted resolver must never strand the player in the
+                    // refresh task or consume the advance as a silent no-op. Series still exits fail-closed;
+                    // `leavePlayback` never issues the movie-only rewind for this path.
+                    DiagnosticsLog.log(
+                        "binge",
+                        "successor admission rejected target=\(VXProbeRedaction.identityToken(id)); leaving playback"
+                    )
+                    leavePlayback()
+                    return
+                }
+            case .refresh, .keepState:
+                guard !Task.isCancelled,
+                      terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
+                leavePlayback()
+            }
+        }
+    }
 
     private var episodeIndex: Int? {
-        guard let id = curMeta?.videoId, !episodes.isEmpty else { return nil }
-        return episodes.firstIndex { $0.id == id }
+        guard let id = curMeta?.videoId, !allEpisodeRefs.isEmpty else { return nil }
+        return allEpisodeRefs.firstIndex { $0.id == id }
     }
-    private var canNextEpisode: Bool { episodeIndex.map { $0 + 1 < episodes.count } ?? false }
+    private var canNextEpisode: Bool { episodeIndex.map { $0 + 1 < allEpisodeRefs.count } ?? false }
 
     /// Seconds left until auto-advance, when the Up Next band should be on screen: only with a next
     /// episode queued, a real runtime, the play head in the final stretch, and the user hasn't chosen to
@@ -3838,8 +4219,8 @@ struct PlayerScreen: View {
     }
     /// The label of the episode that plays next, for the Up Next band.
     private var nextEpisodeLabel: String? {
-        guard let i = episodeIndex, i + 1 < episodes.count else { return nil }
-        return episodes[i + 1].label
+        guard let i = episodeIndex, i + 1 < allEpisodeRefs.count else { return nil }
+        return allEpisodeRefs[i + 1].label
     }
 
     /// Wall-clock time the title will finish ("Ends 10:45 PM"), from the remaining runtime. Tracks the
@@ -3935,18 +4316,146 @@ struct PlayerScreen: View {
         .accessibilityElement(children: .contain)
     }
 
-    private func goToNextEpisode() { if let i = episodeIndex, i + 1 < episodes.count { goToEpisode(episodes[i + 1].id) } }
-    private func goToPrevEpisode() { if let i = episodeIndex, i > 0 { goToEpisode(episodes[i - 1].id) } }
+    private func goToNextEpisode() { if let i = episodeIndex, i + 1 < allEpisodeRefs.count { goToEpisode(allEpisodeRefs[i + 1].id) } }
+    private func goToPrevEpisode() { if let i = episodeIndex, i > 0 { goToEpisode(allEpisodeRefs[i - 1].id) } }
 
-    /// Fire the next-episode warm-up once per episode (F6 preload). Guarded so it runs a single time
-    /// even though the time tick calls it every second past the halfway point, and only when a next
-    /// episode exists and the caller supplied a warm closure.
+    /// Prepare the next episode through a bounded retry policy. Playback ticks may call this repeatedly,
+    /// but only one active attempt, two delayed retries, and one final credits attempt can be admitted.
     private func warmNextIfNeeded() {
         guard let warm = warmNextEpisode, canNextEpisode, let i = episodeIndex else { return }
-        let nextID = episodes[i + 1].id
-        guard warmedEpisodeID != nextID else { return }
-        warmedEpisodeID = nextID
-        Task { await warm(nextID) }
+        let nextID = allEpisodeRefs[i + 1].id
+        guard warmedEpisodeID != nextID, preparingEpisodeID != nextID else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard let attempt = nextEpisodeAttemptPolicy.evaluate(
+            targetEpisodeID: nextID,
+            position: currentTime,
+            duration: duration,
+            now: now
+        ) else { return }
+        let originID = curMeta?.videoId
+        let generation = nextEpisodePreparationGeneration
+        let mountIsOnDevice: Bool
+        if case .onDevice = VortXExternalEngine.shared.mountPlan {
+            mountIsOnDevice = true
+        } else {
+            mountIsOnDevice = false
+        }
+        let request = attempt.preparationRequest(
+            protectedTorrentHash: currentTorrentHash,
+            preparedRemuxGeneration: UInt64(max(0, generation)),
+            prepareLocalAVPlayerRemux: coordinator.player is AVPlayerEngineController
+                && mountIsOnDevice
+        )
+        preparingEpisodeID = nextID
+        DiagnosticsLog.log("binge", "next prepare trigger target=\(VXProbeRedaction.identityToken(nextID)) generation=\(generation) attempt=\(attempt.sequence) credits=\(attempt.nearCredits ? "Y" : "N")")
+        nextEpisodePreparationTask = Task { @MainActor in
+            let result = await warm(request)
+            guard preparingEpisodeID == nextID,
+                  PreparedEpisodeRetentionPolicy.ownsCompletion(
+                    capturedGeneration: generation,
+                    currentGeneration: nextEpisodePreparationGeneration,
+                    capturedOriginEpisodeID: originID,
+                    currentOriginEpisodeID: curMeta?.videoId,
+                    canceled: Task.isCancelled
+              ) else {
+                retirePreparedTorrentEngine(result?.torrentPreparationLease, reason: "stale completion")
+                result?.preparedRemux?.abandon(reason: "stale iOS preparation completion")
+                return
+            }
+            preparingEpisodeID = nil
+            let accepted = result.map {
+                PreparedEpisodeRetentionPolicy.admitsPreparedValue(
+                    requestedEpisodeID: nextID,
+                    returnedEpisodeID: $0.meta.videoId
+                )
+            } ?? false
+            let completion = nextEpisodeAttemptPolicy.complete(
+                attempt,
+                succeeded: accepted,
+                now: ProcessInfo.processInfo.systemUptime
+            )
+            guard accepted, completion == .ready, let result else {
+                retirePreparedTorrentEngine(result?.torrentPreparationLease, reason: "rejected completion")
+                result?.preparedRemux?.abandon(reason: "rejected iOS preparation completion")
+                DiagnosticsLog.log("binge", "next prepare empty target=\(VXProbeRedaction.identityToken(nextID)) generation=\(generation) attempt=\(attempt.sequence) outcome=\(String(describing: completion))")
+                return
+            }
+            if preparedEpisode?.torrentPreparationLease !== result.torrentPreparationLease {
+                retirePreparedTorrentEngine(
+                    preparedEpisode?.torrentPreparationLease,
+                    reason: "replacement prepared value"
+                )
+            }
+            preparedEpisode?.preparedRemux?.abandon(reason: "replacement prepared episode")
+            warmedEpisodeID = nextID
+            preparedEpisode = result
+            DiagnosticsLog.log("binge", "next prepare ready target=\(VXProbeRedaction.identityToken(nextID)) host=\(result.url.host ?? "-") generation=\(generation)")
+        }
+    }
+
+    private func takePreparedEpisode(for videoID: String) -> PlayerEpisodeStream? {
+        let result = PreparedEpisodeRetentionPolicy.consumes(
+            requestedEpisodeID: videoID,
+            preparedEpisodeID: preparedEpisode?.meta.videoId
+        ) ? preparedEpisode : nil
+        if result == nil {
+            retirePreparedTorrentEngine(
+                preparedEpisode?.torrentPreparationLease,
+                reason: "different episode requested"
+            )
+            preparedEpisode?.preparedRemux?.abandon(reason: "different episode requested")
+        }
+        nextEpisodePreparationGeneration &+= 1
+        nextEpisodePreparationTask?.cancel()
+        nextEpisodePreparationTask = nil
+        preparingEpisodeID = nil
+        preparedEpisode = nil
+        warmedEpisodeID = nil
+        nextEpisodeAttemptPolicy.reset()
+        if result != nil {
+            DiagnosticsLog.log("binge", "next prepare consumed target=\(VXProbeRedaction.identityToken(videoID))")
+        }
+        return result
+    }
+
+    private func invalidatePreparedEpisode(reason: String) {
+        nextEpisodePreparationGeneration &+= 1
+        nextEpisodePreparationTask?.cancel()
+        nextEpisodePreparationTask = nil
+        preparingEpisodeID = nil
+        retirePreparedTorrentEngine(preparedEpisode?.torrentPreparationLease, reason: reason)
+        preparedEpisode?.preparedRemux?.abandon(reason: reason)
+        preparedEpisode = nil
+        warmedEpisodeID = nil
+        nextEpisodeAttemptPolicy.reset()
+        DiagnosticsLog.log("binge", "next prepare invalidated reason=\(reason)")
+    }
+
+    private func retirePreparedTorrentEngine(
+        _ lease: PreparedTorrentEngineLease?,
+        reason: String
+    ) {
+        guard let lease, lease.abandon() else { return }
+        let protected = lease.protectsPlayingEngine
+            || currentTorrentHash?.caseInsensitiveCompare(lease.hash) == .orderedSame
+        if !protected { closeTorrent(hash: lease.hash) }
+        DiagnosticsLog.log(
+            "binge",
+            "next prepare torrent retired target=\(VXProbeRedaction.identityToken(lease.request.episodeID)) attempt=\(lease.request.attemptSequence) remove=\(protected ? "N" : "Y") reason=\(reason)"
+        )
+    }
+
+    private func preparedTorrentLeaseIsAdmissible(
+        _ episode: PlayerEpisodeStream,
+        requestedEpisodeID: String
+    ) -> Bool {
+        guard let lease = episode.torrentPreparationLease else { return true }
+        guard let request = episode.preparationRequest,
+              request.episodeID == requestedEpisodeID else { return false }
+        return lease.canAdmit(
+            episodeID: requestedEpisodeID,
+            attemptSequence: request.attemptSequence
+        )
     }
 
     private var currentEpisodeResolutionOwner: EpisodeResolutionOwner? {
@@ -4031,6 +4540,7 @@ struct PlayerScreen: View {
         supersededAdvance = nil
         switchingEpisode = false
         coordinator.player?.invalidateLoadToken()
+        invalidatePreparedEpisode(reason: "player exit")
     }
 
     private func currentEpisodeSourceSnapshot() -> EpisodeSourceSnapshot {
@@ -4088,8 +4598,37 @@ struct PlayerScreen: View {
     /// Switch to another episode in place: flush the current position, resolve the episode through the
     /// caller, then hot-swap the source and record against the new episode. No cover teardown - the
     /// chrome stays put and only the video reloads, the same feel as an in-player source switch.
-    private func goToEpisode(_ videoId: String, autoAdvance: Bool = false) {
-        guard let loadEpisode, !playbackExited else { return }
+    @discardableResult
+    private func goToEpisode(_ videoId: String, autoAdvance: Bool = false) -> Bool {
+        let refreshedMetadata = loadedSeriesVideoMetadata.first { $0.id == videoId }
+        let resolverRoute: AppleEpisodeResolverAdmission.Route<PlayerEpisodeStream>? =
+            AppleEpisodeResolverAdmission.route(
+                videoID: videoId,
+                refreshedMetadata: refreshedMetadata,
+                idResolver: loadEpisode,
+                metadataResolver: loadEpisodeWithMetadata
+            )
+        guard !playbackExited, resolverRoute != nil else {
+            return false
+        }
+        if let pending = pendingAdvance,
+           PreparedEpisodeRetentionPolicy.isPendingReentry(
+            requestedEpisodeID: videoId,
+            pendingEpisodeID: pending.meta.videoId,
+            pendingIssued: pending.issued,
+            pendingTerminal: pending.terminal,
+            activeLoadMatches: PlayerLoadProvenanceState.accepts(
+                callbackToken: pending.loadToken,
+                activeToken: coordinator.player?.activeLoadToken
+            )
+           ) {
+            DiagnosticsLog.log(
+                "binge",
+                "episode reentry ignored target=\(VXProbeRedaction.identityToken(videoId)); retained preparation preserved"
+            )
+            return true
+        }
+        let retainedPreparedEpisode = takePreparedEpisode(for: videoId)
         if let pending = pendingAdvance,
            IssuedPendingEpisodeReentryPolicy.shouldPreserve(
             issued: pending.issued, terminal: pending.terminal
@@ -4122,7 +4661,68 @@ struct PlayerScreen: View {
         withAnimation { panel = nil }
         buffering = true; reconnecting = true; reconnectMsg = "Loading episode…"
         episodeResolutionTask = Task { @MainActor in
-            let resolved = await loadEpisode(videoId)
+            // takePreparedEpisode has already removed this value from retained view state. Own its cleanup
+            // before any guard, await, or stale-generation return so cancellation cannot orphan a raw engine.
+            let admissionLease = retainedPreparedEpisode?.torrentPreparationLease
+            let admissionPreparedRemux = retainedPreparedEpisode?.preparedRemux
+            var admissionCommandIssued = false
+            var admissionLeaseAdopted = false
+            defer {
+                if PreparedTorrentAdmissionPolicy.shouldRetireLease(
+                    playerCommandIssued: admissionCommandIssued,
+                    leaseAdopted: admissionLeaseAdopted
+                ) {
+                    retirePreparedTorrentEngine(
+                        admissionLease,
+                        reason: "episode admission task ended before issued ownership"
+                    )
+                }
+                if !admissionCommandIssued {
+                    admissionPreparedRemux?.abandon(
+                        reason: "episode admission task ended before prepared-remux issue"
+                    )
+                }
+            }
+            let resolved: PlayerEpisodeStream?
+            if let retainedPreparedEpisode,
+               preparedTorrentLeaseIsAdmissible(
+                    retainedPreparedEpisode,
+                    requestedEpisodeID: videoId
+               ) {
+                // The retained URL/selection avoids a cold resolve, but CoreBridge still has to move its
+                // episode-scoped source owner before switchStream can bind engine attribution or fail over.
+                // This is the same identity load performed by loadEpisodeStream, without re-ranking.
+                guard let sourceIdentityTarget = PreparedEpisodeRetentionPolicy.sourceIdentityTarget(
+                    requestedEpisodeID: videoId,
+                    preparedEpisodeID: retainedPreparedEpisode.meta.videoId
+                ) else { return }
+                core.loadMeta(
+                    type: "series",
+                    id: retainedPreparedEpisode.meta.libraryId,
+                    streamType: "series",
+                    streamId: sourceIdentityTarget
+                )
+                DiagnosticsLog.log(
+                    "binge",
+                    "next prepare admitted target=\(VXProbeRedaction.identityToken(videoId)); source identity advanced without reselection"
+                )
+                resolved = retainedPreparedEpisode
+            } else {
+                if let retainedPreparedEpisode {
+                    retirePreparedTorrentEngine(
+                        retainedPreparedEpisode.torrentPreparationLease,
+                        reason: "admission identity rejected"
+                    )
+                    retainedPreparedEpisode.preparedRemux?.abandon(
+                        reason: "admission identity rejected"
+                    )
+                }
+                if let resolverRoute {
+                    resolved = await AppleEpisodeResolverAdmission.resolve(resolverRoute)
+                } else {
+                    resolved = nil
+                }
+            }
             let resultIsCurrent = !Task.isCancelled && !playbackExited
                 && episodeGeneration == episodeSwitchGeneration
                 && mediaGeneration == resumeRetryGeneration
@@ -4175,6 +4775,7 @@ struct PlayerScreen: View {
                 currentVideoID: curMeta?.videoId, targetVideoID: es.meta.videoId,
                 currentURL: curURL, targetURL: es.url
             ) else {
+                es.preparedRemux?.abandon(reason: "duplicate episode media rejected")
                 invalidateEpisodeResolution()
                 episodeResolveGeneration = nil
                 if restoreSupersededAdvance() { return }
@@ -4222,11 +4823,36 @@ struct PlayerScreen: View {
                   episodeGeneration == episodeSwitchGeneration,
                   mediaGeneration == resumeRetryGeneration,
                   pendingAdvance?.meta.videoId == es.meta.videoId else { return }
-            switchStream(to: es.stream, url: es.url, userInitiated: true, resumeOverride: es.resume,
-                         debridRef: es.debridRef, engineAlreadyBound: false,
-                         engineAddonBaseOverride: es.engineAddonBase,
-                         mediaGenerationAlreadyClaimed: true)
+            let expectedPreparedRemuxOwner = es.preparationRequest.map {
+                VortXPreparedRemuxOwnerIdentity(
+                    mediaID: es.meta.videoId,
+                    generation: $0.preparedRemuxGeneration,
+                    sourceSignature: StreamRanking.signature(es.stream)
+                )
+            }
+            let issued = switchStream(
+                to: es.stream, url: es.url, userInitiated: true,
+                resumeOverride: es.resume, debridRef: es.debridRef,
+                engineAlreadyBound: false,
+                engineAddonBaseOverride: es.engineAddonBase,
+                mediaGenerationAlreadyClaimed: true,
+                preparedRemux: es.preparedRemux,
+                expectedPreparedRemuxOwner: expectedPreparedRemuxOwner
+            )
+            admissionCommandIssued = issued
+            if issued, let admissionLease, let request = es.preparationRequest {
+                admissionLeaseAdopted = admissionLease.adopt(
+                    episodeID: es.meta.videoId,
+                    attemptSequence: request.attemptSequence
+                )
+                assert(admissionLeaseAdopted, "prepared torrent admission lost exact lease ownership")
+                DiagnosticsLog.log(
+                    "binge",
+                    "next prepare torrent adoption target=\(VXProbeRedaction.identityToken(es.meta.videoId)) attempt=\(request.attemptSequence) transitioned=\(admissionLeaseAdopted ? "Y" : "N") issued=Y"
+                )
+            }
         }
+        return true
     }
 
     /// FIRST-FRAME COMMIT of a binge advance (mirror of TVPlayerView.commitPendingAdvanceOnFirstFrame):
@@ -4243,6 +4869,7 @@ struct PlayerScreen: View {
                 activeToken: coordinator.player?.activeLoadToken,
                 pendingToken: pending.loadToken
               ) else { return false }
+        let acceptedSubtitleTimingScope = pending.subtitleTimingScope
         pendingAdvance = nil
         supersededAdvance = nil
         committedLoadToken = loadToken
@@ -4251,6 +4878,8 @@ struct PlayerScreen: View {
         curTitleState = pending.title
         curBingeState = pending.binge
         curDebridRef = pending.debridRef
+        acceptSubtitleTimingReplacement(scope: acceptedSubtitleTimingScope, clearNewEngineDelay: false)
+        // The caller replays deferredTrackList only after this scope is accepted.
         switchingEpisode = episodeResolveGeneration != nil
         playbackSessionID = UUID().uuidString
         if EpisodeTrickplayIdentityPolicy.shouldRekey(committedPendingAdvance: true) {
@@ -4430,6 +5059,13 @@ struct PlayerScreen: View {
                     onNext()
                 }
             }
+            #if os(iOS) || os(macOS)
+            // The AVPlayer engine owns the real AVPictureInPictureController. Observe that controller directly
+            // so this button is absent on unsupported devices and its glyph/label follows AVKit's settled state.
+            if let controller = coordinator.player as? AVPlayerEngineController {
+                AVPlayerPictureInPictureButton(controller: controller) { scheduleHide() }
+            }
+            #endif
             #if os(iOS)
             // Manual landscape lock is an iOS-only affordance (macOS windows don't rotate).
             iconButton(forcedLandscape ? "arrow.down.right.and.arrow.up.left"
@@ -4452,7 +5088,7 @@ struct PlayerScreen: View {
             if !isLive {
                 // Restart from 0:00 (tvOS parity #5): seek to the start and keep playing.
                 iconButton("arrow.counterclockwise", label: "Restart") {
-                    coordinator.player?.seek(to: 0)
+                    issueSeek(to: 0, reason: "restart")
                     currentTime = 0
                     // Direct onSeek (a restart-to-0 must bypass reportSeek's resume floor), so the
                     // account write rides along explicitly, keyed on the CURRENT episode like every
@@ -4553,9 +5189,19 @@ struct PlayerScreen: View {
     /// The seek-step setting as seconds, falling back to 10 if the stored value is somehow unparsable.
     private var seekStepSeconds: Double { Double(seekStep) ?? 10 }
 
+    /// A9: single logged choke point for a seek so the exportable trail shows every jump (reason, from, to,
+    /// duration). maybeResume / nudgeResume and the automatic-skip path log their own dedicated lines.
+    private func issueSeek(to target: Double, reason: String) {
+        DiagnosticsLog.log(
+            "playback",
+            String(format: "seek reason=%@ from=%.3f to=%.3f duration=%.3f", reason, currentTime, target, duration)
+        )
+        coordinator.player?.seek(to: target)
+    }
+
     private func seekBy(_ delta: Double) {
         let target = min(max(currentTime + delta, 0), max(duration - 1, 0))
-        coordinator.player?.seek(to: target)
+        issueSeek(to: target, reason: "relative")
         currentTime = target
         reportSeek(target)
         scheduleHide()
@@ -4603,7 +5249,7 @@ struct PlayerScreen: View {
                             } else {
                                 let target = scrubTarget
                                 currentTime = target
-                                coordinator.player?.seek(to: target)
+                                issueSeek(to: target, reason: "scrub")
                                 reportSeek(target)
                                 scrubThumbnails.clear()
                                 scheduleHide()
@@ -4740,7 +5386,7 @@ struct PlayerScreen: View {
                     Spacer()
                     controlButton("rectangle.stack", "Sources") { openPanel(.sources) }
                 }
-                if episodes.count > 1 {
+                if allEpisodeRefs.count > 1 {
                     Spacer()
                     controlButton("list.bullet", "Episodes") { openPanel(.episodes) }
                 }
@@ -5171,6 +5817,55 @@ struct PlayerScreen: View {
         .accessibilityLabel(label)
     }
 
+    #if os(iOS) || os(macOS)
+    /// PiP is a real AVPlayer capability, not a routing intent. Keep the control out of the accessibility tree
+    /// until AVKit reports support or an active/transitioning controller, and keep its disabled state truthful
+    /// while AVKit owns a start or stop transition.
+    private struct AVPlayerPictureInPictureButton: View {
+        @ObservedObject var controller: AVPlayerEngineController
+        let onInteraction: () -> Void
+
+        var body: some View {
+            if controller.isPictureInPicturePossible
+                || controller.isPictureInPictureActive
+                || controller.isPictureInPictureTransitioning {
+                Button {
+                    let accepted = controller.isPictureInPictureActive
+                        ? controller.stopPictureInPicture()
+                        : controller.startPictureInPicture()
+                    if accepted { onInteraction() }
+                } label: {
+                    Group {
+                        if controller.isPictureInPictureTransitioning {
+                            ProgressView()
+                        } else {
+                            Image(systemName: controller.isPictureInPictureActive ? "pip.exit" : "pip.enter")
+                        }
+                    }
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.white).padding(11)
+                        .vortxGlassDisc()
+                        .frame(width: 44, height: 44).contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(controller.isPictureInPictureTransitioning)
+                .accessibilityLabel(pictureInPictureAccessibilityLabel)
+            }
+        }
+
+        private var pictureInPictureAccessibilityLabel: String {
+            switch controller.pictureInPictureTransition {
+            case .some(.starting): return "Starting Picture in Picture"
+            case .some(.stopping): return "Stopping Picture in Picture"
+            case nil:
+                return controller.isPictureInPictureActive
+                    ? "Exit Picture in Picture"
+                    : "Enter Picture in Picture"
+            }
+        }
+    }
+    #endif
+
     // MARK: - Skip intro / outro
 
     private func skipPill(_ segment: SkipSegment) -> some View {
@@ -5180,7 +5875,7 @@ struct PlayerScreen: View {
                 Spacer()
                 Button {
                     Haptics.success()
-                    coordinator.player?.seek(to: segment.end)
+                    issueSeek(to: segment.end, reason: "skip")
                     currentTime = segment.end
                     updateCurrentSkip(at: segment.end)
                 } label: {
@@ -5353,8 +6048,8 @@ struct PlayerScreen: View {
                 subtitleLoadingURL = nil
                 // Same still-live-engine gate as the manual row: never record an add the live engine never saw.
                 if ok, player === coordinator.player { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
-                if ok, player === coordinator.player, player.subtitleDelayAvailable, subDelay != 0 {
-                    player.setSubDelay(subDelay)
+                if ok, player === coordinator.player {
+                    applyCurrentSubtitleDelayIfReady(force: false)
                 }
                 refreshSoon()
                 VXProbe.log("subs", "subs selected \(langName(sub.lang)) (add-on auto ok=\(ok ? "Y" : "N"))")
@@ -5379,10 +6074,10 @@ struct PlayerScreen: View {
 
     // MARK: - Community subtitles (pool + sync + embedded upload)
 
-    /// The pool `content_key` for what is playing: the imdb library id, plus season/episode for an episode.
-    /// Live streams and titles with no imdb id return nil, no-oping the whole community-subtitle path.
-    private var communityContentKey: String? {
-        guard let m = curMeta, !effectivelyLive else { return nil }
+    /// Build the community content key for a supplied metadata identity. The caller can use a staged episode
+    /// identity before it is published, while the live property below keeps the existing runtime live gate.
+    private func communityContentKey(for targetMeta: PlaybackMeta?) -> String? {
+        guard let m = targetMeta, !LiveTypes.contains(m.type) else { return nil }
         // A tmdb-backed play carries a `tmdb:` library id; feeding it straight into contentKey mints a bogus
         // `tt<tmdb-number>` via the bare-digit fallback. Route those through the persistent tmdb->tt resolver
         // cache instead: nil until it resolves (the whole community path no-ops rather than running under a wrong
@@ -5392,6 +6087,82 @@ struct PlayerScreen: View {
             return SubtitleReleaseFingerprint.contentKey(imdbId: tt, season: m.season, episode: m.episode)
         }
         return SubtitleReleaseFingerprint.contentKey(imdbId: m.libraryId, season: m.season, episode: m.episode)
+    }
+
+    /// The pool content key for the published current media. Live streams and runtime non-seekable playback
+    /// keep the community path disabled even when their metadata resembles a normal title.
+    private var communityContentKey: String? {
+        guard !effectivelyLive else { return nil }
+        return communityContentKey(for: curMeta)
+    }
+
+    /// Stable local timing scope. It requires the actual stream's release description and never falls back to
+    /// a URL, title, duration, or display label when that authority is absent.
+    private func subtitleTimingScope(for targetMeta: PlaybackMeta?, stream: CoreStream?) -> SubtitleTimingScope? {
+        guard let contentKey = communityContentKey(for: targetMeta),
+              let stream else { return nil }
+        let releaseDescription = StreamRanking.signature(stream)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !releaseDescription.isEmpty,
+              releaseDescription.caseInsensitiveCompare("unknown") != .orderedSame else {
+            return nil
+        }
+        let releaseFingerprint = SubtitleReleaseFingerprint.releaseFingerprint(releaseName: releaseDescription)
+        return SubtitleTimingScope(contentKey: contentKey, releaseFingerprint: releaseFingerprint)
+    }
+
+    /// Establish a local scope when metadata or the actual source becomes authoritative. A late identity fill
+    /// may establish a previously nil scope, but it never clears timing or advances the timing generation.
+    private func establishSubtitleTimingScopeIfAvailable() {
+        guard pendingAdvance == nil else { return }
+        guard subtitleTimingScope == nil else { return }
+        subtitleTimingScope = subtitleTimingScope(
+            for: curMeta,
+            stream: curSourceStream ?? currentStream
+        )
+    }
+
+    /// Local v2 restore is state-only. The track-list seam applies that state once subtitle timing is ready.
+    private func restoreSubtitleTimingOffsetIfReady() {
+        establishSubtitleTimingScopeIfAvailable()
+        guard subDelay == 0, !pooledSeededOffset,
+              let scope = subtitleTimingScope,
+              let savedOffset = SubtitleOffsetMemory.savedOffset(for: scope) else { return }
+        subDelay = savedOffset
+        pooledSeededOffset = true
+    }
+
+    /// Admit a true source or episode replacement at the accepted-load boundary. Preservation paths do not
+    /// call this helper, so their timing state and generation remain intact while their new load token earns
+    /// one track-ready reapplication.
+    private func acceptSubtitleTimingReplacement(
+        scope: SubtitleTimingScope?,
+        clearNewEngineDelay: Bool = true
+    ) {
+        flushPendingSubOffsetSave()
+        offsetCaptureTask?.cancel()
+        offsetCaptureTask = nil
+        subtitleTimingGeneration &+= 1
+        subtitleTimingScope = scope
+        let savedOffset = SubtitleOffsetMemory.savedOffset(for: scope)
+        subDelay = savedOffset ?? 0
+        pooledSeededOffset = savedOffset != nil
+        subtitleDelayAppliedLoadToken = nil
+        if clearNewEngineDelay { coordinator.player?.setSubDelay(0) }
+    }
+
+    /// Apply a nonzero restored or pooled delay once for an exact engine load token. Explicit user actions use
+    /// force so Reset also reaches the engine with zero, while ordinary track-list replays stay idempotent.
+    private func applyCurrentSubtitleDelayIfReady(force: Bool = false) {
+        guard let player = coordinator.player,
+              player.subtitleDelayAvailable,
+              let loadToken = player.activeLoadToken else { return }
+        if !force {
+            guard subDelay != 0 else { return }
+            if subtitleDelayAppliedLoadToken == loadToken { return }
+        }
+        player.setSubDelay(subDelay)
+        subtitleDelayAppliedLoadToken = loadToken
     }
 
     /// A subtitle request may finish after an episode load or same-episode reload replaced the player item.
@@ -5429,8 +6200,15 @@ struct PlayerScreen: View {
             owner: coordinator.player?.activeLoadToken
         ) else { return }
         guard let contentKey = communityContentKey else { return }
+        establishSubtitleTimingScopeIfAvailable()
+        if appliedAutoTracks {
+            restoreSubtitleTimingOffsetIfReady()
+            applyCurrentSubtitleDelayIfReady(force: false)
+        }
         refreshSubFingerprint()
         let fp = subFingerprint
+        let poolTimingScope = SubtitleTimingScope(contentKey: contentKey, releaseFingerprint: fp)
+        let capturedTimingGeneration = subtitleTimingGeneration
         // Re-fetch when the content key changes OR when we now have a real fingerprint we didn't have before.
         let key = "\(contentKey)#\(fp ?? "")"
         guard let requestID = subtitlePoolRequests.beginFetch(dedupeKey: key) else { return }
@@ -5458,13 +6236,20 @@ struct PlayerScreen: View {
             autoSelectAddonSubtitleIfNeeded()
             // P3 seed: remember the community-learned offset once. Apply it only when the active subtitle path
             // advertises live delay support (all libmpv subtitles, or AVPlayer's external cue overlay).
-            if !pooledSeededOffset, subDelay == 0, let offsetMs = result.offsetMs, offsetMs != 0 {
+            let timingGenerationMatches = capturedTimingGeneration == subtitleTimingGeneration
+            if let poolTimingScope, !pooledSeededOffset,
+               poolTimingScope == SubtitleTimingScope(
+                   contentKey: communityContentKey,
+                   releaseFingerprint: subFingerprint
+               ),
+               timingGenerationMatches,
+               subDelay == 0,
+               let offsetMs = result.offsetMs,
+               offsetMs != 0 {
                 pooledSeededOffset = true
                 let seconds = (Double(offsetMs) / 1000.0 * 10).rounded() / 10
                 subDelay = seconds
-                if coordinator.player?.subtitleDelayAvailable == true {
-                    coordinator.player?.setSubDelay(seconds)
-                }
+                applyCurrentSubtitleDelayIfReady(force: false)
                 VXProbe.log("subs", "community sync seeded offset=\(String(format: "%+.1f", seconds))s")
             }
             if panel == .subtitles { panelRows = rows(for: .subtitles) }
@@ -5542,8 +6327,8 @@ struct PlayerScreen: View {
                 VXProbe.log("subs", "community subtitle loaded lang=\(sub.lang) ok=\(ok ? "Y" : "N")")
                 // Same still-live-engine gate as the add-on rows: never record an add the live engine never saw.
                 if ok, player === coordinator.player { addedPooledIDs.insert(sub.id) } else if !ok, !auto { subtitleLoadFailed = true }
-                if ok, player === coordinator.player, player.subtitleDelayAvailable, subDelay != 0 {
-                    player.setSubDelay(subDelay)
+                if ok, player === coordinator.player {
+                    applyCurrentSubtitleDelayIfReady(force: false)
                 }
                 if panel == .subtitles { panelRows = rows(for: .subtitles) }
             }
@@ -5563,15 +6348,14 @@ struct PlayerScreen: View {
     private func scheduleSubOffsetSave() {
         subOffsetSaveTask?.cancel()
         let pending = subDelay
-        let contentKey = communityContentKey
-        pendingSubOffsetSave = (pending, contentKey)
+        let scope = subtitleTimingScope
+        pendingSubOffsetSave = (pending, scope)
         subOffsetSaveTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(1000))
-            // No content-key recheck: the key was captured WITH the value, so this write is correct even if the
-            // session has since advanced to another episode - it stores the offset against the title it was
-            // dialled in on. Only cancellation (a newer press) may suppress it.
+            // No scope recheck: the scope was captured WITH the value, so this write is correct even if the
+            // session has since advanced to another episode. Only cancellation may suppress it.
             guard !Task.isCancelled else { return }
-            SubtitleOffsetMemory.save(pending, forContentKey: contentKey)
+            SubtitleOffsetMemory.save(pending, for: scope)
             pendingSubOffsetSave = nil
         }
     }
@@ -5582,7 +6366,7 @@ struct PlayerScreen: View {
         subOffsetSaveTask?.cancel(); subOffsetSaveTask = nil
         guard let pending = pendingSubOffsetSave else { return }
         pendingSubOffsetSave = nil
-        SubtitleOffsetMemory.save(pending.delay, forContentKey: pending.contentKey)
+        SubtitleOffsetMemory.save(pending.delay, for: pending.scope)
     }
 
     /// P3 capture: debounce a manual sync change, then submit the learned offset to the pool. Works on BOTH
@@ -5590,16 +6374,27 @@ struct PlayerScreen: View {
     /// external-subtitle overlay (an add-on/pooled srt/vtt). Both are the same signed cue offset for this
     /// release fingerprint, so either is valid to pool. Gated + fail-soft inside the client.
     private func captureSubOffset() {
-        guard let contentKey = communityContentKey else { return }
+        guard let capturedContentKey = communityContentKey,
+              let capturedFingerprint = subFingerprint else { return }
         offsetCaptureTask?.cancel()
         let delaySeconds = subDelay
-        let fp = subFingerprint
+        guard let capturedTimingScope = SubtitleTimingScope(
+            contentKey: capturedContentKey,
+            releaseFingerprint: capturedFingerprint
+        ) else { return }
+        guard subDelay.isFinite, abs(subDelay) <= 120 else { return }
+        let capturedTimingGeneration = subtitleTimingGeneration
         offsetCaptureTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(1500))
-            guard !Task.isCancelled, communityContentKey == contentKey else { return }
+            guard !Task.isCancelled,
+                  capturedTimingGeneration == subtitleTimingGeneration,
+                  capturedTimingScope == SubtitleTimingScope(
+                    contentKey: communityContentKey,
+                    releaseFingerprint: subFingerprint
+                  ) else { return }
             let offsetMs = Int((delaySeconds * 1000).rounded())
-            await SubtitlePoolClient.postOffset(contentKey: contentKey, lang: "",
-                                                fingerprint: fp, offsetMs: offsetMs)
+            await SubtitlePoolClient.postOffset(contentKey: capturedContentKey, lang: "",
+                                                fingerprint: capturedFingerprint, offsetMs: offsetMs)
         }
     }
 
@@ -5790,7 +6585,7 @@ struct PlayerScreen: View {
             } }
         case .episodes:
             // The season's episodes, current one highlighted; tapping switches in place (goToEpisode).
-            return episodes.map { ep in
+            return allEpisodeRefs.map { ep in
                 Row(label: ep.label, selected: ep.id == curMeta?.videoId) { goToEpisode(ep.id) }
             }
         case .sleep:
@@ -5870,8 +6665,8 @@ struct PlayerScreen: View {
                             // the row from the list with nothing rendering.
                             if ok, player === coordinator.player { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
                             else if !ok { subtitleLoadFailed = true }
-                            if ok, player === coordinator.player, player.subtitleDelayAvailable, subDelay != 0 {
-                                player.setSubDelay(subDelay)
+                            if ok, player === coordinator.player {
+                                applyCurrentSubtitleDelayIfReady(force: false)
                             }
                             if panel == .subtitles { panelRows = rows(for: .subtitles) }
                         }
@@ -6288,7 +7083,8 @@ struct PlayerScreen: View {
     private func adjustSubDelay(_ delta: Double) {
         guard coordinator.player?.subtitleDelayAvailable == true else { return }
         subDelay = ((subDelay + delta) * 10).rounded() / 10
-        coordinator.player?.setSubDelay(subDelay)
+        pooledSeededOffset = true
+        applyCurrentSubtitleDelayIfReady(force: true)
         VXProbe.log("subs", "synced delay=\(String(format: "%+.1f", subDelay))s")
         captureSubOffset()   // P3: pool the user-corrected offset (debounced, gated, fail-soft)
         scheduleSubOffsetSave()   // remember this title's manual offset (debounced: one write per burst)
@@ -6340,8 +7136,15 @@ struct PlayerScreen: View {
     @MainActor private func leavePlayback() {
         let exitLoadToken = coordinator.player?.activeLoadToken
         let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: exitLoadToken)
+        cancelTerminalFinalityRefresh()
         flushPendingSubOffsetSave()   // a debounced sync nudge must survive the viewer leaving immediately
         invalidateEpisodeWorkForExit()
+        if !persistenceBlockedForExit, assetSanityAccepted, !effectivelyLive, duration > 0,
+           currentTime / duration >= 0.9, let m = curMeta {
+            if !m.usesSeriesLifecycle, terminalRewindGate.issueTerminalRewind() {
+                core.finishedWatching(libraryId: m.libraryId)
+            }
+        }
         invalidateLocalTrickplayCapture()
         cancelAssetSanityObservationDeadline()
         hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel(); idleWatchTask?.cancel()
@@ -6352,21 +7155,9 @@ struct PlayerScreen: View {
         if assetSanityAccepted {
             scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
         }
-        if assetSanityAccepted, !effectivelyLive, duration > 0 {
+        if terminalRewindGate.permitsExitProgressFlush,
+           assetSanityAccepted, !effectivelyLive, duration > 0 {
             reportProgress(currentTime, acceptedOwner: exitLoadToken)
-            // A manual close at/near the end must clear Continue Watching too, not only a natural EOF. The
-            // engine keeps any item with time_offset > 0 in the rail, so a title watched to the credits then
-            // closed by hand would linger there forever (the "CW never clears" report). Rewind it OUT of CW,
-            // mirroring the EOF branch; 0.9 is the engine's own CREDITS threshold.
-            if !persistenceBlockedForExit, let m = curMeta,
-               currentTime / duration >= 0.9,
-               EpisodePlaybackIdentity.canRewindWholeTitleAtTerminal(
-                   usesSeriesLifecycle: m.usesSeriesLifecycle,
-                   currentEpisodeIndex: episodeIndex,
-                   episodeCount: episodes.count
-               ) {
-                core.finishedWatching(libraryId: m.libraryId)
-            }
         }
         // External sync (Trakt/SIMKL): scrobble STOP on a genuine user exit. Additive + fail-soft + gated +
         // once-latched inside the coordinator; a no-op with empty creds. Near the end this records the watch
@@ -6548,16 +7339,9 @@ struct PlayerScreen: View {
         // + the one-shot latch inside make the double call safe. No-op when userPickedSubtitle is set (an
         // explicit pick, incl. one just re-applied above, hard-stops the async add-on auto path).
         autoSelectAddonSubtitleIfNeeded()
-        // Restore the viewer's OWN last manual sync offset for this title (device-local, instant, offline).
-        // Only when nothing is dialed in this session and the pooled seed hasn't fired; claiming the pooled
-        // latch here suppresses the crowd seed so the viewer's own correction wins.
-        if subDelay == 0, !pooledSeededOffset, let saved = SubtitleOffsetMemory.savedOffset(forContentKey: communityContentKey) {
-            subDelay = saved
-            if coordinator.player?.subtitleDelayAvailable == true {
-                coordinator.player?.setSubDelay(saved)
-            }
-            pooledSeededOffset = true
-        }
+        // Restore local v2 state only after tracks are ready. The track-list handler applies it once for the
+        // exact engine load token below.
+        restoreSubtitleTimingOffsetIfReady()
     }
 
     /// Push a resume/progress position to the presenter, refusing to REGRESS the stored resume below a
@@ -6672,7 +7456,7 @@ struct PlayerScreen: View {
                 guard permitsSubtitlePublication(loadToken: subtitleLoadToken, videoID: subtitleVideoID) else { return }
                 if ok, player === coordinator.player {
                     addedSubURLs.insert(urlStr)
-                    if player.subtitleDelayAvailable, subDelay != 0 { player.setSubDelay(subDelay) }
+                    applyCurrentSubtitleDelayIfReady(force: false)
                 }
             }
         case let .pooled(id):

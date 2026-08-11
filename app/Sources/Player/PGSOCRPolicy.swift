@@ -43,7 +43,12 @@ enum PGSOCRPolicy {
         guard start.isFinite else { return nil }
 
         let duration: Double
-        if displayEndMilliseconds > displayStartMilliseconds {
+        // FFmpeg's PGS decoder uses UInt32.max to mean "open until the next display event", including an
+        // empty composition that clears the previous subtitle. It is not a 49-day duration. Preserve an
+        // explicit finite decoder end, otherwise use the container packet duration and let the cue policy's
+        // existing missing-duration fallback handle zero.
+        if displayEndMilliseconds != UInt32.max,
+           displayEndMilliseconds > displayStartMilliseconds {
             duration = Double(displayEndMilliseconds - displayStartMilliseconds) / 1_000
         } else {
             duration = packetDurationSeconds

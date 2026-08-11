@@ -9,6 +9,7 @@ struct PlaybackRequest: Identifiable {
     let title: String
     var meta: PlaybackMeta? = nil
     var episodes: [CoreVideo] = []
+    var seriesInventoryAuthority: AppleCWSeriesInventory.Authority = .launch
     /// Quality signature of the stream being played, so auto-next can prefer the
     /// same release family for the following episode.
     var sourceHint: String? = nil
@@ -143,6 +144,7 @@ struct RootView: View {
                 // the UIKit RemoteCatcher, so AVKit never fights the Siri-remote focus engine. `forceMPV` (the
                 // last-resort escape hatch) just means TVPlayerView mounts libmpv directly.
                 TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
+                             seriesInventoryAuthority: req.seriesInventoryAuthority,
                              sourceHint: req.sourceHint, torrent: req.torrent, bingeGroup: req.bingeGroup,
                              headers: req.headers, forceMPV: req.forceMPV, isTrailer: req.isTrailer,
                              trailerYouTubeID: req.trailerYouTubeID,

@@ -169,25 +169,17 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
     let episode = EpisodePlaybackIdentity.provenEpisodeNumbers(
         season: v.season, episode: episodeNumber
     ).map { DebridEpisode(season: $0.season, episode: $0.episode) }
+    let settlementStartedAt = Date()
     core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
     var groups: [CoreStreamSourceGroup] = []
-    var firstPlayableAt: Date?
-    for _ in 0 ..< 80 {                                    // ~20s ceiling, matching the episode page
+    while true {
         guard !Task.isCancelled else { return nil }
         groups = core.streamGroups(forStreamId: v.id)
-        let hasCandidate = groups.contains { group in
-            group.streams.contains { stream in
-                stream.playableURL(isEpisode: true) != nil
-                    || (episode != nil && (stream.isTorrent || stream.isUsenet))
-            }
-        }
-        if hasCandidate, firstPlayableAt == nil {
-            firstPlayableAt = Date()
-        }
         let progress = core.streamLoadProgress(forStreamId: v.id)
-        let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
+        let elapsed = Date().timeIntervalSince(settlementStartedAt)
         if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                        secondsSinceFirstPlayable: elapsed, rememberedQuality: continuity) { break }
+                                        secondsSinceRequestStart: elapsed, rememberedQuality: continuity) { break }
+        if elapsed >= StreamRanking.completeSetDeadline { break }
         do {
             try await Task.sleep(for: .milliseconds(250))
         } catch {

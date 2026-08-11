@@ -282,63 +282,24 @@ enum StreamRanking {
         return playablePairs(groups).first { SourcePinStore.matches($0.stream, addon: $0.addon, pin: pin) }?.stream
     }
 
-    /// Bounded wait for the user's remembered MANUAL source when auto-next races a faster rival provider.
-    /// The stream list settles ~9s after the episode starts (the diag-22 device log); 12s from first-playable
-    /// covers the slow aggregator tail (aiostreams/debridio answer ~9s in) while staying well under the commit
-    /// loop's own ~20s hard cap (TVPlayerView.episodeResolutionTask, 200 x 100ms), so the gate can never hang.
-    /// Used ONLY on the wanted-source branch of `resolveSettled`; the no-wanted paths keep the original snappy
-    /// 4s fresh-play window and 16s vanished-quality ceiling exactly as before.
-    static let wantedSourceDeadline: TimeInterval = 12
+    /// Raw-engine callers do not own SourceListModel's auxiliary contributor receipt, but they still must not
+    /// commit a partial raw set. This ceiling bounds a hung add-on and matches the complete-set policy.
+    static let completeSetDeadline: TimeInterval = SourceSettlementPolicy.maximumWait
 
     /// Whether a streams-loading wait should stop now and hand the result to `best(continuity:)`.
     ///
-    /// For a RESUME (`rememberedQuality` set), it holds out until a stream MATCHING that quality has
-    /// loaded, and (unless the user ranks torrents on top, or uses add-on order) a NON-TORRENT one:
-    /// torrents answer in ~4s while the user's debrid/direct stream of that quality usually lands
-    /// ~10-12s later, so a flat short cutoff auto-picked the fast torrent and a Continue-Watching
-    /// resume "tried a torrent first" before reaching the user's stream. A generous ceiling stops a
-    /// quality that never returns from hanging the resume. With no remembered quality (a fresh play),
-    /// it keeps the original short window so picking stays snappy. `best()` still ranks the final
-    /// choice, so a torrent-first user's order is honored once their stream is in hand.
-    ///
-    /// `wantedAddon` is the source the viewer picked BY HAND for this show (`SeriesSourceSticky.addon`). When
-    /// it is known, the gate holds for THAT provider specifically rather than for quality-from-any-provider:
-    /// a fast comet|torbox 1080p can match the remembered quality ~1-2s after EOF while the user's aggregator
-    /// (~9s to answer) is still loading, and the sticky +6000 bonus cannot bonus an ABSENT stream, so the old
-    /// quality-only gate committed auto-next off the rival (diag-22). Both binge auto-next paths pass it (tvOS
-    /// TVPlayerView, and iOS iOSDetailView loadEpisodeStream + iOSResolveEpisodeStream). Default nil keeps the
-    /// non-binge callers (the batch download picker, live failover) byte-identical to before. The wait is bounded three
-    /// ways and can never hang: the wanted source arriving, everyone answering (the `loaded >= total`
-    /// short-circuit above), or `wantedSourceDeadline` elapsing.
+    /// Quality and sticky hints affect ranking only after settlement. They are intentionally not early-open
+    /// conditions: a preferred provider or matching quality in a partial list says nothing about a superior
+    /// contributor that has not delivered yet.
     static func resolveSettled(_ groups: [CoreStreamSourceGroup], loaded: Int, total: Int,
-                               secondsSinceFirstPlayable seconds: TimeInterval,
+                               secondsSinceRequestStart seconds: TimeInterval,
                                rememberedQuality: String?,
                                wantedAddon: String? = nil) -> Bool {
         guard !groups.isEmpty else { return false }
-        if total > 0, loaded >= total { return true }                  // every add-on has answered
-        guard let hint = rememberedQuality, !hint.isEmpty else {
-            return seconds > 4                                         // fresh play: original snappy window
-        }
-        // A known remembered manual source: wait for IT (bounded), not for whoever answers fastest. Present =
-        // a matching-addon group carrying at least one real playable (a bare trailer never counts as arrival),
-        // mirroring how stickyBonus matches by add-on name, case-insensitively. Deliberately NOT gated on the
-        // remembered quality: the sticky record is "same source", and `best`/`rankedCandidates` still rank the
-        // exact stream within it once it lands.
-        if let wanted = wantedAddon, !wanted.isEmpty {
-            let wantedReady = groups.contains { group in
-                group.addon.caseInsensitiveCompare(wanted) == .orderedSame
-                    && group.streams.contains { $0.playableURL != nil && !$0.isYouTubeTrailer }
-            }
-            return wantedReady || seconds > wantedSourceDeadline
-        }
-        let prefs = SourcePreferences.reading
-        let torrentOK = prefs.useAddonOrder || prefs.typeOrder.first == .torrent
-        let qualityReady = groups.contains { group in
-            group.streams.contains { s in
-                s.playableURL != nil && !s.isYouTubeTrailer && continuityBonus(s, hint: hint) > 0 && (torrentOK || !s.isTorrent)
-            }
-        }
-        return qualityReady || seconds > 16                            // ceiling so a vanished quality cannot hang it
+        _ = rememberedQuality
+        _ = wantedAddon
+        if total > 0, loaded >= total { return true }
+        return seconds >= completeSetDeadline
     }
 
     static func score(_ s: CoreStream, debridCachedHashes: Set<String> = []) -> Int {

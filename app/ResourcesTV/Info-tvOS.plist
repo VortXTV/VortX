@@ -16,12 +16,8 @@
 	     the whole External Services feature is a hidden no-op. The repo is public; never hardcode. -->
 	<key>TraktClientId</key>
 	<string>$(TRAKT_CLIENT_ID)</string>
-	<key>TraktClientSecret</key>
-	<string>$(TRAKT_CLIENT_SECRET)</string>
 	<key>SIMKLClientId</key>
 	<string>$(SIMKL_CLIENT_ID)</string>
-	<key>SIMKLClientSecret</key>
-	<string>$(SIMKL_CLIENT_SECRET)</string>
 	<!-- Base Info.plist (Xcode merges its generated keys on top). Allow plain-http connections: the
 	     native client's URLSession reaches the embedded streaming server at http://127.0.0.1:11470
 	     (cleartext loopback) to create torrents, AND add-ons commonly serve POSTER images over plain

@@ -1,147 +1,5 @@
 import Foundation
 
-/// A cancellation-aware sliding window for add-on work. Only `limit` operations
-/// can run at once, completed values retain input order, and the deadline returns
-/// every result that finished before it instead of discarding the partial set.
-enum BoundedPreloadWorkPool {
-    static func map<Input: Sendable, Output: Sendable>(
-        _ inputs: [Input],
-        limit: Int,
-        timeoutNanoseconds: UInt64,
-        operationTimeoutNanoseconds: UInt64? = nil,
-        operationTimeoutFor: (@Sendable (Input) -> UInt64?)? = nil,
-        operation: @escaping @Sendable (Input) async -> Output?
-    ) async -> [Output?] {
-        guard !inputs.isEmpty else { return [] }
-        let width = max(1, min(limit, inputs.count))
-        return await withTaskGroup(of: (Int, Output?).self) { group in
-            var results = Array<Output?>(repeating: nil, count: inputs.count)
-            var nextIndex = 0
-            var completedCount = 0
-
-            func launch(_ index: Int) {
-                let input = inputs[index]
-                // A per-input override lets ONE input (the series-sticky add-on) get a longer per-request
-                // cap while the rest keep the short uniform one; nil override falls back to the uniform cap,
-                // so every existing caller that passes only `operationTimeoutNanoseconds` is byte-identical.
-                let perOperationTimeout = operationTimeoutFor?(input) ?? operationTimeoutNanoseconds
-                group.addTask {
-                    guard !Task.isCancelled else { return (index, nil) }
-                    return (
-                        index,
-                        await valueBeforeTimeout(
-                            perOperationTimeout,
-                            operation: { await operation(input) }
-                        )
-                    )
-                }
-            }
-
-            for _ in 0..<width {
-                launch(nextIndex)
-                nextIndex += 1
-            }
-            group.addTask {
-                do {
-                    try await Task<Never, Never>.sleep(
-                        nanoseconds: timeoutNanoseconds
-                    )
-                } catch {
-                    return (-2, nil)
-                }
-                return (-1, nil)
-            }
-
-            while let (index, output) = await group.next() {
-                if index == -1 {
-                    group.cancelAll()
-                    break
-                }
-                if index == -2 {
-                    if Task.isCancelled {
-                        group.cancelAll()
-                        break
-                    }
-                    continue
-                }
-                results[index] = output
-                completedCount += 1
-                guard !Task.isCancelled else {
-                    group.cancelAll()
-                    break
-                }
-                if completedCount == inputs.count {
-                    group.cancelAll()
-                    break
-                }
-                if nextIndex < inputs.count {
-                    launch(nextIndex)
-                    nextIndex += 1
-                }
-            }
-            group.cancelAll()
-            return results
-        }
-    }
-
-    private static func valueBeforeTimeout<Output: Sendable>(
-        _ timeoutNanoseconds: UInt64?,
-        operation: @escaping @Sendable () async -> Output?
-    ) async -> Output? {
-        guard let timeoutNanoseconds else { return await operation() }
-        return await withTaskGroup(of: (Bool, Output?).self) { group in
-            group.addTask {
-                guard !Task.isCancelled else { return (true, nil) }
-                return (true, await operation())
-            }
-            group.addTask {
-                do {
-                    try await Task<Never, Never>.sleep(
-                        nanoseconds: timeoutNanoseconds
-                    )
-                } catch {
-                    return (false, nil)
-                }
-                return (false, nil)
-            }
-            let first = await group.next()
-            group.cancelAll()
-            guard first?.0 == true else { return nil }
-            return first?.1
-        }
-    }
-}
-
-/// Rotates which account add-on gets the first bounded fetch slot on each
-/// attempt, then maps completed values back to account order before ranking.
-enum PreloadProviderRotation {
-    static func order(
-        count: Int,
-        attemptSequence: Int,
-        stride: Int
-    ) -> [Int] {
-        guard count > 0 else { return [] }
-        let attemptIndex = max(0, attemptSequence - 1) % count
-        let offset = (attemptIndex * (stride % count)) % count
-        return (0..<count).map { (offset + $0) % count }
-    }
-
-    static func restoreOriginalOrder<Value>(
-        _ rotatedValues: [Value?],
-        order: [Int],
-        count: Int
-    ) -> [Value?] {
-        guard count > 0 else { return [] }
-        var restored = Array<Value?>(repeating: nil, count: count)
-        for (rotatedIndex, originalIndex) in order.enumerated()
-        where rotatedValues.indices.contains(rotatedIndex)
-            && restored.indices.contains(originalIndex) {
-            restored[originalIndex] = rotatedValues[rotatedIndex]
-        }
-        return restored
-    }
-}
-
 /// Pure scheduling state for the tvOS next-episode preparation pipeline.
 ///
 /// The player ticks roughly four times a second. A failed preload therefore cannot be represented only by
@@ -180,29 +38,37 @@ struct NextEpisodePreloadPolicy: Equatable {
     static let durationlessNearCreditsSeconds = 300.0
     static let maxRegularAttempts = 3
     static let retryDelays: [TimeInterval] = [20, 60]
-    static let attemptTimeout: TimeInterval = 15
-    static let addonConcurrencyLimit = 5
-    /// Whole-batch budget. Lifted 9 -> 12 to match the ~9-12s the stream list actually takes to settle
-    /// (diag-22): at 9s the slow aggregator was still being cut off before it could contribute a group.
-    /// Stays under the per-attempt `attemptTimeout` (15) so a full batch cannot blow the attempt budget.
-    static let addonFetchBudget: TimeInterval = 12
+    /// Whole preparation budget. Source settlement consumes at most fourteen seconds; the remaining twenty
+    /// seconds cover the sequential debrid cache check and playback-link resolve instead of killing a wanted
+    /// source immediately after its measured 9-12 second response finally arrives.
+    static let attemptTimeout = NextEpisodePreparationBudget.attemptTimeout
+    static let addonConcurrencyLimit = NextEpisodePreparationBudget.addonConcurrencyLimit
+    /// Whole-batch budget. The selected aggregator's observed tail is about 9-12 seconds, so the batch keeps
+    /// two seconds of margin while remaining below the total attempt deadline.
+    static let addonFetchBudget = NextEpisodePreparationBudget.addonFetchBudget
+    static let minimumResolutionBudget = NextEpisodePreparationBudget.minimumResolutionBudget
     /// General per-request cap for a preload add-on fetch. The remembered manual source overrides this with
     /// `stickyAddonRequestTimeout`; every OTHER add-on keeps this short 2s cap so one slow provider cannot
     /// stall the concurrent window.
-    static let addonRequestTimeout: TimeInterval = 2
+    static let addonRequestTimeout = NextEpisodePreparationBudget.addonRequestTimeout
     /// Per-request cap for the WANTED (series-sticky) add-on only. The aggregator the viewer picked by hand
-    /// (aiostreams/debridio) answers ~9s in - the 2s general cap was timing it OUT of preload entirely, so
-    /// the seamless lane never had the user's own source and the fallback wait did all the work. 7s clears
-    /// the aggregator tail yet stays STRICTLY under `attemptTimeout` (15) and the `addonFetchBudget` (12), so
-    /// a slow wanted source can never blow the whole attempt budget and starve the other add-ons.
-    static let stickyAddonRequestTimeout: TimeInterval = 7
+    /// (aiostreams/debridio) answers in the measured 9-12 second window. Thirteen seconds covers that tail
+    /// with one second of scheduling margin while remaining below both the batch and attempt deadlines.
+    static let stickyAddonRequestTimeout = NextEpisodePreparationBudget.stickyAddonRequestTimeout
     /// How far each bounded retry advances the provider window: the provider REACH of one attempt, concurrency
     /// (5) times the ~4 request waves a bounded attempt completes. Pinned to 5 x 4 = 20 (its long-standing
     /// value) rather than re-derived from `addonFetchBudget`, because the budget now ALSO has to cover the
     /// longer sticky-add-on request timeout, and the fair-rotation contract (NextEpisodePreloadPolicyTests) is
     /// tuned to this reach; re-deriving it from the lifted budget would silently change retry coverage, which
     /// the diag-22 source-memory fix has no reason to touch.
-    static let providerRotationStride = addonConcurrencyLimit * 4
+    static let providerRotationStride = NextEpisodePreparationBudget.providerRotationStride
+
+    /// One source of truth for both the work-pool deadline and URLRequest timeout. Keeping these separate
+    /// previously gave the sticky provider a seven-second pool lease while its request still died at two
+    /// seconds, so the user's remembered add-on could never contribute to the prepared episode.
+    static func requestTimeout(addon: String, wantedAddon: String?) -> TimeInterval {
+        NextEpisodePreparationBudget.requestTimeout(addon: addon, wantedAddon: wantedAddon)
+    }
 
     private(set) var target: Target?
     private(set) var activeAttempt: Attempt?

@@ -2035,14 +2035,18 @@ struct CoreEpisodeStreams: View {
                                                       name: meta.name, poster: meta.poster,
                                                       season: currentVideo.season, episode: currentVideo.episode),
                                    episodes: episodes,
+                                   // Detail metadata is a launch/current-season view, not proof of a settled full-title
+                                   // CoreMetaDetails aggregation. Terminal refresh may upgrade this only from its exact
+                                   // request-owned appleCWTerminalFullMeta receipt.
+                                   seriesInventoryAuthority: .launch,
                                    episodeStreamId: currentVideo.id,   // scope by episodic context (covers collections/franchise too)
                                    episodeTargetGeneration: episodeTargetGeneration,
                                    episodeTargetIsCurrent: { videoID, generation in
                                        videoID == currentVideo.id && generation == episodeTargetGeneration
                                    },
                                    // Roles, not an ordered candidate list: this page states what each id IS
-                                   // and the ONE shared resolver ranks them. The catalog id outranks the
-                                   // add-on's episode-shaped defaultVideoId, and the FIELD CASE survives --
+                                   // and the ONE shared resolver requires all applicable valid heads to agree.
+                                   // A conflicting catalog/default/current combination fails closed, while the FIELD CASE survives --
                                    // a TMDB-identified series with no defaultVideoId ("tmdb:94997") holds its
                                    // IMDb identity only on the EPISODE video id ("tt0460649:3:6"), which the
                                    // series kind still admits as the last role.
@@ -2171,6 +2175,7 @@ struct CoreStreamList: View {
     let title: String
     var meta: PlaybackMeta? = nil
     var episodes: [CoreVideo] = []               // the season's episodes (series only), for the player's Prev/Next/Episodes
+    var seriesInventoryAuthority: AppleCWSeriesInventory.Authority = .launch
     /// The episode id to scope stream assembly + the readiness gate to (binge-desync fix, symptom 3). Set by the
     /// episodic page (CoreEpisodeStreams) so the list only ever assembles + plays THIS episode's groups, never the
     /// episode the engine's meta_details last resolved. Scoped by episodic CONTEXT, not meta.type, so franchise /
@@ -2243,7 +2248,6 @@ struct CoreStreamList: View {
     private static let sourceWindowStep = 100
     @State private var showQualityPicker = false   // level 1: pick a resolution tier
     @State private var qualityTier: String? = nil  // level 2: pick a flavor inside that tier
-    @State private var settleTimedOut = false      // opens the Watch-Now gate even if an add-on hangs
     @State private var hasSeatedFocus = false      // one-shot: seat focus on Watch Now once, then leave the user alone
     // FIX H (take 3): seat the detail page's initial focus on Watch Now, not the Trailer chip. The movie
     // page lays the trailer chip out ABOVE this list, so without an explicit default the focus engine parks
@@ -2364,8 +2368,8 @@ struct CoreStreamList: View {
         // seriesPage) scoped too. Movies and live pass nil -> unscoped, unchanged.
         sourceList.setContext(
             metaId: meta?.libraryId ?? "", streamId: episodeStreamId, continuity: remembered, pin: sourcePin,
-            auxiliaryContentID: sourceContentID,
-            mediaServerTargetID: mediaServerTargetID
+            auxiliaryTarget: auxiliaryTarget,
+            mediaServerTarget: mediaServerTarget
         )
         let groups = sourceList.groups                               // best source first within each add-on
         let best = sourceList.best
@@ -2399,7 +2403,7 @@ struct CoreStreamList: View {
         // Watch-Now stays greyed until (nearly) every add-on has answered, so one press plays the
         // best of ALL sources, not the best of whoever answered first. A hung add-on can't hold the
         // button hostage: the timeout opens the gate anyway.
-        let watchReady = !loadingAddons || settleTimedOut
+        let watchReady = sourceList.isSettled
 
         return AnyView(VStack(alignment: .leading, spacing: Theme.Space.md) {
             // Singularity renders INLINE ONLY: its merged group flows through the ranked list like any
@@ -2582,22 +2586,16 @@ struct CoreStreamList: View {
             hasSeatedFocus = true
             watchFocused = true
         }
-        .task {
-            try? await Task.sleep(for: .seconds(12))
-            settleTimedOut = true
-        }
         // Smart Source Selection (Lane A): auto-pick my best source, scoped to a SERIES episode page (meta
         // type "series"), which is only ever reached by pushing CoreEpisodeStreams. The inline movie / live
         // detail list (meta type "movie" / a live type) is deliberately excluded, so opening a movie detail
-        // never auto-starts playback. Waits for the SAME settle gate (`resolveSettled`) the manual Watch uses,
+        // never auto-starts playback. Waits for SourceListModel's generation-owned complete-set receipt,
         // then routes through the EXISTING `playBest` auto-pick. Fires once; a manual pick (presenter.request
         // set) or backing out cancels/short-circuits it, leaving the full list.
         .task {
             guard SourcePreferences.shared.autoPickBest,
                   meta?.usesSeriesLifecycle == true,
                   !didAutoPick else { return }
-            let remembered = meta.flatMap { LastStreamStore.entry(for: $0.libraryId, profileID: ProfileStore.shared.activeID)?.qualityText }
-            var firstBestAt: Date?
             var step = 0
             // Honor cancellation: SwiftUI cancels this .task when the page pops, so the loop must BAIL the
             // instant that happens instead of spinning up to 120 main-actor iterations during the pop
@@ -2605,13 +2603,7 @@ struct CoreStreamList: View {
             while !Task.isCancelled, step < 120 {                   // ~30s ceiling (250 ms steps)
                 step += 1
                 if presenter.request != nil || didAutoPick { return }   // a manual pick / re-entry: stand down
-                let progress = core.streamLoadProgress()
-                if sourceList.best != nil, firstBestAt == nil { firstBestAt = Date() }
-                let elapsed = firstBestAt.map { Date().timeIntervalSince($0) } ?? 0
-                let settled = settleTimedOut || StreamRanking.resolveSettled(
-                    sourceList.groups, loaded: progress.loaded, total: progress.total,
-                    secondsSinceFirstPlayable: elapsed, rememberedQuality: remembered)
-                if let best = sourceList.best, settled {
+                if let best = sourceList.best, sourceList.isSettled {
                     // Re-check right before firing: the view may have popped (task cancelled) or a manual pick
                     // landed during this iteration, so never route playBest onto a dismissed page.
                     guard !Task.isCancelled, presenter.request == nil, !didAutoPick else { return }
@@ -2640,15 +2632,21 @@ struct CoreStreamList: View {
         .onAppear {
             sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
                             mediaServers: mediaServers, debridCache: debridCache)
-            torboxSearch.refresh(imdbId: titleIdentity.titleID, season: meta?.season, episode: meta?.episode)
+            AuxiliarySourcePipeline.refresh(
+                target: auxiliaryTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
+                isSignedIn: VortXSyncManager.shared.isSignedIn
+            )
             mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
-                                 title: meta?.name, publicationTarget: mediaServerTargetID)
+                                 title: meta?.name, publicationTarget: mediaServerTarget)
             refreshSourceIndex()
         }
-        .onChange(of: mediaServerTargetID) { _ in
-            torboxSearch.refresh(imdbId: titleIdentity.titleID, season: meta?.season, episode: meta?.episode)
+        .onChange(of: mediaServerTarget) { _ in
+            AuxiliarySourcePipeline.refresh(
+                target: auxiliaryTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
+                isSignedIn: VortXSyncManager.shared.isSignedIn
+            )
             mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
-                                 title: meta?.name, publicationTarget: mediaServerTargetID)
+                                 title: meta?.name, publicationTarget: mediaServerTarget)
             refreshSourceIndex()
             scheduleSourceRefresh()
         }
@@ -2849,17 +2847,20 @@ struct CoreStreamList: View {
         return try? JSONDecoder().decode(CoreStream.self, from: data)
     }
 
-    /// The pool `content_id` for this list: the title's imdb id, plus `:S:E` when the `PlaybackMeta` carries
-    /// a season + episode (a series episode list). nil when no imdb id is known (e.g. a live channel).
-    private var sourceContentID: String? {
-        SourceIndexClient.contentID(roles: identityRoles, season: meta?.season, episode: meta?.episode)
+    /// One resolver-built publication target for every auxiliary owner on this page. A role mismatch or a
+    /// partial episode tuple is carried as a typed failure, so no caller can silently widen it to a title key.
+    private var auxiliaryTarget: SourceIndexIdentity.TargetResolution {
+        SourceIndexIdentity.publicationTarget(
+            identityRoles, season: meta?.season, episode: meta?.episode
+        )
     }
 
-    private var mediaServerTargetID: String {
-        if let sourceContentID { return sourceContentID }
-        let libraryID = meta?.libraryId ?? titleIdentity.titleID ?? "unknown"
-        let videoID = episodeStreamId ?? meta?.videoId ?? "title"
-        return "meta:\(libraryID)|video:\(videoID)"
+    private var mediaServerTarget: SourceIndexIdentity.MediaServerTarget? {
+        SourceIndexIdentity.mediaServerTarget(
+            preferring: auxiliaryTarget,
+            metaID: meta?.libraryId ?? titleIdentity.titleID,
+            videoID: episodeStreamId ?? meta?.videoId
+        )
     }
 
     /// Community source index (tvOS): SERVE refresh + HOARD contribution for this title/episode. Fully gated
@@ -2875,18 +2876,21 @@ struct CoreStreamList: View {
         guard sourceRefreshPlaybackGate.permitsRefresh(
             playerActive: core.playerActive
         ) else { return }
-        let contentID = sourceContentID
-        let vortxSignedIn = VortXSyncManager.shared.isSignedIn
-        sourceIndex.refresh(contentID: contentID, isSignedIn: vortxSignedIn)
-        guard let contentID else { return }
+        AuxiliarySourcePipeline.refresh(
+            target: auxiliaryTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
+            isSignedIn: VortXSyncManager.shared.isSignedIn
+        )
+        guard let target = SourceIndexIdentity.validatedTarget(auxiliaryTarget) else { return }
         // Pool-EXCLUDED hoard set: the caller's torbox-base when it already merged one (avoids a second walk),
         // else self-merge. NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into
         // itself would be wrong. `providerByHash` tags each cached torrent with the provider the user's OWN
         // cache-check confirmed.
-        let groups = torboxMerged ?? torboxSearch.merged(into: targetCoreGroups)
+        let groups = torboxMerged ?? AuxiliarySourcePipeline.torBoxMerged(
+            into: targetCoreGroups, target: auxiliaryTarget, torBox: torboxSearch
+        )
         guard !groups.isEmpty else { return }
         requestSourceContribution(
-            contentID: contentID, groups: groups, providerByHash: providerByHash
+            target: target, groups: groups, providerByHash: providerByHash
         )
     }
 
@@ -2894,7 +2898,7 @@ struct CoreStreamList: View {
     /// launching another full descriptor extraction. When the owner finishes, one newest-snapshot refresh
     /// catches any rows that arrived meanwhile. Covered detail pages do no contribution work during playback.
     private func requestSourceContribution(
-        contentID: String,
+        target: SourceIndexIdentity.PublicationTarget,
         groups: [CoreStreamSourceGroup],
         providerByHash: [String: String]
     ) {
@@ -2902,7 +2906,7 @@ struct CoreStreamList: View {
         guard case .launch(let claim) = sourceContributionPolicy.request() else { return }
         VXProbe.log(
             "perf",
-            "source contribution start target=\(VXProbeRedaction.identityToken(contentID)) claim=\(claim.generation) groups=\(groups.count)"
+            "source contribution start target=\(VXProbeRedaction.identityToken(target.contentID)) claim=\(claim.generation) groups=\(groups.count)"
         )
         sourceContributionTask = Task.detached(priority: .utility) {
             guard await SourceIndexClient.contributionAllowedNow() else {
@@ -2910,7 +2914,8 @@ struct CoreStreamList: View {
                     finishSourceContribution(
                         claim: claim,
                         target: nil,
-                        acceptedByProcess: false
+                        acceptedByProcess: false,
+                        reason: "rate-limited"
                     )
                 }
                 return
@@ -2924,7 +2929,8 @@ struct CoreStreamList: View {
                     finishSourceContribution(
                         claim: claim,
                         target: nil,
-                        acceptedByProcess: false
+                        acceptedByProcess: false,
+                        reason: "no-descriptors"
                     )
                 }
                 return
@@ -2936,38 +2942,42 @@ struct CoreStreamList: View {
                     finishSourceContribution(
                         claim: claim,
                         target: nil,
-                        acceptedByProcess: false
+                        acceptedByProcess: false,
+                        reason: "empty-fingerprint"
                     )
                 }
                 return
             }
-            let target = SourceContributionWorkPolicy.Target(
-                contentID: contentID, descriptorFingerprint: fingerprint
+            let contributionTarget = SourceContributionWorkPolicy.Target(
+                contentID: target.contentID, descriptorFingerprint: fingerprint
             )
             let shouldSubmit = await MainActor.run {
                 !CoreBridge.shared.playerActive
-                    && sourceContributionPolicy.shouldSubmit(target, for: claim)
+                    && sourceContributionPolicy.shouldSubmit(contributionTarget, for: claim)
             }
             guard shouldSubmit else {
                 await MainActor.run {
                     finishSourceContribution(
                         claim: claim,
-                        target: target,
-                        acceptedByProcess: false
+                        target: contributionTarget,
+                        acceptedByProcess: false,
+                        reason: "player-active-or-dup"
                     )
                 }
                 return
             }
             let outcome = await SourceIndexClient.contribute(
-                contentID: contentID,
+                contentID: target.contentID,
                 descriptors: descriptors
             )
             guard !Task.isCancelled else { return }
+            let accepted = outcome == .acceptedByProcess
             await MainActor.run {
                 finishSourceContribution(
                     claim: claim,
-                    target: target,
-                    acceptedByProcess: outcome == .acceptedByProcess
+                    target: contributionTarget,
+                    acceptedByProcess: accepted,
+                    reason: accepted ? "accepted" : "worker-deferred"
                 )
             }
         }
@@ -2976,7 +2986,8 @@ struct CoreStreamList: View {
     private func finishSourceContribution(
         claim: SourceContributionWorkPolicy.Claim,
         target: SourceContributionWorkPolicy.Target?,
-        acceptedByProcess: Bool
+        acceptedByProcess: Bool,
+        reason: String
     ) {
         let completion = sourceContributionPolicy.complete(
             claim,
@@ -2987,9 +2998,12 @@ struct CoreStreamList: View {
             return
         }
         sourceContributionTask = nil
+        // `accepted=false` has FIVE distinct producers (rate-limited / no-descriptors / empty-fingerprint /
+        // player-active-or-dup / worker-deferred); `reason` names which one so the log is diagnosable instead
+        // of a bare boolean.
         VXProbe.log(
             "perf",
-            "source contribution end claim=\(claim.generation) accepted=\(acceptedByProcess ? "true" : "false") deferred=\(needsNewestSnapshot ? "true" : "false")"
+            "source contribution end claim=\(claim.generation) accepted=\(acceptedByProcess ? "true" : "false") reason=\(reason) deferred=\(needsNewestSnapshot ? "true" : "false")"
         )
         if needsNewestSnapshot, !core.playerActive {
             scheduleSourceRefresh()
@@ -3027,11 +3041,16 @@ struct CoreStreamList: View {
                 sourceRefreshDebounce = nil
                 return
             }
-            let torboxBase = torboxSearch.merged(into: targetCoreGroups)   // pool-EXCLUDED (hoard set)
+            let torboxBase = AuxiliarySourcePipeline.torBoxMerged(
+                into: targetCoreGroups, target: auxiliaryTarget, torBox: torboxSearch
+            )   // pool-EXCLUDED (hoard set)
             // Pool-INCLUDED: cache awareness needs raw torrents and TorBox-search NZBs that the Direct-links-only
             // filter would drop, plus Singularity's torrent-only pool sources. Torrents resolve through debrid;
             // TorBox-search NZBs resolve through TorBox. This remains orthogonal to the display filter.
-            debridCache.refresh(from: sourceIndex.merged(into: torboxBase))
+            debridCache.refresh(from: AuxiliarySourcePipeline.merged(
+                into: torboxBase, target: auxiliaryTarget,
+                torBox: torboxSearch, sourceIndex: sourceIndex
+            ))
             refreshSourceIndex(torboxMerged: torboxBase,
                                providerByHash: debridCache.cachedProviderByHash) // reuse the base; tag cached facts
             sourceRefreshDebounce = nil
@@ -3213,6 +3232,7 @@ struct CoreStreamList: View {
                     currentSessionID: TraktAuth.storedSessionID
                 ) else { return }
                 presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
+                                                    seriesInventoryAuthority: seriesInventoryAuthority,
                                                     sourceHint: entry.qualityText, torrent: false,
                                                     bingeGroup: entry.bingeGroup, headers: entry.headers,
                                                     debridRef: ref, sourceStream: resumeSource,
@@ -3242,6 +3262,7 @@ struct CoreStreamList: View {
                 currentSessionID: TraktAuth.storedSessionID
             ) else { return }
             presenter.request = PlaybackRequest(url: win.ref.url, title: title, meta: meta, episodes: episodes,
+                                                seriesInventoryAuthority: seriesInventoryAuthority,
                                                 sourceHint: StreamRanking.signature(win.stream), torrent: false,
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
                                                 headers: win.stream.requestHeaders, debridRef: win.ref,
@@ -3302,6 +3323,7 @@ struct CoreStreamList: View {
                 currentSessionID: TraktAuth.storedSessionID
             ) else { return }
             presenter.request = PlaybackRequest(url: ref.url, title: title, meta: meta, episodes: episodes,
+                                                seriesInventoryAuthority: seriesInventoryAuthority,
                                                 sourceHint: StreamRanking.signature(stream), torrent: false,
                                                 bingeGroup: stream.behaviorHints?.bingeGroup,
                                                 headers: stream.requestHeaders, debridRef: ref,
@@ -3325,6 +3347,7 @@ struct CoreStreamList: View {
             currentSessionID: TraktAuth.storedSessionID
         ) else { return }
         presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
+                                            seriesInventoryAuthority: seriesInventoryAuthority,
                                             sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             headers: stream.requestHeaders, sourceStream: stream,

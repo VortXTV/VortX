@@ -425,10 +425,14 @@ final class TraktSyncEngine {
         request.setValue("2", forHTTPHeaderField: "trakt-api-version")
         request.setValue(TraktAuth.clientID, forHTTPHeaderField: "trakt-api-key")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200,
+        guard let response = try? await AuthenticatedHTTPTransport.shared.send(
+                  request,
+                  allowedHosts: ["api.trakt.tv"],
+                  maxResponseBytes: AuthenticatedHTTPTransport.snapshotResponseLimit
+              ),
+              response.statusCode == 200,
               await TraktAuth.shared.sessionID == expectedSession,
-              let json = try? JSONSerialization.jsonObject(with: data) else { return nil }
+              let json = try? AuthenticatedHTTPTransport.jsonObject(from: response.data) else { return nil }
         return json
     }
 

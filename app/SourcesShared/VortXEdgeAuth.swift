@@ -36,6 +36,11 @@ enum VortXEdgeAuth {
     private static let tsHeader = "X-VX-Ts"
     private static let sigHeader = "X-VX-Sig"
     private static let kidHeader = "X-VX-Kid"
+    private static let bodyHeader = "X-VX-Body"
+    private static let authVersionHeader = "X-VX-Auth-Version"
+    private static let oauthNonceHeader = "X-VX-Nonce"
+    private static let oauthBodyDigestHeader = "X-VX-Body-SHA256"
+    private static let oauthSigningVersion = "2"
 
     /// Query-param names for the header-less signing variant (`signedURL`). These MUST match the workers'
     /// shared `edge_auth.ts` (`SIG_QUERY_TS` / `SIG_QUERY_SIG` / `SIG_QUERY_KID`), which read a query signature
@@ -58,7 +63,7 @@ enum VortXEdgeAuth {
     private static let signedURLReuse: TimeInterval = 150   // half the 300s worker skew window
     private static let signedURLCacheCap = 512              // bound growth across a long browse session
     private static let signedURLLock = NSLock()
-    private static var signedURLCache: [String: (signed: URL, at: TimeInterval)] = [:]
+    nonisolated(unsafe) private static var signedURLCache: [String: (signed: URL, at: TimeInterval)] = [:]
 
     /// Current signing key id. Rotation is a TWO-part change provisioned together: (1) a NEW masked
     /// `VortXEdgeSecret` in Info.plist (via `maskedValue(for:)`) AND (2) this new kid, plus the matching
@@ -71,7 +76,7 @@ enum VortXEdgeAuth {
     private static let gatedHosts: Set<String> = [
         "skip.vortx.tv", "trickplay.vortx.tv", "ratings.vortx.tv", "poster.vortx.tv", "erdb.vortx.tv",
         "trailer.vortx.tv", "catalogs.vortx.tv", "config.vortx.tv", "subtitles.vortx.tv", "add.vortx.tv",
-        "sources.vortx.tv", "watch.vortx.tv", "iptv.vortx.tv",
+        "sources.vortx.tv", "watch.vortx.tv", "iptv.vortx.tv", "oauth.vortx.tv",
     ]
 
     /// The runtime de-mask key, assembled from two scattered fragments so it is not a single findable
@@ -119,6 +124,60 @@ enum VortXEdgeAuth {
         request.setValue(keyId, forHTTPHeaderField: kidHeader)
         request.setValue(sig, forHTTPHeaderField: sigHeader)
     }
+
+    /// Sign a request whose body changes the authenticated mutation. The body hash is sent explicitly and is
+    /// included in the HMAC message after the timestamp; callers must assign `httpBody` before invoking this.
+    /// This is used for pairing acknowledgements so a valid GET/POST signature cannot be replayed with a changed
+    /// delivery outcome.
+    static func signIncludingBody(_ request: inout URLRequest) {
+        guard let url = request.url, let host = url.host, gatedHosts.contains(host) else { return }
+
+        let method = (request.httpMethod ?? "GET").uppercased()
+        let ts = String(Int(Date().timeIntervalSince1970))
+        let body = request.httpBody ?? Data()
+        let bodyHash = SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
+        let message = "\(method)\n\(signedPath(of: url))\n\(ts)\n\(bodyHash)"
+        let sig = hexSignature(message: message)
+
+        request.setValue(ts, forHTTPHeaderField: tsHeader)
+        request.setValue(keyId, forHTTPHeaderField: kidHeader)
+        request.setValue(bodyHash, forHTTPHeaderField: bodyHeader)
+        request.setValue(sig, forHTTPHeaderField: sigHeader)
+    }
+
+    /// Sign an OAuth broker request with the body-bound v2 contract. The caller must pass the exact bytes it
+    /// assigns to `URLRequest.httpBody`; the worker hashes those same bytes before it parses them. Returning
+    /// false is a fail-closed result for a missing or malformed edge secret, not an unsigned request.
+    @discardableResult
+    static func signOAuthV2(_ request: inout URLRequest, body: Data) -> Bool {
+        guard let url = request.url,
+              url.host == "oauth.vortx.tv",
+              !secret.isEmpty else { return false }
+
+        let method = (request.httpMethod ?? "GET").uppercased()
+        let timestamp = String(Int(Date().timeIntervalSince1970))
+        let nonce = oauthNonce()
+        let digest = sha256Hex(body)
+        let signature = oauthV2Signature(
+            method: method,
+            path: signedOAuthPath(of: url),
+            query: rawQuery(of: url),
+            timestamp: timestamp,
+            nonce: nonce,
+            bodyDigest: digest
+        )
+
+        request.setValue(oauthSigningVersion, forHTTPHeaderField: authVersionHeader)
+        request.setValue(timestamp, forHTTPHeaderField: tsHeader)
+        request.setValue(keyId, forHTTPHeaderField: kidHeader)
+        request.setValue(nonce, forHTTPHeaderField: oauthNonceHeader)
+        request.setValue(digest, forHTTPHeaderField: oauthBodyDigestHeader)
+        request.setValue(signature, forHTTPHeaderField: sigHeader)
+        return true
+    }
+
+    /// True only when the broker signer has a valid masked production key.
+    static var canSignOAuthV2: Bool { !secret.isEmpty }
 
     /// Return a QUERY-signed copy of `url` for header-less asset loads: `AsyncImage(url:)` and other `<img>`/
     /// `<video>`-style GETs that cannot attach `X-VX-*` headers. Appends `vts` / `vkid` / `vsig`, where `vsig`
@@ -183,12 +242,61 @@ enum VortXEdgeAuth {
         URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? url.path
     }
 
+    /// The OAuth v2 contract keeps the raw percent-encoded query spelling. Do not rebuild it with queryItems:
+    /// that can reorder fields or normalize escaped bytes after the signature was computed.
+    private static func rawQuery(of url: URL) -> String {
+        let raw = url.absoluteString
+        guard let question = raw.firstIndex(of: "?") else { return "" }
+        let start = raw.index(after: question)
+        let end = raw[start...].firstIndex(of: "#") ?? raw.endIndex
+        return String(raw[start..<end])
+    }
+
+    private static func signedOAuthPath(of url: URL) -> String {
+        URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? url.path
+    }
+
+    private static func oauthNonce() -> String {
+        var generator = SystemRandomNumberGenerator()
+        var bytes = [UInt8](repeating: 0, count: 16)
+        for index in bytes.indices { bytes[index] = generator.next() }
+        return Data(bytes)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func oauthV2Signature(
+        method: String,
+        path: String,
+        query: String,
+        timestamp: String,
+        nonce: String,
+        bodyDigest: String
+    ) -> String {
+        let message = [
+            "VORTX-OAUTH-V2", method, path, query, timestamp, nonce, bodyDigest,
+        ].joined(separator: "\n")
+        let key = SymmetricKey(data: Data(secret.utf8))
+        let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: key)
+        return mac.map { String(format: "%02x", $0) }.joined()
+    }
+
     /// Lowercase-hex `HMAC-SHA256(key, METHOD\npath\nts)`. `key` = UTF-8 bytes of the 64-char hex secret STRING
     /// (NOT hex-decoded), matching the workers. With an empty secret this is an (empty-key) HMAC; the header
     /// path stamps it regardless (identical wire shape in observe + enforce), while `signedURL` fails open
     /// before ever reaching here.
     private static func hexSignature(method: String, signedPath: String, ts: String) -> String {
         let message = "\(method)\n\(signedPath)\n\(ts)"
+        return hexSignature(message: message)
+    }
+
+    private static func hexSignature(message: String) -> String {
         let key = SymmetricKey(data: Data(secret.utf8))
         let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: key)
         return mac.map { String(format: "%02x", $0) }.joined()

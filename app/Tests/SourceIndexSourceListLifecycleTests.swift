@@ -1,6 +1,9 @@
-// Standalone lifecycle race harness for the production SourceListModel.swift.
+// Standalone lifecycle race harness for the production SourceIndex identity and SourceListModel code.
 //
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors -o /tmp/source-list-lifecycle-test \
+//     app/SourcesShared/SourceIndexContract.swift \
+//     app/SourcesShared/SourceIndexIdentity.swift \
+//     app/SourcesShared/SourceSettlementPolicy.swift \
 //     app/SourcesShared/SourceListModel.swift \
 //     app/Tests/SourceIndexSourceListLifecycleTests.swift && /tmp/source-list-lifecycle-test
 
@@ -66,22 +69,51 @@ final class CoreBridge: ObservableObject {
     @Published var streamsEpoch = 0
     @Published var addons: [String] = []
     var groups: [CoreStreamSourceGroup]
+    var rawSettlement: SourceContributorSettlement = .terminal
+    var rawProgress = (loaded: 1, total: 1)
 
     init(groups: [CoreStreamSourceGroup]) { self.groups = groups }
     func streamGroups() -> [CoreStreamSourceGroup] { groups }
     func streamGroups(forStreamId: String) -> [CoreStreamSourceGroup] { groups }
+    func streamLoadProgress() -> (loaded: Int, total: Int) { rawProgress }
+    func streamLoadProgress(forStreamId: String) -> (loaded: Int, total: Int) { rawProgress }
+    func streamContributorSettlement(metaId: String, streamId: String?) -> SourceContributorSettlement {
+        rawSettlement
+    }
 }
 
 @MainActor
 final class TorBoxSearchSource: ObservableObject {
     @Published var streams: [CoreStream] = [] { didSet { epoch &+= 1 } }
+    @Published var settlementEpoch = 0
     var epoch = 0
-    var publishedContentID: String?
+    var publishedTarget: SourceIndexIdentity.PublicationTarget?
+    var registered = true
+    private var settlementTarget: String?
+    private var settlement: SourceContributorSettlement = .pending
+
+    func setSettlement(target: String?, state: SourceContributorSettlement) {
+        settlementTarget = target
+        settlement = state
+        settlementEpoch &+= 1
+    }
+
+    func settlementState(for target: String?) -> SourceContributorSettlement {
+        guard registered, let target else { return .inactive }
+        guard settlementTarget == target else { return .pending }
+        return settlement
+    }
+
+    func settlementState(for target: SourceIndexIdentity.TargetResolution) -> SourceContributorSettlement {
+        guard let target = SourceIndexIdentity.validatedTarget(target) else { return .inactive }
+        return settlementState(for: target.contentID)
+    }
 
     nonisolated static func merge(
+        authorizedBy authorization: SourceIndexIdentity.MergeAuthorization?,
         _ streams: [CoreStream], into groups: [CoreStreamSourceGroup]
     ) -> [CoreStreamSourceGroup] {
-        guard !streams.isEmpty else { return groups }
+        guard authorization != nil, !streams.isEmpty else { return groups }
         return groups + [CoreStreamSourceGroup(id: "torbox", addon: "TorBox", streams: streams)]
     }
 }
@@ -89,27 +121,52 @@ final class TorBoxSearchSource: ObservableObject {
 @MainActor
 final class SourceIndexServeSource: ObservableObject, SourceIndexLifecycleParticipant {
     @Published var streams: [CoreStream] { didSet { epoch &+= 1 } }
+    @Published var settlementEpoch = 0
     private(set) var epoch = 0
     private var gateOpen = true
-    var publishedContentID: String?
+    var publishedTarget: SourceIndexIdentity.PublicationTarget?
+    var registered = true
+    private var settlementTarget: String?
+    private var settlement: SourceContributorSettlement = .pending
 
-    init(streams: [CoreStream], publishedContentID: String? = nil) {
+    init(streams: [CoreStream], publishedTarget: SourceIndexIdentity.PublicationTarget? = nil) {
         self.streams = streams
-        self.publishedContentID = publishedContentID
+        self.publishedTarget = publishedTarget
+    }
+
+    func setSettlement(target: String?, state: SourceContributorSettlement) {
+        settlementTarget = target
+        settlement = state
+        settlementEpoch &+= 1
+    }
+
+    func settlementState(for target: String?) -> SourceContributorSettlement {
+        guard registered, gateOpen, let target else { return .inactive }
+        guard settlementTarget == target else { return .pending }
+        return settlement
+    }
+
+    func settlementState(for target: SourceIndexIdentity.TargetResolution) -> SourceContributorSettlement {
+        guard let target = SourceIndexIdentity.validatedTarget(target) else { return .inactive }
+        return settlementState(for: target.contentID)
     }
 
     nonisolated static func merge(
+        authorizedBy authorization: SourceIndexIdentity.MergeAuthorization?,
         _ streams: [CoreStream], into groups: [CoreStreamSourceGroup]
     ) -> [CoreStreamSourceGroup] {
-        guard !streams.isEmpty else { return groups }
+        guard authorization != nil, !streams.isEmpty else { return groups }
         return groups + [CoreStreamSourceGroup(id: "singularity", addon: "Singularity", streams: streams)]
     }
 
     func sourceIndexLifecycleDidClose(retiredSourceGeneration _: UInt64) {
         gateOpen = false
-        publishedContentID = nil
+        publishedTarget = nil
         streams = []
         epoch &+= 1
+        settlementTarget = nil
+        settlement = .inactive
+        settlementEpoch &+= 1
     }
 
     func permitsDetachedPublish(
@@ -125,13 +182,34 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
 @MainActor
 final class MediaServerSource: ObservableObject {
     @Published var groups: [CoreStreamSourceGroup] = [] { didSet { epoch &+= 1 } }
+    @Published var settlementEpoch = 0
     var epoch = 0
-    var publishedContentID: String?
+    var publishedTarget: SourceIndexIdentity.MediaServerTarget?
+    var registered = true
+    private var settlementTarget: String?
+    private var settlement: SourceContributorSettlement = .pending
+
+    func setSettlement(target: String?, state: SourceContributorSettlement) {
+        settlementTarget = target
+        settlement = state
+        settlementEpoch &+= 1
+    }
+
+    func settlementState(for target: String?) -> SourceContributorSettlement {
+        guard registered, let target else { return .inactive }
+        guard settlementTarget == target else { return .pending }
+        return settlement
+    }
+
+    func settlementState(for target: SourceIndexIdentity.MediaServerTarget?) -> SourceContributorSettlement {
+        settlementState(for: target?.token)
+    }
 
     nonisolated static func merge(
+        authorizedBy authorization: SourceIndexIdentity.MediaServerMergeAuthorization?,
         _ mediaGroups: [CoreStreamSourceGroup], into groups: [CoreStreamSourceGroup]
     ) -> [CoreStreamSourceGroup] {
-        groups + mediaGroups
+        authorization == nil ? groups : groups + mediaGroups
     }
 }
 
@@ -259,6 +337,34 @@ enum VortxShadowRanking {
 enum VXProbe {
     static func log(_ channel: String, _ message: String) {}
 }
+enum VXProbeRedaction {
+    static func identityToken(_ raw: String?) -> String { raw == nil ? "none" : "redacted" }
+}
+
+func lifecycleTarget(_ contentID: String?) -> SourceIndexIdentity.TargetResolution {
+    guard let contentID else { return .absent }
+    let parts = contentID.split(separator: ":")
+    guard parts.count == 1 || parts.count == 3 else { return .absent }
+    let titleID = String(parts[0])
+    let roles = SourceIndexIdentity.Roles(
+        catalogID: titleID, defaultVideoID: nil, currentVideoID: nil,
+        kind: parts.count == 3 ? .series : .movie
+    )
+    return SourceIndexIdentity.publicationTarget(
+        roles,
+        season: parts.count == 3 ? Int(parts[1]) : nil,
+        episode: parts.count == 3 ? Int(parts[2]) : nil
+    )
+}
+
+func lifecycleMediaTarget(_ contentID: String?) -> SourceIndexIdentity.MediaServerTarget? {
+    guard let contentID else { return nil }
+    let target = lifecycleTarget(contentID)
+    if SourceIndexIdentity.validatedTarget(target) != nil {
+        return SourceIndexIdentity.mediaServerTarget(page: target)
+    }
+    return SourceIndexIdentity.mediaServerTarget(metaID: contentID)
+}
 
 @main
 struct SourceIndexSourceListLifecycleTests {
@@ -271,22 +377,27 @@ struct SourceIndexSourceListLifecycleTests {
         let core = CoreBridge(groups: [
             CoreStreamSourceGroup(id: "ordinary", addon: "Ordinary", streams: [ordinary]),
         ])
+        let target11 = lifecycleTarget("tt0903747:1:1")
+        let media11 = lifecycleMediaTarget("tt0903747:1:1")
         let torbox = TorBoxSearchSource()
-        torbox.publishedContentID = "tt0903747:1:1"
+        torbox.publishedTarget = target11.target
         torbox.streams = [torboxRow]
+        torbox.setSettlement(target: "tt0903747:1:1", state: .terminal)
         let singularity = SourceIndexServeSource(
-            streams: [pooled], publishedContentID: "tt0903747:1:1"
+            streams: [pooled], publishedTarget: target11.target
         )
+        singularity.setSettlement(target: "tt0903747:1:1", state: .terminal)
         let mediaServers = MediaServerSource()
-        mediaServers.publishedContentID = "page:tt0903747:1:1"
+        mediaServers.publishedTarget = media11
         mediaServers.groups = [
             CoreStreamSourceGroup(id: "media", addon: "My Server", streams: [mediaRow]),
         ]
+        mediaServers.setSettlement(target: media11?.token, state: .terminal)
         let debridCache = DebridCacheAwareness()
-        let model = SourceListModel()
+        let model = SourceListModel(settlementMaximumWait: 2)
         model.setContext(
             metaId: "tt0903747", streamId: "tt0903747:1:1", continuity: nil, pin: nil,
-            auxiliaryContentID: "tt0903747:1:1", mediaServerTargetID: "page:tt0903747:1:1"
+            auxiliaryTarget: target11, mediaServerTarget: media11
         )
 
         model.bind(
@@ -303,15 +414,18 @@ struct SourceIndexSourceListLifecycleTests {
         let initialPublished = ["torbox", "singularity", "media"].allSatisfy { id in
             model.groups.contains { $0.id == id }
         }
+        let initialSettled = model.settlement == .settledAll
 
         model.setContext(
             metaId: "tt0903747", streamId: "tt0903747:1:2", continuity: nil, pin: nil,
-            auxiliaryContentID: "tt0903747:1:2", mediaServerTargetID: "page:tt0903747:1:2"
+            auxiliaryTarget: lifecycleTarget("tt0903747:1:2"),
+            mediaServerTarget: lifecycleMediaTarget("tt0903747:1:2")
         )
         let identityClearedSynchronously = model.groups.isEmpty
             && model.best == nil
             && model.tiers.isEmpty
             && model.resolutionOptions.isEmpty
+            && model.settlement == .waiting
         for _ in 0..<4_000 {
             if model.groups.contains(where: { $0.id == "ordinary" }) { break }
             try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
@@ -319,15 +433,25 @@ struct SourceIndexSourceListLifecycleTests {
         let staleAuxiliaryExcluded = ["torbox", "singularity", "media"].allSatisfy { id in
             !model.groups.contains { $0.id == id }
         }
+        torbox.setSettlement(target: "tt0903747:1:1", state: .terminal)
+        singularity.setSettlement(target: "tt0903747:1:1", state: .terminal)
+        mediaServers.setSettlement(target: media11?.token, state: .terminal)
+        try? await Task<Never, Never>.sleep(nanoseconds: 350_000_000)
+        let staleTargetCompletionIgnored = model.settlement == .waiting
 
-        torbox.publishedContentID = "tt0903747:1:2"
+        let target12 = lifecycleTarget("tt0903747:1:2")
+        let media12 = lifecycleMediaTarget("tt0903747:1:2")
+        torbox.publishedTarget = target12.target
         torbox.streams = [torboxRow]
-        singularity.publishedContentID = "tt0903747:1:2"
+        torbox.setSettlement(target: "tt0903747:1:2", state: .terminal)
+        singularity.publishedTarget = target12.target
         singularity.streams = [pooled]
-        mediaServers.publishedContentID = "page:tt0903747:1:2"
+        singularity.setSettlement(target: "tt0903747:1:2", state: .terminal)
+        mediaServers.publishedTarget = media12
         mediaServers.groups = [
             CoreStreamSourceGroup(id: "media", addon: "My Server", streams: [mediaRow]),
         ]
+        mediaServers.setSettlement(target: media12?.token, state: .terminal)
         for _ in 0..<4_000 {
             let ids = Set(model.groups.map(\.id))
             if ids.isSuperset(of: ["torbox", "singularity", "media"]) { break }
@@ -336,10 +460,74 @@ struct SourceIndexSourceListLifecycleTests {
         let matchingAuxiliaryIncluded = ["torbox", "singularity", "media"].allSatisfy { id in
             model.groups.contains { $0.id == id }
         }
+        let matchingAuxiliarySettled = model.settlement == .settledAll
+
+        // A no-raw/add-on installation with one valid-empty auxiliary response is a complete set, not a
+        // twenty-second wait. The same model then proves same-identity retry deadlines are re-armed after both
+        // settled-all and a prior deadline completion.
+        let auxiliaryCore = CoreBridge(groups: [])
+        auxiliaryCore.rawSettlement = .inactive
+        auxiliaryCore.rawProgress = (0, 0)
+        let auxiliaryTorbox = TorBoxSearchSource()
+        auxiliaryTorbox.setSettlement(target: "tt0000001", state: .terminal)
+        let auxiliarySingularity = SourceIndexServeSource(streams: [])
+        auxiliarySingularity.registered = false
+        let auxiliaryMedia = MediaServerSource()
+        auxiliaryMedia.registered = false
+        let auxiliaryDebridCache = DebridCacheAwareness()
+        let auxiliaryModel = SourceListModel(settlementMaximumWait: 0.05)
+        auxiliaryModel.setContext(
+            metaId: "tt0000001", streamId: nil, continuity: nil, pin: nil,
+            auxiliaryTarget: lifecycleTarget("tt0000001"), mediaServerTarget: nil
+        )
+        auxiliaryModel.bind(
+            core: auxiliaryCore,
+            torbox: auxiliaryTorbox,
+            singularity: auxiliarySingularity,
+            mediaServers: auxiliaryMedia,
+            debridCache: auxiliaryDebridCache
+        )
+        for _ in 0..<4_000 {
+            if auxiliaryModel.settlement == .settledAll { break }
+            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+        }
+        let auxiliaryOnlyEmptySettles = auxiliaryModel.settlement == .settledAll
+
+        auxiliaryTorbox.setSettlement(target: "tt0000001", state: .pending)
+        for _ in 0..<4_000 {
+            if auxiliaryModel.settlement == .waiting { break }
+            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+        }
+        let retryReopened = auxiliaryModel.settlement == .waiting
+        try? await Task<Never, Never>.sleep(nanoseconds: 400_000_000)
+        let retryWasBounded = auxiliaryModel.settlement == .settledDeadline
+
+        auxiliaryTorbox.setSettlement(target: "tt0000001", state: .terminal)
+        for _ in 0..<4_000 {
+            if auxiliaryModel.settlement == .settledAll { break }
+            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+        }
+        auxiliaryTorbox.setSettlement(target: "tt0000001", state: .pending)
+        for _ in 0..<4_000 {
+            if auxiliaryModel.settlement == .waiting { break }
+            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+        }
+        let postDeadlineRetryReopened = auxiliaryModel.settlement == .waiting
+        try? await Task<Never, Never>.sleep(nanoseconds: 400_000_000)
+        let postDeadlineRetryWasBounded = auxiliaryModel.settlement == .settledDeadline
+
+        auxiliaryTorbox.registered = false
+        auxiliaryTorbox.setSettlement(target: "tt0000001", state: .terminal)
+        for _ in 0..<4_000 {
+            if auxiliaryModel.settlement == .settledAll { break }
+            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+        }
+        let ineligibleContributorIsInactive = auxiliaryModel.settlement == .settledAll
 
         model.setContext(
             metaId: "tt0903747", streamId: "tt0903747:1:3", continuity: nil, pin: nil,
-            auxiliaryContentID: "tt0903747:1:3", mediaServerTargetID: "page:tt0903747:1:3"
+            auxiliaryTarget: lifecycleTarget("tt0903747:1:3"),
+            mediaServerTarget: lifecycleMediaTarget("tt0903747:1:3")
         )
         let nextEpisodeClearedSynchronously = model.groups.isEmpty
             && model.best == nil
@@ -375,13 +563,16 @@ struct SourceIndexSourceListLifecycleTests {
             && model.best?.id == "ordinary"
             && !model.groups.contains(where: { $0.id == "singularity" })
 
-        if initialPublished && identityClearedSynchronously && staleAuxiliaryExcluded
-            && matchingAuxiliaryIncluded && nextEpisodeClearedSynchronously
+        if initialPublished && initialSettled && identityClearedSynchronously && staleAuxiliaryExcluded
+            && staleTargetCompletionIgnored && matchingAuxiliaryIncluded && matchingAuxiliarySettled
+            && auxiliaryOnlyEmptySettles && retryReopened && retryWasBounded
+            && postDeadlineRetryReopened && postDeadlineRetryWasBounded
+            && ineligibleContributorIsInactive && nextEpisodeClearedSynchronously
             && detachedRankBlocked && clearedSynchronously && staleCompletionFenced {
-            print("PASS  SourceListModel clears identities, excludes stale auxiliary rows, and fences stale ranks")
+            print("PASS  SourceListModel settles complete generations, re-arms bounded retries, and fences stale work")
             exit(0)
         }
-        print("FAIL  initial=\(initialPublished) identityClear=\(identityClearedSynchronously) auxScope=\(staleAuxiliaryExcluded) auxMatch=\(matchingAuxiliaryIncluded) nextClear=\(nextEpisodeClearedSynchronously) blocked=\(detachedRankBlocked) clear=\(clearedSynchronously) fenced=\(staleCompletionFenced)")
+        print("FAIL  initial=\(initialPublished)/\(initialSettled) identityClear=\(identityClearedSynchronously) auxScope=\(staleAuxiliaryExcluded) staleTarget=\(staleTargetCompletionIgnored) auxMatch=\(matchingAuxiliaryIncluded)/\(matchingAuxiliarySettled) empty=\(auxiliaryOnlyEmptySettles) retry=\(retryReopened)/\(retryWasBounded) postDeadlineRetry=\(postDeadlineRetryReopened)/\(postDeadlineRetryWasBounded) ineligible=\(ineligibleContributorIsInactive) nextClear=\(nextEpisodeClearedSynchronously) blocked=\(detachedRankBlocked) clear=\(clearedSynchronously) fenced=\(staleCompletionFenced)")
         exit(1)
     }
 }

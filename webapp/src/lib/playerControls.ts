@@ -77,6 +77,11 @@ export interface PlayerController {
   consumeAutoMuted(): boolean;
   /** Show a transient toast (e.g. an honest "switched source" message). */
   toast(msg: string): void;
+  /** Show (or update) a persistent on-player notice - the honest "browser can't decode this audio" message. */
+  notice(message: string): void;
+  /** Replace the intro/outro skip segments after mount (they are fetched off the click -> play gesture path
+   *  so autoplay-with-sound isn't broken, then fed in here once resolved). */
+  setSkipSegments(segments: SkipSegment[]): void;
   /** Remove listeners + timers. */
   dispose(): void;
 }
@@ -107,8 +112,8 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
   let openMenu: "settings" | "subs" | null = null;
   let sleepTimer = 0;
   let sleepMins = 0;
-  let autoMuted = false; // set when the player muted itself for autoplay (drives the tap-to-unmute pill)
-  const skipSegments = ctx.skipSegments ?? [];
+  let autoMuted = false; // set when the player muted itself for autoplay (drives the tap-for-sound scrim)
+  let skipSegments = ctx.skipSegments ?? []; // replaced post-mount via the controller (fetched off the gesture path)
 
   const remotePlayback = (video as unknown as { remote?: { state?: string } }).remote;
   const canCast = typeof remotePlayback === "object" && remotePlayback !== null && "watchAvailability" in (remotePlayback as object);
@@ -126,7 +131,7 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
         <div class="pl-title" id="pl-title"></div>
       </div>
 
-      <button class="pl-unmute" id="pl-unmute" hidden aria-label="Tap to unmute">${icon("volume-x") || "🔇"}<span>Tap to unmute</span></button>
+      <button class="pl-unmute" id="pl-unmute" hidden aria-label="Tap for sound">${icon("volume-x") || "🔇"}<span>Tap for sound</span></button>
 
       <div class="pl-corner">
         <button class="pl-skipseg" id="pl-skipseg" hidden></button>
@@ -473,6 +478,21 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
     stageRoot.appendChild(n);
     window.setTimeout(() => n.remove(), 2600);
   };
+
+  // ---- persistent notice (D honesty floor) ----
+  // A centered, non-blocking card that stays put (unlike the transient toast) - used when every source left
+  // in the chain plays silently, so we're honest instead of running on in silence. Set as plain text.
+  let noticeEl: HTMLElement | null = null;
+  const showNotice = (message: string) => {
+    if (!noticeEl) {
+      noticeEl = document.createElement("div");
+      noticeEl.className = "pl-notice";
+      noticeEl.setAttribute("role", "status");
+      stageRoot.appendChild(noticeEl);
+    }
+    noticeEl.textContent = message;
+    show(); // reveal the chrome so the notice is visible immediately
+  };
   $("pl-snap")!.addEventListener("click", () => {
     try {
       const canvas = document.createElement("canvas");
@@ -609,6 +629,13 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
     },
     toast(msg: string) {
       flash(msg);
+    },
+    notice(message: string) {
+      showNotice(message);
+    },
+    setSkipSegments(segments: SkipSegment[]) {
+      skipSegments = segments;
+      renderSkip(); // re-evaluate against the current time so a Skip button can appear right away
     },
     dispose() {
       window.clearTimeout(hideTimer);

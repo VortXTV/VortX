@@ -426,10 +426,14 @@ enum TraktListImportClient {
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              let http = resp as? HTTPURLResponse, http.statusCode == 200,
+        guard let response = try? await AuthenticatedHTTPTransport.shared.send(
+                  req,
+                  allowedHosts: ["api.trakt.tv"],
+                  maxResponseBytes: AuthenticatedHTTPTransport.snapshotResponseLimit
+              ),
+              response.statusCode == 200,
               !authorized || TraktAuth.storedSessionID == expectedSession,
-              let array = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+              let array = (try? AuthenticatedHTTPTransport.jsonObject(from: response.data)) as? [[String: Any]] else {
             return RawList(title: nil, entries: [])
         }
 

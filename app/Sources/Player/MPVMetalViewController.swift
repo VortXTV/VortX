@@ -102,6 +102,8 @@ final class MPVMetalViewController: PlatformViewController {
     /// and event binding, so a wakeup cannot observe START_FILE before its exact entry ID is registered.
     private let loadTokenLock = NSLock()
     private var loadProvenance = PlayerLoadProvenanceState()
+    /// One destructive cache flight per controller; all mutations occur on the main queue.
+    private var cacheFlushFlight = CacheFlushSingleFlight<PlayerLoadToken>()
     var activeLoadToken: PlayerLoadToken? {
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         return loadProvenance.activeToken
@@ -228,6 +230,14 @@ final class MPVMetalViewController: PlatformViewController {
 
     #if os(tvOS)
     private let framePresentationDiagnostics = FramePresentationDiagnosticsAccumulator()
+    /// B-instrument: last logged chroma arm-decision signature, so the one-shot decision receipt in
+    /// updateFramePresentationPolicy logs only when the decision or its inputs actually change (a policy pass
+    /// runs on many events and must not spam). Instrumentation only.
+    private var lastFramePresentationDecisionSignature: String?
+    /// Last frame-drop RATE observed by the receipt path, so the Playback info overlay can report "N total,
+    /// R/min". Only the receipt may take a snapshot (taking one resets the interval), so the overlay reads
+    /// what the receipt last measured instead of sampling its own. nil until the first receipt of a mount.
+    private var lastReceiptFrameDropsPerMinute: Double?
     private var framePresentationGeneration: UInt64 = 0
     private var framePresentationLoadedGeneration: UInt64?
     private var framePresentationStartedGeneration: UInt64?
@@ -457,21 +467,20 @@ final class MPVMetalViewController: PlatformViewController {
     /// receiver; Auto downmixes a stereo route but keeps native multichannel for a real receiver.
     private var channelPolicy: String {
         #if canImport(UIKit)
-        // AirPods: prefer a multichannel layout the system can spatialize (#88), never a forced stereo
-        // downmix, unless the viewer explicitly chose Stereo. `auto-safe` stays safe here too: it falls
-        // back to stereo when the route truly cannot take more, so this never silences AirPods.
-        if routeIsAirPods, AudioOutputMode.current != .stereo { return "auto-safe" }
-        // A route that can only render stereo (TV built-in speakers, AirPlay) silently fails to open
-        // a decoded multichannel layout: force a 2.0 downmix regardless of the chosen mode so the AO
-        // always has something it can play (#78). The viewer can still pick a different route's mode
-        // when a real receiver is attached; this only overrides the stereo-only endpoints.
-        if routeIsStereoOnly { return "stereo" }
+        return AudioRoutePolicy.channelPolicy(
+            mode: AudioOutputMode.current,
+            actualOutputChannels: outputChannels,
+            routeIsStereoOnly: routeIsStereoOnly,
+            routeIsAirPods: routeIsAirPods
+        )
+        #else
+        return AudioRoutePolicy.channelPolicy(
+            mode: AudioOutputMode.current,
+            actualOutputChannels: outputChannels,
+            routeIsStereoOnly: false,
+            routeIsAirPods: false
+        )
         #endif
-        switch AudioOutputMode.current {
-        case .stereo: return "stereo"
-        case .surround, .passthrough: return "auto"   // passthrough bitstreams the native layout untouched
-        case .auto: return outputChannels > 2 ? "auto-safe" : "stereo"
-        }
     }
 
     /// The active route's hardware output sample rate (e.g. 48000 over HDMI-ARC), read after the
@@ -529,48 +538,61 @@ final class MPVMetalViewController: PlatformViewController {
             // sampleRatePolicy below still pins mpv's resampler to whatever rate the route opens at (#78).
             try? session.setPreferredSampleRate(48_000)
             try session.setActive(true)
-            // Read the route FIRST: the multichannel decision below depends on it.
-            outputPortType = session.currentRoute.outputs.first?.portType
-            // #78 DIAGNOSTIC: the reporter's Apple TV is silent under Dolby Atmos but plays fine under Dolby
-            // Digital 5.1, and there is no Atmos hardware here to reproduce against. Log the route's port
-            // type, intrinsic max channels, and rate in BOTH states so the discriminator (what the session
-            // reports differently under Atmos vs working 5.1) is visible in the device log. Read the
-            // intrinsic max BEFORE opting into multichannel content, so it reflects the route itself.
-            let intrinsicMaxChannels = session.maximumOutputNumberOfChannels
-            NSLog("%@", "[#78 audio] route=\(outputPortType?.rawValue ?? "nil") maxOutChannels=\(intrinsicMaxChannels) sampleRate=\(session.sampleRate)")
             // #78: re-assert the route's OWN realized rate as the preferred rate so the AudioUnit opens at a
             // rate the locked Atmos/eARC route actually accepts. This backstops the pre-activation 48 kHz hint
             // above: if the route opened at its native rate (already 48k on eARC, or a different fixed rate),
             // this pins to that realized rate; on every other route the session already reports its native rate
             // so this is a no-op. Keep it (do NOT remove): it is part of the #78 eARC-silence fix.
             if session.sampleRate >= 8000 { try? session.setPreferredSampleRate(session.sampleRate) }
-            // #88 / #78: advertise multichannel content ONLY on routes that can actually OPEN a multichannel
-            // layout. AirPods take a system head-tracked Spatial Audio layout. For wired/receiver routes we
-            // now drive this off the route's OWN reported capability (intrinsic max > 2) instead of trusting
-            // the port type alone: an Apple TV outputs over HDMI and reports `.HDMI` even when its system
-            // audio format is plain stereo or an Atmos layout the audiounit AO cannot open, which advertised
-            // multichannel and left the movie SILENT (#78). A route reporting only 2 intrinsic channels now
-            // stays stereo so the AO opens. Forced stereo routes (TV built-in speakers / AirPlay) stay stereo
-            // exactly as before, preserving the working path.
-            let routeIsMultichannelCapable = !routeIsStereoOnly && (routeIsAirPods || intrinsicMaxChannels > 2)
-            if #available(iOS 15.0, tvOS 15.0, *) {
-                try? session.setSupportsMultichannelContent(routeIsMultichannelCapable)
-            }
-            // Ask the session to OPEN the route's real channel count. Without this the session can sit at 2
-            // output channels on a >2ch HDMI route and the AO/renderer silently downmixes multichannel PCM to
-            // stereo (the reference players set this; we never did). Gated exactly like
-            // setSupportsMultichannelContent above so the #78 stereo-route protections are untouched.
-            if routeIsMultichannelCapable, intrinsicMaxChannels > 2 {
-                try? session.setPreferredOutputNumberOfChannels(min(intrinsicMaxChannels, 8))
-            }
-            NSLog("%@", "[#78 audio] realized outputChannels=\(session.outputNumberOfChannels) (multichannelCapable=\(routeIsMultichannelCapable) intrinsicMax=\(intrinsicMaxChannels))")
-            outputChannels = max(session.maximumOutputNumberOfChannels, 2)
-            outputSampleRate = session.sampleRate
+            refreshAudioSessionPolicy()
         } catch {
             mpvLog.error("AVAudioSession .playback setup failed: \(error.localizedDescription, privacy: .public)")
         }
         #endif
     }
+
+    #if canImport(UIKit)
+    /// Refresh the active route's AVAudioSession policy. Maximum channels bound what we request;
+    /// `outputNumberOfChannels` after that request is the only count used to select mpv's layout.
+    private func refreshAudioSessionPolicy() {
+        let session = AVAudioSession.sharedInstance()
+        let mode = AudioOutputMode.current
+        let sessionMode: AVAudioSession.Mode = mode == .stereo ? .default : .moviePlayback
+        do {
+            try session.setCategory(.playback, mode: sessionMode, options: [])
+        } catch {
+            mpvLog.error("AVAudioSession policy refresh failed: \(error.localizedDescription, privacy: .public)")
+        }
+
+        outputPortType = session.currentRoute.outputs.first?.portType
+        let maximumOutputChannels = session.maximumOutputNumberOfChannels
+        let supportsMultichannelContent = AudioRoutePolicy.supportsMultichannelContent(
+            mode: mode,
+            maximumOutputChannels: maximumOutputChannels,
+            routeIsStereoOnly: routeIsStereoOnly,
+            routeIsAirPods: routeIsAirPods
+        )
+        if #available(iOS 15.0, tvOS 15.0, *) {
+            try? session.setSupportsMultichannelContent(supportsMultichannelContent)
+        }
+
+        let requestedOutputChannels = AudioRoutePolicy.preferredOutputChannels(
+            mode: mode,
+            maximumOutputChannels: maximumOutputChannels,
+            routeIsStereoOnly: routeIsStereoOnly,
+            routeIsAirPods: routeIsAirPods
+        )
+        try? session.setPreferredOutputNumberOfChannels(requestedOutputChannels)
+
+        let actualOutputChannels = AudioRoutePolicy.resolvedOutputChannels(session.outputNumberOfChannels)
+        outputChannels = actualOutputChannels
+        outputSampleRate = session.sampleRate
+        DiagnosticsLog.log(
+            "player",
+            "audio route policy mode=\(mode.rawValue) port=\(outputPortType?.rawValue ?? "none") max=\(maximumOutputChannels) actual=\(actualOutputChannels) requested=\(requestedOutputChannels) resolved=\(channelPolicy)"
+        )
+    }
+    #endif
 
     /// mpv `audio-samplerate` for the current route, or nil to leave mpv on the content rate.
     /// THE soundbar fix: mpv's audiounit AO sets its RemoteIO input to the CONTENT rate and never
@@ -704,8 +726,10 @@ final class MPVMetalViewController: PlatformViewController {
         checkError(mpv_set_option_string(mpv, "network-timeout", "30"))
         // Reconnect on dropped/stalled HTTP (debrid CDNs sometimes reset mid-stream); without this
         // a hiccup looks like an infinite buffer. Followed by hard failure → MPV_EVENT_END_FILE.
+        // FFmpeg 9 makes willclose follow multiple_requests. Persistent requests keep bounded 206 spans
+        // from reopening TCP/TLS.
         checkError(mpv_set_option_string(mpv, "stream-lavf-o",
-            "reconnect=1,reconnect_streamed=1,reconnect_delay_max=7"))
+            "reconnect=1,reconnect_streamed=1,reconnect_delay_max=7,multiple_requests=1"))
 
         // Read-ahead cache: buffer past the play head so transient network dips on big 4K streams
         // don't stall playback. These are the exact values proven on-device for weeks (0.2.5 to
@@ -1064,17 +1088,14 @@ final class MPVMetalViewController: PlatformViewController {
     /// AO against the new route. `mpv_set_option_string` is only valid before `mpv_initialize` (a
     /// silent no-op after), which is why the reapply path uses setString. Handles a receiver
     /// powering on or an HDMI-ARC/eARC handshake settling after the AO was first opened.
-    private func applyChannelPolicy() {
+    private func applyChannelPolicy(force: Bool = false) {
         guard mpv != nil else { return }
-        let session = AVAudioSession.sharedInstance()
-        outputChannels = max(session.maximumOutputNumberOfChannels, 2)
-        outputSampleRate = session.sampleRate
-        outputPortType = session.currentRoute.outputs.first?.portType
+        refreshAudioSessionPolicy()
         let next = (channelPolicy, sampleRatePolicy ?? 0)
-        if let applied = appliedAudioPolicy, applied == next { return }   // no real change: don't churn the AO
+        if !force, let applied = appliedAudioPolicy, applied == next { return }   // no real change: don't churn the AO
         appliedAudioPolicy = next
         setString("audio-channels", next.0)
-        if next.1 > 0 { setString("audio-samplerate", String(next.1)) }
+        setString("audio-samplerate", String(next.1))
         mpvLog.log("audio reapplied: channels=\(next.0, privacy: .public) samplerate=\(next.1 > 0 ? String(next.1) : "content", privacy: .public) (route \(self.outputChannels) ch @ \(Int(self.outputSampleRate)) Hz)")
     }
 
@@ -1087,6 +1108,7 @@ final class MPVMetalViewController: PlatformViewController {
     #endif   // canImport(UIKit): audio-session + lifecycle observers are iOS/tvOS only
 
     func invalidateLoadToken() {
+        finishCacheFlushFlight(cacheFlushFlight.reset())
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         loadProvenance.invalidate()
     }
@@ -1148,6 +1170,8 @@ final class MPVMetalViewController: PlatformViewController {
         // sees nil (no double terminate when dealloc beats the queued block), the event drain
         // stops picking it up, and every property accessor becomes a guarded no-op.
         mpv = nil
+        let surface = isFullPlayerPresentation || probeChannel.description == "player" ? "player" : "ambient"
+        DiagnosticsLog.log("mpv", "stop-requested surface=\(surface)")
         mpv_set_wakeup_callback(handle, nil, nil)
         // Tell the core to wind down NOW (mpv_command_string is thread-safe): decode and network
         // stop immediately. Without this, destruction waited its turn on the event queue, and a
@@ -1158,6 +1182,7 @@ final class MPVMetalViewController: PlatformViewController {
         wakeupRelay = nil
         queue.async {
             mpv_terminate_destroy(handle)
+            DiagnosticsLog.log("mpv", "destroy-finished surface=\(surface)")
             relay?.release()   // no callbacks after terminate_destroy; safe to drop the relay
         }
     }
@@ -1168,6 +1193,8 @@ final class MPVMetalViewController: PlatformViewController {
         // SERIALIZED teardown rather than destroying inline: an inline mpv_terminate_destroy here
         // could race an in-flight readEvents drain on `queue` (double-destroy / use-after-free), so
         // nil the handle synchronously (one owner) and dispatch the destroy onto the event queue.
+        // The gate is main-queue-owned. stop()/invalidateLoadToken() cancels its timeout before normal teardown;
+        // if deinit is the safety-net path, the timeout's weak self capture makes the queued work a no-op.
         if let handle = mpv {
             mpv = nil
             mpv_set_wakeup_callback(handle, nil, nil)
@@ -1180,6 +1207,32 @@ final class MPVMetalViewController: PlatformViewController {
         } else {
             wakeupRelay?.release()
         }
+    }
+
+    private func finishCacheFlushFlight(
+        _ flight: CacheFlushFlight<PlayerLoadToken>?,
+        sampleLiveState: Bool = true
+    ) {
+        #if canImport(UIKit)
+        guard let flight else { return }
+        let bufferedAheadReceipt: String
+        let pausedForCacheReceipt: String
+        if sampleLiveState {
+            bufferedAheadReceipt = cacheFlushSampleReceipt("demuxer-cache-duration")
+            pausedForCacheReceipt = diagnosticFlag("paused-for-cache")
+                .map { $0 ? "true" : "false" } ?? "unknown"
+        } else {
+            bufferedAheadReceipt = "unknown"
+            pausedForCacheReceipt = "unknown"
+        }
+        DiagnosticsLog.log(
+            "player",
+            "internal-cache-flush-end flightId=\(flight.id) reason=\(flight.reason.rawValue) target=\(flight.targetArgument) bufferedAhead=\(bufferedAheadReceipt) pausedForCache=\(pausedForCacheReceipt) loadToken=\(flight.owner.hashValue) coalesced=\(flight.coalescedCount) elapsed=\(cacheFlushElapsedReceipt(startUptime: flight.startUptime)) outcome=\(flight.result.rawValue)"
+        )
+        #else
+        _ = flight
+        _ = sampleLiveState
+        #endif
     }
 
     /// mpv's stock User-Agent, captured once so a stream with custom headers can never leak
@@ -1428,32 +1481,6 @@ final class MPVMetalViewController: PlatformViewController {
             appliedCap = readAhead
             #endif
         }
-        mpv_set_property_string(mpv, "demuxer-max-bytes", appliedCap)
-        activeReadAheadCap = appliedCap
-        baselineReadAheadCap = appliedCap
-        // New file: the old file's buffers are freed by the load, so clear any paused/memory cache clamp
-        // from the previous file and start this one on its normal budget (recorded above for the paused
-        // clamp to restore on resume).
-        pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
-        pausedCacheClamped = false
-        memoryCacheClamped = false
-        #if os(tvOS)
-        proactiveMemoryCacheClamped = false
-        proactiveRecoveredSampleCount = 0
-        restoreCyclesThisFile = 0
-        #endif
-        // Restore the back-buffer for the new file too. shedForMemoryPressure dropped
-        // `demuxer-max-back-bytes` to 8MiB and, unlike the forward cap re-applied above, nothing put it
-        // back for later files on this instance (configureLiveMode(false) skips its write when
-        // consecutive loads are both non-live), so every post-shed load started with the shrunken
-        // seek-back buffer. Live stays untouched: configureLiveMode(live) above owns its tight 8MiB.
-        if !live { setString("demuxer-max-back-bytes", defaultBackBufferCap) }
-        #if os(tvOS)
-        // A seek cache hold armed by a seek that never dipped into pausedForCache has no release edge:
-        // drop it here so a lingering `cache-pause-initial=yes` can never hold THIS file's start.
-        releaseSeekCacheHoldIfArmed()
-        #endif
-
         // Log only scheme://host/path: debrid and direct-CDN URLs carry API tokens / signed queries in the
         // userinfo and query string, which must not land in the device's persistent unified log.
         let redactedURL = "\(playURL.scheme ?? "?")://\(playURL.host ?? "?")\(playURL.path)"
@@ -1486,6 +1513,31 @@ final class MPVMetalViewController: PlatformViewController {
         }
         #endif
         loadTokenLock.unlock()
+        if commandResult >= 0 {
+            finishCacheFlushFlight(cacheFlushFlight.reset(), sampleLiveState: false)
+            mpv_set_property_string(mpv, "demuxer-max-bytes", appliedCap)
+            activeReadAheadCap = appliedCap
+            baselineReadAheadCap = appliedCap
+            // Only an accepted replacement owns the new per-file cache lifecycle. A rejected command leaves
+            // the current flight, cap bookkeeping, and paused state untouched so the old source can continue.
+            pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
+            pausedCacheClamped = false
+            memoryCacheClamped = false
+            #if os(tvOS)
+            proactiveMemoryCacheClamped = false
+            proactiveRecoveredSampleCount = 0
+            restoreCyclesThisFile = 0
+            #endif
+            // Restore the back-buffer for the accepted new file. A prior memory shed may have reduced it to
+            // 8MiB; live keeps configureLiveMode's own tight value.
+            if !live { setString("demuxer-max-back-bytes", defaultBackBufferCap) }
+            #if os(tvOS)
+            // A seek cache hold with no pausedForCache release edge must not hold THIS accepted file's start.
+            releaseSeekCacheHoldIfArmed()
+            #endif
+        } else {
+            // Rejected replace: preserve the previous source's cache lifecycle and any active single flight.
+        }
         return issuedToken
     }
 
@@ -1529,7 +1581,7 @@ final class MPVMetalViewController: PlatformViewController {
             mpv_set_property_string(mpv, "demuxer-max-back-bytes", "64MiB")
             mpv_set_property_string(mpv, "demuxer-lavf-o", "")
             mpv_set_property_string(mpv, "stream-lavf-o",
-                                    "reconnect=1,reconnect_streamed=1,reconnect_delay_max=7")
+                                    "reconnect=1,reconnect_streamed=1,reconnect_delay_max=7,multiple_requests=1")
         }
     }
     
@@ -1607,6 +1659,54 @@ final class MPVMetalViewController: PlatformViewController {
         }
     }
 
+    private static let cacheFlushTimeoutSeconds: TimeInterval = 15
+
+    private func cacheFlushSampleReceipt(_ name: String) -> String {
+        guard let value = diagnosticDouble(name), value.isFinite else { return "unknown" }
+        return String(format: "%.3f", value)
+    }
+
+    private func cacheFlushElapsedReceipt(startUptime: TimeInterval) -> String {
+        let now = ProcessInfo.processInfo.systemUptime
+        let elapsed = now.isFinite && startUptime.isFinite ? max(0, now - startUptime) : 0
+        return String(format: "%.3f", elapsed)
+    }
+
+    private func beginCacheFlushReceipt(_ flight: CacheFlushFlight<PlayerLoadToken>) {
+        let bufferedAheadReceipt = cacheFlushSampleReceipt("demuxer-cache-duration")
+        let pausedForCacheReceipt = diagnosticFlag("paused-for-cache")
+            .map { $0 ? "true" : "false" } ?? "unknown"
+        DiagnosticsLog.log(
+            "player",
+            "internal-cache-flush-begin flightId=\(flight.id) reason=\(flight.reason.rawValue) target=\(flight.targetArgument) bufferedAhead=\(bufferedAheadReceipt) pausedForCache=\(pausedForCacheReceipt) loadToken=\(flight.owner.hashValue) coalesced=\(flight.coalescedCount)"
+        )
+    }
+
+    private func cacheFlushCommandErrorReceipt(
+        _ flight: CacheFlushFlight<PlayerLoadToken>,
+        commandName: String,
+        status: Int32
+    ) {
+        DiagnosticsLog.log(
+            "player",
+            "internal-cache-flush-command-error flightId=\(flight.id) reason=\(flight.reason.rawValue) target=\(flight.targetArgument) loadToken=\(flight.owner.hashValue) coalesced=\(flight.coalescedCount) command=\(commandName) status=\(status)"
+        )
+    }
+
+    private func cacheFlushDispositionReceipt(_ disposition: CacheFlushDisposition) -> String {
+        switch disposition {
+        case .started: return "flush started"
+        case .coalesced: return "flush coalesced"
+        case .skipped: return "flush skipped"
+        }
+    }
+
+    private func handleCacheFlushTimeout(id: UInt64, owner: PlayerLoadToken) {
+        guard let ended = cacheFlushFlight.settle(id: id, owner: owner) else { return }
+        mpvLog.log("cache flush settle window ended id=\(id, privacy: .public)")
+        finishCacheFlushFlight(ended)
+    }
+
     /// `reason` only labels the log line; the decision is identical on both paths. `configuredLiveMode` is
     /// re-checked here (not only in pausedStateChanged) because enterBackground calls this directly.
     private func applyPausedCacheClamp(reason: String = "long pause") {
@@ -1615,27 +1715,113 @@ final class MPVMetalViewController: PlatformViewController {
         guard getFlag(MPVProperty.pause) else { return }   // belt-and-suspenders; resume cancels the work item
         pausedCacheClamped = true
         setString("demuxer-max-bytes", Self.clampedCacheCap)
-        flushDemuxerCachePreservingPosition()
-        mpvLog.log("\(reason, privacy: .public): demuxer cache clamped to \(Self.clampedCacheCap, privacy: .public) until resume")
-        DiagnosticsLog.log("player", "\(reason): mpv read-ahead clamped to \(Self.clampedCacheCap) until resume")
+        let flushDisposition = flushDemuxerCachePreservingPosition(reason: .pausedCacheClamp)
+        mpvLog.log("\(reason, privacy: .public): demuxer cache clamped to \(Self.clampedCacheCap, privacy: .public) until resume (\(self.cacheFlushDispositionReceipt(flushDisposition), privacy: .public))")
+        DiagnosticsLog.log("player", "\(reason): mpv read-ahead clamped to \(Self.clampedCacheCap) until resume (\(cacheFlushDispositionReceipt(flushDisposition)))")
     }
 
-    /// Free the demuxer cache WITHOUT moving the play head. `drop-buffers` alone is the wrong tool on a
-    /// seekable stream: it discards the cached packets but leaves the demuxer's READ position at the
-    /// buffered edge (it exists for live streams, where skipping to the edge is the point), so playback
-    /// silently continued from minutes ahead of where the viewer paused, the "jumps forward after a
-    /// minute of pause" regression reported on the first cut of this clamp. Drop, then EXACT-seek back
-    /// to the recorded play head: the RAM is freed and demuxing re-anchors at the right byte offset,
-    /// with the refill bounded by the (already lowered) cap. The exact flag re-decodes to the same
-    /// frame, so the paused picture does not visibly move. Seekable streams only, a non-seekable
-    /// stream cannot re-read, so it keeps its buffers rather than corrupting playback; and a not-yet
-    /// known position (time-pos <= 0) skips too rather than risk re-anchoring at 0.
-    private func flushDemuxerCachePreservingPosition() {
-        guard getFlag(MPVProperty.seekable) else { return }
+    /// Free the demuxer cache without moving the play head. Admission is main-queue-owned and provenance-bound;
+    /// both destructive commands are synchronous, and the settle window is event-independent.
+    private func flushDemuxerCachePreservingPosition(reason: CacheFlushReason) -> CacheFlushDisposition {
+        guard mpv != nil else { return .skipped }
+        guard var owner = callbackLoadToken(requiresLoadedFile: true) else { return .skipped }
+
+        if cacheFlushFlight.current?.owner == owner {
+            _ = cacheFlushFlight.admit(owner: owner)
+            return .coalesced
+        }
+        if cacheFlushFlight.current != nil {
+            finishCacheFlushFlight(cacheFlushFlight.reset())
+            guard mpv != nil,
+                  let refreshedOwner = callbackLoadToken(requiresLoadedFile: true) else {
+                return .skipped
+            }
+            owner = refreshedOwner
+        }
+        guard cacheFlushFlight.admit(owner: owner) == .started else { return .coalesced }
+        guard getFlag(MPVProperty.seekable) else { return .skipped }
         let pos = getDouble(MPVProperty.timePos)
-        guard pos > 0 else { return }
-        command("drop-buffers")
-        command("seek", args: [String(format: "%.3f", pos), "absolute+exact"])
+        guard pos.isFinite, pos > 0 else { return .skipped }
+        let targetArgument = String(format: "%.3f", pos)
+        guard mpv != nil,
+              let loadedOwner = callbackLoadToken(requiresLoadedFile: true),
+              loadedOwner == owner else {
+            return .skipped
+        }
+
+        precondition(cacheFlushFlight.nextFlightID < UInt64.max)
+        let nextFlightID = cacheFlushFlight.nextFlightID + 1
+        let timeoutWorkItem = DispatchWorkItem { [weak self, owner] in
+            self?.handleCacheFlushTimeout(id: nextFlightID, owner: owner)
+        }
+        let flight = cacheFlushFlight.install(
+            owner: owner,
+            reason: reason,
+            target: pos,
+            targetArgument: targetArgument,
+            startUptime: ProcessInfo.processInfo.systemUptime,
+            timeoutWorkItem: timeoutWorkItem
+        )
+        beginCacheFlushReceipt(flight)
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.cacheFlushTimeoutSeconds,
+            execute: timeoutWorkItem
+        )
+
+        guard let flight = cacheFlushFlight.current,
+              cacheFlushFlight.matches(id: flight.id, owner: flight.owner),
+              flight.phase == .dropping,
+              mpv != nil,
+              let currentOwner = callbackLoadToken(requiresLoadedFile: true),
+              currentOwner == flight.owner else {
+            return .started
+        }
+        let dropResult: Int32 = {
+            var status: Int32 = -1
+            command(
+                "drop-buffers",
+                checkForErrors: false,
+                returnValueCallback: { status = $0 }
+            )
+            return status
+        }()
+        guard dropResult >= 0 else {
+            if let ended = cacheFlushFlight.dropCommandError(id: flight.id, owner: flight.owner) {
+                cacheFlushCommandErrorReceipt(ended, commandName: "drop-buffers", status: dropResult)
+                finishCacheFlushFlight(ended)
+            }
+            return .started
+        }
+        guard cacheFlushFlight.markDropSucceeded(id: flight.id, owner: flight.owner) else {
+            return .started
+        }
+
+        // Recheck after drop: a replacement or invalidation may have retired this exact source while mpv
+        // processed the command. Never seek the old target into a new source.
+        guard let flight = cacheFlushFlight.current,
+              cacheFlushFlight.matches(id: flight.id, owner: flight.owner),
+              flight.phase == .seeking,
+              mpv != nil,
+              let currentOwner = callbackLoadToken(requiresLoadedFile: true),
+              currentOwner == flight.owner else {
+            return .started
+        }
+        let seekResult: Int32 = {
+            var status: Int32 = -1
+            command(
+                "seek",
+                args: [flight.targetArgument, "absolute+exact"],
+                checkForErrors: false,
+                returnValueCallback: { status = $0 }
+            )
+            return status
+        }()
+        if seekResult >= 0 {
+            _ = cacheFlushFlight.markSeekCommandAccepted(id: flight.id, owner: flight.owner)
+        } else if cacheFlushFlight.seekCommandError(id: flight.id, owner: flight.owner) {
+            cacheFlushCommandErrorReceipt(flight, commandName: "seek", status: seekResult)
+        }
+        return .started
     }
 
     /// System memory warning (registered in viewDidLoad). Posted on the main thread; re-dispatch is a
@@ -1654,9 +1840,9 @@ final class MPVMetalViewController: PlatformViewController {
         // is lowered ONLY when THIS process's real headroom is below the PRESSURE threshold (the same bar the
         // proactive clamp uses, ~384 MiB on the 3 GB box - so the 712 MiB field-min holds comfortably), and
         // then by one 64 MiB rung toward the raised, device-scaled floor (192 MiB normal / 128 MiB reduced),
-        // never to a razor-thin 48 MiB. At/above the pressure bar the cap is returned UNCHANGED. The forwardCap
-        // decision owns that bar; the expensive flush stays on the stricter restore bar (see shedForMemory
-        // below and shouldDeferFlushOnWarning).
+        // never to a razor-thin 48 MiB. Headroom meeting the pressure bar leaves the cap UNCHANGED. The
+        // forwardCap decision owns that bar; the expensive flush stays on the stricter restore bar (see
+        // shedForMemory below and shouldDeferFlushOnWarning).
         let currentCapBytes = currentReadAheadBudgetBytes
         let floor = shedFloorBytes
         let step = shedStepBytes
@@ -1695,26 +1881,29 @@ final class MPVMetalViewController: PlatformViewController {
                 setString("demuxer-max-bytes", String(newCapBytes))
             }
         }
+        let flushDisposition: CacheFlushDisposition
         if !deferFlush {
             // Real pressure relief: shrink the seek-back buffer and drop the forward cache. Coupled to the
             // flush so an advisory warning with ample headroom never quietly costs the viewer their rewind
             // window or a frame-drop burst.
             setString("demuxer-max-back-bytes", "8MiB")
-            flushDemuxerCachePreservingPosition()   // NOT bare drop-buffers: that moves the play head (see above)
+            flushDisposition = flushDemuxerCachePreservingPosition(reason: .memoryWarning)   // NOT bare drop-buffers: that moves the play head (see above)
+        } else {
+            flushDisposition = .skipped
         }
 
         let mib = newCapBytes >> 20
-        let flushNote = deferFlush ? "flush deferred" : "buffers dropped"
+        let flushNote = deferFlush ? "flush deferred" : cacheFlushDispositionReceipt(flushDisposition)
         if capLowered {
             // Genuine low headroom (below the pressure bar): cap stepped down toward the floor.
             mpvLog.log("memory warning: low headroom, demuxer cache stepped down to \(mib, privacy: .public)MiB")
             DiagnosticsLog.log("player", "memory warning: available \(availableBytes >> 20)MiB below pressure bar, cache -> \(mib)MiB + \(flushNote)")
         } else {
-            // Cap HELD (headroom at/above the pressure bar). The overwhelming field case; note the flush may
+            // Cap HELD (headroom meets the cap threshold). The overwhelming field case; note the flush may
             // still have fired in the [pressure, restore) band, where the cap holds but the conservative flush
             // does not yet defer.
             mpvLog.log("memory warning: cap held at \(mib, privacy: .public)MiB, headroom \(availableBytes >> 20, privacy: .public)MiB (\(flushNote, privacy: .public))")
-            DiagnosticsLog.log("player", "memory warning: available \(availableBytes >> 20)MiB at/above pressure bar, cache held at \(mib)MiB + \(flushNote)")
+            DiagnosticsLog.log("player", "memory warning: available \(availableBytes >> 20)MiB, cap held at \(mib)MiB + \(flushNote)")
         }
     }
 
@@ -1821,14 +2010,14 @@ final class MPVMetalViewController: PlatformViewController {
         if !pausedCacheClamped {
             setString("demuxer-max-bytes", targetString)
         }
-        flushDemuxerCachePreservingPosition()
+        let flushDisposition = flushDemuxerCachePreservingPosition(reason: .proactiveMemoryPressure)
         let targetMiB = target >> 20
         mpvLog.log(
             "proactive memory pressure: demuxer cache clamped to \(targetMiB, privacy: .public)MiB for this file"
         )
         DiagnosticsLog.log(
             "player",
-            "proactive memory clamp: available \(available >> 20)MiB below \(threshold >> 20)MiB, mpv cache -> \(targetMiB)MiB + buffers dropped"
+            "proactive memory clamp: available \(available >> 20)MiB below \(threshold >> 20)MiB, mpv cache -> \(targetMiB)MiB + \(cacheFlushDispositionReceipt(flushDisposition))"
         )
     }
     #endif
@@ -1852,6 +2041,7 @@ final class MPVMetalViewController: PlatformViewController {
         framePresentationVOPassesWork?.cancel()
         framePresentationVOPassesWork = nil
         framePresentationDiagnostics.end()
+        lastReceiptFrameDropsPerMinute = nil   // a new file must not inherit the previous title's drop rate
         framePresentationGeneration &+= 1
         framePresentationLoadedGeneration = nil
         framePresentationStartedGeneration = nil
@@ -2005,11 +2195,31 @@ final class MPVMetalViewController: PlatformViewController {
         // The prior read is EMPTY on `.standard` (libplacebo default is unset), and diagnosticString
         // maps empty -> nil. The pure decision treats that nil as the default sentinel and arms,
         // instead of the old guard that bailed on an unreadable prior and so could never arm here.
+        let shouldApply = TVOSFramePresentationPolicy.shouldUseBilinearChroma(input)
         let action = TVOSFramePresentationPolicy.armDecision(
-            shouldApply: TVOSFramePresentationPolicy.shouldUseBilinearChroma(input),
+            shouldApply: shouldApply,
             alreadyApplied: framePresentationMitigationApplied,
             priorCscale: diagnosticString("cscale") ?? diagnosticString("options/cscale")
         )
+        // B-instrument: a one-shot receipt of the chroma arm-decision inputs, so a device capture shows exactly
+        // why the mitigation did (or did not) arm, since the observed drops are the chroma mitigation, not the
+        // memory clamp. Log only when the decision signature changes so a frequently-run pass does not spam.
+        // Instrumentation only: it changes no behavior.
+        let armActionName: String
+        switch action {
+        case .restore: armActionName = "restore"
+        case .noChange: armActionName = "noChange"
+        case .arm: armActionName = "arm"
+        }
+        let customScaler = TVOSFramePresentationPolicy.hasCustomRendererOrScaler(input.customOptionKeys)
+        let decisionSignature = "\(armActionName)|up=\(input.standardQuality)|\(input.videoWidth)x\(input.videoHeight)|g=\(input.gamma)|dv=\(input.dolbyVision)|sp=\(input.signalPeak)|cs=\(customScaler)"
+        if decisionSignature != lastFramePresentationDecisionSignature {
+            lastFramePresentationDecisionSignature = decisionSignature
+            DiagnosticsLog.log(
+                "perf",
+                "tvOS frame presentation decision armAction=\(armActionName) upscaling=\(PlaybackSettings.videoUpscaling.rawValue) vparams=\(input.videoWidth)x\(input.videoHeight) gamma=\(input.gamma.isEmpty ? "na" : input.gamma) dv=\(input.dolbyVision) sigPeak=\(input.signalPeak) customScaler=\(customScaler) shouldApply=\(shouldApply)"
+            )
+        }
         switch action {
         case .restore:
             restoreFramePresentationCscale()
@@ -2229,13 +2439,17 @@ final class MPVMetalViewController: PlatformViewController {
         // stream was DV-flagged; that flips the TV into real DV mode over tone-mapped PQ pixels ("fake Dolby
         // Vision", the behavior other players are criticized for), and decoded-pixel pipelines deliberately
         // downgrade DV requests to HDR10 for exactly this reason. The DV badge is earned only by the AVPlayer
-        // remux lane, which carries the genuine bitstream to VideoToolbox. Message-only breadcrumb below.
-        if contentIsDolbyVision, range == .hdr10 {
-            DiagnosticsLog.log("dv", "DV title on the libmpv lane: requesting HDR10 output (tone-mapped PQ; true DV plays only on the AVPlayer remux lane)")
-        }
+        // remux lane, which carries the genuine bitstream to VideoToolbox. The breadcrumb for it is emitted
+        // AFTER the transition guard below, so it logs once per actual transition, not on every re-derive.
 #endif
         guard range != appliedDynamicRange else { return }
         appliedDynamicRange = range
+        #if os(tvOS)
+        // A13: one breadcrumb per real HDR10 transition (it fired 4x in 91ms when it sat above the guard).
+        if contentIsDolbyVision, range == .hdr10 {
+            DiagnosticsLog.log("dv", "DV title on the libmpv lane: requesting HDR10 output (tone-mapped PQ; true DV plays only on the AVPlayer remux lane)")
+        }
+        #endif
 
         // Synchronous breadcrumbs: if any of these statements kills the process
         // (MoltenVK owns the layer's drawables and mid-stream colorspace changes
@@ -2385,9 +2599,13 @@ final class MPVMetalViewController: PlatformViewController {
     /// Optional property reads used only by the low-rate performance receipt.
     /// Unlike the player-facing helpers, these preserve "unsupported" as nil.
     private func diagnosticDouble(_ name: String) -> Double? {
-        guard mpv != nil else { return nil }
+        guard let handle = mpv else { return nil }
+        return diagnosticDouble(name, handle: handle)
+    }
+
+    private func diagnosticDouble(_ name: String, handle: OpaquePointer) -> Double? {
         var value = Double()
-        guard mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &value) >= 0,
+        guard mpv_get_property(handle, name, MPV_FORMAT_DOUBLE, &value) >= 0,
               value.isFinite else { return nil }
         return value
     }
@@ -2404,9 +2622,13 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     private func diagnosticFlag(_ name: String) -> Bool? {
-        guard mpv != nil else { return nil }
+        guard let handle = mpv else { return nil }
+        return diagnosticFlag(name, handle: handle)
+    }
+
+    private func diagnosticFlag(_ name: String, handle: OpaquePointer) -> Bool? {
         var value = Int32()
-        guard mpv_get_property(mpv, name, MPV_FORMAT_FLAG, &value) >= 0 else { return nil }
+        guard mpv_get_property(handle, name, MPV_FORMAT_FLAG, &value) >= 0 else { return nil }
         return value > 0
     }
 
@@ -2805,7 +3027,13 @@ final class MPVMetalViewController: PlatformViewController {
     /// Setting `audio-spdif` to "" (when leaving Passthrough) tells mpv to decode to PCM again.
     func setAudioOutputMode(_ mode: AudioOutputMode) {
         UserDefaults.standard.set(mode.rawValue, forKey: AudioOutputMode.key)
+        #if canImport(UIKit)
+        // Refresh AVAudioSession before mpv reopens its audio output. This makes an explicit Stereo
+        // switch withdraw multichannel support and request two channels on the live route.
+        applyChannelPolicy(force: true)
+        #else
         setString("audio-channels", channelPolicy)
+        #endif
         // Never arm spdif on a stereo-only route (TV built-in / AirPlay): passthrough there freezes
         // the AO (#78). channelPolicy already forces a stereo downmix for those routes; keep spdif off
         // so a runtime switch to Passthrough on the built-in speakers degrades to decoded stereo PCM.
@@ -2838,7 +3066,22 @@ final class MPVMetalViewController: PlatformViewController {
         rows.append(("Decode", getString("hwdec-current") ?? "software"))
         let fps = getDouble("container-fps")
         if fps > 0 { rows.append(("FPS", String(format: "%.3f", fps))) }
-        rows.append(("Dropped", "\(getInt("frame-drop-count"))"))
+        // TOTAL AND RATE. This row used to show the bare cumulative frame-drop count, which reads as a burst:
+        // the Beta 13 report was "57 dropped frames" on a title that had been playing for 51 minutes with the
+        // last drop long behind it. The rate comes from the delta the 30-second receipt path already computes
+        // (FramePresentationDiagnosticsSnapshot.frameDropsPerMinute); no counter is added here, and before the
+        // first receipt of a mount (or off tvOS, where the receipt carries no frame-presentation snapshot) the
+        // row honestly shows the total alone rather than inventing a rate.
+        let dropped = getInt("frame-drop-count")
+        #if os(tvOS)
+        if let rate = lastReceiptFrameDropsPerMinute {
+            rows.append(("Dropped", "\(dropped) total, \(String(format: "%.0f", rate))/min"))
+        } else {
+            rows.append(("Dropped", "\(dropped) total"))
+        }
+        #else
+        rows.append(("Dropped", "\(dropped) total"))
+        #endif
         // --- Audio (the soundbar / Atmos / passthrough diagnosis) ---
         if let audio = getString("audio-codec-name") {
             let ch = getInt("audio-params/channel-count"), sr = getInt("audio-params/samplerate")
@@ -2882,6 +3125,9 @@ final class MPVMetalViewController: PlatformViewController {
             mitigationApplied: framePresentationMitigationApplied,
             mitigationGate: "production-4k-hdr"
         )
+        // Keep the rate the overlay renders (see playbackStats); this snapshot has already consumed the
+        // interval, so the overlay must never take one of its own.
+        if let framePresentation { lastReceiptFrameDropsPerMinute = framePresentation.frameDropsPerMinute }
         #else
         framePresentation = nil
         #endif
@@ -3121,6 +3367,27 @@ final class MPVMetalViewController: PlatformViewController {
                                     .recordDrop(raw: Int(raw), decoder: false) else {
                                 break
                             }
+                            if sample.shouldEmitOutputContext {
+                                let cacheDuration = self.diagnosticDouble(
+                                    "demuxer-cache-duration", handle: handle
+                                ).map { String(format: "%.3f", $0) } ?? "na"
+                                let cacheBuffering = self.diagnosticInt(
+                                    "cache-buffering-state", handle: handle
+                                ).map(String.init) ?? "na"
+                                let pausedForCache = self.diagnosticFlag(
+                                    "paused-for-cache", handle: handle
+                                ).map { $0 ? "true" : "false" } ?? "na"
+                                let cacheUnderrun = self.diagnosticFlag(
+                                    "demuxer-cache-state/underrun", handle: handle
+                                ).map { $0 ? "true" : "false" } ?? "na"
+                                let cacheIdle = self.diagnosticFlag(
+                                    "demuxer-cache-state/idle", handle: handle
+                                ).map { $0 ? "true" : "false" } ?? "na"
+                                DiagnosticsLog.log(
+                                    "perf",
+                                    "frame-drop output-context generation=\(sample.generation) outputDelta=\(sample.delta) demuxer-cache-duration=\(cacheDuration) cache-buffering-state=\(cacheBuffering) paused-for-cache=\(pausedForCache) demuxer-cache-state/underrun=\(cacheUnderrun) demuxer-cache-state/idle=\(cacheIdle)"
+                                )
+                            }
                             if sample.delta > 0 {
                                 DispatchQueue.main.async { [weak self] in
                                     self?.scheduleFramePresentationVOPassesSnapshot(
@@ -3223,7 +3490,9 @@ final class MPVMetalViewController: PlatformViewController {
                         case MPVProperty.pause:
                             let paused = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee ?? false
                             if self.ownsSharedProbeState {
-                                VXProbeState.shared.setPlayer(state: paused ? "paused" : "playing")
+                                // A10-ii: always name the engine alongside the state so an mpv pause can never
+                                // publish state=playing/paused with engine=- (a stale/blank lane in the heartbeat).
+                                VXProbeState.shared.setPlayer(state: paused ? "paused" : "playing", engine: "mpv")
                             }
                             VXProbe.log(self.probeChannel, paused ? "paused" : "playing")
                             self.emit(propertyName, paused)
@@ -3261,18 +3530,12 @@ final class MPVMetalViewController: PlatformViewController {
                     }
                     #endif
                     // One-shot audio-negotiation diagnostic: what mpv DECODED vs what the AO actually OPENED
-                    // (the negotiated output layout, e.g. 5.1 vs a silent stereo downmix). Delayed so the AO
-                    // has opened; libmpv property reads are thread-safe and the handle is guarded on main.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                        guard let self, self.mpv != nil,
-                              PlayerLoadProvenanceState.accepts(
-                                callbackToken: loadedToken, activeToken: self.activeLoadToken
-                              ) else { return }
-                        let dec = "\(self.getString("audio-params/hr-channels") ?? self.getString("audio-params/channel-count") ?? "?")@\(self.getString("audio-params/samplerate") ?? "?")"
-                        let out = "\(self.getString("audio-out-params/hr-channels") ?? self.getString("audio-out-params/channel-count") ?? "?")@\(self.getString("audio-out-params/samplerate") ?? "?")"
-                        let ao = self.getString("current-ao") ?? "?"
-                        NSLog("%@", "[#78 audio] negotiated decode=\(dec) out=\(out) ao=\(ao)")
-                        VXProbe.log(self.probeChannel, "audio negotiated decode=\(dec) out=\(out) ao=\(ao)")
+                    // (the negotiated output layout, e.g. 5.1 vs a silent stereo downmix). A6: skip it for a
+                    // muted decorative clip or a trailer probe (neither opens a real AO, so it only sampled the
+                    // "?@?" noise), and for the real player poll until the AO is actually open instead of a
+                    // blind fixed 2.0s read that raced ahead of it.
+                    if !self.startMuted, self.probeChannel.description != "trailer" {
+                        self.pollNegotiatedAudio(loadToken: loadedToken, attemptsRemaining: 10)
                     }
                 case MPV_EVENT_VIDEO_RECONFIG:
                     // The video output was (re)configured for the now-current file/params. This EVENT is
@@ -3300,6 +3563,16 @@ final class MPVMetalViewController: PlatformViewController {
                             break
                         }
                         guard let loadToken = self.loadToken(forEntryID: ef.playlist_entry_id) else { break }
+                        if ef.reason == MPV_END_FILE_REASON_ERROR || ef.reason == MPV_END_FILE_REASON_EOF {
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self, self.mpv != nil,
+                                      PlayerLoadProvenanceState.accepts(
+                                        callbackToken: loadToken,
+                                        activeToken: self.activeLoadToken
+                                      ) else { return }
+                                self.finishCacheFlushFlight(self.cacheFlushFlight.reset(owner: loadToken))
+                            }
+                        }
                         if ef.reason == MPV_END_FILE_REASON_ERROR {
                             #if os(tvOS)
                             DispatchQueue.main.async { [weak self] in
@@ -3360,10 +3633,33 @@ final class MPVMetalViewController: PlatformViewController {
     }
     
     
+    /// A6: sample the negotiated audio (decoded layout vs the layout the AO actually opened) once the AO is
+    /// really open. Poll every 0.5s up to `attemptsRemaining` times (~5s) until `current-ao` is non-nil, then
+    /// log once. A genuine no-AO player still logs after the cap with ao="?" (the #78 signal that no audio
+    /// output ever opened). Bounded and provenance-gated, so a superseded load stops sampling.
+    private func pollNegotiatedAudio(loadToken: PlayerLoadToken, attemptsRemaining: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.mpv != nil,
+                  PlayerLoadProvenanceState.accepts(
+                    callbackToken: loadToken, activeToken: self.activeLoadToken
+                  ) else { return }
+            let ao = self.getString("current-ao")
+            if ao == nil, attemptsRemaining > 1 {
+                self.pollNegotiatedAudio(loadToken: loadToken, attemptsRemaining: attemptsRemaining - 1)
+                return
+            }
+            let dec = "\(self.getString("audio-params/hr-channels") ?? self.getString("audio-params/channel-count") ?? "?")@\(self.getString("audio-params/samplerate") ?? "?")"
+            let out = "\(self.getString("audio-out-params/hr-channels") ?? self.getString("audio-out-params/channel-count") ?? "?")@\(self.getString("audio-out-params/samplerate") ?? "?")"
+            let aoName = ao ?? "?"
+            NSLog("%@", "[#78 audio] negotiated decode=\(dec) out=\(out) ao=\(aoName)")
+            VXProbe.log(self.probeChannel, "audio negotiated decode=\(dec) out=\(out) ao=\(aoName)")
+        }
+    }
+
     private func checkError(_ status: CInt) {
         if status < 0 {
             mpvLog.error("MPV API error: \(String(cString: mpv_error_string(status)), privacy: .public)")
         }
     }
-    
+
 }

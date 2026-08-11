@@ -10,7 +10,7 @@ actor SIMKLService {
     static let shared = SIMKLService(auth: .shared)
 
     private let auth: SIMKLAuth
-    private let session: URLSession
+    private let transport: AuthenticatedHTTPTransport
 
     /// S-3: the next instant a data POST is allowed to fire, on the MONOTONIC uptime clock. Each `write`
     /// RESERVES a slot before sleeping (advancing this by `minPostInterval`), so concurrent callers queue
@@ -21,9 +21,9 @@ actor SIMKLService {
     private var nextPostSlot: DispatchTime?
     private static let minPostInterval: TimeInterval = 1.0
 
-    init(auth: SIMKLAuth, session: URLSession = .shared) {
+    init(auth: SIMKLAuth, transport: AuthenticatedHTTPTransport = .shared) {
         self.auth = auth
-        self.session = session
+        self.transport = transport
     }
 
     // MARK: - History (mark watched on finish)
@@ -211,14 +211,17 @@ actor SIMKLService {
         request.setValue(SIMKLAuth.clientID, forHTTPHeaderField: "simkl-api-key")
         request.setValue(SIMKLAuth.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let (data, status) = try await perform(request)
+        let (data, status) = try await perform(
+            request,
+            maxResponseBytes: AuthenticatedHTTPTransport.snapshotResponseLimit
+        )
         guard await auth.sessionID == expectedSession else { throw SIMKLError.sessionChanged }
         try expectSuccess(status)
         return data
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
-        do { return try JSONDecoder().decode(type, from: data) }
+        do { return try AuthenticatedHTTPTransport.decodeJSON(type, from: data) }
         catch { throw SIMKLError.decoding }
     }
 
@@ -240,7 +243,7 @@ actor SIMKLService {
     ) async throws -> Int {
         try await rateGate()
         let bodyData = try JSONEncoder().encode(body)
-        let urlSession = session
+        let transport = transport
         let status: Int = try await auth.performSessionBoundWrite(
             expectedSession: expectedSession
         ) { token in
@@ -259,10 +262,14 @@ actor SIMKLService {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             request.httpBody = bodyData
             do {
-                let (_, response) = try await urlSession.data(for: request)
-                return (response as? HTTPURLResponse)?.statusCode ?? 0
+                let response = try await transport.send(
+                    request,
+                    allowedHosts: ["api.simkl.com"],
+                    maxResponseBytes: AuthenticatedHTTPTransport.controlResponseLimit
+                )
+                return response.statusCode
             } catch {
-                throw SIMKLError.transport(error.localizedDescription)
+                throw SIMKLError.transport("SIMKL request failed.")
             }
         }
         if status == 401 || status == 403 {
@@ -288,7 +295,10 @@ actor SIMKLService {
         request.setValue(SIMKLAuth.clientID, forHTTPHeaderField: "simkl-api-key")
         request.setValue(SIMKLAuth.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let (data, status) = try await perform(request)
+        let (data, status) = try await perform(
+            request,
+            maxResponseBytes: AuthenticatedHTTPTransport.snapshotResponseLimit
+        )
         guard await auth.sessionID == expectedSession else { throw SIMKLError.sessionChanged }
         try expectSuccess(status)
         return data
@@ -309,12 +319,19 @@ actor SIMKLService {
         }
     }
 
-    private func perform(_ request: URLRequest) async throws -> (Data, Int) {
+    private func perform(
+        _ request: URLRequest,
+        maxResponseBytes: Int
+    ) async throws -> (Data, Int) {
         do {
-            let (data, response) = try await session.data(for: request)
-            return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+            let response = try await transport.send(
+                request,
+                allowedHosts: ["api.simkl.com"],
+                maxResponseBytes: maxResponseBytes
+            )
+            return (response.data, response.statusCode)
         } catch {
-            throw SIMKLError.transport(error.localizedDescription)
+            throw SIMKLError.transport("SIMKL request failed.")
         }
     }
 

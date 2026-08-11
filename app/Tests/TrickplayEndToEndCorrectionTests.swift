@@ -20,6 +20,10 @@ private enum TrickplayEndToEndCorrectionTests {
         testRetainedCadencePreservesCoverageAndSeekGaps()
         testPreStrideGapEvidenceSurvivesAdversarialSheetStrides()
         testMediaGenerationRejectsStaleEpisodeCallback()
+        testFetchEpochClaimRejectsABA()
+        testCommunityFetchContract()
+        testStoreAndUICompletionContract()
+        testProtectedUHDDVCaptureContract()
         testProductionWiringUsesThePolicies()
         print("TrickplayEndToEndCorrectionTests: \(passed)/\(passed) passed")
     }
@@ -451,20 +455,76 @@ private enum TrickplayEndToEndCorrectionTests {
         )
     }
 
+    private static func testFetchEpochClaimRejectsABA() {
+        let claims: [(String, Bool)] = [("A1", TrickplayFetchClaim.accepts(requestEpoch: 1, requestKey: "a", currentEpoch: 3, currentKey: "a")), ("B2", TrickplayFetchClaim.accepts(requestEpoch: 2, requestKey: "b", currentEpoch: 3, currentKey: "a")), ("A3", TrickplayFetchClaim.accepts(requestEpoch: 3, requestKey: "a", currentEpoch: 3, currentKey: "a"))]
+        let published = claims.filter { $0.1 }.map { $0.0 }; let cleared = claims.filter { $0.1 }.map { $0.0 }
+        expect(published == ["A3"] && cleared == ["A3"], "only A3 may publish and clear the retained fetch handle")
+    }
+
+    private static func testCommunityFetchContract() {
+        let community = source("app/SourcesShared/CommunityTrickplay.swift")
+        guard let fetchStart = community.range(of: "enum FetchUnavailableReason"),
+              let fetchEnd = community.range(of: "// MARK: - Upload-after-generate", range: fetchStart.upperBound..<community.endIndex) else {
+            fatalError("cannot inspect community fetch boundary")
+        }
+        let fetch = community[fetchStart.lowerBound..<fetchEnd.lowerBound]
+        expect(["enum FetchUnavailableReason", "metadataUnavailable", "metadataInvalid", "spriteUnavailable", "advertisedIndexInvalid",
+                "case hit(Sheet)", "unavailable(FetchUnavailableReason)", "cancelled"].allSatisfy { fetch.contains($0) },
+               "community fetch must expose only finite typed outcomes")
+        expect(["ContinuousClock.now.advanced(by: .seconds(3))", "ContinuousClock.now.advanced(by: .seconds(5))", "Task.sleep(until:",
+                "withTaskGroup", "group.cancelAll()", "group.addTask { .sprite", "group.addTask { .vtt"].allSatisfy { fetch.contains($0) },
+               "metadata/assets must use absolute 3s/5s structured deadlines")
+        expect(fetch.contains("enum FetchStatus: Sendable") && fetch.contains("statusCode: Int") && !fetch.contains("cues = []") && !fetch.contains("?? []")
+            && fetch.contains("return .unavailable(.advertisedIndexInvalid)"),
+               "asset groups must pass typed status data and never manufacture an advertised-index hit")
+    }
+
+    private static func testStoreAndUICompletionContract() {
+        let store = source("app/SourcesShared/ScrubThumbnails.swift")
+        let tv = source("app/SourcesTV/TVPlayerView.swift")
+        guard let showStart = store.range(of: "func show(time: Double)"), let clearStart = store.range(of: "func clear()", range: showStart.upperBound..<store.endIndex),
+              let clearEnd = store.range(of: "private func previewStateForRemoteState", range: clearStart.upperBound..<store.endIndex),
+              let completionStart = store.range(of: "private func completeCommunityFetch("),
+              let completionEnd = store.range(of: "/// The raw `tmdb:", range: completionStart.upperBound..<store.endIndex),
+              let uiStart = tv.range(of: "private var trickplayControls"), let bubbleStart = tv.range(of: "private func trickplayBubble", range: uiStart.upperBound..<tv.endIndex) else {
+            fatalError("cannot inspect trickplay completion boundaries")
+        }
+        let show = store[showStart.lowerBound..<clearStart.lowerBound]; let clear = store[clearStart.lowerBound..<clearEnd.lowerBound]
+        let completion = store[completionStart.lowerBound..<completionEnd.lowerBound]; let ui = tv[uiStart.lowerBound..<bubbleStart.lowerBound]
+        expect(["private var communityFetchTask: Task<Void, Never>?", "private var communityFetchEpoch", "private var communityFetchKey: String?", "private enum CommunityRemotePhase", "enum PreviewState", "private var activeScrubTime: Double?", "private var pendingLocalReadToken: Int?"].allSatisfy { store.contains($0) } && store.contains("private func cancelCommunityFetch()") && store.contains("deinit { communityFetchTask?.cancel() }") && !store.contains("deinit { cancelCommunityFetch() }") && store.contains("private func completeCommunityFetch("), "the store must own one keyed task, cancellation, epoch, phase, state, and pending read")
+        let communityAt = show.range(of: "communitySheet")!.lowerBound
+        let memoryAt = show.range(of: "memoryImage")!.lowerBound
+        expect(!show.contains("CommunityTrickplay.fetch") && show.contains("activeScrubTime = time") && show.contains("image = nil") && communityAt < memoryAt && memoryAt < show.range(of: "imageAsync")!.lowerBound,
+               "show(time:) must never fetch and must retain community, memory, then disk fallback order")
+        expect(store.contains("TrickplayFetchClaim.accepts(") && store.contains("if let activeTime = activeScrubTime") && store.contains("show(time: activeTime)")
+            && store.contains("pendingLocalReadToken") && store.contains("communityFetchTask = nil") && store.contains("communityFetchKey = nil"),
+               "accepted completion must check key plus epoch and re-resolve the active scrub time")
+        let claim = completion.range(of: "TrickplayFetchClaim.accepts")!.lowerBound
+        expect(claim < completion.range(of: "communityFetchTask = nil")!.lowerBound && claim < completion.range(of: "communityFetchKey = nil")!.lowerBound
+            && claim < completion.range(of: "switch result")!.lowerBound,
+               "stale completion must be rejected before it can clear a newer task")
+        guard let stateStart = store.range(of: "private func previewStateForRemoteState"), let stateEnd = store.range(of: "/// Heavy frame processing", range: stateStart.upperBound..<store.endIndex) else { fatalError("cannot inspect preview-state aggregation") }
+        let state = store[stateStart.lowerBound..<stateEnd.lowerBound]
+        expect(clear.contains("showToken &+= 1") && clear.contains("activeScrubTime = nil") && clear.contains("pendingLocalReadToken = nil") && clear.contains("previewState = .hidden") && show.contains("resolved == nil ? self.previewStateForRemoteState() : .ready") && state.contains("case .idle: return .unavailable") && state.contains("case .loading: return .loading") && state.contains("case .settled: return .unavailable") && store.contains("communityRemotePhase = .loading"), "clear must hide, while a completed local miss aggregates idle/settled as unavailable and loading as loading")
+        expect(ui.contains("Loading previews…") && ui.contains("Previews unavailable") && ui.contains("previewState")
+            && ui.contains("scrubThumbnails.previewState != .hidden") && ui.contains("value: scrubThumbnails.previewState") && !ui.contains("image != nil || scrubThumbnails.previewStatus"),
+               "the TV scrubber must use PreviewState for text-only states and height")
+        expect(completion.components(separatedBy: "VXProbe.log(\"tp\"").count == 2 && completion.contains("outcome=") && !completion.contains("key=") && !completion.contains("url=") && !completion.contains("error="),
+               "fetch completion diagnostics must be fixed-category and redacted")
+    }
+
+    private static func testProtectedUHDDVCaptureContract() {
+        let tv = source("app/SourcesTV/TVPlayerView.swift")
+        guard let start = tv.range(of: "private func maybeCaptureLocalTrickplay"), let end = tv.range(of: "/// True only for a 4K", range: start.upperBound..<tv.endIndex) else {
+            fatalError("cannot inspect UHD-DV capture guard")
+        }
+        let captureGate = tv[start.lowerBound..<end.lowerBound]
+        expect(captureGate.contains("shouldSkipTrickplayCaptureForUHDDolbyVision()") && captureGate.contains("captureTrickplayFrame(at: time)") && captureGate.range(of: "shouldSkipTrickplayCaptureForUHDDolbyVision()")!.lowerBound < captureGate.range(of: "captureTrickplayFrame(at: time)")!.lowerBound && !tv.contains("screenshot-raw") && tv.contains("captureFrameJPEGData"), "the existing UHD-DV guard must remain before the only capture path")
+    }
+
     private static func testProductionWiringUsesThePolicies() {
-        let testFile = URL(fileURLWithPath: #filePath)
-        let repositoryRoot = testFile
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let community = try! String(
-            contentsOf: repositoryRoot.appendingPathComponent("app/SourcesShared/CommunityTrickplay.swift"),
-            encoding: .utf8
-        )
-        let store = try! String(
-            contentsOf: repositoryRoot.appendingPathComponent("app/SourcesShared/ScrubThumbnails.swift"),
-            encoding: .utf8
-        )
+        let community = source("app/SourcesShared/CommunityTrickplay.swift")
+        let store = source("app/SourcesShared/ScrubThumbnails.swift")
         guard let configureStart = store.range(of: "func configure(localCacheKey: String?)"),
               let communityStart = store.range(
                   of: "func configureCommunity(",
@@ -474,8 +534,9 @@ private enum TrickplayEndToEndCorrectionTests {
         }
         let localConfigure = store[configureStart.lowerBound..<communityStart.lowerBound]
         expect(
-            community.contains("cues = TrickplayTimeline.parseVTT(")
+            community.contains("let parsed = TrickplayTimeline.parseVTT(")
                 && community.contains("guard let vtt = TrickplayTimeline.makeVTT(")
+                && community.contains("cues = parsed")
                 && community.contains("parsedCues: cues"),
             "production must consume and publish the tested timestamp timeline"
         )
@@ -503,6 +564,11 @@ private enum TrickplayEndToEndCorrectionTests {
                 && store.contains("TrickplayPreviewReadGate.accepts("),
             "production must generation-fence async local reads on media reconfigure"
         )
+    }
+
+    private static func source(_ relativePath: String) -> String {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        return try! String(contentsOf: root.appendingPathComponent(relativePath), encoding: .utf8)
     }
 
     private static func cueIndex(

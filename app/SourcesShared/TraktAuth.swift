@@ -1,28 +1,114 @@
 import Foundation
 
+// Owner-scoped Keychain slots. The old global names remain only as a one-owner migration source; all new
+// reads and writes append the typed authority namespace. Slot derivation is synchronous so a caller can
+// capture an owner before its first await and never hop actors to decide where a credential belongs.
+enum TraktTokenSlots {
+    static let legacyAccess = "vortx.trakt.accessToken"
+    static let legacyRefresh = "vortx.trakt.refreshToken"
+    static let legacyExpiry = "vortx.trakt.expiresAt"
+    static let legacyCreatedAt = "vortx.trakt.createdAt"
+    static let legacySession = "vortx.trakt.sessionID"
+    static let claimMarker = "vortx.trakt.migration.global.owner"
+
+    static func access(_ namespace: String) -> String { legacyAccess + "." + namespace }
+    static func refresh(_ namespace: String) -> String { legacyRefresh + "." + namespace }
+    static func expiry(_ namespace: String) -> String { legacyExpiry + "." + namespace }
+    static func createdAt(_ namespace: String) -> String { legacyCreatedAt + "." + namespace }
+    static func session(_ namespace: String) -> String { legacySession + "." + namespace }
+    static func active(_ namespace: String) -> String { legacyAccess + ".active." + namespace }
+    static func cleanup(_ namespace: String) -> String { legacyAccess + ".cleanup." + namespace }
+    static func candidate(_ namespace: String) -> String { legacyAccess + ".candidate." + namespace }
+    static func publication(_ namespace: String) -> String { legacyAccess + ".publication." + namespace }
+
+    @discardableResult
+    static func claimLegacyGlobal(
+        owner: CredentialScope,
+        capture: CredentialScopeRegistry.Capture
+    ) -> CredentialLegacyClaim.Result {
+        guard capture.scope == owner,
+              CredentialScopeRegistry.shared.isMigrationEligible(capture) else { return .noSource }
+        let ns = owner.storageNamespace
+        let primary = CredentialLegacyClaim.claimGlobalSlotSet(
+            slots: [
+                (legacyAccess, access(ns)),
+                (legacyRefresh, refresh(ns)),
+                (legacyExpiry, expiry(ns)),
+            ],
+            claimMarkerAccount: claimMarker,
+            ownerNamespace: ns,
+            write: { value, account in Keychain.set(value, for: account) },
+            durableRead: Keychain.confirmedString,
+            sourceRead: Keychain.durableString,
+            provenanceTag: "trakt-token-set"
+        )
+        // `createdAt` and `sessionID` were added after the original token triple. Migrate them with
+        // independent claim markers when present; requiring either optional slot in the primary set would
+        // strand an older but otherwise valid token set behind a half-written marker.
+        guard primary == .migrated || primary == .targetPresent else { return primary }
+        let createdAtResult = CredentialLegacyClaim.claimGlobalSlot(
+            sourceAccount: legacyCreatedAt,
+            destinationAccount: createdAt(ns),
+            claimMarkerAccount: claimMarker + ".createdAt",
+            ownerNamespace: ns,
+            write: { value, account in Keychain.set(value, for: account) },
+            durableRead: Keychain.confirmedString,
+            sourceRead: Keychain.durableString,
+            provenanceTag: "trakt-created-at"
+        )
+        switch createdAtResult {
+        case .noSource, .targetPresent, .migrated:
+            break
+        case .durableReadFailed, .claimWriteFailed, .claimConflict, .claimedByOtherOwner,
+             .sourceLostAfterClaim, .sourceDeleteFailed, .targetReadbackMismatch:
+            return createdAtResult
+        }
+        let sessionResult = CredentialLegacyClaim.claimGlobalSlot(
+            sourceAccount: legacySession,
+            destinationAccount: session(ns),
+            claimMarkerAccount: claimMarker + ".session",
+            ownerNamespace: ns,
+            write: { value, account in Keychain.set(value, for: account) },
+            durableRead: Keychain.confirmedString,
+            sourceRead: Keychain.durableString,
+            provenanceTag: "trakt-session"
+        )
+        switch sessionResult {
+        case .noSource, .targetPresent, .migrated:
+            break
+        case .durableReadFailed, .claimWriteFailed, .claimConflict, .claimedByOtherOwner,
+             .sourceLostAfterClaim, .sourceDeleteFailed, .targetReadbackMismatch:
+            return sessionResult
+        }
+        return primary
+    }
+}
+
 /// Injectable credential persistence used by the auth actor and its security tests.
 struct TraktCredentialStore: Sendable {
-    let read: @Sendable (String) -> String?
-    let write: @Sendable (String?, String) -> Void
+    let certifiedRead: @Sendable (String) -> CredentialDurableReadResult
+    let recoveryRead: @Sendable (String) -> CredentialDurableReadResult
+    let write: @Sendable (String?, String) -> CredentialMutationResult
 
     static let keychain = TraktCredentialStore(
-        read: { Keychain.string($0) },
+        certifiedRead: { Keychain.confirmedString($0) },
+        recoveryRead: { Keychain.durableString($0) },
         write: { value, account in Keychain.set(value, for: account) }
     )
 }
 
-/// OAuth endpoint configuration. Production uses the app's build settings, while tests use a local
-/// protocol-backed URLSession without changing global app credentials.
+/// OAuth endpoint configuration. Production keeps only the public Trakt client ID and the fixed VortX
+/// broker base. Tests can use a local protocol-backed URLSession without changing global credentials.
 struct TraktAuthConfiguration: Sendable {
     let clientID: String
-    let clientSecret: String
     let apiBase: String
+    let brokerBase: String
 
     static var production: TraktAuthConfiguration {
         TraktAuthConfiguration(
             clientID: TraktAuth.clientID,
-            clientSecret: TraktAuth.clientSecret,
-            apiBase: TraktAuth.apiBase
+            apiBase: TraktAuth.apiBase,
+            brokerBase: TraktAuth.brokerBase
         )
     }
 }
@@ -67,31 +153,25 @@ struct TraktLoginAttemptAuthority {
 
 /// Trakt.tv OAuth device-code flow plus Keychain-backed token storage.
 ///
-/// The flow is the standard Trakt device path (https://trakt.docs.apiary.io/reference/authentication-devices):
-///
-///   1. `requestDeviceCode()` -> show `userCode` + `verificationURL` to the user.
-///   2. `pollForToken(deviceCode:)` -> loop on `POST /oauth/device/token` at the server-given
-///      `interval` until the user authorizes (200), denies (418), or the codes expire (410).
-///   3. Tokens are stored in the Keychain via `Keychain.swift` (never UserDefaults, never backups).
-///   4. `validToken()` returns a live access token, transparently refreshing when near expiry.
-///
-/// The config constants `clientID` / `clientSecret` are placeholders. A Trakt app must be registered
-/// at https://trakt.tv/oauth/applications and the values filled in (or, preferably, injected from a
-/// build-time secret) before the flow can run. `isConfigured` gates the whole feature so the app
-/// ships safely with the values blank.
+/// The exchange, refresh, and revoke legs run through the authenticated VortX broker. The app receives
+/// only an opaque broker session and never receives Trakt's device credential. Trakt data-plane calls
+/// remain direct and continue to use the public client ID.
 actor TraktAuth {
     static let shared = TraktAuth()
 
-    // MARK: - Configuration (build-time credentials; empty ships a dormant, invisible feature)
+    // MARK: - Configuration (public client ID; empty ships a dormant, invisible feature)
 
     /// Trakt application client id (https://trakt.tv/oauth/applications), read at runtime from the
     /// Info.plist `TraktClientId` key, which Xcode substitutes from the `$(TRAKT_CLIENT_ID)` build
     /// setting (gitignored Config/ExternalSync.xcconfig or a CI secret; EMPTY default). Falls back to
     /// "" when absent, so a fresh/public build has no credentials and `isConfigured` stays false.
     static let clientID = TraktAuth.infoValue("TraktClientId")
-    /// Trakt application client secret, same seam as `clientID` (Info.plist `TraktClientSecret` <-
-    /// `$(TRAKT_CLIENT_SECRET)`). Never committed; the repo is public.
-    static let clientSecret = TraktAuth.infoValue("TraktClientSecret")
+
+    /// Fixed authenticated VortX broker. Its exact host is validated before every broker request so a
+    /// malformed build or accidental endpoint substitution fails closed rather than making an arbitrary
+    /// network request.
+    static let brokerBase = "https://oauth.vortx.tv"
+    static let brokerSourceID = "vortx-oauth-v2"
 
     /// Read an Info.plist string, trimmed, with a "" fallback. `$(VAR)` substitution leaves the key
     /// as an empty string (not the literal token) when the build setting is empty, so a blank value
@@ -101,39 +181,37 @@ actor TraktAuth {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// API base for OAuth endpoints. Trakt serves OAuth off the same host as the data API.
+    /// API base for the Trakt data plane. OAuth exchange and refresh never use this host.
     static let apiBase = "https://api.trakt.tv"
 
-    /// The OAuth redirect URI registered for this app at https://trakt.tv/oauth/applications. Trakt
-    /// requires it on the `refresh_token` grant and it MUST byte-for-byte equal the registered value,
-    /// or the refresh 401s and the session is silently dropped (which presents to the user as "Trakt
-    /// stopped working" after the first successful sign-in). This is the documented out-of-band value
-    /// for a device/no-callback client; it is a PUBLIC constant (not a secret), so it is hardcoded here
-    /// rather than plumbed through xcconfig/Info.plist. NOTE: the DEVICE token exchange
-    /// (`POST /oauth/device/token`) does NOT send a redirect_uri; Trakt's device flow does not expect
-    /// one, and sending a stray value there can get the exchange rejected. Only `performRefresh` uses it.
-    static let registeredRedirectURI = "urn:ietf:wg:oauth:2.0:oob"
-
-    /// True once a non-empty client id/secret pair is present. Everything no-ops until then.
-    static var isConfigured: Bool { !clientID.isEmpty && !clientSecret.isEmpty }
+    /// True once a non-empty public client ID is present. Broker configuration and signing capability are
+    /// validated at request time, so this remains an offline-safe local dormancy predicate.
+    static var isConfigured: Bool { !clientID.isEmpty }
 
     // MARK: - Keychain accounts (token set lives here, nowhere else)
 
-    private static let accessAccount = "vortx.trakt.accessToken"
-    private static let refreshAccount = "vortx.trakt.refreshToken"
-    private static let expiryAccount = "vortx.trakt.expiresAt"   // unix epoch seconds, stored as a string
+    private static let accessAccount = TraktTokenSlots.legacyAccess
+    private static let refreshAccount = TraktTokenSlots.legacyRefresh
+    private static let expiryAccount = TraktTokenSlots.legacyExpiry   // unix epoch seconds, stored as a string
     /// Unix epoch seconds when the token was ISSUED, stored as a string. Fourth slot: it lets
     /// `currentToken()` rebuild the token with its ORIGINAL lifetime so the 30-minute early-refresh
     /// leeway actually fires (see `TraktToken.defaultLeeway`). May be absent on installs whose token
     /// was stored before this slot existed; `currentToken()` degrades gracefully to hard-expiry-only.
-    private static let createdAtAccount = "vortx.trakt.createdAt"
+    private static let createdAtAccount = TraktTokenSlots.legacyCreatedAt
     /// Random identity of the currently installed credential set. This is intentionally separate from
     /// OAuth tokens so a normal token refresh does not invalidate queued work or private snapshots.
-    private static let sessionAccount = "vortx.trakt.sessionID"
+    private static let sessionAccount = TraktTokenSlots.legacySession
 
-    private let session: URLSession
+    private let sessionConfiguration: URLSessionConfiguration
     private let credentials: TraktCredentialStore
     private let configuration: TraktAuthConfiguration
+    /// Test-only transport seam. Production leaves this nil and must use the masked VortX edge signer;
+    /// fixture tests may return the same request without provisioning or embedding a real edge secret.
+    private let oauthRequestSigner: (@Sendable (URLRequest, Data) -> URLRequest?)?
+    /// Inert-by-default scheduling probes for deterministic standalone race contracts. Test callbacks
+    /// capture only their continuations, never this actor, so they add no production work or retain cycle.
+    private let refreshJoinObserver: (@Sendable () -> Void)?
+    private let sessionWriteDrainObserver: (@Sendable () -> Void)?
 
     /// Number of session-bound provider writes currently holding a credential lease. Auth boundaries
     /// wait for these operations to finish, so credentials cannot switch after final validation but before
@@ -151,82 +229,409 @@ actor TraktAuth {
     private var credentialBoundaryWaiters: [CheckedContinuation<Void, Never>] = []
     private var loginAttempts = TraktLoginAttemptAuthority()
 
-    /// The single in-flight refresh, if one is running. Concurrent `validToken()` callers (scrobbleStart,
-    /// TraktSyncEngine.pullWatched, a rail fetch) await THIS task instead of each firing their own refresh
-    /// POST. Trakt rotates the refresh token on every refresh, so two independent refreshes would race:
-    /// the loser 401s on an already-spent refresh token and would drop the whole session. Single-flight
-    /// collapses them into one, so only one rotation happens and everyone gets the same fresh token.
-    private var inFlightRefresh: Task<TraktToken, Error>?
+    /// A refresh may be shared only by callers holding the exact owner epoch and account session that
+    /// created it. A changed account cancels/replaces the old flight instead of joining its result.
+    private struct TraktRefreshFlight {
+        let id: UUID
+        let ownerCapture: CredentialScopeRegistry.Capture
+        let sessionID: TraktSessionID
+        let task: Task<TraktToken, Error>
+    }
+    private var inFlightRefresh: TraktRefreshFlight?
 
     /// Injected at app startup (by `VortXSyncManager`): returns the freshest cross-device Trakt token
-    /// triple from the synced `doc.apiKeys` mirror, or nil. Lets the refresh-401 path re-adopt a token a
+    /// triple from the synced `doc.apiKeys` mirror, or nil. Lets invalid-grant recovery re-adopt a token a
     /// SIBLING device rotated and pushed, instead of signing this device out. A seam (not a direct import)
     /// so `TraktAuth` stays free of a `VortXSyncManager` dependency.
     private var syncedTokenProvider: (@Sendable () async -> (access: String, refresh: String, expiryUnix: Int)?)?
 
     init(
-        session: URLSession = .shared,
+        sessionConfiguration: URLSessionConfiguration = TraktAuth.defaultSessionConfiguration(),
         credentials: TraktCredentialStore = .keychain,
-        configuration: TraktAuthConfiguration = .production
+        configuration: TraktAuthConfiguration = .production,
+        oauthRequestSigner: (@Sendable (URLRequest, Data) -> URLRequest?)? = nil,
+        refreshJoinObserver: (@Sendable () -> Void)? = nil,
+        sessionWriteDrainObserver: (@Sendable () -> Void)? = nil
     ) {
-        self.session = session
+        sessionConfiguration.httpShouldSetCookies = false
+        sessionConfiguration.httpCookieAcceptPolicy = .never
+        sessionConfiguration.httpCookieStorage = nil
+        sessionConfiguration.urlCredentialStorage = nil
+        sessionConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        sessionConfiguration.urlCache = nil
+        self.sessionConfiguration = sessionConfiguration
         self.credentials = credentials
         self.configuration = configuration
-
-        // One-time migration for a credential set created before session identities existed. The session
-        // is stored last, so synchronous readers stay fail closed if credential persistence is unavailable.
-        if credentials.read(Self.accessAccount)?.isEmpty == false,
-           credentials.read(Self.refreshAccount)?.isEmpty == false,
-           let expiry = credentials.read(Self.expiryAccount), Int(expiry) != nil,
-           credentials.read(Self.sessionAccount)?.isEmpty != false {
-            credentials.write(TraktSessionID.random().rawValue, Self.sessionAccount)
-        }
+        self.oauthRequestSigner = oauthRequestSigner
+        self.refreshJoinObserver = refreshJoinObserver
+        self.sessionWriteDrainObserver = sessionWriteDrainObserver
     }
 
-    /// Wire the cross-device synced-token lookup used by the refresh-401 recovery path (T-2). Called once
+    /// Wire the cross-device synced-token lookup used by invalid-grant recovery (T-2). Called once
     /// at startup from `VortXSyncManager`; a nil provider simply disables cross-device recovery.
     func setSyncedTokenProvider(_ provider: @escaping @Sendable () async -> (access: String, refresh: String, expiryUnix: Int)?) {
         syncedTokenProvider = provider
     }
 
+    private nonisolated func ownerCapture() -> CredentialScopeRegistry.Capture {
+        CredentialScopeRegistry.shared.capture()
+    }
+
+    private nonisolated func slot(_ legacy: String, ownerNamespace: String) -> String {
+        legacy + "." + ownerNamespace
+    }
+
+    private func tupleAccounts(ownerNamespace namespace: String) -> [String] {
+        [
+            slot(Self.accessAccount, ownerNamespace: namespace),
+            slot(Self.refreshAccount, ownerNamespace: namespace),
+            slot(Self.expiryAccount, ownerNamespace: namespace),
+            slot(Self.sessionAccount, ownerNamespace: namespace)
+        ]
+    }
+
+    private nonisolated static func recoverCredentialAuthority(
+        credentials: TraktCredentialStore,
+        ownerNamespace namespace: String
+    ) -> Bool {
+        CredentialTupleTransaction.recoverUncertainState(
+            baseAccounts: [
+                TraktTokenSlots.access(namespace),
+                TraktTokenSlots.refresh(namespace),
+                TraktTokenSlots.expiry(namespace),
+                TraktTokenSlots.session(namespace)
+            ],
+            activePointer: TraktTokenSlots.active(namespace),
+            cleanupMarker: TraktTokenSlots.cleanup(namespace),
+            candidateMarker: TraktTokenSlots.candidate(namespace),
+            publicationMarker: TraktTokenSlots.publication(namespace),
+            certifiedRead: credentials.certifiedRead,
+            recoveryRead: credentials.recoveryRead,
+            write: credentials.write
+        )
+    }
+
+    private func recoverCredentialAuthority(ownerNamespace namespace: String) -> Bool {
+        Self.recoverCredentialAuthority(credentials: credentials, ownerNamespace: namespace)
+    }
+
+    /// Complete an active candidate transaction before a mutation-capable token/session read. Passive
+    /// readers intentionally remain gated by a discoverable candidate marker; this helper resolves that
+    /// marker only after the dual-read evidence pass and a fresh certified staged-tuple read.
+    private func recoverMutationState(ownerCapture capture: CredentialScopeRegistry.Capture) -> Bool {
+        guard let mutationLease = CredentialPublicationOutbox.beginMutation() else { return false }
+        defer { CredentialPublicationOutbox.endMutation(mutationLease) }
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
+        let namespace = capture.namespace
+        guard recoverCredentialAuthority(ownerNamespace: namespace) else { return false }
+        let activePointer = TraktTokenSlots.active(namespace)
+        let cleanupMarker = TraktTokenSlots.cleanup(namespace)
+        let candidateMarker = TraktTokenSlots.candidate(namespace)
+        let publicationMarker = TraktTokenSlots.publication(namespace)
+        let baseAccounts = tupleAccounts(ownerNamespace: namespace)
+
+        func canonicalPointer(_ raw: String) -> String? {
+            guard let uuid = UUID(uuidString: raw) else { return nil }
+            return uuid.uuidString.lowercased()
+        }
+
+        func priorSessionID(candidatePointer: String, activePointerValue: String?) -> String? {
+            if activePointerValue != candidatePointer {
+                guard let activePointerValue,
+                      case let .authority(active) = CredentialTupleTransaction.readStagedAuthority(
+                          baseAccounts: baseAccounts,
+                          pointer: activePointerValue,
+                          certifiedRead: credentials.certifiedRead
+                      ),
+                      active.values.count == 4,
+                      let session = active.values.last,
+                      !session.isEmpty else { return nil }
+                return session
+            }
+            guard case let .value(raw) = credentials.certifiedRead(cleanupMarker) else { return nil }
+            return CredentialTupleTransaction.cleanupPriorSession(raw)
+        }
+
+        func promoteCandidate(pointer: String, activePointerValue: String?) -> Bool {
+            guard case let .authority(candidate) = CredentialTupleTransaction.readStagedAuthority(
+                baseAccounts: baseAccounts,
+                pointer: pointer,
+                certifiedRead: credentials.certifiedRead
+            ),
+            candidate.values.count == 4,
+            !candidate.values[0].isEmpty,
+            !candidate.values[1].isEmpty,
+            Int(candidate.values[2]) != nil,
+            !candidate.values[3].isEmpty else { return false }
+
+            let publicationValue: String?
+            switch CredentialPublicationOutbox.state(account: publicationMarker, read: credentials.certifiedRead) {
+            case .missing:
+                // A missing outbox is valid only for a same-session refresh candidate. A candidate with
+                // no active session or a changed session is a new account boundary; do not let a mutation
+                // read silently activate it without a durable publication intent.
+                guard priorSessionID(candidatePointer: pointer, activePointerValue: activePointerValue)
+                        == candidate.values.last else { return false }
+                publicationValue = nil
+            case let .pending(session), let .acknowledged(session):
+                guard candidate.values.last == session else { return false }
+                publicationValue = session
+            case .dispatching:
+                return false
+            case .failure:
+                return false
+            }
+
+            let promoted = CredentialTupleTransaction.transition(
+                baseAccounts: baseAccounts,
+                activePointer: activePointer,
+                cleanupMarker: cleanupMarker,
+                candidateMarker: candidateMarker,
+                candidateValues: candidate.values,
+                publicationMarker: publicationValue == nil ? nil : publicationMarker,
+                publicationValue: publicationValue,
+                certifiedRead: credentials.certifiedRead,
+                recoveryRead: credentials.recoveryRead,
+                write: credentials.write
+            )
+            switch promoted {
+            case .activated, .alreadyActive:
+                guard publicationValue != nil else { return true }
+                return Self.replayPublicationOutbox(credentials: credentials, ownerNamespace: namespace)
+            case .cleanupPending, .failedBeforeActivation, .activationStateUnknown:
+                return false
+            }
+        }
+
+        /// A final candidate-delete fault can leave B selected with its cleanup provenance but with the
+        /// candidate marker now certified absent after recovery. Finish that exact cleanup before exposing
+        /// B. A missing outbox is permitted only when the retained provenance proves this was a same-session
+        /// refresh; a changed-session B stays closed until its own durable publication record exists.
+        func finalizeSelectedCleanupWithoutCandidate() -> Bool {
+            guard case let .authority(active) = CredentialTupleTransaction.readAuthority(
+                baseAccounts: baseAccounts,
+                activePointer: activePointer,
+                certifiedRead: credentials.certifiedRead
+            ), active.values.count == 4,
+               let sessionID = active.values.last,
+               !sessionID.isEmpty else { return false }
+            let cleanupRaw: String
+            switch credentials.certifiedRead(cleanupMarker) {
+            case .missing:
+                return Self.replayPublicationOutbox(credentials: credentials, ownerNamespace: namespace)
+            case .failure:
+                return false
+            case let .value(raw):
+                cleanupRaw = raw
+            }
+            let publicationValue: String?
+            switch CredentialPublicationOutbox.state(account: publicationMarker, read: credentials.certifiedRead) {
+            case .missing:
+                guard CredentialTupleTransaction.cleanupPriorSession(cleanupRaw) == sessionID else {
+                    return false
+                }
+                publicationValue = nil
+            case let .pending(existing), let .acknowledged(existing):
+                guard existing == sessionID else { return false }
+                publicationValue = existing
+            case .dispatching, .failure:
+                return false
+            }
+            switch CredentialTupleTransaction.transition(
+                baseAccounts: baseAccounts,
+                activePointer: activePointer,
+                cleanupMarker: cleanupMarker,
+                candidateMarker: candidateMarker,
+                candidateValues: active.values,
+                publicationMarker: publicationValue == nil ? nil : publicationMarker,
+                publicationValue: publicationValue,
+                certifiedRead: credentials.certifiedRead,
+                recoveryRead: credentials.recoveryRead,
+                write: credentials.write
+            ) {
+            case .activated, .alreadyActive:
+                return Self.replayPublicationOutbox(credentials: credentials, ownerNamespace: namespace)
+            case .cleanupPending, .failedBeforeActivation, .activationStateUnknown:
+                return false
+            }
+        }
+
+        let activeRaw: String
+        switch credentials.certifiedRead(activePointer) {
+        case .missing:
+            switch credentials.certifiedRead(candidateMarker) {
+            case .missing:
+                // A mutation-capable read may drain a durable pending boundary, but it must propagate a
+                // dispatch failure instead of treating an active tuple with no candidate marker as settled.
+                return Self.replayPublicationOutbox(credentials: credentials, ownerNamespace: namespace)
+            case .failure:
+                return false
+            case let .value(raw):
+                guard raw.hasPrefix("candidate:"),
+                      let pointer = canonicalPointer(String(raw.dropFirst("candidate:".count))) else {
+                    return false
+                }
+                return promoteCandidate(pointer: pointer, activePointerValue: nil)
+            }
+        case .failure:
+            return false
+        case let .value(raw):
+            guard let pointer = canonicalPointer(raw) else { return false }
+            activeRaw = pointer
+        }
+
+        switch credentials.certifiedRead(candidateMarker) {
+        case .missing:
+            return finalizeSelectedCleanupWithoutCandidate()
+        case .failure:
+            return false
+        case let .value(raw):
+            guard raw.hasPrefix("candidate:"),
+                  let pointer = canonicalPointer(String(raw.dropFirst("candidate:".count))) else { return false }
+            if pointer != activeRaw {
+                return promoteCandidate(pointer: pointer, activePointerValue: activeRaw)
+            }
+            return promoteCandidate(pointer: pointer, activePointerValue: activeRaw)
+        }
+    }
+
+    private func readCredentialTuple(ownerNamespace namespace: String) -> CredentialTupleReadResult {
+        return CredentialTupleTransaction.readAuthority(
+            baseAccounts: tupleAccounts(ownerNamespace: namespace),
+            activePointer: TraktTokenSlots.active(namespace),
+            cleanupMarker: TraktTokenSlots.cleanup(namespace),
+            candidateMarker: TraktTokenSlots.candidate(namespace),
+            certifiedRead: credentials.certifiedRead
+        )
+    }
+
+    private func readCredentialTupleForMutation(ownerNamespace namespace: String) -> CredentialTupleReadResult {
+        guard recoverCredentialAuthority(ownerNamespace: namespace) else { return .failure }
+        return CredentialTupleTransaction.readAuthority(
+            baseAccounts: tupleAccounts(ownerNamespace: namespace),
+            activePointer: TraktTokenSlots.active(namespace),
+            certifiedRead: credentials.certifiedRead
+        )
+    }
+
     // MARK: - Public state
 
-    /// The production session visible to synchronous read paths and enqueue sites. A partial credential
-    /// write is not a session: both the access token and random session slot must be present.
+    /// The production session visible to synchronous read paths and enqueue sites. This is a certified
+    /// passive read: partial tuples and pending/dispatching publications remain invisible here, and repair
+    /// or replay is reserved for mutation-capable paths that can propagate a failure.
     nonisolated static var storedSessionID: TraktSessionID? {
-        guard Keychain.string(Self.accessAccount)?.isEmpty == false,
-              Keychain.string(Self.refreshAccount)?.isEmpty == false,
-              let expiry = Keychain.string(Self.expiryAccount), Int(expiry) != nil,
-              let raw = Keychain.string(Self.sessionAccount), !raw.isEmpty else { return nil }
-        return TraktSessionID(rawValue: raw)
+        let authority = CredentialScopeRegistry.shared
+        let capture = authority.capture()
+        let namespace = capture.namespace
+        let baseAccounts = [
+            TraktTokenSlots.access(namespace),
+            TraktTokenSlots.refresh(namespace),
+            TraktTokenSlots.expiry(namespace),
+            TraktTokenSlots.session(namespace)
+        ]
+        let read = {
+            CredentialTupleTransaction.readAuthority(
+                baseAccounts: baseAccounts,
+                activePointer: TraktTokenSlots.active(namespace),
+                cleanupMarker: TraktTokenSlots.cleanup(namespace),
+                candidateMarker: TraktTokenSlots.candidate(namespace),
+                certifiedRead: Keychain.confirmedString
+            )
+        }
+        guard authority.isCurrent(capture),
+              case let .authority(active) = read(),
+              active.values.count == 4,
+              !active.values[0].isEmpty,
+              !active.values[1].isEmpty,
+              Int(active.values[2]) != nil,
+              !active.values[3].isEmpty,
+              CredentialPublicationOutbox.permitsPassiveRead(
+                  account: TraktTokenSlots.publication(namespace),
+                  sessionID: active.values[3],
+                  read: Keychain.confirmedString
+              ),
+              authority.isCurrent(capture) else { return nil }
+        // The selected tuple is read exactly once. No separate slot read can be
+        // combined with a different pointer generation and accidentally form a mixed token/session view.
+        return TraktSessionID(rawValue: active.values[3])
     }
 
     /// The session in this actor's credential store. Tests use an isolated store, while production uses
     /// the same Keychain slots as `storedSessionID`.
-    var sessionID: TraktSessionID? { currentSessionID() }
+    var sessionID: TraktSessionID? {
+        let capture = ownerCapture()
+        guard CredentialScopeRegistry.shared.isCurrent(capture),
+              let sessionID = currentSessionID(ownerNamespace: capture.namespace),
+              CredentialScopeRegistry.shared.isCurrent(capture) else { return nil }
+        return sessionID
+    }
 
     /// Test seam proving that a boundary has announced intent before its active write finishes.
     var isCredentialBoundaryPending: Bool { pendingCredentialBoundaries > 0 }
 
     /// True only when a complete token set and its session identity are stored.
-    var isSignedIn: Bool { currentSessionID() != nil }
+    var isSignedIn: Bool { sessionID != nil }
 
     /// Drop all stored Trakt credentials after any already-authorized provider write finishes.
-    func signOut() async {
+    @discardableResult
+    func signOut() async -> Bool {
+        let capture = ownerCapture()
         loginAttempts.invalidate()
-        await performCredentialBoundary {
-            clearCredentialsAndPublishBoundary()
+        return await performCredentialBoundary {
+            guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
+            return await clearCredentialsAndPublishBoundary(ownerCapture: capture)
         }
     }
 
-    /// Automatic auth-loss path. A stale 401 from an older session cannot sign out a newer account.
-    func signOut(ifCurrent expectedSession: TraktSessionID) async {
-        guard currentSessionID() == expectedSession else { return }
+    /// Automatic auth-loss path. A stale invalid-grant verdict cannot sign out a newer account.
+    @discardableResult
+    func signOut(ifCurrent expectedSession: TraktSessionID) async -> Bool {
+        let capture = ownerCapture()
+        return await signOut(ifCurrent: expectedSession, ownerCapture: capture)
+    }
+
+    @discardableResult
+    private func signOut(
+        ifCurrent expectedSession: TraktSessionID,
+        ownerCapture capture: CredentialScopeRegistry.Capture
+    ) async -> Bool {
+        guard CredentialScopeRegistry.shared.isCurrent(capture),
+              currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { return false }
         loginAttempts.invalidate()
-        await performCredentialBoundary {
-            guard currentSessionID() == expectedSession else { return }
-            clearCredentialsAndPublishBoundary()
+        return await performCredentialBoundary {
+            guard CredentialScopeRegistry.shared.isCurrent(capture),
+                  currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { return false }
+            return await clearCredentialsAndPublishBoundary(ownerCapture: capture)
         }
+    }
+
+    /// Revoke a user-requested disconnect through the broker, then clear only the owner and session that
+    /// initiated it. Broker failures are not auth verdicts and must not prevent local disconnect. An owner or
+    /// account replacement that wins during the network await remains untouched by both fences.
+    @discardableResult
+    func revokeAndSignOut() async -> Bool {
+        let capture = ownerCapture()
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
+        guard let expectedSession = currentSessionID(ownerNamespace: capture.namespace),
+              let token = currentToken(ownerNamespace: capture.namespace) else {
+            loginAttempts.invalidate()
+            return await performCredentialBoundary {
+                guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
+                return await clearCredentialsAndPublishBoundary(ownerCapture: capture)
+            }
+        }
+        do {
+            struct Body: Encodable { let access_token: String }
+            let request = try makeBrokerRequest(
+                path: "/v1/oauth/trakt/revoke",
+                body: Body(access_token: token.accessToken)
+            )
+            let (_, status) = try await send(request)
+            DiagnosticsLog.log("trakt-auth", "broker revoke -> HTTP \(status)")
+        } catch {
+            DiagnosticsLog.log("trakt-auth", "broker revoke failed; disconnecting locally")
+        }
+        return await signOut(ifCurrent: expectedSession, ownerCapture: capture)
     }
 
     /// Adopt a token set that arrived from ANOTHER device over the E2E `doc.apiKeys` sync channel, so
@@ -234,158 +639,323 @@ actor TraktAuth {
     /// slots directly (no network). `expiryUnix` is absolute unix-epoch seconds (what token persistence
     /// and `syncUp` mirror). Ignores an empty access/refresh pair so a partial doc never clears a live
     /// local session. An identical replay is a no-op. A changed adoption is an account boundary.
-    func adoptTokens(access: String, refresh: String, expiryUnix: Int) async {
-        guard !access.isEmpty, !refresh.isEmpty else { return }
-        if let existing = syncableTokens(),
-           existing.access == access,
-           existing.refresh == refresh,
-           existing.expiryUnix == expiryUnix,
-           currentSessionID() != nil {
-            return
-        }
+    @discardableResult
+    func adoptTokens(
+        access: String,
+        refresh: String,
+        expiryUnix: Int,
+        ownerCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil
+    ) async -> CredentialMutationResult {
+        guard !access.isEmpty, !refresh.isEmpty else { return .failure }
+        let capture = suppliedCapture ?? ownerCapture()
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else { return .failure }
+        let namespace = capture.namespace
         loginAttempts.invalidate()
-        await performCredentialBoundary {
+        var result: CredentialMutationResult = .failure
+        let installed = await performCredentialBoundary {
+            guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
             // Re-check inside the serialized turn. A competing adoption may have installed this exact
             // triple while this caller waited for the boundary turnstile.
-            if let existing = syncableTokens(),
-               existing.access == access,
-               existing.refresh == refresh,
-               existing.expiryUnix == expiryUnix,
-               currentSessionID() != nil {
-                return
-            }
-            replaceCredentialsWithNewSession(
+            result = replaceCredentialsWithNewSession(
                 access: access,
                 refresh: refresh,
-                expiryUnix: expiryUnix
+                expiryUnix: expiryUnix,
+                ownerCapture: capture,
+                ownerNamespace: namespace
             )
+            return result == .success
         }
+        return installed ? result : .failure
+    }
+
+    /// Finish a legacy claim only after the account layer has established the exact owner capture. This is
+    /// deliberately mutation-only: passive session/token surfaces never manufacture identity or publish.
+    /// The optional migrated session is preserved; a missing session is generated by the tuple transaction
+    /// and is reused by recovery once any durable candidate or publication intent exists.
+    @discardableResult
+    func finalizeLegacyMigration(
+        ownerCapture capture: CredentialScopeRegistry.Capture
+    ) async -> CredentialMutationResult {
+        guard CredentialScopeRegistry.shared.isMigrationEligible(capture) else { return .failure }
+        loginAttempts.invalidate()
+        var result: CredentialMutationResult = .failure
+        let finalized = await performCredentialBoundary {
+            guard let mutationLease = CredentialPublicationOutbox.beginMutation() else { return false }
+            defer { CredentialPublicationOutbox.endMutation(mutationLease) }
+            guard CredentialScopeRegistry.shared.isMigrationEligible(capture) else { return false }
+            let namespace = capture.namespace
+            func requiredSnapshot() -> (access: String, refresh: String, expiry: Int)? {
+                guard case let .value(access) = credentials.certifiedRead(TraktTokenSlots.access(namespace)),
+                      !access.isEmpty,
+                      case let .value(refresh) = credentials.certifiedRead(TraktTokenSlots.refresh(namespace)),
+                      !refresh.isEmpty,
+                      case let .value(rawExpiry) = credentials.certifiedRead(TraktTokenSlots.expiry(namespace)),
+                      let expiry = Int(rawExpiry) else { return nil }
+                return (access, refresh, expiry)
+            }
+            var snapshot = requiredSnapshot()
+            if snapshot == nil {
+                guard recoverMutationState(ownerCapture: capture),
+                      CredentialScopeRegistry.shared.isMigrationEligible(capture) else { return false }
+                snapshot = requiredSnapshot()
+            }
+            guard let snapshot else { return false }
+
+            let sessionAccount = TraktTokenSlots.session(namespace)
+            let publicationAccount = TraktTokenSlots.publication(namespace)
+            let sessionID: TraktSessionID
+            switch credentials.certifiedRead(TraktTokenSlots.session(namespace)) {
+            case let .value(value) where !value.isEmpty:
+                sessionID = TraktSessionID(rawValue: value)
+            case .missing, .value:
+                guard case .missing = credentials.certifiedRead(TraktTokenSlots.active(namespace)),
+                      case .missing = credentials.certifiedRead(TraktTokenSlots.cleanup(namespace)),
+                      case .missing = credentials.certifiedRead(TraktTokenSlots.candidate(namespace)),
+                      CredentialPublicationOutbox.recoverIfUncertain(
+                          account: publicationAccount,
+                          certifiedRead: credentials.certifiedRead,
+                          recoveryRead: credentials.recoveryRead,
+                          write: credentials.write
+                      ) else { return false }
+                let planned: TraktSessionID
+                switch CredentialPublicationOutbox.state(
+                    account: publicationAccount,
+                    read: credentials.certifiedRead
+                ) {
+                case .missing:
+                    planned = TraktSessionID.random()
+                    guard CredentialPublicationOutbox.prepare(
+                        sessionID: planned.rawValue,
+                        account: publicationAccount,
+                        read: credentials.certifiedRead,
+                        write: credentials.write
+                    ) else { return false }
+                case let .pending(raw) where !raw.isEmpty:
+                    planned = TraktSessionID(rawValue: raw)
+                case let .acknowledged(raw) where !raw.isEmpty:
+                    planned = TraktSessionID(rawValue: raw)
+                case .pending, .dispatching, .acknowledged, .failure:
+                    return false
+                }
+                switch credentials.certifiedRead(sessionAccount) {
+                case let .value(existing) where existing == planned.rawValue:
+                    break
+                case .missing, .value:
+                    guard credentials.write(planned.rawValue, sessionAccount) == .success,
+                          credentials.certifiedRead(sessionAccount) == .value(planned.rawValue) else {
+                        return false
+                    }
+                case .failure:
+                    switch credentials.recoveryRead(sessionAccount) {
+                    case let .value(raw) where raw == planned.rawValue:
+                        guard credentials.write(planned.rawValue, sessionAccount) == .success,
+                              credentials.certifiedRead(sessionAccount) == .value(planned.rawValue) else {
+                            return false
+                        }
+                    case .missing:
+                        guard credentials.write(planned.rawValue, sessionAccount) == .success,
+                              credentials.certifiedRead(sessionAccount) == .value(planned.rawValue) else {
+                            return false
+                        }
+                    case .value, .failure:
+                        return false
+                    }
+                }
+                sessionID = planned
+            case .failure:
+                guard case .missing = credentials.certifiedRead(TraktTokenSlots.active(namespace)),
+                      case .missing = credentials.certifiedRead(TraktTokenSlots.cleanup(namespace)),
+                      case .missing = credentials.certifiedRead(TraktTokenSlots.candidate(namespace)),
+                      case let .pending(prepared) = CredentialPublicationOutbox.state(
+                          account: publicationAccount,
+                          read: credentials.certifiedRead
+                      ),
+                      !prepared.isEmpty else {
+                    return false
+                }
+                let recoveredSession = credentials.recoveryRead(sessionAccount)
+                guard recoveredSession == .missing || recoveredSession == .value(prepared) else {
+                    return false
+                }
+                guard credentials.write(prepared, sessionAccount) == .success,
+                      credentials.certifiedRead(sessionAccount) == .value(prepared) else {
+                    return false
+                }
+                sessionID = TraktSessionID(rawValue: prepared)
+            }
+            guard CredentialScopeRegistry.shared.isMigrationEligible(capture) else { return false }
+            result = replaceCredentialsWithNewSession(
+                access: snapshot.access,
+                refresh: snapshot.refresh,
+                expiryUnix: snapshot.expiry,
+                ownerCapture: capture,
+                ownerNamespace: namespace,
+                sessionID: sessionID,
+                promoteLegacyMirror: true
+            )
+            return result == .success
+        }
+        return finalized ? result : .failure
     }
 
     /// The stored token triple for the sync PUSH side (access, refresh, absolute unix expiry), or nil
     /// when not signed in. Read-only mirror of `currentToken`; the sync manager sends these only when a
     /// local session exists and NEVER deletes them from the doc when absent (mirrors the debrid guard).
-    func syncableTokens() -> (access: String, refresh: String, expiryUnix: Int)? {
-        guard currentSessionID() != nil,
-              let access = credentials.read(Self.accessAccount), !access.isEmpty,
-              let refresh = credentials.read(Self.refreshAccount), !refresh.isEmpty,
-              let expiryString = credentials.read(Self.expiryAccount), let expiry = Int(expiryString)
-        else { return nil }
-        return (access, refresh, expiry)
+    func syncableTokens(
+        ownerCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil,
+        ownerNamespace suppliedNamespace: String? = nil
+    ) -> (access: String, refresh: String, expiryUnix: Int)? {
+        let capture = suppliedCapture ?? ownerCapture()
+        let namespace = suppliedNamespace ?? capture.namespace
+        guard capture.namespace == namespace,
+              CredentialScopeRegistry.shared.isCurrent(capture),
+              case let .authority(active) = readCredentialTuple(ownerNamespace: namespace),
+              active.values.count == 4,
+              !active.values[0].isEmpty,
+              !active.values[1].isEmpty,
+              let expiry = Int(active.values[2]),
+              !active.values[3].isEmpty,
+              CredentialPublicationOutbox.permitsPassiveRead(
+                  account: TraktTokenSlots.publication(namespace),
+                  sessionID: active.values[3],
+                  read: credentials.certifiedRead
+              ),
+              CredentialScopeRegistry.shared.isCurrent(capture) else { return nil }
+        return (active.values[0], active.values[1], expiry)
     }
 
     // MARK: - Step 1: request a device code
 
-    /// Begin the device flow. Returns the codes and polling schedule to drive the UI and step 2.
+    /// Begin the device flow through the VortX broker. Trakt's device credential never enters this app.
     func requestDeviceCode() async throws -> TraktDeviceCode {
         try ensureConfigured()
+        let capture = ownerCapture()
         let loginGeneration = loginAttempts.begin()
-        struct Body: Encodable { let client_id: String }
-        let request = try makeRequest(
-            path: "/oauth/device/code",
-            method: "POST",
-            body: Body(client_id: configuration.clientID),
-            authorized: false
+        let request = try makeBrokerRequest(
+            path: "/v1/oauth/trakt/device/start",
+            body: EmptyBody()
         )
         let (data, status) = try await send(request)
-        DiagnosticsLog.log("trakt-auth", "device/code -> HTTP \(status)")
-        guard status == 200 else {
-            // A 401 at the CODE step means the shipped client_id is not a valid Trakt app key. Surface it
-            // distinctly from a transient server fault so a provisioning problem is unambiguous.
-            if status == 401 { throw TraktAuthError.invalidClient }
-            throw TraktAuthError.server(status: status)
+        try Task.checkCancellation()
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else {
+            throw TraktAuthError.sessionChanged
         }
+        DiagnosticsLog.log("trakt-auth", "broker device/start -> HTTP \(status)")
+        guard status == 200 else { throw Self.brokerFault(status: status) }
         let code = try decode(TraktDeviceCode.self, from: data)
+        guard !code.session.isEmpty, !code.userCode.isEmpty,
+              Self.validateVerificationURL(code.verificationURL),
+              code.expiresIn > 0, code.interval > 0 else { throw TraktAuthError.decoding }
         guard loginAttempts.isCurrent(generation: loginGeneration) else {
             throw TraktAuthError.sessionChanged
         }
-        loginAttempts.register(code: code.deviceCode, generation: loginGeneration)
+        loginAttempts.register(code: code.session, generation: loginGeneration)
         return code
     }
 
     // MARK: - Step 2: poll for the token
 
-    /// One poll of `POST /oauth/device/token`. `.pending` and `.slowDown` are the keep-polling
-    /// signals; `.authorized` returns the token; terminal failures throw. Most callers should use
-    /// `pollForToken(deviceCode:interval:expiresIn:)` which runs the whole loop.
+    /// One poll of the broker's `/device/poll`. `.pending` and `.slowDown` are the keep-polling
+    /// signals; `.authorized` returns the token; terminal failures throw.
     enum PollResult: Sendable {
         case authorized(TraktToken)
         case pending
         case slowDown
     }
 
-    func poll(deviceCode: String) async throws -> PollResult {
-        guard let loginGeneration = loginAttempts.generation(for: deviceCode) else {
-            throw TraktAuthError.sessionChanged
-        }
-        return try await poll(deviceCode: deviceCode, loginGeneration: loginGeneration)
+    private struct BrokerPollResponse: Decodable {
+        let status: String
+        let token: TraktToken?
     }
 
-    private func poll(deviceCode: String, loginGeneration: UInt64) async throws -> PollResult {
-        try ensureConfigured()
-        guard loginAttempts.owns(code: deviceCode, generation: loginGeneration) else {
+    func poll(session: String) async throws -> PollResult {
+        let capture = ownerCapture()
+        guard let loginGeneration = loginAttempts.generation(for: session) else {
             throw TraktAuthError.sessionChanged
         }
-        struct Body: Encodable { let code: String; let client_id: String; let client_secret: String }
-        let request = try makeRequest(
-            path: "/oauth/device/token",
-            method: "POST",
-            body: Body(
-                code: deviceCode,
-                client_id: configuration.clientID,
-                client_secret: configuration.clientSecret
-            ),
-            authorized: false
+        return try await poll(
+            session: session,
+            loginGeneration: loginGeneration,
+            ownerCapture: capture
+        )
+    }
+
+    private func poll(
+        session: String,
+        loginGeneration: UInt64,
+        ownerCapture capture: CredentialScopeRegistry.Capture
+    ) async throws -> PollResult {
+        try ensureConfigured()
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else {
+            throw TraktAuthError.sessionChanged
+        }
+        guard loginAttempts.owns(code: session, generation: loginGeneration) else {
+            throw TraktAuthError.sessionChanged
+        }
+        struct Body: Encodable { let session: String }
+        let request = try makeBrokerRequest(
+            path: "/v1/oauth/trakt/device/poll",
+            body: Body(session: session)
         )
         let (data, status) = try await send(request)
-        guard loginAttempts.owns(code: deviceCode, generation: loginGeneration) else {
+        try Task.checkCancellation()
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else {
             throw TraktAuthError.sessionChanged
         }
-        switch status {
-        case 200:
-            let token = try decode(TraktToken.self, from: data)
+        guard loginAttempts.owns(code: session, generation: loginGeneration) else {
+            throw TraktAuthError.sessionChanged
+        }
+        guard status == 200 else { throw Self.brokerFault(status: status) }
+        let response = try decode(BrokerPollResponse.self, from: data)
+        switch response.status {
+        case "authorized":
+            guard let token = response.token,
+                  !token.accessToken.isEmpty, !token.refreshToken.isEmpty,
+                  token.expiresIn > 0 else { throw TraktAuthError.decoding }
+            var persisted = false
+            var mutationAttempted = false
             let installed = await performCredentialBoundary(
                 expectedLoginGeneration: loginGeneration
             ) {
-                guard loginAttempts.owns(code: deviceCode, generation: loginGeneration) else { return }
-                clearCredentialsAndPublishBoundary()
-                storeRefreshedToken(token)
-                installAndPublishNewSession()
-                loginAttempts.invalidate()
+                // This is the credential commit linearization point. Once the synchronous durable
+                // transaction succeeds, task cancellation cannot turn the installed identity into a
+                // cancellation result.
+                guard !Task.isCancelled,
+                      CredentialScopeRegistry.shared.isCurrent(capture),
+                      loginAttempts.owns(code: session, generation: loginGeneration) else { return false }
+                mutationAttempted = true
+                persisted = replaceCredentialsWithNewSession(
+                    access: token.accessToken,
+                    refresh: token.refreshToken,
+                    expiryUnix: Int(token.expiresAt.timeIntervalSince1970),
+                    ownerCapture: capture,
+                    ownerNamespace: capture.namespace
+                ) == .success
+                if persisted { loginAttempts.invalidate() }
+                return persisted
             }
-            guard installed else { throw TraktAuthError.sessionChanged }
-            DiagnosticsLog.log("trakt-auth", "device/token -> 200 authorized")
+            guard installed, persisted else {
+                try Task.checkCancellation()
+                throw mutationAttempted ? TraktAuthError.persistenceFailure : TraktAuthError.sessionChanged
+            }
+            DiagnosticsLog.log("trakt-auth", "broker device/poll -> authorized")
             return .authorized(token)
-        case 400:
-            // Pending: the user has not finished authorizing yet. Keep polling. Trakt sends a bare 400
-            // with no OAuth error body for pending; a rejected client is a distinct status (401 below),
-            // so this stays a clean keep-polling signal and is intentionally NOT logged (it repeats every
-            // `interval` seconds and would flood the capped diagnostics log).
+        case "pending":
             return .pending
-        case 401:
-            // The client_id/client_secret PAIR was rejected. `device/code` needs only the id (so a user
-            // code was still minted and shown), but this token exchange also needs the secret; a wrong or
-            // mismatched TRAKT_CLIENT_SECRET fails ONLY here. This is exactly the SIMKL-works / Trakt-fails
-            // asymmetry the tester saw: SIMKL's PIN flow authenticates with the client_id alone and never
-            // sends a secret, so a bad Trakt secret is invisible to it. Surfaced as a terminal, actionable
-            // error instead of spinning until the code expires.
-            DiagnosticsLog.log("trakt-auth", "device/token -> 401 invalid_client (verify TRAKT_CLIENT_SECRET matches the app)")
-            throw TraktAuthError.invalidClient
-        case 429:
-            // Slow down: the app polled faster than `interval`. Back off, then keep polling.
-            DiagnosticsLog.log("trakt-auth", "device/token -> 429 slow_down")
+        case "slow_down":
+            DiagnosticsLog.log("trakt-auth", "broker device/poll -> slow_down")
             return .slowDown
-        case 404:
+        case "invalid":
             throw TraktAuthError.invalidDeviceCode
-        case 409:
+        case "already_used":
             throw TraktAuthError.codeAlreadyUsed
-        case 410:
+        case "expired":
             throw TraktAuthError.expired
-        case 418:
+        case "denied":
             throw TraktAuthError.denied
         default:
-            DiagnosticsLog.log("trakt-auth", "device/token -> HTTP \(status) (unexpected)")
-            throw TraktAuthError.server(status: status)
+            DiagnosticsLog.log("trakt-auth", "broker device/poll -> unknown status")
+            throw TraktAuthError.brokerUnavailable(status: 200)
         }
     }
 
@@ -393,23 +963,49 @@ actor TraktAuth {
     /// server `interval`, backs off an extra second on a 429, and stops once `expiresIn` elapses.
     /// On success the token is already stored in the Keychain; the return value is the same token.
     @discardableResult
-    func pollForToken(deviceCode: String, interval: Int, expiresIn: Int) async throws -> TraktToken {
-        guard let loginGeneration = loginAttempts.generation(for: deviceCode) else {
+    func pollForToken(session: String, interval: Int, expiresIn: Int) async throws -> TraktToken {
+        let capture = ownerCapture()
+        guard let loginGeneration = loginAttempts.generation(for: session) else {
             throw TraktAuthError.sessionChanged
         }
         let deadline = Date().addingTimeInterval(TimeInterval(expiresIn))
         let baseInterval = max(interval, 1)
         var waitSeconds = baseInterval
+        var lastTransient: TraktAuthError?
         DiagnosticsLog.log("trakt-auth", "poll start interval=\(baseInterval)s expiresIn=\(expiresIn)s")
         while Date() < deadline {
+            guard CredentialScopeRegistry.shared.isCurrent(capture),
+                  loginAttempts.owns(code: session, generation: loginGeneration) else {
+                throw TraktAuthError.sessionChanged
+            }
             try await sleep(seconds: waitSeconds)
             try Task.checkCancellation()
-            switch try await poll(deviceCode: deviceCode, loginGeneration: loginGeneration) {
+            let result: PollResult
+            do {
+                result = try await poll(
+                    session: session,
+                    loginGeneration: loginGeneration,
+                    ownerCapture: capture
+                )
+            } catch let error as TraktAuthError where error.isTransient {
+                try Task.checkCancellation()
+                guard CredentialScopeRegistry.shared.isCurrent(capture),
+                      loginAttempts.owns(code: session, generation: loginGeneration) else {
+                    throw TraktAuthError.sessionChanged
+                }
+                lastTransient = error
+                waitSeconds = min(waitSeconds + 1, baseInterval + 10)
+                continue
+            }
+            lastTransient = nil
+            switch result {
             case .authorized(let token):
                 return token
             case .pending:
+                try Task.checkCancellation()
                 waitSeconds = baseInterval
             case .slowDown:
+                try Task.checkCancellation()
                 // Escalate on REPEATED 429s (Trakt raises the required interval each time it slows you
                 // down); a flat `interval + 1` never grows and keeps tripping the limit. Reset to the base
                 // happens on the next successful pending. Capped so a persistent 429 cannot stretch a
@@ -417,6 +1013,11 @@ actor TraktAuth {
                 waitSeconds = min(waitSeconds + 1, baseInterval + 10)
             }
         }
+        guard CredentialScopeRegistry.shared.isCurrent(capture),
+              loginAttempts.owns(code: session, generation: loginGeneration) else {
+            throw TraktAuthError.sessionChanged
+        }
+        if let lastTransient { throw lastTransient }
         DiagnosticsLog.log("trakt-auth", "poll deadline reached without authorization (expired)")
         throw TraktAuthError.expired
     }
@@ -430,10 +1031,26 @@ actor TraktAuth {
 
     /// A live access token, refreshing first if the stored one is near expiry. Throws
     /// `.notSignedIn` when no token is stored.
-    func validToken() async throws -> String {
-        guard let token = currentToken() else { throw TraktAuthError.notSignedIn }
+    func validToken(ownerCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async throws -> String {
+        let capture = suppliedCapture ?? ownerCapture()
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else { throw TraktAuthError.sessionChanged }
+        guard recoverMutationState(ownerCapture: capture),
+              CredentialScopeRegistry.shared.isCurrent(capture) else { throw TraktAuthError.notSignedIn }
+        guard let token = currentToken(ownerNamespace: capture.namespace),
+              let expectedSession = currentSessionID(ownerNamespace: capture.namespace),
+              CredentialScopeRegistry.shared.isCurrent(capture) else { throw TraktAuthError.notSignedIn }
         if token.isExpired() {
-            return try await refresh(using: token.refreshToken).accessToken
+            do {
+                return try await refresh(using: token.refreshToken, ownerCapture: capture).accessToken
+            } catch let error as TraktAuthError where error.isTransient && !token.isExpired(leeway: 0) {
+                guard pendingCredentialBoundaries == 0,
+                      CredentialScopeRegistry.shared.isCurrent(capture),
+                      currentSessionID(ownerNamespace: capture.namespace) == expectedSession else {
+                    throw TraktAuthError.sessionChanged
+                }
+                DiagnosticsLog.log("trakt-auth", "refresh deferred; using stored token")
+                return token.accessToken
+            }
         }
         return token.accessToken
     }
@@ -441,11 +1058,16 @@ actor TraktAuth {
     /// A live token proven to belong to `expectedSession` both before and after any refresh await.
     /// Read-only callers use this to ensure an old account task never adopts a newer account's token.
     func validToken(for expectedSession: TraktSessionID) async throws -> String {
+        let capture = ownerCapture()
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else { throw TraktAuthError.sessionChanged }
+        guard recoverMutationState(ownerCapture: capture),
+              CredentialScopeRegistry.shared.isCurrent(capture) else { throw TraktAuthError.sessionChanged }
         guard pendingCredentialBoundaries == 0,
-              currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
-        let token = try await validToken()
+              currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { throw TraktAuthError.sessionChanged }
+        let token = try await validToken(ownerCapture: capture)
         guard pendingCredentialBoundaries == 0,
-              currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
+              CredentialScopeRegistry.shared.isCurrent(capture),
+              currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { throw TraktAuthError.sessionChanged }
         return token
     }
 
@@ -458,150 +1080,205 @@ actor TraktAuth {
         expectedSession: TraktSessionID,
         _ operation: @escaping @Sendable (String) async throws -> Result
     ) async throws -> Result {
+        let capture = ownerCapture()
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else { throw TraktAuthError.sessionChanged }
+        guard recoverMutationState(ownerCapture: capture),
+              CredentialScopeRegistry.shared.isCurrent(capture) else { throw TraktAuthError.sessionChanged }
         guard pendingCredentialBoundaries == 0,
-              currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
-        let token = try await validToken()
+              currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { throw TraktAuthError.sessionChanged }
+        let token = try await validToken(ownerCapture: capture)
         guard pendingCredentialBoundaries == 0,
-              currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
+              CredentialScopeRegistry.shared.isCurrent(capture),
+              currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { throw TraktAuthError.sessionChanged }
 
         activeSessionWrites += 1
-        do {
-            let result = try await operation(token)
-            finishSessionWrite()
-            return result
-        } catch {
-            finishSessionWrite()
-            throw error
+        defer { finishSessionWrite() }
+        let result = try await operation(token)
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else {
+            throw TraktAuthError.sessionChanged
         }
+        return result
     }
 
-    /// Exchange the refresh token for a fresh set via `POST /oauth/token`, SINGLE-FLIGHT: if a refresh is
+    /// Exchange the refresh token through the broker, SINGLE-FLIGHT: if a refresh is
     /// already running, await it instead of starting a second one (Trakt rotates the refresh token, so a
-    /// second concurrent refresh would spend an already-rotated token and 401). Stores and returns the set.
+    /// second concurrent refresh would spend an already-rotated token and fail). Stores and returns the set.
     @discardableResult
-    func refresh(using refreshToken: String) async throws -> TraktToken {
-        guard let expectedSession = currentSessionID() else { throw TraktAuthError.notSignedIn }
-        // Join an in-flight refresh rather than starting a competing one.
+    func refresh(
+        using refreshToken: String,
+        ownerCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil
+    ) async throws -> TraktToken {
+        let capture = suppliedCapture ?? ownerCapture()
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else { throw TraktAuthError.sessionChanged }
+        guard recoverMutationState(ownerCapture: capture),
+              CredentialScopeRegistry.shared.isCurrent(capture) else { throw TraktAuthError.notSignedIn }
+        guard let expectedSession = currentSessionID(ownerNamespace: capture.namespace) else { throw TraktAuthError.notSignedIn }
+        // Join only an exact authority match. A flight from another owner epoch or account session may
+        // still be unwinding after an adoption/sign-out and must never supply its result to this caller.
         if let existing = inFlightRefresh {
-            let token = try await existing.value
-            guard currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
-            return token
+            if existing.ownerCapture == capture, existing.sessionID == expectedSession {
+                refreshJoinObserver?()
+                let token = try await existing.task.value
+                try Task.checkCancellation()
+                guard CredentialScopeRegistry.shared.isCurrent(capture),
+                      currentSessionID(ownerNamespace: capture.namespace) == expectedSession else {
+                    throw TraktAuthError.sessionChanged
+                }
+                return token
+            }
+            existing.task.cancel()
+            inFlightRefresh = nil
         }
-        // A refresh that completed moments ago (whose defer already cleared `inFlightRefresh`) may have
+        // A refresh that completed moments ago (whose owner already cleared `inFlightRefresh`) may have
         // stored a fresh token. A caller that just missed the in-flight window must not refresh again with
         // the now-rotated refresh token, so re-check synchronously (no await) before starting a new one.
-        if let fresh = currentToken(), !fresh.isExpired() {
+        if let fresh = currentToken(ownerNamespace: capture.namespace), !fresh.isExpired() {
             return fresh
         }
+        let flightID = UUID()
         let task = Task<TraktToken, Error> { [weak self] in
             guard let self else { throw TraktAuthError.notSignedIn }
             return try await self.performRefresh(
                 using: refreshToken,
-                expectedSession: expectedSession
+                expectedSession: expectedSession,
+                ownerCapture: capture
             )
         }
-        inFlightRefresh = task
-        defer { inFlightRefresh = nil }
+        inFlightRefresh = TraktRefreshFlight(
+            id: flightID,
+            ownerCapture: capture,
+            sessionID: expectedSession,
+            task: task
+        )
+        defer {
+            if inFlightRefresh?.id == flightID {
+                inFlightRefresh = nil
+            }
+        }
         let token = try await task.value
-        guard currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
+        try Task.checkCancellation()
+        guard CredentialScopeRegistry.shared.isCurrent(capture),
+              currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { throw TraktAuthError.sessionChanged }
         return token
     }
 
-    /// The actual `POST /oauth/token` refresh network call. Only ever invoked from inside the single-flight
-    /// `refresh(using:)`, so at most one runs at a time.
+    /// The broker refresh call. Only ever invoked from inside the single-flight `refresh(using:)`, so at
+    /// most one rotation runs at a time.
+    private struct BrokerRefreshResponse: Decodable {
+        let status: String
+        let token: TraktToken?
+    }
+
     private func performRefresh(
         using refreshToken: String,
-        expectedSession: TraktSessionID
+        expectedSession: TraktSessionID,
+        ownerCapture capture: CredentialScopeRegistry.Capture
     ) async throws -> TraktToken {
         try ensureConfigured()
-        struct Body: Encodable {
-            let refresh_token: String
-            let client_id: String
-            let client_secret: String
-            // Trakt requires a redirect_uri on the refresh grant, and it must equal the app's registered
-            // value exactly (see `registeredRedirectURI`). The device token exchange, by contrast, sends
-            // no redirect_uri at all.
-            let redirect_uri: String
-            let grant_type: String
-        }
-        let body = Body(
-            refresh_token: refreshToken,
-            client_id: configuration.clientID,
-            client_secret: configuration.clientSecret,
-            redirect_uri: Self.registeredRedirectURI,
-            grant_type: "refresh_token"
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else { throw TraktAuthError.sessionChanged }
+        struct Body: Encodable { let refresh_token: String }
+        let request = try makeBrokerRequest(
+            path: "/v1/oauth/trakt/refresh",
+            body: Body(refresh_token: refreshToken)
         )
-        let request = try makeRequest(path: "/oauth/token", method: "POST", body: body, authorized: false)
         let (data, status) = try await send(request)
-        guard currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
-        guard status == 200 else {
-            // A rejected refresh token USUALLY means the session is dead, but a concurrent winner (this
-            // device pre single-flight, or a SIBLING device over sync) may already have rotated a NEWER
-            // token. Only sign out when no fresher token exists anywhere; otherwise adopt it and keep going.
-            if status == 401 {
-                if let recovered = await recoverAfterRefreshFailure(
-                    deadRefreshToken: refreshToken,
-                    expectedSession: expectedSession
-                ) {
-                    return recovered
-                }
-                guard currentSessionID() == expectedSession else { throw TraktAuthError.sessionChanged }
-                // Terminal-wipe guard: the recovery path above SUSPENDS (it awaits the synced-token
-                // provider), so another actor turn (a syncDown `adoptTokens`, a device-code poll storing
-                // a brand-new set) may have landed a live token during that await. Re-check the Keychain
-                // with NO suspension between this read and the wipe: a stored refresh token DIFFERENT
-                // from the one this refresh just spent is that winner's live session, so return it
-                // instead of wiping. Only when the stored set still carries the exact spent refresh
-                // token (or nothing is stored) is the session truly dead.
-                if let stored = currentToken(), stored.refreshToken != refreshToken {
-                    return stored
-                }
-                await signOut(ifCurrent: expectedSession)
+        try Task.checkCancellation()
+        guard CredentialScopeRegistry.shared.isCurrent(capture),
+              currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { throw TraktAuthError.sessionChanged }
+        guard status == 200 else { throw TraktAuthError.brokerUnavailable(status: status) }
+        let response = try decode(BrokerRefreshResponse.self, from: data)
+        if response.status == "ok" {
+            guard let token = response.token,
+                  !token.accessToken.isEmpty, !token.refreshToken.isEmpty,
+                  token.expiresIn > 0 else { throw TraktAuthError.decoding }
+            // A normal refresh rotates tokens inside the same authenticated account. Never rotate the local
+            // session identity here: queued work and snapshots captured before refresh remain valid.
+            guard CredentialScopeRegistry.shared.isCurrent(capture),
+                  currentSessionID(ownerNamespace: capture.namespace) == expectedSession else {
+                throw TraktAuthError.sessionChanged
             }
-            throw TraktAuthError.server(status: status)
+            try Task.checkCancellation()
+            guard storeRefreshedToken(token, ownerCapture: capture) else {
+                throw TraktAuthError.persistenceFailure
+            }
+            return token
         }
-        let token = try decode(TraktToken.self, from: data)
-        // A normal refresh rotates tokens inside the same authenticated account. Never rotate the local
-        // session identity here: queued work and snapshots captured before refresh remain valid.
-        storeRefreshedToken(token)
-        return token
+        guard response.status == "invalid_grant" else {
+            DiagnosticsLog.log("trakt-auth", "broker refresh -> unknown status")
+            throw TraktAuthError.brokerUnavailable(status: 200)
+        }
+        // Only the broker's explicit invalid_grant verdict may end the session. Before clearing it, look for
+        // a concurrent local or cross-device refresh winner exactly as the pre-broker durable flow did.
+        let recovered = await recoverAfterRefreshFailure(
+            deadRefreshToken: refreshToken,
+            expectedSession: expectedSession,
+            ownerCapture: capture
+        )
+        try Task.checkCancellation()
+        if let recovered {
+            return recovered
+        }
+        guard CredentialScopeRegistry.shared.isCurrent(capture),
+              currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { throw TraktAuthError.sessionChanged }
+        // The recovery path suspends. A winning refresh may have landed during that await, so re-read without
+        // another suspension and preserve any set whose rotated refresh token differs from the spent token.
+        if let stored = currentToken(ownerNamespace: capture.namespace),
+           stored.refreshToken != refreshToken {
+            return stored
+        }
+        _ = await signOut(ifCurrent: expectedSession, ownerCapture: capture)
+        throw TraktAuthError.notSignedIn
     }
 
-    /// A refresh POST got a 401. Before signing out, look for a fresher token a concurrent winner already
+    /// A broker refresh returned invalid_grant. Before signing out, look for a fresher token a winner already
     /// minted: (T-1c) re-read the Keychain in case a local refresh rotated it, then (T-2) consult the
     /// cross-device synced mirror in case a SIBLING device rotated and pushed one. Returns the token to
     /// adopt, or nil when nothing fresher exists (the caller then signs out).
     private func recoverAfterRefreshFailure(
         deadRefreshToken: String,
-        expectedSession: TraktSessionID
+        expectedSession: TraktSessionID,
+        ownerCapture capture: CredentialScopeRegistry.Capture
     ) async -> TraktToken? {
-        guard currentSessionID() == expectedSession else { return nil }
+        guard CredentialScopeRegistry.shared.isCurrent(capture),
+              currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { return nil }
         // (T-1c) A local winner rotated the token while this refresh was in flight. A Trakt rotation always
         // changes the refresh token, so a stored refresh token different from the one we just spent means a
         // winner already stored a rotated set; adopt it REGARDLESS of the access token's age (even an aged
         // set carries a live refresh token the next `validToken()` will spend), rather than wiping the
         // session over a token that merely needs its own refresh.
-        if let local = currentToken(), local.refreshToken != deadRefreshToken {
+        if let local = currentToken(ownerNamespace: capture.namespace), local.refreshToken != deadRefreshToken {
             return local
         }
         // (T-2) A sibling device rotated + pushed a newer token over the synced `doc.apiKeys` mirror. A
         // synced refresh token different from the one we spent is that sibling's fresher set; adopt it into
         // the Keychain and use it. Same-token or absent means nothing fresher exists remotely.
-        if let synced = await syncedTokenProvider?(),
+        let synced = await syncedTokenProvider?()
+        guard !Task.isCancelled else { return nil }
+        if let synced,
            !synced.access.isEmpty, !synced.refresh.isEmpty, synced.refresh != deadRefreshToken {
-            guard currentSessionID() == expectedSession else { return nil }
+            guard CredentialScopeRegistry.shared.isCurrent(capture),
+                  currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { return nil }
             // The synced token document carries no account fingerprint. A different refresh token may
             // therefore belong to another account, not merely a sibling-device rotation. Treat it as
             // a credential boundary unless a future protocol adds explicit same-account proof.
-            await performCredentialBoundary {
-                guard currentSessionID() == expectedSession else { return }
-                replaceCredentialsWithNewSession(
+            var adoptionResult: CredentialMutationResult = .failure
+            let boundaryInstalled = await performCredentialBoundary {
+                guard !Task.isCancelled,
+                      CredentialScopeRegistry.shared.isCurrent(capture),
+                      currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { return false }
+                adoptionResult = replaceCredentialsWithNewSession(
                     access: synced.access,
                     refresh: synced.refresh,
-                    expiryUnix: synced.expiryUnix
+                    expiryUnix: synced.expiryUnix,
+                    ownerCapture: capture,
+                    ownerNamespace: capture.namespace
                 )
+                return adoptionResult == .success
             }
-            return currentToken()
+            guard boundaryInstalled, adoptionResult == .success,
+                  let adopted = currentToken(ownerNamespace: capture.namespace),
+                  adopted.refreshToken != deadRefreshToken else { return nil }
+            return adopted
         }
         return nil
     }
@@ -609,17 +1286,26 @@ actor TraktAuth {
     // MARK: - Keychain persistence
 
     /// The stored token set, reconstructed from the Keychain entries, or nil if not signed in.
-    private func currentToken() -> TraktToken? {
-        guard currentSessionID() != nil,
-              let access = credentials.read(Self.accessAccount), !access.isEmpty,
-              let refresh = credentials.read(Self.refreshAccount), !refresh.isEmpty,
-              let expiryString = credentials.read(Self.expiryAccount),
-              let expiry = Int(expiryString) else { return nil }
+    private func currentToken(ownerNamespace namespace: String? = nil) -> TraktToken? {
+        let resolvedNamespace = namespace ?? ownerCapture().namespace
+        guard case let .authority(active) = readCredentialTuple(ownerNamespace: resolvedNamespace),
+              active.values.count == 4,
+              let access = active.values.first, !access.isEmpty,
+              let refresh = active.values.dropFirst().first, !refresh.isEmpty,
+              let expiryString = active.values.dropFirst(2).first,
+              let expiry = Int(expiryString),
+              let rawSession = active.values.dropFirst(3).first,
+              !rawSession.isEmpty,
+              CredentialPublicationOutbox.permitsPassiveRead(
+                  account: TraktTokenSlots.publication(resolvedNamespace),
+                  sessionID: rawSession,
+                  read: credentials.certifiedRead
+              ) else { return nil }
         // Rebuild with the ORIGINAL issue time when the fourth slot has it, so `expiresIn` is the
         // original lifetime and `defaultLeeway` gives a real 30-minute early refresh. (A rebuild from
         // the REMAINING lifetime makes `remaining <= min(1800, remaining/2)` unsatisfiable, so the
         // early refresh silently never fires and a data call can carry a token that expires in flight.)
-        if let createdAtString = credentials.read(Self.createdAtAccount),
+        if case let .value(createdAtString) = credentials.certifiedRead(slot(Self.createdAtAccount, ownerNamespace: resolvedNamespace)),
            let createdAt = Int(createdAtString), createdAt < expiry {
             return TraktToken(accessToken: access, refreshToken: refresh,
                               expiresIn: expiry - createdAt, createdAt: createdAt)
@@ -633,56 +1319,358 @@ actor TraktAuth {
                           expiresIn: expiry - now, createdAt: now)
     }
 
-    private func storeRefreshedToken(_ token: TraktToken) {
-        credentials.write(token.accessToken, Self.accessAccount)
-        credentials.write(token.refreshToken, Self.refreshAccount)
-        credentials.write(String(Int(token.expiresAt.timeIntervalSince1970)), Self.expiryAccount)
-        credentials.write(String(token.createdAt), Self.createdAtAccount)
-    }
-
-    private func replaceCredentialsWithNewSession(access: String, refresh: String, expiryUnix: Int) {
-        clearCredentialsAndPublishBoundary()
-        credentials.write(access, Self.accessAccount)
-        credentials.write(refresh, Self.refreshAccount)
-        credentials.write(String(expiryUnix), Self.expiryAccount)
-        credentials.write(String(Int(Date().timeIntervalSince1970)), Self.createdAtAccount)
-        installAndPublishNewSession()
-    }
-
-    private func currentSessionID() -> TraktSessionID? {
-        guard credentials.read(Self.accessAccount)?.isEmpty == false,
-              credentials.read(Self.refreshAccount)?.isEmpty == false,
-              let expiry = credentials.read(Self.expiryAccount), Int(expiry) != nil,
-              let raw = credentials.read(Self.sessionAccount), !raw.isEmpty else { return nil }
-        return TraktSessionID(rawValue: raw)
-    }
-
-    private func installAndPublishNewSession() {
-        let sessionID = TraktSessionID.random()
-        credentials.write(sessionID.rawValue, Self.sessionAccount)
-        guard currentSessionID() == sessionID else {
-            clearCredentialsAndPublishBoundary()
-            DiagnosticsLog.log("trakt-auth", "credential session persistence failed")
-            return
+    private func storeRefreshedToken(
+        _ token: TraktToken,
+        ownerCapture capture: CredentialScopeRegistry.Capture
+    ) -> Bool {
+        guard let mutationLease = CredentialPublicationOutbox.beginMutation() else { return false }
+        defer { CredentialPublicationOutbox.endMutation(mutationLease) }
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
+        let resolvedNamespace = capture.namespace
+        guard case let .authority(active) = readCredentialTupleForMutation(ownerNamespace: resolvedNamespace),
+              active.values.count == 4,
+              let rawSession = active.values.last,
+              !rawSession.isEmpty else { return false }
+        let result = CredentialTupleTransaction.transition(
+            baseAccounts: tupleAccounts(ownerNamespace: resolvedNamespace),
+            activePointer: TraktTokenSlots.active(resolvedNamespace),
+            cleanupMarker: TraktTokenSlots.cleanup(resolvedNamespace),
+            candidateMarker: TraktTokenSlots.candidate(resolvedNamespace),
+            candidateValues: [
+                token.accessToken,
+                token.refreshToken,
+                String(Int(token.expiresAt.timeIntervalSince1970)),
+                rawSession
+            ],
+            certifiedRead: credentials.certifiedRead,
+            recoveryRead: credentials.recoveryRead,
+            write: credentials.write
+        )
+        switch result {
+        case .activated, .alreadyActive:
+            // createdAt is optional legacy metadata, not part of the authoritative four-slot tuple. A
+            // failed best-effort mirror must not turn an already-activated access/refresh/expiry/session
+            // tuple into a reported persistence failure or make the selected B tuple appear mixed.
+            _ = persistCreatedAt(token.createdAt, ownerNamespace: resolvedNamespace)
+            return true
+        case .cleanupPending, .failedBeforeActivation, .activationStateUnknown:
+            return false
         }
-        TraktAuthBoundary.publish(sessionID)
     }
 
-    private func clearCredentialsAndPublishBoundary() {
-        // Clear the session first. Every synchronous reader becomes fail closed before any token slot
-        // changes and before account-owned caches are synchronously notified.
-        credentials.write(nil, Self.sessionAccount)
+    @discardableResult
+    private func replaceCredentialsWithNewSession(
+        access: String,
+        refresh: String,
+        expiryUnix: Int,
+        ownerCapture capture: CredentialScopeRegistry.Capture,
+        ownerNamespace namespace: String? = nil,
+        sessionID suppliedSessionID: TraktSessionID? = nil,
+        publishSession: Bool = true,
+        promoteLegacyMirror: Bool = false
+    ) -> CredentialMutationResult {
+        let resolvedNamespace = namespace ?? ownerCapture().namespace
+        guard capture.namespace == resolvedNamespace,
+              let mutationLease = CredentialPublicationOutbox.beginMutation() else { return .failure }
+        defer { CredentialPublicationOutbox.endMutation(mutationLease) }
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else { return .failure }
+        guard Self.recoverCredentialAuthority(credentials: credentials, ownerNamespace: resolvedNamespace) else {
+            return .failure
+        }
+        // A crash can leave a complete first-login candidate and its exact pending publication intent while
+        // the active-pointer write is confirmed absent. Replay cannot run until a tuple is selected, so let
+        // the certified transaction promote only the candidate matching this public retry before draining it.
+        if case .missing = credentials.certifiedRead(TraktTokenSlots.active(resolvedNamespace)),
+           case let .value(rawCandidate) = credentials.certifiedRead(TraktTokenSlots.candidate(resolvedNamespace)),
+           rawCandidate.hasPrefix("candidate:"),
+           let pointer = CredentialTupleTransaction.canonicalPointer(
+               String(rawCandidate.dropFirst("candidate:".count))
+           ),
+           case let .authority(candidate) = CredentialTupleTransaction.readStagedAuthority(
+               baseAccounts: tupleAccounts(ownerNamespace: resolvedNamespace),
+               pointer: pointer,
+               certifiedRead: credentials.certifiedRead
+           ),
+           candidate.values.count == 4,
+           candidate.values[0] == access,
+           candidate.values[1] == refresh,
+           candidate.values[2] == String(expiryUnix),
+           !candidate.values[3].isEmpty,
+           suppliedSessionID == nil || suppliedSessionID?.rawValue == candidate.values[3] {
+            let state = CredentialPublicationOutbox.state(
+                account: TraktTokenSlots.publication(resolvedNamespace),
+                read: credentials.certifiedRead
+            )
+            let intentMatches: Bool
+            switch state {
+            case let .pending(session), let .acknowledged(session):
+                guard session == candidate.values[3] else { return .failure }
+                intentMatches = true
+            case .missing:
+                intentMatches = false
+            case .dispatching, .failure:
+                return .failure
+            }
+            if intentMatches {
+                switch CredentialTupleTransaction.transition(
+                    baseAccounts: tupleAccounts(ownerNamespace: resolvedNamespace),
+                    activePointer: TraktTokenSlots.active(resolvedNamespace),
+                    cleanupMarker: TraktTokenSlots.cleanup(resolvedNamespace),
+                    candidateMarker: TraktTokenSlots.candidate(resolvedNamespace),
+                    candidateValues: candidate.values,
+                    publicationMarker: TraktTokenSlots.publication(resolvedNamespace),
+                    publicationValue: candidate.values[3],
+                    certifiedRead: credentials.certifiedRead,
+                    recoveryRead: credentials.recoveryRead,
+                    write: credentials.write
+                ) {
+                case .activated, .alreadyActive:
+                    break
+                case .cleanupPending, .failedBeforeActivation, .activationStateUnknown:
+                    return .failure
+                }
+            }
+        }
+        guard Self.replayPublicationOutbox(
+            credentials: credentials,
+            ownerNamespace: resolvedNamespace,
+            promoteLegacyMirror: promoteLegacyMirror
+        ) else {
+            return .failure
+        }
+        let current = readCredentialTupleForMutation(ownerNamespace: resolvedNamespace)
+        guard current != .failure else { return .failure }
+        let existingSession: TraktSessionID?
+        if case let .authority(active) = current,
+           active.values.count == 4,
+           active.values[0] == access,
+           active.values[1] == refresh,
+           active.values[2] == String(expiryUnix),
+           !active.values[3].isEmpty {
+            existingSession = TraktSessionID(rawValue: active.values[3])
+        } else {
+            existingSession = nil
+        }
+        let sessionID = suppliedSessionID ?? existingSession ?? TraktSessionID.random()
+        let transition = CredentialTupleTransaction.transition(
+            baseAccounts: tupleAccounts(ownerNamespace: resolvedNamespace),
+            activePointer: TraktTokenSlots.active(resolvedNamespace),
+            cleanupMarker: TraktTokenSlots.cleanup(resolvedNamespace),
+            candidateMarker: TraktTokenSlots.candidate(resolvedNamespace),
+            candidateValues: [access, refresh, String(expiryUnix), sessionID.rawValue],
+            publicationMarker: publishSession ? TraktTokenSlots.publication(resolvedNamespace) : nil,
+            publicationValue: publishSession ? sessionID.rawValue : nil,
+            promoteLegacyMirror: promoteLegacyMirror,
+            certifiedRead: credentials.certifiedRead,
+            recoveryRead: credentials.recoveryRead,
+            write: credentials.write
+        )
+        switch transition {
+        case .activated:
+            _ = persistCreatedAt(Int(Date().timeIntervalSince1970), ownerNamespace: resolvedNamespace)
+            return publishSession && !Self.replayPublicationOutbox(credentials: credentials, ownerNamespace: resolvedNamespace)
+                ? .failure
+                : .success
+        case .alreadyActive:
+            _ = persistCreatedAt(Int(Date().timeIntervalSince1970), ownerNamespace: resolvedNamespace)
+            return publishSession && !Self.replayPublicationOutbox(credentials: credentials, ownerNamespace: resolvedNamespace)
+                ? .failure
+                : .success
+        case .cleanupPending:
+            return .failure
+        case .failedBeforeActivation, .activationStateUnknown:
+            return .failure
+        }
+    }
+
+    private func persistCreatedAt(_ createdAt: Int, ownerNamespace namespace: String) -> Bool {
+        let value = String(createdAt)
+        let account = slot(Self.createdAtAccount, ownerNamespace: namespace)
+        guard credentials.write(value, account) == .success else { return false }
+        guard case let .value(readBack) = credentials.certifiedRead(account) else { return false }
+        return readBack == value
+    }
+
+    private func currentSessionID(ownerNamespace namespace: String? = nil) -> TraktSessionID? {
+        let resolvedNamespace = namespace ?? ownerCapture().namespace
+        guard case let .authority(active) = readCredentialTuple(ownerNamespace: resolvedNamespace),
+              active.values.count == 4,
+              !active.values[0].isEmpty,
+              !active.values[1].isEmpty,
+              Int(active.values[2]) != nil,
+              !active.values[3].isEmpty,
+              CredentialPublicationOutbox.permitsPassiveRead(
+                  account: TraktTokenSlots.publication(resolvedNamespace),
+                  sessionID: active.values[3],
+                  read: credentials.certifiedRead
+              ) else { return nil }
+        return TraktSessionID(rawValue: active.values[3])
+    }
+
+    private nonisolated static func replayPublicationOutbox(
+        credentials: TraktCredentialStore,
+        ownerNamespace namespace: String,
+        promoteLegacyMirror: Bool = false
+    ) -> Bool {
+        let account = TraktTokenSlots.publication(namespace)
+        guard CredentialPublicationOutbox.recoverIfUncertain(
+            account: account,
+            certifiedRead: credentials.certifiedRead,
+            recoveryRead: credentials.recoveryRead,
+            write: credentials.write
+        ) else { return false }
+        let state = CredentialPublicationOutbox.state(account: account, read: credentials.certifiedRead)
+        let sessionRaw: String
+        switch state {
+        case .missing:
+            return true
+        case .failure:
+            return false
+        case .dispatching:
+            return false
+        case let .pending(value), let .acknowledged(value):
+            sessionRaw = value
+        }
+        let baseAccounts = [
+            TraktTokenSlots.access(namespace),
+            TraktTokenSlots.refresh(namespace),
+            TraktTokenSlots.expiry(namespace),
+            TraktTokenSlots.session(namespace)
+        ]
+        let selected = CredentialTupleTransaction.readAuthority(
+            baseAccounts: baseAccounts,
+            activePointer: TraktTokenSlots.active(namespace),
+            certifiedRead: credentials.certifiedRead
+        )
+        let authority: CredentialTupleAuthority
+        switch selected {
+        case let .authority(active) where active.values.count == 4 && active.values.last == sessionRaw:
+            authority = active
+        case let .authority(active) where active.values.count == 4:
+            guard case let .value(rawCandidate) = credentials.certifiedRead(TraktTokenSlots.candidate(namespace)),
+                  rawCandidate.hasPrefix("candidate:"),
+                  let candidatePointer = CredentialTupleTransaction.canonicalPointer(
+                      String(rawCandidate.dropFirst("candidate:".count))
+                  ),
+                  case let .authority(candidate) = CredentialTupleTransaction.readStagedAuthority(
+                      baseAccounts: baseAccounts,
+                      pointer: candidatePointer,
+                      certifiedRead: credentials.certifiedRead
+                  ),
+                  candidate.values.count == 4,
+                  candidate.values.last == sessionRaw,
+                  active.values.last != sessionRaw else { return false }
+            authority = candidate
+        default:
+            return false
+        }
+        let recovery = CredentialTupleTransaction.transition(
+            baseAccounts: baseAccounts,
+            activePointer: TraktTokenSlots.active(namespace),
+            cleanupMarker: TraktTokenSlots.cleanup(namespace),
+            candidateMarker: TraktTokenSlots.candidate(namespace),
+            candidateValues: authority.values,
+            publicationMarker: account,
+            publicationValue: sessionRaw,
+            promoteLegacyMirror: promoteLegacyMirror,
+            certifiedRead: credentials.certifiedRead,
+            recoveryRead: credentials.recoveryRead,
+            write: credentials.write
+        )
+        switch recovery {
+        case .activated, .alreadyActive:
+            break
+        case .cleanupPending, .failedBeforeActivation, .activationStateUnknown:
+            return false
+        }
+        let recovered = CredentialTupleTransaction.readAuthority(
+            baseAccounts: baseAccounts,
+            activePointer: TraktTokenSlots.active(namespace),
+            certifiedRead: credentials.certifiedRead
+        )
+        guard case let .authority(recoveredAuthority) = recovered,
+              recoveredAuthority.values == authority.values,
+              case .missing = credentials.certifiedRead(TraktTokenSlots.cleanup(namespace)),
+              case .missing = credentials.certifiedRead(TraktTokenSlots.candidate(namespace)) else {
+            return false
+        }
+        if case .pending = state {
+            if let lease = CredentialPublicationOutbox.beginDispatch(
+                sessionID: sessionRaw,
+                account: account,
+                read: credentials.certifiedRead,
+                write: credentials.write
+            ) {
+                defer { CredentialPublicationOutbox.endDispatch(lease) }
+                CredentialPublicationOutbox.withCallback(lease) {
+                    TraktAuthBoundary.publish(TraktSessionID(rawValue: sessionRaw))
+                }
+                guard CredentialPublicationOutbox.acknowledge(
+                    sessionID: sessionRaw,
+                    account: account,
+                    read: credentials.certifiedRead,
+                    write: credentials.write
+                ) else { return false }
+            } else {
+                switch CredentialPublicationOutbox.state(account: account, read: credentials.certifiedRead) {
+                case .missing:
+                    return true
+                case let .acknowledged(existing) where existing == sessionRaw:
+                    break
+                case .pending, .dispatching, .acknowledged, .failure:
+                    return false
+                }
+            }
+        }
+        switch credentials.certifiedRead(TraktTokenSlots.candidate(namespace)) {
+        case .failure:
+            return false
+        case .value:
+            return true
+        case .missing:
+            break
+        }
+        return CredentialPublicationOutbox.removeAcknowledged(
+            sessionID: sessionRaw,
+            account: account,
+            read: credentials.certifiedRead,
+            write: credentials.write
+        )
+    }
+
+    private func clearCredentialsAndPublishBoundary(
+        ownerCapture capture: CredentialScopeRegistry.Capture
+    ) async -> Bool {
+        let resolvedNamespace = capture.namespace
+        guard await acquirePublicationBoundary() else { return false }
+        defer { CredentialPublicationOutbox.endBoundary() }
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
+        guard CredentialTupleTransaction.clear(
+            baseAccounts: tupleAccounts(ownerNamespace: resolvedNamespace),
+            activePointer: TraktTokenSlots.active(resolvedNamespace),
+            cleanupMarker: TraktTokenSlots.cleanup(resolvedNamespace),
+            candidateMarker: TraktTokenSlots.candidate(resolvedNamespace),
+            extraAccounts: [
+                slot(Self.createdAtAccount, ownerNamespace: resolvedNamespace),
+                TraktTokenSlots.publication(resolvedNamespace)
+            ],
+            certifiedRead: credentials.certifiedRead,
+            recoveryRead: credentials.recoveryRead,
+            write: credentials.write
+        ) else { return false }
         TraktAuthBoundary.publish(nil)
-        credentials.write(nil, Self.accessAccount)
-        credentials.write(nil, Self.refreshAccount)
-        credentials.write(nil, Self.expiryAccount)
-        credentials.write(nil, Self.createdAtAccount)
+        return true
+    }
+
+    private func acquirePublicationBoundary() async -> Bool {
+        await CredentialPublicationOutbox.waitForBoundary() == .acquired
     }
 
     private func waitForSessionWrites() async {
         while activeSessionWrites > 0 {
             await withCheckedContinuation { continuation in
                 sessionWriteDrainWaiters.append(continuation)
+                sessionWriteDrainObserver?()
             }
         }
     }
@@ -692,7 +1680,7 @@ actor TraktAuth {
     @discardableResult
     private func performCredentialBoundary(
         expectedLoginGeneration: UInt64? = nil,
-        _ mutation: () -> Void
+        _ mutation: () async -> Bool
     ) async -> Bool {
         pendingCredentialBoundaries += 1
         defer { pendingCredentialBoundaries -= 1 }
@@ -700,11 +1688,11 @@ actor TraktAuth {
         defer { releaseCredentialBoundary() }
         await waitForSessionWrites()
         if let expectedLoginGeneration,
-           !loginAttempts.isCurrent(generation: expectedLoginGeneration) {
+           (expectedLoginGeneration == 0
+                || !loginAttempts.isCurrent(generation: expectedLoginGeneration)) {
             return false
         }
-        mutation()
-        return true
+        return await mutation()
     }
 
     private func acquireCredentialBoundary() async {
@@ -740,33 +1728,141 @@ actor TraktAuth {
     // MARK: - HTTP plumbing
 
     private func ensureConfigured() throws {
-        guard !configuration.clientID.isEmpty,
-              !configuration.clientSecret.isEmpty else { throw TraktAuthError.notConfigured }
+        guard !configuration.clientID.isEmpty else { throw TraktAuthError.notConfigured }
+        guard Self.validateBrokerBase(configuration.brokerBase) != nil else {
+            throw TraktAuthError.brokerUnavailable(status: 0)
+        }
+        guard oauthRequestSigner != nil || VortXEdgeAuth.canSignOAuthV2 else {
+            throw TraktAuthError.brokerUnavailable(status: 0)
+        }
     }
 
-    private func makeRequest<Body: Encodable>(
-        path: String, method: String, body: Body, authorized: Bool
-    ) throws -> URLRequest {
-        guard let url = URL(string: configuration.apiBase + path) else { throw TraktAuthError.badURL }
+    private static func defaultSessionConfiguration() -> URLSessionConfiguration {
+        URLSessionConfiguration.ephemeral
+    }
+
+    private struct EmptyBody: Encodable {}
+
+    /// Accept only the production broker origin and path shape. This prevents a malformed configuration
+    /// from turning the OAuth client into an arbitrary request client.
+    private static func validateBrokerBase(_ raw: String) -> URL? {
+        guard let components = URLComponents(string: raw),
+              components.scheme == "https",
+              components.host == "oauth.vortx.tv",
+              components.user == nil,
+              components.password == nil,
+              components.port == nil,
+              components.query == nil,
+              components.fragment == nil,
+              components.path.isEmpty || components.path == "/" else { return nil }
+        return components.url
+    }
+
+    /// Accept only HTTPS verification pages on the exact trusted Trakt host set.
+    private static func validateVerificationURL(_ raw: String) -> Bool {
+        guard let components = URLComponents(string: raw),
+              components.scheme?.lowercased() == "https",
+              let host = components.host?.lowercased(),
+              ["trakt.tv", "www.trakt.tv"].contains(host),
+              components.user == nil,
+              components.password == nil,
+              components.port == nil,
+              components.query == nil,
+              components.fragment == nil,
+              !components.path.isEmpty else { return false }
+        return true
+    }
+
+    private func makeBrokerRequest<Body: Encodable>(path: String, body: Body) throws -> URLRequest {
+        let allowedPaths = Set([
+            "/v1/oauth/trakt/device/start",
+            "/v1/oauth/trakt/device/poll",
+            "/v1/oauth/trakt/refresh",
+            "/v1/oauth/trakt/revoke",
+        ])
+        guard allowedPaths.contains(path),
+              let base = Self.validateBrokerBase(configuration.brokerBase),
+              let url = URL(string: path, relativeTo: base)?.absoluteURL else {
+            throw TraktAuthError.brokerUnavailable(status: 0)
+        }
         var request = URLRequest(url: url)
-        request.httpMethod = method
+        request.httpMethod = "POST"
         request.timeoutInterval = 20
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // The API key header is required on every Trakt call, even unauthenticated ones.
-        request.setValue("2", forHTTPHeaderField: "trakt-api-version")
-        request.setValue(configuration.clientID, forHTTPHeaderField: "trakt-api-key")
-        request.httpBody = try JSONEncoder().encode(body)
-        _ = authorized   // OAuth endpoints never carry a bearer; flag kept for call-site symmetry.
+        let bodyData = try JSONEncoder().encode(body)
+        guard bodyData.count <= 16 * 1024 else {
+            throw TraktAuthError.brokerUnavailable(status: 0)
+        }
+        request.httpShouldHandleCookies = false
+        request.setValue(nil, forHTTPHeaderField: "Cookie")
+        request.httpBody = bodyData
+        if let oauthRequestSigner {
+            guard let signed = oauthRequestSigner(request, bodyData) else {
+                throw TraktAuthError.brokerUnavailable(status: 0)
+            }
+            request = signed
+        } else {
+            guard VortXEdgeAuth.signOAuthV2(&request, body: bodyData) else {
+                throw TraktAuthError.brokerUnavailable(status: 0)
+            }
+        }
+        guard request.url == url,
+              request.httpMethod == "POST",
+              request.httpBody == bodyData else {
+            throw TraktAuthError.brokerUnavailable(status: 0)
+        }
+        request.httpShouldHandleCookies = false
+        request.setValue(nil, forHTTPHeaderField: "Cookie")
         return request
+    }
+
+    private static func brokerFault(status: Int) -> TraktAuthError {
+        .brokerUnavailable(status: status)
     }
 
     private func send(_ request: URLRequest) async throws -> (Data, Int) {
         do {
-            let (data, response) = try await session.data(for: request)
-            return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+            let delegate = TraktOAuthNoRedirectDelegate()
+            let session = URLSession(
+                configuration: sessionConfiguration,
+                delegate: delegate,
+                delegateQueue: nil
+            )
+            defer { session.finishTasksAndInvalidate() }
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw TraktAuthError.transport("The broker returned an invalid response.")
+            }
+            let expectedLength: Int?
+            if let raw = http.value(forHTTPHeaderField: "Content-Length") {
+                guard let length = Int(raw), length >= 0, length <= 64 * 1024 else {
+                    throw TraktAuthError.transport("The broker response was invalid.")
+                }
+                expectedLength = length
+            } else {
+                expectedLength = nil
+            }
+            var data = Data()
+            data.reserveCapacity(expectedLength ?? 1024)
+            for try await byte in bytes {
+                guard data.count < 64 * 1024 else {
+                    throw TraktAuthError.transport("The broker response was too large.")
+                }
+                data.append(byte)
+            }
+            if let expectedLength, data.count != expectedLength {
+                throw TraktAuthError.transport("The broker response was incomplete.")
+            }
+            return (data, http.statusCode)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
+        } catch let error as TraktAuthError {
+            throw error
         } catch {
-            throw TraktAuthError.transport(error.localizedDescription)
+            throw TraktAuthError.transport("Could not reach the VortX Trakt service.")
         }
     }
 
@@ -780,8 +1876,22 @@ actor TraktAuth {
     }
 }
 
-/// Typed errors for the Trakt auth flow. `.notConfigured` is the pre-credentials state; the rest map
-/// to the documented device/token status codes plus transport/decode faults.
+/// OAuth broker transport never follows redirects. A redirect would otherwise move the signed POST and its
+/// body to a host that was not covered by the v2 signature.
+final class TraktOAuthNoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
+/// Typed errors for the Trakt auth flow. Broker faults are transient and never mean that the account
+/// ended. Only an explicit broker `invalid_grant` response reaches the refresh sign-out branch.
 enum TraktAuthError: LocalizedError, Sendable, Equatable {
     case notConfigured
     case notSignedIn
@@ -791,13 +1901,19 @@ enum TraktAuthError: LocalizedError, Sendable, Equatable {
     case codeAlreadyUsed
     case expired
     case denied
-    /// The Trakt app credentials (client_id/client_secret pair) were rejected by the OAuth endpoint
-    /// (HTTP 401). Distinct from a transient `.server` fault: it means the shipped credentials do not
-    /// match a valid, enabled Trakt application, so retrying will not help until they are fixed.
-    case invalidClient
+    case brokerUnavailable(status: Int)
+    case persistenceFailure
     case server(status: Int)
     case transport(String)
     case decoding
+
+    var isTransient: Bool {
+        switch self {
+        case .brokerUnavailable, .transport: return true
+        case .server(let status): return status >= 500
+        default: return false
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -809,7 +1925,8 @@ enum TraktAuthError: LocalizedError, Sendable, Equatable {
         case .codeAlreadyUsed: return "This Trakt sign-in code was already used."
         case .expired: return "The Trakt sign-in code expired. Please try again."
         case .denied: return "Trakt access was denied."
-        case .invalidClient: return "Trakt did not accept this app's credentials. Please report this if it continues."
+        case .brokerUnavailable: return "Could not reach the VortX Trakt service. Please try again in a moment."
+        case .persistenceFailure: return "Trakt could not durably save the new credentials."
         case .server(let status): return "Trakt returned an error (HTTP \(status))."
         case .transport(let message): return message
         case .decoding: return "Could not read the response from Trakt."

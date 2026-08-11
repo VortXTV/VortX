@@ -2,6 +2,7 @@
 import Foundation
 import AVKit
 import AVFoundation
+import Combine
 import CoreMedia
 import CoreImage
 import ImageIO
@@ -22,6 +23,155 @@ struct AVPlayerRemuxStartupSignal: Equatable {
         mounted || pendingGeneration == itemGeneration
     }
 }
+
+// MARK: - PiP state machine (dependency-free)
+
+enum AVPlayerPictureInPictureCommand: Equatable, Sendable {
+    case start(UInt64)
+    case stop(UInt64)
+}
+
+/// PiP is bound to the AVPlayerLayer, not to one AVPlayerItem. Replacing an episode or source on the same
+/// layer therefore keeps the controller generation alive. Only an engine stop or an actual layer-identity
+/// change retires it. Active/transitioning PiP also keeps the old item mounted until the prepared replacement
+/// is attached, avoiding a transient nil currentItem that can make AVKit tear down the floating session.
+enum AVPlayerPictureInPictureOwnershipEvent: Equatable, Sendable {
+    case itemReplacement(isActive: Bool, isTransitioning: Bool)
+    case engineStop
+    case layerReplacement
+
+    var invalidatesController: Bool {
+        switch self {
+        case .itemReplacement: false
+        case .engineStop, .layerReplacement: true
+        }
+    }
+
+    var clearsCurrentItemBeforeAttach: Bool {
+        switch self {
+        case let .itemReplacement(isActive, isTransitioning):
+            !isActive && !isTransitioning
+        case .engineStop, .layerReplacement:
+            true
+        }
+    }
+}
+
+/// Main-actor AVKit callbacks are asynchronous and can arrive after a replacement has retired the controller
+/// that emitted them. This small state machine owns the request latch and generation fence independently of
+/// AVKit, so unsupported devices, failed starts, repeated taps, and old callbacks all fail closed.
+struct AVPlayerPictureInPictureState: Equatable, Sendable {
+    enum Transition: Equatable, Sendable {
+        case starting
+        case stopping
+    }
+
+    private(set) var generation: UInt64 = 0
+    private(set) var isSupported = false
+    private(set) var isPossible = false
+    private(set) var isActive = false
+    private(set) var transition: Transition?
+
+    var isAvailable: Bool { isSupported && isPossible }
+    var isTransitioning: Bool { transition != nil }
+
+    @discardableResult
+    mutating func attach(supported: Bool, possible: Bool, active: Bool) -> UInt64 {
+        generation &+= 1
+        isSupported = supported
+        isPossible = supported && possible
+        isActive = supported && active
+        transition = nil
+        return generation
+    }
+
+    mutating func invalidate() {
+        generation &+= 1
+        isSupported = false
+        isPossible = false
+        isActive = false
+        transition = nil
+    }
+
+    mutating func requestStart() -> AVPlayerPictureInPictureCommand? {
+        guard isAvailable, !isActive, transition == nil else { return nil }
+        transition = .starting
+        return .start(generation)
+    }
+
+    mutating func requestStop() -> AVPlayerPictureInPictureCommand? {
+        guard isSupported, isActive, transition == nil else { return nil }
+        transition = .stopping
+        return .stop(generation)
+    }
+
+    @discardableResult
+    mutating func willStart(generation callbackGeneration: UInt64) -> Bool {
+        // The delegate callback is AVKit's authoritative start decision; a possible-state KVO update may still
+        // be queued behind it, so do not reject an otherwise current automatic inline start on stale `isPossible`.
+        guard isCurrent(callbackGeneration), !isActive, transition != .stopping else { return false }
+        transition = .starting
+        return true
+    }
+
+    @discardableResult
+    mutating func willStop(generation callbackGeneration: UInt64) -> Bool {
+        guard isCurrent(callbackGeneration), isSupported, transition != .starting else { return false }
+        transition = .stopping
+        return true
+    }
+
+    /// Observe state from the current AVPictureInPictureController without settling a transition. AVKit can
+    /// transiently report `isPictureInPicturePossible == false` while a start or stop is still in flight, so
+    /// only the matching-generation delegate callbacks below may settle those transitions.
+    @discardableResult
+    mutating func observe(possible: Bool, active: Bool, generation callbackGeneration: UInt64) -> Bool {
+        guard isCurrent(callbackGeneration) else { return false }
+        isPossible = possible
+        isActive = active
+        return true
+    }
+
+    @discardableResult
+    mutating func didStart(
+        possible: Bool,
+        active: Bool,
+        generation callbackGeneration: UInt64
+    ) -> Bool {
+        guard isCurrent(callbackGeneration) else { return false }
+        isPossible = possible
+        isActive = active
+        transition = nil
+        return true
+    }
+
+    @discardableResult
+    mutating func didStop(
+        possible: Bool,
+        active: Bool,
+        generation callbackGeneration: UInt64
+    ) -> Bool {
+        guard isCurrent(callbackGeneration) else { return false }
+        isPossible = possible
+        isActive = active
+        transition = nil
+        return true
+    }
+
+    @discardableResult
+    mutating func failStart(generation callbackGeneration: UInt64) -> Bool {
+        guard isCurrent(callbackGeneration) else { return false }
+        isActive = false
+        transition = nil
+        return true
+    }
+
+    private func isCurrent(_ callbackGeneration: UInt64) -> Bool {
+        isSupported && generation == callbackGeneration
+    }
+}
+
+// MARK: - AVPlayer engine
 
 /// AVFoundation implementation of `PlayerEngine`. It drives one `AVPlayer` and maps its KVO + a periodic
 /// time observer onto the SAME `MPVProperty` event keys the chrome already listens for, so the full
@@ -50,7 +200,7 @@ struct AVPlayerRemuxStartupSignal: Equatable {
 /// (`setHardwareDecoding`, always hardware); the chrome hides those rows when this engine is active. iOS HLS
 /// now flows through this same full-chrome engine (Gap 1), so the bare `HLSPlayerView` path is no longer mounted.
 @MainActor
-final class AVPlayerEngineController: NSObject, PlayerEngine {
+final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     let player = AVPlayer()
     /// The chrome's Coordinator. Property changes are pushed here with the same string keys the libmpv
     /// controller emits, so `handleProperty()` runs unchanged against either engine.
@@ -194,6 +344,14 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     private var remuxSubtitleInventoryRefreshTask: Task<Void, Never>?
     private var observations: [NSKeyValueObservation] = []
     private var pipController: AVPictureInPictureController?
+    private var pipObservations: [NSKeyValueObservation] = []
+    private var pipState = AVPlayerPictureInPictureState()
+    /// Published from the current AVPictureInPictureController only. The PlayerScreen child view observes the
+    /// engine so the button appears/disappears and changes glyph after AVKit settles, including a failed start.
+    @Published private(set) var isPictureInPicturePossible = false
+    @Published private(set) var isPictureInPictureActive = false
+    @Published private(set) var pictureInPictureTransition: AVPlayerPictureInPictureState.Transition? = nil
+    var isPictureInPictureTransitioning: Bool { pictureInPictureTransition != nil }
     private weak var playerLayer: AVPlayerLayer?
     /// On-demand video frame tap for trickplay (community scrub previews). Pull-model: AVFoundation only
     /// converts a frame when copyPixelBuffer is called (~every 10s), so it adds no steady-state cost. The MPV
@@ -266,6 +424,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     // delivery AVFoundation supports for a growing fMP4 (the progressive loader path above never framed on
     // device). Held for the whole session; torn down in stop()/loadFile().
     private var remuxHLSServer: VortXRemuxHLSServer?
+    private struct ConfiguredPreparedRemux {
+        let handle: VortXPreparedRemuxHandle
+        let ownerIdentity: VortXPreparedRemuxOwnerIdentity
+    }
+    /// One transport-only next load candidate. The caller must configure the exact owner immediately before
+    /// issuing that load. `loadFile` consumes this slot even on rejection, so it cannot leak into a later title.
+    private var configuredPreparedRemux: ConfiguredPreparedRemux?
     /// EXTERNAL ENGINE MODE: the same remux, produced on ANOTHER machine and mounted over the LAN.
     ///
     /// A separate optional rather than a protocol over the local server, deliberately. The local type is at the
@@ -476,10 +641,64 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         hasConfiguredAudioSourceIndex = true
     }
 
+    /// Create a transport-only next-episode remux using the same initial audio preference snapshot a fresh
+    /// `loadFile` uses. This creates no AVPlayerItem and no visual decoder.
+    static func prepareRemuxTransport(
+        input: URL,
+        headers: [String: String]?,
+        mode: VortXPreparedRemuxMode,
+        startAtSeconds: Double = 0,
+        ownerIdentity: VortXPreparedRemuxOwnerIdentity,
+        selectedAudioStreamIndex: Int? = nil
+    ) async -> VortXPreparedRemuxHandle? {
+        guard VortXRemuxHLSServer.deliveryEnabled else { return nil }
+        let preferences = TrackPreferences.current
+        let normalized = VortXEngineProtocol.normalizedAudioSelectionPreferences(
+            preferredLanguages: preferences.audioLanguages,
+            rejectTerms: preferences.rejectTerms)
+        return await VortXPreparedRemuxHandle.prepare(
+            input: input,
+            headers: headers,
+            mode: mode,
+            startAtSeconds: startAtSeconds,
+            ownerIdentity: ownerIdentity,
+            selectedAudioStreamIndex: selectedAudioStreamIndex,
+            preferredAudioLanguages: normalized?.preferredLanguages,
+            audioRejectTerms: normalized?.rejectTerms)
+    }
+
+    /// Arm exactly one prepared handle for the next load. A stale owner is rejected at configuration time;
+    /// source, headers, mode, origin and audio inputs are checked again inside `loadFile`.
+    @discardableResult
+    func configurePreparedRemuxForNextLoad(
+        _ handle: VortXPreparedRemuxHandle,
+        ownerIdentity: VortXPreparedRemuxOwnerIdentity
+    ) -> Bool {
+        guard handle.identity.owner == ownerIdentity else {
+            handle.abandon(reason: "owner-mismatch")
+            return false
+        }
+        configuredPreparedRemux?.handle.abandon(reason: "superseded-before-load")
+        configuredPreparedRemux = ConfiguredPreparedRemux(
+            handle: handle,
+            ownerIdentity: ownerIdentity)
+        return true
+    }
+
+    func discardPreparedRemuxForNextLoad(reason: String = "caller-discarded") {
+        configuredPreparedRemux?.handle.abandon(reason: reason)
+        configuredPreparedRemux = nil
+    }
+
     @discardableResult
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?,
                   reusing loadToken: PlayerLoadToken?) -> PlayerLoadToken {
         invalidateSeekRequests()
+        let pictureInPictureReplacement = AVPlayerPictureInPictureOwnershipEvent.itemReplacement(
+            isActive: pipState.isActive || pipController?.isPictureInPictureActive == true,
+            isTransitioning: pipState.isTransitioning)
+        let preparedCandidate = configuredPreparedRemux
+        configuredPreparedRemux = nil
         let isIntentRemount = loadToken != nil && pendingPlaybackIntent != nil
         if loadToken == nil {
             let preferences = TrackPreferences.current
@@ -540,10 +759,14 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         teardownObservers()
         teardownRemux()
         remuxTimelineOrigin = 0
-        // Native-DV criteria loading is asynchronous. Retire the old item now so it cannot keep playing behind
-        // the new title's preflight; the guarded attach closure below is the only place a replacement mounts.
+        // Native-DV criteria loading is asynchronous. Normally retire the old item now so it cannot keep
+        // playing behind the new title's preflight. Active/transitioning PiP is the exception: its controller
+        // owns this stable AVPlayerLayer, so keep a paused non-nil currentItem until attachPreparedItem performs
+        // the direct replacement. This preserves AVKit's PiP session without weakening the guarded attach.
         player.pause()
-        player.replaceCurrentItem(with: nil)
+        if pictureInPictureReplacement.clearsCurrentItemBeforeAttach {
+            player.replaceCurrentItem(with: nil)
+        }
         item = nil
         videoOutput = nil
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
@@ -568,6 +791,12 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // audio automatically), so this is iOS/tvOS only.
         #if os(iOS) || os(tvOS)
         AVPlayerAudioSession.activateForMovie()
+        #endif
+        #if os(iOS)
+        // Keep the AVPlayer lane aligned with the existing user-facing background-playback preference. PiP and
+        // inline playback remain AVKit-owned; this only tells AVPlayer what to do when the app backgrounds.
+        player.audiovisualBackgroundPlaybackPolicy = PlaybackSettings.keepPlayingInBackground
+            ? .continuesIfPossible : .pauses
         #endif
         // DV-for-MKV streaming remux path (Phase 1, opt-in): if the router flagged this URL for the in-process
         // MKV -> fMP4 remux, mount the remux instead of loading the MKV directly (AVFoundation has no Matroska
@@ -606,6 +835,34 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         forcePlainRemux = false
         let wantsRemux = wantsDVRemux || wantsPlainRemux
         pendingRemuxGeneration = wantsRemux ? issuedGeneration : nil
+        let startupTimeout: @Sendable (VortXRemuxHLSServer) -> Void = { [weak self] timedOutServer in
+            Task { @MainActor [weak self] in
+                self?.handleRemuxStartupTimeout(
+                    timedOutServer, loadToken: issuedToken)
+            }
+        }
+        var adoptedPrepared: VortXPreparedRemuxHandle.AdoptedTransport?
+        if let preparedCandidate {
+            if wantsRemux, VortXRemuxHLSServer.deliveryEnabled {
+                let expectedIdentity = VortXPreparedRemuxIdentity(
+                    owner: preparedCandidate.ownerIdentity,
+                    input: url,
+                    headers: headers,
+                    mode: wantsPlainRemux ? .plain : .dolbyVision,
+                    startAtSeconds: requestedRemuxOrigin,
+                    selectedAudioStreamIndex: selectedRemuxAudioSourceIndex,
+                    preferredAudioLanguages: remuxPreferredAudioLanguages,
+                    audioRejectTerms: remuxAudioRejectTerms)
+                if case .adopted(let transport) = preparedCandidate.handle.adopt(
+                    expectedIdentity: expectedIdentity,
+                    onStartupTimeout: startupTimeout
+                ) {
+                    adoptedPrepared = transport
+                }
+            } else {
+                preparedCandidate.handle.abandon(reason: "load-not-local-remux")
+            }
+        }
         // EXTERNAL ENGINE MODE. When the user has paired a Mac and turned this on, the remux is produced THERE
         // and mounted over the LAN, so this device spends its whole chip decoding instead of demuxing, rewriting
         // the Dolby Vision RPU, muxing and spooling. The stream is a copy either way: nothing is re-encoded, so
@@ -619,7 +876,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // takes the ordinary local branch below. There is no state in which a bad host is worse than no host.
         let externalConsumed = bypassExternalEngine
         bypassExternalEngine = false
-        if wantsRemux, VortXRemuxHLSServer.deliveryEnabled, !externalConsumed,
+        if adoptedPrepared == nil,
+           wantsRemux, VortXRemuxHLSServer.deliveryEnabled, !externalConsumed,
            case .external = VortXExternalEngine.shared.mountPlan {
             beginExternalEngineMount(
                 url: url,
@@ -635,19 +893,24 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 generation: issuedGeneration)
             return issuedToken
         }
-        if wantsRemux, VortXRemuxHLSServer.deliveryEnabled,
+        if let adopted = adoptedPrepared {
+            remuxHLSServer = adopted.server
+            newAsset = AVURLAsset(url: adopted.playlistURL)
+            let lane = wantsPlainRemux ? "plain-remux" : "dv-remux"
+            DiagnosticsLog.log(
+                "avplayer",
+                "\(lane) mount (prepared local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(adopted.server.port)")
+            VXProbe.log(
+                "dv",
+                "\(lane) adopted (prepared local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(adopted.server.port)")
+        } else if wantsRemux, VortXRemuxHLSServer.deliveryEnabled,
            let mounted = VortXRemuxHLSServer.make(input: url, headers: headers,
                                                   mode: wantsPlainRemux ? .plain : .dolbyVision,
                                                   startAtSeconds: requestedRemuxOrigin,
                                                   selectedAudioStreamIndex: selectedRemuxAudioSourceIndex,
                                                   preferredAudioLanguages: remuxPreferredAudioLanguages,
                                                   audioRejectTerms: remuxAudioRejectTerms,
-                                                  onStartupTimeout: { [weak self] timedOutServer in
-                Task { @MainActor [weak self] in
-                    self?.handleRemuxStartupTimeout(
-                        timedOutServer, loadToken: issuedToken)
-                }
-            }) {
+                                                  onStartupTimeout: startupTimeout) {
             remuxHLSServer = mounted.server
             mounted.server.start()
             newAsset = AVURLAsset(url: mounted.playlistURL)
@@ -697,6 +960,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             newAsset = AVURLAsset(url: url, options: options)
         }
         let newItem = AVPlayerItem(asset: newAsset)
+        // A10-ii: name the AVPlayer lane on the probe at the mount, so the first heartbeat after routing shows
+        // engine=avplayer + the source host instead of a stale or blank lane. The KVO observers refine the
+        // state, position and duration as playback settles.
+        VXProbeState.shared.setPlayer(state: "buffering", source: url.host, engine: "avplayer")
         if isRemuxMounted {
             // The remux window bounds OUR buffer, but AVPlayer keeps its OWN forward buffer of the served HLS
             // and, left unset, sizes it at its discretion (hundreds of MB at 4K DV bitrates, in the SAME
@@ -1283,17 +1550,57 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         }
     }
 
+    /// Apply only the controller's live committed transport. Remount snapshots restore playhead and media
+    /// selections, but a snapshot must never replay transport captured before a later user action.
+    private func applyCommittedTransport() {
+        switch PlaybackIntentPolicy.committedTransportAction(
+            playbackRequested: playbackRequested,
+            requestedRate: requestedRate) {
+        case .play(let rate):
+            // Explicit play() then pin the rate. Direct mounts keep prompt-start behavior; remux mounts wait
+            // only for their explicit bounded startup policy.
+            player.play()
+            player.rate = rate
+        case .pause:
+            player.pause()
+        }
+    }
+
+    /// One line per transport call, carrying the committed intent, the requested rate, AVPlayer's own
+    /// timeControlStatus and whether a replacement intent is outstanding. The Beta 13 remount was read from a
+    /// device log in which play(), pause(), togglePause() and setSpeed() wrote NOTHING at all, so a press that
+    /// reached the engine could not be told from one that never arrived. This is the receipt for the press.
+    private func logTransport(_ call: String) {
+        DiagnosticsLog.log(
+            "avplayer",
+            "\(call) playbackRequested=\(playbackRequested) requestedRate=\(requestedRate) "
+                + "tcs=\(player.timeControlStatus.rawValue) pendingIntent=\(pendingPlaybackIntent != nil)")
+    }
+
     func play() {
         playbackRequested = true
         refreshPendingIntentTransport()
         player.rate = requestedRate
+        logTransport("play")
+        // OPTIMISTIC TRANSPORT PUBLISH. The chrome's pause glyph hangs off this property, and its only other
+        // producer is the timeControlStatus KVO -- which CANNOT fire during a remount, because the player is
+        // already sitting at rate 0 / .paused and nothing changes for it to observe. A press then left the OSD
+        // showing the opposite state for as long as the replacement took. Publish the committed intent here,
+        // where the press is known. The KVO still reports genuine system-driven changes and is guarded (see
+        // `observe`) so it can never contradict an outstanding intent mid-remount.
+        emit(MPVProperty.pause, false)
     }
     func pause() {
         playbackRequested = false
         refreshPendingIntentTransport()
         player.pause()
+        logTransport("pause")
+        emit(MPVProperty.pause, true)   // see play(): the KVO cannot cover a press made during a remount
     }
-    func togglePause() { playbackRequested ? pause() : play() }
+    func togglePause() {
+        logTransport("togglePause")
+        playbackRequested ? pause() : play()
+    }
 
     /// Replace a forward-only remux with one whose input begins at the requested source second. This is the
     /// actual seek operation when the current HLS item has not produced, or no longer retains, that point.
@@ -1323,6 +1630,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             live: lastLoadLive,
             audioSidecar: nil,
             reusing: loadToken)
+        // SEEK FEEDBACK. A seek outside the mounted window is a whole replacement mount, and for its entire
+        // duration (12.9s in the Beta 13 device log) the engine published NOTHING: the heartbeat still read
+        // player=playing while the picture sat frozen on the pre-seek frame, so the wait looked like a hang.
+        // Publish the buffering state the chrome already renders as its spinner; readyToPlay clears it.
+        // Emitted AFTER loadFile on purpose: `emit` captures `itemGeneration` and the replacement bumps it, so
+        // an emit issued before the call would be discarded by its own generation guard. Skipped when the load
+        // already failed fast (the chrome is demoting; a spinner on a dead mount would be noise).
+        if !fatalErrorEmitted {
+            emit(MPVProperty.pausedForCache, true, loadToken: loadToken)
+        }
         return true
     }
 
@@ -1510,6 +1827,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         requestedRate = Float(speed)
         refreshPendingIntentTransport()
         if player.timeControlStatus != .paused { player.rate = requestedRate }
+        logTransport("setSpeed")
     }
 
     /// Live playback position in SOURCE seconds. A resumed remux adds its achieved timeline origin; an
@@ -1544,9 +1862,39 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     }
     func setMuted(_ muted: Bool) { player.isMuted = muted }
 
+    /// Start PiP only when the current controller says it is possible. The state latch suppresses a second
+    /// request while AVKit is still deciding, so repeated taps cannot queue duplicate starts.
+    @discardableResult
+    func startPictureInPicture() -> Bool {
+        guard let pictureInPictureController = pipController,
+              let generation = pictureInPictureGeneration(for: pictureInPictureController) else { return false }
+        refreshPictureInPictureState(for: pictureInPictureController, generation: generation)
+        guard case .start(let requestGeneration) = pipState.requestStart(),
+              requestGeneration == generation,
+              pictureInPictureController.isPictureInPicturePossible,
+              !pictureInPictureController.isPictureInPictureActive else { return false }
+        pictureInPictureController.startPictureInPicture()
+        return true
+    }
+
+    /// Stop only the current active controller. Teardown uses the same controller-identity fence and never
+    /// trusts a late `didStop` callback from a retired item.
+    @discardableResult
+    func stopPictureInPicture() -> Bool {
+        guard let pictureInPictureController = pipController,
+              let generation = pictureInPictureGeneration(for: pictureInPictureController) else { return false }
+        refreshPictureInPictureState(for: pictureInPictureController, generation: generation)
+        guard case .stop(let requestGeneration) = pipState.requestStop(),
+              requestGeneration == generation,
+              pictureInPictureController.isPictureInPictureActive else { return false }
+        pictureInPictureController.stopPictureInPicture()
+        return true
+    }
+
     func stop() {
         invalidateSeekRequests()
         invalidateLoadToken()
+        discardPreparedRemuxForNextLoad(reason: "engine-stop")
         externalMountTask?.cancel()
         externalMountTask = nil
         resumeConfiguration.reset()
@@ -1562,6 +1910,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         #endif
         hdrFallbackCapabilityRefreshTask?.cancel()
         hdrFallbackCapabilityRefreshTask = nil
+        resetPictureInPictureController(for: .engineStop)
         teardownObservers()
         teardownRemux()
         #if os(tvOS)
@@ -1572,8 +1921,6 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         disableExternalSubtitle(discardingCues: true)   // full teardown: nothing survives the session
         player.pause()
         player.replaceCurrentItem(with: nil)
-        pipController?.delegate = nil
-        pipController = nil
         videoOutput = nil
         item = nil
         playbackRequested = false
@@ -2322,12 +2669,110 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
 
     /// The AVPlayerLayer host calls this once its layer exists, so video gravity + PiP bind to the live layer.
     func attachLayer(_ layer: AVPlayerLayer) {
+        if let previousLayer = playerLayer, previousLayer !== layer {
+            resetPictureInPictureController(for: .layerReplacement)
+        }
         playerLayer = layer
         layer.videoGravity = Self.gravity(for: videoSizeMode)
-        guard pipController == nil, AVPictureInPictureController.isPictureInPictureSupported() else { return }
-        let pip = AVPictureInPictureController(playerLayer: layer)
-        pip?.delegate = self
-        pipController = pip
+        installPictureInPictureController(on: layer)
+    }
+
+    private func installPictureInPictureController(on layer: AVPlayerLayer) {
+        guard pipController == nil else { return }
+        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+            pipState.attach(supported: false, possible: false, active: false)
+            publishPictureInPictureState()
+            return
+        }
+        guard let pictureInPictureController = AVPictureInPictureController(playerLayer: layer) else {
+            pipState.attach(supported: false, possible: false, active: false)
+            publishPictureInPictureState()
+            return
+        }
+        pictureInPictureController.delegate = self
+        // Allow AVKit to enter PiP automatically when this inline layer backgrounds. Explicit starts still go
+        // through startPictureInPicture(), so the manual button and automatic entry share the same state truth.
+        #if os(iOS)
+        pictureInPictureController.canStartPictureInPictureAutomaticallyFromInline = true
+        #endif
+        pipController = pictureInPictureController
+        let generation = pipState.attach(
+            supported: true,
+            possible: pictureInPictureController.isPictureInPicturePossible,
+            active: pictureInPictureController.isPictureInPictureActive)
+        publishPictureInPictureState()
+        observePictureInPicture(pictureInPictureController, generation: generation)
+    }
+
+    /// Retire every KVO/delegate edge only when its owning engine or physical layer is going away. The old
+    /// controller is stopped after its delegate is cleared, so a late AVKit callback cannot revive state.
+    private func resetPictureInPictureController(for event: AVPlayerPictureInPictureOwnershipEvent) {
+        guard event.invalidatesController else { return }
+        let retiredController = pipController
+        let shouldStop = retiredController?.isPictureInPictureActive == true || pipState.isTransitioning
+        pipObservations.forEach { $0.invalidate() }
+        pipObservations.removeAll()
+        retiredController?.delegate = nil
+        pipController = nil
+        pipState.invalidate()
+        publishPictureInPictureState()
+        if shouldStop { retiredController?.stopPictureInPicture() }
+    }
+
+    private func publishPictureInPictureState() {
+        isPictureInPicturePossible = pipState.isAvailable
+        isPictureInPictureActive = pipState.isActive
+        pictureInPictureTransition = pipState.transition
+    }
+
+    private func pictureInPictureGeneration(
+        for pictureInPictureController: AVPictureInPictureController
+    ) -> UInt64? {
+        guard pipController === pictureInPictureController, pipState.isSupported else { return nil }
+        return pipState.generation
+    }
+
+    private func refreshPictureInPictureState(
+        for pictureInPictureController: AVPictureInPictureController,
+        generation: UInt64
+    ) {
+        guard pipController === pictureInPictureController,
+              pipState.observe(
+                possible: pictureInPictureController.isPictureInPicturePossible,
+                active: pictureInPictureController.isPictureInPictureActive,
+                generation: generation) else { return }
+        publishPictureInPictureState()
+    }
+
+    private func observePictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController,
+        generation: UInt64
+    ) {
+        let possible = pictureInPictureController.observe(
+            \.isPictureInPicturePossible,
+            options: [.initial, .new]) { [weak self] observedController, _ in
+                Task { @MainActor [weak self] in
+                    guard let self,
+                          let callbackGeneration = self.pictureInPictureGeneration(for: observedController),
+                          callbackGeneration == generation else { return }
+                    self.refreshPictureInPictureState(
+                        for: observedController,
+                        generation: generation)
+                }
+            }
+        let active = pictureInPictureController.observe(
+            \.isPictureInPictureActive,
+            options: [.initial, .new]) { [weak self] observedController, _ in
+                Task { @MainActor [weak self] in
+                    guard let self,
+                          let callbackGeneration = self.pictureInPictureGeneration(for: observedController),
+                          callbackGeneration == generation else { return }
+                    self.refreshPictureInPictureState(
+                        for: observedController,
+                        generation: generation)
+                }
+            }
+        pipObservations.append(contentsOf: [possible, active])
     }
 
     // MARK: Observation -> MPVProperty events
@@ -2394,10 +2839,22 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                     MPVProperty.pausedForCache, waiting,
                     loadToken: loadToken
                 )
-                self.emit(
-                    MPVProperty.pause, player.timeControlStatus == .paused,
-                    loadToken: loadToken
-                )
+                // The KVO is no longer the sole producer of the pause state: play()/pause() publish the
+                // committed intent optimistically so the OSD flips on the press. Echoing the raw status while
+                // a replacement is in flight would FIGHT that emit, because a remounting player legitimately
+                // sits at rate 0 / .paused while the user's intent is PLAYING, and the glyph would flick back.
+                // Publish the observed status only when it AGREES with the committed intent, or when no
+                // replacement is outstanding (the steady state, where the status IS the truth: a system pause,
+                // an interruption, or an end-of-item stop). The two producers can therefore never oscillate.
+                let observedPaused = player.timeControlStatus == .paused
+                let replacementInFlight =
+                    self.pendingPlaybackIntent != nil || self.remuxSeekRemountTarget != nil
+                if !replacementInFlight || observedPaused == !self.playbackRequested {
+                    self.emit(
+                        MPVProperty.pause, observedPaused,
+                        loadToken: loadToken
+                    )
+                }
             }
         })
         // ~4 Hz, matching the libmpv controller's coalesced time-pos cadence. Delivered on .main, so it runs
@@ -2431,7 +2888,15 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 // Push the play head (and duration when known) into the probe, throttled.
                 if clock - self.lastProbeEmit >= minInterval {
                     self.lastProbeEmit = clock
-                    let dur = self.item?.duration.seconds ?? 0
+                    // A10-iii: on a remux mount item.duration is only the LOCAL served playlist window (e.g.
+                    // 1305s), not the true source, so feed the probe the retained full source duration so the
+                    // heartbeat's pos/dur reflects the real title. Keep item.duration for genuine partial/live HLS.
+                    let sourceDuration: Double? = self.isRemuxMounted
+                        ? (self.remuxHLSServer?.sourceDurationSeconds
+                            ?? self.remuxRemoteMount?.sourceDurationSeconds
+                            ?? self.remuxLoader?.sourceDurationSeconds)
+                        : nil
+                    let dur = sourceDuration ?? (self.item?.duration.seconds ?? 0)
                     VXProbeState.shared.setPlayer(pos: position.isFinite ? Int(position) : 0,
                                                   dur: dur.isFinite && dur > 0 ? Int(dur) : nil,
                                                   engine: "avplayer")
@@ -2551,6 +3016,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 }
             }
             isReady = true
+            // Clear the seek-remount spinner (see remountForSeek). The replacement is playable, so whatever
+            // wait it advertised is over; an item that is still genuinely starved re-raises this from its own
+            // buffer observers on the very next callback.
+            emit(MPVProperty.pausedForCache, false, loadToken: loadToken)
             // F3: the engine has a decodable first frame. Widen the remux producer lead from the reduced
             // pre-ready value to the full lead now that the pre-first-frame co-resident window (when a demote
             // may re-open the same 4K stream on libmpv) is past. No-op on a non-remux item.
@@ -2627,16 +3096,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             }
             if !didStart {
                 didStart = true
-                if playbackRequested {
-                    // Explicit play() then pin the rate. Direct mounts keep prompt-start behavior; remux mounts
-                    // wait only for their explicit bounded startup policy.
-                    player.play()
-                    player.rate = requestedRate
-                    DiagnosticsLog.log("avplayer", "readyToPlay -> play() rate=\(requestedRate) tcs=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")
-                } else {
-                    player.pause()
-                    DiagnosticsLog.log("avplayer", "readyToPlay -> preserved paused transport intent")
-                }
+                applyCommittedTransport()
+                DiagnosticsLog.log(
+                    "avplayer",
+                    "readyToPlay -> committed transport playbackRequested=\(playbackRequested) requestedRate=\(requestedRate) tcs=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")
                 // Variant-pick observability: each item has exactly one video variant. The path identifies
                 // whether this is the primary DV item or the explicit HDR-only recovery item.
                 let indicatedBitrate = item.accessLog()?.events.last?.indicatedBitrate ?? -1
@@ -2833,8 +3296,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     @MainActor
     private func repairIncompatibleDVSampleEntry(_ fourcc: String) {
         guard let url = lastLoadURL, let loadToken = activeLoadToken else { return }
+        // `dvRemuxEngaged`, so an explicit "Prefer AVPlayer" pick repairs the sample entry through the remux
+        // lane (true DV) instead of demoting to libmpv HDR10 the moment the toggle happens to be off.
         if VortXRemuxHLSServer.deliveryEnabled,
-           PlayerEngineRouter.dvRemuxEnabled(dvDisplayCapable: DVDisplaySupport.isCapable) {
+           PlayerEngineRouter.dvRemuxEngaged(dvDisplayCapable: DVDisplaySupport.isCapable) {
             DiagnosticsLog.log("dv", "native DV \(fourcc) sample entry is not AVPlayer-decodable (black over audio) -> re-mounting \(url.host ?? "?") through the remux lane for hvc1 repair")
             VXProbe.log("dv", "native DV \(fourcc) -> remux re-mount (hvc1/dvh1 repair)")
             forceRemux = true
@@ -3296,21 +3761,22 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                     break
                 }
 
-                playbackRequested = restore.playbackRequested
-                requestedRate = restore.requestedRate
-                if playbackRequested {
-                    player.play()
-                    player.rate = requestedRate
-                } else {
-                    player.pause()
-                }
+                // The snapshot owns playhead and media selections only. Transport is live controller state:
+                // play(), pause() and setSpeed() may have committed a newer choice while groups were loading.
+                applyCommittedTransport()
                 pendingPlaybackIntent = nil
                 remuxSeekRemountTarget = nil
                 audioReplacement = nil
                 DiagnosticsLog.log(
                     "avplayer",
-                    "playback intent restored once generation=\(selectionGeneration) mount=\(selectionMountIdentity) sourceTime=\(String(format: "%.3f", restore.sourceSeconds)) audio=\(restore.audioSourceIndex.map(String.init) ?? restore.nativeAudioIndex.map(String.init) ?? "default") subtitle=\(String(describing: restore.subtitle))")
+                    "playback intent restored once generation=\(selectionGeneration) mount=\(selectionMountIdentity) sourceTime=\(String(format: "%.3f", restore.sourceSeconds)) audio=\(restore.audioSourceIndex.map(String.init) ?? restore.nativeAudioIndex.map(String.init) ?? "default") subtitle=\(String(describing: restore.subtitle)) capturedPlaybackRequested=\(restore.playbackRequested) capturedRate=\(restore.requestedRate) committedPlaybackRequested=\(playbackRequested) committedRate=\(requestedRate)")
             } else if pendingPlaybackIntent != nil {
+                // A live mount always restores here: `replacementReady` is true by this point (the audio
+                // replacement block above either marks the transaction ready or returns), and loadFile / the
+                // recovery remount rebind the intent to every mount's generation and identity, so `consume`
+                // matches and lands exactly once for the current mount. The only way to reach this branch is a
+                // stale selection pass whose generation the guards above already rejected; keep the unconsumed
+                // local copy so nothing is lost, but there is no restore to retry.
                 pendingPlaybackIntent = ownedIntent
             }
             // A selection notification may arrive before the groups finish loading and publish an empty
@@ -3409,11 +3875,71 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         if let timeObserver { player.removeTimeObserver(timeObserver) }
         if let playheadObserver { player.removeTimeObserver(playheadObserver) }
         observations.forEach { $0.invalidate() }
+        pipObservations.forEach { $0.invalidate() }
+        pipController?.delegate = nil
         NotificationCenter.default.removeObserver(self)   // matches teardownObservers(): drop AVPlayerItem note observers before dealloc
         remuxLoader?.invalidate()
         remuxHLSServer?.invalidate()
+        configuredPreparedRemux?.handle.abandon(reason: "engine-deinit")
     }
 }
 
-extension AVPlayerEngineController: AVPictureInPictureControllerDelegate {}
+extension AVPlayerEngineController: AVPictureInPictureControllerDelegate {
+    func pictureInPictureControllerWillStartPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        guard let generation = pictureInPictureGeneration(for: pictureInPictureController),
+              pipState.willStart(generation: generation) else { return }
+        publishPictureInPictureState()
+    }
+
+    func pictureInPictureControllerDidStartPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        guard let generation = pictureInPictureGeneration(for: pictureInPictureController) else { return }
+        guard pipState.didStart(
+            possible: pictureInPictureController.isPictureInPicturePossible,
+            active: pictureInPictureController.isPictureInPictureActive,
+            generation: generation) else { return }
+        publishPictureInPictureState()
+    }
+
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        failedToStartPictureInPictureWithError error: Error
+    ) {
+        guard let generation = pictureInPictureGeneration(for: pictureInPictureController),
+              pipState.failStart(generation: generation) else { return }
+        publishPictureInPictureState()
+        DiagnosticsLog.log("avplayer", "PiP start failed: \(error.localizedDescription)")
+    }
+
+    func pictureInPictureControllerWillStopPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        guard let generation = pictureInPictureGeneration(for: pictureInPictureController),
+              pipState.willStop(generation: generation) else { return }
+        publishPictureInPictureState()
+    }
+
+    func pictureInPictureControllerDidStopPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        guard let generation = pictureInPictureGeneration(for: pictureInPictureController) else { return }
+        guard pipState.didStop(
+            possible: pictureInPictureController.isPictureInPicturePossible,
+            active: pictureInPictureController.isPictureInPictureActive,
+            generation: generation) else { return }
+        publishPictureInPictureState()
+    }
+
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
+    ) {
+        // PlayerScreen remains mounted over the same layer, so there is no second UI to present. A retired
+        // controller must decline restoration rather than waking a replacement screen with stale state.
+        completionHandler(pictureInPictureGeneration(for: pictureInPictureController) != nil)
+    }
+}
 #endif

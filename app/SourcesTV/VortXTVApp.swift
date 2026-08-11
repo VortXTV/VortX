@@ -179,6 +179,11 @@ struct VortXTVApp: App {
                     // rqbit shutdown off-main); .active above restarts it. No-op while the flag is off.
                     VortxNativeServer.stopOnBackground()
                     #endif
+                    // Drop the memoized YouTube-trailer range-proxy listener: tvOS can reclaim its bound
+                    // loopback port across a suspension, and the proxy caches the port once, so every Home
+                    // hero-preview trailer fails after a resume until it rebinds. proxied() rebinds lazily on
+                    // the next preview, so this just clears the stale listener/port.
+                    VXTrailerProxy.shared.invalidate()
                     VortXSyncManager.shared.stopRealtime()   // drop the socket + poll while suspended
                     // push profiles + settings under a background-task grace window so a just-made library
                     // removal / rewind survives a sideload-update process kill (CW resurrection fix).

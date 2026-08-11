@@ -8,6 +8,16 @@ enum PlaybackSettings {
         static let videoUpscaling = "stremiox.videoUpscaling"
     }
 
+    /// I-settings: a centralized logged write for a user-facing preference. Emits one `[settings]` line so a
+    /// device capture shows exactly which preference changed and to what. Preference writes were silent
+    /// before, which is what made the DV mystery unsolvable. The value is scrubbed through VXProbeRedaction so
+    /// identifier-bearing prefs (custom mpv options, URLs) never leak into the log; DiagnosticsLog scrubs again
+    /// at its durable-write chokepoint, so this is defense-in-depth, not the only guard.
+    static func loggedSet(_ value: Any, forKey key: String) {
+        UserDefaults.standard.set(value, forKey: key)
+        DiagnosticsLog.log("settings", "key=\(key) value=\(VXProbeRedaction.scrub(String(describing: value)))")
+    }
+
     /// Video upscaling / quality preset. Picks the libmpv (gpu-next / libplacebo) scaler and debanding
     /// baseline applied during player setup. Default is hardware-aware: the memory-constrained Apple TV HD
     /// (A8) gets `.performance` so a 4K stream doesn't stutter, every other device gets `.standard` (today's
@@ -26,7 +36,7 @@ enum PlaybackSettings {
             }
             return PerformanceMode.isConstrainedDevice ? .performance : .standard
         }
-        set { UserDefaults.standard.set(newValue.rawValue, forKey: Key.videoUpscaling) }
+        set { loggedSet(newValue.rawValue, forKey: Key.videoUpscaling) }
     }
 
     /// Power-user libmpv options, supplied as a free-form "key=value per line" snippet (an mpv.conf
@@ -36,7 +46,7 @@ enum PlaybackSettings {
     /// it never blocks the baseline config or crashes playback.
     static var customMpvOptions: String {
         get { UserDefaults.standard.string(forKey: Key.customMpvOptions) ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: Key.customMpvOptions) }
+        set { loggedSet(newValue, forKey: Key.customMpvOptions) }
     }
 
     /// Parsed `customMpvOptions`: one (key, value) pair per non-blank, non-comment line, split on the
@@ -284,5 +294,56 @@ struct TrackPreferences: Equatable {
         guard let s, !s.isEmpty else { return nil }
         let parts = s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
         return parts.isEmpty ? nil : parts
+    }
+}
+
+/// I-settings: a single centralized record of user-facing preference writes for the `[settings]` diagnostic
+/// channel. The Settings screens drive ~120 `@AppStorage` controls that write UserDefaults directly (they do
+/// not go through `PlaybackSettings.loggedSet`), so instead of ~120 scattered `.onChange` hooks the settings
+/// views attach ONE `.onReceive(UserDefaults.didChangeNotification)` that calls `logChanges()`. It diffs the
+/// app's own preference keys and logs exactly the ones that changed, so a device capture finally shows which
+/// preference moved and to what. Values are scrubbed through VXProbeRedaction so identifier-bearing prefs
+/// (custom mpv options, URLs) never leak. This was impossible before: preference writes were silent, which is
+/// what made the DV mystery unsolvable.
+enum SettingsChangeLog {
+    private static let lock = NSLock()
+    private static var last: [String: String] = [:]
+    private static var primed = false
+
+    /// Brand prefixes that identify one of the app's own preference keys. Everything else in UserDefaults
+    /// (framework and system state) is ignored so the `[settings]` channel stays a clean record of deliberate
+    /// preference writes. Covers `stremiox.*`, `vortx.*`, and the dotless `vortxNativeServer` / `vortxShadowRanking`.
+    private static let trackedPrefixes = ["stremiox", "vortx"]
+
+    private static func isTracked(_ key: String) -> Bool {
+        trackedPrefixes.contains { key.hasPrefix($0) }
+    }
+
+    private static func snapshot() -> [String: String] {
+        var out: [String: String] = [:]
+        for (key, value) in UserDefaults.standard.dictionaryRepresentation() where isTracked(key) {
+            out[key] = String(describing: value)
+        }
+        return out
+    }
+
+    /// Re-baseline the tracked keys. Called when a settings screen appears so the first edit after opening is
+    /// logged and a change made elsewhere while settings was closed is not replayed as a stale diff.
+    static func prime() {
+        lock.lock(); defer { lock.unlock() }
+        last = snapshot()
+        primed = true
+    }
+
+    /// Log any tracked preference key that changed since the last snapshot. If not yet primed (no appear ran),
+    /// prime silently rather than reporting the resident values as changes.
+    static func logChanges() {
+        lock.lock(); defer { lock.unlock() }
+        let current = snapshot()
+        guard primed else { primed = true; last = current; return }
+        for (key, value) in current where last[key] != value {
+            DiagnosticsLog.log("settings", "key=\(key) value=\(VXProbeRedaction.scrub(value))")
+        }
+        last = current
     }
 }

@@ -56,8 +56,25 @@ enum PlayerEngineRouter {
     ///      genuinely can't. The AVPlayer -> libmpv `.failed` demotion is always the backstop.
     /// - Parameter dvDisplayCapable: the caller's play-start display-capability read (`DVDisplaySupport`).
     static func dvRemuxEnabled(dvDisplayCapable: Bool) -> Bool {
+        dvRemuxResolution(dvDisplayCapable: dvDisplayCapable).enabled
+    }
+
+    /// Which of the three rules above actually answered `dvRemuxEnabled`. Named on the `[dv] route` line and
+    /// rendered by the Settings row, because "the lane is off" and "the lane is off BECAUSE YOU turned it off"
+    /// are different facts and the field could not tell them apart: the Beta 13 report was three hours of a
+    /// silently dead Dolby Vision lane diagnosed by elimination.
+    enum DVRemuxSource: String {
+        case user                              // the Settings toggle wrote `stremiox.dvRemux`
+        case remote = "remote"                 // RemoteConfig `features.dvRemux` is present (fleet switch)
+        case displayDefault = "display-default" // nothing set: the mandate's display-capability baked default
+    }
+
+    /// The resolution AND its provenance. Single source of truth for the order documented on
+    /// `dvRemuxEnabled`; that function is now a thin projection of this one so the two can never drift.
+    static func dvRemuxResolution(dvDisplayCapable: Bool) -> (enabled: Bool, source: DVRemuxSource) {
         if UserDefaults.standard.object(forKey: dvRemuxKey) != nil {
-            return UserDefaults.standard.bool(forKey: dvRemuxKey)   // explicit user toggle always wins
+            // Explicit user toggle always wins.
+            return (UserDefaults.standard.bool(forKey: dvRemuxKey), .user)
         }
         // A remote value (true OR false) still overrides the display default so the owner keeps a fleet
         // kill-switch; only an ABSENT remote value falls through to the display-capability baked default.
@@ -67,8 +84,32 @@ enum PlayerEngineRouter {
         let snap = RemoteConfig.snapshot
         let onWhenAbsentTrue = snap.isFeatureOn("dvRemux", default: true)
         let onWhenAbsentFalse = snap.isFeatureOn("dvRemux", default: false)
-        if onWhenAbsentTrue == onWhenAbsentFalse { return onWhenAbsentTrue }   // remote set explicitly
-        return dvDisplayCapable   // remote absent -> baked default: on where DV can actually be shown (mandate)
+        if onWhenAbsentTrue == onWhenAbsentFalse { return (onWhenAbsentTrue, .remote) }   // remote set explicitly
+        // Remote absent -> baked default: on where DV can actually be shown (the mandate).
+        return (dvDisplayCapable, .displayDefault)
+    }
+
+    /// Whether the DV remux lane is ENGAGED for a mount, which is `dvRemuxEnabled` PLUS the explicit-pick rule.
+    ///
+    /// Owner directive (Beta 13): choosing "Prefer AVPlayer" by hand is an explicit request for the AVPlayer
+    /// lane, and on a DV-capable display that lane's whole point is true Dolby Vision. Before this, an explicit
+    /// AVPlayer pick with the DV-for-MKV toggle Off sent a DV MKV through the PLAIN remux (a container re-wrap
+    /// with no RPU handling), so the viewer got AVPlayer and no Dolby Vision, with nothing on screen saying so.
+    /// The toggle keeps governing the AUTO path alone, where it is the user's standing preference; an explicit
+    /// per-session pick outranks it. Non-DV-capable displays are untouched: without a panel that can present
+    /// DV there is nothing to attempt, so they keep tone-mapping exactly as before.
+    static func dvRemuxEngaged(dvDisplayCapable: Bool, override: Override = currentOverride) -> Bool {
+        if override == .avfoundation, dvDisplayCapable { return true }
+        return dvRemuxEnabled(dvDisplayCapable: dvDisplayCapable)
+    }
+
+    /// The `dvRemux=<on|off>(<source>)` field appended to the `[dv] route` line. A routing flip is a
+    /// user-visible picture change (true DV vs tone-mapped HDR10), so the log names the value AND what decided
+    /// it rather than leaving a reader to re-derive it from the absence of other evidence.
+    static func dvRemuxRouteDescription(dvDisplayCapable: Bool, override: Override = currentOverride) -> String {
+        if override == .avfoundation, dvDisplayCapable { return "dvRemux=on(explicit-avplayer)" }
+        let resolution = dvRemuxResolution(dvDisplayCapable: dvDisplayCapable)
+        return "dvRemux=\(resolution.enabled ? "on" : "off")(\(resolution.source.rawValue))"
     }
 
     /// Pick the engine for a stream.
@@ -300,9 +341,13 @@ enum PlayerEngineRouter {
     /// via the remux lane under Auto, so any candidate that reached this engine is one we chose to remux.)
     /// `dvDisplayCapable` defaults to the live `DVDisplaySupport` read so the caller need not pass it; the same
     /// value the router used at play-start routing time.
+    ///
+    /// Gated on `dvRemuxEngaged`, not `dvRemuxEnabled`: an EXPLICIT "Prefer AVPlayer" pick engages the lane on a
+    /// DV-capable display whatever the toggle says (see `dvRemuxEngaged`), so forcing AVPlayer by hand attempts
+    /// true Dolby Vision instead of quietly landing on the plain container re-wrap.
     @MainActor
     static func shouldDVRemux(url: URL, dvDisplayCapable: Bool) -> Bool {
-        dvRemuxEnabled(dvDisplayCapable: dvDisplayCapable) && isDVRemuxCandidate(url)
+        dvRemuxEngaged(dvDisplayCapable: dvDisplayCapable) && isDVRemuxCandidate(url)
     }
 
     // MARK: - Plain (non-DV) remux lane (#147, the remaining item)

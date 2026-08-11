@@ -418,6 +418,19 @@ enum TrickplayPreviewReadGate {
     }
 }
 
+/// Admission check for one keyed community fetch. The epoch closes the A-to-B-to-A hole that a key-only
+/// comparison cannot close when an old request returns after the same content key is selected again.
+enum TrickplayFetchClaim {
+    static func accepts(
+        requestEpoch: UInt64,
+        requestKey: String,
+        currentEpoch: UInt64,
+        currentKey: String?
+    ) -> Bool {
+        requestEpoch == currentEpoch && requestKey == currentKey
+    }
+}
+
 #if !TRICKPLAY_E2E_POLICY_TESTING
 
 /// Community trickplay: scrub-preview thumbnails SHARED across users, like Netflix / Plex storyboards.
@@ -623,7 +636,7 @@ enum CommunityTrickplay {
         let intervalS: Double
         let frameCount: Int
         let cols: Int
-        /// nil means legacy metadata had no VTT; empty means an advertised VTT could not establish coverage.
+        /// nil means legacy metadata had no VTT; advertised VTT metadata is retained only after full validation.
         let cues: [TrickplayTimelineCue]?
 
         /// The cropped tile covering `time`, drawn from the sheet sub-rect. nil outside genuine VTT coverage.
@@ -657,57 +670,141 @@ enum CommunityTrickplay {
         let cols: Int
     }
 
-    /// GET the community set for `key` and, on a hit, download + decode the sprite. Returns nil on any miss /
-    /// error (404, offline, decode failure) so the caller falls back to local generation. Never throws.
-    static func fetch(key: String) async -> Sheet? {
-        guard let url = URL(string: "\(baseURL)/tp/\(key)") else { return nil }
+    enum FetchUnavailableReason { case metadataUnavailable, metadataInvalid, spriteUnavailable, advertisedIndexInvalid }
+
+    enum FetchResult { case hit(Sheet), unavailable(FetchUnavailableReason), cancelled }
+
+    private enum FetchStatus: Sendable {
+        case response(data: Data, statusCode: Int); case unavailable, cancelled
+        var isHTTP200: Bool { if case .response(_, 200) = self { return true }; return false }
+    }
+
+    private enum AssetEvent: Sendable { case sprite(FetchStatus), vtt(FetchStatus), deadline, cancelled }
+
+    private enum AssetStageResult: Sendable {
+        case ready(sprite: FetchStatus, vtt: FetchStatus?); case deadline(sprite: FetchStatus?, vtt: FetchStatus?); case cancelled
+    }
+
+    private static func remoteURL(_ raw: String) -> URL? {
+        guard let url = URL(string: raw), url.scheme?.lowercased() == "https", url.host != nil else { return nil }
+        return url
+    }
+
+    private static func request(_ request: URLRequest) async -> FetchStatus {
+        guard !Task.isCancelled else { return .cancelled }
         do {
-            var req = URLRequest(url: url, timeoutInterval: 8)
-            req.setValue("application/json", forHTTPHeaderField: "accept")
-            VortXEdgeAuth.sign(&req)   // gated host (trickplay.vortx.tv /tp/<key>): stamp X-VX-Ts / X-VX-Sig
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
-            // NOTE: the sprite (meta.sprite) is on the R2 public asset host, NOT a gated *.vortx.tv
-            // service host, so it intentionally stays unsigned (that route is exempt).
-            let meta = try JSONDecoder().decode(FetchResponse.self, from: data)
-            guard meta.frame_count > 0, meta.cols > 0, meta.tile_w > 0, meta.tile_h > 0,
-                  meta.interval_s > 0, let spriteURL = URL(string: meta.sprite) else { return nil }
-
-            let (imgData, imgResp) = try await URLSession.shared.data(
-                for: URLRequest(url: spriteURL, timeoutInterval: 12))
-            guard let imgHttp = imgResp as? HTTPURLResponse, imgHttp.statusCode == 200,
-                  let image = ScrubImage(data: imgData), let cg = image.cgImageForCrop else { return nil }
-
-            let cues: [TrickplayTimelineCue]?
-            if let rawVTTURL = meta.vtt {
-                // nil is reserved for old metadata that never advertised a VTT and therefore needs the legacy
-                // interval path. A declared but unavailable/invalid VTT becomes an empty index, so unknown
-                // coverage falls through to the persistent local cache instead of inventing a time mapping.
-                if let vttURL = URL(string: rawVTTURL),
-                   let (vttData, vttResponse) = try? await URLSession.shared.data(
-                       for: URLRequest(url: vttURL, timeoutInterval: 8)
-                   ),
-                   let vttHTTP = vttResponse as? HTTPURLResponse, vttHTTP.statusCode == 200,
-                   let vtt = String(data: vttData, encoding: .utf8) {
-                    cues = TrickplayTimeline.parseVTT(
-                        vtt,
-                        frameCount: meta.frame_count,
-                        cols: meta.cols,
-                        tileW: meta.tile_w,
-                        tileH: meta.tile_h
-                    ) ?? []
-                } else {
-                    cues = []
-                }
-            } else {
-                cues = nil
-            }
-            return Sheet(image: image, cgImage: cg, tileW: meta.tile_w, tileH: meta.tile_h,
-                         intervalS: meta.interval_s, frameCount: meta.frame_count, cols: meta.cols,
-                         cues: cues)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return Task.isCancelled ? .cancelled : .response(data: data, statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
         } catch {
-            return nil
+            return Task.isCancelled ? .cancelled : .unavailable
         }
+    }
+
+    private static func race(_ request: URLRequest, until deadline: ContinuousClock.Instant) async -> FetchStatus {
+        await withTaskGroup(of: FetchStatus.self) { group in
+            group.addTask { await self.request(request) }
+            group.addTask { (try? await Task.sleep(until: deadline, clock: ContinuousClock())) == nil ? .cancelled : .unavailable }
+            let result = await group.next() ?? .cancelled; group.cancelAll(); return result
+        }
+    }
+
+    private static func fetchMetadata(at url: URL) async -> FetchStatus {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        var request = URLRequest(url: url, timeoutInterval: 3)
+        request.setValue("application/json", forHTTPHeaderField: "accept")
+        VortXEdgeAuth.sign(&request)
+        return await race(request, until: deadline)
+    }
+
+    private static func fetchAssets(spriteURL: URL, vttURL: URL?) async -> AssetStageResult {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        return await withTaskGroup(of: AssetEvent.self) { group in
+            var sprite: FetchStatus?
+            var vtt: FetchStatus?
+            group.addTask { .sprite(await request(URLRequest(url: spriteURL, timeoutInterval: 5))) }
+            if let vttURL {
+                group.addTask { .vtt(await request(URLRequest(url: vttURL, timeoutInterval: 5))) }
+            }
+            group.addTask { (try? await Task.sleep(until: deadline, clock: ContinuousClock())) == nil ? .cancelled : .deadline }
+            while let event = await group.next() {
+                switch event {
+                case .sprite(let result):
+                    sprite = result
+                case .vtt(let result):
+                    vtt = result
+                case .deadline:
+                    group.cancelAll(); return .deadline(sprite: sprite, vtt: vtt)
+                case .cancelled:
+                    group.cancelAll(); return .cancelled
+                }
+                if let sprite, vttURL == nil || vtt != nil {
+                    group.cancelAll(); return .ready(sprite: sprite, vtt: vtt)
+                }
+            }
+            return Task.isCancelled ? .cancelled : .deadline(sprite: sprite, vtt: vtt)
+        }
+    }
+
+    /// GET the community set for `key` and, on a hit, download + decode the sprite and advertised index.
+    /// Every failure is reduced to a finite redacted reason so callers never receive raw transport details.
+    static func fetch(key: String) async -> FetchResult {
+        guard !Task.isCancelled, let url = URL(string: "\(baseURL)/tp/\(key)") else {
+            return Task.isCancelled ? .cancelled : .unavailable(.metadataUnavailable)
+        }
+        let metadata = await fetchMetadata(at: url)
+        let data: Data
+        switch metadata {
+        case .cancelled: return .cancelled
+        case .unavailable: return .unavailable(.metadataUnavailable)
+        case .response(let body, 200):
+            data = body
+        case .response: return .unavailable(.metadataUnavailable)
+        }
+        guard !Task.isCancelled, let meta = try? JSONDecoder().decode(FetchResponse.self, from: data) else {
+            return Task.isCancelled ? .cancelled : .unavailable(.metadataInvalid)
+        }
+        guard meta.frame_count > 0, meta.cols > 0, meta.tile_w > 0, meta.tile_h > 0, meta.interval_s.isFinite, meta.interval_s > 0, let spriteURL = remoteURL(meta.sprite) else {
+            return .unavailable(.metadataInvalid)
+        }
+        let vttURL = meta.vtt.flatMap(remoteURL)
+        guard meta.vtt == nil || vttURL != nil else { return .unavailable(.advertisedIndexInvalid) }
+
+        let assets = await fetchAssets(spriteURL: spriteURL, vttURL: vttURL)
+        let sprite: FetchStatus
+        let advertisedVTT: FetchStatus?
+        switch assets {
+        case .cancelled: return .cancelled
+        case .deadline(let partialSprite, let partialVTT):
+            guard partialSprite?.isHTTP200 == true else { return .unavailable(.spriteUnavailable) }
+            guard vttURL == nil || partialVTT?.isHTTP200 == true else { return .unavailable(.advertisedIndexInvalid) }
+            return .unavailable(.spriteUnavailable)
+        case .ready(let readySprite, let readyVTT):
+            if case .cancelled = readySprite { return .cancelled }; if let readyVTT, case .cancelled = readyVTT { return .cancelled }
+            sprite = readySprite
+            advertisedVTT = readyVTT
+        }
+        guard case .response(let spriteData, 200) = sprite,
+              let image = ScrubImage(data: spriteData), let cg = image.cgImageForCrop else {
+            return .unavailable(.spriteUnavailable)
+        }
+
+        let cues: [TrickplayTimelineCue]?
+        if vttURL != nil {
+            guard let advertisedVTT, case .response(let vttData, 200) = advertisedVTT,
+                  let raw = String(data: vttData, encoding: .utf8),
+                  let parsed = TrickplayTimeline.parseVTT(
+                      raw, frameCount: meta.frame_count, cols: meta.cols,
+                      tileW: meta.tile_w, tileH: meta.tile_h
+                  ), !parsed.isEmpty else {
+                return .unavailable(.advertisedIndexInvalid)
+            }
+            cues = parsed
+        } else {
+            cues = nil
+        }
+        return .hit(Sheet(image: image, cgImage: cg, tileW: meta.tile_w, tileH: meta.tile_h,
+                          intervalS: meta.interval_s, frameCount: meta.frame_count, cols: meta.cols,
+                          cues: cues))
     }
 
     // MARK: - Upload-after-generate (sprite-sheet build + POST)
