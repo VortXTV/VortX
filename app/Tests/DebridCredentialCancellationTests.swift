@@ -254,6 +254,21 @@ private func source(_ relativePath: String) -> String? {
     return try? String(contentsOf: root.appendingPathComponent(relativePath), encoding: .utf8)
 }
 
+private func sourceRegion(_ source: String, from start: String, to end: String) -> String {
+    guard let startRange = source.range(of: start),
+          let endRange = source.range(of: end, range: startRange.upperBound..<source.endIndex) else { return "" }
+    return String(source[startRange.lowerBound..<endRange.lowerBound])
+}
+
+private func containsInOrder(_ source: String, _ fragments: [String]) -> Bool {
+    var remainder = source[...]
+    for fragment in fragments {
+        guard let range = remainder.range(of: fragment) else { return false }
+        remainder = remainder[range.upperBound...]
+    }
+    return true
+}
+
 private func waitUntil(
     _ predicate: @escaping @Sendable () async -> Bool
 ) async -> Bool {
@@ -269,18 +284,48 @@ private func testProductionWiring() -> (resolver: Bool, keys: Bool, sync: Bool) 
     let keys = source("SourcesShared/DebridKeys.swift") ?? ""
     let sync = source("SourcesShared/VortXSyncManager.swift") ?? ""
     let providerLeaseCalls = resolver.components(separatedBy: "runProvider(").count - 1
+    let setKeyRegion = sourceRegion(keys, from: "func setKey(", to: "func applyRemoteKeys(")
+    let remoteApplyRegion = sourceRegion(keys, from: "func applyRemoteKeys(", to: "private func reloadResolvers(")
+    let primarySyncApplyRegion = sourceRegion(
+        sync,
+        from: "if let keys = doc[\"apiKeys\"] as? [String: String] {",
+        to: "if doc[\"apiKeys\"] == nil, !pendingDebridValues.isEmpty {")
+    let setKeyWiring = containsInOrder(setKeyRegion, [
+        "let authorityCapture = CredentialScopeRegistry.shared.capture()",
+        "guard authorityCapture.scope == owner,\n              CredentialScopeRegistry.shared.isCurrent(authorityCapture) else { return false }",
+        "guard owner == boundOwner,\n                  CredentialScopeRegistry.shared.isCurrent(authorityCapture) else { return false }",
+        "guard storage.mutate(expected, for: account) == .success else { continue }",
+        "guard certified,\n              owner == boundOwner,\n              CredentialScopeRegistry.shared.isCurrent(authorityCapture) else { return false }",
+        "revision &+= 1",
+        "let snapshot = self.credentialSnapshot(capture: authorityCapture)",
+        "await DebridCoordinator.shared.reload(snapshot: snapshot)"
+    ])
+    let remoteApplyWiring = containsInOrder(remoteApplyRegion, [
+        "let remoteServices = Set(values.keys.compactMap(DebridService.init(rawValue:)))",
+        "guard owner == capture.scope,\n              capture.scope == owner,\n              CredentialScopeRegistry.shared.isCurrent(capture) else {",
+        "for service in DebridService.allCases {",
+        "guard let value = values[service.rawValue] else { continue }",
+        "guard CredentialScopeRegistry.shared.isCurrent(capture), owner == capture.scope else {",
+        "if value != key(for: service), !setKey(value, for: service) {"
+    ])
+    let primaryApplyWiring = containsInOrder(primarySyncApplyRegion, [
+        "guard isCurrent(capture) else { return }",
+        "DebridKeys.shared.applyRemoteKeys(remoteDebridValues, capture: capture)"
+    ])
     return (
         resolver.contains("DebridProviderTaskRegistry")
             && resolver.contains("beginTransition()")
             && resolver.contains("runProvider")
             && resolver.contains("await taskRegistry.finishTransition")
             && providerLeaseCalls >= 8,
-        keys.contains("await DebridCoordinator.shared.reload(snapshot: snapshot)")
-            && keys.contains("migrateLegacyIfEligible"),
-        sync.contains("await DebridCoordinator.shared.reload(snapshot: debridSnapshot)")
-            && sync.contains("private func bindCredentialOwner")
+        keys.contains("migrateLegacyIfEligible")
+            && setKeyWiring
+            && remoteApplyWiring,
+        sync.contains("private func bindCredentialOwner")
             && sync.contains("bindCredentialOwner(.signedOutDevice)")
             && sync.contains("guard isCurrent(capture)")
+            && primaryApplyWiring
+            && sync.contains("DebridKeys.shared.applyRemoteKeys(pendingDebridValues, capture: capture)")
     )
 }
 
@@ -539,8 +584,8 @@ struct DebridCredentialCancellationTestRunner {
     static func main() async {
         let wiring = testProductionWiring()
         expect(wiring.resolver, "DebridResolver is wired to the production owner/revision task registry")
-        expect(wiring.keys, "DebridKeys retains production reload and migration wiring")
-        expect(wiring.sync, "VortXSyncManager retains the post-pull authority fence and reload wiring")
+        expect(wiring.keys, "DebridKeys preserves certified setKey reload delegation and migration wiring")
+        expect(wiring.sync, "VortXSyncManager preserves fenced remote-key delegation and pending apply wiring")
 
         let polling = testProviderPollingCancellationWiring()
         expect(polling.realDebridFileList,
