@@ -4,31 +4,11 @@
 //   swiftc -D DEBRID_CREDENTIAL_SECURITY_TESTS -module-cache-path /private/tmp/vortx-debrid-security-module-cache \
 //     -swift-version 5 -strict-concurrency=complete -warnings-as-errors -o /private/tmp/debrid-security \
 //     app/SourcesShared/CredentialScope.swift \
+//     app/SourcesShared/DebridPlaybackAvailability.swift \
 //     app/SourcesShared/DebridKeys.swift \
 //     app/Tests/DebridCredentialSecurityTests.swift && /private/tmp/debrid-security
 
 import Foundation
-
-final class DebridPlaybackAvailability: @unchecked Sendable {
-    static let shared = DebridPlaybackAvailability()
-
-    private let lock = NSLock()
-    private var torBoxConfigured = false
-
-    private init() {}
-
-    func publish(torBoxConfigured: Bool) {
-        lock.lock()
-        self.torBoxConfigured = torBoxConfigured
-        lock.unlock()
-    }
-
-    var canResolveUsenet: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return torBoxConfigured
-    }
-}
 
 #if !DEBRID_KEYCHAIN_SOURCE_LINKED
 

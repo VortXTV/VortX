@@ -53,6 +53,14 @@ struct CredentialCompositionGreenHarness {
             ]
         ),
         SourceSpec(
+            path: "app/SourcesShared/DebridPlaybackAvailability.swift",
+            anchors: [
+                "final class DebridPlaybackAvailability",
+                "func publish(",
+                "var canResolveUsenet: Bool"
+            ]
+        ),
+        SourceSpec(
             path: "app/SourcesShared/DebridKeys.swift",
             anchors: [
                 "final class DebridKeys",
@@ -902,6 +910,9 @@ struct CredentialCompositionGreenHarness {
         let scope = root.appendingPathComponent("app/SourcesShared/CredentialScope.swift")
         let keychain = root.appendingPathComponent("app/SourcesShared/Keychain.swift")
         let apiKeys = root.appendingPathComponent("app/SourcesShared/ApiKeys.swift")
+        let debridPlaybackAvailability = root.appendingPathComponent(
+            "app/SourcesShared/DebridPlaybackAvailability.swift"
+        )
         let debridKeys = root.appendingPathComponent("app/SourcesShared/DebridKeys.swift")
         let traktAuth = root.appendingPathComponent("app/SourcesShared/TraktAuth.swift")
         let authenticatedHTTPTransport = root.appendingPathComponent(
@@ -920,6 +931,7 @@ struct CredentialCompositionGreenHarness {
             scope.path,
             keychain.path,
             apiKeys.path,
+            debridPlaybackAvailability.path,
             debridKeys.path,
             traktAuth.path,
             authenticatedHTTPTransport.path,
@@ -1466,7 +1478,7 @@ struct CredentialCompositionGreenHarness {
                 id: "GREEN-01-SOURCE-MANIFEST",
                 passed: manifestPassed,
                 detail: manifestPassed
-                    ? "all seven credential sources and every declared anchor are present"
+                    ? "all eight credential sources and every declared anchor are present"
                     : manifestFailureDetail(sourceSet)
             ),
             Gate(
@@ -1480,7 +1492,7 @@ struct CredentialCompositionGreenHarness {
                 id: "GREEN-03-INTEGRATED-CREDENTIAL-COMPILER",
                 passed: compilerPassed,
                 detail: compilerPassed
-                    ? "all seven credential sources typecheck together with the standalone closure stubs and driver"
+                    ? "all eight credential sources typecheck together with the standalone closure stubs and driver"
                     : compilerFailureDetail(compiler)
             ),
             Gate(
@@ -3299,6 +3311,27 @@ struct CredentialCompositionGreenHarness {
         )
         let transportCompilerFailure = try evaluate(root: transportCompilerFailureRoot)
 
+        let debridPlaybackAvailabilityCompilerFailureRoot = try makeRealRootFixture(
+            base: base,
+            name: "real-root-debrid-playback-availability-compiler-failure"
+        )
+        try append(
+            """
+
+            extension DebridPlaybackAvailability {
+                private func debridPlaybackAvailabilityCompilerFailure() {
+                    let _: Int = "typecheck-only failure"
+                }
+            }
+            """,
+            to: debridPlaybackAvailabilityCompilerFailureRoot.appendingPathComponent(
+                "app/SourcesShared/DebridPlaybackAvailability.swift"
+            )
+        )
+        let debridPlaybackAvailabilityCompilerFailure = try evaluate(
+            root: debridPlaybackAvailabilityCompilerFailureRoot
+        )
+
         let ownerCollisionRoot = try makeRealRootFixture(
             base: base,
             name: "real-root-unrelated-owner-collision"
@@ -4492,6 +4525,18 @@ struct CredentialCompositionGreenHarness {
                     )?.passed == false
             ),
             SelfTest(
+                name: "real DebridPlaybackAvailability dependency is compiler-integrated",
+                passed: debridPlaybackAvailabilityCompilerFailure.sourceSet.requiredMissing.isEmpty
+                    && debridPlaybackAvailabilityCompilerFailure.sourceSet.requiredExternal.isEmpty
+                    && debridPlaybackAvailabilityCompilerFailure.sourceSet.inventoryExternal.isEmpty
+                    && debridPlaybackAvailabilityCompilerFailure.compiler.parse.status == 0
+                    && debridPlaybackAvailabilityCompilerFailure.compiler.typecheck.status != 0
+                    && !debridPlaybackAvailabilityCompilerFailure.allGreen
+                    && debridPlaybackAvailabilityCompilerFailure.gates.first(
+                        where: { $0.id == "GREEN-03-INTEGRATED-CREDENTIAL-COMPILER" }
+                    )?.passed == false
+            ),
+            SelfTest(
                 name: "unrelated same-name owner raw reader does not poison recovery",
                 passed: ownerCollision.allGreen
                     && ownerCollision.gates.first(
@@ -5077,6 +5122,28 @@ struct CredentialCompositionGreenHarness {
                     guard authority.isCurrent(capture) else { return nil }
                     guard case let .value(value) = result else { return nil }
                     return value
+                }
+            }
+            """,
+            "DebridPlaybackAvailability.swift": """
+            import Foundation
+
+            final class DebridPlaybackAvailability: @unchecked Sendable {
+                static let shared = DebridPlaybackAvailability()
+
+                private let lock = NSLock()
+                private var torBoxConfigured = false
+
+                private init() {}
+
+                func publish(torBoxConfigured: Bool) {
+                    lock.withLock {
+                        self.torBoxConfigured = torBoxConfigured
+                    }
+                }
+
+                var canResolveUsenet: Bool {
+                    lock.withLock { torBoxConfigured }
                 }
             }
             """,

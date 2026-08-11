@@ -1340,25 +1340,6 @@ enum EpisodePlaybackIdentity {
     }
 }
 
-final class DebridPlaybackAvailability: @unchecked Sendable {
-    static let shared = DebridPlaybackAvailability()
-
-    private let lock = NSLock()
-    private var torBoxConfigured = false
-
-    private init() {}
-
-    func publish(torBoxConfigured: Bool) {
-        lock.withLock {
-            self.torBoxConfigured = torBoxConfigured
-        }
-    }
-
-    var canResolveUsenet: Bool {
-        lock.withLock { torBoxConfigured }
-    }
-}
-
 /// A playable stream. `StreamSource` is `#[serde(untagged)]` + flattened, so the source fields
 /// (url / ytId / infoHash / externalUrl) sit at the top level, decode them all optionally.
 struct CoreStream: Decodable, Identifiable, Equatable, Sendable {

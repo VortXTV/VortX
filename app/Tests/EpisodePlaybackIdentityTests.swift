@@ -6,6 +6,7 @@
 //     app/SourcesShared/CatalogRowResolution.swift \
 //     app/SourcesShared/AppleCWSeasonRolloverPolicy.swift \
 //     app/SourcesShared/AppleEpisodeResolverAdmission.swift \
+//     app/SourcesShared/DebridPlaybackAvailability.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //     app/Tests/EpisodePlaybackIdentityTests.swift && \
