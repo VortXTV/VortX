@@ -82,11 +82,43 @@ private struct StartupWiringRule {
     let exactSection: String
     let mutationTarget: String
     let mutationReplacement: String
+    let allowsExecutablePrefix: Bool
+    let secondaryMutationTarget: String?
+    let secondaryMutationReplacement: String?
+
+    init(
+        name: String,
+        usesServer: Bool,
+        start: String,
+        end: String,
+        exactSection: String,
+        mutationTarget: String,
+        mutationReplacement: String,
+        allowsExecutablePrefix: Bool = false,
+        secondaryMutationTarget: String? = nil,
+        secondaryMutationReplacement: String? = nil
+    ) {
+        self.name = name
+        self.usesServer = usesServer
+        self.start = start
+        self.end = end
+        self.exactSection = exactSection
+        self.mutationTarget = mutationTarget
+        self.mutationReplacement = mutationReplacement
+        self.allowsExecutablePrefix = allowsExecutablePrefix
+        self.secondaryMutationTarget = secondaryMutationTarget
+        self.secondaryMutationReplacement = secondaryMutationReplacement
+    }
 
     func passes(engine: String, server: String) -> Bool {
         let source = usesServer ? server : engine
-        return sourceSlice(source, from: start, to: end)
-            .map { compactSwift($0) == compactSwift(exactSection) } ?? false
+        return sourceSlice(source, from: start, to: end).map {
+            let compactActual = compactSwift($0)
+            let compactExpected = compactSwift(exactSection)
+            return allowsExecutablePrefix
+                ? compactActual.hasSuffix(compactExpected)
+                : compactActual == compactExpected
+        } ?? false
     }
 }
 
@@ -124,7 +156,6 @@ private struct StartupWiringRule {
             start: "let newItem = AVPlayerItem(asset: newAsset)",
             end: "// Attach a pull-model frame tap",
             exactSection: """
-            let newItem = AVPlayerItem(asset: newAsset)
             if isRemuxMounted {
                 newItem.preferredForwardBufferDuration =
                     VortXRemuxForwardBufferPolicy.preferredDuration(
@@ -133,7 +164,10 @@ private struct StartupWiringRule {
             }
             """,
             mutationTarget: "newItem.preferredForwardBufferDuration =",
-            mutationReplacement: "_ ="),
+            mutationReplacement: "_ =",
+            allowsExecutablePrefix: true,
+            secondaryMutationTarget: "if isRemuxMounted {",
+            secondaryMutationReplacement: "if false && isRemuxMounted {"),
         StartupWiringRule(
             name: "first-frame steady-buffer restore", usesServer: false,
             start: "videoFrameEverProduced = true",
@@ -306,6 +340,21 @@ private struct StartupWiringRule {
                 : !rule.passes(engine: $0, server: server)
         } ?? false
         check("startup production wiring mutation: \(rule.name) turns red", caught)
+
+        if let secondaryTarget = rule.secondaryMutationTarget,
+           let secondaryReplacement = rule.secondaryMutationReplacement {
+            let secondaryMutated = replacingFirst(
+                source,
+                after: rule.start,
+                target: secondaryTarget,
+                with: secondaryReplacement)
+            let secondaryCaught = secondaryMutated.map {
+                rule.usesServer
+                    ? !rule.passes(engine: engine, server: $0)
+                    : !rule.passes(engine: $0, server: server)
+            } ?? false
+            check("startup production wiring guard mutation: \(rule.name) turns red", secondaryCaught)
+        }
     }
 }
 
@@ -754,7 +803,7 @@ check("target authority: exact twelve is valid while malformed or over-twelve co
               adjacentIntervalsSeconds: [12.000_001])) == nil)
 let targetSevenReadiness = VortXHLSStartupReadiness(
     frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex))
-// The startup floor is a flat one-decodable-segment / four-second budget, decoupled from the frozen target: the
+// The startup floor is a flat one-decodable-segment / six-second budget, decoupled from the frozen target: the
 // 6-segment / 3x-target floor (36s at the conservative target) held every UHD master past the chrome's 10s
 // start watchdog and inflated the live window into the then-smaller session spool ceiling - the build 189
 // field regression, twice over.
@@ -1083,25 +1132,40 @@ let fieldStartupWindow = VortXHLSWindow(segments: [
     VortXHLSSegment(id: 2, byteOffset: 200, byteLength: 100, start: 3.38, duration: 1.25),
     VortXHLSSegment(id: 3, byteOffset: 300, byteLength: 100, start: 4.63, duration: 1.25),
     VortXHLSSegment(id: 4, byteOffset: 400, byteLength: 100, start: 5.88, duration: 1.25),
+    VortXHLSSegment(id: 5, byteOffset: 500, byteLength: 100, start: 7.13, duration: 1.25),
 ])
+let fieldStartupFirstFour = VortXHLSWindow(
+    segments: Array(fieldStartupWindow.segments.prefix(4)))
+let fieldStartupFirstFive = VortXHLSWindow(
+    segments: Array(fieldStartupWindow.segments.prefix(5)))
+let fieldStartupFirstFourCohort = DVPlaybackPolicy.pinnedStartupCohort(
+    windows: [fieldStartupFirstFour],
+    ended: false,
+    minimumSegmentCount: targetSevenReadiness?.minimumSegmentCount ?? 0,
+    minimumRenderedDurationMilliseconds:
+        targetSevenReadiness?.minimumRenderedDurationMilliseconds ?? 0)
+check("startup readiness: the first four field segments total 5880ms and do not form a non-ended cohort",
+      DVPlaybackPolicy.renderedDurationMilliseconds(of: fieldStartupFirstFour) == 5_880
+          && fieldStartupFirstFourCohort == nil)
 let fieldStartupCohort = DVPlaybackPolicy.pinnedStartupCohort(
     windows: [fieldStartupWindow],
     ended: false,
     minimumSegmentCount: targetSevenReadiness?.minimumSegmentCount ?? 0,
     minimumRenderedDurationMilliseconds:
         targetSevenReadiness?.minimumRenderedDurationMilliseconds ?? 0)
-check("startup readiness: the field-duration shape freezes the shortest three-segment cohort",
-      fieldStartupCohort?.window.segments.map(\.id) == [0, 1, 2])
-check("startup readiness: the first field-shaped body includes segment three as growth evidence",
+check("startup readiness: the first five field segments total 7130ms and freeze the shortest five-segment cohort",
+      DVPlaybackPolicy.renderedDurationMilliseconds(of: fieldStartupFirstFive) == 7_130
+          && fieldStartupCohort?.window.segments.map(\.id) == [0, 1, 2, 3, 4])
+check("startup readiness: the first field-shaped body includes segment five as growth evidence",
       targetSevenReadiness?.unconsumedStartupWindow(
           fieldStartupWindow,
           startupCohortCount: fieldStartupCohort?.window.segments.count ?? 0
-      ).segments.map(\.id) == [0, 1, 2, 3])
+      ).segments.map(\.id) == [0, 1, 2, 3, 4, 5])
 check("startup readiness: a successor that is not produced yet is never invented",
       targetSevenReadiness?.unconsumedStartupWindow(
-          VortXHLSWindow(segments: Array(fieldStartupWindow.segments.prefix(3))),
-          startupCohortCount: 3
-      ).segments.map(\.id) == [0, 1, 2])
+          fieldStartupFirstFive,
+          startupCohortCount: 5
+      ).segments.map(\.id) == [0, 1, 2, 3, 4])
 check("startup readiness: invalid target bounds and segment counts are rejected without a force unwrap",
       VortXHLSStartupReadiness(
           frozenTarget: .init(seconds: 4, authority: .validatedCompleteIndex)) == nil
