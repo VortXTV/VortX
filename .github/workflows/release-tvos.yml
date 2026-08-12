@@ -298,7 +298,15 @@ jobs:
         id: cache-core-xcframework
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: app/Vendor/StremioXCore.xcframework
+          # Cache the xcframework AND its retained pre-localization archive under the SAME exact key,
+          # so a warm hit restores BOTH together: the localized macOS object's OSO/debug-map points at
+          # engine-prelocalize/StremioXCore/..., which must exist at the app's dsymutil time even when
+          # the build step below is skipped on the hit. Same exact-key-only, no-restore-keys posture as
+          # before (content-addressed to the private core source via hashFiles), so a run without the
+          # private source cannot reconstruct the key and cannot restore these engine-derived objects.
+          path: |
+            app/Vendor/StremioXCore.xcframework
+            app/Vendor/engine-prelocalize/StremioXCore
           key: stremio-core-xcframework-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ steps.toolchain.outputs.tvos_sdk }}-${{ hashFiles('core/Cargo.lock', 'core/Cargo.toml', 'core/rust-toolchain.toml', 'core/src/**', 'core/include/**', 'scripts/build-core-xcframework.sh') }}
 
       - name: Build the stremio-core xcframework
@@ -314,7 +322,13 @@ jobs:
         id: cache-ffi-xcframework
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: app/Vendor/VortxEngine.xcframework
+          # Cache the xcframework AND its five retained pre-localization archives under the SAME exact
+          # key (see the core cache above for the full rationale): every FFI slice is localized, so all
+          # five engine-prelocalize/VortxEngine/<triple> archives must survive to the app's dsymutil
+          # time, including on a warm hit that skips the build step. Exact-key-only, no restore-keys.
+          path: |
+            app/Vendor/VortxEngine.xcframework
+            app/Vendor/engine-prelocalize/VortxEngine
           key: vortx-ffi-xcframework-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ hashFiles('vortx-core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/rust-toolchain.toml', 'vortx-core/crates/**', 'scripts/build-ffi-xcframework.sh') }}
 
       - name: Build the vortx-ffi xcframework
@@ -322,6 +336,15 @@ jobs:
         env:
           VORTX_ENGINE_DIR: vortx-core
         run: ./scripts/build-ffi-xcframework.sh
+
+      # Fail closed if either engine xcframework OR its retained pre-localization archives would
+      # reintroduce the newer-minOS or missing-OSO warning families this repair removed. Runs
+      # UNCONDITIONALLY (not gated on a cache miss): on a warm build the two build steps above are
+      # skipped, so this is the only place that re-proves the cache-restored objects are clean. It
+      # inspects the final XCFramework slices AND app/Vendor/engine-prelocalize/*, asserting zero of
+      # each family (whole-family, computed) without filtering, stripping, or -oso_prefix.
+      - name: Verify Apple engine artifacts (fail closed)
+        run: ./scripts/verify-apple-engine-artifacts.sh
 
       # The self-built player stack. `app/Vendor/MPVKit-DVFEL/artifacts/` is gitignored and reproducing it
       # needs a multi-hour nine-slice source build, so CI fetches the prebuilt xcframeworks the same way it
@@ -616,6 +639,41 @@ jobs:
             SIMKL_CLIENT_ID="${{ secrets.SIMKL_CLIENT_ID }}" \
             SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build
 
+      # Generic iOS-SIMULATOR link + dSYM gate. The device builds above never link the
+      # aarch64-apple-ios-sim engine slice, so any newer-minOS / missing-OSO defect specific to it
+      # stays latent. Link the simulator product with dwarf-with-dsym so BOTH ld (newer-minOS) and
+      # dsymutil (missing-OSO) actually run over that slice, then FAIL on either warning family. The
+      # grep DETECTS and fails the build (the opposite of suppressing a warning); nothing is filtered
+      # from the log, which is streamed in full via tee.
+      - name: Gate iOS-simulator link + dSYM (fail closed)
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/ios-sim-dsym.log"
+          xcodebuild -project app/VortX.xcodeproj -scheme VortXiOSNative \
+            -configuration Release -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath app/build/ci-ios-sim CODE_SIGNING_ALLOWED=NO \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
+            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" \
+            TRAKT_CLIENT_ID="${{ secrets.TRAKT_CLIENT_ID }}" \
+            TRAKT_CLIENT_SECRET="${{ secrets.TRAKT_CLIENT_SECRET }}" \
+            SIMKL_CLIENT_ID="${{ secrets.SIMKL_CLIENT_ID }}" \
+            SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build 2>&1 | tee "$LOG"
+          SIM_DSYM="app/build/ci-ios-sim/Build/Products/Release-iphonesimulator/VortXiOSNative.app.dSYM"
+          if [ ! -d "$SIM_DSYM" ]; then
+            echo "::error::iOS-simulator dSYM was not produced at $SIM_DSYM (dsymutil did not run; the missing-OSO family would stay latent)"
+            exit 1
+          fi
+          # Broad on purpose: dsymutil's missing-input wording varies across LLVM (".*object file",
+          # "could not open '<path>'", "unable to open"), so match the verbs without requiring a fixed
+          # trailing token. The verifier (run earlier) is the primary OSO check; this is defense in depth.
+          if grep -E "was built for newer|warning:.*(could not (find|open)|unable to open)" "$LOG"; then
+            echo "::error::iOS-simulator link/dSYM reintroduced a newer-minOS or missing-OSO warning (matches printed above)"
+            exit 1
+          fi
+          # Reclaim the simulator build tree at once; the disk-tight IPA/DMG legs below do not need it.
+          rm -rf app/build/ci-ios-sim
+          echo "iOS-simulator link + dSYM gate passed: no newer-minOS, no missing-OSO"
+
       - name: Build macOS
         run: |
           # ARCHS=arm64 (not just destination arch): a macOS Release build otherwise compiles the universal
@@ -733,6 +791,76 @@ jobs:
             "app/build/ci-ios/Build/Products/Release-iphoneos/VortXiOSNative.app" \
             "app/build/ci-mac/Build/Products/Release/VortX.app"
 
+      # Private-symbols RETENTION. Keep the five shipped app dSYMs for later crash symbolication in a
+      # PRIVATE symbols vault, keyed by the exact release tag + built commit. Must run BEFORE "Package
+      # the IPAs" below, which deletes the app/build/ci* trees (dSYMs included). The dSYMs are NEVER
+      # added to the public VortX-tvOS-ci artifact or any release asset - only to the private vault
+      # repo. GUARDED: with no SYMBOL_VAULT_TOKEN (provisioned separately) or no release tag to key by,
+      # the step SKIPS cleanly (exit 0) and changes nothing, so it is a no-op on ordinary pushes today.
+      - name: Retain app dSYMs to the private symbols vault (guarded)
+        env:
+          # Distinct from GITHUB_TOKEN and ENGINE_REPO_TOKEN: a narrowly scoped token for the symbols
+          # vault only. Absent today (provisioned separately), which makes the step skip.
+          SYMBOL_VAULT_TOKEN: ${{ secrets.SYMBOL_VAULT_TOKEN }}
+          # The private repo that holds symbols only. Overridable via an Actions variable; falls back
+          # to the org default below when unset.
+          SYMBOL_VAULT_REPO: ${{ vars.SYMBOL_VAULT_REPO }}
+          # Passed through env (never inlined into the script body) so a tag string can never be parsed
+          # as shell; the strict grammar below is re-asserted before the value reaches any gh call.
+          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SYMBOL_VAULT_TOKEN:-}" ]; then
+            echo "SYMBOL_VAULT_TOKEN not set; skipping private dSYM retention (provisioned separately)."
+            exit 0
+          fi
+          if [ -z "${TAG:-}" ]; then
+            echo "no release tag on this run; skipping private dSYM retention (nothing to key by)."
+            exit 0
+          fi
+          # Same strict release-tag grammar the attach-release job enforces: refuse anything that is
+          # not vMAJOR.MINOR.PATCH[-prerelease], so an option-shaped value can never reach a gh call.
+          TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if ! [[ "$TAG" =~ $TAG_RE ]]; then
+            echo "::error::release tag '$TAG' is not a strict release tag; refusing to retain symbols"
+            exit 1
+          fi
+          VAULT="${SYMBOL_VAULT_REPO:-VortXTV/vortx-symbols}"
+          SHORT_SHA="$(printf '%s' "$GITHUB_SHA" | cut -c1-12)"
+          # Exactly the five shipped-binary dSYMs (VortXTV, VortXTVLite, VortXTopShelf, VortXiOSNative,
+          # VortX/mac). Missing any is a hard failure once the token exists: never retain fewer symbol
+          # sets than the release ships.
+          DSYMS=(
+            "app/build/ci/Build/Products/Release-appletvos/VortXTV.app.dSYM"
+            "app/build/ci-lite/Build/Products/Release-appletvos/VortXTVLite.app.dSYM"
+            "app/build/ci/Build/Products/Release-appletvos/VortXTopShelf.appex.dSYM"
+            "app/build/ci-ios/Build/Products/Release-iphoneos/VortXiOSNative.app.dSYM"
+            "app/build/ci-mac/Build/Products/Release/VortX.app.dSYM"
+          )
+          for d in "${DSYMS[@]}"; do
+            [ -d "$d" ] || { echo "::error::expected app dSYM missing: $d"; exit 1; }
+          done
+          STAGE="$RUNNER_TEMP/vortx-dsyms"
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          for d in "${DSYMS[@]}"; do cp -R "$d" "$STAGE/"; done
+          BUNDLE="$RUNNER_TEMP/VortX-$TAG-$SHORT_SHA-dSYMs.zip"
+          ( cd "$STAGE" && zip -qry "$BUNDLE" . )
+          echo "retaining ${#DSYMS[@]} dSYMs to private vault $VAULT, keyed by $TAG @ $GITHUB_SHA"
+          # Private vault only. A per-key prerelease in the PRIVATE repo carries the bundle; tag AND
+          # commit are encoded in the vault release tag, the asset name, and the notes, so a retained
+          # symbol set is unambiguously addressable by (release tag, built commit).
+          export GH_TOKEN="$SYMBOL_VAULT_TOKEN"
+          VAULT_TAG="symbols-$TAG-$SHORT_SHA"
+          if ! gh release view -R "$VAULT" -- "$VAULT_TAG" >/dev/null 2>&1; then
+            gh release create -R "$VAULT" --prerelease \
+              --title "VortX symbols $TAG ($SHORT_SHA)" \
+              --notes "Private dSYMs for $TAG at $GITHUB_SHA. Internal symbolication only; not for distribution." \
+              -- "$VAULT_TAG" \
+              || { echo "::error::could not create private symbols release $VAULT_TAG in $VAULT"; exit 1; }
+          fi
+          gh release upload -R "$VAULT" --clobber -- "$VAULT_TAG" "$BUNDLE"
+          echo "private dSYM retention complete: $VAULT $VAULT_TAG"
+
       - name: Package the IPAs
         run: |
           mkdir -p out/full/Payload out/lite/Payload out/ios/Payload
@@ -791,13 +919,16 @@ jobs:
   # write job still cannot reach the token or the build secrets.
   #
   # Arbitrary-ref guard: a `release` event runs on the tag's own ref and is bound to the built
-  # commit by the tag-commit binding step below. A `workflow_dispatch` can be launched from any
-  # ref, so the dispatch lane ADDITIONALLY requires a protected branch ref (main / beta) here. This
-  # in-workflow ref check is only defense in depth; the real enforcement is the environment's
-  # required reviewer plus the branch protection the owner configures on those refs.
+  # commit by the tag-commit binding step below. A `workflow_dispatch` can be launched from any ref,
+  # so the dispatch lane ADDITIONALLY requires the run's ref to be EXACTLY the immutable release tag
+  # (refs/tags/<release_tag>), never a mutable branch: the dispatch must be started AT the tag, so
+  # github.sha is the tag's own commit and the tag-commit binding below is tautological instead of
+  # trusting a branch tip that can move between dispatch and attach. This in-workflow check is
+  # defense in depth; the real enforcement is the environment's required reviewer plus the
+  # tag/branch protection the owner configures.
   attach-release:
     needs: [build-tvos]
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/beta'))
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && github.ref == format('refs/tags/{0}', inputs.release_tag))
     runs-on: ubuntu-24.04
     environment: release-approval
     permissions:

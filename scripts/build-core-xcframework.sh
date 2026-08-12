@@ -35,6 +35,13 @@ LOCKED="--locked"
 LIB="libstremiox_core.a"
 OUT="$REPO_ROOT/app/Vendor/StremioXCore.xcframework"   # Vendor/ is gitignored; produced by this script
 
+# Apple deployment floors - MUST match app/project.yml (tvOS 18.0, iOS 16.0, macOS 14.0). Exported so
+# the Cargo + build-std COMPILATION stamps LC_BUILD_VERSION.minos on the OBJECTS THEMSELVES (rustc reads
+# the per-platform var; simulator triples read their device sibling's var), not merely the ld -r relabel.
+export TVOS_DEPLOYMENT_TARGET=18.0
+export IPHONEOS_DEPLOYMENT_TARGET=16.0
+export MACOSX_DEPLOYMENT_TARGET=14.0
+
 rustup +nightly-2026-07-19 target add aarch64-apple-ios aarch64-apple-ios-sim 2>/dev/null || true
 
 echo "▸ tvOS device (aarch64-apple-tvos)"
@@ -64,7 +71,13 @@ cargo +nightly-2026-07-19 build $LOCKED $BUILDSTD --target aarch64-apple-darwin 
 # one object with that symbol made LOCAL, then re-archive: our refs still resolve in-archive, but it
 # no longer exports a clashing global. Only the macOS slice needs this.
 DARWIN="target/aarch64-apple-darwin/release"
-ld -r -arch arm64 -platform_version macos 14.0 14.0 -all_load "$DARWIN/$LIB" -unexported_symbol _rust_eh_personality -o "$DARWIN/core_localized.o"
+# Retain the pre-localization archive at a stable, cacheable, $REPO_ROOT-absolute path BEFORE localizing,
+# and feed ld -r FROM it, so the localized object's OSO/debug-map references a file that still exists at
+# dsymutil time on both cold and cache-warm CI (release-tvos.yml caches this dir with the xcframework key).
+RETAINED="$REPO_ROOT/app/Vendor/engine-prelocalize/StremioXCore/aarch64-apple-darwin"
+mkdir -p "$RETAINED"
+cp "$DARWIN/$LIB" "$RETAINED/$LIB"
+ld -r -arch arm64 -platform_version macos 14.0 14.0 -all_load "$RETAINED/$LIB" -unexported_symbol _rust_eh_personality -o "$DARWIN/core_localized.o"
 rm -f "$DARWIN/$LIB"
 libtool -static -o "$DARWIN/$LIB" "$DARWIN/core_localized.o"
 

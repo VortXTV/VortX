@@ -93,6 +93,13 @@ LIB="libvortx_ffi.a"
 OUT="$REPO_ROOT/app/Vendor/VortxEngine.xcframework"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ENGINE_DIR/target}"
 
+# Apple deployment floors - MUST match app/project.yml (tvOS 18.0, iOS 16.0, macOS 14.0). Exported so
+# every build_slice (incl. -Z build-std) stamps the OBJECTS' LC_BUILD_VERSION.minos, not just the ld -r
+# relabel below. rustc reads the per-platform var; sim triples read their device sibling's var.
+export TVOS_DEPLOYMENT_TARGET=18.0
+export IPHONEOS_DEPLOYMENT_TARGET=16.0
+export MACOSX_DEPLOYMENT_TARGET=14.0
+
 # Tier-2 targets install prebuilt components; the tier-3 tvOS triples have none to install
 # (build-std compiles std from rust-src), so they are deliberately absent here.
 rustup +nightly-2026-07-19 target add aarch64-apple-ios aarch64-apple-ios-sim 2>/dev/null || true
@@ -133,10 +140,17 @@ build_slice aarch64-apple-darwin    macosx            kernel
 EXPORTS="$(mktemp)"
 trap 'rm -f "$EXPORTS"; rm -rf "${HDRS:-}"' EXIT
 printf '_vortx_*\n' > "$EXPORTS"
+# Stable, cacheable, $REPO_ROOT-absolute retain root for the pre-localization archives (one per slice).
+# Deliberately NOT in the EXIT trap above: these must survive to app-link/dsymutil time and into the CI
+# cache so every localized object's OSO/debug-map still resolves on cold AND cache-warm runs.
+RETAINED_FFI="$REPO_ROOT/app/Vendor/engine-prelocalize/VortxEngine"
 
 localize() { # <triple> <ld-platform> <minos> <sdkver>
     local dir="$TARGET_DIR/$1/release"
-    ld -r -arch arm64 -platform_version "$2" "$3" "$4" -all_load "$dir/$LIB" \
+    local keep="$RETAINED_FFI/$1"
+    mkdir -p "$keep"
+    cp "$dir/$LIB" "$keep/$LIB"                   # retain pre-localization archive (stable path) BEFORE ld -r overwrites $dir/$LIB
+    ld -r -arch arm64 -platform_version "$2" "$3" "$4" -all_load "$keep/$LIB" \
         -exported_symbols_list "$EXPORTS" -o "$dir/vortx_ffi_localized.o"
     rm -f "$dir/$LIB"
     libtool -static -o "$dir/$LIB" "$dir/vortx_ffi_localized.o"
@@ -149,8 +163,8 @@ TVSIM_SDK="$(xcrun --sdk appletvsimulator --show-sdk-version)"
 MAC_SDK="$(xcrun --sdk macosx --show-sdk-version)"
 localize aarch64-apple-ios      ios             16.0 "$IOS_SDK"
 localize aarch64-apple-ios-sim  ios-simulator   16.0 "$SIM_SDK"
-localize aarch64-apple-tvos     tvos            16.0 "$TVOS_SDK"
-localize aarch64-apple-tvos-sim tvos-simulator  16.0 "$TVSIM_SDK"
+localize aarch64-apple-tvos     tvos            18.0 "$TVOS_SDK"
+localize aarch64-apple-tvos-sim tvos-simulator  18.0 "$TVSIM_SDK"
 localize aarch64-apple-darwin   macos           14.0 "$MAC_SDK"
 
 # Stage the nested header dir: Headers/vortx/{vortx_ffi.h,module.modulemap}. One header for every
