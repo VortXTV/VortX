@@ -344,7 +344,12 @@ jobs:
       # inspects the final XCFramework slices AND app/Vendor/engine-prelocalize/*, asserting zero of
       # each family (whole-family, computed) without filtering, stripping, or -oso_prefix.
       - name: Verify Apple engine artifacts (fail closed)
-        run: ./scripts/verify-apple-engine-artifacts.sh
+        # Apple's nm cannot parse some rust-produced objects (newer LLVM attribute format), so the
+        # verifier's OSO check falls back to the rust toolchain's llvm-nm; install it here so it is
+        # present on cold AND warm runs (the verifier still runs on a cache hit).
+        run: |
+          rustup component add llvm-tools-preview 2>/dev/null || true
+          ./scripts/verify-apple-engine-artifacts.sh
 
       # The self-built player stack. `app/Vendor/MPVKit-DVFEL/artifacts/` is gitignored and reproducing it
       # needs a multi-hour nine-slice source build, so CI fetches the prebuilt xcframeworks the same way it
