@@ -466,16 +466,19 @@ check("pre-start: a target the origin already reached needs no seek",
       RemuxResumePolicy.preStartSeek(target: 1830, origin: 1830) == .satisfied)
 
 // The input seek lands on the keyframe AT OR BEFORE the request, so the mount legitimately starts earlier than
-// asked. That must still count as satisfied, or every resume would immediately issue a forward seek.
-check("pre-start: a mount that started a few seconds early still counts as satisfied",
-      RemuxResumePolicy.preStartSeek(target: 1830, origin: 1826) == .satisfied)
+// asked. Root-cause report section 7: those extra frames must decode (an open GOP needs them as reference) but
+// must never be PRESENTED, so this must resolve to a corrective seek (`.hidePreroll`) rather than silently
+// accepting the keyframe's own preroll as "close enough" - the pre-fix behavior this test used to assert.
+check("pre-start: a mount that started a few seconds early hides the preroll instead of presenting it",
+      RemuxResumePolicy.preStartSeek(target: 1830, origin: 1826) == .hidePreroll(4))
 check("pre-start: a target behind the origin counts as satisfied",
       RemuxResumePolicy.preStartSeek(target: 100, origin: 1830) == .satisfied)
 
 // The case that PROTECTS the session: the origin seek did not happen (or not for this target), so the request
 // is dropped rather than issued into bytes that do not exist. Asserted as a boundary pair around the tolerance.
-check("pre-start: a target exactly at the tolerance is satisfied",
-      RemuxResumePolicy.preStartSeek(target: RemuxResumePolicy.originToleranceSeconds, origin: 0) == .satisfied)
+check("pre-start: a target exactly at the tolerance still hides its preroll, not past it",
+      RemuxResumePolicy.preStartSeek(target: RemuxResumePolicy.originToleranceSeconds, origin: 0)
+        == .hidePreroll(RemuxResumePolicy.originToleranceSeconds))
 check("pre-start: a target just past the tolerance is unreachable",
       RemuxResumePolicy.preStartSeek(target: RemuxResumePolicy.originToleranceSeconds + 1, origin: 0)
         == .unreachable(RemuxResumePolicy.originToleranceSeconds + 1))
@@ -486,10 +489,31 @@ check("pre-start: the reported distance is measured from the origin, not from ze
 
 check("pre-start: a non-finite target is never issued",
       RemuxResumePolicy.preStartSeek(target: .nan, origin: 0) == .satisfied)
+check("pre-start: a non-finite origin is never issued",
+      RemuxResumePolicy.preStartSeek(target: 1830, origin: .nan) == .satisfied)
+
+// Root-cause report section 7's exact field number: a keyframe landing 1.845s before a 115.959s target.
+// Compared with `near`, not `==`: 115.959 - 114.114 is not exactly representable in binary floating point.
+check("pre-start: the field-observed 1.845s keyframe preroll resolves to that exact corrective seek",
+      { if case .hidePreroll(let ahead) = RemuxResumePolicy.preStartSeek(target: 115.959, origin: 114.114) {
+            return near(ahead, 1.845)
+        }
+        return false }())
+
+// `.hidePreroll`'s associated value doubles as the player-second seek destination: proven here against
+// `presented`, the SAME origin-mapping function the engine uses to report progress, so a mutation that flips
+// the sign or drops the origin term is caught by their disagreement rather than by two independently
+// hand-computed numbers that could both be wrong the same way.
+check("pre-start: hidePreroll's seek destination round-trips through the origin mapping back to the target",
+      { if case .hidePreroll(let playerSeconds) = RemuxResumePolicy.preStartSeek(target: 1830, origin: 1826) {
+            return RemuxResumePolicy.presented(playerSeconds: playerSeconds, origin: 1826) == 1830
+        }
+        return false }())
 
 // The tolerance must stay inside one long GOP. Raised to minutes it would silently accept resume requests the
-// mount never honored, reporting the viewer as resumed while playback runs from somewhere else entirely; cut to
-// zero it would issue a forward seek on every single resume.
+// mount never honored, presenting minutes of the wrong content as a "hidden preroll" rather than genuinely
+// failing the resume; cut to zero it would issue a forward seek on every single resume, including the
+// zero-preroll case that needs none.
 check("pre-start: the tolerance stays around one long GOP",
       RemuxResumePolicy.originToleranceSeconds > 0 && RemuxResumePolicy.originToleranceSeconds <= 20)
 
@@ -511,9 +535,10 @@ check("pre-start: the tolerance stays around one long GOP",
 //      zero and the FIRST segment holds the resume content. The playlist renderer states that start explicitly
 //      (EXT-X-START:TIME-OFFSET=0 while segment zero is retained), which is the only lever that matters: the
 //      client picks the first segment from playlist CONTENTS; EXT-X-START is advisory.
-//   5. playlist -> chrome: the pre-start seek resolves satisfied (no post-mount seek is issued into a
-//      forward-only mount) and the first reported frame maps back to the stored position, so progress saves
-//      continue from where the viewer left off.
+//   5. playlist -> chrome: the achieved keyframe origin (1828s) lands 2.25s before the stored ask (1830.25s),
+//      so the pre-start seek resolves to ONE corrective local seek that hides that keyframe preroll
+//      (root-cause report section 7) rather than presenting it; the first reported frame still maps back to
+//      the stored position, so progress saves continue from where the viewer left off.
 
 let storedPosition = 1830.25          // the continue-watching value the chrome fetched
 var launchConfiguration = RemuxResumeConfiguration()
@@ -531,7 +556,8 @@ check("wired: the consumed origin is the exact input-seek target",
 let achievedOrigin = 1828.0
 check("wired: the achieved keyframe origin is latched from mapped base video",
       RemuxResumePolicy.canEstablishOrigin(packetStreamIndex: 0, baseVideoStreamIndex: 0, isMapped: true)
-        && RemuxResumePolicy.preStartSeek(target: storedPosition, origin: achievedOrigin) == .satisfied)
+        && RemuxResumePolicy.preStartSeek(target: storedPosition, origin: achievedOrigin)
+            == .hidePreroll(storedPosition - achievedOrigin))
 
 // Step 4: the produced window after rebase. Segment ids and starts both begin at ZERO even though the mount
 // began 1828 s into the source; nine 4 s segments cover the startup oracle's admission floor below.

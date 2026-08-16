@@ -598,6 +598,13 @@ struct PlayerScreen: View {
     /// wait-and-hop runs at most once per playback (no unbounded loop). Reset on each new media load.
     @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
+    /// Wall-clock uptime of the genuine first-frame event (set only alongside the true `hasStartedPlaying =
+    /// true` transition below, never at the "foreground re-mount was not issued, restore the playing state"
+    /// site - that one never actually stopped presentation, so resetting this there would wrongly reopen the
+    /// trickplay settle window). Nil until the first real frame of this playback has rendered. Drives
+    /// `TrickplayPresentationReadinessPolicy` so a capture cannot land in the startup window the report ties
+    /// to a drop burst (report item 8).
+    @State private var firstFrameRenderedAt: TimeInterval?
     /// A per-playback token for external-sync sessions: fresh per view instance (so a rewatch of the same
     /// title scrobbles again) and re-minted on a genuine episode advance. A same-title recovery reload
     /// (source hop / demote / retry) keeps it unchanged, so the scrobble coordinator's once-latches survive
@@ -1625,6 +1632,7 @@ struct PlayerScreen: View {
                     // then cleared here, not a real failure.
                     srcProbe("FIRST FRAME at pos=\(String(format: "%.1f", d))s (playback started, clearing overlays)")
                     hasStartedPlaying = true
+                    firstFrameRenderedAt = ProcessInfo.processInfo.systemUptime
                     midPlayFailureResume = nil   // a mount that is playing owns its own position again
                     // FIRST-FRAME COMMIT (binge-desync fix): the incoming episode's file actually
                     // rendered, so publish an in-flight advance NOW, before anything below
@@ -1791,6 +1799,13 @@ struct PlayerScreen: View {
                                 suppressedResumeFloor = nil
                                 currentTime = origin
                                 lastReported = origin
+                            case .hidePreroll:
+                                // AVPlayerEngine issues the actual corrective local seek (root-cause report
+                                // section 7); this is only the UI/progress bookkeeping. Once that seek lands,
+                                // the viewer sees `resumeSeconds`, not `origin`, so report that here too.
+                                suppressedResumeFloor = nil
+                                currentTime = resumeSeconds
+                                lastReported = resumeSeconds
                             case .unreachable:
                                 suppressedResumeFloor = resumeSeconds
                                 lastReported = resumeSeconds
@@ -1900,7 +1915,17 @@ struct PlayerScreen: View {
             // A pre-first-frame failure demotes SILENTLY (no notice); a genuine mid-play decode failure keeps
             // the informative DV notice. Either way it re-loads the SAME source on libmpv, never a source hop.
             if coordinator.player is AVPlayerEngineController, !avEngineFailed {
-                srcProbe("endFileError on AVPlayer -> demote to libmpv in place (not a hop) reason=\((data as? String) ?? "-")")
+                let avFailureMessage = (data as? String) ?? "-"
+                // A terminal zero-packet source (the remux pre-scan proved EOF before any timestamped
+                // base-video packet) can never produce a frame on libmpv either: it is the same dead bytes,
+                // not a decoder problem. Hop to the next source instead of burning ~30s on a second engine
+                // that is guaranteed to fail the same way. Only pre-first-frame failures qualify; a mid-play
+                // failure already proves packets WERE flowing, so it keeps the existing in-place demote.
+                if !hasStartedPlaying, RemuxFirstPacketFailure.isTerminalZeroPacket(avFailureMessage) {
+                    srcProbe("endFileError on AVPlayer -> terminal zero-packet source, hop instead of demote reason=\(avFailureMessage)")
+                    if hopToNextSource(reason: "remux terminal zero-packet source") { return }
+                }
+                srcProbe("endFileError on AVPlayer -> demote to libmpv in place (not a hop) reason=\(avFailureMessage)")
                 demoteAVPlayerToMPV(silent: !hasStartedPlaying)
                 return
             }
@@ -2161,7 +2186,30 @@ struct PlayerScreen: View {
             isScrubbing: scrubbing,
             captureInFlight: localTrickplayCaptureInFlight
         ) else { return }
+        // Report item 8: withhold capture until first frame + display settle so its GPU work cannot land in
+        // the startup/renegotiation window the diagnosed drop bursts cluster in. tvOS is the platform with a
+        // real HDMI display-mode renegotiation; HDRDisplayMode.isSwitchSettled is a permanently-true no-op
+        // on iOS/macOS, so this reduces to the elapsed-time gate there. Checked here, after the cheap cadence
+        // gate, so mediaSummary() (inside isCurrentContentUHDHDR) reads only at capture boundaries, not on
+        // every timePos tick.
+        guard TrickplayPresentationReadinessPolicy.isReady(
+            elapsedSinceFirstFrame: firstFrameRenderedAt.map { ProcessInfo.processInfo.systemUptime - $0 },
+            displaySwitchSettled: HDRDisplayMode.isSwitchSettled,
+            isUltraHighDefinitionHDR: isCurrentContentUHDHDR()
+        ) else { return }
         captureTrickplayFrame(at: time)
+    }
+
+    /// Longer trickplay settle threshold for the most expensive frame to scale (report item 8: "lower
+    /// cadence during 4K HDR/DV"). Fail-open like the equivalent tvOS check: unknown/unprobed resolution or
+    /// HDR state keeps the shorter, default threshold rather than withholding capture indefinitely.
+    private func isCurrentContentUHDHDR() -> Bool {
+        guard let player = coordinator.player else { return false }
+        guard player.contentIsDolbyVision || player.hdrAvailable else { return false }
+        let summary = player.mediaSummary()
+        guard summary.width > 0, summary.height > 0 else { return false }
+        return TVOSFramePresentationPolicy.isUltraHighDefinition(
+            width: summary.width, height: summary.height)
     }
 
     private func invalidateLocalTrickplayCapture() {
@@ -2455,6 +2503,14 @@ struct PlayerScreen: View {
         coordinator.player?.contentIsDolbyVision = StreamRanking.isDolbyVision(
             contentHint ?? curHint ?? recordQualityText ?? ""
         )
+        // Real DV-profile evidence only ever survives from demoteAVPlayerToMPV's Coordinator handoff into a
+        // FRESH mpv controller at makeController time, never through this function. Every load THIS
+        // function issues targets an already-configured engine instance directly, so any evidence already
+        // sitting on it belongs to a DIFFERENT prior source (or, in the demote-reissue race where curURL
+        // changed underneath it, the WRONG url) and must not leak forward into this load.
+        if let mpv = coordinator.player as? MPVMetalViewController {
+            mpv.dolbyVisionFallbackInfo = .unknown
+        }
         guard let player = coordinator.player else { return nil }
         clearCachedAudioOutputTruth()
         let requestedResumeOrigin = live ? 0 : (
@@ -3268,6 +3324,10 @@ struct PlayerScreen: View {
         // Resume where it froze: reload in place, the seek lands once duration is known again.
         let resume = currentTime
         appliedSize = false; hasStartedPlaying = false; isSeekable = true; buffering = true
+        // The stalled mount already had a first frame; this reload earns its own. Without clearing it,
+        // elapsedSinceFirstFrame (the playback-diagnostics receipt) keeps measuring from the ORIGINAL,
+        // now-stale first frame across the reload instead of the fresh one this recovery is about to render.
+        firstFrameRenderedAt = nil
         curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
         let issuedToken = loadIntoPlayer(
             curURL ?? url, headers: curHeaders, live: isLive, resumeOrigin: resume
@@ -3309,6 +3369,12 @@ struct PlayerScreen: View {
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         let engineRequestedResume =
             (coordinator.player as? AVPlayerEngineController)?.pendingRequestedSourcePositionSeconds
+        // Real DV-profile evidence from the outgoing AVPlayer's own remux parse (#148), captured for the
+        // SAME reason as engineRequestedResume above: stop() below tears the remux session down, so this
+        // MUST read before it. Feeds the fresh mpv mount's pre-probe colour fallback via the Coordinator
+        // (MPVMetalPlayerView.makeController copies it onto the new controller).
+        coordinator.dolbyVisionFallbackInfo =
+            (coordinator.player as? AVPlayerEngineController)?.dolbyVisionFallbackInfo ?? .unknown
         // Engine of origin for the `avDemotedAt` grace (W2-A item 3a; tvOS twin in TVPlayerView). Captured
         // BEFORE stop() clears the engine's active token: this is the exact load the grace exists to swallow.
         demotedEngineLoadToken = coordinator.player?.activeLoadToken
@@ -3340,6 +3406,10 @@ struct PlayerScreen: View {
         // Treat the mpv mount as a fresh load: full timeout window, no stale error/overlay state.
         appliedSize = false; appliedVolume = false; hasStartedPlaying = false; isSeekable = true
         buffering = true; loadFailed = false; loadErrorMsg = ""
+        // The outgoing AVPlayer mount already had a first frame (or never got one); either way this fresh
+        // mpv mount earns its own. Without clearing it, elapsedSinceFirstFrame keeps measuring from the
+        // OUTGOING engine's stale timestamp instead of the incoming mpv leg's.
+        firstFrameRenderedAt = nil
         subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the AVPlayer engine; a stranded latch would gate every later pick
         srcProbeLoadStart = Date()   // [src-probe] fresh mpv mount: re-anchor the elapsed clock
         // RE-BASELINE the first-buffer grace for the mpv leg (tvOS twin does the same). `handleStartTimeout`
@@ -3422,6 +3492,9 @@ struct PlayerScreen: View {
         subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the old engine; a stranded latch would gate every later pick
         hasStartedPlaying = false; isSeekable = true
         buffering = true; loadFailed = false; loadErrorMsg = ""
+        // Mirrors demoteAVPlayerToMPV: the outgoing engine's first frame belongs to a mount this session is
+        // leaving, so elapsedSinceFirstFrame must not keep measuring from it once the new engine mounts.
+        firstFrameRenderedAt = nil
         srcProbeLoadStart = Date()
         startLoadTimeout()
         if toAVPlayer { startAVStartWatchdog() }   // arm the AV no-frame demote on the new mount
@@ -3605,6 +3678,17 @@ struct PlayerScreen: View {
                     case .satisfied:
                         suppressedResumeFloor = nil
                         let landed = duration > 0 ? min(max(0, origin), max(0, duration - 5)) : max(0, origin)
+                        currentTime = landed
+                        lastReported = landed
+                    case .hidePreroll:
+                        // AVPlayerEngine issues the actual corrective local seek (root-cause report section 7,
+                        // "apply to resume + stall-recovery remounts too" - this IS the stall-recovery remount
+                        // path); this is only the UI/progress bookkeeping. Once that seek lands, the viewer
+                        // sees `ticket.targetSeconds`, not `origin`, so report that here too.
+                        suppressedResumeFloor = nil
+                        let landed = duration > 0
+                            ? min(max(0, ticket.targetSeconds), max(0, duration - 5))
+                            : max(0, ticket.targetSeconds)
                         currentTime = landed
                         lastReported = landed
                     case .unreachable:

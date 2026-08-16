@@ -171,6 +171,62 @@ struct AVPlayerPictureInPictureState: Equatable, Sendable {
     }
 }
 
+// MARK: - Stall telemetry episode (dependency-free)
+
+/// One logical AVPlayer stall can span many `timeControlStatus` KVO callbacks: the wait reason changes
+/// mid-wait (buffering-rate -> minimize-stalls), and the transport can flip to `.paused` and back while the
+/// media clock never moves. Deriving `stall start`/`stall end` straight off `timeControlStatus == .waitingToPlayAtSpecifiedRate`
+/// therefore emits a duplicate start on every reason change and a false end on pause, which was making the
+/// recovery telemetry lie (root-cause report section 2). This owns ONE episode per item/load-generation: a
+/// start fires only on the genuine idle -> waiting edge, a reason change updates the episode without a second
+/// start, and the episode ends only once the media clock has proven forward progress, never off `.paused` or
+/// `.playing` alone.
+struct AVPlayerStallEpisodeState: Equatable {
+    enum Event: Equatable {
+        case none
+        case started(AVPlayer.WaitingReason?)
+        case reasonChanged(AVPlayer.WaitingReason?)
+        case ended
+    }
+
+    /// Media/displayed time must advance at least this much past the episode's baseline before it counts as
+    /// proven progress rather than clock jitter.
+    static let minimumProgressSeconds: Double = 0.10
+
+    private(set) var active = false
+    private(set) var reason: AVPlayer.WaitingReason?
+    private(set) var baselinePosition: Double?
+
+    mutating func enteredWaiting(reason: AVPlayer.WaitingReason?, position: Double) -> Event {
+        if !active {
+            active = true
+            self.reason = reason
+            baselinePosition = position
+            return .started(reason)
+        }
+        if self.reason != reason {
+            self.reason = reason
+            return .reasonChanged(reason)
+        }
+        return .none
+    }
+
+    mutating func mediaAdvanced(to position: Double) -> Event {
+        guard active, let baselinePosition,
+              position.isFinite, position - baselinePosition >= Self.minimumProgressSeconds else {
+            return .none
+        }
+        self = .init()
+        return .ended
+    }
+
+    /// Item/load-generation replacement: retire the episode WITHOUT emitting `stall end`. The retired item's
+    /// own telemetry stream is already closed by whatever terminal event (ready/failed/endfile) ended it.
+    mutating func reset() {
+        self = .init()
+    }
+}
+
 // MARK: - AVPlayer engine
 
 /// AVFoundation implementation of `PlayerEngine`. It drives one `AVPlayer` and maps its KVO + a periodic
@@ -312,6 +368,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var preferredPeakBitRatePinned = false
     private var audioOverBlackSince: TimeInterval = 0
     private var audioOverBlackFired = false
+    /// Progress-proven AVPlayer stall episode for the CURRENT item (root-cause report section 2). Advanced by
+    /// the `timeControlStatus` KVO (start on the idle -> waiting edge, reason changes update it silently) and
+    /// by the periodic time observer (end, only once the media clock proves forward progress). Reset alongside
+    /// the other item-scoped latches in `loadFile`.
+    private var stallEpisode = AVPlayerStallEpisodeState()
     /// Sustained window of advancing playback clock with ZERO video frames before demoting. Long enough to
     /// clear a slow first-frame on a healthy native DV start (normally sub-second once timePos ticks), short
     /// enough that black-with-Atmos flips to a working picture on libmpv in well under ten seconds.
@@ -780,6 +841,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         lastLoadURL = url; lastLoadHeaders = headers; lastLoadLive = live
         videoFrameEverProduced = false; preferredPeakBitRatePinned = false
         audioOverBlackSince = 0; audioOverBlackFired = false
+        stallEpisode.reset()
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []; loadedChapters = []; containerFPS = 0
         selectionTopologyGeneration = nil
         selectionRefreshState.reset()
@@ -1473,6 +1535,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
         videoFrameEverProduced = false; preferredPeakBitRatePinned = false
         audioOverBlackSince = 0; audioOverBlackFired = false
+        stallEpisode.reset()
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []
         selectionTopologyGeneration = nil
         selectionRefreshState.reset()
@@ -1846,6 +1909,29 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     var pendingRequestedSourcePositionSeconds: Double? {
         if let pendingSeek, pendingSeek.isFinite { return max(0, pendingSeek) }
         return pendingPlaybackIntent?.sourceSeconds
+    }
+
+    /// Real (non-guessed) Dolby Vision profile evidence recovered from this session's own local remux, if
+    /// one was mounted. `VortXMKVRemuxStream.hlsBuildSignaling` already parses the source's DOVI
+    /// configuration record (dv_profile / dv_bl_signal_compatibility_id) and bakes the result into the RFC
+    /// 6381 CODECS/SUPPLEMENTAL-CODECS strings this reads back out - the same evidence a libmpv demote
+    /// (#148) needs so it stops guessing HDR10 from the bare "is this DV" text flag. The caller must read
+    /// this BEFORE stop(), exactly like `pendingRequestedSourcePositionSeconds` above: stop() tears the
+    /// remux session down (teardownRemux), and a read after that always sees .unknown.
+    var dolbyVisionFallbackInfo: DVPlaybackPolicy.DolbyVisionFallbackInfo {
+        guard let signaling = remuxHLSServer?.signaling, signaling.dolbyVision else { return .unknown }
+        if signaling.videoCodec.hasPrefix("dvh1.05.") {
+            // Profile 5: IPT-only Dolby Vision, no HDR10-compatible base layer.
+            return DVPlaybackPolicy.DolbyVisionFallbackInfo(profile: 5, baseLayerHDR10Compatible: false)
+        }
+        if let supplemental = signaling.supplementalCodec, supplemental.hasSuffix("/db1p") {
+            // Profile 8.1 (or a converted Profile 7): db1p is the HDR10/PQ-compatible base-layer brand.
+            return DVPlaybackPolicy.DolbyVisionFallbackInfo(profile: 8, baseLayerHDR10Compatible: true)
+        }
+        // HLG-compatible (8.4, db4h) or unknown compat id: no proven HDR10-safe fallback here. The real
+        // gamma=="hlg" decoded-parameter branch in MPVMetalViewController.syncDisplayDynamicRange already
+        // handles 8.4 correctly once mpv decodes; guessing here would only risk a wrong pre-probe tag.
+        return .unknown
     }
 
     /// The authoritative source-timeline origin once a remux item is ready. nil distinguishes "not ready yet"
@@ -2834,7 +2920,22 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 let stateText = player.timeControlStatus == .paused ? "paused"
                     : (waiting ? "buffering" : "playing")
                 VXProbeState.shared.setPlayer(state: stateText, engine: "avplayer", buffering: waiting)
-                VXProbe.event("player", "stall \(waiting ? "start" : "end")")
+                // Progress-proven stall telemetry (root-cause report section 2): a start fires only on the
+                // idle -> waiting edge, and a wait-reason change (buffering-rate -> minimize-stalls etc.)
+                // updates the SAME episode without a second start. `.paused`/`.playing` never end it here -
+                // only proven media-clock progress does, in the periodic time observer below.
+                if waiting {
+                    let baseline = player.currentTime().seconds
+                    switch self.stallEpisode.enteredWaiting(
+                        reason: player.reasonForWaitingToPlay,
+                        position: baseline.isFinite ? baseline : 0
+                    ) {
+                    case .started:
+                        VXProbe.event("player", "stall start")
+                    case .reasonChanged, .none, .ended:
+                        break
+                    }
+                }
                 self.emit(
                     MPVProperty.pausedForCache, waiting,
                     loadToken: loadToken
@@ -2876,6 +2977,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     loadToken: loadToken
                 )
                 self.updateSubtitleOverlay(atClock: position)   // sync external-sub overlay to source time
+                // Proven-progress stall-episode end (root-cause report section 2): the raw AVPlayer clock, in
+                // the SAME seconds space the KVO handler above baselined the episode against. `.paused`/
+                // `.playing` transitions never end the episode on their own; only actual forward movement of
+                // this clock does.
+                if case .ended = self.stallEpisode.mediaAdvanced(to: time.seconds) {
+                    VXProbe.event("player", "stall end")
+                }
                 // Gate the two EXPENSIVE side effects (the NSLock probe write and the loadedTimeRanges scan)
                 // behind the same PerformanceMode-scaled interval the libmpv path uses (0.5s reduced, else
                 // 0.25s), so a constrained device is not doing an unconditional lock + O(ranges) loop 4x/sec.
@@ -3075,7 +3183,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             if let target = pendingSeek, seekable {
                 pendingSeek = nil
                 // A remux resume is fulfilled by opening the INPUT at its origin, not by seeking AVPlayer into
-                // bytes that have not been produced. A keyframe landing within one GOP is already satisfied;
+                // bytes that have not been produced. A keyframe landing exactly on the target is already
+                // satisfied; one within one GOP hides its own preroll with ONE local seek (root-cause report
+                // section 7 - decode needs those extra reference frames, but the viewer must never see them);
                 // anything farther ahead remains unreachable on the forward-only mount and is safely dropped.
                 if isRemuxMounted {
                     switch RemuxResumePolicy.preStartSeek(
@@ -3085,6 +3195,15 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                         DiagnosticsLog.log(
                             "dv",
                             "pre-start seek to \(Int(target))s already satisfied by remux origin \(Int(remuxTimelineOrigin))s")
+                    case .hidePreroll(let playerSeconds):
+                        // `playerSeconds` is already the exact local-clock destination (see the policy's own
+                        // header): the SAME CMTime construction the non-remux branch below uses, so a mutant
+                        // that reused `target` (the SOURCE second) here instead would seek to the wrong clock
+                        // on every resumed remux mount, not just fail to hide the preroll.
+                        player.seek(to: CMTime(seconds: max(playerSeconds, 0), preferredTimescale: 600))
+                        DiagnosticsLog.log(
+                            "dv",
+                            "pre-start seek to \(Int(target))s: hiding \(String(format: "%.3f", playerSeconds))s of keyframe preroll from remux origin \(Int(remuxTimelineOrigin))s")
                     case .unreachable(let ahead):
                         DiagnosticsLog.log(
                             "dv",

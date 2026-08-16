@@ -10,6 +10,7 @@
 //     app/SourcesShared/SourceContributionWorkPolicy.swift \
 //     app/SourcesShared/MoatToken.swift \
 //     app/SourcesShared/SourceSettlementPolicy.swift \
+//     app/SourcesShared/ProviderCircuitBreaker.swift \
 //     app/SourcesShared/TorBoxSearchSource.swift \
 //     app/SourcesShared/SourceIndexClient.swift \
 //     app/Tests/SourceIndexTorrentContractTests.swift && /tmp/source-index-contract-test

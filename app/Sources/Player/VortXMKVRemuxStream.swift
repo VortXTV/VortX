@@ -90,6 +90,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var producerTerminalState = VortXRemuxProducerTerminalState()
     private let onProducerTerminal: @Sendable () -> Void
     private let preparationGate = VortXRemuxPreparationGate()
+    /// Producer-lead backpressure (root-cause report section 6). Internal, not private: `VortXRemuxHLSServer`
+    /// is the one object with a live playhead, so it drives `setPaused` directly from its publication cycle;
+    /// this stream only checks it at closed-segment boundaries. See `VortXRemuxProducerLeadPolicy` for why this
+    /// is a SEPARATE gate from `preparationGate` rather than a reuse of it.
+    let producerLeadGate = VortXRemuxProducerLeadGate()
 
     /// F1: stable heap cell the INPUT context's `interrupt_callback` polls to abort a blocking network
     /// open/read/reconnect-sleep the instant cancel() fires. Without it a demote on a STALLED CDN leaves the
@@ -945,6 +950,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     func cancel() {
         cancelledFlag.set()
         preparationGate.cancel()
+        producerLeadGate.cancel()
         // F1: trip the INPUT context's interrupt flag too, so a thread blocked inside avformat_open_input /
         // av_read_frame / a reconnect sleep on a stalled CDN aborts in milliseconds (AVERROR_EXIT) instead of
         // waiting out rw_timeout x reconnects. Set-after cancelledFlag so isCancelled is already true when the
@@ -1903,6 +1909,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // a function-scope defer frees any packet the mux loop never got to (early return / non-DV fall-through).
         var prebuffered: [UnsafeMutablePointer<AVPacket>] = []
         defer { for p in prebuffered { var pp: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&pp) } }
+        // Root-cause report section 3: the classified pre-scan read failure (nil when the scan simply
+        // exhausted its bound without a hard read error - the "malformed" bucket, which still falls through
+        // to the existing generic message + libmpv demote below, now with more evidence attached). Hoisted
+        // above the pre-scan's own `if` so the post-scan fallback below (well outside that block's scope) can
+        // still see it.
+        var firstReadFailure: RemuxFirstPacketFailure?
+        var firstReadFailureMessage: String?
         // The pre-scan also runs when the base track's extradata cannot yield a valid hvcC (not only when the
         // DV profile is unknown): the SAME first access unit that would carry an in-band RPU also carries the
         // in-band VPS/SPS/PPS a parameter-sets-in-band stream repeats ahead of its IDR slice, so one bounded,
@@ -1918,9 +1931,44 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             var scanned = 0
             var mappedBaseScanned = 0
             var prescanDTS: Int64?
+            // Bounded reopen budget for a timeout/transient-IO read failure (root-cause report section 3):
+            // retrying the SAME already-open AVIOContext IS the reopen, because the reconnect flags already
+            // set on this input (see the live mid-stream read loop's retry comment below) re-establish the
+            // connection transparently. `firstReadFailure`/`firstReadFailureMessage` are the OUTER, function-
+            // scope variables declared above the pre-scan; this loop only writes them.
+            var readRetriesUsed = 0
             while scanned < maxScan, !isCancelled {
                 guard let p = av_packet_alloc() else { break }
-                if av_read_frame(inCtx, p) < 0 { var pp: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&pp); break }
+                let readRC = av_read_frame(inCtx, p)
+                if readRC < 0 {
+                    // Preserve the exact failure evidence the old `if av_read_frame(...) < 0 { ...; break }`
+                    // discarded: the rc itself, whether the input's AVIOContext is at genuine EOF, and its
+                    // sticky I/O error code, all sampled BEFORE the packet is freed and before any retry can
+                    // overwrite them.
+                    let pb = inCtx.pointee.pb
+                    let avioEOF = pb.map { avio_feof($0) != 0 } ?? false
+                    let avioError = pb?.pointee.error ?? 0
+                    let classification = RemuxFirstPacketFailure.classify(
+                        readResult: readRC, avioEOF: avioEOF, avioError: avioError, isCancelled: isCancelled)
+                    var pp: UnsafeMutablePointer<AVPacket>? = p
+                    av_packet_free(&pp)
+                    if classification.deservesOneBoundedRetry,
+                       readRetriesUsed < RemuxFirstPacketFailure.maxPreScanReadRetries {
+                        readRetriesUsed += 1
+                        DiagnosticsLog.log(
+                            "dv",
+                            "pre-scan read failed rc=\(readRC) avioEOF=\(avioEOF) avioError=\(avioError) "
+                                + "scanned=\(scanned)/\(maxScan) mappedBase=\(mappedBaseScanned) -> "
+                                + "bounded retry \(readRetriesUsed)/\(RemuxFirstPacketFailure.maxPreScanReadRetries)")
+                        continue
+                    }
+                    firstReadFailure = classification
+                    firstReadFailureMessage = classification.failureMessage(
+                        isResume: originSeekApplied,
+                        evidence: "scanned=\(scanned)/\(maxScan) mappedBase=\(mappedBaseScanned) "
+                            + "rc=\(readRC) avioEOF=\(avioEOF) avioError=\(avioError)")
+                    break
+                }
                 scanned += 1
                 prebuffered.append(p)
                 if Int(p.pointee.stream_index) == baseVideoIn {
@@ -1995,6 +2043,22 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             return
         }
         if !latchTimelineShiftFromFallbackIfNeeded() {
+            // Root-cause report section 3: route through the classified pre-scan read failure when one exists,
+            // instead of always collapsing to the one generic string. `firstReadFailure` is nil exactly for
+            // the "malformed" bucket - the scan exhausted its bound (or found no mapped base packet) WITHOUT a
+            // hard read error - which still falls through to the original generic message below and still
+            // permits the existing libmpv demote, now carrying more evidence in the same message.
+            if let firstReadFailure {
+                // cancel() already publishes `buffer.fail("cancelled")` itself the moment it runs, on
+                // whichever thread called it; publishing a SECOND, source-blaming failure here would either
+                // no-op against that first write or - on the losing side of the race - be the one message a
+                // reader sees, wrongly blaming the source for our own teardown. Silent return either way.
+                guard !firstReadFailure.isCancellation else { return }
+                buffer.fail(firstReadFailureMessage ?? (originSeekApplied
+                    ? "resume input seek produced no timestamped base-video packet"
+                    : "fresh input produced no timestamped base-video packet"))
+                return
+            }
             buffer.fail(originSeekApplied
                 ? "resume input seek produced no timestamped base-video packet"
                 : "fresh input produced no timestamped base-video packet")
@@ -3715,6 +3779,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 hlsSegmentStartSec = pending.endSeconds
                 hlsSegmentStartPacketProven = true
                 if preparationGate.waitAtClosedSegmentBoundary() == .cancelled { return false }
+                // Producer-lead backpressure (root-cause report section 6): the SAME closed-segment boundary
+                // the prepared-remux handoff parks at, so a lead-driven pause can only ever land between
+                // fragments too. `VortXRemuxHLSServer` drives `setPaused` from its own publication cycle,
+                // which has the live playhead this stream does not.
+                if producerLeadGate.waitAtClosedSegmentBoundaryIfPaused() == .cancelled { return false }
                 return true
             })
         switch result {

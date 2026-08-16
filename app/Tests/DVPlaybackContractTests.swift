@@ -978,16 +978,22 @@ check("played frontier: no playhead receipt keeps the original sequence pinned",
         suffixStartID: requestAheadOfPlayhead,
         playbackSegmentID: nil,
         window: fieldWindow) == fieldWindow.mediaSequence)
+// 50 and 57 (not 12/37): after the section-6 two-pool fix, the behind-frontier byte cap on THIS field shape
+// (`fieldSegmentSizes`) only starts to bind once the behind-only prefix itself exceeds 352 MiB, which first
+// happens crossing index 44. 12/37 both left the cap unbound now that ahead-of-frontier volume no longer
+// counts toward it, so both floors were 0 and the strict `<` below no longer discriminated anything - 50 and
+// 57 keep this a real test of "a later frontier's OWN behind-frontier volume trips the cap further out," not
+// an artifact of the old ahead-of-frontier crowding bug.
 check("played frontier: a backward seek moves eviction authority backward",
       VortXHLSConsumptionWindowPolicy.publicationStartID(
         currentStartID: fieldWindow.mediaSequence,
         suffixStartID: requestAheadOfPlayhead,
-        playbackSegmentID: 12,
+        playbackSegmentID: 50,
         window: fieldWindow)
           < VortXHLSConsumptionWindowPolicy.publicationStartID(
             currentStartID: fieldWindow.mediaSequence,
             suffixStartID: requestAheadOfPlayhead,
-            playbackSegmentID: 37,
+            playbackSegmentID: 57,
             window: fieldWindow))
 
 let fieldSegmentBytes = 8 * retentionMiB
@@ -1002,12 +1008,29 @@ let producedAheadWindow = VortXHLSWindow(segments: (0..<80).map {
 let producedAheadFloor = VortXHLSConsumptionWindowPolicy.floor(
     frontier: 59,
     window: producedAheadWindow)
+// Root-cause report section 6: before the two-pool fix, the 20 segments AHEAD of frontier 59 (ids 60-79, 160
+// MiB) were folded into `retainedBytes` FIRST (the reversed walk visits the highest IDs first), so only
+// 352-160=192 MiB (24 segments) of BEHIND-frontier budget was left, giving floor=36 and exactly 55 seconds
+// less rewind history than this fixture's segment shape can actually afford. The fix reserves the full 352
+// MiB for behind-frontier retention regardless of how much lies ahead: 352 MiB / 8 MiB = exactly 44
+// behind-frontier segments (ids 16-59, 55s of rewind - well under the independent 150s cap, so the byte cap is
+// what binds here), giving floor=16. A regression to the old shared-pool behavior would move this back to 36
+// and shrink `behindFrontierBytes` below the full retention budget, so this assertion catches that mutation.
 let producedAheadRetained = producedAheadWindow.segments.filter { $0.id >= producedAheadFloor }
-check("consumption retention: produced-ahead bytes consume the same retained-window budget",
-      producedAheadFloor == 36
-          && producedAheadRetained.count == 44
-          && producedAheadRetained.reduce(0) { $0 + $1.byteLength }
-              == VortXHLSConsumptionWindowPolicy.retainedWindowMaximumBytes)
+let producedAheadBehindFrontier = producedAheadRetained.filter { $0.id <= 59 }
+let producedAheadAheadOfFrontier = producedAheadRetained.filter { $0.id > 59 }
+check("consumption retention: produced-ahead bytes no longer crowd out the behind-frontier rewind budget",
+      producedAheadFloor == 16
+          && producedAheadBehindFrontier.count == 44
+          && producedAheadBehindFrontier.reduce(0) { $0 + $1.byteLength }
+              == VortXHLSConsumptionWindowPolicy.retainedWindowMaximumBytes
+          && producedAheadBehindFrontier.reduce(0.0) { $0 + $1.duration } == 55)
+check("consumption retention: every produced-ahead segment stays published regardless of its own volume",
+      producedAheadAheadOfFrontier.count == 20
+          && producedAheadAheadOfFrontier.map(\.id) == Array(60..<80))
+check("consumption retention: the retained window can legitimately exceed W once ahead/behind are independent",
+      producedAheadRetained.reduce(0) { $0 + $1.byteLength }
+          > VortXHLSConsumptionWindowPolicy.retainedWindowMaximumBytes)
 
 let longPlaylistWindow = VortXHLSWindow(segments: (0..<26).map {
     VortXHLSSegment(

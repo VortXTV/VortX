@@ -47,11 +47,15 @@ struct VortXHLSWindow: Equatable, Sendable {
 /// O and H are a planning decomposition, not separately enforced runtime ceilings. Only aggregate physical
 /// admission at C is hard; aligned audio/subtitle resources and open-GOP state share that same aggregate cap.
 ///
-/// The video byte window covers the whole published video suffix, including segments produced ahead of the
-/// client's fetch frontier. The time window applies only at and behind that frontier, where it represents useful
-/// rewind history. If the produced-ahead suffix alone exceeds W, the demonstrated frontier remains the hard
-/// lower bound: this policy never discards an unseen segment or splits a GOP. The session spool's admission
-/// ceiling then provides the physical bound and backpressures the producer.
+/// Both the byte window (W) and the time window apply ONLY at and behind the client's demonstrated fetch
+/// frontier, where they represent useful rewind history (root-cause report section 6: W previously also
+/// counted every segment produced AHEAD of the frontier before reserving anything behind it, so a large
+/// produced-ahead suffix could silently starve the whole rewind reservation - see `floor`'s own header for the
+/// exact fix). Segments ahead of the frontier are never evicted by this policy regardless of their volume: the
+/// demonstrated frontier remains the hard lower bound, so this policy never discards an unseen segment or
+/// splits a GOP. Their own volume is bounded separately, by `VortXRemuxProducerLeadPolicy`'s producer-lead
+/// pause/resume and the session spool's admission ceiling, which provides the hard physical bound and
+/// backpressures the producer independently of this window's own accounting.
 enum VortXHLSConsumptionWindowPolicy {
     private static let mebibyte = 1024 * 1024
 
@@ -104,7 +108,8 @@ enum VortXHLSConsumptionWindowPolicy {
     }
 
     /// Returns the oldest absolute segment ID that may remain published without crossing the time or byte
-    /// budget. Segments ahead of `frontier` consume byte budget but not rewind-time budget.
+    /// budget. Segments ahead of `frontier` consume NEITHER budget: see the guard below (root-cause report
+    /// section 6).
     static func floor(frontier: Int, window: VortXHLSWindow) -> Int {
         guard frontier >= 0 else { return frontier }
         var rewindSeconds = 0.0
@@ -113,14 +118,23 @@ enum VortXHLSConsumptionWindowPolicy {
 
         for segment in window.segments.reversed() {
             guard segment.byteLength >= 0 else { return frontier }
+            // Segments AHEAD of the frontier (not yet displayed) can never be evicted by this floor - the
+            // `min(floor, frontier)` return below clamps to `frontier` regardless of anything computed here -
+            // so they must never consume the SAME budget this loop reserves for BEHIND-frontier rewind
+            // history. Before this guard, walking the reversed array visited every ahead-of-frontier segment
+            // FIRST (they have the highest IDs, so they sort to the front of `.reversed()`) and folded its
+            // bytes into `retainedBytes`, so a large produced-ahead suffix could exhaust
+            // `retainedWindowMaximumBytes` before the loop ever reached a single behind-frontier segment. That
+            // is the direct cause of the field "seek outside mounted window" failure on a ten-second rewind
+            // after several minutes of produced-ahead media: the 150-second rewind promise silently collapsed
+            // toward zero exactly when the produced-ahead suffix was largest. Ahead-of-frontier volume is
+            // bounded separately now, by `VortXRemuxProducerLeadPolicy`'s producer-lead pause/resume and the
+            // session spool's aggregate physical admission ceiling; this function is no longer where it is
+            // rationed.
+            guard segment.id <= frontier else { continue }
+
             let (nextBytes, byteOverflow) = retainedBytes.addingReportingOverflow(segment.byteLength)
             guard !byteOverflow else { return frontier }
-
-            if segment.id > frontier {
-                retainedBytes = nextBytes
-                continue
-            }
-
             guard segment.duration.isFinite, segment.duration >= 0 else { return frontier }
             let nextSeconds = rewindSeconds + segment.duration
             guard nextSeconds.isFinite else { return frontier }

@@ -304,18 +304,19 @@ final class TorBoxSearchSource: ObservableObject {
     /// so browsing back and forth never re-hits the TorBox scraper. Re-hitting on every open is exactly what
     /// exhausts the account's small daily search allowance and trips its ~24h `cooldown_until`.
     private var cache: [String: [CoreStream]] = [:]
-    /// Set when the index last answered 429 (over the scraper allowance). While in the future, `refresh`
-    /// short-circuits so the app stops firing requests against a `0 per 1 minute` wall. We can't read the
-    /// exact reset from the 429, so we back off a short window and re-probe: the feature self-heals the
-    /// moment the allowance frees, without hammering in between.
-    private var cooldownUntil: Date?
-    /// Consecutive transport errors (no HTTP response completed) seen so far. A single offline blip must still
-    /// self-heal immediately on the next open, so the first few are retried with no backoff; only a PERSISTENT
-    /// streak arms a cooldown, so a dead host (search-api.torbox.app went DNS-dead) is probed occasionally
-    /// instead of firing two failing lookups on every title open forever. ANY completed HTTP response (2xx,
-    /// 429, other) resets it: the host is reachable, so the streak is broken.
-    private var consecutiveTransportErrors = 0
-    private static let maxConsecutiveTransportErrors = 3
+    /// The 429/transport-error backoff itself is NOT instance state anymore: it lives in the shared
+    /// `ProviderCircuitBreaker`, keyed by (provider, contentID). This type is a per-detail-view
+    /// `@StateObject`, so a `cooldownUntil` kept HERE was forgotten every time a view was torn down and
+    /// rebuilt (every navigation away and back), letting the next view re-fire the request that just got
+    /// rate-limited. The diag-21 log shows the same content id tripping TorBox's scraper cooldown six
+    /// separate times because of exactly that. `shouldAttempt`/`recordFailure`/`recordSuccess` below are
+    /// the replacement; every instance shares the same breaker state.
+    ///
+    /// A literal, not `Self.breakerProvider`: this file also compiles standalone under
+    /// `SOURCE_INDEX_IDENTITY_TESTING` (see `TorBoxIdentityBoundaryTests.swift`'s header), whose minimal
+    /// `DebridService` stub carries no raw value. `DebridService` never overrides its raw values (they
+    /// default to the case name), so this matches `Self.breakerProvider` in the real app exactly.
+    private static let breakerProvider = "torBox"
     private var task: Task<Void, Never>?
     private let fetchStreams: FetchStreams
     private let hasKey: KeyGate
@@ -393,10 +394,6 @@ final class TorBoxSearchSource: ObservableObject {
             return
         }                                                  // cached: already published above, no round trip
         if inFlightKey == fetchKey { return }             // the paired onChange/onAppear for this id: fetch once
-        if let until = cooldownUntil, until > Date() {
-            publishSettlement(contentID: fetchKey, terminal: true)
-            return
-        }                                                   // in scraper cooldown: terminal failure for this generation
         task?.cancel()
         inFlightKey = fetchKey
         publishSettlement(contentID: fetchKey, terminal: false)
@@ -417,6 +414,24 @@ final class TorBoxSearchSource: ObservableObject {
         VXProbe.log("torbox-search", "refresh id=\(VXProbeRedaction.identityToken(target.titleID)) \(scope) hasKey=\(key.isEmpty ? "no" : "yes")")
         task = Task { [weak self] in
             guard let self else { return }
+            // Ask the SHARED breaker, not instance state: an open circuit here means some earlier caller
+            // (possibly a now-dead view) already saw TorBox back off for this exact content id, and that
+            // memory must survive this view's own lifetime. `shouldAttempt` also grants at most one
+            // half-open probe once the cooldown elapses, so this refresh may be the probe owner even while
+            // the circuit was open a moment ago.
+            guard await ProviderCircuitBreaker.shared.shouldAttempt(
+                provider: Self.breakerProvider, sourceID: fetchKey
+            ) else {
+                guard SourceContributorCompletionOwnership.accepts(
+                    completedKey: fetchKey, shownKey: self.shownKey, inFlightKey: self.inFlightKey,
+                    canceled: Task.isCancelled
+                ) else { return }
+                self.inFlightKey = nil
+                self.task = nil
+                VXProbe.log("torbox-search", "circuit open for id=\(VXProbeRedaction.identityToken(target.titleID)), skipping fetch")
+                self.publishSettlement(contentID: fetchKey, terminal: true)
+                return
+            }
             let result = await self.fetchStreams(target, key)
             guard SourceContributorCompletionOwnership.accepts(
                 completedKey: fetchKey,
@@ -427,34 +442,33 @@ final class TorBoxSearchSource: ObservableObject {
             self.inFlightKey = nil
             self.task = nil
             if result.rateLimited {
-                // Over the TorBox scraper allowance. Back off ~15 min before re-probing; do NOT cache the
-                // empty result, so it re-fetches for real once the cooldown lifts. A 429 IS a completed HTTP
-                // response, so the host is reachable: reset the transport-error streak.
-                self.consecutiveTransportErrors = 0
-                self.cooldownUntil = Date().addingTimeInterval(15 * 60)
-                VXProbe.log("torbox-search", "rate-limited (scraper cooldown) for id=\(VXProbeRedaction.identityToken(target.titleID)), backing off ~15m")
+                // Over the TorBox scraper allowance. A 429 IS a completed HTTP response (the host is
+                // reachable), so this trips the breaker on the FIRST occurrence rather than accumulating a
+                // streak; do NOT cache the empty result, so it re-fetches for real once the cooldown lifts.
+                await ProviderCircuitBreaker.shared.recordFailure(
+                    provider: Self.breakerProvider, sourceID: fetchKey,
+                    phase: .discover, reason: .httpStatus(429)
+                )
+                VXProbe.log("torbox-search", "rate-limited (scraper cooldown) for id=\(VXProbeRedaction.identityToken(target.titleID)), backing off")
                 self.publishSettlement(contentID: fetchKey, terminal: true)
                 return
             }
             if result.transportError {
-                // The request never completed (offline / network failure / a DNS-dead host). Do NOT cache the
-                // empty result. A single blip must self-heal immediately on the next open, so the first few
-                // retry with no backoff; only a PERSISTENT streak arms a ~15 min cooldown (mirroring the 429
-                // path) so a dead host is probed occasionally instead of firing failing lookups on every open.
-                self.consecutiveTransportErrors += 1
-                if self.consecutiveTransportErrors >= Self.maxConsecutiveTransportErrors {
-                    self.cooldownUntil = Date().addingTimeInterval(15 * 60)
-                    VXProbe.log("torbox-search", "\(self.consecutiveTransportErrors) consecutive transport errors for id=\(VXProbeRedaction.identityToken(target.titleID)), backing off ~15m")
-                } else {
-                    VXProbe.log("torbox-search", "transport error for id=\(VXProbeRedaction.identityToken(target.titleID)), not caching, will retry")
-                }
+                // The request never completed (offline / network failure / a DNS-dead host). Do NOT cache
+                // the empty result. A single blip must self-heal immediately on the next attempt (the
+                // breaker only trips after a PERSISTENT streak for a plain transport failure), so a dead
+                // host is probed occasionally instead of firing failing lookups on every open.
+                await ProviderCircuitBreaker.shared.recordFailure(
+                    provider: Self.breakerProvider, sourceID: fetchKey,
+                    phase: .discover, reason: .other("transport")
+                )
+                VXProbe.log("torbox-search", "transport error for id=\(VXProbeRedaction.identityToken(target.titleID)), not caching")
                 self.publishSettlement(contentID: fetchKey, terminal: true)
                 return
             }
-            // A completed HTTP response with results (or a legit empty 200): the host is reachable, so reset the
-            // transport-error streak and clear any stale cooldown before caching.
-            self.consecutiveTransportErrors = 0
-            self.cooldownUntil = nil
+            // A completed HTTP response with results (or a legit empty 200): the host is reachable, so
+            // reset the breaker before caching.
+            await ProviderCircuitBreaker.shared.recordSuccess(provider: Self.breakerProvider, sourceID: fetchKey)
             VXProbe.log("torbox-search", "fetched \(result.streams.count) stream(s) for id=\(VXProbeRedaction.identityToken(target.titleID))")
             self.cache[fetchKey] = result.streams
             self.streams = result.streams

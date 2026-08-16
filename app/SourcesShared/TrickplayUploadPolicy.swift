@@ -3,6 +3,13 @@ import Foundation
 /// Local-preview capture follows the same configured playback-time cadence that
 /// community coverage and VTT metadata advertise. Frame-drop diagnostics are
 /// deliberately absent: telemetry must never disable capture.
+///
+/// `presentationReady` is a SEPARATE, non-telemetry gate (report item 8: the diagnosed output-drop bursts
+/// coincide with trickplay captures run at 0/10/20s, before the display has finished settling). It answers
+/// "has the presentation pipeline been stable long enough for a capture to be safe", derived only from
+/// elapsed time and the HDMI display-mode-switch state - never from a frame-drop count - so it does not
+/// reopen the deliberately-rejected feedback loop above. Defaults to `true` so every other call site (and
+/// the existing tests) is unaffected.
 struct TrickplayCaptureCadencePolicy {
     static func shouldCapture(
         playbackTime: Double,
@@ -10,7 +17,8 @@ struct TrickplayCaptureCadencePolicy {
         intervalSeconds: Double,
         playbackActive: Bool,
         isScrubbing: Bool,
-        captureInFlight: Bool
+        captureInFlight: Bool,
+        presentationReady: Bool = true
     ) -> Bool {
         guard playbackTime.isFinite,
               lastCaptureTime.isFinite,
@@ -19,9 +27,35 @@ struct TrickplayCaptureCadencePolicy {
               playbackTime > 0,
               playbackActive,
               !isScrubbing,
-              !captureInFlight else { return false }
+              !captureInFlight,
+              presentationReady else { return false }
         let elapsed = playbackTime - lastCaptureTime
         return elapsed <= -intervalSeconds || elapsed >= intervalSeconds
+    }
+}
+
+/// First-frame + display-settle readiness for trickplay capture (report item 8). The libmpv frame grab
+/// scales the drawable INLINE on mpv's VO thread (`MetalLayer.nextDrawable`, right before the very next
+/// present), so a capture request that lands during a display-mode renegotiation or in the first seconds of
+/// a new renderer generation extends exactly the drawable wait the diagnosed bursts show. Withholding
+/// capture until both gates clear keeps every capture's GPU work outside that window without having to move
+/// the scale off the VO thread. UHD HDR/DV content gets the longer threshold: it is both the most expensive
+/// frame to scale and the specific case the diagnostic log ties to a drop burst.
+enum TrickplayPresentationReadinessPolicy {
+    static let defaultSettleSeconds: Double = 5
+    static let uhdHDRSettleSeconds: Double = 30
+
+    static func isReady(
+        elapsedSinceFirstFrame: Double?,
+        displaySwitchSettled: Bool,
+        isUltraHighDefinitionHDR: Bool
+    ) -> Bool {
+        guard displaySwitchSettled,
+              let elapsedSinceFirstFrame, elapsedSinceFirstFrame.isFinite else {
+            return false
+        }
+        let threshold = isUltraHighDefinitionHDR ? uhdHDRSettleSeconds : defaultSettleSeconds
+        return elapsedSinceFirstFrame >= threshold
     }
 }
 

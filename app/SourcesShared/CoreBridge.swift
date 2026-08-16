@@ -2797,6 +2797,15 @@ final class CoreBridge: ObservableObject {
             || current.libraryItem?.state.timeOffset != next.libraryItem?.state.timeOffset
             || current.libraryItem?.state.videoId != next.libraryItem?.state.videoId
             || current.libraryItem?.state.duration != next.libraryItem?.state.duration
+            // A manual "Mark as Watched" on a movie (or one whose position never advanced, e.g. flagged
+            // watched with no active offset) flips ONLY flaggedWatched/timesWatched: timeOffset, duration,
+            // videoId, libraryItem.id/removed/temp and watchedVideoIds.count all stay exactly as they were.
+            // Without comparing these two fields, that mark landed on the engine (Library tab / Continue
+            // Watching, which decode fresh every event) but `core.metaDetails` never republished, so the
+            // open detail page's own watched checkmark (state.timesWatched > 0) stayed stuck on the stale
+            // value until an unrelated field changed or the page reloaded.
+            || current.libraryItem?.state.flaggedWatched != next.libraryItem?.state.flaggedWatched
+            || current.libraryItem?.state.timesWatched != next.libraryItem?.state.timesWatched
             || (current.watchedVideoIds?.count ?? 0) != (next.watchedVideoIds?.count ?? 0) {
             return true
         }

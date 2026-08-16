@@ -99,11 +99,16 @@ struct FramePresentationDropCounter: Equatable {
         raw = initialRaw.flatMap { $0 >= 0 ? $0 : nil }
     }
 
-    mutating func observe(_ next: Int) -> Int {
+    /// `raw` always advances so a later call's delta stays correct, even for a delta this call chooses not
+    /// to score. `count` gates only whether the delta is added to `interval` (the reported total): a burst
+    /// suppressed while the presentation generation is unsettled (report item 8: display-mode transition,
+    /// first seconds of a new renderer generation, unstable drawable, seek/remount) is discarded outright,
+    /// never deferred into the next settled sample once the gate opens.
+    mutating func observe(_ next: Int, count: Bool = true) -> Int {
         guard next >= 0 else { return 0 }
         let delta = raw.map { next >= $0 ? next - $0 : next } ?? next
         raw = next
-        interval += delta
+        if count { interval += delta }
         return delta
     }
 
@@ -156,6 +161,9 @@ final class FramePresentationDiagnosticsAccumulator: @unchecked Sendable {
     private struct State {
         let generation: UInt64
         var intervalStartedAt: Double
+        /// Set once at `begin()` and never advanced by `takeSnapshot()`, unlike `intervalStartedAt`. This is
+        /// the fixed origin `isGenerationPastStartupWindow` measures elapsed time against.
+        let generationStartedAt: Double
         var successfulDrawableSequence = 0
         var drawableRequests = 0
         var drawableNil = 0
@@ -180,10 +188,31 @@ final class FramePresentationDiagnosticsAccumulator: @unchecked Sendable {
         lock.lock()
         state = State(
             generation: generation, intervalStartedAt: now.isFinite ? now : 0,
+            generationStartedAt: now.isFinite ? now : 0,
             frameDrops: FramePresentationDropCounter(initialRaw: frameDropRaw),
             decoderDrops: FramePresentationDropCounter(initialRaw: decoderDropRaw)
         )
         lock.unlock()
+    }
+
+    /// Minimum elapsed time and successful-drawable count before an output-drop delta is treated as a
+    /// scored regression rather than expected renegotiation/startup noise (report item 8). Both must clear:
+    /// time alone would let a genuinely stalled drawable start scoring early, and a drawable count alone
+    /// would let a pathologically fast opening sequence score before the display has had a chance to settle.
+    private static let presentationSettleSeconds: Double = 5
+    private static let presentationSettleDrawables = presentedSampleStride
+
+    /// True once the current generation has run long enough, with enough successfully-acquired drawables,
+    /// that an output-drop burst is unlikely to be startup/renderer-generation noise. The caller ANDs this
+    /// with the seek and HDMI display-mode-switch signals (state this accumulator does not own) to decide
+    /// whether to pass `presentationSettled: true` into `recordDrop`.
+    func isGenerationPastStartupWindow(now: Double) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let current = state else { return false }
+        let elapsed = now.isFinite ? now - current.generationStartedAt : 0
+        return elapsed >= Self.presentationSettleSeconds
+            && current.successfulDrawableSequence >= Self.presentationSettleDrawables
     }
 
     func end() {
@@ -228,17 +257,23 @@ final class FramePresentationDiagnosticsAccumulator: @unchecked Sendable {
         state = current
     }
 
+    /// `presentationSettled` gates only the OUTPUT branch (`decoder == false`): the report's evidence is
+    /// output/presentation drops with `decoderDrop=0` in every diagnosed burst, so a decoder drop stays
+    /// scored unconditionally - it is real decode-side signal regardless of what the display is doing.
+    /// Defaults to `true` so the decoder call site (which never computes this) is unaffected.
     func recordDrop(
         raw: Int,
-        decoder: Bool
+        decoder: Bool,
+        presentationSettled: Bool = true
     ) -> (generation: UInt64, delta: Int, shouldEmitOutputContext: Bool)? {
         lock.lock()
         defer { lock.unlock() }
         guard var current = state else { return nil }
         let delta = decoder
             ? current.decoderDrops.observe(raw)
-            : current.frameDrops.observe(raw)
+            : current.frameDrops.observe(raw, count: presentationSettled)
         let shouldEmitOutputContext = !decoder
+            && presentationSettled
             && delta > 0
             && !current.outputDropContextEmitted
         if shouldEmitOutputContext {

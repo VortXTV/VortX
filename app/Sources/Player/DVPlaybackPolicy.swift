@@ -510,6 +510,60 @@ enum DVPlaybackPolicy {
         videoRange?.uppercased() == "HLG" ? .hlg : .hdr10
     }
 
+    // MARK: - libmpv pre-probe colour fallback (unsafe-until-proven-safe)
+
+    /// Evidence available about a Dolby Vision title BEFORE mpv has decoded any real video parameters
+    /// (empty gamma, sig-peak still 0.0/unset). A text-parsed "this stream is Dolby Vision" Boolean is not
+    /// proof of which colour space the eventual decoded frames use: Profile 8.1 carries an HDR10-compatible
+    /// base layer and may safely pre-seed HDR10 while mpv is still probing, but Profile 5 has no
+    /// independently playable base layer, and relabelling it HDR10 on a guess can present a genuine
+    /// green/purple matrix error as if it were correct output. `nil` on either field means "not proven",
+    /// never "assume compatible".
+    struct DolbyVisionFallbackInfo: Equatable, Sendable {
+        let profile: Int?
+        let baseLayerHDR10Compatible: Bool?
+
+        static let unknown = DolbyVisionFallbackInfo(profile: nil, baseLayerHDR10Compatible: nil)
+    }
+
+    /// What the libmpv pre-probe colour policy may do before mpv has reported ANY decoded transfer
+    /// function or signal peak. The caller's own decoded-parameter branches (real gamma/sigPeak evidence)
+    /// are consulted first and always win; this decision exists only for the gap before that evidence
+    /// exists, where a bare "is DV" flag used to be trusted as if it were proof.
+    enum DolbyVisionFallbackOutput: Equatable, Sendable {
+        /// No decoded evidence and no proven-compatible base layer: apply NOTHING. Do not set
+        /// target-trc/target-prim, tag the layer colourspace, or request a tvOS display mode. The next
+        /// decoded-parameter callback re-derives the real answer once mpv has actually probed the stream.
+        case waitForDecodedParameters
+        case hdr10
+        case mappedDolbyVision
+        /// A proven-incompatible base layer (Profile 5, or an explicit non-HDR10-compatible id) with no
+        /// mapped Dolby Vision output path available on this lane. The caller must not relabel this as
+        /// HDR10; it needs a source hop, not a colour tag.
+        case rejectAndHopSource
+    }
+
+    /// Decision order: (1) a proven HDR10-compatible base layer (container/DOVI
+    /// `dv_bl_signal_compatibility_id`) is safe to pre-seed as HDR10; (2) an explicitly proven-incompatible
+    /// base layer (Profile 5, or `baseLayerHDR10Compatible == false`) uses a mapped Dolby Vision path if one
+    /// exists on this lane, otherwise the source must be rejected/hopped rather than relabelled; (3)
+    /// everything else - including the common case where no profile/compatibility evidence has reached this
+    /// lane at all - waits instead of guessing. Callers consult this ONLY while real decoded transfer/peak
+    /// evidence is still absent; once mpv reports gamma=="pq" or sigPeak>1.0 that IS proof and the caller's
+    /// own decoded-parameter branch already resolves HDR10 without going through this function at all.
+    static func dolbyVisionFallbackOutput(
+        contentIsDolbyVision: Bool,
+        info: DolbyVisionFallbackInfo,
+        mappedDolbyVisionAvailable: Bool
+    ) -> DolbyVisionFallbackOutput {
+        guard contentIsDolbyVision else { return .waitForDecodedParameters }
+        if info.baseLayerHDR10Compatible == true { return .hdr10 }
+        if info.profile == 5 || info.baseLayerHDR10Compatible == false {
+            return mappedDolbyVisionAvailable ? .mappedDolbyVision : .rejectAndHopSource
+        }
+        return .waitForDecodedParameters
+    }
+
     // MARK: - Display switch de-duplication
 
     /// One request for a display mode. `range` is carried as its raw string so this file needs no player types.

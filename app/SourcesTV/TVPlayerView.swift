@@ -276,6 +276,13 @@ struct TVPlayerView: View {
     /// wait-and-hop runs at most once per playback (TVPlayerView is fresh per playback, so it starts false).
     @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
+    /// Wall-clock uptime of the genuine first-frame event (set only alongside the true `hasStartedPlaying =
+    /// true` transition below, never at the "foreground re-mount was not issued, restore the playing state"
+    /// sites - those never actually stopped presentation, so resetting this there would wrongly reopen the
+    /// trickplay settle window). Nil until the first real frame of this playback has rendered. Drives
+    /// `TrickplayPresentationReadinessPolicy` so a capture cannot land in the startup window the report ties
+    /// to a drop burst (report item 8).
+    @State private var firstFrameRenderedAt: TimeInterval?
     /// A per-playback token for external-sync sessions. TVPlayerView is fresh per playback, so a rewatch of
     /// the same title carries a new token and scrobbles again; the same-title recovery reloads (switchStream
     /// hop, AVPlayer->libmpv demote, retry) keep it unchanged so the coordinator's once-latches survive and a
@@ -613,6 +620,7 @@ struct TVPlayerView: View {
     @State private var lastObservedTime = -1.0
     @State private var stalledTicks = 0
     @State private var stallRecoveries = 0
+    @State private var stallStableProgressTicks = 0
     // Direct-resume launches (Continue Watching) start without an episode list;
     // it loads in the background so Next/auto-advance still work.
     @State private var loadedEpisodes: [CoreVideo] = []
@@ -1522,6 +1530,7 @@ struct TVPlayerView: View {
                         )
                     )
                     hasStartedPlaying = true
+                    firstFrameRenderedAt = ProcessInfo.processInfo.systemUptime
                     // FIRST-FRAME COMMIT (binge-desync fix): the incoming episode's file actually rendered,
                     // so publish the advance NOW, before anything below (the LastStreamStore record, the
                     // scrobble start) reads curMeta. enginePlayerVideoId was already re-pointed at
@@ -1821,6 +1830,14 @@ struct TVPlayerView: View {
                 // The engine consumes one exact CoreMedia -12927 on a healthy DV mount and mounts its explicit
                 // HDR-only recovery item before it emits endFileError. Reaching this chrome edge therefore
                 // means recovery was unavailable or already failed, so demotion is final and loop-free.
+                // A terminal zero-packet source (the remux pre-scan proved EOF before any timestamped
+                // base-video packet) can never produce a frame on libmpv either: it is the same dead bytes,
+                // not a decoder problem. Hop to the next source instead of burning a demote on a second
+                // engine that is guaranteed to fail the same way.
+                if !hasStartedPlaying, RemuxFirstPacketFailure.isTerminalZeroPacket(failureMessage) {
+                    DiagnosticsLog.log("dv", "endFileError terminal zero-packet source -> hop instead of demote reason=\(failureMessage)")
+                    if hopToNextSource(reason: "remux terminal zero-packet source") { return }
+                }
                 if demoteAVPlayerToMPV() { return }
                 handleLoadFailure((data as? String) ?? "")
             } else if isAVPlayerActive {
@@ -1832,7 +1849,16 @@ struct TVPlayerView: View {
                 // exactly like the pre-start path: mpv re-opens the same stream with an honest HDR10 picture
                 // and decoded audio. Mirrors iOS PlayerScreen, which already demotes mid-play. Genuine mpv
                 // mid-play errors are untouched (isAVPlayerActive is false): the stall recovery owns those.
-                DiagnosticsLog.log("dv", "mid-play AVPlayer endFileError (\((data as? String) ?? "-")) -> demote to libmpv in place")
+                let midPlayAVFailureMessage = (data as? String) ?? "-"
+                // A terminal zero-packet source is provably empty end to end, so a hop beats retrying the
+                // same dead bytes on libmpv even here. hasStartedPlaying is already true whenever this
+                // branch runs in practice, so the guard rarely fires; it stays for parity with the pre-start
+                // branch above and to fail safe if that invariant ever loosens.
+                if !hasStartedPlaying, RemuxFirstPacketFailure.isTerminalZeroPacket(midPlayAVFailureMessage) {
+                    DiagnosticsLog.log("dv", "endFileError terminal zero-packet source (mid-play branch) -> hop instead of demote reason=\(midPlayAVFailureMessage)")
+                    if hopToNextSource(reason: "remux terminal zero-packet source") { return }
+                }
+                DiagnosticsLog.log("dv", "mid-play AVPlayer endFileError (\(midPlayAVFailureMessage)) -> demote to libmpv in place")
                 if demoteAVPlayerToMPV() { return }
                 // The demotion was not issued (already demoted, or no surface to swap to), so this failure is
                 // still nobody's - which is exactly the unowned state the branch below exists to end. Hand it
@@ -3153,6 +3179,15 @@ struct TVPlayerView: View {
         coordinator.player?.contentIsDolbyVision = StreamRanking.isDolbyVision(
             contentHint ?? curHint ?? sourceHint ?? ""
         )
+        // Real DV-profile evidence only ever survives from demoteAVPlayerToMPV's Coordinator handoff into a
+        // FRESH mpv controller at makeController time, never through this function. Every load THIS
+        // function issues targets an already-configured engine instance directly, so any evidence already
+        // sitting on it belongs to a DIFFERENT prior source (or, in the demote-reissue race where curURL
+        // changed underneath it, the WRONG url) and must not leak forward into this load. Mirrors iOS
+        // PlayerScreen.loadIntoPlayer.
+        if let mpv = coordinator.player as? MPVMetalViewController {
+            mpv.dolbyVisionFallbackInfo = .unknown
+        }
         guard let player = coordinator.player else { return nil }
         clearCachedAudioOutputTruth()
         let requestedResumeOrigin = live ? 0 : (
@@ -3958,38 +3993,88 @@ struct TVPlayerView: View {
         .transition(.opacity)
     }
 
-    /// Watch for a hard stall: the position frozen while NOT paused and NOT
-    /// buffering. mpv's own cache stalls set buffering, so this fires only on the
-    /// freeze/black-screen case, and reloads in place at the current position.
+    /// Watch for a hard stall after the first frame. Buffering is deliberately observable: AVPlayer can
+    /// remain in its waiting state indefinitely (root-cause report section 1), so the visible spinner must
+    /// still have a bounded recovery owner instead of the old `!buffering` exemption resetting the counter
+    /// forever. Live/paused/failed/pre-first-frame states remain excluded via `PlayerMidPlaybackStallPolicy`,
+    /// the SAME shared policy `PlayerScreen` already uses on iOS/macOS (ports it here identically).
     private func startStallWatchdog() {
         stallWatchdog?.cancel()
-        lastObservedTime = -1; stalledTicks = 0
+        lastObservedTime = -1
+        stalledTicks = 0
+        stallStableProgressTicks = 0
         stallWatchdog = Task { @MainActor in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(6))
+                try? await Task.sleep(
+                    for: .seconds(PlayerMidPlaybackStallPolicy.pollIntervalSeconds)
+                )
                 // A terminal freeze - the play head parked on the FINAL frame at EOF while the next target
-                // resolves - reports paused-for-cache=true (mapped to `buffering`), so the normal `!buffering`
-                // stand-down just below would wait on it forever (diag-22). It is NOT a mid-stream rebuffer:
-                // treat it as recoverable regardless of buffering and drive it into the SAME bounded advance-
-                // or-exit as the LAYER-1 deadline (idempotent, so the two can never double-fire).
+                // resolves - reports paused-for-cache=true (mapped to `buffering`), so the normal buffering-
+                // aware stand-down just below would wait on it forever (diag-22). It is NOT a mid-stream
+                // rebuffer: treat it as recoverable regardless of buffering and drive it into the SAME bounded
+                // advance-or-exit as the LAYER-1 deadline (idempotent, so the two can never double-fire).
                 let atEOFFrozen = TerminalPlaybackWatchdogPolicy.eofFreezeIsRecoverable(
                     atEOF: eofFrozenAtTerminal, currentTime: currentTime, duration: duration,
                     hasStartedPlaying: hasStartedPlaying, loadFailed: loadFailed
                 )
-                guard atEOFFrozen
-                    || (hasStartedPlaying && !isPaused && !buffering && !loadFailed && duration > 0) else {
-                    lastObservedTime = currentTime; stalledTicks = 0; continue
-                }
-                if lastObservedTime >= 0, abs(currentTime - lastObservedTime) < 0.25 {
-                    stalledTicks += 1
-                    if stalledTicks >= 3 {            // ~18s frozen -> recover in place (or advance-or-exit at EOF)
+
+                if atEOFFrozen {
+                    if lastObservedTime >= 0, abs(currentTime - lastObservedTime) < 0.25 {
+                        stalledTicks += 1
+                        if stalledTicks >= PlayerMidPlaybackStallPolicy.ordinaryRecoveryTicks {
+                            stalledTicks = 0
+                            resolveTerminalAdvanceOrExit(reason: "stall watchdog at EOF")
+                        }
+                    } else {
                         stalledTicks = 0
-                        if atEOFFrozen { resolveTerminalAdvanceOrExit(reason: "stall watchdog at EOF") }
-                        else { recoverFromStall() }
+                    }
+                    lastObservedTime = currentTime
+                    continue
+                }
+
+                guard PlayerMidPlaybackStallPolicy.shouldObserve(
+                    hasStartedPlaying: hasStartedPlaying,
+                    isPaused: isPaused,
+                    loadFailed: loadFailed,
+                    isLive: isCurrentLiveStream,
+                    duration: duration,
+                    buffering: buffering
+                ) else {
+                    // Mirrors iOS PlayerScreen.startStallWatchdog: -1 is the sentinel "not observing yet",
+                    // not the last real position. Stamping currentTime here would let the FIRST tick after
+                    // observation resumes compare against a position from an unobserved gap (paused,
+                    // buffering-exempt, pre-first-frame) instead of skipping that tick, which could count a
+                    // pause/resume as a stall or as stable progress it never actually measured.
+                    lastObservedTime = -1
+                    stalledTicks = 0
+                    stallStableProgressTicks = 0
+                    continue
+                }
+
+                if lastObservedTime < 0 {
+                    // Just resumed observing: no prior position to compare against, so this tick is neither
+                    // a stall nor progress. Mirrors iOS PlayerScreen.
+                    stalledTicks = 0
+                    stallStableProgressTicks = 0
+                } else if abs(currentTime - lastObservedTime) < 0.25 {
+                    stallStableProgressTicks = 0
+                    stalledTicks += 1
+                    if stalledTicks >= PlayerMidPlaybackStallPolicy.recoveryTickThreshold(
+                        buffering: buffering
+                    ) {
+                        stalledTicks = 0
+                        recoverFromStall()
                     }
                 } else {
                     stalledTicks = 0
-                    if !atEOFFrozen { stallRecoveries = 0 }   // sustained good playback clears the budget
+                    stallStableProgressTicks += 1
+                    if PlayerMidPlaybackStallPolicy.shouldResetRecoveryBudget(
+                        recoveries: stallRecoveries,
+                        stableProgressTicks: stallStableProgressTicks
+                    ) {
+                        stallRecoveries = 0
+                        stallStableProgressTicks = 0
+                    }
                 }
                 lastObservedTime = currentTime
             }
@@ -4188,6 +4273,7 @@ struct TVPlayerView: View {
             return
         }
         stallRecoveries += 1
+        stallStableProgressTicks = 0
         plog.info("mid-playback stall, reloading at \(currentTime, privacy: .public)")
         DiagnosticsLog.log("player", "mid-playback stall \(stallRecoveries), reloading at \(Int(currentTime))s")
         resumeSeconds = currentTime
@@ -4195,6 +4281,11 @@ struct TVPlayerView: View {
         appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false
         buffering = true
         hasStartedPlaying = false
+        // The stalled mount already had a first frame; this reload earns its own. Without clearing it,
+        // elapsedSinceFirstFrame (the playback-diagnostics receipt) keeps measuring from the ORIGINAL,
+        // now-stale first frame across the reload instead of the fresh one this recovery is about to render.
+        // Mirrors iOS PlayerScreen.recoverFromStall.
+        firstFrameRenderedAt = nil
         curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
                        resumeOrigin: currentTime)
@@ -4351,6 +4442,12 @@ struct TVPlayerView: View {
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         let engineRequestedResume =
             (coordinator.player as? AVPlayerEngineController)?.pendingRequestedSourcePositionSeconds
+        // Real DV-profile evidence from the outgoing AVPlayer's own remux parse (#148), captured for the
+        // SAME reason as engineRequestedResume above: stop() below tears the remux session down, so this
+        // MUST read before it. Feeds the fresh mpv mount's pre-probe colour fallback via the Coordinator
+        // (MPVMetalPlayerView.makeController copies it onto the new controller). Mirrors iOS PlayerScreen.
+        coordinator.dolbyVisionFallbackInfo =
+            (coordinator.player as? AVPlayerEngineController)?.dolbyVisionFallbackInfo ?? .unknown
         // Engine of origin for the 2s post-switch grace (W2-A item 3a). Captured BEFORE stop(), which clears the
         // engine's active token: this is the exact load whose queued .failed the grace exists to swallow.
         demotedEngineLoadToken = (coordinator.player as? AVPlayerEngineController)?.activeLoadToken
@@ -4393,6 +4490,10 @@ struct TVPlayerView: View {
         // would then bypass its near-end guard and auto-resume a fresh play straight into the credits.
         let carriedPlayHead = hasStartedPlaying || resumeIsMidPlayRecovery
         hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false; loadErrorMsg = ""
+        // The outgoing AVPlayer mount already had a first frame (or never got one); either way this fresh
+        // mpv mount earns its own. Without clearing it, elapsedSinceFirstFrame keeps measuring from the
+        // OUTGOING engine's stale timestamp instead of the incoming mpv leg's. Mirrors iOS PlayerScreen.
+        firstFrameRenderedAt = nil
         subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the AVPlayer engine; a stranded latch would gate every later pick
         inFlightSeekTarget = nil   // any seek in flight died with the AVPlayer engine; mpv's fresh ticks are authoritative
         // Carry the live position into the mpv re-load UNCONDITIONALLY (maybeResume reads resumeSeconds once
@@ -4496,6 +4597,9 @@ struct TVPlayerView: View {
         engineSwitchedAt = Date()           // grace window swallows a stale event from the outgoing engine
         hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false
         appliedAutoTracks = false; loadErrorMsg = ""
+        // Mirrors demoteAVPlayerToMPV: the outgoing engine's first frame belongs to a mount this session is
+        // leaving, so elapsedSinceFirstFrame must not keep measuring from it once the new engine mounts.
+        firstFrameRenderedAt = nil
         subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the old engine; a stranded latch would gate every later pick
         // The new engine loads no external subtitles yet: drop the added-set tracking so the picker is honest
         // and the subtitle reapply can re-add cleanly.
@@ -7761,6 +7865,15 @@ struct TVPlayerView: View {
                 currentTime = landed
                 lastSaved = landed
                 DiagnosticsLog.log("dv", "resume to \(Int(r))s satisfied by remux origin \(Int(origin))s")
+            case .hidePreroll:
+                // AVPlayerEngine issues the actual corrective local seek (root-cause report section 7); this
+                // is only the UI/progress bookkeeping. Once that seek lands, the viewer sees `r`, not `origin`,
+                // so report `r` here too - showing `origin` would desync the scrubber from the hidden frames.
+                suppressedResumeFloor = nil
+                let landed = min(max(0, r), max(0, duration - 5))
+                currentTime = landed
+                lastSaved = landed
+                DiagnosticsLog.log("dv", "resume to \(Int(r))s hides \(String(format: "%.3f", r - origin))s of keyframe preroll from remux origin \(Int(origin))s")
             case .unreachable:
                 let floor = min(max(0, r), max(0, duration - 5))
                 suppressedResumeFloor = floor
@@ -7969,6 +8082,16 @@ struct TVPlayerView: View {
         // contribution on 4K DV titles (a feature cost, zero image risk). Checked here, after the
         // cadence gate, so mediaSummary() reads only at capture boundaries, not every timePos tick.
         if shouldSkipTrickplayCaptureForUHDDolbyVision() { return }
+        // Report item 8: withhold capture until first frame + display settle so its GPU work cannot land in
+        // the startup/renegotiation window the diagnosed drop bursts cluster in. UHD HDR/DV content gets the
+        // longer threshold (isCurrentContentUHDHDR). Checked here, after the cadence gate and the DV skip
+        // above, for the same reason those are: mediaSummary() must read only at capture boundaries, not on
+        // every timePos tick.
+        guard TrickplayPresentationReadinessPolicy.isReady(
+            elapsedSinceFirstFrame: firstFrameRenderedAt.map { ProcessInfo.processInfo.systemUptime - $0 },
+            displaySwitchSettled: HDRDisplayMode.isSwitchSettled,
+            isUltraHighDefinitionHDR: isCurrentContentUHDHDR()
+        ) else { return }
         captureTrickplayFrame(at: time)
     }
 
@@ -7978,6 +8101,20 @@ struct TVPlayerView: View {
     /// are unaffected.
     private func shouldSkipTrickplayCaptureForUHDDolbyVision() -> Bool {
         guard let player = coordinator.player, player.contentIsDolbyVision else { return false }
+        let summary = player.mediaSummary()
+        guard summary.width > 0, summary.height > 0 else { return false }
+        return TVOSFramePresentationPolicy.isUltraHighDefinition(
+            width: summary.width, height: summary.height)
+    }
+
+    /// Broader than `shouldSkipTrickplayCaptureForUHDDolbyVision` (DV only, hard skip): this also covers
+    /// plain HDR10/HLG UHD, which has no hard skip today but is still the most expensive frame to scale
+    /// (report item 8: "lower cadence during 4K HDR/DV"). Used only to pick the longer readiness threshold
+    /// above, never to skip capture outright. Fail-open like its DV sibling: unknown/unprobed resolution or
+    /// HDR state keeps the shorter, default threshold rather than withholding capture indefinitely.
+    private func isCurrentContentUHDHDR() -> Bool {
+        guard let player = coordinator.player else { return false }
+        guard player.contentIsDolbyVision || player.hdrAvailable else { return false }
         let summary = player.mediaSummary()
         guard summary.width > 0, summary.height > 0 else { return false }
         return TVOSFramePresentationPolicy.isUltraHighDefinition(

@@ -287,9 +287,16 @@ enum RemuxResumePolicy {
 
     /// What to do with a seek that was issued BEFORE the item became playable, once it is.
     enum PreStartSeek: Equatable, Sendable {
-        /// The mount already starts at (or past) the requested point: there is nothing to seek. This is the
-        /// case a successful origin seek produces, and it is why resume now works without seeking at all.
+        /// The mount landed AT (or past) the requested point: there is nothing to hide.
         case satisfied
+        /// The mount landed on the keyframe AT OR BEFORE the requested point, within one GOP's worth of
+        /// preroll (root-cause report section 7). Those extra frames decode correctly - an open GOP needs
+        /// them as reference - but must never be PRESENTED: issue exactly one local seek to the associated
+        /// PLAYER second once the item is ready, so the first frame the viewer actually sees is the requested
+        /// target, not the earlier keyframe. This is well inside the produced startup cohort (readiness itself
+        /// already guarantees at least that much is produced), so unlike `.unreachable` it can never land in
+        /// unproduced bytes.
+        case hidePreroll(Double)
         /// The requested point is ahead of where the mount begins, and the mount is forward-only, so the seek
         /// is DROPPED rather than issued. The associated value is how far ahead, in player seconds, purely so
         /// the caller can log an honest number. Dropping is what protects the session: issuing it would land
@@ -297,23 +304,25 @@ enum RemuxResumePolicy {
         case unreachable(Double)
     }
 
-    /// How close to the origin counts as "already there".
+    /// How close to the origin still counts as the SAME keyframe landing (vs. a genuinely failed/out-of-reach
+    /// origin seek).
     ///
     /// The input seek lands on the keyframe AT OR BEFORE the request, so the mount legitimately starts a little
-    /// earlier than asked. A GOP on a 4K source runs to a few seconds, and re-seeking forward by that much
-    /// would buy nothing and risk the produced edge. Anything beyond one long GOP means the origin seek did not
-    /// happen (or did not happen for this target) and the target is genuinely out of reach.
+    /// earlier than asked. A GOP on a 4K source runs to a few seconds, so anything within this band is real
+    /// keyframe preroll to hide (`.hidePreroll`, see its case doc); anything beyond it means the origin seek did
+    /// not happen (or did not happen for this target) and the target is genuinely out of reach (`.unreachable`).
     static let originToleranceSeconds: Double = 12.0
 
     /// Resolve a pre-start seek against the mount's origin.
     ///
-    /// Note what is NOT here: a case that issues the seek. On a forward-only mount there is no pre-start seek
-    /// worth issuing, because at the instant the item becomes playable the produced edge is only the startup
-    /// segments. Either the origin already put us where we were asked to be, or the request cannot be honored.
+    /// `target - origin` is already the exact PLAYER-second position of `target` (by definition of the origin
+    /// mapping `presented(playerSeconds:origin:) = origin + playerSeconds`), so `.hidePreroll`'s associated
+    /// value doubles as the seek destination the caller issues once ready: no separate conversion needed.
     static func preStartSeek(target: Double, origin: Double) -> PreStartSeek {
-        guard target.isFinite else { return .satisfied }
+        guard target.isFinite, origin.isFinite else { return .satisfied }
         let ahead = target - origin
-        if ahead <= originToleranceSeconds { return .satisfied }
+        if ahead <= 0 { return .satisfied }
+        if ahead <= originToleranceSeconds { return .hidePreroll(ahead) }
         return .unreachable(ahead)
     }
 }

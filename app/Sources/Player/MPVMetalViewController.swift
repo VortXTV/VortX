@@ -212,6 +212,18 @@ final class MPVMetalViewController: PlatformViewController {
     /// does on a decoded MKV. tvOS-only effect (the display-mode request is tvOS); harmless elsewhere.
     var contentIsDolbyVision = false
 
+    /// Profile-aware evidence for `contentIsDolbyVision`, set by the same launch site when it has proof
+    /// beyond the text-parsed Boolean - see DVPlaybackPolicy.DolbyVisionFallbackInfo. Defaults to `.unknown`
+    /// so the pre-probe colour policy in `syncDisplayDynamicRange` never treats "labelled Dolby Vision" as
+    /// proof of PQ/BT.2020 on its own; it waits for either this descriptor to prove a compatible base layer
+    /// or for mpv to report real decoded parameters. `MPVMetalPlayerView.makeController` copies this from
+    /// its Coordinator on every fresh mount; `demoteAVPlayerToMPV` (PlayerScreen/TVPlayerView) is the only
+    /// caller that ever sets the Coordinator's copy to real evidence (the outgoing AVPlayer's own remux
+    /// parse, `AVPlayerEngineController.dolbyVisionFallbackInfo`), read BEFORE the remux session tears
+    /// down. Every ordinary load (`loadIntoPlayer`) resets this instance's copy back to `.unknown` first, so
+    /// the evidence can never outlive the one demote it was captured for.
+    var dolbyVisionFallbackInfo = DVPlaybackPolicy.DolbyVisionFallbackInfo.unknown
+
     /// Set only by the full playback chrome. Embedded hero/trailer controllers keep the
     /// default false and therefore cannot arm the tvOS chroma mitigation or diagnostics.
     var isFullPlayerPresentation = false {
@@ -1827,7 +1839,30 @@ final class MPVMetalViewController: PlatformViewController {
     /// System memory warning (registered in viewDidLoad). Posted on the main thread; re-dispatch is a
     /// cheap guarantee in case a future SDK posts it elsewhere.
     @objc private func handleMemoryWarningNote() {
-        DispatchQueue.main.async { [weak self] in self?.shedForMemoryPressure() }
+        DispatchQueue.main.async { [weak self] in self?.handleMemoryWarningCoalesced() }
+    }
+
+    /// The main-thread-only cooldown deadline `handleMemoryWarningCoalesced` enforces. Not `TimeInterval`-
+    /// zero-initialized as "never fired": `ProcessInfo.processInfo.systemUptime` starts at boot, so 0 is
+    /// already in the past on first call and the very first warning is always acted on immediately.
+    private var memoryWarningCooldownUntil: TimeInterval = 0
+    /// Report item 8: "coalesce OS memory warnings, but do not let each callback initiate additional
+    /// main-thread work" - the diagnosed log shows six `didReceiveMemoryWarningNotification`s land in one
+    /// window. `shedForMemoryPressure()` is not free (an `os_proc_available_memory()` syscall, and when it
+    /// decides to act, mpv property-string IPC), so running it once per callback turns one system burst
+    /// into N redundant passes on the same main thread that also owns frame presentation.
+    private static let memoryWarningCoalesceWindow: TimeInterval = 2
+
+    /// Act on the FIRST warning in a burst immediately - jetsam relief must never wait on a debounce timer -
+    /// then ignore every further warning until the cooldown lapses. A warning arriving after the cooldown
+    /// starts a fresh one-shot evaluation rather than being silently dropped, so sustained pressure keeps
+    /// getting a fresh read of `os_proc_available_memory()` every window instead of acting once and going
+    /// silent for the rest of playback.
+    private func handleMemoryWarningCoalesced() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now >= memoryWarningCooldownUntil else { return }
+        memoryWarningCooldownUntil = now + Self.memoryWarningCoalesceWindow
+        shedForMemoryPressure()
     }
 
     private func shedForMemoryPressure() {
@@ -2406,12 +2441,40 @@ final class MPVMetalViewController: PlatformViewController {
         } else if contentIsDolbyVision && gamma.isEmpty && sigPeak <= 1.0 {
             // Demote-to-libmpv edge (#148): a DV/HDR title that just fell back from the AVPlayer remux lane
             // runs this the FIRST time before mpv has probed the stream (the first videoParamsSigPeak observer
-            // fires with sigPeak=0.0 and gamma still empty). Classifying that unprobed instant as .sdr tags the
-            // layer SDR + EDR-off and, on tvOS, drives the panel DV -> SDR while genuine PQ pixels present: the
-            // washed-out wrong-colour flash. The frames ARE PQ, so seed HDR10 up front instead. The later
-            // real-params apply (gamma=pq, sigPeak~4.9) resolves to the same .hdr10 and no-ops on the
-            // `range != appliedDynamicRange` guard below, so there is no second mode switch.
-            range = .hdr10
+            // fires with sigPeak=0.0 and gamma still empty). This branch used to treat the bare
+            // `contentIsDolbyVision` text-parsed Boolean as proof the eventual frames are PQ/BT.2020 and seed
+            // HDR10 immediately - unsafe: a title labelled Dolby Vision can be Profile 5, which has no
+            // independently playable HDR10-compatible base layer, so pre-tagging it HDR10 before any real
+            // decoded evidence exists can present a genuine green/purple matrix error as if it were correct
+            // HDR10 output. Consult the profile-aware descriptor instead of assuming the label is proof.
+            switch DVPlaybackPolicy.dolbyVisionFallbackOutput(
+                contentIsDolbyVision: contentIsDolbyVision,
+                info: dolbyVisionFallbackInfo,
+                // The libmpv/libplacebo lane only ever tone-maps Dolby Vision to a PQ base layer (see the
+                // .dolbyVision case comment below); it has no true DV output path to map into.
+                mappedDolbyVisionAvailable: false
+            ) {
+            case .hdr10, .mappedDolbyVision:
+                // A proven HDR10-compatible base layer (e.g. Profile 8.1). The frames ARE PQ, so seed HDR10
+                // up front instead of a transient SDR tag. The later real-params apply (gamma=pq,
+                // sigPeak~4.9) resolves to the same .hdr10 and no-ops on the `range != appliedDynamicRange`
+                // guard below, so there is no second mode switch.
+                range = .hdr10
+            case .waitForDecodedParameters, .rejectAndHopSource:
+                // No decoded evidence and no proven-compatible base layer. Apply NOTHING: do not set
+                // target-trc/target-prim, do not tag the layer colourspace, and do not request a tvOS
+                // display mode yet. Falling through to `.sdr` here would be the same kind of guess in the
+                // other direction (a Profile 5 title is not proven SDR either); leaving `appliedDynamicRange`
+                // untouched means the next sig-peak/gamma callback, once mpv actually decodes, makes the
+                // real decision instead of this one guessing it.
+                DiagnosticsLog.log(
+                    "dv",
+                    "libmpv pre-probe: no decoded params and no proven base-layer compatibility "
+                        + "(dv=\(contentIsDolbyVision) profile=\(dolbyVisionFallbackInfo.profile.map(String.init) ?? "?") "
+                        + "blHDR10Compat=\(dolbyVisionFallbackInfo.baseLayerHDR10Compatible.map(String.init) ?? "?")); "
+                        + "deferring colour/display-mode apply")
+                return
+            }
         } else {
             range = .sdr
         }
@@ -3362,9 +3425,25 @@ final class MPVMetalViewController: PlatformViewController {
                                   ),
                                   let raw = UnsafePointer<Int64>(
                                     OpaquePointer(property.data)
-                                  )?.pointee,
-                                  let sample = self.framePresentationDiagnostics
-                                    .recordDrop(raw: Int(raw), decoder: false) else {
+                                  )?.pointee else {
+                                break
+                            }
+                            // Report item 8: mpv's OUTPUT drop counter bursts during a display-mode
+                            // transition, the first seconds of a new renderer generation, before the
+                            // drawable stabilises, or a seek/remount - none of those are presentation
+                            // regressions, they are expected renegotiation/startup noise. Score a delta
+                            // into the reported total only once the generation is past its own startup
+                            // window AND no seek or HDMI display-mode switch is currently in flight; the
+                            // raw counter still advances underneath regardless (recordDrop/observe), so a
+                            // drop that occurs while unsettled is discarded, never deferred into the next
+                            // settled sample.
+                            let presentationSettled = self.framePresentationDiagnostics
+                                .isGenerationPastStartupWindow(now: ProcessInfo.processInfo.systemUptime)
+                                && !self.seekCacheHoldArmed
+                                && HDRDisplayMode.isSwitchSettled
+                            guard let sample = self.framePresentationDiagnostics.recordDrop(
+                                raw: Int(raw), decoder: false, presentationSettled: presentationSettled
+                            ) else {
                                 break
                             }
                             if sample.shouldEmitOutputContext {
@@ -3388,7 +3467,7 @@ final class MPVMetalViewController: PlatformViewController {
                                     "frame-drop output-context generation=\(sample.generation) outputDelta=\(sample.delta) demuxer-cache-duration=\(cacheDuration) cache-buffering-state=\(cacheBuffering) paused-for-cache=\(pausedForCache) demuxer-cache-state/underrun=\(cacheUnderrun) demuxer-cache-state/idle=\(cacheIdle)"
                                 )
                             }
-                            if sample.delta > 0 {
+                            if sample.delta > 0, presentationSettled {
                                 DispatchQueue.main.async { [weak self] in
                                     self?.scheduleFramePresentationVOPassesSnapshot(
                                         generation: sample.generation,

@@ -3,6 +3,7 @@
 // Run with:
 //   swiftc -swift-version 5 -strict-concurrency=complete -warnings-as-errors -o /tmp/debrid-cancellation \
 //     app/SourcesShared/CredentialScope.swift \
+//     app/SourcesShared/ProviderCircuitBreaker.swift \
 //     app/SourcesShared/DebridResolver.swift \
 //     app/Tests/DebridCredentialCancellationTests.swift && /tmp/debrid-cancellation
 

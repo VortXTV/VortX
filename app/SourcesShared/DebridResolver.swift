@@ -1041,6 +1041,24 @@ enum DebridUsenetCacheCheckResult: Sendable {
     case failure
 }
 
+/// Best-effort classification of a thrown provider error into a `ProviderCircuitBreaker` reason. Every
+/// actor's private `send()` (TorBoxResolver, RealDebridResolver, AllDebridResolver, PremiumizeResolver)
+/// throws the raw `"HTTP \(code)"` string inside `DebridError.providerError` on a non-2xx response, so a
+/// numeric suffix there is parsed back into a real status code; anything else (a raw `URLError` from a
+/// transport failure, `.invalidKey`, `.notReady`, `.noMatchingFile`, `.notCached`, a decode failure, ...)
+/// falls back to a best-effort text bucket. Pure and total: this never throws and always returns SOME
+/// reason, so an error it cannot finely classify still trips the breaker via `.other` rather than being lost.
+private func breakerReason(for error: Error) -> ProviderCircuitBreaker.FailureReason {
+    if let urlError = error as? URLError { return .network(urlError.code) }
+    if let debridError = error as? DebridError,
+       case let .providerError(message) = debridError,
+       message.hasPrefix("HTTP "),
+       let code = Int(message.dropFirst("HTTP ".count)) {
+        return .httpStatus(code)
+    }
+    return .other(String(describing: error))
+}
+
 actor DebridCoordinator {
     static let shared = DebridCoordinator()
 
@@ -1268,10 +1286,25 @@ actor DebridCoordinator {
         let revision = latestCredentialRevision
         let resolver = pick(service)
         guard let resolver else { throw DebridError.noKey }
-        let result = try await runProvider(capture: capture, revision: revision) {
-            try await resolver.resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
+        let breakerProvider = resolver.service.rawValue
+        let breakerSource = infoHash.lowercased()
+        // A provider/source pair that has been failing has a shared, cross-view memory of that now (see
+        // `ProviderCircuitBreaker`); this fails fast with no network instead of re-hammering a provider some
+        // OTHER caller (a different view, a different player instance) already learned is down for this hash.
+        guard await ProviderCircuitBreaker.shared.shouldAttempt(
+            provider: breakerProvider, sourceID: breakerSource
+        ) else { throw DebridError.providerError("circuit open, backing off \(breakerProvider)") }
+        let result: URL
+        do {
+            result = try await runProvider(capture: capture, revision: revision) {
+                try await resolver.resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
+            }
+        } catch {
+            await recordBreakerFailure(error, provider: breakerProvider, sourceID: breakerSource, phase: .resolve)
+            throw error
         }
         guard isCurrent(capture, revision: revision) else { throw DebridError.sessionChanged }
+        await ProviderCircuitBreaker.shared.recordSuccess(provider: breakerProvider, sourceID: breakerSource)
         return result
     }
 
@@ -1284,10 +1317,22 @@ actor DebridCoordinator {
         guard let capture = currentAuthorityCapture() else { throw DebridError.sessionChanged }
         let revision = latestCredentialRevision
         guard let resolver = pick(service) else { throw DebridError.noKey }
-        let r = try await runProvider(capture: capture, revision: revision) {
-            try await resolver.resolveWithIds(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
+        let breakerProvider = resolver.service.rawValue
+        let breakerSource = infoHash.lowercased()
+        guard await ProviderCircuitBreaker.shared.shouldAttempt(
+            provider: breakerProvider, sourceID: breakerSource
+        ) else { throw DebridError.providerError("circuit open, backing off \(breakerProvider)") }
+        let r: (url: URL, torrentId: Int?, fileId: Int?)
+        do {
+            r = try await runProvider(capture: capture, revision: revision) {
+                try await resolver.resolveWithIds(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
+            }
+        } catch {
+            await recordBreakerFailure(error, provider: breakerProvider, sourceID: breakerSource, phase: .resolve)
+            throw error
         }
         guard isCurrent(capture, revision: revision) else { throw DebridError.sessionChanged }
+        await ProviderCircuitBreaker.shared.recordSuccess(provider: breakerProvider, sourceID: breakerSource)
         return (r, resolver.service)
     }
 
@@ -1302,19 +1347,44 @@ actor DebridCoordinator {
         guard let capture = currentAuthorityCapture() else { throw DebridError.sessionChanged }
         let revision = latestCredentialRevision
         guard let resolver = resolvers[service] else { throw DebridError.noKey }
-        let result = try await runProvider(capture: capture, revision: revision) {
-            try await resolver.reresolveLink(
-                infoHash: infoHash, torrentId: torrentId, fileId: fileId, fileIdx: fileIdx,
-                episode: episode, requiresSemanticSelection: requiresSemanticSelection
-            )
+        let breakerProvider = service.rawValue
+        let breakerSource = infoHash.lowercased()
+        guard await ProviderCircuitBreaker.shared.shouldAttempt(
+            provider: breakerProvider, sourceID: breakerSource
+        ) else { throw DebridError.providerError("circuit open, backing off \(breakerProvider)") }
+        let result: URL
+        do {
+            result = try await runProvider(capture: capture, revision: revision) {
+                try await resolver.reresolveLink(
+                    infoHash: infoHash, torrentId: torrentId, fileId: fileId, fileIdx: fileIdx,
+                    episode: episode, requiresSemanticSelection: requiresSemanticSelection
+                )
+            }
+        } catch {
+            await recordBreakerFailure(error, provider: breakerProvider, sourceID: breakerSource, phase: .download)
+            throw error
         }
         guard isCurrent(capture, revision: revision) else { throw DebridError.sessionChanged }
+        await ProviderCircuitBreaker.shared.recordSuccess(provider: breakerProvider, sourceID: breakerSource)
         return result
     }
 
     private func pick(_ service: DebridService?) -> (any DebridResolving)? {
         if let service { return resolvers[service] }
         return resolvers.values.first
+    }
+
+    /// Record a real provider failure into the shared circuit breaker, skipping the two app-side races that
+    /// are not the provider's fault: a cancelled resolve (the caller moved on, e.g. the user backed out or a
+    /// faster candidate already won) and a session/capture change (`.sessionChanged`, a different account or
+    /// profile became current mid-request). Neither should count against a provider's failure streak.
+    private func recordBreakerFailure(
+        _ error: Error, provider: String, sourceID: String, phase: ProviderCircuitBreaker.Phase
+    ) async {
+        guard !(error is CancellationError), (error as? DebridError) != .sessionChanged else { return }
+        await ProviderCircuitBreaker.shared.recordFailure(
+            provider: provider, sourceID: sourceID, phase: phase, reason: breakerReason(for: error)
+        )
     }
 
     // MARK: Usenet (TorBox-only)
@@ -1327,13 +1397,25 @@ actor DebridCoordinator {
         guard let capture = currentAuthorityCapture() else { throw DebridError.sessionChanged }
         let revision = latestCredentialRevision
         guard let usenet = torboxUsenet else { throw DebridError.noKey }
-        let result = try await runProvider(capture: capture, revision: revision) {
-            try await usenet.resolve(
-                nzbUrl: nzbUrl, knownHash: knownHash, fileMustInclude: fileMustInclude,
-                fileIdx: fileIdx, episode: episode
-            )
+        let breakerProvider = DebridService.torBox.rawValue
+        let breakerSource = knownHash ?? nzbUrl
+        guard await ProviderCircuitBreaker.shared.shouldAttempt(
+            provider: breakerProvider, sourceID: breakerSource
+        ) else { throw DebridError.providerError("circuit open, backing off \(breakerProvider)") }
+        let result: URL
+        do {
+            result = try await runProvider(capture: capture, revision: revision) {
+                try await usenet.resolve(
+                    nzbUrl: nzbUrl, knownHash: knownHash, fileMustInclude: fileMustInclude,
+                    fileIdx: fileIdx, episode: episode
+                )
+            }
+        } catch {
+            await recordBreakerFailure(error, provider: breakerProvider, sourceID: breakerSource, phase: .resolve)
+            throw error
         }
         guard isCurrent(capture, revision: revision) else { throw DebridError.sessionChanged }
+        await ProviderCircuitBreaker.shared.recordSuccess(provider: breakerProvider, sourceID: breakerSource)
         return result
     }
 

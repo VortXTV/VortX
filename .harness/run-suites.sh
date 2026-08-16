@@ -38,6 +38,14 @@ run remux-resume-policy \
   app/Sources/Player/DVPlaybackPolicy.swift \
   app/Tests/RemuxResumePolicyTests.swift
 
+run remux-first-packet-failure-policy \
+  app/Sources/Player/RemuxFirstPacketFailurePolicy.swift \
+  app/Tests/RemuxFirstPacketFailurePolicyTests.swift
+
+run producer-lead-policy \
+  app/Sources/Player/VortXRemuxProducerLeadPolicy.swift \
+  app/Tests/VortXRemuxProducerLeadPolicyTests.swift
+
 run player-live-contract \
   app/Sources/Player/DVPlaybackPolicy.swift \
   app/Sources/Player/VortXRemuxBuffer.swift \

@@ -26,6 +26,7 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         mpv.playUrlLive = coordinator.playLive
         mpv.playAudioSidecarURL = coordinator.playAudioSidecar
         mpv.contentIsDolbyVision = coordinator.contentIsDolbyVision
+        mpv.dolbyVisionFallbackInfo = coordinator.dolbyVisionFallbackInfo
         mpv.startMuted = coordinator.muted
         mpv.loopPlayback = coordinator.loops
         mpv.probeChannel = coordinator.probeChannel
@@ -120,6 +121,12 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         /// Dolby Vision flag for the launching stream; copied onto the controller in makeController so the
         /// libmpv lane requests DV display mode for DV content on the FIRST load, not just source switches.
         var contentIsDolbyVision = false
+        /// Real (non-guessed) DV-profile evidence for the launching stream, copied onto the controller in
+        /// makeController alongside `contentIsDolbyVision`. Set by `demoteAVPlayerToMPV` (PlayerScreen /
+        /// TVPlayerView) from the outgoing AVPlayer's own remux parse just before this Coordinator's mpv
+        /// controller is (re)created; every other caller leaves it at `.unknown`, the same fail-soft
+        /// default `MPVMetalViewController.dolbyVisionFallbackInfo` already had.
+        var dolbyVisionFallbackInfo = DVPlaybackPolicy.DolbyVisionFallbackInfo.unknown
         /// Hero-preview only (#44): start the libmpv instance muted / looping for an ambient background clip.
         var muted = false
         var loops = false

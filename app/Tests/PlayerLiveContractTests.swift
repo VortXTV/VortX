@@ -3035,11 +3035,14 @@ enum PlayerLiveContractTests {
                   && publicationReceipt?.contains("/media-hdr.m3u8") == true
                   && publicationReceipt?.contains("/audio\\(plan.alternate.id).m3u8") == true
                   && publicationReceipt?.contains("/sub\\(rendition.id).m3u8") == true)
+        // Root-cause report section 3: a producer failure now closes 410 Gone (via `closeForProducerFailure`,
+        // carrying the typed reason) instead of a bare 404, but the transport-edge SHAPE this test protects is
+        // unchanged and still the point of the check - an early `return` before `buildMediaBody(` so a failed
+        // producer can never fall through to a natural-ENDLIST-shaped body.
         check("wiring: producer failure remains a fatal transport edge rather than natural ENDLIST",
               sourceContainsInOrder(mediaPublication, [
                 "if let failure = stream.buffer.status().failure, !publication.ended",
-                "hls 404",
-                "close(connection, status: \"404 Not Found\")",
+                "closeForProducerFailure(connection, path: path, failure: failure)",
                 "return",
                 "buildMediaBody(",
               ])

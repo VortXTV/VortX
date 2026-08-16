@@ -4,6 +4,7 @@
 //     -strict-concurrency=complete -warnings-as-errors -o /tmp/torbox-identity-boundary \
 //     app/SourcesShared/SourceIndexContract.swift \
 //     app/SourcesShared/SourceIndexIdentity.swift \
+//     app/SourcesShared/ProviderCircuitBreaker.swift \
 //     app/SourcesShared/TorBoxSearchSource.swift \
 //     app/Tests/TorBoxIdentityBoundaryTests.swift && /tmp/torbox-identity-boundary
 //

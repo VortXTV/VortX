@@ -695,6 +695,18 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         }
     }
 
+    /// Raw playback clock in source seconds, for consumers that need the value itself rather than a segment
+    /// ID (root-cause report section 6's producer-lead check). `.nan` before any playback receipt exists, so
+    /// callers doing arithmetic on it (e.g. `producedEnd - currentPlaybackSeconds()`) get a non-finite result
+    /// that `VortXRemuxProducerLeadPolicy.shouldPauseProducer` already fails closed on, rather than a
+    /// plausible-looking zero that could wrongly read as "massively ahead of a just-started playhead".
+    private func currentPlaybackSeconds() -> Double {
+        playbackClockLock.lock()
+        let seconds = seekAnchorState.currentPlaybackSeconds
+        playbackClockLock.unlock()
+        return seconds ?? .nan
+    }
+
     /// Stop everything: the remux thread, the listener, and every open connection. Idempotent.
     func invalidate() {
         stateLock.lock()
@@ -1007,7 +1019,18 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         let switched = DispatchSemaphore(value: 0)
         DispatchQueue.main.async { [weak self] in
             defer { switched.signal() }
-            guard let self, !self.isInvalidated else { return }
+            // Re-check BOTH the server's own lifecycle and the remux's live/failed state at APPLY time, not
+            // at request-construction time. The classify that triggered this call can be a stale positive:
+            // verified-preflight fires off proven container/DOVI metadata, and final-signaling fires off a
+            // published master, but either can be followed - before this main-queue hop runs - by a later
+            // packet-level failure (e.g. zero timestamped base-video packets) that marks the SAME mount
+            // terminal without yet having invalidated this server (invalidation is a separate, later action
+            // the owning player takes once it observes the failure). Without re-checking `stream.buffer
+            // .status().failure` here, a queued display request could still start a real HDMI mode switch for
+            // a source the player has already begun demoting away from.
+            guard let self,
+                  !self.isInvalidated,
+                  self.stream.buffer.status().failure == nil else { return }
             let applied = MainActor.assumeIsolated {
                 HDRDisplayMode.request(
                     requestedRange, fps: fps, width: width, height: height, in: nil)
@@ -1095,8 +1118,14 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         }
         #endif
         guard let sig = preludeSignaling ?? waitForMount({ stream.hlsSnapshot().signaling }) else {
-            DiagnosticsLog.log("dv", "hls 404 /master.m3u8")
-            close(connection, status: "404 Not Found")
+            // Root-cause report section 3: this is the classify-stage wait - exactly where a zero-packet
+            // source (e.g. genuine EOF before any timestamped base-video packet) surfaces, because the
+            // producer fails BEFORE it ever reaches signaling. Distinguish that from an ordinary cold start.
+            if let failure = stream.buffer.status().failure {
+                closeForProducerFailure(connection, path: "/master.m3u8", failure: failure)
+            } else {
+                closeForPendingProducer(connection, path: "/master.m3u8")
+            }
             return
         }
         if videoVariant == .hdrFallback {
@@ -1177,11 +1206,17 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         guard let publication = waitForMount({
             self.prepareMasterPublication()
         }) else {
-            if !isInvalidated, stream.buffer.status().failure == nil {
+            // Root-cause report section 3: distinguish a producer that has already given up (410, typed) from
+            // one that simply has not finished its startup cohort yet (503 + Retry-After) - the difference
+            // between "hop the source now" and "the ordinary cold-start window is still running."
+            if let failure = stream.buffer.status().failure {
+                closeForProducerFailure(connection, path: "/master.m3u8", failure: failure)
+                return
+            }
+            if !isInvalidated {
                 logStartupCohortTimeout()
             }
-            DiagnosticsLog.log("dv", "hls 404 /master.m3u8")
-            close(connection, status: "404 Not Found")
+            closeForPendingProducer(connection, path: "/master.m3u8")
             return
         }
 
@@ -1481,6 +1516,24 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             }
             publishedVideoWindow = selectedVideo
             ended = commonReachedEOF
+            // Producer-lead backpressure (root-cause report section 6). `common` is the FULL produced window
+            // (not `selectedVideo`, which can be a smaller advertised slice), so its tail is the true produced-
+            // ahead edge the report's field timeline measured against the playhead. Skipped for a
+            // full-timeline-retention (hosted) session: that mode exists precisely to let a REMOTE client seek
+            // anywhere already produced, so bounding production against this device's own local playhead would
+            // fight its purpose; the spool's physical admission ceiling still bounds it either way.
+            if !retainsFullTimeline, !commonReachedEOF, let producedEnd = common.segments.last?.end {
+                let leadSeconds = producedEnd - currentPlaybackSeconds()
+                stream.producerLeadGate.setPaused(
+                    VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                        leadSeconds: leadSeconds,
+                        currentlyPaused: stream.producerLeadGate.isPaused))
+            } else {
+                // At EOF, or on a hosted session, there is nothing left to bound production against (EOF: the
+                // producer is already done; hosted: production is meant to run ahead) - make sure a pause
+                // armed earlier this same session can never outlive the condition that set it.
+                stream.producerLeadGate.setPaused(false)
+            }
         }
 
         // Until AVPlayer requests its first media segment, keep the initial playlist near the independently
@@ -1640,17 +1693,26 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         publicationLock.lock()
         let hdrAdvertised = advertisedDolbyVision
         publicationLock.unlock()
-        guard !hdr || hdrAdvertised,
-              let publication = waitForResource(seconds: Self.resourceWaitSeconds, {
-                  self.currentPublication()
-              }) else {
-            DiagnosticsLog.log("dv", "hls 404 \(path)")
+        guard !hdr || hdrAdvertised else {
+            // A genuinely nonexistent resource (the HDR recovery variant was never advertised for this
+            // source), not a producer-state question: an ordinary 404 is correct here.
+            DiagnosticsLog.log("dv", "hls 404 \(path) (HDR recovery not advertised)")
             close(connection, status: "404 Not Found")
             return
         }
+        guard let publication = waitForResource(seconds: Self.resourceWaitSeconds, {
+            self.currentPublication()
+        }) else {
+            // Root-cause report section 3: same pending-vs-terminal split as `/master.m3u8` above.
+            if let failure = stream.buffer.status().failure {
+                closeForProducerFailure(connection, path: path, failure: failure)
+            } else {
+                closeForPendingProducer(connection, path: path)
+            }
+            return
+        }
         if let failure = stream.buffer.status().failure, !publication.ended {
-            DiagnosticsLog.log("dv", "hls 404 \(path) (remux failed: \(failure))")
-            close(connection, status: "404 Not Found")
+            closeForProducerFailure(connection, path: path, failure: failure)
             return
         }
         let body = buildMediaBody(
@@ -1944,11 +2006,36 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         })
     }
 
-    private func close(_ connection: NWConnection, status: String) {
-        let head = "HTTP/1.1 \(status)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    private func close(_ connection: NWConnection, status: String, extraHeaders: String = "") {
+        let head = "HTTP/1.1 \(status)\r\n\(extraHeaders)Content-Length: 0\r\nConnection: close\r\n\r\n"
         connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in
             connection.cancel()
         })
+    }
+
+    /// Root-cause report section 3: the local HLS server used to collapse every reason a playlist request
+    /// could not be answered into one bare 404, which reads identically whether the producer is still cold
+    /// starting, has permanently failed, or the path is simply wrong. AVPlayer cannot tell "come back shortly"
+    /// from "never coming" from "no such resource," so it treated all three the same way.
+    ///
+    /// By the time `stream.buffer.status().failure` is non-nil, the producer has ALREADY given up on this
+    /// attempt: `VortXMKVRemuxStream` never calls `buffer.fail` for a first-packet read failure until its own
+    /// bounded retry (if the classification even allows one) is exhausted - see
+    /// `RemuxFirstPacketFailure.deservesOneBoundedRetry`. So every failure this server can observe here is
+    /// terminal for THIS mount attempt: 410 Gone, carrying the typed reason in the diagnostic line, rather than
+    /// a bare 404 that reads identically to "no such playlist ever existed."
+    private func closeForProducerFailure(_ connection: NWConnection, path: String, failure: String) {
+        DiagnosticsLog.log("dv", "hls 410 \(path) (remux failed: \(failure))")
+        close(connection, status: "410 Gone")
+    }
+
+    /// The producer has not failed yet and has not published anything yet either: still starting, not dead. A
+    /// short `Retry-After` tells AVPlayer's playlist-reload loop (and any external/hosted client) to try again
+    /// shortly instead of a bare 404 that reads as a permanently missing resource during an ordinary cold
+    /// start.
+    private func closeForPendingProducer(_ connection: NWConnection, path: String) {
+        DiagnosticsLog.log("dv", "hls 503 \(path) (remux starting)")
+        close(connection, status: "503 Service Unavailable", extraHeaders: "Retry-After: 1\r\n")
     }
 
     // MARK: - Serve-log volume policy
