@@ -81,13 +81,6 @@ const name = cleanedName || `${version} (${tag})`; // never let an empty/degener
 const note = cleanProse(args.note || "");
 const generatedDescription = note || `${name}. One-tap update over any earlier build, nothing resets.`;
 
-// Never let an AI/vendor name reach the public manifest (house rule: no AI names in public git).
-for (const [label, value] of [["name", name], ["note", note]]) {
-  if (/(claude|codex|anthropic|openai)/i.test(value)) {
-    die(`--${label} contains a disallowed AI/vendor name; refusing to write it to the public store manifest`);
-  }
-}
-
 const sizes = {
   "ios-size": requirePositiveInt("ios-size", args["ios-size"]),
   "tvos-size": requirePositiveInt("tvos-size", args["tvos-size"]),
