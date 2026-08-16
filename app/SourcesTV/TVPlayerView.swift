@@ -602,6 +602,9 @@ struct TVPlayerView: View {
     // or `idleAutoAdvanceLimit` back-to-back auto-advances with zero input) pause and ask, so a binge does
     // not run all night. ANY press / swipe re-arms it, so an attended session never trips. Mirrors PlayerScreen.
     @State private var stillWatching = false             // the modal is up (playback paused, awaiting Continue / Stop)
+    // Settings toggle (#200): default ON = current behavior. Off disables BOTH triggers below; playback then
+    // runs uninterrupted (no idle pause, auto-advance proceeds without asking). SAME key PlayerScreen binds.
+    @AppStorage("vortx.stillWatchingPrompt") private var stillWatchingPromptEnabled = true
     @State private var stillWatchingWantsStop = false    // remote focus: false = Continue (default), true = Stop
     @State private var idleDeadline: Date = .distantFuture   // wall-clock idle deadline; pushed forward on every press
     @State private var consecutiveAutoAdvances = 0        // back-to-back auto-advances with no interaction between them
@@ -6288,7 +6291,7 @@ struct TVPlayerView: View {
             // "Still watching?" binge guard: after N back-to-back auto-advances with zero remote input,
             // pause at this boundary and ask instead of rolling straight on (Continue resumes the roll).
             consecutiveAutoAdvances += 1
-            if consecutiveAutoAdvances >= Self.idleAutoAdvanceLimit {
+            if stillWatchingPromptEnabled, consecutiveAutoAdvances >= Self.idleAutoAdvanceLimit {
                 presentStillWatching(pendingAdvance: true)
             } else {
                 playNext()
@@ -8332,6 +8335,7 @@ struct TVPlayerView: View {
     /// Fire the timed prompt iff the session looks unattended AND is actually playing. Never interrupts a
     /// paused / buffering / options / failed session; each is re-checked on the next poll tick.
     private func maybePromptStillWatching() {
+        guard stillWatchingPromptEnabled else { return }   // disabled: never interrupt an idle session
         guard hasStartedPlaying, !stillWatching else { return }
         guard !isPaused, !showOptions, !buffering, !loadFailed else { return }
         guard Date() >= idleDeadline else { return }

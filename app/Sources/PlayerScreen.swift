@@ -340,6 +340,9 @@ struct PlayerScreen: View {
     // pause playback and ask, so a binge does not run all night. ANY interaction re-arms it, so an
     // actively-attended session never trips. Mirrors TVPlayerView.
     @State private var stillWatchingPrompt = false          // the modal is up (playback paused, awaiting Continue / Stop)
+    // Settings toggle (#200): default ON = current behavior. Off disables BOTH triggers below; playback then
+    // runs uninterrupted (no idle pause, auto-advance proceeds without asking). SAME key TVPlayerView binds.
+    @AppStorage("vortx.stillWatchingPrompt") private var stillWatchingPromptEnabled = true
     @State private var idleDeadline = Date.distantFuture    // wall-clock idle deadline; pushed forward on every interaction
     @State private var idleWatchTask: Task<Void, Never>?    // single poll loop; started on open, cancelled on teardown
     @State private var consecutiveAutoAdvances = 0          // back-to-back auto-advances with no interaction between them
@@ -2031,7 +2034,7 @@ struct PlayerScreen: View {
                 // "Still watching?" binge guard: after N back-to-back auto-advances with zero interaction,
                 // pause at this boundary and ask instead of rolling straight on (Continue resumes the roll).
                 consecutiveAutoAdvances += 1
-                if consecutiveAutoAdvances >= Self.idleAutoAdvanceLimit {
+                if stillWatchingPromptEnabled, consecutiveAutoAdvances >= Self.idleAutoAdvanceLimit {
                     presentStillWatching(pendingNext: allEpisodeRefs[i + 1].id)
                 } else {
                     goToEpisode(allEpisodeRefs[i + 1].id, autoAdvance: true)
@@ -7679,6 +7682,7 @@ struct PlayerScreen: View {
     /// paused / buffering / panel / failed / scrubbing session (those are not "running all night", and a
     /// modal there is just noise); each is re-checked on the next poll tick.
     private func maybePromptStillWatching() {
+        guard stillWatchingPromptEnabled else { return }   // disabled: never interrupt an idle session
         guard hasStartedPlaying, !stillWatchingPrompt else { return }
         guard !isPaused, panel == nil, !scrubbing, !buffering, !loadFailed, !skipEditActive else { return }
         guard Date() >= idleDeadline else { return }
