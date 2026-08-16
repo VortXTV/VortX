@@ -19,6 +19,24 @@
       "versions": [
         {
           "version": "0.3.14",
+          "buildVersion": "217",
+          "date": "2026-08-16",
+          "localizedDescription": "0.3.14 Beta 15. A focused playback-reliability wave from a full diagnostic-log audit. Streams that spun forever now recover on their own, a dead source is dropped in a couple of seconds instead of half a minute, marking something watched shows up right away, rewinding keeps working on long streams, and an unsafe Dolby Vision colour fallback is corrected. Trakt sign-in works again, no app update needed. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.15/VortX-iOS-v0.3.14-beta.15-ci.ipa",
+          "size": 64172346,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "216",
+          "date": "2026-08-11",
+          "localizedDescription": "0.3.14 Beta 14. The big one since Beta 12. The playback-stability campaign that fixes the Beta 12 constant-buffering regression plus a long list of stalls, freezes, and crashes traced on real Apple devices, a full account and credential security pass, audio and Continue Watching fixes, and deeper diagnostics. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.14/VortX-iOS-v0.3.14-beta.14-ci.ipa",
+          "size": 64137204,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
           "buildVersion": "207",
           "date": "2026-08-01",
           "localizedDescription": "0.3.14 Beta 12. Two hotfixes over Beta 10. The app opens again: a keychain locking deadlock that froze the splash screen on signed-in installs (worst on Apple TV) is fixed. External debrid playback works again: a TLS enforcement shipped with no certificate trust store, which blocked every Real-Debrid and TorBox source while local torrents played, is removed. In-place update over any earlier build, nothing resets.",
@@ -66,6 +84,24 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.3.14",
+          "buildVersion": "217",
+          "date": "2026-08-16",
+          "localizedDescription": "0.3.14 Beta 15. A focused playback-reliability wave from a full diagnostic-log audit. On Apple TV a stream that froze mid-play now recovers on its own instead of spinning forever, a dead source is dropped in a couple of seconds instead of half a minute, marking something watched shows up right away, rewinding keeps working on long streams, and an unsafe Dolby Vision colour fallback is corrected. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.15/VortX-tvOS-v0.3.14-beta.15-ci.ipa",
+          "size": 63601691,
+          "minOSVersion": "18.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "216",
+          "date": "2026-08-11",
+          "localizedDescription": "0.3.14 Beta 14. The big one since Beta 12. The playback-stability campaign that fixes the Beta 12 constant-buffering regression on Apple TV plus a long list of stalls, freezes, and crashes traced on real Apple TVs, a full account and credential security pass, audio and Continue Watching fixes, and deeper diagnostics. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.14/VortX-tvOS-v0.3.14-beta.14-ci.ipa",
+          "size": 63561827,
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.3.14",
           "buildVersion": "207",
