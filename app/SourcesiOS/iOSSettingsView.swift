@@ -160,6 +160,10 @@ struct iOSSettingsView: View {
     /// Auto-add watched to Library (D8): when playback of a title crosses ~60s it is added to the Library.
     /// Default ON. Read at the 60s progress tick in PlayerScreen / TVPlayerView via LibraryAutoAdd.
     @AppStorage("stremiox.autoAddLibrary") private var autoAddLibrary = true
+    /// "Still watching?" prompt (#200): default ON = current behavior. Off disables both the idle-timeout
+    /// guard and the binge-boundary guard in PlayerScreen (and TVPlayerView, same key), so playback never
+    /// pauses to ask and auto-advance always proceeds straight through.
+    @AppStorage("vortx.stillWatchingPrompt") private var stillWatchingPromptEnabled = true
     /// Auto-delete watched downloads: when ON, a completed download whose title crosses the watched
     /// threshold is removed to reclaim space. Default OFF. Read by DownloadManager at its watched-state tick.
     @AppStorage(DownloadManager.autoDeleteWatchedDefaultsKey) private var autoDeleteWatched = false
@@ -736,6 +740,10 @@ struct iOSSettingsView: View {
             // account library). A manual removal is remembered so a title is not force-re-added on replay.
             Toggle("Auto-add watched to Library", isOn: $autoAddLibrary)
                 .tint(Theme.Palette.accent)
+            Toggle("Still watching prompt", isOn: $stillWatchingPromptEnabled)
+                .tint(Theme.Palette.accent)
+            Text("Pauses and asks if you are still watching after a long idle stretch or many auto-played episodes. Turn off to keep playing.")
+                .font(.caption).foregroundStyle(.secondary)
             #if os(iOS)
             Toggle("Landscape in player", isOn: $autoLandscapeInPlayer)
                 .tint(Theme.Palette.accent)
@@ -2055,7 +2063,7 @@ private enum SettingsSearchSection: CaseIterable {
                                 "credits", "skip timestamps", "skip database", "seek bar", "community scrub previews",
                                 "trickplay", "autoplay trailers", "trailer language", "default volume",
                                 "auto-add watched", "landscape", "background playback", "keep playing", "play in",
-                                "external player"]
+                                "external player", "still watching", "idle"]
         case .downloads: return ["downloads", "auto-delete", "delete watched", "offline", "storage", "reclaim space"]
         case .notifications: return ["new episode alerts", "episode", "notification"]
         case .streams: return ["quality preset", "smart source selection", "add-on ranking", "source type",

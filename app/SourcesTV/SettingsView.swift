@@ -117,6 +117,10 @@ struct SettingsView: View {
     // Auto-add watched to Library (D8): a title is added to the Library once ~60s of it has played.
     // Default ON. SAME key iOS/Mac binds; read at the 60s progress tick in the player.
     @AppStorage("stremiox.autoAddLibrary") private var autoAddLibrary = true
+    /// "Still watching?" prompt (#200): default ON = current behavior. Off disables both the idle-timeout
+    /// guard and the binge-boundary guard in TVPlayerView (and PlayerScreen, same key), so playback never
+    /// pauses to ask and auto-advance always proceeds straight through. SAME key iOS/Mac binds.
+    @AppStorage("vortx.stillWatchingPrompt") private var stillWatchingPromptEnabled = true
     // Default player volume 0-100 (D5): the level a new playback starts at. The in-player volume slider
     // writes this same key, so the last level persists; this picker sets it explicitly. SAME key as iOS/Mac.
     @AppStorage("stremiox.playerVolume") private var playerVolume = 100.0
@@ -574,6 +578,10 @@ struct SettingsView: View {
             choiceRow(String(localized: "Auto-add watched to Library"), [("0", "Off"), ("1", "On")],
                       selection: Binding(get: { autoAddLibrary ? "1" : "0" }, set: { autoAddLibrary = ($0 == "1") }))
             Text("Adds a title to your Library once about a minute of it has played, so it is easy to find again.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow(String(localized: "Still watching prompt"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { stillWatchingPromptEnabled ? "1" : "0" }, set: { stillWatchingPromptEnabled = ($0 == "1") }))
+            Text("Pauses and asks if you are still watching after a long idle stretch or many auto-played episodes. Turn off to keep playing.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
     }
@@ -1558,7 +1566,7 @@ private enum SettingsSearchSection: CaseIterable {
                                 "player engine", "dolby vision", "mkv", "skip step", "auto-skip", "intro",
                                 "credits", "skip timestamps", "skip database", "seek bar", "community scrub previews",
                                 "trickplay", "autoplay trailers", "trailer language", "default volume",
-                                "auto-add watched", "play in", "external player"]
+                                "auto-add watched", "play in", "external player", "still watching", "idle"]
         case .downloads: return ["downloads", "auto-delete", "delete watched", "offline", "storage", "reclaim space"]
         case .notifications: return ["new episode alerts", "episode", "notification"]
         case .streams: return ["quality preset", "smart source selection", "add-on ranking", "source type",
