@@ -35,6 +35,10 @@ on:
         description: "Attach the built apps to this existing release tag (e.g. v0.3.0-beta13). Leave blank to upload as a run artifact only."
         required: false
         default: ""
+      altstore_note:
+        description: "Optional one-line blurb for the AltStore/SideStore update entry. Leave blank to derive it from the release name."
+        required: false
+        default: ""
 
 # Workflow-wide default is READ-ONLY: the build job executes repo-controlled code (scripts/*,
 # app/scripts/*, the xcodegen'd build phases), so it must never hold write authority on the repo.
@@ -1048,3 +1052,94 @@ jobs:
             out/SHA256SUMS-ci.txt
           # Remove the older .zip mac asset if this tag had one from a previous run.
           gh release delete-asset -y -- "$TAG" "VortX-macOS-$TAG-ci.zip" 2>/dev/null || true
+
+      # Keep the AltStore / SideStore source in lockstep with every cut. Sideload auto-update is a
+      # PULL: each installed app polls .../main/altstore/source.json and compares its top versions[]
+      # entry to what is installed. Nothing used to write that file, so it froze at Beta 12 (build
+      # 207) through Beta 15 and every app polled it and saw "no update". These two steps advance it
+      # on every approved cut. Idempotent: a re-attach or the publish re-trigger produces no diff.
+      - name: Check out main to update the AltStore source
+        # Only on the canonical cut path (workflow_dispatch attach). The release-published
+        # re-trigger rebuilds and re-attaches assets, but must not re-run the source update: that
+        # would land a redundant commit and overwrite any hand-supplied note with the generated one.
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: srcrepo
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Update altstore/source.json and push to main
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          ALTSTORE_NOTE: ${{ inputs.altstore_note }}
+        run: |
+          set -euo pipefail
+          # Same strict release-tag grammar the attach steps enforce: this value is spent in a
+          # download URL and gh calls, so it must never be anything but a real release tag.
+          TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if [ -z "${TAG:-}" ] || ! [[ "$TAG" =~ $TAG_RE ]]; then
+            echo "::error::release tag '$TAG' is not a strict release tag; refusing to update AltStore source"
+            exit 1
+          fi
+          cd srcrepo
+          # Build number: read it from the TAG's own project.yml (the exact commit that was built),
+          # NOT from main HEAD. If main's CURRENT_PROJECT_VERSION is bumped for the next beta during
+          # the approval wait (two betas briefly in flight), reading main would advertise a
+          # buildVersion that does not match the CFBundleVersion inside the linked IPA, and AltStore
+          # would re-offer the same update forever. The tag peels to the built commit (proven by the
+          # tag-commit binding step above), so its project.yml is the authoritative build number.
+          git fetch --no-tags origin "+refs/tags/$TAG:refs/tags/$TAG"
+          BUILD="$(git show "refs/tags/$TAG:app/project.yml" | grep -m1 -E 'CURRENT_PROJECT_VERSION:' | sed -E 's/.*"([0-9]+)".*/\1/')"
+          if ! [[ "$BUILD" =~ ^[0-9]+$ ]]; then
+            echo "::error::could not read a numeric CURRENT_PROJECT_VERSION from app/project.yml at tag $TAG"
+            exit 1
+          fi
+          # Sizes come from the assets just uploaded to THIS release (bytes), so the store entry
+          # matches exactly what a user downloads.
+          # Flags BEFORE the `--` terminator so gh parses --json/--jq as options; the tag stays the
+          # sole positional after `--` (gh release view accepts at most one positional, unlike the
+          # upload/delete-asset calls above whose args are all positional).
+          ASSETS_JSON="$(gh release view --json assets -- "$TAG")"
+          IOS_SIZE="$(jq -r --arg n "VortX-iOS-$TAG-ci.ipa" '.assets[] | select(.name==$n) | .size' <<<"$ASSETS_JSON")"
+          TVOS_SIZE="$(jq -r --arg n "VortX-tvOS-$TAG-ci.ipa" '.assets[] | select(.name==$n) | .size' <<<"$ASSETS_JSON")"
+          # `// ""` guards a JSON-null (untitled) release from arriving as the literal string "null".
+          NAME="$(gh release view --json name --jq '.name // ""' -- "$TAG")"
+          for pair in "iOS:$IOS_SIZE" "tvOS:$TVOS_SIZE"; do
+            v="${pair#*:}"
+            if ! [[ "$v" =~ ^[0-9]+$ ]] || [ "$v" -le 0 ]; then
+              echo "::error::missing/invalid asset size for ${pair%%:*} (iOS=$IOS_SIZE tvOS=$TVOS_SIZE); did the upload attach both IPAs?"
+              exit 1
+            fi
+          done
+          node scripts/update-altstore-source.mjs \
+            --file altstore/source.json \
+            --tag "$TAG" --build "$BUILD" --date "$(date -u +%F)" \
+            --name "$NAME" --note "${ALTSTORE_NOTE:-}" \
+            --ios-size "$IOS_SIZE" --tvos-size "$TVOS_SIZE"
+          if git diff --quiet -- altstore/source.json; then
+            echo "AltStore source already current for build $BUILD ($TAG); nothing to commit."
+            exit 0
+          fi
+          git config user.name "Mamaclapper"
+          git config user.email "50227842+mamaclapper@users.noreply.github.com"
+          git add altstore/source.json
+          git commit -m "chore(release): point AltStore source at ${NAME:-$TAG} (build $BUILD)"
+          # main may have advanced between checkout and now. Push; on a stale-ref rejection, rebase
+          # our single-file change onto the latest main and retry (bounded). The ruleset on main
+          # allows fast-forward pushes and forbids only force-push/deletion, so the rebase path stays
+          # a valid fast-forward.
+          pushed=0
+          for attempt in 1 2 3; do
+            if git push origin main; then pushed=1; break; fi
+            echo "push rejected (attempt $attempt); rebasing on latest main and retrying"
+            git pull --rebase origin main || git rebase --abort 2>/dev/null || true
+            sleep "$((attempt * 3))"
+          done
+          if [ "$pushed" != 1 ]; then
+            echo "::error::could not push the AltStore source update to main after 3 attempts (assets are attached; re-run the dispatch or update altstore/source.json by hand)"
+            exit 1
+          fi
