@@ -19,6 +19,15 @@
       "versions": [
         {
           "version": "0.3.14",
+          "buildVersion": "218",
+          "date": "2026-08-19",
+          "localizedDescription": "0.3.14 Beta 16. One-tap update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.16/VortX-iOS-v0.3.14-beta.16-ci.ipa",
+          "size": 64182016,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
           "buildVersion": "217",
           "date": "2026-08-16",
           "localizedDescription": "0.3.14 Beta 15. A focused playback-reliability wave from a full diagnostic-log audit. Streams that spun forever now recover on their own, a dead source is dropped in a couple of seconds instead of half a minute, marking something watched shows up right away, rewinding keeps working on long streams, and an unsafe Dolby Vision colour fallback is corrected. Trakt sign-in works again, no app update needed. In-place update over any earlier build, nothing resets.",
@@ -84,6 +93,15 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.3.14",
+          "buildVersion": "218",
+          "date": "2026-08-19",
+          "localizedDescription": "0.3.14 Beta 16. One-tap update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.16/VortX-tvOS-v0.3.14-beta.16-ci.ipa",
+          "size": 63617303,
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.3.14",
           "buildVersion": "217",
